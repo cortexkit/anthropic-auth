@@ -23,7 +23,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.12",
+    "@biomejs/biome": "2.4.14",
     "@mariozechner/pi-ai": "0.72.1",
     "@mariozechner/pi-coding-agent": "0.72.1",
     "@opencode-ai/plugin": "1.4.7",
