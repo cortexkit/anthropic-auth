@@ -32,6 +32,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc",
     "types": "tsc",
+    "test": "bun test src/tests",
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
