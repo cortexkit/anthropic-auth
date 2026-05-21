@@ -21,13 +21,16 @@ import {
   executeCacheKeepCommand,
   executeDumpCommand,
   executeFastModeCommand,
+  executeKillswitchCommand,
   executeRoutingCommand,
   FallbackAccountManager,
+  formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
   getAccountStoragePath,
   getCache1hMode,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getKillswitchConfig,
   getRelayConfig,
   getRoutingMode,
   hashRefreshToken,
@@ -39,9 +42,14 @@ import {
   isFastModeEnabled,
   isFastModePersistentlyEnabled,
   isFastModeSupportedModel,
+  isKillswitchEnabled,
+  KILLSWITCH_COMMAND_NAME,
+  killswitchPassesPolicy,
+  killswitchRetryAfterSeconds,
   loadAccounts,
   log,
   mergeAnthropicBetas,
+  type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
@@ -65,6 +73,7 @@ import {
   setDumpPersistentEnabled,
   setFastModeEnabled,
   setFastModePersistentEnabled,
+  setKillswitchPersistent,
   setRoutingMode,
   shouldFallbackStatus,
 } from '@cortexkit/anthropic-auth-core'
@@ -705,6 +714,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           description:
             'Show or change Claude account routing between main-first and fallback-first.',
         },
+        [KILLSWITCH_COMMAND_NAME]: {
+          template: KILLSWITCH_COMMAND_NAME,
+          description:
+            'Manage killswitch — hard-block requests when quota drops below per-account thresholds.',
+        },
       }
     },
     'experimental.chat.system.transform': async (
@@ -783,6 +797,24 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           input.sessionID,
           await executePersistentRoutingCommand(input.arguments),
         )
+        throwHandledSentinel()
+      }
+
+      if (input.command === KILLSWITCH_COMMAND_NAME) {
+        const storage = await loadAccounts()
+        const config = getKillswitchConfig(storage)
+        const accountIds = (storage?.accounts ?? [])
+          .filter((a) => a.enabled !== false)
+          .map((a) => a.id)
+        const result = executeKillswitchCommand({
+          argumentsText: input.arguments,
+          config,
+          accountIds,
+        })
+        if (result.updatedConfig) {
+          await setKillswitchPersistent(result.updatedConfig)
+        }
+        await sendIgnoredMessage(ctx, input.sessionID, result.text)
         throwHandledSentinel()
       }
     },
@@ -1439,6 +1471,36 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             return response
           }
 
+          function getFallbackQuota(account: {
+            id: string
+            access?: string
+            quota?: OAuthQuotaSnapshot
+          }): OAuthQuotaSnapshot | undefined {
+            // Token-aware read: a cached entry bound to a different access token
+            // (account re-login) is dropped so a stale snapshot is never used.
+            return (
+              quotaManager.getFallback(account.id, account.access)?.quota ??
+              account.quota
+            )
+          }
+
+          // The fallbacks routing may actually send to: usable accounts that
+          // also pass the killswitch policy. Every fallback-selection path
+          // (fallback-first, soft-quota skip-main, the killswitch gate, reactive
+          // retries) must go through this so the killswitch is a hard block on
+          // ALL routes — a killswitch-killed account must never serve a request,
+          // even if it still passes the softer routing quota policy.
+          async function getRoutableFallbackAccounts(
+            storageArg: Awaited<ReturnType<typeof loadAccounts>>,
+          ) {
+            const usable =
+              await fallbackManager.getUsableFallbackAccounts(storageArg)
+            if (!isKillswitchEnabled(storageArg)) return usable
+            return usable.filter((a) =>
+              killswitchPassesPolicy(getFallbackQuota(a), storageArg, a.id),
+            )
+          }
+
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -1555,6 +1617,21 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 accounts: accounts.length,
               })
             }
+            if (isKillswitchEnabled(storage)) {
+              const before = accounts.length
+              accounts = accounts.filter((a) =>
+                // Prefer the fresh QuotaManager cache (updated by the eager
+                // killswitch refresh) over the request-start storage snapshot,
+                // matching the other killswitch fallback filters.
+                killswitchPassesPolicy(getFallbackQuota(a), storage, a.id),
+              )
+              if (accounts.length < before) {
+                log('[killswitch] filtered fallbacks', {
+                  before,
+                  after: accounts.length,
+                })
+              }
+            }
             return (
               (await tryUsableFallbackAccounts(
                 input,
@@ -1627,7 +1704,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 try {
                   const fallbackStart = nowMs()
                   preselectedFallbackAccounts =
-                    await fallbackManager.getUsableFallbackAccounts(storage)
+                    await getRoutableFallbackAccounts(storage)
                   trace.mark('fallback_first_get_accounts', {
                     ms: roundMs(nowMs() - fallbackStart),
                     accounts: preselectedFallbackAccounts.length,
@@ -1745,7 +1822,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   if (!quotaSnapshotPassesPolicy(routingQuota, storage)) {
                     const fallbackStart = nowMs()
                     preselectedFallbackAccounts =
-                      await fallbackManager.getUsableFallbackAccounts(storage)
+                      await getRoutableFallbackAccounts(storage)
                     trace.mark('preselect_fallback_accounts', {
                       ms: roundMs(nowMs() - fallbackStart),
                       accounts: preselectedFallbackAccounts.length,
@@ -1776,6 +1853,157 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   })
                   // Main quota checks should optimize routing, not break requests.
                 }
+              }
+
+              // Fail-closed: if failClosedOnUnknownQuota is set, quota API is backed off,
+              // and we have no cached quota, block the request. Token-aware read
+              // so a previous account's cached quota can't satisfy this check
+              // (and feed the killswitch eval below) after a main-account switch.
+              let mainQuota = quotaManager.getMain(auth.access)?.quota
+              if (
+                storage?.quota?.failClosedOnUnknownQuota &&
+                !mainQuota &&
+                quotaManager.isBackedOff()
+              ) {
+                const lastError = quotaManager.getLastApiError()
+                const msg = lastError
+                  ? formatQuotaBackoffMessage(lastError, Date.now())
+                  : 'Quota API unavailable'
+                log('[quota] blocked: quota API backed off (failClosed)', {
+                  nextRetryAt: lastError?.nextRetryAt,
+                  retryCount: lastError?.retryCount,
+                })
+                return new Response(
+                  JSON.stringify({
+                    type: 'error',
+                    error: { type: 'rate_limit_error', message: msg },
+                  }),
+                  {
+                    status: 429,
+                    headers: {
+                      'content-type': 'application/json',
+                      'retry-after': String(
+                        lastError?.nextRetryAt
+                          ? Math.max(
+                              1,
+                              Math.ceil(
+                                (lastError.nextRetryAt - Date.now()) / 1000,
+                              ),
+                            )
+                          : 60,
+                      ),
+                    },
+                  },
+                )
+              }
+              // Killswitch — eagerly refresh quota so it can evaluate
+              if (isKillswitchEnabled(storage)) {
+                const needsRefresh =
+                  quotaManager.needsRefresh(sessionRequestCount)
+                if (needsRefresh) {
+                  try {
+                    const fallbackAccts = (storage?.accounts ?? []).filter(
+                      (a) => a.enabled !== false && a.access,
+                    )
+                    await Promise.all([
+                      quotaManager.refreshMain(auth.access),
+                      quotaManager.refreshAllFallbacks(fallbackAccts),
+                    ])
+                  } catch (error) {
+                    log('[quota] killswitch refresh failed', {
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                      backedOff: quotaManager.isBackedOff(),
+                    })
+                  }
+                }
+                // Re-read after the eager refresh so the killswitch evaluates
+                // against fresh quota. The initial read above is null on the
+                // first request, before the refresh populates the cache.
+                mainQuota = quotaManager.getMain(auth.access)?.quota
+              }
+
+              if (
+                isKillswitchEnabled(storage) &&
+                // No `mainQuota &&` guard: when main quota is unknown (eager
+                // refresh failed on the first request) killswitchPassesPolicy
+                // returns false under failClosedOnUnknownQuota, so the killswitch
+                // must still block / reroute instead of falling through to main.
+                !killswitchPassesPolicy(mainQuota, storage)
+              ) {
+                // Main is killswitch-killed. Decide where to route from the SAME
+                // set routing will actually use — usable fallbacks that also
+                // pass the killswitch policy. Deriving the 429 decision from this
+                // single source of truth means an account that passes the quota
+                // check but is dropped by routing (expired/un-refreshable token,
+                // refresh backoff, below routing threshold) cannot suppress the
+                // 429 and let the request fall through to the killed main. A
+                // non-replayable body cannot use a fallback at all, so it has no
+                // survivors by definition.
+                const canReplayToFallback = isReplayableRequest(
+                  input,
+                  init?.body,
+                )
+                const survivingFallbacks = canReplayToFallback
+                  ? await getRoutableFallbackAccounts(storage)
+                  : []
+
+                if (survivingFallbacks.length > 0) {
+                  log('[route] skipping main (killswitch), trying fallbacks')
+                  const fallbackResponse = await tryUsableFallbackAccounts(
+                    input,
+                    init,
+                    survivingFallbacks,
+                    storage,
+                    undefined,
+                    trace,
+                    {
+                      // Correct the sidebar's active account — the routing
+                      // writeback above optimistically set it to 'main', which
+                      // is wrong once the killswitch hands off to a fallback.
+                      onSuccess: (account) =>
+                        writeCurrentSidebarState(account.id, 'fallback'),
+                    },
+                  )
+                  // The killswitch is a HARD block: it must never fall through to
+                  // the killed main. tryUsableFallbackAccounts returns the last
+                  // upstream error on exhaustion (returnLastOnExhausted defaults
+                  // to true), so a transient fallback failure surfaces that real
+                  // error rather than being retried on the killswitched main.
+                  if (fallbackResponse) {
+                    trace.done('return_killswitch_fallback', {
+                      status: fallbackResponse.status,
+                    })
+                    return createStrippedStream(fallbackResponse)
+                  }
+                }
+                // Nowhere to route (no surviving fallback, or none produced a
+                // response): hard-block instead of using the killed main.
+                const now = Date.now()
+                const fallbackAccounts = (storage?.accounts ?? [])
+                  .filter((a) => a.enabled !== false)
+                  .map((a) => ({ ...a, quota: getFallbackQuota(a) }))
+                const retryAfter = killswitchRetryAfterSeconds(
+                  mainQuota,
+                  fallbackAccounts,
+                  now,
+                )
+                return new Response(
+                  JSON.stringify({
+                    type: 'error',
+                    error: {
+                      type: 'rate_limit_error',
+                      message: `Killswitch: no routable accounts. Retry in ${Math.floor(retryAfter / 60)}m ${retryAfter % 60}s.`,
+                    },
+                  }),
+                  {
+                    status: 429,
+                    headers: {
+                      'content-type': 'application/json',
+                      'retry-after': String(retryAfter),
+                    },
+                  },
+                )
               }
 
               const mainResponse = await sendWithAccessToken(

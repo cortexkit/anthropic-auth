@@ -19,8 +19,8 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Primary Claude Pro/Max OAuth | OpenCode `/connect anthropic` | Pi `/login anthropic` |
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
-| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
-| Fallback accounts, quota routing, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
+| Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump`, `/claude-killswitch` | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Fallback accounts, quota routing, killswitch, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
 ## What CortexKit adds over the original plugin
 
@@ -31,6 +31,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Cache keepalive**: use `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
+- **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
 - **Claude-compatible request hardening**: final-body billing signing, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
 
@@ -173,6 +174,11 @@ Example:
     },
     "failClosedOnUnknownQuota": true
   },
+  "killswitch": {
+    "enabled": false,
+    "main": { "five_hour": 5, "seven_day": 10 },
+    "accounts": {}
+  },
   "claudeCache": {
     "enabled": false,
     "mode": "explicit"
@@ -263,6 +269,49 @@ Show current quota state:
 In OpenCode, this includes the main Anthropic account and sidecar fallback accounts. In Pi, the command reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`.
 
 Reset times are rendered as relative durations, such as `resets in 10m` or `resets in 1h 15m`.
+
+## Killswitch
+
+The killswitch is a per-account hard-block that stops requests when remaining quota drops below configured thresholds, even if Anthropic's API would still accept them. Unlike `minimumRemaining` (which routes to fallback accounts), the killswitch removes accounts from the routing pool entirely.
+
+Add a `killswitch` block to the sidecar config:
+
+```json
+"killswitch": {
+  "enabled": true,
+  "main": {
+    "five_hour": 5,
+    "seven_day": 10
+  },
+  "accounts": {
+    "work-alt": {
+      "five_hour": 10,
+      "seven_day": 20
+    }
+  }
+}
+```
+
+Thresholds are remaining-percent values. With `five_hour: 5`, the account is killed when less than 5% of the 5-hour quota window remains. Accounts without an entry in `accounts` fall back to the `main` thresholds. The aliases `5h` and `1w` are also accepted.
+
+Behavior:
+
+- When an account is killed, it is skipped during routing. Surviving accounts are tried instead.
+- When all accounts (main and all enabled fallbacks) are killed, the plugin returns a synthetic 429 response with a `retry-after` header set to the earliest quota reset time across all accounts.
+- On the first request after restart, the plugin eagerly fetches main quota so the killswitch evaluates immediately.
+- `/claude-quota` shows killswitch status and per-account killed/active state.
+
+Manage the killswitch from inside OpenCode:
+
+```text
+/claude-killswitch              — show status and command cheatsheet
+/claude-killswitch on           — enable with current or default thresholds
+/claude-killswitch off          — disable
+/claude-killswitch set all:5,10 — set all accounts to 5h≥5%, 1w≥10%
+/claude-killswitch set main:3,8 work-alt:5,10 — per-account thresholds
+```
+
+Changes made with `/claude-killswitch` are persisted to the sidecar config.
 
 ## Claude prompt cache control
 

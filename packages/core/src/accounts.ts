@@ -53,6 +53,18 @@ export type AccountQuotaWindow = {
 
 export type RoutingMode = 'main-first' | 'fallback-first'
 
+export type KillswitchThresholds = Partial<
+  Record<QuotaWindowName | '5h' | '1w', number>
+>
+
+export type KillswitchConfig = {
+  enabled?: boolean
+  /** Thresholds for the main OAuth account (remaining % below which the account is killed). */
+  main?: KillswitchThresholds
+  /** Per-account overrides keyed by account ID. Accounts without an entry use the `main` thresholds. */
+  accounts?: Record<string, KillswitchThresholds>
+}
+
 export type AccountStorage = {
   version: 1
   main?: {
@@ -107,6 +119,7 @@ export type AccountStorage = {
     fallbackToDirect?: boolean
     transport?: 'http' | 'websocket'
   }
+  killswitch?: KillswitchConfig
   accounts: OAuthAccount[]
 }
 
@@ -274,6 +287,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     claudeFast: isRecord(value.claudeFast) ? value.claudeFast : undefined,
     cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     relay: isRecord(value.relay) ? value.relay : undefined,
+    killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
     accounts: value.accounts
       .map(normalizeAccount)
       .filter((account): account is OAuthAccount => account != null),
@@ -781,6 +795,118 @@ export function quotaSnapshotPassesPolicy(
     if (window.remainingPercent < thresholds[key]) return false
   }
   return true
+}
+
+// ---------------------------------------------------------------------------
+// Killswitch — hard-block requests when remaining quota drops below per-account
+// thresholds, even if the API would still accept them.
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_KILLSWITCH_THRESHOLDS: Record<QuotaWindowName, number> = {
+  five_hour: 5,
+  seven_day: 10,
+}
+
+function normalizeKillswitchThresholds(
+  thresholds: KillswitchThresholds | undefined,
+): Record<QuotaWindowName, number> {
+  return {
+    five_hour:
+      thresholds?.five_hour ??
+      thresholds?.['5h'] ??
+      DEFAULT_KILLSWITCH_THRESHOLDS.five_hour,
+    seven_day:
+      thresholds?.seven_day ??
+      thresholds?.['1w'] ??
+      DEFAULT_KILLSWITCH_THRESHOLDS.seven_day,
+  }
+}
+
+export function isKillswitchEnabled(storage: AccountStorage | null) {
+  return storage?.killswitch?.enabled === true
+}
+
+function getKillswitchThresholdsForAccount(
+  storage: AccountStorage | null,
+  accountId?: string,
+): Record<QuotaWindowName, number> {
+  if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
+  if (accountId && storage.killswitch.accounts?.[accountId]) {
+    return normalizeKillswitchThresholds(storage.killswitch.accounts[accountId])
+  }
+  return normalizeKillswitchThresholds(storage.killswitch.main)
+}
+
+/**
+ * Returns true if the account's quota is above its killswitch threshold.
+ * When killswitch is disabled, always returns true.
+ */
+export function killswitchPassesPolicy(
+  quota: OAuthQuotaSnapshot | undefined,
+  storage: AccountStorage | null,
+  accountId?: string,
+) {
+  if (!isKillswitchEnabled(storage)) return true
+  const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
+  let sawUnknownWindow = false
+  for (const key of ['five_hour', 'seven_day'] as const) {
+    const window = quota?.[key]
+    // Defer the unknown-window decision: a quota snapshot can legally carry
+    // only one window, and a present window below its threshold must still
+    // block even if the other window is missing.
+    if (!window) {
+      sawUnknownWindow = true
+      continue
+    }
+    if (window.remainingPercent < thresholds[key]) return false
+  }
+  if (sawUnknownWindow) return !failClosedOnUnknownQuota(storage)
+  return true
+}
+
+/**
+ * Find the earliest reset time across all accounts' quota windows.
+ * Returns seconds from `now` until that reset, or 300 as a fallback.
+ */
+export function killswitchRetryAfterSeconds(
+  mainQuota: OAuthQuotaSnapshot | undefined,
+  fallbackAccounts: Array<{ quota?: OAuthQuotaSnapshot }>,
+  now: number,
+): number {
+  const resetTimes: number[] = []
+  const allQuotas = [mainQuota, ...fallbackAccounts.map((a) => a.quota)]
+  for (const quota of allQuotas) {
+    for (const key of ['five_hour', 'seven_day'] as const) {
+      const resetStr = quota?.[key]?.resetsAt
+      if (!resetStr) continue
+      const resetTime = Date.parse(resetStr)
+      if (Number.isFinite(resetTime) && resetTime > now) {
+        resetTimes.push(resetTime)
+      }
+    }
+  }
+  if (!resetTimes.length) return 300
+  return Math.max(1, Math.ceil((Math.min(...resetTimes) - now) / 1000)) + 60
+}
+
+export function getKillswitchConfig(
+  storage: AccountStorage | null,
+): KillswitchConfig {
+  return storage?.killswitch ?? { enabled: false }
+}
+
+export async function setKillswitchPersistent(
+  config: KillswitchConfig,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? {
+    version: 1,
+    main: { type: 'opencode' as const, provider: 'anthropic' as const },
+    accounts: [],
+  }
+  storage.killswitch = config
+  await saveAccounts(storage, path)
+  return storage
 }
 
 export function getQuotaNextRefreshAt(

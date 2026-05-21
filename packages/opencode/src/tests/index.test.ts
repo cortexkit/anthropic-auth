@@ -2841,3 +2841,401 @@ describe('auth.loader', () => {
     expect(state.fallbacks[0]?.id).toBe('fallback-1')
   })
 })
+
+describe('killswitch fetch gate', () => {
+  const originalFetch = globalThis.fetch
+  const originalSetInterval = globalThis.setInterval
+
+  beforeEach(() => {
+    globalThis.fetch = originalFetch
+    // Prevent the plugin's background quota-refresh interval from leaking a
+    // real timer that fires during later tests (test-isolation flake).
+    globalThis.setInterval = mock(
+      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
+    ) as unknown as typeof setInterval
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    globalThis.setInterval = originalSetInterval
+  })
+
+  const oauthLoader = () =>
+    Promise.resolve({
+      type: 'oauth' as const,
+      access: 'main-access',
+      refresh: 'main-refresh',
+      expires: Date.now() + 100000,
+    })
+
+  // Main below the soft routing threshold but ABOVE the killswitch threshold,
+  // with no fallbacks: the killswitch must not hard-block — the request falls
+  // through to main as it would with the killswitch disabled.
+  test('does not 429 when main is only below the routing threshold', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+      }),
+    )
+
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            // five_hour remaining 8% (< routing 10, > killswitch 5),
+            // seven_day remaining 60% (above both).
+            JSON.stringify({
+              five_hour: { utilization: 92 },
+              seven_day: { utilization: 40 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('message-ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('message-ok')
+  })
+
+  // Main killed (below killswitch threshold) with a non-replayable body and a
+  // healthy fallback: the fallback cannot accept the request, so the killswitch
+  // must 429 rather than silently serving the killed main account.
+  test('429s a non-replayable request when main is killed even if a fallback is alive', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+      }),
+    )
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        // main killed (remaining 2%), fallback healthy (remaining 90%).
+        const utilization = authorization.includes('main-access') ? 98 : 10
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization },
+              seven_day: { utilization: 10 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('message-ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('hi'))
+        controller.close()
+      },
+    })
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: stream,
+      duplex: 'half',
+    } as RequestInit)
+
+    expect(response.status).toBe(429)
+    expect(await response.text()).toContain('Killswitch')
+  })
+
+  test('429s a replayable request when main is killed and the only fallback passes killswitch but fails routing quota policy', async () => {
+    // The fallback is above its killswitch threshold (so it passes the
+    // killswitch quota check) but below the routing minimumRemaining, so
+    // getUsableFallbackAccounts — and therefore routing — drops it. The 429
+    // decision must be derived from the routable set, not the storage snapshot,
+    // so the request is hard-blocked instead of falling through to the killed
+    // main account.
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: false,
+        },
+        killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      }),
+    )
+
+    let mainServed = false
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        // main killed (5h remaining 2%). fallback 5h remaining 7% — above the
+        // killswitch threshold (5) but below the routing minimumRemaining (10).
+        const fiveHourUtil = authorization.includes('main-access') ? 98 : 93
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: fiveHourUtil },
+              seven_day: { utilization: 50 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      mainServed = true
+      return Promise.resolve(new Response('message-ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(429)
+    expect(await response.text()).toContain('Killswitch')
+    // Must NOT have fallen through to the killswitched main account.
+    expect(mainServed).toBe(false)
+  })
+
+  test('fallback-first routing does not serve from a killswitch-killed fallback', async () => {
+    // killswitch threshold (5h:50) is higher than the routing minimumRemaining
+    // (5h:10): a fallback at 30% passes routing policy but is killswitch-killed.
+    // fallback-first must NOT serve from it — it should fall through to the
+    // healthy main account instead.
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: false,
+        },
+        killswitch: { enabled: true, main: { five_hour: 50, seven_day: 10 } },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      }),
+    )
+
+    let servedAuth: string | undefined
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        const isMain = authorization.includes('main-access')
+        // main healthy (80%); fallback at 30% — below killswitch (50), above
+        // routing minimumRemaining (10).
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: isMain ? 20 : 70 },
+              seven_day: { utilization: isMain ? 20 : 50 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      servedAuth = new Headers(init?.headers).get('authorization') ?? ''
+      return Promise.resolve(new Response('message-ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(servedAuth).toContain('main-access')
+    expect(servedAuth).not.toContain('fallback-access')
+  })
+
+  test('fail-closed killswitch blocks the first request when main quota is unknown', async () => {
+    // failClosedOnUnknownQuota=true: on the first request the quota API is down,
+    // so the eager refresh fails and main quota stays unknown. The killswitch
+    // must treat main as killed (fail-closed) and 429 rather than fall through
+    // to main — even before the quota-API backoff is armed.
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+      }),
+    )
+
+    let mainServed = false
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        // Quota API down → eager refresh fails → main quota stays unknown.
+        return Promise.resolve(new Response('upstream error', { status: 500 }))
+      }
+      mainServed = true
+      return Promise.resolve(new Response('message-ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(429)
+    expect(mainServed).toBe(false)
+  })
+
+  test('sidebar marks the fallback active when the killswitch routes to it', async () => {
+    // killswitch threshold (5h:50) is above the routing minimumRemaining
+    // (5h:10): main at 30% passes routing (so the routing writeback optimistically
+    // sets the sidebar to 'main') but is killswitch-killed, so the killswitch gate
+    // hands off to the healthy fallback. The sidebar's active account must be
+    // corrected to that fallback, not left showing 'main'.
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: false,
+        },
+        killswitch: { enabled: true, main: { five_hour: 50, seven_day: 10 } },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      }),
+    )
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        const isMain = authorization.includes('main-access')
+        // main 5h 30% (passes routing 10, fails killswitch 50 → killed);
+        // fallback 5h 90% (passes both). 7d healthy for both.
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: isMain ? 70 : 10 },
+              seven_day: { utilization: 10 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('message-ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    const state = await waitForSidebarState((s) => s.activeId === 'fallback-1')
+    expect(state.activeId).toBe('fallback-1')
+  })
+
+  test('killswitch returns the surviving fallback error rather than falling through to the killed main', async () => {
+    // main is killswitch-killed; a surviving fallback is tried but returns 429.
+    // The killswitch is a hard block, so the request must surface the fallback's
+    // real error — never retry on the killed main.
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: false,
+        },
+        killswitch: { enabled: true, main: { five_hour: 50, seven_day: 10 } },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      }),
+    )
+
+    let mainServed = false
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (url.includes('/api/oauth/usage')) {
+        const isMain = authorization.includes('main-access')
+        // main 30% (passes routing 10, fails killswitch 50 → killed);
+        // fallback 90% (a survivor).
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: isMain ? 70 : 10 },
+              seven_day: { utilization: 10 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (authorization.includes('main-access')) {
+        mainServed = true
+        return Promise.resolve(new Response('main-ok', { status: 200 }))
+      }
+      // Surviving fallback is rate-limited at request time.
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: 'fallback-limited' }), {
+          status: 429,
+        }),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(429)
+    const body = await response.text()
+    expect(body).toContain('fallback-limited')
+    expect(body).not.toContain('Killswitch: no routable')
+    expect(mainServed).toBe(false)
+  })
+})
