@@ -935,6 +935,47 @@ describe('FallbackAccountManager', () => {
       'Claude OAuth refresh failed: 400 — invalid_grant',
     )
   })
+
+  test('force refreshes fresh accounts and persists the new quota', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fresh-but-forced',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: 20_000_000,
+      // Fresh quota — would normally be skipped by the staleness gate.
+      quota: {
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: 1_900 },
+        seven_day: { usedPercent: 20, remainingPercent: 80, checkedAt: 1_900 },
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            five_hour: { utilization: 70 },
+            seven_day: { utilization: 30 },
+          }),
+          { status: 200 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({ fetchImpl, now: () => 2_000 })
+
+    // force: true bypasses the staleness skip and fetches anyway.
+    const result = await manager.refreshQuotaForAllAccounts({ force: true })
+
+    expect(result.errors).toEqual([])
+    expect(fetchImpl).toHaveBeenCalled()
+    // Refreshed numbers are PERSISTED to disk (regression guard for #2).
+    const saved = await loadAccounts()
+    expect(saved?.accounts[0]?.quota?.five_hour?.remainingPercent).toBe(30)
+    expect(saved?.accounts[0]?.quota?.seven_day?.remainingPercent).toBe(70)
+  })
 })
 
 describe('buildRefreshOperationError', () => {

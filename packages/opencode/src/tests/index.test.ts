@@ -334,6 +334,18 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
 
     globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedHeaders = init?.headers
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
@@ -402,7 +414,19 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
     let capturedHeaders: Headers | undefined
     globalThis.fetch = mock((input: any, init: any) => {
-      capturedUrl = extractUrl(input)
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      capturedUrl = url
       capturedBody = init?.body
       capturedHeaders = new Headers(init?.headers)
       return Promise.resolve(
@@ -916,7 +940,19 @@ describe('auth.loader', () => {
 
     let capturedHeaders: Headers | undefined
     let capturedBody: string | undefined
-    globalThis.fetch = mock((_input: any, init: any) => {
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedHeaders = init?.headers
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
@@ -958,7 +994,19 @@ describe('auth.loader', () => {
 
     let capturedHeaders: Headers | undefined
     let capturedBody: string | undefined
-    globalThis.fetch = mock((_input: any, init: any) => {
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedHeaders = init?.headers
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
@@ -995,7 +1043,19 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
     const mockClient = createMockClient()
 
-    globalThis.fetch = mock((_input: any, init: any) => {
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       capturedBody = init?.body
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
@@ -1050,7 +1110,19 @@ describe('auth.loader', () => {
     const mockClient = createMockClient()
 
     globalThis.fetch = mock(
-      (_input: string | URL | Request, init?: RequestInit) => {
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
         capturedBody = String(init?.body)
         capturedHeaders = new Headers(init?.headers)
         return Promise.resolve(new Response(null, { status: 200 }))
@@ -1100,7 +1172,19 @@ describe('auth.loader', () => {
     const mockClient = createMockClient()
 
     globalThis.fetch = mock(
-      (_input: string | URL | Request, init?: RequestInit) => {
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+              }),
+              { status: 200 },
+            ),
+          )
+        }
         capturedBody = String(init?.body)
         return Promise.resolve(new Response(null, { status: 200 }))
       },
@@ -1780,7 +1864,19 @@ describe('auth.loader', () => {
     let capturedUrl: string | undefined
 
     globalThis.fetch = mock((input: any) => {
-      capturedUrl = extractUrl(input)
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      capturedUrl = url
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
@@ -2144,6 +2240,8 @@ describe('auth.loader', () => {
       ])
 
       expect(second).toBe('message-2')
+      // Background quota refresh involves file-lock I/O; wait for it to fire.
+      await new Promise((r) => setTimeout(r, 50))
       expect(quotaCalls).toBe(2)
       expect(messageCalls).toBe(2)
     } finally {
