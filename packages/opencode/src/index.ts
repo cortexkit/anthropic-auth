@@ -40,6 +40,7 @@ import {
   loadAccounts,
   log,
   mergeAnthropicBetas,
+  type OAuthQuotaSnapshot,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
@@ -517,6 +518,110 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     const enabled = isFastModePersistentlyEnabled(storage)
     setFastModeEnabled(enabled)
     return executeFastModeCommand({ argumentsText, enabled })
+  }
+
+  function quotaBar(pct: number, width = 16): string {
+    const filled = Math.min(Math.round((pct / 100) * width), width)
+    return '█'.repeat(filled) + '░'.repeat(width - filled)
+  }
+
+  function formatResetIn(resetsAt: string | undefined): string {
+    if (!resetsAt) return ''
+    const ms = new Date(resetsAt).getTime() - Date.now()
+    if (ms <= 0) return 'resets now'
+    const mins = Math.floor(ms / 60_000)
+    if (mins < 60) return `resets ${mins}m`
+    const hrs = Math.floor(mins / 60)
+    const rm = mins % 60
+    return rm > 0 ? `resets ${hrs}h${rm}m` : `resets ${hrs}h`
+  }
+
+  function showQuotaToast(
+    quota: OAuthQuotaSnapshot | null,
+    fallbacks?: Array<{
+      id: string
+      label?: string
+      quota?: OAuthQuotaSnapshot
+    }>,
+    activeAccountId?: string,
+  ) {
+    const sections: string[] = []
+    let globalMaxUsed = 0
+
+    // Main account
+    if (quota) {
+      const fh = quota.five_hour
+      const sd = quota.seven_day
+      if (fh || sd) {
+        const mainActive = activeAccountId === 'main'
+        const indicator = mainActive ? '🟢' : '  '
+        const reset = formatResetIn(fh?.resetsAt)
+        const lines: string[] = [
+          `${indicator} main${reset ? ` (${reset})` : ''}`,
+        ]
+        if (fh) {
+          lines.push(
+            `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
+        }
+        if (sd) {
+          lines.push(
+            `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
+        }
+        sections.push(lines.join('\n'))
+      }
+    }
+
+    // Fallback accounts
+    if (fallbacks?.length) {
+      for (const fb of fallbacks) {
+        const q = fb.quota
+        if (!q) continue
+        const fh = q.five_hour
+        const sd = q.seven_day
+        if (!fh && !sd) continue
+        const name = fb.label || 'alt'
+        const fbActive = activeAccountId === fb.id
+        const indicator = fbActive ? '🟢' : '  '
+        const fbReset = formatResetIn(fh?.resetsAt)
+        const lines: string[] = [
+          `${indicator} ${name}${fbReset ? ` (${fbReset})` : ''}`,
+        ]
+        if (fh) {
+          lines.push(
+            `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
+        }
+        if (sd) {
+          lines.push(
+            `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
+          )
+          globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
+        }
+        sections.push(lines.join('\n'))
+      }
+    }
+
+    if (!sections.length) return
+    const message = sections.join('\n\n')
+    const variant =
+      globalMaxUsed >= 90 ? 'error' : globalMaxUsed >= 70 ? 'warning' : 'info'
+
+    // biome-ignore lint/suspicious/noExplicitAny: SDK client.tui type not exposed to server plugins
+    void (client.tui as any)
+      ?.showToast?.({
+        body: {
+          title: 'Claude Quota',
+          message,
+          variant,
+          duration: variant === 'error' ? 8000 : 5000,
+        },
+      })
+      ?.catch?.(() => {})
   }
 
   return {
@@ -1388,6 +1493,27 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               quotaManager.updateStorage(storage)
               quotaManager.seedFallbacksFromAccounts(storage?.accounts ?? [])
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
+
+              /** Show quota toast from current QuotaManager state */
+              function showQuotaToastFromCache() {
+                const mainEntry = quotaManager.getMain()
+                if (!mainEntry) return
+                const fallbacks = (storage?.accounts ?? []).filter(
+                  (a) => a.enabled !== false,
+                )
+                const mainPassesPolicy = quotaSnapshotPassesPolicy(
+                  mainEntry.quota,
+                  storage,
+                )
+                let activeId: string | undefined
+                if (mainPassesPolicy) {
+                  activeId = 'main'
+                } else {
+                  activeId = fallbacks[0]?.id
+                }
+                showQuotaToast(mainEntry.quota, fallbacks, activeId)
+              }
+
               let preselectedFallbackAccounts:
                 | Awaited<
                     ReturnType<
@@ -1405,6 +1531,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   let routingQuota = quotaManager.getMain()?.quota
                   if (!routingQuota) {
                     routingQuota = await quotaManager.refreshMain(auth.access)
+                    showQuotaToastFromCache()
                   } else if (quotaManager.isMainStale()) {
                     // Background refresh — return stale to avoid blocking
                     void quotaManager.refreshMain(auth.access).catch(() => {})
