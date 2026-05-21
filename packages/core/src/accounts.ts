@@ -67,8 +67,12 @@ export type AccountStorage = {
   quota?: {
     enabled?: boolean
     checkIntervalMinutes?: number
+    refreshEveryNRequests?: number
     minimumRemaining?: Partial<Record<QuotaWindowName | '5h' | '1w', number>>
     failClosedOnUnknownQuota?: boolean
+    mainQuota?: OAuthQuotaSnapshot
+    mainQuotaCheckedAt?: number
+    mainLastQuotaApiError?: AccountOperationError
   }
   claudeCache?: {
     enabled?: boolean
@@ -113,6 +117,7 @@ export type AccountManagerOptions = {
   now?: () => number
   fetchImpl?: typeof fetch
   configPath?: string
+  quotaManager?: import('./quota-manager.ts').QuotaManager
 }
 
 export type AccountRefreshError = {
@@ -127,6 +132,9 @@ const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
 const MIN_REFRESH_RETRY_DELAY_MS = 5 * 60_000
 const MAX_REFRESH_RETRY_DELAY_MS = 60 * 60_000
 const NON_TRANSIENT_REFRESH_RETRY_DELAY_MS = 24 * 60 * 60_000
+const MIN_QUOTA_RETRY_DELAY_MS = 60_000
+const MAX_QUOTA_RETRY_DELAY_MS = 15 * 60_000
+const NON_TRANSIENT_QUOTA_RETRY_DELAY_MS = 5 * 60_000
 const DEFAULT_QUOTA_CHECK_INTERVAL_MINUTES = 5
 const DEFAULT_MINIMUM_REMAINING: Record<QuotaWindowName, number> = {
   five_hour: 0,
@@ -608,10 +616,93 @@ export function formatRefreshBackoffMessage(
   return `Claude OAuth refresh is backed off for ${seconds}s after: ${error.message}`
 }
 
+function isTransientQuotaError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  // fetchOAuthQuotaSnapshot throws: "Claude quota check failed: {status} — {body}"
+  const statusMatch = error.message.match(/Claude quota check failed: (\d+)/)
+  if (statusMatch) {
+    const status = Number(statusMatch[1])
+    return status === 429 || status >= 500
+  }
+  // Network errors
+  return (
+    error.message.includes('fetch failed') ||
+    ('code' in error &&
+      (error.code === 'ECONNRESET' ||
+        error.code === 'ECONNREFUSED' ||
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'UND_ERR_CONNECT_TIMEOUT'))
+  )
+}
+
+export function buildQuotaOperationError(input: {
+  error: unknown
+  now: number
+  previous?: AccountOperationError
+}): AccountOperationError {
+  const previousRetryCount = input.previous?.retryCount ?? 0
+  const retryCount = previousRetryCount + 1
+  const delay = isTransientQuotaError(input.error)
+    ? Math.min(
+        MAX_QUOTA_RETRY_DELAY_MS,
+        MIN_QUOTA_RETRY_DELAY_MS * 2 ** Math.min(retryCount - 1, 6),
+      )
+    : NON_TRANSIENT_QUOTA_RETRY_DELAY_MS
+  return {
+    message: formatErrorMessage(input.error),
+    checkedAt: input.now,
+    nextRetryAt: input.now + delay,
+    retryCount,
+  }
+}
+
+export function quotaBackoffActive(
+  error: AccountOperationError | undefined,
+  now: number,
+): boolean {
+  if (!error?.nextRetryAt || error.nextRetryAt <= now) return false
+  return true
+}
+
+export function formatQuotaBackoffMessage(
+  error: AccountOperationError,
+  now: number,
+): string {
+  const seconds = Math.max(
+    1,
+    Math.ceil(((error.nextRetryAt ?? now) - now) / 1000),
+  )
+  return `Quota API backed off for ${seconds}s after: ${error.message}`
+}
+
 export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
   const minutes =
     storage?.quota?.checkIntervalMinutes ?? DEFAULT_QUOTA_CHECK_INTERVAL_MINUTES
   return Math.max(1, minutes) * 60_000
+}
+
+export function getPersistedMainQuota(
+  storage: AccountStorage | null,
+): { quota: OAuthQuotaSnapshot; checkedAt: number } | null {
+  if (!storage?.quota?.mainQuota || !storage.quota.mainQuotaCheckedAt)
+    return null
+  return {
+    quota: storage.quota.mainQuota,
+    checkedAt: storage.quota.mainQuotaCheckedAt,
+  }
+}
+
+/**
+ * How often (in requests) to force a quota refresh, independent of the timer.
+ * Returns 0 when disabled (default).
+ */
+export function getQuotaRefreshEveryNRequests(
+  storage: AccountStorage | null,
+): number {
+  const n = storage?.quota?.refreshEveryNRequests
+  return typeof n === 'number' && Number.isFinite(n) && n > 0
+    ? Math.floor(n)
+    : 0
 }
 
 function failClosedOnUnknownQuota(storage: AccountStorage | null) {
@@ -764,10 +855,11 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
-  account.lastQuotaRefreshError = {
-    message: formatErrorMessage(error),
-    checkedAt: now,
-  }
+  account.lastQuotaRefreshError = buildQuotaOperationError({
+    error,
+    now,
+    previous: account.lastQuotaRefreshError,
+  })
   if (error instanceof ClaudeOAuthRefreshError) {
     recordRefreshError(account, error, now)
   }
@@ -780,11 +872,37 @@ export class FallbackAccountManager {
   private readonly refreshPromises = new Map<string, Promise<OAuthAccount>>()
   private refreshTimer: ReturnType<typeof setInterval> | null = null
   private quotaTimer: ReturnType<typeof setInterval> | null = null
+  readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
 
   constructor(options: AccountManagerOptions = {}) {
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl ?? fetch
     this.configPath = options.configPath ?? getAccountStoragePath()
+    this.quotaManager = options.quotaManager ?? null
+  }
+
+  /**
+   * Seed QuotaManager from persisted account.quota if no cache entry exists
+   * yet. Prevents unnecessary API calls when the on-disk snapshot is fresh.
+   */
+  private seedFallbackQuota(
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ): void {
+    if (!this.quotaManager) return
+    if (this.quotaManager.getFallback(account.id)) return
+    if (!account.quota) return
+    const checkedAt = Math.max(
+      account.quota.five_hour?.checkedAt ?? 0,
+      account.quota.seven_day?.checkedAt ?? 0,
+    )
+    if (checkedAt <= 0) return
+    const checkInterval = getQuotaCheckIntervalMs(storage)
+    this.quotaManager.setFallback(account.id, {
+      quota: account.quota,
+      refreshAfter: checkedAt + checkInterval,
+      checkedAt,
+    })
   }
 
   async load() {
@@ -840,7 +958,11 @@ export class FallbackAccountManager {
           next = await this.refreshAccount(next, storage)
           changed = true
         }
-        if (quotaIsStale(next, storage, this.now())) {
+        this.seedFallbackQuota(next, storage)
+        const stale = this.quotaManager
+          ? this.quotaManager.isFallbackStale(next.id)
+          : quotaIsStale(next, storage, this.now())
+        if (stale) {
           next = await this.refreshAccountQuota(next, storage)
           changed = true
         }
@@ -937,7 +1059,16 @@ export class FallbackAccountManager {
           next = await this.refreshAccount(next, storage)
           changed = true
         }
-        if (!quotaIsStale(next, storage, this.now())) continue
+        if (quotaBackoffActive(next.lastQuotaRefreshError, this.now())) {
+          continue
+        }
+        this.seedFallbackQuota(next, storage)
+        // Use QuotaManager staleness when available (shared cache);
+        // fall back to per-account on-disk staleness otherwise.
+        const stale = this.quotaManager
+          ? this.quotaManager.isFallbackStale(next.id)
+          : quotaIsStale(next, storage, this.now())
+        if (!stale) continue
         await this.refreshAccountQuota(next, storage)
         changed = true
       } catch (error) {
@@ -1085,6 +1216,15 @@ export class FallbackAccountManager {
     }
     target.lastQuotaRefreshError = undefined
     updateStoredAccount(storage, target)
+    // Sync to shared QuotaManager so all consumers see the same cache
+    if (this.quotaManager && target.quota) {
+      const now = this.now()
+      this.quotaManager.setFallback(target.id, {
+        quota: target.quota,
+        refreshAfter: now + getQuotaCheckIntervalMs(storage),
+        checkedAt: now,
+      })
+    }
     return target
   }
 }

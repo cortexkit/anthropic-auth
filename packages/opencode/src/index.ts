@@ -21,13 +21,12 @@ import {
   executeDumpCommand,
   executeFastModeCommand,
   FallbackAccountManager,
-  fetchOAuthQuotaSnapshot,
+  formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
+  getAccountStoragePath,
   getCache1hMode,
   getCache1hPersistentMode,
   getCacheKeepWindow,
-  getQuotaCheckIntervalMs,
-  getQuotaNextRefreshAt,
   getRelayConfig,
   hashRefreshToken,
   isCache1hEnabled,
@@ -41,12 +40,12 @@ import {
   loadAccounts,
   log,
   mergeAnthropicBetas,
-  type OAuthQuotaSnapshot,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
   type QuotaAccountSummary,
+  QuotaManager,
   quotaSnapshotPassesPolicy,
   type RelayConfig,
   refreshBackoffActive,
@@ -85,12 +84,6 @@ const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
 const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
-
-type MainQuotaCache = {
-  accessToken: string
-  refreshAfter: number
-  quota: OAuthQuotaSnapshot
-}
 
 type NotificationRequest = {
   path: { id: string }
@@ -247,11 +240,50 @@ function throwHandledSentinel(): never {
 export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   startEventLoopLagMonitor()
   const { client } = ctx
-  const fallbackManager = new FallbackAccountManager()
+  const accountStoragePath = getAccountStoragePath()
+  const initialStorage = await loadAccounts(accountStoragePath)
+  const quotaManager = new QuotaManager({
+    storage: initialStorage,
+    onMainQuotaFetched: async (quota, checkedAt) => {
+      try {
+        const storage = (await loadAccounts(accountStoragePath)) ?? {
+          version: 1 as const,
+          accounts: [],
+        }
+        storage.quota = storage.quota ?? {}
+        storage.quota.mainQuota = quota
+        storage.quota.mainQuotaCheckedAt = checkedAt
+        storage.quota.mainLastQuotaApiError = undefined
+        await saveAccounts(storage, accountStoragePath)
+      } catch (error) {
+        log('[quota] failed to persist main quota', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    },
+    onApiError: async (error) => {
+      try {
+        const storage = (await loadAccounts(accountStoragePath)) ?? {
+          version: 1 as const,
+          accounts: [],
+        }
+        storage.quota = storage.quota ?? {}
+        storage.quota.mainLastQuotaApiError = error
+        await saveAccounts(storage, accountStoragePath)
+      } catch (e) {
+        log('[quota] failed to persist backoff state', {
+          error: e instanceof Error ? e.message : String(e),
+        })
+      }
+    },
+  })
+  const fallbackManager = new FallbackAccountManager({
+    quotaManager,
+  })
   fallbackManager.startBackgroundRefresh()
   let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
   const cacheKeepManager = new CacheKeepManager({
-    loadStorage: () => loadAccounts(),
+    loadStorage: () => loadAccounts(accountStoragePath),
     prepareHeaders: async (headers, target) => {
       if (!latestGetAuth) return headers
       const auth = await latestGetAuth()
@@ -289,14 +321,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     },
     log,
   })
-  const initialCache1hStorage = await loadAccounts()
-  const relayConfig: RelayConfig | null = getRelayConfig(initialCache1hStorage)
+  const relayConfig: RelayConfig | null = getRelayConfig(initialStorage)
   setCache1hState({
-    enabled: isCache1hPersistentlyEnabled(initialCache1hStorage),
-    mode: getCache1hPersistentMode(initialCache1hStorage),
+    enabled: isCache1hPersistentlyEnabled(initialStorage),
+    mode: getCache1hPersistentMode(initialStorage),
   })
-  setDumpEnabled(isDumpPersistentlyEnabled(initialCache1hStorage))
-  setFastModeEnabled(isFastModePersistentlyEnabled(initialCache1hStorage))
+  setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
+  setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
   let latestGetAuth:
     | (() => Promise<{
         type: string
@@ -324,7 +355,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   async function clearStaleMainRefreshError(refreshToken?: string) {
     if (!refreshToken) return
-    const storage = await loadAccounts()
+    const storage = await loadAccounts(accountStoragePath)
     const error = storage?.refresh?.mainLastRefreshError
     if (!storage?.refresh || !error?.tokenHash) return
     const tokenHash = hashRefreshToken(refreshToken)
@@ -347,10 +378,15 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       try {
         const auth = await latestGetAuth()
         if (auth.type === 'oauth' && auth.access) {
+          // Use QuotaManager cache; eager fetch on first request means
+          // this is always populated after the first API call.
+          const cached = quotaManager.getMain()
+          const quota =
+            cached?.quota ?? (await quotaManager.refreshMain(auth.access))
           accounts.push({
             name: 'OpenCode anthropic',
             role: 'main',
-            quota: await fetchOAuthQuotaSnapshot({ accessToken: auth.access }),
+            quota,
           })
         } else if (auth.type === 'oauth') {
           accounts.push({
@@ -361,22 +397,34 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           })
         }
       } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
         accounts.push({
           name: 'OpenCode anthropic',
           role: 'main',
-          error: error instanceof Error ? error.message : String(error),
+          error: msg.includes('429')
+            ? 'Usage API rate limited — try again in a moment'
+            : msg,
         })
       }
     }
 
-    const { storage, errors } =
-      await fallbackManager.refreshQuotaForAllAccounts()
-    accounts.push(
-      ...buildFallbackQuotaSummaries(
-        storage,
-        new Map(errors.map((error) => [error.accountId, error.message])),
-      ),
+    // Use QuotaManager for fallbacks — goes through serial API gate
+    const storage = await loadAccounts(accountStoragePath)
+    const fallbackAccts = (storage?.accounts ?? []).filter(
+      (a) => a.enabled !== false && a.access,
     )
+    try {
+      await quotaManager.refreshAllFallbacks(fallbackAccts)
+    } catch {
+      // Best-effort — stale cache is fine for display
+    }
+    // Overlay QuotaManager cache onto storage accounts for display
+    const fallbackEntries = quotaManager.getAllFallbacks()
+    for (const account of storage?.accounts ?? []) {
+      const cached = fallbackEntries.get(account.id)
+      if (cached) account.quota = cached.quota
+    }
+    accounts.push(...buildFallbackQuotaSummaries(storage, new Map()))
 
     if (!latestGetAuth) {
       accounts.unshift({
@@ -410,7 +458,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       })
     }
 
-    const storage = await loadAccounts()
+    const storage = await loadAccounts(accountStoragePath)
     const enabled = isCache1hPersistentlyEnabled(storage)
     const mode = getCache1hPersistentMode(storage)
     setCache1hState({ enabled, mode })
@@ -419,7 +467,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   async function executePersistentCacheKeepCommand(argumentsText: string) {
     const action = parseCacheKeepCommandAction(argumentsText)
-    let storage = await loadAccounts()
+    let storage = await loadAccounts(accountStoragePath)
     if (action.type === 'window') {
       storage = await setCacheKeepPersistentWindow(
         action.startHour,
@@ -450,7 +498,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       return executeDumpCommand({ argumentsText, enabled })
     }
 
-    const storage = await loadAccounts()
+    const storage = await loadAccounts(accountStoragePath)
     const enabled = isDumpPersistentlyEnabled(storage)
     setDumpEnabled(enabled)
     return executeDumpCommand({ argumentsText, enabled })
@@ -465,7 +513,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       return executeFastModeCommand({ argumentsText, enabled })
     }
 
-    const storage = await loadAccounts()
+    const storage = await loadAccounts(accountStoragePath)
     const enabled = isFastModePersistentlyEnabled(storage)
     setFastModeEnabled(enabled)
     return executeFastModeCommand({ argumentsText, enabled })
@@ -581,9 +629,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           // Shared inflight refresh promise — prevents concurrent token refreshes
           // from racing against each other (and causing 401 cascades with token rotation)
           let refreshPromise: Promise<string> | null = null
-          let mainQuotaCache: MainQuotaCache | null = null
-          let mainQuotaRefreshPromise: Promise<OAuthQuotaSnapshot> | null = null
-          let mainQuotaRetryAfter = 0
 
           async function refreshMainAccessToken() {
             if (!refreshPromise) {
@@ -597,7 +642,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 async function updateMainRefreshState(
                   update: (storage: AccountStorage) => void,
                 ) {
-                  const storage: AccountStorage = (await loadAccounts()) ?? {
+                  const storage: AccountStorage = (await loadAccounts(
+                    accountStoragePath,
+                  )) ?? {
                     version: 1,
                     main: { type: 'opencode', provider: 'anthropic' },
                     accounts: [],
@@ -665,7 +712,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       )
                     }
 
-                    const storage = await loadAccounts()
+                    const storage = await loadAccounts(accountStoragePath)
                     const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
                     const mainError = storage?.refresh?.mainLastRefreshError
                     log('[refresh] opencode main oauth refresh check', {
@@ -751,7 +798,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                       nextStorage.refresh.mainRefreshLeaseTokenHash =
                         refreshTokenHash
                     })
-                    const latestLease = await loadAccounts()
+                    const latestLease = await loadAccounts(accountStoragePath)
                     log(
                       '[refresh] opencode main oauth refresh lease acquired',
                       {
@@ -897,7 +944,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
             const run = async () => {
               try {
-                const storage = await loadAccounts()
+                const storage = await loadAccounts(accountStoragePath)
                 if (!mainRefreshEnabled(storage)) return
                 const latestAuth = await getAuth()
                 if (latestAuth.type !== 'oauth') return
@@ -1143,7 +1190,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               isCache1hEnabled() &&
               getCache1hMode() === 'hybrid'
             ) {
-              const storage = await loadAccounts()
+              const storage = await loadAccounts(accountStoragePath)
               const tracked = await cacheKeepManager.track({
                 sessionId: relayAffinity,
                 url: rewritten.url?.toString() ?? rewritten.input.toString(),
@@ -1185,54 +1232,6 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             })
 
             return response
-          }
-
-          async function refreshMainQuotaCache(
-            accessToken: string,
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const now = Date.now()
-            const quota = await fetchOAuthQuotaSnapshot({ accessToken })
-            mainQuotaCache = {
-              accessToken,
-              refreshAfter: getQuotaNextRefreshAt(quota, storage, now),
-              quota,
-            }
-            return quota
-          }
-
-          function refreshMainQuotaCacheInBackground(
-            accessToken: string,
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const now = Date.now()
-            if (mainQuotaRefreshPromise || now < mainQuotaRetryAfter) return
-            mainQuotaRefreshPromise = refreshMainQuotaCache(
-              accessToken,
-              storage,
-            )
-              .catch((error) => {
-                mainQuotaRetryAfter = now + getQuotaCheckIntervalMs(storage)
-                throw error
-              })
-              .finally(() => {
-                mainQuotaRefreshPromise = null
-              })
-            void mainQuotaRefreshPromise.catch(() => {})
-          }
-
-          async function getMainQuotaForRouting(
-            accessToken: string,
-            storage: Awaited<ReturnType<typeof loadAccounts>>,
-          ) {
-            const now = Date.now()
-            if (mainQuotaCache?.accessToken !== accessToken) {
-              return await refreshMainQuotaCache(accessToken, storage)
-            }
-            if (now >= mainQuotaCache.refreshAfter) {
-              refreshMainQuotaCacheInBackground(accessToken, storage)
-            }
-            return mainQuotaCache.quota
           }
 
           async function tryUsableFallbackAccounts(
@@ -1296,7 +1295,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
             const loadStart = nowMs()
-            const storage = existingStorage ?? (await loadAccounts())
+            const storage = existingStorage ?? (await loadAccounts(accountStoragePath))
             trace?.mark('fallback_load_storage', {
               ms: roundMs(nowMs() - loadStart),
               cached: !!existingStorage,
@@ -1385,7 +1384,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 throw new Error('OAuth access token is missing after refresh')
               }
               const loadStart = nowMs()
-              const storage = await loadAccounts()
+              const storage = await loadAccounts(accountStoragePath)
+              quotaManager.updateStorage(storage)
+              quotaManager.seedFallbacksFromAccounts(storage?.accounts ?? [])
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
               let preselectedFallbackAccounts:
                 | Awaited<
@@ -1400,18 +1401,22 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               ) {
                 try {
                   const quotaStart = nowMs()
-                  const mainQuota = await getMainQuotaForRouting(
-                    auth.access,
-                    storage,
-                  )
+                  // Use QuotaManager: get cached or eagerly refresh if first time
+                  let routingQuota = quotaManager.getMain()?.quota
+                  if (!routingQuota) {
+                    routingQuota = await quotaManager.refreshMain(auth.access)
+                  } else if (quotaManager.isMainStale()) {
+                    // Background refresh — return stale to avoid blocking
+                    void quotaManager.refreshMain(auth.access).catch(() => {})
+                  }
                   trace.mark('main_quota_for_routing', {
                     ms: roundMs(nowMs() - quotaStart),
-                    passes: quotaSnapshotPassesPolicy(mainQuota, storage),
+                    passes: quotaSnapshotPassesPolicy(routingQuota, storage),
                   })
-                  if (!quotaSnapshotPassesPolicy(mainQuota, storage)) {
+                  if (!quotaSnapshotPassesPolicy(routingQuota, storage)) {
                     const fallbackStart = nowMs()
                     preselectedFallbackAccounts =
-                      await fallbackManager.getUsableFallbackAccounts()
+                      await fallbackManager.getUsableFallbackAccounts(storage)
                     trace.mark('preselect_fallback_accounts', {
                       ms: roundMs(nowMs() - fallbackStart),
                       accounts: preselectedFallbackAccounts.length,
@@ -1438,6 +1443,46 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                   })
                   // Main quota checks should optimize routing, not break requests.
                 }
+              }
+
+              // Fail-closed: if failClosedOnUnknownQuota is set, quota API is backed off,
+              // and we have no cached quota, block the request.
+              const mainQuota = quotaManager.getMain()?.quota
+              if (
+                storage?.quota?.failClosedOnUnknownQuota &&
+                !mainQuota &&
+                quotaManager.isBackedOff()
+              ) {
+                const lastError = quotaManager.getLastApiError()
+                const msg = lastError
+                  ? formatQuotaBackoffMessage(lastError, Date.now())
+                  : 'Quota API unavailable'
+                log('[killswitch] blocked: quota API backed off', {
+                  nextRetryAt: lastError?.nextRetryAt,
+                  retryCount: lastError?.retryCount,
+                })
+                return new Response(
+                  JSON.stringify({
+                    type: 'error',
+                    error: { type: 'rate_limit_error', message: msg },
+                  }),
+                  {
+                    status: 429,
+                    headers: {
+                      'content-type': 'application/json',
+                      'retry-after': String(
+                        lastError?.nextRetryAt
+                          ? Math.max(
+                              1,
+                              Math.ceil(
+                                (lastError.nextRetryAt - Date.now()) / 1000,
+                              ),
+                            )
+                          : 60,
+                      ),
+                    },
+                  },
+                )
               }
               const mainResponse = await sendWithAccessToken(
                 input,
