@@ -13,8 +13,16 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "default": "./dist/tui.tsx"
     }
   },
+  "oc-plugin": [
+    ".",
+    "./tui"
+  ],
   "bin": {
     "opencode-anthropic-auth": "dist/cli.js"
   },
@@ -27,7 +35,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/copy-tui.mjs",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "dev": "bun ../../scripts/dev.ts",
     "dev:clean": "bun ../../scripts/dev-clean.ts",
@@ -41,6 +49,9 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@cortexkit/anthropic-auth-core": "1.4.1"
+    "@cortexkit/anthropic-auth-core": "1.4.1",
+    "@opentui/core": ">=0.1.92",
+    "@opentui/solid": ">=0.1.92",
+    "solid-js": "^1.9.10"
   }
 }

@@ -301,6 +301,10 @@ export class CacheKeepManager {
     return { trackedSessions: targets.length, nextPrewarmAt }
   }
 
+  trackedCount(): number {
+    return this.targets.size
+  }
+
   track(input: {
     sessionId?: string | null
     url: string

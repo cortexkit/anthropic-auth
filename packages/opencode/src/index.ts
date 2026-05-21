@@ -71,6 +71,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
+import { type SidebarState, setSidebarState } from './sidebar-state.ts'
 import {
   addFastModeBetaHeader,
   createStrippedStream,
@@ -355,6 +356,49 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
+
+  function writeSidebarState(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    activeId: string | undefined,
+    route: string,
+  ) {
+    const mainEntry = quotaManager.getMain()
+    const state: SidebarState = {
+      main: {
+        quota: mainEntry?.quota ?? null,
+      },
+      fallbacks: (storage?.accounts ?? [])
+        .filter((a) => a.enabled !== false)
+        .map((a) => ({
+          id: a.id,
+          label: a.label,
+          quota: a.quota ?? null,
+          enabled: a.enabled !== false,
+        })),
+      activeId,
+      route,
+      relay: relayConfig
+        ? { enabled: true, transport: relayConfig.transport ?? 'http' }
+        : null,
+      fastMode: isFastModeEnabled(),
+      cacheKeep: {
+        enabled: isCacheKeepHybridActive(storage),
+        window:
+          storage?.cacheKeep?.startHour != null &&
+          storage?.cacheKeep?.endHour != null
+            ? `${storage.cacheKeep.startHour}-${storage.cacheKeep.endHour}`
+            : undefined,
+        trackedSessions: cacheKeepManager.trackedCount(),
+      },
+      lastUpdated: Date.now(),
+    }
+    setSidebarState(state).catch((error) =>
+      log('[sidebar] state write failed', {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    )
+  }
+
   let latestGetAuth:
     | (() => Promise<{
         type: string
@@ -641,6 +685,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           input.sessionID,
           await buildQuotaCommandSummary(),
         )
+        const cmdStorage = await loadAccounts()
+        writeSidebarState(cmdStorage, 'main', 'main')
         throwHandledSentinel()
       }
 
@@ -1086,6 +1132,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
           }
 
           startMainBackgroundRefresh()
+          writeSidebarState(initialStorage, 'main', 'main')
 
           function isReplayableRequest(
             input: string | URL | Request,
