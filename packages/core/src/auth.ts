@@ -12,13 +12,30 @@ type CallbackParams = {
   state: string
 }
 
+function parseRetryAfterHeader(value: string | undefined | null): number | undefined {
+  if (!value) return undefined
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds)
+  const date = Date.parse(value)
+  if (Number.isFinite(date)) {
+    const delta = Math.ceil((date - Date.now()) / 1000)
+    return delta > 0 ? delta : undefined
+  }
+  return undefined
+}
+
 export class ClaudeOAuthRefreshError extends Error {
+  /** Parsed Retry-After value in seconds, if the server provided one. */
+  public readonly retryAfter: number | undefined
+
   constructor(
     public readonly status: number,
     public readonly body: string,
+    retryAfterHeader?: string | null,
   ) {
     super(`Claude OAuth refresh failed: ${status} — ${body}`)
     this.name = 'ClaudeOAuthRefreshError'
+    this.retryAfter = parseRetryAfterHeader(retryAfterHeader ?? undefined)
   }
 }
 
@@ -78,7 +95,11 @@ export async function refreshClaudeOAuthToken(input: {
           continue
         }
         const body = await response.text().catch(() => '')
-        throw new ClaudeOAuthRefreshError(response.status, body)
+        throw new ClaudeOAuthRefreshError(
+          response.status,
+          body,
+          response.headers.get('retry-after'),
+        )
       }
 
       const json = (await response.json()) as {

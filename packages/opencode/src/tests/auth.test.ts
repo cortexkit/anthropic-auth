@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import {
   authorize,
   CLIENT_ID,
+  ClaudeOAuthRefreshError,
   CODE_CALLBACK_URL,
   exchange,
   OAUTH_SCOPES,
@@ -250,5 +251,29 @@ describe('refreshClaudeOAuthToken', () => {
       ).rejects.toThrow(`Claude OAuth refresh failed: ${status}`)
       expect(calls).toBe(1)
     }
+  })
+})
+
+describe('ClaudeOAuthRefreshError', () => {
+  test('captures Retry-After header as seconds', () => {
+    const error = new ClaudeOAuthRefreshError(429, 'rate limited', '60')
+    expect(error.retryAfter).toBe(60)
+  })
+
+  test('captures Retry-After header as HTTP date', () => {
+    const futureDate = new Date(Date.now() + 120_000).toUTCString()
+    const error = new ClaudeOAuthRefreshError(429, 'rate limited', futureDate)
+    expect(error.retryAfter).toBeGreaterThan(0)
+    expect(error.retryAfter).toBeLessThanOrEqual(121)
+  })
+
+  test('retryAfter is undefined when header missing', () => {
+    const error = new ClaudeOAuthRefreshError(429, 'rate limited')
+    expect(error.retryAfter).toBeUndefined()
+  })
+
+  test('retryAfter is undefined for non-parseable values', () => {
+    const error = new ClaudeOAuthRefreshError(429, 'rate limited', 'garbage')
+    expect(error.retryAfter).toBeUndefined()
   })
 })
