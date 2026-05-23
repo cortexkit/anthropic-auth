@@ -1,5 +1,6 @@
 import {
   AUTHORIZE_URLS,
+  CLAUDE_CODE_VERSION,
   CLIENT_ID,
   CODE_CALLBACK_URL,
   OAUTH_SCOPES,
@@ -81,6 +82,7 @@ export async function refreshClaudeOAuthToken(input: {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
+          'User-Agent': `claude-code/${CLAUDE_CODE_VERSION}`,
         },
         body: JSON.stringify({
           grant_type: 'refresh_token',
