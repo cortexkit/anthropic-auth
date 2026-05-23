@@ -329,6 +329,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (!storage?.refresh || !error?.tokenHash) return
     const tokenHash = hashRefreshToken(refreshToken)
     if (error.tokenHash === tokenHash) return
+    // Don't clear backoff if the error is still within its retry window —
+    // a new token (from another process) doesn't mean the rate limit is gone.
+    if (error.nextRetryAt && error.nextRetryAt > Date.now()) {
+      log(
+        '[refresh] opencode main oauth keeping backoff despite token rotation',
+        {
+          nextRetryAt: error.nextRetryAt,
+          retryCount: error.retryCount,
+          remainingMs: error.nextRetryAt - Date.now(),
+        },
+      )
+      return
+    }
     storage.refresh.mainLastRefreshError = undefined
     await saveAccounts(storage)
     log(
