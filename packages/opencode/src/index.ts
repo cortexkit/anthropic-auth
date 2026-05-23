@@ -943,8 +943,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 }
 
                 await refreshMainAccessToken()
+                const refreshedAuth = await getAuth()
                 log('[refresh] opencode main oauth refreshed in background', {
-                  expires: latestAuth.expires,
+                  newExpiresInMs: refreshedAuth.expires
+                    ? refreshedAuth.expires - Date.now()
+                    : undefined,
                 })
               } catch (error) {
                 log('[refresh] opencode main oauth refresh failed', {
@@ -1399,6 +1402,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     hasAccess: Boolean(auth.access),
                     expiresInMs: auth.expires
                       ? auth.expires - Date.now()
+                      : undefined,
+                    expiredAgoMs: auth.expires && auth.expires < Date.now()
+                      ? Date.now() - auth.expires
                       : undefined,
                   },
                 )
