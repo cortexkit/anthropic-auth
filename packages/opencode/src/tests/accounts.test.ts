@@ -577,7 +577,7 @@ describe('FallbackAccountManager', () => {
 
     const fetchImpl = mock(
       (input: string | URL | Request, init?: RequestInit) => {
-        expect(String(input)).toBe('https://api.anthropic.com/v1/oauth/token')
+        expect(String(input)).toBe('https://platform.claude.com/v1/oauth/token')
         const body = JSON.parse(String(init?.body))
         expect(body.refresh_token).toBe('old-refresh')
         expect(new Headers(init?.headers).get('content-type')).toBe(
@@ -641,7 +641,7 @@ describe('FallbackAccountManager', () => {
           )
         }
 
-        expect(url).toBe('https://api.anthropic.com/v1/oauth/token')
+        expect(url).toBe('https://platform.claude.com/v1/oauth/token')
         const body = JSON.parse(String(init?.body))
         expect(body.refresh_token).toBe('refresh-token')
         expect(new Headers(init?.headers).get('content-type')).toBe(

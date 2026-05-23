@@ -176,7 +176,7 @@ describe('refreshClaudeOAuthToken', () => {
       }) as unknown as typeof fetch,
     })
 
-    expect(capturedUrl).toBe('https://api.anthropic.com/v1/oauth/token')
+    expect(capturedUrl).toBe('https://platform.claude.com/v1/oauth/token')
     expect(capturedHeaders?.get('content-type')).toBe('application/json')
     const body = JSON.parse(capturedBody ?? '{}')
     expect(body.grant_type).toBe('refresh_token')

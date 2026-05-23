@@ -1289,7 +1289,7 @@ describe('auth.loader', () => {
     // Should have called token endpoint first
     const tokenCall = fetchCalls.find((c) => c.url.includes('/v1/oauth/token'))
     expect(tokenCall).toBeDefined()
-    expect(tokenCall!.url).toBe('https://api.anthropic.com/v1/oauth/token')
+    expect(tokenCall!.url).toBe('https://platform.claude.com/v1/oauth/token')
     const tokenBody = JSON.parse(tokenCall!.body!)
     expect(tokenBody.grant_type).toBe('refresh_token')
     expect(tokenBody.refresh_token).toBe('old-refresh')
