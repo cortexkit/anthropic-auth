@@ -927,6 +927,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                         storage?.refresh?.mainLastRefreshError?.nextRetryAt,
                       retryCount:
                         storage?.refresh?.mainLastRefreshError?.retryCount,
+                      expiresInMs,
                     },
                   )
                   return
@@ -1364,6 +1365,34 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               }
               await clearStaleMainRefreshError(auth.refresh)
               if (!auth.access || !auth.expires || auth.expires < Date.now()) {
+                // Check backoff before attempting refresh — avoids noisy
+                // per-request retries during prolonged rate limits
+                const refreshStorage = await loadAccounts()
+                const mainRefreshError =
+                  refreshStorage?.refresh?.mainLastRefreshError
+                if (
+                  auth.refresh &&
+                  mainRefreshError &&
+                  refreshBackoffActive(
+                    mainRefreshError,
+                    auth.refresh,
+                    Date.now(),
+                  )
+                ) {
+                  log(
+                    '[refresh] opencode main oauth request skipped backoff',
+                    {
+                      nextRetryAt: mainRefreshError.nextRetryAt,
+                      retryCount: mainRefreshError.retryCount,
+                      expiresInMs: auth.expires
+                        ? auth.expires - Date.now()
+                        : undefined,
+                    },
+                  )
+                  throw new Error(
+                    formatRefreshBackoffMessage(mainRefreshError, Date.now()),
+                  )
+                }
                 log(
                   '[refresh] opencode main oauth refresh required for request',
                   {
