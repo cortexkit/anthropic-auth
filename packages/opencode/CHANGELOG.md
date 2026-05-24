@@ -1,6 +1,12 @@
-# @cortexkit/opencode-anthropic-auth
+# @marcusrbrown/opencode-anthropic-auth
 
-This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
+This fork publishes the OpenCode package as `@marcusrbrown/opencode-anthropic-auth`. Entries below `1.2.2-mb.1` are inherited from the CortexKit and upstream package history.
+
+## 1.2.2-mb.1
+
+### Patch Changes
+
+- Publish the OpenCode package under `@marcusrbrown/opencode-anthropic-auth` with fork suffix versioning for pinned fork installs.
 
 ## 1.2.1
 

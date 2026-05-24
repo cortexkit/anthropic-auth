@@ -4,5 +4,5 @@ Shared Anthropic OAuth, quota, cache, cache-keepalive, fast mode, relay, dump, a
 
 User-facing packages:
 
-- `@cortexkit/opencode-anthropic-auth` for OpenCode
+- `@marcusrbrown/opencode-anthropic-auth` for OpenCode
 - `@cortexkit/pi-anthropic-auth` for Pi

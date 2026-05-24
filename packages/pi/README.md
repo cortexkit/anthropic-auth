@@ -2,7 +2,7 @@
 
 Pi package for CortexKit Anthropic OAuth support. It overrides Pi's built-in `anthropic` provider with a CortexKit provider extension backed by the shared `@cortexkit/anthropic-auth-core` package.
 
-This package is part of the CortexKit Anthropic Auth monorepo, which supports both OpenCode (`@cortexkit/opencode-anthropic-auth`) and Pi (`@cortexkit/pi-anthropic-auth`) through the same shared core logic.
+This package is part of the CortexKit Anthropic Auth monorepo, which supports both OpenCode (`@marcusrbrown/opencode-anthropic-auth`) and Pi (`@cortexkit/pi-anthropic-auth`) through the same shared core logic.
 
 ## Install
 
@@ -74,7 +74,7 @@ The sidecar uses the same JSON shape as the OpenCode package, including `claudeC
 The Pi package can use the same user-owned Cloudflare relay config as the OpenCode package. The relay setup helper currently lives in the OpenCode package CLI:
 
 ```bash
-CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... bunx @cortexkit/opencode-anthropic-auth relay setup
+CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... bunx @marcusrbrown/opencode-anthropic-auth relay setup
 ```
 
 For Pi, copy the generated `relay` block into `~/.pi/agent/anthropic-auth.json`.

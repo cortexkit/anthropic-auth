@@ -1,14 +1,16 @@
 # CortexKit Anthropic Auth for OpenCode and Pi
 
-Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), maintained by CortexKit.
+Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), originally maintained by CortexKit.
 
-This repo is a Bun workspace monorepo with two user-facing integrations and one shared core package. The OpenCode package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. The Pi package is a native Pi provider extension that overrides Pi's built-in Anthropic provider. Both integrations share the same Anthropic OAuth, fallback-account, quota, prompt-cache, relay, dump, and request-signing logic through `@cortexkit/anthropic-auth-core`.
+Fork note: the OpenCode package in this fork is published as `@marcusrbrown/opencode-anthropic-auth`; pin `@marcusrbrown/opencode-anthropic-auth@1.2.2-mb.1` in OpenCode config.
+
+This repo is a Bun workspace monorepo with two user-facing integrations and one shared core package. The OpenCode package is based on CortexKit's maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. The Pi package is a native Pi provider extension that overrides Pi's built-in Anthropic provider. Both integrations share the same Anthropic OAuth, fallback-account, quota, prompt-cache, relay, dump, and request-signing logic through `@cortexkit/anthropic-auth-core`.
 
 ## Packages
 
 | Package | Agent | Purpose |
 | --- | --- | --- |
-| `@cortexkit/opencode-anthropic-auth` | OpenCode | OpenCode plugin and CLI for Claude OAuth, request rewriting, fallback accounts, quotas, cache controls, dumps, and relay setup. |
+| `@marcusrbrown/opencode-anthropic-auth` | OpenCode | OpenCode plugin and CLI for Claude OAuth, request rewriting, fallback accounts, quotas, cache controls, dumps, and relay setup. |
 | `@cortexkit/pi-anthropic-auth` | Pi | Pi package/extension that registers a CortexKit Anthropic provider under Pi's built-in `anthropic` provider ID. |
 | `@cortexkit/anthropic-auth-core` | Shared | Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic used by both integrations. |
 
@@ -53,7 +55,7 @@ Add the OpenCode plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-anthropic-auth"]
+  "plugin": ["@marcusrbrown/opencode-anthropic-auth"]
 }
 ```
 
@@ -61,7 +63,7 @@ Pinning is strongly recommended for any OpenCode plugin:
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-anthropic-auth@1.0.0"]
+  "plugin": ["@marcusrbrown/opencode-anthropic-auth@1.2.2-mb.1"]
 }
 ```
 
@@ -210,17 +212,17 @@ Default fallback statuses:
 Add and inspect OpenCode fallback accounts with the CLI:
 
 ```bash
-bunx @cortexkit/opencode-anthropic-auth login personal-alt
-bunx @cortexkit/opencode-anthropic-auth list
+bunx @marcusrbrown/opencode-anthropic-auth login personal-alt
+bunx @marcusrbrown/opencode-anthropic-auth list
 ```
 
-Prefer npm? Use `npx -y @cortexkit/opencode-anthropic-auth ...` with the same subcommands.
+Prefer npm? Use `npx -y @marcusrbrown/opencode-anthropic-auth ...` with the same subcommands.
 
 For Pi fallback accounts, write the same account JSON shape to `~/.pi/agent/anthropic-auth.json`. The CLI helper currently lives in the OpenCode package, so you can also point it at Pi's sidecar path when logging in a fallback account:
 
 ```bash
 OPENCODE_ANTHROPIC_AUTH_FILE="$HOME/.pi/agent/anthropic-auth.json" \
-  bunx @cortexkit/opencode-anthropic-auth login personal-alt
+  bunx @marcusrbrown/opencode-anthropic-auth login personal-alt
 ```
 
 Fallback retries are only attempted when the request body is safely replayable. If the original body is non-replayable or already consumed, the plugin returns the primary response unchanged.
@@ -361,13 +363,13 @@ WebSocket mode uses protocol v2 on `/ws`, keeps one connection per OpenCode `x-s
 Set up a relay in your Cloudflare account with the OpenCode package CLI:
 
 ```bash
-CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... bunx @cortexkit/opencode-anthropic-auth relay setup
+CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... bunx @marcusrbrown/opencode-anthropic-auth relay setup
 ```
 
 Or with npm:
 
 ```bash
-CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx -y @cortexkit/opencode-anthropic-auth relay setup
+CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx -y @marcusrbrown/opencode-anthropic-auth relay setup
 ```
 
 The setup command:
@@ -438,7 +440,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `OPENCODE_ANTHROPIC_AUTH_FILE` | Override the OpenCode sidecar config path. |
 | `PI_ANTHROPIC_AUTH_FILE` | Override the Pi sidecar config path. |
 | `PI_AGENT_DIR` | Override Pi's agent directory when deriving the default sidecar path. |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @marcusrbrown/opencode-anthropic-auth relay setup`. Not stored. |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID used by relay setup. |
 
 ## Request rewriting
@@ -550,7 +552,7 @@ The release workflow runs checks, publishes the core, OpenCode, and Pi packages 
 
 - Clear OpenCode's plugin cache after plugin config changes: `rm -rf ~/.cache/opencode`.
 - Restart OpenCode or Pi after changing sidecar config; some settings are loaded at startup.
-- If an OpenCode fallback account shows `invalid_grant`, run `bunx @cortexkit/opencode-anthropic-auth login <label>` again for that account.
+- If an OpenCode fallback account shows `invalid_grant`, run `bunx @marcusrbrown/opencode-anthropic-auth login <label>` again for that account.
 - Tail relay diagnostics when debugging relay setup: `tail -f "$(node -p 'require("node:os").tmpdir()')/opencode-anthropic-auth.log"`.
 - Use `/claude-quota` to inspect quota and refresh errors surfaced by the plugin.
 
