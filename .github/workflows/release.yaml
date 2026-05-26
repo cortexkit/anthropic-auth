@@ -204,7 +204,16 @@ jobs:
           echo "✓ mb dist-tag → ${VER}"
 
           LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
-          echo "  latest dist-tag: ${LATEST_TAG} (not changed by this workflow)"
+          if [[ "$LATEST_TAG" != "$VER" ]]; then
+            echo "latest dist-tag for ${PKG} is '${LATEST_TAG}', setting to '${VER}'..."
+            npm dist-tag add "${PKG}@${VER}" latest
+            LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
+            if [[ "$LATEST_TAG" != "$VER" ]]; then
+              echo "Error: latest dist-tag still incorrect after correction attempt."
+              exit 1
+            fi
+          fi
+          echo "✓ latest dist-tag → ${VER}"
 
           node scripts/verify-artifacts.mjs \
             --version "${{ steps.version.outputs.version }}" \
@@ -344,7 +353,16 @@ jobs:
           echo "✓ mb dist-tag → ${VER}"
 
           LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
-          echo "  latest dist-tag: ${LATEST_TAG} (not changed by this workflow)"
+          if [[ "$LATEST_TAG" != "$VER" ]]; then
+            echo "latest dist-tag for ${PKG} is '${LATEST_TAG}', setting to '${VER}'..."
+            npm dist-tag add "${PKG}@${VER}" latest
+            LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
+            if [[ "$LATEST_TAG" != "$VER" ]]; then
+              echo "Error: latest dist-tag still incorrect after correction attempt."
+              exit 1
+            fi
+          fi
+          echo "✓ latest dist-tag → ${VER}"
 
           CORE_DEP=$(npm view "${PKG}@${VER}" dependencies."${CORE_PKG}" 2>/dev/null || true)
           if [[ -z "$CORE_DEP" ]]; then
