@@ -107,7 +107,7 @@ if [[ "$DRY" == true ]]; then
   node scripts/version-sync.mjs "$VERSION" --dry-run
   echo ""
   echo "[DRY RUN] Would tag $TAG and push the current committed state to origin."
-  echo "[DRY RUN] CI would then: test → publish core (mb tag) → verify core → publish OpenCode (mb tag) → verify → GitHub release"
+  echo "[DRY RUN] CI would then: test → publish core (latest tag) → verify core → publish OpenCode (latest tag) → verify → GitHub release"
   exit 0
 fi
 
@@ -162,9 +162,9 @@ echo ""
 echo "  ✓ Released $TAG"
 echo "  → GitHub Actions will now:"
 echo "      1. test (typecheck, build, unit, e2e, lint)"
-echo "      2. publish @marcusrbrown/anthropic-auth-core with --tag mb"
-echo "      3. verify core registry metadata and mb dist-tag"
-echo "      4. publish @marcusrbrown/opencode-anthropic-auth with --tag mb"
-echo "      5. verify OpenCode registry metadata, mb dist-tag, and core dependency"
+echo "      2. publish @marcusrbrown/anthropic-auth-core with --tag latest"
+echo "      3. verify core registry metadata and latest dist-tag"
+echo "      4. publish @marcusrbrown/opencode-anthropic-auth with --tag latest"
+echo "      5. verify OpenCode registry metadata, latest dist-tag, and core dependency"
 echo "      6. create GitHub release"
 echo "  → Watch: https://github.com/marcusrbrown/cortexkit_anthropic-auth/actions"

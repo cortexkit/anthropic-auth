@@ -150,8 +150,6 @@ jobs:
         run: node scripts/verify-artifacts.mjs --version "${{ steps.version.outputs.version }}"
 
       - name: Pack, verify, and publish core tarball (fail-closed)
-        env:
-          NPM_DIST_TAG_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
         run: |
           TARBALL=$(npm pack --workspace "@marcusrbrown/anthropic-auth-core" --pack-destination "$RUNNER_TEMP" | tail -n1)
           TARBALL_PATH="$RUNNER_TEMP/$TARBALL"
@@ -166,7 +164,7 @@ jobs:
             echo "${PKG}@${VER} already published; verifying instead of republishing."
             PUBLISH_SKIPPED=true
           else
-            if ! npm publish "$TARBALL_PATH" --access public --provenance --tag mb; then
+            if ! npm publish "$TARBALL_PATH" --access public --provenance --tag latest; then
               if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
                 echo "${PKG}@${VER} became visible after a publish race; continuing to verification."
                 PUBLISH_SKIPPED=true
@@ -192,36 +190,16 @@ jobs:
           fi
           echo "✓ ${PKG}@${VER} is visible on registry."
 
-          MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
-          if [[ "$MB_TAG" != "$VER" ]]; then
-            echo "Error: mb dist-tag for ${PKG} is '${MB_TAG}', expected '${VER}'."
-            echo "  Attempting to set mb dist-tag..."
-            if [[ -z "${NPM_DIST_TAG_TOKEN:-}" ]]; then
-              echo "Error: NPM_DIST_TAG_TOKEN secret is not set. Add it as a repository secret to allow dist-tag mutations."
-              exit 1
-            fi
-            NODE_AUTH_TOKEN="$NPM_DIST_TAG_TOKEN" npm dist-tag add "${PKG}@${VER}" mb
-            MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
-            if [[ "$MB_TAG" != "$VER" ]]; then
-              echo "Error: mb dist-tag still incorrect after correction attempt."
-              exit 1
-            fi
-          fi
-          echo "✓ mb dist-tag → ${VER}"
-
-          LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
-          if [[ "$LATEST_TAG" != "$VER" ]]; then
-            echo "latest dist-tag for ${PKG} is '${LATEST_TAG}', setting to '${VER}'..."
-            if [[ -z "${NPM_DIST_TAG_TOKEN:-}" ]]; then
-              echo "Error: NPM_DIST_TAG_TOKEN secret is not set. Add it as a repository secret to allow dist-tag mutations."
-              exit 1
-            fi
-            NODE_AUTH_TOKEN="$NPM_DIST_TAG_TOKEN" npm dist-tag add "${PKG}@${VER}" latest
+          echo "→ Verifying latest dist-tag for ${PKG}..."
+          for i in $(seq 1 12); do
             LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
-            if [[ "$LATEST_TAG" != "$VER" ]]; then
-              echo "Error: latest dist-tag still incorrect after correction attempt."
-              exit 1
-            fi
+            if [[ "$LATEST_TAG" == "$VER" ]]; then break; fi
+            echo "  Waiting for latest dist-tag propagation (attempt ${i}/12)..."
+            sleep 5
+          done
+          if [[ "$LATEST_TAG" != "$VER" ]]; then
+            echo "Error: latest dist-tag for ${PKG} is '${LATEST_TAG}', expected '${VER}'. Published with --tag latest but tag did not propagate."
+            exit 1
           fi
           echo "✓ latest dist-tag → ${VER}"
 
@@ -294,12 +272,7 @@ jobs:
             echo "Error: ${CORE_PKG}@${VER} is not resolvable from npm registry. Cannot publish OpenCode."
             exit 1
           fi
-          CORE_MB=$(npm view "${CORE_PKG}" dist-tags.mb 2>/dev/null || true)
-          if [[ "$CORE_MB" != "$VER" ]]; then
-            echo "Error: ${CORE_PKG} mb dist-tag is '${CORE_MB}', expected '${VER}'. Cannot publish OpenCode."
-            exit 1
-          fi
-          echo "✓ Core gate passed: ${CORE_PKG}@${VER} (mb → ${VER})"
+          echo "✓ Core gate passed: ${CORE_PKG}@${VER}"
 
       - name: Build
         run: bun run build
@@ -308,8 +281,6 @@ jobs:
         run: node scripts/verify-artifacts.mjs --version "${{ steps.version.outputs.version }}"
 
       - name: Pack, verify, and publish OpenCode tarball (fail-closed)
-        env:
-          NPM_DIST_TAG_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
         run: |
           TARBALL=$(npm pack --workspace "@marcusrbrown/opencode-anthropic-auth" --pack-destination "$RUNNER_TEMP" | tail -n1)
           TARBALL_PATH="$RUNNER_TEMP/$TARBALL"
@@ -325,7 +296,7 @@ jobs:
             echo "${PKG}@${VER} already published; verifying instead of republishing."
             PUBLISH_SKIPPED=true
           else
-            if ! npm publish "$TARBALL_PATH" --access public --provenance --tag mb; then
+            if ! npm publish "$TARBALL_PATH" --access public --provenance --tag latest; then
               if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
                 echo "${PKG}@${VER} became visible after a publish race; continuing to verification."
                 PUBLISH_SKIPPED=true
@@ -351,36 +322,16 @@ jobs:
           fi
           echo "✓ ${PKG}@${VER} is visible on registry."
 
-          MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
-          if [[ "$MB_TAG" != "$VER" ]]; then
-            echo "Error: mb dist-tag for ${PKG} is '${MB_TAG}', expected '${VER}'."
-            echo "  Attempting to set mb dist-tag..."
-            if [[ -z "${NPM_DIST_TAG_TOKEN:-}" ]]; then
-              echo "Error: NPM_DIST_TAG_TOKEN secret is not set. Add it as a repository secret to allow dist-tag mutations."
-              exit 1
-            fi
-            NODE_AUTH_TOKEN="$NPM_DIST_TAG_TOKEN" npm dist-tag add "${PKG}@${VER}" mb
-            MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
-            if [[ "$MB_TAG" != "$VER" ]]; then
-              echo "Error: mb dist-tag still incorrect after correction attempt."
-              exit 1
-            fi
-          fi
-          echo "✓ mb dist-tag → ${VER}"
-
-          LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
-          if [[ "$LATEST_TAG" != "$VER" ]]; then
-            echo "latest dist-tag for ${PKG} is '${LATEST_TAG}', setting to '${VER}'..."
-            if [[ -z "${NPM_DIST_TAG_TOKEN:-}" ]]; then
-              echo "Error: NPM_DIST_TAG_TOKEN secret is not set. Add it as a repository secret to allow dist-tag mutations."
-              exit 1
-            fi
-            NODE_AUTH_TOKEN="$NPM_DIST_TAG_TOKEN" npm dist-tag add "${PKG}@${VER}" latest
+          echo "→ Verifying latest dist-tag for ${PKG}..."
+          for i in $(seq 1 12); do
             LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
-            if [[ "$LATEST_TAG" != "$VER" ]]; then
-              echo "Error: latest dist-tag still incorrect after correction attempt."
-              exit 1
-            fi
+            if [[ "$LATEST_TAG" == "$VER" ]]; then break; fi
+            echo "  Waiting for latest dist-tag propagation (attempt ${i}/12)..."
+            sleep 5
+          done
+          if [[ "$LATEST_TAG" != "$VER" ]]; then
+            echo "Error: latest dist-tag for ${PKG} is '${LATEST_TAG}', expected '${VER}'. Published with --tag latest but tag did not propagate."
+            exit 1
           fi
           echo "✓ latest dist-tag → ${VER}"
 

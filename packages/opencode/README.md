@@ -546,7 +546,7 @@ Wait for GitHub Actions:
 ./scripts/wait-release.sh v1.8.0
 ```
 
-The fork release workflow runs checks, publishes the core (`@marcusrbrown/anthropic-auth-core`) and OpenCode (`@marcusrbrown/opencode-anthropic-auth`) packages to npm with provenance under the `mb` dist-tag, then creates the GitHub release. Pi (`@cortexkit/pi-anthropic-auth`) is published separately by the upstream CortexKit release lane and is not included in fork publish jobs.
+The fork release workflow runs checks, publishes the core (`@marcusrbrown/anthropic-auth-core`) and OpenCode (`@marcusrbrown/opencode-anthropic-auth`) packages to npm with provenance under the `latest` dist-tag, then creates the GitHub release. Pi (`@cortexkit/pi-anthropic-auth`) is published separately by the upstream CortexKit release lane and is not included in fork publish jobs.
 
 ## Troubleshooting
 
