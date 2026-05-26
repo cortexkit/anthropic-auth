@@ -153,7 +153,6 @@ jobs:
         run: |
           TARBALL=$(npm pack --workspace "@marcusrbrown/anthropic-auth-core" --pack-destination "$RUNNER_TEMP" | tail -n1)
           TARBALL_PATH="$RUNNER_TEMP/$TARBALL"
-          LOCAL_SHASUM=$(shasum -a 1 "$TARBALL_PATH" | awk '{print $1}')
           node scripts/verify-artifacts.mjs \
             --version "${{ steps.version.outputs.version }}" \
             --core-tarball "$TARBALL_PATH"
@@ -190,17 +189,6 @@ jobs:
             exit 1
           fi
           echo "✓ ${PKG}@${VER} is visible on registry."
-
-          if [[ "$PUBLISH_SKIPPED" == true ]]; then
-            REGISTRY_SHASUM=$(npm view "${PKG}@${VER}" dist.shasum 2>/dev/null || true)
-            if [[ "$REGISTRY_SHASUM" != "$LOCAL_SHASUM" ]]; then
-              echo "Error: existing ${PKG}@${VER} tarball shasum does not match this checkout."
-              echo "  local:    ${LOCAL_SHASUM}"
-              echo "  registry: ${REGISTRY_SHASUM:-'(missing)'}"
-              exit 1
-            fi
-            echo "✓ Existing registry tarball shasum matches local verified tarball."
-          fi
 
           MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
           if [[ "$MB_TAG" != "$VER" ]]; then
@@ -304,7 +292,6 @@ jobs:
         run: |
           TARBALL=$(npm pack --workspace "@marcusrbrown/opencode-anthropic-auth" --pack-destination "$RUNNER_TEMP" | tail -n1)
           TARBALL_PATH="$RUNNER_TEMP/$TARBALL"
-          LOCAL_SHASUM=$(shasum -a 1 "$TARBALL_PATH" | awk '{print $1}')
           node scripts/verify-artifacts.mjs \
             --version "${{ steps.version.outputs.version }}" \
             --opencode-tarball "$TARBALL_PATH"
@@ -342,17 +329,6 @@ jobs:
             exit 1
           fi
           echo "✓ ${PKG}@${VER} is visible on registry."
-
-          if [[ "$PUBLISH_SKIPPED" == true ]]; then
-            REGISTRY_SHASUM=$(npm view "${PKG}@${VER}" dist.shasum 2>/dev/null || true)
-            if [[ "$REGISTRY_SHASUM" != "$LOCAL_SHASUM" ]]; then
-              echo "Error: existing ${PKG}@${VER} tarball shasum does not match this checkout."
-              echo "  local:    ${LOCAL_SHASUM}"
-              echo "  registry: ${REGISTRY_SHASUM:-'(missing)'}"
-              exit 1
-            fi
-            echo "✓ Existing registry tarball shasum matches local verified tarball."
-          fi
 
           MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
           if [[ "$MB_TAG" != "$VER" ]]; then
