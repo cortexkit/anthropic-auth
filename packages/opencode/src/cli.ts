@@ -12,7 +12,7 @@ import {
   type OAuthAccount,
   saveAccounts,
   WORKER_SCRIPT,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 function defaultStorage(): AccountStorage {
   return {

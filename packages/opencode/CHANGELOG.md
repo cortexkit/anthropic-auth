@@ -2,6 +2,14 @@
 
 This fork publishes the OpenCode package as `@marcusrbrown/opencode-anthropic-auth`. Entries below `1.2.2-mb.1` are inherited from the CortexKit and upstream package history.
 
+## 1.2.2-mb.2
+
+### Patch Changes
+
+- Publish the shared core as `@marcusrbrown/anthropic-auth-core@1.2.2-mb.2` and update this package's dependency to resolve forked core instead of upstream `@cortexkit/anthropic-auth-core`.
+- The fork release pair is now core + OpenCode, both at `1.2.2-mb.2` under the `mb` dist-tag. Pi remains `@cortexkit/pi-anthropic-auth` and is not included in fork publish jobs.
+- Install pin: `@marcusrbrown/opencode-anthropic-auth@1.2.2-mb.2`.
+
 ## 1.2.2-mb.1
 
 ### Patch Changes

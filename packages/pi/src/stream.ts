@@ -1,4 +1,18 @@
 import {
+  type Api,
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Context,
+  calculateCost,
+  createAssistantMessageEventStream,
+  type Model,
+  type SimpleStreamOptions,
+  type StopReason,
+  type TextContent,
+  type ThinkingContent,
+  type ToolCall,
+} from '@earendil-works/pi-ai'
+import {
   applyClaudeCodeHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
@@ -14,21 +28,7 @@ import {
   resolveClaudeCodeIdentity,
   sendViaRelay,
   shouldFallbackStatus,
-} from '@cortexkit/anthropic-auth-core'
-import {
-  type Api,
-  type AssistantMessage,
-  type AssistantMessageEventStream,
-  type Context,
-  calculateCost,
-  createAssistantMessageEventStream,
-  type Model,
-  type SimpleStreamOptions,
-  type StopReason,
-  type TextContent,
-  type ThinkingContent,
-  type ToolCall,
-} from '@earendil-works/pi-ai'
+} from '@marcusrbrown/anthropic-auth-core'
 
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import { getPiAccountStoragePath } from './paths.ts'

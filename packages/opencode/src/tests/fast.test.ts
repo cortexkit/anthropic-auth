@@ -6,7 +6,7 @@ import {
   parseFastModeCommandAction,
   resetFastModeState,
   setFastModeEnabled,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 function parseEnabled(summary: string) {
   const enabledMatch = summary.match(/- Enabled: (enabled|disabled)/)

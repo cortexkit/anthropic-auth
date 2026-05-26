@@ -1,13 +1,13 @@
-import {
-  authorize,
-  exchange,
-  refreshClaudeOAuthToken,
-} from '@cortexkit/anthropic-auth-core'
 import type {
   OAuthCredentials,
   OAuthLoginCallbacks,
 } from '@earendil-works/pi-ai'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import {
+  authorize,
+  exchange,
+  refreshClaudeOAuthToken,
+} from '@marcusrbrown/anthropic-auth-core'
 
 import { registerCommands } from './commands.ts'
 import { streamCortexKitAnthropic } from './stream.ts'

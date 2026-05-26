@@ -8,7 +8,7 @@ import {
   REQUIRED_BETAS,
   resolveClaudeCodeIdentity,
   selectClaudeCodeBetas,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 describe('Claude Code fingerprint helpers', () => {
   test('selects the live-captured full-agent beta set only for tool-bearing agent requests', () => {

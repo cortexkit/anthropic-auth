@@ -5,7 +5,7 @@ import {
   CacheKeepManager,
   executeCacheKeepCommand,
   parseCacheKeepCommandAction,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 const hybridStorage = (): AccountStorage => ({
   version: 1,

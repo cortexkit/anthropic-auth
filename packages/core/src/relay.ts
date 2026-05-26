@@ -438,6 +438,31 @@ class PersistentRelaySession {
     private readonly affinity: string,
   ) {}
 
+  async close(): Promise<void> {
+    const socket = this.socket
+    this.socket = undefined
+    this.serverState = undefined
+    this.connecting = undefined
+
+    if (this.pending) {
+      this.failPending(new Error('relay websocket session closed'))
+    }
+    if (!socket || socket.readyState === WebSocket.CLOSED) return
+
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(resolve, 1_000)
+      socket.addEventListener(
+        'close',
+        () => {
+          clearTimeout(timeout)
+          resolve()
+        },
+        { once: true },
+      )
+      if (socket.readyState !== WebSocket.CLOSING) socket.close()
+    })
+  }
+
   send(
     payload: RelayPayload,
     bodyText: string,
@@ -878,6 +903,12 @@ function getPersistentRelaySession(config: RelayConfig, affinity: string) {
   const session = new PersistentRelaySession(config, affinity)
   websocketSessions.set(affinity, session)
   return session
+}
+
+export async function closeRelaySessions(): Promise<void> {
+  const sessions = [...websocketSessions.values()]
+  websocketSessions.clear()
+  await Promise.all(sessions.map((session) => session.close()))
 }
 
 export async function sendViaRelay(options: {

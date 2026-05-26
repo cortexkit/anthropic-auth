@@ -1,9 +1,10 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import {
+  closeRelaySessions,
   hashBody,
   sendViaRelay,
   WORKER_SCRIPT,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 import { Miniflare, NoOpLog } from 'miniflare'
 
 const RELAY_TOKEN = 'relay-token'
@@ -141,10 +142,39 @@ function sendPayload(socket: WebSocket, payload: Record<string, unknown>) {
   socket.send(JSON.stringify(payload))
 }
 
+async function closeSocket(socket: WebSocket) {
+  if (socket.readyState === WebSocket.CLOSED) return
+
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, 1_000)
+    socket.addEventListener(
+      'close',
+      () => {
+        clearTimeout(timeout)
+        resolve()
+      },
+      { once: true },
+    )
+
+    if (socket.readyState === WebSocket.CLOSING) return
+    socket.close()
+  })
+}
+
 describe('relay Worker under Miniflare', () => {
+  let mf: Miniflare
+
+  beforeAll(async () => {
+    mf = await startWorker()
+  })
+
+  afterAll(async () => {
+    await closeRelaySessions()
+    await mf.dispose()
+  })
+
   test('client websocket transport reaches Miniflare Worker with byte-exact patch reconstruction', async () => {
     const upstream = startUpstream()
-    const mf = await startWorker()
     const affinity = 'miniflare-client-session'
 
     try {
@@ -185,14 +215,13 @@ describe('relay Worker under Miniflare', () => {
       expect(await second.text()).toBe('upstream-ok')
       expect(upstream.bodies).toEqual([firstBody, secondBody])
     } finally {
-      await mf.dispose()
+      await closeRelaySessions()
       upstream.server.stop(true)
     }
   }, 30_000)
 
   test('websocket full_sync and patch reconstruct byte-exact upstream bodies', async () => {
     const upstream = startUpstream()
-    const mf = await startWorker()
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-byte-exact-session',
@@ -239,15 +268,13 @@ describe('relay Worker under Miniflare', () => {
 
       expect(upstream.bodies).toEqual([firstBody, secondBody])
     } finally {
-      workerSocket.socket.close()
-      await mf.dispose()
+      await closeSocket(workerSocket.socket)
       upstream.server.stop(true)
     }
   }, 30_000)
 
   test('websocket hash mismatch returns 409 before upstream fetch', async () => {
     const upstream = startUpstream()
-    const mf = await startWorker()
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-hash-mismatch-session',
@@ -295,8 +322,7 @@ describe('relay Worker under Miniflare', () => {
       expect(error).toMatchObject({ status: 409, message: 'hash mismatch' })
       expect(upstream.bodies).toEqual([firstBody])
     } finally {
-      workerSocket.socket.close()
-      await mf.dispose()
+      await closeSocket(workerSocket.socket)
       upstream.server.stop(true)
     }
   }, 30_000)

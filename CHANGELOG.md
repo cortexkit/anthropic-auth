@@ -2,6 +2,14 @@
 
 This repo is a fork of the CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. This fork publishes the OpenCode package as `@marcusrbrown/opencode-anthropic-auth`; older entries below the initial CortexKit release are inherited from upstream package history.
 
+## 1.2.2-mb.2
+
+### Patch Changes
+
+- Publish the shared core package as `@marcusrbrown/anthropic-auth-core@1.2.2-mb.2`, closing the namespace gap where the forked OpenCode package depended on the upstream-scoped `@cortexkit/anthropic-auth-core`.
+- Update `@marcusrbrown/opencode-anthropic-auth` to `1.2.2-mb.2` and point its dependency at `@marcusrbrown/anthropic-auth-core@1.2.2-mb.2`.
+- The fork release pair is now core + OpenCode, both at `1.2.2-mb.2` under the `mb` dist-tag. Pi remains `@cortexkit/pi-anthropic-auth` and is not included in fork publish jobs.
+
 ## 1.2.2-mb.1
 
 ### Patch Changes

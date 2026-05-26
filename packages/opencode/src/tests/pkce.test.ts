@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { generatePKCE } from '@cortexkit/anthropic-auth-core'
+import { generatePKCE } from '@marcusrbrown/anthropic-auth-core'
 
 afterEach(() => {
   mock.restore()

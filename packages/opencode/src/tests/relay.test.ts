@@ -8,7 +8,7 @@ import {
   sendViaRelay,
   setDumpEnabled,
   WORKER_SCRIPT,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 const config = {
   enabled: true,

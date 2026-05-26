@@ -2,9 +2,9 @@
 
 Claude Pro/Max OAuth support for both [OpenCode](https://opencode.ai) and [Pi](https://pi.dev), originally maintained by CortexKit.
 
-Fork note: the OpenCode package in this fork is published as `@marcusrbrown/opencode-anthropic-auth`; pin `@marcusrbrown/opencode-anthropic-auth@1.2.2-mb.1` in OpenCode config.
+Fork note: this fork publishes two packages — `@marcusrbrown/anthropic-auth-core` (shared core) and `@marcusrbrown/opencode-anthropic-auth` (OpenCode plugin) — both at `1.2.2-mb.2`. Pin `@marcusrbrown/opencode-anthropic-auth@1.2.2-mb.2` in OpenCode config. Pi remains `@cortexkit/pi-anthropic-auth` and is not published in this fork.
 
-This repo is a Bun workspace monorepo with two user-facing integrations and one shared core package. The OpenCode package is based on CortexKit's maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. The Pi package is a native Pi provider extension that overrides Pi's built-in Anthropic provider. Both integrations share the same Anthropic OAuth, fallback-account, quota, prompt-cache, relay, dump, and request-signing logic through `@cortexkit/anthropic-auth-core`.
+This repo is a Bun workspace monorepo with two user-facing integrations and one shared core package. The OpenCode package is based on CortexKit's maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. The Pi package is a native Pi provider extension that overrides Pi's built-in Anthropic provider. Both integrations share the same Anthropic OAuth, fallback-account, quota, prompt-cache, relay, dump, and request-signing logic through `@marcusrbrown/anthropic-auth-core` (fork) / `@cortexkit/anthropic-auth-core` (upstream).
 
 ## Packages
 
@@ -12,7 +12,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | --- | --- | --- |
 | `@marcusrbrown/opencode-anthropic-auth` | OpenCode | OpenCode plugin and CLI for Claude OAuth, request rewriting, fallback accounts, quotas, cache controls, dumps, and relay setup. |
 | `@cortexkit/pi-anthropic-auth` | Pi | Pi package/extension that registers a CortexKit Anthropic provider under Pi's built-in `anthropic` provider ID. |
-| `@cortexkit/anthropic-auth-core` | Shared | Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic used by both integrations. |
+| `@marcusrbrown/anthropic-auth-core` | Shared (fork) | Reusable OAuth, account, quota, cache, relay, dump, SSE, and request-signing logic used by both integrations. Published in this fork at `1.2.2-mb.2`. |
 
 ## Support matrix
 
@@ -63,7 +63,7 @@ Pinning is strongly recommended for any OpenCode plugin:
 
 ```json
 {
-  "plugin": ["@marcusrbrown/opencode-anthropic-auth@1.2.2-mb.1"]
+  "plugin": ["@marcusrbrown/opencode-anthropic-auth@1.2.2-mb.2"]
 }
 ```
 
@@ -492,7 +492,7 @@ bun run build      # Deploy: bun build → bundled dist/ with all deps inlined (
 bun run build:dev  # Dev: tsc → individual dist/*.js files (requires workspace node_modules)
 ```
 
-The default `build` uses `bun build` to bundle `@cortexkit/anthropic-auth-core` and all transitive dependencies into self-contained output files. No `node_modules/` needed at runtime — the plugin works via `file://` path in OpenCode config:
+The default `build` uses `bun build` to bundle `@marcusrbrown/anthropic-auth-core` and all transitive dependencies into self-contained output files. No `node_modules/` needed at runtime — the plugin works via `file://` path in OpenCode config:
 
 ```json
 {
@@ -546,7 +546,7 @@ Wait for GitHub Actions:
 ./scripts/wait-release.sh v1.8.0
 ```
 
-The release workflow runs checks, publishes the core, OpenCode, and Pi packages to npm with provenance, and creates the GitHub release.
+The fork release workflow runs checks, publishes the core (`@marcusrbrown/anthropic-auth-core`) and OpenCode (`@marcusrbrown/opencode-anthropic-auth`) packages to npm with provenance under the `mb` dist-tag, then creates the GitHub release. Pi (`@cortexkit/pi-anthropic-auth`) is published separately by the upstream CortexKit release lane and is not included in fork publish jobs.
 
 ## Troubleshooting
 

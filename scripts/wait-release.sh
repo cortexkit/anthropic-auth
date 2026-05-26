@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 # Wait for the GitHub Actions release workflow to complete for a given tag.
-# Usage: ./scripts/wait-release.sh v1.8.0 [--max-wait <seconds>]
+# Usage: ./scripts/wait-release.sh v1.2.2-mb.2 [--max-wait <seconds>] [--repo <owner/repo>]
 # Polls every 5 seconds, exits 0 on success, 1 on failure, 2 on timeout.
+#
+# Defaults to the marcusrbrown fork repo. Override with --repo or RELEASE_REPO env var.
 
 set -euo pipefail
 
 TAG=""
 MAX_WAIT="${MAX_WAIT_SECONDS:-900}"
-REPO="cortexkit/anthropic-auth"
+# Default to the fork repo; override with --repo flag or RELEASE_REPO env var.
+REPO="${RELEASE_REPO:-marcusrbrown/cortexkit_anthropic-auth}"
 INTERVAL=5
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --max-wait)
       MAX_WAIT="$2"
+      shift 2
+      ;;
+    --repo)
+      REPO="$2"
       shift 2
       ;;
     -*)
@@ -33,11 +40,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$TAG" ]]; then
-  echo "Usage: wait-release.sh <tag> [--max-wait <seconds>]" >&2
+  echo "Usage: wait-release.sh <tag> [--max-wait <seconds>] [--repo <owner/repo>]" >&2
   exit 64
 fi
 
-echo "⏳ Waiting for release workflow on ${TAG} (max ${MAX_WAIT}s)..."
+echo "⏳ Waiting for release workflow on ${TAG} in ${REPO} (max ${MAX_WAIT}s)..."
 
 START_TIME=$(date +%s)
 

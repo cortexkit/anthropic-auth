@@ -1,8 +1,8 @@
 # @cortexkit/pi-anthropic-auth
 
-Pi package for CortexKit Anthropic OAuth support. It overrides Pi's built-in `anthropic` provider with a CortexKit provider extension backed by the shared `@cortexkit/anthropic-auth-core` package.
+Pi package for CortexKit Anthropic OAuth support. It overrides Pi's built-in `anthropic` provider with a CortexKit provider extension backed by the shared core package (`@marcusrbrown/anthropic-auth-core` in this fork; `@cortexkit/anthropic-auth-core` upstream).
 
-This package is part of the CortexKit Anthropic Auth monorepo, which supports both OpenCode (`@marcusrbrown/opencode-anthropic-auth`) and Pi (`@cortexkit/pi-anthropic-auth`) through the same shared core logic.
+This package is part of the CortexKit Anthropic Auth monorepo, which supports both OpenCode (`@marcusrbrown/opencode-anthropic-auth`) and Pi (`@cortexkit/pi-anthropic-auth`) through the same shared core logic. Pi is published upstream as `@cortexkit/pi-anthropic-auth` and is not included in this fork's publish lane.
 
 ## Install
 

@@ -7,7 +7,7 @@ import {
   exchange,
   OAUTH_SCOPES,
   refreshClaudeOAuthToken,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 const originalSetTimeout = globalThis.setTimeout
 

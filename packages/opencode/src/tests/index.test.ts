@@ -8,7 +8,7 @@ import {
   resetDumpState,
   resetFastModeState,
   saveAccounts,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */

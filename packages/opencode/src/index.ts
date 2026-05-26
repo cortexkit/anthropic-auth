@@ -64,7 +64,7 @@ import {
   setFastModeEnabled,
   setFastModePersistentEnabled,
   shouldFallbackStatus,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
@@ -1395,16 +1395,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     Date.now(),
                   )
                 ) {
-                  log(
-                    '[refresh] opencode main oauth request skipped backoff',
-                    {
-                      nextRetryAt: mainRefreshError.nextRetryAt,
-                      retryCount: mainRefreshError.retryCount,
-                      expiresInMs: auth.expires
-                        ? auth.expires - Date.now()
-                        : undefined,
-                    },
-                  )
+                  log('[refresh] opencode main oauth request skipped backoff', {
+                    nextRetryAt: mainRefreshError.nextRetryAt,
+                    retryCount: mainRefreshError.retryCount,
+                    expiresInMs: auth.expires
+                      ? auth.expires - Date.now()
+                      : undefined,
+                  })
                   throw new Error(
                     formatRefreshBackoffMessage(mainRefreshError, Date.now()),
                   )
@@ -1416,9 +1413,10 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     expiresInMs: auth.expires
                       ? auth.expires - Date.now()
                       : undefined,
-                    expiredAgoMs: auth.expires && auth.expires < Date.now()
-                      ? Date.now() - auth.expires
-                      : undefined,
+                    expiredAgoMs:
+                      auth.expires && auth.expires < Date.now()
+                        ? Date.now() - auth.expires
+                        : undefined,
                   },
                 )
                 const refreshStart = nowMs()

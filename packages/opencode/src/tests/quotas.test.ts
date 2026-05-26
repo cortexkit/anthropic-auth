@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import type { AccountStorage } from '@cortexkit/anthropic-auth-core'
+import type { AccountStorage } from '@marcusrbrown/anthropic-auth-core'
 import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 describe('quota summaries', () => {
   test('formats main and fallback quota windows', () => {

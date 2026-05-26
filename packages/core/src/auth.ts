@@ -12,7 +12,9 @@ type CallbackParams = {
   state: string
 }
 
-function parseRetryAfterHeader(value: string | undefined | null): number | undefined {
+function parseRetryAfterHeader(
+  value: string | undefined | null,
+): number | undefined {
   if (!value) return undefined
   const seconds = Number(value)
   if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds)

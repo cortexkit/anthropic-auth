@@ -4,7 +4,7 @@ import {
   FAST_MODE_BETA,
   OPENCODE_IDENTITY_PREFIX,
   REQUIRED_BETAS,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 import dedent from 'dedent'
 import {
   addFastModeBetaHeader,

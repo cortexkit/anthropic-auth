@@ -5,7 +5,7 @@ import {
   computeVersionSuffix,
   extractFirstUserMessageText,
   signRequestBody,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 describe('billing header helpers', () => {
   test('extracts text from the first user message', () => {

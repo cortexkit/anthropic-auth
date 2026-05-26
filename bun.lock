@@ -19,8 +19,8 @@
       },
     },
     "packages/core": {
-      "name": "@cortexkit/anthropic-auth-core",
-      "version": "1.2.2",
+      "name": "@marcusrbrown/anthropic-auth-core",
+      "version": "1.2.2-mb.2",
       "dependencies": {
         "xxhash-wasm": "^1.1.0",
       },
@@ -33,12 +33,12 @@
     },
     "packages/opencode": {
       "name": "@marcusrbrown/opencode-anthropic-auth",
-      "version": "1.2.2-mb.1",
+      "version": "1.2.2-mb.2",
       "bin": {
         "opencode-anthropic-auth": "dist/cli.js",
       },
       "dependencies": {
-        "@cortexkit/anthropic-auth-core": "1.2.2",
+        "@marcusrbrown/anthropic-auth-core": "1.2.2-mb.2",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": "*",
@@ -48,7 +48,7 @@
       "name": "@cortexkit/pi-anthropic-auth",
       "version": "1.2.2",
       "dependencies": {
-        "@cortexkit/anthropic-auth-core": "1.1.3",
+        "@marcusrbrown/anthropic-auth-core": "1.2.2-mb.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -162,8 +162,6 @@
 
     "@cloudflare/workerd-windows-64": ["@cloudflare/workerd-windows-64@1.20260515.1", "", { "os": "win32", "cpu": "x64" }, "sha512-WmV/iv+MHjYsvkcMVzpM2B5/mf06UUkdpVhZrtMfV9graWjBGPYFvE/eab8748RPVGKh1Xe1vXofLzDSwc08lA=="],
 
-    "@cortexkit/anthropic-auth-core": ["@cortexkit/anthropic-auth-core@workspace:packages/core"],
-
     "@cortexkit/anthropic-auth-e2e": ["@cortexkit/anthropic-auth-e2e@workspace:packages/e2e-tests"],
 
     "@cortexkit/pi-anthropic-auth": ["@cortexkit/pi-anthropic-auth@workspace:packages/pi"],
@@ -237,6 +235,8 @@
     "@jridgewell/sourcemap-codec": ["@jridgewell/sourcemap-codec@1.5.5", "", {}, "sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og=="],
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.9", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.0.3", "@jridgewell/sourcemap-codec": "^1.4.10" } }, "sha512-3Belt6tdc8bPgAtbcmdtNJlirVoTmEb5e2gC94PnkwEW9jI6CAHUeoG85tjWP5WquqfavoMtMwiG4P926ZKKuQ=="],
+
+    "@marcusrbrown/anthropic-auth-core": ["@marcusrbrown/anthropic-auth-core@workspace:packages/core"],
 
     "@marcusrbrown/opencode-anthropic-auth": ["@marcusrbrown/opencode-anthropic-auth@workspace:packages/opencode"],
 

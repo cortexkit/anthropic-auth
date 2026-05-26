@@ -19,7 +19,7 @@ import {
   setCacheKeepPersistentWindow,
   setFastModePersistentEnabled,
   shouldFallbackStatus,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 let tempDir: string
 let accountPath: string

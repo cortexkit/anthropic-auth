@@ -1,3 +1,7 @@
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+} from '@earendil-works/pi-coding-agent'
 import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
@@ -24,11 +28,7 @@ import {
   setCacheKeepPersistentWindow,
   setDumpPersistentEnabled,
   setFastModePersistentEnabled,
-} from '@cortexkit/anthropic-auth-core'
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-} from '@earendil-works/pi-coding-agent'
+} from '@marcusrbrown/anthropic-auth-core'
 
 import { getPiAccountStoragePath } from './paths.ts'
 

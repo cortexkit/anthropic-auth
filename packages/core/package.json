@@ -1,11 +1,14 @@
 {
-  "name": "@cortexkit/anthropic-auth-core",
-  "version": "1.2.2",
+  "name": "@marcusrbrown/anthropic-auth-core",
+  "version": "1.2.2-mb.2",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cortexkit/anthropic-auth.git",
+    "url": "git+https://github.com/marcusrbrown/cortexkit_anthropic-auth.git",
     "directory": "packages/core"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

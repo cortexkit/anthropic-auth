@@ -1,14 +1,3 @@
-import {
-  applyClaudeCodeMetadata,
-  buildBillingHeaderValue,
-  type Cache1hMode,
-  CLAUDE_CODE_ENTRYPOINT,
-  CLAUDE_CODE_IDENTITY,
-  type ClaudeCodeIdentity,
-  isFastModeSupportedModel,
-  orderClaudeCodeBody,
-  signRequestBody,
-} from '@cortexkit/anthropic-auth-core'
 import type {
   Context,
   ImageContent,
@@ -19,6 +8,17 @@ import type {
   Tool,
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
+import {
+  applyClaudeCodeMetadata,
+  buildBillingHeaderValue,
+  type Cache1hMode,
+  CLAUDE_CODE_ENTRYPOINT,
+  CLAUDE_CODE_IDENTITY,
+  type ClaudeCodeIdentity,
+  isFastModeSupportedModel,
+  orderClaudeCodeBody,
+  signRequestBody,
+} from '@marcusrbrown/anthropic-auth-core'
 
 const CLAUDE_CODE_TOOLS = new Map(
   [

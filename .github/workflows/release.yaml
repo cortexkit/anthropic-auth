@@ -9,17 +9,14 @@ on:
       version:
         description: "Version to publish, without leading v"
         required: true
-      ref:
-        description: "Git ref to publish from, such as v1.1.0"
-        required: false
 
 concurrency:
-  group: release-${{ github.ref }}-${{ github.event.inputs.version || '' }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
   cancel-in-progress: false
 
+# Default: read-only. Elevated permissions are scoped to individual jobs below.
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -28,10 +25,28 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # No elevated permissions needed for test.
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', github.event.inputs.version) || github.ref }}
+
+      - name: Verify checked-out commit matches release tag
+        run: |
+          REF="${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', github.event.inputs.version) || github.ref }}"
+          # Only enforce tag integrity when triggered by a tag push or when ref looks like a tag.
+          if [[ "$REF" == refs/tags/* ]] || git rev-parse --verify "refs/tags/${REF#refs/tags/}" >/dev/null 2>&1; then
+            TAG="${REF#refs/tags/}"
+            TAG_COMMIT=$(git rev-list -n1 "refs/tags/${TAG}" 2>/dev/null || true)
+            HEAD_COMMIT=$(git rev-parse HEAD)
+            if [[ -z "$TAG_COMMIT" ]]; then
+              echo "Warning: tag '${TAG}' not found locally; skipping tag-commit check."
+            elif [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+              echo "Error: checked-out commit ${HEAD_COMMIT} does not match tag ${TAG} commit ${TAG_COMMIT}."
+              exit 1
+            fi
+            echo "✓ HEAD matches tag ${TAG} (${HEAD_COMMIT})"
+          fi
 
       - uses: actions/setup-node@v6
         with:
@@ -43,6 +58,16 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Resolve release version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version sync (manifests must already match - no CI mutation)
+        run: node scripts/version-sync.mjs "${{ steps.version.outputs.version }}" --validate
 
       - name: TypeScript typecheck
         run: bun run typecheck
@@ -65,24 +90,33 @@ jobs:
       - name: Lint
         run: bun run lint
 
-  publish-npm:
-    name: Publish ${{ matrix.package }} to npm
+  publish-core:
+    name: Publish @marcusrbrown/anthropic-auth-core to npm
     runs-on: ubuntu-latest
     needs: [test]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - package: "@cortexkit/anthropic-auth-core"
-            workspace: "@cortexkit/anthropic-auth-core"
-          - package: "@cortexkit/opencode-anthropic-auth"
-            workspace: "@cortexkit/opencode-anthropic-auth"
-          - package: "@cortexkit/pi-anthropic-auth"
-            workspace: "@cortexkit/pi-anthropic-auth"
+    permissions:
+      contents: read
+      id-token: write  # Required for npm trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', github.event.inputs.version) || github.ref }}
+
+      - name: Verify checked-out commit matches release tag
+        run: |
+          REF="${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', github.event.inputs.version) || github.ref }}"
+          if [[ "$REF" == refs/tags/* ]] || git rev-parse --verify "refs/tags/${REF#refs/tags/}" >/dev/null 2>&1; then
+            TAG="${REF#refs/tags/}"
+            TAG_COMMIT=$(git rev-list -n1 "refs/tags/${TAG}" 2>/dev/null || true)
+            HEAD_COMMIT=$(git rev-parse HEAD)
+            if [[ -z "$TAG_COMMIT" ]]; then
+              echo "Warning: tag '${TAG}' not found locally; skipping tag-commit check."
+            elif [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+              echo "Error: checked-out commit ${HEAD_COMMIT} does not match tag ${TAG} commit ${TAG_COMMIT}."
+              exit 1
+            fi
+            echo "✓ HEAD matches tag ${TAG} (${HEAD_COMMIT})"
+          fi
 
       - uses: actions/setup-node@v6
         with:
@@ -106,38 +140,272 @@ jobs:
           VERSION="${VERSION#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Sync version
-        run: node scripts/version-sync.mjs "${{ steps.version.outputs.version }}"
+      - name: Validate version sync (manifests must already match - no CI mutation)
+        run: node scripts/version-sync.mjs "${{ steps.version.outputs.version }}" --validate
 
       - name: Build
         run: bun run build
 
-      - name: Check whether package version is already published
-        id: published
+      - name: Verify local manifests and packed artifacts (pre-publish gate)
+        run: node scripts/verify-artifacts.mjs --version "${{ steps.version.outputs.version }}"
+
+      - name: Pack, verify, and publish core tarball (fail-closed)
         run: |
-          if npm view "${{ matrix.package }}@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "${{ matrix.package }}@${{ steps.version.outputs.version }} is already published; skipping."
+          TARBALL=$(npm pack --workspace "@marcusrbrown/anthropic-auth-core" --pack-destination "$RUNNER_TEMP" | tail -n1)
+          TARBALL_PATH="$RUNNER_TEMP/$TARBALL"
+          LOCAL_SHASUM=$(shasum -a 1 "$TARBALL_PATH" | awk '{print $1}')
+          node scripts/verify-artifacts.mjs \
+            --version "${{ steps.version.outputs.version }}" \
+            --core-tarball "$TARBALL_PATH"
+
+          PKG="@marcusrbrown/anthropic-auth-core"
+          VER="${{ steps.version.outputs.version }}"
+          PUBLISH_SKIPPED=false
+          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+            echo "${PKG}@${VER} already published; verifying instead of republishing."
+            PUBLISH_SKIPPED=true
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            if ! npm publish "$TARBALL_PATH" --access public --provenance --tag mb; then
+              if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+                echo "${PKG}@${VER} became visible after a publish race; continuing to verification."
+                PUBLISH_SKIPPED=true
+              else
+                exit 1
+              fi
+            fi
           fi
 
-      # Uses npm Trusted Publishing (OIDC) configured on npmjs.com.
-      # Each package runs in a separate matrix job so npm obtains a package-scoped
-      # OIDC publish token for that package instead of reusing the previous one.
-      - name: Publish package to npm
-        if: steps.published.outputs.exists != 'true'
-        run: npm publish --workspace "${{ matrix.workspace }}" --access public --provenance
+          echo "→ Verifying ${PKG}@${VER} on npm registry..."
+          for i in $(seq 1 12); do
+            if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+              break
+            fi
+            echo "  Waiting for registry propagation (attempt ${i}/12)..."
+            sleep 5
+          done
+
+          PUBLISHED_VER=$(npm view "${PKG}@${VER}" version 2>/dev/null)
+          if [[ "$PUBLISHED_VER" != "$VER" ]]; then
+            echo "Error: expected ${PKG}@${VER} but registry returned '${PUBLISHED_VER}'."
+            exit 1
+          fi
+          echo "✓ ${PKG}@${VER} is visible on registry."
+
+          if [[ "$PUBLISH_SKIPPED" == true ]]; then
+            REGISTRY_SHASUM=$(npm view "${PKG}@${VER}" dist.shasum 2>/dev/null || true)
+            if [[ "$REGISTRY_SHASUM" != "$LOCAL_SHASUM" ]]; then
+              echo "Error: existing ${PKG}@${VER} tarball shasum does not match this checkout."
+              echo "  local:    ${LOCAL_SHASUM}"
+              echo "  registry: ${REGISTRY_SHASUM:-'(missing)'}"
+              exit 1
+            fi
+            echo "✓ Existing registry tarball shasum matches local verified tarball."
+          fi
+
+          MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
+          if [[ "$MB_TAG" != "$VER" ]]; then
+            echo "Error: mb dist-tag for ${PKG} is '${MB_TAG}', expected '${VER}'."
+            echo "  Attempting to set mb dist-tag..."
+            npm dist-tag add "${PKG}@${VER}" mb
+            MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
+            if [[ "$MB_TAG" != "$VER" ]]; then
+              echo "Error: mb dist-tag still incorrect after correction attempt."
+              exit 1
+            fi
+          fi
+          echo "✓ mb dist-tag → ${VER}"
+
+          LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
+          echo "  latest dist-tag: ${LATEST_TAG} (not changed by this workflow)"
+
+          node scripts/verify-artifacts.mjs \
+            --version "${{ steps.version.outputs.version }}" \
+            --registry-tarball \
+            --manifests-only \
+            --registry-package core
+
+  publish-opencode:
+    name: Publish @marcusrbrown/opencode-anthropic-auth to npm
+    runs-on: ubuntu-latest
+    needs: [publish-core]
+    permissions:
+      contents: read
+      id-token: write  # Required for npm trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', github.event.inputs.version) || github.ref }}
+
+      - name: Verify checked-out commit matches release tag
+        run: |
+          REF="${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', github.event.inputs.version) || github.ref }}"
+          if [[ "$REF" == refs/tags/* ]] || git rev-parse --verify "refs/tags/${REF#refs/tags/}" >/dev/null 2>&1; then
+            TAG="${REF#refs/tags/}"
+            TAG_COMMIT=$(git rev-list -n1 "refs/tags/${TAG}" 2>/dev/null || true)
+            HEAD_COMMIT=$(git rev-parse HEAD)
+            if [[ -z "$TAG_COMMIT" ]]; then
+              echo "Warning: tag '${TAG}' not found locally; skipping tag-commit check."
+            elif [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+              echo "Error: checked-out commit ${HEAD_COMMIT} does not match tag ${TAG} commit ${TAG_COMMIT}."
+              exit 1
+            fi
+            echo "✓ HEAD matches tag ${TAG} (${HEAD_COMMIT})"
+          fi
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure latest npm (for trusted publishing)
+        run: npm install -g npm@latest
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Resolve release version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version sync (manifests must already match - no CI mutation)
+        run: node scripts/version-sync.mjs "${{ steps.version.outputs.version }}" --validate
+
+      - name: "Gate: verify core is resolvable before publishing OpenCode"
+        run: |
+          CORE_PKG="@marcusrbrown/anthropic-auth-core"
+          VER="${{ steps.version.outputs.version }}"
+          echo "→ Pre-publish gate: confirming ${CORE_PKG}@${VER} is resolvable..."
+          CORE_VER=$(npm view "${CORE_PKG}@${VER}" version 2>/dev/null || true)
+          if [[ "$CORE_VER" != "$VER" ]]; then
+            echo "Error: ${CORE_PKG}@${VER} is not resolvable from npm registry. Cannot publish OpenCode."
+            exit 1
+          fi
+          CORE_MB=$(npm view "${CORE_PKG}" dist-tags.mb 2>/dev/null || true)
+          if [[ "$CORE_MB" != "$VER" ]]; then
+            echo "Error: ${CORE_PKG} mb dist-tag is '${CORE_MB}', expected '${VER}'. Cannot publish OpenCode."
+            exit 1
+          fi
+          echo "✓ Core gate passed: ${CORE_PKG}@${VER} (mb → ${VER})"
+
+      - name: Build
+        run: bun run build
+
+      - name: Verify local manifests and packed artifacts (pre-publish gate)
+        run: node scripts/verify-artifacts.mjs --version "${{ steps.version.outputs.version }}"
+
+      - name: Pack, verify, and publish OpenCode tarball (fail-closed)
+        run: |
+          TARBALL=$(npm pack --workspace "@marcusrbrown/opencode-anthropic-auth" --pack-destination "$RUNNER_TEMP" | tail -n1)
+          TARBALL_PATH="$RUNNER_TEMP/$TARBALL"
+          LOCAL_SHASUM=$(shasum -a 1 "$TARBALL_PATH" | awk '{print $1}')
+          node scripts/verify-artifacts.mjs \
+            --version "${{ steps.version.outputs.version }}" \
+            --opencode-tarball "$TARBALL_PATH"
+
+          PKG="@marcusrbrown/opencode-anthropic-auth"
+          CORE_PKG="@marcusrbrown/anthropic-auth-core"
+          VER="${{ steps.version.outputs.version }}"
+          PUBLISH_SKIPPED=false
+          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+            echo "${PKG}@${VER} already published; verifying instead of republishing."
+            PUBLISH_SKIPPED=true
+          else
+            if ! npm publish "$TARBALL_PATH" --access public --provenance --tag mb; then
+              if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+                echo "${PKG}@${VER} became visible after a publish race; continuing to verification."
+                PUBLISH_SKIPPED=true
+              else
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "→ Verifying ${PKG}@${VER} on npm registry..."
+          for i in $(seq 1 12); do
+            if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+              break
+            fi
+            echo "  Waiting for registry propagation (attempt ${i}/12)..."
+            sleep 5
+          done
+
+          PUBLISHED_VER=$(npm view "${PKG}@${VER}" version 2>/dev/null)
+          if [[ "$PUBLISHED_VER" != "$VER" ]]; then
+            echo "Error: expected ${PKG}@${VER} but registry returned '${PUBLISHED_VER}'."
+            exit 1
+          fi
+          echo "✓ ${PKG}@${VER} is visible on registry."
+
+          if [[ "$PUBLISH_SKIPPED" == true ]]; then
+            REGISTRY_SHASUM=$(npm view "${PKG}@${VER}" dist.shasum 2>/dev/null || true)
+            if [[ "$REGISTRY_SHASUM" != "$LOCAL_SHASUM" ]]; then
+              echo "Error: existing ${PKG}@${VER} tarball shasum does not match this checkout."
+              echo "  local:    ${LOCAL_SHASUM}"
+              echo "  registry: ${REGISTRY_SHASUM:-'(missing)'}"
+              exit 1
+            fi
+            echo "✓ Existing registry tarball shasum matches local verified tarball."
+          fi
+
+          MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
+          if [[ "$MB_TAG" != "$VER" ]]; then
+            echo "Error: mb dist-tag for ${PKG} is '${MB_TAG}', expected '${VER}'."
+            echo "  Attempting to set mb dist-tag..."
+            npm dist-tag add "${PKG}@${VER}" mb
+            MB_TAG=$(npm view "${PKG}" dist-tags.mb 2>/dev/null || true)
+            if [[ "$MB_TAG" != "$VER" ]]; then
+              echo "Error: mb dist-tag still incorrect after correction attempt."
+              exit 1
+            fi
+          fi
+          echo "✓ mb dist-tag → ${VER}"
+
+          LATEST_TAG=$(npm view "${PKG}" dist-tags.latest 2>/dev/null || true)
+          echo "  latest dist-tag: ${LATEST_TAG} (not changed by this workflow)"
+
+          CORE_DEP=$(npm view "${PKG}@${VER}" dependencies."${CORE_PKG}" 2>/dev/null || true)
+          if [[ -z "$CORE_DEP" ]]; then
+            echo "Error: published ${PKG}@${VER} does not declare a dependency on ${CORE_PKG}."
+            echo "  This indicates a stale dependency graph. Release invariant violated."
+            exit 1
+          fi
+          echo "✓ ${PKG}@${VER} depends on ${CORE_PKG}@${CORE_DEP}"
+
+          STALE_DEP=$(npm view "${PKG}@${VER}" dependencies."@cortexkit/anthropic-auth-core" 2>/dev/null || true)
+          if [[ -n "$STALE_DEP" ]]; then
+            echo "Error: published ${PKG}@${VER} still declares dependency on @cortexkit/anthropic-auth-core."
+            echo "  Release invariant violated: stale upstream core dependency in published artifact."
+            exit 1
+          fi
+          echo "✓ No stale @cortexkit/anthropic-auth-core dependency in published metadata."
+
+          node scripts/verify-artifacts.mjs \
+            --version "${{ steps.version.outputs.version }}" \
+            --registry-tarball \
+            --manifests-only \
+            --registry-package opencode
 
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [test]
-    if: github.event_name == 'push'
+    needs: [publish-opencode]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write  # Required to create GitHub releases
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/v{0}', github.event.inputs.version) || github.ref }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
           generate_release_notes: true

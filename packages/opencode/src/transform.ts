@@ -16,7 +16,7 @@ import {
   signRequestBody,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
-} from '@cortexkit/anthropic-auth-core'
+} from '@marcusrbrown/anthropic-auth-core'
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
