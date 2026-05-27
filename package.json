@@ -33,7 +33,7 @@
     "@types/bun": "1.3.14",
     "dedent": "^1.7.2",
     "lefthook": "2.1.6",
-    "miniflare": "^4.20260515.0",
+    "miniflare": "^4.20260526.0",
     "typescript": "6.0.3"
   }
 }
