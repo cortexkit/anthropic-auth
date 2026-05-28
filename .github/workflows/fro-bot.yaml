@@ -1,0 +1,410 @@
+name: Fro Bot
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted, edited]
+  discussion:
+    types: [created, edited]
+  discussion_comment:
+    types: [created]
+  issues:
+    types: [opened, edited]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, review_requested]
+  schedule:
+    - cron: '0 9 * * 1'   # weekly maintenance (Monday 09:00 UTC)
+    - cron: '30 3 * * *'  # daily autoheal (03:30 UTC)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Operation mode
+        type: choice
+        options:
+          - review
+          - maintenance
+          - autoheal
+        default: autoheal
+      prompt:
+        description: Custom prompt; overrides mode prompts when non-empty.
+        required: false
+        default: ''
+
+concurrency:
+  group: >-
+    fro-bot-${{
+      github.event.issue.number ||
+      github.event.pull_request.number ||
+      github.event.discussion.number ||
+      (github.event_name == 'schedule' && github.event.schedule) ||
+      github.run_id
+    }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_CONSTRAINTS: |
+    Local release constraints:
+    - This fork publishes only `@marcusrbrown/anthropic-auth-core` and `@marcusrbrown/opencode-anthropic-auth`.
+    - Pi remains private/not published by this fork.
+    - Preserve npm Trusted Publishing/OIDC/provenance.
+    - Publish behavior is `npm publish --tag latest`.
+    - Do not add `NPM_DIST_TAG_TOKEN` or fallback `NPM_TOKEN`.
+    - Do not reintroduce the `mb` dist-tag lane.
+    - Do not add `environment: npm-publish` unless both the GitHub environment and npm Trusted Publisher config are confirmed.
+    - Any cross-project pattern that conflicts with these constraints goes under "Needs Human Attention", not "Recommended actions".
+
+  GENERAL_INTERACTION_PROMPT: |
+    Respond to the triggering GitHub issue, issue comment, PR review thread, or discussion comment using the event context.
+
+    Safety boundaries:
+    - Do not expose OAuth tokens, refresh tokens, local auth/config dumps, `.env` values, mitmproxy captures, or system-prompt captures.
+    - Do not push commits, create branches, approve PRs, merge PRs, or change repository settings.
+    - Do not alter release/publish behavior.
+
+    Local release constraints:
+    - This fork publishes only `@marcusrbrown/anthropic-auth-core` and `@marcusrbrown/opencode-anthropic-auth`.
+    - Pi remains private/not published by this fork.
+    - Preserve npm Trusted Publishing/OIDC/provenance.
+    - Publish behavior is `npm publish --tag latest`.
+    - Do not add `NPM_DIST_TAG_TOKEN` or fallback `NPM_TOKEN`.
+    - Do not reintroduce the `mb` dist-tag lane.
+    - Do not add `environment: npm-publish` unless both the GitHub environment and npm Trusted Publisher config are confirmed.
+
+    If asked to perform a risky or write-capable task, explain the required confirmation and safe next step instead of mutating the repository.
+
+  PR_REVIEW_PROMPT: |
+    Review this Bun/TypeScript monorepo PR for `marcusrbrown/cortexkit_anthropic-auth`.
+
+    Focus on:
+    - OAuth/token safety: no logging or exposing access tokens, refresh tokens, local auth files, `.env` values, or prompt-capture artifacts.
+    - Release invariants: this fork publishes only `@marcusrbrown/anthropic-auth-core` and `@marcusrbrown/opencode-anthropic-auth`; Pi is not published by this fork.
+    - npm publishing: preserve Trusted Publishing/OIDC/provenance, `npm publish --tag latest`, no `NPM_DIST_TAG_TOKEN`, no `NPM_TOKEN` fallback, and no `mb` dist-tag lane.
+    - Workflow safety: do not add `environment: npm-publish` unless the GitHub environment and npm Trusted Publisher config are confirmed.
+    - TypeScript correctness and ESM conventions in source code.
+    - Test coverage for behavior changes; for workflow/config changes, do not ask for file-content tests — verify syntax or behavior instead.
+    - OpenCode/Pi behavior compatibility, especially request rewriting, quota routing, fallback accounts, cache controls, dumps, relay, and refresh behavior.
+
+    Skip style nits — Biome handles formatting and lint.
+
+    Do NOT push commits, modify code, create branches, approve PRs, or merge. Review only.
+    Use inline comments for file-specific issues. Reserve the review body for the structured summary below.
+
+    You MUST structure your review using exactly these headings:
+    ## Verdict: [PASS | CONDITIONAL | REJECT]
+    CONDITIONAL = can merge after addressing the listed blocking issues.
+    ### Blocking issues
+    ### Non-blocking concerns
+    ### Missing tests
+    ### Risk assessment (LOW/MED/HIGH) + rationale
+    If a section has no items, write "None" under the heading. Do not omit any heading.
+
+  MAINTENANCE_PROMPT: |
+    Perform weekly repository maintenance for `marcusrbrown/cortexkit_anthropic-auth`.
+    This is read-only except for updating the SINGLE perpetual issue titled "Daily Autohealing Report".
+
+    Local release constraints:
+    - This fork publishes only `@marcusrbrown/anthropic-auth-core` and `@marcusrbrown/opencode-anthropic-auth`.
+    - Pi remains private/not published by this fork.
+    - Preserve npm Trusted Publishing/OIDC/provenance.
+    - Publish behavior is `npm publish --tag latest`.
+    - Do not add `NPM_DIST_TAG_TOKEN` or fallback `NPM_TOKEN`.
+    - Do not reintroduce the `mb` dist-tag lane.
+    - Do not add `environment: npm-publish` unless both the GitHub environment and npm Trusted Publisher config are confirmed.
+    - Any cross-project pattern that conflicts with these constraints goes under "Needs Human Attention", not "Recommended actions".
+
+    Find the perpetual issue:
+    1. Search for an open issue titled "Daily Autohealing Report" (exact match).
+    2. If found, update that issue.
+    3. If no open issue exists but a closed exact-title issue exists, reopen the most recently updated one.
+    4. If no exact-title issue exists, create one.
+
+    Perpetual issue hygiene:
+    - Search for any other open issues titled "Daily Autohealing Report" or matching "Daily Autohealing Report — YYYY-MM-DD".
+    - Close duplicates with a brief comment: "Consolidating into the perpetual autohealing report."
+    - Keep exactly one open report issue.
+
+    PREPEND a new section to the top using `## Maintenance Update — YYYY-MM-DD (UTC)`.
+    Keep links concise. Do not duplicate full logs.
+    If the issue body approaches 50,000 characters, keep the 30 most recent sections and add an archival note.
+
+    Sections:
+    - Summary metrics: new issues since previous run, open PRs, stale issues/PRs, latest main CI status, release workflow status, security alert availability.
+    - Stale issues: no activity >30 days; recommend close/keep/investigate.
+    - Stale PRs: no activity >7 days; recommend next action.
+    - Unassigned bugs: bug-labeled issues with no assignee.
+    - Workflow health: CI, Release, Copilot Setup Steps, Fro Bot over last 7 days; flag workflows with repeated failures.
+    - Release lane watch: verify recent release workflow failures do not suggest regressions in Trusted Publishing, latest dist-tag verification, or fork package dependency checks.
+    - Cross-project intelligence (inbound only): inspect public GitHub metadata for `fro-bot/agent`, `marcusrbrown/opencode-copilot-delegate`, and `marcusrbrown/systematic` for Fro Bot prompt/workflow patterns worth considering here. Observation only; do not modify or comment in other repositories.
+    - Recommended actions: actionable checklist with issue/PR links.
+    - Needs human attention: blockers, incompatible cross-project findings, missing permissions, or risky decisions.
+
+    Do NOT open PRs. Do NOT modify source files. Do NOT apply labels. Do NOT comment on individual issues/PRs except duplicate report closure.
+
+  AUTOHEAL_PROMPT: |
+    Perform repository autohealing for `marcusrbrown/cortexkit_anthropic-auth`, a Bun workspace monorepo for Claude OAuth support in OpenCode and Pi.
+    Prioritize minimal, reversible changes. Analyze all categories independently, but perform write actions serially.
+
+    GLOBAL RULES
+    - Before creating a PR or issue, search for an existing open bot-authored item for the same root cause and update/reuse it instead.
+    - Never push directly to main or the repository default branch.
+    - Never force-push, rewrite history, delete branches, merge PRs, approve PRs, or change branch protection/repo settings/secrets/environments.
+    - Never weaken validation to make checks pass. Do not disable tests, delete failing assertions, lower lint/type safety, or edit workflows only to hide failures.
+    - Never expose OAuth tokens, refresh tokens, local auth/config dumps, `.env` values, mitmproxy captures, or system-prompt captures.
+    - Never modify release/publish behavior unless the root cause is specifically in the release workflow and the fix preserves all release invariants below.
+    - If the smallest safe fix is broad, architectural, or touches high-risk release/auth behavior, open/update an issue and log it under Needs Human Attention instead of auto-fixing.
+
+    RELEASE INVARIANTS
+    - This fork publishes only `@marcusrbrown/anthropic-auth-core` and `@marcusrbrown/opencode-anthropic-auth`.
+    - Pi remains private/not published by this fork.
+    - Preserve npm Trusted Publishing/OIDC/provenance.
+    - Publish behavior is `npm publish --tag latest`.
+    - Do not add `NPM_DIST_TAG_TOKEN` or fallback `NPM_TOKEN`.
+    - Do not reintroduce the `mb` dist-tag lane.
+    - Do not add `environment: npm-publish` unless both the GitHub environment and npm Trusted Publisher config are confirmed.
+
+    CATEGORY 1 — ERRORED PRs
+    Find open PRs with failing CI checks.
+    Fix only PRs whose head branch is in this repository and whose author is trusted. Exact trusted logins:
+    - `marcusrbrown`
+    - `app/copilot-swe-agent`
+    - `dependabot[bot]`
+    - `renovate[bot]`
+    - `fro-bot`
+    - `mrbro-bot[bot]`
+    Skip fork PRs and untrusted authors.
+    If the PR touches `.github/workflows/`, release scripts, package manifests, `bun.lock`, `scripts/version-sync.mjs`, or `scripts/verify-artifacts.mjs`, do not run code from that branch until you have inspected the diff for unsafe workflow/package-script changes. If risk is unclear, skip and log under Needs Human Attention.
+    For each safe fixable PR:
+    1. Check out the PR branch.
+    2. Read failing check logs and identify the root cause.
+    3. Apply the smallest safe fix.
+    4. Run the relevant command(s): `bun run typecheck`, `bun run test`, `bun run lint`, `bun run format:check`, or targeted release/artifact validation as appropriate.
+    5. Commit with a conventional message and push to the PR branch.
+    6. Comment on the PR with failure root cause, fix, and verification.
+
+    CATEGORY 2 — SECURITY
+    Review Dependabot alerts/security PRs and GitHub security alert data if accessible.
+    Fix critical/high security update PRs when safe and branch is trusted/writable.
+    If an unaddressed critical/high advisory has no PR, open a minimal remediation PR.
+    Do not batch unrelated dependency updates. Do not change dependency versions for routine maintenance; Dependabot owns non-security updates.
+    If alert data is unavailable, write "security alerts unavailable" under Needs Human Attention and do not guess.
+
+    CATEGORY 3 — CODE QUALITY & REPO HYGIENE
+    Run/report these gates on the default branch:
+    - `bun run typecheck`
+    - `bun run test`
+    - `bun run lint`
+    - `bun run format:check`
+    - `bun run build`
+    - `bun run verify:artifacts:manifests`
+    Report failures. Only auto-fix mechanical formatting/lint changes that are clearly safe; otherwise open/update an issue.
+    Check for stale TODO/FIXME/HACK annotations older than 90 days via git blame; collect actionable items into one issue or update an existing stale-TODO issue.
+
+    CATEGORY 4 — RELEASE & PACKAGE HEALTH
+    Verify package graph health without publishing:
+    - `node scripts/verify-artifacts.mjs --manifests-only`
+    - `bun run pack:core:dry`
+    - `bun run pack:opencode:dry`
+    - `bun run pack:pi:dry`
+    Flag any drift in fork package names, stale upstream core dependency in OpenCode package, or Pi accidentally entering fork publish scope.
+    Do not create tags or run `scripts/release.sh` except in dry-run mode when explicitly asked.
+
+    CATEGORY 5 — DEVELOPER EXPERIENCE
+    Apply safe mechanical fixes from category 3 only when minimal and reversible.
+    Open one PR per coherent fix. Do not combine unrelated changes.
+    Use clear conventional titles, e.g. `chore(lint): apply auto-fixes from autoheal`.
+
+    CATEGORY 6 — CROSS-PROJECT INTELLIGENCE (INBOUND ONLY)
+    Observe these repos for adoptable patterns. Do not clone, modify, comment, open issues, or open PRs in other repositories.
+    - `fro-bot/agent`: runtime/workflow example changes and pinned action recommendations.
+    - `marcusrbrown/opencode-copilot-delegate`: sibling Fro Bot prompt and OpenCode plugin workflow patterns.
+    - `marcusrbrown/systematic`: mature autoheal prompt strategies, single-issue hygiene, cross-project intelligence patterns.
+    - `anomalyco/opencode`: OpenCode API/plugin changes that could affect this plugin.
+    - `cortexkit/opencode-magic-context`: companion OpenCode plugin patterns that may affect request rewriting or agent integration.
+    Record only actionable findings for this repository.
+
+    SINGLE ISSUE MANAGEMENT
+    Manage a SINGLE perpetual issue titled "Daily Autohealing Report".
+    Search exact title. Use the open one if present. If multiple open matches exist, keep the most recently updated one and close the others with a consolidation comment. If only a closed exact-title issue exists, reopen it. If none exists, create it.
+    PREPEND a new update section using `## Autoheal Update — YYYY-MM-DD (UTC)`.
+    If a section has no rows, write "None." instead of an empty table.
+
+    Required report structure:
+    ### Errored PRs
+    | PR | Failure | Fix | Status |
+    | --- | --- | --- | --- |
+
+    ### Security
+    | Advisory / PR | Severity | Action Taken |
+    | --- | --- | --- |
+
+    ### Code Quality & Repo Hygiene
+    | Check | Result | Action |
+    | --- | --- | --- |
+
+    ### Release & Package Health
+    | Check | Result | Action |
+    | --- | --- | --- |
+
+    ### Developer Experience
+    - PRs or issues created, or "None."
+
+    ### Tasks for Fro Bot
+    - PAT-powered, multi-step, or reactive repair tasks Fro Bot should own.
+
+    ### Tasks for Copilot
+    - Single-PR scoped implementation tasks suitable for assignment to Copilot.
+
+    ### Cross-Project Intelligence (Inbound)
+    | Repo | Finding | Actionable follow-up | Priority |
+    | --- | --- | --- | --- |
+
+    ### Needs Human Attention
+    - Blockers and decisions, or "None."
+
+    Classify unresolved work into Tasks for Fro Bot or Tasks for Copilot whenever possible.
+    Do not create multiple daily issues. Do not close the perpetual issue.
+
+jobs:
+  fro-bot:
+    name: Fro Bot
+    runs-on: ubuntu-latest
+    if: >-
+      (
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch'
+      ) || (
+        (
+          github.event.pull_request == null ||
+          (
+            (
+              github.event.pull_request.head.repo.full_name == github.repository ||
+              !github.event.pull_request.head.repo.fork
+            ) &&
+            !endsWith(github.event.pull_request.user.login || '', '[bot]') &&
+            github.event.pull_request.user.type != 'Bot'
+          )
+        ) && (
+          (
+            github.event_name == 'issues' &&
+            !endsWith(github.event.issue.user.login || '', '[bot]') &&
+            github.event.issue.user.type != 'Bot' &&
+            (github.event.issue.user.login || '') != 'fro-bot' &&
+            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association || '') &&
+            (
+              github.event.action == 'opened' ||
+              contains(github.event.issue.body || '', '@fro-bot')
+            )
+          ) ||
+          (
+            github.event_name == 'pull_request' &&
+            !endsWith(github.event.pull_request.user.login || '', '[bot]') &&
+            github.event.pull_request.user.type != 'Bot' &&
+            (github.event.pull_request.user.login || '') != 'fro-bot' &&
+            (
+              github.event.action != 'review_requested' ||
+              (github.event.requested_reviewer.login || '') == 'fro-bot'
+            )
+          ) ||
+          (
+            github.event_name == 'pull_request_review' &&
+            contains(github.event.review.body || '', '@fro-bot') &&
+            !endsWith(github.event.review.user.login || '', '[bot]') &&
+            github.event.review.user.type != 'Bot' &&
+            (github.event.review.user.login || '') != 'fro-bot' &&
+            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association || '')
+          ) ||
+          (
+            github.event_name == 'discussion' &&
+            !endsWith(github.event.discussion.user.login || '', '[bot]') &&
+            github.event.discussion.user.type != 'Bot' &&
+            (github.event.discussion.user.login || '') != 'fro-bot' &&
+            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.discussion.author_association || '') &&
+            (
+              github.event.action == 'created' ||
+              contains(github.event.discussion.body || '', '@fro-bot')
+            )
+          ) ||
+          (
+            (github.event_name == 'issue_comment' ||
+             github.event_name == 'pull_request_review_comment' ||
+             github.event_name == 'discussion_comment') &&
+            contains(github.event.comment.body || '', '@fro-bot') &&
+            !endsWith(github.event.comment.user.login || '', '[bot]') &&
+            github.event.comment.user.type != 'Bot' &&
+            (github.event.comment.user.login || '') != 'fro-bot' &&
+            contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || '')
+          )
+        )
+      )
+    steps:
+      - name: Refuse unsafe PR heads from issue comments
+        # When an issue comment targets a PR, verify the PR is not from a fork,
+        # not authored by a bot (login suffix or user.type), and not fro-bot itself.
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        env:
+          GH_TOKEN: ${{ secrets.FRO_BOT_PAT }}
+        run: |
+          pr_number="${{ github.event.issue.number }}"
+          pr_json=$(gh api "repos/${{ github.repository }}/pulls/${pr_number}")
+          is_fork=$(echo "$pr_json" | jq -r '.head.repo.fork // "unknown"')
+          author=$(echo "$pr_json" | jq -r '.user.login // "unknown"')
+          author_type=$(echo "$pr_json" | jq -r '.user.type // "unknown"')
+          head_repo=$(echo "$pr_json" | jq -r '.head.repo.full_name // "unknown"')
+          if { [ "$head_repo" != "${{ github.repository }}" ] && [ "$is_fork" != "false" ]; } || [[ "$author" == *"[bot]" ]] || [ "$author_type" = "Bot" ] || [ "$author" = "fro-bot" ]; then
+            echo "::error::Refusing unsafe PR head from comment trigger (PR #${pr_number}, fork=${is_fork}, head_repo=${head_repo}, author=${author}, type=${author_type})."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.FRO_BOT_PAT }}
+          ref: >-
+            ${{
+              (github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number))
+              || github.event.pull_request.head.sha
+              || ''
+            }}
+
+      - name: Setup mise tools
+        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4
+
+      - name: Install dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Run Fro Bot
+        uses: fro-bot/agent@8aac0fc36437a6c871321fa3389033c8262504b7 # v0.45.0
+        env:
+          OPENCODE_PROMPT_ARTIFACT: 'true'
+          # Prompt selection priority:
+          # 1. workflow_dispatch with non-empty custom prompt → use it verbatim
+          # 2. workflow_dispatch mode=review → PR_REVIEW_PROMPT
+          # 3. workflow_dispatch mode=maintenance → MAINTENANCE_PROMPT
+          # 4. workflow_dispatch mode=autoheal → AUTOHEAL_PROMPT
+          # 5. schedule Monday 09:00 UTC → MAINTENANCE_PROMPT
+          # 6. schedule daily 03:30 UTC → AUTOHEAL_PROMPT
+          # 7. pull_request event → PR_REVIEW_PROMPT
+          # 8. all other interaction events → GENERAL_INTERACTION_PROMPT
+          PROMPT: >-
+            ${{
+              (github.event_name == 'workflow_dispatch' && inputs.prompt != '' && inputs.prompt)
+              || (github.event_name == 'workflow_dispatch' && inputs.mode == 'review' && env.PR_REVIEW_PROMPT)
+              || (github.event_name == 'workflow_dispatch' && inputs.mode == 'maintenance' && env.MAINTENANCE_PROMPT)
+              || (github.event_name == 'workflow_dispatch' && inputs.mode == 'autoheal' && env.AUTOHEAL_PROMPT)
+              || (github.event_name == 'schedule' && github.event.schedule == '0 9 * * 1' && env.MAINTENANCE_PROMPT)
+              || (github.event_name == 'schedule' && github.event.schedule == '30 3 * * *' && env.AUTOHEAL_PROMPT)
+              || (github.event_name == 'pull_request' && env.PR_REVIEW_PROMPT)
+              || env.GENERAL_INTERACTION_PROMPT
+            }}
+        with:
+          auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+          github-token: ${{ secrets.FRO_BOT_PAT }}
+          model: ${{ vars.FRO_BOT_MODEL }}
+          opencode-config: ${{ secrets.OPENCODE_CONFIG }}
+          prompt: ${{ env.PROMPT }}
+          timeout: 0
