@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report a bug with OpenCode/Pi OAuth support
 title: "[BUG]"
 labels: bug
 assignees: ''
@@ -8,38 +8,47 @@ assignees: ''
 ---
 
 > [!IMPORTANT]
->  Did you clear your cache and install the latest version before making this report?
-> 
+> Did you clear your cache and install the latest version before making this report?
+>
 > `rm -rf ~/.cache/opencode` and checking your `opencode.json` version pin?
 >
 > Please remove this block to signal that you have tried the above, before posting a bug report.
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**Affected integration**
+- [ ] OpenCode
+- [ ] Pi
+- [ ] Both
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**Versions**
+- Package/plugin version:
+- Host agent version:
+- OS:
+
+**What is affected?**
+- [ ] Login/auth flow
+- [ ] Fallback accounts
+- [ ] Quotas
+- [ ] Prompt cache / cachekeep (cache behavior)
+- [ ] Fast mode
+- [ ] Dumps (debug dump output)
+- [ ] Relay (upstream relay/proxy path)
+- [ ] Request rewriting (request transform rules)
+
+**Describe the bug**
+A clear and concise description of what happened.
+
+**Steps to reproduce**
+1.
+2.
+3.
 
 **Expected behavior**
-A clear and concise description of what you expected to happen.
+What did you expect to happen?
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**Sanitized logs/errors**
+Paste relevant logs or errors (sanitized).
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
-
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
+⚠️ **Do not include secrets**: OAuth access tokens, refresh tokens, local auth files, `.env` values, or mitmproxy/system-prompt captures (captured traffic or prompt dumps).
 
 **Additional context**
-Add any other context about the problem here.
+Anything else that may help.
