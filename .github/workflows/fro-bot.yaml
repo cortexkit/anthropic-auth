@@ -131,7 +131,7 @@ env:
     If the issue body approaches 50,000 characters, keep the 30 most recent sections and add an archival note.
 
     Sections:
-    - Summary metrics: new issues since previous run, open PRs, stale issues/PRs, latest main CI status, release workflow status, security alert availability.
+    - Summary metrics: new issues since previous run, open PRs, stale issues/PRs, latest main CI status, and release workflow status.
     - Stale issues: no activity >30 days; recommend close/keep/investigate.
     - Stale PRs: no activity >7 days; recommend next action.
     - Unassigned bugs: bug-labeled issues with no assignee.
@@ -184,14 +184,7 @@ env:
     5. Commit with a conventional message and push to the PR branch.
     6. Comment on the PR with failure root cause, fix, and verification.
 
-    CATEGORY 2 — SECURITY
-    Review Dependabot alerts/security PRs and GitHub security alert data if accessible.
-    Fix critical/high security update PRs when safe and branch is trusted/writable.
-    If an unaddressed critical/high advisory has no PR, open a minimal remediation PR.
-    Do not batch unrelated dependency updates. Do not change dependency versions for routine maintenance; Dependabot owns non-security updates.
-    If alert data is unavailable, write "security alerts unavailable" under Needs Human Attention and do not guess.
-
-    CATEGORY 3 — CODE QUALITY & REPO HYGIENE
+    CATEGORY 2 — CODE QUALITY & REPO HYGIENE
     Run/report these gates on the default branch:
     - `bun run typecheck`
     - `bun run test`
@@ -202,7 +195,7 @@ env:
     Report failures. Only auto-fix mechanical formatting/lint changes that are clearly safe; otherwise open/update an issue.
     Check for stale TODO/FIXME/HACK annotations older than 90 days via git blame; collect actionable items into one issue or update an existing stale-TODO issue.
 
-    CATEGORY 4 — RELEASE & PACKAGE HEALTH
+    CATEGORY 3 — RELEASE & PACKAGE HEALTH
     Verify package graph health without publishing:
     - `node scripts/verify-artifacts.mjs --manifests-only`
     - `bun run pack:core:dry`
@@ -211,12 +204,12 @@ env:
     Flag any drift in fork package names, stale upstream core dependency in OpenCode package, or Pi accidentally entering fork publish scope.
     Do not create tags or run `scripts/release.sh` except in dry-run mode when explicitly asked.
 
-    CATEGORY 5 — DEVELOPER EXPERIENCE
-    Apply safe mechanical fixes from category 3 only when minimal and reversible.
+    CATEGORY 4 — DEVELOPER EXPERIENCE
+    Apply safe mechanical fixes from category 2 only when minimal and reversible.
     Open one PR per coherent fix. Do not combine unrelated changes.
     Use clear conventional titles, e.g. `chore(lint): apply auto-fixes from autoheal`.
 
-    CATEGORY 6 — CROSS-PROJECT INTELLIGENCE (INBOUND ONLY)
+    CATEGORY 5 — CROSS-PROJECT INTELLIGENCE (INBOUND ONLY)
     Observe these repos for adoptable patterns. Do not clone, modify, comment, open issues, or open PRs in other repositories.
     - `fro-bot/agent`: runtime/workflow example changes and pinned action recommendations.
     - `marcusrbrown/opencode-copilot-delegate`: sibling Fro Bot prompt and OpenCode plugin workflow patterns.
@@ -235,10 +228,6 @@ env:
     ### Errored PRs
     | PR | Failure | Fix | Status |
     | --- | --- | --- | --- |
-
-    ### Security
-    | Advisory / PR | Severity | Action Taken |
-    | --- | --- | --- |
 
     ### Code Quality & Repo Hygiene
     | Check | Result | Action |
