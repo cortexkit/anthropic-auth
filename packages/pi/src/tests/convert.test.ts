@@ -177,6 +177,17 @@ describe('convertMessages — basic transforms', () => {
     })
   })
 
+  test('preserves valid surrogate pairs (astral characters) in text', async () => {
+    // The /gu sanitize regex must only replace LONE surrogates — a valid
+    // surrogate pair (😀 = \uD83D\uDE00) is a single astral code point and
+    // must survive unmangled.
+    const messages = await buildMessages([userMsg('hi \uD83D\uDE00 there')])
+    expect(messages[0]).toEqual({
+      role: 'user',
+      content: 'hi \uD83D\uDE00 there',
+    })
+  })
+
   test('sanitizes tool IDs with invalid characters', async () => {
     const messages = await buildMessages([
       userMsg('run it'),
@@ -331,5 +342,87 @@ describe('convertMessages — empty error tool_result guard', () => {
       expect(tr.is_error).toBe(true)
       expect(tr.content).toEqual([{ type: 'text', text: 'Error' }])
     }
+  })
+})
+
+function thinkingToolMsg(
+  thinking: string,
+  signature: string,
+  toolId: string,
+): Message {
+  return {
+    role: 'assistant',
+    content: [
+      { type: 'thinking', thinking, thinkingSignature: signature },
+      { type: 'toolCall', id: toolId, name: 'Bash', arguments: {} },
+    ],
+    timestamp: 0,
+  } as Message
+}
+
+describe('convertMessages — signed thinking blocks', () => {
+  test('preserves signed thinking with signature in the last assistant turn', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('reason A', 'sig-A', 'tool_1'),
+      toolResultMsg('tool_1', 'out1'),
+      thinkingToolMsg('reason B', 'sig-B', 'tool_2'),
+      toolResultMsg('tool_2', 'out2'),
+    ])
+
+    // Last assistant turn (index 3): thinking preserved verbatim with signature.
+    const current = messages[3]?.content as Array<Record<string, unknown>>
+    expect(current[0]).toEqual({
+      type: 'thinking',
+      thinking: 'reason B',
+      signature: 'sig-B',
+    })
+    expect(current[1]?.type).toBe('tool_use')
+  })
+
+  test('downgrades a signed thinking block with a lone surrogate to sanitized text', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('bad\uD800text', 'sig-A', 'tool_1'),
+      toolResultMsg('tool_1', 'out1'),
+      thinkingToolMsg('reason B', 'sig-B', 'tool_2'),
+      toolResultMsg('tool_2', 'out2'),
+    ])
+
+    // A signed block with a lone surrogate can't keep its signature: sanitizing
+    // would break it and sending the raw surrogate is an invalid-UTF8 400. Drop
+    // the signature and downgrade to sanitized text during conversion.
+    const block = messages[1]?.content as Array<Record<string, unknown>>
+    expect(block[0]).toEqual({ type: 'text', text: 'bad\uFFFDtext' })
+  })
+
+  test('downgrades signed last-turn thinking to sanitized text if it has a lone surrogate', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('safe reason', 'sig-A', 'tool_1'),
+      toolResultMsg('tool_1', 'out1'),
+      thinkingToolMsg('bad\uD800reason', 'sig-B', 'tool_2'),
+      toolResultMsg('tool_2', 'out2'),
+    ])
+
+    // Last assistant turn, but signed thinking contains a lone surrogate: the
+    // signature cannot survive sanitization, so drop it and emit text.
+    const current = messages[3]?.content as Array<Record<string, unknown>>
+    expect(current[0]).toEqual({ type: 'text', text: 'bad\uFFFDreason' })
+    expect(current[1]?.type).toBe('tool_use')
+  })
+
+  test('preserves clean signed last-turn thinking verbatim (no surrogate)', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('clean reason', 'sig-B', 'tool_2'),
+      toolResultMsg('tool_2', 'out2'),
+    ])
+    const current = messages[1]?.content as Array<Record<string, unknown>>
+    expect(current[0]).toEqual({
+      type: 'thinking',
+      thinking: 'clean reason',
+      signature: 'sig-B',
+    })
   })
 })

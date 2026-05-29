@@ -52,6 +52,16 @@ function sanitize(text: string): string {
 }
 
 /**
+ * Detect lone (unpaired) UTF-16 surrogates. With the `u` flag the character
+ * class only matches surrogates that are NOT part of a valid pair, since valid
+ * pairs are folded into a single astral code point. Anthropic rejects payloads
+ * containing lone surrogates (invalid UTF-8).
+ */
+function hasLoneSurrogate(text: string): boolean {
+  return /[\uD800-\uDFFF]/u.test(text)
+}
+
+/**
  * Sanitize a tool-call ID to match Anthropic's `^[a-zA-Z0-9_-]+$` pattern.
  * Cross-provider IDs (e.g. OpenAI Codex `call_xxx|fc_xxx`) contain characters
  * Anthropic rejects. Deterministic — same input always yields the same output.
@@ -136,13 +146,24 @@ function convertMessages(
           blocks.push({ type: 'text', text: sanitize(block.text) })
         } else if (block.type === 'thinking' && block.thinking.trim()) {
           const thinking = block as ThinkingContent
-          if (thinking.thinkingSignature) {
+          if (
+            thinking.thinkingSignature &&
+            !hasLoneSurrogate(thinking.thinking)
+          ) {
+            // Signed thinking blocks must be sent back verbatim — the signature
+            // is computed over the original text. Sanitizing would alter it and
+            // Anthropic rejects the block as "modified". Anthropic-origin
+            // thinking is valid UTF-8, so this is the normal path.
             blocks.push({
               type: 'thinking',
-              thinking: sanitize(thinking.thinking),
+              thinking: thinking.thinking,
               signature: thinking.thinkingSignature,
             })
           } else {
+            // Either unsigned, or signed-but-contains a lone surrogate. In the
+            // latter case we cannot keep the signature: sanitizing breaks it and
+            // sending the raw lone surrogate is an invalid-UTF8 400. Drop the
+            // signature and downgrade to sanitized text.
             blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
           }
         } else if (block.type === 'toolCall') {
@@ -165,9 +186,7 @@ function convertMessages(
       // Anthropic rejects tool_result with is_error=true but empty content
       if (
         toolResult.isError &&
-        (!content ||
-          (Array.isArray(content) && content.length === 0) ||
-          content === '')
+        (!content || (Array.isArray(content) && content.length === 0))
       ) {
         content = [{ type: 'text', text: 'Error' }]
       }
@@ -189,8 +208,7 @@ function convertMessages(
         if (
           next.isError &&
           (!nextContent ||
-            (Array.isArray(nextContent) && nextContent.length === 0) ||
-            nextContent === '')
+            (Array.isArray(nextContent) && nextContent.length === 0))
         ) {
           nextContent = [{ type: 'text', text: 'Error' }]
         }
