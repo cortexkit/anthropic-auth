@@ -594,6 +594,113 @@ function applyCache1hStrategy(
   delete parsed.cacheControl
 }
 
+/** Replace lone (unpaired) UTF-16 surrogates Anthropic rejects as invalid UTF-8. */
+function sanitizeThinkingText(text: string): string {
+  return text.replace(/[\uD800-\uDFFF]/gu, '\uFFFD')
+}
+
+/** Downgrade a thinking block to a plain `<thinking>` text block (signature dropped). */
+function downgradeThinkingBlock(block: Record<string, unknown>) {
+  const thinking = typeof block.thinking === 'string' ? block.thinking : ''
+  return {
+    type: 'text',
+    text: `<thinking>${sanitizeThinkingText(thinking)}</thinking>`,
+  }
+}
+
+/**
+ * Repair `thinking`/`redacted_thinking` blocks so Anthropic accepts them.
+ *
+ * Anthropic signs each thinking block against its original position. Two things
+ * break that and trigger `... thinking blocks ... cannot be modified` 400s:
+ *
+ *   1. Interleaved thinking that opencode's AI SDK flattens — it regroups all
+ *      thinking blocks to the front of the assistant turn instead of leaving
+ *      them interleaved with the tool_use blocks they authorized. The displaced
+ *      blocks no longer match their signed positions. The original interleaving
+ *      is not recoverable from the body, so any assistant turn carrying more
+ *      than one thinking block is downgraded entirely.
+ *   2. Stale signatures on historical (non-last) assistant turns replayed in a
+ *      new request context.
+ *
+ * Strategy: keep a single thinking block only when it is the lone block in the
+ * *latest* assistant turn (the normal, still-valid current-turn case). Every
+ * other thinking block is downgraded to `<thinking>` text; redacted_thinking
+ * blocks (no readable text) are dropped.
+ */
+function sanitizeAssistantThinking(parsed: Record<string, unknown>) {
+  if (!Array.isArray(parsed.messages)) return
+
+  let lastAssistant = -1
+  for (let index = parsed.messages.length - 1; index >= 0; index--) {
+    const message = parsed.messages[index]
+    if (isRecord(message) && message.role === 'assistant') {
+      lastAssistant = index
+      break
+    }
+  }
+
+  for (let index = 0; index < parsed.messages.length; index++) {
+    const message = parsed.messages[index]
+    if (
+      !isRecord(message) ||
+      message.role !== 'assistant' ||
+      !Array.isArray(message.content)
+    ) {
+      continue
+    }
+
+    const content = message.content as Array<Record<string, unknown>>
+    const thinkingCount = content.filter(
+      (block) =>
+        isRecord(block) &&
+        (block.type === 'thinking' || block.type === 'redacted_thinking'),
+    ).length
+    if (thinkingCount === 0) continue
+
+    // A single thinking block in the current turn is still positionally valid.
+    const keepSingle = index === lastAssistant && thinkingCount === 1
+
+    const rewritten: Array<Record<string, unknown>> = []
+    for (const block of content) {
+      if (!isRecord(block)) {
+        rewritten.push(block)
+        continue
+      }
+      if (block.type === 'redacted_thinking') {
+        if (keepSingle) rewritten.push(block)
+        continue // otherwise drop — no readable text to preserve
+      }
+      if (block.type === 'thinking') {
+        rewritten.push(keepSingle ? block : downgradeThinkingBlock(block))
+        continue
+      }
+      rewritten.push(block)
+    }
+
+    // Anthropic rejects an assistant message whose final block is a thinking
+    // block ("The final block in an assistant message cannot be `thinking`").
+    // This can happen when the kept single current-turn thinking block is also
+    // the last block (a thinking-only turn). Downgrade a trailing thinking
+    // block to text; drop a trailing redacted_thinking block.
+    while (rewritten.length) {
+      const last = rewritten[rewritten.length - 1]
+      if (!isRecord(last)) break
+      if (last.type === 'thinking') {
+        rewritten[rewritten.length - 1] = downgradeThinkingBlock(last)
+        break
+      }
+      if (last.type === 'redacted_thinking') {
+        rewritten.pop()
+        continue
+      }
+      break
+    }
+
+    message.content = rewritten
+  }
+}
+
 /**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
@@ -608,6 +715,9 @@ export async function rewriteRequestBody(
 ): Promise<string> {
   try {
     const parsed = JSON.parse(body)
+    // Repair thinking blocks before anything else so signature-invalid blocks
+    // (flattened interleaving / stale history) can't reach Anthropic.
+    sanitizeAssistantThinking(parsed)
     const billingHeader =
       Array.isArray(parsed.messages) &&
       parsed.messages.some(

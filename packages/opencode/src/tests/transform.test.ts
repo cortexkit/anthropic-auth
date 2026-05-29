@@ -1306,3 +1306,190 @@ describe('sanitizeSystemText – realistic prompt', () => {
     expect(parsed).toMatchSnapshot()
   })
 })
+
+describe('rewriteRequestBody — thinking block repair', () => {
+  const userMsg = { role: 'user', content: 'hello world test message' }
+  const toolResult = {
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: 't1', content: 'out' }],
+  }
+
+  function assistant(content: unknown[]) {
+    return { role: 'assistant', content }
+  }
+
+  test('downgrades flattened interleaved thinking blocks to text', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'thinking', thinking: 'A', signature: 'sigA' },
+          { type: 'text', text: 'plan' },
+          { type: 'thinking', thinking: 'B', signature: 'sigB' },
+          { type: 'thinking', thinking: 'C', signature: 'sigC' },
+          { type: 'tool_use', id: 't1', name: 'bash', input: {} },
+        ]),
+        toolResult,
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    const content = result.messages[1].content
+    // All thinking blocks downgraded; no signed thinking blocks remain.
+    expect(content.some((b: any) => b.type === 'thinking')).toBe(false)
+    expect(content[0]).toEqual({ type: 'text', text: '<thinking>A</thinking>' })
+    expect(content[1]).toEqual({ type: 'text', text: 'plan' })
+    expect(content[2]).toEqual({ type: 'text', text: '<thinking>B</thinking>' })
+    expect(content[3]).toEqual({ type: 'text', text: '<thinking>C</thinking>' })
+    // tool_use preserved (and prefixed).
+    expect(content[4].type).toBe('tool_use')
+    expect(content[4].name).toBe('mcp_Bash')
+  })
+
+  test('preserves a single thinking block in the latest assistant turn', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'thinking', thinking: 'reasoning', signature: 'sig1' },
+          { type: 'tool_use', id: 't1', name: 'bash', input: {} },
+        ]),
+        toolResult,
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    const content = result.messages[1].content
+    expect(content[0]).toEqual({
+      type: 'thinking',
+      thinking: 'reasoning',
+      signature: 'sig1',
+    })
+  })
+
+  test('downgrades a single thinking block in a historical assistant turn', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'thinking', thinking: 'old', signature: 'stale' },
+          { type: 'tool_use', id: 't1', name: 'bash', input: {} },
+        ]),
+        toolResult,
+        assistant([
+          { type: 'thinking', thinking: 'current', signature: 'fresh' },
+          { type: 'tool_use', id: 't2', name: 'read', input: {} },
+        ]),
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 't2', content: 'x' }],
+        },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    // Historical assistant (index 1): downgraded.
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'text',
+      text: '<thinking>old</thinking>',
+    })
+    // Latest assistant (index 3): preserved.
+    expect(result.messages[3].content[0]).toEqual({
+      type: 'thinking',
+      thinking: 'current',
+      signature: 'fresh',
+    })
+  })
+
+  test('drops redacted_thinking among flattened blocks', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'thinking', thinking: 'A', signature: 'sigA' },
+          { type: 'redacted_thinking', data: 'enc' },
+          { type: 'tool_use', id: 't1', name: 'bash', input: {} },
+        ]),
+        toolResult,
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    const content = result.messages[1].content
+    expect(content.some((b: any) => b.type === 'redacted_thinking')).toBe(false)
+    expect(content[0]).toEqual({ type: 'text', text: '<thinking>A</thinking>' })
+    expect(content[1].type).toBe('tool_use')
+  })
+
+  test('downgrades a trailing thinking block (cannot be final block)', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'thinking', thinking: 'only reasoning', signature: 'sig1' },
+        ]),
+        { role: 'user', content: 'next' },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    const content = result.messages[1].content
+    expect(content[content.length - 1].type).not.toBe('thinking')
+    expect(content[0]).toEqual({
+      type: 'text',
+      text: '<thinking>only reasoning</thinking>',
+    })
+  })
+
+  test('keeps single current-turn thinking when followed by tool_use', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'thinking', thinking: 'reasoning', signature: 'sig1' },
+          { type: 'tool_use', id: 't1', name: 'bash', input: {} },
+        ]),
+        toolResult,
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    const content = result.messages[1].content
+    // thinking preserved (not final block), tool_use is final.
+    expect(content[0].type).toBe('thinking')
+    expect(content[content.length - 1].type).toBe('tool_use')
+  })
+
+  test('drops a trailing redacted_thinking block', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'text', text: 'answer' },
+          { type: 'redacted_thinking', data: 'enc' },
+        ]),
+        { role: 'user', content: 'next' },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    const content = result.messages[1].content
+    expect(content.some((b: any) => b.type === 'redacted_thinking')).toBe(false)
+    expect(content[content.length - 1]).toEqual({
+      type: 'text',
+      text: 'answer',
+    })
+  })
+
+  test('sanitizes lone surrogates when downgrading thinking', async () => {
+    const body = JSON.stringify({
+      messages: [
+        userMsg,
+        assistant([
+          { type: 'thinking', thinking: 'bad\uD800', signature: 'a' },
+          { type: 'thinking', thinking: 'b', signature: 'b' },
+          { type: 'tool_use', id: 't1', name: 'bash', input: {} },
+        ]),
+        toolResult,
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    expect(result.messages[1].content[0]).toEqual({
+      type: 'text',
+      text: '<thinking>bad\uFFFD</thinking>',
+    })
+  })
+})
