@@ -20,6 +20,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 | Provider integration point | OpenCode plugin fetch/request transform | Pi `registerProvider("anthropic")` provider override |
 | Sidecar config | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
 | Commands | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` | `/claude-cache`, `/claude-cachekeep`, `/claude-routing`, `/claude-fast`, `/claude-quota`, `/claude-dump` |
+| Quota sidebar widget | OpenCode TUI plugin via `tui.json` | Not available |
 | Fallback accounts, quota routing, relay, dumps, fast mode | Supported | Supported through the same shared core and Pi sidecar |
 
 ## What CortexKit adds over the original plugin
@@ -31,6 +32,7 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Cache keepalive**: use `/claude-cachekeep HH-HH` to pre-warm hybrid cache anchors for active sessions before the 1-hour TTL expires.
 - **Fast mode toggle**: use `/claude-fast on|off` to request Anthropic fast mode for supported Opus models.
 - **Live quota visibility**: use `/claude-quota` to see main and fallback quota state, reset times, and refresh errors.
+- **Quota sidebar widget**: register the OpenCode TUI plugin in `tui.json` to render a live sidebar with per-account quota, routing, cache, and health state.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
 - **Claude-compatible request hardening**: final-body billing signing, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
 
@@ -263,6 +265,35 @@ Show current quota state:
 In OpenCode, this includes the main Anthropic account and sidecar fallback accounts. In Pi, the command reports sidecar fallback account quota state from `~/.pi/agent/anthropic-auth.json`.
 
 Reset times are rendered as relative durations, such as `resets in 10m` or `resets in 1h 15m`.
+
+## Quota sidebar (OpenCode TUI)
+
+OpenCode can render a live quota sidebar widget that surfaces plugin state without running a slash command. The widget is OpenCode-only; Pi has no TUI surface.
+
+OpenCode loads TUI plugins from a separate `tui.json` (or `tui.jsonc`) file in your OpenCode config directory, not from the main `plugin` array. Register the package there:
+
+```json
+{
+  "plugin": ["@cortexkit/opencode-anthropic-auth"]
+}
+```
+
+Pinning is recommended, matching the main plugin entry:
+
+```json
+{
+  "plugin": ["@cortexkit/opencode-anthropic-auth@1.0.0"]
+}
+```
+
+After changing `tui.json`, restart OpenCode. Keep the version in `tui.json` in sync with the version in your main plugin config.
+
+The sidebar polls plugin state and refreshes on OpenCode session and message events. It renders the following sections, styled with the active OpenCode theme tokens:
+
+- **Quota** — per-account 5-hour and 7-day usage bars for the main account and each enabled fallback, with a status word (`active`, `blocked`, or `idle`) and the soonest reset time.
+- **Routing** — the current route, standard/fast mode, and relay transport state.
+- **Cache** — the 1-hour cache keepalive window and the number of tracked sessions, shown when cache keepalive is configured.
+- **Health** — quota-API and token-refresh backoff countdowns. This section is hidden unless a backoff is active, and a `LIMITED` badge appears in the header.
 
 ## Claude prompt cache control
 

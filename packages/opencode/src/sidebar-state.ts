@@ -19,6 +19,10 @@ export interface SidebarAccountState {
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    quotaBackedOff?: boolean
+    quotaBackoffUntil?: number
+    refreshBackedOff?: boolean
+    refreshBackoffUntil?: number
   }
   fallbacks: SidebarAccountState[]
   activeId: string | undefined

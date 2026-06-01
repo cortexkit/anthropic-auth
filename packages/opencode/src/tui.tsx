@@ -16,7 +16,8 @@ const STATE_FILE = join(
   'opencode-anthropic-auth',
   'sidebar-state.json',
 )
-const POLL_MS = 2000
+const POLL_MS = 1500
+const REFRESH_DEBOUNCE_MS = 200
 
 const DEFAULT_STATE: SidebarState = {
   main: { quota: null },
@@ -28,19 +29,42 @@ const DEFAULT_STATE: SidebarState = {
   lastUpdated: 0,
 }
 
-async function readStateFromFile(): Promise<SidebarState> {
-  try {
-    const raw = await readFile(STATE_FILE, 'utf8')
-    return JSON.parse(raw) as SidebarState
-  } catch {
-    return DEFAULT_STATE
+const ID = 'cortexkit.anthropic-auth'
+const BAR_WIDTH = 10
+const BAR_FILLED = '\u2588'
+const BAR_EMPTY = '\u2591'
+
+// biome-ignore lint/suspicious/noExplicitAny: opentui border prop not typed in plugin tui surface
+const SINGLE_BORDER = { type: 'single' } as any
+
+type Tone = 'ok' | 'warn' | 'err' | 'muted' | 'accent' | 'text'
+type ThemeCurrent = TuiPluginApi['theme']['current']
+type ThemeColor = ThemeCurrent['text']
+
+// Tone -> theme token. Theme tokens only — never hardcoded colors. Fallbacks
+// resolve to other theme tokens so the sidebar always tracks the active theme.
+function toneColor(theme: ThemeCurrent, tone: Tone): ThemeColor {
+  switch (tone) {
+    case 'ok':
+      return theme.success ?? theme.accent
+    case 'warn':
+      return theme.warning ?? theme.accent
+    case 'err':
+      return theme.error ?? theme.accent
+    case 'muted':
+      return theme.textMuted ?? theme.text
+    case 'accent':
+      return theme.accent ?? theme.text
+    default:
+      return theme.text
   }
 }
 
-const ID = 'cortexkit.anthropic-auth'
-const BAR_WIDTH = 12
-const BAR_FILLED = '\u2588'
-const BAR_EMPTY = '\u2591'
+function usageTone(usedPct: number): Tone {
+  if (usedPct < 50) return 'ok'
+  if (usedPct < 80) return 'warn'
+  return 'err'
+}
 
 function quotaBar(usedPct: number, width = BAR_WIDTH): string {
   const filled = Math.max(
@@ -48,13 +72,6 @@ function quotaBar(usedPct: number, width = BAR_WIDTH): string {
     Math.min(Math.round((usedPct / 100) * width), width),
   )
   return BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(width - filled)
-}
-
-function barColor(usedPct: number, api: TuiPluginApi): string {
-  if (usedPct < 50)
-    return api.theme.current.success ?? api.theme.current.accent ?? 'green'
-  if (usedPct < 80) return api.theme.current.warning ?? 'yellow'
-  return api.theme.current.error ?? 'red'
 }
 
 function formatResetIn(resetsAt: string | undefined): string {
@@ -68,71 +85,137 @@ function formatResetIn(resetsAt: string | undefined): string {
   return rm > 0 ? `${hrs}h${rm}m` : `${hrs}h`
 }
 
-function QuotaBar(props: {
-  label: string
-  usedPct: number
-  api: TuiPluginApi
+function formatUntil(until: number | undefined): string {
+  if (!until) return ''
+  const ms = until - Date.now()
+  if (ms <= 0) return 'now'
+  const mins = Math.ceil(ms / 60_000)
+  if (mins < 60) return `${mins}m`
+  const hrs = Math.floor(mins / 60)
+  const rm = mins % 60
+  return rm > 0 ? `${hrs}h${rm}m` : `${hrs}h`
+}
+
+// --- Reusable components (aft-style) ---------------------------------------
+
+function SectionHeader(props: {
+  theme: ThemeCurrent
+  title: string
+  marginTop?: number
 }) {
-  const color = () => barColor(props.usedPct, props.api)
-  const muted = () => props.api.theme.current.textMuted
   return (
-    <box flexDirection='row'>
-      <text fg={muted()}>{`   ${props.label} `}</text>
-      <text fg={color()}>{quotaBar(props.usedPct)}</text>
-      <text
-        fg={muted()}
-      >{` ${String(Math.round(props.usedPct)).padStart(3)}%`}</text>
+    <box width='100%' marginTop={props.marginTop ?? 1}>
+      <text fg={props.theme.text}>
+        <b>{props.title}</b>
+      </text>
     </box>
   )
 }
 
-function AccountSection(props: {
+function StatRow(props: {
+  theme: ThemeCurrent
+  label: string
+  value: string
+  tone?: Tone
+}) {
+  return (
+    <box width='100%' flexDirection='row' justifyContent='space-between'>
+      <text fg={props.theme.textMuted}>{props.label}</text>
+      <text fg={toneColor(props.theme, props.tone ?? 'text')}>
+        <b>{props.value}</b>
+      </text>
+    </box>
+  )
+}
+
+// Quota window row: muted label left, tone-colored bar + percentage right,
+// with an optional muted reset suffix.
+function QuotaRow(props: {
+  theme: ThemeCurrent
+  label: string
+  window: { usedPercent: number; resetsAt?: string } | undefined
+}) {
+  const used = () => props.window?.usedPercent ?? 0
+  const reset = () => formatResetIn(props.window?.resetsAt)
+  return (
+    <Show
+      when={props.window}
+      fallback={
+        <box width='100%' flexDirection='row' justifyContent='space-between'>
+          <text fg={props.theme.textMuted}>{props.label}</text>
+          <text fg={props.theme.textMuted}>{'\u2014'}</text>
+        </box>
+      }
+    >
+      <box width='100%' flexDirection='row' justifyContent='space-between'>
+        <text fg={props.theme.textMuted}>{props.label}</text>
+        <box flexDirection='row'>
+          <text fg={toneColor(props.theme, usageTone(used()))}>
+            {`${quotaBar(used())} ${String(Math.round(used())).padStart(3)}%`}
+          </text>
+          <Show when={reset()}>
+            <text fg={props.theme.textMuted}>{` \u00b7 ${reset()}`}</text>
+          </Show>
+        </box>
+      </box>
+    </Show>
+  )
+}
+
+// Account block: header row (name + status word) then per-window quota rows.
+function AccountBlock(props: {
+  theme: ThemeCurrent
   name: string
   quota: AccountQuota | null
   active: boolean
-  api: TuiPluginApi
+  marginTop?: number
 }) {
-  const dotColor = () =>
-    props.active
-      ? (props.api.theme.current.success ??
-        props.api.theme.current.accent ??
-        'green')
-      : (props.api.theme.current.textMuted ?? 'gray')
-  const muted = () => props.api.theme.current.textMuted
-  const resetStr = () => formatResetIn(props.quota?.five_hour?.resetsAt)
+  const statusWord = () => (props.active ? 'active' : 'idle')
+  const statusTone = (): Tone => (props.active ? 'ok' : 'muted')
   return (
-    <box flexDirection='column'>
-      <box flexDirection='row'>
-        <text fg={dotColor()} bold>
-          {'* '}
+    <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
+      <box width='100%' flexDirection='row' justifyContent='space-between'>
+        <text fg={props.theme.text}>
+          <b>{props.name}</b>
         </text>
-        <text bold>{props.name}</text>
-        <Show when={resetStr()}>
-          <text fg={muted()}>{` ${resetStr()}`}</text>
-        </Show>
+        <text fg={toneColor(props.theme, statusTone())}>
+          <b>{statusWord()}</b>
+        </text>
       </box>
       <Show
         when={props.quota}
-        fallback={<text fg={muted()}>{'    checking...'}</text>}
+        fallback={<text fg={props.theme.textMuted}>{'checking\u2026'}</text>}
       >
-        <QuotaBar
+        <QuotaRow
+          theme={props.theme}
           label='5h'
-          usedPct={props.quota?.five_hour?.usedPercent ?? 0}
-          api={props.api}
+          window={props.quota?.five_hour}
         />
-        <QuotaBar
+        <QuotaRow
+          theme={props.theme}
           label='7d'
-          usedPct={props.quota?.seven_day?.usedPercent ?? 0}
-          api={props.api}
+          window={props.quota?.seven_day}
         />
       </Show>
     </box>
   )
 }
 
+// --- State plumbing ---------------------------------------------------------
+
+async function readStateFromFile(): Promise<SidebarState> {
+  try {
+    const raw = await readFile(STATE_FILE, 'utf8')
+    return JSON.parse(raw) as SidebarState
+  } catch {
+    return DEFAULT_STATE
+  }
+}
+
 function QuotaSidebar(props: { api: TuiPluginApi }) {
   const [state, setState] = createSignal<SidebarState>(DEFAULT_STATE)
   let lastUpdated = 0
+  let debounce: ReturnType<typeof setTimeout> | null = null
 
   async function refresh() {
     const next = await readStateFromFile()
@@ -142,99 +225,177 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
     }
   }
 
-  // Poll globalThis since server and TUI load separate module instances
-  const timer = setInterval(refresh, POLL_MS)
-  onCleanup(() => clearInterval(timer))
+  function scheduleRefresh() {
+    if (debounce) clearTimeout(debounce)
+    debounce = setTimeout(() => {
+      debounce = null
+      void refresh()
+    }, REFRESH_DEBOUNCE_MS)
+  }
 
-  // Also refresh on OpenCode events for faster updates
+  // Background poller (server and TUI run as separate module instances, so we
+  // sync through the state file) plus event-driven refreshes for low latency.
+  const timer = setInterval(refresh, POLL_MS)
   const unsubs = [
-    props.api.event.on('session.updated', refresh),
-    props.api.event.on('message.updated', refresh),
+    props.api.event.on('session.updated', scheduleRefresh),
+    props.api.event.on('message.updated', scheduleRefresh),
   ]
+  setTimeout(refresh, 300)
   onCleanup(() => {
+    clearInterval(timer)
+    if (debounce) clearTimeout(debounce)
     for (const u of unsubs) u()
   })
 
-  // Initial refresh after short delay (server plugin may not have written yet)
-  setTimeout(refresh, 500)
-  setTimeout(refresh, 2000)
-
+  const theme = () => props.api.theme.current
+  const enabledFallbacks = () => state().fallbacks.filter((f) => f.enabled)
   const hasData = () =>
-    state().main.quota != null || state().fallbacks.length > 0
-  const muted = () => props.api.theme.current.textMuted ?? '#71717a'
+    state().main.quota != null || enabledFallbacks().length > 0
+
+  const quotaBackedOff = () => state().main.quotaBackedOff === true
+  const refreshBackedOff = () => state().main.refreshBackedOff === true
+  const degraded = () => quotaBackedOff() || refreshBackedOff()
+
+  const cacheKeep = () => state().cacheKeep
+  const showCache = () => cacheKeep() != null && cacheKeep()?.window != null
+  const relayValue = () => {
+    const r = state().relay
+    if (!r) return '\u2014'
+    return `${r.transport} \u00b7 ${r.enabled ? 'on' : 'off'}`
+  }
 
   return (
-    <box flexDirection='column'>
-      <text fg={muted()}>
-        {'\u2500 Claude Quota \u2500\u2500\u2500\u2500\u2500'}
-      </text>
+    <box
+      width='100%'
+      flexDirection='column'
+      border={SINGLE_BORDER}
+      borderColor={theme().borderActive}
+      paddingTop={1}
+      paddingBottom={1}
+      paddingLeft={1}
+      paddingRight={1}
+    >
+      {/* Header: CLAUDE badge + optional LIMITED degraded badge */}
+      <box
+        width='100%'
+        flexDirection='row'
+        justifyContent='space-between'
+        alignItems='center'
+      >
+        <box paddingLeft={1} paddingRight={1} backgroundColor={theme().accent}>
+          <text fg={theme().background}>
+            <b>{'CLAUDE'}</b>
+          </text>
+        </box>
+        <Show when={degraded()}>
+          <box
+            paddingLeft={1}
+            paddingRight={1}
+            backgroundColor={theme().warning}
+          >
+            <text fg={theme().background}>
+              <b>{'LIMITED'}</b>
+            </text>
+          </box>
+        </Show>
+      </box>
+
       <Show
         when={hasData()}
-        fallback={<text fg={muted()}>{'  Waiting...'}</text>}
+        fallback={
+          <box marginTop={1} width='100%'>
+            <text fg={theme().textMuted}>{'Waiting for quota\u2026'}</text>
+          </box>
+        }
       >
-        <text> </text>
-        <AccountSection
+        {/* Quota */}
+        <SectionHeader theme={theme()} title='Quota' />
+        <AccountBlock
+          theme={theme()}
           name='main'
           quota={state().main.quota}
           active={state().activeId === 'main'}
-          api={props.api}
         />
-        <For each={state().fallbacks.filter((f) => f.enabled)}>
+        <For each={enabledFallbacks()}>
           {(fb) => (
-            <box flexDirection='column'>
-              <text> </text>
-              <AccountSection
-                name={fb.label ?? fb.id}
-                quota={fb.quota}
-                active={state().activeId === fb.id}
-                api={props.api}
-              />
-            </box>
+            <AccountBlock
+              theme={theme()}
+              name={fb.label ?? fb.id}
+              quota={fb.quota}
+              active={state().activeId === fb.id}
+              marginTop={1}
+            />
           )}
         </For>
       </Show>
-      <text> </text>
-      <text fg={muted()}>
-        {
-          '\u2500\u2500 Status \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500'
-        }
-      </text>
-      <box flexDirection='row'>
-        <text fg={muted()}>{'  Route: '}</text>
-        <text fg={props.api.theme.current.accent ?? '#3b82f6'}>
-          {state().route}
-        </text>
-      </box>
-      <box flexDirection='row'>
-        <text fg={muted()}>{'  Mode:  '}</text>
-        <text>{state().fastMode ? 'fast \u26a1' : 'std'}</text>
-      </box>
-      <box flexDirection='row'>
-        <text fg={muted()}>{'  Relay: '}</text>
-        <Show
-          when={state().relay}
-          fallback={<text fg={muted()}>{'\u2014'}</text>}
-        >
-          <text>{`${state().relay?.transport} `}</text>
-          <text
-            fg={
-              state().relay?.enabled
-                ? (props.api.theme.current.success ??
-                  props.api.theme.current.accent)
-                : props.api.theme.current.error
-            }
-          >
-            {'*'}
-          </text>
+
+      {/* Routing */}
+      <SectionHeader theme={theme()} title='Routing' />
+      <StatRow
+        theme={theme()}
+        label='Route'
+        value={state().route}
+        tone='accent'
+      />
+      <StatRow
+        theme={theme()}
+        label='Mode'
+        value={state().fastMode ? 'fast' : 'std'}
+        tone={state().fastMode ? 'accent' : 'muted'}
+      />
+      <StatRow
+        theme={theme()}
+        label='Relay'
+        value={relayValue()}
+        tone={state().relay?.enabled ? 'ok' : 'muted'}
+      />
+
+      {/* Cache */}
+      <Show when={showCache()}>
+        <SectionHeader theme={theme()} title='Cache' />
+        <StatRow
+          theme={theme()}
+          label='1h cache'
+          value={`${cacheKeep()?.window} \u00b7 ${cacheKeep()?.enabled ? 'on' : 'off'}`}
+          tone={cacheKeep()?.enabled ? 'ok' : 'muted'}
+        />
+        <Show when={(cacheKeep()?.trackedSessions ?? 0) > 0}>
+          <StatRow
+            theme={theme()}
+            label='Tracked'
+            value={String(cacheKeep()?.trackedSessions)}
+            tone='text'
+          />
         </Show>
-      </box>
+      </Show>
+
+      {/* Health — only when something is wrong */}
+      <Show when={degraded()}>
+        <SectionHeader theme={theme()} title='Health' />
+        <Show when={quotaBackedOff()}>
+          <StatRow
+            theme={theme()}
+            label='Quota API'
+            value={`backoff ${formatUntil(state().main.quotaBackoffUntil)}`}
+            tone='warn'
+          />
+        </Show>
+        <Show when={refreshBackedOff()}>
+          <StatRow
+            theme={theme()}
+            label='Token refresh'
+            value={`backoff ${formatUntil(state().main.refreshBackoffUntil)}`}
+            tone='warn'
+          />
+        </Show>
+      </Show>
     </box>
   )
 }
 
 const tui: TuiPlugin = async (api) => {
   api.slots.register({
-    order: 150,
+    order: 160,
     slots: {
       sidebar_content(_ctx: unknown, _props: { session_id: string }) {
         return <QuotaSidebar api={api} />
