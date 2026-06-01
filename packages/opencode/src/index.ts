@@ -672,16 +672,23 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     })
   }
 
-  function quotaBar(pct: number, width = 16): string {
-    const filled = Math.min(Math.round((pct / 100) * width), width)
+  function quotaBar(pct: number, width = 10): string {
+    const filled = Math.max(0, Math.min(Math.round((pct / 100) * width), width))
     return '█'.repeat(filled) + '░'.repeat(width - filled)
+  }
+
+  function quotaLine(label: string, pct: number): string {
+    return `${label}  ${quotaBar(pct)}  ${String(Math.round(pct)).padStart(3)}%`
   }
 
   function formatResetIn(resetsAt: string | undefined): string {
     if (!resetsAt) return ''
-    const ms = new Date(resetsAt).getTime() - Date.now()
+    const ts = new Date(resetsAt).getTime()
+    if (Number.isNaN(ts)) return ''
+    const ms = ts - Date.now()
     if (ms <= 0) return 'resets now'
     const mins = Math.floor(ms / 60_000)
+    if (mins < 1) return 'resets <1m'
     if (mins < 60) return `resets ${mins}m`
     const hrs = Math.floor(mins / 60)
     const rm = mins % 60
@@ -706,21 +713,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const sd = quota.seven_day
       if (fh || sd) {
         const mainActive = activeAccountId === 'main'
-        const indicator = mainActive ? '🟢' : '  '
+        const status = mainActive ? 'active' : 'idle'
         const reset = formatResetIn(fh?.resetsAt)
         const lines: string[] = [
-          `${indicator} main${reset ? ` (${reset})` : ''}`,
+          `main · ${status}${reset ? ` (${reset})` : ''}`,
         ]
         if (fh) {
-          lines.push(
-            `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
-          )
+          lines.push(quotaLine('5h', fh.usedPercent))
           globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
         }
         if (sd) {
-          lines.push(
-            `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
-          )
+          lines.push(quotaLine('7d', sd.usedPercent))
           globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
         }
         sections.push(lines.join('\n'))
@@ -737,21 +740,17 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         if (!fh && !sd) continue
         const name = fb.label || 'alt'
         const fbActive = activeAccountId === fb.id
-        const indicator = fbActive ? '🟢' : '  '
+        const status = fbActive ? 'active' : 'idle'
         const fbReset = formatResetIn(fh?.resetsAt)
         const lines: string[] = [
-          `${indicator} ${name}${fbReset ? ` (${fbReset})` : ''}`,
+          `${name} · ${status}${fbReset ? ` (${fbReset})` : ''}`,
         ]
         if (fh) {
-          lines.push(
-            `5h  ${quotaBar(fh.usedPercent)}  ${Math.round(fh.usedPercent)}%`,
-          )
+          lines.push(quotaLine('5h', fh.usedPercent))
           globalMaxUsed = Math.max(globalMaxUsed, fh.usedPercent)
         }
         if (sd) {
-          lines.push(
-            `1w  ${quotaBar(sd.usedPercent)}  ${Math.round(sd.usedPercent)}%`,
-          )
+          lines.push(quotaLine('7d', sd.usedPercent))
           globalMaxUsed = Math.max(globalMaxUsed, sd.usedPercent)
         }
         sections.push(lines.join('\n'))
@@ -1819,9 +1818,19 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               function showQuotaToastFromCache() {
                 const mainEntry = quotaManager.getMain()
                 if (!mainEntry) return
-                const fallbacks = (storage?.accounts ?? []).filter(
-                  (a) => a.enabled !== false,
-                )
+                // Prefer the shared QuotaManager cache for fallback quota so the
+                // toast matches the sidebar and reflects background refreshes
+                // rather than the request-start storage snapshot.
+                const fallbacks = (storage?.accounts ?? [])
+                  .filter((a) => a.enabled !== false)
+                  .map((a) => ({
+                    ...a,
+                    // Token-aware read so a cached snapshot bound to a previous
+                    // access token (account re-login) is never shown.
+                    quota:
+                      quotaManager.getFallback(a.id, a.access)?.quota ??
+                      a.quota,
+                  }))
                 const mainPassesPolicy = quotaSnapshotPassesPolicy(
                   mainEntry.quota,
                   storage,
@@ -1830,7 +1839,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 if (mainPassesPolicy) {
                   activeId = 'main'
                 } else {
-                  activeId = fallbacks[0]?.id
+                  // Mirror routing: the active account is the first fallback that
+                  // actually passes quota policy; if none do, routing falls
+                  // through to main, so label main — never a failing fallback.
+                  activeId =
+                    fallbacks.find((f) =>
+                      quotaSnapshotPassesPolicy(f.quota, storage),
+                    )?.id ?? 'main'
                 }
                 showQuotaToast(mainEntry.quota, fallbacks, activeId)
               }
