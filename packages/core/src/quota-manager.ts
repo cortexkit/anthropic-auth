@@ -6,6 +6,7 @@
  * Handles deduplication, rate-limiting (429 backoff), and staleness.
  */
 
+import { createHash } from 'node:crypto'
 import type {
   AccountOperationError,
   AccountStorage,
@@ -26,6 +27,15 @@ import {
 // Capture real setTimeout before tests can mock globalThis.setTimeout
 const nativeSetTimeout = globalThis.setTimeout
 
+/**
+ * Stable, non-reversible fingerprint of an access token. Used to detect a
+ * main-account switch so a different account's persisted/cached quota is never
+ * reused. Not a secret — a truncated SHA-256, safe to persist alongside quota.
+ */
+export function tokenFingerprint(token: string): string {
+  return createHash('sha256').update(token).digest('hex').slice(0, 16)
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -40,7 +50,11 @@ export type QuotaManagerOptions = {
   storage: AccountStorage | null
   fetchImpl?: typeof fetch
   now?: () => number
-  onMainQuotaFetched?: (quota: OAuthQuotaSnapshot, checkedAt: number) => void
+  onMainQuotaFetched?: (
+    quota: OAuthQuotaSnapshot,
+    checkedAt: number,
+    tokenFingerprint: string,
+  ) => void
   onApiError?: (error: AccountOperationError) => void
 }
 
@@ -51,7 +65,7 @@ export type QuotaManagerOptions = {
 export class QuotaManager {
   // --- State ---
   private main: QuotaEntry | null = null
-  private mainAccessToken: string | null = null
+  private mainTokenFp: string | null = null
   private fallbacks = new Map<string, QuotaEntry>()
 
   // --- Inflight deduplication ---
@@ -79,7 +93,10 @@ export class QuotaManager {
     this.onMainQuotaFetched = opts.onMainQuotaFetched
     this.onApiError = opts.onApiError
 
-    // Seed main quota from persisted storage
+    // Seed main quota from persisted storage, bound to the token fingerprint
+    // that produced it. refreshMain() drops this seed if the live token's
+    // fingerprint differs (main-account switch), preventing stale wrong-account
+    // quota from being served during backoff.
     const persisted = getPersistedMainQuota(opts.storage)
     if (persisted) {
       this.main = {
@@ -91,6 +108,7 @@ export class QuotaManager {
         ),
         checkedAt: persisted.checkedAt,
       }
+      this.mainTokenFp = persisted.tokenFingerprint ?? null
     }
 
     // Seed backoff state from persisted storage
@@ -121,7 +139,7 @@ export class QuotaManager {
   // =========================================================================
 
   setMain(accessToken: string, entry: QuotaEntry): void {
-    this.mainAccessToken = accessToken
+    this.mainTokenFp = tokenFingerprint(accessToken)
     this.main = entry
   }
 
@@ -134,10 +152,13 @@ export class QuotaManager {
   // =========================================================================
 
   async refreshMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
-    // If token changed, invalidate cache
-    if (this.mainAccessToken && this.mainAccessToken !== accessToken) {
+    // If the main account/token changed, invalidate the cache (including a
+    // persisted seed) BEFORE the backoff short-circuit so a different account's
+    // stale quota is never returned while the quota API is backed off.
+    const fp = tokenFingerprint(accessToken)
+    if (this.mainTokenFp && this.mainTokenFp !== fp) {
       this.main = null
-      this.mainAccessToken = null
+      this.mainTokenFp = null
     }
 
     // Deduplicate — return in-flight promise if already fetching
@@ -327,14 +348,14 @@ export class QuotaManager {
             now: this.now,
           })
           const now = this.now()
-          this.mainAccessToken = accessToken
+          this.mainTokenFp = tokenFingerprint(accessToken)
           this.main = {
             quota,
             refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
             checkedAt: now,
           }
           this.lastApiError = undefined
-          this.onMainQuotaFetched?.(quota, now)
+          this.onMainQuotaFetched?.(quota, now, this.mainTokenFp)
           return quota
         } catch (error) {
           this._handleFetchError(error)

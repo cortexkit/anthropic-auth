@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { QuotaManager } from '@cortexkit/anthropic-auth-core'
+import { QuotaManager, tokenFingerprint } from '@cortexkit/anthropic-auth-core'
 
 function makeQuotaResponse(now: number) {
   return new Response(
@@ -235,6 +235,71 @@ describe('QuotaManager', () => {
       const main = qm.getMain()
       expect(main).not.toBeNull()
       expect(main!.checkedAt).toBe(900_000)
+    })
+
+    test('drops persisted main seed during backoff when the token changed', async () => {
+      // Regression: a persisted seed must be bound to the account that produced
+      // it. After a main-account switch (different access token), the seed must
+      // not be served — even while the quota API is backed off.
+      const quota = {
+        quotas: [],
+        expires: new Date(2_000_000).toISOString(),
+      }
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: {
+            mainQuota: quota as any,
+            mainQuotaCheckedAt: 900_000,
+            mainQuotaToken: 'old-account-fingerprint',
+            mainLastQuotaApiError: {
+              message: 'Claude quota check failed: 429 — rate limited',
+              checkedAt: 999_000,
+              nextRetryAt: 1_030_000,
+              retryCount: 1,
+            },
+          },
+        },
+        now: () => 1_000_000,
+      })
+
+      expect(qm.getMain()).not.toBeNull()
+      expect(qm.isBackedOff()).toBe(true)
+
+      // Different account token: seed is invalidated rather than returned.
+      await expect(qm.refreshMain('different-account-token')).rejects.toThrow()
+      expect(qm.getMain()).toBeNull()
+    })
+
+    test('keeps persisted main seed during backoff when the token matches', async () => {
+      const quota = {
+        quotas: [],
+        expires: new Date(2_000_000).toISOString(),
+      }
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: {
+            mainQuota: quota as any,
+            mainQuotaCheckedAt: 900_000,
+            mainQuotaToken: tokenFingerprint('same-account-token'),
+            mainLastQuotaApiError: {
+              message: 'Claude quota check failed: 429 — rate limited',
+              checkedAt: 999_000,
+              nextRetryAt: 1_030_000,
+              retryCount: 1,
+            },
+          },
+        },
+        now: () => 1_000_000,
+      })
+
+      // Same account token: backed off, so the seed is returned (not refetched).
+      const result = await qm.refreshMain('same-account-token')
+      expect(result).toEqual(quota as any)
+      expect(qm.getMain()).not.toBeNull()
     })
 
     test('calls onMainQuotaFetched after successful fetch', async () => {

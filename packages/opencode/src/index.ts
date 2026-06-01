@@ -271,7 +271,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   const initialStorage = await loadAccounts(accountStoragePath)
   const quotaManager = new QuotaManager({
     storage: initialStorage,
-    onMainQuotaFetched: async (quota, checkedAt) => {
+    onMainQuotaFetched: async (quota, checkedAt, tokenFingerprint) => {
       try {
         const storage = (await loadAccounts(accountStoragePath)) ?? {
           version: 1 as const,
@@ -280,6 +280,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         storage.quota = storage.quota ?? {}
         storage.quota.mainQuota = quota
         storage.quota.mainQuotaCheckedAt = checkedAt
+        storage.quota.mainQuotaToken = tokenFingerprint
         storage.quota.mainLastQuotaApiError = undefined
         await saveAccounts(storage, accountStoragePath)
       } catch (error) {
@@ -1552,10 +1553,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace.done('missing_access_error')
                 throw new Error('OAuth access token is missing after refresh')
               }
+              // Count every replayable request so the every-N refresh cadence
+              // (quota.refreshEveryNRequests) advances on all routing paths,
+              // not only when main-quota routing is enabled.
+              if (replayableRequest) sessionRequestCount++
               if (replayableRequest && mainQuotaRoutingEnabled(storage)) {
                 try {
                   const quotaStart = nowMs()
-                  sessionRequestCount++
                   // Use QuotaManager: get cached or eagerly refresh if first time
                   let routingQuota = quotaManager.getMain()?.quota
                   if (!routingQuota) {

@@ -80,6 +80,9 @@ export type AccountStorage = {
     failClosedOnUnknownQuota?: boolean
     mainQuota?: OAuthQuotaSnapshot
     mainQuotaCheckedAt?: number
+    // Fingerprint of the access token that produced mainQuota. Used to avoid
+    // seeding a different account's persisted quota after a main-account switch.
+    mainQuotaToken?: string
     mainLastQuotaApiError?: AccountOperationError
   }
   claudeCache?: {
@@ -727,14 +730,17 @@ export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
   return Math.max(1, minutes) * 60_000
 }
 
-export function getPersistedMainQuota(
-  storage: AccountStorage | null,
-): { quota: OAuthQuotaSnapshot; checkedAt: number } | null {
+export function getPersistedMainQuota(storage: AccountStorage | null): {
+  quota: OAuthQuotaSnapshot
+  checkedAt: number
+  tokenFingerprint?: string
+} | null {
   if (!storage?.quota?.mainQuota || !storage.quota.mainQuotaCheckedAt)
     return null
   return {
     quota: storage.quota.mainQuota,
     checkedAt: storage.quota.mainQuotaCheckedAt,
+    tokenFingerprint: storage.quota.mainQuotaToken,
   }
 }
 
