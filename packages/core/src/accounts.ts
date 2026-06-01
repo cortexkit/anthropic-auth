@@ -1065,7 +1065,7 @@ export class FallbackAccountManager {
         }
         this.seedFallbackQuota(next, storage)
         const stale = this.quotaManager
-          ? this.quotaManager.isFallbackStale(next.id)
+          ? this.quotaManager.isFallbackStale(next.id, next.access)
           : quotaIsStale(next, storage, this.now())
         // Skip the request-time refresh when this account's quota API is
         // backed off (recent 429/5xx). Hitting it again would extend the
@@ -1078,7 +1078,13 @@ export class FallbackAccountManager {
           next = await this.refreshAccountQuota(next, storage)
           changed = true
         }
-        if (this.accountPassesQuotaPolicy(next, storage)) usable.push(next)
+        // Single source of truth: evaluate quota policy from the unified
+        // QuotaManager cache (the same source as the staleness check above) so
+        // an active-route refresh that updated only the cache is not ignored.
+        if (
+          this.accountPassesQuotaPolicy(this.quotaPolicyAccount(next), storage)
+        )
+          usable.push(next)
       } catch (error) {
         if (
           canUseCachedQuotaAfterRefreshError(
@@ -1122,6 +1128,21 @@ export class FallbackAccountManager {
     storage: AccountStorage | null,
   ) {
     return quotaSnapshotPassesPolicy(account.quota, storage)
+  }
+
+  /**
+   * Return the account with its quota overlaid from the unified QuotaManager
+   * cache (token-bound) when available, so quota-policy decisions use the same
+   * source of truth as the staleness check. Falls back to the stored
+   * account.quota when no manager is wired or the cache has no entry.
+   */
+  private quotaPolicyAccount(account: OAuthAccount): OAuthAccount {
+    if (!this.quotaManager) return account
+    const cached = this.quotaManager.getFallback(
+      account.id,
+      account.access,
+    )?.quota
+    return cached ? { ...account, quota: cached } : account
   }
 
   async refreshDueAccounts() {

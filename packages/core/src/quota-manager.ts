@@ -67,6 +67,10 @@ export class QuotaManager {
   private main: QuotaEntry | null = null
   private mainTokenFp: string | null = null
   private fallbacks = new Map<string, QuotaEntry>()
+  // Fingerprint of the access token that produced each fallback cache entry, so
+  // a re-login (credential change) for the same account id invalidates the
+  // stale entry instead of being treated as fresh.
+  private fallbackTokenFps = new Map<string, string>()
 
   // --- Inflight deduplication ---
   private inflightMain: Promise<OAuthQuotaSnapshot> | null = null
@@ -144,7 +148,20 @@ export class QuotaManager {
     return this.main
   }
 
-  getFallback(accountId: string): QuotaEntry | null {
+  /**
+   * Cached fallback quota entry. Pass the live access token to enforce token
+   * binding: if the entry was produced by a different token (account re-login),
+   * it is dropped and null is returned so the caller refetches.
+   */
+  getFallback(accountId: string, accessToken?: string): QuotaEntry | null {
+    if (accessToken) {
+      const fp = this.fallbackTokenFps.get(accountId)
+      if (fp && fp !== tokenFingerprint(accessToken)) {
+        this.fallbacks.delete(accountId)
+        this.fallbackTokenFps.delete(accountId)
+        return null
+      }
+    }
     return this.fallbacks.get(accountId) ?? null
   }
 
@@ -248,8 +265,9 @@ export class QuotaManager {
     return this.now() >= this.main.refreshAfter
   }
 
-  isFallbackStale(accountId: string): boolean {
-    const entry = this.fallbacks.get(accountId)
+  isFallbackStale(accountId: string, accessToken?: string): boolean {
+    // Token-aware: a credential change invalidates the entry (treated as stale).
+    const entry = this.getFallback(accountId, accessToken)
     if (!entry) return true
     return this.now() >= entry.refreshAfter
   }
@@ -418,6 +436,7 @@ export class QuotaManager {
           refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
           checkedAt: now,
         })
+        this.fallbackTokenFps.set(accountId, tokenFingerprint(accessToken))
         this.fallbackApiErrors.delete(accountId)
         return quota
       } catch (error) {
