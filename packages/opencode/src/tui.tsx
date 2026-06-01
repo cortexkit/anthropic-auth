@@ -141,22 +141,28 @@ function QuotaRow(props: {
     <Show
       when={props.window}
       fallback={
-        <box width='100%' flexDirection='row' justifyContent='space-between'>
-          <text fg={props.theme.textMuted}>{props.label}</text>
+        <box width='100%' flexDirection='row'>
+          <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
           <text fg={props.theme.textMuted}>{'\u2014'}</text>
         </box>
       }
     >
+      {/* Left group (label · bar · pct) stays left-aligned in fixed columns so
+          bars and percentages line up across rows; the reset time is pushed to
+          the right edge so reset times align in their own right column. */}
       <box width='100%' flexDirection='row' justifyContent='space-between'>
-        <text fg={props.theme.textMuted}>{props.label}</text>
         <box flexDirection='row'>
+          <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
           <text fg={toneColor(props.theme, usageTone(used()))}>
-            {`${quotaBar(used())} ${String(Math.round(used())).padStart(3)}%`}
+            {quotaBar(used())}
           </text>
-          <Show when={reset()}>
-            <text fg={props.theme.textMuted}>{` \u00b7 ${reset()}`}</text>
-          </Show>
+          <text fg={toneColor(props.theme, usageTone(used()))}>
+            {` ${String(Math.round(used())).padStart(3)}%`}
+          </text>
         </box>
+        <Show when={reset()}>
+          <text fg={props.theme.textMuted}>{reset()}</text>
+        </Show>
       </box>
     </Show>
   )
