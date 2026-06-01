@@ -595,6 +595,22 @@ function applyCache1hStrategy(
 }
 
 /**
+ * Strip trailing assistant messages. Anthropic rejects assistant-message
+ * prefill on Claude Code OAuth models with: "This model does not support
+ * assistant message prefill. The conversation must end with a user message."
+ * A resumed/compacted session can end on an assistant turn (e.g. after a
+ * failed tool round); pop those before signing.
+ */
+function stripTrailingAssistantMessages(parsed: Record<string, unknown>) {
+  if (!Array.isArray(parsed.messages)) return
+  while (parsed.messages.length) {
+    const last = parsed.messages[parsed.messages.length - 1]
+    if (!isRecord(last) || last.role !== 'assistant') break
+    parsed.messages.pop()
+  }
+}
+
+/**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
 export async function rewriteRequestBody(
@@ -608,6 +624,7 @@ export async function rewriteRequestBody(
 ): Promise<string> {
   try {
     const parsed = JSON.parse(body)
+    stripTrailingAssistantMessages(parsed)
     const billingHeader =
       Array.isArray(parsed.messages) &&
       parsed.messages.some(

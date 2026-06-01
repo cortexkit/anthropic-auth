@@ -770,6 +770,7 @@ describe('rewriteRequestBody', () => {
             { type: 'text', text: 'Let me check' },
           ],
         },
+        { role: 'user', content: 'Thanks' },
       ],
       system: [
         { type: 'text', text: systemPrompt },
@@ -791,6 +792,7 @@ describe('rewriteRequestBody', () => {
     // User messages are untouched
     expect(result.messages[0].content).toBe('Help me fix this bug')
     expect(result.messages[1].content[0].name).toBe('mcp_Bash')
+    expect(result.messages[2].content).toBe('Thanks')
   })
 
   test('handles body with no messages array', async () => {
@@ -995,6 +997,7 @@ describe('rewriteRequestBody', () => {
             },
           ],
         },
+        { role: 'user', content: 'follow up' },
       ],
     })
 
@@ -1096,7 +1099,6 @@ describe('rewriteRequestBody', () => {
         { role: 'user', content: 'message 0' },
         { role: 'assistant', content: 'message 1' },
         { role: 'user', content: 'message 2' },
-        { role: 'assistant', content: 'message 3' },
       ],
     })
 
@@ -1122,7 +1124,6 @@ describe('rewriteRequestBody', () => {
         cache_control: { type: 'ephemeral', ttl: '1h' },
       },
     ])
-    expect(result.messages[3].content).toBe('message 3')
   })
 
   test('hybrid mode keeps the system anchor when the latest user boundary is within lookback', async () => {
@@ -1247,6 +1248,7 @@ describe('rewriteRequestBody', () => {
             },
           ],
         },
+        { role: 'user', content: 'follow up' },
       ],
     })
 
@@ -1272,6 +1274,106 @@ describe('rewriteRequestBody', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
+  })
+
+  // -----------------------------------------------------------------------
+  // Prefill stripping — trailing assistant messages
+  // -----------------------------------------------------------------------
+
+  test('strips single trailing assistant message', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: [{ type: 'text', text: 'I will help' }] },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    expect(result.messages.length).toBe(1)
+    expect(result.messages[0].role).toBe('user')
+  })
+
+  test('strips multiple trailing assistant messages', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: [{ type: 'text', text: 'first' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'second' }] },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    expect(result.messages.length).toBe(1)
+    expect(result.messages[0].role).toBe('user')
+  })
+
+  test('preserves assistant message followed by user message', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: [{ type: 'text', text: 'response' }] },
+        { role: 'user', content: 'follow up' },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    expect(result.messages.length).toBe(3)
+    expect(result.messages[0].role).toBe('user')
+    expect(result.messages[1].role).toBe('assistant')
+    expect(result.messages[2].role).toBe('user')
+  })
+
+  test('preserves assistant tool_use followed by user tool_result', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'do something' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'output' },
+          ],
+        },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    expect(result.messages.length).toBe(3)
+    expect(result.messages[1].role).toBe('assistant')
+    expect(result.messages[2].role).toBe('user')
+  })
+
+  test('strips trailing assistant after tool_result + assistant', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'do something' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'output' },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'based on that output...' }],
+        },
+      ],
+    })
+    const result = JSON.parse(await rewriteRequestBody(body))
+    expect(result.messages.length).toBe(3)
+    expect(result.messages[2].role).toBe('user')
   })
 })
 
