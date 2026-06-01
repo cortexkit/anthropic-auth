@@ -1459,6 +1459,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               quotaManager.updateStorage(storage)
               quotaManager.seedFallbacksFromAccounts(storage?.accounts ?? [])
               const replayableRequest = isReplayableRequest(input, init?.body)
+              // Count every replayable request up front — before the
+              // fallback-first early return — so the every-N refresh cadence
+              // (quota.refreshEveryNRequests) advances for main and the active
+              // fallback route on all paths, including successful fallback-first.
+              if (replayableRequest) sessionRequestCount++
               let preselectedFallbackAccounts:
                 | Awaited<
                     ReturnType<
@@ -1553,15 +1558,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 trace.done('missing_access_error')
                 throw new Error('OAuth access token is missing after refresh')
               }
-              // Count every replayable request so the every-N refresh cadence
-              // (quota.refreshEveryNRequests) advances on all routing paths,
-              // not only when main-quota routing is enabled.
-              if (replayableRequest) sessionRequestCount++
               if (replayableRequest && mainQuotaRoutingEnabled(storage)) {
                 try {
                   const quotaStart = nowMs()
-                  // Use QuotaManager: get cached or eagerly refresh if first time
-                  let routingQuota = quotaManager.getMain()?.quota
+                  // Token-aware read: getMain(auth.access) drops a cached entry
+                  // bound to a different access token (main-account switch) so
+                  // routing never uses the previous account's quota.
+                  let routingQuota = quotaManager.getMain(auth.access)?.quota
                   if (!routingQuota) {
                     routingQuota = await quotaManager.refreshMain(auth.access)
                   } else if (quotaManager.needsRefresh(sessionRequestCount)) {

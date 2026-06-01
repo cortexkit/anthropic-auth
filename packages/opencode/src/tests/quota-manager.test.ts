@@ -282,6 +282,36 @@ describe('QuotaManager', () => {
       expect(main!.checkedAt).toBe(900_000)
     })
 
+    test('getMain(accessToken) drops a cached entry bound to a different token', () => {
+      // Regression: the request path reads getMain() before refreshMain, so the
+      // token-binding check must also apply on the cached read — otherwise a
+      // stale previous-account quota is used for a new access token.
+      const quota = {
+        quotas: [],
+        expires: new Date(2_000_000).toISOString(),
+      }
+      const qm = new QuotaManager({
+        storage: {
+          version: 1,
+          accounts: [],
+          quota: {
+            mainQuota: quota as any,
+            mainQuotaCheckedAt: 900_000,
+            mainQuotaToken: tokenFingerprint('old-main-token'),
+          },
+        },
+        now: () => 1_000_000,
+      })
+
+      // Tokenless read returns the cached entry (e.g. display paths).
+      expect(qm.getMain()).not.toBeNull()
+      // Matching token keeps the entry.
+      expect(qm.getMain('old-main-token')).not.toBeNull()
+      // Different token (account switch) drops the entry and returns null.
+      expect(qm.getMain('new-main-token')).toBeNull()
+      expect(qm.getMain()).toBeNull()
+    })
+
     test('drops persisted main seed during backoff when the token changed', async () => {
       // Regression: a persisted seed must be bound to the account that produced
       // it. After a main-account switch (different access token), the seed must

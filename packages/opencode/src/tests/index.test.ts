@@ -1979,6 +1979,65 @@ describe('auth.loader', () => {
     expect(authorizations).toEqual(['Bearer fallback-access'])
   })
 
+  test('successful fallback-first request advances the every-N counter and refreshes the served fallback', async () => {
+    // Regression: the request counter must increment before the fallback-first
+    // early return, so a served fallback's active-route every-N refresh fires.
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          refreshEveryNRequests: 1,
+        },
+      }),
+    )
+    const usageTokens: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        usageTokens.push(new Headers(init?.headers).get('authorization') ?? '')
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 20 },
+              seven_day: { utilization: 20 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('fallback ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('fallback ok')
+
+    // The active-route refresh is fire-and-forget; wait for it to land.
+    for (
+      let i = 0;
+      i < 50 && !usageTokens.includes('Bearer fallback-access');
+      i++
+    ) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(usageTokens).toContain('Bearer fallback-access')
+  })
+
   test('fallback-first routing does not refresh expired main oauth when fallback succeeds', async () => {
     await useTempAccountFile(
       createFallbackStorage({

@@ -124,7 +124,23 @@ export class QuotaManager {
   // Get (synchronous, from cache)
   // =========================================================================
 
-  getMain(): QuotaEntry | null {
+  /**
+   * Cached main quota entry. Pass the live access token to enforce token
+   * binding: if the cached entry was produced by a different token (main
+   * account switched), it is dropped and null is returned so the caller
+   * refetches for the current account. Called without a token (e.g. for
+   * display) it returns whatever is cached.
+   */
+  getMain(accessToken?: string): QuotaEntry | null {
+    if (
+      accessToken &&
+      this.main &&
+      this.mainTokenFp &&
+      this.mainTokenFp !== tokenFingerprint(accessToken)
+    ) {
+      this.main = null
+      this.mainTokenFp = null
+    }
     return this.main
   }
 
