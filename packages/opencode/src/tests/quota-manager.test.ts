@@ -63,6 +63,51 @@ describe('QuotaManager', () => {
       expect(qm.isBackedOff()).toBe(false)
     })
 
+    test('fallback 429 does NOT back off main or fire onApiError', async () => {
+      // Regression: backoff is scoped per route. A fallback account's quota
+      // 429 must not suppress main quota checks nor persist as the main quota
+      // API error (onApiError -> mainLastQuotaApiError).
+      let apiErrorCount = 0
+      const fetchMock = mock(() =>
+        Promise.resolve(new Response('rate limited', { status: 429 })),
+      ) as unknown as typeof fetch
+      const qm = new QuotaManager({
+        storage: null,
+        fetchImpl: fetchMock,
+        now: () => now,
+        onApiError: () => {
+          apiErrorCount++
+        },
+      })
+
+      try {
+        await qm.refreshFallback('fallback-1', 'fallback-token')
+      } catch {}
+
+      // Fallback account is backed off; main is not.
+      expect(qm.isFallbackBackedOff('fallback-1')).toBe(true)
+      expect(qm.isBackedOff()).toBe(false)
+      // onApiError (persists mainLastQuotaApiError) must NOT have fired.
+      expect(apiErrorCount).toBe(0)
+      expect(qm.getLastApiError()).toBeUndefined()
+      // A different fallback is unaffected.
+      expect(qm.isFallbackBackedOff('fallback-2')).toBe(false)
+    })
+
+    test('main 429 does NOT back off a fallback account', async () => {
+      const fetchMock = mock(() =>
+        Promise.resolve(new Response('rate limited', { status: 429 })),
+      ) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+
+      try {
+        await qm.refreshMain('main-token')
+      } catch {}
+
+      expect(qm.isBackedOff()).toBe(true)
+      expect(qm.isFallbackBackedOff('fallback-1')).toBe(false)
+    })
+
     test('401 does not arm backoff (auth error, caller retries)', async () => {
       // A 401 means the access token expired — the caller refreshes the token
       // and retries. Backing off here would block that retry and every other

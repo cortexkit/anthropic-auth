@@ -72,8 +72,10 @@ export class QuotaManager {
   private inflightMain: Promise<OAuthQuotaSnapshot> | null = null
   private inflightFallbacks = new Map<string, Promise<OAuthQuotaSnapshot>>()
 
-  // --- Rate-limiting ---
-  private lastApiError: AccountOperationError | undefined = undefined
+  // --- Rate-limiting (scoped per route so a fallback 429 never backs off the
+  // main account or vice versa) ---
+  private mainLastApiError: AccountOperationError | undefined = undefined
+  private fallbackApiErrors = new Map<string, AccountOperationError>()
 
   // --- Serial API gate (prevents concurrent quota API calls) ---
   private apiGate: Promise<unknown> = Promise.resolve()
@@ -114,7 +116,7 @@ export class QuotaManager {
     // Seed backoff state from persisted storage
     const persistedError = opts.storage?.quota?.mainLastQuotaApiError
     if (persistedError && quotaBackoffActive(persistedError, this.now())) {
-      this.lastApiError = persistedError
+      this.mainLastApiError = persistedError
     }
   }
 
@@ -182,8 +184,8 @@ export class QuotaManager {
     const inflight = this.inflightFallbacks.get(accountId)
     if (inflight) return inflight
 
-    // Rate-limit
-    if (this.isBackedOff()) {
+    // Rate-limit — scoped to THIS fallback account only
+    if (this.isFallbackBackedOff(accountId)) {
       const cached = this.fallbacks.get(accountId)
       if (cached) return cached.quota
       throw new Error('Quota API rate-limited — try again later')
@@ -283,14 +285,22 @@ export class QuotaManager {
   }
 
   /**
-   * Whether the API is currently in backoff due to a recent error.
+   * Whether the MAIN quota API is currently in backoff. Scoped to the main
+   * account — a fallback account's 429 never reports here.
    */
   isBackedOff(): boolean {
-    return quotaBackoffActive(this.lastApiError, this.now())
+    return quotaBackoffActive(this.mainLastApiError, this.now())
+  }
+
+  /**
+   * Whether a specific fallback account's quota API is in backoff.
+   */
+  isFallbackBackedOff(accountId: string): boolean {
+    return quotaBackoffActive(this.fallbackApiErrors.get(accountId), this.now())
   }
 
   getLastApiError(): AccountOperationError | undefined {
-    return this.lastApiError
+    return this.mainLastApiError
   }
 
   // =========================================================================
@@ -354,11 +364,11 @@ export class QuotaManager {
             refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
             checkedAt: now,
           }
-          this.lastApiError = undefined
+          this.mainLastApiError = undefined
           this.onMainQuotaFetched?.(quota, now, this.mainTokenFp)
           return quota
         } catch (error) {
-          this._handleFetchError(error)
+          this._handleMainFetchError(error)
           throw error
         } finally {
           await fileLock.release()
@@ -375,8 +385,8 @@ export class QuotaManager {
   ): Promise<OAuthQuotaSnapshot> {
     return this._enqueueApiFetch(async () => {
       try {
-        // Re-check backoff inside gate
-        if (this.isBackedOff()) {
+        // Re-check backoff inside gate — scoped to this fallback account
+        if (this.isFallbackBackedOff(accountId)) {
           const cached = this.fallbacks.get(accountId)
           if (cached) return cached.quota
           throw new Error('Quota API rate-limited — try again later')
@@ -392,10 +402,10 @@ export class QuotaManager {
           refreshAfter: now + getQuotaCheckIntervalMs(this.storage),
           checkedAt: now,
         })
-        this.lastApiError = undefined
+        this.fallbackApiErrors.delete(accountId)
         return quota
       } catch (error) {
-        this._handleFetchError(error)
+        this._handleFallbackFetchError(accountId, error)
         throw error
       } finally {
         this.inflightFallbacks.delete(accountId)
@@ -403,18 +413,40 @@ export class QuotaManager {
     })
   }
 
-  private _handleFetchError(error: unknown): void {
-    // A 401 is an auth/token problem, not a rate limit. The caller refreshes
-    // the token and retries; backing off the quota API here would block that
-    // retry — and every other account — for minutes. Surface it without
-    // recording backoff state.
+  // A 401 is an auth/token problem, not a rate limit. The caller refreshes the
+  // token and retries; backing off the quota API here would block that retry,
+  // so surface 401s without recording backoff state.
+  private static isAuthError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error)
-    if (/quota check failed: 401\b/.test(message)) return
-    this.lastApiError = buildQuotaOperationError({
+    return /quota check failed: 401\b/.test(message)
+  }
+
+  /** Main quota failure: arms main-only backoff and persists via onApiError. */
+  private _handleMainFetchError(error: unknown): void {
+    if (QuotaManager.isAuthError(error)) return
+    this.mainLastApiError = buildQuotaOperationError({
       error,
       now: this.now(),
-      previous: this.lastApiError,
+      previous: this.mainLastApiError,
     })
-    this.onApiError?.(this.lastApiError)
+    this.onApiError?.(this.mainLastApiError)
+  }
+
+  /**
+   * Fallback quota failure: arms backoff for THIS account only. Never touches
+   * main backoff state and never calls onApiError (which persists the main
+   * quota error) — the per-account error is recorded by the caller via the
+   * account's lastQuotaRefreshError.
+   */
+  private _handleFallbackFetchError(accountId: string, error: unknown): void {
+    if (QuotaManager.isAuthError(error)) return
+    this.fallbackApiErrors.set(
+      accountId,
+      buildQuotaOperationError({
+        error,
+        now: this.now(),
+        previous: this.fallbackApiErrors.get(accountId),
+      }),
+    )
   }
 }
