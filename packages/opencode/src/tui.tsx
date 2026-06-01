@@ -43,7 +43,10 @@ const BAR_FILLED = '\u2588'
 const BAR_EMPTY = '\u2591'
 
 function quotaBar(usedPct: number, width = BAR_WIDTH): string {
-  const filled = Math.max(0, Math.min(Math.round((usedPct / 100) * width), width))
+  const filled = Math.max(
+    0,
+    Math.min(Math.round((usedPct / 100) * width), width),
+  )
   return BAR_FILLED.repeat(filled) + BAR_EMPTY.repeat(width - filled)
 }
 
@@ -136,7 +139,6 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
     if (next.lastUpdated !== lastUpdated) {
       lastUpdated = next.lastUpdated
       setState(next)
-
     }
   }
 
@@ -156,8 +158,6 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
   // Initial refresh after short delay (server plugin may not have written yet)
   setTimeout(refresh, 500)
   setTimeout(refresh, 2000)
-
-
 
   const hasData = () =>
     state().main.quota != null || state().fallbacks.length > 0
