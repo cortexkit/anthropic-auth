@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 let tempDir: string
 
@@ -27,7 +30,7 @@ describe('CLI login', () => {
     const proc = Bun.spawn(
       ['bun', '--preload', preloadPath, 'src/cli.ts', 'login'],
       {
-        cwd: process.cwd(),
+        cwd: packageRoot,
         env: {
           ...process.env,
           OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
@@ -133,7 +136,7 @@ describe('CLI login', () => {
     const proc = Bun.spawn(
       ['bun', '--preload', preloadPath, 'src/cli.ts', 'login', 'cli-label'],
       {
-        cwd: process.cwd(),
+        cwd: packageRoot,
         env: {
           ...process.env,
           OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,
@@ -220,7 +223,7 @@ globalThis.fetch = async (input, init) => {
     const proc = Bun.spawn(
       ['bun', '--preload', preloadPath, 'src/cli.ts', 'relay', 'setup'],
       {
-        cwd: process.cwd(),
+        cwd: packageRoot,
         env: {
           ...process.env,
           OPENCODE_ANTHROPIC_AUTH_FILE: accountPath,

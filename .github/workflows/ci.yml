@@ -19,6 +19,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run types
       - run: bun run build
-      - run: bun test
+      - run: bun run test
+      - run: npm install -g opencode-ai@1.15.12
+      - run: bun run test:e2e
       - run: bun run format:check
       - run: bun run lint
