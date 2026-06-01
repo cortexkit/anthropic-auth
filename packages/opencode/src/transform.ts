@@ -477,14 +477,27 @@ function applyAutomaticCache1h(parsed: Record<string, unknown>) {
 function setMessageCacheAnchor(message: unknown) {
   if (!isRecord(message)) return false
 
+  // cache_control is only valid on content blocks, never on the message
+  // object itself. A message with no cacheable content block (empty content,
+  // or only thinking/redacted_thinking blocks) must be skipped entirely;
+  // attaching cache_control to the message triggers Anthropic's
+  // "messages.N.cache_control: Extra inputs are not permitted" 400.
   const content = normalizeContentToArray(message.content)
-  if (!content?.length) return setWireCacheControl(message, true)
+  if (!content?.length) return false
 
-  message.content = content
   const lastCacheableBlock = [...content]
     .reverse()
-    .find((block) => isRecord(block) && block.type !== 'thinking')
-  return setWireCacheControl(lastCacheableBlock ?? message, true)
+    .find(
+      (block) =>
+        isRecord(block) &&
+        block.type !== 'thinking' &&
+        block.type !== 'redacted_thinking',
+    )
+  if (!lastCacheableBlock) return false
+
+  // Only materialize the normalized content array once we know we will anchor.
+  message.content = content
+  return setWireCacheControl(lastCacheableBlock, true)
 }
 
 function messageContentBlockCount(message: unknown) {

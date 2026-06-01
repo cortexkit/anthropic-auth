@@ -1375,6 +1375,75 @@ describe('rewriteRequestBody', () => {
     expect(result.messages.length).toBe(3)
     expect(result.messages[2].role).toBe('user')
   })
+
+  test('hybrid mode never sets cache_control on the message object when the n-2 anchor has no cacheable block', async () => {
+    // Reproduces "messages.N.cache_control: Extra inputs are not permitted".
+    // The moving anchor (messages[n-2]) lands on a message whose content has no
+    // cacheable block (empty content array). cache_control must NOT be attached
+    // to the message object itself — Anthropic only allows it on content blocks.
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages: [
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'second' },
+        { role: 'user', content: [] },
+        { role: 'assistant', content: 'last' },
+      ],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    // The empty n-2 message must remain free of a message-level cache_control.
+    expect(result.messages[2].cache_control).toBeUndefined()
+    expect(result.messages[2].cacheControl).toBeUndefined()
+
+    // No message in the request may carry a message-level cache_control.
+    for (const message of result.messages) {
+      expect(message.cache_control).toBeUndefined()
+      expect(message.cacheControl).toBeUndefined()
+    }
+  })
+
+  test('hybrid mode anchors on the last non-thinking block, never the message object', async () => {
+    // messages[1] is always an anchor slot in hybrid mode. Give it mixed
+    // content ending in a thinking block: the anchor must land on the text
+    // block, never the trailing thinking block and never the message object.
+    const body = JSON.stringify({
+      system: 'Stable system block',
+      messages: [
+        { role: 'user', content: 'first' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'reasoning preface' },
+            { type: 'thinking', thinking: 'internal', signature: 'sig' },
+          ],
+        },
+        { role: 'user', content: 'last' },
+      ],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid',
+      }),
+    )
+
+    // Anchor goes on the text block, not the message and not the thinking block.
+    expect(result.messages[1].cache_control).toBeUndefined()
+    const blocks = result.messages[1].content
+    const cachedBlocks = blocks.filter(
+      (block: { cache_control?: unknown }) => block.cache_control != null,
+    )
+    expect(cachedBlocks).toHaveLength(1)
+    expect(cachedBlocks[0].type).toBe('text')
+  })
 })
 
 // ---------------------------------------------------------------------------
