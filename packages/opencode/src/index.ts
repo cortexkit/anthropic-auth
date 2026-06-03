@@ -355,6 +355,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   setDumpEnabled(isDumpPersistentlyEnabled(initialStorage))
   setFastModeEnabled(isFastModePersistentlyEnabled(initialStorage))
 
+  // Remembers the last explicit routing decision so quota-only sidebar refreshes
+  // (background main/fallback quota landing) do not reset the active account.
+  let lastSidebarRouting: { activeId: string | undefined; route: string } = {
+    activeId: 'main',
+    route: 'main',
+  }
+
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     options: {
@@ -364,6 +371,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       mainRefreshToken?: string
     },
   ) {
+    lastSidebarRouting = { activeId: options.activeId, route: options.route }
     const mainEntry = quotaManager.getMain(options.mainAccessToken)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
@@ -423,6 +431,30 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         error: error instanceof Error ? error.message : String(error),
       }),
     )
+  }
+
+  // Re-write the sidebar using the LAST known routing decision, refreshing only
+  // the quota numbers. Used by async quota refreshes (main + background fallback)
+  // so they never clobber the active account back to 'main'.
+  async function refreshSidebarQuota() {
+    const storage = await loadAccounts(accountStoragePath)
+    let access: string | undefined
+    let refresh: string | undefined
+    if (latestGetAuth) {
+      try {
+        const auth = await latestGetAuth()
+        access = auth.access
+        refresh = auth.refresh
+      } catch {
+        // best-effort
+      }
+    }
+    writeSidebarState(storage, {
+      activeId: lastSidebarRouting.activeId,
+      route: lastSidebarRouting.route,
+      mainAccessToken: access,
+      mainRefreshToken: refresh,
+    })
   }
 
   let latestGetAuth:
@@ -1690,14 +1722,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                     // sidebar again once the new main quota lands.
                     void quotaManager
                       .refreshMain(auth.access)
-                      .then(() =>
-                        writeSidebarState(storage, {
-                          activeId: 'main',
-                          route: 'main',
-                          mainAccessToken: auth.access,
-                          mainRefreshToken: auth.refresh,
-                        }),
-                      )
+                      .then(() => {
+                        void refreshSidebarQuota()
+                      })
                       .catch(() => {})
                   }
                   // Update the sidebar every replayable request so fallback
