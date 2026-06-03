@@ -295,6 +295,8 @@ The sidebar polls plugin state and refreshes on OpenCode session and message eve
 - **Cache** — the 1-hour cache keepalive window and the number of tracked sessions, shown when cache keepalive is configured.
 - **Health** — quota-API and token-refresh backoff countdowns. This section is hidden unless a backoff is active, and a `LIMITED` badge appears in the header.
 
+Click the `CLAUDE` header to collapse or expand the sidebar. Collapsed, it shows the active account's 5-hour quota usage and a fast-mode row when fast mode is on; the header shows the plugin version (or a `LIMITED` badge when degraded). Collapse state is per-session and resets when OpenCode restarts.
+
 ## Claude prompt cache control
 
 Both OpenCode and Pi packages add a slash command for Anthropic's 1-hour ephemeral prompt-cache TTL:
