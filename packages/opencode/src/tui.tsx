@@ -1,17 +1,21 @@
 /** @jsxImportSource @opentui/solid */
 
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
-import { For, Show, createSignal, onCleanup } from 'solid-js'
+import { For, type JSX, Show, createSignal, onCleanup } from 'solid-js'
 
 import {
   type AccountQuota,
   DEFAULT_SIDEBAR_STATE,
   type SidebarState,
   getSidebarState,
+  resolveActiveAccount,
 } from './sidebar-state.js'
 
 const POLL_MS = 1500
@@ -21,6 +25,20 @@ const ID = 'cortexkit.anthropic-auth'
 const BAR_WIDTH = 10
 const BAR_FILLED = '\u2588'
 const BAR_EMPTY = '\u2591'
+
+// Plugin version for the header (mirrors the Magic Context / AFT convention).
+// Read at runtime from package.json relative to this module — NOT a TS JSON
+// import, which would break the declaration build (package.json is outside
+// rootDir). Empty string on any failure → header shows the badge with no version.
+const PLUGIN_VERSION: string = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const raw = readFileSync(join(here, '..', 'package.json'), 'utf8')
+    return (JSON.parse(raw) as { version?: string }).version ?? ''
+  } catch {
+    return ''
+  }
+})()
 
 // biome-ignore lint/suspicious/noExplicitAny: opentui border prop not typed in plugin tui surface
 const SINGLE_BORDER = { type: 'single' } as any
@@ -116,6 +134,21 @@ function StatRow(props: {
   )
 }
 
+// Compact row for the collapsed view: muted label left, caller-provided value
+// right. Mirrors StatRow's layout so columns line up.
+function CollapsedRow(props: {
+  theme: ThemeCurrent
+  label: string
+  children: JSX.Element
+}) {
+  return (
+    <box width='100%' flexDirection='row' justifyContent='space-between'>
+      <text fg={props.theme.textMuted}>{props.label}</text>
+      {props.children}
+    </box>
+  )
+}
+
 // Quota window row: muted label left, tone-colored bar + percentage right,
 // with an optional muted reset suffix.
 function QuotaRow(props: {
@@ -203,6 +236,7 @@ async function readStateFromFile(): Promise<SidebarState> {
 
 function QuotaSidebar(props: { api: TuiPluginApi }) {
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
+  const [collapsed, setCollapsed] = createSignal(false)
   let lastUpdated = 0
   let debounce: ReturnType<typeof setTimeout> | null = null
 
@@ -241,6 +275,12 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
   const hasData = () =>
     state().main.quota != null || enabledFallbacks().length > 0
 
+  const headerLabel = () =>
+    !hasData() ? 'CLAUDE' : collapsed() ? '\u25b6 CLAUDE' : '\u25bc CLAUDE'
+  const activeAccount = () => resolveActiveAccount(state())
+  const activeFiveHourPct = () =>
+    activeAccount().quota?.five_hour?.usedPercent ?? null
+
   const quotaBackedOff = () => state().main.quotaBackedOff === true
   const refreshBackedOff = () => state().main.refreshBackedOff === true
   const degraded = () => quotaBackedOff() || refreshBackedOff()
@@ -264,19 +304,29 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
       paddingLeft={1}
       paddingRight={1}
     >
-      {/* Header: CLAUDE badge + optional LIMITED degraded badge */}
+      {/* Header: ▼/▶ CLAUDE badge (click to collapse) + version, or LIMITED badge */}
       <box
         width='100%'
         flexDirection='row'
         justifyContent='space-between'
         alignItems='center'
+        onMouseDown={() => {
+          if (hasData()) setCollapsed((value) => !value)
+        }}
       >
         <box paddingLeft={1} paddingRight={1} backgroundColor={theme().accent}>
           <text fg={theme().background}>
-            <b>{'CLAUDE'}</b>
+            <b>{headerLabel()}</b>
           </text>
         </box>
-        <Show when={degraded()}>
+        <Show
+          when={degraded()}
+          fallback={
+            <Show when={PLUGIN_VERSION !== ''}>
+              <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
+            </Show>
+          }
+        >
           <box
             paddingLeft={1}
             paddingRight={1}
