@@ -77,3 +77,27 @@ export async function setSidebarState(state: SidebarState): Promise<void> {
     // Best-effort — sidebar is non-critical
   }
 }
+
+// Resolve the currently-active account from activeId for the collapsed sidebar
+// view. activeId === 'main' (or undefined/unmatched/disabled) → the main
+// account; otherwise the enabled fallback whose id matches.
+export function resolveActiveAccount(state: SidebarState): {
+  id: string
+  name: string
+  quota: AccountQuota | null
+} {
+  const activeId = state.activeId
+  if (activeId && activeId !== 'main') {
+    const fallback = state.fallbacks.find(
+      (account) => account.enabled && account.id === activeId,
+    )
+    if (fallback) {
+      return {
+        id: fallback.id,
+        name: fallback.label ?? fallback.id,
+        quota: fallback.quota,
+      }
+    }
+  }
+  return { id: 'main', name: 'main', quota: state.main.quota }
+}
