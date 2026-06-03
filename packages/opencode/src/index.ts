@@ -306,6 +306,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
+    onFallbackQuotaFetched: () => {
+      void refreshSidebarQuota()
+    },
   })
   fallbackManager.startBackgroundRefresh()
   let latestRefreshMainAccessToken: (() => Promise<string>) | null = null

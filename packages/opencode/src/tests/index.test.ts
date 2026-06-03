@@ -2774,4 +2774,70 @@ describe('auth.loader', () => {
     expect(response.status).toBe(429)
     expect(calls).toBe(1)
   })
+
+  test('background fallback refresh updates the sidebar without a request', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              // Stale (old checkedAt) → background pass will refresh it.
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: 1,
+              },
+              seven_day: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                checkedAt: 1,
+              },
+            },
+          },
+        ],
+      }),
+    )
+
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.42 },
+              seven_day: { utilization: 0.1 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    // Running the loader starts the background refresh (immediate first pass).
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    // The background pass refreshes the stale fallback and the hook re-writes the
+    // sidebar — without any request to the messages endpoint.
+    // utilization: 0.42 → usedPercent: 0.42 (stored as-is, not multiplied by 100)
+    const state = await waitForSidebarState(
+      (candidate) =>
+        candidate.fallbacks[0]?.quota?.five_hour?.usedPercent === 0.42,
+    )
+    expect(state.fallbacks[0]?.id).toBe('fallback-1')
+  })
 })

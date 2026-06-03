@@ -707,6 +707,49 @@ describe('FallbackAccountManager', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1)
   })
 
+  test('refreshQuotaForDueAccounts fires onFallbackQuotaFetched when quota changes', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'idle-stale',
+      type: 'oauth',
+      access: 'idle-access',
+      refresh: 'idle-refresh',
+      expires: 20_000_000,
+      quota: {
+        // checkedAt far in the past → stale → will be refreshed this pass.
+        five_hour: { usedPercent: 5, remainingPercent: 95, checkedAt: 1 },
+        seven_day: { usedPercent: 5, remainingPercent: 95, checkedAt: 1 },
+      },
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            five_hour: { utilization: 40 },
+            seven_day: { utilization: 30 },
+          }),
+          { status: 200 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+
+    let fired = 0
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => 50_000_000, // well past checkedAt → stale
+      onFallbackQuotaFetched: () => {
+        fired += 1
+      },
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    expect(fetchImpl).toHaveBeenCalled()
+    expect(fired).toBe(1)
+  })
+
   test('refreshes fallback token and retries quota check after stale access token 401', async () => {
     const storage = baseStorage()
     storage.accounts.push({

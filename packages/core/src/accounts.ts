@@ -129,6 +129,10 @@ export type AccountManagerOptions = {
   fetchImpl?: typeof fetch
   configPath?: string
   quotaManager?: import('./quota-manager.ts').QuotaManager
+  // Invoked after a background quota pass persists at least one fallback quota
+  // change, so consumers (e.g. the OpenCode sidebar) can re-render without a
+  // request flowing through the fetch handler.
+  onFallbackQuotaFetched?: () => void
 }
 
 export type AccountRefreshError = {
@@ -978,12 +982,14 @@ export class FallbackAccountManager {
   private refreshTimer: ReturnType<typeof setInterval> | null = null
   private quotaTimer: ReturnType<typeof setInterval> | null = null
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
+  private readonly onFallbackQuotaFetched: (() => void) | undefined
 
   constructor(options: AccountManagerOptions = {}) {
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl ?? fetch
     this.configPath = options.configPath ?? getAccountStoragePath()
     this.quotaManager = options.quotaManager ?? null
+    this.onFallbackQuotaFetched = options.onFallbackQuotaFetched
   }
 
   /**
@@ -1233,7 +1239,10 @@ export class FallbackAccountManager {
         // Quota probes are advisory; failed probes fail closed at selection time.
       }
     }
-    if (changed) await this.save(storage)
+    if (changed) {
+      await this.save(storage)
+      this.onFallbackQuotaFetched?.()
+    }
   }
 
   async refreshQuotaForAllAccounts(options: { force?: boolean } = {}) {
