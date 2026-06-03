@@ -339,93 +339,134 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
         </Show>
       </box>
 
-      <Show
-        when={hasData()}
-        fallback={
-          <box marginTop={1} width='100%'>
-            <text fg={theme().textMuted}>{'Waiting for quota\u2026'}</text>
-          </box>
-        }
-      >
-        {/* Quota */}
-        <SectionHeader theme={theme()} title='Quota' />
-        <AccountBlock
-          theme={theme()}
-          name='main'
-          quota={state().main.quota}
-          active={state().activeId === 'main'}
-        />
-        <For each={enabledFallbacks()}>
-          {(fb) => (
-            <AccountBlock
-              theme={theme()}
-              name={fb.label ?? fb.id}
-              quota={fb.quota}
-              active={state().activeId === fb.id}
-              marginTop={1}
-            />
-          )}
-        </For>
+      {/* Collapsed: active account 5h quota + dot, plus fast-mode when on */}
+      <Show when={collapsed() && hasData()}>
+        <CollapsedRow theme={theme()} label={activeAccount().name}>
+          <Show
+            when={activeFiveHourPct() != null}
+            fallback={<text fg={theme().textMuted}>{'\u2014'}</text>}
+          >
+            <box flexDirection='row'>
+              <text
+                fg={toneColor(
+                  theme(),
+                  usageTone(activeFiveHourPct() as number),
+                )}
+              >
+                <b>
+                  {`${String(Math.round(activeFiveHourPct() as number)).padStart(3)}%`}
+                </b>
+              </text>
+              <text
+                fg={toneColor(
+                  theme(),
+                  usageTone(activeFiveHourPct() as number),
+                )}
+              >
+                {' \u25cf'}
+              </text>
+            </box>
+          </Show>
+        </CollapsedRow>
+        <Show when={state().fastMode}>
+          <CollapsedRow theme={theme()} label='Mode'>
+            <text fg={toneColor(theme(), 'accent')}>
+              <b>{'fast'}</b>
+            </text>
+          </CollapsedRow>
+        </Show>
       </Show>
 
-      {/* Routing */}
-      <SectionHeader theme={theme()} title='Routing' />
-      <StatRow
-        theme={theme()}
-        label='Route'
-        value={state().route}
-        tone='accent'
-      />
-      <StatRow
-        theme={theme()}
-        label='Mode'
-        value={state().fastMode ? 'fast' : 'std'}
-        tone={state().fastMode ? 'accent' : 'muted'}
-      />
-      <StatRow
-        theme={theme()}
-        label='Relay'
-        value={relayValue()}
-        tone={state().relay?.enabled ? 'ok' : 'muted'}
-      />
+      {/* Expanded: full sections, hidden when collapsed */}
+      <Show when={!collapsed()}>
+        <Show
+          when={hasData()}
+          fallback={
+            <box marginTop={1} width='100%'>
+              <text fg={theme().textMuted}>{'Waiting for quota\u2026'}</text>
+            </box>
+          }
+        >
+          {/* Quota */}
+          <SectionHeader theme={theme()} title='Quota' />
+          <AccountBlock
+            theme={theme()}
+            name='main'
+            quota={state().main.quota}
+            active={state().activeId === 'main'}
+          />
+          <For each={enabledFallbacks()}>
+            {(fb) => (
+              <AccountBlock
+                theme={theme()}
+                name={fb.label ?? fb.id}
+                quota={fb.quota}
+                active={state().activeId === fb.id}
+                marginTop={1}
+              />
+            )}
+          </For>
+        </Show>
 
-      {/* Cache */}
-      <Show when={showCache()}>
-        <SectionHeader theme={theme()} title='Cache' />
+        {/* Routing */}
+        <SectionHeader theme={theme()} title='Routing' />
         <StatRow
           theme={theme()}
-          label='1h cache'
-          value={`${cacheKeep()?.window} \u00b7 ${cacheKeep()?.enabled ? 'on' : 'off'}`}
-          tone={cacheKeep()?.enabled ? 'ok' : 'muted'}
+          label='Route'
+          value={state().route}
+          tone='accent'
         />
-        <Show when={(cacheKeep()?.trackedSessions ?? 0) > 0}>
-          <StatRow
-            theme={theme()}
-            label='Tracked'
-            value={String(cacheKeep()?.trackedSessions)}
-            tone='text'
-          />
-        </Show>
-      </Show>
+        <StatRow
+          theme={theme()}
+          label='Mode'
+          value={state().fastMode ? 'fast' : 'std'}
+          tone={state().fastMode ? 'accent' : 'muted'}
+        />
+        <StatRow
+          theme={theme()}
+          label='Relay'
+          value={relayValue()}
+          tone={state().relay?.enabled ? 'ok' : 'muted'}
+        />
 
-      {/* Health — only when something is wrong */}
-      <Show when={degraded()}>
-        <SectionHeader theme={theme()} title='Health' />
-        <Show when={quotaBackedOff()}>
+        {/* Cache */}
+        <Show when={showCache()}>
+          <SectionHeader theme={theme()} title='Cache' />
           <StatRow
             theme={theme()}
-            label='Quota API'
-            value={`backoff ${formatUntil(state().main.quotaBackoffUntil)}`}
-            tone='warn'
+            label='1h cache'
+            value={`${cacheKeep()?.window} \u00b7 ${cacheKeep()?.enabled ? 'on' : 'off'}`}
+            tone={cacheKeep()?.enabled ? 'ok' : 'muted'}
           />
+          <Show when={(cacheKeep()?.trackedSessions ?? 0) > 0}>
+            <StatRow
+              theme={theme()}
+              label='Tracked'
+              value={String(cacheKeep()?.trackedSessions)}
+              tone='text'
+            />
+          </Show>
         </Show>
-        <Show when={refreshBackedOff()}>
-          <StatRow
-            theme={theme()}
-            label='Token refresh'
-            value={`backoff ${formatUntil(state().main.refreshBackoffUntil)}`}
-            tone='warn'
-          />
+
+        {/* Health — only when something is wrong */}
+        <Show when={degraded()}>
+          <SectionHeader theme={theme()} title='Health' />
+          <Show when={quotaBackedOff()}>
+            <StatRow
+              theme={theme()}
+              label='Quota API'
+              value={`backoff ${formatUntil(state().main.quotaBackoffUntil)}`}
+              tone='warn'
+            />
+          </Show>
+          <Show when={refreshBackedOff()}>
+            <StatRow
+              theme={theme()}
+              label='Token refresh'
+              value={`backoff ${formatUntil(state().main.refreshBackoffUntil)}`}
+              tone='warn'
+            />
+          </Show>
         </Show>
       </Show>
     </box>
