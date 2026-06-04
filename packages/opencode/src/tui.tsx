@@ -377,8 +377,9 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
         </Show>
       </Show>
 
-      {/* Expanded: full sections, hidden when collapsed */}
-      <Show when={!collapsed()}>
+      {/* Expanded: full sections. Also render when there's no data so the
+          sidebar can never go blank if data clears while collapsed. */}
+      <Show when={!collapsed() || !hasData()}>
         <Show
           when={hasData()}
           fallback={
