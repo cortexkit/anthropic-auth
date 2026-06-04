@@ -88,6 +88,10 @@ export function resolveActiveAccount(state: SidebarState): {
 } {
   const activeId = state.activeId
   if (activeId && activeId !== 'main') {
+    // `account.enabled` is defensive: writeSidebarState already filters disabled
+    // accounts out of state.fallbacks, so in normal operation every entry is
+    // enabled. Kept so this pure helper stays correct for any caller and is
+    // exercised directly by the unit tests.
     const fallback = state.fallbacks.find(
       (account) => account.enabled && account.id === activeId,
     )

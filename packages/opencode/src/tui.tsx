@@ -29,7 +29,10 @@ const BAR_EMPTY = '\u2591'
 // Plugin version for the header (mirrors the Magic Context / AFT convention).
 // Read at runtime from package.json relative to this module — NOT a TS JSON
 // import, which would break the declaration build (package.json is outside
-// rootDir). Empty string on any failure → header shows the badge with no version.
+// rootDir). tui.tsx ships as source (package.json exports["./tui"] →
+// "./src/tui.tsx") and is never compiled into a deeper dist tree, so `..` from
+// src/ is always the package root. Empty string on any failure → header shows
+// the badge with no version.
 const PLUGIN_VERSION: string = (() => {
   try {
     const here = dirname(fileURLToPath(import.meta.url))
