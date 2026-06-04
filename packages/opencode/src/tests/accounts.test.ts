@@ -707,7 +707,7 @@ describe('FallbackAccountManager', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1)
   })
 
-  test('refreshQuotaForDueAccounts fires onFallbackQuotaFetched when quota changes', async () => {
+  test('refreshQuotaForDueAccounts fires onFallbackStorageChanged when storage changes', async () => {
     const storage = baseStorage()
     storage.accounts.push({
       id: 'idle-stale',
@@ -739,7 +739,7 @@ describe('FallbackAccountManager', () => {
     const manager = new FallbackAccountManager({
       fetchImpl,
       now: () => 50_000_000, // well past checkedAt → stale
-      onFallbackQuotaFetched: () => {
+      onFallbackStorageChanged: () => {
         fired += 1
       },
     })

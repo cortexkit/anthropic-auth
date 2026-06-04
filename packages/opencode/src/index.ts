@@ -306,7 +306,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
   })
   const fallbackManager = new FallbackAccountManager({
     quotaManager,
-    onFallbackQuotaFetched: () => {
+    onFallbackStorageChanged: () => {
       void refreshSidebarQuota()
     },
   })
