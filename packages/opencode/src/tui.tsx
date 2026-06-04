@@ -305,6 +305,7 @@ function QuotaSidebar(props: { api: TuiPluginApi }) {
       paddingRight={1}
     >
       {/* Header: ▼/▶ CLAUDE badge (click to collapse) + version, or LIMITED badge */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: opentui renders to a terminal, not the DOM — ARIA roles do not apply */}
       <box
         width='100%'
         flexDirection='row'
