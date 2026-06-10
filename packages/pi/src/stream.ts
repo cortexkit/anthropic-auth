@@ -301,26 +301,57 @@ export function shouldPreflightPrimaryForFallback(
   return Boolean(storage?.accounts.length)
 }
 
+async function peekFirstSseEvent(response: { body: Response['body'] }) {
+  if (!response.body) return null
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) return null
+
+      buffer += decoder.decode(value, { stream: true })
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        boundary = buffer.indexOf('\n\n')
+
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data:')) continue
+          const data = line.slice(5).trim()
+          if (!data || data === '[DONE]') continue
+          return JSON.parse(data) as AnthropicEvent
+        }
+      }
+    }
+  } finally {
+    void reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+}
+
 async function firstStreamingError(
   response: Response,
 ): Promise<Response | string> {
   if (!response.ok) return response
   const clone = response.clone()
   try {
-    for await (const event of parseSse(clone as unknown as Response)) {
-      if (
-        event.type === 'error' &&
-        typeof event.delta?.type === 'string' &&
-        event.delta.type === 'rate_limit_error'
-      ) {
-        return 'rate_limit_error'
-      }
-      return response
+    const event = await peekFirstSseEvent(clone)
+    if (
+      event?.type === 'error' &&
+      typeof event.delta?.type === 'string' &&
+      event.delta.type === 'rate_limit_error'
+    ) {
+      return 'rate_limit_error'
     }
+    return response
   } catch {
     return response
   }
-  return response
 }
 
 async function executeWithFallback(options: {
