@@ -176,6 +176,27 @@ export function configureApiRouteHeaders(
   return headers
 }
 
+function extractSseEvents(buffer: string) {
+  const events: AnthropicEvent[] = []
+  let nextBuffer = buffer
+  let boundary = nextBuffer.indexOf('\n\n')
+
+  while (boundary !== -1) {
+    const frame = nextBuffer.slice(0, boundary)
+    nextBuffer = nextBuffer.slice(boundary + 2)
+    boundary = nextBuffer.indexOf('\n\n')
+
+    for (const line of frame.split('\n')) {
+      if (!line.startsWith('data:')) continue
+      const data = line.slice(5).trim()
+      if (!data || data === '[DONE]') continue
+      events.push(JSON.parse(data) as AnthropicEvent)
+    }
+  }
+
+  return { events, buffer: nextBuffer }
+}
+
 async function* parseSse(response: Response): AsyncGenerator<AnthropicEvent> {
   if (!response.body) return
   const reader = response.body.getReader()
@@ -191,18 +212,9 @@ async function* parseSse(response: Response): AsyncGenerator<AnthropicEvent> {
         break
       }
       buffer += decoder.decode(value, { stream: true })
-      let boundary = buffer.indexOf('\n\n')
-      while (boundary !== -1) {
-        const frame = buffer.slice(0, boundary)
-        buffer = buffer.slice(boundary + 2)
-        boundary = buffer.indexOf('\n\n')
-        for (const line of frame.split('\n')) {
-          if (!line.startsWith('data:')) continue
-          const data = line.slice(5).trim()
-          if (!data || data === '[DONE]') continue
-          yield JSON.parse(data) as AnthropicEvent
-        }
-      }
+      const parsed = extractSseEvents(buffer)
+      buffer = parsed.buffer
+      yield* parsed.events
     }
   } finally {
     if (!completed) await reader.cancel().catch(() => {})
@@ -314,19 +326,9 @@ async function peekFirstSseEvent(response: { body: Response['body'] }) {
       if (done) return null
 
       buffer += decoder.decode(value, { stream: true })
-      let boundary = buffer.indexOf('\n\n')
-      while (boundary !== -1) {
-        const frame = buffer.slice(0, boundary)
-        buffer = buffer.slice(boundary + 2)
-        boundary = buffer.indexOf('\n\n')
-
-        for (const line of frame.split('\n')) {
-          if (!line.startsWith('data:')) continue
-          const data = line.slice(5).trim()
-          if (!data || data === '[DONE]') continue
-          return JSON.parse(data) as AnthropicEvent
-        }
-      }
+      const parsed = extractSseEvents(buffer)
+      buffer = parsed.buffer
+      if (parsed.events.length > 0) return parsed.events[0]
     }
   } finally {
     void reader.cancel().catch(() => {})
