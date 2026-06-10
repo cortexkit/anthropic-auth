@@ -4,6 +4,7 @@ import {
   buildExplicitBaseMessagesUrl,
   configureApiRouteHeaders,
   primaryResponseAllowsApiFallback,
+  shouldPreflightPrimaryForFallback,
 } from '../stream.ts'
 
 describe('Pi API fallback routing helpers', () => {
@@ -47,6 +48,18 @@ describe('Pi API fallback routing helpers', () => {
     expect(
       primaryResponseAllowsApiFallback(new Response(null, { status: 200 })),
     ).toBe(false)
+  })
+
+  test('skips primary SSE preflight when no fallback accounts are configured', () => {
+    expect(shouldPreflightPrimaryForFallback(null)).toBe(false)
+    expect(shouldPreflightPrimaryForFallback({ accounts: [] } as any)).toBe(
+      false,
+    )
+    expect(
+      shouldPreflightPrimaryForFallback({
+        accounts: [{ id: 'fallback' }],
+      } as any),
+    ).toBe(true)
   })
 
   test('supports x-api-key auth mode for API fallback routes', () => {

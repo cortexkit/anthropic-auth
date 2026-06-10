@@ -1,4 +1,5 @@
 import {
+  type AccountStorage,
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
@@ -294,6 +295,12 @@ export function primaryResponseAllowsApiFallback(preflight: Response | string) {
   )
 }
 
+export function shouldPreflightPrimaryForFallback(
+  storage: AccountStorage | null,
+) {
+  return Boolean(storage?.accounts.length)
+}
+
 async function firstStreamingError(
   response: Response,
 ): Promise<Response | string> {
@@ -403,6 +410,8 @@ async function executeWithFallback(options: {
     ...options,
     accessToken: options.primaryAccessToken,
   })
+  if (!shouldPreflightPrimaryForFallback(storage)) return primary
+
   const primaryPreflight = await firstStreamingError(primary)
   if (primaryPreflight instanceof Response) {
     if (!shouldFallbackStatus(primaryPreflight.status, storage))
