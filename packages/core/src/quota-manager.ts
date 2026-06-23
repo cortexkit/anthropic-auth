@@ -555,12 +555,12 @@ export class QuotaManager {
     })
   }
 
-  // A 401 is an auth/token problem, not a rate limit. The caller refreshes the
-  // token and retries; backing off the quota API here would block that retry,
-  // so surface 401s without recording backoff state.
+  // A 401 is an auth/token problem and a 403 is an account/org policy problem,
+  // not a rate limit. Surface them without recording quota backoff state so
+  // callers can refresh, re-auth, or try a fallback account immediately.
   private static isAuthError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error)
-    return /quota check failed: 401\b/.test(message)
+    return /quota check failed: (401|403)\b/.test(message)
   }
 
   /** Main quota failure: arms main-only backoff and persists via onApiError. */

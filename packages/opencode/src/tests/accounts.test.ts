@@ -2194,6 +2194,67 @@ describe('recordQuotaRefreshError refresh-backoff arming', () => {
     expect(account?.lastQuotaRefreshError).toBeDefined()
     expect(account?.lastQuotaRefreshError?.checkedAt).toBe(now)
   })
+
+  test('quota-endpoint 403 does NOT arm quota backoff', async () => {
+    const now = 1_000_000
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fb-quota-403',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: now + 24 * 60 * 60_000,
+    })
+    await saveAccounts(storage)
+
+    const fetchImpl = mock((input: string | URL | Request) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof Request
+            ? input.url
+            : input.href
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-access',
+              refresh_token: 'new-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'permission_error',
+              message:
+                'OAuth authentication is currently not allowed for this organization.',
+            },
+          }),
+          { status: 403 },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+    })
+
+    await manager.refreshQuotaForDueAccounts()
+
+    const loaded = await loadAccounts()
+    const account = loaded?.accounts.find((a) => a.id === 'fb-quota-403') as
+      | OAuthAccount
+      | undefined
+    expect(account?.lastRefreshError).toBeUndefined()
+    expect(account?.lastQuotaRefreshError).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

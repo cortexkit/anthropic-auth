@@ -1808,6 +1808,12 @@ function formatErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
+function isQuotaPolicyAuthError(error: unknown) {
+  const status = (error as { status?: unknown }).status
+  if (status === 403) return true
+  return /Claude quota check failed: 403\b/.test(formatErrorMessage(error))
+}
+
 function recordRefreshError(
   account: OAuthAccount,
   error: unknown,
@@ -1826,6 +1832,7 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (isQuotaPolicyAuthError(error)) return
   account.lastQuotaRefreshError = buildQuotaOperationError({
     error,
     now,
