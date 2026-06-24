@@ -4,6 +4,7 @@ import {
   CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  createEmptyStorage,
   executeAccountCommand,
   executeCache1hCommand,
   executeCacheKeepCommand,
@@ -237,7 +238,7 @@ export function registerCommands(pi: ExtensionAPI) {
       const storage = await loadAccounts(path)
       const result = executeAccountCommand({
         argumentsText: args ?? '',
-        storage: storage ?? { version: 1, accounts: [] },
+        storage: storage ?? createEmptyStorage(),
       })
 
       if (!result.updated) {

@@ -24,6 +24,7 @@ import {
   CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  createEmptyStorage,
   dumpDirectRequest,
   exchange,
   executeAccountCommand,
@@ -485,10 +486,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       fetchStartedAt,
     ) => {
       try {
-        const storage = (await loadAccounts(accountStoragePath)) ?? {
-          version: 1 as const,
-          accounts: [],
-        }
+        const storage =
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
         const persisted = getPersistedMainQuota(storage)
         if (
           persisted &&
@@ -513,10 +512,8 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     },
     onApiError: async (error) => {
       try {
-        const storage = (await loadAccounts(accountStoragePath)) ?? {
-          version: 1 as const,
-          accounts: [],
-        }
+        const storage =
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
         storage.quota = storage.quota ?? {}
         storage.quota.mainLastQuotaApiError = error
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
@@ -1001,10 +998,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
     if (action.type === 'add-apikey') {
       if (!action.apiKey) {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return { text: 'API key is required', accounts }
       }
@@ -1014,10 +1008,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         action.baseURL?.trim() || 'https://api.kie.ai/claude'
       if (!isValidApiBaseURL(resolvedBaseURL)) {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return {
           text: 'Invalid base URL. Must be an http(s) URL without embedded credentials.',
@@ -1070,10 +1061,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         text: `Open this URL in your browser:\n${authResult.url}`,
         knobs: { oauthUrl: authResult.url },
         accounts: buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         ),
       }
     }
@@ -1084,10 +1072,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
       const pending = takeOAuthPending(key)
       if (!pending) {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return {
           text: 'OAuth session expired. Please start again.',
@@ -1105,10 +1090,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
         if (result.type === 'failed') {
           const accounts = buildAccountList(
-            (await loadAccounts(accountStoragePath)) ?? {
-              version: 1,
-              accounts: [],
-            },
+            (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
           )
           return {
             text: 'OAuth authentication failed. Please check the code and try again.',
@@ -1137,15 +1119,12 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         const updatedStorage = await loadAccounts(accountStoragePath)
         await refreshSidebarAfterMutation(updatedStorage)
         const accounts = buildAccountList(
-          updatedStorage ?? { version: 1, accounts: [] },
+          updatedStorage ?? createEmptyStorage(),
         )
         return { text: `OAuth account added.`, accounts }
       } catch {
         const accounts = buildAccountList(
-          (await loadAccounts(accountStoragePath)) ?? {
-            version: 1,
-            accounts: [],
-          },
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage(),
         )
         return {
           text: 'OAuth exchange failed due to a network error. Please try again.',
@@ -1595,13 +1574,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                 async function updateMainRefreshState(
                   update: (storage: AccountStorage) => void,
                 ) {
-                  const storage: AccountStorage = (await loadAccounts(
-                    accountStoragePath,
-                  )) ?? {
-                    version: 1,
-                    main: { type: 'opencode', provider: 'anthropic' },
-                    accounts: [],
-                  }
+                  const storage: AccountStorage =
+                    (await loadAccounts(accountStoragePath)) ??
+                    createEmptyStorage()
                   storage.refresh = storage.refresh ?? {}
                   update(storage)
                   await saveAccountState(storage, accountStoragePath, {

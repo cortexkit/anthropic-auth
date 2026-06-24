@@ -402,6 +402,16 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
   return Object.keys(quota).length ? quota : undefined
 }
 
+// Fresh empty storage shell — main OpenCode OAuth account, no fallback
+// accounts. Returns a new object each call so mutating callers don't alias.
+export function createEmptyStorage(): AccountStorage {
+  return {
+    version: 1,
+    main: { type: 'opencode', provider: 'anthropic' },
+    accounts: [],
+  }
+}
+
 function normalizeStorage(value: unknown): AccountStorage | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null
   return {
@@ -497,9 +507,13 @@ function mergeConfigAndState(
 
 export async function loadAccounts(path = getAccountStoragePath()) {
   const config = await readJsonIfPresent(path)
-  if (!config.exists) return null
   const state = await readJsonIfPresent(getAccountStatePath(path))
-  return normalizeStorage(mergeConfigAndState(config.value, state.value))
+  // Runtime-only flows (main-OAuth refresh with no fallback accounts) write the
+  // state file but never the config file, so the store is absent only when
+  // neither exists. Synthesize an empty config to merge state into otherwise.
+  if (!config.exists && !state.exists) return null
+  const configValue = config.exists ? config.value : createEmptyStorage()
+  return normalizeStorage(mergeConfigAndState(configValue, state.value))
 }
 
 async function loadExistingTopLevelFields(path: string) {
@@ -1027,11 +1041,7 @@ export async function setCache1hPersistentEnabled(
   mode?: Cache1hMode,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.claudeCache = {
     ...(storage.claudeCache ?? {}),
     enabled,
@@ -1045,11 +1055,7 @@ export async function setCache1hPersistentMode(
   mode: Cache1hMode,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.claudeCache = {
     ...(storage.claudeCache ?? {}),
     enabled: storage.claudeCache?.enabled === true,
@@ -1067,11 +1073,7 @@ export async function setDumpPersistentEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.dump = {
     ...(storage.dump ?? {}),
     enabled,
@@ -1088,11 +1090,7 @@ export async function setFastModePersistentEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.claudeFast = {
     ...(storage.claudeFast ?? {}),
     enabled,
@@ -1106,11 +1104,7 @@ export async function setCacheKeepPersistentWindow(
   endHour: number,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
     enabled: true,
     startHour,
@@ -1124,11 +1118,7 @@ export async function setCacheKeepPersistentEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
     ...(storage.cacheKeep ?? {}),
     enabled,
@@ -1145,11 +1135,7 @@ export async function setCacheKeepSubagentsEnabled(
   enabled: boolean,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.cacheKeep = {
     ...(storage.cacheKeep ?? {}),
     subagents: enabled,
@@ -1340,11 +1326,7 @@ export async function setLogLevelPersistent(
   path = getAccountStoragePath(),
 ) {
   const { setLogLevel } = await import('./logger.ts')
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.logging = {
     ...(storage.logging ?? {}),
     level,
@@ -1512,11 +1494,7 @@ export async function setKillswitchPersistent(
   config: KillswitchConfig,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.killswitch = config
   await saveAccounts(storage, path)
   return storage
@@ -1559,11 +1537,7 @@ export async function addAccountPersistent(
   account: FallbackAccount,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   upsertAccount(storage, account)
   await saveAccounts(storage, path)
 }

@@ -1,5 +1,6 @@
 import {
   type AccountStorage,
+  createEmptyStorage,
   getAccountStoragePath,
   loadAccounts,
   type RoutingMode,
@@ -33,11 +34,7 @@ export async function setRoutingMode(
   mode: RoutingMode,
   path = getAccountStoragePath(),
 ) {
-  const storage = (await loadAccounts(path)) ?? {
-    version: 1,
-    main: { type: 'opencode' as const, provider: 'anthropic' as const },
-    accounts: [],
-  }
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   storage.routing = {
     ...(storage.routing ?? {}),
     mode,

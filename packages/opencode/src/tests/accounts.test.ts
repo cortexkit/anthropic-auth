@@ -800,6 +800,70 @@ describe('account storage', () => {
     expect(saved?.claudeFast).toEqual({ enabled: false })
     expect(isFastModePersistentlyEnabled(saved)).toBe(false)
   })
+
+  test('returns null when neither config nor state file exists', async () => {
+    await expect(loadAccounts()).resolves.toBeNull()
+  })
+
+  test('reads runtime state when config file is absent (no fallback accounts)', async () => {
+    const statePath = getAccountStatePath(accountPath)
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        main: {
+          refreshLeaseId: 'lease-abc',
+          refreshLeaseUntil: 9_999_999_999_999,
+          refreshLeaseTokenHash: 'hash-xyz',
+          quota: {
+            five_hour: {
+              usedPercent: 33,
+              remainingPercent: 67,
+              checkedAt: 777,
+            },
+          },
+          quotaCheckedAt: 777,
+          quotaToken: 'token-state-only',
+        },
+      }),
+      'utf8',
+    )
+
+    // Config file must NOT exist for this scenario.
+    await expect(stat(accountPath)).rejects.toThrow()
+
+    const loaded = await loadAccounts()
+    expect(loaded).not.toBeNull()
+    expect(loaded?.accounts).toEqual([])
+    expect(loaded?.refresh?.mainRefreshLeaseId).toBe('lease-abc')
+    expect(loaded?.refresh?.mainRefreshLeaseUntil).toBe(9_999_999_999_999)
+    expect(loaded?.refresh?.mainRefreshLeaseTokenHash).toBe('hash-xyz')
+    expect(loaded?.quota?.mainQuotaToken).toBe('token-state-only')
+    expect(loaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(33)
+  })
+
+  test('lease written via saveAccountState is visible to loadAccounts without a config file', async () => {
+    const storage: AccountStorage = {
+      version: 1,
+      main: { type: 'opencode', provider: 'anthropic' },
+      accounts: [],
+      refresh: {
+        mainRefreshLeaseId: 'lease-from-save',
+        mainRefreshLeaseUntil: 9_999_999_999_999,
+        mainRefreshLeaseTokenHash: 'token-hash-from-save',
+      },
+    }
+    await saveAccountState(storage, accountPath, { mainRefresh: true })
+
+    // saveAccountState must not have created the config file.
+    await expect(stat(accountPath)).rejects.toThrow()
+
+    const loaded = await loadAccounts()
+    expect(loaded?.refresh?.mainRefreshLeaseId).toBe('lease-from-save')
+    expect(loaded?.refresh?.mainRefreshLeaseTokenHash).toBe(
+      'token-hash-from-save',
+    )
+  })
 })
 
 describe('FallbackAccountManager', () => {
