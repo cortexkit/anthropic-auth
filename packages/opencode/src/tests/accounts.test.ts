@@ -1888,6 +1888,35 @@ describe('buildRefreshOperationError', () => {
     })
     expect(rateLimited.permanent).toBe(false)
   })
+
+  test('sets permanent false for a 400 that is NOT invalid_grant', () => {
+    // The OAuth spec allows 400 invalid_client / invalid_request /
+    // unsupported_grant_type — none of which re-login fixes. Only invalid_grant
+    // means the refresh token itself is dead.
+    const invalidClient = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(invalidClient.status).toBe(400)
+    expect(invalidClient.permanent).toBe(false)
+    // Explicit false must short-circuit isPermanentRefreshError before the
+    // legacy status===400 fallback can wrongly flag it.
+    expect(isPermanentRefreshError(invalidClient)).toBe(false)
+  })
+
+  test('sets permanent true for a 400 invalid_grant from the body JSON', () => {
+    const dead = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(
+        400,
+        '{"error":"invalid_grant","error_description":"Refresh token expired"}',
+      ),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(dead.permanent).toBe(true)
+    expect(isPermanentRefreshError(dead)).toBe(true)
+  })
 })
 
 describe('isPermanentRefreshError', () => {
@@ -2013,6 +2042,34 @@ describe('isPermanentRefreshError across save/load round-trip', () => {
     expect(reloaded.lastRefreshError?.status).toBe(400)
     expect(reloaded.lastRefreshError?.permanent).toBe(true)
     expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(true)
+  })
+
+  test('400 non-invalid_grant survives round-trip as NON-permanent', async () => {
+    // A 400 invalid_client (misconfig) must NOT nag re-login — and the explicit
+    // permanent=false must survive load so the status===400 fallback never fires.
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
+      now: Date.now(),
+      refreshToken: 'rt-misconfig',
+    })
+    expect(error.permanent).toBe(false)
+
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'misconfig',
+      type: 'oauth',
+      refresh: 'rt-misconfig',
+      lastRefreshError: error,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const reloaded = expectOAuthAccount(
+      loaded!.accounts.find((a) => a.id === 'misconfig'),
+    )
+    expect(reloaded.lastRefreshError?.status).toBe(400)
+    expect(reloaded.lastRefreshError?.permanent).toBe(false)
+    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(false)
   })
 })
 

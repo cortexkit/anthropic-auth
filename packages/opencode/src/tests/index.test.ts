@@ -188,8 +188,11 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
   function fallbackWithRefreshError(status: number) {
     const refresh = 'fallback-refresh'
     const now = Date.now()
+    // A genuinely-dead token returns 400 invalid_grant; only that classifies as
+    // permanent (a bare 400 / other OAuth errors do not).
+    const body = status === 400 ? '{"error":"invalid_grant"}' : 'boom'
     const error = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(status, 'boom'),
+      error: new ClaudeOAuthRefreshError(status, body),
       now,
       refreshToken: refresh,
     })

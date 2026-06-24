@@ -1293,18 +1293,27 @@ export function buildRefreshOperationError(input: {
     typeof statusFromError === 'number' && Number.isFinite(statusFromError)
       ? statusFromError
       : undefined
-  // A token is permanently dead only on 400 invalid_grant. A retry-exhausted /
-  // network error gets a long (non-transient) backoff above but is NOT dead, so
-  // permanent must be false for it — otherwise it would be falsely flagged as
-  // "needs re-login".
+  const message = formatErrorMessage(input.error)
+  // A token is permanently dead ONLY on 400 invalid_grant. The OAuth spec allows
+  // other 400s (invalid_client / invalid_request / unsupported_grant_type) that
+  // re-login does NOT fix — those, like a retry-exhausted / network / 429 / 5xx
+  // error, get a long backoff but must stay permanent=false so they are not
+  // falsely flagged "needs re-login". ClaudeOAuthRefreshError carries the raw
+  // OAuth body, and its message embeds it (`...: 400 — <body>`), so check both.
+  const body =
+    typeof (input.error as { body?: unknown }).body === 'string'
+      ? (input.error as { body: string }).body
+      : ''
+  const isInvalidGrant =
+    body.includes('invalid_grant') || message.includes('invalid_grant')
   return {
-    message: formatErrorMessage(input.error),
+    message,
     checkedAt: input.now,
     nextRetryAt: input.now + delay,
     retryCount,
     tokenHash,
     status,
-    permanent: status === 400,
+    permanent: status === 400 && isInvalidGrant,
   }
 }
 

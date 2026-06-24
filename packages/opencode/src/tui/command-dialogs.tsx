@@ -517,13 +517,13 @@ export function openCommandDialog(
               openOAuthUrlScreen(oauthUrl)
               return
             }
-            openOAuthCodePrompt()
+            openOAuthCodePrompt(oauthUrl)
           }}
         />
       ))
     }
 
-    const openOAuthCodePrompt = () => {
+    const openOAuthCodePrompt = (oauthUrl: string) => {
       const DialogPrompt = api.ui.DialogPrompt
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
@@ -543,14 +543,18 @@ export function openCommandDialog(
               buildL1()
               return
             }
-            openOAuthLabelPrompt(trimmed)
+            openOAuthLabelPrompt(trimmed, oauthUrl)
           }}
-          onCancel={() => buildL1()}
+          // Step BACK to the sign-in URL screen, not L1: the OAuth session
+          // (PKCE verifier/state) is already minted. Returning to L1 would let a
+          // retry re-run add-oauth-start and re-mint it, invalidating the URL the
+          // user is mid-sign-in with. Same session → same URL is preserved.
+          onCancel={() => openOAuthUrlScreen(oauthUrl)}
         />
       ))
     }
 
-    const openOAuthLabelPrompt = (code: string) => {
+    const openOAuthLabelPrompt = (code: string, oauthUrl: string) => {
       const DialogPrompt = api.ui.DialogPrompt
       api.ui.dialog.setSize('xlarge')
       api.ui.dialog.replace(() => (
@@ -572,7 +576,11 @@ export function openCommandDialog(
               buildL1()
             })
           }}
-          onCancel={() => buildL1()}
+          // Step BACK to the code prompt, not L1: the user already obtained an
+          // auth code to reach this step. Returning to L1 would let a retry
+          // re-run add-oauth-start, minting a new PKCE verifier/state that
+          // invalidates the code they already have and forces a full re-auth.
+          onCancel={() => openOAuthCodePrompt(oauthUrl)}
         />
       ))
     }
