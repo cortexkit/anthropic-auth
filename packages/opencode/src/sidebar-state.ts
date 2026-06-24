@@ -14,6 +14,9 @@ export interface SidebarAccountState {
   label: string | undefined
   quota: AccountQuota | null
   enabled: boolean
+  // True when the account's refresh token is permanently dead (400
+  // invalid_grant) and it needs a re-login — distinct from a transient backoff.
+  needsReauth: boolean
 }
 
 export interface SidebarState {
@@ -88,6 +91,8 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           label: typeof entry.label === 'string' ? entry.label : undefined,
           quota: isRecord(entry.quota) ? (entry.quota as AccountQuota) : null,
           enabled: typeof entry.enabled === 'boolean' ? entry.enabled : false,
+          needsReauth:
+            typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
         }))
     : []
 

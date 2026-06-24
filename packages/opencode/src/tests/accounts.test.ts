@@ -27,6 +27,7 @@ import {
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  isPermanentRefreshError,
   type KillswitchThresholds,
   killswitchPassesPolicy,
   loadAccounts,
@@ -1841,6 +1842,178 @@ describe('buildRefreshOperationError', () => {
     })
     expect(result.nextRetryAt).toBe(1000000 + 5 * 60_000)
   })
+
+  test('captures the error status on the operation error', () => {
+    const error = new ClaudeOAuthRefreshError(400, 'invalid_grant')
+    const result = buildRefreshOperationError({
+      error,
+      now: 1000000,
+      refreshToken: 'test-token',
+    })
+    expect(result.status).toBe(400)
+  })
+
+  test('captures duck-typed status when no ClaudeOAuthRefreshError', () => {
+    const result = buildRefreshOperationError({
+      error: { status: 429 },
+      now: 1000000,
+      refreshToken: 'test-token',
+    })
+    expect(result.status).toBe(429)
+  })
+
+  test('sets permanent true only for 400 invalid_grant', () => {
+    const dead = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(dead.permanent).toBe(true)
+  })
+
+  test('sets permanent false for retry-exhausted transient (no status)', () => {
+    const exhausted = buildRefreshOperationError({
+      error: new Error('Token refresh exhausted all retries'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(exhausted.permanent).toBe(false)
+  })
+
+  test('sets permanent false for a 429', () => {
+    const rateLimited = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(rateLimited.permanent).toBe(false)
+  })
+})
+
+describe('isPermanentRefreshError', () => {
+  test('400 (invalid_grant) → permanent (dead token, needs re-login)', () => {
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(isPermanentRefreshError(error)).toBe(true)
+  })
+
+  test('429 (rate limited) → NOT permanent (transient, recovers)', () => {
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+
+  test('500 (server error) → NOT permanent (transient)', () => {
+    const error = buildRefreshOperationError({
+      error: { status: 500 },
+      now: 1000000,
+      refreshToken: 't',
+    })
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+
+  test('legacy error without status but 24h delay → permanent (heuristic)', () => {
+    // Mirrors a dead token persisted before the status field existed: a
+    // non-transient error gets NON_TRANSIENT_REFRESH_RETRY_DELAY_MS (24h).
+    const checkedAt = 1000000
+    const error = {
+      message: 'invalid_grant',
+      checkedAt,
+      nextRetryAt: checkedAt + 24 * 60 * 60_000,
+    }
+    expect(isPermanentRefreshError(error)).toBe(true)
+  })
+
+  test('legacy error without status, short delay → NOT permanent', () => {
+    const checkedAt = 1000000
+    const error = {
+      message: 'rate limited',
+      checkedAt,
+      nextRetryAt: checkedAt + 5 * 60_000,
+    }
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+
+  test('retry-exhausted transient error → NOT permanent (no false re-login nag)', () => {
+    // A network glitch that exhausts all retries throws a plain Error with NO
+    // status. isTransientRefreshError classifies it non-transient (no status,
+    // message is not "fetch failed"), so it gets the 24h backoff delay — but it
+    // is NOT a dead token. Built through buildRefreshOperationError, the explicit
+    // `permanent` flag must be false so it is not nagged for re-login.
+    const error = buildRefreshOperationError({
+      error: new Error('Token refresh exhausted all retries'),
+      now: 1000000,
+      refreshToken: 't',
+    })
+    // Sanity: it really did get the 24h non-transient delay (so the legacy
+    // heuristic alone would have wrongly flagged it permanent).
+    expect(error.nextRetryAt).toBe(1000000 + 24 * 60 * 60_000)
+    expect(isPermanentRefreshError(error)).toBe(false)
+  })
+})
+
+describe('isPermanentRefreshError across save/load round-trip', () => {
+  test('retry-exhausted transient survives round-trip as NON-permanent', async () => {
+    // The classification only matters once persisted. A retry-exhausted error
+    // is permanent=false in memory but gets a 24h NON_TRANSIENT backoff — if the
+    // status/permanent fields are dropped on load, the 24h-delay heuristic wrongly
+    // re-classifies it permanent and the sidebar falsely nags re-login.
+    const error = buildRefreshOperationError({
+      error: new Error('Token refresh exhausted all retries'),
+      now: Date.now(),
+      refreshToken: 'rt-exhausted',
+    })
+    expect(error.permanent).toBe(false)
+    expect(isPermanentRefreshError(error)).toBe(false)
+
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'exhausted',
+      type: 'oauth',
+      refresh: 'rt-exhausted',
+      lastRefreshError: error,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const reloaded = expectOAuthAccount(
+      loaded!.accounts.find((a) => a.id === 'exhausted'),
+    )
+    expect(reloaded.lastRefreshError?.permanent).toBe(false)
+    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(false)
+  })
+
+  test('400 invalid_grant survives round-trip as permanent', async () => {
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
+      now: Date.now(),
+      refreshToken: 'rt-dead',
+    })
+    expect(error.permanent).toBe(true)
+
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'dead',
+      type: 'oauth',
+      refresh: 'rt-dead',
+      lastRefreshError: error,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const reloaded = expectOAuthAccount(
+      loaded!.accounts.find((a) => a.id === 'dead'),
+    )
+    expect(reloaded.lastRefreshError?.status).toBe(400)
+    expect(reloaded.lastRefreshError?.permanent).toBe(true)
+    expect(isPermanentRefreshError(reloaded.lastRefreshError)).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2659,6 +2832,59 @@ describe('removeAccountPersistent', () => {
     expect(await removeAccountPersistent('nonexistent', accountPath)).toBe(
       false,
     )
+  })
+
+  test('prunes the orphaned per-account state on removal (full-save path)', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'doomed',
+      type: 'oauth',
+      access: 'access-token',
+      refresh: 'refresh-token',
+      expires: Date.now() + 3600_000,
+      lastRefreshError: {
+        message: 'boom',
+        checkedAt: Date.now(),
+      },
+    })
+    await saveAccounts(storage, accountPath)
+
+    // Sanity: the state file holds the per-account block before removal.
+    const statePath = getAccountStatePath(accountPath)
+    const before = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(before.accounts?.doomed).toBeDefined()
+
+    expect(await removeAccountPersistent('doomed', accountPath)).toBe(true)
+
+    const after = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(after.accounts?.doomed).toBeUndefined()
+  })
+
+  test('removing one fallback leaves the other fallback state intact', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'keep',
+      type: 'oauth',
+      access: 'keep-access',
+      refresh: 'keep-refresh',
+      expires: Date.now() + 3600_000,
+    })
+    storage.accounts.push({
+      id: 'drop',
+      type: 'oauth',
+      access: 'drop-access',
+      refresh: 'drop-refresh',
+      expires: Date.now() + 3600_000,
+    })
+    await saveAccounts(storage, accountPath)
+
+    expect(await removeAccountPersistent('drop', accountPath)).toBe(true)
+
+    const statePath = getAccountStatePath(accountPath)
+    const after = JSON.parse(await readFile(statePath, 'utf8'))
+    expect(after.accounts?.drop).toBeUndefined()
+    expect(after.accounts?.keep).toBeDefined()
+    expect(after.accounts?.keep?.refresh).toBe('keep-refresh')
   })
 })
 

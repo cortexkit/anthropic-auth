@@ -17,7 +17,7 @@ export type AccountCommandAction =
       authHeader?: 'authorization-bearer' | 'x-api-key'
     }
   | { type: 'add-oauth-start' }
-  | { type: 'add-oauth-finish'; code: string }
+  | { type: 'add-oauth-finish'; code: string; label?: string }
   | { type: 'usage' }
 
 export function parseAccountCommandAction(
@@ -89,8 +89,22 @@ export function parseAccountCommandAction(
 
   if (action === 'add-oauth-start') return { type: 'add-oauth-start' }
 
-  if (action === 'add-oauth-finish' && rest)
-    return { type: 'add-oauth-finish', code: rest }
+  if (action === 'add-oauth-finish' && rest) {
+    let remaining = rest
+
+    // Parse --label flag (mirrors add-apikey). The OAuth code is opaque (may
+    // contain a #state segment) so the label is collected via the flag, never
+    // positionally.
+    let label: string | undefined
+    const labelMatch = remaining.match(/--label\s+(.+)/)
+    if (labelMatch) {
+      label = labelMatch[1]?.trim() || undefined
+      remaining = remaining.replace(labelMatch[0], '').trim()
+    }
+
+    if (!remaining) return { type: 'usage' }
+    return { type: 'add-oauth-finish', code: remaining, label }
+  }
 
   return { type: 'usage' }
 }

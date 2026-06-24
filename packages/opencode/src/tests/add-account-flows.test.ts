@@ -429,6 +429,102 @@ describe('add-oauth error paths', () => {
 })
 
 // ---------------------------------------------------------------------------
+// add-oauth — label threading (the fix: prompt for a label, default UUID name)
+// ---------------------------------------------------------------------------
+describe('add-oauth label threading', () => {
+  async function getPluginWithClient() {
+    const client = createMockClient()
+    const { AnthropicAuthPlugin } = await import('../index')
+    const plugin = (await AnthropicAuthPlugin({
+      // @ts-expect-error: minimal mock for testing
+      client,
+    })) as any
+    return { plugin, client }
+  }
+
+  function extractStateFromPromptCalls(
+    client: ReturnType<typeof createMockClient>,
+  ): string {
+    const calls = (client.session.promptAsync as { mock: { calls: any[] } })
+      .mock.calls
+    for (const [req] of calls) {
+      const text: string | undefined = req?.body?.parts?.[0]?.text
+      if (!text) continue
+      const match = text.match(/state=([^\s&]+)/)
+      if (match?.[1]) return decodeURIComponent(match[1])
+    }
+    throw new Error('no OAuth URL with state captured from prompt calls')
+  }
+
+  async function runOAuthAddWithLabel(labelArg: string | null) {
+    const { plugin, client } = await getPluginWithClient()
+    const sessionId = 'ses_oauth_label'
+
+    // Real add-oauth-start: builds a URL with a real state, stores pending,
+    // and delivers the URL text via session.promptAsync (TUI not connected).
+    await executeCommand(plugin, 'claude-account', 'add-oauth-start', sessionId)
+    const state = extractStateFromPromptCalls(client)
+
+    // Mock the token exchange endpoint to succeed.
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock((input: any) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url
+      if (url.includes('oauth/token') || url.includes('/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'oauth-access',
+              refresh_token: 'oauth-refresh',
+              expires_in: 3600,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    try {
+      const finishArgs =
+        labelArg == null
+          ? `add-oauth-finish dummy-code#${state}`
+          : `add-oauth-finish dummy-code#${state} --label ${labelArg}`
+      await executeCommand(plugin, 'claude-account', finishArgs, sessionId)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
+    const loaded = await loadAccounts(accountPath)
+    return loaded
+  }
+
+  test('add-oauth-finish --label sets the account label', async () => {
+    const loaded = await runOAuthAddWithLabel('work')
+    expect(loaded).not.toBeNull()
+    expect(loaded!.accounts).toHaveLength(1)
+    const account = loaded!.accounts[0]!
+    expect(account.type).toBe('oauth')
+    expect(account.label).toBe('work')
+  })
+
+  test('add-oauth-finish without --label leaves label undefined (UUID-name fallback)', async () => {
+    const loaded = await runOAuthAddWithLabel(null)
+    expect(loaded).not.toBeNull()
+    expect(loaded!.accounts).toHaveLength(1)
+    const account = loaded!.accounts[0]!
+    expect(account.label).toBeUndefined()
+    // id is a UUID (no natural key for OAuth)
+    expect(account.id).toMatch(/^[0-9a-f-]{36}$/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // security — no secrets in logs
 // ---------------------------------------------------------------------------
 describe('security — no secrets in logs', () => {

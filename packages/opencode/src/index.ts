@@ -61,6 +61,7 @@ import {
   isFastModeSupportedModel,
   isKillswitchEnabled,
   isOAuthAccount,
+  isPermanentRefreshError,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
@@ -661,6 +662,18 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             ? (quotaManager.getFallback(account.id, account.access)?.quota ??
               null)
             : null,
+          // A fallback with a permanently-dead refresh token (400 invalid_grant)
+          // is dropped by getUsableFallbackAccounts and silently degrades to
+          // main — surface it as "needs re-login". Only flag truly-dead tokens
+          // whose backoff is still active, not transient (429/5xx) backoff.
+          needsReauth:
+            account.lastRefreshError != null &&
+            refreshBackoffActive(
+              account.lastRefreshError,
+              account.refresh,
+              Date.now(),
+            ) &&
+            isPermanentRefreshError(account.lastRefreshError),
           enabled: account.enabled !== false,
         })),
       activeId: options.activeId,
@@ -1117,9 +1130,13 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
         }
 
         const now = Date.now()
+        // OAuth accounts have no natural key, so the id stays a UUID even when a
+        // label is given (label collisions must not collide ids). The label is
+        // optional — a blank one keeps the UUID-name fallback in the UI.
         const account: OAuthAccount = {
           id: randomUUID(),
           type: 'oauth' as const,
+          label: action.label || undefined,
           access: result.access,
           refresh: result.refresh,
           expires: result.expires,

@@ -82,6 +82,22 @@ export type AccountOperationError = {
   nextRetryAt?: number
   retryCount?: number
   tokenHash?: string
+  /**
+   * HTTP status of the underlying refresh/quota failure, when known. Lets
+   * consumers distinguish a permanently-dead token (400 invalid_grant →
+   * re-login) from a transient failure (429/5xx → recovers) without a delay
+   * heuristic. Absent on errors persisted before this field existed.
+   */
+  status?: number
+  /**
+   * Explicit dead-token discriminator, set at construction. True ONLY when the
+   * refresh endpoint returned 400 invalid_grant (token is genuinely dead →
+   * re-login). False for transient failures AND for retry-exhausted/network
+   * errors that get a long backoff but are NOT dead — so they are not nagged
+   * for re-login. Absent on errors persisted before this field existed (those
+   * fall back to status / the 24h-delay heuristic).
+   */
+  permanent?: boolean
 }
 
 export type AccountQuotaWindow = {
@@ -365,6 +381,7 @@ function normalizeOperationError(
   if (!Number.isFinite(checkedAt)) return undefined
   const nextRetryAt = Number(value.nextRetryAt)
   const retryCount = Number(value.retryCount)
+  const status = Number(value.status)
   return {
     message: value.message,
     checkedAt,
@@ -372,6 +389,13 @@ function normalizeOperationError(
     retryCount: Number.isFinite(retryCount) ? retryCount : undefined,
     tokenHash:
       typeof value.tokenHash === 'string' ? value.tokenHash : undefined,
+    // Preserve the dead-token discriminators across save/load. Without these,
+    // a retry-exhausted transient (permanent=false, 24h backoff) would lose its
+    // flag on reload and the 24h-delay heuristic would wrongly re-classify it
+    // permanent → false "needs re-login" nag.
+    status: Number.isFinite(status) ? status : undefined,
+    permanent:
+      typeof value.permanent === 'boolean' ? value.permanent : undefined,
   }
 }
 
@@ -769,6 +793,17 @@ async function saveAccountStateUnlocked(
         if (!storage.accounts.some((account) => account.id === id)) {
           delete next.accounts[id]
         }
+      }
+    } else {
+      // Full save: drop any per-account state whose id is no longer present in
+      // storage.accounts. The scoped path above only prunes ids it was asked to
+      // save; on a removal the storage is saved with scope.accounts === true
+      // (ids === null), so without this branch the removed account's runtime
+      // state (quota/lastRefreshError/access/refresh/expires) would be orphaned
+      // in the state file and later merged onto a re-added same-id account.
+      const present = new Set(storage.accounts.map((account) => account.id))
+      for (const id of Object.keys(next.accounts)) {
+        if (!present.has(id)) delete next.accounts[id]
       }
     }
   }
@@ -1253,13 +1288,54 @@ export function buildRefreshOperationError(input: {
   } else {
     delay = NON_TRANSIENT_REFRESH_RETRY_DELAY_MS
   }
+  const statusFromError = (input.error as { status?: unknown }).status
+  const status =
+    typeof statusFromError === 'number' && Number.isFinite(statusFromError)
+      ? statusFromError
+      : undefined
+  // A token is permanently dead only on 400 invalid_grant. A retry-exhausted /
+  // network error gets a long (non-transient) backoff above but is NOT dead, so
+  // permanent must be false for it — otherwise it would be falsely flagged as
+  // "needs re-login".
   return {
     message: formatErrorMessage(input.error),
     checkedAt: input.now,
     nextRetryAt: input.now + delay,
     retryCount,
     tokenHash,
+    status,
+    permanent: status === 400,
   }
+}
+
+/**
+ * True when a refresh error means the token is permanently dead and the account
+ * needs a re-login (vs a transient failure that recovers).
+ *
+ * Precedence:
+ *  1. the explicit `permanent` flag (set at construction from 400 invalid_grant)
+ *     — the authoritative signal; correctly classifies a retry-exhausted/network
+ *     error (long backoff, but NOT dead) as non-permanent;
+ *  2. else the captured HTTP `status` — 400 (for errors built before `permanent`
+ *     existed but after `status`);
+ *  3. else the legacy 24h-delay heuristic — back-compat ONLY for errors persisted
+ *     before either field existed (e.g. an operator's already-dead token: no
+ *     status, ~24h backoff). It still flags those until the next refresh restamps
+ *     the error with the explicit field.
+ */
+export function isPermanentRefreshError(
+  error: AccountOperationError | undefined,
+): boolean {
+  if (!error) return false
+  if (typeof error.permanent === 'boolean') return error.permanent
+  if (typeof error.status === 'number') return error.status === 400
+  if (typeof error.nextRetryAt === 'number') {
+    return (
+      error.nextRetryAt - error.checkedAt >=
+      NON_TRANSIENT_REFRESH_RETRY_DELAY_MS
+    )
+  }
+  return false
 }
 
 export function refreshBackoffActive(

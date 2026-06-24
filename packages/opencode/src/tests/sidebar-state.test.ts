@@ -37,7 +37,13 @@ describe('resolveActiveAccount', () => {
     const state = make({
       activeId: 'fb1',
       fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: true },
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: quota(40),
+          enabled: true,
+          needsReauth: false,
+        },
       ],
     })
     const active = resolveActiveAccount(state)
@@ -50,7 +56,13 @@ describe('resolveActiveAccount', () => {
     const state = make({
       activeId: 'fb1',
       fallbacks: [
-        { id: 'fb1', label: undefined, quota: quota(5), enabled: true },
+        {
+          id: 'fb1',
+          label: undefined,
+          quota: quota(5),
+          enabled: true,
+          needsReauth: false,
+        },
       ],
     })
     expect(resolveActiveAccount(state).name).toBe('fb1')
@@ -61,7 +73,13 @@ describe('resolveActiveAccount', () => {
       activeId: 'fb1',
       main: { quota: quota(12) },
       fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: false },
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: quota(40),
+          enabled: false,
+          needsReauth: false,
+        },
       ],
     })
     const active = resolveActiveAccount(state)
@@ -79,7 +97,13 @@ describe('resolveActiveAccount', () => {
       activeId: 'ghost',
       main: { quota: null },
       fallbacks: [
-        { id: 'fb1', label: 'work', quota: quota(40), enabled: true },
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: quota(40),
+          enabled: true,
+          needsReauth: false,
+        },
       ],
     })
     const active = resolveActiveAccount(state)
@@ -382,6 +406,27 @@ describe('normalizeSidebarState', () => {
     expect(out.fallbacks[0]!.enabled).toBe(false)
   })
 
+  test('fallbacks: needsReauth defaults to false when missing', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: true }],
+    })
+    expect(out.fallbacks[0]!.needsReauth).toBe(false)
+  })
+
+  test('fallbacks: needsReauth is parsed when present', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: true, needsReauth: true }],
+    })
+    expect(out.fallbacks[0]!.needsReauth).toBe(true)
+  })
+
+  test('fallbacks: needsReauth defaults to false when non-boolean', () => {
+    const out = normalizeSidebarState({
+      fallbacks: [{ id: 'a', label: 'a', enabled: true, needsReauth: 'yes' }],
+    })
+    expect(out.fallbacks[0]!.needsReauth).toBe(false)
+  })
+
   test('relay defaults to null when missing transport', () => {
     const out = normalizeSidebarState({ relay: { enabled: true } })
     expect(out.relay).toBeNull()
@@ -461,6 +506,7 @@ describe('normalizeSidebarState', () => {
             five_hour: { usedPercent: 40, remainingPercent: 60 },
           },
           enabled: true,
+          needsReauth: false,
         },
       ],
       activeId: 'fb1',
@@ -530,7 +576,15 @@ describe('getSidebarState malformed file round-trip', () => {
         quotaBackedOff: false,
         refreshBackedOff: true,
       },
-      fallbacks: [{ id: 'fb1', label: 'work', quota: null, enabled: true }],
+      fallbacks: [
+        {
+          id: 'fb1',
+          label: 'work',
+          quota: null,
+          enabled: true,
+          needsReauth: false,
+        },
+      ],
       activeId: 'fb1',
       route: 'fallback',
       relay: { enabled: false, transport: 'sse' },

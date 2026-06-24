@@ -543,13 +543,34 @@ export function openCommandDialog(
               buildL1()
               return
             }
-            void apply('claude-account', `add-oauth-finish ${trimmed}`).then(
-              (r) => {
-                api.ui.toast({ message: r.text })
-                updateAccounts(r)
-                buildL1()
-              },
-            )
+            openOAuthLabelPrompt(trimmed)
+          }}
+          onCancel={() => buildL1()}
+        />
+      ))
+    }
+
+    const openOAuthLabelPrompt = (code: string) => {
+      const DialogPrompt = api.ui.DialogPrompt
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title='OAuth sign-in \u2014 label'
+          description={() => (
+            <text>A short name for this account (optional).</text>
+          )}
+          placeholder='e.g. work'
+          value=''
+          onConfirm={(value: string) => {
+            const label = value.trim()
+            const args = label
+              ? `add-oauth-finish ${code} --label ${label}`
+              : `add-oauth-finish ${code}`
+            void apply('claude-account', args).then((r) => {
+              api.ui.toast({ message: r.text })
+              updateAccounts(r)
+              buildL1()
+            })
           }}
           onCancel={() => buildL1()}
         />

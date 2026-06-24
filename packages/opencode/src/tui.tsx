@@ -304,10 +304,13 @@ function AccountBlock(props: {
   quota: AccountQuota | null
   active: boolean
   pacingEnabled: boolean
+  needsReauth?: boolean
   marginTop?: number
 }) {
-  const statusWord = () => (props.active ? 'active' : 'idle')
-  const statusTone = (): Tone => (props.active ? 'ok' : 'muted')
+  const statusWord = () =>
+    props.needsReauth ? 're-login' : props.active ? 'active' : 'idle'
+  const statusTone = (): Tone =>
+    props.needsReauth ? 'err' : props.active ? 'ok' : 'muted'
   const pacingFor = (
     window:
       | { usedPercent: number; remainingPercent: number; resetsAt?: string }
@@ -402,6 +405,7 @@ function QuotaDialogContent(props: {
                 quota={fb.quota}
                 active={state().activeId === fb.id}
                 pacingEnabled={prefs().sections.pacing}
+                needsReauth={fb.needsReauth}
                 marginTop={1}
               />
             )}
@@ -572,7 +576,8 @@ function QuotaSidebar(props: {
 
   const quotaBackedOff = () => state().main?.quotaBackedOff === true
   const refreshBackedOff = () => state().main?.refreshBackedOff === true
-  const degraded = () => quotaBackedOff() || refreshBackedOff()
+  const needsReauth = () => enabledFallbacks().some((f) => f.needsReauth)
+  const degraded = () => quotaBackedOff() || refreshBackedOff() || needsReauth()
 
   const cacheKeep = () => state().cacheKeep
   const showCache = () =>
@@ -683,6 +688,7 @@ function QuotaSidebar(props: {
                     quota={fb.quota}
                     active={state().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
+                    needsReauth={fb.needsReauth}
                     marginTop={1}
                   />
                 )}

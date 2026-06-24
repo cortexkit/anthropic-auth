@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
+  buildRefreshOperationError,
+  ClaudeOAuthRefreshError,
   getAccountStatePath,
   hashRefreshToken,
   loadAccounts,
@@ -181,6 +183,70 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
     client: client ?? createMockClient(),
   })) as Promise<any>
 }
+
+describe('sidebar needsReauth (dead-fallback indicator)', () => {
+  function fallbackWithRefreshError(status: number) {
+    const refresh = 'fallback-refresh'
+    const now = Date.now()
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(status, 'boom'),
+      now,
+      refreshToken: refresh,
+    })
+    return createFallbackStorage({
+      accounts: [
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'fallback-access',
+          refresh,
+          expires: now + 5 * 60 * 60 * 1000,
+          lastRefreshError: error,
+        },
+      ],
+    })
+  }
+
+  test('dead (400 invalid_grant) fallback → needsReauth true', async () => {
+    await useTempAccountFile(fallbackWithRefreshError(400))
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+    const state = await waitForSidebarState(
+      (candidate) => candidate.fallbacks[0]?.id === 'fallback-1',
+    )
+    expect(state.fallbacks[0]?.needsReauth).toBe(true)
+  })
+
+  test('transient (429 rate-limited) fallback → needsReauth false', async () => {
+    await useTempAccountFile(fallbackWithRefreshError(429))
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+    const state = await waitForSidebarState(
+      (candidate) => candidate.fallbacks[0]?.id === 'fallback-1',
+    )
+    expect(state.fallbacks[0]?.needsReauth).toBe(false)
+  })
+})
 
 describe('package metadata', () => {
   test('exports a runtime-loadable TUI entrypoint', async () => {

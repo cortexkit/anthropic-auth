@@ -129,6 +129,33 @@ describe('parseAccountCommandAction', () => {
   test('garbage returns usage', () => {
     expect(parseAccountCommandAction('garbage')).toEqual({ type: 'usage' })
   })
+
+  test('add-oauth-finish with code only (no label)', () => {
+    expect(parseAccountCommandAction('add-oauth-finish abc123')).toEqual({
+      type: 'add-oauth-finish',
+      code: 'abc123',
+    })
+  })
+
+  test('add-oauth-finish with --label', () => {
+    expect(
+      parseAccountCommandAction('add-oauth-finish abc123 --label work'),
+    ).toEqual({
+      type: 'add-oauth-finish',
+      code: 'abc123',
+      label: 'work',
+    })
+  })
+
+  test('add-oauth-finish --label with multi-word label', () => {
+    expect(
+      parseAccountCommandAction('add-oauth-finish abc123 --label my work acct'),
+    ).toEqual({
+      type: 'add-oauth-finish',
+      code: 'abc123',
+      label: 'my work acct',
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
