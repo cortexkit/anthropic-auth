@@ -39,6 +39,7 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
       name: 'Claude Sonnet 5',
       reasoning: true,
       input: ['text', 'image'],
+      cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
       contextWindow: 1_000_000,
       maxTokens: 128_000,
     })
