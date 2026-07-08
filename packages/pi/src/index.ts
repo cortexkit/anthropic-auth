@@ -107,6 +107,15 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
         contextWindow: 200_000,
         maxTokens: 64_000,
       },
+      {
+        id: 'claude-sonnet-5',
+        name: 'Claude Sonnet 5',
+        reasoning: true,
+        input: textImageInput(),
+        cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
+      },
     ],
     oauth: {
       name: 'Anthropic Claude Pro/Max (CortexKit)',

@@ -2,7 +2,7 @@
 
 Pi package for CortexKit Anthropic OAuth support. It overrides Pi's built-in `anthropic` provider with a CortexKit provider extension backed by the shared `@cortexkit/anthropic-auth-core` package.
 
-The Pi provider catalog includes Claude Fable 5 (`claude-fable-5`), limited-access Claude Mythos 5 (`claude-mythos-5`), Claude Opus 4.8, Claude Opus 4.5, and Claude Sonnet 4.5. Fable/Mythos reasoning uses Anthropic adaptive thinking with `thinking.display: "summarized"` and `output_config.effort`; the package does not send rejected manual `thinking.budget_tokens` for those models.
+The Pi provider catalog includes Claude Fable 5 (`claude-fable-5`), limited-access Claude Mythos 5 (`claude-mythos-5`), Claude Opus 4.8, Claude Opus 4.5, Claude Sonnet 4.5, and Claude Sonnet 5 (`claude-sonnet-5`). Fable/Mythos reasoning uses Anthropic adaptive thinking with `thinking.display: "summarized"` and `output_config.effort`; the package does not send rejected manual `thinking.budget_tokens` for those models.
 
 This package is part of the CortexKit Anthropic Auth monorepo, which supports both OpenCode (`@cortexkit/opencode-anthropic-auth`) and Pi (`@cortexkit/pi-anthropic-auth`) through the same shared core logic.
 
