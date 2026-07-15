@@ -6,6 +6,6 @@
     "test": "bun test tests"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "1.17.15"
+    "@opencode-ai/sdk": "1.18.1"
   }
 }
