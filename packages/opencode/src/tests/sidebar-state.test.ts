@@ -20,6 +20,9 @@ import {
   drainSidebarWrites,
   FIVE_HOUR_MS,
   formatFallbackModelLabel,
+  formatPrimeAccountValue,
+  formatPrimeCost,
+  formatPrimeTime,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -50,6 +53,65 @@ async function pathExists(path: string): Promise<boolean> {
 const quota = (used: number): AccountQuota => ({
   five_hour: { usedPercent: used, remainingPercent: 100 - used },
   seven_day: { usedPercent: used, remainingPercent: 100 - used },
+})
+
+describe('prime display formatters', () => {
+  test('formats time and cost consistently for sidebar and dialog consumers', () => {
+    expect(formatPrimeTime(0)).toBe(
+      new Date(0).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    )
+    expect(formatPrimeCost(0)).toBe('0')
+    expect(formatPrimeCost(0.000025)).toBe('2.50e-5')
+    expect(formatPrimeCost(0.125)).toBe('0.1250')
+  })
+
+  test('formats one sidebar value per prime account', () => {
+    const nextDueAt = Date.now() + 60 * 60_000
+    const lastPrimedAt = Date.now() - 60_000
+
+    expect(
+      formatPrimeAccountValue({
+        id: 'main',
+        label: 'main',
+        nextDueAt,
+      }),
+    ).toEqual({ text: formatPrimeTime(nextDueAt), hasError: false })
+    expect(
+      formatPrimeAccountValue({
+        id: 'work-alt',
+        label: 'work-alt',
+        lastPrimedAt,
+        lastResult: 'ok',
+        usage: { count: 3, inputTokens: 60, outputTokens: 3, since: 1 },
+        estimatedCostUsd: 0.000075,
+      }),
+    ).toEqual({
+      text: `primed ${formatPrimeTime(lastPrimedAt)} \u2713`,
+      hasError: false,
+    })
+    expect(
+      formatPrimeAccountValue({
+        id: 'work-alt',
+        label: 'work-alt',
+        usage: { count: 3, inputTokens: 60, outputTokens: 3, since: 1 },
+        estimatedCostUsd: 0.000075,
+      }),
+    ).toEqual({ text: '\u2713 3 \u2248 $7.50e-5', hasError: false })
+    expect(
+      formatPrimeAccountValue({
+        id: 'broken',
+        label: 'broken',
+        lastResult: 'error',
+      }),
+    ).toEqual({ text: 'err', hasError: true })
+    expect(formatPrimeAccountValue({ id: 'idle', label: 'idle' })).toEqual({
+      text: '\u2014',
+      hasError: false,
+    })
+  })
 })
 
 function make(overrides: Partial<SidebarState>): SidebarState {
@@ -870,6 +932,67 @@ describe('normalizeSidebarState', () => {
   test('cacheKeep defaults to undefined when non-object', () => {
     const out = normalizeSidebarState({ cacheKeep: 'bad' })
     expect(out.cacheKeep).toBeUndefined()
+  })
+
+  test('prime defaults to undefined when non-object', () => {
+    const out = normalizeSidebarState({ prime: 'bad' })
+    expect(out.prime).toBeUndefined()
+  })
+
+  test('prime defaults to undefined when enabled is non-boolean', () => {
+    const out = normalizeSidebarState({ prime: { enabled: 'yes' } })
+    expect(out.prime).toBeUndefined()
+  })
+
+  test('prime drops accounts with non-string id', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          { id: 'main' }, // no label → dropped
+          { id: 123, label: 'numeric' },
+          { id: 'work', label: 'work' },
+        ],
+      },
+    })
+    expect(out.prime?.accounts).toEqual([{ id: 'work', label: 'work' }])
+  })
+
+  test('prime drops account with non-finite nextDueAt and preserves null', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          { id: 'main', label: 'main', nextDueAt: 'soon' },
+          { id: 'work', label: 'work', nextDueAt: null },
+        ],
+      },
+    })
+    expect(out.prime?.accounts?.[0]?.nextDueAt).toBeUndefined()
+    expect(out.prime?.accounts?.[1]?.nextDueAt).toBeNull()
+  })
+
+  test('prime drops invalid lastPrimedAt / lastResult / usage / cost', () => {
+    const out = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          {
+            id: 'main',
+            label: 'main',
+            lastPrimedAt: 'never',
+            lastResult: 'unknown',
+            usage: { count: -1, inputTokens: 0, outputTokens: 0, since: -5 },
+            estimatedCostUsd: 'cheap',
+          },
+        ],
+      },
+    })
+    const acct = out.prime?.accounts?.[0]
+    expect(acct?.lastPrimedAt).toBeUndefined()
+    expect(acct?.lastResult).toBeUndefined()
+    expect(acct?.usage).toBeUndefined()
+    expect(acct?.estimatedCostUsd).toBeUndefined()
   })
 
   test('route defaults when non-string', () => {

@@ -43,6 +43,12 @@ export type QuotaEntry = {
   checkedAt: number // when snapshot was fetched
 }
 
+export type QuotaRefreshResult = {
+  quota: OAuthQuotaSnapshot
+  /** False when backoff or a cross-process lock served the existing cache. */
+  fetched: boolean
+}
+
 export type QuotaManagerOptions = {
   storage: AccountStorage | null
   fetchImpl?: typeof fetch
@@ -102,9 +108,9 @@ export class QuotaManager {
   private fallbackTokenFps = new Map<string, string>()
 
   // --- Inflight deduplication ---
-  private inflightMain: Promise<OAuthQuotaSnapshot> | null = null
+  private inflightMain: Promise<QuotaRefreshResult> | null = null
   private inflightMainFp: string | null = null
-  private inflightFallbacks = new Map<string, Promise<OAuthQuotaSnapshot>>()
+  private inflightFallbacks = new Map<string, Promise<QuotaRefreshResult>>()
 
   // --- Rate-limiting (scoped per route so a fallback 429 never backs off the
   // main account or vice versa) ---
@@ -249,6 +255,12 @@ export class QuotaManager {
   // =========================================================================
 
   async refreshMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
+    return (await this.refreshMainWithMetadata(accessToken)).quota
+  }
+
+  async refreshMainWithMetadata(
+    accessToken: string,
+  ): Promise<QuotaRefreshResult> {
     // If the main account/token changed, invalidate the cache (including a
     // persisted seed) BEFORE the backoff short-circuit so a different account's
     // stale quota is never returned while the quota API is backed off.
@@ -264,7 +276,7 @@ export class QuotaManager {
 
     // Rate-limit — if API recently 429'd, return stale or throw
     if (this.isBackedOff()) {
-      if (this.main) return this.main.quota
+      if (this.main) return { quota: this.main.quota, fetched: false }
       throw new Error('Quota API rate-limited — try again later')
     }
 
@@ -277,6 +289,14 @@ export class QuotaManager {
     accountId: string,
     accessToken: string,
   ): Promise<OAuthQuotaSnapshot> {
+    return (await this.refreshFallbackWithMetadata(accountId, accessToken))
+      .quota
+  }
+
+  async refreshFallbackWithMetadata(
+    accountId: string,
+    accessToken: string,
+  ): Promise<QuotaRefreshResult> {
     // Deduplicate per account+token so a same-label re-login never joins a
     // quota probe that was started with the previous credentials.
     const inflightKey = QuotaManager.fallbackInflightKey(accountId, accessToken)
@@ -286,7 +306,7 @@ export class QuotaManager {
     // Rate-limit — scoped to THIS fallback account only
     if (this.isFallbackBackedOff(accountId, accessToken)) {
       const cached = this.getFallback(accountId, accessToken)
-      if (cached) return cached.quota
+      if (cached) return { quota: cached.quota, fetched: false }
       throw new Error('Quota API rate-limited — try again later')
     }
 
@@ -531,14 +551,14 @@ export class QuotaManager {
     return queued
   }
 
-  private async _fetchMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
+  private async _fetchMain(accessToken: string): Promise<QuotaRefreshResult> {
     const thisFetchFp = tokenFingerprint(accessToken)
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — may have been set by
         // a preceding queued call while we waited
         if (this.isBackedOff()) {
-          if (this.main) return this.main.quota
+          if (this.main) return { quota: this.main.quota, fetched: false }
           throw new Error('Quota API rate-limited — try again later')
         }
         const fileLock = await acquireRefreshFileLock({
@@ -547,7 +567,9 @@ export class QuotaManager {
         })
         if (!fileLock) {
           const cached = this.main
-          if (cached && this.now() < cached.refreshAfter) return cached.quota
+          if (cached && this.now() < cached.refreshAfter) {
+            return { quota: cached.quota, fetched: false }
+          }
           throw new Error('Quota refresh is already in progress')
         }
         try {
@@ -579,7 +601,7 @@ export class QuotaManager {
             this.mainTokenFp,
             fetchStartedAt,
           )
-          return completedQuota
+          return { quota: completedQuota, fetched: true }
         } catch (error) {
           this._handleMainFetchError(error)
           throw error
@@ -598,13 +620,13 @@ export class QuotaManager {
   private async _fetchFallback(
     accountId: string,
     accessToken: string,
-  ): Promise<OAuthQuotaSnapshot> {
+  ): Promise<QuotaRefreshResult> {
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — scoped to this fallback account
         if (this.isFallbackBackedOff(accountId, accessToken)) {
           const cached = this.getFallback(accountId, accessToken)
-          if (cached) return cached.quota
+          if (cached) return { quota: cached.quota, fetched: false }
           throw new Error('Quota API rate-limited — try again later')
         }
         const fileLock = await acquireRefreshFileLock({
@@ -613,7 +635,9 @@ export class QuotaManager {
         })
         if (!fileLock) {
           const cached = this.getFallback(accountId, accessToken)
-          if (cached && this.now() < cached.refreshAfter) return cached.quota
+          if (cached && this.now() < cached.refreshAfter) {
+            return { quota: cached.quota, fetched: false }
+          }
           throw new Error('Quota refresh is already in progress')
         }
         try {
@@ -642,7 +666,7 @@ export class QuotaManager {
           )
           this.fallbackApiErrors.delete(accountId)
           this.fallbackErrorTokenFps.delete(accountId)
-          return completedQuota
+          return { quota: completedQuota, fetched: true }
         } finally {
           await fileLock.release()
         }

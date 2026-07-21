@@ -382,4 +382,55 @@ describe('setting-change INFO logs', () => {
       }
     }
   })
+
+  // -- prime ---------------------------------------------------------------
+
+  test('prime on emits info log and persists', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-prime', 'on')
+    expect(
+      capturedRecords.filter((r) => r.channel === 'commands'),
+    ).toHaveLength(1)
+    const rec = findCommandsLog('prime changed')
+    expect(rec).toBeDefined()
+    expect(rec!.payload).toEqual({ enabled: true })
+    const raw = await readConfigFile()
+    expect(raw.prime?.enabled).toBe(true)
+  })
+
+  test('prime off after on emits info log', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    // Turn on first so off is a genuine change
+    await executeCommand(plugin, 'claude-prime', 'on')
+    capturedRecords = []
+    await executeCommand(plugin, 'claude-prime', 'off')
+    expect(
+      capturedRecords.filter((r) => r.channel === 'commands'),
+    ).toHaveLength(1)
+    const rec = findCommandsLog('prime changed')
+    expect(rec).toBeDefined()
+    expect(rec!.payload).toEqual({ enabled: false })
+  })
+
+  test('prime status emits no setting-change info log', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-prime', '')
+    expect(
+      capturedRecords.filter((r) => r.channel === 'commands'),
+    ).toHaveLength(0)
+  })
+
+  test('repeated prime on emits only one setting-change log', async () => {
+    await useTempAccountFile(createFallbackStorage())
+    const plugin = await getPlugin()
+    await executeCommand(plugin, 'claude-prime', 'on')
+    capturedRecords = []
+    await executeCommand(plugin, 'claude-prime', 'on')
+    expect(
+      capturedRecords.filter((r) => r.channel === 'commands'),
+    ).toHaveLength(0)
+  })
 })

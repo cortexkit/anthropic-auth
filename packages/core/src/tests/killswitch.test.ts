@@ -341,6 +341,31 @@ describe('killswitchPassesPolicy — scoped model dimension', () => {
     ).toBe(true)
   })
 
+  test('matches a Haiku scoped window by display name when modelId is absent', () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10, scoped: 0 },
+    }
+    const quota: OAuthQuotaSnapshot = {
+      ...healthy5h7d(),
+      scoped: [
+        {
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: Date.now(),
+          id: 'claude-weekly-scoped-haiku',
+          title: 'Claude Haiku 4.5',
+          modelName: 'Claude Haiku 4.5',
+        },
+      ],
+    }
+
+    expect(
+      killswitchPassesPolicy(quota, storage, undefined, 'claude-haiku-4-5'),
+    ).toBe(false)
+  })
+
   test('killswitch disabled → scoped check never runs', () => {
     const storage = baseStorage()
     // killswitch NOT enabled; even with a present scoped window and a model

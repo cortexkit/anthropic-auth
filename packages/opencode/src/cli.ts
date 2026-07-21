@@ -324,6 +324,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     id: label || crypto.randomUUID(),
     label: label || undefined,
     type: 'oauth',
+    authLineageId: crypto.randomUUID(),
     access: result.access,
     refresh: result.refresh,
     expires: result.expires,

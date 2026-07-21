@@ -162,6 +162,7 @@ describe('refreshClaudeOAuthToken', () => {
 
     const result = await refreshClaudeOAuthToken({
       refreshToken: 'old-refresh',
+      authLineageId: 'stable-lineage',
       now: () => 1_000,
       fetchImpl: mock((input: string | URL | Request, init?: RequestInit) => {
         capturedUrl = String(input)
@@ -197,6 +198,7 @@ describe('refreshClaudeOAuthToken', () => {
       refresh: 'old-refresh',
       expires: 3_601_000,
       expiresIn: 3600,
+      authLineageId: 'stable-lineage',
     })
   })
 

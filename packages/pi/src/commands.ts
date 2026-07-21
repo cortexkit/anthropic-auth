@@ -1,8 +1,10 @@
 import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  buildPrimeAccountStatuses,
   CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
+  CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
   createEmptyStorage,
   executeAccountCommand,
@@ -11,6 +13,7 @@ import {
   executeDumpCommand,
   executeFastModeCommand,
   executeLoggingCommand,
+  executePrimeCommand,
   executeRoutingCommand,
   getCache1hPersistentMode,
   getCacheKeepWindow,
@@ -22,6 +25,7 @@ import {
   isCacheKeepPersistentlyEnabled,
   isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
+  isPrimePersistentlyEnabled,
   loadAccounts,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
@@ -310,6 +314,27 @@ export function registerCommands(pi: ExtensionAPI) {
       }
 
       notify(ctx, executeLoggingCommand({ argumentsText: args ?? '', level }))
+    },
+  })
+
+  pi.registerCommand(CLAUDE_PRIME_COMMAND_NAME, {
+    description: "Show each OAuth account's five-hour quota window state",
+    handler: async (_args, ctx) => {
+      // Pi has no live PrimeManager; render persisted counters and the
+      // next-due timestamp from stored quota snapshots. Always pass
+      // `argumentsText: 'status'` to the pure executor so on/off args
+      // are display-only — Pi cannot toggle the setting.
+      const path = getPiAccountStoragePath()
+      const storage = await loadAccounts(path)
+      const accounts = buildPrimeAccountStatuses(storage, { now: Date.now() })
+      notify(
+        ctx,
+        executePrimeCommand({
+          argumentsText: 'status',
+          enabled: isPrimePersistentlyEnabled(storage),
+          accounts,
+        }).text,
+      )
     },
   })
 }

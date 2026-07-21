@@ -24,6 +24,7 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   FIVE_HOUR_MS,
+  formatPrimeAccountValue,
   formatScopedQuotaLabel,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
@@ -650,6 +651,10 @@ function QuotaSidebar(props: {
   const cacheKeep = () => state().cacheKeep
   const showCache = () =>
     prefs().sections.cache && cacheKeep() != null && cacheKeep()?.window != null
+  const prime = () => state().prime
+  const showPrime = () => prime() != null
+  const primeHasError = () =>
+    prime()?.accounts.some((account) => account.lastResult === 'error') ?? false
   const relayValue = () => {
     const r = state().relay
     if (!r) return '\u2014'
@@ -827,6 +832,29 @@ function QuotaSidebar(props: {
               tone='text'
             />
           </Show>
+        </Show>
+
+        {/* Prime — only when enabled. Expanded view only (no collapsed surface). */}
+        <Show when={showPrime()}>
+          <StatRow
+            theme={theme()}
+            label='Prime'
+            value={primeHasError() ? 'err' : 'on'}
+            tone={primeHasError() ? 'warn' : 'ok'}
+          />
+          <For each={prime()?.accounts ?? []}>
+            {(account) => {
+              const value = () => formatPrimeAccountValue(account)
+              return (
+                <StatRow
+                  theme={theme()}
+                  label={account.label}
+                  value={value().text}
+                  tone={value().hasError ? 'warn' : 'text'}
+                />
+              )
+            }}
+          </For>
         </Show>
 
         {/* Health — only when something is wrong */}

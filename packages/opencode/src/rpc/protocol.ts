@@ -2,6 +2,7 @@ export type CommandModalName =
   | 'claude-account'
   | 'claude-cache'
   | 'claude-cachekeep'
+  | 'claude-prime'
   | 'claude-quota'
   | 'claude-dump'
   | 'claude-fast'

@@ -195,6 +195,9 @@ describe('CLI login', () => {
       access: 'cli-access',
       refresh: 'cli-refresh',
     })
+    expect(runtimeState.accounts['cli-label'].authLineageId).toMatch(
+      /^[0-9a-f-]{36}$/,
+    )
   })
 
   test('preserves an account committed while the interactive OAuth flow is open', async () => {

@@ -1,6 +1,8 @@
 /** @jsxImportSource @opentui/solid */
+import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
+import { formatPrimeCost, formatPrimeTime } from '../sidebar-state.js'
 
 type ApplyFn = (
   command: OpenDialogPayload['command'],
@@ -11,6 +13,20 @@ type KillswitchDialogConfig = {
   enabled?: boolean
   main?: Record<string, number>
   accounts?: Record<string, Record<string, number>>
+}
+
+export const PRIME_DIALOG_OPTIONS = [
+  { title: 'Enable', value: 'on' },
+  { title: 'Disable', value: 'off' },
+  { title: 'Status', value: 'status' },
+  { title: 'Back', value: 'back' },
+]
+
+export function handlePrimeStatusOption(
+  option: { value: string },
+  renderMain: () => void,
+): void {
+  if (option.value === 'back') renderMain()
 }
 
 export function buildKillswitchThresholdSeed(
@@ -59,6 +75,41 @@ function showText(api: TuiPluginApi, text: string) {
       <text>{text}</text>
     </box>
   ))
+}
+
+/**
+ * Format the per-account status lines shown in the Claude prime Status
+ * view. Pure: consumed by the dialog's Status pane; the sidebar uses a
+ * different formatter (`formatPrimeSidebarValue`) for its one-line
+ * expanded row.
+ */
+export function buildPrimeStatusRows(accounts: PrimeAccountStatus[]): string[] {
+  const rows: string[] = []
+  for (const account of accounts) {
+    if (account.usage?.count) {
+      const cost = account.estimatedCostUsd ?? 0
+      rows.push(
+        `${account.label}: ${account.usage.count} ${account.usage.count === 1 ? 'prime' : 'primes'} \u2248 $${formatPrimeCost(cost)}`,
+      )
+    }
+    if (account.nextDueAt && account.nextDueAt > Date.now()) {
+      rows.push(
+        `${account.label} \u00b7 next prime ${formatPrimeTime(account.nextDueAt)}`,
+      )
+    } else if (account.lastPrimedAt) {
+      const time = formatPrimeTime(account.lastPrimedAt)
+      if (account.lastResult === 'error') {
+        rows.push(`${account.label} \u00b7 primed ${time} err`)
+      } else {
+        rows.push(`${account.label} \u00b7 primed ${time} \u2713`)
+      }
+    } else if (account.usage?.count) {
+      // already shown above
+    } else {
+      rows.push(`${account.label} \u2014 window active`)
+    }
+  }
+  return rows
 }
 
 export function openCommandDialog(
@@ -202,6 +253,67 @@ export function openCommandDialog(
         onCancel={() => api.ui.dialog.clear()}
       />
     ))
+    return
+  }
+
+  if (payload.command === 'claude-prime') {
+    // Prime modal spec: always four options — Enable / Disable / Status /
+    // Back — regardless of current state (the contextual toggle
+    // approach is forbidden). Status uses a DialogSelect replace with
+    // a single Back action (killswitch dialog-replace pattern), so the
+    // user has a working affordance to return to the main menu.
+    const DialogSelect = api.ui.DialogSelect<string>
+    const openStatusView = () => {
+      const accounts =
+        (payload.knobs.accounts as PrimeAccountStatus[] | undefined) ?? []
+      const lines = buildPrimeStatusRows(accounts)
+      const statusText = `Claude prime status:\n\n${lines.join('\n')}`
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <box flexDirection='column' padding={1} width='100%'>
+          <text>{statusText}</text>
+          <box marginTop={1}>
+            <DialogSelect
+              title='Claude prime — status'
+              current='back'
+              options={[{ title: 'Back', value: 'back' }]}
+              onSelect={(option) => handlePrimeStatusOption(option, renderMain)}
+            />
+          </box>
+        </box>
+      ))
+    }
+    const renderMain = () => {
+      const enabled = payload.knobs.enabled === true
+      api.ui.dialog.setSize('xlarge')
+      api.ui.dialog.replace(() => (
+        <DialogSelect
+          title='Claude prime'
+          current={enabled ? 'on' : 'off'}
+          options={PRIME_DIALOG_OPTIONS}
+          onSelect={(option) => {
+            if (option.value === 'back') {
+              api.ui.dialog.clear()
+              return
+            }
+            if (option.value === 'status') {
+              openStatusView()
+              return
+            }
+            void apply('claude-prime', String(option.value)).then((r) => {
+              api.ui.toast({ message: r.text })
+              payload = {
+                command: 'claude-prime',
+                text: r.text,
+                knobs: r.knobs,
+              }
+              renderMain()
+            })
+          }}
+        />
+      ))
+    }
+    renderMain()
     return
   }
 

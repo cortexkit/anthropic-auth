@@ -8,6 +8,7 @@ import {
   buildAccountList,
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
+  buildPrimeRequestBody,
   buildRefreshOperationError,
   CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
@@ -22,9 +23,12 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
   CLAUDE_FAST_COMMAND_NAME,
+  CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_LOGGING_COMMAND_NAME,
+  CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
   createStickyNoRouteResponse,
   decideStickyQuotaFailure,
@@ -37,6 +41,7 @@ import {
   executeFastModeCommand,
   executeKillswitchCommand,
   executeLoggingCommand,
+  executePrimeCommand,
   executeRoutingCommand,
   FallbackAccountManager,
   fetchOAuthAccountProfile,
@@ -50,6 +55,7 @@ import {
   getDefaultCacheKeepRegistryDirectory,
   getKillswitchConfig,
   getKillswitchThresholdsForAccount,
+  getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
@@ -58,6 +64,7 @@ import {
   getScopedQuotaWindowForModel,
   getStickyRoutingStatePath,
   hashRefreshToken,
+  incrementPrimeUsagePersistent,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -74,6 +81,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isPermanentRefreshError,
+  isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
   KILLSWITCH_COMMAND_NAME,
@@ -89,13 +97,19 @@ import {
   oauthProfileIsFresh,
   oauthProfileMatchesToken,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  PrimeManager,
+  type PrimeManagerOptions,
+  type PrimeRefreshResult,
+  type PrimeSendResult,
   parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
   parseDumpCommandAction,
   parseFastModeCommandAction,
   parseLoggingCommandAction,
+  parsePrimeCommandAction,
   parseRoutingCommandAction,
+  primeQuotaSnapshotCheckedAt,
   type QuotaAccountSummary,
   type QuotaEntry,
   QuotaManager,
@@ -128,6 +142,7 @@ import {
   setKillswitchPersistent,
   setLogLevel,
   setLogLevelPersistent,
+  setPrimePersistentEnabled,
   setRoutingMode,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
@@ -143,6 +158,7 @@ import {
   isRecoverableRefusalModel,
   recoverableRefusalFamily,
 } from './fable-fallback.ts'
+import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   drainNotifications,
@@ -185,6 +201,7 @@ const HTTP_SERVER_RESPONSE_TYPE_ID = '~effect/http/HttpServerResponse'
 const HTTP_COOKIES_TYPE_ID = '~effect/http/Cookies'
 const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
+const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
@@ -778,6 +795,13 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
   ) as T
 }
 
+export function primeQuotaSnapshotIsFreshSince(
+  quota: OAuthQuotaSnapshot | undefined,
+  refreshStartedAt: number,
+): boolean {
+  return primeQuotaSnapshotCheckedAt(quota) > refreshStartedAt
+}
+
 type PluginRuntimeTimerOverrides = Partial<{
   setTimeout: typeof globalThis.setTimeout
   setInterval: typeof globalThis.setInterval
@@ -1251,6 +1275,247 @@ const anthropicAuthPlugin = async (
 
   const recoveryWarmChains = new Map<string, Promise<void>>()
 
+  // -- /claude-prime manager: direct OAuth request to start each account's
+  // five-hour quota window ~60s after reset, exactly once across concurrent
+  // OpenCode processes via atomic marker claim. In-process manager mirrors the
+  // cacheKeep singleton shape; cross-process exclusivity is the marker's job.
+
+  // Obtain a CURRENT main access token via the existing refresh path
+  // (M2). If the cached auth has no access or the token is expired, refresh
+  // first; only fail when the refresh path itself fails. Returns the live
+  // token so the fresh-check and the fire path use the same value.
+  async function getCurrentMainAccessToken(): Promise<string> {
+    if (!latestGetAuth) {
+      throw new Error('prime: main auth loader is not available')
+    }
+    const auth = await latestGetAuth()
+    if (auth.type !== 'oauth') {
+      throw new Error('prime: main account is not an OAuth account')
+    }
+    if (auth.access && (!auth.expires || auth.expires > Date.now())) {
+      return auth.access
+    }
+    if (!latestRefreshMainAccessToken) {
+      throw new Error('prime: main token refresh unavailable')
+    }
+    try {
+      return await latestRefreshMainAccessToken()
+    } catch (error) {
+      if (error instanceof Error) {
+        ;(
+          error as Error & { isPrimeTokenRefresh?: boolean }
+        ).isPrimeTokenRefresh = true
+      }
+      throw error
+    }
+  }
+
+  async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
+    const accessToken = await getCurrentMainAccessToken()
+    const result = await quotaManager.refreshMainWithMetadata(accessToken)
+    return { quota: result.quota, fresh: result.fetched }
+  }
+
+  async function refreshPrimeFallbackQuota(
+    accountId: string,
+  ): Promise<PrimeRefreshResult> {
+    const storage = await loadAccounts(accountStoragePath)
+    const account = storage?.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === accountId &&
+        candidate.enabled !== false &&
+        isOAuthAccount(candidate),
+    )
+    if (!account || !storage) {
+      throw new Error(`prime: OAuth account ${accountId} is unavailable`)
+    }
+    // Reuse the same fallback-manager refresh path used by the
+    // background quota refresh — it persists the refreshed quota to the
+    // state file (M1 persist requirement) and is the SINGLE usage-API
+    // call per tick for fallback fresh-checks. The redundant
+    // `quotaManager.refreshFallback` call was collapsed (R2).
+    const refreshed = await fallbackManager.refreshAccountQuota(
+      account,
+      storage,
+    )
+    await fallbackManager.save(storage, [accountId])
+    if (!refreshed.account.access) {
+      throw new Error(`prime: OAuth account ${accountId} has no access token`)
+    }
+    return {
+      quota: refreshed.account.quota ?? {},
+      fresh: refreshed.fetched,
+    }
+  }
+
+  async function sendPrime(
+    accountId: 'main' | string,
+  ): Promise<PrimeSendResult> {
+    const start = performance.now()
+    let accessToken: string | undefined
+    let resolvedModel: string | undefined
+    try {
+      if (accountId === 'main') {
+        // Use the same refresh path the fresh-check uses, so a missing or
+        // expired access token is refreshed BEFORE the request — not used
+        // as-is. The previous early-return-on-!auth.access made the
+        // refresh arm unreachable (M2).
+        try {
+          accessToken = await getCurrentMainAccessToken()
+        } catch (error) {
+          const isTokenRefresh =
+            error instanceof Error &&
+            (error as Error & { isPrimeTokenRefresh?: boolean })
+              .isPrimeTokenRefresh === true
+          return {
+            ok: false,
+            ...(isTokenRefresh && { reason: 'token-refresh' as const }),
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
+      } else {
+        const storage = await loadAccounts(accountStoragePath)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId &&
+            candidate.enabled !== false &&
+            isOAuthAccount(candidate),
+        )
+        if (!account || !storage) {
+          return {
+            ok: false,
+            error: `prime: OAuth account ${accountId} is unavailable`,
+          }
+        }
+        let current = account
+        try {
+          // R2: the fire path refreshes ONLY the token, not the quota.
+          // The fresh-check already performed the single usage-API
+          // call and persisted the result; the fire path reuses the
+          // in-memory quota via the headers / URL contract. This keeps
+          // the cycle at exactly one quota API call per account.
+          current = await fallbackManager.refreshAccount(account, storage)
+        } catch (error) {
+          return {
+            ok: false,
+            reason: 'token-refresh',
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+        accessToken = current.access
+        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
+      }
+
+      if (!accessToken) {
+        return { ok: false, error: 'prime: no access token available' }
+      }
+
+      const primeBody = buildPrimeRequestBody()
+      const identity = await resolveClaudeCodeIdentity(
+        accessToken,
+        resolvedModel,
+      )
+      const body = await rewriteRequestBody(JSON.stringify(primeBody), {
+        identity,
+      })
+      const headers = new Headers({
+        'content-type': 'application/json',
+      })
+      setOAuthHeaders(headers, accessToken, {
+        body: JSON.parse(body),
+        identity,
+      })
+      headers.delete('content-length')
+      headers.delete('transfer-encoding')
+      // Route through rewriteUrl so the request inherits the canonical
+      // ?beta=true query param and ANTHROPIC_BASE_URL overrides like every
+      // other direct Anthropic call in this codebase. The URL is rendered
+      // back to a string here because the surrounding fetch wrapper and
+      // test mocks expect a string input.
+      const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
+      const primeUrl =
+        primeRequest.url?.toString() ?? primeRequest.input.toString()
+      const response = await fetch(primeUrl, {
+        method: 'POST',
+        headers,
+        body,
+        signal: AbortSignal.timeout(30_000),
+      })
+      const ms = Math.round(performance.now() - start)
+      if (!response.ok) {
+        const reason =
+          (await response.text().catch(() => '')) || `HTTP ${response.status}`
+        return { ok: false, status: response.status, ms, error: reason }
+      }
+      const data = (await response.json().catch(() => null)) as Record<
+        string,
+        unknown
+      > | null
+      const usageRaw = data?.usage as
+        | { input_tokens?: number; output_tokens?: number }
+        | undefined
+      const usage =
+        usageRaw &&
+        (Number.isFinite(usageRaw.input_tokens) ||
+          Number.isFinite(usageRaw.output_tokens))
+          ? {
+              inputTokens: Number.isFinite(usageRaw.input_tokens)
+                ? usageRaw.input_tokens
+                : undefined,
+              outputTokens: Number.isFinite(usageRaw.output_tokens)
+                ? usageRaw.output_tokens
+                : undefined,
+            }
+          : undefined
+      return { ok: true, status: response.status, ms, ...(usage && { usage }) }
+    } catch (error) {
+      return {
+        ok: false,
+        ms: Math.round(performance.now() - start),
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  const primeManagerOptions: PrimeManagerOptions = {
+    storagePath: accountStoragePath,
+    loadStorage: () => loadAccounts(accountStoragePath),
+    getAccountFingerprint: async (accountId) => {
+      let mainRefreshToken: string | undefined
+      if (accountId === 'main') {
+        try {
+          const auth = await latestGetAuth?.()
+          if (auth?.type === 'oauth') mainRefreshToken = auth.refresh
+        } catch {}
+      }
+      const authLineageId = await getOrCreatePrimeAuthLineageId(
+        accountId,
+        accountStoragePath,
+        mainRefreshToken,
+      )
+      return authLineageId ? tokenFingerprint(authLineageId) : undefined
+    },
+    refreshQuota: async (accountId) => {
+      if (accountId === 'main') return refreshPrimeMainQuota()
+      return refreshPrimeFallbackQuota(accountId)
+    },
+    sendPrime,
+    recordSuccess: (accountId, usage) =>
+      incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
+  }
+  const primeManager: PrimeManager = adoptPrimeManager(
+    accountStoragePath,
+    () => new PrimeManager(primeManagerOptions),
+    {
+      slot: ctx.directory ?? 'default',
+      rebind: (manager) => manager.updateOptions(primeManagerOptions),
+    },
+  )
+  if (isPrimePersistentlyEnabled(initialStorage)) {
+    primeManager.start()
+  }
+
   function warmRecoverySourceAfterOpus(context: FableRequestContext) {
     const sessionId = context.plan.sessionId
     const modelLabel = isClaudeOpus5Model(context.plan.requestedModel)
@@ -1500,6 +1765,16 @@ const anthropicAuthPlugin = async (
             : undefined,
         trackedSessions: aggregateCacheKeepSessions.length,
       },
+      // Prime section is omitted from the wire when the feature is disabled
+      // so the sidebar reads a clean `prime === undefined` and the expanded
+      // view renders nothing (declutter rule). Enabled writes include
+      // per-account status (next-due / last-primed / cumulative usage).
+      prime: isPrimePersistentlyEnabled(storage)
+        ? {
+            enabled: true,
+            accounts: primeManager.stats(storage),
+          }
+        : undefined,
       fableRecoveries:
         fableRecoveryNotices.size > 0
           ? [...fableRecoveryNotices.values()]
@@ -1740,7 +2015,7 @@ const anthropicAuthPlugin = async (
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        writeSidebarState(updatedStorage, {
+        await writeSidebarState(updatedStorage, {
           activeId: lastSidebarRouting.activeId,
           route: lastSidebarRouting.route,
           mainAccessToken: auth.access,
@@ -2107,6 +2382,61 @@ const anthropicAuthPlugin = async (
     return executeLoggingCommand({ argumentsText, level })
   }
 
+  async function executePersistentPrimeCommand(argumentsText: string) {
+    const action = parsePrimeCommandAction(argumentsText)
+    const previous = isPrimePersistentlyEnabled(
+      await loadAccounts(accountStoragePath),
+    )
+    let enabled = previous
+    if (action.type === 'enable') {
+      enabled = true
+      if (!previous) {
+        await setPrimePersistentEnabled(true, accountStoragePath)
+        primeManager.start()
+        logger.info('commands', 'prime changed', { enabled: true })
+      }
+    } else if (action.type === 'disable') {
+      enabled = false
+      if (previous) {
+        await setPrimePersistentEnabled(false, accountStoragePath)
+        primeManager.stop()
+        logger.info('commands', 'prime changed', { enabled: false })
+      }
+    }
+
+    // Publish the new prime section to the sidebar file (M7) so the
+    // expanded Prime row appears on `on` and disappears on `off` without
+    // waiting for the next quota refresh path. The post-mutation storage
+    // IS authoritative; we re-read it so the section payload reflects
+    // the freshly persisted flag.
+    if (action.type === 'enable' || action.type === 'disable') {
+      const reloaded = await loadAccounts(accountStoragePath)
+      if (reloaded && latestGetAuth) {
+        try {
+          const cmdAuth = await latestGetAuth().catch(() => undefined)
+          await writeSidebarState(reloaded, {
+            activeId: lastSidebarRouting.activeId,
+            route: lastSidebarRouting.route,
+            mainAccessToken: cmdAuth?.access,
+            mainRefreshToken: cmdAuth?.refresh,
+            routingAuthoritative: false,
+          })
+        } catch (error) {
+          logger.warn('sidebar', 'prime-toggle sidebar write failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+    }
+
+    const storage = await loadAccounts(accountStoragePath)
+    return executePrimeCommand({
+      argumentsText,
+      enabled,
+      accounts: primeManager.stats(storage),
+    }).text
+  }
+
   async function executePersistentAccountCommand(
     argumentsText: string,
     sessionId?: string,
@@ -2224,6 +2554,7 @@ const anthropicAuthPlugin = async (
         const account: OAuthAccount = {
           id: randomUUID(),
           type: 'oauth' as const,
+          authLineageId: randomUUID(),
           label: action.label || undefined,
           access: result.access,
           refresh: result.refresh,
@@ -2412,6 +2743,19 @@ const anthropicAuthPlugin = async (
       const text = await executePersistentCacheKeepCommand(args)
       const storage = await loadAccounts(accountStoragePath)
       return { command, text, knobs: { window: getCacheKeepWindow(storage) } }
+    }
+    if (command === 'claude-prime') {
+      const text = await executePersistentPrimeCommand(args)
+      const storage = await loadAccounts(accountStoragePath)
+      const enabled = isPrimePersistentlyEnabled(storage)
+      return {
+        command,
+        text,
+        knobs: {
+          enabled,
+          accounts: primeManager.stats(storage),
+        },
+      }
     }
     const storage = await loadAccounts()
     const config = getKillswitchConfig(storage)
@@ -2621,6 +2965,11 @@ const anthropicAuthPlugin = async (
           description:
             'Keep hybrid Claude cache warm always or during a local time window.',
         },
+        [CLAUDE_PRIME_COMMAND_NAME]: {
+          template: CLAUDE_PRIME_COMMAND_NAME,
+          description:
+            "Start each OAuth account's five-hour quota window after reset.",
+        },
 
         [CLAUDE_QUOTAS_COMMAND_NAME]: {
           template: CLAUDE_QUOTAS_COMMAND_NAME,
@@ -2693,6 +3042,7 @@ const anthropicAuthPlugin = async (
         'claude-account',
         'claude-cache',
         'claude-cachekeep',
+        'claude-prime',
         'claude-quota',
         'claude-dump',
         'claude-fast',
@@ -2791,6 +3141,15 @@ const anthropicAuthPlugin = async (
                       changed &&
                       (!latest.expires || latest.expires > Date.now())
                     ) {
+                      if (previous.refresh && latest.refresh) {
+                        await continueMainPrimeAuthLineageAfterRefresh(
+                          {
+                            previousRefreshToken: previous.refresh,
+                            currentRefreshToken: latest.refresh,
+                          },
+                          accountStoragePath,
+                        )
+                      }
                       log(
                         '[refresh] opencode main oauth joined concurrent refresh',
                         {
@@ -2944,18 +3303,37 @@ const anthropicAuthPlugin = async (
                       maxRetries: 0,
                     })
 
-                    // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                    await (client as any).auth.set({
-                      path: {
-                        id: 'anthropic',
+                    await continueMainPrimeAuthLineageAfterRefresh(
+                      {
+                        previousRefreshToken: freshAuth.refresh,
+                        currentRefreshToken: refreshed.refresh,
                       },
-                      body: {
-                        type: 'oauth',
-                        refresh: refreshed.refresh,
-                        access: refreshed.access,
-                        expires: refreshed.expires,
-                      },
-                    })
+                      accountStoragePath,
+                    )
+
+                    try {
+                      // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+                      await (client as any).auth.set({
+                        path: {
+                          id: 'anthropic',
+                        },
+                        body: {
+                          type: 'oauth',
+                          refresh: refreshed.refresh,
+                          access: refreshed.access,
+                          expires: refreshed.expires,
+                        },
+                      })
+                    } catch (error) {
+                      await continueMainPrimeAuthLineageAfterRefresh(
+                        {
+                          previousRefreshToken: refreshed.refresh,
+                          currentRefreshToken: freshAuth.refresh,
+                        },
+                        accountStoragePath,
+                      )
+                      throw error
+                    }
 
                     await updateMainRefreshState((storage) => {
                       if (!storage?.refresh) return
@@ -5266,6 +5644,8 @@ const anthropicAuthPlugin = async (
         },
       ],
     },
+    __primeManager: primeManager,
+    __quotaManager: quotaManager,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }

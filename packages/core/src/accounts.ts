@@ -32,6 +32,7 @@ export type AccountBase = {
 
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
+  authLineageId?: string
   access?: string
   refresh: string
   expires?: number
@@ -40,6 +41,11 @@ export type OAuthAccount = AccountBase & {
   lastQuotaRefreshError?: AccountOperationError
   quota?: OAuthQuotaSnapshot
   profile?: OAuthAccountProfile
+  /**
+   * Per-fallback cumulative prime counters. Lives in the runtime-state file
+   * (scoped under `accounts[id].prime`) and never in `anthropic-auth.json`.
+   */
+  prime?: PrimeUsageCounters
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -154,6 +160,30 @@ export type OAuthQuotaSnapshot = Partial<
   checkedAt?: number
 }
 
+export type PrimeUsageCounters = {
+  count: number
+  inputTokens: number
+  outputTokens: number
+  since: number
+}
+
+export type PrimeUsageDelta = {
+  inputTokens?: number
+  outputTokens?: number
+}
+
+export type PrimeRuntimeState = {
+  enabled?: boolean
+  mainAuthLineageId?: string
+  mainAuthLineageRefreshTokenFingerprint?: string
+  /**
+   * Main account prime counters. Persisted only on the main side of the
+   * runtime-state file — `configFromStorage()` never writes them to the config
+   * file so they cannot leak into `anthropic-auth.json`.
+   */
+  main?: PrimeUsageCounters
+}
+
 export type RoutingMode = 'main-first' | 'fallback-first' | 'sticky-balanced'
 
 export type KillswitchThresholds = Partial<
@@ -231,6 +261,13 @@ export type AccountStorage = {
     endHour?: number
     subagents?: boolean
   }
+  /**
+   * Opt-in flag and runtime metadata for `/claude-prime`. The `enabled` flag
+   * belongs on the config side; counters and main lineage bindings live in the
+   * state file and must never appear in `anthropic-auth.json`. See
+   * `configFromStorage()` for the write-side filter.
+   */
+  prime?: PrimeRuntimeState
   relay?: {
     enabled?: boolean
     url?: string
@@ -257,6 +294,7 @@ export type AccountRuntimeEntry = Partial<
   Pick<
     OAuthAccount,
     | 'access'
+    | 'authLineageId'
     | 'refresh'
     | 'expires'
     | 'lastUsed'
@@ -265,6 +303,7 @@ export type AccountRuntimeEntry = Partial<
     | 'lastQuotaRefreshError'
     | 'quota'
     | 'profile'
+    | 'prime'
   > &
     Pick<ApiKeyAccount, 'apiKey' | 'lastUsed'>
 >
@@ -282,6 +321,9 @@ export type AccountRuntimeState = {
     refreshLeaseId?: string
     refreshLeaseUntil?: number
     refreshLeaseTokenHash?: string
+    prime?: PrimeUsageCounters
+    primeAuthLineageId?: string
+    primeAuthLineageRefreshTokenFingerprint?: string
   }
   accounts?: Record<string, AccountRuntimeEntry>
 }
@@ -290,6 +332,7 @@ export type AccountStateSaveScope = {
   mainProfile?: boolean
   mainQuota?: boolean
   mainRefresh?: boolean
+  mainPrime?: boolean
   accounts?: true | string[]
 }
 
@@ -440,6 +483,10 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
   return {
     ...normalizeAccountBase(value),
     type: 'oauth',
+    authLineageId:
+      typeof value.authLineageId === 'string' && value.authLineageId.trim()
+        ? value.authLineageId
+        : undefined,
     access: typeof value.access === 'string' ? value.access : undefined,
     refresh: value.refresh,
     expires: typeof value.expires === 'number' ? value.expires : undefined,
@@ -451,6 +498,7 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     lastQuotaRefreshError: normalizeOperationError(value.lastQuotaRefreshError),
     quota: normalizeQuota(value.quota),
     profile: normalizeOAuthAccountProfile(value.profile),
+    prime: normalizePrimeUsageCounters(value.prime),
   }
 }
 
@@ -523,6 +571,31 @@ function normalizeQuotaWindow(value: unknown): AccountQuotaWindow | undefined {
     remainingPercent,
     checkedAt,
     resetsAt: typeof value.resetsAt === 'string' ? value.resetsAt : undefined,
+  }
+}
+
+function normalizePrimeUsageCounters(
+  value: unknown,
+): PrimeUsageCounters | undefined {
+  if (!isRecord(value)) return undefined
+  const count = Number(value.count)
+  const inputTokens = Number(value.inputTokens)
+  const outputTokens = Number(value.outputTokens)
+  const since = Number(value.since)
+  if (
+    ![count, inputTokens, outputTokens, since].every(Number.isFinite) ||
+    count < 0 ||
+    inputTokens < 0 ||
+    outputTokens < 0 ||
+    since < 0
+  ) {
+    return undefined
+  }
+  return {
+    count: Math.floor(count),
+    inputTokens: Math.floor(inputTokens),
+    outputTokens: Math.floor(outputTokens),
+    since: Math.floor(since),
   }
 }
 
@@ -668,6 +741,39 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     relay: isRecord(value.relay) ? value.relay : undefined,
     logging: isRecord(value.logging) ? value.logging : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
+    prime: (() => {
+      if (!isRecord(value.prime)) return undefined
+      const enabled =
+        typeof value.prime.enabled === 'boolean'
+          ? value.prime.enabled
+          : undefined
+      const main = normalizePrimeUsageCounters(value.prime.main)
+      const mainAuthLineageId =
+        typeof value.prime.mainAuthLineageId === 'string' &&
+        value.prime.mainAuthLineageId.trim()
+          ? value.prime.mainAuthLineageId
+          : undefined
+      const mainAuthLineageRefreshTokenFingerprint =
+        typeof value.prime.mainAuthLineageRefreshTokenFingerprint ===
+          'string' && value.prime.mainAuthLineageRefreshTokenFingerprint.trim()
+          ? value.prime.mainAuthLineageRefreshTokenFingerprint
+          : undefined
+      if (
+        enabled === undefined &&
+        !main &&
+        !mainAuthLineageId &&
+        !mainAuthLineageRefreshTokenFingerprint
+      )
+        return undefined
+      return {
+        ...(enabled !== undefined && { enabled }),
+        ...(main && { main }),
+        ...(mainAuthLineageId && { mainAuthLineageId }),
+        ...(mainAuthLineageRefreshTokenFingerprint && {
+          mainAuthLineageRefreshTokenFingerprint,
+        }),
+      }
+    })(),
     accounts: value.accounts
       .map(normalizeAccount)
       .filter((account): account is FallbackAccount => account != null),
@@ -796,6 +902,44 @@ function mergeConfigAndState(
       mainQuotaToken: mainQuotaSource.quotaToken,
       mainLastQuotaApiError: mainQuotaSource.lastQuotaApiError,
     }),
+    // Carry the main-side prime counters from the state file back into the
+    // merged storage so a subsequent read sees the cumulative counters. The
+    // `enabled` flag stays sourced from the config side; main-side counters
+    // live exclusively on the state file.
+    prime: (() => {
+      const configPrime = isRecord(configValue.prime)
+        ? configValue.prime
+        : undefined
+      const mainCounters = normalizePrimeUsageCounters(mainState?.prime)
+      const mainAuthLineageId =
+        typeof mainState?.primeAuthLineageId === 'string' &&
+        mainState.primeAuthLineageId.trim()
+          ? mainState.primeAuthLineageId
+          : undefined
+      const mainAuthLineageRefreshTokenFingerprint =
+        typeof mainState?.primeAuthLineageRefreshTokenFingerprint ===
+          'string' && mainState.primeAuthLineageRefreshTokenFingerprint.trim()
+          ? mainState.primeAuthLineageRefreshTokenFingerprint
+          : undefined
+      if (
+        !configPrime &&
+        !mainCounters &&
+        !mainAuthLineageId &&
+        !mainAuthLineageRefreshTokenFingerprint
+      )
+        return undefined
+      return {
+        ...(configPrime &&
+          typeof configPrime.enabled === 'boolean' && {
+            enabled: configPrime.enabled,
+          }),
+        ...(mainCounters && { main: mainCounters }),
+        ...(mainAuthLineageId && { mainAuthLineageId }),
+        ...(mainAuthLineageRefreshTokenFingerprint && {
+          mainAuthLineageRefreshTokenFingerprint,
+        }),
+      }
+    })(),
     accounts,
   }
 }
@@ -842,6 +986,7 @@ function accountRuntimeState(account: FallbackAccount) {
     })
   }
   return objectWithDefinedEntries({
+    authLineageId: account.authLineageId,
     access: account.access,
     refresh: account.refresh,
     expires: account.expires,
@@ -851,6 +996,7 @@ function accountRuntimeState(account: FallbackAccount) {
     lastQuotaRefreshError: account.lastQuotaRefreshError,
     quota: account.quota,
     profile: account.profile,
+    prime: account.prime,
   })
 }
 
@@ -927,6 +1073,13 @@ function mergeHeaderQuotaForPersistence(
       ? 'poll'
       : (incoming.bindingWindowSource ?? existing.bindingWindowSource),
   } satisfies OAuthQuotaSnapshot
+}
+
+/** Returns the latest timestamp carried by a quota snapshot. */
+export function primeQuotaSnapshotCheckedAt(
+  quota: OAuthQuotaSnapshot | undefined,
+): number {
+  return quotaSnapshotCheckedAt(quota)
 }
 
 function mergeAccountRuntimeState(
@@ -1060,6 +1213,14 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     cacheKeep: storage.cacheKeep,
     relay: storage.relay,
     killswitch: storage.killswitch,
+    prime: (() => {
+      // Config side carries ONLY the `enabled` flag — runtime counters and
+      // lineage bindings stay on the state file. Write `enabled` whenever it was explicitly set so a
+      // toggle off persists `{ enabled: false }` and is visible to a stale
+      // reader that only inspects the config.
+      if (typeof storage.prime?.enabled !== 'boolean') return undefined
+      return { enabled: storage.prime.enabled }
+    })(),
     accounts: storage.accounts.map(accountConfig),
   })
 }
@@ -1306,6 +1467,35 @@ function applyMainRefreshStatePatch(
   state.main.refreshLeaseTokenHash = storage.refresh?.mainRefreshLeaseTokenHash
 }
 
+function applyMainPrimeStatePatch(
+  state: AccountRuntimeState,
+  storage: AccountStorage,
+) {
+  const incoming = storage.prime?.main
+  const incomingAuthLineageId = storage.prime?.mainAuthLineageId
+  const incomingAuthLineageRefreshTokenFingerprint =
+    storage.prime?.mainAuthLineageRefreshTokenFingerprint
+  if (
+    !incoming &&
+    !incomingAuthLineageId &&
+    !incomingAuthLineageRefreshTokenFingerprint
+  )
+    return
+  state.main = state.main ?? {}
+  // Last-writer-wins on prime counters — the only writer is the prime manager
+  // itself, monotonically accumulating per success, so there is no race for an
+  // older write to overwrite a newer one within this process. Across processes
+  // the cross-process claim marker (#1247) keeps the fire exclusive.
+  if (incoming) state.main.prime = incoming
+  if (incomingAuthLineageId) {
+    state.main.primeAuthLineageId = incomingAuthLineageId
+  }
+  if (incomingAuthLineageRefreshTokenFingerprint) {
+    state.main.primeAuthLineageRefreshTokenFingerprint =
+      incomingAuthLineageRefreshTokenFingerprint
+  }
+}
+
 function pruneUndefined(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(pruneUndefined)
   if (!isRecord(value)) return value
@@ -1454,6 +1644,7 @@ async function saveAccountStateUnlocked(
   if (scope.mainProfile) applyMainProfileStatePatch(next, storage)
   if (scope.mainQuota) applyMainQuotaStatePatch(next, storage)
   if (scope.mainRefresh) applyMainRefreshStatePatch(next, storage)
+  if (scope.mainPrime) applyMainPrimeStatePatch(next, storage)
 
   if (scope.accounts) {
     const ids = scope.accounts === true ? null : new Set(scope.accounts)
@@ -1863,6 +2054,245 @@ export async function setCacheKeepSubagentsEnabled(
   return storage
 }
 
+export function isPrimePersistentlyEnabled(storage: AccountStorage | null) {
+  return storage?.prime?.enabled === true
+}
+
+export async function setPrimePersistentEnabled(
+  enabled: boolean,
+  path = getAccountStoragePath(),
+) {
+  const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+  storage.prime = {
+    ...(storage.prime ?? {}),
+    enabled,
+  }
+  await saveAccounts(storage, path)
+  return storage
+}
+
+/**
+ * Return the stable prime marker identity for an OAuth account, seeding it in
+ * runtime state when older storage has no lineage yet. Main lookups return
+ * undefined when the live refresh token is unavailable and no lineage exists.
+ */
+export async function getOrCreatePrimeAuthLineageId(
+  accountId: 'main' | string,
+  path = getAccountStoragePath(),
+  mainRefreshToken?: string,
+): Promise<string | undefined> {
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+        if (accountId === 'main') {
+          const existing = storage.prime?.mainAuthLineageId
+          const observedFingerprint = mainRefreshToken
+            ? tokenFingerprint(mainRefreshToken)
+            : undefined
+          const boundFingerprint =
+            storage.prime?.mainAuthLineageRefreshTokenFingerprint
+          if (existing) {
+            if (
+              !observedFingerprint ||
+              boundFingerprint === observedFingerprint
+            )
+              return existing
+
+            if (
+              boundFingerprint &&
+              storage.refresh?.mainRefreshLeaseUntil &&
+              storage.refresh.mainRefreshLeaseUntil > Date.now()
+            ) {
+              // The owner binds before publishing its rotated credential. An
+              // active lease makes either side of that handoff ambiguous, so
+              // suppress this tick instead of classifying it as a re-login.
+              return existing
+            }
+
+            if (!boundFingerprint) {
+              // Legacy lineages predate refresh-token binding. The first
+              // observation attaches the credential without changing markers.
+              storage.prime = {
+                ...(storage.prime ?? {}),
+                mainAuthLineageRefreshTokenFingerprint: observedFingerprint,
+              }
+              await saveAccountStateUnlocked(storage, path, {
+                mainPrime: true,
+              })
+              return existing
+            }
+          }
+
+          // Without the live host credential there is no safe way to bind a
+          // new identity. Skip this tick rather than creating an unbound
+          // namespace that could churn or suppress another account.
+          if (!observedFingerprint) return undefined
+
+          // A bound mismatch that did not pass through the owned refresh path
+          // is a host credential replacement and needs a fresh marker identity.
+          const authLineageId = randomUUID()
+          storage.prime = {
+            ...(storage.prime ?? {}),
+            mainAuthLineageId: authLineageId,
+            ...(observedFingerprint && {
+              mainAuthLineageRefreshTokenFingerprint: observedFingerprint,
+            }),
+          }
+          await saveAccountStateUnlocked(storage, path, { mainPrime: true })
+          return authLineageId
+        }
+
+        const account = storage.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === accountId && isOAuthAccount(candidate),
+        )
+        if (!account) {
+          throw new Error(
+            `getOrCreatePrimeAuthLineageId: OAuth account "${accountId}" not found`,
+          )
+        }
+        if (account.authLineageId) return account.authLineageId
+
+        // Upgrading changes the marker namespace once, so an already-primed
+        // window may fire again; persisting the seed prevents every later token
+        // rotation from repeating that migration cost.
+        const authLineageId = randomUUID()
+        account.authLineageId = authLineageId
+        await saveAccountStateUnlocked(storage, path, {
+          accounts: [accountId],
+        })
+        return authLineageId
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
+}
+
+/** Advance a main lineage across a refresh performed by this plugin. */
+export async function continueMainPrimeAuthLineageAfterRefresh(
+  input: {
+    previousRefreshToken: string
+    currentRefreshToken: string
+  },
+  path = getAccountStoragePath(),
+): Promise<void> {
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+        const authLineageId = storage.prime?.mainAuthLineageId
+        if (!authLineageId) return
+
+        const previousFingerprint = tokenFingerprint(input.previousRefreshToken)
+        const currentFingerprint = tokenFingerprint(input.currentRefreshToken)
+        const boundFingerprint =
+          storage.prime?.mainAuthLineageRefreshTokenFingerprint
+        if (
+          boundFingerprint &&
+          boundFingerprint !== previousFingerprint &&
+          boundFingerprint !== currentFingerprint
+        ) {
+          // Another process observed a host replacement after this refresh
+          // started; the stale rotation must not rebind that newer lineage.
+          return
+        }
+
+        storage.prime = {
+          ...(storage.prime ?? {}),
+          mainAuthLineageRefreshTokenFingerprint: currentFingerprint,
+        }
+        await saveAccountStateUnlocked(storage, path, { mainPrime: true })
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
+}
+
+/**
+ * Atomically increment an account's cumulative prime counters and persist via
+ * the scoped runtime-state path. The `main` account lives at state.main.prime;
+ * every other account lives at state.accounts[id].prime. Config-side writes
+ * are intentionally NOT triggered so prime counters cannot leak into
+ * `anthropic-auth.json`. Callers should not depend on this function to mutate
+ * the caller's storage object.
+ */
+export async function incrementPrimeUsagePersistent(
+  accountId: 'main' | string,
+  usage: PrimeUsageDelta,
+  path = getAccountStoragePath(),
+  now = Date.now(),
+): Promise<PrimeUsageCounters> {
+  const inputTokens = Number.isFinite(usage?.inputTokens)
+    ? Math.max(0, Math.floor(usage.inputTokens as number))
+    : 0
+  const outputTokens = Number.isFinite(usage?.outputTokens)
+    ? Math.max(0, Math.floor(usage.outputTokens as number))
+    : 0
+
+  return enqueueSave(async () => {
+    // The config-write lock is the repository-wide outer lock for config and
+    // runtime-state RMW operations; taking it before the state write preserves
+    // saveAccountsLocked's config → state ordering across processes.
+    const lock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+
+        if (accountId === 'main') {
+          const existing = storage.prime?.main
+          const next: PrimeUsageCounters = {
+            count: (existing?.count ?? 0) + 1,
+            inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
+            outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
+            since: existing?.since ?? Math.floor(now),
+          }
+          storage.prime = { ...(storage.prime ?? {}), main: next }
+          await saveAccountStateUnlocked(storage, path, { mainPrime: true })
+          return next
+        }
+
+        const index = storage.accounts.findIndex(
+          (account) => account.id === accountId,
+        )
+        if (index < 0) {
+          throw new Error(
+            `incrementPrimeUsagePersistent: account "${accountId}" not found`,
+          )
+        }
+        const account = storage.accounts[index] as OAuthAccount
+        const existing = account.prime
+        const next: PrimeUsageCounters = {
+          count: (existing?.count ?? 0) + 1,
+          inputTokens: (existing?.inputTokens ?? 0) + inputTokens,
+          outputTokens: (existing?.outputTokens ?? 0) + outputTokens,
+          since: existing?.since ?? Math.floor(now),
+        }
+        storage.accounts[index] = { ...account, prime: next }
+        await saveAccountStateUnlocked(storage, path, {
+          accounts: [accountId],
+        })
+        return next
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await lock.release()
+    }
+  })
+}
+
 function getFallbackStatuses(storage: AccountStorage | null) {
   return storage?.fallbackOn?.length ? storage.fallbackOn : DEFAULT_FALLBACK_ON
 }
@@ -2146,12 +2576,16 @@ function failClosedOnUnknownQuota(storage: AccountStorage | null) {
   )
 }
 
+function normalizeScopedQuotaModel(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
 function scopedQuotaModelKey(model: unknown): string | null {
   if (typeof model !== 'string') return null
-  const normalized = model.toLowerCase()
+  const normalized = normalizeScopedQuotaModel(model)
   if (normalized.includes('fable')) return 'fable'
   if (normalized.includes('mythos')) return 'mythos'
-  return null
+  return normalized
 }
 
 export function getScopedQuotaWindowForModel(
@@ -2163,8 +2597,8 @@ export function getScopedQuotaWindowForModel(
   return quota?.scoped?.find((window) => {
     const haystack = [window.modelId, window.modelName, window.title]
       .filter((value): value is string => typeof value === 'string')
+      .map(normalizeScopedQuotaModel)
       .join(' ')
-      .toLowerCase()
     return haystack.includes(key)
   })
 }
@@ -2950,7 +3384,7 @@ export class FallbackAccountManager {
           stale &&
           !quotaBackoffActive(next.lastQuotaRefreshError, this.now())
         ) {
-          next = await this.refreshAccountQuota(next, storage)
+          next = (await this.refreshAccountQuota(next, storage)).account
           changed = true
         }
         // Single source of truth: evaluate quota policy from the unified
@@ -3322,11 +3756,14 @@ export class FallbackAccountManager {
       })
       const refreshed = await refreshClaudeOAuthToken({
         refreshToken,
+        authLineageId: sourceAccount.authLineageId,
         fetchImpl: this.fetchImpl,
         now: this.now,
       })
       sourceAccount.access = refreshed.access
       sourceAccount.refresh = refreshed.refresh
+      sourceAccount.authLineageId =
+        refreshed.authLineageId ?? sourceAccount.authLineageId
       sourceAccount.expires = refreshed.expires
       sourceAccount.lastRefreshedAt =
         refreshed.expires - refreshed.expiresIn * 1000
@@ -3355,15 +3792,18 @@ export class FallbackAccountManager {
     // to a direct fetch only when no QuotaManager is wired (e.g. in isolation).
     const fetchSnapshot = (accessToken: string) =>
       this.quotaManager
-        ? this.quotaManager.refreshFallback(target.id, accessToken)
+        ? this.quotaManager.refreshFallbackWithMetadata(target.id, accessToken)
         : fetchOAuthQuotaSnapshot({
             accessToken,
             fetchImpl: this.fetchImpl,
             now: this.now,
-          })
+          }).then((quota) => ({ quota, fetched: true }))
     const fetchStartedAt = this.now()
+    let fetched = false
     try {
-      target.quota = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(target.access)
+      target.quota = result.quota
+      fetched = result.fetched
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (!message.includes('Claude quota check failed: 401')) throw error
@@ -3372,7 +3812,9 @@ export class FallbackAccountManager {
       })
       if (!target.access) throw error
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
-      target.quota = await fetchSnapshot(target.access)
+      const result = await fetchSnapshot(target.access)
+      target.quota = result.quota
+      fetched = result.fetched
     }
 
     const latestStorage = await this.load()
@@ -3387,7 +3829,7 @@ export class FallbackAccountManager {
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return latestAccount
+      return { account: latestAccount, fetched: false }
     }
     if (
       latestStorage &&
@@ -3398,7 +3840,7 @@ export class FallbackAccountManager {
     ) {
       this.seedFallbackQuota(latestAccount, latestStorage)
       updateStoredAccount(storage, latestAccount)
-      return latestAccount
+      return { account: latestAccount, fetched }
     }
 
     target.lastQuotaRefreshError = undefined
@@ -3418,6 +3860,6 @@ export class FallbackAccountManager {
         target.access,
       )
     }
-    return target
+    return { account: target, fetched }
   }
 }

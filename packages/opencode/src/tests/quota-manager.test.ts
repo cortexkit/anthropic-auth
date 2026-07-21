@@ -118,6 +118,80 @@ describe('QuotaManager', () => {
   })
 
   describe('backoff', () => {
+    test('fallback refresh metadata distinguishes cached backoff from a network fetch', async () => {
+      let fetchCalls = 0
+      const fetchMock = mock(() => {
+        fetchCalls += 1
+        if (fetchCalls === 1) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(makeQuotaResponse(now))
+      }) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      const cachedQuota = {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: now,
+        },
+      }
+      qm.setFallback(
+        'fallback-1',
+        { quota: cachedQuota, refreshAfter: now, checkedAt: now },
+        'fallback-token',
+      )
+
+      await expect(
+        qm.refreshFallback('fallback-1', 'fallback-token'),
+      ).rejects.toThrow('429')
+      const cached = await qm.refreshFallbackWithMetadata(
+        'fallback-1',
+        'fallback-token',
+      )
+      expect(cached).toEqual({ quota: cachedQuota, fetched: false })
+
+      now += 61_000
+      const fetched = await qm.refreshFallbackWithMetadata(
+        'fallback-1',
+        'fallback-token',
+      )
+      expect(fetched.fetched).toBe(true)
+      expect(fetchCalls).toBe(2)
+    })
+
+    test('main refresh metadata also distinguishes cached backoff from a network fetch', async () => {
+      let fetchCalls = 0
+      const fetchMock = mock(() => {
+        fetchCalls += 1
+        if (fetchCalls === 1) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(makeQuotaResponse(now))
+      }) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      const cachedQuota = {
+        five_hour: {
+          usedPercent: 25,
+          remainingPercent: 75,
+          checkedAt: now,
+        },
+      }
+      qm.setMain('main-token', {
+        quota: cachedQuota,
+        refreshAfter: now,
+        checkedAt: now,
+      })
+
+      await expect(qm.refreshMain('main-token')).rejects.toThrow('429')
+      const cached = await qm.refreshMainWithMetadata('main-token')
+      expect(cached).toEqual({ quota: cachedQuota, fetched: false })
+
+      now += 61_000
+      const fetched = await qm.refreshMainWithMetadata('main-token')
+      expect(fetched.fetched).toBe(true)
+      expect(fetchCalls).toBe(2)
+    })
+
     test('first 429 backs off for 60s', async () => {
       const fetchMock = mock(() =>
         Promise.resolve(new Response('rate limited', { status: 429 })),

@@ -190,7 +190,7 @@ Also returned: account/org uuids, email, subscription status/created, `enabled_p
 curl -s https://api.anthropic.com/api/oauth/usage \
   -H "authorization: Bearer $TOKEN" -H "anthropic-beta: oauth-2025-04-20" | jq .
 
-# headers (one ~20-token haiku request)
+# headers (one minimal Haiku request; usage is measured from response accounting)
 curl -sD - -o /dev/null https://api.anthropic.com/v1/messages?beta=true \
   -H "authorization: Bearer $TOKEN" -H "anthropic-version: 2023-06-01" \
   -H "anthropic-beta: oauth-2025-04-20" -H "content-type: application/json" \

@@ -52,6 +52,16 @@ export interface FableRecoverySidebarState {
   targetModelId?: string
 }
 
+export interface PrimeSidebarAccountState {
+  id: string
+  label: string
+  nextDueAt?: number | null
+  lastPrimedAt?: number | null
+  lastResult?: 'ok' | 'error'
+  usage?: PrimeUsageCounters
+  estimatedCostUsd?: number
+}
+
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
@@ -71,6 +81,15 @@ export interface SidebarState {
     window?: string
     trackedSessions?: number
   }
+  /**
+   * Prime opt-in flag plus per-account status. Absent on the wire when
+   * the feature is disabled — `normalizeSidebarState` validates every
+   * account independently and drops any entry it cannot prove.
+   */
+  prime?: {
+    enabled: boolean
+    accounts: PrimeSidebarAccountState[]
+  }
   fableRecoveries?: FableRecoverySidebarState[]
   lastUpdated: number
 }
@@ -88,6 +107,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import type { PrimeUsageCounters } from '@cortexkit/anthropic-auth-core'
 import { logger } from '@cortexkit/anthropic-auth-core'
 
 const STATE_FILE_ENV = 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE'
@@ -109,6 +129,77 @@ export const DEFAULT_SIDEBAR_STATE: SidebarState = {
 }
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function normalizePrimeUsage(value: unknown): PrimeUsageCounters | undefined {
+  if (!isRecord(value)) return undefined
+  const count = Number(value.count)
+  const inputTokens = Number(value.inputTokens)
+  const outputTokens = Number(value.outputTokens)
+  const since = Number(value.since)
+  if (
+    ![count, inputTokens, outputTokens, since].every(Number.isFinite) ||
+    count < 0 ||
+    inputTokens < 0 ||
+    outputTokens < 0 ||
+    since < 0
+  ) {
+    return undefined
+  }
+  return {
+    count: Math.floor(count),
+    inputTokens: Math.floor(inputTokens),
+    outputTokens: Math.floor(outputTokens),
+    since: Math.floor(since),
+  }
+}
+
+function normalizePrimeAccount(
+  value: unknown,
+): PrimeSidebarAccountState | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.id !== 'string' || !value.id.trim()) return undefined
+  if (typeof value.label !== 'string' || !value.label.trim()) return undefined
+  const account: PrimeSidebarAccountState = {
+    id: value.id.trim(),
+    label: value.label.trim(),
+  }
+  if (value.nextDueAt === null) {
+    account.nextDueAt = null
+  } else if (isFiniteNumber(value.nextDueAt)) {
+    account.nextDueAt = value.nextDueAt
+  }
+  if (value.lastPrimedAt === null) {
+    account.lastPrimedAt = null
+  } else if (isFiniteNumber(value.lastPrimedAt)) {
+    account.lastPrimedAt = value.lastPrimedAt
+  }
+  if (value.lastResult === 'ok' || value.lastResult === 'error') {
+    account.lastResult = value.lastResult
+  }
+  const usage = normalizePrimeUsage(value.usage)
+  if (usage) account.usage = usage
+  if (isFiniteNumber(value.estimatedCostUsd)) {
+    account.estimatedCostUsd = value.estimatedCostUsd
+  }
+  return account
+}
+
+function normalizePrimeSection(
+  value: unknown,
+): SidebarState['prime'] | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.enabled !== 'boolean') return undefined
+  const accounts = Array.isArray(value.accounts)
+    ? value.accounts
+        .map(normalizePrimeAccount)
+        .filter((a): a is PrimeSidebarAccountState => a != null)
+    : []
+  return { enabled: value.enabled, accounts }
 }
 
 function normalizeQuotaWindow(value: unknown): QuotaWindow | undefined {
@@ -322,6 +413,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
     cacheKeep,
+    prime: normalizePrimeSection(raw.prime),
     fableRecoveries: fableRecoveries.length > 0 ? fableRecoveries : undefined,
     lastUpdated: typeof raw.lastUpdated === 'number' ? raw.lastUpdated : 0,
   }
@@ -708,6 +800,44 @@ export function formatFallbackModelLabel(modelId: string | undefined): string {
   if (modelId === 'claude-opus-4-8' || modelId?.startsWith('claude-opus-4-8-'))
     return 'Opus 4.8'
   return modelId ?? 'Fable 5'
+}
+
+export function formatPrimeTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+export function formatPrimeCost(value: number): string {
+  if (value === 0) return '0'
+  if (value < 0.0001) return value.toExponential(2)
+  return value.toFixed(Math.min(6, Math.max(0, 4)))
+}
+
+export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
+  text: string
+  hasError: boolean
+} {
+  if (account.lastResult === 'error') {
+    return { text: 'err', hasError: true }
+  }
+  if (account.nextDueAt && account.nextDueAt > Date.now()) {
+    return { text: formatPrimeTime(account.nextDueAt), hasError: false }
+  }
+  if (account.lastPrimedAt) {
+    return {
+      text: `primed ${formatPrimeTime(account.lastPrimedAt)} \u2713`,
+      hasError: false,
+    }
+  }
+  if (account.usage?.count) {
+    return {
+      text: `\u2713 ${account.usage.count} \u2248 $${formatPrimeCost(account.estimatedCostUsd ?? 0)}`,
+      hasError: false,
+    }
+  }
+  return { text: '\u2014', hasError: false }
 }
 
 export function getFableRecoverySummary(

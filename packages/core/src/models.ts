@@ -1,6 +1,24 @@
 export const CLAUDE_FABLE_5_MODEL_ID = 'claude-fable-5'
 export const CLAUDE_MYTHOS_5_MODEL_ID = 'claude-mythos-5'
 
+/**
+ * Haiku 4.5 model identifier used by `/claude-prime` to start each OAuth
+ * account's five-hour quota window with a minimal request. Usage is measured
+ * from response accounting. Kept distinct from the Fable/Mythos pricing block
+ * above so per-million-token cost estimation does not conflate families.
+ */
+export const CLAUDE_HAIKU_4_5_MODEL_ID = 'claude-haiku-4-5'
+
+/**
+ * Per-million-token USD pricing for Haiku 4.5. Used to project the cumulative
+ * cost of prime requests from persisted usage counters — never persisted on
+ * disk; derive at display time so future pricing revisions land in one place.
+ */
+export const CLAUDE_HAIKU_4_5_PRICING = {
+  input: 1,
+  output: 5,
+} as const
+
 export const CLAUDE_FABLE_MYTHOS_5_MODEL_IDS = [
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_MYTHOS_5_MODEL_ID,

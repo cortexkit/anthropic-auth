@@ -522,6 +522,24 @@ describe('add-oauth label threading', () => {
     // id is a UUID (no natural key for OAuth)
     expect(account.id).toMatch(/^[0-9a-f-]{36}$/)
   })
+
+  test('a fresh login at the same label gets a new auth lineage', async () => {
+    const first = await runOAuthAddWithLabel('work')
+    const firstAccount = first!.accounts[0]!
+    expect(firstAccount.type).toBe('oauth')
+    if (firstAccount.type !== 'oauth') throw new Error('expected OAuth account')
+
+    const second = await runOAuthAddWithLabel('work')
+    const secondAccount = second!.accounts[0]!
+    expect(secondAccount.type).toBe('oauth')
+    if (secondAccount.type !== 'oauth')
+      throw new Error('expected OAuth account')
+    expect(secondAccount.authLineageId).not.toBe(firstAccount.authLineageId)
+    const { tokenFingerprint } = await import('@cortexkit/anthropic-auth-core')
+    expect(tokenFingerprint(secondAccount.authLineageId!)).not.toBe(
+      tokenFingerprint(firstAccount.authLineageId!),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
