@@ -42,6 +42,12 @@ export interface FableRecoverySidebarState {
   mode: 'opus' | 'fable'
   remaining: number
   changedAt: number
+  /**
+   * The model id the user originally requested (e.g. 'claude-fable-5' or
+   * 'claude-opus-5'). Optional for backward compatibility with pre-Opus-5
+   * state files; older recoveries default to Fable 5 in the summary.
+   */
+  requestedModelId?: string
 }
 
 export interface SidebarState {
@@ -287,6 +293,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
               mode: recovery.mode,
               remaining: Math.max(0, Math.floor(recovery.remaining)),
               changedAt: recovery.changedAt,
+              requestedModelId:
+                typeof recovery.requestedModelId === 'string'
+                  ? recovery.requestedModelId
+                  : undefined,
             },
           ]
         })
@@ -677,6 +687,19 @@ export function formatScopedQuotaLabel(title: string) {
   return /^fable$/i.test(label) ? 'Fa' : label
 }
 
+/**
+ * Pretty label for a recoverable-refusal source model (Fable 5 or Opus 5).
+ * Falls back to the raw id for unrecognized ids so the sidebar never goes
+ * blank on a future model that has not yet been cataloged here.
+ */
+export function formatFallbackModelLabel(modelId: string | undefined): string {
+  if (modelId === 'claude-fable-5' || modelId?.startsWith('claude-fable-5-'))
+    return 'Fable 5'
+  if (modelId === 'claude-opus-5' || modelId?.startsWith('claude-opus-5-'))
+    return 'Opus 5'
+  return modelId ?? 'Fable 5'
+}
+
 export function getFableRecoverySummary(
   state: SidebarState,
   sessionId: string,
@@ -685,7 +708,9 @@ export function getFableRecoverySummary(
     (candidate) => candidate.sessionId === sessionId,
   )
   if (!recovery) return undefined
-  if (recovery.mode === 'fable') return 'Fable 5 · restored'
+  if (recovery.mode === 'fable') {
+    return `${formatFallbackModelLabel(recovery.requestedModelId)} · restored`
+  }
   return `Opus 4.8 · ${recovery.remaining} left`
 }
 

@@ -679,6 +679,70 @@ describe('createStrippedStream', () => {
     expect(completed).toBe(0)
   })
 
+  test('refusal error message names Opus 5 when contentFilterModel is set', async () => {
+    const encoder = new TextEncoder()
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
+      'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+    ]
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+    const response = createStrippedStream(new Response(stream), {
+      onContentFilter: () => true,
+      contentFilterModel: 'claude-opus-5',
+    })
+    const reader = response.body!.getReader()
+    expect((await reader.read()).done).toBe(false)
+
+    let caught: unknown
+    try {
+      while (!(await reader.read()).done) {}
+    } catch (error) {
+      caught = error
+    }
+
+    expect((caught as { code?: string }).code).toBe('ECONNRESET')
+    expect((caught as { providerErrorType?: string }).providerErrorType).toBe(
+      'refusal',
+    )
+    expect((caught as Error).message).toContain('Opus 5')
+    expect((caught as Error).message).not.toContain('Fable')
+  })
+
+  test('refusal error message uses Fable when contentFilterModel not set', async () => {
+    const encoder = new TextEncoder()
+    const chunks = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_',
+      'reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+    ]
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+    const response = createStrippedStream(new Response(stream), {
+      onContentFilter: () => true,
+    })
+    const reader = response.body!.getReader()
+    expect((await reader.read()).done).toBe(false)
+
+    let caught: unknown
+    try {
+      while (!(await reader.read()).done) {}
+    } catch (error) {
+      caught = error
+    }
+
+    expect((caught as Error).message).toContain('Fable')
+  })
+
   test('signals successful Anthropic finishes exactly once', async () => {
     const finishes: string[] = []
     const response = createStrippedStream(
@@ -779,6 +843,25 @@ describe('prepareFableCacheWarmSource', () => {
     expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
     expect(body.output_config).toEqual({ effort: 'xhigh' })
     expect(body.messages).toEqual([{ role: 'user', content: 'same input' }])
+  })
+
+  test('restores an Opus 5 request to claude-opus-5 when explicitly requested', () => {
+    const source = prepareFableCacheWarmSource(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        speed: 'fast',
+        thinking: { type: 'enabled', budget_tokens: 4096 },
+        output_config: { effort: 'xhigh' },
+        messages: [{ role: 'user', content: 'same input' }],
+      }),
+      'claude-opus-5',
+    )
+
+    expect(source.ok).toBe(true)
+    if (!source.ok) throw new Error(source.reason)
+    const body = JSON.parse(source.bodyText)
+    expect(body.model).toBe('claude-opus-5')
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
   })
 })
 
@@ -1014,6 +1097,19 @@ describe('rewriteRequestBody', () => {
     expect(result.speed).toBe('fast')
   })
 
+  test('sets fast speed for Opus 5 when fast mode is enabled', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(
+      await rewriteRequestBody(body, { fastModeEnabled: true }),
+    )
+
+    expect(result.speed).toBe('fast')
+  })
+
   test('does not set fast speed for unsupported models', async () => {
     for (const model of ['claude-sonnet-4-5', 'claude-fable-5']) {
       const body = JSON.stringify({
@@ -1101,6 +1197,173 @@ describe('rewriteRequestBody', () => {
     const result = JSON.parse(await rewriteRequestBody(body))
 
     expect(result.thinking).toEqual({ type: 'enabled', budget_tokens: 5_000 })
+  })
+
+  test('requests summarized adaptive thinking for Opus 5 without thinking', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('replaces manual enabled thinking with adaptive summarized for Opus 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5-20260701',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 10_000 },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(result.thinking.budget_tokens).toBeUndefined()
+  })
+
+  test('preserves explicitly disabled thinking for Opus 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('strips display from disabled thinking for Opus 5', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled', display: 'summarized' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+  })
+
+  test('lowers Opus 5 disabled thinking + effort xhigh to effort high', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'xhigh' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+    expect(result.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('lowers Opus 5 disabled thinking + effort max to effort high', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'max' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+    expect(result.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('leaves Opus 5 disabled thinking effort untouched at high or below', async () => {
+    for (const effort of ['high', 'medium', 'low']) {
+      const body = JSON.stringify({
+        model: 'claude-opus-5',
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: { type: 'disabled' },
+        output_config: { effort },
+      })
+
+      const result = JSON.parse(await rewriteRequestBody(body))
+
+      expect(result.thinking).toEqual({ type: 'disabled' })
+      expect(result.output_config).toEqual({ effort })
+    }
+  })
+
+  test('preserves Opus 5 adaptive thinking effort at xhigh (no lower applied)', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      output_config: { effort: 'xhigh' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(result.output_config).toEqual({ effort: 'xhigh' })
+  })
+
+  test('does not touch thinking for non-Opus5 models', async () => {
+    const body = JSON.stringify({
+      model: 'claude-fable-5',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 5_000 },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('downgraded Opus 5 recovery body keeps Opus 4.8 thinking semantics (no Opus 5 injection)', async () => {
+    // After fable-fallback rewrites the body to claude-opus-4-8, the Opus 5
+    // normalizer must NOT fire — the predicted 4.8 body should preserve the
+    // user's manual thinking settings (they would have been valid for 4.8
+    // before the recovery started; only the model id changed).
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'enabled', budget_tokens: 8_000 },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'enabled', budget_tokens: 8_000 })
+  })
+
+  test('downgraded Opus 5 recovery with disabled+xhigh preserves thinking and effort (normalizer bypass)', async () => {
+    // After recovery rewrites model→claude-opus-4-8, the Opus 5 normalizer
+    // must NOT fire. A disabled+xhigh pair is invalid for Opus 5 (400) but
+    // perfectly valid for 4.8 (where thinking is not adaptive-by-default
+    // and no effort constraint exists). The normalizer must only match
+    // actual Opus 5 bodies — not recovered 4.8 bodies that carry the
+    // user's original settings.
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'xhigh' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+    expect(result.output_config).toEqual({ effort: 'xhigh' })
+  })
+
+  test('downgraded Opus 5 recovery with disabled+max preserves thinking and effort (normalizer bypass)', async () => {
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      messages: [{ role: 'user', content: 'hi' }],
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'max' },
+    })
+
+    const result = JSON.parse(await rewriteRequestBody(body))
+
+    expect(result.thinking).toEqual({ type: 'disabled' })
+    expect(result.output_config).toEqual({ effort: 'max' })
   })
 
   test('strips OpenAI encrypted reasoning blocks before sending to Anthropic', async () => {

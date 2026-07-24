@@ -48,7 +48,8 @@ export function isFastModeSupportedModel(model: unknown) {
     typeof model === 'string' &&
     (model.startsWith('claude-opus-4-6') ||
       model.startsWith('claude-opus-4-7') ||
-      model.startsWith('claude-opus-4-8'))
+      model.startsWith('claude-opus-4-8') ||
+      model.startsWith('claude-opus-5'))
   )
 }
 

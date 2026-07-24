@@ -64,6 +64,7 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isCacheKeepSubagentsEnabled,
+  isClaudeOpus5Model,
   isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
   isFastModeEnabled,
@@ -631,6 +632,26 @@ const FABLE_SWITCHED_TO_OPUS_NOTICE =
 const FABLE_RESTORED_NOTICE =
   'Fable recovery window complete. Returning to Fable 5.'
 
+/**
+ * Compose the recovery-window notice text for the requested model. Fable 5 and
+ * Opus 5 follow the same Anthropic-recommended fallback (Opus 4.8) for the
+ * same reason (cyber safety classifiers returning `stop_reason: "refusal"`),
+ * so the message structure is shared; only the model name moves.
+ */
+function buildSwitchedToOpusNotice(modelId: string): string {
+  if (isClaudeOpus5Model(modelId)) {
+    return 'Opus 5 content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Opus 5 cache warm.'
+  }
+  return FABLE_SWITCHED_TO_OPUS_NOTICE
+}
+
+function buildRestoredNotice(modelId: string): string {
+  if (isClaudeOpus5Model(modelId)) {
+    return 'Opus 5 recovery window complete. Returning to Opus 5.'
+  }
+  return FABLE_RESTORED_NOTICE
+}
+
 type AnthropicProviderModel = {
   id?: string
   name?: string
@@ -1148,6 +1169,9 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
 
   function warmFableAfterOpus(context: FableRequestContext) {
     const sessionId = context.plan.sessionId
+    const modelLabel = isClaudeOpus5Model(context.plan.requestedModel)
+      ? 'Opus 5'
+      : 'Fable'
     const run = async () => {
       const target = context.warmTarget
       if (!target) {
@@ -1180,20 +1204,20 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
             target.oauthAccountId,
         })
         if (result.ok) {
-          logger.debug('fable-fallback', 'Fable cache warmed', {
+          logger.debug('fable-fallback', `${modelLabel} cache warmed`, {
             session: sessionId,
             remaining: fableFallbackManager.remaining(sessionId),
             ...(result.usage && { usage: result.usage }),
           })
           return
         }
-        logger.warn('fable-fallback', 'Fable cache warm skipped', {
+        logger.warn('fable-fallback', `${modelLabel} cache warm skipped`, {
           session: sessionId,
           status: result.status,
           reason: result.reason,
         })
       } catch (error) {
-        logger.warn('fable-fallback', 'Fable cache warm failed', {
+        logger.warn('fable-fallback', `${modelLabel} cache warm failed`, {
           session: sessionId,
           error: error instanceof Error ? error.message : String(error),
         })
@@ -3898,6 +3922,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
               const wrapResponse = (response: Response) =>
                 createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
+                  contentFilterModel: fablePlan?.requestedModel,
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
                         onContentFilter: () => {
@@ -3916,17 +3941,22 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                           logger.info(
                             'fable-fallback',
                             'content filter detected; switching session to Opus 4.8',
-                            { session: fablePlan.sessionId, remaining },
+                            {
+                              session: fablePlan.sessionId,
+                              requestedModel: fablePlan.requestedModel,
+                              remaining,
+                            },
                           )
                           publishFableRecoveryNotice(
                             {
                               sessionId: fablePlan.sessionId,
                               mode: 'opus',
                               remaining,
+                              requestedModelId: fablePlan.requestedModel,
                             },
                             storage,
                             auth,
-                            FABLE_SWITCHED_TO_OPUS_NOTICE,
+                            buildSwitchedToOpusNotice(fablePlan.requestedModel),
                           )
                         },
                       }
@@ -3944,6 +3974,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                             'Opus 4.8 turn completed',
                             {
                               session: fablePlan.sessionId,
+                              requestedModel: fablePlan.requestedModel,
                               finishReason,
                               remaining: completed.remaining,
                             },
@@ -3953,6 +3984,7 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                               sessionId: fablePlan.sessionId,
                               mode: 'opus',
                               remaining: completed.remaining,
+                              requestedModelId: fablePlan.requestedModel,
                             },
                             storage,
                             auth,
@@ -3971,10 +4003,11 @@ export const AnthropicAuthPlugin: Plugin = async (ctx) => {
                                   sessionId: fablePlan.sessionId,
                                   mode: 'fable',
                                   remaining: 0,
+                                  requestedModelId: fablePlan.requestedModel,
                                 },
                                 storage,
                                 auth,
-                                FABLE_RESTORED_NOTICE,
+                                buildRestoredNotice(fablePlan.requestedModel),
                               )
                             }
                             void warm.then(notifyRestored, notifyRestored)

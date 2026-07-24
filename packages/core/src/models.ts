@@ -69,6 +69,27 @@ export function isClaudeSonnet5Model(model: unknown) {
   )
 }
 
+export const CLAUDE_OPUS_5_MODEL_ID = 'claude-opus-5'
+
+/**
+ * Opus 5 has the same adaptive-thinking-by-default + `display: "omitted"`
+ * shape as Sonnet 5, so the injected thinking must also be summarized to be
+ * visible. Kept as its own constant per the PR #100 lesson — hook callers
+ * should reference the per-family name (`CLAUDE_OPUS_5_ADAPTIVE_THINKING`,
+ * not the Fable/Mythos alias) so a future divergence between the families
+ * only changes this re-export, not every call site.
+ */
+export const CLAUDE_OPUS_5_ADAPTIVE_THINKING =
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
+
+export function isClaudeOpus5Model(model: unknown) {
+  return (
+    typeof model === 'string' &&
+    (model === CLAUDE_OPUS_5_MODEL_ID ||
+      model.startsWith(`${CLAUDE_OPUS_5_MODEL_ID}-`))
+  )
+}
+
 export function isOpenAIReasoningSignature(value: unknown): boolean {
   if (typeof value !== 'string') return false
   if (value.startsWith('gAAAA')) return true

@@ -1,4 +1,7 @@
-import { CLAUDE_FABLE_5_MODEL_ID } from '@cortexkit/anthropic-auth-core'
+import {
+  CLAUDE_FABLE_5_MODEL_ID,
+  isClaudeOpus5Model,
+} from '@cortexkit/anthropic-auth-core'
 
 export const FABLE_FALLBACK_MODEL_ID = 'claude-opus-4-8'
 export const FABLE_FALLBACK_TURNS = 10
@@ -37,11 +40,21 @@ type FableFallbackState = {
   updatedAt: number
 }
 
-function isFableModel(model: unknown): model is string {
+/**
+ * Models whose content-filter refusal we recover from by downgrading to Opus 4.8
+ * for a short window. Fable 5 is the original case; Opus 5 is identical in
+ * shape (cyber safety classifiers that can return `stop_reason: "refusal"`,
+ * Anthropic's own fallback default is `claude-opus-4-8`, same pricing). Mythos
+ * has no classifiers and Sonnet 5 is not flagged — both stay outside this
+ * gate. The single shared fallback id matches Anthropic's default for both
+ * source models, so the recovery period is uniform.
+ */
+function isRecoverableRefusalModel(model: unknown): model is string {
+  if (typeof model !== 'string') return false
+  if (isClaudeOpus5Model(model)) return true
   return (
-    typeof model === 'string' &&
-    (model === CLAUDE_FABLE_5_MODEL_ID ||
-      model.startsWith(`${CLAUDE_FABLE_5_MODEL_ID}-`))
+    model === CLAUDE_FABLE_5_MODEL_ID ||
+    model.startsWith(`${CLAUDE_FABLE_5_MODEL_ID}-`)
   )
 }
 
@@ -79,7 +92,7 @@ export class FableFallbackManager {
   ): FableFallbackPlan | null {
     if (!sessionId || typeof bodyText !== 'string') return null
     const parsed = parseBody(bodyText)
-    if (!parsed || !isFableModel(parsed.model)) return null
+    if (!parsed || !isRecoverableRefusalModel(parsed.model)) return null
 
     this.prune()
     const state = this.sessions.get(sessionId)
@@ -135,7 +148,7 @@ export class FableFallbackManager {
   }
 
   activate(plan: FableFallbackPlan, cacheAccountId?: string): number {
-    if (plan.downgraded || !isFableModel(plan.requestedModel)) {
+    if (plan.downgraded || !isRecoverableRefusalModel(plan.requestedModel)) {
       return this.remaining(plan.sessionId)
     }
     const state: FableFallbackState = {
@@ -179,9 +192,9 @@ export class FableFallbackManager {
       state.standbyAnchorSequence = plan.requestSequence
     }
     state.updatedAt = this.now()
-    // Retain the zero-remaining state so a later Fable refusal can bridge back
+    // Retain the zero-remaining state so a later refusal can bridge back
     // to this model-specific Opus cache boundary without continuously warming
-    // Opus while Fable is healthy.
+    // Opus while the original model is healthy.
     this.sessions.delete(plan.sessionId)
     this.sessions.set(plan.sessionId, state)
     return { counted: true, remaining: state.remaining }

@@ -47,7 +47,7 @@ export function buildFastModeStatusSummary(input?: { enabled?: boolean }) {
     `- Enabled: ${enabled ? 'enabled' : 'disabled'}`,
     '- Persisted: ~/.config/opencode/anthropic-auth.json',
     '- Scope: adds Anthropic fast mode to supported Opus requests',
-    '- Supported models: claude-opus-4-6, claude-opus-4-7, and claude-opus-4-8',
+    '- Supported models: claude-opus-4-6, claude-opus-4-7, claude-opus-4-8, and claude-opus-5',
     '- Request changes: adds `speed: "fast"` and the `fast-mode-2026-02-01` beta header',
     '- Note: fast and standard speeds do not share prompt-cache prefixes',
   ].join('\n')

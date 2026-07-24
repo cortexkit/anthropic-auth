@@ -400,6 +400,55 @@ describe('buildAnthropicRequest — Sonnet 5 thinking', () => {
   })
 })
 
+describe('buildAnthropicRequest — Opus 5 thinking', () => {
+  test('requests summarized adaptive thinking for Opus 5 without reasoning', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toBeUndefined()
+  })
+
+  test('maps reasoning to output_config effort for Opus 5', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5-20260701',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'high' } as any,
+      defaultCache,
+    )
+
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('sets display summarized (not omitted) so Opus 5 thinking is visible', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-5',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      {} as any,
+      defaultCache,
+    )
+
+    expect((body.thinking as { display?: string }).display).toBe('summarized')
+  })
+
+  test('keeps manual thinking budgets for non-Opus5 models', async () => {
+    const { body } = await buildAnthropicRequest(
+      'claude-opus-4-8',
+      { messages: [userMsg('hello')], systemPrompt: 'test', tools: [] } as any,
+      { reasoning: 'high' } as any,
+      defaultCache,
+    )
+
+    expect(body.output_config).toBeUndefined()
+    expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 20_480 })
+  })
+})
+
 describe('convertMessages — empty error tool_result guard', () => {
   test('injects Error placeholder when is_error=true and content is empty', async () => {
     const messages = await buildMessages([

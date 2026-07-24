@@ -8,10 +8,12 @@ import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
+  isClaudeOpus5Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
@@ -969,6 +971,37 @@ function normalizeSonnet5Request(
   return { replacedExisting: hadThinking, display: 'summarized' }
 }
 
+/**
+ * Opus 5 mirrors Sonnet 5: adaptive thinking on by default with
+ * `display: "omitted"`, so the synthesized request must inject a summarized
+ * shape to be visible. Unlike Fable/Mythos (which reject a disable), Opus 5
+ * accepts `{type:"disabled"}` — but only at effort `high` or below; pairing
+ * `disabled` with `output_config.effort` of `xhigh` or `max` 400s server-side
+ * per request. The user's intent to disable thinking wins over their effort
+ * setting, so when both are present we rewrite `effort` down to `high` to
+ * satisfy the API contract. When thinking is enabled (or absent), the effort
+ * value is left untouched — only the disable pair is constrained.
+ */
+function normalizeOpus5Request(
+  parsed: Record<string, unknown>,
+): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
+  if (!isClaudeOpus5Model(parsed.model)) return null
+  const hadThinking = Object.hasOwn(parsed, 'thinking')
+  const thinking = parsed.thinking
+  if (isRecord(thinking) && thinking.type === 'disabled') {
+    parsed.thinking = { type: 'disabled' }
+    const outputConfig = parsed.output_config
+    if (isRecord(outputConfig) && outputConfig.effort === 'xhigh') {
+      outputConfig.effort = 'high'
+    } else if (isRecord(outputConfig) && outputConfig.effort === 'max') {
+      outputConfig.effort = 'high'
+    }
+    return { replacedExisting: hadThinking, display: 'disabled' }
+  }
+  parsed.thinking = { ...CLAUDE_OPUS_5_ADAPTIVE_THINKING }
+  return { replacedExisting: hadThinking, display: 'summarized' }
+}
+
 export function prepareFableCacheWarmSource(
   bodyText: string,
   fableModel = CLAUDE_FABLE_5_MODEL_ID,
@@ -978,6 +1011,7 @@ export function prepareFableCacheWarmSource(
     body.model = fableModel
     delete body.speed
     normalizeFableMythosRequest(body)
+    normalizeOpus5Request(body)
     return { ok: true, bodyText: JSON.stringify(body) }
   } catch {
     return { ok: false, reason: 'body is not valid JSON' }
@@ -1116,6 +1150,7 @@ export async function rewriteRequestBody(
     const removedNonAnthropicThinking = stripNonAnthropicThinkingBlocks(parsed)
     const fableMythosThinking = normalizeFableMythosRequest(parsed)
     const sonnet5Thinking = normalizeSonnet5Request(parsed)
+    const opus5Thinking = normalizeOpus5Request(parsed)
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
@@ -1126,6 +1161,8 @@ export async function rewriteRequestBody(
         fableMythosThinking?.replacedExisting ?? false,
       sonnet5ThinkingDisplay: sonnet5Thinking?.display,
       replacedSonnet5Thinking: sonnet5Thinking?.replacedExisting ?? false,
+      opus5ThinkingDisplay: opus5Thinking?.display,
+      replacedOpus5Thinking: opus5Thinking?.replacedExisting ?? false,
       removedNonAnthropicThinking,
       hasOutputConfig: Object.hasOwn(parsed, 'output_config'),
     })
@@ -1486,9 +1523,12 @@ function retryableAnthropicStreamError(
   return error
 }
 
-function retryableFableContentFilterError(): RetryableAnthropicStreamError {
+function retryableFableContentFilterError(
+  model: unknown,
+): RetryableAnthropicStreamError {
+  const label = isClaudeOpus5Model(model) ? 'Opus 5' : 'Fable'
   const error = new Error(
-    'Fable response was blocked by the provider content filter; retrying with Opus 4.8',
+    `${label} response was blocked by the provider content filter; retrying with Opus 4.8`,
   ) as RetryableAnthropicStreamError
   error.code = 'ECONNRESET'
   error.syscall = 'anthropic-sse'
@@ -1589,6 +1629,7 @@ export function createStrippedStream(
     perf?: RewritePerfCallback
     onContentFilter?: () => boolean | undefined
     onComplete?: (finishReason: string) => void
+    contentFilterModel?: unknown
   } = {},
 ): Response {
   if (!response.body) return response
@@ -1618,7 +1659,9 @@ export function createStrippedStream(
     const update = updateSseFinishState(sseFinish, text)
     if (update?.type === 'content-filter' && options.onContentFilter) {
       const handled = options.onContentFilter()
-      return handled === false ? null : retryableFableContentFilterError()
+      return handled === false
+        ? null
+        : retryableFableContentFilterError(options.contentFilterModel)
     }
     if (update?.type === 'complete') options.onComplete?.(update.finishReason)
     return null

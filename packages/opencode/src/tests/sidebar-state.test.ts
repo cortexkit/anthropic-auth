@@ -19,6 +19,7 @@ import {
   DEFAULT_SIDEBAR_STATE,
   drainSidebarWrites,
   FIVE_HOUR_MS,
+  formatFallbackModelLabel,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
   getSidebarState,
@@ -187,12 +188,14 @@ describe('getFableRecoverySummary', () => {
           mode: 'opus',
           remaining: 7,
           changedAt: 123,
+          requestedModelId: 'claude-fable-5',
         },
         {
           sessionId: 'ses_other',
           mode: 'fable',
           remaining: 0,
           changedAt: 124,
+          requestedModelId: 'claude-fable-5',
         },
       ],
     })
@@ -214,6 +217,7 @@ describe('getFableRecoverySummary', () => {
           mode: 'fable',
           remaining: 0,
           changedAt: 456,
+          requestedModelId: 'claude-fable-5',
         },
       ],
     })
@@ -221,6 +225,73 @@ describe('getFableRecoverySummary', () => {
     expect(getFableRecoverySummary(state, 'ses_fable')).toBe(
       'Fable 5 · restored',
     )
+  })
+
+  test('names the originally-requested model when an Opus 5 session is restored', () => {
+    const state = make({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_opus5',
+          mode: 'opus',
+          remaining: 4,
+          changedAt: 100,
+          requestedModelId: 'claude-opus-5',
+        },
+        {
+          sessionId: 'ses_opus5_fast',
+          mode: 'fable',
+          remaining: 0,
+          changedAt: 200,
+          requestedModelId: 'claude-opus-5-fast',
+        },
+      ],
+    })
+
+    expect(getFableRecoverySummary(state, 'ses_opus5')).toBe(
+      'Opus 4.8 · 4 left',
+    )
+    expect(getFableRecoverySummary(state, 'ses_opus5_fast')).toBe(
+      'Opus 5 · restored',
+    )
+  })
+
+  test('defaults to Fable 5 when an older recovery has no requestedModelId', () => {
+    const state = make({
+      fableRecoveries: [
+        {
+          sessionId: 'ses_legacy',
+          mode: 'fable',
+          remaining: 0,
+          changedAt: 1,
+        },
+      ],
+    })
+
+    expect(getFableRecoverySummary(state, 'ses_legacy')).toBe(
+      'Fable 5 · restored',
+    )
+  })
+})
+
+describe('formatFallbackModelLabel', () => {
+  test('formats Fable 5 ids', () => {
+    expect(formatFallbackModelLabel('claude-fable-5')).toBe('Fable 5')
+    expect(formatFallbackModelLabel('claude-fable-5-20260608')).toBe('Fable 5')
+  })
+
+  test('formats Opus 5 ids', () => {
+    expect(formatFallbackModelLabel('claude-opus-5')).toBe('Opus 5')
+    expect(formatFallbackModelLabel('claude-opus-5-fast')).toBe('Opus 5')
+    expect(formatFallbackModelLabel('claude-opus-5-20260701')).toBe('Opus 5')
+  })
+
+  test('falls back to the raw id for unrecognized models', () => {
+    expect(formatFallbackModelLabel('claude-fable-99')).toBe('claude-fable-99')
+    expect(formatFallbackModelLabel('claude-opus-4-8')).toBe('claude-opus-4-8')
+  })
+
+  test('defaults to Fable 5 when the id is missing', () => {
+    expect(formatFallbackModelLabel(undefined)).toBe('Fable 5')
   })
 })
 

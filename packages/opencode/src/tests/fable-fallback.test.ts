@@ -164,4 +164,158 @@ describe('FableFallbackManager', () => {
 
     expect(manager.complete(oldOpus)).toEqual({ counted: false, remaining: 10 })
   })
+
+  test('routes dated Fable snapshot to Opus 4.8 after filter activation', () => {
+    const manager = new FableFallbackManager()
+    const datedModel = 'claude-fable-5-20260608'
+    const filtered = manager.plan('session-a', body(datedModel))!
+    expect(manager.activate(filtered, 'fable-account')).toBe(
+      FABLE_FALLBACK_TURNS,
+    )
+
+    const plan = manager.plan('session-a', body(datedModel))!
+    expect(plan.downgraded).toBe(true)
+    expect(plan.requestedModel).toBe(datedModel)
+    expect(plan.effectiveModel).toBe(FABLE_FALLBACK_MODEL_ID)
+    expect(JSON.parse(plan.bodyText).model).toBe(FABLE_FALLBACK_MODEL_ID)
+  })
+})
+
+describe('FableFallbackManager — Opus 5 recovery parity', () => {
+  test('leaves Opus 5 unchanged until its content filter activates a session', () => {
+    const manager = new FableFallbackManager()
+    const plan = manager.plan('session-a', body('claude-opus-5'))
+
+    expect(plan).toMatchObject({
+      requestedModel: 'claude-opus-5',
+      effectiveModel: 'claude-opus-5',
+      downgraded: false,
+    })
+    expect(JSON.parse(plan!.bodyText).model).toBe('claude-opus-5')
+  })
+
+  test('matches the claude-opus-5-fast catalog variant', () => {
+    const manager = new FableFallbackManager()
+    const plan = manager.plan('session-a', body('claude-opus-5-fast'))
+
+    expect(plan).toMatchObject({
+      requestedModel: 'claude-opus-5-fast',
+      effectiveModel: 'claude-opus-5-fast',
+      downgraded: false,
+    })
+  })
+
+  test('matches the dated claude-opus-5-20260701 snapshot', () => {
+    const manager = new FableFallbackManager()
+    const plan = manager.plan('session-a', body('claude-opus-5-20260701'))
+
+    expect(plan).toMatchObject({
+      requestedModel: 'claude-opus-5-20260701',
+      effectiveModel: 'claude-opus-5-20260701',
+      downgraded: false,
+    })
+  })
+
+  test('routes the next ten successful Opus 5 requests to Opus 4.8', () => {
+    const manager = new FableFallbackManager()
+    const filtered = manager.plan('session-a', body('claude-opus-5'))!
+    expect(manager.activate(filtered, 'opus5-account')).toBe(
+      FABLE_FALLBACK_TURNS,
+    )
+
+    for (
+      let remaining = FABLE_FALLBACK_TURNS - 1;
+      remaining >= 0;
+      remaining--
+    ) {
+      const plan = manager.plan('session-a', body('claude-opus-5'))!
+      expect(plan.downgraded).toBe(true)
+      expect(plan.requestedModel).toBe('claude-opus-5')
+      expect(plan.effectiveModel).toBe(FABLE_FALLBACK_MODEL_ID)
+      expect(plan.cacheAccountId).toBe('opus5-account')
+      expect(JSON.parse(plan.bodyText).model).toBe(FABLE_FALLBACK_MODEL_ID)
+      expect(manager.complete(plan)).toEqual({ counted: true, remaining })
+    }
+
+    const restored = manager.plan('session-a', body('claude-opus-5'))!
+    expect(restored.downgraded).toBe(false)
+    expect(restored.requestedModel).toBe('claude-opus-5')
+    expect(JSON.parse(restored.bodyText).model).toBe('claude-opus-5')
+  })
+
+  test('keeps Opus 5 downgrade state isolated by session and ignores other models', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body('claude-opus-5'))!)
+
+    expect(manager.plan('session-a', body('claude-opus-5'))?.downgraded).toBe(
+      true,
+    )
+    expect(manager.plan('session-b', body('claude-opus-5'))?.downgraded).toBe(
+      false,
+    )
+    expect(manager.plan('session-a', body('claude-opus-4-8'))).toBeNull()
+    expect(manager.plan('session-a', body('claude-mythos-5'))).toBeNull()
+    expect(manager.plan('session-a', body('claude-sonnet-5'))).toBeNull()
+    expect(manager.plan(undefined, body('claude-opus-5'))).toBeNull()
+  })
+
+  test('rebinds an active Opus 5 recovery cycle when sticky routing migrates accounts', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body('claude-opus-5'))!, 'old')
+    const lateOldRoute = manager.plan('session-a', body('claude-opus-5'))!
+    const migrated = manager.plan('session-a', body('claude-opus-5'))!
+
+    expect(manager.bindRecoveryAccount(migrated, 'new')).toBe(true)
+    expect(migrated.cacheAccountId).toBe('new')
+    expect(manager.recoveryAccount(lateOldRoute)).toBe('new')
+  })
+
+  test('retains the newest Opus 5 cache anchor across a restored period', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body('claude-opus-5'))!)
+
+    for (let index = 0; index < FABLE_FALLBACK_TURNS; index++) {
+      const plan = manager.plan('session-a', body('claude-opus-5'))!
+      expect(
+        manager.complete(plan, {
+          fingerprint: `anchor-${index}`,
+          messageIndex: 10 + index * 2,
+          messageCount: 11 + index * 2,
+          oauthAccountId: 'fallback-account',
+        }).counted,
+      ).toBe(true)
+    }
+
+    const restored = manager.plan('session-a', body('claude-opus-5'))!
+    expect(restored).toMatchObject({
+      downgraded: false,
+      requestedModel: 'claude-opus-5',
+      standbyCacheAnchor: {
+        fingerprint: 'anchor-9',
+        messageIndex: 28,
+        messageCount: 29,
+        oauthAccountId: 'fallback-account',
+      },
+    })
+
+    manager.activate(restored, 'opus5-account')
+    const nextCycle = manager.plan('session-a', body('claude-opus-5'))!
+    expect(nextCycle).toMatchObject({
+      downgraded: true,
+      cacheAccountId: 'opus5-account',
+      standbyCacheAnchor: restored.standbyCacheAnchor,
+    })
+  })
+
+  test('Opus 5 recovery does not touch unrelated sessions', () => {
+    const manager = new FableFallbackManager()
+    manager.activate(manager.plan('session-a', body('claude-opus-5'))!)
+
+    const otherSession = manager.plan('session-b', body('claude-opus-5'))
+    expect(otherSession).toMatchObject({
+      requestedModel: 'claude-opus-5',
+      effectiveModel: 'claude-opus-5',
+      downgraded: false,
+    })
+  })
 })
