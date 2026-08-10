@@ -1022,6 +1022,9 @@ export function prepareFableCacheWarmSource(
     const body = JSON.parse(bodyText) as Record<string, unknown>
     body.model = fableModel
     delete body.speed
+    // The prewarm must reach the source model (not be fallback-routed),
+    // so strip any server-side fallback opt-in inherited from the captured body.
+    delete body.fallbacks
     normalizeFableMythosRequest(body)
     normalizeOpus5Request(body)
     return { ok: true, bodyText: JSON.stringify(body) }

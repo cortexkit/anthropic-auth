@@ -4,6 +4,7 @@ import {
   FAST_MODE_BETA,
   OPENCODE_IDENTITY_PREFIX,
   REQUIRED_BETAS,
+  selectClaudeCodeBetas,
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
@@ -983,6 +984,26 @@ describe('prepareFableCacheWarmSource', () => {
     const body = JSON.parse(source.bodyText)
     expect(body.model).toBe('claude-opus-5')
     expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
+  test('strips the server-side fallback opt-in so the source-model prewarm never triggers Anthropic fallback routing', () => {
+    const source = prepareFableCacheWarmSource(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        fallbacks: 'default',
+        speed: 'fast',
+        messages: [{ role: 'user', content: 'same input' }],
+      }),
+    )
+
+    expect(source.ok).toBe(true)
+    if (!source.ok) throw new Error(source.reason)
+    const body = JSON.parse(source.bodyText)
+    expect(body.fallbacks).toBeUndefined()
+    expect(body.speed).toBeUndefined()
+    expect(selectClaudeCodeBetas(body).split(',')).not.toContain(
+      'server-side-fallback-2026-07-01',
+    )
   })
 })
 
