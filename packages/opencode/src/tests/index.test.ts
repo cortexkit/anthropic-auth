@@ -7917,6 +7917,278 @@ describe('auth.loader', () => {
     ).toBe(0)
   })
 
+  test('server mode — refusal with no server-side handoff downgrades to Opus (wedge regression)', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: false },
+        cacheKeep: { enabled: false },
+      }),
+    )
+    const models: string[] = []
+    let firstFable = true
+    const refusalSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const successSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (body.max_tokens === 0) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      models.push(String(body.model))
+      if (body.model === 'claude-fable-5' && firstFable) {
+        firstFable = false
+        return Promise.resolve(new Response(refusalSse, { status: 200 }))
+      }
+      return Promise.resolve(new Response(successSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_wedge' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 128_000,
+        stream: true,
+        system: [{ type: 'text', text: 'stable system' }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    // First request hits the refusal — onContentFilter fires, stream rejects.
+    // The second request must carry the downgraded Opus model.
+    const filtered = await result.fetch(MESSAGES_URL, request)
+    await expect(filtered.text()).rejects.toThrow()
+    const second = await result.fetch(MESSAGES_URL, request)
+    await second.text()
+
+    expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
+  })
+
+  test('server mode — absorbed server-side fallback does NOT activate client-side downgrade', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: false },
+        cacheKeep: { enabled: false },
+      }),
+    )
+    const models: string[] = []
+    const frame = (event: string, data: unknown) =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    const fallbackSse = [
+      frame('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_fallback', model: 'claude-opus-5' },
+      }),
+      frame('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-5' },
+        },
+      }),
+      frame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      frame('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'text', text: '' },
+      }),
+      frame('content_block_delta', {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'text_delta', text: 'safe answer' },
+      }),
+      frame('content_block_stop', { type: 'content_block_stop', index: 1 }),
+      frame('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { output_tokens: 2 },
+      }),
+      frame('message_stop', { type: 'message_stop' }),
+    ].join('')
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (body.max_tokens === 0) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      models.push(String(body.model))
+      return Promise.resolve(new Response(fallbackSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_no_double' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 128_000,
+        stream: true,
+        system: [{ type: 'text', text: 'stable system' }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    const first = await result.fetch(MESSAGES_URL, request)
+    await first.text()
+    const second = await result.fetch(MESSAGES_URL, request)
+    await second.text()
+
+    // Both requests stayed on Fable — no client-side downgrade triggered.
+    expect(models).toEqual(['claude-fable-5', 'claude-fable-5'])
+  })
+
+  test('server mode — downgraded Opus request does not carry server-side fallback opt-in', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: false },
+        cacheKeep: { enabled: false },
+      }),
+    )
+    const models: string[] = []
+    const bodies: Array<Record<string, unknown>> = []
+    let firstFable = true
+    const refusalSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_filtered"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const successSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_ok"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (!url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (body.max_tokens === 0) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      models.push(String(body.model))
+      bodies.push(body)
+      if (body.model === 'claude-fable-5' && firstFable) {
+        firstFable = false
+        return Promise.resolve(new Response(refusalSse, { status: 200 }))
+      }
+      return Promise.resolve(new Response(successSse, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_no_optin' },
+      body: JSON.stringify({
+        model: 'claude-fable-5',
+        max_tokens: 128_000,
+        stream: true,
+        system: [{ type: 'text', text: 'stable system' }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    // First request hits the refusal. After the fix, onContentFilter fires
+    // causing the stream to reject with a ContentFilterError.
+    const filtered = await result.fetch(MESSAGES_URL, request)
+    await expect(filtered.text()).rejects.toThrow()
+    const opus = await result.fetch(MESSAGES_URL, request)
+    await opus.text()
+
+    expect(models).toEqual(['claude-fable-5', 'claude-opus-4-8'])
+    // The Opus request must NOT carry the server-side fallback opt-in.
+    expect(bodies[1]?.fallbacks).toBeUndefined()
+  })
+
   test('uses the sidebar instead of promptAsync when the matching TUI is connected', async () => {
     await useTempAccountFile(
       createFallbackStorage({
