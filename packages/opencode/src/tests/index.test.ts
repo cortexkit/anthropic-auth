@@ -7694,6 +7694,33 @@ describe('auth.loader', () => {
         },
       },
     })
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_server_fallback',
+          status: { type: 'idle' },
+        },
+      },
+    })
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_server_fallback' },
+      },
+    })
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+
+    await plugin.event?.({
+      event: {
+        type: 'session.updated',
+        properties: { sessionID: 'ses_server_fallback' },
+      },
+    })
     await waitForMockCall(mockClient.session.promptAsync)
     expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
@@ -7711,8 +7738,8 @@ describe('auth.loader', () => {
 
     const restoredResponse = await result.fetch(MESSAGES_URL, request)
     // OpenCode can publish the assistant-completed event before the wrapped
-    // response emits its final fallback outcome. The later idle event must flush
-    // a notice queued after that completion event without starting another turn.
+    // response emits its final fallback outcome. The post-idle session update must
+    // flush a notice queued after that completion event without starting another turn.
     await plugin.event?.({
       event: {
         type: 'message.updated',
@@ -7741,11 +7768,14 @@ describe('auth.loader', () => {
     )
     await plugin.event?.({
       event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_server_fallback',
-          status: { type: 'idle' },
-        },
+        type: 'session.idle',
+        properties: { sessionID: 'ses_server_fallback' },
+      },
+    })
+    await plugin.event?.({
+      event: {
+        type: 'session.updated',
+        properties: { sessionID: 'ses_server_fallback' },
       },
     })
     await waitForMockCall({
@@ -7830,7 +7860,7 @@ describe('auth.loader', () => {
 
     const latestUserMessageId = 'msg_000000000100AAAAAAAAAAAAAA'
     const latestAssistantMessageId = 'msg_000000000200BBBBBBBBBBBBBB'
-    let sessionIdle = false
+    let noticeStatusChecks = 0
     const mockClient = createMockClient(
       [
         {
@@ -7857,7 +7887,9 @@ describe('auth.loader', () => {
         },
       ],
       (): Record<string, { type: string }> =>
-        sessionIdle ? {} : { ses_fable_filter: { type: 'busy' } },
+        noticeStatusChecks++ === 0
+          ? { ses_fable_filter: { type: 'busy' } }
+          : {},
     )
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(
@@ -7911,17 +7943,17 @@ describe('auth.loader', () => {
     await firstOpus.text()
     await plugin.event?.({
       event: {
-        type: 'message.updated',
-        properties: {
-          info: {
-            id: latestAssistantMessageId,
-            sessionID: 'ses_fable_filter',
-            role: 'assistant',
-            time: { completed: Date.now() },
-          },
-        },
+        type: 'session.idle',
+        properties: { sessionID: 'ses_fable_filter' },
       },
     })
+    await plugin.event?.({
+      event: {
+        type: 'session.updated',
+        properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    await waitForMockCall(mockClient.session.promptAsync)
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
     expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
@@ -8032,14 +8064,16 @@ describe('auth.loader', () => {
 
     // Reproduce the host race: OpenCode can publish idle while the final cache
     // warm is still pending, before the restoration notice has been queued.
-    sessionIdle = true
     await plugin.event?.({
       event: {
-        type: 'session.status',
-        properties: {
-          sessionID: 'ses_fable_filter',
-          status: { type: 'idle' },
-        },
+        type: 'session.idle',
+        properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    await plugin.event?.({
+      event: {
+        type: 'session.updated',
+        properties: { sessionID: 'ses_fable_filter' },
       },
     })
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
@@ -8049,13 +8083,13 @@ describe('auth.loader', () => {
     await restored.text()
     expect(normalModels.at(-1)).toBe('claude-fable-5')
 
-    for (
-      let attempt = 0;
-      attempt < 100 && mockClient.session.promptAsync.mock.calls.length < 2;
-      attempt++
-    ) {
-      await new Promise((resolve) => setTimeout(resolve, 1))
-    }
+    await waitForMockCall({
+      mock: {
+        get calls() {
+          return mockClient.session.promptAsync.mock.calls.slice(1)
+        },
+      },
+    })
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(2)
     expect(mockClient.session.promptAsync.mock.calls[1]?.[0]).toEqual(
       expect.objectContaining({

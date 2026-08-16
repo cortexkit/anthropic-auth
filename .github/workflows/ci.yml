@@ -23,7 +23,7 @@ jobs:
         env:
           TUI_SMOKE_SKIP_BUILD: "1"
       - run: bun run test
-      - run: npm install -g opencode-ai@1.17.13
+      - run: npm install -g opencode-ai@1.18.18
       - run: bun run test:e2e
       - run: bun run format:check
       - run: bun run lint
