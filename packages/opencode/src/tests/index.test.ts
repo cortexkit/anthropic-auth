@@ -7886,10 +7886,18 @@ describe('auth.loader', () => {
           },
         },
       ],
-      (): Record<string, { type: string }> =>
-        noticeStatusChecks++ === 0
-          ? { ses_fable_filter: { type: 'busy' } }
-          : {},
+      (): Record<string, { type: string }> => {
+        if (noticeStatusChecks++ === 0) {
+          throw new Error('transient status failure')
+        }
+        if (noticeStatusChecks === 2) {
+          return [] as unknown as Record<string, { type: string }>
+        }
+        if (noticeStatusChecks === 3) {
+          return { ses_fable_filter: { type: 'busy' } }
+        }
+        return {}
+      },
     )
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(

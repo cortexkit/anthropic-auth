@@ -391,6 +391,7 @@ type PluginSessionClient = {
 }
 
 const DESKTOP_NOTICE_PROBE_LIMIT = 4
+const DESKTOP_NOTICE_PROBE_DELAY_MS = 25
 
 type PerfTrace = {
   requestId: string
@@ -1806,11 +1807,22 @@ const anthropicAuthPlugin = async (
       return
     }
     desktopNoticeProbes.set(sessionId, attempt)
-    setImmediate(() => {
+    const run = () => {
       if (desktopNoticeProbes.get(sessionId) !== attempt) return
       desktopNoticeProbes.delete(sessionId)
       void flushDesktopNoticesIfIdle(sessionId, attempt)
-    })
+    }
+    if (attempt === 0) {
+      setImmediate(run)
+    } else {
+      setTimeout(run, DESKTOP_NOTICE_PROBE_DELAY_MS * attempt)
+    }
+  }
+
+  function rearmDesktopNoticeProbe(sessionId: string, attempt: number) {
+    if (attempt + 1 < DESKTOP_NOTICE_PROBE_LIMIT) {
+      scheduleDesktopNoticeProbe(sessionId, attempt + 1)
+    }
   }
 
   async function flushDesktopNoticesIfIdle(sessionId: string, attempt: number) {
@@ -1832,21 +1844,23 @@ const anthropicAuthPlugin = async (
           responseRecord && Object.hasOwn(responseRecord, 'data')
             ? responseRecord.data
             : responseRecord
-        if (data === null || typeof data !== 'object' || Array.isArray(data))
+        if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+          rearmDesktopNoticeProbe(sessionId, attempt)
           return
+        }
         const status = (data as Record<string, unknown>)[sessionId]
+        // OpenCode 1.17 and 1.18 omit idle sessions from this map.
         if (
           status !== undefined &&
           (!status ||
             typeof status !== 'object' ||
             (status as { type?: unknown }).type !== 'idle')
         ) {
-          if (attempt < DESKTOP_NOTICE_PROBE_LIMIT) {
-            scheduleDesktopNoticeProbe(sessionId, attempt + 1)
-          }
+          rearmDesktopNoticeProbe(sessionId, attempt)
           return
         }
       } catch {
+        rearmDesktopNoticeProbe(sessionId, attempt)
         return
       }
     }
