@@ -339,7 +339,7 @@ export type CacheKeepPrewarmResult =
         cache_read_input_tokens?: number
       }
     }
-  | { ok: false; reason: string; status?: number }
+  | { ok: false; reason: string; status?: number; transient?: true }
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
@@ -576,7 +576,15 @@ export class CacheKeepManager {
     const dueAt = now + CACHE_KEEP_PREWARM_LEAD_MS
     for (const target of this.targets.values()) {
       if (target.cacheExpiresAt > dueAt) continue
-      await this.prewarm(target, now)
+      try {
+        await this.prewarm(target, now)
+      } catch (error) {
+        logger.warn('cachekeep', 'prewarm failed', {
+          session: target.id,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+        target.cacheExpiresAt = now + CACHE_KEEP_PREWARM_LEAD_MS + 5 * 60_000
+      }
     }
     this.publishTrackedSessions()
   }
@@ -597,14 +605,23 @@ export class CacheKeepManager {
       : new Headers(target.headers)
     headers.delete('content-length')
     headers.delete('transfer-encoding')
-    const response = await fetchImpl(target.url, {
-      method: 'POST',
-      headers,
-      body: prewarm.bodyText,
-      signal: AbortSignal.timeout(
-        this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
-      ),
-    })
+    let response: Response
+    try {
+      response = await fetchImpl(target.url, {
+        method: 'POST',
+        headers,
+        body: prewarm.bodyText,
+        signal: AbortSignal.timeout(
+          this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
+        ),
+      })
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error instanceof Error ? error.message : String(error),
+        transient: true,
+      }
+    }
     if (!response.ok) {
       return {
         ok: false,
@@ -632,7 +649,7 @@ export class CacheKeepManager {
   private async prewarm(target: CacheKeepTarget, now: number) {
     const result = await this.sendPrewarm(target)
     if (!result.ok) {
-      if (result.status == null) {
+      if (result.status == null && !result.transient) {
         logger.debug('cachekeep', 'prewarm skipped', {
           session: target.id,
           reason: result.reason,
