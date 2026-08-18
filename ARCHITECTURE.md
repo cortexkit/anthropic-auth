@@ -76,6 +76,16 @@
 3. Removes response-only fields (streaming, thinking, structured output, forced tool choice) from the pre-warm body
 4. Each manager publishes session IDs and cache timing (never request bodies, headers, or tokens) to a host-scoped temporary lease registry; status commands aggregate live records across project/plugin processes, and stale process records age out after three minutes. Schedule mode can be a local hour window or `always`, which remains active across midnight while the process is open
 
+**Quota Priming Flow:**
+1. `/claude-prime` parses status, `on`, and `off` actions; toggles persist only the `prime.enabled` flag in account configuration, while status projection combines the main account and enabled OAuth fallbacks with due times, transient attempt results, persisted usage counters, and estimated cost — `packages/core/src/prime.ts`, `packages/core/src/accounts.ts`, `packages/opencode/src/index.ts`
+2. The OpenCode plugin adopts one `PrimeManager` per account-storage identity through a process-wide registry; instances sharing a storage path rebind the existing manager on reload, while a storage-path change stops and removes the old manager when its last project slot leaves — `packages/opencode/src/prime-manager-registry.ts`, `packages/opencode/src/index.ts`
+3. An enabled manager runs an unref'd 60-second interval; every tick sweeps stale markers, reloads persisted state, and evaluates the main account plus configured accounts. An account is due when its persisted five-hour `resetsAt` plus the 60-second due offset has passed; an unknown reset uses the bootstrap claim path — `packages/core/src/prime.ts`
+4. A due OAuth account performs one fresh quota check through `refreshMainWithMetadata()` or the fallback refresh path before claiming. Cached or stale results never claim, a future fresh reset marks the window active instead of priming, and the Haiku request is rejected by the account or model-scoped killswitch policy before claim — `packages/core/src/prime.ts`, `packages/core/src/quota-manager.ts`, `packages/opencode/src/index.ts`, `packages/core/src/accounts.ts`
+5. The manager derives a storage-path namespace and account-auth-lineage fingerprint, then atomically creates an account-and-reset marker with `writeFile(..., { flag: 'wx' })`; the storage namespace isolates independent config stores, the account namespace prevents credential-lineage reuse, and the first process to create the marker is the only process that fires for that reset epoch — `packages/core/src/prime.ts`, `packages/core/src/accounts.ts`, `packages/opencode/src/index.ts`
+6. The winner sends one authenticated `POST` request through the normal request rewrite path with model `claude-haiku-4-5`, `max_tokens: 1`, system instruction `Reply with 1 when you receive 0.`, and user message `0`; the request has a 30-second timeout and records response usage when available — `packages/core/src/prime.ts`, `packages/core/src/models.ts`, `packages/opencode/src/index.ts`
+7. A successful fire atomically increments the account's cumulative input/output token counters and count in runtime state, updates manager/sidebar status, and schedules a 90-second unref'd quota refresh so the newly started window is persisted after usage propagation; stopping or disabling the feature aborts in-flight work before claim or send — `packages/core/src/accounts.ts`, `packages/core/src/prime.ts`, `packages/opencode/src/index.ts`, `packages/opencode/src/sidebar-state.ts`
+8. Marker cleanup recursively removes files older than six hours from the storage namespace, allowing abandoned claims to age out without allowing concurrent processes to reclaim a live marker — `packages/core/src/prime.ts`
+
 ## Key Abstractions
 
 **QuotaManager:**
@@ -102,6 +112,16 @@
 - Purpose: Aggregates current CacheKeep session visibility across independently loaded OpenCode project plugins or Pi processes without sharing request payloads or credentials
 - Location: `packages/core/src/cachekeep-registry.ts`
 - Pattern: One atomic JSON lease record per manager under the system temporary directory; records contain only session IDs and cache timing, are separated into OpenCode/Pi scopes, deduplicate by session ID, and are ignored after a three-minute stale lease
+
+**PrimeManager:**
+- Purpose: Schedules opt-in five-hour quota priming for each OAuth account and projects per-account status
+- Location: `packages/core/src/prime.ts`
+- Pattern: Unref'd 60-second interval with fresh quota and killswitch gates, cross-process atomic marker claims, minimal Haiku requests, runtime usage persistence, delayed quota refresh, and idempotent start/stop lifecycle
+
+**PrimeManagerRegistry:**
+- Purpose: Shares one PrimeManager across OpenCode plugin instances that use the same account storage path
+- Location: `packages/opencode/src/prime-manager-registry.ts`
+- Pattern: Process-wide map keyed by a SHA-256 storage-path fingerprint; project slots rebind the manager on reload, and a storage-path change stops and removes an unreferenced manager
 
 **ServerSideFallbackStreamRewriter:**
 - Purpose: Opts eligible OAuth Fable 5/Opus 5 requests into Anthropic's default safety fallback, preserves fallback conversation boundaries across OpenCode storage, and classifies active/restored fallback outcomes
@@ -171,6 +191,6 @@
 
 **Caching:** In-memory quota cache (`QuotaManager`) with staleness-based refresh logic; memoized system prompt sanitization (`sanitize-memo.ts`) with 8MB max; 1-hour Anthropic prompt cache managed via cache strategy (`cache1h.ts`, `cachekeep.ts`)
 
-**Storage:** Sidecar JSON files for config + credential/quota state (separate files to avoid config overwrite), a cross-process locked `anthropic-auth-routing-state.json` containing hashed sticky session assignments, JSONC preferences for the TUI (`tui-preferences.jsonc`), JSON state for TUI sidebar IPC at `$TMPDIR/opencode-anthropic-auth/`, and an auto-sweeping dump directory for request payloads capped at 512MB by default.
+**Storage:** Sidecar JSON files for config + credential/quota state (separate files to avoid config overwrite), a cross-process locked `anthropic-auth-routing-state.json` containing hashed sticky session assignments, a prime marker directory at `$TMPDIR/opencode-anthropic-auth/prime/<storage-fingerprint>/<account-fingerprint>/`, where `anthropic-auth.json` stores the prime opt-in flag and `anthropic-auth-state.json` stores per-account prime usage counters and lineage bindings, JSONC preferences for the TUI (`tui-preferences.jsonc`), JSON state for TUI sidebar IPC at `$TMPDIR/opencode-anthropic-auth/`, and an auto-sweeping dump directory for request payloads capped at 512MB by default.
 
 **Security:** OAuth tokens are stored in the sidecar state file (separate from config); sticky routing stores only SHA-256 session hashes, account IDs, quota timestamps, and initial input byte counts; relay uses a shared secret token; RPC server uses a bearer token; token refresh and configuration/routing writes use file locks to prevent races and concurrent write loss; no secrets are stored in git
