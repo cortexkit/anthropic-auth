@@ -1109,6 +1109,7 @@ export async function sendViaRelay(options: {
    * within an attempt are ignored.
    */
   onResponseHeaders?: (headers: Headers) => void
+  onDumpCreated?: (handle: { responsePath: string; tag?: 'cachekeep' }) => void
   setTimeoutImpl?: typeof globalThis.setTimeout
   clearTimeoutImpl?: typeof globalThis.clearTimeout
 }): Promise<Response> {
@@ -1122,6 +1123,7 @@ export async function sendViaRelay(options: {
     affinity: explicitAffinity,
     optimisticResponse,
     onResponseHeaders,
+    onDumpCreated,
     setTimeoutImpl = globalThis.setTimeout,
     clearTimeoutImpl = globalThis.clearTimeout,
   } = options
@@ -1237,7 +1239,7 @@ export async function sendViaRelay(options: {
       `used relay transport=${result.transport} protocol=${result.protocol} mode=${result.payload.mode} status=${result.response.status} session=${shortAffinity(affinity)} bodyBytes=${bodyText.length} relayBytes=${actualPayloadBytes}`,
     )
     const dumpStart = perfNowMs()
-    await dumpRelayRequest({
+    const dumpHandle = await dumpRelayRequest({
       affinity,
       transport: result.transport,
       protocol: result.protocol,
@@ -1248,6 +1250,9 @@ export async function sendViaRelay(options: {
       payload: result.payload,
       relayBytes: actualPayloadBytes,
     })
+    try {
+      if (dumpHandle) onDumpCreated?.(dumpHandle)
+    } catch {}
     relayPerfLog('dump', {
       session: shortAffinity(affinity),
       ms: formatMs(perfNowMs() - dumpStart),

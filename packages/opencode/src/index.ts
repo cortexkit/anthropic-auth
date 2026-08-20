@@ -28,11 +28,14 @@ import {
   CLAUDE_PRIME_COMMAND_NAME,
   CLAUDE_QUOTAS_COMMAND_NAME,
   CLAUDE_ROUTING_COMMAND_NAME,
+  computeXxhash64Hex,
   continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
   createStickyNoRouteResponse,
+  type DumpHandle,
   decideStickyQuotaFailure,
   dumpDirectRequest,
+  dumpResponseArtifact,
   exchange,
   executeAccountCommand,
   executeCache1hCommand,
@@ -147,11 +150,23 @@ import {
   setRoutingMode,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
-  stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
+import {
+  applyCacheDiagnosticsOptIn,
+  buildCacheDiagnosticsRecord,
+  CACHE_DIAGNOSTICS_BETA,
+  CacheDiagnosticsBetaTracker,
+  type CacheDiagnosticsRequestContext,
+  type CacheDiagnosticsSource,
+  CacheDiagnosticsTracker,
+  copyCacheDiagnosticsContext,
+  formatCacheDiagnosticsLogLine,
+  summarizeCacheTtl,
+  withStickyRetryAfter,
+} from './cache-diagnostics.ts'
 import {
   FableFallbackManager,
   type FableFallbackPlan,
@@ -1188,6 +1203,150 @@ const anthropicAuthPlugin = async (
     },
   })
   fallbackManager.startBackgroundRefresh()
+  const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
+  const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
+  type CacheDiagnosticsResponse = {
+    request?: CacheDiagnosticsRequestContext
+    trackSessionId?: string
+    source: CacheDiagnosticsSource
+    accountId: string
+    synthetic: boolean
+    betasHash: string
+    betas: string[]
+    requestedModel?: string
+    dump: DumpHandle | null
+    status: number
+    streaming: boolean
+    dumpWrite: Promise<void>
+  }
+  const cacheDiagnosticsResponses = new WeakMap<
+    Response,
+    CacheDiagnosticsResponse
+  >()
+  const cacheKeepDiagnosticsRequests = new Map<
+    string,
+    CacheDiagnosticsRequestContext & {
+      accountId: string
+      synthetic: boolean
+      betasHash?: string
+      betas?: string[]
+      requestedModel?: string
+    }
+  >()
+
+  async function getCacheDiagnosticsBetas(headers: Headers) {
+    const betas = (headers.get('anthropic-beta') ?? '')
+      .split(',')
+      .map((beta) => beta.trim())
+      .filter(Boolean)
+      .sort()
+    return {
+      betas,
+      betasHash: await computeXxhash64Hex(betas.join(',')),
+    }
+  }
+
+  function observeCacheDiagnosticsMessage(input: {
+    source: CacheDiagnosticsSource
+    accountId: string
+    synthetic: boolean
+    betasHash: string
+    betas: string[]
+    requestedModel?: string
+    request?: CacheDiagnosticsRequestContext
+    trackSessionId?: string
+    status: number
+    message: unknown
+    receivedAt: number
+    dump?: DumpHandle | null
+    dumpWrite?: Promise<void>
+  }) {
+    try {
+      if (input.dumpWrite) {
+        void input.dumpWrite
+          .then(() =>
+            dumpResponseArtifact(input.dump ?? null, {
+              status: input.status,
+              message: input.message,
+            }),
+          )
+          .catch(() => {})
+      }
+      if (!input.request) return
+      const observed = buildCacheDiagnosticsRecord({
+        request: input.request,
+        source: input.source,
+        accountId: input.accountId,
+        synthetic: input.synthetic,
+        betasHash: input.betasHash,
+        requestedModel: input.requestedModel,
+        onWarning: (message) => logger.warn('cache-diagnostics', message),
+        message: input.message,
+        receivedAt: input.receivedAt,
+      })
+      if (!observed.record || !observed.messageId) {
+        logger.debug('cache-diagnostics', 'skipped invalid response envelope', {
+          status: input.status,
+        })
+        return
+      }
+      logger.debug(
+        'cache-diagnostics',
+        formatCacheDiagnosticsLogLine(observed.record),
+      )
+      const betaLine = cacheDiagnosticsBetaTracker.capture(
+        input.betasHash,
+        input.betas,
+      )
+      if (betaLine) logger.debug('cache-diagnostics', betaLine)
+      if (observed.canary) {
+        logger.warn(
+          'cache-diagnostics',
+          'short-gap previous_message_not_found',
+          {
+            message_id: observed.canary.messageId,
+            previous_message_id: observed.canary.previousMessageId,
+          },
+        )
+      }
+      if (input.trackSessionId) {
+        cacheDiagnosticsTracker.capture(
+          input.trackSessionId,
+          observed.messageId,
+          input.receivedAt,
+        )
+      }
+    } catch (error) {
+      logger.debug('cache-diagnostics', 'response observation failed', {
+        status: input.status,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  function observeCacheDiagnosticsResponse(
+    response: Response,
+    message: unknown,
+  ) {
+    const context = cacheDiagnosticsResponses.get(response)
+    if (!context) return
+    observeCacheDiagnosticsMessage({
+      ...context,
+      message,
+      receivedAt: Date.now(),
+    })
+  }
+
+  function attachCacheDiagnosticsResponse(
+    response: Response,
+    input: Omit<CacheDiagnosticsResponse, 'dumpWrite'>,
+  ) {
+    const dumpWrite = Promise.resolve(
+      dumpResponseArtifact(input.dump, { status: input.status, message: null }),
+    ).catch(() => {})
+    cacheDiagnosticsResponses.set(response, { ...input, dumpWrite })
+  }
+
   let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
   const cacheKeepRegistry = new CacheKeepSessionRegistry({
     directory:
@@ -1204,6 +1363,82 @@ const anthropicAuthPlugin = async (
     onTrackedSessionsChanged: async (sessions) => {
       await cacheKeepRegistry.publish(sessions)
       aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)
+    },
+    prepareBody: (bodyText, target) => {
+      if (
+        !new Headers(target.headers)
+          .get('anthropic-beta')
+          ?.split(',')
+          .map((beta) => beta.trim())
+          .includes(CACHE_DIAGNOSTICS_BETA)
+      ) {
+        return bodyText
+      }
+      try {
+        const body = JSON.parse(bodyText) as Record<string, unknown>
+        const previous = cacheDiagnosticsTracker.previousFor(target.id)
+        const previousMessageId = previous?.messageId ?? null
+        applyCacheDiagnosticsOptIn(body, previousMessageId)
+        cacheKeepDiagnosticsRequests.set(target.id, {
+          sessionId: target.id,
+          previousMessageId,
+          ...(previous
+            ? { previousMessageReceivedAt: previous.receivedAt }
+            : {}),
+          isSubagent: target.isSubagent,
+          ttlSent: summarizeCacheTtl(body),
+          accountId: target.oauthAccountId ?? 'main',
+          synthetic: true,
+          requestedModel:
+            typeof body.model === 'string' ? body.model : undefined,
+        })
+        return JSON.stringify(body)
+      } catch {
+        return bodyText
+      }
+    },
+    onResponse: ({ target, bodyText, status, data, receivedAt }) => {
+      const prepared = cacheKeepDiagnosticsRequests.get(target.id)
+      if (!prepared?.betasHash || !prepared.betas) {
+        cacheKeepDiagnosticsRequests.delete(target.id)
+        return
+      }
+      try {
+        const sentBody = JSON.parse(bodyText)
+        const diagnostics =
+          sentBody && typeof sentBody === 'object' && !Array.isArray(sentBody)
+            ? (sentBody as { diagnostics?: unknown }).diagnostics
+            : undefined
+        const previousMessageId =
+          diagnostics &&
+          typeof diagnostics === 'object' &&
+          !Array.isArray(diagnostics) &&
+          (diagnostics as { previous_message_id?: unknown })
+            .previous_message_id === prepared.previousMessageId
+            ? prepared.previousMessageId
+            : undefined
+        if (previousMessageId === undefined) return
+        observeCacheDiagnosticsMessage({
+          source: 'prewarm_cachekeep',
+          accountId: prepared.accountId,
+          synthetic: prepared.synthetic,
+          betasHash: prepared.betasHash,
+          betas: prepared.betas,
+          requestedModel: prepared.requestedModel,
+          request: {
+            ...prepared,
+            previousMessageId,
+            ttlSent: summarizeCacheTtl(sentBody),
+          },
+          trackSessionId: target.id,
+          status,
+          message: data,
+          receivedAt,
+        })
+      } catch {
+      } finally {
+        cacheKeepDiagnosticsRequests.delete(target.id)
+      }
     },
     prepareHeaders: async (headers, target) => {
       let accessToken: string | undefined
@@ -1268,6 +1503,12 @@ const anthropicAuthPlugin = async (
           ]),
         )
         if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
+        const prepared = cacheKeepDiagnosticsRequests.get(target.id)
+        if (prepared) {
+          const { betas, betasHash } = await getCacheDiagnosticsBetas(headers)
+          prepared.betas = betas
+          prepared.betasHash = betasHash
+        }
       } catch {
         setOAuthHeaders(headers, accessToken)
       }
@@ -3680,12 +3921,18 @@ const anthropicAuthPlugin = async (
                 bytes,
                 rateLimited: true,
               })
+              const inspectedResponse = new Response(stream, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+              })
+              copyCacheDiagnosticsContext(
+                cacheDiagnosticsResponses,
+                response,
+                inspectedResponse,
+              )
               return {
-                response: new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers,
-                }),
+                response: inspectedResponse,
                 rateLimited: true,
               }
             }
@@ -3712,12 +3959,18 @@ const anthropicAuthPlugin = async (
               bytes,
               rateLimited: false,
             })
+            const inspectedResponse = new Response(stream, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            })
+            copyCacheDiagnosticsContext(
+              cacheDiagnosticsResponses,
+              response,
+              inspectedResponse,
+            )
             return {
-              response: new Response(stream, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers,
-              }),
+              response: inspectedResponse,
               rateLimited: false,
             }
           }
@@ -3760,6 +4013,8 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
             let body = init?.body
+            let streaming = false
+            let dump: DumpHandle | null = null
 
             const originalBytes =
               typeof body === 'string' ? body.length : undefined
@@ -3786,6 +4041,9 @@ const anthropicAuthPlugin = async (
                 mergeAnthropicBetas(requestHeaders.get('anthropic-beta'), []),
               )
               if (fastModeRequested) addFastModeBetaHeader(requestHeaders)
+              try {
+                streaming = JSON.parse(body).stream === true
+              } catch {}
               trace?.mark('rewrite_body', {
                 route,
                 ms: roundMs(nowMs() - rewriteStart),
@@ -3800,6 +4058,8 @@ const anthropicAuthPlugin = async (
               configureApiRouteHeaders(requestHeaders, account)
             }
 
+            const cacheDiagnosticsBetas =
+              await getCacheDiagnosticsBetas(requestHeaders)
             const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
             const sendStart = nowMs()
             let response: Response
@@ -3826,7 +4086,7 @@ const anthropicAuthPlugin = async (
               throw error
             }
             if (typeof body === 'string') {
-              await dumpDirectRequest({
+              dump = await dumpDirectRequest({
                 affinity: directAffinity,
                 route,
                 status: response.status,
@@ -3837,6 +4097,16 @@ const anthropicAuthPlugin = async (
                 headers: requestHeaders,
               })
             }
+            attachCacheDiagnosticsResponse(response, {
+              source: 'turn',
+              accountId: account.id,
+              synthetic: false,
+              ...cacheDiagnosticsBetas,
+              requestedModel: parseRequestModel(body),
+              dump,
+              status: response.status,
+              streaming,
+            })
             trace?.mark('send_headers_received', {
               route,
               ms: roundMs(nowMs() - sendStart),
@@ -3873,6 +4143,17 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
             let body = init?.body
+            const previousDiagnosticsMessage = relayAffinity
+              ? cacheDiagnosticsTracker.previousFor(relayAffinity)
+              : null
+            const cacheDiagnosticsPreviousMessageId =
+              previousDiagnosticsMessage?.messageId ?? null
+            let cacheDiagnosticsRequest:
+              | CacheDiagnosticsRequestContext
+              | undefined
+            let streaming = false
+            let directDump: DumpHandle | null = null
+            let relayDump: DumpHandle | null = null
             let modelForIdentity: string | undefined
             if (body && typeof body === 'string') {
               const modelParseStart = nowMs()
@@ -3926,6 +4207,7 @@ const anthropicAuthPlugin = async (
                 identity,
                 hybridStandbyAnchor: standbyCacheAnchor,
                 serverSideFallbackEnabled: fallbackMode === 'server',
+                cacheDiagnosticsPreviousMessageId,
                 perf: (stage, data) => {
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data })
                   if (
@@ -3958,10 +4240,42 @@ const anthropicAuthPlugin = async (
               }
               const headerBodyParseStart = nowMs()
               try {
+                const finalBody = JSON.parse(body) as Record<string, unknown>
                 setOAuthHeaders(requestHeaders, accessToken, {
-                  body: JSON.parse(body),
+                  body: finalBody,
                   identity,
                 })
+                const diagnostics = finalBody.diagnostics
+                const sentPreviousMessageId =
+                  diagnostics &&
+                  typeof diagnostics === 'object' &&
+                  !Array.isArray(diagnostics) &&
+                  (diagnostics as { previous_message_id?: unknown })
+                    .previous_message_id === cacheDiagnosticsPreviousMessageId
+                    ? cacheDiagnosticsPreviousMessageId
+                    : undefined
+                if (
+                  sentPreviousMessageId !== undefined &&
+                  requestHeaders
+                    .get('anthropic-beta')
+                    ?.split(',')
+                    .map((beta) => beta.trim())
+                    .includes(CACHE_DIAGNOSTICS_BETA)
+                ) {
+                  cacheDiagnosticsRequest = {
+                    sessionId: relayAffinity ?? 'session-unknown',
+                    previousMessageId: sentPreviousMessageId,
+                    ...(previousDiagnosticsMessage
+                      ? {
+                          previousMessageReceivedAt:
+                            previousDiagnosticsMessage.receivedAt,
+                        }
+                      : {}),
+                    isSubagent: subagentRequest,
+                    ttlSent: summarizeCacheTtl(finalBody),
+                  }
+                }
+                streaming = finalBody.stream === true
                 trace?.mark('set_oauth_headers_body_parse', {
                   route,
                   ms: roundMs(nowMs() - headerBodyParseStart),
@@ -3990,6 +4304,8 @@ const anthropicAuthPlugin = async (
               })
             }
 
+            const cacheDiagnosticsBetas =
+              await getCacheDiagnosticsBetas(requestHeaders)
             const rewritten = rewriteUrl(input)
             if (fableRequest && typeof body === 'string') {
               fableRequest.warmTarget = {
@@ -4015,6 +4331,7 @@ const anthropicAuthPlugin = async (
                   storage,
                   cacheMode: 'hybrid',
                   oauthAccountId,
+                  isSubagent: subagentRequest,
                 })
                 trace?.mark('cachekeep_track', {
                   session: relayAffinity,
@@ -4037,7 +4354,7 @@ const anthropicAuthPlugin = async (
                   ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
                 })
                 if (typeof body === 'string') {
-                  await dumpDirectRequest({
+                  directDump = await dumpDirectRequest({
                     affinity: relayAffinity,
                     route,
                     status: response.status,
@@ -4085,6 +4402,9 @@ const anthropicAuthPlugin = async (
               optimisticResponse: relayConfig?.transport === 'websocket',
               onResponseHeaders: (headers) =>
                 harvestQuotaHeaders(headers, served),
+              onDumpCreated: (handle) => {
+                relayDump = handle
+              },
             })
             trace?.mark('send_headers_received', {
               route,
@@ -4095,6 +4415,18 @@ const anthropicAuthPlugin = async (
             })
 
             if (usedDirectFetch) harvestQuotaHeaders(response.headers, served)
+            attachCacheDiagnosticsResponse(response, {
+              source: 'turn',
+              accountId: oauthAccountId,
+              synthetic: false,
+              ...cacheDiagnosticsBetas,
+              requestedModel: parseRequestModel(body),
+              request: cacheDiagnosticsRequest,
+              trackSessionId: relayAffinity ?? undefined,
+              dump: usedDirectFetch ? directDump : relayDump,
+              status: response.status,
+              streaming,
+            })
             return response
           }
 
@@ -4356,39 +4688,6 @@ const anthropicAuthPlugin = async (
             }
           }
 
-          async function withStickyRetryAfter(
-            response: Response,
-            sessionId: string,
-            retryAfterSeconds: number,
-            streamingRateLimit = false,
-          ) {
-            const headers = new Headers(response.headers)
-            headers.set(
-              'retry-after',
-              String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
-            )
-            if (streamingRateLimit) {
-              await response.body?.cancel().catch(() => {})
-              headers.set('content-type', 'application/json')
-              return new Response(
-                JSON.stringify({
-                  type: 'error',
-                  error: {
-                    type: 'rate_limit_error',
-                    message:
-                      'Sticky OAuth account five-hour quota resets shortly; retaining session affinity.',
-                  },
-                }),
-                { status: 429, headers },
-              )
-            }
-            return new Response(response.body, {
-              status: response.status,
-              statusText: response.statusText,
-              headers,
-            })
-          }
-
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -4629,9 +4928,23 @@ const anthropicAuthPlugin = async (
                     ? initialBody.length
                     : undefined,
               })
-              const wrapResponse = (response: Response) =>
-                createStrippedStream(response, {
+              const wrapResponse = (response: Response) => {
+                const diagnosticsContext =
+                  cacheDiagnosticsResponses.get(response)
+                return createStrippedStream(response, {
                   perf: (stage, data) => trace.mark(stage, data),
+                  ...(diagnosticsContext
+                    ? diagnosticsContext.streaming
+                      ? {
+                          onMessageStart: (message) =>
+                            observeCacheDiagnosticsResponse(response, message),
+                        }
+                      : {
+                          onMessageResponse: (message) =>
+                            observeCacheDiagnosticsResponse(response, message),
+                          responseMode: 'json' as const,
+                        }
+                    : {}),
                   contentFilterModel: fablePlan?.requestedModel,
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
@@ -4745,6 +5058,7 @@ const anthropicAuthPlugin = async (
                       }
                     : {}),
                 })
+              }
               const authStart = nowMs()
               const auth = await getAuth()
               trace.mark('get_auth', {
@@ -4984,6 +5298,8 @@ const anthropicAuthPlugin = async (
                           ),
                           sessionId,
                           proactiveQuotaDecision.retryAfterSeconds,
+                          false,
+                          cacheDiagnosticsResponses,
                         ),
                         false,
                       )
@@ -5078,6 +5394,7 @@ const anthropicAuthPlugin = async (
                             sessionId,
                             decision.retryAfterSeconds,
                             inspected.streamingRateLimit,
+                            cacheDiagnosticsResponses,
                           ),
                         )
                       }

@@ -216,10 +216,14 @@ function sameRequestedModel(requestedModel: string, servedModel: string) {
 
 export function createServerSideFallbackStreamRewriter(options: {
   requestedModel: string
+  maxPendingBytes?: number
   onOutcome?: (outcome: ServerSideFallbackOutcome) => void
   onRefusalAfterToolUse?: () => boolean | undefined
 }) {
   let pending = ''
+  let pendingBytes = 0
+  let resync = false
+  let resyncCarry = ''
   let servedModel: string | undefined
   let handoff: ServerSideFallbackMarker | undefined
   let fallbackIterationModel: string | undefined
@@ -323,21 +327,59 @@ export function createServerSideFallbackStreamRewriter(options: {
         boundary.index + boundary.length,
       )
       pending = pending.slice(boundary.index + boundary.length)
+      pendingBytes = new TextEncoder().encode(pending).byteLength
       output += rewriteEvent(rawEvent, delimiter)
     }
     return output
   }
 
   return {
+    pendingLength() {
+      return pendingBytes
+    },
     push(text: string) {
+      let output = ''
+      if (resync) {
+        const window = resyncCarry + text
+        const boundary = findSseBoundary(window)
+        if (!boundary) {
+          resyncCarry = window.slice(-3)
+          return text
+        }
+        const end = boundary.index + boundary.length
+        output = text.slice(0, Math.max(0, end - resyncCarry.length))
+        text = window.slice(end)
+        resync = false
+        resyncCarry = ''
+      }
+      if (!text) return output
+      const textBytes = new TextEncoder().encode(text).byteLength
       pending += text
-      return drain()
+      pendingBytes += textBytes
+      output += drain()
+      if (
+        options.maxPendingBytes !== undefined &&
+        pendingBytes > options.maxPendingBytes
+      ) {
+        const tail = pending
+        pending = ''
+        pendingBytes = 0
+        resync = true
+        resyncCarry = tail.slice(-3)
+        return output + tail
+      }
+      return output
     },
     flush() {
+      if (resync) {
+        resyncCarry = ''
+        return ''
+      }
       const output = drain()
       if (!pending) return output
       const tail = rewriteEvent(pending, '')
       pending = ''
+      pendingBytes = 0
       return output + tail
     },
   }

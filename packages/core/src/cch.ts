@@ -58,6 +58,12 @@ export async function computeCCH(bodyBytes: Uint8Array): Promise<string> {
   return (hash & 0xfffffn).toString(16).padStart(5, '0')
 }
 
+export async function computeXxhash64Hex(value: string): Promise<string> {
+  await ensureXxhash()
+  const hash = xxhash64Raw?.(new TextEncoder().encode(value), 0n) ?? 0n
+  return hash.toString(16).padStart(16, '0').slice(0, 16)
+}
+
 export function resetBillingHeaderCCH(bodyString: string): string {
   return bodyString.replace(BILLING_HEADER_CCH_PATTERN, `$1${CCH_PLACEHOLDER}`)
 }

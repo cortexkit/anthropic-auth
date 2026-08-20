@@ -2,6 +2,7 @@ import type { AccountStorage } from './accounts.ts'
 import type { CacheKeepTrackedSession } from './cachekeep-registry.ts'
 import { signRequestBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
+import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
 import { logger } from './logger.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
@@ -332,6 +333,7 @@ export type CacheKeepTarget = {
   consecutiveFailures: number
   dayKey: string
   oauthAccountId?: string
+  isSubagent: boolean
 }
 
 function cacheKeepRetryDelayMs(targetId: string, failureCount: number) {
@@ -381,6 +383,17 @@ export class CacheKeepManager {
       onTrackedSessionsChanged?: (
         sessions: readonly CacheKeepTrackedSession[],
       ) => Promise<void> | void
+      prepareBody?: (
+        bodyText: string,
+        target: CacheKeepTarget,
+      ) => string | Promise<string>
+      onResponse?: (input: {
+        target: CacheKeepTarget
+        bodyText: string
+        status: number
+        data: unknown
+        receivedAt: number
+      }) => void | Promise<void>
     },
   ) {}
 
@@ -497,6 +510,7 @@ export class CacheKeepManager {
     storage: AccountStorage | null
     cacheMode: string
     oauthAccountId?: string
+    isSubagent?: boolean
   }) {
     if (!input.sessionId)
       return { tracked: false, reason: 'missing session id' }
@@ -534,6 +548,7 @@ export class CacheKeepManager {
       consecutiveFailures: 0,
       dayKey: today,
       oauthAccountId: input.oauthAccountId,
+      isSubagent: input.isSubagent ?? false,
     })
     this.pruneTargets(now, today)
     this.publishTrackedSessions()
@@ -547,6 +562,7 @@ export class CacheKeepManager {
     headers: Headers
     bodyText: string
     oauthAccountId?: string
+    isSubagent?: boolean
   }): Promise<CacheKeepPrewarmResult> {
     const headers: Record<string, string> = {}
     input.headers.forEach((value, key) => {
@@ -562,6 +578,7 @@ export class CacheKeepManager {
       consecutiveFailures: 0,
       dayKey: '',
       oauthAccountId: input.oauthAccountId,
+      isSubagent: input.isSubagent ?? false,
     }
     return this.sendPrewarm(target)
   }
@@ -622,11 +639,23 @@ export class CacheKeepManager {
   private async sendPrewarm(
     target: CacheKeepTarget,
   ): Promise<CacheKeepPrewarmResult> {
-    const prewarm = await buildCacheKeepPrewarmBody(target.bodyText)
+    let bodyText = target.bodyText
+    if (this.options.prepareBody) {
+      try {
+        bodyText = await this.options.prepareBody(bodyText, target)
+      } catch (error) {
+        logger.warn('cachekeep', 'prepare body failed', {
+          session: target.id,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    const preparedTarget = { ...target, bodyText }
+    const prewarm = await buildCacheKeepPrewarmBody(bodyText)
     if (!prewarm.ok) return prewarm
 
     const fetchImpl = this.options.fetchImpl ?? fetch
-    const prewarmTarget = { ...target, bodyText: prewarm.bodyText }
+    const prewarmTarget = { ...preparedTarget, bodyText: prewarm.bodyText }
     const headers = this.options.prepareHeaders
       ? await this.options.prepareHeaders(
           new Headers(target.headers),
@@ -652,21 +681,54 @@ export class CacheKeepManager {
         transient: true,
       }
     }
+    const receivedAt = this.options.now?.() ?? Date.now()
+    const raw = await response.text().catch(() => '')
+    let data: unknown = null
+    try {
+      data = raw ? JSON.parse(raw) : null
+    } catch {}
+    try {
+      await this.options.onResponse?.({
+        target,
+        bodyText: prewarm.bodyText,
+        status: response.status,
+        data,
+        receivedAt,
+      })
+    } catch {}
+    try {
+      const dumpHandle = await dumpDirectRequest({
+        affinity: target.id,
+        route: 'cachekeep',
+        status: response.status,
+        bodyText: prewarm.bodyText,
+        url: target.url,
+        method: 'POST',
+        headers,
+        tag: 'cachekeep',
+      })
+      await dumpResponseArtifact(dumpHandle, {
+        status: response.status,
+        message: data,
+      })
+    } catch (error) {
+      logger.debug('cachekeep', 'dump failed', {
+        session: target.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
     if (!response.ok) {
       return {
         ok: false,
-        reason: await response
-          .text()
-          .catch(() => '')
-          .then((body) => body || `HTTP ${response.status}`),
+        reason: raw || `HTTP ${response.status}`,
         status: response.status,
       }
     }
-    const data = (await response.json().catch(() => null)) as Record<
-      string,
-      unknown
-    > | null
-    const usage = data?.usage as
+    const objectData =
+      data && typeof data === 'object' && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : null
+    const usage = objectData?.usage as
       | {
           input_tokens?: number
           cache_creation_input_tokens?: number

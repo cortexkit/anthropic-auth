@@ -1,4 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   type AccountStorage,
   buildCacheKeepPrewarmBody,
@@ -7,6 +10,8 @@ import {
   CacheKeepManager,
   executeCacheKeepCommand,
   parseCacheKeepCommandAction,
+  resetDumpState,
+  setDumpEnabled,
 } from '@cortexkit/anthropic-auth-core'
 
 const hybridStorage = (): AccountStorage => ({
@@ -128,6 +133,138 @@ describe('cachekeep prewarm body', () => {
 })
 
 describe('CacheKeepManager', () => {
+  test('writes cachekeep-tagged prewarm request and response artifacts', async () => {
+    const dumpDir = await mkdtemp(join(tmpdir(), 'cachekeep-dump-test-'))
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    setDumpEnabled(true)
+    try {
+      const manager = new CacheKeepManager({
+        loadStorage: () => Promise.resolve(hybridStorage()),
+        fetchImpl: mock(
+          async () => new Response('malformed', { status: 429 }),
+        ) as unknown as typeof fetch,
+      })
+      await manager.prewarmNow({
+        sessionId: 'ses_dump',
+        url: 'https://api.anthropic.com/v1/messages',
+        headers: new Headers(),
+        bodyText: JSON.stringify({
+          system: [
+            {
+              type: 'text',
+              text: 'stable',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      const files = await readdir(dumpDir)
+      expect(files.some((file) => file.includes('-prewarm-cachekeep-'))).toBe(
+        true,
+      )
+      const metadataPath = files.find((file) => file.endsWith('.meta.json'))
+      expect(metadataPath).toBeDefined()
+      const metadata = JSON.parse(
+        await readFile(join(dumpDir, metadataPath!), 'utf8'),
+      )
+      expect(metadata.tag).toBe('cachekeep')
+      const responsePath = files.find((file) => file.endsWith('.response.json'))
+      expect(responsePath).toBeDefined()
+      expect(
+        JSON.parse(await readFile(join(dumpDir, responsePath!), 'utf8')),
+      ).toEqual({ status: 429 })
+    } finally {
+      resetDumpState()
+      if (originalDumpDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
+      await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('prepares the tracked body and observes the exact sent body', async () => {
+    const sent: string[] = []
+    const observed: unknown[] = []
+    const body = JSON.stringify({
+      model: 'claude-opus-4-7',
+      max_tokens: 100,
+      stream: true,
+      system: [
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl: mock(async (_input, init) => {
+        sent.push(String(init?.body))
+        return new Response(
+          JSON.stringify({
+            usage: {
+              input_tokens: 2,
+              cache_creation_input_tokens: 1,
+              cache_read_input_tokens: 3,
+              cache_creation: {
+                ephemeral_5m_input_tokens: 4,
+                ephemeral_1h_input_tokens: 5,
+              },
+            },
+          }),
+          { status: 200 },
+        )
+      }) as unknown as typeof fetch,
+      prepareBody: (value) => value.replace('hello', 'prepared'),
+      onResponse: (input) => {
+        observed.push(input)
+      },
+    })
+    const result = await manager.prewarmNow({
+      sessionId: 'ses_prepare',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: body,
+    })
+    expect(result.ok).toBe(true)
+    expect(sent[0]).toContain('prepared')
+    expect(observed).toHaveLength(1)
+    expect(sent[0]).toBeDefined()
+    expect((observed[0] as { bodyText: string }).bodyText).toBe(sent[0]!)
+    expect(
+      (observed[0] as { data: { usage: { cache_creation: unknown } } }).data
+        .usage.cache_creation,
+    ).toEqual({ ephemeral_5m_input_tokens: 4, ephemeral_1h_input_tokens: 5 })
+  })
+
+  test('observer errors do not break malformed responses or scheduling', async () => {
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl: mock(
+        async () => new Response('not-json', { status: 429 }),
+      ) as unknown as typeof fetch,
+      onResponse: () => {
+        throw new Error('observer failure')
+      },
+    })
+    const result = await manager.prewarmNow({
+      sessionId: 'ses_observer',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+    expect(result).toMatchObject({ ok: false, status: 429 })
+  })
+
   test('tracks hybrid sessions and prewarms five minutes before expiry', async () => {
     let now = new Date('2026-05-18T10:00:00').getTime()
     const calls: Array<{ url: string; body: string }> = []

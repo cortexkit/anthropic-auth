@@ -18,8 +18,13 @@ export type ClaudeCodeIdentity = {
 const IDENTITY_CACHE_LIMIT = 1_000
 const identityCache = new Map<string, ClaudeCodeIdentity>()
 
-function setBounded<K, V>(map: Map<K, V>, key: K, value: V) {
-  if (!map.has(key) && map.size >= IDENTITY_CACHE_LIMIT) {
+export function setBounded<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  limit = IDENTITY_CACHE_LIMIT,
+) {
+  if (!map.has(key) && map.size >= limit) {
     const oldest = map.keys().next().value
     if (oldest !== undefined) map.delete(oldest)
   }

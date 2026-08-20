@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -13,7 +14,15 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { sweepDumpDirectory, writeDumpFile } from '../dump'
+import {
+  dumpDirectRequest,
+  dumpRelayRequest,
+  dumpResponseArtifact,
+  resetDumpState,
+  setDumpEnabled,
+  sweepDumpDirectory,
+  writeDumpFile,
+} from '../dump'
 
 const dumpDirs: string[] = []
 const dumpLinks: string[] = []
@@ -22,12 +31,13 @@ const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
 
 function dumpArtifactName(
   id: number,
-  kind: 'body' | 'meta' | 'relay' | 'request' = 'body',
+  kind: 'body' | 'meta' | 'relay' | 'request' | 'response' = 'body',
 ) {
   return `2026-07-17T12-00-00-000Z-${String(id).padStart(6, '0')}-session-direct.${kind}.json`
 }
 
 afterEach(async () => {
+  resetDumpState()
   if (originalDumpMaxBytes === undefined) {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_MAX_BYTES
   } else {
@@ -46,6 +56,158 @@ afterEach(async () => {
       .splice(0)
       .map((path) => rm(path, { recursive: true, force: true })),
   )
+})
+
+test('request dumps return response handles only when enabled', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+
+  expect(
+    await dumpDirectRequest({
+      affinity: 'ses-a',
+      bodyText: '{}',
+      route: 'oauth',
+    }),
+  ).toBeNull()
+  setDumpEnabled(true)
+  const direct = await dumpDirectRequest({
+    affinity: 'ses-a',
+    bodyText: '{}',
+    route: 'oauth',
+  })
+  const relay = await dumpRelayRequest({
+    affinity: 'ses-b',
+    transport: 'http',
+    protocol: 1,
+    mode: 'full_sync',
+    bodyText: '{}',
+    payload: {},
+    relayBytes: 2,
+  })
+  expect(direct?.responsePath).toMatch(/\.response\.json$/)
+  expect(relay?.responsePath).toMatch(/\.response\.json$/)
+  expect(await lstat(direct!.responsePath).catch(() => null)).toBeNull()
+})
+
+test('sweeps tagged dumps with a maximum-length affinity segment', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+
+  await dumpDirectRequest({
+    affinity: 'a'.repeat(80),
+    bodyText: '{"messages":[]}',
+    tag: 'cachekeep',
+  })
+
+  expect(await readdir(dumpDir)).not.toEqual([])
+  const result = await sweepDumpDirectory({
+    dumpDir,
+    maxBytes: 1,
+    minAgeMs: 0,
+    now: Date.now() + 1,
+  })
+
+  expect(result.removed).toBeGreaterThan(0)
+  expect(await readdir(dumpDir)).toEqual([])
+})
+
+test('failed request dumps return no handle or orphan response artifact', async () => {
+  if (process.getuid?.() === 0) return
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  await chmod(dumpDir, 0o500)
+  try {
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    setDumpEnabled(true)
+    const handle = await dumpDirectRequest({
+      affinity: 'ses-failure',
+      bodyText: '{}',
+    })
+    expect(handle).toBeNull()
+    expect(
+      (await readdir(dumpDir)).some((name) => name.endsWith('.response.json')),
+    ).toBe(false)
+  } finally {
+    await chmod(dumpDir, 0o700)
+  }
+})
+
+test('response artifacts sanitize message fields and preserve diagnostics presence', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({ affinity: 'ses-a', bodyText: '{}' })
+  expect(handle).not.toBeNull()
+  await dumpResponseArtifact(handle, {
+    status: 200,
+    message: {
+      id: 'msg_provider',
+      model: 'claude-opus-4-7',
+      usage: { input_tokens: 1 },
+      diagnostics: null,
+      content: [{ text: 'secret' }],
+    },
+  })
+  const artifact = JSON.parse(await readFile(handle!.responsePath, 'utf8'))
+  expect(artifact).toEqual({
+    status: 200,
+    message_id: 'msg_provider',
+    model: 'claude-opus-4-7',
+    usage: { input_tokens: 1 },
+    diagnostics: null,
+  })
+  expect(JSON.stringify(artifact)).not.toContain('secret')
+})
+
+test('tagged prewarm dumps include the tag in filenames and metadata', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({
+    affinity: 'ses-a',
+    bodyText: '{}',
+    tag: 'cachekeep',
+  })
+  expect(handle?.tag).toBe('cachekeep')
+  expect(handle?.responsePath).toContain('-prewarm-cachekeep-')
+  const files = await readdir(dumpDir)
+  const metadata = JSON.parse(
+    await readFile(
+      join(dumpDir, files.find((name) => name.endsWith('.meta.json'))!),
+      'utf8',
+    ),
+  )
+  expect(metadata.tag).toBe('cachekeep')
+})
+
+test('dump sweep recognizes response artifacts', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  const response = join(dumpDir, dumpArtifactName(1, 'response'))
+  await writeFile(response, '12345678')
+  await utimes(response, new Date(1_000), new Date(1_000))
+  expect(await sweepDumpDirectory({ dumpDir, maxBytes: 1 })).toEqual({
+    removed: 1,
+    freedBytes: 8,
+  })
 })
 
 test('dump sweep deletes oldest files until the directory is under its cap', async () => {

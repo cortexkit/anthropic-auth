@@ -9,6 +9,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Retry failed CacheKeep prewarms while the last confirmed cache can still be alive, and serialize overlapping manager ticks to avoid duplicate requests.
 - Preserve fresh scoped-only fallback quota snapshots, permanent refresh-error classification across lock contention, and explicit re-login guidance for unusable fallback accounts.
 - Evict complete request artifact groups when enforcing the dump-directory size cap.
+- Capture Anthropic cache diagnostics in versioned `MC-CACHE-DIAG ` debug records, preserve provider response IDs across requests and cachekeep prewarms, and write response/request dump artifacts without response content. Document the beta states and known fingerprint, organization, workspace, and beta-set limitations.
 
 ## 1.19.1
 

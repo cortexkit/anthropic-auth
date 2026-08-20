@@ -283,6 +283,46 @@ describe('relay client', () => {
     }
   })
 
+  test('reports the created HTTP relay dump handle without replacing the response', async () => {
+    const originalFetch = globalThis.fetch
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = await mkdtemp(
+      join(tmpdir(), 'anthropic-auth-relay-handle-'),
+    )
+    setDumpEnabled(true)
+    globalThis.fetch = mock(
+      async () => new Response('relay', { status: 201 }),
+    ) as unknown as typeof fetch
+    const handles: unknown[] = []
+    try {
+      const response = await sendViaRelay({
+        config,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-handle'),
+        body: '{}',
+        fallback: async () => new Response('direct'),
+        onDumpCreated: (handle) => {
+          handles.push(handle)
+          throw new Error('observer failure')
+        },
+      })
+      expect(response.status).toBe(201)
+      expect(handles).toHaveLength(1)
+      expect((handles[0] as { responsePath: string }).responsePath).toEndWith(
+        '.response.json',
+      )
+    } finally {
+      const dumpDir = getDumpDirectory()
+      resetDumpState()
+      globalThis.fetch = originalFetch
+      if (originalDumpDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
+      await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
   test('retries with full sync when relay reports state mismatch', async () => {
     const calls: unknown[] = []
     const originalFetch = globalThis.fetch
@@ -1686,6 +1726,7 @@ describe('relay client', () => {
     const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-dump-test-'))
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
     const sentPayloads: unknown[] = []
+    const handles: unknown[] = []
     setDumpEnabled(true)
 
     class DumpingWebSocket extends EventTarget {
@@ -1754,6 +1795,7 @@ describe('relay client', () => {
         headers: headers('session-relay-ws-dump-exact'),
         body: JSON.stringify({ messages: ['one'] }),
         fallback: async () => new Response('direct'),
+        onDumpCreated: (handle) => handles.push(handle),
       })
 
       const files = await readdir(getDumpDirectory())
@@ -1774,6 +1816,10 @@ describe('relay client', () => {
       expect(relay).toMatchObject({ protocol: 2, mode: 'full_sync' })
       expect(relay.id).toBeString()
       expect(meta.relayBytes).toBe(JSON.stringify(sentPayloads[0]).length)
+      expect(handles).toHaveLength(1)
+      expect((handles[0] as { responsePath: string }).responsePath).toEndWith(
+        '.response.json',
+      )
     } finally {
       resetDumpState()
       globalThis.WebSocket = originalWebSocket

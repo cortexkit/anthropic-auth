@@ -450,4 +450,59 @@ describe('createServerSideFallbackStreamRewriter', () => {
       }),
     ])
   })
+
+  test.each([
+    ['LF', '\n\n', 1],
+    ['CRLF', '\r\n\r\n', 2],
+  ])('resyncs after an oversized frame ending in a split %s boundary', (_name, delimiter, splitAt) => {
+    let handled = 0
+    const skipped = `data: ${'x'.repeat(256)}`
+    const later = [
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: 'toolu_after_overflow',
+          name: 'mcp_Bash',
+          input: {},
+        },
+      }),
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }),
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: {
+          type: 'fallback',
+          from: { model: 'claude-fable-5' },
+          to: { model: 'claude-opus-4-8' },
+        },
+      }),
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'refusal' },
+      }),
+    ].join('')
+    const rewriter = createServerSideFallbackStreamRewriter({
+      requestedModel: 'claude-fable-5',
+      maxPendingBytes: 64,
+      onRefusalAfterToolUse: () => {
+        handled++
+        return true
+      },
+    })
+
+    const output =
+      rewriter.push(`${skipped}${delimiter.slice(0, splitAt)}`) +
+      rewriter.push(`${delimiter.slice(splitAt)}${later}`) +
+      rewriter.flush()
+
+    expect(output.slice(0, skipped.length + delimiter.length)).toBe(
+      `${skipped}${delimiter}`,
+    )
+    expect(output).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+    expect(output).toContain('"stop_reason":"tool_use"')
+    expect(output).not.toContain('"stop_reason":"refusal"')
+    expect(handled).toBe(1)
+  })
 })
