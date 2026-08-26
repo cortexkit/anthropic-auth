@@ -29,7 +29,7 @@
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@earendil-works/pi-tui": "0.84.2",
     "@opencode-ai/plugin": "1.18.21",
-    "@tsconfig/bun": "1.0.10",
+    "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.3.14",
     "dedent": "^1.7.2",
     "lefthook": "2.1.9",
