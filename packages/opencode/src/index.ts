@@ -1321,6 +1321,7 @@ const anthropicAuthPlugin = async (
     status: number
     streaming: boolean
     dumpWrite: Promise<void>
+    messageStart?: Record<string, unknown>
   }
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
@@ -1420,14 +1421,24 @@ const anthropicAuthPlugin = async (
   function observeCacheDiagnosticsResponse(
     response: Response,
     message: unknown,
+    complete = true,
   ) {
     const context = cacheDiagnosticsResponses.get(response)
     if (!context) return
+    if (
+      message &&
+      typeof message === 'object' &&
+      !Array.isArray(message) &&
+      !complete
+    ) {
+      context.messageStart = message as Record<string, unknown>
+    }
     context.dumpWrite = context.dumpWrite
       .then(() =>
         dumpResponseArtifact(context.dump, {
           status: context.status,
           message,
+          complete,
         }),
       )
       .catch(() => {})
@@ -1438,12 +1449,45 @@ const anthropicAuthPlugin = async (
     })
   }
 
+  function observeCacheDiagnosticsDelta(
+    response: Response,
+    delta: { usage?: Record<string, unknown>; stopReason?: string },
+  ) {
+    const context = cacheDiagnosticsResponses.get(response)
+    if (!context) return
+    const start = context.messageStart ?? {}
+    const startUsage =
+      start.usage &&
+      typeof start.usage === 'object' &&
+      !Array.isArray(start.usage)
+        ? (start.usage as Record<string, unknown>)
+        : {}
+    const message = {
+      ...start,
+      ...(delta.usage ? { usage: { ...startUsage, ...delta.usage } } : {}),
+      ...(delta.stopReason ? { stop_reason: delta.stopReason } : {}),
+    }
+    context.dumpWrite = context.dumpWrite
+      .then(() =>
+        dumpResponseArtifact(context.dump, {
+          status: context.status,
+          message,
+          complete: true,
+        }),
+      )
+      .catch(() => {})
+  }
+
   function attachCacheDiagnosticsResponse(
     response: Response,
     input: Omit<CacheDiagnosticsResponse, 'dumpWrite'>,
   ) {
     const dumpWrite = Promise.resolve(
-      dumpResponseArtifact(input.dump, { status: input.status, message: null }),
+      dumpResponseArtifact(input.dump, {
+        status: input.status,
+        message: null,
+        complete: false,
+      }),
     ).catch(() => {})
     cacheDiagnosticsResponses.set(response, { ...input, dumpWrite })
   }
@@ -5177,7 +5221,13 @@ const anthropicAuthPlugin = async (
                     ? diagnosticsContext.streaming
                       ? {
                           onMessageStart: (message) =>
-                            observeCacheDiagnosticsResponse(response, message),
+                            observeCacheDiagnosticsResponse(
+                              response,
+                              message,
+                              false,
+                            ),
+                          onMessageDelta: (delta) =>
+                            observeCacheDiagnosticsDelta(response, delta),
                           onStreamEnd: () => diagnosticsContext.dumpWrite,
                         }
                       : {

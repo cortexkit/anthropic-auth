@@ -174,7 +174,7 @@ describe('CacheKeepManager', () => {
       expect(responsePath).toBeDefined()
       expect(
         JSON.parse(await readFile(join(dumpDir, responsePath!), 'utf8')),
-      ).toEqual({ status: 429 })
+      ).toEqual({ status: 429, stream_complete: true })
     } finally {
       resetDumpState()
       if (originalDumpDir === undefined)

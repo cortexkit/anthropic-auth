@@ -710,6 +710,51 @@ describe('createStrippedStream', () => {
     expect(perf.at(-1)?.ssePendingOverflowCount).toBe(1)
   })
 
+  test('observes terminal message_delta usage and stop reason', async () => {
+    const start = sse('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_terminal_usage',
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 10, output_tokens: 3 },
+      },
+    })
+    const terminal = sse('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn' },
+      usage: { output_tokens: 1749 },
+    })
+    const seenStart: unknown[] = []
+    const seenDelta: unknown[] = []
+    const response = createStrippedStream(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder()
+            controller.enqueue(encoder.encode(`${start}${terminal}`))
+            controller.close()
+          },
+        }),
+      ),
+      {
+        onMessageStart: (message) => seenStart.push(message),
+        onMessageDelta: (delta) => seenDelta.push(delta),
+      },
+    )
+
+    expect(await response.text()).toBe(`${start}${terminal}`)
+    expect(seenStart).toEqual([
+      {
+        id: 'msg_terminal_usage',
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 10, output_tokens: 3 },
+      },
+    ])
+    expect(seenDelta).toEqual([
+      { usage: { output_tokens: 1749 }, stopReason: 'end_turn' },
+    ])
+  })
+
   test('observes a split non-streaming message response without changing bytes', async () => {
     const message = {
       id: 'msg_provider_2',

@@ -1353,6 +1353,7 @@ type SseEventSummary = {
   signatureDeltaBytes?: number
   redactedThinkingBytes?: number
   message?: Record<string, unknown>
+  usage?: Record<string, unknown>
 }
 
 type SseDiagnosticState = {
@@ -1499,6 +1500,7 @@ function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
     )
   }
   if (usage) {
+    summary.usage = usage
     summary.stopReason ??= stringField(message, 'stop_reason')
   }
   if (summary.type === 'message_start' && message) summary.message = message
@@ -1850,6 +1852,10 @@ export function createStrippedStream(
     serverSideFallbackModel?: string
     onServerSideFallbackOutcome?: (outcome: ServerSideFallbackOutcome) => void
     onMessageStart?: (message: Record<string, unknown>) => void
+    onMessageDelta?: (delta: {
+      usage?: Record<string, unknown>
+      stopReason?: string
+    }) => void
     onMessageResponse?: (message: Record<string, unknown>) => void
     onStreamEnd?: () => void | Promise<void>
     responseMode?: 'json'
@@ -1874,7 +1880,7 @@ export function createStrippedStream(
   let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
   const sseDiagnostics =
-    options.perf || options.onMessageStart
+    options.perf || options.onMessageStart || options.onMessageDelta
       ? createSseDiagnosticState()
       : undefined
   let responseText = ''
@@ -2004,6 +2010,18 @@ export function createStrippedStream(
                   const message = summary.message
                   if (summary.type === 'message_start' && message)
                     observe(() => options.onMessageStart?.(message))
+                  if (
+                    summary.type === 'message_delta' &&
+                    (summary.usage || summary.stopReason)
+                  )
+                    observe(() =>
+                      options.onMessageDelta?.({
+                        ...(summary.usage ? { usage: summary.usage } : {}),
+                        ...(summary.stopReason
+                          ? { stopReason: summary.stopReason }
+                          : {}),
+                      }),
+                    )
                 },
               )
             if (jsonMode) {
@@ -2098,6 +2116,18 @@ export function createStrippedStream(
                 const message = summary.message
                 if (summary.type === 'message_start' && message)
                   observe(() => options.onMessageStart?.(message))
+                if (
+                  summary.type === 'message_delta' &&
+                  (summary.usage || summary.stopReason)
+                )
+                  observe(() =>
+                    options.onMessageDelta?.({
+                      ...(summary.usage ? { usage: summary.usage } : {}),
+                      ...(summary.stopReason
+                        ? { stopReason: summary.stopReason }
+                        : {}),
+                    }),
+                  )
               },
             )
           const rewriteStart = rewriteNowMs()

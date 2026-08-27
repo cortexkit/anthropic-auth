@@ -2431,6 +2431,107 @@ describe('auth.loader', () => {
     }
   })
 
+  test('dumps final streamed usage while retaining opening counters', async () => {
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-stream-dump-test-'))
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+
+    try {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          dump: { enabled: true },
+          quota: { enabled: false },
+        }),
+      )
+      const start = `event: message_start\ndata: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: 'msg_stream_usage',
+          model: 'claude-opus-4-7',
+          usage: {
+            input_tokens: 10,
+            cache_creation_input_tokens: 20,
+            cache_read_input_tokens: 30,
+            cache_creation: {
+              ephemeral_5m_input_tokens: 4,
+              ephemeral_1h_input_tokens: 16,
+            },
+            output_tokens: 3,
+          },
+          diagnostics: null,
+        },
+      })}\n\n`
+      const delta = `event: message_delta\ndata: ${JSON.stringify({
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { output_tokens: 1749 },
+      })}\n\n`
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response(`${start}${delta}`, {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+        ),
+      ) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+
+      const response = await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-stream-dump' },
+        body: JSON.stringify({
+          model: 'claude-opus-4-7',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      expect(await response.text()).toBe(`${start}${delta}`)
+
+      const files = await readdir(dumpDir)
+      const responsePath = files.find((file) => file.endsWith('.response.json'))
+      expect(responsePath).toBeString()
+      expect(
+        JSON.parse(await readFile(join(dumpDir, responsePath!), 'utf8')),
+      ).toEqual({
+        status: 200,
+        message_id: 'msg_stream_usage',
+        model: 'claude-opus-4-7',
+        usage: {
+          input_tokens: 10,
+          cache_creation_input_tokens: 20,
+          cache_read_input_tokens: 30,
+          cache_creation: {
+            ephemeral_5m_input_tokens: 4,
+            ephemeral_1h_input_tokens: 16,
+          },
+          output_tokens: 1749,
+        },
+        diagnostics: null,
+        stop_reason: 'end_turn',
+        stream_complete: true,
+      })
+    } finally {
+      if (originalDumpDir === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
+      }
+      await rm(dumpDir, { recursive: true, force: true })
+    }
+  })
+
   test('sidebar shows persisted main quota written after plugin startup', async () => {
     await useTempAccountFile(
       createFallbackStorage({
@@ -12566,9 +12667,13 @@ describe('cache diagnostics', () => {
         ),
       )
       expect(artifacts).toContainEqual(
-        expect.objectContaining({ status: 200, message_id: 'provider-dump' }),
+        expect.objectContaining({
+          status: 200,
+          message_id: 'provider-dump',
+          stream_complete: false,
+        }),
       )
-      expect(artifacts).toContainEqual({ status: 503 })
+      expect(artifacts).toContainEqual({ status: 503, stream_complete: false })
       expect(JSON.stringify(artifacts)).not.toContain('secret')
     } finally {
       if (originalDumpDir === undefined) {

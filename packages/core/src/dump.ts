@@ -770,7 +770,7 @@ export async function dumpRelayRequest(input: {
 
 export async function dumpResponseArtifact(
   handle: DumpHandle | null,
-  input: { status: number; message: unknown },
+  input: { status: number; message: unknown; complete?: boolean },
 ): Promise<void> {
   if (!handle) return
   const message =
@@ -779,7 +779,10 @@ export async function dumpResponseArtifact(
     !Array.isArray(input.message)
       ? (input.message as Record<string, unknown>)
       : {}
-  const artifact: Record<string, unknown> = { status: input.status }
+  const artifact: Record<string, unknown> = {
+    status: input.status,
+    stream_complete: input.complete ?? true,
+  }
   if (typeof message.id === 'string' && message.id.length > 0)
     artifact.message_id = message.id
   if (typeof message.model === 'string' && message.model.length > 0)
@@ -787,6 +790,8 @@ export async function dumpResponseArtifact(
   if (Object.hasOwn(message, 'usage')) artifact.usage = message.usage
   if (Object.hasOwn(message, 'diagnostics'))
     artifact.diagnostics = message.diagnostics
+  if (typeof message.stop_reason === 'string' && message.stop_reason.length > 0)
+    artifact.stop_reason = message.stop_reason
   try {
     await writeDumpFile(
       handle.responsePath,

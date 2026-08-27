@@ -309,6 +309,7 @@ test('response artifacts sanitize message fields and preserve diagnostics presen
       diagnostics: null,
       content: [{ text: 'secret' }],
     },
+    complete: true,
   })
   const artifact = JSON.parse(await readFile(handle!.responsePath, 'utf8'))
   expect(artifact).toEqual({
@@ -317,8 +318,107 @@ test('response artifacts sanitize message fields and preserve diagnostics presen
     model: 'claude-opus-4-7',
     usage: { input_tokens: 1 },
     diagnostics: null,
+    stream_complete: true,
   })
   expect(JSON.stringify(artifact)).not.toContain('secret')
+})
+
+test('response artifacts preserve opening usage while recording terminal usage and reason', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({
+    affinity: 'ses-usage',
+    bodyText: '{}',
+  })
+  expect(handle).not.toBeNull()
+
+  const opening = {
+    id: 'msg_provider_usage',
+    model: 'claude-opus-4-7',
+    usage: {
+      input_tokens: 10,
+      cache_creation_input_tokens: 20,
+      cache_read_input_tokens: 30,
+      cache_creation: {
+        ephemeral_5m_input_tokens: 4,
+        ephemeral_1h_input_tokens: 16,
+      },
+      output_tokens: 3,
+    },
+    diagnostics: null,
+  }
+  await dumpResponseArtifact(handle, {
+    status: 200,
+    message: opening,
+    complete: false,
+  })
+  await dumpResponseArtifact(handle, {
+    status: 200,
+    message: {
+      ...opening,
+      usage: { ...opening.usage, output_tokens: 1749 },
+      stop_reason: 'end_turn',
+    },
+    complete: true,
+  })
+
+  expect(JSON.parse(await readFile(handle!.responsePath, 'utf8'))).toEqual({
+    status: 200,
+    message_id: 'msg_provider_usage',
+    model: 'claude-opus-4-7',
+    usage: {
+      input_tokens: 10,
+      cache_creation_input_tokens: 20,
+      cache_read_input_tokens: 30,
+      cache_creation: {
+        ephemeral_5m_input_tokens: 4,
+        ephemeral_1h_input_tokens: 16,
+      },
+      output_tokens: 1749,
+    },
+    diagnostics: null,
+    stop_reason: 'end_turn',
+    stream_complete: true,
+  })
+})
+
+test('response artifacts mark a stream incomplete when no terminal frame arrives', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({
+    affinity: 'ses-incomplete',
+    bodyText: '{}',
+  })
+  expect(handle).not.toBeNull()
+
+  await dumpResponseArtifact(handle, {
+    status: 200,
+    message: {
+      id: 'msg_provider_incomplete',
+      usage: { input_tokens: 10, output_tokens: 3 },
+    },
+    complete: false,
+  })
+
+  expect(
+    JSON.parse(await readFile(handle!.responsePath, 'utf8')),
+  ).toMatchObject({
+    status: 200,
+    message_id: 'msg_provider_incomplete',
+    usage: { input_tokens: 10, output_tokens: 3 },
+    stream_complete: false,
+  })
+  expect(
+    JSON.parse(await readFile(handle!.responsePath, 'utf8')).stop_reason,
+  ).toBeUndefined()
 })
 
 test('tagged prewarm dumps include the tag in filenames and metadata', async () => {
