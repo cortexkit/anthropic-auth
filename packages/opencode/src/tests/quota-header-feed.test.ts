@@ -72,17 +72,18 @@ describe('quota header feed', () => {
     const raw = JSON.parse(
       await readFile(join(directory, 'required.json'), 'utf8'),
     )
-    expect(raw.entries.a.schema_version).toBe(1)
+    expect(QUOTA_HEADER_FEED_SCHEMA_VERSION).toBe(2)
+    expect(raw.entries.a.schema_version).toBe(2)
     expect(raw.entries.a.provider).toBe('anthropic')
   })
 
-  test('rejects unknown schema versions', async () => {
+  test.each([1, 999])('rejects unknown schema versions %p', async (version) => {
     await mkdir(directory, { recursive: true })
     await writeFile(
       join(directory, 'unknown.json'),
       JSON.stringify({
-        version: 999,
-        entries: { a: { ...entry(), schema_version: 999 } },
+        version,
+        entries: { a: { ...entry(), schema_version: version } },
         updated_at_ms: 1_000,
       }),
     )
@@ -186,10 +187,47 @@ describe('quota header feed', () => {
     await registry.publish({
       ...entry({
         quota: {
-          five_hour: undefined,
-          seven_day: undefined,
+          five_hour: {
+            usedPercent: 10,
+            remainingPercent: 90,
+            resetsAt: '2026-08-26T01:00:00.000Z',
+            checkedAt: 800,
+            unexpected_window_secret: 'must-not-publish-window',
+          },
+          seven_day: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            resetsAt: '2026-08-27T00:00:00.000Z',
+            checkedAt: 801,
+            unexpected_window_secret: 'must-not-publish-window',
+          },
           bindingWindow: 'five_hour',
           fallbackAdvised: false,
+          scoped: [
+            {
+              id: 'scope-1',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 55,
+              remainingPercent: 45,
+              resetsAt: '2026-08-26T00:00:00.000Z',
+              checkedAt: 900,
+              unexpected_scope_secret: 'must-not-publish-scope',
+            },
+          ],
+          extraUsage: {
+            used: {
+              amountMinor: 25,
+              currency: 'USD',
+              exponent: 2,
+              unexpected_money_secret: 'must-not-publish-money',
+            },
+            limit: { amountMinor: 100, currency: 'USD', exponent: 2 },
+            utilizationPercent: 25,
+            severity: 'warning',
+            exhausted: false,
+            unexpected_extra_usage_secret: 'must-not-publish-extra-usage',
+          },
           unexpected_secret: 'must-not-publish',
         } as unknown as QuotaHeaderFeedEntry['quota'],
       }),
@@ -200,13 +238,120 @@ describe('quota header feed', () => {
     )
     const bytes = await readFile(join(directory, 'quota-fields.json'), 'utf8')
     expect(raw.entries.a.quota).toEqual({
+      five_hour: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        resetsAt: '2026-08-26T01:00:00.000Z',
+        checkedAt: 800,
+      },
+      seven_day: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        resetsAt: '2026-08-27T00:00:00.000Z',
+        checkedAt: 801,
+      },
       bindingWindow: 'five_hour',
       fallbackAdvised: false,
+      scoped: [
+        {
+          id: 'scope-1',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 55,
+          remainingPercent: 45,
+          resetsAt: '2026-08-26T00:00:00.000Z',
+          checkedAt: 900,
+        },
+      ],
+      extraUsage: {
+        used: { amountMinor: 25, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 100, currency: 'USD', exponent: 2 },
+        utilizationPercent: 25,
+        severity: 'warning',
+        exhausted: false,
+      },
     })
     expect(raw.entries.a.quota).not.toHaveProperty('unexpected_secret')
+    expect(bytes).not.toContain('must-not-publish-window')
+    expect(bytes).not.toContain('must-not-publish-scope')
+    expect(bytes).not.toContain('must-not-publish-money')
+    expect(bytes).not.toContain('must-not-publish-extra-usage')
     expect(bytes).not.toContain('must-not-publish')
     expect(bytes).not.toContain('authorization')
     expect(bytes).not.toContain('access-token')
+  })
+
+  test('omits malformed nested quota values without dropping the entry', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'malformed-nested',
+    })
+    await registry.publish({
+      ...entry({
+        quota: {
+          five_hour: {
+            usedPercent: 'not-a-number',
+            remainingPercent: 90,
+            checkedAt: 800,
+          },
+          seven_day: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: 801,
+          },
+          bindingWindow: 'seven_day',
+          fallbackAdvised: false,
+          scoped: [
+            {
+              id: 'valid',
+              title: 'Valid',
+              modelName: 'Fable',
+              usedPercent: 55,
+              remainingPercent: 45,
+              checkedAt: 900,
+            },
+            {
+              id: 'invalid',
+              title: 'Invalid',
+              modelName: 'Fable',
+              usedPercent: Number.NaN,
+              remainingPercent: 45,
+              checkedAt: 900,
+            },
+          ],
+          extraUsage: {
+            used: { amountMinor: 25, currency: 'USD', exponent: 2 },
+            limit: { amountMinor: Number.NaN, currency: 'USD', exponent: 2 },
+            utilizationPercent: Number.NaN,
+            severity: 42,
+            exhausted: false,
+          },
+        } as unknown as QuotaHeaderFeedEntry['quota'],
+      }),
+      accountKey: 'a',
+    })
+    const raw = JSON.parse(
+      await readFile(join(directory, 'malformed-nested.json'), 'utf8'),
+    )
+    expect(raw.entries.a.quota).toEqual({
+      seven_day: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: 801,
+      },
+      bindingWindow: 'seven_day',
+      fallbackAdvised: false,
+      scoped: [
+        {
+          id: 'valid',
+          title: 'Valid',
+          modelName: 'Fable',
+          usedPercent: 55,
+          remainingPercent: 45,
+          checkedAt: 900,
+        },
+      ],
+    })
   })
 
   test('ignores stale, future, and malformed records', async () => {
@@ -214,14 +359,14 @@ describe('quota header feed', () => {
     await writeFile(
       join(directory, 'stale.json'),
       JSON.stringify({
-        version: 1,
+        version: 2,
         entries: { a: entry({ observed_at_ms: 1_000 }) },
       }),
     )
     await writeFile(
       join(directory, 'future.json'),
       JSON.stringify({
-        version: 1,
+        version: 2,
         entries: { a: entry({ observed_at_ms: 181_001 }) },
       }),
     )

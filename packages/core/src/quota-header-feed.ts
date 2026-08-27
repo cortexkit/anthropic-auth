@@ -12,12 +12,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  type AccountQuotaWindow,
+  type AccountScopedQuotaWindow,
   type AccountStorage,
   isOAuthAccount,
+  type OAuthExtraUsageSnapshot,
   type OAuthQuotaSnapshot,
+  type QuotaMoney,
 } from './accounts.ts'
 
-export const QUOTA_HEADER_FEED_SCHEMA_VERSION = 1
+export const QUOTA_HEADER_FEED_SCHEMA_VERSION = 2
 export const QUOTA_HEADER_FEED_LEASE_MS = 180_000
 
 export type QuotaHeaderFeedIdentity =
@@ -26,18 +30,23 @@ export type QuotaHeaderFeedIdentity =
   | { identity_source: 'none' }
 
 export type QuotaHeaderFeedEntry = QuotaHeaderFeedIdentity & {
-  schema_version: 1
+  schema_version: typeof QUOTA_HEADER_FEED_SCHEMA_VERSION
   provider: 'anthropic'
   configured_account_count: number
   observed_at_ms: number
   quota: Pick<
     OAuthQuotaSnapshot,
-    'five_hour' | 'seven_day' | 'bindingWindow' | 'fallbackAdvised'
+    | 'five_hour'
+    | 'seven_day'
+    | 'bindingWindow'
+    | 'fallbackAdvised'
+    | 'scoped'
+    | 'extraUsage'
   >
 }
 
 type FeedRecord = {
-  version: 1
+  version: typeof QUOTA_HEADER_FEED_SCHEMA_VERSION
   entries: Record<string, QuotaHeaderFeedEntry>
 }
 
@@ -94,8 +103,129 @@ function validIdentity(
 }
 
 function validatePublishEntry(entry: QuotaHeaderFeedEntry) {
-  if (!validIdentity(entry as unknown as Record<string, unknown>)) {
+  if (
+    entry.schema_version !== QUOTA_HEADER_FEED_SCHEMA_VERSION ||
+    entry.provider !== 'anthropic' ||
+    !validIdentity(entry as unknown as Record<string, unknown>)
+  ) {
     throw new Error('Invalid quota header feed entry')
+  }
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function projectQuotaWindow(value: unknown): AccountQuotaWindow | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  if (
+    !finiteNumber(candidate.usedPercent) ||
+    !finiteNumber(candidate.remainingPercent) ||
+    !finiteNumber(candidate.checkedAt)
+  ) {
+    return undefined
+  }
+  return {
+    usedPercent: candidate.usedPercent,
+    remainingPercent: candidate.remainingPercent,
+    ...(typeof candidate.resetsAt === 'string' && {
+      resetsAt: candidate.resetsAt,
+    }),
+    checkedAt: candidate.checkedAt,
+  }
+}
+
+function projectScopedQuotaWindow(
+  value: unknown,
+): AccountScopedQuotaWindow | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  const window = projectQuotaWindow(candidate)
+  if (
+    !window ||
+    typeof candidate.id !== 'string' ||
+    !candidate.id.trim() ||
+    typeof candidate.title !== 'string' ||
+    !candidate.title.trim() ||
+    typeof candidate.modelName !== 'string' ||
+    !candidate.modelName.trim()
+  ) {
+    return undefined
+  }
+  return {
+    ...window,
+    id: candidate.id,
+    title: candidate.title,
+    ...(typeof candidate.modelId === 'string' &&
+      candidate.modelId.trim() && {
+        modelId: candidate.modelId,
+      }),
+    modelName: candidate.modelName,
+  }
+}
+
+function projectQuotaMoney(value: unknown): QuotaMoney | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  if (
+    !finiteNumber(candidate.amountMinor) ||
+    typeof candidate.currency !== 'string' ||
+    !candidate.currency.trim() ||
+    !finiteNumber(candidate.exponent)
+  ) {
+    return undefined
+  }
+  return {
+    amountMinor: candidate.amountMinor,
+    currency: candidate.currency,
+    exponent: candidate.exponent,
+  }
+}
+
+function projectExtraUsage(
+  value: unknown,
+): OAuthExtraUsageSnapshot | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  const used = projectQuotaMoney(candidate.used)
+  const limit = projectQuotaMoney(candidate.limit)
+  if (!used || !limit || typeof candidate.exhausted !== 'boolean') {
+    return undefined
+  }
+  return {
+    used,
+    limit,
+    ...(finiteNumber(candidate.utilizationPercent) && {
+      utilizationPercent: candidate.utilizationPercent,
+    }),
+    ...(typeof candidate.severity === 'string' && {
+      severity: candidate.severity,
+    }),
+    exhausted: candidate.exhausted,
+  }
+}
+
+function projectQuota(quota: QuotaHeaderFeedEntry['quota']) {
+  const fiveHour = projectQuotaWindow(quota.five_hour)
+  const sevenDay = projectQuotaWindow(quota.seven_day)
+  const scoped = Array.isArray(quota.scoped)
+    ? quota.scoped
+        .map(projectScopedQuotaWindow)
+        .filter((entry): entry is AccountScopedQuotaWindow => entry != null)
+    : undefined
+  const extraUsage = projectExtraUsage(quota.extraUsage)
+  return {
+    ...(fiveHour && { five_hour: fiveHour }),
+    ...(sevenDay && { seven_day: sevenDay }),
+    ...(typeof quota.bindingWindow === 'string' && {
+      bindingWindow: quota.bindingWindow,
+    }),
+    ...(typeof quota.fallbackAdvised === 'boolean' && {
+      fallbackAdvised: quota.fallbackAdvised,
+    }),
+    ...(scoped && { scoped }),
+    ...(extraUsage && { extraUsage }),
   }
 }
 
@@ -122,12 +252,7 @@ export class QuotaHeaderFeedRegistry {
     const { accountKey, quota, ...entryWithoutQuota } = entry
     const cleanEntry = {
       ...entryWithoutQuota,
-      quota: {
-        five_hour: quota.five_hour,
-        seven_day: quota.seven_day,
-        bindingWindow: quota.bindingWindow,
-        fallbackAdvised: quota.fallbackAdvised,
-      },
+      quota: projectQuota(quota),
     }
     try {
       validatePublishEntry(cleanEntry)
@@ -149,7 +274,7 @@ export class QuotaHeaderFeedRegistry {
             await readFile(this.filePath, 'utf8'),
           ) as Partial<FeedRecord>
           if (
-            record.version === 1 &&
+            record.version === QUOTA_HEADER_FEED_SCHEMA_VERSION &&
             record.entries &&
             typeof record.entries === 'object'
           )
@@ -160,7 +285,7 @@ export class QuotaHeaderFeedRegistry {
         try {
           await writeFile(
             tempPath,
-            `${JSON.stringify({ version: 1, entries })}\n`,
+            `${JSON.stringify({ version: QUOTA_HEADER_FEED_SCHEMA_VERSION, entries })}\n`,
             { mode: 0o600 },
           )
           await chmod(tempPath, 0o600)
@@ -194,7 +319,7 @@ export class QuotaHeaderFeedRegistry {
             await readFile(join(directory, name), 'utf8'),
           ) as Partial<FeedRecord>
           if (
-            record.version !== 1 ||
+            record.version !== QUOTA_HEADER_FEED_SCHEMA_VERSION ||
             !record.entries ||
             typeof record.entries !== 'object'
           )
@@ -205,6 +330,8 @@ export class QuotaHeaderFeedRegistry {
             if (
               !candidate ||
               typeof candidate !== 'object' ||
+              candidate.schema_version !== QUOTA_HEADER_FEED_SCHEMA_VERSION ||
+              candidate.provider !== 'anthropic' ||
               !validIdentity(candidate as unknown as Record<string, unknown>)
             )
               continue

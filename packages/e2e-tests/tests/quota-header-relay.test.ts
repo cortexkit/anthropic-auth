@@ -104,7 +104,7 @@ describe('quota headers through relay', () => {
     expect(state?.main?.quotaToken).toBeUndefined()
   }, 90_000)
 
-  it('writes one equivalent schema-v1 feed record for an HTTP relay response', async () => {
+  it('writes one equivalent schema-v2 feed record for an HTTP relay response', async () => {
     harness = await E2EHarness.create({ relay: 'http', quotaFeed: true })
     harness.script([{ type: 'text', text: 'http relay response', headers: quotaHeaders }])
     const sessionId = await harness.createSession()
@@ -112,11 +112,13 @@ describe('quota headers through relay', () => {
     await harness.waitFor(() => (harness?.relay?.acceptedRequests() ?? 0) >= 1)
     const files = await waitForFeed(harness)
     const record = JSON.parse(files[0]!)
-    expect(record.version).toBe(1)
+    expect(record.version).toBe(2)
     expect(Object.values(record.entries)).toHaveLength(1)
     expect(Object.values(record.entries)[0]).toEqual(
-      expect.objectContaining({ provider: 'anthropic', schema_version: 1 }),
+      expect.objectContaining({ provider: 'anthropic', schema_version: 2 }),
     )
+    expect(files[0]).not.toContain('authorization')
+    expect(files[0]).not.toContain('access-token')
   }, 90_000)
 
   it('does not publish optimistic websocket headers before response_start', async () => {
@@ -141,7 +143,7 @@ describe('quota headers through relay', () => {
     expect(Object.values(record.entries)[0]).toEqual(
       expect.objectContaining({
         provider: 'anthropic',
-        schema_version: 1,
+        schema_version: 2,
         quota: expect.objectContaining({
           five_hour: expect.objectContaining({ usedPercent: 78 }),
         }),

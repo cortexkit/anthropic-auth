@@ -116,6 +116,7 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
+  QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
   type QuotaEntry,
   type QuotaHeaderFeedEntry,
@@ -1198,6 +1199,8 @@ const anthropicAuthPlugin = async (
       seven_day: entry.quota.seven_day,
       bindingWindow: entry.quota.bindingWindow,
       fallbackAdvised: entry.quota.fallbackAdvised,
+      scoped: entry.quota.scoped,
+      extraUsage: entry.quota.extraUsage,
     }
     const accountKey =
       credentialId ??
@@ -1209,7 +1212,7 @@ const anthropicAuthPlugin = async (
         ? {
             identity_source: 'credential_id',
             credential_id: credentialId,
-            schema_version: 1,
+            schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
             provider: 'anthropic',
             configured_account_count: configuredAccountCount,
             observed_at_ms: observedAtMs,
@@ -1220,7 +1223,7 @@ const anthropicAuthPlugin = async (
           ? {
               identity_source: 'account_ref',
               account_ref: mainAccountId,
-              schema_version: 1,
+              schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
               observed_at_ms: observedAtMs,
@@ -1230,7 +1233,7 @@ const anthropicAuthPlugin = async (
           : served.accountId === 'main'
             ? {
                 identity_source: 'none',
-                schema_version: 1,
+                schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
                 provider: 'anthropic',
                 configured_account_count: configuredAccountCount,
                 observed_at_ms: observedAtMs,
@@ -1240,7 +1243,7 @@ const anthropicAuthPlugin = async (
             : {
                 identity_source: 'account_ref',
                 account_ref: served.accountId,
-                schema_version: 1,
+                schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
                 provider: 'anthropic',
                 configured_account_count: configuredAccountCount,
                 observed_at_ms: observedAtMs,
