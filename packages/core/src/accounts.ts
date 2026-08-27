@@ -233,6 +233,9 @@ export type AccountStorage = {
     mainQuotaToken?: string
     mainLastQuotaApiError?: AccountOperationError
   }
+  quotaHeaderFeed?: {
+    enabled?: boolean
+  }
   claudeCache?: {
     enabled?: boolean
     mode?: Cache1hMode
@@ -733,6 +736,9 @@ function normalizeStorage(value: unknown): AccountStorage | null {
       : undefined,
     refresh: isRecord(value.refresh) ? value.refresh : undefined,
     quota: isRecord(value.quota) ? value.quota : undefined,
+    quotaHeaderFeed: isRecord(value.quotaHeaderFeed)
+      ? value.quotaHeaderFeed
+      : undefined,
     claudeCache: isRecord(value.claudeCache) ? value.claudeCache : undefined,
     dump: isRecord(value.dump) ? value.dump : undefined,
     claudeFast: isRecord(value.claudeFast) ? value.claudeFast : undefined,
@@ -1199,6 +1205,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     fallbackOn: storage.fallbackOn,
     refresh,
     quota,
+    quotaHeaderFeed: storage.quotaHeaderFeed,
     claudeCache: storage.claudeCache,
     dump: storage.dump,
     logging: storage.logging,

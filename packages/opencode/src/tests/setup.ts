@@ -14,3 +14,7 @@ process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
   testDir,
   'cachekeep-registry',
 )
+process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
+  testDir,
+  'quota-header-feed',
+)

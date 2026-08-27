@@ -1,0 +1,226 @@
+import { randomUUID } from 'node:crypto'
+import {
+  chmod,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import {
+  type AccountStorage,
+  isOAuthAccount,
+  type OAuthQuotaSnapshot,
+} from './accounts.ts'
+
+export const QUOTA_HEADER_FEED_SCHEMA_VERSION = 1
+export const QUOTA_HEADER_FEED_LEASE_MS = 180_000
+
+export type QuotaHeaderFeedIdentity =
+  | { identity_source: 'credential_id'; credential_id: string }
+  | { identity_source: 'account_ref'; account_ref: string }
+  | { identity_source: 'none' }
+
+export type QuotaHeaderFeedEntry = QuotaHeaderFeedIdentity & {
+  schema_version: 1
+  provider: 'anthropic'
+  configured_account_count: number
+  observed_at_ms: number
+  quota: Pick<
+    OAuthQuotaSnapshot,
+    'five_hour' | 'seven_day' | 'bindingWindow' | 'fallbackAdvised'
+  >
+}
+
+type FeedRecord = {
+  version: 1
+  entries: Record<string, QuotaHeaderFeedEntry>
+}
+
+export function getDefaultQuotaHeaderFeedDirectory() {
+  return (
+    process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR ??
+    join(tmpdir(), 'opencode-anthropic-auth', 'quota-header-feed')
+  )
+}
+
+export function configuredAnthropicOAuthAccountCount(input: {
+  storage: AccountStorage | null
+  mainOAuthConfigured: boolean
+}): number {
+  const fallbackCount =
+    input.storage?.accounts.filter(isOAuthAccount).length ?? 0
+  return fallbackCount + (input.mainOAuthConfigured ? 1 : 0)
+}
+
+function validIdentity(
+  entry: Record<string, unknown>,
+): entry is QuotaHeaderFeedEntry {
+  if (
+    entry.schema_version !== QUOTA_HEADER_FEED_SCHEMA_VERSION ||
+    entry.provider !== 'anthropic'
+  )
+    return false
+  if (
+    !Number.isFinite(entry.configured_account_count) ||
+    !Number.isFinite(entry.observed_at_ms)
+  )
+    return false
+  if (!entry.quota || typeof entry.quota !== 'object') return false
+  if (entry.identity_source === 'none') {
+    return !('credential_id' in entry) && !('account_ref' in entry)
+  }
+  if (entry.identity_source === 'credential_id') {
+    return (
+      typeof entry.credential_id === 'string' &&
+      entry.credential_id.length > 0 &&
+      entry.credential_id !== 'main' &&
+      !('account_ref' in entry)
+    )
+  }
+  if (entry.identity_source === 'account_ref') {
+    return (
+      typeof entry.account_ref === 'string' &&
+      entry.account_ref.length > 0 &&
+      entry.account_ref !== 'main' &&
+      !('credential_id' in entry)
+    )
+  }
+  return false
+}
+
+function validatePublishEntry(entry: QuotaHeaderFeedEntry) {
+  if (!validIdentity(entry as unknown as Record<string, unknown>)) {
+    throw new Error('Invalid quota header feed entry')
+  }
+}
+
+export class QuotaHeaderFeedRegistry {
+  private readonly filePath: string
+  private writeChain: Promise<void> = Promise.resolve()
+
+  constructor(
+    private readonly options: {
+      directory?: string
+      now?: () => number
+      leaseMs?: number
+      instanceId?: string
+    } = {},
+  ) {
+    const instanceId = options.instanceId ?? `${process.pid}-${randomUUID()}`
+    this.filePath = join(
+      options.directory ?? getDefaultQuotaHeaderFeedDirectory(),
+      `${instanceId}.json`,
+    )
+  }
+
+  publish(entry: QuotaHeaderFeedEntry & { accountKey: string }): Promise<void> {
+    const { accountKey, quota, ...entryWithoutQuota } = entry
+    const cleanEntry = {
+      ...entryWithoutQuota,
+      quota: {
+        five_hour: quota.five_hour,
+        seven_day: quota.seven_day,
+        bindingWindow: quota.bindingWindow,
+        fallbackAdvised: quota.fallbackAdvised,
+      },
+    }
+    try {
+      validatePublishEntry(cleanEntry)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+    if (!accountKey)
+      return Promise.reject(new Error('Invalid quota header feed account key'))
+    this.writeChain = this.writeChain
+      .catch(() => {})
+      .then(async () => {
+        const directory =
+          this.options.directory ?? getDefaultQuotaHeaderFeedDirectory()
+        await mkdir(directory, { recursive: true, mode: 0o700 })
+        await chmod(directory, 0o700)
+        let entries: Record<string, QuotaHeaderFeedEntry> = {}
+        try {
+          const record = JSON.parse(
+            await readFile(this.filePath, 'utf8'),
+          ) as Partial<FeedRecord>
+          if (
+            record.version === 1 &&
+            record.entries &&
+            typeof record.entries === 'object'
+          )
+            entries = record.entries
+        } catch {}
+        entries[accountKey] = cleanEntry
+        const tempPath = `${this.filePath}.${randomUUID()}.tmp`
+        try {
+          await writeFile(
+            tempPath,
+            `${JSON.stringify({ version: 1, entries })}\n`,
+            { mode: 0o600 },
+          )
+          await chmod(tempPath, 0o600)
+          await rename(tempPath, this.filePath)
+          await chmod(this.filePath, 0o600)
+        } finally {
+          await rm(tempPath, { force: true })
+        }
+      })
+    return this.writeChain
+  }
+
+  async list(): Promise<QuotaHeaderFeedEntry[]> {
+    await this.writeChain.catch(() => {})
+    const directory =
+      this.options.directory ?? getDefaultQuotaHeaderFeedDirectory()
+    const now = this.options.now?.() ?? Date.now()
+    const leaseMs = this.options.leaseMs ?? QUOTA_HEADER_FEED_LEASE_MS
+    let names: string[]
+    try {
+      names = (await readdir(directory)).filter((name) =>
+        name.endsWith('.json'),
+      )
+    } catch {
+      return []
+    }
+    const newest = new Map<string, QuotaHeaderFeedEntry>()
+    await Promise.all(
+      names.map(async (name) => {
+        try {
+          const record = JSON.parse(
+            await readFile(join(directory, name), 'utf8'),
+          ) as Partial<FeedRecord>
+          if (
+            record.version !== 1 ||
+            !record.entries ||
+            typeof record.entries !== 'object'
+          )
+            return
+          for (const [accountKey, candidate] of Object.entries(
+            record.entries,
+          )) {
+            if (!validIdentity(candidate as unknown as Record<string, unknown>))
+              continue
+            const observed = candidate.observed_at_ms
+            if (observed > now || now - observed >= leaseMs) continue
+            const existing = newest.get(accountKey)
+            if (!existing || observed > existing.observed_at_ms)
+              newest.set(accountKey, candidate)
+          }
+        } catch {}
+      }),
+    )
+    return [...newest.values()].sort(
+      (a, b) => a.observed_at_ms - b.observed_at_ms,
+    )
+  }
+
+  async dispose(): Promise<void> {
+    await this.writeChain.catch(() => {})
+    await rm(this.filePath, { force: true })
+  }
+}

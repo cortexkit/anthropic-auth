@@ -171,6 +171,10 @@ async function useTempAccountFile(storage: AccountStorage) {
     tempConfigDir,
     'cachekeep-registry',
   )
+  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
+    tempConfigDir,
+    'quota-header-feed',
+  )
   await saveAccounts(storage)
   if (storage.main?.profile) {
     await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
@@ -371,6 +375,134 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
   })
 })
 
+async function readFeedEntries() {
+  await Bun.sleep(25)
+  const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
+  try {
+    const files = await readdir(directory)
+    const records = await Promise.all(
+      files.map(async (file) =>
+        JSON.parse(await readFile(join(directory, file), 'utf8')),
+      ),
+    )
+    return records.flatMap((record) => Object.values(record.entries ?? {}))
+  } catch {
+    return []
+  }
+}
+
+async function loadMainAndFetch(
+  storage: AccountStorage,
+  response: Response | (() => Response),
+  requestHeaders?: Record<string, string>,
+) {
+  await useTempAccountFile(storage)
+  globalThis.fetch = mock(() =>
+    Promise.resolve(
+      typeof response === 'function' ? response() : response.clone(),
+    ),
+  ) as unknown as typeof fetch
+  const plugin = await getPlugin()
+  const result = await plugin.auth.loader(
+    () =>
+      Promise.resolve({
+        type: 'oauth',
+        access: 'main-access',
+        refresh: 'main-refresh',
+        expires: Date.now() + 100000,
+      }),
+    { models: {} },
+  )
+  const fetched = await result.fetch(MESSAGES_URL, {
+    method: 'POST',
+    headers: requestHeaders,
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+  })
+  return { plugin, response: fetched }
+}
+
+describe('quota header feed integration', () => {
+  test('publishes a direct harvested response with the observation timestamp', async () => {
+    const originalNow = Date.now
+    let clock = 1_000_000
+    Date.now = () => clock
+    try {
+      await useTempAccountFile({
+        ...createFallbackStorage({
+          quotaHeaderFeed: { enabled: true },
+        }),
+        accounts: [],
+      })
+      globalThis.fetch = mock(() =>
+        Promise.resolve(
+          new Response('{}', {
+            status: 200,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.25',
+              'anthropic-ratelimit-unified-5h-reset': '1800000000',
+            },
+          }),
+        ),
+      ) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+      const response = await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+      })
+      await response.text()
+      clock += 1_000
+      await Bun.sleep(25)
+
+      const feedDirectory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
+      const files = await readdir(feedDirectory)
+      expect(files).toHaveLength(1)
+      const record = JSON.parse(
+        await readFile(join(feedDirectory, files[0]!), 'utf8'),
+      )
+      const raw = await readFile(join(feedDirectory, files[0]!), 'utf8')
+      const published = Object.values(record.entries)[0] as any
+      expect(published).toEqual(
+        expect.objectContaining({
+          identity_source: 'none',
+          configured_account_count: 1,
+          observed_at_ms: 1_000_000,
+          quota: expect.objectContaining({
+            five_hour: expect.objectContaining({ checkedAt: 1_000_000 }),
+          }),
+        }),
+      )
+      for (const secret of [
+        'main-access',
+        'main-refresh',
+        'test-access-token',
+        'test-refresh-token',
+        'authorization',
+        'anthropic-ratelimit-unified-5h-utilization',
+        'claude-sonnet-4-5',
+        'vault',
+        'credential_id',
+      ]) {
+        expect(raw).not.toContain(secret)
+      }
+      expect(raw).not.toContain('"credential_id":"main"')
+      expect(raw).not.toContain('"account_ref":"main"')
+    } finally {
+      Date.now = originalNow
+    }
+  })
+})
+
 describe('package metadata', () => {
   test('exports a runtime-loadable TUI entrypoint', async () => {
     const packageJson = JSON.parse(
@@ -483,6 +615,171 @@ describe('experimental.chat.system.transform', () => {
     )
     expect(PARALLEL_TOOL_CALLS_SYSTEM_PROMPT).toContain(
       'Never invent placeholder IDs, guessed task IDs, or other guessed values',
+    )
+  })
+})
+
+describe('quota header feed extended integration', () => {
+  test('disabled quota header feed publishes nothing by default or when explicitly false', async () => {
+    for (const enabled of [undefined, false]) {
+      const storage = createFallbackStorage({
+        quotaHeaderFeed: enabled === undefined ? undefined : { enabled },
+        accounts: [],
+      })
+      const { response } = await loadMainAndFetch(
+        storage,
+        new Response('{}', {
+          status: 200,
+          headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+        }),
+      )
+      expect(await response.text()).toBe('{}')
+      expect(await readFeedEntries()).toEqual([])
+    }
+  })
+
+  test('feed publication failure does not affect response, quota persistence, or sidebar update', async () => {
+    const feedDirectory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
+    await useTempAccountFile(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        accounts: [],
+      }),
+    )
+    await Bun.write(feedDirectory, 'not a directory')
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response('{"ok":true}', {
+          status: 200,
+          headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+        }),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+    })
+    expect(await response.text()).toBe('{"ok":true}')
+    const persisted = await waitForAccountStorage((storage) =>
+      Boolean(storage?.quota?.mainQuota?.five_hour),
+    )
+    expect(persisted?.quota?.mainQuota?.five_hour?.usedPercent).toBe(25)
+    const sidebar = await waitForSidebarState(
+      (state) => state.main.quota?.five_hour?.usedPercent === 25,
+    )
+    expect(sidebar.main.quota?.five_hour?.usedPercent).toBe(25)
+  })
+
+  test('selects none for main and account_ref for fallback identity without leaking the other field', async () => {
+    const main = await loadMainAndFetch(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        accounts: [],
+      }),
+      new Response('{}', {
+        status: 200,
+        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+      }),
+    )
+    await main.response.text()
+    const mainEntries = await readFeedEntries()
+    expect(mainEntries[0]).toEqual(
+      expect.objectContaining({ identity_source: 'none' }),
+    )
+    expect(mainEntries[0]).not.toHaveProperty('credential_id')
+    expect(mainEntries[0]).not.toHaveProperty('account_ref')
+
+    const fallback = await loadMainAndFetch(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        routing: { mode: 'fallback-first' },
+      }),
+      new Response('{}', {
+        status: 200,
+        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+      }),
+    )
+    await fallback.response.text()
+    const fallbackEntry = (await readFeedEntries()).find(
+      (entry: any) => entry.identity_source === 'account_ref',
+    ) as any
+    expect(fallbackEntry).toEqual(
+      expect.objectContaining({
+        identity_source: 'account_ref',
+        account_ref: 'fallback-1',
+      }),
+    )
+    expect(fallbackEntry).not.toHaveProperty('credential_id')
+  })
+
+  test('published configured account count uses live main OAuth plus every OAuth fallback and excludes API keys', async () => {
+    const { response } = await loadMainAndFetch(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        accounts: [
+          { id: 'disabled-oauth', type: 'oauth', refresh: 'r', enabled: false },
+          { id: 'enabled-oauth', type: 'oauth', refresh: 'r', enabled: true },
+          {
+            id: 'api-key',
+            type: 'api',
+            apiKey: 'key',
+            baseURL: 'https://example.test',
+          },
+        ] as AccountStorage['accounts'],
+      }),
+      new Response('{}', {
+        status: 200,
+        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+      }),
+    )
+    await response.text()
+    const entries = await readFeedEntries()
+    expect(entries[0]).toEqual(
+      expect.objectContaining({ configured_account_count: 3 }),
+    )
+  })
+
+  test('publishes genuine relay response headers through onResponseHeaders', async () => {
+    const { response } = await loadMainAndFetch(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          transport: 'http',
+        },
+      }),
+      () =>
+        new Response('{}', {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.5',
+            'x-cortexkit-relay-optimistic': 'true',
+          },
+        }),
+      { 'x-session-affinity': 'feed-relay-session' },
+    )
+    await response.text()
+    const entries = await readFeedEntries()
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toEqual(
+      expect.objectContaining({
+        quota: expect.objectContaining({
+          five_hour: expect.objectContaining({ usedPercent: 50 }),
+        }),
+      }),
     )
   })
 })

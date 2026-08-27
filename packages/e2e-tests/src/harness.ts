@@ -23,7 +23,9 @@ type SdkClient = {
 }
 
 export type E2EHarnessOptions = {
-  relay?: 'websocket'
+  relay?: 'websocket' | 'http'
+  quotaFeed?: boolean
+  relayResponseStartDelayMs?: number
   hybridCache?: boolean
   fallbackMode?: 'server' | 'legacy'
   childTmpDir?: string
@@ -52,15 +54,18 @@ export class E2EHarness {
     const { baseURL } = await anthropic.start()
     let relay: MockRelayServer | null = null
     let relayConfig:
-      | { url: string; token: string; transport: 'websocket' }
+      | { url: string; token: string; transport: 'websocket' | 'http' }
       | undefined
-    if (options.relay === 'websocket') {
+    if (options.relay) {
       relay = new MockRelayServer()
-      const started = await relay.start({ token: 'relay-token' })
+      const started = await relay.start({
+        token: 'relay-token',
+        responseStartDelayMs: options.relayResponseStartDelayMs,
+      })
       relayConfig = {
         url: started.url,
         token: 'relay-token',
-        transport: 'websocket',
+        transport: options.relay,
       }
     }
 
@@ -70,6 +75,7 @@ export class E2EHarness {
       hybridCache: options.hybridCache,
       fallbackMode: options.fallbackMode,
       childTmpDir: options.childTmpDir,
+      quotaFeed: options.quotaFeed,
     })
     const sdk = await import('@opencode-ai/sdk')
     const client = sdk.createOpencodeClient({

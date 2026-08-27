@@ -36,13 +36,18 @@ export class MockRelayServer {
   private state = new Map<string, SessionState>()
   private token = 'relay-token'
   private acceptedCount = 0
+  private responseStartDelayMs = 0
 
-  async start(options: { token?: string } = {}) {
+  async start(options: { token?: string; responseStartDelayMs?: number } = {}) {
     this.token = options.token ?? this.token
+    this.responseStartDelayMs = options.responseStartDelayMs ?? 0
     this.server = Bun.serve({
       port: 0,
       fetch: (request, server) => {
         const url = new URL(request.url)
+        if (request.method === 'POST' && url.pathname === '/') {
+          return this.handleHttp(request)
+        }
         if (url.pathname === '/ws') {
           if (url.searchParams.get('token') !== this.token) {
             return new Response('unauthorized', { status: 401 })
@@ -90,6 +95,8 @@ export class MockRelayServer {
             headers: payload.upstream.headers,
             body,
           })
+          if (this.responseStartDelayMs > 0)
+            await Bun.sleep(this.responseStartDelayMs)
           socket.send(
             JSON.stringify({
               type: 'response_start',
@@ -131,6 +138,29 @@ export class MockRelayServer {
     const previous = this.state.get(affinity)
     if (!previous) throw new Error('missing previous relay state')
     return applyPatches(previous.body, payload.patch ?? [])
+  }
+
+  private async handleHttp(request: Request) {
+    if (request.headers.get('x-relay-token') !== this.token)
+      return new Response('unauthorized', { status: 401 })
+    const payload = (await request.json()) as RelayPayload
+    const body = this.reconstructBody(payload.affinity, payload)
+    this.state.set(payload.affinity, {
+      body,
+      hash: payload.next_hash,
+      revision: payload.revision,
+    })
+    this.acceptedCount += 1
+    const upstream = await fetch(payload.upstream.url, {
+      method: payload.upstream.method,
+      headers: payload.upstream.headers,
+      body,
+    })
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: upstream.headers,
+    })
   }
 }
 

@@ -30,6 +30,7 @@ import {
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
   computeXxhash64Hex,
+  configuredAnthropicOAuthAccountCount,
   continueMainPrimeAuthLineageAfterRefresh,
   createEmptyStorage,
   createStickyNoRouteResponse,
@@ -116,6 +117,8 @@ import {
   parseRoutingCommandAction,
   type QuotaAccountSummary,
   type QuotaEntry,
+  type QuotaHeaderFeedEntry,
+  QuotaHeaderFeedRegistry,
   QuotaManager,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -154,6 +157,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
+
 import {
   applyCacheDiagnosticsOptIn,
   buildCacheDiagnosticsRecord,
@@ -907,6 +911,10 @@ const anthropicAuthPlugin = async (
       }
     },
   })
+  const quotaHeaderFeedRegistry =
+    initialStorage?.quotaHeaderFeed?.enabled === true
+      ? new QuotaHeaderFeedRegistry()
+      : null
   const profileHydrationAttempts = new Map<
     string,
     Promise<Awaited<ReturnType<typeof fetchOAuthAccountProfile>> | undefined>
@@ -1110,6 +1118,93 @@ const anthropicAuthPlugin = async (
     })
   }
 
+  function getCredentialId(value: unknown): string | undefined {
+    if (!value || typeof value !== 'object') return undefined
+    const record = value as Record<string, unknown>
+    const direct = record.credential_id
+    if (typeof direct === 'string' && direct && direct !== 'main') return direct
+    const vault = record.vault
+    if (vault && typeof vault === 'object') {
+      const nested = (vault as Record<string, unknown>).credential_id
+      if (typeof nested === 'string' && nested && nested !== 'main')
+        return nested
+    }
+    return undefined
+  }
+
+  async function publishQuotaHeaderFeed(
+    served: { accountId: 'main' | string; accessToken: string },
+    entry: QuotaEntry,
+  ): Promise<void> {
+    if (!quotaHeaderFeedRegistry) return
+    const storage =
+      (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+    const mainAuth = await latestGetAuth?.()
+    const mainOAuthConfigured = mainAuth?.type === 'oauth'
+    const account =
+      served.accountId === 'main'
+        ? storage.main
+        : storage.accounts.find(
+            (candidate) => candidate.id === served.accountId,
+          )
+    const credentialId = getCredentialId(account)
+    const configuredAccountCount = configuredAnthropicOAuthAccountCount({
+      storage,
+      mainOAuthConfigured,
+    })
+    const observedAtMs = entry.checkedAt
+    const quota = {
+      five_hour: entry.quota.five_hour,
+      seven_day: entry.quota.seven_day,
+      bindingWindow: entry.quota.bindingWindow,
+      fallbackAdvised: entry.quota.fallbackAdvised,
+    }
+    const accountKey =
+      credentialId ??
+      (served.accountId === 'main'
+        ? tokenFingerprint(served.accessToken)
+        : served.accountId)
+    const feedEntry: QuotaHeaderFeedEntry & { accountKey: string } =
+      credentialId
+        ? {
+            identity_source: 'credential_id',
+            credential_id: credentialId,
+            schema_version: 1,
+            provider: 'anthropic',
+            configured_account_count: configuredAccountCount,
+            observed_at_ms: observedAtMs,
+            quota,
+            accountKey,
+          }
+        : served.accountId === 'main'
+          ? {
+              identity_source: 'none',
+              schema_version: 1,
+              provider: 'anthropic',
+              configured_account_count: configuredAccountCount,
+              observed_at_ms: observedAtMs,
+              quota,
+              accountKey,
+            }
+          : {
+              identity_source: 'account_ref',
+              account_ref: served.accountId,
+              schema_version: 1,
+              provider: 'anthropic',
+              configured_account_count: configuredAccountCount,
+              observed_at_ms: observedAtMs,
+              quota,
+              accountKey,
+            }
+    await quotaHeaderFeedRegistry.publish(feedEntry)
+  }
+
+  function logQuotaHeaderFeedFailure(error: unknown) {
+    logger.debug('quota', 'failed to publish quota header feed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+
   function harvestQuotaHeaders(
     headers: Headers,
     served: { accountId: 'main' | string; accessToken: string },
@@ -1131,6 +1226,9 @@ const anthropicAuthPlugin = async (
               incoming,
             )
       void persistPushedQuota(served, entry).catch(logPersistFailure)
+      void publishQuotaHeaderFeed(served, entry).catch(
+        logQuotaHeaderFeedFailure,
+      )
       void refreshSidebarQuota().catch(() => {})
       logger.debug('quota', 'harvested response quota', {
         account: served.accountId,
@@ -6059,6 +6157,9 @@ const anthropicAuthPlugin = async (
         }
 
         return {}
+      },
+      dispose: async () => {
+        await quotaHeaderFeedRegistry?.dispose()
       },
       methods: [
         {

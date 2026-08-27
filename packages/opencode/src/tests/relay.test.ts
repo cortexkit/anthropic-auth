@@ -6,6 +6,7 @@ import {
   createStringPatch,
   getDumpDirectory,
   hashBody,
+  isQuotaBearingHeaderFrame,
   resetDumpState,
   sendViaRelay,
   setDumpEnabled,
@@ -529,6 +530,9 @@ describe('relay client', () => {
       })
       expect(response.status).toBe(200)
       expect(response.headers.get('x-cortexkit-relay-optimistic')).toBe('true')
+      // The optimistic envelope intentionally has no quota-bearing headers.
+      // Genuine response_start remains the only path that can stage headers for delivery.
+      expect(isQuotaBearingHeaderFrame(response.headers)).toBe(false)
       expect(acceptedSent).toBe(false)
 
       const textPromise = response.text()
