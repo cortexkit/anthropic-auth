@@ -2659,6 +2659,12 @@ export function quotaSnapshotPassesPolicy(
   return true
 }
 
+export function quotaSnapshotHasStandardWindows(
+  quota: OAuthQuotaSnapshot | undefined,
+): quota is OAuthQuotaSnapshot {
+  return Boolean(quota?.five_hour && quota.seven_day)
+}
+
 // ---------------------------------------------------------------------------
 // Killswitch — hard-block requests when remaining quota drops below per-account
 // thresholds, even if the API would still accept them.

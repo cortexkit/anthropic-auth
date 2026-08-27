@@ -146,6 +146,184 @@ describe('Pi API fallback routing helpers', () => {
     expect(headers.get('anthropic-beta')).toContain('fast-mode-2026-02-01')
   })
 
+  test('sticky-balanced sends the main route when the quota source returns an empty snapshot', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-empty-quota-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = join(
+      tempDir,
+      'sticky-routes.json',
+    )
+    await saveAccounts(
+      {
+        version: 1,
+        mainAccountId: 'main-account',
+        main: { type: 'opencode', provider: 'anthropic' },
+        fallbackOn: [401, 403, 429],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+        },
+        routing: { mode: 'sticky-balanced' },
+        accounts: [],
+      },
+      storagePath,
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }
+        if (url.includes('/v1/messages')) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_empty_quota',
+    })
+    for await (const _event of stream) {
+      // Drain the provider stream.
+    }
+
+    expect(authorizations).toEqual(['Bearer main-access'])
+  })
+
+  test('fallback-first admits an OAuth fallback whose quota is unknown', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-fallback-unknown-quota-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    const expires = Date.now() + 5 * 60 * 60_000
+    await saveAccounts(
+      {
+        version: 1,
+        mainAccountId: 'main-account',
+        main: { type: 'opencode', provider: 'anthropic' },
+        fallbackOn: [401, 403, 429],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+        },
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'unknown-fallback',
+            type: 'oauth',
+            access: 'unknown-fallback-access',
+            refresh: 'unknown-fallback-refresh',
+            expires,
+          },
+        ],
+      },
+      storagePath,
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.reject(new Error('quota source unavailable'))
+        }
+        if (url.includes('/v1/messages')) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_fallback_unknown_quota',
+    })
+    for await (const _event of stream) {
+      // Drain the provider stream.
+    }
+
+    expect(authorizations).toEqual(['Bearer unknown-fallback-access'])
+  })
+
+  test('main-first blocks an unknown main quota when the killswitch is fail-closed', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-killswitch-unknown-quota-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveAccounts(
+      {
+        version: 1,
+        mainAccountId: 'main-account',
+        main: { type: 'opencode', provider: 'anthropic' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+        },
+        killswitch: {
+          enabled: true,
+          main: { five_hour: 5, seven_day: 10 },
+        },
+        routing: { mode: 'main-first' },
+        accounts: [],
+      },
+      storagePath,
+    )
+
+    const authorizations: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url
+        if (url.includes('/api/oauth/usage')) {
+          return Promise.reject(new Error('quota source unavailable'))
+        }
+        if (url.includes('/v1/messages')) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+
+    const events = []
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'main-access',
+      sessionId: 'ses_pi_killswitch_unknown_quota',
+    })
+    for await (const event of stream) events.push(event)
+
+    expect(authorizations).toEqual([])
+    expect(events.some((event) => event.type === 'error')).toBe(true)
+  })
+
   test('sticky-balanced keeps repeated Pi session requests on the quota-selected account', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-routing-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')

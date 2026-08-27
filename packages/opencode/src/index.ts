@@ -69,6 +69,7 @@ import {
   getRoutingMode,
   getStickyRoutingStatePath,
   hashRefreshToken,
+  type IdentityState,
   incrementPrimeUsagePersistent,
   isApiKeyAccount,
   isCache1hEnabled,
@@ -120,6 +121,7 @@ import {
   type QuotaHeaderFeedEntry,
   QuotaHeaderFeedRegistry,
   QuotaManager,
+  quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -621,6 +623,7 @@ type StickyOAuthRoute = {
   id: string
   access: string
   quota?: OAuthQuotaSnapshot
+  identity: IdentityState
   order: number
   account?: OAuthAccount
 }
@@ -4643,7 +4646,21 @@ const anthropicAuthPlugin = async (
             for (const account of storageArg?.accounts ?? []) {
               if (isOAuthAccount(account)) {
                 const usableAccount = usableOAuthById.get(account.id)
-                if (usableAccount) usable.push(usableAccount)
+                if (usableAccount) {
+                  usable.push(usableAccount)
+                } else if (
+                  account.access &&
+                  (!account.expires || account.expires > Date.now()) &&
+                  !isPermanentRefreshError(account.lastRefreshError) &&
+                  !refreshBackoffActive(
+                    account.lastRefreshError,
+                    account.id,
+                    Date.now(),
+                  ) &&
+                  !quotaSnapshotHasStandardWindows(getFallbackQuota(account))
+                ) {
+                  usable.push(account)
+                }
                 continue
               }
               if (
@@ -4710,6 +4727,9 @@ const anthropicAuthPlugin = async (
                 id: STICKY_ROUTING_MAIN_ACCOUNT_ID,
                 access: input.mainAccessToken,
                 quota: mainQuota,
+                identity: mainAccountId
+                  ? { kind: 'known', accountId: mainAccountId }
+                  : { kind: 'unknown' },
                 order: 0,
               })
             }
@@ -4743,6 +4763,7 @@ const anthropicAuthPlugin = async (
                 id: account.id,
                 access: account.access,
                 quota: accountQuota,
+                identity: { kind: 'known', accountId: account.id },
                 order: index + 1,
                 account,
               })
@@ -4754,7 +4775,19 @@ const anthropicAuthPlugin = async (
                   route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                     ? latestStorage?.refresh?.mainLastRefreshError
                     : route.account?.lastRefreshError
+                const accountIdentity =
+                  route.identity.kind === 'known'
+                    ? route.identity.accountId
+                    : undefined
                 if (isPermanentRefreshError(refreshError)) return []
+                if (
+                  refreshBackoffActive(
+                    refreshError,
+                    accountIdentity,
+                    Date.now(),
+                  )
+                )
+                  return []
                 if (
                   stickyQuotaSnapshotIsFresh(
                     route.quota,
@@ -4790,31 +4823,60 @@ const anthropicAuthPlugin = async (
             )
             const candidates: StickyRouteCandidate[] = allRoutes.flatMap(
               (route) => {
-                if (!route.quota) return []
+                const refreshError =
+                  route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                    ? latestStorage?.refresh?.mainLastRefreshError
+                    : route.account?.lastRefreshError
+                const accountIdentity =
+                  route.identity.kind === 'known'
+                    ? route.identity.accountId
+                    : undefined
+                if (
+                  isPermanentRefreshError(refreshError) ||
+                  refreshBackoffActive(
+                    refreshError,
+                    accountIdentity,
+                    Date.now(),
+                  )
+                )
+                  return []
                 const accountId =
                   route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                     ? undefined
                     : route.id
-                const passes =
-                  quotaSnapshotPassesPolicy(route.quota, latestStorage) &&
-                  quotaSnapshotPassesModelScope(
-                    route.quota,
+                const quota = quotaSnapshotHasStandardWindows(route.quota)
+                  ? route.quota
+                  : undefined
+                const quotaState = quota
+                  ? { kind: 'known' as const, quota }
+                  : ({ kind: 'unknown' } as const)
+                const passesKillswitch =
+                  !isKillswitchEnabled(latestStorage) ||
+                  killswitchPassesPolicy(
+                    quotaState.kind === 'known' ? quotaState.quota : undefined,
+                    latestStorage,
+                    accountId,
                     input.requestedModelId,
-                  ) &&
-                  (!isKillswitchEnabled(latestStorage) ||
-                    killswitchPassesPolicy(
-                      route.quota,
-                      latestStorage,
-                      accountId,
-                      input.requestedModelId,
-                    )) &&
-                  (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
-                    usableIds.has(route.id))
+                  )
+                const passes =
+                  passesKillswitch &&
+                  (quotaState.kind === 'unknown'
+                    ? true
+                    : quotaSnapshotPassesPolicy(
+                        quotaState.quota,
+                        latestStorage,
+                      ) &&
+                      quotaSnapshotPassesModelScope(
+                        quotaState.quota,
+                        input.requestedModelId,
+                      ) &&
+                      (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
+                        usableIds.has(route.id)))
                 return passes
                   ? [
                       {
                         accountId: route.id,
-                        quota: route.quota,
+                        quota: quotaState,
                         order: route.order,
                       },
                     ]
@@ -5937,10 +5999,6 @@ const anthropicAuthPlugin = async (
                 }
               }
 
-              // Fail-closed: if failClosedOnUnknownQuota is set, quota API is backed off,
-              // and we have no cached quota, block the request. Identity-aware read
-              // so a previous account's cached quota can't satisfy this check
-              // (and feed the killswitch eval below) after a main-account switch.
               let mainQuota = quotaManager.getMain(mainAccountId)?.quota
               if (
                 storage?.quota?.failClosedOnUnknownQuota &&

@@ -6,6 +6,7 @@ import {
   createStickyNoRouteResponse,
   decideStickyQuotaFailure,
   getStickyRoutingStatePath,
+  type OAuthQuotaSnapshot,
   type StickyRouteCandidate,
   StickySessionRouter,
   stickyQuotaSnapshotIsFresh,
@@ -15,6 +16,9 @@ import {
 
 const NOW = Date.parse('2026-07-18T08:00:00Z')
 const directories: string[] = []
+type KnownStickyRouteCandidate = Omit<StickyRouteCandidate, 'quota'> & {
+  quota: OAuthQuotaSnapshot
+}
 
 async function statePath() {
   const directory = await mkdtemp(join(tmpdir(), 'sticky-routing-test-'))
@@ -29,7 +33,7 @@ function candidate(input: {
   sevenDay: number
   fable: number
   resetHours?: number
-}): StickyRouteCandidate {
+}): KnownStickyRouteCandidate {
   const checkedAt = NOW - 1_000
   const resetsAt = new Date(
     NOW + (input.resetHours ?? 96) * 60 * 60_000,
@@ -669,5 +673,138 @@ describe('sticky-balanced session routing', () => {
       reason: 'five-hour-short-reset',
       retryAfterSeconds: 14 * 60,
     })
+  })
+
+  test('keeps an unknown quota as a retained route instead of treating it as absent', () => {
+    expect(
+      decideStickyQuotaFailure({
+        quota: { kind: 'unknown' },
+        modelId: 'claude-opus-5',
+        now: NOW,
+      }),
+    ).toEqual({ action: 'retain', reason: 'unknown' })
+  })
+
+  test('excludes an unknown-quota candidate from cold weighted selection when a known candidate exists', async () => {
+    const path = await statePath()
+    const router = new StickySessionRouter({ path, now: () => NOW })
+    const known = candidate({
+      accountId: 'known',
+      order: 1,
+      fiveHour: 100,
+      sevenDay: 100,
+      fable: 100,
+    })
+    const resolution = await router.resolve({
+      sessionId: 'unknown-quota-cold-selection',
+      family: 'fable',
+      modelId: 'claude-fable-5',
+      candidates: [
+        { accountId: 'unknown', quota: { kind: 'unknown' }, order: 0 },
+        known,
+      ],
+      retainAccountIds: new Set(['unknown', 'known']),
+      storage,
+      inputBytes: 1_000,
+    })
+
+    expect(resolution?.accountId).toBe('known')
+  })
+
+  test('router-level escape degrades to ordered selection when every candidate quota is unknown', async () => {
+    const path = await statePath()
+    const router = new StickySessionRouter({ path, now: () => NOW })
+    const resolution = await router.resolve({
+      sessionId: 'all-unknown-quota-selection',
+      family: 'general',
+      candidates: [
+        { accountId: 'later', quota: { kind: 'unknown' }, order: 1 },
+        { accountId: 'first', quota: { kind: 'unknown' }, order: 0 },
+      ],
+      retainAccountIds: new Set(['later', 'first']),
+      storage,
+      inputBytes: 1_000,
+    })
+
+    expect(resolution?.accountId).toBe('first')
+  })
+
+  test('router-level pending bytes reset when an unknown quota becomes known', async () => {
+    const path = await statePath()
+    const router = new StickySessionRouter({ path, now: () => NOW })
+    const unknown = {
+      accountId: 'a',
+      quota: { kind: 'unknown' as const },
+      order: 0,
+    }
+    const knownA = candidate({
+      accountId: 'a',
+      order: 0,
+      fiveHour: 100,
+      sevenDay: 100,
+      fable: 100,
+    })
+    const knownB = candidate({
+      accountId: 'b',
+      order: 1,
+      fiveHour: 100,
+      sevenDay: 100,
+      fable: 100,
+    })
+
+    await router.resolve({
+      sessionId: 'unknown-pending-bytes',
+      family: 'general',
+      candidates: [unknown],
+      retainAccountIds: new Set(['a']),
+      storage,
+      inputBytes: 100_000,
+    })
+    const resolution = await router.resolve({
+      sessionId: 'known-after-unknown',
+      family: 'general',
+      candidates: [knownA, knownB],
+      retainAccountIds: new Set(['a', 'b']),
+      storage,
+      inputBytes: 1,
+    })
+
+    expect(resolution?.accountId).toBe('a')
+  })
+
+  test('keeps an unknown-identity route excluded while an active restriction applies', async () => {
+    const path = await statePath()
+    const router = new StickySessionRouter({ path, now: () => NOW })
+    const input = {
+      sessionId: 'restricted-unknown-identity',
+      family: 'general',
+      candidates: [
+        {
+          accountId: 'unknown-identity',
+          identity: { kind: 'unknown' },
+          quota: candidate({
+            accountId: 'unknown-identity',
+            order: 0,
+            fiveHour: 100,
+            sevenDay: 100,
+            fable: 100,
+          }).quota,
+          order: 0,
+        },
+      ],
+      storage,
+      inputBytes: 1_000,
+    } as const
+    await router.resolve({
+      ...input,
+      retainAccountIds: new Set(['unknown-identity']),
+    })
+    const resolution = await router.resolve({
+      ...input,
+      retainAccountIds: new Set(),
+      excludeAccountIds: new Set(['unknown-identity']),
+    })
+
+    expect(resolution).toBeNull()
   })
 })

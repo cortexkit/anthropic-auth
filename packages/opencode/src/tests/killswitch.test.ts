@@ -232,6 +232,15 @@ describe('killswitchPassesPolicy', () => {
     expect(killswitchPassesPolicy(undefined, storage)).toBe(false)
   })
 
+  test('empty quota snapshot remains killswitch-unknown under fail-closed policy', () => {
+    const storage = baseStorage()
+    storage.killswitch = {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 10 },
+    }
+    expect(killswitchPassesPolicy({}, storage)).toBe(false)
+  })
+
   test('missing quota without failClosedOnUnknownQuota returns true', () => {
     const storage = baseStorage()
     storage.quota = { ...storage.quota, failClosedOnUnknownQuota: false }

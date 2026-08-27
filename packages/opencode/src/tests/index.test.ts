@@ -6456,6 +6456,264 @@ describe('auth.loader', () => {
     expect(tokenRefreshCount).toBe(0)
   })
 
+  test('serves an existing sticky assignment with a live token', async () => {
+    const checkedAt = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            checkedAt,
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt,
+            },
+            seven_day: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt,
+            },
+          },
+          mainQuotaCheckedAt: checkedAt,
+        },
+      }),
+    )
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      if (extractUrl(input).includes('/v1/messages')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'unknown-identity-sticky' },
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+
+    const responses = await Promise.all([
+      result.fetch(MESSAGES_URL, request),
+      result.fetch(MESSAGES_URL, request),
+    ])
+    expect(authorizations).toEqual(['Bearer main-access', 'Bearer main-access'])
+    expect(responses.map((response) => response.status)).toEqual([200, 200])
+  })
+
+  test('admits and sends an OAuth route when an empty quota snapshot is fail-open', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: false,
+        },
+      }),
+    )
+    const usageRequests: string[] = []
+    const messageAuthorizations: string[] = []
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        usageRequests.push(url)
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      if (url.includes('/v1/messages')) {
+        messageAuthorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'truly-unknown-quota' },
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(usageRequests).toHaveLength(1)
+    expect(messageAuthorizations).toEqual(['Bearer main-access'])
+  })
+
+  test('unknown identity routes when fail-open, then unknown quota blocks when fail-closed', async () => {
+    const storage = createFallbackStorage({
+      accounts: [],
+      routing: { mode: 'main-first' },
+      quota: {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        minimumRemaining: { five_hour: 1, seven_day: 1 },
+        failClosedOnUnknownQuota: false,
+      },
+    })
+    await useTempAccountFile(storage)
+    const messageAuthorizations: string[] = []
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.resolve(
+          new Response('quota unavailable', { status: 500 }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        messageAuthorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'unknown-identity-routes' },
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+    const routed = await result.fetch(MESSAGES_URL, request)
+    expect(routed.status).toBe(200)
+
+    await saveAccounts({
+      ...storage,
+      quota: { ...storage.quota, failClosedOnUnknownQuota: true },
+    })
+    const blocked = await result.fetch(MESSAGES_URL, {
+      ...request,
+      headers: { 'x-session-affinity': 'unknown-quota-blocked' },
+    })
+
+    expect(blocked.status).toBe(429)
+    expect(await blocked.clone().text()).toContain('Quota API')
+    expect(messageAuthorizations).toEqual(['Bearer main-access'])
+  })
+
+  test('keeps a sticky main route excluded during identity-agnostic active refresh backoff', async () => {
+    const checkedAt = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+        refresh: {
+          enabled: true,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 30,
+          mainLastRefreshError: {
+            message: 'refresh unavailable',
+            checkedAt,
+            nextRetryAt: checkedAt + 60_000,
+          },
+        },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            checkedAt,
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt,
+            },
+            seven_day: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt,
+            },
+          },
+          mainQuotaCheckedAt: checkedAt,
+        },
+      }),
+    )
+    const messageRequests: string[] = []
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/v1/messages')) {
+        messageRequests.push(extractUrl(input))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'restricted-unknown-identity' },
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    expect(response.status).toBe(429)
+    expect(messageRequests).toEqual([])
+  })
+
   test('concurrent refresh with token rotation should not cause cascading failures', async () => {
     const usedRefreshTokens = new Set<string>()
 
@@ -6711,6 +6969,113 @@ describe('auth.loader', () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toBe('fallback ok')
     expect(authorizations).toEqual(['Bearer fallback-access'])
+  })
+
+  test('main-first tries an OAuth fallback whose quota is unknown after main fails', async () => {
+    const expires = Date.now() + 5 * 60 * 60_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: false,
+        },
+        accounts: [
+          {
+            id: 'unknown-fallback',
+            type: 'oauth',
+            access: 'unknown-fallback-access',
+            refresh: 'unknown-fallback-refresh',
+            expires,
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.reject(new Error('quota source unavailable'))
+      }
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      authorizations.push(authorization)
+      return Promise.resolve(
+        new Response(
+          authorization === 'Bearer main-access' ? 'limited' : 'ok',
+          {
+            status: authorization === 'Bearer main-access' ? 429 : 200,
+          },
+        ),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    expect(authorizations).toEqual([
+      'Bearer main-access',
+      'Bearer unknown-fallback-access',
+    ])
+  })
+
+  test('fallback-first tries an OAuth fallback whose quota is unknown before main', async () => {
+    const expires = Date.now() + 5 * 60 * 60_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'unknown-fallback',
+            type: 'oauth',
+            access: 'unknown-fallback-access',
+            refresh: 'unknown-fallback-refresh',
+            expires,
+          },
+        ],
+      }),
+    )
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/api/oauth/usage')) {
+        return Promise.reject(new Error('quota source unavailable'))
+      }
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      authorizations.push(authorization)
+      return Promise.resolve(new Response('fallback ok', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe('fallback ok')
+    expect(authorizations).toEqual(['Bearer unknown-fallback-access'])
   })
 
   test('successful fallback-first request advances the every-N counter and refreshes the served fallback', async () => {
