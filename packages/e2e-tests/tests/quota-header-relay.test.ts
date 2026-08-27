@@ -1,7 +1,6 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from 'bun:test'
-import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -13,6 +12,7 @@ type PersistedQuotaState = {
   main?: {
     quota?: {
       source?: string
+      accountIdentity?: string
       five_hour?: { usedPercent?: number }
       seven_day?: { usedPercent?: number }
     }
@@ -100,12 +100,8 @@ describe('quota headers through relay', () => {
     expect(state?.main?.quota?.source).toBe('headers')
     expect(state?.main?.quota?.five_hour?.usedPercent).toBe(78)
     expect(state?.main?.quota?.seven_day?.usedPercent).toBe(40)
-    expect(state?.main?.quotaToken).toBe(
-      createHash('sha256')
-        .update('test-access-token')
-        .digest('hex')
-      .slice(0, 16),
-    )
+    expect(state?.main?.quota?.accountIdentity).toEqual(expect.any(String))
+    expect(state?.main?.quotaToken).toBeUndefined()
   }, 90_000)
 
   it('writes one equivalent schema-v1 feed record for an HTTP relay response', async () => {

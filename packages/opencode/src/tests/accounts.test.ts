@@ -3264,26 +3264,22 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
     const qm = new QuotaManager({ storage, fetchImpl, now: () => 1_000 })
     // Active-route refresh left a FRESH but EXHAUSTED entry in the QM cache.
-    qm.setFallback(
-      'fallback-1',
-      {
-        quota: {
-          five_hour: {
-            usedPercent: 100,
-            remainingPercent: 0,
-            checkedAt: 1_000,
-          },
-          seven_day: {
-            usedPercent: 100,
-            remainingPercent: 0,
-            checkedAt: 1_000,
-          },
+    qm.setFallback('fallback-1', {
+      quota: {
+        five_hour: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: 1_000,
         },
-        refreshAfter: 1_000 + 10 * 60_000,
-        checkedAt: 1_000,
+        seven_day: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: 1_000,
+        },
       },
-      'fallback-access',
-    )
+      refreshAfter: 1_000 + 10 * 60_000,
+      checkedAt: 1_000,
+    })
 
     const manager = new FallbackAccountManager({
       fetchImpl,
@@ -3315,7 +3311,7 @@ describe('FallbackAccountManager', () => {
     expect(qm.isFallbackStale('fallback-1', 'old-access')).toBe(false)
 
     expect(qm.isFallbackStale('fallback-1', 'new-access')).toBe(false)
-    expect(qm.getFallback('fallback-1', 'new-access')).not.toBeNull()
+    expect(qm.getFallback('fallback-1')).not.toBeNull()
   })
 
   test('uses a fresh persisted scoped-only fallback quota without refetching it', async () => {

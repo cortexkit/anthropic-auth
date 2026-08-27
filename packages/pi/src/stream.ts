@@ -31,6 +31,7 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   QuotaManager,
+  type QuotaState,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -550,8 +551,7 @@ async function executeWithFallback(options: {
       if (!account.access || isPermanentRefreshError(account.lastRefreshError))
         continue
       let accountQuota =
-        quotaManager.getFallback(account.id, account.access)?.quota ??
-        account.quota
+        quotaManager.getFallback(account.id)?.quota ?? account.quota
       if (
         !stickyQuotaSnapshotIsFresh(accountQuota, storage, Date.now(), modelId)
       ) {
@@ -610,9 +610,9 @@ async function executeWithFallback(options: {
         : undefined
       const accountId =
         route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ? undefined : route.id
-      const quotaState = quota
-        ? { kind: 'known' as const, quota }
-        : ({ kind: 'unknown' } as const)
+      const quotaState: QuotaState = quota
+        ? { kind: 'known', quota }
+        : { kind: 'unknown' }
       const passesKillswitch =
         !isKillswitchEnabled(storage) ||
         killswitchPassesPolicy(
@@ -724,8 +724,7 @@ async function executeWithFallback(options: {
           continue
         account = configured
         const quota =
-          quotaManager.getFallback(configured.id, configured.access)?.quota ??
-          configured.quota
+          quotaManager.getFallback(configured.id)?.quota ?? configured.quota
         if (quotaSnapshotHasStandardWindows(quota)) continue
         if (
           isKillswitchEnabled(storage) &&
@@ -741,8 +740,7 @@ async function executeWithFallback(options: {
         isOAuthAccount(account) &&
         isKillswitchEnabled(storage) &&
         !killswitchPassesPolicy(
-          quotaManager.getFallback(account.id, account.access)?.quota ??
-            account.quota,
+          quotaManager.getFallback(account.id)?.quota ?? account.quota,
           storage,
           account.id,
           options.model.id,

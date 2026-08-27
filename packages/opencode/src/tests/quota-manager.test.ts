@@ -135,11 +135,11 @@ describe('QuotaManager', () => {
           checkedAt: now,
         },
       }
-      qm.setFallback(
-        'fallback-1',
-        { quota: cachedQuota, refreshAfter: now, checkedAt: now },
-        'fallback-token',
-      )
+      qm.setFallback('fallback-1', {
+        quota: cachedQuota,
+        refreshAfter: now,
+        checkedAt: now,
+      })
 
       await expect(
         qm.refreshFallback('fallback-1', 'fallback-token'),
@@ -240,7 +240,7 @@ describe('QuotaManager', () => {
 
       // Fallback account is backed off; main is not.
       expect(qm.isFallbackBackedOff('fallback-1')).toBe(true)
-      expect(qm.isFallbackBackedOff('fallback-1', 'fallback-token')).toBe(true)
+      expect(qm.isFallbackBackedOff('fallback-1')).toBe(true)
       expect(qm.isBackedOff()).toBe(false)
       // onApiError (persists mainLastQuotaApiError) must NOT have fired.
       expect(apiErrorCount).toBe(0)
@@ -249,9 +249,9 @@ describe('QuotaManager', () => {
       expect(qm.isFallbackBackedOff('fallback-2')).toBe(false)
     })
 
-    test('fallback quota backoff is token-bound after re-login', async () => {
-      // Same-label re-login changes the access token. A quota backoff recorded
-      // for the old token must not block a fresh quota probe for the new token.
+    test('fallback quota backoff survives access-token rotation', async () => {
+      // A rotated token still belongs to the same account, so its quota backoff
+      // remains active until the account-level retry window expires.
       const seenTokens: string[] = []
       const fetchMock = mock(
         (_: string | URL | Request, init?: RequestInit) => {
@@ -270,14 +270,13 @@ describe('QuotaManager', () => {
       await expect(
         qm.refreshFallback('fallback-1', 'old-token'),
       ).rejects.toThrow('429')
-      expect(qm.isFallbackBackedOff('fallback-1', 'old-token')).toBe(true)
-      expect(qm.isFallbackBackedOff('fallback-1', 'new-token')).toBe(false)
+      expect(qm.isFallbackBackedOff('fallback-1')).toBe(true)
 
       now += 1_100
       await expect(
         qm.refreshFallback('fallback-1', 'new-token'),
-      ).resolves.toBeDefined()
-      expect(seenTokens).toEqual(['Bearer old-token', 'Bearer new-token'])
+      ).rejects.toThrow('rate-limited')
+      expect(seenTokens).toEqual(['Bearer old-token'])
     })
 
     test('main 429 does NOT back off a fallback account', async () => {
@@ -335,7 +334,7 @@ describe('QuotaManager', () => {
       await expect(
         qm.refreshFallback('fallback-1', 'fallback-token'),
       ).rejects.toThrow('403')
-      expect(qm.isFallbackBackedOff('fallback-1', 'fallback-token')).toBe(false)
+      expect(qm.isFallbackBackedOff('fallback-1')).toBe(false)
     })
 
     test('repeated 429s escalate backoff exponentially', async () => {
@@ -569,7 +568,7 @@ describe('QuotaManager', () => {
       expect(qm.getMain('main-token')?.quota.five_hour?.usedPercent).toBe(12)
     })
 
-    test('seedFallbacksFromAccounts binds persisted fallback quota to account id', () => {
+    test('seedFallbacksFromAccounts binds persisted fallback quota to account id across token rotation', () => {
       const qm = new QuotaManager({
         storage: {
           version: 1,
@@ -601,8 +600,7 @@ describe('QuotaManager', () => {
         },
       ])
 
-      expect(qm.getFallback('fallback-1', 'old-fallback-token')).not.toBeNull()
-      expect(qm.getFallback('fallback-1', 'new-fallback-token')).not.toBeNull()
+      expect(qm.getFallback('fallback-1')).not.toBeNull()
     })
 
     test('seedFallbacksFromAccounts preserves freshness for scoped-only quota', () => {
@@ -637,9 +635,7 @@ describe('QuotaManager', () => {
         },
       ])
 
-      expect(qm.getFallback('scoped-only', 'fallback-token')?.checkedAt).toBe(
-        999_000,
-      )
+      expect(qm.getFallback('scoped-only')?.checkedAt).toBe(999_000)
       expect(
         qm.isFallbackStale('scoped-only', 'fallback-token', 'claude-fable-5'),
       ).toBe(false)
@@ -654,21 +650,17 @@ describe('QuotaManager', () => {
         },
         now: () => 1_000_000,
       })
-      qm.setFallback(
-        'fallback-1',
-        {
-          quota: {
-            five_hour: {
-              usedPercent: 90,
-              remainingPercent: 10,
-              checkedAt: 900_000,
-            },
+      qm.setFallback('fallback-1', {
+        quota: {
+          five_hour: {
+            usedPercent: 90,
+            remainingPercent: 10,
+            checkedAt: 900_000,
           },
-          refreshAfter: 900_000,
-          checkedAt: 900_000,
         },
-        'fallback-token',
-      )
+        refreshAfter: 900_000,
+        checkedAt: 900_000,
+      })
 
       qm.seedFallbacksFromAccounts([
         {
@@ -687,13 +679,10 @@ describe('QuotaManager', () => {
         },
       ])
 
-      expect(qm.getFallback('fallback-1', 'fallback-token')?.checkedAt).toBe(
-        999_000,
+      expect(qm.getFallback('fallback-1')?.checkedAt).toBe(999_000)
+      expect(qm.getFallback('fallback-1')?.quota.five_hour?.usedPercent).toBe(
+        12,
       )
-      expect(
-        qm.getFallback('fallback-1', 'fallback-token')?.quota.five_hour
-          ?.usedPercent,
-      ).toBe(12)
     })
 
     test('drops persisted main seed during backoff when the token changed', async () => {
@@ -1040,6 +1029,7 @@ describe('QuotaManager', () => {
       const qm = new QuotaManager({ storage, now: () => now })
 
       expect(qm.getMain('main-a')).not.toBeNull()
+      expect(qm.getMain('main-a')?.quota.accountIdentity).toBe('main-a')
     })
 
     test('missing main identity leaves quota unknown without changing credentials', () => {
@@ -1110,7 +1100,7 @@ describe('QuotaManager', () => {
         refreshAfter: now + 20_000,
       })
 
-      const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
+      const pushed = qm.pushMainFromHeaders('main-account', headerSnapshot())
 
       expect(pushed.quota.five_hour?.usedPercent).toBe(78)
       expect(pushed.quota.seven_day?.usedPercent).toBe(40)
@@ -1230,7 +1220,7 @@ describe('QuotaManager', () => {
         refreshAfter: 200,
       })
 
-      qm.pushFallbackFromHeaders('target', 'target-token', headerSnapshot())
+      qm.pushFallbackFromHeaders('target', headerSnapshot())
 
       expect(qm.getFallback('target')?.quota.five_hour?.usedPercent).toBe(78)
       expect(qm.getFallback('other')?.quota.checkedAt).toBe(100)
@@ -1239,15 +1229,11 @@ describe('QuotaManager', () => {
     test('header push binds main to account identity and fallback to account id', () => {
       const qm = createQM()
 
-      qm.pushMainFromHeaders(
-        'main-account',
-        'rotated-main-token',
-        headerSnapshot(),
-      )
-      qm.pushFallbackFromHeaders('fallback', 'fallback-token', headerSnapshot())
+      qm.pushMainFromHeaders('main-account', headerSnapshot())
+      qm.pushFallbackFromHeaders('fallback', headerSnapshot())
 
       expect(qm.getMain('different-account')).toBeNull()
-      expect(qm.getFallback('fallback', 'different-token')).not.toBeNull()
+      expect(qm.getFallback('fallback')).not.toBeNull()
     })
 
     test('header checkedAt moves refreshAfter through getQuotaNextRefreshAt', () => {

@@ -41,7 +41,9 @@ const nativeSetTimeout = globalThis.setTimeout
 export type QuotaEntry = {
   quota: OAuthQuotaSnapshot
   refreshAfter: number // Unix ms — earliest next refresh
-  checkedAt: number // when snapshot was fetched
+  // Receipt/observation time; current headers expose no authoritative server
+  // ordering field, so cross-response ordering is intentionally last-write-wins.
+  checkedAt: number
 }
 
 export type QuotaRefreshResult = {
@@ -113,7 +115,6 @@ export class QuotaManager {
   // main account or vice versa) ---
   private mainLastApiError: AccountOperationError | undefined = undefined
   private fallbackApiErrors = new Map<string, AccountOperationError>()
-  private fallbackErrorTokenFps = new Map<string, string>()
 
   // --- Serial API gate (prevents concurrent quota API calls) ---
   private apiGate: Promise<unknown> = Promise.resolve()
@@ -152,8 +153,7 @@ export class QuotaManager {
   /**
    * Cached fallback quota entry, scoped to the configured account id.
    */
-  getFallback(accountId: string, accessToken?: string): QuotaEntry | null {
-    void accessToken
+  getFallback(accountId: string): QuotaEntry | null {
     return this.fallbacks.get(accountId) ?? null
   }
 
@@ -170,23 +170,14 @@ export class QuotaManager {
     this.main = entry
   }
 
-  setFallback(
-    accountId: string,
-    entry: QuotaEntry,
-    accessToken?: string,
-  ): void {
-    void accessToken
+  setFallback(accountId: string, entry: QuotaEntry): void {
     this.fallbacks.set(accountId, entry)
   }
 
   pushMainFromHeaders(
     mainAccountId: string | undefined,
-    incomingOrAccessToken: OAuthQuotaSnapshot | string,
-    legacyIncoming?: OAuthQuotaSnapshot,
+    incoming: OAuthQuotaSnapshot,
   ): QuotaEntry {
-    const incoming =
-      legacyIncoming ?? (incomingOrAccessToken as OAuthQuotaSnapshot)
-    if (legacyIncoming) void incomingOrAccessToken
     const checkedAt = incoming.checkedAt ?? this.now()
     const quota = mergeHeaderQuotaSnapshot(
       this.mainAccountId === mainAccountId ? this.main?.quota : undefined,
@@ -206,20 +197,19 @@ export class QuotaManager {
 
   pushFallbackFromHeaders(
     accountId: string,
-    accessToken: string,
     incoming: OAuthQuotaSnapshot,
   ): QuotaEntry {
     const checkedAt = incoming.checkedAt ?? this.now()
-    const quota = mergeHeaderQuotaSnapshot(
-      this.getFallback(accountId, accessToken)?.quota,
-      { ...incoming, accountIdentity: accountId },
-    )
+    const quota = mergeHeaderQuotaSnapshot(this.getFallback(accountId)?.quota, {
+      ...incoming,
+      accountIdentity: accountId,
+    })
     const entry = {
       quota,
       checkedAt,
       refreshAfter: getQuotaNextRefreshAt(quota, this.storage, checkedAt),
     }
-    this.setFallback(accountId, entry, accessToken)
+    this.setFallback(accountId, entry)
     return entry
   }
 
@@ -231,21 +221,15 @@ export class QuotaManager {
     mainAccountIdOrAccessToken: string | undefined,
     accessToken?: string,
   ): Promise<OAuthQuotaSnapshot> {
-    const legacy = accessToken === undefined
-    const mainAccountId = legacy
-      ? mainAccountIdOrAccessToken
-      : mainAccountIdOrAccessToken
+    const mainAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
     if (!credential) throw new Error('Main OAuth access token is unavailable')
-    return (
-      await this.refreshMainWithMetadata(mainAccountId, credential, legacy)
-    ).quota
+    return (await this.refreshMainWithMetadata(mainAccountId, credential)).quota
   }
 
   async refreshMainWithMetadata(
     mainAccountIdOrAccessToken: string | undefined,
     accessToken?: string,
-    _legacy = false,
   ): Promise<QuotaRefreshResult> {
     const effectiveAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
@@ -288,8 +272,8 @@ export class QuotaManager {
     if (inflight) return inflight
 
     // Rate-limit — scoped to THIS fallback account only
-    if (this.isFallbackBackedOff(accountId, accessToken)) {
-      const cached = this.getFallback(accountId, accessToken)
+    if (this.isFallbackBackedOff(accountId)) {
+      const cached = this.getFallback(accountId)
       if (cached) return { quota: cached.quota, fetched: false }
       throw new Error('Quota API rate-limited — try again later')
     }
@@ -306,7 +290,7 @@ export class QuotaManager {
       if (account.enabled === false) continue
       if (!account.access) continue
 
-      const cached = this.getFallback(account.id, account.access)
+      const cached = this.getFallback(account.id)
       if (cached && now < cached.refreshAfter) continue
 
       try {
@@ -348,11 +332,12 @@ export class QuotaManager {
 
   isFallbackStale(
     accountId: string,
-    accessToken?: string,
+    _accessToken?: string,
     modelId?: string,
   ): boolean {
-    // Token-aware: a credential change invalidates the entry (treated as stale).
-    const entry = this.getFallback(accountId, accessToken)
+    // Keep the unused slot to avoid breaking internal callers that pass modelId
+    // third; cached quota is scoped to stable account identity.
+    const entry = this.getFallback(accountId)
     if (!entry) return true
     return (
       this.now() >= entry.refreshAfter ||
@@ -464,17 +449,13 @@ export class QuotaManager {
       if (!account.quota) continue
       const checkedAt = quotaSnapshotCheckedAt(account.quota)
       if (checkedAt <= 0) continue
-      const existing = this.getFallback(account.id, account.access)
+      const existing = this.getFallback(account.id)
       if (existing && existing.checkedAt >= checkedAt) continue
-      this.setFallback(
-        account.id,
-        {
-          quota: { ...account.quota, accountIdentity: account.id },
-          refreshAfter: checkedAt + checkInterval,
-          checkedAt,
-        },
-        account.access,
-      )
+      this.setFallback(account.id, {
+        quota: { ...account.quota, accountIdentity: account.id },
+        refreshAfter: checkedAt + checkInterval,
+        checkedAt,
+      })
     }
   }
 
@@ -489,11 +470,7 @@ export class QuotaManager {
   /**
    * Whether a specific fallback account's quota API is in backoff.
    */
-  isFallbackBackedOff(accountId: string, accessToken?: string): boolean {
-    if (accessToken) {
-      const errorFp = this.fallbackErrorTokenFps.get(accountId)
-      if (errorFp !== tokenFingerprint(accessToken)) return false
-    }
+  isFallbackBackedOff(accountId: string): boolean {
     return quotaBackoffActive(this.fallbackApiErrors.get(accountId), this.now())
   }
 
@@ -627,7 +604,7 @@ export class QuotaManager {
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — scoped to this fallback account
-        if (this.isFallbackBackedOff(accountId, accessToken)) {
+        if (this.isFallbackBackedOff(accountId)) {
           const cached = this.getFallback(accountId)
           if (cached) return { quota: cached.quota, fetched: false }
           throw new Error('Quota API rate-limited — try again later')
@@ -654,27 +631,22 @@ export class QuotaManager {
             this.getFallback(accountId)?.quota,
             { ...quota, accountIdentity: accountId },
           )
-          this.setFallback(
-            accountId,
-            {
-              quota: completedQuota,
-              refreshAfter: getQuotaNextRefreshAt(
-                completedQuota,
-                this.storage,
-                now,
-              ),
-              checkedAt: completedQuota.checkedAt ?? now,
-            },
-            accessToken,
-          )
+          this.setFallback(accountId, {
+            quota: completedQuota,
+            refreshAfter: getQuotaNextRefreshAt(
+              completedQuota,
+              this.storage,
+              now,
+            ),
+            checkedAt: completedQuota.checkedAt ?? now,
+          })
           this.fallbackApiErrors.delete(accountId)
-          this.fallbackErrorTokenFps.delete(accountId)
           return { quota: completedQuota, fetched: true }
         } finally {
           await fileLock.release()
         }
       } catch (error) {
-        this._handleFallbackFetchError(accountId, accessToken, error)
+        this._handleFallbackFetchError(accountId, error)
         throw error
       } finally {
         this.inflightFallbacks.delete(
@@ -711,25 +683,17 @@ export class QuotaManager {
    * quota error) — the per-account error is recorded by the caller via the
    * account's lastQuotaRefreshError.
    */
-  private _handleFallbackFetchError(
-    accountId: string,
-    accessToken: string,
-    error: unknown,
-  ): void {
+  private _handleFallbackFetchError(accountId: string, error: unknown): void {
     if (QuotaManager.isAuthError(error)) return
-    const tokenFp = tokenFingerprint(accessToken)
-    const previous =
-      this.fallbackErrorTokenFps.get(accountId) === tokenFp
-        ? this.fallbackApiErrors.get(accountId)
-        : undefined
+    const previous = this.fallbackApiErrors.get(accountId)
     this.fallbackApiErrors.set(
       accountId,
       buildQuotaOperationError({
         error,
         now: this.now(),
         previous,
+        accountIdentity: accountId,
       }),
     )
-    this.fallbackErrorTokenFps.set(accountId, tokenFp)
   }
 }

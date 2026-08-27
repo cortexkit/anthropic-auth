@@ -121,6 +121,7 @@ import {
   type QuotaHeaderFeedEntry,
   QuotaHeaderFeedRegistry,
   QuotaManager,
+  type QuotaState,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -1110,30 +1111,31 @@ const anthropicAuthPlugin = async (
     const storage =
       (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
     if (served.accountId === 'main') {
-      let currentAccessToken: string | undefined
-      try {
-        const auth = await latestGetAuth?.()
-        if (auth?.type === 'oauth') currentAccessToken = auth.access
-      } catch {}
-      if (currentAccessToken !== served.accessToken) {
-        logger.trace('quota', 'skipped stale main response quota persistence')
+      if (!mainAccountId || entry.quota.accountIdentity !== mainAccountId) {
+        logger.trace(
+          'quota',
+          'skipped quota persistence without stable main identity',
+        )
         return
       }
       storage.quota = storage.quota ?? {}
-      storage.quota.mainQuota = entry.quota
+      storage.quota.mainQuota = {
+        ...entry.quota,
+        accountIdentity: mainAccountId,
+      }
       storage.quota.mainQuotaCheckedAt = entry.checkedAt
-      storage.quota.mainQuotaToken = tokenFingerprint(served.accessToken)
       await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       return
     }
     const account = storage.accounts.find(
       (candidate): candidate is OAuthAccount =>
-        candidate.id === served.accountId &&
-        isOAuthAccount(candidate) &&
-        candidate.access === served.accessToken,
+        candidate.id === served.accountId && isOAuthAccount(candidate),
     )
     if (!account) return
-    account.quota = entry.quota
+    account.quota = {
+      ...entry.quota,
+      accountIdentity: account.id,
+    }
     await saveAccountState(storage, accountStoragePath, {
       accounts: [served.accountId],
     })
@@ -1200,7 +1202,7 @@ const anthropicAuthPlugin = async (
     const accountKey =
       credentialId ??
       (served.accountId === 'main'
-        ? tokenFingerprint(served.accessToken)
+        ? (mainAccountId ?? 'main')
         : served.accountId)
     const feedEntry: QuotaHeaderFeedEntry & { accountKey: string } =
       credentialId
@@ -1268,16 +1270,8 @@ const anthropicAuthPlugin = async (
       const incoming = normalizeQuotaHeaders(headers)
       const entry =
         served.accountId === 'main'
-          ? quotaManager.pushMainFromHeaders(
-              mainAccountId,
-              served.accessToken,
-              incoming,
-            )
-          : quotaManager.pushFallbackFromHeaders(
-              served.accountId,
-              served.accessToken,
-              incoming,
-            )
+          ? quotaManager.pushMainFromHeaders(mainAccountId, incoming)
+          : quotaManager.pushFallbackFromHeaders(served.accountId, incoming)
       void persistPushedQuota(served, entry).catch(logPersistFailure)
       void publishQuotaHeaderFeed(served, entry).catch(
         logQuotaHeaderFeedFailure,
@@ -2063,8 +2057,7 @@ const anthropicAuthPlugin = async (
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
           quota: account.access
-            ? (quotaManager.getFallback(account.id, account.access)?.quota ??
-              null)
+            ? (quotaManager.getFallback(account.id)?.quota ?? null)
             : null,
           // A fallback with a permanently-dead refresh token (400 invalid_grant)
           // is dropped by getUsableFallbackAccounts and silently degrades to
@@ -4578,12 +4571,9 @@ const anthropicAuthPlugin = async (
             access?: string
             quota?: OAuthQuotaSnapshot
           }): OAuthQuotaSnapshot | undefined {
-            // Token-aware read: a cached entry bound to a different access token
-            // (account re-login) is dropped so a stale snapshot is never used.
-            return (
-              quotaManager.getFallback(account.id, account.access)?.quota ??
-              account.quota
-            )
+            // Cached entries are scoped to stable account ids; token rotation
+            // must not discard an otherwise valid account-level observation.
+            return quotaManager.getFallback(account.id)?.quota ?? account.quota
           }
 
           // The fallbacks routing may actually send to: usable accounts that
@@ -4847,9 +4837,9 @@ const anthropicAuthPlugin = async (
                 const quota = quotaSnapshotHasStandardWindows(route.quota)
                   ? route.quota
                   : undefined
-                const quotaState = quota
-                  ? { kind: 'known' as const, quota }
-                  : ({ kind: 'unknown' } as const)
+                const quotaState: QuotaState = quota
+                  ? { kind: 'known', quota }
+                  : { kind: 'unknown' }
                 const passesKillswitch =
                   !isKillswitchEnabled(latestStorage) ||
                   killswitchPassesPolicy(
@@ -5859,11 +5849,8 @@ const anthropicAuthPlugin = async (
                   )
                   .map((a) => ({
                     ...a,
-                    // Token-aware read so a cached snapshot bound to a previous
-                    // access token (account re-login) is never shown.
-                    quota:
-                      quotaManager.getFallback(a.id, a.access)?.quota ??
-                      a.quota,
+                    // Account ids scope quota observations across token rotation.
+                    quota: quotaManager.getFallback(a.id)?.quota ?? a.quota,
                   }))
                 const mainPassesPolicy = quotaSnapshotPassesPolicy(
                   mainEntry.quota,
