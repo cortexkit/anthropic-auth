@@ -48,6 +48,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  refreshBackoffActive,
   removeAccount,
   removeAccountPersistent,
   reorderAccounts,
@@ -255,7 +256,6 @@ describe('OAuth account profiles', () => {
       tier: 'default_claude_max_20x',
       orgType: 'claude_max',
       checkedAt: 1234,
-      tokenFingerprint: tokenFingerprint('token'),
     })
     expect(formatOAuthAccountTier(profile)).toBe('Max 20x')
   })
@@ -267,7 +267,6 @@ describe('OAuth account profiles', () => {
       tier: 'default_claude_max_5x',
       orgType: 'claude_team',
       checkedAt: 1234,
-      tokenFingerprint: tokenFingerprint('token'),
     })
     expect(formatOAuthAccountTier(profile)).toBe('Team · Max 5x')
   })
@@ -452,17 +451,17 @@ describe('OAuth account profiles', () => {
         {
           accountId: 'main',
           profile: undefined,
-          expectedTokenFingerprint,
+          accountIdentity: 'main',
         },
         accountPath,
       ),
-    ).toBe(true)
+    ).toBe(false)
     expect(
       await saveOAuthProfileState(
         {
           accountId: 'main',
           profile: freshProfile,
-          expectedTokenFingerprint,
+          accountIdentity: 'main',
         },
         accountPath,
       ),
@@ -472,13 +471,14 @@ describe('OAuth account profiles', () => {
       {
         accountId: 'main',
         profile: undefined,
-        expectedTokenFingerprint,
+        accountIdentity: 'main',
       },
       accountPath,
     )
-    expect((await loadAccounts(accountPath))?.main?.profile).toEqual(
-      freshProfile,
-    )
+    expect((await loadAccounts(accountPath))?.main?.profile).toEqual({
+      ...freshProfile,
+      accountIdentity: 'main',
+    })
     expect(clearAccepted).toBe(false)
   })
 
@@ -516,17 +516,17 @@ describe('OAuth account profiles', () => {
         {
           accountId: 'work',
           profile: undefined,
-          expectedTokenFingerprint,
+          accountIdentity: 'work',
         },
         accountPath,
       ),
-    ).toBe(true)
+    ).toBe(false)
     expect(
       await saveOAuthProfileState(
         {
           accountId: 'work',
           profile: freshProfile,
-          expectedTokenFingerprint,
+          accountIdentity: 'work',
         },
         accountPath,
       ),
@@ -536,15 +536,158 @@ describe('OAuth account profiles', () => {
       {
         accountId: 'work',
         profile: undefined,
-        expectedTokenFingerprint,
+        accountIdentity: 'work',
       },
       accountPath,
     )
     expect(
       expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
         .profile,
-    ).toEqual(freshProfile)
+    ).toEqual({ ...freshProfile, accountIdentity: 'work' })
     expect(clearAccepted).toBe(false)
+  })
+
+  test('rotated access token reuses the same account profile', async () => {
+    const firstToken = 'first-access'
+    const secondToken = 'second-access'
+    const firstProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 100,
+      tokenFingerprint: tokenFingerprint(firstToken),
+    }
+    const secondProfile: OAuthAccountProfile = {
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 200,
+      tokenFingerprint: tokenFingerprint(secondToken),
+    }
+    const storage = baseStorage()
+    storage.main = { ...storage.main!, profile: firstProfile }
+    await saveAccounts(storage, accountPath)
+    await saveAccountState(storage, accountPath, { mainProfile: true })
+
+    expect(
+      await saveOAuthProfileState(
+        {
+          accountId: 'main',
+          profile: secondProfile,
+          accountIdentity: 'main',
+        },
+        accountPath,
+      ),
+    ).toBe(true)
+    expect((await loadAccounts(accountPath))?.main?.profile).toEqual({
+      ...secondProfile,
+      accountIdentity: 'main',
+    })
+  })
+
+  test('older profile cannot overwrite newer profile for the same identity', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage, accountPath)
+    const newer: OAuthAccountProfile = {
+      tier: 'new-tier',
+      orgType: 'new-org',
+      checkedAt: 200,
+      accountIdentity: 'main',
+    }
+    const older: OAuthAccountProfile = {
+      tier: 'old-tier',
+      orgType: 'old-org',
+      checkedAt: 100,
+      accountIdentity: 'main',
+    }
+
+    expect(
+      await saveOAuthProfileState(
+        { accountId: 'main', profile: newer, accountIdentity: 'main' },
+        accountPath,
+      ),
+    ).toBe(true)
+    expect(
+      await saveOAuthProfileState(
+        { accountId: 'main', profile: older, accountIdentity: 'main' },
+        accountPath,
+      ),
+    ).toBe(false)
+    expect((await loadAccounts(accountPath))?.main?.profile).toEqual(newer)
+  })
+
+  test('different identity does not reuse another account profile', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage, accountPath)
+    const first: OAuthAccountProfile = {
+      tier: 'first-tier',
+      orgType: 'first-org',
+      checkedAt: 200,
+      accountIdentity: 'account-a',
+    }
+    const second: OAuthAccountProfile = {
+      tier: 'second-tier',
+      orgType: 'second-org',
+      checkedAt: 100,
+      accountIdentity: 'account-b',
+    }
+
+    expect(
+      await saveOAuthProfileState(
+        { accountId: 'main', profile: first, accountIdentity: 'account-a' },
+        accountPath,
+      ),
+    ).toBe(true)
+    expect(
+      await saveOAuthProfileState(
+        { accountId: 'main', profile: second, accountIdentity: 'account-b' },
+        accountPath,
+      ),
+    ).toBe(true)
+    expect((await loadAccounts(accountPath))?.main?.profile).toEqual(second)
+  })
+
+  test('legacy profile without identity is adopted under the current identity', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage, accountPath)
+    const legacy: OAuthAccountProfile = {
+      tier: 'legacy-tier',
+      orgType: 'legacy-org',
+      checkedAt: 100,
+      tokenFingerprint: tokenFingerprint('old-access'),
+    }
+
+    expect(
+      await saveOAuthProfileState(
+        { accountId: 'main', profile: legacy, accountIdentity: 'main' },
+        accountPath,
+      ),
+    ).toBe(true)
+    expect((await loadAccounts(accountPath))?.main?.profile).toEqual({
+      ...legacy,
+      accountIdentity: 'main',
+    })
+  })
+
+  test('missing identity never deletes stored profile state', async () => {
+    const profile: OAuthAccountProfile = {
+      tier: 'default_claude_max_5x',
+      orgType: 'claude_team',
+      checkedAt: 100,
+      accountIdentity: 'main',
+    }
+    const storage = {
+      ...baseStorage(),
+      main: { ...baseStorage().main!, profile },
+    }
+    await saveAccounts(storage, accountPath)
+    await saveAccountState(storage, accountPath, { mainProfile: true })
+
+    expect(
+      await saveOAuthProfileState(
+        { accountId: 'main', profile: undefined },
+        accountPath,
+      ),
+    ).toBe(false)
+    expect((await loadAccounts(accountPath))?.main?.profile).toEqual(profile)
   })
 })
 
@@ -2222,27 +2365,83 @@ describe('FallbackAccountManager', () => {
     expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
   })
 
-  test('refresh backoff retry count resets after token rotation', () => {
+  test('stable identity backoff survives refresh-token rotation and releases after expiry', () => {
     const first = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
       now: 1_000,
+      accountIdentity: 'fallback-1',
       refreshToken: 'old-refresh',
-    })
+    } as never)
     const second = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
       now: first.nextRetryAt ?? 2_000,
-      refreshToken: 'old-refresh',
+      accountIdentity: 'fallback-1',
+      refreshToken: 'rotated-refresh',
       previous: first,
-    })
-    const afterRelogin = buildRefreshOperationError({
-      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
-      now: second.nextRetryAt ?? 3_000,
-      refreshToken: 'new-refresh',
-      previous: second,
-    })
+    } as never)
 
     expect(second.retryCount).toBe(2)
-    expect(afterRelogin.retryCount).toBe(1)
+    expect(
+      refreshBackoffActive(second, 'fallback-1', (second.nextRetryAt ?? 0) - 1),
+    ).toBe(true)
+    expect(
+      refreshBackoffActive(second, 'fallback-1', second.nextRetryAt ?? 0),
+    ).toBe(false)
+  })
+
+  test('stable identity backoff does not transfer to a different account', () => {
+    const first = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1_000,
+      accountIdentity: 'fallback-1',
+      refreshToken: 'shared-refresh',
+    } as never)
+    const other = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: first.nextRetryAt ?? 2_000,
+      accountIdentity: 'fallback-2',
+      refreshToken: 'shared-refresh',
+      previous: first,
+    } as never)
+
+    expect(other.retryCount).toBe(1)
+    expect(
+      refreshBackoffActive(other, 'fallback-1', (other.nextRetryAt ?? 0) - 1),
+    ).toBe(false)
+  })
+
+  test('stable identity backoff remains active when current identity is unavailable', () => {
+    const error = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1_000,
+      accountIdentity: 'fallback-1',
+      refreshToken: 'refresh',
+    } as never)
+
+    expect(
+      refreshBackoffActive(error, undefined, (error.nextRetryAt ?? 0) - 1),
+    ).toBe(true)
+  })
+
+  test('stable identity backoff upgrades legacy token-hash errors on the next failure', () => {
+    const legacy = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: 1_000,
+      refreshToken: 'legacy-refresh',
+    } as never)
+    const upgraded = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(429, 'rate limited'),
+      now: legacy.nextRetryAt ?? 2_000,
+      accountIdentity: 'fallback-1',
+      refreshToken: 'rotated-refresh',
+      previous: legacy,
+    } as never)
+
+    expect(upgraded.accountIdentity).toBe('fallback-1')
+    expect(upgraded.tokenHash).toBeUndefined()
+    expect(
+      refreshBackoffActive(legacy, 'fallback-1', (legacy.nextRetryAt ?? 0) - 1),
+    ).toBe(true)
   })
 
   test('backs off failed fallback refreshes instead of retrying every pass', async () => {
@@ -3097,10 +3296,7 @@ describe('FallbackAccountManager', () => {
     expect(accounts.map((a) => a.id)).not.toContain('fallback-1')
   })
 
-  test('re-login (token change) invalidates a fresh fallback cache entry', async () => {
-    // Regression: a same-id re-login changes the access token. The token-bound
-    // fallback cache entry from the old token must be treated as stale so the
-    // new credentials trigger a refetch instead of reusing the old quota.
+  test('access-token rotation does not invalidate a fresh fallback cache entry', async () => {
     const fetchImpl = mock(() =>
       Promise.resolve(
         new Response(
@@ -3114,13 +3310,12 @@ describe('FallbackAccountManager', () => {
     ) as unknown as typeof fetch
     const qm = new QuotaManager({ storage: null, fetchImpl, now: () => 2_000 })
 
-    // Cache populated by the OLD token (binds its fingerprint), entry is fresh.
+    // Cache identity is the configured account id, not the rotating credential.
     await qm.refreshFallback('fallback-1', 'old-access')
     expect(qm.isFallbackStale('fallback-1', 'old-access')).toBe(false)
 
-    // Same account id, NEW token (re-login): entry is invalidated → stale.
-    expect(qm.isFallbackStale('fallback-1', 'new-access')).toBe(true)
-    expect(qm.getFallback('fallback-1', 'new-access')).toBeNull()
+    expect(qm.isFallbackStale('fallback-1', 'new-access')).toBe(false)
+    expect(qm.getFallback('fallback-1', 'new-access')).not.toBeNull()
   })
 
   test('uses a fresh persisted scoped-only fallback quota without refetching it', async () => {
@@ -3211,8 +3406,8 @@ describe('FallbackAccountManager', () => {
     ).toContain('same-label')
     expect(quotaProbeTokens).toEqual([])
 
-    // Simulate same-label re-login in a still-running process. CLI upsert clears
-    // quota/error metadata for the stored account.
+    // Simulate same-label re-login in a still-running process. The account id
+    // remains the cache identity, so a fresh quota snapshot is still usable.
     storage.accounts[0] = {
       id: 'same-label',
       label: 'same-label',
@@ -3228,11 +3423,11 @@ describe('FallbackAccountManager', () => {
     expect(
       (await manager.getUsableFallbackAccounts(storage)).map((a) => a.id),
     ).toContain('same-label')
-    expect(quotaProbeTokens).toEqual(['Bearer new-access'])
+    expect(quotaProbeTokens).toEqual([])
     expect(
       expectOAuthAccount(storage.accounts[0]).quota?.five_hour
         ?.remainingPercent,
-    ).toBe(90)
+    ).toBeUndefined()
   })
 })
 
@@ -3242,7 +3437,7 @@ describe('buildRefreshOperationError', () => {
     const result = buildRefreshOperationError({
       error,
       now: 1000000,
-      refreshToken: 'test-token',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt).toBe(1000000 + 120_000)
   })
@@ -3252,7 +3447,7 @@ describe('buildRefreshOperationError', () => {
     const result = buildRefreshOperationError({
       error,
       now: 1000000,
-      refreshToken: 'test-token',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt).toBe(1000000 + 5 * 60_000)
   })
@@ -3262,7 +3457,7 @@ describe('buildRefreshOperationError', () => {
     const result = buildRefreshOperationError({
       error,
       now: 1000000,
-      refreshToken: 'test-token',
+      accountIdentity: 'test-account',
     })
     expect(result.status).toBe(400)
   })
@@ -3271,7 +3466,7 @@ describe('buildRefreshOperationError', () => {
     const result = buildRefreshOperationError({
       error: { status: 429 },
       now: 1000000,
-      refreshToken: 'test-token',
+      accountIdentity: 'test-account',
     })
     expect(result.status).toBe(429)
   })
@@ -3280,7 +3475,7 @@ describe('buildRefreshOperationError', () => {
     const dead = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(dead.permanent).toBe(true)
   })
@@ -3289,7 +3484,7 @@ describe('buildRefreshOperationError', () => {
     const exhausted = buildRefreshOperationError({
       error: new Error('Token refresh exhausted all retries'),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(exhausted.permanent).toBe(false)
   })
@@ -3298,7 +3493,7 @@ describe('buildRefreshOperationError', () => {
     const rateLimited = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(rateLimited.permanent).toBe(false)
   })
@@ -3310,7 +3505,7 @@ describe('buildRefreshOperationError', () => {
     const invalidClient = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(invalidClient.status).toBe(400)
     expect(invalidClient.permanent).toBe(false)
@@ -3326,7 +3521,7 @@ describe('buildRefreshOperationError', () => {
         '{"error":"invalid_grant","error_description":"Refresh token expired"}',
       ),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(dead.permanent).toBe(true)
     expect(isPermanentRefreshError(dead)).toBe(true)
@@ -3380,7 +3575,7 @@ describe('isPermanentRefreshError', () => {
     const error = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(isPermanentRefreshError(error)).toBe(true)
   })
@@ -3389,7 +3584,7 @@ describe('isPermanentRefreshError', () => {
     const error = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(isPermanentRefreshError(error)).toBe(false)
   })
@@ -3398,7 +3593,7 @@ describe('isPermanentRefreshError', () => {
     const error = buildRefreshOperationError({
       error: { status: 500 },
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(isPermanentRefreshError(error)).toBe(false)
   })
@@ -3434,7 +3629,7 @@ describe('isPermanentRefreshError', () => {
     const error = buildRefreshOperationError({
       error: new Error('Token refresh exhausted all retries'),
       now: 1000000,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     // Sanity: it really did get the 24h non-transient delay (so the legacy
     // heuristic alone would have wrongly flagged it permanent).
@@ -3452,7 +3647,7 @@ describe('isPermanentRefreshError across save/load round-trip', () => {
     const error = buildRefreshOperationError({
       error: new Error('Token refresh exhausted all retries'),
       now: Date.now(),
-      refreshToken: 'rt-exhausted',
+      accountIdentity: 'exhausted',
     })
     expect(error.permanent).toBe(false)
     expect(isPermanentRefreshError(error)).toBe(false)
@@ -3478,7 +3673,7 @@ describe('isPermanentRefreshError across save/load round-trip', () => {
     const error = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(400, 'invalid_grant'),
       now: Date.now(),
-      refreshToken: 'rt-dead',
+      accountIdentity: 'dead',
     })
     expect(error.permanent).toBe(true)
 
@@ -3506,7 +3701,7 @@ describe('isPermanentRefreshError across save/load round-trip', () => {
     const error = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_client"}'),
       now: Date.now(),
-      refreshToken: 'rt-misconfig',
+      accountIdentity: 'misconfig',
     })
     expect(error.permanent).toBe(false)
 
@@ -3541,7 +3736,7 @@ describe('isTransientRefreshError via duck-typed error classification', () => {
     const result = buildRefreshOperationError({
       error: { status: 429 },
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
   })
@@ -3550,7 +3745,7 @@ describe('isTransientRefreshError via duck-typed error classification', () => {
     const result = buildRefreshOperationError({
       error: { status: 500 },
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
   })
@@ -3559,7 +3754,7 @@ describe('isTransientRefreshError via duck-typed error classification', () => {
     const result = buildRefreshOperationError({
       error: { status: 503 },
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
   })
@@ -3568,7 +3763,7 @@ describe('isTransientRefreshError via duck-typed error classification', () => {
     const result = buildRefreshOperationError({
       error: { status: 401 },
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
   })
@@ -3577,7 +3772,7 @@ describe('isTransientRefreshError via duck-typed error classification', () => {
     const result = buildRefreshOperationError({
       error: { status: 400 },
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt).toBe(now + REFRESH_NON_TRANSIENT)
   })
@@ -3586,7 +3781,7 @@ describe('isTransientRefreshError via duck-typed error classification', () => {
     const result = buildRefreshOperationError({
       error: new Error('fetch failed'),
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
   })
@@ -3595,7 +3790,7 @@ describe('isTransientRefreshError via duck-typed error classification', () => {
     const result = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited'),
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt!).toBeLessThan(now + REFRESH_NON_TRANSIENT)
   })
@@ -3615,7 +3810,7 @@ describe('buildRefreshOperationError retryAfter duck-typed propagation', () => {
     const result = buildRefreshOperationError({
       error,
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt).toBe(now + 60_000)
   })
@@ -3624,7 +3819,7 @@ describe('buildRefreshOperationError retryAfter duck-typed propagation', () => {
     const result = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(429, 'rate limited', '120'),
       now,
-      refreshToken: 't',
+      accountIdentity: 'test-account',
     })
     expect(result.nextRetryAt).toBe(now + 120_000)
   })
@@ -5014,26 +5209,19 @@ describe('getOrCreatePrimeAuthLineageId', () => {
     expect(expectOAuthAccount(loaded?.accounts[0]).authLineageId).toBe(first)
   })
 
-  test('concurrent main replacement observations converge on one new lineage', async () => {
-    const original = await getOrCreatePrimeAuthLineageId(
-      'main',
+  test('main lineage stays bound to the stable main account identity', async () => {
+    const mainAccountId = await getOrCreateMainAccountId(
       accountPath,
-      'main-refresh-a',
+      () => 'main-stable-identity',
     )
 
     const [first, second] = await Promise.all([
-      getOrCreatePrimeAuthLineageId('main', accountPath, 'main-refresh-b'),
-      getOrCreatePrimeAuthLineageId('main', accountPath, 'main-refresh-b'),
+      getOrCreatePrimeAuthLineageId('main', accountPath),
+      getOrCreatePrimeAuthLineageId('main', accountPath),
     ])
 
     expect(first).toBe(second)
-    expect(first).not.toBe(original)
-    const rawState = JSON.parse(
-      await readFile(getAccountStatePath(accountPath), 'utf8'),
-    )
-    expect(rawState.main.primeAuthLineageRefreshTokenFingerprint).toBe(
-      tokenFingerprint('main-refresh-b'),
-    )
+    expect(first).toBe(mainAccountId)
   })
 
   test('a legacy main lineage binds once without changing identity', async () => {
@@ -5047,30 +5235,20 @@ describe('getOrCreatePrimeAuthLineageId', () => {
       'utf8',
     )
 
-    const migrated = await getOrCreatePrimeAuthLineageId(
-      'main',
-      accountPath,
-      'main-refresh-a',
-    )
+    const migrated = await getOrCreatePrimeAuthLineageId('main', accountPath)
 
     expect(migrated).toBe(legacy)
-    const rawState = JSON.parse(
-      await readFile(getAccountStatePath(accountPath), 'utf8'),
-    )
-    expect(rawState.main.primeAuthLineageRefreshTokenFingerprint).toBe(
-      tokenFingerprint('main-refresh-a'),
-    )
   })
 
-  test('a missing main refresh token does not mint or persist a lineage', async () => {
+  test('a missing main refresh token still resolves a stable lineage', async () => {
     const statePath = getAccountStatePath(accountPath)
 
     const first = await getOrCreatePrimeAuthLineageId('main', accountPath)
     const second = await getOrCreatePrimeAuthLineageId('main', accountPath)
 
-    expect(first).toBeUndefined()
-    expect(second).toBeUndefined()
-    await expect(stat(statePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(first).toBeDefined()
+    expect(second).toBe(first)
+    await expect(stat(statePath)).resolves.toBeDefined()
   })
 
   test('a missing main refresh token returns persisted lineage without writing', async () => {

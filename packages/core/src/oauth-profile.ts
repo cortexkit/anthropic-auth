@@ -1,5 +1,4 @@
 import type { OAuthAccountProfile } from './accounts.ts'
-import { tokenFingerprint } from './quota-manager.ts'
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 
@@ -7,6 +6,7 @@ export const PROFILE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 export async function fetchOAuthAccountProfile(input: {
   accessToken: string
+  accountIdentity?: string
   fetchImpl?: typeof fetch
   now?: () => number
   signal?: AbortSignal
@@ -43,15 +43,22 @@ export async function fetchOAuthAccountProfile(input: {
     tier,
     orgType,
     checkedAt: input.now?.() ?? Date.now(),
-    tokenFingerprint: tokenFingerprint(input.accessToken),
+    ...(input.accountIdentity !== undefined && {
+      accountIdentity: input.accountIdentity,
+    }),
   }
 }
 
-export function oauthProfileMatchesToken(
+export function oauthProfileMatchesIdentity(
   profile: OAuthAccountProfile | undefined,
-  accessToken: string,
+  accountIdentity: string | undefined,
 ) {
-  return profile?.tokenFingerprint === tokenFingerprint(accessToken)
+  if (!profile) return false
+  if (accountIdentity === undefined) return true
+  return (
+    profile.accountIdentity === undefined ||
+    profile.accountIdentity === accountIdentity
+  )
 }
 
 export function oauthProfileIsFresh(

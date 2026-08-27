@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { saveAccounts, tokenFingerprint } from '@cortexkit/anthropic-auth-core'
+import { loadAccounts, saveAccounts } from '@cortexkit/anthropic-auth-core'
 
 import {
   buildExplicitBaseMessagesUrl,
@@ -41,6 +41,52 @@ afterEach(async () => {
 })
 
 describe('Pi API fallback routing helpers', () => {
+  test('mints the main account identity when Pi storage omits it', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-main-identity-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+      },
+      storagePath,
+    )
+    expect((await loadAccounts(storagePath))?.mainAccountId).toBeUndefined()
+
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = input.toString()
+      if (url.includes('/api/claude_cli/bootstrap')) {
+        return new Response(
+          JSON.stringify({
+            oauth_account: { account_uuid: 'pi-main-bootstrap-uuid' },
+          }),
+        )
+      }
+      return new Response(
+        [
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ].join(''),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      apiKey: 'sk-ant-oat-pi-main',
+      sessionId: 'ses_pi_main_identity',
+    })
+    for await (const _event of stream) {
+      // Drain the provider stream.
+    }
+
+    expect((await loadAccounts(storagePath))?.mainAccountId).toEqual(
+      expect.any(String),
+    )
+  })
+
   test('preserves provider base path when building /v1/messages URL', () => {
     const url = buildExplicitBaseMessagesUrl('https://api.kie.ai/claude')
 
@@ -137,6 +183,7 @@ describe('Pi API fallback routing helpers', () => {
     await saveAccounts(
       {
         version: 1,
+        mainAccountId: 'main-account',
         main: { type: 'opencode', provider: 'anthropic' },
         fallbackOn: [401, 403, 429],
         refresh: {
@@ -149,9 +196,8 @@ describe('Pi API fallback routing helpers', () => {
           checkIntervalMinutes: 5,
           minimumRemaining: { five_hour: 1, seven_day: 1 },
           failClosedOnUnknownQuota: true,
-          mainQuota: quota(0),
+          mainQuota: { ...quota(0), accountIdentity: 'main-account' },
           mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('main-access'),
         },
         routing: { mode: 'sticky-balanced' },
         accounts: [
@@ -289,6 +335,7 @@ describe('Pi API fallback routing helpers', () => {
     await saveAccounts(
       {
         version: 1,
+        mainAccountId: 'main-account',
         main: { type: 'opencode', provider: 'anthropic' },
         fallbackOn: [401, 403, 429],
         refresh: {
@@ -307,9 +354,8 @@ describe('Pi API fallback routing helpers', () => {
           checkIntervalMinutes: 5,
           minimumRemaining: { five_hour: 1, seven_day: 1 },
           failClosedOnUnknownQuota: true,
-          mainQuota: quota(88),
+          mainQuota: { ...quota(88), accountIdentity: 'main-account' },
           mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('main-access'),
         },
         routing: { mode: 'sticky-balanced' },
         accounts: [
@@ -396,6 +442,7 @@ describe('Pi API fallback routing helpers', () => {
     await saveAccounts(
       {
         version: 1,
+        mainAccountId: 'main-account',
         main: { type: 'opencode', provider: 'anthropic' },
         fallbackOn: [401, 403, 429],
         quota: {
@@ -403,9 +450,8 @@ describe('Pi API fallback routing helpers', () => {
           checkIntervalMinutes: 5,
           minimumRemaining: { five_hour: 1, seven_day: 1 },
           failClosedOnUnknownQuota: true,
-          mainQuota: quota(0),
+          mainQuota: { ...quota(0), accountIdentity: 'main-account' },
           mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('main-access'),
         },
         routing: { mode: 'sticky-balanced' },
         accounts: [

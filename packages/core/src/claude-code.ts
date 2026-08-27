@@ -11,6 +11,7 @@ import {
 
 export type ClaudeCodeIdentity = {
   deviceId: string
+  accountIdentity?: string
   accountUuid?: string
   sessionId: string
 }
@@ -52,6 +53,63 @@ const bootstrapResults = new Map<
   { accountUuid: string | null; expiresAt: number }
 >()
 
+function compatibilityCacheKey(accessToken: string) {
+  return `compat:${accessToken || 'anonymous'}`
+}
+
+function explicitCacheKey(accountIdentity: string) {
+  return `identity:${accountIdentity}`
+}
+
+function accountCacheKey(accountUuid: string, accountIdentity: string) {
+  return `account:${accountUuid}:${accountIdentity}`
+}
+
+function adoptCachedIdentity(
+  cached: ClaudeCodeIdentity | undefined,
+  accountIdentity: string,
+  accountUuid?: string,
+) {
+  if (!cached) return undefined
+  if (
+    cached.accountIdentity !== undefined &&
+    cached.accountIdentity !== accountIdentity
+  ) {
+    return undefined
+  }
+  if (
+    accountUuid !== undefined &&
+    cached.accountUuid !== undefined &&
+    cached.accountUuid !== accountUuid
+  ) {
+    return undefined
+  }
+  if (
+    cached.accountIdentity === accountIdentity &&
+    (accountUuid === undefined || cached.accountUuid === accountUuid)
+  ) {
+    return cached
+  }
+  return {
+    ...cached,
+    accountIdentity,
+    ...(accountUuid !== undefined && { accountUuid }),
+  }
+}
+
+function cacheAccountIdentity(
+  identity: ClaudeCodeIdentity,
+  accountIdentity: string,
+  accountUuid: string,
+) {
+  setBounded(identityCache, explicitCacheKey(accountIdentity), identity)
+  setBounded(
+    identityCache,
+    accountCacheKey(accountUuid, accountIdentity),
+    identity,
+  )
+}
+
 async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
   if (!accessToken.startsWith('sk-ant-oat')) return null
   const controller = new AbortController()
@@ -87,33 +145,81 @@ async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
 
 export async function resolveClaudeCodeIdentity(
   accessToken: string,
-  model?: string,
+  model: string | undefined,
+  accountIdentity: string | undefined,
 ): Promise<ClaudeCodeIdentity> {
-  const identity = getClaudeCodeIdentity(accessToken)
+  const stableAccountIdentity = accountIdentity?.trim() || undefined
+  const cacheKey = stableAccountIdentity
+    ? explicitCacheKey(stableAccountIdentity)
+    : compatibilityCacheKey(accessToken)
+  let identity: ClaudeCodeIdentity
+  if (stableAccountIdentity) {
+    const cachedIdentity = adoptCachedIdentity(
+      identityCache.get(cacheKey) ?? identityCache.get(accessToken),
+      stableAccountIdentity,
+    )
+    identity = cachedIdentity ?? getClaudeCodeIdentity(cacheKey)
+    identity = adoptCachedIdentity(identity, stableAccountIdentity) ?? identity
+    setBounded(identityCache, cacheKey, identity)
+  } else {
+    identity = getClaudeCodeIdentity(cacheKey)
+  }
+
   if (!accessToken.startsWith('sk-ant-oat')) return identity
 
   const now = Date.now()
-  const cachedResult = bootstrapResults.get(accessToken)
+  const bootstrapKey = cacheKey
+  const cachedResult = bootstrapResults.get(bootstrapKey)
   if (cachedResult && cachedResult.expiresAt > now) {
     if (!cachedResult.accountUuid) return identity
-    const accountCacheKey = `account:${cachedResult.accountUuid}`
-    const accountIdentity = identityCache.get(accountCacheKey)
-    if (accountIdentity) {
-      setBounded(identityCache, accessToken, accountIdentity)
-      return accountIdentity
+    if (!stableAccountIdentity) {
+      if (identity.accountUuid === cachedResult.accountUuid) return identity
+      identity = { ...identity, accountUuid: cachedResult.accountUuid }
+      setBounded(identityCache, bootstrapKey, identity)
+      return identity
     }
+    const cachedAccountIdentity = adoptCachedIdentity(
+      identityCache.get(
+        accountCacheKey(cachedResult.accountUuid, stableAccountIdentity),
+      ) ?? identityCache.get(`account:${cachedResult.accountUuid}`),
+      stableAccountIdentity,
+      cachedResult.accountUuid,
+    )
+    if (cachedAccountIdentity) {
+      identity = cachedAccountIdentity
+      cacheAccountIdentity(
+        identity,
+        stableAccountIdentity,
+        cachedResult.accountUuid,
+      )
+      return identity
+    }
+    if (identity.accountUuid === cachedResult.accountUuid) return identity
+    identity = {
+      ...identity,
+      accountIdentity: stableAccountIdentity,
+      accountUuid: cachedResult.accountUuid,
+    }
+    cacheAccountIdentity(
+      identity,
+      stableAccountIdentity,
+      cachedResult.accountUuid,
+    )
+    return identity
   }
 
-  let fetchPromise = bootstrapFetches.get(accessToken)
+  let fetchPromise = bootstrapFetches.get(bootstrapKey)
   if (!fetchPromise) {
     fetchPromise = fetchClaudeCodeAccountUuid(accessToken, model)
-    bootstrapFetches.set(accessToken, fetchPromise)
+    setBounded(bootstrapFetches, bootstrapKey, fetchPromise)
   }
 
   const accountUuid = await fetchPromise.finally(() => {
-    bootstrapFetches.delete(accessToken)
+    if (bootstrapFetches.get(bootstrapKey) === fetchPromise) {
+      bootstrapFetches.delete(bootstrapKey)
+    }
   })
-  setBounded(bootstrapResults, accessToken, {
+  setBounded(bootstrapResults, bootstrapKey, {
     accountUuid,
     expiresAt:
       now +
@@ -122,16 +228,30 @@ export async function resolveClaudeCodeIdentity(
         : BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS),
   })
   if (!accountUuid) return identity
-
-  const accountCacheKey = `account:${accountUuid}`
-  const accountIdentity = identityCache.get(accountCacheKey)
-  if (accountIdentity) {
-    setBounded(identityCache, accessToken, accountIdentity)
-    return accountIdentity
+  if (!stableAccountIdentity) {
+    identity = { ...identity, accountUuid }
+    setBounded(identityCache, bootstrapKey, identity)
+    return identity
   }
 
-  identity.accountUuid = accountUuid
-  setBounded(identityCache, accountCacheKey, identity)
+  const cachedAccountIdentity = adoptCachedIdentity(
+    identityCache.get(accountCacheKey(accountUuid, stableAccountIdentity)) ??
+      identityCache.get(`account:${accountUuid}`),
+    stableAccountIdentity,
+    accountUuid,
+  )
+  if (cachedAccountIdentity) {
+    identity = cachedAccountIdentity
+    cacheAccountIdentity(identity, stableAccountIdentity, accountUuid)
+    return identity
+  }
+
+  identity = {
+    ...identity,
+    accountIdentity: stableAccountIdentity,
+    accountUuid,
+  }
+  cacheAccountIdentity(identity, stableAccountIdentity, accountUuid)
   return identity
 }
 

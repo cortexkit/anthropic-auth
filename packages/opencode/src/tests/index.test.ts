@@ -319,7 +319,7 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
     const error = buildRefreshOperationError({
       error: new ClaudeOAuthRefreshError(status, body),
       now,
-      refreshToken: refresh,
+      accountIdentity: 'fallback-1',
     })
     return createFallbackStorage({
       accounts: [
@@ -2980,7 +2980,6 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
-
     const response = await result.fetch(MESSAGES_URL, {
       method: 'POST',
       body: JSON.stringify({
@@ -3141,7 +3140,7 @@ describe('auth.loader', () => {
     })
   })
 
-  test('fallback-first refreshes current main quota for sidebar when persisted main quota belongs to an old token', async () => {
+  test('fallback-first adopts legacy persisted main quota for sidebar without refetching', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
@@ -3207,11 +3206,11 @@ describe('auth.loader', () => {
     const state = await waitForSidebarState(
       (candidate) =>
         candidate.activeId === 'fallback-1' &&
-        candidate.main.quota?.five_hour?.usedPercent === 12,
+        candidate.main.quota?.five_hour?.usedPercent === 6,
     )
     expect(state.route).toBe('fallback-first')
-    expect(state.main.quota?.seven_day?.usedPercent).toBe(34)
-    expect(mainQuotaCalls).toBe(1)
+    expect(state.main.quota?.seven_day?.usedPercent).toBe(75)
+    expect(mainQuotaCalls).toBe(0)
     expect(authorizations[0]).toBe('Bearer fallback-access')
   })
 
@@ -4314,7 +4313,7 @@ describe('auth.loader', () => {
     expect(profileCalls).toBe(0)
   })
 
-  test('main token rotation clears a stale bound profile before display', async () => {
+  test('legacy profile is adopted under the current main identity', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -4331,11 +4330,16 @@ describe('auth.loader', () => {
       }),
     )
     const mockClient = createMockClient()
+    let profileCalls = 0
     globalThis.fetch = mock((input: string | URL | Request) =>
       Promise.resolve(
-        extractUrl(input).includes('/api/oauth/profile')
-          ? new Response('failed', { status: 500 })
-          : new Response('ok'),
+        (() => {
+          if (extractUrl(input).includes('/api/oauth/profile')) {
+            profileCalls++
+            return new Response('failed', { status: 500 })
+          }
+          return new Response('ok')
+        })(),
       ),
     ) as unknown as typeof fetch
     const plugin = await getPlugin(mockClient)
@@ -4361,11 +4365,88 @@ describe('auth.loader', () => {
     const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
       ?.body.parts[0]?.text
 
-    expect(text).not.toContain('Max 20x')
-    const clearedStorage = await waitForAccountStorage(
-      (storage) => storage?.main?.profile === undefined,
+    expect(text).toContain('Max 20x')
+    expect(profileCalls).toBe(0)
+    const adoptedStorage = await waitForAccountStorage(
+      (storage) => storage?.main?.profile?.accountIdentity !== undefined,
     )
-    expect(clearedStorage?.main?.profile).toBeUndefined()
+    expect(adoptedStorage?.main?.profile?.accountIdentity).toBe(
+      adoptedStorage?.mainAccountId,
+    )
+  })
+
+  test('in-flight hydration is shared across access-token rotation', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const mockClient = createMockClient()
+    let liveAccess = 'token-a'
+    let profileCalls = 0
+    let resolveFirstProfile!: (response: Response) => void
+    let markProfileStarted!: () => void
+    const profileStarted = new Promise<void>((resolve) => {
+      markProfileStarted = resolve
+    })
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      if (!extractUrl(input).includes('/api/oauth/profile')) {
+        return Promise.resolve(new Response('ok'))
+      }
+      profileCalls++
+      if (profileCalls === 1) {
+        markProfileStarted()
+        return new Promise<Response>((resolve) => {
+          resolveFirstProfile = resolve
+        })
+      }
+      return Promise.resolve(
+        Response.json({
+          organization: {
+            organization_type: 'claude_team',
+            rate_limit_tier: 'default_claude_max_5x',
+          },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(mockClient)
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    const firstCommand = expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    await profileStarted
+
+    liveAccess = 'token-b'
+    const command = expectHandledCommandResponse(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    )
+    await Bun.sleep(25)
+    resolveFirstProfile(
+      Response.json({
+        organization: {
+          organization_type: 'claude_team',
+          rate_limit_tier: 'default_claude_max_5x',
+        },
+      }),
+    )
+    await firstCommand
+    await command
+
+    expect(profileCalls).toBe(1)
   })
 
   test('same main token keeps a fresh bound profile without refetching', async () => {
@@ -4483,11 +4564,13 @@ describe('auth.loader', () => {
     )
     let resolveProfile!: (response: Response) => void
     let markProfileStarted!: () => void
+    let profileCalls = 0
     const profileStarted = new Promise<void>((resolve) => {
       markProfileStarted = resolve
     })
     globalThis.fetch = mock((input: string | URL | Request) => {
       if (extractUrl(input).includes('/api/oauth/profile')) {
+        profileCalls++
         markProfileStarted()
         return new Promise<Response>((resolve) => {
           resolveProfile = resolve
@@ -4542,7 +4625,11 @@ describe('auth.loader', () => {
     if (reloadedFallback?.type !== 'oauth') {
       throw new Error('expected reloaded fallback OAuth account')
     }
-    expect(reloadedFallback.profile).toBeUndefined()
+    expect(reloadedFallback.profile).toMatchObject({
+      tier: 'default_claude_max_5x',
+      accountIdentity: 'fb',
+    })
+    expect(profileCalls).toBe(1)
   })
 
   test('late main profile hydration cannot replace a rotated-token profile', async () => {
@@ -4587,8 +4674,8 @@ describe('auth.loader', () => {
       profile: {
         tier: 'default_claude_max_20x',
         orgType: 'claude_max',
-        checkedAt: Date.now(),
-        tokenFingerprint: tokenFingerprint(liveAccess),
+        checkedAt: Date.now() + 10_000,
+        accountIdentity: rotated.mainAccountId,
       },
     }
     await saveAccountState(rotated, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
@@ -4609,7 +4696,7 @@ describe('auth.loader', () => {
 
     expect((await loadAccounts())?.main?.profile).toMatchObject({
       tier: 'default_claude_max_20x',
-      tokenFingerprint: tokenFingerprint('new-main-access'),
+      accountIdentity: rotated.mainAccountId,
     })
   })
 
@@ -4872,7 +4959,7 @@ describe('auth.loader', () => {
     )
   })
 
-  test('token rotation hydrates the new profile once and restores its tier label', async () => {
+  test('token rotation reuses the profile for the same account identity', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
     const profileCalls: string[] = []
@@ -4924,21 +5011,15 @@ describe('auth.loader', () => {
     expect(await showAccounts()).toContain('Team · Max 5x')
     await waitForAccountStorage(
       (storage) =>
-        storage?.main?.profile?.tokenFingerprint ===
-        tokenFingerprint('token-a'),
+        storage?.main?.profile?.accountIdentity === storage?.mainAccountId,
     )
     liveAccess = 'token-b'
-    expect(await showAccounts()).toContain('Max 20x')
-    await waitForAccountStorage(
-      (storage) =>
-        storage?.main?.profile?.tokenFingerprint ===
-        tokenFingerprint('token-b'),
-    )
-    expect(await showAccounts()).toContain('Max 20x')
+    expect(await showAccounts()).toContain('Team · Max 5x')
+    expect(await showAccounts()).toContain('Team · Max 5x')
 
-    expect(profileCalls).toEqual(['Bearer token-a', 'Bearer token-b'])
-    expect((await loadAccounts())?.main?.profile?.tokenFingerprint).toBe(
-      tokenFingerprint('token-b'),
+    expect(profileCalls).toEqual(['Bearer token-a'])
+    expect((await loadAccounts())?.main?.profile?.accountIdentity).toBe(
+      (await loadAccounts())?.mainAccountId,
     )
   })
 
@@ -5003,7 +5084,7 @@ describe('auth.loader', () => {
     }
   })
 
-  test('completed profile hydrations do not block later token generations', async () => {
+  test('completed profile hydration does not refetch later token generations', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
     let profileCalls = 0
@@ -5044,24 +5125,19 @@ describe('auth.loader', () => {
       ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
     }
 
-    for (let generation = 0; generation < 66; generation++) {
-      liveAccess = `token-${generation}`
-      await showAccounts()
-      const expectedFingerprint = tokenFingerprint(liveAccess)
-      await waitForAccountStorage(
-        (storage) =>
-          storage?.main?.profile?.tokenFingerprint === expectedFingerprint,
-      )
-    }
-    liveAccess = 'token-0'
     await showAccounts()
     await waitForAccountStorage(
       (storage) =>
-        storage?.main?.profile?.tokenFingerprint ===
-        tokenFingerprint(liveAccess),
+        storage?.main?.profile?.accountIdentity === storage?.mainAccountId,
     )
+    for (let generation = 0; generation < 66; generation++) {
+      liveAccess = `token-${generation}`
+      await showAccounts()
+    }
+    liveAccess = 'token-0'
+    await showAccounts()
 
-    expect(profileCalls).toBe(67)
+    expect(profileCalls).toBe(1)
   })
 
   test('stale profile refreshes on display', async () => {
@@ -5806,6 +5882,77 @@ describe('auth.loader', () => {
     expect(savedState.main.lastRefreshError.nextRetryAt).toBeGreaterThan(
       Date.now(),
     )
+  })
+
+  test('successful re-login clears a live stale main refresh backoff', async () => {
+    const now = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        mainAccountId: 'main-account-id',
+        quota: { enabled: false },
+        refresh: {
+          enabled: true,
+          mainLastRefreshError: {
+            message: 'stale refresh failure',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 60_000,
+            retryCount: 1,
+            accountIdentity: 'relogged-main-refresh',
+          },
+        },
+      }),
+    )
+    let tokenRefreshCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        tokenRefreshCalls += 1
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'relogged-main-refresh-new',
+              access_token: 'relogged-main-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'relogged-main-access',
+          refresh: 'relogged-main-refresh',
+          expires: now + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const preflight = await loadAccounts()
+    expect(preflight?.refresh?.mainLastRefreshError).toEqual(
+      expect.objectContaining({
+        accountIdentity: 'relogged-main-refresh',
+        nextRetryAt: expect.any(Number),
+      }),
+    )
+
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: '{}',
+    })
+
+    expect(response.status).toBe(200)
+    expect(tokenRefreshCalls).toBe(0)
+    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
+    expect(savedState.main.lastRefreshError).toBeUndefined()
   })
 
   test('fallback-first uses stale passing fallback quota while quota refresh is in progress even when main refresh is backed off', async () => {
@@ -7616,10 +7763,10 @@ describe('auth.loader', () => {
       }),
     })
 
-    expect(recovered.status).toBe(200)
-    expect(messageRequests).toBe(1)
+    expect(recovered.status).toBe(401)
+    expect(messageRequests).toBe(0)
     const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
-    expect(savedState.main?.lastRefreshError).toBeUndefined()
+    expect(savedState.main?.lastRefreshError).toBeDefined()
   })
 
   test('sticky-balanced uses API routes only after confirmed OAuth exhaustion', async () => {
@@ -11938,7 +12085,7 @@ describe('claude-prime direct request', () => {
     expect(observedAuth).toContain('main-access')
   })
 
-  test('main host credential replacement primes a new lineage in the same reset window', async () => {
+  test('main host credential replacement keeps the stable lineage in the same reset window', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
     await useTempAccountFile(
@@ -12027,13 +12174,12 @@ describe('claude-prime direct request', () => {
       }
     ).__primeManager.tick()
 
-    expect(sends).toBe(2)
+    expect(sends).toBe(1)
     const state = JSON.parse(await readFile(getAccountStatePath(), 'utf8')) as {
       main?: { primeAuthLineageId?: string }
     }
     expect(firstLineage).toMatch(/^[0-9a-f-]{36}$/)
-    expect(state.main?.primeAuthLineageId).toMatch(/^[0-9a-f-]{36}$/)
-    expect(state.main?.primeAuthLineageId).not.toBe(firstLineage)
+    expect(state.main?.primeAuthLineageId).toBe(firstLineage)
   })
 
   test('main refresh through the plugin keeps the lineage and prime claim', async () => {
@@ -12088,13 +12234,11 @@ describe('claude-prime direct request', () => {
         lineageObservedBeforePublish = await getOrCreatePrimeAuthLineageId(
           'main',
           process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-          hostAuth.refresh,
         )
         hostAuth = { ...input.body }
         lineageObservedDuringPublish = await getOrCreatePrimeAuthLineageId(
           'main',
           process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-          hostAuth.refresh,
         )
       },
     )
@@ -12162,12 +12306,10 @@ describe('claude-prime direct request', () => {
     expect(lineageObservedBeforePublish).toBe(before.main?.primeAuthLineageId)
     expect(lineageObservedDuringPublish).toBe(before.main?.primeAuthLineageId)
     expect(after.main?.primeAuthLineageId).toBe(before.main?.primeAuthLineageId)
-    expect(after.main?.primeAuthLineageRefreshTokenFingerprint).toBe(
-      tokenFingerprint('main-refresh-b'),
-    )
+    expect(after.main?.primeAuthLineageRefreshTokenFingerprint).toBeUndefined()
   })
 
-  test('a main refresh lease adopter advances the lineage binding', async () => {
+  test('a main refresh lease adopter preserves the legacy lineage binding', async () => {
     const lineage = 'main-lineage-a'
     const refreshToken = 'main-refresh-a'
     const storage = createFallbackStorage({
@@ -12233,7 +12375,7 @@ describe('claude-prime direct request', () => {
     }
     expect(state.main?.primeAuthLineageId).toBe(lineage)
     expect(state.main?.primeAuthLineageRefreshTokenFingerprint).toBe(
-      tokenFingerprint('main-refresh-b'),
+      tokenFingerprint(refreshToken),
     )
   })
 
@@ -13297,7 +13439,7 @@ describe('claude-prime — warn dedup (R3)', () => {
     await plugin.auth.loader(
       () => {
         authCallCount += 1
-        if (authCallCount <= 3) {
+        if (authCallCount <= 2) {
           return Promise.resolve({
             type: 'oauth',
             access: 'main-access',
@@ -13429,7 +13571,7 @@ describe('claude-prime — warn dedup (R3)', () => {
     await plugin.auth.loader(
       () => {
         authCallCount += 1
-        if (authCallCount >= 4) {
+        if (authCallCount >= 3) {
           return Promise.reject(
             new Error('prime: main auth loader is not available'),
           )

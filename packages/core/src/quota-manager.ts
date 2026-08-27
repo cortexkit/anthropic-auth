@@ -101,16 +101,12 @@ function mergePollCompletionWithNewerHeaders(
 export class QuotaManager {
   // --- State ---
   private main: QuotaEntry | null = null
-  private mainTokenFp: string | null = null
+  private mainAccountId: string | undefined
   private fallbacks = new Map<string, QuotaEntry>()
-  // Fingerprint of the access token that produced each fallback cache entry, so
-  // a re-login (credential change) for the same account id invalidates the
-  // stale entry instead of being treated as fresh.
-  private fallbackTokenFps = new Map<string, string>()
 
   // --- Inflight deduplication ---
   private inflightMain: Promise<QuotaRefreshResult> | null = null
-  private inflightMainFp: string | null = null
+  private inflightMainAccountId: string | undefined
   private inflightFallbacks = new Map<string, Promise<QuotaRefreshResult>>()
 
   // --- Rate-limiting (scoped per route so a fallback 429 never backs off the
@@ -137,11 +133,7 @@ export class QuotaManager {
     this.onMainQuotaFetched = opts.onMainQuotaFetched
     this.onApiError = opts.onApiError
 
-    // Seed main quota from persisted storage, bound to the token fingerprint
-    // that produced it. refreshMain() drops this seed if the live token's
-    // fingerprint differs (main-account switch), preventing stale wrong-account
-    // quota from being served during backoff.
-    this.seedMainFromStorage(opts.storage)
+    this.seedMainFromStorage(opts.storage, opts.storage?.mainAccountId)
     this.seedMainBackoffFromStorage(opts.storage)
   }
 
@@ -150,41 +142,19 @@ export class QuotaManager {
   // =========================================================================
 
   /**
-   * Cached main quota entry. Pass the live access token to enforce token
-   * binding: if the cached entry was produced by a different token (main
-   * account switched), it is dropped and null is returned so the caller
-   * refetches for the current account. Called without a token (e.g. for
-   * display) it returns whatever is cached.
+   * Cached main quota entry, scoped to the stable main account identity.
    */
-  getMain(accessToken?: string): QuotaEntry | null {
-    if (
-      accessToken &&
-      this.main &&
-      this.mainTokenFp &&
-      this.mainTokenFp !== tokenFingerprint(accessToken)
-    ) {
-      this.main = null
-      this.mainTokenFp = null
-    }
+  getMain(mainAccountId?: string): QuotaEntry | null {
+    if (this.mainAccountId !== mainAccountId) return null
     return this.main
   }
 
   /**
-   * Cached fallback quota entry. Pass the live access token to enforce token
-   * binding: if the entry was produced by a different token (account re-login),
-   * it is dropped and null is returned so the caller refetches.
+   * Cached fallback quota entry, scoped to the configured account id.
    */
   getFallback(accountId: string, accessToken?: string): QuotaEntry | null {
-    const entry = this.fallbacks.get(accountId) ?? null
-    if (!accessToken || !entry) return entry
-
-    const fp = this.fallbackTokenFps.get(accountId)
-    if (fp !== tokenFingerprint(accessToken)) {
-      this.fallbacks.delete(accountId)
-      this.fallbackTokenFps.delete(accountId)
-      return null
-    }
-    return entry
+    void accessToken
+    return this.fallbacks.get(accountId) ?? null
   }
 
   getAllFallbacks(): Map<string, QuotaEntry> {
@@ -195,8 +165,8 @@ export class QuotaManager {
   // Set (manual inject — seeding from persisted account.quota on boot)
   // =========================================================================
 
-  setMain(accessToken: string, entry: QuotaEntry): void {
-    this.mainTokenFp = tokenFingerprint(accessToken)
+  setMain(mainAccountId: string | undefined, entry: QuotaEntry): void {
+    this.mainAccountId = mainAccountId
     this.main = entry
   }
 
@@ -205,30 +175,32 @@ export class QuotaManager {
     entry: QuotaEntry,
     accessToken?: string,
   ): void {
+    void accessToken
     this.fallbacks.set(accountId, entry)
-    if (accessToken) {
-      this.fallbackTokenFps.set(accountId, tokenFingerprint(accessToken))
-    } else {
-      this.fallbackTokenFps.delete(accountId)
-    }
   }
 
   pushMainFromHeaders(
-    accessToken: string,
-    incoming: OAuthQuotaSnapshot,
+    mainAccountId: string | undefined,
+    incomingOrAccessToken: OAuthQuotaSnapshot | string,
+    legacyIncoming?: OAuthQuotaSnapshot,
   ): QuotaEntry {
+    const incoming =
+      legacyIncoming ?? (incomingOrAccessToken as OAuthQuotaSnapshot)
+    if (legacyIncoming) void incomingOrAccessToken
     const checkedAt = incoming.checkedAt ?? this.now()
-    const accessTokenFp = tokenFingerprint(accessToken)
     const quota = mergeHeaderQuotaSnapshot(
-      this.mainTokenFp === accessTokenFp ? this.main?.quota : undefined,
-      incoming,
+      this.mainAccountId === mainAccountId ? this.main?.quota : undefined,
+      {
+        ...incoming,
+        ...(mainAccountId !== undefined && { accountIdentity: mainAccountId }),
+      },
     )
     const entry = {
       quota,
       checkedAt,
       refreshAfter: getQuotaNextRefreshAt(quota, this.storage, checkedAt),
     }
-    this.setMain(accessToken, entry)
+    this.setMain(mainAccountId, entry)
     return entry
   }
 
@@ -240,7 +212,7 @@ export class QuotaManager {
     const checkedAt = incoming.checkedAt ?? this.now()
     const quota = mergeHeaderQuotaSnapshot(
       this.getFallback(accountId, accessToken)?.quota,
-      incoming,
+      { ...incoming, accountIdentity: accountId },
     )
     const entry = {
       quota,
@@ -255,34 +227,47 @@ export class QuotaManager {
   // Refresh (async, deduplicated, rate-limited)
   // =========================================================================
 
-  async refreshMain(accessToken: string): Promise<OAuthQuotaSnapshot> {
-    return (await this.refreshMainWithMetadata(accessToken)).quota
+  async refreshMain(
+    mainAccountIdOrAccessToken: string | undefined,
+    accessToken?: string,
+  ): Promise<OAuthQuotaSnapshot> {
+    const legacy = accessToken === undefined
+    const mainAccountId = legacy
+      ? mainAccountIdOrAccessToken
+      : mainAccountIdOrAccessToken
+    const credential = accessToken ?? mainAccountIdOrAccessToken
+    if (!credential) throw new Error('Main OAuth access token is unavailable')
+    return (
+      await this.refreshMainWithMetadata(mainAccountId, credential, legacy)
+    ).quota
   }
 
   async refreshMainWithMetadata(
-    accessToken: string,
+    mainAccountIdOrAccessToken: string | undefined,
+    accessToken?: string,
+    _legacy = false,
   ): Promise<QuotaRefreshResult> {
-    // If the main account/token changed, invalidate the cache (including a
-    // persisted seed) BEFORE the backoff short-circuit so a different account's
-    // stale quota is never returned while the quota API is backed off.
-    const fp = tokenFingerprint(accessToken)
-    if (this.mainTokenFp && this.mainTokenFp !== fp) {
+    const effectiveAccountId = mainAccountIdOrAccessToken
+    const credential = accessToken ?? mainAccountIdOrAccessToken
+    if (!credential) throw new Error('Main OAuth access token is unavailable')
+    if (this.mainAccountId !== effectiveAccountId) {
       this.main = null
-      this.mainTokenFp = null
+      this.mainAccountId = effectiveAccountId
     }
 
-    // Deduplicate — return in-flight promise only if same token fingerprint
-    if (this.inflightMain && this.inflightMainFp === fp)
+    if (this.inflightMain && this.inflightMainAccountId === effectiveAccountId)
       return this.inflightMain
 
     // Rate-limit — if API recently 429'd, return stale or throw
     if (this.isBackedOff()) {
-      if (this.main) return { quota: this.main.quota, fetched: false }
+      if (this.main && this.mainAccountId === effectiveAccountId) {
+        return { quota: this.main.quota, fetched: false }
+      }
       throw new Error('Quota API rate-limited — try again later')
     }
 
-    this.inflightMainFp = fp
-    this.inflightMain = this._fetchMain(accessToken)
+    this.inflightMainAccountId = effectiveAccountId
+    this.inflightMain = this._fetchMain(effectiveAccountId, credential)
     return this.inflightMain
   }
 
@@ -298,9 +283,7 @@ export class QuotaManager {
     accountId: string,
     accessToken: string,
   ): Promise<QuotaRefreshResult> {
-    // Deduplicate per account+token so a same-label re-login never joins a
-    // quota probe that was started with the previous credentials.
-    const inflightKey = QuotaManager.fallbackInflightKey(accountId, accessToken)
+    const inflightKey = QuotaManager.fallbackInflightKey(accountId)
     const inflight = this.inflightFallbacks.get(inflightKey)
     if (inflight) return inflight
 
@@ -340,7 +323,7 @@ export class QuotaManager {
   refreshMainInBackground(accessToken: string): void {
     if (this.inflightMain) return
     if (this.isBackedOff()) return
-    void this.refreshMain(accessToken).catch(() => {})
+    void this.refreshMain(undefined, accessToken).catch(() => {})
   }
 
   // =========================================================================
@@ -400,7 +383,7 @@ export class QuotaManager {
 
   updateStorage(storage: AccountStorage | null): void {
     this.storage = storage
-    this.seedMainFromStorage(storage)
+    this.seedMainFromStorage(storage, storage?.mainAccountId)
     this.seedMainBackoffFromStorage(storage)
   }
 
@@ -412,22 +395,36 @@ export class QuotaManager {
    */
   seedMainFromStorage(
     storage: AccountStorage | null,
-    accessToken?: string,
+    mainAccountId?: string,
   ): void {
     const persisted = getPersistedMainQuota(storage)
     if (!persisted) return
 
-    const accessTokenFp = accessToken ? tokenFingerprint(accessToken) : null
     if (
-      accessTokenFp &&
-      persisted.tokenFingerprint &&
-      persisted.tokenFingerprint !== accessTokenFp
+      mainAccountId === undefined &&
+      persisted.accountIdentity !== undefined
     ) {
+      this.main = null
+      this.mainAccountId = undefined
+      return
+    }
+    if (
+      mainAccountId !== undefined &&
+      persisted.accountIdentity !== undefined &&
+      persisted.accountIdentity !== mainAccountId
+    ) {
+      this.main = null
+      this.mainAccountId = mainAccountId
       return
     }
 
     const entry: QuotaEntry = {
-      quota: persisted.quota,
+      quota: {
+        ...persisted.quota,
+        ...(mainAccountId !== undefined && {
+          accountIdentity: mainAccountId,
+        }),
+      },
       refreshAfter: getQuotaNextRefreshAt(
         persisted.quota,
         storage,
@@ -438,15 +435,13 @@ export class QuotaManager {
     if (
       this.main &&
       this.main.checkedAt >= entry.checkedAt &&
-      (!accessTokenFp ||
-        !this.mainTokenFp ||
-        this.mainTokenFp === accessTokenFp)
+      this.mainAccountId === mainAccountId
     ) {
       return
     }
 
     this.main = entry
-    this.mainTokenFp = persisted.tokenFingerprint ?? null
+    this.mainAccountId = mainAccountId
   }
 
   private seedMainBackoffFromStorage(storage: AccountStorage | null): void {
@@ -474,7 +469,7 @@ export class QuotaManager {
       this.setFallback(
         account.id,
         {
-          quota: account.quota,
+          quota: { ...account.quota, accountIdentity: account.id },
           refreshAfter: checkedAt + checkInterval,
           checkedAt,
         },
@@ -513,11 +508,8 @@ export class QuotaManager {
   /** Minimum gap between consecutive quota API calls (ms). */
   private static readonly API_CALL_GAP_MS = 1_000
 
-  private static fallbackInflightKey(
-    accountId: string,
-    accessToken: string,
-  ): string {
-    return JSON.stringify([accountId, tokenFingerprint(accessToken)])
+  private static fallbackInflightKey(accountId: string): string {
+    return accountId
   }
 
   private static quotaLockName(accountId: string): string {
@@ -549,14 +541,18 @@ export class QuotaManager {
     return queued
   }
 
-  private async _fetchMain(accessToken: string): Promise<QuotaRefreshResult> {
-    const thisFetchFp = tokenFingerprint(accessToken)
+  private async _fetchMain(
+    mainAccountId: string | undefined,
+    accessToken: string,
+  ): Promise<QuotaRefreshResult> {
     return this._enqueueApiFetch(async () => {
       try {
         // Re-check backoff inside gate — may have been set by
         // a preceding queued call while we waited
         if (this.isBackedOff()) {
-          if (this.main) return { quota: this.main.quota, fetched: false }
+          if (this.main && this.mainAccountId === mainAccountId) {
+            return { quota: this.main.quota, fetched: false }
+          }
           throw new Error('Quota API rate-limited — try again later')
         }
         const fileLock = await acquireRefreshFileLock({
@@ -565,7 +561,11 @@ export class QuotaManager {
         })
         if (!fileLock) {
           const cached = this.main
-          if (cached && this.now() < cached.refreshAfter) {
+          if (
+            cached &&
+            this.mainAccountId === mainAccountId &&
+            this.now() < cached.refreshAfter
+          ) {
             return { quota: cached.quota, fetched: false }
           }
           throw new Error('Quota refresh is already in progress')
@@ -579,10 +579,15 @@ export class QuotaManager {
           })
           const now = this.now()
           const completedQuota = mergePollCompletionWithNewerHeaders(
-            this.mainTokenFp === thisFetchFp ? this.main?.quota : undefined,
-            quota,
+            this.mainAccountId === mainAccountId ? this.main?.quota : undefined,
+            {
+              ...quota,
+              ...(mainAccountId !== undefined && {
+                accountIdentity: mainAccountId,
+              }),
+            },
           )
-          this.mainTokenFp = tokenFingerprint(accessToken)
+          this.mainAccountId = mainAccountId
           this.main = {
             quota: completedQuota,
             refreshAfter: getQuotaNextRefreshAt(
@@ -596,7 +601,7 @@ export class QuotaManager {
           this.onMainQuotaFetched?.(
             completedQuota,
             now,
-            this.mainTokenFp,
+            tokenFingerprint(accessToken),
             fetchStartedAt,
           )
           return { quota: completedQuota, fetched: true }
@@ -607,9 +612,9 @@ export class QuotaManager {
           await fileLock.release()
         }
       } finally {
-        if (this.inflightMainFp === thisFetchFp) {
+        if (this.inflightMainAccountId === mainAccountId) {
           this.inflightMain = null
-          this.inflightMainFp = null
+          this.inflightMainAccountId = undefined
         }
       }
     })
@@ -623,7 +628,7 @@ export class QuotaManager {
       try {
         // Re-check backoff inside gate — scoped to this fallback account
         if (this.isFallbackBackedOff(accountId, accessToken)) {
-          const cached = this.getFallback(accountId, accessToken)
+          const cached = this.getFallback(accountId)
           if (cached) return { quota: cached.quota, fetched: false }
           throw new Error('Quota API rate-limited — try again later')
         }
@@ -632,7 +637,7 @@ export class QuotaManager {
           ttlMs: 30_000,
         })
         if (!fileLock) {
-          const cached = this.getFallback(accountId, accessToken)
+          const cached = this.getFallback(accountId)
           if (cached && this.now() < cached.refreshAfter) {
             return { quota: cached.quota, fetched: false }
           }
@@ -646,8 +651,8 @@ export class QuotaManager {
           })
           const now = this.now()
           const completedQuota = mergePollCompletionWithNewerHeaders(
-            this.getFallback(accountId, accessToken)?.quota,
-            quota,
+            this.getFallback(accountId)?.quota,
+            { ...quota, accountIdentity: accountId },
           )
           this.setFallback(
             accountId,
@@ -673,7 +678,7 @@ export class QuotaManager {
         throw error
       } finally {
         this.inflightFallbacks.delete(
-          QuotaManager.fallbackInflightKey(accountId, accessToken),
+          QuotaManager.fallbackInflightKey(accountId),
         )
       }
     })

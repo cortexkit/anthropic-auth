@@ -4,6 +4,7 @@ import {
   applyClaudeCodeMetadata,
   CLAUDE_CODE_FULL_AGENT_BETAS,
   type ClaudeCodeIdentity,
+  getClaudeCodeIdentity,
   orderClaudeCodeBody,
   REQUIRED_BETAS,
   resolveClaudeCodeIdentity,
@@ -176,6 +177,7 @@ describe('Claude Code bootstrap identity lookup', () => {
     const identity = await resolveClaudeCodeIdentity(
       'sk-ant-oat-test-bootstrap',
       'claude-sonnet-4-6',
+      'bootstrap-account',
     )
 
     expect(identity.accountUuid).toBe('11111111-2222-4333-8444-555555555555')
@@ -188,6 +190,8 @@ describe('Claude Code bootstrap identity lookup', () => {
 
     const identity = await resolveClaudeCodeIdentity(
       'sk-ant-oat-bootstrap-fails',
+      undefined,
+      'failed-account',
     )
     const body: Record<string, unknown> = {
       metadata: { user_id: 'stale-user-id', other: 'preserved' },
@@ -203,8 +207,16 @@ describe('Claude Code bootstrap identity lookup', () => {
     const fetchMock = mock(async () => new Response('nope', { status: 503 }))
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
-    const first = await resolveClaudeCodeIdentity('sk-ant-oat-negative-cache')
-    const second = await resolveClaudeCodeIdentity('sk-ant-oat-negative-cache')
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-negative-cache',
+      undefined,
+      'negative-account',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-negative-cache-rotated',
+      undefined,
+      'negative-account',
+    )
 
     expect(first.accountUuid).toBeUndefined()
     expect(second.accountUuid).toBeUndefined()
@@ -221,13 +233,160 @@ describe('Claude Code bootstrap identity lookup', () => {
     )
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
-    const first = await resolveClaudeCodeIdentity('sk-ant-oat-rotation-a')
-    const second = await resolveClaudeCodeIdentity('sk-ant-oat-rotation-b')
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-rotation-a',
+      undefined,
+      'uuid-account',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-rotation-b',
+      undefined,
+      'uuid-account',
+    )
 
     expect(first.accountUuid).toBe(accountUuid)
     expect(second.accountUuid).toBe(accountUuid)
     expect(second.deviceId).toBe(first.deviceId)
     expect(second.sessionId).toBe(first.sessionId)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('keeps identity stable across rotated access tokens for the same explicit account identity', async () => {
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            oauth_account: {
+              account_uuid: 'explicit-account-bootstrap',
+            },
+          }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-explicit-rotation-a',
+      undefined,
+      'account-a',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-explicit-rotation-b',
+      undefined,
+      'account-a',
+    )
+
+    expect(second.deviceId).toBe(first.deviceId)
+    expect(second.sessionId).toBe(first.sessionId)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('never shares a device identity between distinct account identities', async () => {
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            oauth_account: { account_uuid: 'shared-bootstrap-uuid' },
+          }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-distinct-a',
+      undefined,
+      'distinct-account-a',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-distinct-b',
+      undefined,
+      'distinct-account-b',
+    )
+
+    expect(second.deviceId).not.toBe(first.deviceId)
+    expect(second.sessionId).not.toBe(first.sessionId)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('adopts a legacy cached identity with no account identity', async () => {
+    const legacy = getClaudeCodeIdentity('sk-ant-oat-legacy-token')
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({
+            oauth_account: { account_uuid: 'legacy-bootstrap-uuid' },
+          }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const resolved = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-legacy-token',
+      undefined,
+      'legacy-account',
+    )
+
+    expect(resolved.deviceId).toBe(legacy.deviceId)
+    expect(resolved.sessionId).toBe(legacy.sessionId)
+    expect(resolved.accountUuid).toBe('legacy-bootstrap-uuid')
+  })
+
+  test('deduplicates bootstrap across rotated tokens while the stable identity is in flight', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const fetchMock = mock(async () => {
+      await gate
+      return new Response(
+        JSON.stringify({
+          oauth_account: { account_uuid: 'in-flight-bootstrap-uuid' },
+        }),
+      )
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const firstPromise = resolveClaudeCodeIdentity(
+      'sk-ant-oat-in-flight-a',
+      undefined,
+      'in-flight-account',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const secondPromise = resolveClaudeCodeIdentity(
+      'sk-ant-oat-in-flight-b',
+      undefined,
+      'in-flight-account',
+    )
+    release()
+    const [first, second] = await Promise.all([firstPromise, secondPromise])
+
+    expect(second.deviceId).toBe(first.deviceId)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('keeps Claude Code metadata.user_id on the wire when account identity is missing', async () => {
+    const accountUuid = 'missing-identity-bootstrap-uuid'
+    const fetchMock = mock(
+      async () =>
+        new Response(
+          JSON.stringify({ oauth_account: { account_uuid: accountUuid } }),
+        ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const identity = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-missing-id-wire',
+      undefined,
+      undefined,
+    )
+    const body: Record<string, unknown> = { metadata: { stale: true } }
+    applyClaudeCodeMetadata(body, identity)
+    const wireBody = JSON.parse(JSON.stringify(body)) as {
+      metadata?: { user_id?: string }
+    }
+
+    expect(identity.accountIdentity).toBeUndefined()
+    expect(typeof wireBody.metadata?.user_id).toBe('string')
+    expect(wireBody.metadata?.user_id).toContain(accountUuid)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

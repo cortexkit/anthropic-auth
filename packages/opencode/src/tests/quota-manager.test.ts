@@ -176,18 +176,26 @@ describe('QuotaManager', () => {
           checkedAt: now,
         },
       }
-      qm.setMain('main-token', {
+      qm.setMain('main-account', {
         quota: cachedQuota,
         refreshAfter: now,
         checkedAt: now,
       })
 
-      await expect(qm.refreshMain('main-token')).rejects.toThrow('429')
-      const cached = await qm.refreshMainWithMetadata('main-token')
+      await expect(
+        qm.refreshMain('main-account', 'main-token'),
+      ).rejects.toThrow('429')
+      const cached = await qm.refreshMainWithMetadata(
+        'main-account',
+        'main-token',
+      )
       expect(cached).toEqual({ quota: cachedQuota, fetched: false })
 
       now += 61_000
-      const fetched = await qm.refreshMainWithMetadata('main-token')
+      const fetched = await qm.refreshMainWithMetadata(
+        'main-account',
+        'main-token',
+      )
       expect(fetched.fetched).toBe(true)
       expect(fetchCalls).toBe(2)
     })
@@ -450,16 +458,16 @@ describe('QuotaManager', () => {
       }) as unknown as typeof fetch
       const qm = createQM(fetchMock)
 
-      const first = await qm.refreshMain('token')
+      const first = await qm.refreshMain('main-account', 'token')
       expect(first).toBeDefined()
 
       failNext = true
       now += 1_100
       try {
-        await qm.refreshMain('token')
+        await qm.refreshMain('main-account', 'token')
       } catch {}
 
-      const cached = qm.getMain()
+      const cached = qm.getMain('main-account')
       expect(cached).not.toBeNull()
     })
   })
@@ -487,10 +495,7 @@ describe('QuotaManager', () => {
       expect(main!.checkedAt).toBe(900_000)
     })
 
-    test('getMain(accessToken) drops a cached entry bound to a different token', () => {
-      // Regression: the request path reads getMain() before refreshMain, so the
-      // token-binding check must also apply on the cached read — otherwise a
-      // stale previous-account quota is used for a new access token.
+    test('getMain(mainAccountId) rejects a cached entry from a different identity', () => {
       const quota = {
         quotas: [],
         expires: new Date(2_000_000).toISOString(),
@@ -499,22 +504,17 @@ describe('QuotaManager', () => {
         storage: {
           version: 1,
           accounts: [],
+          mainAccountId: 'main-a',
           quota: {
-            mainQuota: quota as any,
+            mainQuota: { ...(quota as any), accountIdentity: 'main-a' },
             mainQuotaCheckedAt: 900_000,
-            mainQuotaToken: tokenFingerprint('old-main-token'),
           },
         },
         now: () => 1_000_000,
       })
 
-      // Tokenless read returns the cached entry (e.g. display paths).
-      expect(qm.getMain()).not.toBeNull()
-      // Matching token keeps the entry.
-      expect(qm.getMain('old-main-token')).not.toBeNull()
-      // Different token (account switch) drops the entry and returns null.
-      expect(qm.getMain('new-main-token')).toBeNull()
-      expect(qm.getMain()).toBeNull()
+      expect(qm.getMain('main-a')).not.toBeNull()
+      expect(qm.getMain('main-b')).toBeNull()
     })
 
     test('updateStorage seeds main quota written by another process', () => {
@@ -569,10 +569,7 @@ describe('QuotaManager', () => {
       expect(qm.getMain('main-token')?.quota.five_hour?.usedPercent).toBe(12)
     })
 
-    test('seedFallbacksFromAccounts token-binds persisted fallback quota', () => {
-      // Regression: persisted fallback quota seeds must be tied to the access
-      // token that produced them. Otherwise same-label re-login can reuse a
-      // still-running plugin's old in-memory quota cache.
+    test('seedFallbacksFromAccounts binds persisted fallback quota to account id', () => {
       const qm = new QuotaManager({
         storage: {
           version: 1,
@@ -605,7 +602,7 @@ describe('QuotaManager', () => {
       ])
 
       expect(qm.getFallback('fallback-1', 'old-fallback-token')).not.toBeNull()
-      expect(qm.getFallback('fallback-1', 'new-fallback-token')).toBeNull()
+      expect(qm.getFallback('fallback-1', 'new-fallback-token')).not.toBeNull()
     })
 
     test('seedFallbacksFromAccounts preserves freshness for scoped-only quota', () => {
@@ -734,7 +731,7 @@ describe('QuotaManager', () => {
       expect(qm.getMain()).toBeNull()
     })
 
-    test('keeps persisted main seed during backoff when the token matches', async () => {
+    test('keeps persisted main seed during backoff when the identity matches', async () => {
       const quota = {
         quotas: [],
         expires: new Date(2_000_000).toISOString(),
@@ -743,10 +740,10 @@ describe('QuotaManager', () => {
         storage: {
           version: 1,
           accounts: [],
+          mainAccountId: 'main-a',
           quota: {
-            mainQuota: quota as any,
+            mainQuota: { ...(quota as any), accountIdentity: 'main-a' },
             mainQuotaCheckedAt: 900_000,
-            mainQuotaToken: tokenFingerprint('same-account-token'),
             mainLastQuotaApiError: {
               message: 'Claude quota check failed: 429 — rate limited',
               checkedAt: 999_000,
@@ -758,10 +755,10 @@ describe('QuotaManager', () => {
         now: () => 1_000_000,
       })
 
-      // Same account token: backed off, so the seed is returned (not refetched).
-      const result = await qm.refreshMain('same-account-token')
-      expect(result).toEqual(quota as any)
-      expect(qm.getMain()).not.toBeNull()
+      // Same account identity: backed off, so the seed is returned (not refetched).
+      const result = await qm.refreshMain('main-a', 'rotated-access-token')
+      expect(result).toEqual({ ...(quota as any), accountIdentity: 'main-a' })
+      expect(qm.getMain('main-a')).not.toBeNull()
     })
 
     test('calls onMainQuotaFetched after successful fetch', async () => {
@@ -849,7 +846,28 @@ describe('QuotaManager', () => {
     })
   })
 
-  describe('refreshMain dedup (token-keyed)', () => {
+  describe('refreshMain dedup (identity-keyed)', () => {
+    test('rotated access tokens under one main identity share one in-flight fetch', async () => {
+      let fetchCalls = 0
+      const fetchMock = mock(async () => {
+        fetchCalls++
+        return makeQuotaResponse(now)
+      }) as unknown as typeof fetch
+      const qm = new QuotaManager({
+        storage: null,
+        fetchImpl: fetchMock,
+        now: () => now,
+      })
+
+      const [quotaA, quotaB] = await Promise.all([
+        qm.refreshMain('main-account', 'access-token-a'),
+        qm.refreshMain('main-account', 'access-token-b'),
+      ])
+
+      expect(quotaA).toEqual(quotaB)
+      expect(fetchCalls).toBe(1)
+    })
+
     test('concurrent different-token refreshMain: each gets its own quota', async () => {
       let callCount = 0
       const fetchMock = mock(async (_url: string, _init?: unknown) => {
@@ -980,6 +998,74 @@ describe('QuotaManager', () => {
       expect(quotaA.five_hour?.usedPercent).not.toBe(
         quotaB.five_hour?.usedPercent,
       )
+    })
+  })
+
+  describe('main identity cache seeding', () => {
+    const persistedQuota = {
+      five_hour: {
+        usedPercent: 25,
+        remainingPercent: 75,
+        checkedAt: 900_000,
+      },
+      checkedAt: 900_000,
+    }
+
+    test('does not share a cached entry with a different main identity', () => {
+      const storage = {
+        version: 1 as const,
+        accounts: [],
+        mainAccountId: 'main-a',
+        quota: {
+          mainQuota: { ...persistedQuota, accountIdentity: 'main-a' },
+          mainQuotaCheckedAt: 900_000,
+        },
+      }
+      const qm = new QuotaManager({ storage, now: () => now })
+
+      expect(qm.getMain('main-a')).not.toBeNull()
+      expect(qm.getMain('main-b')).toBeNull()
+    })
+
+    test('adopts legacy persisted quota without an account identity', () => {
+      const storage = {
+        version: 1 as const,
+        accounts: [],
+        mainAccountId: 'main-a',
+        quota: {
+          mainQuota: persistedQuota,
+          mainQuotaCheckedAt: 900_000,
+        },
+      }
+      const qm = new QuotaManager({ storage, now: () => now })
+
+      expect(qm.getMain('main-a')).not.toBeNull()
+    })
+
+    test('missing main identity leaves quota unknown without changing credentials', () => {
+      const storage = {
+        version: 1 as const,
+        mainAccountId: 'main-a',
+        main: { type: 'opencode' as const, provider: 'anthropic' as const },
+        accounts: [
+          {
+            id: 'fallback-a',
+            type: 'oauth' as const,
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+          },
+        ],
+        quota: {
+          mainQuota: { ...persistedQuota, accountIdentity: 'main-a' },
+          mainQuotaCheckedAt: 900_000,
+        },
+      }
+      const qm = new QuotaManager({ storage, now: () => now })
+
+      qm.seedMainFromStorage(storage, undefined)
+
+      expect(qm.getMain()).toBeNull()
+      expect(storage.accounts[0]?.access).toBe('fallback-access')
     })
   })
 
@@ -1150,14 +1236,18 @@ describe('QuotaManager', () => {
       expect(qm.getFallback('other')?.quota.checkedAt).toBe(100)
     })
 
-    test('header push binds main and fallback entries to the supplied token fingerprint', () => {
+    test('header push binds main to account identity and fallback to account id', () => {
       const qm = createQM()
 
-      qm.pushMainFromHeaders('main-token', headerSnapshot())
+      qm.pushMainFromHeaders(
+        'main-account',
+        'rotated-main-token',
+        headerSnapshot(),
+      )
       qm.pushFallbackFromHeaders('fallback', 'fallback-token', headerSnapshot())
 
-      expect(qm.getMain('different-token')).toBeNull()
-      expect(qm.getFallback('fallback', 'different-token')).toBeNull()
+      expect(qm.getMain('different-account')).toBeNull()
+      expect(qm.getFallback('fallback', 'different-token')).not.toBeNull()
     })
 
     test('header checkedAt moves refreshAfter through getQuotaNextRefreshAt', () => {

@@ -23,6 +23,10 @@ import {
 // instance is the package-alias target used by other tests; both must be
 // wired to keep sink assertions consistent across runs.
 import {
+  getOrCreateMainAccountId,
+  getOrCreatePrimeAuthLineageId,
+} from '../accounts.ts'
+import {
   __setLogTestSink as __setLogTestSinkSource,
   getLogLevel,
   setLogLevel as setLogLevelSource,
@@ -447,6 +451,34 @@ afterEach(async () => {
   if (markerRoot) {
     await rm(markerRoot, { recursive: true, force: true }).catch(() => {})
   }
+})
+
+describe('Prime main identity lineage', () => {
+  test('main identity stays stable across refresh rotation and missing refresh material', async () => {
+    const storagePath = join(markerRoot, 'accounts.json')
+    const mainAccountId = await getOrCreateMainAccountId(
+      storagePath,
+      () => 'main-stable-identity',
+    )
+
+    const beforeRotation = await getOrCreatePrimeAuthLineageId(
+      'main',
+      storagePath,
+    )
+    const afterRotation = await getOrCreatePrimeAuthLineageId(
+      'main',
+      storagePath,
+    )
+    const withoutRefreshMaterial = await getOrCreatePrimeAuthLineageId(
+      'main',
+      storagePath,
+    )
+
+    expect(mainAccountId).toBe('main-stable-identity')
+    expect(beforeRotation).toBe('main-stable-identity')
+    expect(afterRotation).toBe('main-stable-identity')
+    expect(withoutRefreshMaterial).toBe('main-stable-identity')
+  })
 })
 
 describe('PrimeManager — due boundary', () => {
