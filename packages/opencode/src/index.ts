@@ -61,6 +61,7 @@ import {
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getKillswitchConfig,
+  getOrCreateMainAccountId,
   getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
   getPersistedMainQuota,
@@ -1176,19 +1177,10 @@ const anthropicAuthPlugin = async (
             quota,
             accountKey,
           }
-        : served.accountId === 'main'
+        : served.accountId === 'main' && mainAccountId
           ? {
-              identity_source: 'none',
-              schema_version: 1,
-              provider: 'anthropic',
-              configured_account_count: configuredAccountCount,
-              observed_at_ms: observedAtMs,
-              quota,
-              accountKey,
-            }
-          : {
               identity_source: 'account_ref',
-              account_ref: served.accountId,
+              account_ref: mainAccountId,
               schema_version: 1,
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
@@ -1196,6 +1188,26 @@ const anthropicAuthPlugin = async (
               quota,
               accountKey,
             }
+          : served.accountId === 'main'
+            ? {
+                identity_source: 'none',
+                schema_version: 1,
+                provider: 'anthropic',
+                configured_account_count: configuredAccountCount,
+                observed_at_ms: observedAtMs,
+                quota,
+                accountKey,
+              }
+            : {
+                identity_source: 'account_ref',
+                account_ref: served.accountId,
+                schema_version: 1,
+                provider: 'anthropic',
+                configured_account_count: configuredAccountCount,
+                observed_at_ms: observedAtMs,
+                quota,
+                accountKey,
+              }
     await quotaHeaderFeedRegistry.publish(feedEntry)
   }
 
@@ -2171,6 +2183,7 @@ const anthropicAuthPlugin = async (
         expires?: number
       }>)
     | null = null
+  let mainAccountId: string | undefined
   let sidebarMainQuotaRefreshInFlight = false
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
   // Per-process counter of replayable model requests. Drives the every-N
@@ -3492,6 +3505,7 @@ const anthropicAuthPlugin = async (
         latestGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type === 'oauth') {
+          mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
           async function refreshMainAccessToken(rejectedAccess?: string) {
             if (rejectedAccess) {
               const currentAuth = await getAuth()

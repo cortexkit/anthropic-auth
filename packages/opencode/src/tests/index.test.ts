@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -430,6 +431,7 @@ describe('quota header feed integration', () => {
       await useTempAccountFile({
         ...createFallbackStorage({
           quotaHeaderFeed: { enabled: true },
+          mainAccountId: 'main-fixed-id',
         }),
         accounts: [],
       })
@@ -474,7 +476,8 @@ describe('quota header feed integration', () => {
       const published = Object.values(record.entries)[0] as any
       expect(published).toEqual(
         expect.objectContaining({
-          identity_source: 'none',
+          identity_source: 'account_ref',
+          account_ref: 'main-fixed-id',
           configured_account_count: 1,
           observed_at_ms: 1_000_000,
           quota: expect.objectContaining({
@@ -482,6 +485,7 @@ describe('quota header feed integration', () => {
           }),
         }),
       )
+      expect(published).not.toHaveProperty('credential_id')
       for (const secret of [
         'main-access',
         'main-refresh',
@@ -500,6 +504,59 @@ describe('quota header feed integration', () => {
     } finally {
       Date.now = originalNow
     }
+  })
+})
+
+describe('main identity boot order', () => {
+  test('mints before background refresh can observe storage and survives token rotation', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
+    )
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    const observedIds: (string | undefined)[] = []
+    const timerObservedIds: (string | undefined)[] = []
+    let authCalls = 0
+    const auth = () => {
+      authCalls += 1
+      if (authCalls > 1) {
+        void loadAccounts().then((storage) =>
+          observedIds.push(storage?.mainAccountId),
+        )
+      }
+      return Promise.resolve({
+        type: 'oauth' as const,
+        access: `access-${authCalls}`,
+        refresh: `refresh-${authCalls}`,
+        expires: Date.now() + 100_000,
+      })
+    }
+    const plugin = await getPlugin(undefined, undefined, {
+      setInterval: ((callback: () => void) => {
+        const config = JSON.parse(
+          readFileSync(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+        ) as { mainAccountId?: unknown }
+        timerObservedIds.push(
+          typeof config.mainAccountId === 'string'
+            ? config.mainAccountId
+            : undefined,
+        )
+        callback()
+        return { unref() {} } as unknown as ReturnType<typeof setInterval>
+      }) as typeof setInterval,
+      clearInterval: (() => {}) as typeof clearInterval,
+    })
+    timerObservedIds.length = 0
+
+    await plugin.auth.loader(auth, { models: {} })
+    await Bun.sleep(25)
+    const first = (await loadAccounts())?.mainAccountId
+    await plugin.auth.loader(auth, { models: {} })
+    const second = (await loadAccounts())?.mainAccountId
+
+    expect(first).toMatch(/^[0-9a-f-]{36}$/)
+    expect(second).toBe(first)
+    expect(timerObservedIds).toEqual([first, first])
+    expect(observedIds).toContain(first)
   })
 })
 
@@ -681,7 +738,7 @@ describe('quota header feed extended integration', () => {
     expect(sidebar.main.quota?.five_hour?.usedPercent).toBe(25)
   })
 
-  test('selects none for main and account_ref for fallback identity without leaking the other field', async () => {
+  test('selects account_ref for main and fallback without leaking credential_id', async () => {
     const main = await loadMainAndFetch(
       createFallbackStorage({
         quotaHeaderFeed: { enabled: true },
@@ -694,11 +751,14 @@ describe('quota header feed extended integration', () => {
     )
     await main.response.text()
     const mainEntries = await readFeedEntries()
+    const mainAccountId = (await loadAccounts())?.mainAccountId
     expect(mainEntries[0]).toEqual(
-      expect.objectContaining({ identity_source: 'none' }),
+      expect.objectContaining({
+        identity_source: 'account_ref',
+        account_ref: mainAccountId,
+      }),
     )
     expect(mainEntries[0]).not.toHaveProperty('credential_id')
-    expect(mainEntries[0]).not.toHaveProperty('account_ref')
 
     const fallback = await loadMainAndFetch(
       createFallbackStorage({

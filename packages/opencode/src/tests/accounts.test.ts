@@ -26,6 +26,7 @@ import {
   getCache1hPersistentMode,
   getFallbackReauthLabels,
   getLogLevel,
+  getOrCreateMainAccountId,
   getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
   getScopedQuotaWindowForModel,
@@ -147,6 +148,66 @@ const baseStorage = (): AccountStorage => ({
     failClosedOnUnknownQuota: true,
   },
   accounts: [],
+})
+
+describe('main account identity', () => {
+  test('mainAccountId loads a valid persisted id unchanged', async () => {
+    await saveAccounts(
+      { ...baseStorage(), mainAccountId: '  main-fixed-id  ' },
+      accountPath,
+    )
+
+    expect((await loadAccounts(accountPath))?.mainAccountId).toBe(
+      'main-fixed-id',
+    )
+  })
+
+  test('mainAccountId normalizes blank and non-string ids to absent', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({ ...baseStorage(), mainAccountId: '   ' }),
+    )
+    expect((await loadAccounts(accountPath))?.mainAccountId).toBeUndefined()
+
+    await writeFile(
+      accountPath,
+      JSON.stringify({ ...baseStorage(), mainAccountId: 42 }),
+    )
+    expect((await loadAccounts(accountPath))?.mainAccountId).toBeUndefined()
+  })
+
+  test('mainAccountId saveAccounts writes the id only to config', async () => {
+    await saveAccounts(
+      { ...baseStorage(), mainAccountId: 'main-fixed-id' },
+      accountPath,
+    )
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(config.mainAccountId).toBe('main-fixed-id')
+    expect(state.mainAccountId).toBeUndefined()
+  })
+
+  test('getOrCreateMainAccountId concurrent creation persists one id', async () => {
+    const ids = await Promise.all([
+      getOrCreateMainAccountId(accountPath, () => 'first-id'),
+      getOrCreateMainAccountId(accountPath, () => 'second-id'),
+    ])
+
+    expect(ids).toEqual(['first-id', 'first-id'])
+    expect((await loadAccounts(accountPath))?.mainAccountId).toBe('first-id')
+  })
+
+  test('getOrCreateMainAccountId never replaces an existing id', async () => {
+    expect(await getOrCreateMainAccountId(accountPath, () => 'first-id')).toBe(
+      'first-id',
+    )
+    expect(await getOrCreateMainAccountId(accountPath, () => 'second-id')).toBe(
+      'first-id',
+    )
+  })
 })
 
 beforeEach(async () => {

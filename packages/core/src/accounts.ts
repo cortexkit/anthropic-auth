@@ -200,6 +200,7 @@ export type KillswitchConfig = {
 
 export type AccountStorage = {
   version: 1
+  mainAccountId?: string
   main?: {
     type: 'opencode'
     provider: 'anthropic'
@@ -723,6 +724,10 @@ function normalizeStorage(value: unknown): AccountStorage | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null
   return {
     version: 1,
+    mainAccountId:
+      typeof value.mainAccountId === 'string' && value.mainAccountId.trim()
+        ? value.mainAccountId.trim()
+        : undefined,
     main: {
       type: 'opencode',
       provider: 'anthropic',
@@ -1200,6 +1205,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
 
   return omitUndefinedTopLevel({
     version: 1,
+    mainAccountId: storage.mainAccountId,
     main: { type: 'opencode', provider: 'anthropic' },
     routing: storage.routing,
     fallbackOn: storage.fallbackOn,
@@ -1367,6 +1373,30 @@ export function saveAccounts(
 ): Promise<void> {
   const resolvedPath = path
   return enqueueSave(() => saveAccountsLocked(storage, resolvedPath, options))
+}
+
+export async function getOrCreateMainAccountId(
+  path = getAccountStoragePath(),
+  createId: () => string = randomUUID,
+): Promise<string> {
+  return enqueueSave(async () => {
+    const lock = await acquireAccountConfigWriteLock(path)
+    try {
+      const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+      if (storage.mainAccountId) return storage.mainAccountId
+
+      const mainAccountId = createId()
+      const nextStorage = { ...storage, mainAccountId }
+      const existing = await loadExistingTopLevelFields(path)
+      await writeJsonAtomic(path, {
+        ...existing,
+        ...configFromStorage(nextStorage),
+      })
+      return mainAccountId
+    } finally {
+      await lock.release()
+    }
+  })
 }
 
 async function saveAccountsLocked(
