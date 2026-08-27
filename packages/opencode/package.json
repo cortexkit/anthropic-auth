@@ -65,6 +65,6 @@
     "@opentui/core": "0.5.7",
     "@opentui/solid": "0.5.7",
     "jsonc-parser": "^3.3.1",
-    "solid-js": "1.9.12"
+    "solid-js": "1.9.15"
   }
 }
