@@ -76,11 +76,22 @@ export function mergeHeaderQuotaSnapshot(
   existing: OAuthQuotaSnapshot | undefined,
   incoming: OAuthQuotaSnapshot,
 ): OAuthQuotaSnapshot {
+  const {
+    scoped: existingScoped,
+    extraUsage: existingExtraUsage,
+    ...existingWithoutPollOwnedFields
+  } = existing ?? {}
+  const {
+    scoped: _incomingScoped,
+    extraUsage: _incomingExtraUsage,
+    ...incomingWithoutPollOwnedFields
+  } = incoming
+
   return {
-    ...existing,
-    ...incoming,
-    scoped: existing && 'scoped' in existing ? existing.scoped : undefined,
-    extraUsage: existing?.extraUsage,
+    ...existingWithoutPollOwnedFields,
+    ...incomingWithoutPollOwnedFields,
+    ...(Array.isArray(existingScoped) && { scoped: existingScoped }),
+    ...(existingExtraUsage != null && { extraUsage: existingExtraUsage }),
     bindingWindow:
       existing?.bindingWindowSource === 'poll'
         ? existing.bindingWindow

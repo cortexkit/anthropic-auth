@@ -1763,6 +1763,35 @@ describe('QuotaManager', () => {
       expect(pushed.quota.scoped).toEqual([])
     })
 
+    test('header push never introduces poll-owned scoped data', () => {
+      const qm = createQM()
+      const incoming = {
+        ...headerSnapshot(),
+        scoped: [
+          {
+            id: 'header-scope',
+            title: 'Header scope',
+            modelName: 'Fable',
+            usedPercent: 1,
+            remainingPercent: 99,
+            checkedAt: now,
+          },
+        ],
+        extraUsage: {
+          used: { amountMinor: 1, currency: 'USD', exponent: 2 },
+          limit: { amountMinor: 100, currency: 'USD', exponent: 2 },
+          exhausted: false,
+        },
+      } as OAuthQuotaSnapshot
+
+      const pushed = qm.pushMainFromHeaders('token', incoming)
+
+      expect('scoped' in pushed.quota).toBe(false)
+      expect(pushed.quota.scoped).toBeUndefined()
+      expect('extraUsage' in pushed.quota).toBe(false)
+      expect(pushed.quota.extraUsage).toBeUndefined()
+    })
+
     test('header push preserves extraUsage and poll bindingWindow', () => {
       const qm = createQM()
       const extraUsage = {
@@ -1784,6 +1813,63 @@ describe('QuotaManager', () => {
 
       const pushed = qm.pushMainFromHeaders('token', headerSnapshot())
 
+      expect(pushed.quota.extraUsage).toEqual(extraUsage)
+      expect(pushed.quota.bindingWindow).toBe('claude-weekly-scoped-fable')
+      expect(pushed.quota.bindingWindowSource).toBe('poll')
+    })
+
+    test('cache seeding restores poll-owned fields before a newer header harvest', () => {
+      const qm = createQM()
+      const scoped = [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 55,
+          remainingPercent: 45,
+          checkedAt: 100,
+        },
+      ]
+      const extraUsage = {
+        used: { amountMinor: 1261, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        utilizationPercent: 12.61,
+        severity: 'normal',
+        exhausted: false,
+      }
+      qm.setMain('main-account', {
+        quota: {
+          ...headerSnapshot(200),
+          bindingWindow: 'claude-weekly-scoped-fable',
+          bindingWindowSource: 'poll',
+        },
+        checkedAt: 200,
+        refreshAfter: 300,
+      })
+
+      qm.seedMainFromStorage(
+        {
+          version: 1,
+          mainAccountId: 'main-account',
+          accounts: [],
+          quota: {
+            mainQuota: {
+              source: 'poll',
+              checkedAt: 100,
+              scoped,
+              extraUsage,
+              bindingWindow: 'claude-weekly-scoped-fable',
+              bindingWindowSource: 'poll',
+            },
+            mainQuotaCheckedAt: 100,
+          },
+        },
+        'main-account',
+      )
+
+      const pushed = qm.pushMainFromHeaders('main-account', headerSnapshot(300))
+
+      expect(pushed.quota.scoped).toEqual(scoped)
       expect(pushed.quota.extraUsage).toEqual(extraUsage)
       expect(pushed.quota.bindingWindow).toBe('claude-weekly-scoped-fable')
       expect(pushed.quota.bindingWindowSource).toBe('poll')

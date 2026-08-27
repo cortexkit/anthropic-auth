@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -18,6 +26,7 @@ import {
   type LogTestRecord,
   loadAccounts,
   type OAuthAccount,
+  type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   PROFILE_TTL_MS,
   resetCache1hState,
@@ -539,6 +548,130 @@ describe('quota header feed integration', () => {
       expect(raw).not.toContain('"account_ref":"main"')
     } finally {
       Date.now = originalNow
+    }
+  })
+
+  test('cache-seeded poll fields survive a later header harvest into the feed', async () => {
+    const originalNow = Date.now
+    let clock = 1_000_000
+    Date.now = () => clock
+    try {
+      const mainAccountId = 'cache-seeded-main'
+      const pollCheckedAt = 900_000
+      const initialPollQuota: OAuthQuotaSnapshot = {
+        source: 'poll',
+        accountIdentity: mainAccountId,
+        checkedAt: pollCheckedAt,
+        five_hour: {
+          usedPercent: 4,
+          remainingPercent: 96,
+          checkedAt: pollCheckedAt,
+        },
+        seven_day: {
+          usedPercent: 52,
+          remainingPercent: 48,
+          checkedAt: pollCheckedAt,
+        },
+        bindingWindow: 'claude-weekly-scoped-fable',
+        bindingWindowSource: 'poll',
+      }
+      const scoped = [
+        {
+          id: 'claude-weekly-scoped-fable',
+          title: 'Fable only',
+          modelName: 'Fable',
+          usedPercent: 55,
+          remainingPercent: 45,
+          checkedAt: pollCheckedAt,
+        },
+      ]
+      const extraUsage = {
+        used: { amountMinor: 1261, currency: 'USD', exponent: 2 },
+        limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
+        utilizationPercent: 12.61,
+        severity: 'normal',
+        exhausted: false,
+      }
+      const storage = createFallbackStorage({
+        mainAccountId,
+        quotaHeaderFeed: { enabled: true },
+        accounts: [],
+        quota: {
+          ...createFallbackStorage().quota,
+          mainQuota: initialPollQuota,
+          mainQuotaCheckedAt: pollCheckedAt,
+          mainQuotaToken: tokenFingerprint('main-access'),
+        },
+      })
+      await useTempAccountFile(storage)
+      await saveAccountState(
+        storage,
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+        {
+          mainQuota: true,
+        },
+      )
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+      globalThis.fetch = mock((input: any) => {
+        if (extractUrl(input).includes('/v1/messages')) {
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: {
+                'anthropic-ratelimit-unified-5h-utilization': '0.04',
+                'anthropic-ratelimit-unified-7d-utilization': '0.52',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(Response.json({}))
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+      const firstResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await firstResponse.text()
+      const firstEntry = (await readFeedEntries())[0] as any
+      expect(firstEntry.quota.scoped).toBeUndefined()
+      expect(firstEntry.quota.extraUsage).toBeUndefined()
+
+      const statePath = getAccountStatePath(
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+      )
+      const state = JSON.parse(await readFile(statePath, 'utf8')) as {
+        main?: Record<string, unknown>
+      }
+      state.main = {
+        ...(state.main ?? {}),
+        quota: {
+          ...initialPollQuota,
+          scoped,
+          extraUsage,
+        },
+        quotaCheckedAt: pollCheckedAt + 50_000,
+        quotaToken: tokenFingerprint('main-access'),
+      }
+      await writeFile(statePath, `${JSON.stringify(state)}\n`)
+
+      clock += 1_000
+      const secondResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await secondResponse.text()
+      const secondEntry = (await readFeedEntries())[0] as any
+      expect(secondEntry.quota.scoped).toEqual(scoped)
+      expect(secondEntry.quota.extraUsage).toEqual(extraUsage)
+      expect(secondEntry.quota.bindingWindow).toBe('claude-weekly-scoped-fable')
+    } finally {
+      Date.now = originalNow
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     }
   })
 })

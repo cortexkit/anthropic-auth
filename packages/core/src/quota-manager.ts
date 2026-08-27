@@ -464,6 +464,26 @@ export class QuotaManager {
       ),
       checkedAt: persisted.checkedAt,
     }
+    const current =
+      this.main && this.mainAccountId === mainAccountId ? this.main : undefined
+    if (
+      current &&
+      current.checkedAt >= entry.checkedAt &&
+      current.quota.source === 'headers' &&
+      entry.quota.source === 'poll'
+    ) {
+      const mergedQuota = mergeHeaderQuotaSnapshot(entry.quota, current.quota)
+      this.main = {
+        quota: mergedQuota,
+        refreshAfter: getQuotaNextRefreshAt(
+          mergedQuota,
+          storage,
+          current.checkedAt,
+        ),
+        checkedAt: current.checkedAt,
+      }
+      return
+    }
     if (
       this.main &&
       this.main.checkedAt >= entry.checkedAt &&
