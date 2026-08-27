@@ -25,6 +25,8 @@ import {
 import {
   getOrCreateMainAccountId,
   getOrCreatePrimeAuthLineageId,
+  loadAccounts,
+  saveAccountState,
 } from '../accounts.ts'
 import {
   __setLogTestSink as __setLogTestSinkSource,
@@ -454,30 +456,51 @@ afterEach(async () => {
 })
 
 describe('Prime main identity lineage', () => {
-  test('main identity stays stable across refresh rotation and missing refresh material', async () => {
+  test('main identity stays stable across refresh token rotation', async () => {
     const storagePath = join(markerRoot, 'accounts.json')
     const mainAccountId = await getOrCreateMainAccountId(
       storagePath,
       () => 'main-stable-identity',
     )
 
+    await saveAccountState(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+        mainAccountId,
+        prime: {
+          mainAuthLineageRefreshTokenFingerprint: 'refresh-before-rotation',
+        },
+      },
+      storagePath,
+      { mainPrime: true },
+    )
+
     const beforeRotation = await getOrCreatePrimeAuthLineageId(
       'main',
       storagePath,
     )
-    const afterRotation = await getOrCreatePrimeAuthLineageId(
-      'main',
+
+    const persisted = await loadAccounts(storagePath)
+    expect(persisted?.prime?.mainAuthLineageId).toBe(beforeRotation)
+    await saveAccountState(
+      {
+        ...persisted!,
+        prime: {
+          ...persisted?.prime,
+          mainAuthLineageRefreshTokenFingerprint: 'refresh-after-rotation',
+        },
+      },
       storagePath,
-    )
-    const withoutRefreshMaterial = await getOrCreatePrimeAuthLineageId(
-      'main',
-      storagePath,
+      { mainPrime: true },
     )
 
     expect(mainAccountId).toBe('main-stable-identity')
     expect(beforeRotation).toBe('main-stable-identity')
-    expect(afterRotation).toBe('main-stable-identity')
-    expect(withoutRefreshMaterial).toBe('main-stable-identity')
+    expect(await getOrCreatePrimeAuthLineageId('main', storagePath)).toBe(
+      beforeRotation,
+    )
   })
 })
 

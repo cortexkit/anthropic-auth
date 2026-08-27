@@ -162,13 +162,20 @@ export async function resolveClaudeCodeIdentity(
     identity = adoptCachedIdentity(identity, stableAccountIdentity) ?? identity
     setBounded(identityCache, cacheKey, identity)
   } else {
-    identity = getClaudeCodeIdentity(cacheKey)
+    identity =
+      identityCache.get(cacheKey) ??
+      identityCache.get(accessToken) ??
+      getClaudeCodeIdentity(cacheKey)
+    setBounded(identityCache, cacheKey, identity)
+    setBounded(identityCache, accessToken, identity)
   }
 
   if (!accessToken.startsWith('sk-ant-oat')) return identity
 
   const now = Date.now()
-  const bootstrapKey = cacheKey
+  // A slot-stable identity survives account replacement; bootstrap is the
+  // account lookup that must be repeated for each credential presented to it.
+  const bootstrapKey = `${cacheKey}:${accessToken}`
   const cachedResult = bootstrapResults.get(bootstrapKey)
   if (cachedResult && cachedResult.expiresAt > now) {
     if (!cachedResult.accountUuid) return identity

@@ -94,9 +94,12 @@ function setBoundedService<T>(map: Map<string, T>, key: string, value: T) {
 function ensurePiMainAccountId(storagePath: string) {
   let initialization = mainAccountIdInitializations.get(storagePath)
   if (!initialization) {
-    initialization = getOrCreateMainAccountId(storagePath).catch(
-      () => undefined,
-    )
+    initialization = getOrCreateMainAccountId(storagePath).catch((error) => {
+      if (mainAccountIdInitializations.get(storagePath) === initialization) {
+        mainAccountIdInitializations.delete(storagePath)
+      }
+      throw error
+    })
     setBoundedService(mainAccountIdInitializations, storagePath, initialization)
   }
   return initialization
@@ -493,6 +496,7 @@ async function executeWithFallback(options: {
   primaryAccessToken: string
   storagePath: string
 }): Promise<Response> {
+  await ensurePiMainAccountId(options.storagePath)
   const storage = await loadAccounts(options.storagePath)
   const { quotaManager, fallbackManager: manager } = getPiRoutingServices(
     options.storagePath,

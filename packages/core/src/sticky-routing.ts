@@ -581,7 +581,10 @@ export class StickySessionRouter {
       })
       return weight > 0 ? [{ candidate, weight }] : []
     })
-    if (weighted.length === 0) {
+    if (
+      weighted.length === 0 &&
+      candidates.every((candidate) => !knownQuota(candidate.quota))
+    ) {
       return [...candidates].sort(
         (left, right) =>
           left.order - right.order ||

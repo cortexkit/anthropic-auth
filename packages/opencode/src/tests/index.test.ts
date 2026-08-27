@@ -154,6 +154,42 @@ function createFallbackStorage(
   }
 }
 
+async function expectUnknownQuotaAdmissionBlocked(storage: AccountStorage) {
+  const now = Date.now()
+  storage.quota = {
+    ...storage.quota,
+    mainLastQuotaApiError: {
+      message: 'quota source unavailable',
+      checkedAt: now,
+      nextRetryAt: now + 60_000,
+      retryCount: 1,
+    },
+  }
+  await useTempAccountFile(storage)
+  await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
+    mainQuota: true,
+  })
+  globalThis.fetch = mock((input: any) => {
+    const url = extractUrl(input)
+    if (url.includes('/api/oauth/usage'))
+      return Promise.reject(new Error('quota source unavailable'))
+    return Promise.resolve(new Response('{}', { status: 200 }))
+  }) as unknown as typeof fetch
+  const plugin = await getPlugin()
+  const result = await plugin.auth.loader(
+    () =>
+      Promise.resolve({
+        type: 'oauth' as const,
+        access: 'main-access',
+        refresh: 'main-refresh',
+        expires: Date.now() + 100000,
+      }),
+    { models: {} },
+  )
+  const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+  expect(response.status).toBe(429)
+}
+
 async function useTempAccountFile(storage: AccountStorage) {
   if (tempConfigDir) {
     await drainSidebarWrites()
@@ -508,6 +544,10 @@ describe('quota header feed integration', () => {
 })
 
 describe('main identity boot order', () => {
+  afterEach(() => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+  })
+
   test('mints before background refresh can observe storage and survives token rotation', async () => {
     await useTempAccountFile(
       createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
@@ -802,6 +842,10 @@ describe('quota header feed extended integration', () => {
     await useTempAccountFile(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
+        quota: {
+          ...createFallbackStorage().quota,
+          failClosedOnUnknownQuota: false,
+        },
         accounts: [
           {
             id: 'unknown-fallback',
@@ -838,6 +882,23 @@ describe('quota header feed extended integration', () => {
     expect(authorizations).toContain('Bearer unknown-fallback-access')
   })
 
+  test('ordered fallback admission rejects unknown-quota OAuth under fail-closed', async () => {
+    await expectUnknownQuotaAdmissionBlocked(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'unknown-fallback',
+            type: 'oauth',
+            access: 'unknown-fallback-access',
+            refresh: 'unknown-fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+          },
+        ],
+      }),
+    )
+  })
+
   test('ordered fallback admission excludes an active refresh-backoff account while admitting an identical account without backoff', async () => {
     const now = Date.now()
     for (const lastRefreshError of [
@@ -853,6 +914,10 @@ describe('quota header feed extended integration', () => {
     ]) {
       const storage = createFallbackStorage({
         routing: { mode: 'fallback-first' },
+        quota: {
+          ...createFallbackStorage().quota,
+          failClosedOnUnknownQuota: false,
+        },
         accounts: [
           {
             id: 'unknown-fallback',
@@ -915,6 +980,32 @@ describe('quota header feed extended integration', () => {
         )
       }
     }
+  })
+
+  test('ordered fallback admission rejects unknown-quota OAuth with refresh backoff under fail-closed', async () => {
+    const now = Date.now()
+    await expectUnknownQuotaAdmissionBlocked(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'unknown-fallback',
+            type: 'oauth',
+            access: 'unknown-fallback-access',
+            refresh: 'unknown-fallback-refresh',
+            expires: now + 5 * 60 * 60_000,
+            lastRefreshError: {
+              message: 'refresh temporarily unavailable',
+              checkedAt: now,
+              nextRetryAt: now + 60_000,
+              retryCount: 1,
+              accountIdentity: 'unknown-fallback',
+              permanent: false,
+            },
+          },
+        ],
+      }),
+    )
   })
 
   test('fail-closed quota backoff gate blocks send when main quota is unknown', async () => {
@@ -1637,6 +1728,10 @@ describe('auth.loader', () => {
     await saveAccounts(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
+        quota: {
+          ...createFallbackStorage().quota,
+          failClosedOnUnknownQuota: false,
+        },
         accounts: [
           {
             id: 'work-2',
@@ -6189,7 +6284,15 @@ describe('auth.loader', () => {
       createFallbackStorage({
         accounts: [],
         mainAccountId: 'main-account-id',
-        quota: { enabled: false },
+        quota: {
+          enabled: false,
+          mainLastQuotaApiError: {
+            message: 'stale quota failure',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 60_000,
+            retryCount: 1,
+          },
+        },
         refresh: {
           enabled: true,
           mainLastRefreshError: {
@@ -6252,6 +6355,75 @@ describe('auth.loader', () => {
     expect(tokenRefreshCalls).toBe(0)
     const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
     expect(savedState.main.lastRefreshError).toBeUndefined()
+    const savedConfig = await loadAccounts()
+    expect(savedConfig?.quota?.mainLastQuotaApiError).toBeUndefined()
+  })
+
+  test('successful re-login preserves the current account main quota backoff', async () => {
+    const now = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        mainAccountId: 'main-account-id',
+        quota: {
+          enabled: false,
+          mainLastQuotaApiError: {
+            message: 'current quota failure',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 60_000,
+            retryCount: 1,
+            accountIdentity: 'main-account-id',
+          },
+        },
+        refresh: {
+          enabled: true,
+          mainLastRefreshError: {
+            message: 'stale refresh failure',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 60_000,
+            retryCount: 1,
+            accountIdentity: 'relogged-main-refresh',
+          },
+        },
+      }),
+    )
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/v1/messages'))
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'relogged-main-access',
+          refresh: 'relogged-main-refresh',
+          expires: now + 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: '{}',
+    })
+
+    expect(response.status).toBe(200)
+    const savedConfig = await loadAccounts()
+    // The entry surviving is not the property under test — a backoff whose
+    // retry time has been zeroed is no longer restricting anything.
+    expect(savedConfig?.quota?.mainLastQuotaApiError).toEqual(
+      expect.objectContaining({
+        accountIdentity: 'main-account-id',
+        message: 'current quota failure',
+        nextRetryAt: now + 60_000,
+      }),
+    )
+    expect(
+      savedConfig?.quota?.mainLastQuotaApiError?.nextRetryAt,
+    ).toBeGreaterThan(Date.now())
   })
 
   test('fallback-first uses stale passing fallback quota while quota refresh is in progress even when main refresh is backed off', async () => {
@@ -7335,6 +7507,10 @@ describe('auth.loader', () => {
     await useTempAccountFile(
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
+        quota: {
+          ...createFallbackStorage().quota,
+          failClosedOnUnknownQuota: false,
+        },
         accounts: [
           {
             id: 'unknown-fallback',
@@ -7375,6 +7551,23 @@ describe('auth.loader', () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toBe('fallback ok')
     expect(authorizations).toEqual(['Bearer unknown-fallback-access'])
+  })
+
+  test('fallback-first rejects an OAuth fallback whose quota is unknown under fail-closed', async () => {
+    await expectUnknownQuotaAdmissionBlocked(
+      createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        accounts: [
+          {
+            id: 'unknown-fallback',
+            type: 'oauth',
+            access: 'unknown-fallback-access',
+            refresh: 'unknown-fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+          },
+        ],
+      }),
+    )
   })
 
   test('successful fallback-first request advances the every-N counter and refreshes the served fallback', async () => {

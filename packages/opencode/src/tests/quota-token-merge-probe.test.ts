@@ -221,7 +221,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       persisted_quotaToken: state.main?.quotaToken,
       persisted_quotaCheckedAt: state.main?.quotaCheckedAt,
     }
-    console.log('Q1_HEADER_AFTER_POLL:', JSON.stringify(headerResult, null, 2))
+    void headerResult
 
     // The merged snapshot must still carry the poll's scoped windows, the
     // poll's extraUsage, and the poll's bindingWindowSource — even though the
@@ -235,7 +235,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
     expect(quota?.five_hour?.usedPercent).toBe(18)
   })
 
-  test('Q2 — rotation case: header harvest after a token rotation preserves scoped (HEAD behavior)', async () => {
+  test('Q2 — HEAD pushed harvest ignores rotated served token and preserves poll fields', async () => {
     const storage = await seedStorage()
 
     // Poll establishes scoped quota with token-A.
@@ -251,14 +251,13 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
     const fingerprintBefore = state.main?.quotaToken
     expect(fingerprintBefore).toBe(tokenFingerprint('token-A'))
 
-    // Token rotates to token-B. Header harvest arrives served by token-B.
-    // HEAD's persistPushedQuota does NOT write mainQuotaToken.
+    // The served token is intentionally absent: HEAD's pushed path does not
+    // inspect or write it.
     const headerCheckedAt = pollCheckedAt + 50
     await pushHeaderHarvest(
       storage,
       buildHeaderQuota(headerCheckedAt),
       headerCheckedAt,
-      { writeMainQuotaToken: false, servedAccessToken: 'token-B' },
     )
 
     state = await readStateFile()
@@ -275,10 +274,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       persisted_quotaToken_unchanged_from_poll:
         state.main?.quotaToken === tokenFingerprint('token-A'),
     }
-    console.log(
-      'Q2_HEADER_AFTER_ROTATION:',
-      JSON.stringify(rotationResult, null, 2),
-    )
+    void rotationResult
 
     expect(quota?.scoped?.length).toBe(2)
     expect(state.main?.quotaToken).toBe(tokenFingerprint('token-A'))
@@ -322,10 +318,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       persisted_bindingWindowSource: quota?.bindingWindowSource,
       persisted_quotaToken: state.main?.quotaToken,
     }
-    console.log(
-      'Q2_TOKEN_KEYED_CONTROL:',
-      JSON.stringify(tokenKeyedResult, null, 2),
-    )
+    void tokenKeyedResult
 
     // A token-keyed write loses the poll-only fields when the access token
     // rotates before the header harvest.
@@ -369,20 +362,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       const sameToken = evaluateSameToken(preHarvestState, storage)
       await saveAccountState(storage, accountPath, { mainQuota: true })
       const after = await readStateFile()
-      console.log(
-        'Q3_SCENARIO_A_SAME_TOKEN:',
-        JSON.stringify(
-          {
-            pre_harvest_state_quotaToken: preHarvestState.main?.quotaToken,
-            pre_harvest_storage_mainQuotaToken: storage.quota?.mainQuotaToken,
-            sameToken_observed_at_apply: sameToken,
-            persisted_scoped_count: after.main?.quota?.scoped?.length ?? 0,
-            persisted_source: after.main?.quota?.source,
-          },
-          null,
-          2,
-        ),
-      )
+
       expect(sameToken).toBe(true)
       expect(after.main?.quota?.scoped?.length).toBe(2)
     }
@@ -400,21 +380,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       const sameToken = evaluateSameToken(preHarvestState, storage)
       await saveAccountState(storage, accountPath, { mainQuota: true })
       const after = await readStateFile()
-      console.log(
-        'Q3_SCENARIO_B_ROTATION_HEAD:',
-        JSON.stringify(
-          {
-            pre_harvest_state_quotaToken: preHarvestState.main?.quotaToken,
-            pre_harvest_storage_mainQuotaToken: storage.quota?.mainQuotaToken,
-            sameToken_observed_at_apply: sameToken,
-            persisted_scoped_count: after.main?.quota?.scoped?.length ?? 0,
-            persisted_quotaToken: after.main?.quotaToken,
-            persisted_source: after.main?.quota?.source,
-          },
-          null,
-          2,
-        ),
-      )
+
       expect(sameToken).toBe(true)
       expect(after.main?.quota?.scoped?.length).toBe(2)
       expect(after.main?.quotaToken).toBe(fp('token-A'))
@@ -434,21 +400,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       const sameToken = evaluateSameToken(preHarvestState, storage)
       await saveAccountState(storage, accountPath, { mainQuota: true })
       const after = await readStateFile()
-      console.log(
-        'Q3_SCENARIO_C_ROTATION_TOKEN_KEYED:',
-        JSON.stringify(
-          {
-            pre_harvest_state_quotaToken: preHarvestState.main?.quotaToken,
-            pre_harvest_storage_mainQuotaToken: storage.quota?.mainQuotaToken,
-            sameToken_observed_at_apply: sameToken,
-            persisted_scoped_count: after.main?.quota?.scoped?.length ?? 0,
-            persisted_quotaToken: after.main?.quotaToken,
-            persisted_source: after.main?.quota?.source,
-          },
-          null,
-          2,
-        ),
-      )
+
       expect(sameToken).toBe(false)
       expect(after.main?.quota?.scoped?.length ?? 0).toBe(0)
       expect(after.main?.quotaToken).toBe(fp('token-B'))
@@ -464,7 +416,6 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       storage,
       buildHeaderQuota(headerCheckedAt),
       headerCheckedAt,
-      { writeMainQuotaToken: false, servedAccessToken: 'token-A' },
     )
 
     const state = await readStateFile()
@@ -475,7 +426,7 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
         Array.isArray(quota?.scoped) && (quota?.scoped?.length ?? 0) > 0,
       persisted_quotaToken: state.main?.quotaToken,
     }
-    console.log('Q4_FRESH_INSTALL:', JSON.stringify(freshResult, null, 2))
+    void freshResult
 
     expect(quota?.source).toBe('headers')
     expect(state.main?.quotaToken).toBeUndefined() // no poll ran
@@ -518,7 +469,6 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       storage,
       buildHeaderQuota(pollCheckedAt + 100),
       pollCheckedAt + 100,
-      { writeMainQuotaToken: false, servedAccessToken: 'token-B' },
     )
     state = await readStateFile()
     const after = {
@@ -526,7 +476,8 @@ describe('token rotation preserves scoped quota windows and extra usage', () => 
       scoped_count: state.main?.quota?.scoped?.length,
       quotaToken: state.main?.quotaToken,
     }
-    console.log('Q5_AFTER_ALL_HEAD_HEADERS:', JSON.stringify(after, null, 2))
+    void after
+
     expect(state.main?.quota?.scoped?.length).toBe(2)
     expect(state.main?.quotaToken).toBe(tokenFingerprint('token-A'))
   })

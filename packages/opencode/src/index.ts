@@ -2240,7 +2240,20 @@ const anthropicAuthPlugin = async (
     if (!error.accountIdentity || error.accountIdentity === accountIdentity)
       return
     storage.refresh.mainLastRefreshError = undefined
-    await saveAccountState(storage, accountStoragePath, { mainRefresh: true })
+    const quotaError = storage.quota?.mainLastQuotaApiError
+    if (
+      storage.quota &&
+      quotaError &&
+      (!quotaError.accountIdentity ||
+        quotaError.accountIdentity !== accountIdentity)
+    ) {
+      storage.quota.mainLastQuotaApiError = undefined
+      quotaManager.clearMainBackoff()
+    }
+    await saveAccountState(storage, accountStoragePath, {
+      mainRefresh: true,
+      mainQuota: true,
+    })
     log(
       '[refresh] opencode main oauth cleared stale backoff after token rotation',
       {
@@ -4647,6 +4660,7 @@ const anthropicAuthPlugin = async (
                     account.id,
                     Date.now(),
                   ) &&
+                  storageArg?.quota?.failClosedOnUnknownQuota !== true &&
                   !quotaSnapshotHasStandardWindows(getFallbackQuota(account))
                 ) {
                   usable.push(account)
@@ -4850,18 +4864,17 @@ const anthropicAuthPlugin = async (
                   )
                 const passes =
                   passesKillswitch &&
-                  (quotaState.kind === 'unknown'
-                    ? true
-                    : quotaSnapshotPassesPolicy(
-                        quotaState.quota,
-                        latestStorage,
-                      ) &&
-                      quotaSnapshotPassesModelScope(
-                        quotaState.quota,
-                        input.requestedModelId,
-                      ) &&
+                  quotaSnapshotPassesPolicy(
+                    quotaState.kind === 'known' ? quotaState.quota : undefined,
+                    latestStorage,
+                  ) &&
+                  (quotaState.kind === 'unknown' ||
+                    (quotaSnapshotPassesModelScope(
+                      quotaState.quota,
+                      input.requestedModelId,
+                    ) &&
                       (route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID ||
-                        usableIds.has(route.id)))
+                        usableIds.has(route.id))))
                 return passes
                   ? [
                       {

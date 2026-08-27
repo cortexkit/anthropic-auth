@@ -3459,6 +3459,11 @@ export class FallbackAccountManager {
           }
         } else if (
           !failClosedOnUnknownQuota(storage) &&
+          !refreshBackoffActive(
+            account.lastRefreshError,
+            account.id,
+            this.now(),
+          ) &&
           quotaSnapshotPassesModelScope(account.quota, options.modelId)
         ) {
           usable.push(account)

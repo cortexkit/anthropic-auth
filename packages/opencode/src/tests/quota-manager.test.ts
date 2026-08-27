@@ -217,6 +217,37 @@ describe('QuotaManager', () => {
       expect(qm.isBackedOff()).toBe(false)
     })
 
+    test('legacy main quota backoff survives ordinary access-token rotation', async () => {
+      const fetchMock = mock(() => {
+        throw new Error('quota fetch should be blocked by backoff')
+      }) as unknown as typeof fetch
+      const storage: import('@cortexkit/anthropic-auth-core').AccountStorage = {
+        version: 1,
+        mainAccountId: 'main-account',
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+        quota: {
+          mainLastQuotaApiError: {
+            message: 'legacy quota failure',
+            checkedAt: now - 1_000,
+            nextRetryAt: now + 60_000,
+            retryCount: 1,
+          },
+        },
+      }
+      const qm = new QuotaManager({
+        storage,
+        fetchImpl: fetchMock,
+        now: () => now,
+      })
+
+      expect(qm.isBackedOff()).toBe(true)
+      await expect(
+        qm.refreshMain('main-account', 'rotated-access-token'),
+      ).rejects.toThrow('rate-limited')
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
+
     test('fallback 429 does NOT back off main or fire onApiError', async () => {
       // Regression: backoff is scoped per route. A fallback account's quota
       // 429 must not suppress main quota checks nor persist as the main quota
@@ -601,6 +632,18 @@ describe('QuotaManager', () => {
       ])
 
       expect(qm.getFallback('fallback-1')).not.toBeNull()
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'new-fallback-token',
+          refresh: 'refresh-token',
+          expires: 2_000_000,
+        },
+      ])
+      expect(
+        qm.getFallback('fallback-1')?.quota.five_hour?.remainingPercent,
+      ).toBe(90)
     })
 
     test('seedFallbacksFromAccounts preserves freshness for scoped-only quota', () => {

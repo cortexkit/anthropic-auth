@@ -165,7 +165,6 @@ export class QuotaHeaderFeedRegistry {
           )
           await chmod(tempPath, 0o600)
           await rename(tempPath, this.filePath)
-          await chmod(this.filePath, 0o600)
         } finally {
           await rm(tempPath, { force: true })
         }
@@ -203,7 +202,11 @@ export class QuotaHeaderFeedRegistry {
           for (const [accountKey, candidate] of Object.entries(
             record.entries,
           )) {
-            if (!validIdentity(candidate as unknown as Record<string, unknown>))
+            if (
+              !candidate ||
+              typeof candidate !== 'object' ||
+              !validIdentity(candidate as unknown as Record<string, unknown>)
+            )
               continue
             const observed = candidate.observed_at_ms
             if (observed > now || now - observed >= leaseMs) continue

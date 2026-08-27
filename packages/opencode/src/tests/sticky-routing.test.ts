@@ -729,6 +729,36 @@ describe('sticky-balanced session routing', () => {
     expect(resolution?.accountId).toBe('first')
   })
 
+  test('does not escape to an exhausted candidate when every known quota is exhausted', async () => {
+    const path = await statePath()
+    const router = new StickySessionRouter({ path, now: () => NOW })
+    const resolution = await router.resolve({
+      sessionId: 'all-exhausted-quota-selection',
+      family: 'general',
+      candidates: [
+        candidate({
+          accountId: 'first',
+          order: 0,
+          fiveHour: 0,
+          sevenDay: 0,
+          fable: 0,
+        }),
+        candidate({
+          accountId: 'later',
+          order: 1,
+          fiveHour: 0,
+          sevenDay: 0,
+          fable: 0,
+        }),
+      ],
+      retainAccountIds: new Set(['first', 'later']),
+      storage,
+      inputBytes: 1_000,
+    })
+
+    expect(resolution).toBeNull()
+  })
+
   test('router-level pending bytes reset when an unknown quota becomes known', async () => {
     const path = await statePath()
     const router = new StickySessionRouter({ path, now: () => NOW })
@@ -772,7 +802,7 @@ describe('sticky-balanced session routing', () => {
     expect(resolution?.accountId).toBe('a')
   })
 
-  test('keeps an unknown-identity route excluded while an active restriction applies', async () => {
+  test('keeps an excluded route out of a new assignment', async () => {
     const path = await statePath()
     const router = new StickySessionRouter({ path, now: () => NOW })
     const input = {
@@ -781,7 +811,6 @@ describe('sticky-balanced session routing', () => {
       candidates: [
         {
           accountId: 'unknown-identity',
-          identity: { kind: 'unknown' },
           quota: candidate({
             accountId: 'unknown-identity',
             order: 0,

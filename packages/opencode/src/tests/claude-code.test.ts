@@ -12,6 +12,12 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 
 describe('Claude Code fingerprint helpers', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
   test('selects the live-captured full-agent beta set only for tool-bearing agent requests', () => {
     const body = {
       model: 'claude-sonnet-4-6',
@@ -124,6 +130,26 @@ describe('Claude Code fingerprint helpers', () => {
     })
   })
 
+  test('shares the no-account identity between resolution and default headers', async () => {
+    const accessToken = 'sk-ant-oat-no-account-identity-split'
+    const fetchMock = mock(async () => new Response('stubbed', { status: 503 }))
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+    const resolvedIdentity = await resolveClaudeCodeIdentity(
+      accessToken,
+      undefined,
+      undefined,
+    )
+    const headers = applyClaudeCodeHeaders(new Headers(), accessToken)
+    const defaultHeaderIdentity = getClaudeCodeIdentity(accessToken)
+
+    expect(defaultHeaderIdentity.deviceId).toBe(resolvedIdentity.deviceId)
+    expect(defaultHeaderIdentity.sessionId).toBe(resolvedIdentity.sessionId)
+    expect(headers.get('x-claude-code-session-id')).toBe(
+      resolvedIdentity.sessionId,
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   test('orders serialized body fields like captured Claude Code requests', () => {
     const ordered = orderClaudeCodeBody({
       stream: true,
@@ -220,10 +246,38 @@ describe('Claude Code bootstrap identity lookup', () => {
 
     expect(first.accountUuid).toBeUndefined()
     expect(second.accountUuid).toBeUndefined()
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  test('keeps identity stable across rotated access tokens for the same account UUID', async () => {
+  test('does not reuse the previous main-slot account UUID after account replacement', async () => {
+    const fetchMock = mock(async () => {
+      const uuid =
+        fetchMock.mock.calls.length === 1 ? 'main-account-a' : 'main-account-b'
+      return new Response(
+        JSON.stringify({ oauth_account: { account_uuid: uuid } }),
+      )
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-main-account-a',
+      undefined,
+      'stable-main-slot',
+    )
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-main-account-b',
+      undefined,
+      'stable-main-slot',
+    )
+
+    expect(first.accountUuid).toBe('main-account-a')
+    expect(second.accountUuid).toBe('main-account-b')
+    expect(second.deviceId).toBe(first.deviceId)
+    expect(second.sessionId).toBe(first.sessionId)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('keeps device identity stable while refreshing bootstrap UUID per credential', async () => {
     const accountUuid = 'c7b3bc43-f4d8-48c6-a30f-7fd81a8db03f'
     const fetchMock = mock(
       async () =>
@@ -248,10 +302,10 @@ describe('Claude Code bootstrap identity lookup', () => {
     expect(second.accountUuid).toBe(accountUuid)
     expect(second.deviceId).toBe(first.deviceId)
     expect(second.sessionId).toBe(first.sessionId)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  test('keeps identity stable across rotated access tokens for the same explicit account identity', async () => {
+  test('keeps device identity stable across rotated credentials for an explicit account identity', async () => {
     const fetchMock = mock(
       async () =>
         new Response(
@@ -277,7 +331,7 @@ describe('Claude Code bootstrap identity lookup', () => {
 
     expect(second.deviceId).toBe(first.deviceId)
     expect(second.sessionId).toBe(first.sessionId)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   test('never shares a device identity between distinct account identities', async () => {
@@ -330,7 +384,7 @@ describe('Claude Code bootstrap identity lookup', () => {
     expect(resolved.accountUuid).toBe('legacy-bootstrap-uuid')
   })
 
-  test('deduplicates bootstrap across rotated tokens while the stable identity is in flight', async () => {
+  test('does not reuse an in-flight bootstrap from a rotated credential', async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
       release = resolve
@@ -360,7 +414,7 @@ describe('Claude Code bootstrap identity lookup', () => {
     const [first, second] = await Promise.all([firstPromise, secondPromise])
 
     expect(second.deviceId).toBe(first.deviceId)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   test('keeps Claude Code metadata.user_id on the wire when account identity is missing', async () => {

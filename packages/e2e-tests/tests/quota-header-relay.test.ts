@@ -46,7 +46,7 @@ async function readFeedFiles(harness: E2EHarness) {
   try {
     const names = await readdir(harness.opencode.env.quotaFeedDir)
     return Promise.all(
-      names.map(async (name) =>
+            names.filter((name) => name.endsWith('.json')).map(async (name) =>
         readFile(join(harness.opencode.env.quotaFeedDir, name), 'utf8'),
       ),
     )

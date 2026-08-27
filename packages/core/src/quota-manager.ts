@@ -307,7 +307,7 @@ export class QuotaManager {
   refreshMainInBackground(accessToken: string): void {
     if (this.inflightMain) return
     if (this.isBackedOff()) return
-    void this.refreshMain(undefined, accessToken).catch(() => {})
+    void this.refreshMain(this.mainAccountId, accessToken).catch(() => {})
   }
 
   // =========================================================================
@@ -431,10 +431,22 @@ export class QuotaManager {
 
   private seedMainBackoffFromStorage(storage: AccountStorage | null): void {
     const persistedError = storage?.quota?.mainLastQuotaApiError
-    this.mainLastApiError =
-      persistedError && quotaBackoffActive(persistedError, this.now())
-        ? persistedError
-        : undefined
+    const persistedIdentity = persistedError?.accountIdentity
+    if (
+      persistedError &&
+      (persistedIdentity === undefined ||
+        persistedIdentity === this.mainAccountId) &&
+      quotaBackoffActive(persistedError, this.now())
+    ) {
+      this.mainLastApiError = persistedError
+      return
+    }
+    if (
+      this.mainLastApiError?.accountIdentity !== undefined &&
+      this.mainLastApiError.accountIdentity !== this.mainAccountId
+    ) {
+      this.mainLastApiError = undefined
+    }
   }
 
   /**
@@ -476,6 +488,10 @@ export class QuotaManager {
 
   getLastApiError(): AccountOperationError | undefined {
     return this.mainLastApiError
+  }
+
+  clearMainBackoff(): void {
+    this.mainLastApiError = undefined
   }
 
   // =========================================================================
@@ -672,6 +688,7 @@ export class QuotaManager {
     this.mainLastApiError = buildQuotaOperationError({
       error,
       now: this.now(),
+      accountIdentity: this.mainAccountId,
       previous: this.mainLastApiError,
     })
     this.onApiError?.(this.mainLastApiError)
