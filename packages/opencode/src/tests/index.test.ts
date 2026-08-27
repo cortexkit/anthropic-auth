@@ -427,7 +427,6 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
 })
 
 async function readFeedEntries() {
-  await Bun.sleep(25)
   const directory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
   try {
     const files = await readdir(directory)
@@ -439,6 +438,38 @@ async function readFeedEntries() {
     return records.flatMap((record) => Object.values(record.entries ?? {}))
   } catch {
     return []
+  }
+}
+
+async function waitForFeedEntries(
+  predicate: (entries: Awaited<ReturnType<typeof readFeedEntries>>) => boolean,
+  description: string,
+) {
+  const deadline = performance.now() + 2_500
+  let entries = await readFeedEntries()
+  while (!predicate(entries) && performance.now() < deadline) {
+    await Bun.sleep(10)
+    entries = await readFeedEntries()
+  }
+  if (!predicate(entries)) {
+    throw new Error(
+      `Quota header feed did not match ${description}: ${JSON.stringify(entries)}`,
+    )
+  }
+  return entries
+}
+
+async function waitForLogRecord(
+  records: LogTestRecord[],
+  predicate: (record: LogTestRecord) => boolean,
+  description: string,
+) {
+  const deadline = performance.now() + 2_500
+  while (!records.some(predicate) && performance.now() < deadline) {
+    await Bun.sleep(10)
+  }
+  if (!records.some(predicate)) {
+    throw new Error(`Expected log record ${description}`)
   }
 }
 
@@ -514,9 +545,12 @@ describe('quota header feed integration', () => {
       })
       await response.text()
       clock += 1_000
-      await Bun.sleep(25)
 
       const feedDirectory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
+      await waitForFeedEntries(
+        (entries) => entries.length === 1,
+        'one published entry',
+      )
       const files = await readdir(feedDirectory)
       expect(files).toHaveLength(1)
       const record = JSON.parse(
@@ -686,7 +720,12 @@ describe('quota header feed integration', () => {
       clock += 1_000
       const secondResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
       await secondResponse.text()
-      const secondEntry = (await readFeedEntries())[0] as any
+      const secondEntry = (
+        await waitForFeedEntries(
+          (entries) => entries.length === 1,
+          'one published entry',
+        )
+      )[0] as any
       expect(secondEntry.quota.scoped).toEqual(scoped)
       expect(secondEntry.quota.extraUsage).toEqual(extraUsage)
       expect(secondEntry.quota.bindingWindow).toBe('claude-weekly-scoped-fable')
@@ -779,9 +818,15 @@ describe('quota header feed integration', () => {
       await waitForAccountStorage(
         (loaded) => loaded?.quota?.mainQuotaCheckedAt === otherCheckedAt,
       )
-      await Bun.sleep(100)
 
-      const published = (await readFeedEntries())[0] as any
+      const published = (
+        await waitForFeedEntries(
+          (entries) =>
+            entries.length === 1 &&
+            (entries[0] as any)?.account_ref === accountIdentity,
+          'one account-a published entry',
+        )
+      )[0] as any
       expect(published.account_ref).toBe(accountIdentity)
       expect(published.observed_at_ms).toBe(requestCheckedAt)
       expect(published.observed_at_ms).not.toBe(otherCheckedAt)
@@ -956,7 +1001,12 @@ describe('quota header feed integration', () => {
       expect(quotaManager.getMain('account-b')?.quota.accountIdentity).toBe(
         'account-b',
       )
-      const entries = await readFeedEntries()
+      const entries = await waitForFeedEntries(
+        (candidate) =>
+          candidate.length === 1 &&
+          candidate.some((entry: any) => entry.account_ref === 'account-b'),
+        'one account-b published entry',
+      )
       expect(entries).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -1146,6 +1196,9 @@ describe('quota header feed integration', () => {
       }) as unknown as typeof fetch
 
       const plugin = await getPlugin()
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      setLogLevel('trace')
       const tokenA = 'sk-ant-oat-race-token-a'
       const tokenB = 'sk-ant-oat-race-token-b'
       const resultA = await plugin.auth.loader(
@@ -1183,8 +1236,16 @@ describe('quota header feed integration', () => {
         }),
       )
       expect((await inFlight).status).toBe(200)
-      await Bun.sleep(25)
 
+      // The stale-identity trace is emitted before any feed writer can start.
+      await waitForLogRecord(
+        records,
+        (record) =>
+          record.level === 'trace' &&
+          record.channel === 'quota' &&
+          record.message === 'discarded stale main quota headers',
+        'stale main quota header discard',
+      )
       const entries = await readFeedEntries()
       expect(entries).not.toEqual(
         expect.arrayContaining([
@@ -1193,6 +1254,8 @@ describe('quota header feed integration', () => {
       )
       expect(plugin.__quotaManager.getMain('account-a')).toBeNull()
     } finally {
+      __setLogTestSink(null)
+      setLogLevel('info')
       if (originalProfileHydration === undefined) {
         delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
       } else {
@@ -1572,7 +1635,10 @@ describe('quota header feed extended integration', () => {
       await response.text()
     }
 
-    const entries = await readFeedEntries()
+    const entries = await waitForFeedEntries(
+      (candidate) => candidate.length === 1,
+      'one published entry',
+    )
     expect(entries).toHaveLength(1)
     expect(entries[0]).toEqual(
       expect.objectContaining({
@@ -1884,7 +1950,10 @@ describe('quota header feed extended integration', () => {
       }),
     )
     await main.response.text()
-    const mainEntries = await readFeedEntries()
+    const mainEntries = await waitForFeedEntries(
+      (entries) => entries.length === 1,
+      'one main published entry',
+    )
     const mainAccountId = (await loadAccounts())?.mainAccountId
     expect(mainEntries[0]).toEqual(
       expect.objectContaining({
@@ -1905,9 +1974,14 @@ describe('quota header feed extended integration', () => {
       }),
     )
     await fallback.response.text()
-    const fallbackEntry = (await readFeedEntries()).find(
-      (entry: any) => entry.identity_source === 'account_ref',
-    ) as any
+    const fallbackEntry = (
+      await waitForFeedEntries(
+        (entries) =>
+          entries.length === 1 &&
+          entries.some((entry: any) => entry.account_ref === 'fallback-1'),
+        'one fallback-1 published entry',
+      )
+    ).find((entry: any) => entry.identity_source === 'account_ref') as any
     expect(fallbackEntry).toEqual(
       expect.objectContaining({
         identity_source: 'account_ref',
@@ -1938,7 +2012,10 @@ describe('quota header feed extended integration', () => {
       }),
     )
     await response.text()
-    const entries = await readFeedEntries()
+    const entries = await waitForFeedEntries(
+      (candidate) => candidate.length === 1,
+      'one configured-account-count entry',
+    )
     expect(entries[0]).toEqual(
       expect.objectContaining({ configured_account_count: 3 }),
     )
@@ -1966,7 +2043,10 @@ describe('quota header feed extended integration', () => {
       { 'x-session-affinity': 'feed-relay-session' },
     )
     await response.text()
-    const entries = await readFeedEntries()
+    const entries = await waitForFeedEntries(
+      (candidate) => candidate.length === 1,
+      'one relay published entry',
+    )
     expect(entries).toHaveLength(1)
     expect(entries[0]).toEqual(
       expect.objectContaining({
