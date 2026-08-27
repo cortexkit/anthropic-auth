@@ -39,6 +39,7 @@ import {
   type KillswitchThresholds,
   killswitchPassesPolicy,
   loadAccounts,
+  mergeMainQuotaErrorClearedAt,
   type OAuthAccount,
   type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
@@ -208,6 +209,78 @@ describe('main account identity', () => {
     expect(await getOrCreateMainAccountId(accountPath, () => 'second-id')).toBe(
       'first-id',
     )
+  })
+})
+
+describe('main quota clear marker', () => {
+  test('keeps the newer marker when an older marker arrives', () => {
+    expect(mergeMainQuotaErrorClearedAt(2_000, 1_000)).toBe(2_000)
+  })
+
+  test('keeps a defined marker when undefined arrives', () => {
+    expect(mergeMainQuotaErrorClearedAt(2_000, undefined)).toBe(2_000)
+  })
+})
+
+describe('cross-process main quota backoff', () => {
+  test('an equal-generation stale observation cannot resurrect a clear', async () => {
+    const error = {
+      message: 'quota API unavailable',
+      checkedAt: 900_000,
+      nextRetryAt: 1_060_000,
+      retryCount: 1,
+      accountIdentity: 'account-a',
+    }
+    const initial = {
+      ...baseStorage(),
+      mainAccountId: 'main-slot',
+      quota: {
+        ...baseStorage().quota,
+        mainLastQuotaApiError: error,
+        mainQuotaErrorGeneration: 1,
+      },
+    }
+    await saveAccounts(initial, accountPath)
+    const staleWriterStorage = (await loadAccounts(accountPath))!
+    const managerA = new QuotaManager({
+      storage: staleWriterStorage,
+      now: () => 1_000_000,
+    })
+    const managerB = new QuotaManager({
+      storage: staleWriterStorage,
+      now: () => 1_000_000,
+    })
+    expect(managerA.isBackedOff()).toBe(true)
+    expect(managerB.isBackedOff()).toBe(true)
+
+    const clearWriterStorage = (await loadAccounts(accountPath))!
+    clearWriterStorage.quota = {
+      ...clearWriterStorage.quota,
+      mainLastQuotaApiError: undefined,
+      mainQuotaErrorGeneration: 2,
+      mainQuotaErrorClearedAt: 1_000_200,
+    }
+    await saveAccountState(clearWriterStorage, accountPath, { mainQuota: true })
+
+    const clearedStorage = (await loadAccounts(accountPath))!
+    managerB.updateStorage(clearedStorage)
+    staleWriterStorage.quota = {
+      ...staleWriterStorage.quota,
+      mainLastQuotaApiError: {
+        ...error,
+        checkedAt: 1_000_100,
+      },
+      // Both writers started from generation 1 and allocated generation 2.
+      mainQuotaErrorGeneration: 2,
+      mainQuotaErrorClearedAt: 1_000_100,
+    }
+    await saveAccountState(staleWriterStorage, accountPath, { mainQuota: true })
+    const finalStorage = (await loadAccounts(accountPath))!
+    expect(finalStorage.quota?.mainLastQuotaApiError).toBeUndefined()
+    expect(finalStorage.quota?.mainQuotaErrorGeneration).toBe(2)
+    expect(finalStorage.quota?.mainQuotaErrorClearedAt).toBe(1_000_200)
+    managerB.updateStorage(finalStorage)
+    expect(managerB.isBackedOff()).toBe(false)
   })
 })
 

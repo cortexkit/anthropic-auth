@@ -32,6 +32,19 @@ export function setBounded<K, V>(
   map.set(key, value)
 }
 
+function clearCachedAccountUuid(
+  key: string,
+  identity: ClaudeCodeIdentity,
+): ClaudeCodeIdentity {
+  if (!identity.accountUuid) return identity
+  if (identityCache.get(key) !== identity) {
+    return { ...identity, accountUuid: undefined }
+  }
+  const cleared = { ...identity, accountUuid: undefined }
+  setBounded(identityCache, key, cleared)
+  return cleared
+}
+
 export function getClaudeCodeIdentity(seed: string): ClaudeCodeIdentity {
   const cacheKey = seed || 'anonymous'
   const cached = identityCache.get(cacheKey)
@@ -52,6 +65,12 @@ const bootstrapResults = new Map<
   string,
   { accountUuid: string | null; expiresAt: number }
 >()
+
+export function resetClaudeCodeIdentityCachesForTest() {
+  identityCache.clear()
+  bootstrapFetches.clear()
+  bootstrapResults.clear()
+}
 
 function compatibilityCacheKey(accessToken: string) {
   return `compat:${accessToken || 'anonymous'}`
@@ -178,7 +197,10 @@ export async function resolveClaudeCodeIdentity(
   const bootstrapKey = `${cacheKey}:${accessToken}`
   const cachedResult = bootstrapResults.get(bootstrapKey)
   if (cachedResult && cachedResult.expiresAt > now) {
-    if (!cachedResult.accountUuid) return identity
+    if (!cachedResult.accountUuid) {
+      identity = clearCachedAccountUuid(cacheKey, identity)
+      return identity
+    }
     if (!stableAccountIdentity) {
       if (identity.accountUuid === cachedResult.accountUuid) return identity
       identity = { ...identity, accountUuid: cachedResult.accountUuid }
@@ -234,7 +256,10 @@ export async function resolveClaudeCodeIdentity(
         ? BOOTSTRAP_IDENTITY_CACHE_TTL_MS
         : BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS),
   })
-  if (!accountUuid) return identity
+  if (!accountUuid) {
+    identity = clearCachedAccountUuid(cacheKey, identity)
+    return identity
+  }
   if (!stableAccountIdentity) {
     identity = { ...identity, accountUuid }
     setBounded(identityCache, bootstrapKey, identity)

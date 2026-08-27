@@ -22,6 +22,7 @@ import {
   getQuotaRefreshEveryNRequests,
   getScopedQuotaWindowForModel,
   isQuotaPolicyAuthError,
+  mergeMainQuotaErrorClearedAt,
   quotaBackoffActive,
   quotaSnapshotCheckedAt,
 } from './accounts.ts'
@@ -61,8 +62,13 @@ export type QuotaManagerOptions = {
     checkedAt: number,
     tokenFingerprint: string,
     fetchStartedAt: number,
+    quotaErrorGeneration: number,
+    quotaErrorClearedAt: number | undefined,
   ) => void
-  onApiError?: (error: AccountOperationError) => void
+  onApiError?: (
+    error: AccountOperationError,
+    quotaErrorGeneration: number,
+  ) => void
 }
 
 function mergePollCompletionWithNewerHeaders(
@@ -104,6 +110,11 @@ export class QuotaManager {
   // --- State ---
   private main: QuotaEntry | null = null
   private mainAccountId: string | undefined
+  private mainQuotaIdentityKnown = false
+  private mainQuotaIdentityStrict = false
+  private mainGeneration = 0
+  private mainQuotaErrorGeneration = 0
+  private mainQuotaErrorClearedAt: number | undefined
   private fallbacks = new Map<string, QuotaEntry>()
   private fallbackAuthLineages = new Map<string, string | undefined>()
   private fallbackGenerations = new Map<string, number>()
@@ -145,10 +156,19 @@ export class QuotaManager {
   // =========================================================================
 
   /**
-   * Cached main quota entry, scoped to the stable main account identity.
+   * Cached main quota entry, scoped to the account behind the main credential.
+   * An unresolved identity keeps a retained cache unverified rather than exposing it.
    */
   getMain(mainAccountId?: string): QuotaEntry | null {
     if (this.mainAccountId !== mainAccountId) return null
+    if (
+      this.mainQuotaIdentityKnown &&
+      this.mainQuotaIdentityStrict &&
+      (mainAccountId === undefined ||
+        this.main?.quota.accountIdentity !== mainAccountId)
+    ) {
+      return null
+    }
     return this.main
   }
 
@@ -176,6 +196,49 @@ export class QuotaManager {
     this.main = entry
   }
 
+  /** Bind quota state to the account behind the current main credential. */
+  setMainQuotaAccountIdentity(
+    accountIdentity: string | undefined,
+    strict = true,
+  ): number | undefined {
+    const previousIdentityKnown = this.mainQuotaIdentityKnown
+    const previousAccountIdentity = this.mainAccountId
+    const changed =
+      !previousIdentityKnown ||
+      this.mainAccountId !== accountIdentity ||
+      this.mainQuotaIdentityStrict !== strict
+    this.mainQuotaIdentityKnown = true
+    this.mainQuotaIdentityStrict = strict
+    if (!changed) return undefined
+
+    this.mainGeneration += 1
+    this.mainAccountId = accountIdentity
+    if (
+      accountIdentity !== undefined &&
+      this.main?.quota.accountIdentity !== accountIdentity
+    ) {
+      this.main = null
+    }
+    if (
+      accountIdentity !== undefined &&
+      this.mainLastApiError &&
+      (this.mainLastApiError.accountIdentity !== undefined
+        ? this.mainLastApiError.accountIdentity !== accountIdentity
+        : previousIdentityKnown &&
+          previousAccountIdentity !== undefined &&
+          previousAccountIdentity !== accountIdentity)
+    ) {
+      this.mainLastApiError = undefined
+      this.mainQuotaErrorGeneration += 1
+      this.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+        this.mainQuotaErrorClearedAt,
+        this.now(),
+      )
+      return this.mainQuotaErrorGeneration
+    }
+    return undefined
+  }
+
   setFallback(
     accountId: string,
     entry: QuotaEntry,
@@ -201,7 +264,12 @@ export class QuotaManager {
   ): QuotaEntry {
     const checkedAt = incoming.checkedAt ?? this.now()
     const quota = mergeHeaderQuotaSnapshot(
-      this.mainAccountId === mainAccountId ? this.main?.quota : undefined,
+      this.mainAccountId === mainAccountId &&
+        (!this.mainQuotaIdentityKnown ||
+          !this.mainQuotaIdentityStrict ||
+          this.main?.quota.accountIdentity === mainAccountId)
+        ? this.main?.quota
+        : undefined,
       {
         ...incoming,
         ...(mainAccountId !== undefined && { accountIdentity: mainAccountId }),
@@ -243,23 +311,39 @@ export class QuotaManager {
   async refreshMain(
     mainAccountIdOrAccessToken: string | undefined,
     accessToken?: string,
+    expectedIdentityGeneration?: number,
   ): Promise<OAuthQuotaSnapshot> {
     const mainAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
     if (!credential) throw new Error('Main OAuth access token is unavailable')
-    return (await this.refreshMainWithMetadata(mainAccountId, credential)).quota
+    return (
+      await this.refreshMainWithMetadata(
+        mainAccountId,
+        credential,
+        expectedIdentityGeneration,
+      )
+    ).quota
   }
 
   async refreshMainWithMetadata(
     mainAccountIdOrAccessToken: string | undefined,
     accessToken?: string,
+    expectedIdentityGeneration?: number,
   ): Promise<QuotaRefreshResult> {
     const effectiveAccountId = mainAccountIdOrAccessToken
     const credential = accessToken ?? mainAccountIdOrAccessToken
     if (!credential) throw new Error('Main OAuth access token is unavailable')
+    if (
+      expectedIdentityGeneration !== undefined &&
+      (this.mainGeneration !== expectedIdentityGeneration ||
+        this.mainAccountId !== effectiveAccountId)
+    ) {
+      throw new Error('Main quota identity changed before refresh')
+    }
     if (this.mainAccountId !== effectiveAccountId) {
       this.main = null
       this.mainAccountId = effectiveAccountId
+      if (this.mainQuotaIdentityKnown) this.mainGeneration += 1
     }
 
     if (this.inflightMain && this.inflightMainAccountId === effectiveAccountId)
@@ -274,7 +358,12 @@ export class QuotaManager {
     }
 
     this.inflightMainAccountId = effectiveAccountId
-    this.inflightMain = this._fetchMain(effectiveAccountId, credential)
+    const generation = this.mainGeneration
+    this.inflightMain = this._fetchMain(
+      effectiveAccountId,
+      credential,
+      generation,
+    )
     return this.inflightMain
   }
 
@@ -370,6 +459,14 @@ export class QuotaManager {
 
   isMainStale(modelId?: string): boolean {
     if (!this.main) return true
+    if (
+      this.mainQuotaIdentityKnown &&
+      this.mainQuotaIdentityStrict &&
+      (this.mainAccountId === undefined ||
+        this.main.quota.accountIdentity !== this.mainAccountId)
+    ) {
+      return true
+    }
     return (
       this.now() >= this.main.refreshAfter ||
       this.scopedWindowIsStale(this.main, modelId)
@@ -415,7 +512,10 @@ export class QuotaManager {
 
   updateStorage(storage: AccountStorage | null): void {
     this.storage = storage
-    this.seedMainFromStorage(storage, storage?.mainAccountId)
+    this.seedMainFromStorage(
+      storage,
+      this.mainQuotaIdentityKnown ? this.mainAccountId : storage?.mainAccountId,
+    )
     this.seedMainBackoffFromStorage(storage)
   }
 
@@ -432,30 +532,14 @@ export class QuotaManager {
     const persisted = getPersistedMainQuota(storage)
     if (!persisted) return
 
-    if (
-      mainAccountId === undefined &&
-      persisted.accountIdentity !== undefined
-    ) {
-      this.main = null
-      this.mainAccountId = undefined
-      return
-    }
-    if (
-      mainAccountId !== undefined &&
-      persisted.accountIdentity !== undefined &&
-      persisted.accountIdentity !== mainAccountId
-    ) {
-      this.main = null
-      this.mainAccountId = mainAccountId
-      return
-    }
-
     const entry: QuotaEntry = {
       quota: {
         ...persisted.quota,
-        ...(mainAccountId !== undefined && {
-          accountIdentity: mainAccountId,
-        }),
+        ...((!this.mainQuotaIdentityKnown || !this.mainQuotaIdentityStrict) &&
+          mainAccountId !== undefined &&
+          persisted.accountIdentity === undefined && {
+            accountIdentity: mainAccountId,
+          }),
       },
       refreshAfter: getQuotaNextRefreshAt(
         persisted.quota,
@@ -465,7 +549,13 @@ export class QuotaManager {
       checkedAt: persisted.checkedAt,
     }
     const current =
-      this.main && this.mainAccountId === mainAccountId ? this.main : undefined
+      this.main &&
+      this.mainAccountId === mainAccountId &&
+      (!this.mainQuotaIdentityKnown ||
+        !this.mainQuotaIdentityStrict ||
+        this.main.quota.accountIdentity === mainAccountId)
+        ? this.main
+        : undefined
     if (
       current &&
       current.checkedAt >= entry.checkedAt &&
@@ -486,29 +576,84 @@ export class QuotaManager {
     }
     if (
       this.main &&
-      this.main.checkedAt >= entry.checkedAt &&
-      this.mainAccountId === mainAccountId
+      this.mainAccountId === mainAccountId &&
+      this.main.checkedAt >= entry.checkedAt
     ) {
       return
     }
 
     this.main = entry
-    this.mainAccountId = mainAccountId
+    if (mainAccountId !== undefined) this.mainAccountId = mainAccountId
   }
 
   private seedMainBackoffFromStorage(storage: AccountStorage | null): void {
     const persistedError = storage?.quota?.mainLastQuotaApiError
     const persistedIdentity = persistedError?.accountIdentity
+    const persistedGeneration =
+      typeof storage?.quota?.mainQuotaErrorGeneration === 'number' &&
+      Number.isSafeInteger(storage.quota.mainQuotaErrorGeneration) &&
+      storage.quota.mainQuotaErrorGeneration >= 0
+        ? storage.quota.mainQuotaErrorGeneration
+        : undefined
+    const persistedClearedAt =
+      typeof storage?.quota?.mainQuotaErrorClearedAt === 'number' &&
+      Number.isFinite(storage.quota.mainQuotaErrorClearedAt) &&
+      storage.quota.mainQuotaErrorClearedAt >= 0
+        ? storage.quota.mainQuotaErrorClearedAt
+        : undefined
+    if (
+      persistedClearedAt !== undefined &&
+      (this.mainQuotaErrorClearedAt === undefined ||
+        persistedClearedAt > this.mainQuotaErrorClearedAt)
+    ) {
+      this.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+        this.mainQuotaErrorClearedAt,
+        persistedClearedAt,
+      )
+      if (
+        (!persistedError ||
+          (typeof persistedError.checkedAt === 'number' &&
+            persistedError.checkedAt <= persistedClearedAt)) &&
+        (this.mainLastApiError?.checkedAt === undefined ||
+          this.mainLastApiError.checkedAt <= persistedClearedAt)
+      ) {
+        this.mainLastApiError = undefined
+      }
+    }
+    if (
+      persistedGeneration !== undefined &&
+      persistedGeneration > this.mainQuotaErrorGeneration
+    ) {
+      this.mainQuotaErrorGeneration = persistedGeneration
+      if (
+        !persistedError &&
+        (this.mainLastApiError?.checkedAt === undefined ||
+          this.mainQuotaErrorClearedAt === undefined ||
+          this.mainLastApiError.checkedAt <= this.mainQuotaErrorClearedAt)
+      ) {
+        this.mainLastApiError = undefined
+      }
+    }
     if (
       persistedError &&
-      (persistedIdentity === undefined ||
+      (!this.mainQuotaIdentityKnown ||
+        persistedIdentity === undefined ||
         persistedIdentity === this.mainAccountId) &&
+      (this.mainQuotaErrorClearedAt === undefined ||
+        typeof persistedError.checkedAt !== 'number' ||
+        persistedError.checkedAt > this.mainQuotaErrorClearedAt) &&
+      (this.mainLastApiError?.checkedAt === undefined ||
+        persistedError.checkedAt >= this.mainLastApiError.checkedAt) &&
       quotaBackoffActive(persistedError, this.now())
     ) {
       this.mainLastApiError = persistedError
+      if (persistedGeneration !== undefined) {
+        this.mainQuotaErrorGeneration = persistedGeneration
+      }
       return
     }
     if (
+      this.mainAccountId !== undefined &&
       this.mainLastApiError?.accountIdentity !== undefined &&
       this.mainLastApiError.accountIdentity !== this.mainAccountId
     ) {
@@ -556,6 +701,8 @@ export class QuotaManager {
    * account — a fallback account's 429 never reports here.
    */
   isBackedOff(): boolean {
+    // Unlike cached numbers above, restrictions stay active while identity is
+    // ambiguous; only a confirmed account change may release an inherited guard.
     return quotaBackoffActive(this.mainLastApiError, this.now())
   }
 
@@ -570,8 +717,27 @@ export class QuotaManager {
     return this.mainLastApiError
   }
 
-  clearMainBackoff(): void {
+  getMainQuotaErrorGeneration(): number {
+    return this.mainQuotaErrorGeneration
+  }
+
+  getMainQuotaIdentityGeneration(): number {
+    return this.mainGeneration
+  }
+
+  getMainQuotaErrorClearedAt(): number | undefined {
+    return this.mainQuotaErrorClearedAt
+  }
+
+  clearMainBackoff(): number | undefined {
+    if (!this.mainLastApiError) return undefined
     this.mainLastApiError = undefined
+    this.mainQuotaErrorGeneration += 1
+    this.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+      this.mainQuotaErrorClearedAt,
+      this.now(),
+    )
+    return this.mainQuotaErrorGeneration
   }
 
   // =========================================================================
@@ -634,6 +800,7 @@ export class QuotaManager {
   private async _fetchMain(
     mainAccountId: string | undefined,
     accessToken: string,
+    generation: number,
   ): Promise<QuotaRefreshResult> {
     return this._enqueueApiFetch(async () => {
       try {
@@ -644,6 +811,16 @@ export class QuotaManager {
             return { quota: this.main.quota, fetched: false }
           }
           throw new Error('Quota API rate-limited — try again later')
+        }
+        if (
+          this.mainQuotaIdentityKnown &&
+          this.mainQuotaIdentityStrict &&
+          this.mainGeneration !== generation
+        ) {
+          return {
+            quota: { accountIdentity: mainAccountId },
+            fetched: false,
+          }
         }
         const fileLock = await acquireRefreshFileLock({
           name: 'opencode-main-quota-refresh',
@@ -668,8 +845,28 @@ export class QuotaManager {
             now: this.now,
           })
           const now = this.now()
+          if (
+            this.mainQuotaIdentityKnown &&
+            this.mainQuotaIdentityStrict &&
+            this.mainGeneration !== generation
+          ) {
+            return {
+              quota: {
+                ...quota,
+                ...(mainAccountId !== undefined && {
+                  accountIdentity: mainAccountId,
+                }),
+              },
+              fetched: true,
+            }
+          }
           const completedQuota = mergePollCompletionWithNewerHeaders(
-            this.mainAccountId === mainAccountId ? this.main?.quota : undefined,
+            this.mainAccountId === mainAccountId &&
+              (!this.mainQuotaIdentityKnown ||
+                !this.mainQuotaIdentityStrict ||
+                this.main?.quota.accountIdentity === mainAccountId)
+              ? this.main?.quota
+              : undefined,
             {
               ...quota,
               ...(mainAccountId !== undefined && {
@@ -687,16 +884,25 @@ export class QuotaManager {
             ),
             checkedAt: completedQuota.checkedAt ?? now,
           }
-          this.mainLastApiError = undefined
+          if (this.mainLastApiError) {
+            this.mainLastApiError = undefined
+            this.mainQuotaErrorGeneration += 1
+            this.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+              this.mainQuotaErrorClearedAt,
+              now,
+            )
+          }
           this.onMainQuotaFetched?.(
             completedQuota,
             now,
             tokenFingerprint(accessToken),
             fetchStartedAt,
+            this.mainQuotaErrorGeneration,
+            this.mainQuotaErrorClearedAt,
           )
           return { quota: completedQuota, fetched: true }
         } catch (error) {
-          this._handleMainFetchError(error)
+          this._handleMainFetchError(error, generation)
           throw error
         } finally {
           await fileLock.release()
@@ -791,7 +997,15 @@ export class QuotaManager {
   }
 
   /** Main quota failure: arms main-only backoff and persists via onApiError. */
-  private _handleMainFetchError(error: unknown): void {
+  private _handleMainFetchError(error: unknown, generation: number): void {
+    if (this.mainGeneration !== generation) return
+    if (
+      this.mainQuotaIdentityKnown &&
+      this.mainQuotaIdentityStrict &&
+      this.mainAccountId === undefined
+    ) {
+      return
+    }
     if (QuotaManager.isAuthError(error)) return
     this.mainLastApiError = buildQuotaOperationError({
       error,
@@ -799,7 +1013,8 @@ export class QuotaManager {
       accountIdentity: this.mainAccountId,
       previous: this.mainLastApiError,
     })
-    this.onApiError?.(this.mainLastApiError)
+    this.mainQuotaErrorGeneration += 1
+    this.onApiError?.(this.mainLastApiError, this.mainQuotaErrorGeneration)
   }
 
   /**

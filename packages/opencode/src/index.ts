@@ -97,6 +97,8 @@ import {
   log,
   logger,
   mergeAnthropicBetas,
+  mergeHeaderQuotaForPersistence,
+  mergeMainQuotaErrorClearedAt,
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -630,6 +632,15 @@ type StickyOAuthRoute = {
   account?: OAuthAccount
 }
 
+type MainQuotaIdentityBinding = {
+  accountIdentity: string | undefined
+  generation: number
+}
+
+type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
+  stale: boolean
+}
+
 const FABLE_SWITCHED_TO_OPUS_NOTICE =
   'Fable content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Fable cache warm.'
 const FABLE_RESTORED_NOTICE =
@@ -876,6 +887,8 @@ const anthropicAuthPlugin = async (
       checkedAt,
       tokenFingerprint,
       fetchStartedAt,
+      quotaErrorGeneration,
+      quotaErrorClearedAt,
     ) => {
       try {
         const storage =
@@ -887,7 +900,7 @@ const anthropicAuthPlugin = async (
           getQuotaNextRefreshAt(persisted.quota, storage, persisted.checkedAt) >
             Date.now()
         ) {
-          quotaManager.seedMainFromStorage(storage, mainAccountId)
+          quotaManager.seedMainFromStorage(storage, mainQuotaAccountId)
           return
         }
         storage.quota = storage.quota ?? {}
@@ -895,6 +908,11 @@ const anthropicAuthPlugin = async (
         storage.quota.mainQuotaCheckedAt = checkedAt
         storage.quota.mainQuotaToken = tokenFingerprint
         storage.quota.mainLastQuotaApiError = undefined
+        storage.quota.mainQuotaErrorGeneration = quotaErrorGeneration
+        storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+          storage.quota.mainQuotaErrorClearedAt,
+          quotaErrorClearedAt,
+        )
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (error) {
         logger.warn('quota', 'failed to persist main quota', {
@@ -902,12 +920,13 @@ const anthropicAuthPlugin = async (
         })
       }
     },
-    onApiError: async (error) => {
+    onApiError: async (error, quotaErrorGeneration) => {
       try {
         const storage =
           (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
         storage.quota = storage.quota ?? {}
         storage.quota.mainLastQuotaApiError = error
+        storage.quota.mainQuotaErrorGeneration = quotaErrorGeneration
         await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       } catch (e) {
         logger.warn('quota', 'failed to persist backoff state', {
@@ -916,6 +935,85 @@ const anthropicAuthPlugin = async (
       }
     },
   })
+
+  async function reconcileMainQuotaAccountIdentity(
+    accessToken: string,
+    accountIdentity: string | undefined,
+  ): Promise<void> {
+    if (
+      mainQuotaIdentityAccessToken === accessToken &&
+      mainQuotaAccountId === accountIdentity
+    ) {
+      return
+    }
+
+    mainQuotaIdentityAccessToken = accessToken
+    mainQuotaAccountId = accountIdentity
+    const clearedGeneration = quotaManager.setMainQuotaAccountIdentity(
+      accountIdentity,
+      accessToken.startsWith('sk-ant-oat'),
+    )
+    if (accountIdentity === undefined) return
+
+    const storage = await loadAccounts(accountStoragePath)
+    const persistedError = storage?.quota?.mainLastQuotaApiError
+    if (
+      !storage ||
+      !persistedError ||
+      persistedError.accountIdentity === accountIdentity ||
+      (!accessToken.startsWith('sk-ant-oat') &&
+        persistedError.accountIdentity === undefined)
+    ) {
+      return
+    }
+
+    storage.quota = storage.quota ?? {}
+    storage.quota.mainLastQuotaApiError = undefined
+    storage.quota.mainQuotaErrorGeneration = Math.max(
+      storage.quota.mainQuotaErrorGeneration ?? 0,
+      clearedGeneration ?? quotaManager.getMainQuotaErrorGeneration(),
+    )
+    storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+      storage.quota.mainQuotaErrorClearedAt,
+      quotaManager.getMainQuotaErrorClearedAt() ?? Date.now(),
+    )
+    await saveAccountState(storage, accountStoragePath, { mainQuota: true })
+  }
+
+  async function resolveMainQuotaAccountIdentity(
+    accessToken: string,
+    model?: string,
+  ): Promise<MainQuotaIdentityResolution> {
+    const resolutionGeneration = ++mainQuotaIdentityResolutionGeneration
+    const identity = await resolveClaudeCodeIdentity(
+      accessToken,
+      model,
+      mainAccountId,
+    )
+    // Adapters that do not use Claude's OAuth token format cannot be bootstrapped;
+    // keep the slot identity only for that compatibility path. Claude OAuth
+    // credentials use the oat prefix and stay unknown when bootstrap fails.
+    const quotaIdentity =
+      identity.accountUuid ??
+      (!accessToken.startsWith('sk-ant-oat') ? mainAccountId : undefined)
+    if (resolutionGeneration !== mainQuotaIdentityResolutionGeneration) {
+      const identityChanged =
+        mainQuotaIdentityAccessToken !== accessToken ||
+        mainQuotaAccountId !== quotaIdentity
+      return {
+        accountIdentity: quotaIdentity,
+        generation: quotaManager.getMainQuotaIdentityGeneration(),
+        stale: identityChanged,
+      }
+    }
+    await reconcileMainQuotaAccountIdentity(accessToken, quotaIdentity)
+    return {
+      accountIdentity: quotaIdentity,
+      generation: quotaManager.getMainQuotaIdentityGeneration(),
+      stale: false,
+    }
+  }
+
   const quotaHeaderFeedRegistry =
     initialStorage?.quotaHeaderFeed?.enabled === true
       ? new QuotaHeaderFeedRegistry()
@@ -1005,7 +1103,7 @@ const anthropicAuthPlugin = async (
       return storage
     }
     const now = Date.now()
-    const mainIdentity = mainAccountId
+    const mainIdentity = mainQuotaAccountId
     if (
       mainAccessToken &&
       storage.main?.profile &&
@@ -1106,33 +1204,54 @@ const anthropicAuthPlugin = async (
   const warnedQuotaNormalizeErrors = new Set<string>()
 
   async function persistPushedQuota(
-    served: { accountId: 'main' | string; accessToken: string },
+    served: {
+      accountId: 'main' | string
+      accessToken: string
+      mainQuotaIdentity?: MainQuotaIdentityBinding
+    },
     entry: QuotaEntry,
-  ) {
+  ): Promise<QuotaEntry | undefined> {
     const storage =
       (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
     if (served.accountId === 'main') {
-      if (!mainAccountId || entry.quota.accountIdentity !== mainAccountId) {
+      const accountIdentity = served.mainQuotaIdentity?.accountIdentity
+      if (!accountIdentity || entry.quota.accountIdentity !== accountIdentity) {
         logger.trace(
           'quota',
-          'skipped quota persistence without stable main identity',
+          'skipped quota persistence without verified main account identity',
         )
-        return
+        return undefined
       }
       storage.quota = storage.quota ?? {}
       storage.quota.mainQuota = {
         ...entry.quota,
-        accountIdentity: mainAccountId,
+        accountIdentity,
       }
       storage.quota.mainQuotaCheckedAt = entry.checkedAt
       await saveAccountState(storage, accountStoragePath, { mainQuota: true })
-      return
+      const reloaded = await loadAccounts(accountStoragePath)
+      const persistedQuota = reloaded?.quota?.mainQuota
+      const persistedQuotaBelongsToRequest = Boolean(
+        persistedQuota && persistedQuota.accountIdentity === accountIdentity,
+      )
+      const mergedQuota = persistedQuotaBelongsToRequest
+        ? mergeHeaderQuotaForPersistence(persistedQuota, entry.quota)
+        : entry.quota
+      return persistedQuota
+        ? {
+            ...entry,
+            quota: mergedQuota,
+            checkedAt: persistedQuotaBelongsToRequest
+              ? (reloaded.quota?.mainQuotaCheckedAt ?? entry.checkedAt)
+              : entry.checkedAt,
+          }
+        : entry
     }
     const account = storage.accounts.find(
       (candidate): candidate is OAuthAccount =>
         candidate.id === served.accountId && isOAuthAccount(candidate),
     )
-    if (!account) return
+    if (!account) return undefined
     account.quota = {
       ...entry.quota,
       accountIdentity: account.id,
@@ -1140,6 +1259,7 @@ const anthropicAuthPlugin = async (
     await saveAccountState(storage, accountStoragePath, {
       accounts: [served.accountId],
     })
+    return entry
   }
 
   function logPersistFailure(error: unknown) {
@@ -1174,10 +1294,21 @@ const anthropicAuthPlugin = async (
   }
 
   async function publishQuotaHeaderFeed(
-    served: { accountId: 'main' | string; accessToken: string },
+    served: {
+      accountId: 'main' | string
+      accessToken: string
+      mainQuotaIdentity?: MainQuotaIdentityBinding
+    },
     entry: QuotaEntry,
   ): Promise<void> {
     if (!quotaHeaderFeedRegistry) return
+    if (
+      served.accountId === 'main' &&
+      !served.mainQuotaIdentity?.accountIdentity
+    ) {
+      // Observed-at staleness exposes silence; an unknown key must not replace verified data.
+      return
+    }
     const storage =
       (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
     const mainAuth = await latestGetAuth?.()
@@ -1205,7 +1336,7 @@ const anthropicAuthPlugin = async (
     const accountKey =
       credentialId ??
       (served.accountId === 'main'
-        ? (mainAccountId ?? 'main')
+        ? (served.mainQuotaIdentity?.accountIdentity ?? 'main')
         : served.accountId)
     const feedEntry: QuotaHeaderFeedEntry & { accountKey: string } =
       credentialId
@@ -1219,10 +1350,11 @@ const anthropicAuthPlugin = async (
             quota,
             accountKey,
           }
-        : served.accountId === 'main' && mainAccountId
+        : served.accountId === 'main' &&
+            served.mainQuotaIdentity?.accountIdentity
           ? {
               identity_source: 'account_ref',
-              account_ref: mainAccountId,
+              account_ref: served.mainQuotaIdentity.accountIdentity,
               schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
@@ -1265,6 +1397,7 @@ const anthropicAuthPlugin = async (
       accountId: 'main' | string
       accessToken: string
       authLineageId?: string
+      mainQuotaIdentity?: MainQuotaIdentityBinding
     },
   ): void {
     try {
@@ -1275,16 +1408,39 @@ const anthropicAuthPlugin = async (
         return
       }
       const incoming = normalizeQuotaHeaders(headers)
+      const mainQuotaIdentity =
+        served.accountId === 'main' ? served.mainQuotaIdentity : undefined
+      if (served.accountId === 'main') {
+        if (
+          !mainQuotaIdentity ||
+          quotaManager.getMainQuotaIdentityGeneration() !==
+            mainQuotaIdentity.generation
+        ) {
+          logger.trace('quota', 'discarded stale main quota headers', {
+            boundIdentity: mainQuotaIdentity?.accountIdentity,
+            currentGeneration: quotaManager.getMainQuotaIdentityGeneration(),
+          })
+          return
+        }
+      }
       const entry =
         served.accountId === 'main'
-          ? quotaManager.pushMainFromHeaders(mainAccountId, incoming)
+          ? quotaManager.pushMainFromHeaders(
+              mainQuotaIdentity?.accountIdentity,
+              incoming,
+            )
           : quotaManager.pushFallbackFromHeaders(served.accountId, incoming, {
               authLineageId: served.authLineageId,
             })
-      void persistPushedQuota(served, entry).catch(logPersistFailure)
-      void publishQuotaHeaderFeed(served, entry).catch(
-        logQuotaHeaderFeedFailure,
-      )
+      void (async () => {
+        let feedEntry = entry
+        try {
+          feedEntry = (await persistPushedQuota(served, entry)) ?? entry
+        } catch (error) {
+          logPersistFailure(error)
+        }
+        await publishQuotaHeaderFeed(served, feedEntry)
+      })().catch(logQuotaHeaderFeedFailure)
       void refreshSidebarQuota().catch(() => {})
       logger.debug('quota', 'harvested response quota', {
         account: served.accountId,
@@ -1701,8 +1857,9 @@ const anthropicAuthPlugin = async (
 
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
     const accessToken = await getCurrentMainAccessToken()
+    await resolveMainQuotaAccountIdentity(accessToken)
     const result = await quotaManager.refreshMainWithMetadata(
-      mainAccountId,
+      mainQuotaAccountId,
       accessToken,
     )
     return { quota: result.quota, fresh: result.fetched }
@@ -2075,11 +2232,11 @@ const anthropicAuthPlugin = async (
     options: SidebarStateInput,
   ): SidebarState {
     quotaManager.updateStorage(storage)
-    quotaManager.seedMainFromStorage(storage, mainAccountId)
+    quotaManager.seedMainFromStorage(storage, mainQuotaAccountId)
     quotaManager.seedFallbacksFromAccounts(
       (storage?.accounts ?? []).filter(isOAuthAccount),
     )
-    const mainEntry = quotaManager.getMain(mainAccountId)
+    const mainEntry = quotaManager.getMain(mainQuotaAccountId)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
     return {
@@ -2239,15 +2396,18 @@ const anthropicAuthPlugin = async (
   function scheduleSidebarMainQuotaRefresh(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     accessToken: string | undefined,
+    mainQuotaIdentity?: MainQuotaIdentityBinding,
   ) {
     if (!accessToken) return
     if (storage?.quota?.enabled !== true) return
-    if (quotaManager.getMain(mainAccountId)) return
+    const accountIdentity =
+      mainQuotaIdentity?.accountIdentity ?? mainQuotaAccountId
+    if (quotaManager.getMain(accountIdentity)) return
     if (sidebarMainQuotaRefreshInFlight) return
 
     sidebarMainQuotaRefreshInFlight = true
     void quotaManager
-      .refreshMain(mainAccountId, accessToken)
+      .refreshMain(accountIdentity, accessToken, mainQuotaIdentity?.generation)
       .then(() => refreshSidebarQuota())
       .catch(() => {})
       .finally(() => {
@@ -2264,6 +2424,9 @@ const anthropicAuthPlugin = async (
       }>)
     | null = null
   let mainAccountId: string | undefined
+  let mainQuotaAccountId: string | undefined
+  let mainQuotaIdentityAccessToken: string | undefined
+  let mainQuotaIdentityResolutionGeneration = 0
   let sidebarMainQuotaRefreshInFlight = false
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
   // Per-process counter of replayable model requests. Drives the every-N
@@ -2293,19 +2456,27 @@ const anthropicAuthPlugin = async (
     if (!error.accountIdentity || error.accountIdentity === accountIdentity)
       return
     storage.refresh.mainLastRefreshError = undefined
-    const quotaError = storage.quota?.mainLastQuotaApiError
-    if (
-      storage.quota &&
-      quotaError &&
-      (!quotaError.accountIdentity ||
-        quotaError.accountIdentity !== accountIdentity)
-    ) {
-      storage.quota.mainLastQuotaApiError = undefined
-      quotaManager.clearMainBackoff()
+    if (!mainQuotaIdentityAccessToken?.startsWith('sk-ant-oat')) {
+      const quotaError = storage.quota?.mainLastQuotaApiError
+      if (quotaError && quotaError.accountIdentity !== mainQuotaAccountId) {
+        const clearedGeneration = quotaManager.clearMainBackoff()
+        storage.quota = storage.quota ?? {}
+        storage.quota.mainLastQuotaApiError = undefined
+        storage.quota.mainQuotaErrorGeneration = Math.max(
+          storage.quota.mainQuotaErrorGeneration ?? 0,
+          clearedGeneration ?? quotaManager.getMainQuotaErrorGeneration(),
+        )
+        storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+          storage.quota.mainQuotaErrorClearedAt,
+          quotaManager.getMainQuotaErrorClearedAt() ?? Date.now(),
+        )
+      }
     }
     await saveAccountState(storage, accountStoragePath, {
       mainRefresh: true,
-      mainQuota: true,
+      ...(!mainQuotaIdentityAccessToken?.startsWith('sk-ant-oat') && {
+        mainQuota: true,
+      }),
     })
     log(
       '[refresh] opencode main oauth cleared stale backoff after token rotation',
@@ -2325,11 +2496,12 @@ const anthropicAuthPlugin = async (
         const auth = await latestGetAuth()
         if (auth.type === 'oauth' && auth.access) {
           mainAccessToken = auth.access
+          await resolveMainQuotaAccountIdentity(auth.access)
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
           // returns the last cached snapshot when the API is backed off.
           const quota = await quotaManager.refreshMain(
-            mainAccountId,
+            mainQuotaAccountId,
             auth.access,
           )
           accounts.push({
@@ -3578,6 +3750,9 @@ const anthropicAuthPlugin = async (
         const auth = await getAuth()
         if (auth.type === 'oauth') {
           mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
+          if (auth.access) {
+            await resolveMainQuotaAccountIdentity(auth.access)
+          }
           async function refreshMainAccessToken(rejectedAccess?: string) {
             if (rejectedAccess) {
               const currentAuth = await getAuth()
@@ -4325,6 +4500,7 @@ const anthropicAuthPlugin = async (
             fallbackAuthLineageId?: string,
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
+            mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
             const start = nowMs()
             let requestStorage = currentStorage
@@ -4592,6 +4768,9 @@ const anthropicAuthPlugin = async (
               accountId: oauthAccountId,
               accessToken,
               authLineageId: fallbackAuthLineageId,
+              ...(oauthAccountId === 'main' && mainQuotaIdentity
+                ? { mainQuotaIdentity }
+                : {}),
             }
             const sendStart = nowMs()
             const response = await sendViaRelay({
@@ -4669,9 +4848,14 @@ const anthropicAuthPlugin = async (
             return response.status === 429 || streamingRateLimited
           }
 
-          function mainQuotaEntryIsFreshExhausted(accessToken?: string) {
+          function mainQuotaEntryIsFreshExhausted(
+            accessToken?: string,
+            mainQuotaIdentity?: MainQuotaIdentityBinding,
+          ) {
             if (!accessToken) return false
-            const entry = quotaManager.getMain(mainAccountId)
+            const entry = quotaManager.getMain(
+              mainQuotaIdentity?.accountIdentity ?? mainQuotaAccountId,
+            )
             // A genuine response header is live routing evidence like a 429, but
             // it gets no exemption from the shared freshness and token gates.
             return Boolean(
@@ -4683,11 +4867,19 @@ const anthropicAuthPlugin = async (
 
           async function refreshMainQuotaConfirmsExhausted(
             accessToken?: string,
+            mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
             if (!accessToken) return false
             try {
-              await quotaManager.refreshMain(mainAccountId, accessToken)
-              return mainQuotaEntryIsFreshExhausted(accessToken)
+              await quotaManager.refreshMain(
+                mainQuotaIdentity?.accountIdentity ?? mainQuotaAccountId,
+                accessToken,
+                mainQuotaIdentity?.generation,
+              )
+              return mainQuotaEntryIsFreshExhausted(
+                accessToken,
+                mainQuotaIdentity,
+              )
             } catch {
               return false
             }
@@ -4753,8 +4945,10 @@ const anthropicAuthPlugin = async (
             storage: AccountStorage | null
             mainAccessToken: string
             requestedModelId?: string
+            mainQuotaIdentity?: MainQuotaIdentityBinding
           }) {
-            const mainEntry = quotaManager.getMain(mainAccountId)
+            const mainQuotaIdentity = input.mainQuotaIdentity?.accountIdentity
+            const mainEntry = quotaManager.getMain(mainQuotaIdentity)
             let mainQuota = mainEntry?.quota
             if (
               !stickyQuotaSnapshotIsFresh(
@@ -4766,8 +4960,9 @@ const anthropicAuthPlugin = async (
             ) {
               try {
                 mainQuota = await quotaManager.refreshMain(
-                  mainAccountId,
+                  mainQuotaIdentity,
                   input.mainAccessToken,
+                  input.mainQuotaIdentity?.generation,
                 )
               } catch {}
             }
@@ -5064,6 +5259,7 @@ const anthropicAuthPlugin = async (
             modelId?: string,
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
+            mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
             if (!isReplayableRequest(input, init?.body)) return mainResponse
 
@@ -5113,8 +5309,10 @@ const anthropicAuthPlugin = async (
             if (preselectedAccounts) {
               includeApiRoutes = preselectedAccounts.some(isApiKeyAccount)
             } else if (mainQuotaExhaustedByResponse) {
-              includeApiRoutes =
-                await refreshMainQuotaConfirmsExhausted(mainAccessToken)
+              includeApiRoutes = await refreshMainQuotaConfirmsExhausted(
+                mainAccessToken,
+                mainQuotaIdentity,
+              )
             }
 
             let accounts = preselectedAccounts
@@ -5396,12 +5594,25 @@ const anthropicAuthPlugin = async (
                 trace.done('non_oauth_passthrough', { status: response.status })
                 return response
               }
+              let requestMainQuotaIdentity: MainQuotaIdentityBinding | undefined
+              if (auth.access) {
+                const resolution = await resolveMainQuotaAccountIdentity(
+                  auth.access,
+                  parseRequestModel(init?.body),
+                )
+                if (resolution.stale) {
+                  throw new Error(
+                    'Main OAuth identity changed while resolving request credentials',
+                  )
+                }
+                requestMainQuotaIdentity = resolution
+              }
               await clearStaleMainRefreshError(mainAccountId)
               const loadStart = nowMs()
               const storage = await loadAccounts()
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
               quotaManager.updateStorage(storage)
-              quotaManager.seedMainFromStorage(storage, mainAccountId)
+              quotaManager.seedMainFromStorage(storage, mainQuotaAccountId)
               quotaManager.seedFallbacksFromAccounts(
                 (storage?.accounts ?? []).filter(isOAuthAccount),
               )
@@ -5429,7 +5640,11 @@ const anthropicAuthPlugin = async (
                 auth.access &&
                 (!auth.expires || auth.expires > Date.now())
               ) {
-                scheduleSidebarMainQuotaRefresh(storage, auth.access)
+                scheduleSidebarMainQuotaRefresh(
+                  storage,
+                  auth.access,
+                  requestMainQuotaIdentity,
+                )
               }
               const writeCurrentSidebarState = (
                 activeId: string | undefined,
@@ -5467,6 +5682,7 @@ const anthropicAuthPlugin = async (
                     storage,
                     mainAccessToken: auth.access,
                     requestedModelId: routingModelId,
+                    mainQuotaIdentity: requestMainQuotaIdentity,
                   })
                   const resolveRoute = (excludeAccountIds?: Set<string>) =>
                     stickySessionRouter.resolve({
@@ -5552,6 +5768,9 @@ const anthropicAuthPlugin = async (
                         selected.account?.authLineageId,
                         fableRequest,
                         laneStartRequest,
+                        selected.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                          ? requestMainQuotaIdentity
+                          : undefined,
                       )
                     const completeRoute = async (
                       selected: StickyOAuthRoute,
@@ -5696,8 +5915,9 @@ const anthropicAuthPlugin = async (
                         quota =
                           route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                             ? await quotaManager.refreshMain(
-                                mainAccountId,
+                                requestMainQuotaIdentity?.accountIdentity,
                                 route.access,
+                                requestMainQuotaIdentity?.generation,
                               )
                             : await quotaManager.refreshFallback(
                                 route.id,
@@ -5739,6 +5959,7 @@ const anthropicAuthPlugin = async (
                         storage: stickyRoutes.storage,
                         mainAccessToken: auth.access,
                         requestedModelId: routingModelId,
+                        mainQuotaIdentity: requestMainQuotaIdentity,
                       })
                       const alternatives = stickyRoutes.candidates.filter(
                         (candidate) => candidate.accountId !== failedRouteId,
@@ -5764,7 +5985,10 @@ const anthropicAuthPlugin = async (
                       } else if (
                         (inspected.response.status === 429 ||
                           inspected.streamingRateLimit) &&
-                        mainQuotaEntryIsFreshExhausted(auth.access)
+                        mainQuotaEntryIsFreshExhausted(
+                          auth.access,
+                          requestMainQuotaIdentity,
+                        )
                       ) {
                         const apiAccounts = (
                           await getRoutableFallbackAccounts(
@@ -5830,6 +6054,7 @@ const anthropicAuthPlugin = async (
                     await getRoutableFallbackAccounts(storage, {
                       includeApiRoutes: mainQuotaEntryIsFreshExhausted(
                         auth.access,
+                        requestMainQuotaIdentity,
                       ),
                       modelId: requestModelId,
                     })
@@ -5919,7 +6144,9 @@ const anthropicAuthPlugin = async (
               /** Show quota toast from current QuotaManager state. */
               function showQuotaToastFromCache() {
                 if (storage?.quota?.showToasts !== true) return
-                const mainEntry = quotaManager.getMain(mainAccountId)
+                const mainEntry = quotaManager.getMain(
+                  requestMainQuotaIdentity?.accountIdentity,
+                )
                 if (!mainEntry) return
                 // Prefer the shared QuotaManager cache for fallback quota so the
                 // toast matches the sidebar and reflects background refreshes
@@ -5958,14 +6185,19 @@ const anthropicAuthPlugin = async (
                   const quotaStart = nowMs()
                   // Identity-aware read prevents routing with a previous main
                   // account's quota after a slot switch.
-                  let routingQuotaEntry = quotaManager.getMain(mainAccountId)
+                  let routingQuotaEntry = quotaManager.getMain(
+                    requestMainQuotaIdentity?.accountIdentity,
+                  )
                   let routingQuota = routingQuotaEntry?.quota
                   if (!routingQuota) {
                     routingQuota = await quotaManager.refreshMain(
-                      mainAccountId,
+                      requestMainQuotaIdentity?.accountIdentity,
                       auth.access,
+                      requestMainQuotaIdentity?.generation,
                     )
-                    routingQuotaEntry = quotaManager.getMain(mainAccountId)
+                    routingQuotaEntry = quotaManager.getMain(
+                      requestMainQuotaIdentity?.accountIdentity,
+                    )
                     showQuotaToastFromCache()
                   } else if (
                     quotaManager.needsRefresh(
@@ -5987,16 +6219,23 @@ const anthropicAuthPlugin = async (
                       // below still refuses API-key routes because the entry is not
                       // fresh.
                       routingQuota = await quotaManager.refreshMain(
-                        mainAccountId,
+                        requestMainQuotaIdentity?.accountIdentity,
                         auth.access,
+                        requestMainQuotaIdentity?.generation,
                       )
-                      routingQuotaEntry = quotaManager.getMain(mainAccountId)
+                      routingQuotaEntry = quotaManager.getMain(
+                        requestMainQuotaIdentity?.accountIdentity,
+                      )
                     } else {
                       // Stale OR every-N request boundary — background refresh,
                       // return current snapshot to avoid blocking. Refresh the
                       // sidebar and show the toast once the new main quota lands.
                       void quotaManager
-                        .refreshMain(mainAccountId, auth.access)
+                        .refreshMain(
+                          requestMainQuotaIdentity?.accountIdentity,
+                          auth.access,
+                          requestMainQuotaIdentity?.generation,
+                        )
                         .then(() => {
                           void refreshSidebarQuota().catch(() => {})
                           showQuotaToastFromCache()
@@ -6068,7 +6307,9 @@ const anthropicAuthPlugin = async (
                 }
               }
 
-              let mainQuota = quotaManager.getMain(mainAccountId)?.quota
+              let mainQuota = quotaManager.getMain(
+                requestMainQuotaIdentity?.accountIdentity,
+              )?.quota
               if (
                 storage?.quota?.failClosedOnUnknownQuota &&
                 !mainQuota &&
@@ -6120,7 +6361,11 @@ const anthropicAuthPlugin = async (
                         Boolean(a.access),
                     )
                     await Promise.all([
-                      quotaManager.refreshMain(mainAccountId, auth.access),
+                      quotaManager.refreshMain(
+                        requestMainQuotaIdentity?.accountIdentity,
+                        auth.access,
+                        requestMainQuotaIdentity?.generation,
+                      ),
                       quotaManager.refreshAllFallbacks(fallbackAccts),
                     ])
                   } catch (error) {
@@ -6134,7 +6379,9 @@ const anthropicAuthPlugin = async (
                 // Re-read after the eager refresh so the killswitch evaluates
                 // against fresh quota. The initial read above is null on the
                 // first request, before the refresh populates the cache.
-                mainQuota = quotaManager.getMain(mainAccountId)?.quota
+                mainQuota = quotaManager.getMain(
+                  requestMainQuotaIdentity?.accountIdentity,
+                )?.quota
               }
 
               if (
@@ -6261,6 +6508,7 @@ const anthropicAuthPlugin = async (
                 undefined,
                 fableRequest,
                 laneStartRequest,
+                requestMainQuotaIdentity,
               )
               let fallbackServed = false
               const response = await tryFallbackAccounts(
@@ -6278,6 +6526,7 @@ const anthropicAuthPlugin = async (
                 requestModelId,
                 fableRequest,
                 laneStartRequest,
+                requestMainQuotaIdentity,
               )
               if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 

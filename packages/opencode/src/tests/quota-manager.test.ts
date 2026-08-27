@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  type AccountStorage,
   acquireRefreshFileLock,
   type OAuthQuotaSnapshot,
   QuotaManager,
@@ -50,6 +51,68 @@ describe('QuotaManager', () => {
     })
   }
 
+  test('reload keeps a newer in-memory backoff than a persisted clear', () => {
+    const localError = {
+      message: 'newer local quota error',
+      checkedAt: 2_000,
+      nextRetryAt: 2_000_000,
+      retryCount: 1,
+      accountIdentity: 'account-a',
+    }
+    const qm = new QuotaManager({
+      storage: {
+        quota: {
+          mainLastQuotaApiError: localError,
+          mainQuotaErrorGeneration: 1,
+          mainQuotaErrorClearedAt: 1_000,
+        },
+      } as AccountStorage,
+      now: () => now,
+    })
+
+    qm.updateStorage({
+      quota: {
+        mainLastQuotaApiError: undefined,
+        mainQuotaErrorGeneration: 2,
+        mainQuotaErrorClearedAt: 1_500,
+      },
+    } as AccountStorage)
+
+    expect(qm.isBackedOff()).toBe(true)
+    expect(qm.getLastApiError()?.checkedAt).toBe(2_000)
+  })
+
+  test('reload clear marker cannot clear a newer error at the same generation', () => {
+    const localError = {
+      message: 'newer local quota error',
+      checkedAt: 2_000,
+      nextRetryAt: 2_000_000,
+      retryCount: 1,
+      accountIdentity: 'account-a',
+    }
+    const qm = new QuotaManager({
+      storage: {
+        quota: {
+          mainLastQuotaApiError: localError,
+          mainQuotaErrorGeneration: 2,
+          mainQuotaErrorClearedAt: 1_000,
+        },
+      } as AccountStorage,
+      now: () => now,
+    })
+
+    qm.updateStorage({
+      quota: {
+        mainLastQuotaApiError: undefined,
+        mainQuotaErrorGeneration: 2,
+        mainQuotaErrorClearedAt: 1_500,
+      },
+    } as AccountStorage)
+
+    expect(qm.isBackedOff()).toBe(true)
+    expect(qm.getLastApiError()?.checkedAt).toBe(2_000)
+  })
+
   describe('model-scoped staleness', () => {
     test('treats a stale matching Fable window as stale even when standard windows are fresh', () => {
       const qm = createQM()
@@ -94,6 +157,46 @@ describe('QuotaManager', () => {
   })
 
   describe('cross-process quota locks', () => {
+    test('a confirmed main retarget cannot return the previous account cache on lock collision', async () => {
+      const lock = await acquireRefreshFileLock({
+        name: 'opencode-main-quota-refresh',
+        ttlMs: 30_000,
+      })
+      expect(lock).not.toBeNull()
+
+      const qm = createQM()
+      qm.setMain('account-a', {
+        quota: { accountIdentity: 'account-a', checkedAt: now },
+        refreshAfter: now + 60_000,
+        checkedAt: now,
+      })
+      qm.setMainQuotaAccountIdentity('account-b')
+
+      await expect(
+        qm.refreshMain('account-b', 'account-b-token'),
+      ).rejects.toThrow('Quota refresh is already in progress')
+      expect(qm.getMain('account-b')).toBeNull()
+
+      await lock?.release()
+    })
+
+    test('a request-bound refresh cannot retarget after the main identity changes', async () => {
+      let apiCalls = 0
+      const qm = createQM((async () => {
+        apiCalls += 1
+        return new Response('{}', { status: 200 })
+      }) as unknown as typeof fetch)
+      qm.setMainQuotaAccountIdentity('account-a')
+      const requestGeneration = qm.getMainQuotaIdentityGeneration()
+      qm.setMainQuotaAccountIdentity('account-b')
+
+      await expect(
+        qm.refreshMain('account-a', 'account-a-token', requestGeneration),
+      ).rejects.toThrow('Main quota identity changed before refresh')
+      expect(apiCalls).toBe(0)
+      expect(qm.getMain('account-b')).toBeNull()
+    })
+
     test('fallback quota refresh does not call the API while another process holds the account lock', async () => {
       const lock = await acquireRefreshFileLock({
         name: 'opencode-fallback-quota-refresh-fallback-1',

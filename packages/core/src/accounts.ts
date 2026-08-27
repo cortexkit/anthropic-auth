@@ -237,6 +237,12 @@ export type AccountStorage = {
     // seeding a different account's persisted quota after a main-account switch.
     mainQuotaToken?: string
     mainLastQuotaApiError?: AccountOperationError
+    // Monotonic transition marker. Unlike an absent error, a newer marker is an
+    // affirmative cross-process clear that stale writers must not resurrect.
+    mainQuotaErrorGeneration?: number
+    // Observation time for the clear; rejects errors observed before it even
+    // when a separate process allocated an equal or higher generation.
+    mainQuotaErrorClearedAt?: number
   }
   quotaHeaderFeed?: {
     enabled?: boolean
@@ -325,6 +331,8 @@ export type AccountRuntimeState = {
     quotaCheckedAt?: number
     quotaToken?: string
     lastQuotaApiError?: AccountOperationError
+    quotaErrorGeneration?: number
+    quotaErrorClearedAt?: number
     lastRefreshError?: AccountOperationError
     refreshLeaseId?: string
     refreshLeaseUntil?: number
@@ -836,6 +844,16 @@ function numericField(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
+// A clear is a monotonic tombstone; older or absent writes must not reopen backoff.
+export function mergeMainQuotaErrorClearedAt(
+  existing: number | undefined,
+  incoming: number | undefined,
+): number | undefined {
+  if (incoming === undefined || !Number.isFinite(incoming)) return existing
+  if (existing === undefined || !Number.isFinite(existing)) return incoming
+  return Math.max(existing, incoming)
+}
+
 function accountCredentialTimestamp(value: Record<string, unknown>): number {
   return Math.max(
     numericField(value.lastRefreshedAt),
@@ -898,6 +916,21 @@ function mergeConfigAndState(
   const refreshConfig = isRecord(configValue.refresh) ? configValue.refresh : {}
   const mainQuotaSource = mainState ?? quotaConfig
   const mainRefreshSource = mainState ?? refreshConfig
+  const mainQuotaErrorClearedAt =
+    typeof mainState?.quotaErrorClearedAt === 'number' &&
+    Number.isFinite(mainState.quotaErrorClearedAt) &&
+    mainState.quotaErrorClearedAt >= 0
+      ? mainState.quotaErrorClearedAt
+      : undefined
+  const configQuotaError = quotaConfig.mainLastQuotaApiError
+  const mainLastQuotaApiError =
+    mainState?.lastQuotaApiError ??
+    (mainQuotaErrorClearedAt !== undefined &&
+    isRecord(configQuotaError) &&
+    typeof configQuotaError.checkedAt === 'number' &&
+    configQuotaError.checkedAt <= mainQuotaErrorClearedAt
+      ? undefined
+      : configQuotaError)
 
   const accounts = Array.isArray(configValue.accounts)
     ? configValue.accounts.map((account) => {
@@ -929,7 +962,9 @@ function mergeConfigAndState(
       mainQuota: mainQuotaSource.quota,
       mainQuotaCheckedAt: mainQuotaSource.quotaCheckedAt,
       mainQuotaToken: mainQuotaSource.quotaToken,
-      mainLastQuotaApiError: mainQuotaSource.lastQuotaApiError,
+      mainLastQuotaApiError,
+      mainQuotaErrorGeneration: mainQuotaSource.quotaErrorGeneration,
+      mainQuotaErrorClearedAt: mainQuotaSource.quotaErrorClearedAt,
     }),
     // Carry the main-side prime counters from the state file back into the
     // merged storage so a subsequent read sees the cumulative counters. The
@@ -1083,7 +1118,7 @@ function mergeHeaderOwnedWindow(
     : incoming
 }
 
-function mergeHeaderQuotaForPersistence(
+export function mergeHeaderQuotaForPersistence(
   existing: OAuthQuotaSnapshot | undefined,
   incoming: OAuthQuotaSnapshot,
 ) {
@@ -1466,6 +1501,99 @@ function applyMainQuotaStatePatch(
   storage: AccountStorage,
 ) {
   state.main = state.main ?? {}
+  const incomingError = storage.quota?.mainLastQuotaApiError
+  const incomingGeneration =
+    typeof storage.quota?.mainQuotaErrorGeneration === 'number' &&
+    Number.isSafeInteger(storage.quota.mainQuotaErrorGeneration) &&
+    storage.quota.mainQuotaErrorGeneration >= 0
+      ? storage.quota.mainQuotaErrorGeneration
+      : undefined
+  const incomingClearedAt =
+    typeof storage.quota?.mainQuotaErrorClearedAt === 'number' &&
+    Number.isFinite(storage.quota.mainQuotaErrorClearedAt) &&
+    storage.quota.mainQuotaErrorClearedAt >= 0
+      ? storage.quota.mainQuotaErrorClearedAt
+      : undefined
+  const existingGeneration =
+    typeof state.main.quotaErrorGeneration === 'number' &&
+    Number.isSafeInteger(state.main.quotaErrorGeneration) &&
+    state.main.quotaErrorGeneration >= 0
+      ? state.main.quotaErrorGeneration
+      : 0
+  const existingErrorObservedAt =
+    typeof state.main.lastQuotaApiError?.checkedAt === 'number' &&
+    Number.isFinite(state.main.lastQuotaApiError.checkedAt) &&
+    state.main.lastQuotaApiError.checkedAt >= 0
+      ? state.main.lastQuotaApiError.checkedAt
+      : undefined
+  const existingClearedAt =
+    typeof state.main.quotaErrorClearedAt === 'number' &&
+    Number.isFinite(state.main.quotaErrorClearedAt) &&
+    state.main.quotaErrorClearedAt >= 0
+      ? state.main.quotaErrorClearedAt
+      : undefined
+  const existingObservedAt = Math.max(
+    existingErrorObservedAt ?? 0,
+    existingClearedAt ?? 0,
+  )
+  const incomingErrorObservedAt =
+    typeof incomingError?.checkedAt === 'number' &&
+    Number.isFinite(incomingError.checkedAt) &&
+    incomingError.checkedAt >= 0
+      ? incomingError.checkedAt
+      : undefined
+
+  // Error transitions are ordered by observation time, not write order. All
+  // instances share one host clock, so an error observed before a clear cannot
+  // resurrect that clear even when both processes allocated the same generation.
+  if (
+    incomingError === undefined &&
+    incomingClearedAt !== undefined &&
+    incomingClearedAt >= existingObservedAt
+  ) {
+    state.main.lastQuotaApiError = undefined
+    state.main.quotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+      existingClearedAt,
+      incomingClearedAt,
+    )
+    if (
+      incomingGeneration !== undefined &&
+      incomingGeneration >= existingGeneration
+    ) {
+      state.main.quotaErrorGeneration = incomingGeneration
+    }
+  } else if (incomingError) {
+    const acceptsByObservation =
+      incomingErrorObservedAt !== undefined &&
+      incomingErrorObservedAt > existingObservedAt
+    const acceptsEqualObservation =
+      incomingErrorObservedAt !== undefined &&
+      incomingErrorObservedAt === existingObservedAt &&
+      existingErrorObservedAt !== undefined &&
+      existingClearedAt === undefined &&
+      incomingGeneration !== undefined &&
+      incomingGeneration >= existingGeneration
+    const acceptsLegacyGeneration =
+      incomingErrorObservedAt === undefined &&
+      incomingClearedAt === undefined &&
+      incomingGeneration !== undefined &&
+      incomingGeneration >= existingGeneration &&
+      existingClearedAt === undefined
+    if (
+      acceptsByObservation ||
+      acceptsEqualObservation ||
+      acceptsLegacyGeneration
+    ) {
+      state.main.lastQuotaApiError = incomingError
+      if (incomingGeneration !== undefined) {
+        state.main.quotaErrorGeneration = Math.max(
+          existingGeneration,
+          incomingGeneration,
+        )
+      }
+    }
+  }
+
   const incomingQuota = storage.quota?.mainQuota
   const sameToken = Boolean(
     state.main.quotaToken &&
@@ -1502,7 +1630,6 @@ function applyMainQuotaStatePatch(
     ? Math.max(existingCheckedAt, incomingCheckedAt)
     : storage.quota?.mainQuotaCheckedAt
   state.main.quotaToken = storage.quota?.mainQuotaToken
-  state.main.lastQuotaApiError = storage.quota?.mainLastQuotaApiError
 }
 
 function applyMainRefreshStatePatch(

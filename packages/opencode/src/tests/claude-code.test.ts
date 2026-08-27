@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
@@ -7,6 +7,7 @@ import {
   getClaudeCodeIdentity,
   orderClaudeCodeBody,
   REQUIRED_BETAS,
+  resetClaudeCodeIdentityCachesForTest,
   resolveClaudeCodeIdentity,
   selectClaudeCodeBetas,
 } from '@cortexkit/anthropic-auth-core'
@@ -14,8 +15,69 @@ import {
 describe('Claude Code fingerprint helpers', () => {
   const originalFetch = globalThis.fetch
 
+  beforeEach(() => {
+    resetClaudeCodeIdentityCachesForTest()
+  })
+
   afterEach(() => {
     globalThis.fetch = originalFetch
+  })
+
+  test('compare-and-clear prevents a negative bootstrap from leaking a slot UUID', async () => {
+    globalThis.fetch = mock((_input: any, init: RequestInit = {}) => {
+      const authorization = new Headers(init.headers).get('authorization')
+      return Promise.resolve(
+        authorization?.includes('sk-ant-oat-isolation-seed')
+          ? Response.json({ oauth_account: { account_uuid: 'uuid-isolation' } })
+          : Response.json({}),
+      )
+    }) as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-seed',
+      undefined,
+      'isolation-main',
+    )
+    expect(first.accountUuid).toBe('uuid-isolation')
+
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-next',
+      undefined,
+      'isolation-main',
+    )
+    // This assertion pins the production compare-and-clear against the seeded UUID.
+    expect(second.accountUuid).toBeUndefined()
+
+    // No reset runs between these resolves, so the slot device identity remains stable.
+    expect(second.deviceId).toBe(first.deviceId)
+  })
+
+  test('explicit identity-cache reset clears a slot device identity', async () => {
+    globalThis.fetch = mock((_input: any, init: RequestInit = {}) => {
+      const authorization = new Headers(init.headers).get('authorization')
+      return Promise.resolve(
+        authorization?.includes('sk-ant-oat-isolation-reset-seed')
+          ? Response.json({ oauth_account: { account_uuid: 'uuid-reset' } })
+          : Response.json({}),
+      )
+    }) as unknown as typeof fetch
+
+    const first = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-reset-seed',
+      undefined,
+      'isolation-reset-main',
+    )
+    expect(first.accountUuid).toBe('uuid-reset')
+
+    resetClaudeCodeIdentityCachesForTest()
+
+    const second = await resolveClaudeCodeIdentity(
+      'sk-ant-oat-isolation-reset-next',
+      undefined,
+      'isolation-reset-main',
+    )
+    // This assertion pins the explicit test reset, not production UUID clearing.
+    expect(second.deviceId).not.toBe(first.deviceId)
   })
 
   test('selects the live-captured full-agent beta set only for tool-bearing agent requests', () => {
@@ -148,6 +210,98 @@ describe('Claude Code fingerprint helpers', () => {
       resolvedIdentity.sessionId,
     )
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('clears a cached account UUID after negative bootstrap before compatibility fallback', async () => {
+    const successfulToken = 'sk-ant-oat-negative-cache-success'
+    const failedToken = 'sk-ant-oat-negative-cache-failure'
+    globalThis.fetch = mock(async (_input, init?: RequestInit) => {
+      const token = new Headers(init?.headers).get('authorization')
+      if (token?.includes(successfulToken)) {
+        return Response.json({
+          oauth_account: { account_uuid: 'account-a' },
+        })
+      }
+      return new Response('bootstrap unavailable', { status: 503 })
+    }) as unknown as typeof fetch
+
+    const successful = await resolveClaudeCodeIdentity(
+      successfulToken,
+      undefined,
+      'main-slot',
+    )
+    expect(successful.accountUuid).toBe('account-a')
+
+    const failed = await resolveClaudeCodeIdentity(
+      failedToken,
+      undefined,
+      'main-slot',
+    )
+    expect(failed.accountUuid).toBeUndefined()
+
+    const compatibility = await resolveClaudeCodeIdentity(
+      'compatibility-token-after-failure',
+      undefined,
+      'main-slot',
+    )
+    expect(compatibility.accountUuid).toBeUndefined()
+  })
+
+  test('late negative bootstrap cannot clobber a newer stable-account identity', async () => {
+    const tokenOld = 'sk-ant-oat-late-negative-old'
+    const tokenA = 'sk-ant-oat-late-negative-a'
+    const tokenB = 'sk-ant-oat-late-negative-b'
+    let releaseA!: (response: Response) => void
+    let markAStarted!: () => void
+    const aStarted = new Promise<void>((resolve) => {
+      markAStarted = resolve
+    })
+    globalThis.fetch = mock(async (_input, init?: RequestInit) => {
+      const token = new Headers(init?.headers).get('authorization')
+      if (token?.includes(tokenA)) {
+        markAStarted()
+        return await new Promise<Response>((resolve) => {
+          releaseA = resolve
+        })
+      }
+      if (token?.includes(tokenOld)) {
+        return Response.json({
+          oauth_account: { account_uuid: 'account-a' },
+        })
+      }
+      if (token?.includes(tokenB)) {
+        return Response.json({
+          oauth_account: { account_uuid: 'account-b' },
+        })
+      }
+      return new Response('unexpected bootstrap token', { status: 503 })
+    }) as unknown as typeof fetch
+
+    const initialIdentity = await resolveClaudeCodeIdentity(
+      tokenOld,
+      undefined,
+      'main-slot',
+    )
+    expect(initialIdentity.accountUuid).toBe('account-a')
+    const pendingA = resolveClaudeCodeIdentity(tokenA, undefined, 'main-slot')
+    await aStarted
+    const identityB = await resolveClaudeCodeIdentity(
+      tokenB,
+      undefined,
+      'main-slot',
+    )
+    expect(identityB.accountUuid).toBe('account-b')
+
+    releaseA(new Response('bootstrap unavailable', { status: 503 }))
+    const identityA = await pendingA
+    expect(identityA.accountUuid).toBeUndefined()
+
+    const compatibility = await resolveClaudeCodeIdentity(
+      'compatibility-token-after-late-failure',
+      undefined,
+      'main-slot',
+    )
+    expect(compatibility.accountUuid).toBe('account-b')
   })
 
   test('orders serialized body fields like captured Claude Code requests', () => {
