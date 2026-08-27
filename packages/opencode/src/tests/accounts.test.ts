@@ -3031,6 +3031,104 @@ describe('FallbackAccountManager', () => {
     expect(accounts.map((account) => account.id)).toEqual(['stale-good-quota'])
   })
 
+  test('keeps a concurrent replacement account when its quota probe fails', async () => {
+    const oldStorage = baseStorage()
+    const oldAccount: OAuthAccount = {
+      id: 'replacement-race',
+      type: 'oauth',
+      authLineageId: 'old-lineage',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1_000,
+      lastRefreshedAt: 500,
+      quota: {
+        source: 'poll',
+        five_hour: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+        seven_day: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-07T00:00:00Z',
+        },
+      },
+    }
+    oldStorage.accounts.push(oldAccount)
+    await saveAccounts(oldStorage, accountPath)
+
+    const replacementStorage = baseStorage()
+    const replacementAccount: OAuthAccount = {
+      ...oldAccount,
+      authLineageId: 'new-lineage',
+      access: 'new-access',
+      refresh: 'new-refresh',
+      expires: 100_000_000,
+      lastRefreshedAt: 2_000,
+      quota: {
+        source: 'poll',
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+        seven_day: {
+          usedPercent: 30,
+          remainingPercent: 70,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-07T00:00:00Z',
+        },
+      },
+    }
+    replacementStorage.accounts.push(replacementAccount)
+
+    const loadStarted = Promise.withResolvers<void>()
+    const releaseLoad = Promise.withResolvers<void>()
+    let firstLoad = true
+    class ReplacementAwareManager extends FallbackAccountManager {
+      override async load() {
+        if (firstLoad) {
+          firstLoad = false
+          loadStarted.resolve()
+          await releaseLoad.promise
+        }
+        return loadAccounts(accountPath)
+      }
+    }
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('temporarily unavailable', { status: 500 })),
+    ) as unknown as typeof fetch
+    const quotaManager = new QuotaManager({
+      storage: oldStorage,
+      fetchImpl,
+      now: () => 10 * 60_000,
+    })
+    const manager = new ReplacementAwareManager({
+      fetchImpl,
+      now: () => 10 * 60_000,
+      configPath: accountPath,
+      quotaManager,
+    })
+
+    const usablePromise = manager.getUsableFallbackAccounts(oldStorage)
+    await loadStarted.promise
+    await saveAccounts(replacementStorage, accountPath)
+    releaseLoad.resolve()
+
+    const usable = await usablePromise
+
+    expect(usable.map((account) => account.access)).toEqual(['new-access'])
+    expect(
+      quotaManager.getAllFallbacks().get('replacement-race')?.quota.five_hour
+        ?.remainingPercent,
+    ).toBe(80)
+    expect(quotaManager.isFallbackBackedOff('replacement-race')).toBe(true)
+  })
+
   test('uses cached passing quota when a stale quota refresh is already in progress', async () => {
     const storage = baseStorage()
     storage.accounts.push({
@@ -3264,22 +3362,26 @@ describe('FallbackAccountManager', () => {
     }) as unknown as typeof fetch
     const qm = new QuotaManager({ storage, fetchImpl, now: () => 1_000 })
     // Active-route refresh left a FRESH but EXHAUSTED entry in the QM cache.
-    qm.setFallback('fallback-1', {
-      quota: {
-        five_hour: {
-          usedPercent: 100,
-          remainingPercent: 0,
-          checkedAt: 1_000,
+    qm.setFallback(
+      'fallback-1',
+      {
+        quota: {
+          five_hour: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: 1_000,
+          },
+          seven_day: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: 1_000,
+          },
         },
-        seven_day: {
-          usedPercent: 100,
-          remainingPercent: 0,
-          checkedAt: 1_000,
-        },
+        refreshAfter: 1_000 + 10 * 60_000,
+        checkedAt: 1_000,
       },
-      refreshAfter: 1_000 + 10 * 60_000,
-      checkedAt: 1_000,
-    })
+      undefined,
+    )
 
     const manager = new FallbackAccountManager({
       fetchImpl,
@@ -3290,6 +3392,62 @@ describe('FallbackAccountManager', () => {
     // QM cache is exhausted → account must NOT be usable (was usable when policy
     // read the stale storage quota).
     expect(accounts.map((a) => a.id)).not.toContain('fallback-1')
+  })
+
+  test('background fallback seeding binds a replacement lineage before reusing cache', async () => {
+    const now = 1_000_000
+    const storage = baseStorage()
+    storage.quota = { checkIntervalMinutes: 5 }
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      authLineageId: 'replacement-login',
+      access: 'replacement-access',
+      refresh: 'replacement-refresh',
+      expires: now + 5 * 60 * 60_000,
+      quota: {
+        five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+        seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+      },
+    })
+    const fetchImpl = mock(() => {
+      throw new Error('replacement quota is already fresh')
+    }) as unknown as typeof fetch
+    const qm = new QuotaManager({ storage, fetchImpl, now: () => now })
+    qm.seedFallbacksFromAccounts([
+      {
+        id: 'fallback-1',
+        type: 'oauth',
+        authLineageId: 'old-login',
+        access: 'old-access',
+        refresh: 'old-refresh',
+        expires: now + 5 * 60 * 60_000,
+        quota: {
+          five_hour: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: now,
+          },
+          seven_day: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: now,
+          },
+        },
+      },
+    ])
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+      quotaManager: qm,
+    })
+
+    const accounts = await manager.getUsableFallbackAccounts(storage)
+
+    expect(accounts.map((account) => account.id)).toEqual(['fallback-1'])
+    expect(
+      qm.getFallback('fallback-1')?.quota.five_hour?.remainingPercent,
+    ).toBe(100)
   })
 
   test('access-token rotation does not invalidate a fresh fallback cache entry', async () => {
@@ -3307,7 +3465,7 @@ describe('FallbackAccountManager', () => {
     const qm = new QuotaManager({ storage: null, fetchImpl, now: () => 2_000 })
 
     // Cache identity is the configured account id, not the rotating credential.
-    await qm.refreshFallback('fallback-1', 'old-access')
+    await qm.refreshFallback('fallback-1', 'old-access', undefined)
     expect(qm.isFallbackStale('fallback-1', 'old-access')).toBe(false)
 
     expect(qm.isFallbackStale('fallback-1', 'new-access')).toBe(false)

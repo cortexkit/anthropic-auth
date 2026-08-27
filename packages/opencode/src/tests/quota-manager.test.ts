@@ -109,7 +109,7 @@ describe('QuotaManager', () => {
       const qm = createQM(fetchMock)
 
       await expect(
-        qm.refreshFallback('fallback-1', 'fallback-token'),
+        qm.refreshFallback('fallback-1', 'fallback-token', undefined),
       ).rejects.toThrow('Quota refresh is already in progress')
       expect(fetchCalls).toBe(0)
 
@@ -135,18 +135,23 @@ describe('QuotaManager', () => {
           checkedAt: now,
         },
       }
-      qm.setFallback('fallback-1', {
-        quota: cachedQuota,
-        refreshAfter: now,
-        checkedAt: now,
-      })
+      qm.setFallback(
+        'fallback-1',
+        {
+          quota: cachedQuota,
+          refreshAfter: now,
+          checkedAt: now,
+        },
+        undefined,
+      )
 
       await expect(
-        qm.refreshFallback('fallback-1', 'fallback-token'),
+        qm.refreshFallback('fallback-1', 'fallback-token', undefined),
       ).rejects.toThrow('429')
       const cached = await qm.refreshFallbackWithMetadata(
         'fallback-1',
         'fallback-token',
+        undefined,
       )
       expect(cached).toEqual({ quota: cachedQuota, fetched: false })
 
@@ -154,6 +159,7 @@ describe('QuotaManager', () => {
       const fetched = await qm.refreshFallbackWithMetadata(
         'fallback-1',
         'fallback-token',
+        undefined,
       )
       expect(fetched.fetched).toBe(true)
       expect(fetchCalls).toBe(2)
@@ -266,7 +272,7 @@ describe('QuotaManager', () => {
       })
 
       try {
-        await qm.refreshFallback('fallback-1', 'fallback-token')
+        await qm.refreshFallback('fallback-1', 'fallback-token', undefined)
       } catch {}
 
       // Fallback account is backed off; main is not.
@@ -299,13 +305,13 @@ describe('QuotaManager', () => {
       const qm = createQM(fetchMock)
 
       await expect(
-        qm.refreshFallback('fallback-1', 'old-token'),
+        qm.refreshFallback('fallback-1', 'old-token', undefined),
       ).rejects.toThrow('429')
       expect(qm.isFallbackBackedOff('fallback-1')).toBe(true)
 
       now += 1_100
       await expect(
-        qm.refreshFallback('fallback-1', 'new-token'),
+        qm.refreshFallback('fallback-1', 'new-token', undefined),
       ).rejects.toThrow('rate-limited')
       expect(seenTokens).toEqual(['Bearer old-token'])
     })
@@ -363,7 +369,7 @@ describe('QuotaManager', () => {
       expect(apiErrorCount).toBe(0)
 
       await expect(
-        qm.refreshFallback('fallback-1', 'fallback-token'),
+        qm.refreshFallback('fallback-1', 'fallback-token', undefined),
       ).rejects.toThrow('403')
       expect(qm.isFallbackBackedOff('fallback-1')).toBe(false)
     })
@@ -646,6 +652,573 @@ describe('QuotaManager', () => {
       ).toBe(90)
     })
 
+    test('credential replacement clears fallback quota and quota backoff for the labelled slot', async () => {
+      const qm = createQM(
+        mock(() =>
+          Promise.resolve(new Response('rate limited', { status: 429 })),
+        ) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'old-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+
+      await expect(
+        qm.refreshFallback('work', 'old-access', {
+          authLineageId: 'old-login',
+        }),
+      ).rejects.toThrow('429')
+      expect(qm.isFallbackBackedOff('work')).toBe(true)
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'replacement-login',
+          access: 'replacement-access',
+          refresh: 'replacement-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      expect(qm.getFallback('work')).toBeNull()
+      expect(qm.isFallbackBackedOff('work')).toBe(false)
+    })
+
+    test('legacy fallback re-login clears quota and quota backoff', async () => {
+      const qm = createQM(
+        mock(() =>
+          Promise.resolve(new Response('rate limited', { status: 429 })),
+        ) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          access: 'legacy-access',
+          refresh: 'legacy-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+      await expect(
+        qm.refreshFallback('work', 'legacy-access', undefined),
+      ).rejects.toThrow('429')
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'replacement-login',
+          access: 'replacement-access',
+          refresh: 'replacement-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      expect(qm.getFallback('work')).toBeNull()
+      expect(qm.isFallbackBackedOff('work')).toBe(false)
+    })
+
+    test('legacy fallback re-login starts a new quota poll', async () => {
+      let fetchCalls = 0
+      let releaseOldPoll!: () => void
+      let markOldPollEntered!: () => void
+      const oldPollEntered = new Promise<void>((resolve) => {
+        markOldPollEntered = resolve
+      })
+      const oldPoll = new Promise<Response>((resolve) => {
+        releaseOldPoll = () => resolve(makeQuotaResponse(now))
+      })
+      const qm = createQM(
+        mock(() => {
+          fetchCalls += 1
+          if (fetchCalls === 1) {
+            markOldPollEntered()
+            return oldPoll
+          }
+          return Promise.resolve(makeQuotaResponse(now))
+        }) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          access: 'legacy-access',
+          refresh: 'legacy-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      const priorPoll = qm.refreshFallback('work', 'legacy-access', undefined)
+      await oldPollEntered
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'replacement-login',
+          access: 'replacement-access',
+          refresh: 'replacement-refresh',
+          expires: now + 60_000,
+        },
+      ])
+      const replacementPoll = qm.refreshFallback('work', 'replacement-access', {
+        authLineageId: 'replacement-login',
+      })
+      releaseOldPoll()
+
+      await priorPoll
+      await replacementPoll
+      expect(fetchCalls).toBe(2)
+    })
+
+    test('credential replacement does not reseed a persisted prior-login quota', () => {
+      const qm = createQM()
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'old-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'replacement-login',
+          access: 'replacement-access',
+          refresh: 'replacement-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+
+      expect(qm.getFallback('work')).toBeNull()
+    })
+
+    test('credential replacement starts a new fallback poll instead of joining the prior login', async () => {
+      let fetchCalls = 0
+      let releaseOldPoll!: () => void
+      let markOldPollEntered!: () => void
+      const oldPollEntered = new Promise<void>((resolve) => {
+        markOldPollEntered = resolve
+      })
+      const oldPoll = new Promise<Response>((resolve) => {
+        releaseOldPoll = () =>
+          resolve(
+            new Response(
+              JSON.stringify({
+                five_hour: {
+                  utilization: 90,
+                  resets_at: new Date(now + 3600_000).toISOString(),
+                },
+              }),
+              { status: 200 },
+            ),
+          )
+      })
+      const fetchMock = mock(() => {
+        fetchCalls += 1
+        if (fetchCalls === 1) {
+          markOldPollEntered()
+          return oldPoll
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              five_hour: {
+                utilization: 10,
+                resets_at: new Date(now + 3600_000).toISOString(),
+              },
+            }),
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'old-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      const priorPoll = qm.refreshFallback('work', 'old-access', {
+        authLineageId: 'old-login',
+      })
+      await oldPollEntered
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'replacement-login',
+          access: 'replacement-access',
+          refresh: 'replacement-refresh',
+          expires: now + 60_000,
+        },
+      ])
+      const replacementPoll = qm.refreshFallback('work', 'replacement-access', {
+        authLineageId: 'replacement-login',
+      })
+      now += 1_000
+      releaseOldPoll()
+
+      await priorPoll
+      const replacement = await replacementPoll
+      expect(fetchCalls).toBe(2)
+      expect(replacement.five_hour?.remainingPercent).toBe(90)
+      expect(qm.getFallback('work')?.quota.five_hour?.remainingPercent).toBe(90)
+    })
+
+    test('replacement-lineage refresh does not join an unseeded prior-login poll', async () => {
+      let fetchCalls = 0
+      let releaseOldPoll!: () => void
+      let markOldPollEntered!: () => void
+      const oldPollEntered = new Promise<void>((resolve) => {
+        markOldPollEntered = resolve
+      })
+      const oldPoll = new Promise<Response>((resolve) => {
+        releaseOldPoll = () => resolve(makeQuotaResponse(now))
+      })
+      const fetchMock = mock(() => {
+        fetchCalls += 1
+        if (fetchCalls === 1) {
+          markOldPollEntered()
+          return oldPoll
+        }
+        return Promise.resolve(makeQuotaResponse(now))
+      }) as unknown as typeof fetch
+      const qm = createQM(fetchMock)
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'old-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      const priorPoll = qm.refreshFallback('work', 'old-access', {
+        authLineageId: 'old-login',
+      })
+      await oldPollEntered
+      const replacementPoll = qm.refreshFallback('work', 'replacement-access', {
+        authLineageId: 'replacement-login',
+      })
+      now += 1_000
+      releaseOldPoll()
+
+      await priorPoll
+      await replacementPoll
+      expect(fetchCalls).toBe(2)
+    })
+
+    test('replacement-lineage refresh clears prior-login quota backoff before reading it', async () => {
+      let fetchCalls = 0
+      const qm = createQM(
+        mock(() => {
+          fetchCalls += 1
+          if (fetchCalls === 1) {
+            return Promise.resolve(
+              new Response('rate limited', { status: 429 }),
+            )
+          }
+          return Promise.resolve(makeQuotaResponse(now))
+        }) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'old-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+
+      await expect(
+        qm.refreshFallback('work', 'old-access', {
+          authLineageId: 'old-login',
+        }),
+      ).rejects.toThrow('429')
+      now += 1_000
+
+      const replacement = await qm.refreshFallbackWithMetadata(
+        'work',
+        'replacement-access',
+        { authLineageId: 'replacement-login' },
+      )
+
+      expect(replacement.fetched).toBe(true)
+      expect(qm.isFallbackBackedOff('work')).toBe(false)
+      expect(fetchCalls).toBe(2)
+    })
+
+    test('ordinary lineage-preserving rotation retains fallback quota and backoff', async () => {
+      let fetchCalls = 0
+      const qm = createQM(
+        mock(() => {
+          fetchCalls += 1
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'stable-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+
+      await expect(
+        qm.refreshFallback('work', 'old-access', {
+          authLineageId: 'stable-login',
+        }),
+      ).rejects.toThrow('429')
+      now += 1_000
+
+      const rotated = await qm.refreshFallbackWithMetadata(
+        'work',
+        'rotated-access',
+        { authLineageId: 'stable-login' },
+      )
+
+      expect(rotated).toMatchObject({ fetched: false })
+      expect(rotated.quota.five_hour?.remainingPercent).toBe(75)
+      expect(qm.isFallbackBackedOff('work')).toBe(true)
+      expect(fetchCalls).toBe(1)
+    })
+
+    test('ordinary lineage-preserving rotation retains an in-flight fallback poll', async () => {
+      let fetchCalls = 0
+      let releasePoll!: () => void
+      let markPollEntered!: () => void
+      const pollEntered = new Promise<void>((resolve) => {
+        markPollEntered = resolve
+      })
+      const delayedResponse = new Promise<Response>((resolve) => {
+        releasePoll = () => resolve(makeQuotaResponse(now))
+      })
+      const qm = createQM(
+        mock(() => {
+          fetchCalls += 1
+          markPollEntered()
+          return delayedResponse
+        }) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'stable-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      const priorPoll = qm.refreshFallback('work', 'old-access', {
+        authLineageId: 'stable-login',
+      })
+      await pollEntered
+      const rotatedPoll = qm.refreshFallback('work', 'rotated-access', {
+        authLineageId: 'stable-login',
+      })
+      releasePoll()
+
+      expect(await rotatedPoll).toEqual(await priorPoll)
+      expect(fetchCalls).toBe(1)
+    })
+
+    test('replacement under a new fallback id removes the departed slot cache', () => {
+      const qm = createQM()
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'old-plugin-id',
+          type: 'oauth',
+          authLineageId: 'old-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'new-plugin-id',
+          type: 'oauth',
+          authLineageId: 'replacement-login',
+          access: 'replacement-access',
+          refresh: 'replacement-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      expect(qm.getFallback('old-plugin-id')).toBeNull()
+    })
+
+    test('ordinary fallback token rotation preserves quota and quota backoff', async () => {
+      const qm = createQM(
+        mock(() =>
+          Promise.resolve(new Response('rate limited', { status: 429 })),
+        ) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'stable-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+          quota: {
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: now,
+            },
+          },
+        },
+      ])
+      await expect(
+        qm.refreshFallback('work', 'old-access', {
+          authLineageId: 'stable-login',
+        }),
+      ).rejects.toThrow('429')
+
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'stable-login',
+          access: 'rotated-access',
+          refresh: 'rotated-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      expect(qm.getFallback('work')?.quota.five_hour?.remainingPercent).toBe(75)
+      expect(qm.isFallbackBackedOff('work')).toBe(true)
+    })
+
+    test('ordinary fallback token rotation preserves an in-flight quota poll', async () => {
+      let fetchCalls = 0
+      let releasePoll!: () => void
+      let markPollEntered!: () => void
+      const pollEntered = new Promise<void>((resolve) => {
+        markPollEntered = resolve
+      })
+      const delayedResponse = new Promise<Response>((resolve) => {
+        releasePoll = () => resolve(makeQuotaResponse(now))
+      })
+      const qm = createQM(
+        mock(() => {
+          fetchCalls += 1
+          markPollEntered()
+          return delayedResponse
+        }) as unknown as typeof fetch,
+      )
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'stable-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      const priorPoll = qm.refreshFallback('work', 'old-access', {
+        authLineageId: 'stable-login',
+      })
+      await pollEntered
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'work',
+          type: 'oauth',
+          authLineageId: 'stable-login',
+          access: 'rotated-access',
+          refresh: 'rotated-refresh',
+          expires: now + 60_000,
+        },
+      ])
+      const rotatedPoll = qm.refreshFallback('work', 'rotated-access', {
+        authLineageId: 'stable-login',
+      })
+      releasePoll()
+
+      expect(await rotatedPoll).toEqual(await priorPoll)
+      expect(fetchCalls).toBe(1)
+    })
+
     test('seedFallbacksFromAccounts preserves freshness for scoped-only quota', () => {
       const qm = new QuotaManager({
         storage: {
@@ -693,17 +1266,21 @@ describe('QuotaManager', () => {
         },
         now: () => 1_000_000,
       })
-      qm.setFallback('fallback-1', {
-        quota: {
-          five_hour: {
-            usedPercent: 90,
-            remainingPercent: 10,
-            checkedAt: 900_000,
+      qm.setFallback(
+        'fallback-1',
+        {
+          quota: {
+            five_hour: {
+              usedPercent: 90,
+              remainingPercent: 10,
+              checkedAt: 900_000,
+            },
           },
+          refreshAfter: 900_000,
+          checkedAt: 900_000,
         },
-        refreshAfter: 900_000,
-        checkedAt: 900_000,
-      })
+        undefined,
+      )
 
       qm.seedFallbacksFromAccounts([
         {
@@ -1257,23 +1834,82 @@ describe('QuotaManager', () => {
 
     test('fallback header push updates only the named account', () => {
       const qm = createQM()
-      qm.setFallback('other', {
-        quota: { checkedAt: 100 },
-        checkedAt: 100,
-        refreshAfter: 200,
-      })
+      qm.setFallback(
+        'other',
+        {
+          quota: { checkedAt: 100 },
+          checkedAt: 100,
+          refreshAfter: 200,
+        },
+        undefined,
+      )
 
-      qm.pushFallbackFromHeaders('target', headerSnapshot())
+      qm.pushFallbackFromHeaders('target', headerSnapshot(), undefined)
 
       expect(qm.getFallback('target')?.quota.five_hour?.usedPercent).toBe(78)
       expect(qm.getFallback('other')?.quota.checkedAt).toBe(100)
+    })
+
+    test('clears a header cache written before its first seed when the login lineage changes', () => {
+      const qm = createQM()
+
+      qm.pushFallbackFromHeaders('fallback', headerSnapshot(), {
+        authLineageId: 'first-login',
+      })
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback',
+          type: 'oauth',
+          authLineageId: 'replacement-login',
+          access: 'replacement-access',
+          refresh: 'replacement-refresh',
+          expires: now + 60_000,
+        },
+      ])
+
+      expect(qm.getFallback('fallback')).toBeNull()
+    })
+
+    test('replacement-lineage header push clears cache before merging it', () => {
+      const qm = createQM()
+      qm.seedFallbacksFromAccounts([
+        {
+          id: 'fallback',
+          type: 'oauth',
+          authLineageId: 'old-login',
+          access: 'old-access',
+          refresh: 'old-refresh',
+          expires: now + 60_000,
+          quota: {
+            scoped: [
+              {
+                id: 'old-login-scope',
+                title: 'Old login scope',
+                modelName: 'Old login',
+                usedPercent: 90,
+                remainingPercent: 10,
+                checkedAt: now,
+              },
+            ],
+            source: 'poll',
+            checkedAt: now,
+          },
+        },
+      ])
+
+      const pushed = qm.pushFallbackFromHeaders('fallback', headerSnapshot(), {
+        authLineageId: 'replacement-login',
+      })
+
+      expect(pushed.quota.scoped).toBeUndefined()
+      expect(qm.getFallback('fallback')?.quota.scoped).toBeUndefined()
     })
 
     test('header push binds main to account identity and fallback to account id', () => {
       const qm = createQM()
 
       qm.pushMainFromHeaders('main-account', headerSnapshot())
-      qm.pushFallbackFromHeaders('fallback', headerSnapshot())
+      qm.pushFallbackFromHeaders('fallback', headerSnapshot(), undefined)
 
       expect(qm.getMain('different-account')).toBeNull()
       expect(qm.getFallback('fallback')).not.toBeNull()

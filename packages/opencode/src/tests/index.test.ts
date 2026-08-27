@@ -14310,13 +14310,17 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
       { models: {} },
     )
     const quotaManager = (plugin as any).__quotaManager
-    quotaManager.setFallback('work-alt', {
-      quota: cachedQuota,
-      refreshAfter: now,
-      checkedAt: now + 60_000,
-    })
+    quotaManager.setFallback(
+      'work-alt',
+      {
+        quota: cachedQuota,
+        refreshAfter: now,
+        checkedAt: now + 60_000,
+      },
+      undefined,
+    )
     await expect(
-      quotaManager.refreshFallback('work-alt', 'fb-access'),
+      quotaManager.refreshFallback('work-alt', 'fb-access', undefined),
     ).rejects.toThrow('429')
 
     const mgr = (plugin as any).__primeManager

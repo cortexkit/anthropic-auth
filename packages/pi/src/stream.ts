@@ -555,7 +555,7 @@ async function executeWithFallback(options: {
       if (!account.access || isPermanentRefreshError(account.lastRefreshError))
         continue
       let accountQuota =
-        quotaManager.getFallback(account.id)?.quota ?? account.quota
+        quotaManager.getFallback(account.id, account)?.quota ?? account.quota
       if (
         !stickyQuotaSnapshotIsFresh(accountQuota, storage, Date.now(), modelId)
       ) {
@@ -563,6 +563,7 @@ async function executeWithFallback(options: {
           accountQuota = await quotaManager.refreshFallback(
             account.id,
             account.access,
+            account,
           )
         } catch {}
       }
@@ -728,7 +729,8 @@ async function executeWithFallback(options: {
           continue
         account = configured
         const quota =
-          quotaManager.getFallback(configured.id)?.quota ?? configured.quota
+          quotaManager.getFallback(configured.id, configured)?.quota ??
+          configured.quota
         if (quotaSnapshotHasStandardWindows(quota)) continue
         if (
           isKillswitchEnabled(storage) &&
@@ -744,7 +746,7 @@ async function executeWithFallback(options: {
         isOAuthAccount(account) &&
         isKillswitchEnabled(storage) &&
         !killswitchPassesPolicy(
-          quotaManager.getFallback(account.id)?.quota ?? account.quota,
+          quotaManager.getFallback(account.id, account)?.quota ?? account.quota,
           storage,
           account.id,
           options.model.id,
@@ -959,7 +961,11 @@ async function executeWithFallback(options: {
           quota =
             route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
               ? await quotaManager.refreshMain(mainAccountId, route.access)
-              : await quotaManager.refreshFallback(route.id, route.access)
+              : await quotaManager.refreshFallback(
+                  route.id,
+                  route.access,
+                  route.account,
+                )
         } catch {
           // Retain affinity when the quota probe itself is unavailable.
           quota = undefined

@@ -1258,7 +1258,11 @@ const anthropicAuthPlugin = async (
 
   function harvestQuotaHeaders(
     headers: Headers,
-    served: { accountId: 'main' | string; accessToken: string },
+    served: {
+      accountId: 'main' | string
+      accessToken: string
+      authLineageId?: string
+    },
   ): void {
     try {
       if (!isQuotaBearingHeaderFrame(headers)) {
@@ -1271,7 +1275,9 @@ const anthropicAuthPlugin = async (
       const entry =
         served.accountId === 'main'
           ? quotaManager.pushMainFromHeaders(mainAccountId, incoming)
-          : quotaManager.pushFallbackFromHeaders(served.accountId, incoming)
+          : quotaManager.pushFallbackFromHeaders(served.accountId, incoming, {
+              authLineageId: served.authLineageId,
+            })
       void persistPushedQuota(served, entry).catch(logPersistFailure)
       void publishQuotaHeaderFeed(served, entry).catch(
         logQuotaHeaderFeedFailure,
@@ -2057,7 +2063,7 @@ const anthropicAuthPlugin = async (
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
           quota: account.access
-            ? (quotaManager.getFallback(account.id)?.quota ?? null)
+            ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
             : null,
           // A fallback with a permanently-dead refresh token (400 invalid_grant)
           // is dropped by getUsableFallbackAccounts and silently degrades to
@@ -4269,6 +4275,7 @@ const anthropicAuthPlugin = async (
             route = 'unknown',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             oauthAccountId = 'main',
+            fallbackAuthLineageId?: string,
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
           ) {
@@ -4537,6 +4544,7 @@ const anthropicAuthPlugin = async (
             const served = {
               accountId: oauthAccountId,
               accessToken,
+              authLineageId: fallbackAuthLineageId,
             }
             const sendStart = nowMs()
             const response = await sendViaRelay({
@@ -4583,10 +4591,14 @@ const anthropicAuthPlugin = async (
             id: string
             access?: string
             quota?: OAuthQuotaSnapshot
+            authLineageId?: string
           }): OAuthQuotaSnapshot | undefined {
             // Cached entries are scoped to stable account ids; token rotation
             // must not discard an otherwise valid account-level observation.
-            return quotaManager.getFallback(account.id)?.quota ?? account.quota
+            return (
+              quotaManager.getFallback(account.id, account)?.quota ??
+              account.quota
+            )
           }
 
           // The fallbacks routing may actually send to: usable accounts that
@@ -4760,6 +4772,7 @@ const anthropicAuthPlugin = async (
                   accountQuota = await quotaManager.refreshFallback(
                     account.id,
                     account.access,
+                    account,
                   )
                 } catch {}
               }
@@ -4943,6 +4956,7 @@ const anthropicAuthPlugin = async (
                   `fallback_${index}`,
                   storage,
                   account.id,
+                  account.authLineageId,
                   options?.fableRequest,
                   options?.laneStartRequest,
                 )
@@ -4974,7 +4988,7 @@ const anthropicAuthPlugin = async (
                   quotaManager.shouldRefreshOnRequestCount(sessionRequestCount)
                 ) {
                   void quotaManager
-                    .refreshFallback(account.id, account.access)
+                    .refreshFallback(account.id, account.access, account)
                     .then(() => options?.onSuccess?.(account))
                     .catch(() => {})
                 }
@@ -5482,6 +5496,7 @@ const anthropicAuthPlugin = async (
                         `sticky:${selected.id}`,
                         stickyRoutes.storage,
                         selected.id,
+                        selected.account?.authLineageId,
                         fableRequest,
                         laneStartRequest,
                       )
@@ -5634,6 +5649,7 @@ const anthropicAuthPlugin = async (
                             : await quotaManager.refreshFallback(
                                 route.id,
                                 route.access,
+                                route.account,
                               )
                       } catch {
                         // A model 429 plus a failed quota probe is not enough to
@@ -5863,7 +5879,7 @@ const anthropicAuthPlugin = async (
                   .map((a) => ({
                     ...a,
                     // Account ids scope quota observations across token rotation.
-                    quota: quotaManager.getFallback(a.id)?.quota ?? a.quota,
+                    quota: quotaManager.getFallback(a.id, a)?.quota ?? a.quota,
                   }))
                 const mainPassesPolicy = quotaSnapshotPassesPolicy(
                   mainEntry.quota,
@@ -6189,6 +6205,7 @@ const anthropicAuthPlugin = async (
                 'main',
                 storage,
                 'main',
+                undefined,
                 fableRequest,
                 laneStartRequest,
               )

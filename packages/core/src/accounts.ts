@@ -3332,14 +3332,18 @@ export class FallbackAccountManager {
     if (!account.quota) return
     const checkedAt = quotaSnapshotCheckedAt(account.quota)
     if (checkedAt <= 0) return
-    const existing = this.quotaManager.getFallback(account.id)
+    const existing = this.quotaManager.getFallback(account.id, account)
     if (existing && existing.checkedAt >= checkedAt) return
     const checkInterval = getQuotaCheckIntervalMs(storage)
-    this.quotaManager.setFallback(account.id, {
-      quota: account.quota,
-      refreshAfter: checkedAt + checkInterval,
-      checkedAt,
-    })
+    this.quotaManager.setFallback(
+      account.id,
+      {
+        quota: account.quota,
+        refreshAfter: checkedAt + checkInterval,
+        checkedAt,
+      },
+      account,
+    )
   }
 
   async load() {
@@ -3385,8 +3389,8 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      let next = account
       try {
-        let next = account
         if (tokenNeedsRefresh(next, storage, this.now())) {
           const refreshError = next.lastRefreshError
           if (
@@ -3404,6 +3408,7 @@ export class FallbackAccountManager {
               next.id,
               next.access,
               options.modelId,
+              next,
             )
           : quotaIsStale(next, storage, this.now(), options.modelId)
         // Skip the request-time refresh when this account's quota API is
@@ -3432,41 +3437,32 @@ export class FallbackAccountManager {
           usable.push(next)
       } catch (error) {
         if (
-          canUseCachedQuotaAfterRefreshError(
-            account,
-            storage,
-            error,
-            this.now(),
-          )
+          canUseCachedQuotaAfterRefreshError(next, storage, error, this.now())
         ) {
           log(
             '[refresh] fallback quota using cached quota after refresh error',
             {
-              accountId: account.id,
+              accountId: next.id,
               error: formatErrorMessage(error),
             },
           )
           if (
             this.accountPassesQuotaPolicy(
-              this.quotaPolicyAccount(account),
+              this.quotaPolicyAccount(next),
               storage,
               {
                 modelId: options.modelId,
               },
             )
           ) {
-            usable.push(account)
+            usable.push(next)
           }
         } else if (
           !failClosedOnUnknownQuota(storage) &&
-          !refreshBackoffActive(
-            account.lastRefreshError,
-            account.id,
-            this.now(),
-          ) &&
-          quotaSnapshotPassesModelScope(account.quota, options.modelId)
+          !refreshBackoffActive(next.lastRefreshError, next.id, this.now()) &&
+          quotaSnapshotPassesModelScope(next.quota, options.modelId)
         ) {
-          usable.push(account)
+          usable.push(next)
         }
       }
     }
@@ -3505,7 +3501,7 @@ export class FallbackAccountManager {
    */
   private quotaPolicyAccount(account: OAuthAccount): OAuthAccount {
     if (!this.quotaManager) return account
-    const cached = this.quotaManager.getFallback(account.id)?.quota
+    const cached = this.quotaManager.getFallback(account.id, account)?.quota
     return cached ? { ...account, quota: cached } : account
   }
 
@@ -3814,7 +3810,11 @@ export class FallbackAccountManager {
     // to a direct fetch only when no QuotaManager is wired (e.g. in isolation).
     const fetchSnapshot = (accessToken: string) =>
       this.quotaManager
-        ? this.quotaManager.refreshFallbackWithMetadata(target.id, accessToken)
+        ? this.quotaManager.refreshFallbackWithMetadata(
+            target.id,
+            accessToken,
+            target,
+          )
         : fetchOAuthQuotaSnapshot({
             accessToken,
             fetchImpl: this.fetchImpl,
@@ -3872,11 +3872,15 @@ export class FallbackAccountManager {
     // refreshAfter reflects this storage's check interval consistently.
     if (this.quotaManager && target.quota) {
       const now = this.now()
-      this.quotaManager.setFallback(target.id, {
-        quota: target.quota,
-        refreshAfter: now + getQuotaCheckIntervalMs(storage),
-        checkedAt: now,
-      })
+      this.quotaManager.setFallback(
+        target.id,
+        {
+          quota: target.quota,
+          refreshAfter: now + getQuotaCheckIntervalMs(storage),
+          checkedAt: now,
+        },
+        target,
+      )
     }
     return { account: target, fetched }
   }
