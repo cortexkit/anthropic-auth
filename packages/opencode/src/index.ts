@@ -1207,10 +1207,11 @@ const anthropicAuthPlugin = async (
     served: {
       accountId: 'main' | string
       accessToken: string
+      authLineageId?: string
       mainQuotaIdentity?: MainQuotaIdentityBinding
     },
     entry: QuotaEntry,
-  ): Promise<QuotaEntry | undefined> {
+  ): Promise<QuotaEntry | null> {
     const storage =
       (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
     if (served.accountId === 'main') {
@@ -1220,7 +1221,7 @@ const anthropicAuthPlugin = async (
           'quota',
           'skipped quota persistence without verified main account identity',
         )
-        return undefined
+        return null
       }
       storage.quota = storage.quota ?? {}
       storage.quota.mainQuota = {
@@ -1251,7 +1252,21 @@ const anthropicAuthPlugin = async (
       (candidate): candidate is OAuthAccount =>
         candidate.id === served.accountId && isOAuthAccount(candidate),
     )
-    if (!account) return undefined
+    if (!account) return null
+    // A lineage mismatch is a confirmed replacement; two absent markers remain
+    // legacy-compatible, while one-sided absence is too ambiguous to persist.
+    if (account.authLineageId !== served.authLineageId) {
+      logger.trace(
+        'quota',
+        'skipped stale fallback quota persistence after lineage change',
+        {
+          accountId: served.accountId,
+          storedLineage: account.authLineageId,
+          servedLineage: served.authLineageId,
+        },
+      )
+      return null
+    }
     account.quota = {
       ...entry.quota,
       accountIdentity: account.id,
@@ -1432,10 +1447,13 @@ const anthropicAuthPlugin = async (
           : quotaManager.pushFallbackFromHeaders(served.accountId, incoming, {
               authLineageId: served.authLineageId,
             })
+      if (!entry) return
       void (async () => {
         let feedEntry = entry
         try {
-          feedEntry = (await persistPushedQuota(served, entry)) ?? entry
+          const persistedEntry = await persistPushedQuota(served, entry)
+          if (persistedEntry === null) return
+          feedEntry = persistedEntry
         } catch (error) {
           logPersistFailure(error)
         }
@@ -5304,7 +5322,6 @@ const anthropicAuthPlugin = async (
             if (!shouldFallback) {
               return currentResponse
             }
-
             let includeApiRoutes = false
             if (preselectedAccounts) {
               includeApiRoutes = preselectedAccounts.some(isApiKeyAccount)

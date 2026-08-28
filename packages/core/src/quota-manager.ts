@@ -26,6 +26,7 @@ import {
   quotaBackoffActive,
   quotaSnapshotCheckedAt,
 } from './accounts.ts'
+import { logger } from './logger.ts'
 import { mergeHeaderQuotaSnapshot } from './quota-headers.ts'
 
 export { tokenFingerprint } from './token-fingerprint.ts'
@@ -288,19 +289,22 @@ export class QuotaManager {
     accountId: string,
     incoming: OAuthQuotaSnapshot,
     account: Pick<OAuthAccount, 'authLineageId'> | undefined,
-  ): QuotaEntry {
-    this.bindFallbackLineage(accountId, account)
+  ): QuotaEntry | null {
+    if (!this.acceptFallbackQuotaObservation(accountId, account)) return null
     const checkedAt = incoming.checkedAt ?? this.now()
-    const quota = mergeHeaderQuotaSnapshot(this.getFallback(accountId)?.quota, {
-      ...incoming,
-      accountIdentity: accountId,
-    })
+    const quota = mergeHeaderQuotaSnapshot(
+      this.fallbacks.get(accountId)?.quota,
+      {
+        ...incoming,
+        accountIdentity: accountId,
+      },
+    )
     const entry = {
       quota,
       checkedAt,
       refreshAfter: getQuotaNextRefreshAt(quota, this.storage, checkedAt),
     }
-    this.setFallback(accountId, entry, account)
+    this.fallbacks.set(accountId, entry)
     return entry
   }
 
@@ -771,6 +775,29 @@ export class QuotaManager {
     if (lineageChanged) this.clearFallback(accountId)
     this.fallbackAuthLineages.set(accountId, account.authLineageId)
     return lineageChanged
+  }
+
+  private acceptFallbackQuotaObservation(
+    accountId: string,
+    account: Pick<OAuthAccount, 'authLineageId'> | undefined,
+  ): boolean {
+    const hasLineage = this.fallbackAuthLineages.has(accountId)
+    const currentLineage = this.fallbackAuthLineages.get(accountId)
+    const observedLineage = account?.authLineageId
+    if (hasLineage && currentLineage !== observedLineage) {
+      logger.trace(
+        'quota',
+        'skipped stale fallback quota observation after lineage change',
+        {
+          accountId,
+          storedLineage: currentLineage,
+          servedLineage: observedLineage,
+        },
+      )
+      return false
+    }
+    if (!hasLineage) this.fallbackAuthLineages.set(accountId, observedLineage)
+    return true
   }
 
   /**

@@ -611,6 +611,86 @@ describe('QuotaManager', () => {
     })
   })
 
+  test('authoritative fallback lineage rebind clears the old cache', () => {
+    const qm = createQM()
+    const accountA = {
+      id: 'fallback-1',
+      type: 'oauth' as const,
+      access: 'fallback-a',
+      refresh: 'refresh-a',
+      expires: now + 60_000,
+      authLineageId: 'lineage-a',
+      quota: {
+        checkedAt: now,
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+      },
+    }
+    const accountB = {
+      ...accountA,
+      access: 'fallback-b',
+      authLineageId: 'lineage-b',
+      quota: {
+        checkedAt: now,
+        five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: now },
+      },
+    }
+
+    qm.seedFallbacksFromAccounts([accountA])
+    qm.seedFallbacksFromAccounts([accountB])
+    qm.seedFallbacksFromAccounts([accountB])
+
+    expect(
+      qm.getFallback('fallback-1', accountB)?.quota.five_hour?.usedPercent,
+    ).toBe(20)
+  })
+
+  test('stale fallback observation is discarded without rebinding the cache', () => {
+    const qm = createQM()
+    const accountA = {
+      id: 'fallback-1',
+      type: 'oauth' as const,
+      access: 'fallback-a',
+      refresh: 'refresh-a',
+      expires: now + 60_000,
+      authLineageId: 'lineage-a',
+      quota: {
+        checkedAt: now,
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+      },
+    }
+    const accountB = {
+      ...accountA,
+      access: 'fallback-b',
+      authLineageId: 'lineage-b',
+      quota: {
+        checkedAt: now,
+        five_hour: { usedPercent: 20, remainingPercent: 80, checkedAt: now },
+      },
+    }
+
+    qm.seedFallbacksFromAccounts([accountA])
+    qm.seedFallbacksFromAccounts([accountB])
+    qm.seedFallbacksFromAccounts([accountB])
+
+    expect(
+      qm.pushFallbackFromHeaders(
+        'fallback-1',
+        {
+          five_hour: {
+            usedPercent: 95,
+            remainingPercent: 5,
+            checkedAt: now + 1,
+          },
+          checkedAt: now + 1,
+        },
+        accountA,
+      ),
+    ).toBeNull()
+    expect(
+      qm.getFallback('fallback-1', accountB)?.quota.five_hour?.usedPercent,
+    ).toBe(20)
+  })
+
   describe('persistence', () => {
     test('seeds main quota from persisted storage', () => {
       const quota = {
@@ -2059,7 +2139,7 @@ describe('QuotaManager', () => {
       expect(qm.getFallback('fallback')).toBeNull()
     })
 
-    test('replacement-lineage header push clears cache before merging it', () => {
+    test('replacement-lineage header push discards the stale observation', () => {
       const qm = createQM()
       qm.seedFallbacksFromAccounts([
         {
@@ -2090,8 +2170,10 @@ describe('QuotaManager', () => {
         authLineageId: 'replacement-login',
       })
 
-      expect(pushed.quota.scoped).toBeUndefined()
-      expect(qm.getFallback('fallback')?.quota.scoped).toBeUndefined()
+      expect(pushed).toBeNull()
+      expect(qm.getFallback('fallback')?.quota.scoped).toEqual([
+        expect.objectContaining({ id: 'old-login-scope' }),
+      ])
     })
 
     test('header push binds main to account identity and fallback to account id', () => {

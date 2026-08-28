@@ -23,6 +23,7 @@ import {
   getClaudeCodeIdentity,
   getOrCreatePrimeAuthLineageId,
   hashRefreshToken,
+  isOAuthAccount,
   type LogTestRecord,
   loadAccounts,
   type OAuthAccount,
@@ -398,9 +399,8 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
         }),
       { models: {} },
     )
-    await drainSidebarWrites()
     const state = await waitForSidebarState(
-      (candidate) => candidate.fallbacks[0]?.id === 'fallback-1',
+      (candidate) => candidate.fallbacks[0]?.needsReauth === true,
     )
     expect(state.fallbacks[0]?.needsReauth).toBe(true)
   })
@@ -418,9 +418,8 @@ describe('sidebar needsReauth (dead-fallback indicator)', () => {
         }),
       { models: {} },
     )
-    await drainSidebarWrites()
     const state = await waitForSidebarState(
-      (candidate) => candidate.fallbacks[0]?.id === 'fallback-1',
+      (candidate) => candidate.fallbacks[0]?.needsReauth === false,
     )
     expect(state.fallbacks[0]?.needsReauth).toBe(false)
   })
@@ -469,7 +468,9 @@ async function waitForLogRecord(
     await Bun.sleep(10)
   }
   if (!records.some(predicate)) {
-    throw new Error(`Expected log record ${description}`)
+    throw new Error(
+      `Expected log record ${description}: ${JSON.stringify(records)}`,
+    )
   }
 }
 
@@ -732,6 +733,142 @@ describe('quota header feed integration', () => {
     } finally {
       Date.now = originalNow
       delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    }
+  })
+
+  test('stale fallback headers do not persist or publish after re-login', async () => {
+    const fallbackAccess = 'fallback-lineage-a-access'
+    const fallbackCheckedAt = Date.now()
+    let releaseFallbackResponse: ((response: Response) => void) | undefined
+    let fallbackStarted: (() => void) | undefined
+    const fallbackResponse = new Promise<Response>((resolve) => {
+      releaseFallbackResponse = resolve
+    })
+    const fallbackRequestStarted = new Promise<void>((resolve) => {
+      fallbackStarted = resolve
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        quota: {
+          ...createFallbackStorage().quota,
+          checkIntervalMinutes: 60,
+        },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: fallbackAccess,
+            refresh: 'fallback-lineage-a-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            authLineageId: 'lineage-a',
+            quota: {
+              five_hour: {
+                usedPercent: 25,
+                remainingPercent: 75,
+                checkedAt: fallbackCheckedAt,
+              },
+              seven_day: {
+                usedPercent: 30,
+                remainingPercent: 70,
+                checkedAt: fallbackCheckedAt,
+              },
+            },
+          },
+        ],
+      }),
+    )
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        const token = new Headers(init?.headers).get('authorization')
+        if (token === `Bearer ${fallbackAccess}`) {
+          fallbackStarted?.()
+          return fallbackResponse
+        }
+        return Promise.resolve(new Response(null, { status: 429 }))
+      }
+      return Promise.resolve(Response.json({}))
+    }) as unknown as typeof fetch
+
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    try {
+      const plugin = await getPlugin()
+      setLogLevel('trace')
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+      const responsePromise = result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+      })
+      await fallbackRequestStarted
+
+      const replacement = await loadAccounts(
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+      )
+      if (!replacement) throw new Error('fallback storage unexpectedly missing')
+      const replacementAccount = replacement.accounts.find(
+        (account) => account.id === 'fallback-1',
+      )
+      if (!replacementAccount || !isOAuthAccount(replacementAccount)) {
+        throw new Error('fallback account unexpectedly missing')
+      }
+      replacementAccount.authLineageId = 'lineage-b'
+      await saveAccounts(replacement)
+      setLogLevel('trace')
+
+      releaseFallbackResponse?.(
+        new Response('{}', {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.04',
+            'anthropic-ratelimit-unified-7d-utilization': '0.12',
+          },
+        }),
+      )
+      const response = await responsePromise
+      expect(response.status).toBe(200)
+      await response.text()
+
+      await waitForLogRecord(
+        records,
+        (record) =>
+          record.level === 'trace' &&
+          record.channel === 'quota' &&
+          ((record.message ===
+            'skipped stale fallback quota persistence after lineage change' &&
+            record.payload?.accountId === 'fallback-1' &&
+            record.payload?.storedLineage === 'lineage-b' &&
+            record.payload?.servedLineage === 'lineage-a') ||
+            (record.message ===
+              'skipped stale fallback quota observation after lineage change' &&
+              record.payload?.accountId === 'fallback-1' &&
+              record.payload?.storedLineage === 'lineage-b' &&
+              record.payload?.servedLineage === 'lineage-a')),
+        'stale fallback quota persistence discard',
+      )
+      const settled = await loadAccounts()
+      const settledAccount = settled?.accounts.find(
+        (candidate) => candidate.id === 'fallback-1',
+      )
+      expect(
+        settledAccount && isOAuthAccount(settledAccount)
+          ? settledAccount.quota?.five_hour?.checkedAt
+          : undefined,
+      ).toBe(fallbackCheckedAt)
+      expect(await readFeedEntries()).toEqual([])
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel('info')
     }
   })
 
@@ -3277,6 +3414,7 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
+    await drainSidebarWrites()
 
     await result.fetch(MESSAGES_URL, {
       method: 'POST',
@@ -3286,9 +3424,7 @@ describe('auth.loader', () => {
       }),
     })
 
-    const state = await waitForSidebarState(
-      (candidate) => candidate.main.quota?.five_hour?.usedPercent === 12,
-    )
+    const state = await getSidebarState()
     expect(state.main.quota?.seven_day?.usedPercent).toBe(2)
     expect(quotaApiCalls).toBe(0)
   })
