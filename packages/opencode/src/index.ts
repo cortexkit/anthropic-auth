@@ -984,33 +984,46 @@ const anthropicAuthPlugin = async (
     accessToken: string,
     model?: string,
   ): Promise<MainQuotaIdentityResolution> {
-    const resolutionGeneration = ++mainQuotaIdentityResolutionGeneration
-    const identity = await resolveClaudeCodeIdentity(
-      accessToken,
-      model,
-      mainAccountId,
-    )
-    // Adapters that do not use Claude's OAuth token format cannot be bootstrapped;
-    // keep the slot identity only for that compatibility path. Claude OAuth
-    // credentials use the oat prefix and stay unknown when bootstrap fails.
-    const quotaIdentity =
-      identity.accountUuid ??
-      (!accessToken.startsWith('sk-ant-oat') ? mainAccountId : undefined)
-    if (resolutionGeneration !== mainQuotaIdentityResolutionGeneration) {
-      const identityChanged =
-        mainQuotaIdentityAccessToken !== accessToken ||
-        mainQuotaAccountId !== quotaIdentity
+    const inFlight = mainQuotaIdentityResolutions.get(accessToken)
+    if (inFlight) return inFlight
+
+    const resolution = (async () => {
+      const resolutionGeneration = ++mainQuotaIdentityResolutionGeneration
+      const identity = await resolveClaudeCodeIdentity(
+        accessToken,
+        model,
+        mainAccountId,
+      )
+      // Adapters that do not use Claude's OAuth token format cannot be bootstrapped;
+      // keep the slot identity only for that compatibility path. Claude OAuth
+      // credentials use the oat prefix and stay unknown when bootstrap fails.
+      const quotaIdentity =
+        identity.accountUuid ??
+        (!accessToken.startsWith('sk-ant-oat') ? mainAccountId : undefined)
+      if (resolutionGeneration !== mainQuotaIdentityResolutionGeneration) {
+        const identityChanged =
+          mainQuotaIdentityAccessToken !== accessToken ||
+          mainQuotaAccountId !== quotaIdentity
+        return {
+          accountIdentity: quotaIdentity,
+          generation: quotaManager.getMainQuotaIdentityGeneration(),
+          stale: identityChanged,
+        }
+      }
+      await reconcileMainQuotaAccountIdentity(accessToken, quotaIdentity)
       return {
         accountIdentity: quotaIdentity,
         generation: quotaManager.getMainQuotaIdentityGeneration(),
-        stale: identityChanged,
+        stale: false,
       }
-    }
-    await reconcileMainQuotaAccountIdentity(accessToken, quotaIdentity)
-    return {
-      accountIdentity: quotaIdentity,
-      generation: quotaManager.getMainQuotaIdentityGeneration(),
-      stale: false,
+    })()
+    mainQuotaIdentityResolutions.set(accessToken, resolution)
+    try {
+      return await resolution
+    } finally {
+      if (mainQuotaIdentityResolutions.get(accessToken) === resolution) {
+        mainQuotaIdentityResolutions.delete(accessToken)
+      }
     }
   }
 
@@ -2455,6 +2468,10 @@ const anthropicAuthPlugin = async (
   let mainQuotaAccountId: string | undefined
   let mainQuotaIdentityAccessToken: string | undefined
   let mainQuotaIdentityResolutionGeneration = 0
+  const mainQuotaIdentityResolutions = new Map<
+    string,
+    Promise<MainQuotaIdentityResolution>
+  >()
   let sidebarMainQuotaRefreshInFlight = false
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
   // Per-process counter of replayable model requests. Drives the every-N
@@ -5694,7 +5711,9 @@ const anthropicAuthPlugin = async (
                     skipFallbackQuotaSeed = true
                   }
                 }
-                return writeSidebarState(sidebarStorage, {
+                // State construction reconciles quota caches synchronously; only
+                // the display-only file write is detached from the response path.
+                void writeSidebarState(sidebarStorage, {
                   activeId,
                   route,
                   mainAccessToken: auth.access,

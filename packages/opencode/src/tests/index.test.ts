@@ -1019,14 +1019,76 @@ describe('quota header feed integration', () => {
       const response = await responsePromise
       expect(response.status).toBe(200)
       await response.text()
-      await drainSidebarWrites()
 
       expect(
         quotaManager.getAllFallbacks().get('fallback-1')?.quota.five_hour
           ?.usedPercent,
       ).toBeUndefined()
+      await drainSidebarWrites()
     } finally {
       setLogLevel('info')
+    }
+  })
+
+  test('does not hold a model response on the display-only sidebar write', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
+    )
+    let responseStarted!: () => void
+    const responseStartedPromise = new Promise<void>((resolve) => {
+      responseStarted = resolve
+    })
+    let sidebarWriteStarted!: () => void
+    const sidebarWriteStartedPromise = new Promise<void>((resolve) => {
+      sidebarWriteStarted = resolve
+    })
+    let releaseSidebarWrite!: () => void
+    const sidebarWriteRelease = new Promise<void>((resolve) => {
+      releaseSidebarWrite = resolve
+    })
+    globalThis.fetch = mock((input: any) => {
+      if (extractUrl(input).includes('/v1/messages')) {
+        responseStarted()
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      return Promise.resolve(Response.json({}))
+    }) as unknown as typeof fetch
+
+    try {
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+      await drainSidebarWrites()
+      __setSidebarStateWriteTestHooks({
+        beforeRename: async () => {
+          sidebarWriteStarted()
+          await sidebarWriteRelease
+        },
+      })
+
+      const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
+      await responseStartedPromise
+      await sidebarWriteStartedPromise
+      const settledBeforeRelease = await Promise.race([
+        responsePromise.then(() => true),
+        Bun.sleep(50).then(() => false),
+      ])
+      expect(settledBeforeRelease).toBe(true)
+
+      releaseSidebarWrite()
+      expect((await responsePromise).status).toBe(200)
+    } finally {
+      releaseSidebarWrite?.()
+      await drainSidebarWrites()
+      __setSidebarStateWriteTestHooks(null)
     }
   })
 
@@ -1551,6 +1613,73 @@ describe('quota header feed integration', () => {
     } finally {
       __setLogTestSink(null)
       setLogLevel('info')
+      if (originalProfileHydration === undefined) {
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+      } else {
+        process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION =
+          originalProfileHydration
+      }
+    }
+  })
+
+  test('coalesces concurrent main identity resolution for the same token', async () => {
+    const originalProfileHydration =
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+    try {
+      await useTempAccountFile({
+        ...createFallbackStorage({
+          mainAccountId: 'main-slot',
+          quota: { enabled: false },
+        }),
+        accounts: [],
+      })
+      let releaseBootstrap!: (response: Response) => void
+      const bootstrapResponse = new Promise<Response>((resolve) => {
+        releaseBootstrap = resolve
+      })
+      let bootstrapStarted!: () => void
+      const bootstrapStartedPromise = new Promise<void>((resolve) => {
+        bootstrapStarted = resolve
+      })
+      let bootstrapCalls = 0
+      globalThis.fetch = mock((input: any) => {
+        const url = extractUrl(input)
+        if (url.includes('/api/claude_cli/bootstrap')) {
+          bootstrapCalls++
+          bootstrapStarted()
+          return bootstrapResponse
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin()
+      let currentAuth = {
+        type: 'oauth' as const,
+        access: 'compat-main-access',
+        refresh: 'main-refresh',
+        expires: Date.now() + 100_000,
+      }
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(currentAuth),
+        { models: {} },
+      )
+      currentAuth = {
+        ...currentAuth,
+        access: 'sk-ant-oat-shared-token',
+      }
+
+      const firstRequest = result.fetch(MESSAGES_URL, EMPTY_POST)
+      await bootstrapStartedPromise
+      const secondRequest = result.fetch(MESSAGES_URL, EMPTY_POST)
+      releaseBootstrap(
+        Response.json({ oauth_account: { account_uuid: 'shared-account' } }),
+      )
+
+      const responses = await Promise.all([firstRequest, secondRequest])
+      expect(responses.map((response) => response.status)).toEqual([200, 200])
+      expect(bootstrapCalls).toBe(1)
+    } finally {
       if (originalProfileHydration === undefined) {
         delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
       } else {
