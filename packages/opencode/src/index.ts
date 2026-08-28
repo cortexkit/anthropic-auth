@@ -1265,6 +1265,11 @@ const anthropicAuthPlugin = async (
           servedLineage: served.authLineageId,
         },
       )
+      // The persistence fence is authoritative; discard the optimistic cache
+      // write unless a newer replacement observation already won the race.
+      if (quotaManager.getAllFallbacks().get(served.accountId) === entry) {
+        quotaManager.clearFallback(served.accountId)
+      }
       return null
     }
     account.quota = {
@@ -1457,9 +1462,9 @@ const anthropicAuthPlugin = async (
         } catch (error) {
           logPersistFailure(error)
         }
+        void refreshSidebarQuota().catch(() => {})
         await publishQuotaHeaderFeed(served, feedEntry)
       })().catch(logQuotaHeaderFeedFailure)
-      void refreshSidebarQuota().catch(() => {})
       logger.debug('quota', 'harvested response quota', {
         account: served.accountId,
         fiveHourPercent: entry.quota.five_hour?.usedPercent,
@@ -2203,6 +2208,7 @@ const anthropicAuthPlugin = async (
     mainAccessToken?: string
     routingAuthoritative?: boolean
     useHydratedProfiles?: boolean
+    skipFallbackQuotaSeed?: boolean
   }
 
   function mergeHydratedProfilesForSidebar(
@@ -2251,9 +2257,11 @@ const anthropicAuthPlugin = async (
   ): SidebarState {
     quotaManager.updateStorage(storage)
     quotaManager.seedMainFromStorage(storage, mainQuotaAccountId)
-    quotaManager.seedFallbacksFromAccounts(
-      (storage?.accounts ?? []).filter(isOAuthAccount),
-    )
+    if (!options.skipFallbackQuotaSeed) {
+      quotaManager.seedFallbacksFromAccounts(
+        (storage?.accounts ?? []).filter(isOAuthAccount),
+      )
+    }
     const mainEntry = quotaManager.getMain(mainQuotaAccountId)
     const lastApiError = quotaManager.getLastApiError()
     const mainRefreshError = storage?.refresh?.mainLastRefreshError
@@ -2284,9 +2292,11 @@ const anthropicAuthPlugin = async (
           // Token-aware read: if a fallback account was re-logged with the same
           // id/label, an old in-memory quota snapshot must not be shown as the
           // new account's quota.
-          quota: account.access
-            ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
-            : null,
+          quota: options.skipFallbackQuotaSeed
+            ? null
+            : account.access
+              ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
+              : null,
           // A fallback with a permanently-dead refresh token (400 invalid_grant)
           // is dropped by getUsableFallbackAccounts and silently degrades to
           // main — surface it as "needs re-login". Only flag truly-dead tokens
@@ -5273,7 +5283,7 @@ const anthropicAuthPlugin = async (
             onFallbackSuccess?: (account: {
               id: string
               access?: string
-            }) => void,
+            }) => void | Promise<void>,
             modelId?: string,
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
@@ -5663,15 +5673,34 @@ const anthropicAuthPlugin = async (
                   requestMainQuotaIdentity,
                 )
               }
-              const writeCurrentSidebarState = (
+              const writeCurrentSidebarState = async (
                 activeId: string | undefined,
                 route: string,
-              ) =>
-                writeSidebarState(storage, {
+              ) => {
+                let sidebarStorage = storage
+                let skipFallbackQuotaSeed = false
+                if (
+                  (storage?.accounts ?? []).some(
+                    (account) => isOAuthAccount(account) && account.quota,
+                  )
+                ) {
+                  try {
+                    const currentStorage =
+                      await loadAccounts(accountStoragePath)
+                    if (currentStorage) sidebarStorage = currentStorage
+                    else skipFallbackQuotaSeed = true
+                  } catch {
+                    // An unverifiable snapshot must not seed spend-affecting state.
+                    skipFallbackQuotaSeed = true
+                  }
+                }
+                return writeSidebarState(sidebarStorage, {
                   activeId,
                   route,
                   mainAccessToken: auth.access,
+                  skipFallbackQuotaSeed,
                 })
+              }
               let preselectedFallbackAccounts:
                 | Array<OAuthAccount | ApiKeyAccount>
                 | undefined
@@ -5797,7 +5826,10 @@ const anthropicAuthPlugin = async (
                       if (markUsed && selected.account) {
                         await fallbackManager.markUsed(selected.account)
                       }
-                      writeCurrentSidebarState(selected.id, 'sticky-balanced')
+                      await writeCurrentSidebarState(
+                        selected.id,
+                        'sticky-balanced',
+                      )
                       trace.done('return_sticky_balanced', {
                         status: response.status,
                         accountId: selected.id,
@@ -6538,14 +6570,15 @@ const anthropicAuthPlugin = async (
                 auth.access,
                 (account) => {
                   fallbackServed = true
-                  writeCurrentSidebarState(account.id, 'fallback')
+                  return writeCurrentSidebarState(account.id, 'fallback')
                 },
                 requestModelId,
                 fableRequest,
                 laneStartRequest,
                 requestMainQuotaIdentity,
               )
-              if (!fallbackServed) writeCurrentSidebarState('main', 'main')
+              if (!fallbackServed)
+                await writeCurrentSidebarState('main', 'main')
 
               trace.done('return_response', { status: response.status })
               return wrapResponse(response)
