@@ -123,7 +123,7 @@ import {
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
   type QuotaEntry,
-  type QuotaHeaderFeedEntry,
+  type QuotaHeaderFeedPublishEntry,
   QuotaHeaderFeedRegistry,
   QuotaManager,
   type QuotaState,
@@ -1383,17 +1383,28 @@ const anthropicAuthPlugin = async (
       fallbackAdvised: entry.quota.fallbackAdvised,
       scoped: entry.quota.scoped,
       extraUsage: entry.quota.extraUsage,
+      fieldSources: entry.quota.fieldSources,
     }
     const accountKey =
       credentialId ??
       (served.accountId === 'main'
         ? (served.mainQuotaIdentity?.accountIdentity ?? 'main')
         : served.accountId)
-    const feedEntry: QuotaHeaderFeedEntry & { accountKey: string } =
-      credentialId
+    const feedEntry: QuotaHeaderFeedPublishEntry = credentialId
+      ? {
+          identity_source: 'credential_id',
+          credential_id: credentialId,
+          schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
+          provider: 'anthropic',
+          configured_account_count: configuredAccountCount,
+          observed_at_ms: observedAtMs,
+          quota,
+          accountKey,
+        }
+      : served.accountId === 'main' && served.mainQuotaIdentity?.accountIdentity
         ? {
-            identity_source: 'credential_id',
-            credential_id: credentialId,
+            identity_source: 'account_ref',
+            account_ref: served.mainQuotaIdentity.accountIdentity,
             schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
             provider: 'anthropic',
             configured_account_count: configuredAccountCount,
@@ -1401,11 +1412,9 @@ const anthropicAuthPlugin = async (
             quota,
             accountKey,
           }
-        : served.accountId === 'main' &&
-            served.mainQuotaIdentity?.accountIdentity
+        : served.accountId === 'main'
           ? {
-              identity_source: 'account_ref',
-              account_ref: served.mainQuotaIdentity.accountIdentity,
+              identity_source: 'none',
               schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
@@ -1413,26 +1422,16 @@ const anthropicAuthPlugin = async (
               quota,
               accountKey,
             }
-          : served.accountId === 'main'
-            ? {
-                identity_source: 'none',
-                schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
-                provider: 'anthropic',
-                configured_account_count: configuredAccountCount,
-                observed_at_ms: observedAtMs,
-                quota,
-                accountKey,
-              }
-            : {
-                identity_source: 'account_ref',
-                account_ref: served.accountId,
-                schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
-                provider: 'anthropic',
-                configured_account_count: configuredAccountCount,
-                observed_at_ms: observedAtMs,
-                quota,
-                accountKey,
-              }
+          : {
+              identity_source: 'account_ref',
+              account_ref: served.accountId,
+              schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
+              provider: 'anthropic',
+              configured_account_count: configuredAccountCount,
+              observed_at_ms: observedAtMs,
+              quota,
+              accountKey,
+            }
     await quotaHeaderFeedRegistry.publish(feedEntry)
   }
 

@@ -17,6 +17,7 @@ import {
   QUOTA_HEADER_FEED_LEASE_MS,
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaHeaderFeedEntry,
+  type QuotaHeaderFeedPublishEntry,
   QuotaHeaderFeedRegistry,
 } from '../../../core/src/quota-header-feed.ts'
 
@@ -72,27 +73,30 @@ describe('quota header feed', () => {
     const raw = JSON.parse(
       await readFile(join(directory, 'required.json'), 'utf8'),
     )
-    expect(QUOTA_HEADER_FEED_SCHEMA_VERSION).toBe(2)
-    expect(raw.entries.a.schema_version).toBe(2)
+    expect(QUOTA_HEADER_FEED_SCHEMA_VERSION).toBe(3)
+    expect(raw.entries.a.schema_version).toBe(3)
     expect(raw.entries.a.provider).toBe('anthropic')
   })
 
-  test.each([1, 999])('rejects unknown schema versions %p', async (version) => {
-    await mkdir(directory, { recursive: true })
-    await writeFile(
-      join(directory, 'unknown.json'),
-      JSON.stringify({
-        version,
-        entries: { a: { ...entry(), schema_version: version } },
-        updated_at_ms: 1_000,
-      }),
-    )
-    const registry = new QuotaHeaderFeedRegistry({
-      directory,
-      now: () => 1_000,
-    })
-    expect(await registry.list()).toEqual([])
-  })
+  test.each([1, 2, 999])(
+    'rejects unknown schema versions %p',
+    async (version) => {
+      await mkdir(directory, { recursive: true })
+      await writeFile(
+        join(directory, 'unknown.json'),
+        JSON.stringify({
+          version,
+          entries: { a: { ...entry(), schema_version: version } },
+          updated_at_ms: 1_000,
+        }),
+      )
+      const registry = new QuotaHeaderFeedRegistry({
+        directory,
+        now: () => 1_000,
+      })
+      expect(await registry.list()).toEqual([])
+    },
+  )
 
   test('enforces identity exclusivity and omits identity fields for none', async () => {
     const registry = new QuotaHeaderFeedRegistry({
@@ -232,7 +236,7 @@ describe('quota header feed', () => {
         } as unknown as QuotaHeaderFeedEntry['quota'],
       }),
       accountKey: 'a',
-    })
+    } as unknown as QuotaHeaderFeedPublishEntry)
     const raw = JSON.parse(
       await readFile(join(directory, 'quota-fields.json'), 'utf8'),
     )
@@ -279,6 +283,56 @@ describe('quota header feed', () => {
     expect(bytes).not.toContain('must-not-publish')
     expect(bytes).not.toContain('authorization')
     expect(bytes).not.toContain('access-token')
+  })
+
+  test('publishes only allowlisted per-field provenance', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'provenance-fields',
+    })
+    await registry.publish({
+      ...entry({
+        quota: {
+          five_hour: {
+            usedPercent: 10,
+            remainingPercent: 90,
+            checkedAt: 800,
+          },
+          seven_day: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: 801,
+          },
+          bindingWindow: 'five_hour',
+          fallbackAdvised: false,
+          fieldSources: {
+            five_hour: 'headers',
+            seven_day: 'poll',
+            scoped: 'poll',
+            extraUsage: 'poll',
+            bindingWindow: 'headers',
+            unexpected: 'must-not-publish',
+          },
+        } as unknown as QuotaHeaderFeedEntry['quota'],
+      }),
+      accountKey: 'a',
+    } as unknown as QuotaHeaderFeedPublishEntry)
+
+    const raw = JSON.parse(
+      await readFile(join(directory, 'provenance-fields.json'), 'utf8'),
+    )
+    const bytes = await readFile(
+      join(directory, 'provenance-fields.json'),
+      'utf8',
+    )
+    expect(raw.entries.a.quota.provenance).toEqual({
+      five_hour: 'headers',
+      seven_day: 'poll',
+      scoped: 'poll',
+      extraUsage: 'poll',
+      bindingWindow: 'headers',
+    })
+    expect(bytes).not.toContain('must-not-publish')
   })
 
   test('omits malformed nested quota values without dropping the entry', async () => {
@@ -329,7 +383,7 @@ describe('quota header feed', () => {
         } as unknown as QuotaHeaderFeedEntry['quota'],
       }),
       accountKey: 'a',
-    })
+    } as unknown as QuotaHeaderFeedPublishEntry)
     const raw = JSON.parse(
       await readFile(join(directory, 'malformed-nested.json'), 'utf8'),
     )
@@ -359,14 +413,14 @@ describe('quota header feed', () => {
     await writeFile(
       join(directory, 'stale.json'),
       JSON.stringify({
-        version: 2,
+        version: 3,
         entries: { a: entry({ observed_at_ms: 1_000 }) },
       }),
     )
     await writeFile(
       join(directory, 'future.json'),
       JSON.stringify({
-        version: 2,
+        version: 3,
         entries: { a: entry({ observed_at_ms: 181_001 }) },
       }),
     )
