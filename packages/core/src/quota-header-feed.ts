@@ -232,11 +232,13 @@ function projectExtraUsage(
 
 function projectQuotaProvenance(
   value: unknown,
+  presentFields: ReadonlySet<QuotaFieldName>,
 ): QuotaHeaderFeedProvenance | undefined {
   if (!value || typeof value !== 'object') return undefined
   const candidate = value as Record<string, unknown>
   const provenance: QuotaHeaderFeedProvenance = {}
   for (const field of QUOTA_FIELD_NAMES) {
+    if (!presentFields.has(field)) continue
     const source = candidate[field]
     if (source === 'poll' || source === 'headers') provenance[field] = source
   }
@@ -252,7 +254,18 @@ function projectQuota(quota: QuotaHeaderFeedPublishEntry['quota']) {
         .filter((entry): entry is AccountScopedQuotaWindow => entry != null)
     : undefined
   const extraUsage = projectExtraUsage(quota.extraUsage)
-  const provenance = projectQuotaProvenance(quota.fieldSources)
+  const presentFields = new Set<QuotaFieldName>()
+  if (fiveHour) presentFields.add('five_hour')
+  if (sevenDay) presentFields.add('seven_day')
+  if (typeof quota.bindingWindow === 'string') {
+    presentFields.add('bindingWindow')
+  }
+  if (typeof quota.fallbackAdvised === 'boolean') {
+    presentFields.add('fallbackAdvised')
+  }
+  if (scoped) presentFields.add('scoped')
+  if (extraUsage) presentFields.add('extraUsage')
+  const provenance = projectQuotaProvenance(quota.fieldSources, presentFields)
   return {
     ...(fiveHour && { five_hour: fiveHour }),
     ...(sevenDay && { seven_day: sevenDay }),

@@ -329,11 +329,39 @@ describe('quota header feed', () => {
     expect(raw.entries.a.quota.provenance).toEqual({
       five_hour: 'headers',
       seven_day: 'poll',
-      scoped: 'poll',
-      extraUsage: 'poll',
       bindingWindow: 'headers',
     })
     expect(bytes).not.toContain('must-not-publish')
+  })
+
+  test('does not publish provenance for absent quota fields', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'provenance-presence',
+    })
+    await registry.publish({
+      ...entry({
+        quota: {
+          seven_day: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: 801,
+          },
+          fieldSources: {
+            five_hour: 'poll',
+            seven_day: 'headers',
+          },
+        } as unknown as QuotaHeaderFeedEntry['quota'],
+      }),
+      accountKey: 'a',
+    } as unknown as QuotaHeaderFeedPublishEntry)
+
+    const raw = JSON.parse(
+      await readFile(join(directory, 'provenance-presence.json'), 'utf8'),
+    )
+    expect(raw.entries.a.quota.provenance).toEqual({
+      seven_day: 'headers',
+    })
   })
 
   test('keeps source internal and excludes it from published entries', async () => {

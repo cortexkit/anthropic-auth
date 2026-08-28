@@ -917,6 +917,42 @@ describe('account storage', () => {
     )
   })
 
+  test('drops provenance for quota fields rejected during normalization', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 123,
+      quota: {
+        five_hour: {
+          usedPercent: 'not-a-number' as unknown as number,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        seven_day: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 700,
+        },
+        fieldSources: {
+          five_hour: 'poll',
+          seven_day: 'headers',
+        },
+        source: 'headers',
+        checkedAt: 700,
+      },
+    })
+
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const quota = expectOAuthAccount(loaded?.accounts[0]).quota
+    expect(quota?.five_hour).toBeUndefined()
+    expect(quota?.fieldSources).toEqual({ seven_day: 'headers' })
+  })
+
   test('saves and loads sidecar accounts', async () => {
     const storage = baseStorage()
     storage.accounts.push({

@@ -713,19 +713,6 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     }
   }
 
-  if (isRecord(value.fieldSources)) {
-    const fieldSources: QuotaFieldSources = {}
-    for (const field of QUOTA_FIELD_NAMES) {
-      const source = value.fieldSources[field]
-      if (source === 'poll' || source === 'headers') {
-        fieldSources[field] = source
-      }
-    }
-    if (Object.keys(fieldSources).length > 0) {
-      quota.fieldSources = fieldSources
-    }
-  }
-
   if (typeof value.bindingWindow === 'string' && value.bindingWindow.trim()) {
     quota.bindingWindow = value.bindingWindow.trim()
   }
@@ -740,6 +727,20 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
   }
   if (value.source === 'poll' || value.source === 'headers') {
     quota.source = value.source
+  }
+
+  if (isRecord(value.fieldSources)) {
+    const fieldSources: QuotaFieldSources = {}
+    for (const field of QUOTA_FIELD_NAMES) {
+      if (quota[field] === undefined) continue
+      const source = value.fieldSources[field]
+      if (source === 'poll' || source === 'headers') {
+        fieldSources[field] = source
+      }
+    }
+    if (Object.keys(fieldSources).length > 0) {
+      quota.fieldSources = fieldSources
+    }
   }
 
   return Object.keys(quota).length ? quota : undefined
@@ -1179,6 +1180,14 @@ function fieldSourcesForMergedQuota(
       fieldSources[field] = 'poll'
       continue
     }
+    if (
+      field === 'fallbackAdvised' &&
+      incoming.fieldSources?.fallbackAdvised === undefined
+    ) {
+      const source = quotaFieldSource(existing, field)
+      if (source) fieldSources[field] = source
+      continue
+    }
     const source =
       incoming[field] === merged[field]
         ? quotaFieldSource(incoming, field)
@@ -1204,6 +1213,10 @@ export function mergeHeaderQuotaForPersistence(
     seven_day: mergeHeaderOwnedWindow(existing, incoming, 'seven_day'),
     scoped: mergeHeaderScopedQuota(existing, incoming),
     extraUsage: existing.extraUsage ?? incoming.extraUsage,
+    fallbackAdvised:
+      incoming.fieldSources?.fallbackAdvised !== undefined
+        ? incoming.fallbackAdvised
+        : (existing.fallbackAdvised ?? incoming.fallbackAdvised),
     bindingWindow: preservePollBinding
       ? existing.bindingWindow
       : (incoming.bindingWindow ?? existing.bindingWindow),
