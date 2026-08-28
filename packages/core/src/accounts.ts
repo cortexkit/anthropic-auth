@@ -713,6 +713,19 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     }
   }
 
+  if (isRecord(value.fieldSources)) {
+    const fieldSources: QuotaFieldSources = {}
+    for (const field of QUOTA_FIELD_NAMES) {
+      const source = value.fieldSources[field]
+      if (source === 'poll' || source === 'headers') {
+        fieldSources[field] = source
+      }
+    }
+    if (Object.keys(fieldSources).length > 0) {
+      quota.fieldSources = fieldSources
+    }
+  }
+
   if (typeof value.bindingWindow === 'string' && value.bindingWindow.trim()) {
     quota.bindingWindow = value.bindingWindow.trim()
   }

@@ -39,13 +39,16 @@ import {
   type KillswitchThresholds,
   killswitchPassesPolicy,
   loadAccounts,
+  mergeHeaderQuotaSnapshot,
   mergeMainQuotaErrorClearedAt,
+  normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   PROFILE_TTL_MS,
   QuotaManager,
+  quotaFieldSource,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -790,6 +793,130 @@ describe('isCostZeroingEnabled', () => {
 })
 
 describe('account storage', () => {
+  test('preserves mixed quota field provenance across a save/load round-trip', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 123,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        seven_day: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 700,
+        },
+        fieldSources: {
+          five_hour: 'poll',
+          seven_day: 'headers',
+        },
+        source: 'headers',
+        checkedAt: 700,
+      },
+    })
+
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const quota = expectOAuthAccount(loaded?.accounts[0]).quota
+    expect(quota?.fieldSources).toEqual({
+      five_hour: 'poll',
+      seven_day: 'headers',
+    })
+  })
+
+  test('keeps a reloaded poll window poll-owned during a partial header harvest', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 123,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        seven_day: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 700,
+        },
+        fieldSources: {
+          five_hour: 'poll',
+          seven_day: 'headers',
+        },
+        source: 'headers',
+        checkedAt: 700,
+      },
+    })
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    const existing = expectOAuthAccount(loaded?.accounts[0]).quota
+    const merged = mergeHeaderQuotaSnapshot(
+      existing,
+      normalizeQuotaHeaders(
+        new Headers({
+          'anthropic-ratelimit-unified-7d-utilization': '0.5',
+        }),
+        800,
+      ),
+    )
+
+    expect(quotaFieldSource(merged, 'five_hour')).toBe('poll')
+    expect(quotaFieldSource(merged, 'seven_day')).toBe('headers')
+  })
+
+  test('filters unknown quota provenance fields and invalid sources on load', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'fallback-1',
+      type: 'oauth',
+      access: 'access',
+      refresh: 'refresh',
+      expires: 123,
+      quota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 600,
+        },
+        seven_day: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          checkedAt: 700,
+        },
+        fieldSources: {
+          five_hour: 'poll',
+          seven_day: 'headers',
+          unknown: 'poll',
+          extraUsage: 'database',
+        } as unknown as OAuthQuotaSnapshot['fieldSources'],
+        source: 'headers',
+        checkedAt: 700,
+      },
+    })
+
+    await saveAccounts(storage, accountPath)
+
+    const loaded = await loadAccounts(accountPath)
+    expect(expectOAuthAccount(loaded?.accounts[0]).quota?.fieldSources).toEqual(
+      {
+        five_hour: 'poll',
+        seven_day: 'headers',
+      },
+    )
+  })
+
   test('saves and loads sidecar accounts', async () => {
     const storage = baseStorage()
     storage.accounts.push({
