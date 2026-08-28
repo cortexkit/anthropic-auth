@@ -20,6 +20,7 @@ import {
   type QuotaHeaderFeedPublishEntry,
   QuotaHeaderFeedRegistry,
 } from '../../../core/src/quota-header-feed.ts'
+import { normalizeQuotaHeaders } from '../../../core/src/quota-headers.ts'
 
 const quota = { bindingWindow: 'five_hour', fallbackAdvised: false }
 
@@ -333,6 +334,32 @@ describe('quota header feed', () => {
       bindingWindow: 'headers',
     })
     expect(bytes).not.toContain('must-not-publish')
+  })
+
+  test('keeps source internal and excludes it from published entries', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'source-projection',
+    })
+    const internalSnapshot = normalizeQuotaHeaders(
+      new Headers({
+        'anthropic-ratelimit-unified-fallback': 'available',
+      }),
+    )
+    expect(internalSnapshot).toHaveProperty('source', 'headers')
+
+    await registry.publish({
+      ...entry(),
+      quota: {
+        fallbackAdvised: internalSnapshot.fallbackAdvised,
+        source: 'headers',
+      } as unknown as QuotaHeaderFeedPublishEntry['quota'],
+      accountKey: 'a',
+    })
+    const raw = JSON.parse(
+      await readFile(join(directory, 'source-projection.json'), 'utf8'),
+    )
+    expect(raw.entries.a.quota).not.toHaveProperty('source')
   })
 
   test('omits malformed nested quota values without dropping the entry', async () => {

@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import type { OAuthQuotaSnapshot } from '../../../core/src/accounts.ts'
+import {
+  fetchOAuthQuotaSnapshot,
+  type OAuthQuotaSnapshot,
+} from '../../../core/src/accounts.ts'
 import {
   mergeHeaderQuotaSnapshot,
   normalizeQuotaHeaders,
@@ -139,5 +142,99 @@ describe('quota field provenance', () => {
       bindingWindowSource: 'poll',
       fieldSources: { bindingWindow: 'poll' },
     })
+  })
+
+  test('marks fallback advice as header-derived only when its header is present', () => {
+    const available = normalizeQuotaHeaders(
+      new Headers({
+        'anthropic-ratelimit-unified-fallback': 'available',
+      }),
+      1_700_000_000_000,
+    )
+    const unavailable = normalizeQuotaHeaders(
+      new Headers({
+        'anthropic-ratelimit-unified-fallback': 'not-available',
+      }),
+      1_700_000_000_000,
+    )
+    const absent = normalizeQuotaHeaders(new Headers(), 1_700_000_000_000)
+    const existing = {
+      fallbackAdvised: true,
+      fieldSources: { fallbackAdvised: 'poll' },
+      source: 'poll',
+      checkedAt: 1_699_999_000_000,
+    } satisfies OAuthQuotaSnapshot
+
+    expect(available).toMatchObject({
+      fallbackAdvised: true,
+      fieldSources: { fallbackAdvised: 'headers' },
+    })
+    expect(unavailable).toMatchObject({
+      fallbackAdvised: false,
+      fieldSources: { fallbackAdvised: 'headers' },
+    })
+    expect(absent.fieldSources).not.toHaveProperty('fallbackAdvised')
+    expect(
+      mergeHeaderQuotaSnapshot(absent, normalizeQuotaHeaders(new Headers())),
+    ).not.toMatchObject({
+      fieldSources: { fallbackAdvised: expect.anything() },
+    })
+    expect(
+      mergeHeaderQuotaSnapshot(
+        existing,
+        normalizeQuotaHeaders(new Headers(), 1_700_000_000_000),
+      ),
+    ).toMatchObject({
+      fallbackAdvised: true,
+      fieldSources: { fallbackAdvised: 'poll' },
+    })
+  })
+
+  test('preserves the quota-window complement invariant across header and poll producers', async () => {
+    const percentages = Array.from({ length: 1001 }, (_, index) => index / 1000)
+    const boundaryUtilizations = [0.005, 0.015, 0.025]
+    const samples = [...percentages, ...boundaryUtilizations]
+
+    for (const utilization of samples) {
+      const headers = normalizeQuotaHeaders(
+        new Headers({
+          'anthropic-ratelimit-unified-5h-utilization': String(utilization),
+          'anthropic-ratelimit-unified-7d-utilization': String(utilization),
+        }),
+      )
+      expect(
+        headers.five_hour!.usedPercent + headers.five_hour!.remainingPercent,
+      ).toBe(100)
+      expect(
+        headers.seven_day!.usedPercent + headers.seven_day!.remainingPercent,
+      ).toBe(100)
+
+      const poll = await fetchOAuthQuotaSnapshot({
+        accessToken: 'test-token',
+        now: () => 1_700_000_000_000,
+        fetchImpl: (async () =>
+          Response.json({
+            five_hour: { utilization },
+            seven_day: { utilization },
+            limits: [
+              {
+                kind: 'weekly_scoped',
+                group: 'weekly',
+                percent: utilization * 100,
+                scope: { model: { id: 'fable', display_name: 'Fable' } },
+              },
+            ],
+          })) as unknown as typeof fetch,
+      })
+      expect(
+        poll.five_hour!.usedPercent + poll.five_hour!.remainingPercent,
+      ).toBe(100)
+      expect(
+        poll.seven_day!.usedPercent + poll.seven_day!.remainingPercent,
+      ).toBe(100)
+      expect(
+        poll.scoped![0]!.usedPercent + poll.scoped![0]!.remainingPercent,
+      ).toBe(100)
+    }
   })
 })

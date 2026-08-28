@@ -27,6 +27,7 @@ export const QUOTA_FIELD_NAMES = [
   'scoped',
   'extraUsage',
   'bindingWindow',
+  'fallbackAdvised',
 ] as const
 export type QuotaFieldName = (typeof QUOTA_FIELD_NAMES)[number]
 export type QuotaFieldSource = 'poll' | 'headers'

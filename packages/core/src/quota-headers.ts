@@ -58,8 +58,9 @@ export function normalizeQuotaHeaders(
   now = Date.now(),
 ): OAuthQuotaSnapshot {
   const fieldSources: QuotaFieldSources = {}
+  const fallbackHeader = headers.get(`${PREFIX}fallback`)
   const snapshot: OAuthQuotaSnapshot = {
-    fallbackAdvised: headers.get(`${PREFIX}fallback`) === 'available',
+    fallbackAdvised: fallbackHeader === 'available',
     source: 'headers',
     checkedAt: now,
   }
@@ -76,9 +77,10 @@ export function normalizeQuotaHeaders(
     snapshot.bindingWindowSource = 'headers'
     fieldSources.bindingWindow = 'headers'
   }
+  if (fallbackHeader !== null) fieldSources.fallbackAdvised = 'headers'
   return {
     ...snapshot,
-    ...(Object.keys(fieldSources).length > 0 && { fieldSources }),
+    fieldSources,
   }
 }
 
@@ -106,24 +108,35 @@ export function mergeHeaderQuotaSnapshot(
         ? existingScoped
         : field === 'extraUsage'
           ? existingExtraUsage
-          : field === 'bindingWindow'
-            ? existing?.bindingWindowSource === 'poll'
-              ? existing?.bindingWindow
-              : (incoming.bindingWindow ?? existing?.bindingWindow)
-            : (incoming[field] ?? existing?.[field])
+          : field === 'fallbackAdvised'
+            ? incomingFieldSources?.fallbackAdvised !== undefined
+              ? incoming.fallbackAdvised
+              : (existing?.fallbackAdvised ?? incoming.fallbackAdvised)
+            : field === 'bindingWindow'
+              ? existing?.bindingWindowSource === 'poll'
+                ? existing?.bindingWindow
+                : (incoming.bindingWindow ?? existing?.bindingWindow)
+              : (incoming[field] ?? existing?.[field])
     if (value === undefined) continue
     const source =
-      (field === 'scoped' || field === 'extraUsage') && value !== undefined
-        ? 'poll'
-        : field === 'bindingWindow' &&
-            existing?.bindingWindowSource === 'poll' &&
-            existing.bindingWindow !== undefined
+      field === 'fallbackAdvised'
+        ? (incomingFieldSources?.fallbackAdvised ??
+          (existing?.fallbackAdvised !== undefined
+            ? existingFieldSources
+              ? existingFieldSources.fallbackAdvised
+              : quotaFieldSource(existing, field)
+            : undefined))
+        : (field === 'scoped' || field === 'extraUsage') && value !== undefined
           ? 'poll'
-          : incoming[field] !== undefined
-            ? (incomingFieldSources?.[field] ??
-              quotaFieldSource(incoming, field))
-            : (existingFieldSources?.[field] ??
-              quotaFieldSource(existing, field))
+          : field === 'bindingWindow' &&
+              existing?.bindingWindowSource === 'poll' &&
+              existing.bindingWindow !== undefined
+            ? 'poll'
+            : incoming[field] !== undefined
+              ? (incomingFieldSources?.[field] ??
+                quotaFieldSource(incoming, field))
+              : (existingFieldSources?.[field] ??
+                quotaFieldSource(existing, field))
     if (source) fieldSources[field] = source
   }
 
@@ -132,6 +145,10 @@ export function mergeHeaderQuotaSnapshot(
     ...incomingWithoutPollOwnedFields,
     ...(Array.isArray(existingScoped) && { scoped: existingScoped }),
     ...(existingExtraUsage != null && { extraUsage: existingExtraUsage }),
+    fallbackAdvised:
+      incomingFieldSources?.fallbackAdvised !== undefined
+        ? incoming.fallbackAdvised
+        : (existing?.fallbackAdvised ?? incoming.fallbackAdvised),
     bindingWindow:
       existing?.bindingWindowSource === 'poll'
         ? existing.bindingWindow
