@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "test": "bun test src/tests",
+    "test": "bun run build && bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc",
     "prepublishOnly": "bun run build"
