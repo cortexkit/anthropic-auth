@@ -80,7 +80,16 @@ async function startWorker(upstream: ReturnType<typeof createUpstream>) {
     port: 0,
     log: new NoOpLog(),
   })
-  await waitForWorkerReady(mf)
+  try {
+    await waitForWorkerReady(mf)
+  } catch (error) {
+    try {
+      await mf.dispose()
+    } catch {
+      // Preserve the named startup failure when cleanup also fails.
+    }
+    throw error
+  }
   return mf
 }
 
@@ -178,7 +187,7 @@ describe('relay Worker under Miniflare', () => {
       upstream = createUpstream()
       mf = await startWorker(upstream)
     },
-    { timeout: WORKER_STARTUP_TIMEOUT_MS },
+    { timeout: WORKER_STARTUP_TIMEOUT_MS + 10_000 },
   )
 
   afterAll(async () => {
@@ -196,6 +205,7 @@ describe('relay Worker under Miniflare', () => {
   })
 
   test('HTTP relay forwards upstream unified quota headers', async () => {
+    const startLen = upstream.bodies.length
     const response = await sendViaRelay({
       config: {
         enabled: true,
@@ -221,10 +231,11 @@ describe('relay Worker under Miniflare', () => {
       'available',
     )
     expect(await response.text()).toBe('upstream-ok')
-    expect(upstream.bodies).toContain('{}')
+    expect(upstream.bodies.slice(startLen)).toEqual(['{}'])
   }, 30_000)
 
   test('client websocket transport reaches Miniflare Worker with byte-exact patch reconstruction', async () => {
+    const startLen = upstream.bodies.length
     const affinity = 'miniflare-client-session'
 
     const firstBody = `client prefix cch=aaaaa; ${'x'.repeat(2048)} tail`
@@ -268,11 +279,11 @@ describe('relay Worker under Miniflare', () => {
       fallback: async () => new Response('direct'),
     })
     expect(await second.text()).toBe('upstream-ok')
-    expect(upstream.bodies).toContain(firstBody)
-    expect(upstream.bodies).toContain(secondBody)
+    expect(upstream.bodies.slice(startLen)).toEqual([firstBody, secondBody])
   }, 30_000)
 
   test('websocket full_sync and patch reconstruct byte-exact upstream bodies', async () => {
+    const startLen = upstream.bodies.length
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-byte-exact-session',
@@ -326,12 +337,12 @@ describe('relay Worker under Miniflare', () => {
       (message) => message.type === 'done' && message.id === 'req_patch',
     )
 
-    expect(upstream.bodies).toContain(firstBody)
-    expect(upstream.bodies).toContain(secondBody)
+    expect(upstream.bodies.slice(startLen)).toEqual([firstBody, secondBody])
     workerSocket.socket.close()
   }, 30_000)
 
   test('websocket hash mismatch returns 409 before upstream fetch', async () => {
+    const startLen = upstream.bodies.length
     const workerSocket = await connectWorkerSocket(
       mf,
       'miniflare-hash-mismatch-session',
@@ -376,7 +387,7 @@ describe('relay Worker under Miniflare', () => {
       (message) => message.type === 'error' && message.id === 'req_bad_patch',
     )
     expect(error).toMatchObject({ status: 409, message: 'hash mismatch' })
-    expect(upstream.bodies).toContain(firstBody)
+    expect(upstream.bodies.slice(startLen)).toEqual([firstBody])
     workerSocket.socket.close()
   }, 30_000)
 })
