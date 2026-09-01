@@ -17,6 +17,7 @@ import {
   CLAUDE_ACCOUNT_COMMAND_NAME,
   CLAUDE_CACHE_KEEP_COMMAND_NAME,
   CLAUDE_DUMP_COMMAND_NAME,
+  CLAUDE_FABLE_MYTHOS_5_1_PRICING,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
@@ -78,6 +79,7 @@ import {
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
   isCacheKeepSubagentsEnabled,
+  isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
   isCostZeroingEnabled,
   isDumpPersistentlyEnabled,
@@ -668,6 +670,13 @@ function buildRestoredNotice(modelId: string): string {
 
 function fallbackModelLabel(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) return 'Opus 5'
+  if (
+    modelId === 'claude-mythos-5-1' ||
+    modelId.startsWith('claude-mythos-5-1-')
+  )
+    return 'Mythos 5.1'
+  if (modelId === 'claude-fable-5-1' || modelId.startsWith('claude-fable-5-1-'))
+    return 'Fable 5.1'
   if (modelId === 'claude-fable-5' || modelId.startsWith('claude-fable-5-'))
     return 'Fable 5'
   if (modelId === 'claude-opus-4-8' || modelId.startsWith('claude-opus-4-8-')) {
@@ -710,35 +719,40 @@ function addFableMythos5Models<
   return {
     ...models,
     ...Object.fromEntries(
-      Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((spec) => [
-        spec.id,
-        {
-          ...base,
-          id: spec.id,
-          name: spec.name,
-          api: base.api ? { ...base.api, id: spec.id } : undefined,
-          cost: {
-            input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
-            output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,
-            cache: {
-              read: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheRead,
-              write: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
+      Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((spec) => {
+        const pricing = isClaudeFableOrMythos51Model(spec.id)
+          ? CLAUDE_FABLE_MYTHOS_5_1_PRICING
+          : CLAUDE_FABLE_MYTHOS_5_PRICING
+        return [
+          spec.id,
+          {
+            ...base,
+            id: spec.id,
+            name: spec.name,
+            api: base.api ? { ...base.api, id: spec.id } : undefined,
+            cost: {
+              input: pricing.input,
+              output: pricing.output,
+              cache: {
+                read: pricing.cacheRead,
+                write: pricing.cacheWrite5m,
+              },
             },
+            limit: {
+              ...(base.limit ?? {}),
+              context: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
+              output: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+            },
+            capabilities: {
+              ...(base.capabilities ?? {}),
+              reasoning: true,
+              attachment: true,
+              toolcall: true,
+            },
+            release_date: CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
           },
-          limit: {
-            ...(base.limit ?? {}),
-            context: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-            output: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
-          },
-          capabilities: {
-            ...(base.capabilities ?? {}),
-            reasoning: true,
-            attachment: true,
-            toolcall: true,
-          },
-          release_date: CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE,
-        },
-      ]),
+        ]
+      }),
     ),
   } as T
 }

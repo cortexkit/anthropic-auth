@@ -251,6 +251,83 @@ describe('setOAuthHeaders', () => {
       SERVER_SIDE_FALLBACK_BETA,
     )
   })
+
+  test('adds the server-side fallback beta for OAuth Fable/Mythos 5.1 bodies', () => {
+    for (const model of ['claude-fable-5-1', 'claude-mythos-5-1']) {
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'token', {
+        body: { model, fallbacks: 'default' },
+      })
+      expect(headers.get('anthropic-beta')?.split(',')).toContain(
+        SERVER_SIDE_FALLBACK_BETA,
+      )
+    }
+  })
+})
+
+describe('Fable/Mythos 5.1 request normalization', () => {
+  test.each([
+    ['claude-fable-5-1', { type: 'any' }],
+    ['claude-fable-5-1', { type: 'tool', name: 'lookup' }],
+    ['claude-mythos-5-1', { type: 'any' }],
+    ['claude-mythos-5-1', { type: 'tool', name: 'lookup' }],
+  ])(
+    '%s maps manual thinking to adaptive and strips forced tool choice',
+    async (model, toolChoice) => {
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            max_tokens: 1024,
+            stream: true,
+            thinking: { type: 'enabled', budget_tokens: 4096 },
+            output_config: { effort: 'xhigh' },
+            tool_choice: toolChoice,
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        ),
+      )
+
+      expect(result.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      })
+      expect(result.output_config).toEqual({ effort: 'xhigh' })
+      expect(result.tool_choice).toBeUndefined()
+    },
+  )
+
+  test('passes every supported effort variant through unchanged', async () => {
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-fable-5-1',
+            max_tokens: 1024,
+            stream: true,
+            output_config: { effort },
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        ),
+      )
+      expect(result.output_config).toEqual({ effort })
+    }
+  })
+
+  test('does not strip forced tool choice from legacy Fable 5', async () => {
+    const result = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5',
+          max_tokens: 1024,
+          stream: true,
+          tool_choice: { type: 'any' },
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      ),
+    )
+    expect(result.tool_choice).toEqual({ type: 'any' })
+  })
 })
 
 describe('prefixToolNames', () => {
@@ -1616,6 +1693,20 @@ describe('prepareFableCacheWarmSource', () => {
     expect(selectClaudeCodeBetas(body).split(',')).not.toContain(
       'server-side-fallback-2026-07-01',
     )
+  })
+
+  test('preserves the requested Fable 5.1 model when warming its source cache', () => {
+    const source = prepareFableCacheWarmSource(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'same input' }],
+      }),
+      'claude-fable-5-1',
+    )
+
+    expect(source.ok).toBe(true)
+    if (!source.ok) throw new Error(source.reason)
+    expect(JSON.parse(source.bodyText).model).toBe('claude-fable-5-1')
   })
 })
 

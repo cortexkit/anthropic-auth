@@ -4204,7 +4204,13 @@ describe('fetchOAuthQuotaSnapshot duck-typed error producer', () => {
     expect(getScopedQuotaWindowForModel(quota, 'claude-fable-5')?.title).toBe(
       'Fable only',
     )
+    expect(getScopedQuotaWindowForModel(quota, 'claude-fable-5-1')?.title).toBe(
+      'Fable only',
+    )
     expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5')).toBe(
+      true,
+    )
+    expect(quotaSnapshotModelScopeIsExhausted(quota, 'claude-fable-5-1')).toBe(
       true,
     )
     expect(quotaSnapshotPassesModelScope(quota, 'claude-opus-4-8')).toBe(true)

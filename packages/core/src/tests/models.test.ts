@@ -1,10 +1,60 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  CLAUDE_FABLE_5_1_MODEL_ID,
+  CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS,
+  CLAUDE_FABLE_MYTHOS_5_1_MODEL_SPECS,
+  CLAUDE_FABLE_MYTHOS_5_1_PRICING,
+  CLAUDE_MYTHOS_5_1_MODEL_ID,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_MODEL_ID,
+  isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
 } from '../models'
+
+describe('Claude Fable/Mythos 5.1 models', () => {
+  test('exposes both 5.1 model ids and complete specs', () => {
+    expect(CLAUDE_FABLE_5_1_MODEL_ID).toBe('claude-fable-5-1')
+    expect(CLAUDE_MYTHOS_5_1_MODEL_ID).toBe('claude-mythos-5-1')
+    expect(CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS).toEqual([
+      CLAUDE_FABLE_5_1_MODEL_ID,
+      CLAUDE_MYTHOS_5_1_MODEL_ID,
+    ])
+    expect(CLAUDE_FABLE_MYTHOS_5_1_MODEL_SPECS).toMatchObject({
+      [CLAUDE_FABLE_5_1_MODEL_ID]: {
+        id: CLAUDE_FABLE_5_1_MODEL_ID,
+        name: 'Claude Fable 5.1',
+      },
+      [CLAUDE_MYTHOS_5_1_MODEL_ID]: {
+        id: CLAUDE_MYTHOS_5_1_MODEL_ID,
+        name: 'Claude Mythos 5.1',
+        limited: true,
+      },
+    })
+    expect(CLAUDE_FABLE_MYTHOS_5_1_PRICING).toEqual({
+      input: 10,
+      output: 50,
+      cacheRead: 0.25,
+      cacheWrite5m: 12.5,
+      cacheWrite1h: 20,
+    })
+  })
+
+  test('normalizes exact ids and dated snapshots as Fable/Mythos 5 models', () => {
+    for (const model of [
+      'claude-fable-5',
+      'claude-mythos-5',
+      'claude-fable-5-20260608',
+      'claude-mythos-5-20260608',
+      'claude-fable-5-1',
+      'claude-mythos-5-1',
+      'claude-fable-5-1-20260701',
+      'claude-mythos-5-1-20260701',
+    ]) {
+      expect(isClaudeFableOrMythos5Model(model)).toBe(true)
+    }
+  })
+})
 
 describe('isClaudeSonnet5Model', () => {
   test('matches the bare claude-sonnet-5 id', () => {

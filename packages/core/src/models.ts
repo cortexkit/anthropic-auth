@@ -1,5 +1,7 @@
 export const CLAUDE_FABLE_5_MODEL_ID = 'claude-fable-5'
 export const CLAUDE_MYTHOS_5_MODEL_ID = 'claude-mythos-5'
+export const CLAUDE_FABLE_5_1_MODEL_ID = 'claude-fable-5-1'
+export const CLAUDE_MYTHOS_5_1_MODEL_ID = 'claude-mythos-5-1'
 
 /**
  * Haiku 4.5 model identifier used by `/claude-prime` to start each OAuth
@@ -19,9 +21,15 @@ export const CLAUDE_HAIKU_4_5_PRICING = {
   output: 5,
 } as const
 
+export const CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS = [
+  CLAUDE_FABLE_5_1_MODEL_ID,
+  CLAUDE_MYTHOS_5_1_MODEL_ID,
+] as const
+
 export const CLAUDE_FABLE_MYTHOS_5_MODEL_IDS = [
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_MYTHOS_5_MODEL_ID,
+  ...CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS,
 ] as const
 
 export type ClaudeFableMythos5ModelId =
@@ -36,6 +44,14 @@ export const CLAUDE_FABLE_MYTHOS_5_PRICING = {
   input: 10,
   output: 50,
   cacheRead: 1,
+  cacheWrite5m: 12.5,
+  cacheWrite1h: 20,
+} as const
+
+export const CLAUDE_FABLE_MYTHOS_5_1_PRICING = {
+  input: 10,
+  output: 50,
+  cacheRead: 0.25,
   cacheWrite5m: 12.5,
   cacheWrite1h: 20,
 } as const
@@ -57,12 +73,40 @@ export const CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS: Record<
     name: 'Claude Mythos 5',
     limited: true,
   },
+  [CLAUDE_FABLE_5_1_MODEL_ID]: {
+    id: CLAUDE_FABLE_5_1_MODEL_ID,
+    name: 'Claude Fable 5.1',
+  },
+  [CLAUDE_MYTHOS_5_1_MODEL_ID]: {
+    id: CLAUDE_MYTHOS_5_1_MODEL_ID,
+    name: 'Claude Mythos 5.1',
+    limited: true,
+  },
 }
+
+export const CLAUDE_FABLE_MYTHOS_5_1_MODEL_SPECS = {
+  [CLAUDE_FABLE_5_1_MODEL_ID]:
+    CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS[CLAUDE_FABLE_5_1_MODEL_ID],
+  [CLAUDE_MYTHOS_5_1_MODEL_ID]:
+    CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS[CLAUDE_MYTHOS_5_1_MODEL_ID],
+} satisfies Record<
+  (typeof CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS)[number],
+  { id: string; name: string; limited?: boolean }
+>
 
 export function isClaudeFableOrMythos5Model(model: unknown) {
   return (
     typeof model === 'string' &&
     CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
+      (id) => model === id || model.startsWith(`${id}-`),
+    )
+  )
+}
+
+export function isClaudeFableOrMythos51Model(model: unknown) {
+  return (
+    typeof model === 'string' &&
+    CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS.some(
       (id) => model === id || model.startsWith(`${id}-`),
     )
   )

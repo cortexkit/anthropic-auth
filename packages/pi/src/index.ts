@@ -1,10 +1,12 @@
 import {
   authorize,
+  CLAUDE_FABLE_MYTHOS_5_1_PRICING,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   exchange,
+  isClaudeFableOrMythos51Model,
   refreshClaudeOAuthToken,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -66,20 +68,25 @@ export default function cortexKitPiAnthropicAuth(pi: ExtensionAPI) {
     baseUrl: 'https://api.anthropic.com',
     api: 'cortexkit-anthropic-messages',
     models: [
-      ...Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((model) => ({
-        id: model.id,
-        name: model.name,
-        reasoning: true,
-        input: textImageInput(),
-        cost: {
-          input: CLAUDE_FABLE_MYTHOS_5_PRICING.input,
-          output: CLAUDE_FABLE_MYTHOS_5_PRICING.output,
-          cacheRead: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheRead,
-          cacheWrite: CLAUDE_FABLE_MYTHOS_5_PRICING.cacheWrite5m,
-        },
-        contextWindow: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
-        maxTokens: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
-      })),
+      ...Object.values(CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS).map((model) => {
+        const pricing = isClaudeFableOrMythos51Model(model.id)
+          ? CLAUDE_FABLE_MYTHOS_5_1_PRICING
+          : CLAUDE_FABLE_MYTHOS_5_PRICING
+        return {
+          id: model.id,
+          name: model.name,
+          reasoning: true,
+          input: textImageInput(),
+          cost: {
+            input: pricing.input,
+            output: pricing.output,
+            cacheRead: pricing.cacheRead,
+            cacheWrite: pricing.cacheWrite5m,
+          },
+          contextWindow: CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
+          maxTokens: CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
+        }
+      }),
       {
         id: 'claude-opus-5',
         name: 'Claude Opus 5',

@@ -13,6 +13,7 @@ import {
   type ClaudeCodeIdentity,
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
+  isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
@@ -962,6 +963,15 @@ function normalizeFableMythosRequest(
   if (!isClaudeFableOrMythos5Model(parsed.model)) return null
   const hadThinking = Object.hasOwn(parsed, 'thinking')
   parsed.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  if (isClaudeFableOrMythos51Model(parsed.model)) {
+    const toolChoice = parsed.tool_choice
+    if (
+      isRecord(toolChoice) &&
+      (toolChoice.type === 'any' || toolChoice.type === 'tool')
+    ) {
+      delete parsed.tool_choice
+    }
+  }
   return { replacedExisting: hadThinking }
 }
 

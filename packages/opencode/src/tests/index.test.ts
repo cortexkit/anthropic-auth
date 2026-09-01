@@ -2696,6 +2696,13 @@ describe('provider.models', () => {
       output: 128_000,
     })
     expect(result?.['claude-mythos-5']?.name).toBe('Claude Mythos 5')
+    expect(result?.['claude-fable-5-1']?.name).toBe('Claude Fable 5.1')
+    expect(result?.['claude-fable-5-1']?.cost).toEqual({
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    })
+    expect(result?.['claude-mythos-5-1']?.name).toBe('Claude Mythos 5.1')
     expect(models['claude-opus-4-8'].cost).toEqual({
       input: 5,
       output: 25,
@@ -2703,7 +2710,7 @@ describe('provider.models', () => {
     })
   })
 
-  test('keeps Anthropic API-key model costs unchanged and prices Fable 5', async () => {
+  test('keeps Anthropic API-key model costs unchanged and prices Fable 5/5.1', async () => {
     const plugin = await getPlugin()
     const models = {
       'claude-opus-4-8': {
@@ -2737,6 +2744,11 @@ describe('provider.models', () => {
       input: 10,
       output: 50,
       cache: { read: 1, write: 12.5 },
+    })
+    expect(result?.['claude-fable-5-1']?.cost).toEqual({
+      input: 10,
+      output: 50,
+      cache: { read: 0.25, write: 12.5 },
     })
   })
 

@@ -369,6 +369,14 @@ describe('formatFallbackModelLabel', () => {
   test('formats Fable 5 ids', () => {
     expect(formatFallbackModelLabel('claude-fable-5')).toBe('Fable 5')
     expect(formatFallbackModelLabel('claude-fable-5-20260608')).toBe('Fable 5')
+    expect(formatFallbackModelLabel('claude-fable-5-1')).toBe('Fable 5.1')
+    expect(formatFallbackModelLabel('claude-fable-5-1-20260701')).toBe(
+      'Fable 5.1',
+    )
+    expect(formatFallbackModelLabel('claude-mythos-5-1')).toBe('Mythos 5.1')
+    expect(formatFallbackModelLabel('claude-mythos-5-1-20260701')).toBe(
+      'Mythos 5.1',
+    )
   })
 
   test('formats Opus 5 ids', () => {

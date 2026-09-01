@@ -1,4 +1,5 @@
 import {
+  CLAUDE_FABLE_5_1_MODEL_ID,
   CLAUDE_FABLE_5_MODEL_ID,
   isClaudeOpus5Model,
 } from '@cortexkit/anthropic-auth-core'
@@ -43,20 +44,27 @@ type FableFallbackState = {
 
 /**
  * Models whose content-filter refusal we recover from by downgrading to Opus 4.8
- * for a short window. Fable 5 is the original case; Opus 5 is identical in
+ * for a short window. Fable 5 and Fable 5.1 are separate source families because
+ * recovery state must not cross-contaminate distinct requested models; Opus 5 is identical in
  * shape (cyber safety classifiers that can return `stop_reason: "refusal"`,
  * Anthropic's own fallback default is `claude-opus-4-8`, same pricing). Mythos
  * has no classifiers and Sonnet 5 is not flagged — both stay outside this
  * gate. The single shared fallback id matches Anthropic's default for both
  * source models, so the recovery period is uniform.
  */
-export type RecoverableRefusalFamily = 'fable-5' | 'opus-5'
+export type RecoverableRefusalFamily = 'fable-5' | 'fable-5-1' | 'opus-5'
 
 export function recoverableRefusalFamily(
   model: unknown,
 ): RecoverableRefusalFamily | null {
   if (typeof model !== 'string') return null
   if (isClaudeOpus5Model(model)) return 'opus-5'
+  if (
+    model === CLAUDE_FABLE_5_1_MODEL_ID ||
+    model.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
+  ) {
+    return 'fable-5-1'
+  }
   if (
     model === CLAUDE_FABLE_5_MODEL_ID ||
     model.startsWith(`${CLAUDE_FABLE_5_MODEL_ID}-`)

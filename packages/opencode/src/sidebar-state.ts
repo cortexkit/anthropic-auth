@@ -795,11 +795,21 @@ export function formatScopedQuotaLabel(title: string) {
 }
 
 /**
- * Pretty label for a recoverable-refusal source model (Fable 5 or Opus 5).
+ * Pretty label for a recoverable-refusal source model (Fable 5/5.1 or Opus 5).
  * Falls back to the raw id for unrecognized ids so the sidebar never goes
  * blank on a future model that has not yet been cataloged here.
  */
 export function formatFallbackModelLabel(modelId: string | undefined): string {
+  if (
+    modelId === 'claude-mythos-5-1' ||
+    modelId?.startsWith('claude-mythos-5-1-')
+  )
+    return 'Mythos 5.1'
+  if (
+    modelId === 'claude-fable-5-1' ||
+    modelId?.startsWith('claude-fable-5-1-')
+  )
+    return 'Fable 5.1'
   if (modelId === 'claude-fable-5' || modelId?.startsWith('claude-fable-5-'))
     return 'Fable 5'
   if (modelId === 'claude-opus-5' || modelId?.startsWith('claude-opus-5-'))
