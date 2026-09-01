@@ -100,11 +100,10 @@ describe('resolveContentFilterFallbackMode', () => {
 })
 
 describe('applyServerSideFallbackToBody', () => {
-  test('opts Fable 5 and Opus 5 requests into the default server policy', () => {
+  test('opts only recoverable Fable/Opus models into the default server policy', () => {
     for (const model of [
       'claude-fable-5',
       'claude-fable-5-1',
-      'claude-mythos-5-1',
       'claude-opus-5-20260701',
     ]) {
       const body = { model, messages: [{ role: 'user', content: 'hello' }] }
@@ -116,6 +115,15 @@ describe('applyServerSideFallbackToBody', () => {
       expect((body as { fallbacks?: unknown }).fallbacks).toBe('default')
     }
     expect(SERVER_SIDE_FALLBACK_BETA).toBe('server-side-fallback-2026-07-01')
+  })
+
+  test('does not opt Mythos 5.1 into server-side fallback', () => {
+    const body = {
+      model: 'claude-mythos-5-1',
+      messages: [{ role: 'user', content: 'hello' }],
+    }
+    expect(applyServerSideFallbackToBody(body, true).enabled).toBe(false)
+    expect(body).not.toHaveProperty('fallbacks')
   })
 
   test('does not opt unrelated models into server-side fallback', () => {

@@ -112,6 +112,14 @@ export function isClaudeFableOrMythos51Model(model: unknown) {
   )
 }
 
+export function isClaudeFable51Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  return (
+    model === CLAUDE_FABLE_5_1_MODEL_ID ||
+    model.startsWith(`${CLAUDE_FABLE_5_1_MODEL_ID}-`)
+  )
+}
+
 export const CLAUDE_SONNET_5_MODEL_ID = 'claude-sonnet-5'
 
 /**

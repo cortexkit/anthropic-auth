@@ -251,18 +251,6 @@ describe('setOAuthHeaders', () => {
       SERVER_SIDE_FALLBACK_BETA,
     )
   })
-
-  test('adds the server-side fallback beta for OAuth Fable/Mythos 5.1 bodies', () => {
-    for (const model of ['claude-fable-5-1', 'claude-mythos-5-1']) {
-      const headers = new Headers()
-      setOAuthHeaders(headers, 'token', {
-        body: { model, fallbacks: 'default' },
-      })
-      expect(headers.get('anthropic-beta')?.split(',')).toContain(
-        SERVER_SIDE_FALLBACK_BETA,
-      )
-    }
-  })
 })
 
 describe('Fable/Mythos 5.1 request normalization', () => {

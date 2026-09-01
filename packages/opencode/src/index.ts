@@ -658,6 +658,10 @@ function buildSwitchedToOpusNotice(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) {
     return 'Opus 5 content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the Opus 5 cache warm.'
   }
+  if (isClaudeFableOrMythos51Model(modelId)) {
+    const label = fallbackModelLabel(modelId)
+    return `${label} content filter detected. Switched to Opus 4.8 for a 10-response recovery window while keeping the ${label} cache warm.`
+  }
   return FABLE_SWITCHED_TO_OPUS_NOTICE
 }
 
@@ -665,18 +669,18 @@ function buildRestoredNotice(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) {
     return 'Opus 5 recovery window complete. Returning to Opus 5.'
   }
+  if (isClaudeFableOrMythos51Model(modelId)) {
+    return `Recovery window complete. Returning to ${fallbackModelLabel(modelId)}.`
+  }
   return FABLE_RESTORED_NOTICE
 }
 
 function fallbackModelLabel(modelId: string): string {
   if (isClaudeOpus5Model(modelId)) return 'Opus 5'
-  if (
-    modelId === 'claude-mythos-5-1' ||
-    modelId.startsWith('claude-mythos-5-1-')
-  )
-    return 'Mythos 5.1'
-  if (modelId === 'claude-fable-5-1' || modelId.startsWith('claude-fable-5-1-'))
-    return 'Fable 5.1'
+  if (isClaudeFableOrMythos51Model(modelId)) {
+    if (modelId.startsWith('claude-mythos-5-1')) return 'Mythos 5.1'
+    if (modelId.startsWith('claude-fable-5-1')) return 'Fable 5.1'
+  }
   if (modelId === 'claude-fable-5' || modelId.startsWith('claude-fable-5-'))
     return 'Fable 5'
   if (modelId === 'claude-opus-4-8' || modelId.startsWith('claude-opus-4-8-')) {

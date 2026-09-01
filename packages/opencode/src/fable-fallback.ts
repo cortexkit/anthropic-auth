@@ -44,13 +44,11 @@ type FableFallbackState = {
 
 /**
  * Models whose content-filter refusal we recover from by downgrading to Opus 4.8
- * for a short window. Fable 5 and Fable 5.1 are separate source families because
- * recovery state must not cross-contaminate distinct requested models; Opus 5 is identical in
- * shape (cyber safety classifiers that can return `stop_reason: "refusal"`,
- * Anthropic's own fallback default is `claude-opus-4-8`, same pricing). Mythos
- * has no classifiers and Sonnet 5 is not flagged — both stay outside this
- * gate. The single shared fallback id matches Anthropic's default for both
- * source models, so the recovery period is uniform.
+ * for a short window. Fable 5, Fable 5.1, and Opus 5 each have a separate
+ * source family because recovery state must not cross-contaminate distinct
+ * requested models. All three use Anthropic's `claude-opus-4-8` fallback for
+ * the same classifier refusal shape and recovery period. Mythos has no
+ * classifiers and Sonnet 5 is not flagged — both stay outside this gate.
  */
 export type RecoverableRefusalFamily = 'fable-5' | 'fable-5-1' | 'opus-5'
 

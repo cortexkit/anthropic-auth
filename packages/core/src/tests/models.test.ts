@@ -7,6 +7,7 @@ import {
   CLAUDE_MYTHOS_5_1_MODEL_ID,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_MODEL_ID,
+  isClaudeFable51Model,
   isClaudeFableOrMythos5Model,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
@@ -53,6 +54,18 @@ describe('Claude Fable/Mythos 5.1 models', () => {
     ]) {
       expect(isClaudeFableOrMythos5Model(model)).toBe(true)
     }
+  })
+})
+
+describe('isClaudeFable51Model', () => {
+  test('matches exact and dated Fable 5.1 ids only', () => {
+    expect(isClaudeFable51Model('claude-fable-5-1')).toBe(true)
+    expect(isClaudeFable51Model('claude-fable-5-1-20260830')).toBe(true)
+    expect(isClaudeFable51Model('claude-mythos-5-1')).toBe(false)
+    expect(isClaudeFable51Model('claude-fable-5')).toBe(false)
+    expect(isClaudeFable51Model('claude-mythos-5')).toBe(false)
+    expect(isClaudeFable51Model('claude-fable-5-1x')).toBe(false)
+    expect(isClaudeFable51Model(42)).toBe(false)
   })
 })
 
