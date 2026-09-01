@@ -1,6 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import {
-  CLAUDE_CODE_BUILD_HASH,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_STAINLESS_PACKAGE_VERSION,
   CLAUDE_CODE_STAINLESS_RUNTIME_VERSION,
@@ -318,6 +317,8 @@ export function applyClaudeCodeMetadata(
   return true
 }
 
+// Claude Code 2.1.257 sends redact-thinking-2026-02-12, but it suppresses
+// thinking-block content that OpenCode displays; deliberately omitted after A/B proof on 2026-09-01.
 export const CLAUDE_CODE_FULL_AGENT_BETAS = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
@@ -327,6 +328,9 @@ export const CLAUDE_CODE_FULL_AGENT_BETAS = [
   'claude-code-20250219',
   'advisor-tool-2026-03-01',
   'advanced-tool-use-2025-11-20',
+  'mid-conversation-system-2026-04-07',
+  'effort-2025-11-24',
+  'fallback-credit-2026-06-01',
   'extended-cache-ttl-2025-04-11',
   'cache-diagnosis-2026-04-07',
 ] as const
@@ -492,10 +496,6 @@ export function orderClaudeCodeBody<T extends Record<string, unknown>>(
     if (!Object.hasOwn(ordered, key)) ordered[key] = value
   }
   return ordered as T
-}
-
-export function claudeCodeBuildHash() {
-  return CLAUDE_CODE_BUILD_HASH
 }
 
 export function claudeCodeEntrypoint() {

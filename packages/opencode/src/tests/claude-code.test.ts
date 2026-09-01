@@ -102,7 +102,9 @@ describe('Claude Code fingerprint helpers', () => {
     expect(fullBetas).not.toContain('redact-thinking-2026-02-12')
     expect(fullBetas).toContain('claude-code-20250219')
     expect(fullBetas).not.toContain('context-1m-2025-08-07')
-    expect(fullBetas).not.toContain('effort-2025-11-24')
+    expect(fullBetas).toContain('effort-2025-11-24')
+    expect(fullBetas).toContain('mid-conversation-system-2026-04-07')
+    expect(fullBetas).toContain('fallback-credit-2026-06-01')
   })
 
   test('selects structured-output betas without full-agent private betas', () => {
@@ -117,7 +119,6 @@ describe('Claude Code fingerprint helpers', () => {
 
     expect(betas).toContain('structured-outputs-2025-12-15')
     expect(betas).toContain('thinking-token-count-2026-05-13')
-    expect(betas).not.toContain('redact-thinking-2026-02-12')
     expect(betas).not.toContain('claude-code-20250219')
     expect(betas).not.toContain('advanced-tool-use-2025-11-20')
     expect(betas).not.toContain('context-1m-2025-08-07')
@@ -139,7 +140,6 @@ describe('Claude Code fingerprint helpers', () => {
     expect(betas).not.toContain('claude-code-20250219')
     expect(betas).not.toContain('context-1m-2025-08-07')
     expect(betas).not.toContain('effort-2025-11-24')
-    expect(betas).not.toContain('redact-thinking-2026-02-12')
   })
 
   test('does not add full-agent betas when request shape is unavailable', () => {
@@ -148,7 +148,6 @@ describe('Claude Code fingerprint helpers', () => {
     for (const beta of REQUIRED_BETAS) expect(betas).toContain(beta)
     expect(betas[0]).toBe('oauth-2025-04-20')
     expect(betas).toContain('thinking-token-count-2026-05-13')
-    expect(betas).not.toContain('redact-thinking-2026-02-12')
     expect(betas).not.toContain('claude-code-20250219')
   })
 
@@ -172,10 +171,10 @@ describe('Claude Code fingerprint helpers', () => {
       { body, identity },
     )
 
-    expect(headers.get('user-agent')).toBe('claude-cli/2.1.177 (external, cli)')
+    expect(headers.get('user-agent')).toBe('claude-cli/2.1.257 (external, cli)')
     expect(headers.get('x-claude-code-session-id')).toBe(identity.sessionId)
-    expect(headers.get('x-stainless-package-version')).toBe('0.94.0')
-    expect(headers.get('x-stainless-runtime-version')).toBe('v24.3.0')
+    expect(headers.get('x-stainless-package-version')).toBe('0.112.1')
+    expect(headers.get('x-stainless-runtime-version')).toBe('v26.3.0')
     expect(headers.get('x-app')).toBe('cli')
     expect(headers.get('anthropic-dangerous-direct-browser-access')).toBe(
       'true',
@@ -339,7 +338,7 @@ describe('Claude Code bootstrap identity lookup', () => {
         expect(url.searchParams.get('model')).toBe('claude-sonnet-4-6')
 
         const headers = new Headers(init?.headers)
-        expect(headers.get('user-agent')).toBe('claude-code/2.1.177')
+        expect(headers.get('user-agent')).toBe('claude-code/2.1.257')
         expect(headers.get('anthropic-beta')).toBe('oauth-2025-04-20')
         expect(headers.get('content-type')).toBe('application/json')
 

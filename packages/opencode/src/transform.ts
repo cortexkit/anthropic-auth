@@ -11,8 +11,10 @@ import {
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_ADAPTIVE_THINKING,
   type ClaudeCodeIdentity,
+  extractFirstUserMessageText,
   FAST_MODE_BETA,
   isClaudeFableOrMythos5Model,
+  isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
   isClaudeSonnet5Model,
   isFastModeSupportedModel,
@@ -23,6 +25,7 @@ import {
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
   selectClaudeCodeBetas,
+  setBounded,
   signRequestBody,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
@@ -40,6 +43,8 @@ import {
 } from './server-fallback'
 
 export const NON_STREAMING_DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
+export const THINKING_BINDING_CONTROLS_BETA =
+  'thinking-binding-controls-2026-08-01'
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
@@ -159,10 +164,14 @@ export function setOAuthHeaders(
 ): Headers {
   return applyClaudeCodeHeaders(headers, accessToken, {
     ...options,
-    extraBetas:
-      options.body?.fallbacks === 'default'
+    extraBetas: [
+      ...(options.body?.fallbacks === 'default'
         ? [SERVER_SIDE_FALLBACK_BETA]
-        : undefined,
+        : []),
+      ...(isClaudeFableOrMythos51Model(options.body?.model)
+        ? [THINKING_BINDING_CONTROLS_BETA]
+        : []),
+    ],
   })
 }
 
@@ -1136,6 +1145,41 @@ type RewritePerfCallback = (
   data?: Record<string, unknown>,
 ) => void
 
+export const CC_VERSION_SUFFIX_SESSION_LIMIT = 1_000
+const pinnedFirstUserTexts = new Map<string, string>()
+
+export function resetPinnedFirstUserTextsForTest() {
+  pinnedFirstUserTexts.clear()
+}
+
+export function hasPinnedFirstUserTextForTest(sessionId: string) {
+  return pinnedFirstUserTexts.has(sessionId)
+}
+
+function firstUserTextForSession(
+  sessionId: string,
+  messages: Parameters<typeof buildBillingHeaderValue>[0],
+  laneStart: boolean,
+): string {
+  const pinned = pinnedFirstUserTexts.get(sessionId)
+  if (pinned !== undefined) {
+    pinnedFirstUserTexts.delete(sessionId)
+    pinnedFirstUserTexts.set(sessionId, pinned)
+    return pinned
+  }
+
+  const firstUserText = extractFirstUserMessageText(messages)
+  if (!laneStart) {
+    setBounded(
+      pinnedFirstUserTexts,
+      sessionId,
+      firstUserText,
+      CC_VERSION_SUFFIX_SESSION_LIMIT,
+    )
+  }
+  return firstUserText
+}
+
 function rewriteNowMs() {
   return performance.now()
 }
@@ -1181,6 +1225,8 @@ export async function rewriteRequestBody(
     cache1hMode?: Cache1hMode
     fastModeEnabled?: boolean
     identity?: ClaudeCodeIdentity
+    sessionId?: string
+    thinkingBindingControlsEnabled?: boolean
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1250,6 +1296,19 @@ export async function rewriteRequestBody(
       delete parsed.thinking
     }
 
+    if (
+      options.thinkingBindingControlsEnabled === true &&
+      isClaudeFableOrMythos51Model(parsed.model) &&
+      parsed.thinking &&
+      typeof parsed.thinking === 'object' &&
+      !Array.isArray(parsed.thinking) &&
+      (parsed.thinking as { type?: unknown }).type !== 'disabled'
+    ) {
+      ;(parsed.thinking as Record<string, unknown>).block_binding = {
+        prefix_mismatch_behavior: 'drop_block',
+      }
+    }
+
     const billingStart = rewriteNowMs()
     const billingHeader =
       Array.isArray(parsed.messages) &&
@@ -1260,6 +1319,13 @@ export async function rewriteRequestBody(
             parsed.messages,
             undefined,
             CLAUDE_CODE_ENTRYPOINT,
+            options.sessionId
+              ? firstUserTextForSession(
+                  options.sessionId,
+                  parsed.messages,
+                  options.laneStart === true,
+                )
+              : undefined,
           )
         : null
     options.perf?.('billing_header', {

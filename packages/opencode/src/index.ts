@@ -4448,6 +4448,7 @@ const anthropicAuthPlugin = async (
                 cache1hEnabled: !subagentRequest && isCache1hEnabled(),
                 cache1hMode: getCache1hMode(),
                 fastModeEnabled: fastModeRequested,
+                sessionId: directAffinity || undefined,
                 perf: (stage, data) =>
                   trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
               })
@@ -4625,6 +4626,8 @@ const anthropicAuthPlugin = async (
                 cache1hMode: cacheMode,
                 fastModeEnabled: fastModeRequested,
                 identity,
+                sessionId: relayAffinity || undefined,
+                thinkingBindingControlsEnabled: true,
                 hybridStandbyAnchor: standbyCacheAnchor,
                 serverSideFallbackEnabled: fallbackMode === 'server',
                 laneStart: laneStartRequest,

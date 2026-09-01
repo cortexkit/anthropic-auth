@@ -24,6 +24,11 @@ export const CLAUDE_FABLE_MYTHOS_5_MODEL_IDS = [
   CLAUDE_MYTHOS_5_MODEL_ID,
 ] as const
 
+export const CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS = [
+  'claude-fable-5-1',
+  'claude-mythos-5-1',
+] as const
+
 export type ClaudeFableMythos5ModelId =
   (typeof CLAUDE_FABLE_MYTHOS_5_MODEL_IDS)[number]
 
@@ -63,6 +68,15 @@ export function isClaudeFableOrMythos5Model(model: unknown) {
   return (
     typeof model === 'string' &&
     CLAUDE_FABLE_MYTHOS_5_MODEL_IDS.some(
+      (id) => model === id || model.startsWith(`${id}-`),
+    )
+  )
+}
+
+export function isClaudeFableOrMythos51Model(model: unknown) {
+  return (
+    typeof model === 'string' &&
+    CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS.some(
       (id) => model === id || model.startsWith(`${id}-`),
     )
   )

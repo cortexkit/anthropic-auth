@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { computeCcVersionSuffix } from '@cortexkit/anthropic-auth-core'
 import type { Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
 
@@ -440,6 +441,21 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
     const body = await buildBody([userMsg('hello')])
     expect(body.system).toHaveLength(2)
     expect(body.messages[0]).toEqual({ role: 'user', content: 'hello' })
+  })
+
+  test('recomputes the Claude Code suffix from changing first-user text', async () => {
+    const first = await buildBody([userMsg('messCage')])
+    const changed = await buildBody([userMsg('messDage')])
+    const firstHeader = String(first.system?.[0]?.text)
+    const changedHeader = String(changed.system?.[0]?.text)
+
+    expect(firstHeader).toContain(
+      `cc_version=2.1.257.${computeCcVersionSuffix('messCage', '2.1.257')};`,
+    )
+    expect(changedHeader).toContain(
+      `cc_version=2.1.257.${computeCcVersionSuffix('messDage', '2.1.257')};`,
+    )
+    expect(changedHeader).not.toBe(firstHeader)
   })
 })
 
