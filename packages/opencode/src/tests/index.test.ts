@@ -19086,6 +19086,39 @@ describe('claude-prime direct request', () => {
     globalThis.setInterval = originalSetInterval
   })
 
+  function primeCredentialResponse(
+    accessToken: string,
+    recordVersion: number,
+    expiresAtMs = Date.now() + 60_000,
+  ) {
+    return {
+      result: {
+        payload: Array.from(
+          new TextEncoder().encode(
+            JSON.stringify({ access_token: accessToken }),
+          ),
+        ),
+        expires_at_ms: expiresAtMs,
+        record_version: recordVersion,
+      },
+    }
+  }
+
+  function primeConnector(
+    calls: Array<{ method: string; params: Record<string, unknown> }>,
+    handler: (method: string, params: Record<string, unknown>) => unknown,
+  ) {
+    return async () =>
+      ({
+        call: async (_moduleId: string, method: string, params: unknown) => {
+          const normalized = (params ?? {}) as Record<string, unknown>
+          calls.push({ method, params: normalized })
+          return handler(method, normalized)
+        },
+        close: () => {},
+      }) as never
+  }
+
   test('main prime fires a direct messages request with the documented body shape', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
@@ -19680,6 +19713,397 @@ describe('claude-prime direct request', () => {
     )
     expect(primeCall).toBeDefined()
     expect(primeCall?.auth).toContain('fb-access')
+  })
+
+  test('vault-served fallback prime sends the resident vault credential without refreshing the sidecar', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-prime-canary',
+            refresh: 'sidecar-prime-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'prime-vault-handle',
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: Date.now() - 60_000,
+              },
+            },
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method === 'credential.get') {
+        return primeCredentialResponse('vault-prime-access', 101)
+      }
+      return { result: {} }
+    })
+    const requestAuthorizations: string[] = []
+    let tokenEndpointCalls = 0
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (url.includes('/v1/messages')) {
+        requestAuthorizations.push(authorization)
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 20, output_tokens: 1 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        requestAuthorizations.push(authorization)
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
+      }
+      if (url.includes('/v1/oauth/token')) tokenEndpointCalls += 1
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    await mgr.tick()
+
+    expect(requestAuthorizations).toContain('Bearer vault-prime-access')
+    expect(requestAuthorizations).not.toContain('Bearer sidecar-prime-canary')
+    expect(tokenEndpointCalls).toBe(0)
+    await plugin.dispose?.()
+  })
+
+  test('a cold vault fallback skips prime without a fire-failed warning', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    const dueQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(past).toISOString(),
+        checkedAt: Date.now(),
+      },
+    }
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-cold-canary',
+            refresh: 'sidecar-cold-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'prime-cold-handle',
+            quota: dueQuota,
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method === 'credential.get') {
+        return primeCredentialResponse(
+          'expired-vault-prime-access',
+          102,
+          Date.now() - 1,
+        )
+      }
+      return { result: {} }
+    })
+    let sidecarPrimeRequests = 0
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages')
+      ) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (authorization === 'Bearer sidecar-cold-canary') {
+          sidecarPrimeRequests += 1
+        }
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    const directResult = await mgr.options.sendPrime('work-alt')
+    expect(directResult).toMatchObject({ ok: false, reason: 'vault-cold' })
+    expect(sidecarPrimeRequests).toBe(0)
+
+    const records: any[] = []
+    const { __setLogTestSink, setLogLevel } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    setLogLevel('debug')
+    __setLogTestSink((record: any) => records.push(record))
+    mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
+    await mgr.tick()
+    await mgr.tick()
+    __setLogTestSink(null)
+    setLogLevel('info')
+
+    expect(sidecarPrimeRequests).toBe(0)
+    expect(
+      records.filter((record) => record.message === 'prime fire failed'),
+    ).toHaveLength(0)
+    const coldRecords = records.filter(
+      (record) =>
+        record.channel === 'prime' && record.payload?.account === 'work-alt',
+    )
+    expect(coldRecords).toHaveLength(1)
+    expect(coldRecords[0]?.level).toBe('debug')
+    await plugin.dispose?.()
+  })
+
+  test('a vault prime 401 reports the credential version sent before a cache rotation', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    const dueQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(past).toISOString(),
+        checkedAt: Date.now(),
+      },
+    }
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-401-canary',
+            refresh: 'sidecar-401-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'prime-401-handle',
+            quota: dueQuota,
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    let rotated = false
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method !== 'credential.get') return { result: {} }
+      return primeCredentialResponse(
+        rotated ? 'vault-prime-new-access' : 'vault-prime-401-access',
+        rotated ? 104 : 103,
+      )
+    })
+    const requestEntered = deferred()
+    const releaseResponse = deferred()
+    let sentAuthorization: string | undefined
+    globalThis.fetch = mock(async (input: unknown, init?: RequestInit) => {
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages')
+      ) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (authorization === 'Bearer vault-prime-401-access') {
+          sentAuthorization = authorization
+          requestEntered.resolve()
+          await releaseResponse.promise
+          return new Response('{}', { status: 401 })
+        }
+        return new Response('{}', { status: 200 })
+      }
+      return new Response('not-mocked', { status: 599 })
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
+    const tick = mgr.tick()
+    await requestEntered.promise
+    const cache = plugin.__claustrumCredentialCache
+    cache.invalidate('prime-401-handle', 103)
+    rotated = true
+    await cache.get('prime-401-handle')
+    releaseResponse.resolve()
+    await tick
+
+    expect(sentAuthorization).toBe('Bearer vault-prime-401-access')
+    expect(credentialCalls).toContainEqual({
+      method: 'credential.report_auth_failure',
+      params: {
+        handle: 'prime-401-handle',
+        provider_status: 401,
+        record_version: 103,
+        reporter_source: 'direct',
+      },
+    })
+    await plugin.dispose?.()
+  })
+
+  test('a sidecar prime 401 is not reported as a vault credential failure', async () => {
+    const past = Date.now() - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-401-access',
+            refresh: 'sidecar-401-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'sidecar-401-handle',
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: Date.now(),
+              },
+            },
+          },
+          {
+            id: 'vault-witness',
+            type: 'oauth',
+            access: 'witness-sidecar-access',
+            refresh: 'witness-sidecar-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'vault-witness-handle',
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'vault-witness': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method === 'credential.get') {
+        return primeCredentialResponse('vault-witness-access', 105)
+      }
+      return { result: {} }
+    })
+    let authorization: string | undefined
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages')
+      ) {
+        authorization =
+          new Headers(init?.headers).get('authorization') ?? undefined
+        return Promise.resolve(new Response('{}', { status: 401 }))
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    const result = await mgr.options.sendPrime('work-alt')
+
+    expect(result).toMatchObject({ ok: false, status: 401 })
+    expect(authorization).toBe('Bearer sidecar-401-access')
+    expect(
+      credentialCalls.some(
+        (call) => call.method === 'credential.report_auth_failure',
+      ),
+    ).toBe(false)
+    await plugin.dispose?.()
   })
 
   test('fallback refresh-token rotation keeps one prime claim per reset window', async () => {
