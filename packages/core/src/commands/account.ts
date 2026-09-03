@@ -1,5 +1,9 @@
-import type { AccountStorage, FallbackAccount } from '../accounts.ts'
-import { isClaustrumEnabledForAccount } from '../accounts.ts'
+import type {
+  AccountStorage,
+  FallbackAccount,
+  OAuthAccount,
+} from '../accounts.ts'
+import { isClaustrumEnabledForAccount, isOAuthAccount } from '../accounts.ts'
 import type { ClaustrumDetection } from '../claustrum.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
@@ -7,6 +11,7 @@ export const CLAUDE_ACCOUNT_COMMAND_NAME = 'claude-account'
 
 export type AccountCommandAction =
   | { type: 'status' }
+  | { type: 'custody'; id: string; enabled: boolean }
   | { type: 'enable'; id: string }
   | { type: 'disable'; id: string }
   | { type: 'remove'; id: string }
@@ -24,6 +29,34 @@ export type AccountCommandAction =
   | { type: 'add-oauth-finish'; code: string; label?: string }
   | { type: 'usage' }
 
+export type AccountCustodyCapability =
+  | {
+      platform: 'opencode'
+      set(input: {
+        account: OAuthAccount
+        storage: AccountStorage
+        enabled: boolean
+      }): Promise<{ text: string; changed: boolean }>
+    }
+  | { platform: 'unsupported'; reason: string }
+
+export type AccountCommandResult = {
+  text: string
+  updated?: {
+    id: string
+    action:
+      | 'enable'
+      | 'disable'
+      | 'remove'
+      | 'reorder'
+      | 'reset-backoff'
+      | 'custody'
+    enabled?: boolean
+    previousOrder?: string[]
+    newOrder?: string[]
+  }
+}
+
 export function parseAccountCommandAction(
   argumentsText: string,
 ): AccountCommandAction {
@@ -39,6 +72,20 @@ export function parseAccountCommandAction(
   if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
   if (action === 'reset-backoff' && !rest) return { type: 'reset-backoff' }
+  const custodyId = parts[1]
+  const custodyState = parts[2]
+  if (
+    action === 'custody' &&
+    parts.length === 3 &&
+    custodyId !== undefined &&
+    (custodyState === 'on' || custodyState === 'off')
+  ) {
+    return {
+      type: 'custody',
+      id: custodyId,
+      enabled: custodyState === 'on',
+    }
+  }
 
   if (action === 'add-apikey' && rest) {
     let remaining = rest
@@ -123,6 +170,41 @@ export interface AccountListItem {
   tierLabel?: string
 }
 
+export type CustodyStatusState =
+  | 'na'
+  | 'off'
+  | 'on-vault-served'
+  | 'on-vault-reauth'
+  | 'on-cold'
+
+export function custodyStatusLabel(state: CustodyStatusState): string {
+  switch (state) {
+    case 'na':
+      return 'n/a (OpenCode managed)'
+    case 'off':
+      return 'off'
+    case 'on-vault-served':
+      return 'on · vault-served'
+    case 'on-vault-reauth':
+      return 'on · vault reauth'
+    case 'on-cold':
+      return 'on · cold'
+  }
+}
+
+export type AccountCommandStatusProjection = {
+  claustrumDetection: string
+  accounts: Array<
+    AccountListItem & {
+      claustrumGate: 'on' | 'off' | 'na'
+      vaultServed: boolean
+      vaultReauth: boolean
+      custodyState: CustodyStatusState
+      custodyEligible: boolean
+    }
+  >
+}
+
 export function buildAccountList(storage: AccountStorage): AccountListItem[] {
   const list: AccountListItem[] = []
 
@@ -163,6 +245,7 @@ const USAGE_TEXT = [
   '  /claude-account enable <id>           Enable a fallback account',
   '  /claude-account disable <id>          Disable a fallback account',
   '  /claude-account remove <id>           Remove a fallback account',
+  '  /claude-account custody <id> on|off    Set fallback custody gate',
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
   '  /claude-account reset-backoff          Clear main OAuth refresh and quota backoff',
@@ -171,38 +254,44 @@ const USAGE_TEXT = [
   '  /claude-account add-oauth-finish <code>  Complete OAuth flow',
 ].join('\n')
 
-export function executeAccountCommand(input: {
+export async function executeAccountCommand(input: {
   argumentsText: string
   storage: AccountStorage
   claustrum?: ClaustrumDetection
-}): {
-  text: string
-  updated?: {
-    id: string
-    action: 'enable' | 'disable' | 'remove' | 'reorder' | 'reset-backoff'
-    enabled?: boolean
-    previousOrder?: string[]
-    newOrder?: string[]
-  }
-} {
+  custody?: AccountCustodyCapability
+  statusProjection?: AccountCommandStatusProjection
+}): Promise<AccountCommandResult> {
   const action = parseAccountCommandAction(input.argumentsText)
   const accounts = input.storage.accounts
   const mainId = 'main'
 
   if (action.type === 'status') {
-    const list = buildAccountList(input.storage)
-    const detection = input.claustrum?.status ?? 'unknown'
+    const list =
+      input.statusProjection?.accounts ?? buildAccountList(input.storage)
+    const detection =
+      input.statusProjection?.claustrumDetection ??
+      input.claustrum?.status ??
+      'unknown'
     const lines = ['## Claude Accounts', '', `- Claustrum: ${detection}`, '']
     for (const a of list) {
       const pct =
         a.quotaPercent != null ? ` ${Math.round(a.quotaPercent)}%` : ''
       const status = !a.enabled ? ' (disabled)' : ''
       const tier = a.tierLabel ? ` · ${a.tierLabel}` : ''
-      const gate =
-        a.id === mainId
-          ? ' · gate n/a (OpenCode managed)'
-          : ` · gate ${isClaustrumEnabledForAccount(input.storage, a.id) ? 'on' : 'off'}`
-      lines.push(`- **${a.label}** [${a.role}]${tier}${status}${pct}${gate}`)
+      const projected = input.statusProjection?.accounts.find(
+        (account) => account.id === a.id,
+      )
+      const custody = custodyStatusLabel(
+        projected?.custodyState ??
+          (a.id === mainId
+            ? 'na'
+            : isClaustrumEnabledForAccount(input.storage, a.id)
+              ? 'on-cold'
+              : 'off'),
+      )
+      lines.push(
+        `- **${a.label}** [${a.role}]${tier}${status}${pct} · custody ${custody}`,
+      )
     }
     lines.push('', USAGE_TEXT)
     return { text: lines.join('\n') }
@@ -225,6 +314,43 @@ export function executeAccountCommand(input: {
     return {
       text: 'Main OAuth refresh and quota backoff cleared.',
       updated: { id: 'main', action: 'reset-backoff' },
+    }
+  }
+
+  if (action.type === 'custody') {
+    const target = accounts.find((account) => account.id === action.id)
+    if (!target) return { text: `Account "${action.id}" not found.` }
+    if (target.id === mainId) {
+      return {
+        text: 'Cannot change custody for the main account.',
+      }
+    }
+    if (!isOAuthAccount(target)) {
+      return { text: 'Custody requires an OAuth fallback account.' }
+    }
+    if (action.enabled && !target.enabled) {
+      return {
+        text: `Cannot enable custody for disabled account "${action.id}".`,
+      }
+    }
+    if (input.custody?.platform !== 'opencode') {
+      return { text: 'Custody is OpenCode-only in this version.' }
+    }
+
+    const result = await input.custody.set({
+      account: target,
+      storage: input.storage,
+      enabled: action.enabled,
+    })
+    return {
+      text: result.text,
+      ...(result.changed && {
+        updated: {
+          id: action.id,
+          action: 'custody' as const,
+          enabled: action.enabled,
+        },
+      }),
     }
   }
 

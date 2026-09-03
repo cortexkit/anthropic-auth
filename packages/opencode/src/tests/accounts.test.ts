@@ -71,6 +71,7 @@ import {
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
+  setClaustrumAccountGatePersistent,
   setFastModePersistentEnabled,
   setLogLevel,
   setLogLevelPersistent,
@@ -3756,6 +3757,63 @@ describe('FallbackAccountManager', () => {
     expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
   })
 
+  test('background refresh skips a custody verification lock without warning', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'custody-verifying',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: Date.now() + 60_000,
+    })
+    await saveAccounts(storage, accountPath)
+    const logs: LogTestRecord[] = []
+    const previousLogLevel = getLogLevel()
+    const entered = deferred()
+    const release = deferred()
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response(null, { status: 200 })),
+    ) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+    })
+
+    try {
+      setLogLevel('debug')
+      __setLogTestSink((record) => logs.push(record))
+      const held = manager.withAccountRefreshLock(
+        'custody-verifying',
+        async () => {
+          entered.resolve()
+          await release.promise
+        },
+      )
+      await entered.promise
+
+      await manager.refreshDueAccounts()
+
+      expect(fetchImpl).not.toHaveBeenCalled()
+      expect(logs).toContainEqual(
+        expect.objectContaining({
+          level: 'debug',
+          channel: 'refresh',
+          message: 'fallback oauth background skipped custody verification',
+        }),
+      )
+      expect(
+        logs.some(
+          (record) => record.level === 'warn' || record.level === 'error',
+        ),
+      ).toBe(false)
+      release.resolve()
+      await held
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(previousLogLevel)
+    }
+  })
+
   test('background fallback refresh retries after a permanent backoff belongs to an older refresh token', async () => {
     const now = Date.now()
     const storage = baseStorage()
@@ -6778,6 +6836,31 @@ describe('setAccountEnabledPersistent', () => {
     )
     const loaded = await loadAccounts()
     expect(loaded?.accounts[0]?.enabled).toBe(false)
+  })
+})
+
+describe('setClaustrumAccountGatePersistent', () => {
+  test('refuses an API fallback without writing custody state', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'api-fallback',
+      type: 'api',
+      apiKey: 'test-api-key',
+      baseURL: 'https://example.test',
+    })
+    await saveAccounts(storage, accountPath)
+    const before = await readFile(accountPath, 'utf8')
+    const beforeStat = await stat(accountPath)
+
+    expect(
+      await setClaustrumAccountGatePersistent({
+        id: 'api-fallback',
+        enabled: true,
+        path: accountPath,
+      }),
+    ).toBe('ineligible')
+    expect(await readFile(accountPath, 'utf8')).toBe(before)
+    expect((await stat(accountPath)).mtimeMs).toBe(beforeStat.mtimeMs)
   })
 })
 

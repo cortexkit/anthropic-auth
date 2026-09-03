@@ -303,6 +303,13 @@ OpenCode can obtain an opted-in fallback OAuth account's access credential from 
 
 The request path reads only a resident in-memory credential. Startup warming and periodic custody ticks perform vault I/O and keep idle credentials refreshed; a cold or unavailable vault falls back to the sidecar credential path. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the OpenCode account modal show the gate, current vault service, and vault reauthentication state without exposing capability handles.
 
+Use `/claude-account custody <id> on|off` to change an eligible fallback OAuth account.
+`on` verifies a usable vault credential under the account refresh lock, then persists the gate. A failed check leaves the gate off.
+`off` persists first, invalidates the resident credential, and returns the account to sidecar service.
+Refusals are explicit: `Cannot change custody for the main account.`, `Custody requires an OAuth fallback account.`, and `Cannot enable custody for disabled account "<id>".`
+Vault failures report `No custody handle for <id>.`, `Claustrum is not available (...)`, `Vault reports the handle as unknown or revoked.`, `Vault credential needs re-login (...)`, or `Vault unavailable: ... Retry.`
+Pi accepts the command but refuses it with `Custody is OpenCode-only in this version.`
+
 Custody currently applies only to fallback OAuth accounts. Main-account vault service is not implemented. If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state.
 
 ## Quota-aware routing

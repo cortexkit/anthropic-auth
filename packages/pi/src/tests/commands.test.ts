@@ -7,7 +7,7 @@ import {
   test,
 } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CacheKeepSessionRegistry } from '@cortexkit/anthropic-auth-core'
@@ -84,6 +84,44 @@ afterAll(() => {
 })
 
 describe('claude-account persistence', () => {
+  test('refuses custody without changing Pi config or state', async () => {
+    const initial = {
+      version: 1,
+      claustrum: { accounts: { unrelated: { enabled: true } } },
+      accounts: [
+        {
+          id: 'oauth-work',
+          type: 'oauth',
+          access: 'access',
+          refresh: 'refresh',
+          enabled: true,
+        },
+      ],
+    }
+    await writeFile(accountPath, JSON.stringify(initial), 'utf8')
+    await writeFile(statePath, JSON.stringify({ version: 1 }), 'utf8')
+    const beforeConfig = await readFile(accountPath, 'utf8')
+    const beforeState = await readFile(statePath, 'utf8')
+    const beforeConfigMtime = (await stat(accountPath)).mtimeMs
+    const beforeStateMtime = (await stat(statePath)).mtimeMs
+    const { pi, commands } = mockPi()
+    registerCommands(pi)
+    const handler = commands.get('claude-account')?.handler
+    const { ctx, notified } = mockNotify()
+
+    await handler!('custody oauth-work on', ctx)
+    await handler!('custody oauth-work off', ctx)
+
+    expect(notified).toEqual([
+      'Custody is OpenCode-only in this version.',
+      'Custody is OpenCode-only in this version.',
+    ])
+    expect(await readFile(accountPath, 'utf8')).toBe(beforeConfig)
+    expect(await readFile(statePath, 'utf8')).toBe(beforeState)
+    expect((await stat(accountPath)).mtimeMs).toBe(beforeConfigMtime)
+    expect((await stat(statePath)).mtimeMs).toBe(beforeStateMtime)
+  })
+
   test('disable persists to storage', async () => {
     await writeFile(
       accountPath,

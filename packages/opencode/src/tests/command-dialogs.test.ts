@@ -3,8 +3,10 @@ import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
 import {
   buildAccountDialogOption,
   buildKillswitchThresholdSeed,
+  buildManageAccountOptions,
   buildPrimeStatusRows,
   handlePrimeStatusOption,
+  normalizeAccountDialogAccounts,
   PRIME_DIALOG_OPTIONS,
 } from '../tui/command-dialogs'
 
@@ -44,27 +46,49 @@ describe('buildAccountDialogOption', () => {
         tierLabel: 'Team · Max 5x',
         claustrumGate: 'on',
         vaultServed: true,
+        vaultReauth: false,
+        custodyState: 'on-vault-served',
+        custodyEligible: true,
       }),
     ).toEqual({
-      title: 'Work [fallback] 22% · gate on · vault served',
+      title: 'Work [fallback] 22% · custody on · vault-served',
       value: 'work',
       description: 'Team · Max 5x',
     })
   })
 
-  test('renders gate and vault markers without exposing credentials', () => {
+  test('renders the settled custody state without exposing credentials', () => {
     const option = buildAccountDialogOption({
       id: 'work',
       label: 'Work',
       role: 'fallback',
       enabled: true,
       quotaPercent: null,
-      claustrumGate: 'off',
+      claustrumGate: 'on',
       vaultServed: false,
+      vaultReauth: true,
+      custodyState: 'on-vault-reauth',
+      custodyEligible: true,
     })
-    expect(option.title).toContain('gate off')
-    expect(option.title).toContain('vault cold')
+    expect(option.title).toContain('custody on · vault reauth')
     expect(option.title).not.toContain('handle')
+  })
+
+  test('renders the cold custody state', () => {
+    const option = buildAccountDialogOption({
+      id: 'work',
+      label: 'Work',
+      role: 'fallback',
+      enabled: true,
+      quotaPercent: null,
+      claustrumGate: 'on',
+      vaultServed: false,
+      vaultReauth: false,
+      custodyState: 'on-cold',
+      custodyEligible: true,
+    })
+
+    expect(option.title).toContain('custody on · cold')
   })
 
   test('renders the main account gate placeholder as n/a', () => {
@@ -76,10 +100,59 @@ describe('buildAccountDialogOption', () => {
       quotaPercent: null,
       claustrumGate: 'na',
       vaultServed: false,
+      vaultReauth: false,
+      custodyState: 'na',
+      custodyEligible: false,
     })
 
-    expect(option.title).toContain('gate n/a')
-    expect(option.title).toContain('vault n/a')
+    expect(option.title).toContain('custody n/a')
+  })
+
+  test('omits custody for an older account-modal payload without custody fields', () => {
+    const [oldPayloadAccount] = normalizeAccountDialogAccounts([
+      {
+        id: 'work',
+        label: 'Work',
+        role: 'fallback',
+        enabled: true,
+        quotaPercent: null,
+        claustrumGate: 'off',
+        vaultServed: false,
+      },
+    ])
+
+    expect(() => buildAccountDialogOption(oldPayloadAccount!)).not.toThrow()
+    expect(buildAccountDialogOption(oldPayloadAccount!)).toEqual({
+      title: 'Work [fallback] –%',
+      value: 'work',
+    })
+  })
+})
+
+describe('buildManageAccountOptions', () => {
+  test('offers custody only for eligible OAuth fallback accounts', () => {
+    const base = {
+      id: 'work',
+      label: 'Work',
+      role: 'fallback' as const,
+      enabled: true,
+      quotaPercent: null,
+      claustrumGate: 'on' as const,
+      vaultServed: false,
+      vaultReauth: false,
+      custodyState: 'on-cold' as const,
+    }
+
+    expect(
+      buildManageAccountOptions({ ...base, custodyEligible: true }).map(
+        (option) => option.title,
+      ),
+    ).toContain('Custody off')
+    expect(
+      buildManageAccountOptions({ ...base, custodyEligible: false }).map(
+        (option) => option.title,
+      ),
+    ).not.toContain('Custody off')
   })
 })
 

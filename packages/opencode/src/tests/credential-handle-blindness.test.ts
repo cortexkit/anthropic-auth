@@ -957,6 +957,12 @@ describe('credential-handle blindness', () => {
       claustrumGate:
         account.role === 'main' ? ('na' as const) : ('on' as const),
       vaultServed: account.role === 'fallback',
+      vaultReauth: false,
+      custodyState:
+        account.role === 'main'
+          ? ('na' as const)
+          : ('on-vault-served' as const),
+      custodyEligible: account.role === 'fallback',
     }))
     const server = await startRpcServer({
       dir: rpcDir,

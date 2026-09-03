@@ -7,13 +7,14 @@ import {
   mock,
   test,
 } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
   buildAccountList,
+  custodyStatusLabel,
   executeAccountCommand,
   type LogTestRecord,
   loadAccounts,
@@ -24,6 +25,7 @@ import {
   setAccountEnabledPersistent,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
+import { drainNotifications } from '../rpc/notifications'
 import { DEFAULT_FETCH_MOCK, installDefaultFetchMock } from './test-fetch'
 import {
   createTimerTracking,
@@ -138,61 +140,83 @@ afterAll(async () => {
 // parseAccountCommandAction
 // ---------------------------------------------------------------------------
 describe('parseAccountCommandAction', () => {
-  test('bare command returns status', () => {
+  test('bare command returns status', async () => {
     expect(parseAccountCommandAction('')).toEqual({ type: 'status' })
   })
 
-  test('enable with id', () => {
+  test('enable with id', async () => {
     expect(parseAccountCommandAction('enable fallback-1')).toEqual({
       type: 'enable',
       id: 'fallback-1',
     })
   })
 
-  test('disable with id', () => {
+  test('disable with id', async () => {
     expect(parseAccountCommandAction('disable fallback-1')).toEqual({
       type: 'disable',
       id: 'fallback-1',
     })
   })
 
-  test('remove with id', () => {
+  test('custody on with id', async () => {
+    expect(parseAccountCommandAction('custody fallback-1 on')).toEqual({
+      type: 'custody',
+      id: 'fallback-1',
+      enabled: true,
+    })
+  })
+
+  test('custody off with id', async () => {
+    expect(parseAccountCommandAction('custody fallback-1 off')).toEqual({
+      type: 'custody',
+      id: 'fallback-1',
+      enabled: false,
+    })
+  })
+
+  test('custody with a malformed state returns usage', async () => {
+    expect(parseAccountCommandAction('custody fallback-1 maybe')).toEqual({
+      type: 'usage',
+    })
+  })
+
+  test('remove with id', async () => {
     expect(parseAccountCommandAction('remove fallback-1')).toEqual({
       type: 'remove',
       id: 'fallback-1',
     })
   })
 
-  test('move-up with id', () => {
+  test('move-up with id', async () => {
     expect(parseAccountCommandAction('move-up fallback-1')).toEqual({
       type: 'move-up',
       id: 'fallback-1',
     })
   })
 
-  test('move-down with id', () => {
+  test('move-down with id', async () => {
     expect(parseAccountCommandAction('move-down fallback-1')).toEqual({
       type: 'move-down',
       id: 'fallback-1',
     })
   })
 
-  test('enable without id returns usage', () => {
+  test('enable without id returns usage', async () => {
     expect(parseAccountCommandAction('enable')).toEqual({ type: 'usage' })
   })
 
-  test('garbage returns usage', () => {
+  test('garbage returns usage', async () => {
     expect(parseAccountCommandAction('garbage')).toEqual({ type: 'usage' })
   })
 
-  test('add-oauth-finish with code only (no label)', () => {
+  test('add-oauth-finish with code only (no label)', async () => {
     expect(parseAccountCommandAction('add-oauth-finish abc123')).toEqual({
       type: 'add-oauth-finish',
       code: 'abc123',
     })
   })
 
-  test('add-oauth-finish with --label', () => {
+  test('add-oauth-finish with --label', async () => {
     expect(
       parseAccountCommandAction('add-oauth-finish abc123 --label work'),
     ).toEqual({
@@ -202,7 +226,7 @@ describe('parseAccountCommandAction', () => {
     })
   })
 
-  test('add-oauth-finish --label with multi-word label', () => {
+  test('add-oauth-finish --label with multi-word label', async () => {
     expect(
       parseAccountCommandAction('add-oauth-finish abc123 --label my work acct'),
     ).toEqual({
@@ -240,14 +264,14 @@ describe('buildAccountList', () => {
     expect(list[3]!.enabled).toBe(false)
   })
 
-  test('no main quota returns null percent', () => {
+  test('no main quota returns null percent', async () => {
     const storage = baseStorage()
     storage.quota!.mainQuota = undefined
     const list = buildAccountList(storage)
     expect(list[0]!.quotaPercent).toBeNull()
   })
 
-  test('no label falls back to id', () => {
+  test('no label falls back to id', async () => {
     const storage: AccountStorage = {
       version: 1,
       accounts: [{ id: 'abc', type: 'oauth', refresh: 'x' }],
@@ -256,7 +280,7 @@ describe('buildAccountList', () => {
     expect(list[1]!.label).toBe('abc')
   })
 
-  test('buildAccountList adds tierLabel only when profile exists', () => {
+  test('buildAccountList adds tierLabel only when profile exists', async () => {
     const storage = baseStorage()
     storage.main = {
       ...storage.main!,
@@ -281,7 +305,7 @@ describe('buildAccountList', () => {
     expect(list[2]!.tierLabel).toBeUndefined()
   })
 
-  test('account modal includes optional tier label', () => {
+  test('account modal includes optional tier label', async () => {
     const storage = baseStorage()
     storage.main = {
       ...storage.main!,
@@ -292,7 +316,7 @@ describe('buildAccountList', () => {
       },
     }
 
-    const result = executeAccountCommand({ argumentsText: '', storage })
+    const result = await executeAccountCommand({ argumentsText: '', storage })
 
     expect(result.text).toContain('Max 20x')
   })
@@ -302,9 +326,17 @@ describe('buildAccountList', () => {
 // executeAccountCommand — status
 // ---------------------------------------------------------------------------
 describe('executeAccountCommand status', () => {
-  test('bare status returns account list in text', () => {
+  test('labels every custody state from the shared formatter', () => {
+    expect(custodyStatusLabel('na')).toBe('n/a (OpenCode managed)')
+    expect(custodyStatusLabel('off')).toBe('off')
+    expect(custodyStatusLabel('on-vault-served')).toBe('on · vault-served')
+    expect(custodyStatusLabel('on-vault-reauth')).toBe('on · vault reauth')
+    expect(custodyStatusLabel('on-cold')).toBe('on · cold')
+  })
+
+  test('bare status returns account list in text', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({ argumentsText: '', storage })
+    const result = await executeAccountCommand({ argumentsText: '', storage })
     expect(result.text).toContain('## Claude Accounts')
     expect(result.text).toContain('OpenCode anthropic')
     expect(result.text).toContain('Work account')
@@ -313,14 +345,59 @@ describe('executeAccountCommand status', () => {
     expect(result.text).toContain('42%')
     expect(result.text).toContain('(disabled)')
     expect(result.text).toContain(
-      '**OpenCode anthropic** [main] 42% · gate n/a (OpenCode managed)',
+      '**OpenCode anthropic** [main] 42% · custody n/a (OpenCode managed)',
     )
-    expect(result.text).toContain('**Work account** [fallback] · gate off')
+    expect(result.text).toContain('**Work account** [fallback] · custody off')
   })
 
-  test('usage returns usage text', () => {
+  test('renders the settled custody projection in account status text', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({ argumentsText: 'garbage', storage })
+    const result = await executeAccountCommand({
+      argumentsText: '',
+      storage,
+      statusProjection: {
+        claustrumDetection: 'available',
+        accounts: [
+          {
+            id: 'main',
+            label: 'OpenCode anthropic',
+            role: 'main',
+            enabled: true,
+            quotaPercent: 42,
+            claustrumGate: 'na',
+            vaultServed: false,
+            vaultReauth: false,
+            custodyState: 'na',
+            custodyEligible: false,
+          },
+          {
+            id: 'fallback-1',
+            label: 'Work account',
+            role: 'fallback',
+            enabled: true,
+            quotaPercent: null,
+            claustrumGate: 'on',
+            vaultServed: false,
+            vaultReauth: true,
+            custodyState: 'on-vault-reauth',
+            custodyEligible: true,
+          },
+        ],
+      },
+    })
+
+    expect(result.text).toContain('Claustrum: available')
+    expect(result.text).toContain(
+      '**Work account** [fallback] · custody on · vault reauth',
+    )
+  })
+
+  test('usage returns usage text', async () => {
+    const storage = baseStorage()
+    const result = await executeAccountCommand({
+      argumentsText: 'garbage',
+      storage,
+    })
     expect(result.text).toContain('Usage:')
     expect(result.text).toContain('/claude-account enable')
   })
@@ -330,9 +407,9 @@ describe('executeAccountCommand status', () => {
 // executeAccountCommand — enable / disable
 // ---------------------------------------------------------------------------
 describe('executeAccountCommand enable/disable', () => {
-  test('enable sets enabled flag on result', () => {
+  test('enable sets enabled flag on result', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'enable fallback-3',
       storage,
     })
@@ -344,9 +421,9 @@ describe('executeAccountCommand enable/disable', () => {
     })
   })
 
-  test('disable sets enabled flag on result', () => {
+  test('disable sets enabled flag on result', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'disable fallback-1',
       storage,
     })
@@ -358,9 +435,9 @@ describe('executeAccountCommand enable/disable', () => {
     })
   })
 
-  test('enable main is rejected', () => {
+  test('enable main is rejected', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'enable main',
       storage,
     })
@@ -368,9 +445,9 @@ describe('executeAccountCommand enable/disable', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('disable main is rejected', () => {
+  test('disable main is rejected', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'disable main',
       storage,
     })
@@ -378,9 +455,9 @@ describe('executeAccountCommand enable/disable', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('enable non-existent returns not found', () => {
+  test('enable non-existent returns not found', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'enable nonexistent',
       storage,
     })
@@ -409,12 +486,128 @@ describe('executeAccountCommand enable/disable', () => {
 })
 
 // ---------------------------------------------------------------------------
+// executeAccountCommand — custody
+// ---------------------------------------------------------------------------
+describe('executeAccountCommand custody', () => {
+  test('checks account existence before rejecting the main account', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: 'custody main on',
+      storage: baseStorage(),
+    })
+
+    expect(result.text).toBe('Account "main" not found.')
+    expect(result.updated).toBeUndefined()
+  })
+
+  test('rejects a stored main account after confirming it exists', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'main',
+      type: 'oauth',
+      refresh: 'refresh-main',
+      enabled: true,
+    })
+
+    const result = await executeAccountCommand({
+      argumentsText: 'custody main on',
+      storage,
+    })
+
+    expect(result.text).toBe('Cannot change custody for the main account.')
+    expect(result.updated).toBeUndefined()
+  })
+
+  test('rejects an API-key account before invoking the custody capability', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'api-fallback',
+      type: 'api',
+      apiKey: 'test-api-key',
+      baseURL: 'https://api.example.test/claude',
+      enabled: true,
+    })
+    let calls = 0
+
+    const result = await executeAccountCommand({
+      argumentsText: 'custody api-fallback on',
+      storage,
+      custody: {
+        platform: 'opencode',
+        async set() {
+          calls += 1
+          return { text: 'unexpected', changed: true }
+        },
+      },
+    })
+
+    expect(result.text).toContain('OAuth')
+    expect(result.updated).toBeUndefined()
+    expect(calls).toBe(0)
+  })
+
+  test('rejects enabling custody for a disabled OAuth account', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: 'custody fallback-3 on',
+      storage: baseStorage(),
+      custody: {
+        platform: 'opencode',
+        async set() {
+          return { text: 'unexpected', changed: true }
+        },
+      },
+    })
+
+    expect(result.text).toContain('disabled')
+    expect(result.updated).toBeUndefined()
+  })
+
+  test('returns the pinned Pi text without a mutation intent when unsupported', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: 'custody fallback-1 on',
+      storage: baseStorage(),
+      custody: {
+        platform: 'unsupported',
+        reason: 'Pi does not support custody',
+      },
+    })
+
+    expect(result.text).toBe('Custody is OpenCode-only in this version.')
+    expect(result.updated).toBeUndefined()
+  })
+
+  test('delegates custody changes to the supported host capability', async () => {
+    const storage = baseStorage()
+    let receivedEnabled: boolean | undefined
+
+    const result = await executeAccountCommand({
+      argumentsText: 'custody fallback-1 off',
+      storage,
+      custody: {
+        platform: 'opencode',
+        async set(input) {
+          receivedEnabled = input.enabled
+          return { text: 'Custody disabled.', changed: true }
+        },
+      },
+    })
+
+    expect(receivedEnabled).toBe(false)
+    expect(result.text).toBe('Custody disabled.')
+    expect(result.updated).toEqual({
+      id: 'fallback-1',
+      action: 'custody',
+      enabled: false,
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // executeAccountCommand — remove
 // ---------------------------------------------------------------------------
 describe('executeAccountCommand remove', () => {
-  test('remove returns updated', () => {
+  test('remove returns updated', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'remove fallback-1',
       storage,
     })
@@ -425,9 +618,9 @@ describe('executeAccountCommand remove', () => {
     })
   })
 
-  test('remove main is rejected', () => {
+  test('remove main is rejected', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'remove main',
       storage,
     })
@@ -435,9 +628,9 @@ describe('executeAccountCommand remove', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('remove non-existent returns not found', () => {
+  test('remove non-existent returns not found', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'remove nonexistent',
       storage,
     })
@@ -469,9 +662,9 @@ describe('executeAccountCommand remove', () => {
 // executeAccountCommand — reorder (move-up / move-down)
 // ---------------------------------------------------------------------------
 describe('executeAccountCommand reorder', () => {
-  test('move-up returns updated with new order', () => {
+  test('move-up returns updated with new order', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'move-up fallback-2',
       storage,
     })
@@ -484,9 +677,9 @@ describe('executeAccountCommand reorder', () => {
     })
   })
 
-  test('move-up first item is no-op', () => {
+  test('move-up first item is no-op', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'move-up fallback-1',
       storage,
     })
@@ -494,9 +687,9 @@ describe('executeAccountCommand reorder', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('move-down returns updated with new order', () => {
+  test('move-down returns updated with new order', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'move-down fallback-1',
       storage,
     })
@@ -509,9 +702,9 @@ describe('executeAccountCommand reorder', () => {
     })
   })
 
-  test('move-down last item is no-op', () => {
+  test('move-down last item is no-op', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'move-down fallback-3',
       storage,
     })
@@ -519,9 +712,9 @@ describe('executeAccountCommand reorder', () => {
     expect(result.updated).toBeUndefined()
   })
 
-  test('move-up non-existent returns not found', () => {
+  test('move-up non-existent returns not found', async () => {
     const storage = baseStorage()
-    const result = executeAccountCommand({
+    const result = await executeAccountCommand({
       argumentsText: 'move-up nonexistent',
       storage,
     })
@@ -705,6 +898,24 @@ describe('account command INFO logs (via plugin)', () => {
     expect(
       capturedRecords.filter((r) => r.channel === 'commands'),
     ).toHaveLength(0)
+  })
+
+  test('custody on refuses a missing handle without touching the account file', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage, accountPath)
+    const before = await readFile(accountPath, 'utf8')
+    const beforeMtime = (await stat(accountPath)).mtimeMs
+    const plugin = await getPlugin()
+    drainNotifications(0, 'ses_test')
+
+    await executeCommand(plugin, 'claude-account', 'custody fallback-1 on')
+
+    const payload = drainNotifications(0, 'ses_test').at(-1)?.payload
+    expect(payload?.text).toBe(
+      'No custody handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
+    )
+    expect(await readFile(accountPath, 'utf8')).toBe(before)
+    expect((await stat(accountPath)).mtimeMs).toBe(beforeMtime)
   })
 
   test('does not retain a background interval unless the helper opts in', async () => {

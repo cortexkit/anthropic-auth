@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import {
+  type AccountCommandStatusProjection,
   type AccountStorage,
   type ApiKeyAccount,
   acquireRefreshFileLock,
@@ -33,6 +34,7 @@ import {
   type ClaustrumCredentialCache,
   ClaustrumCredentialError,
   type ClaustrumReporterSource,
+  type CustodyStatusState,
   CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   computeXxhash64Hex,
@@ -167,6 +169,7 @@ import {
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
+  setClaustrumAccountGatePersistent,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModeEnabled,
@@ -866,6 +869,7 @@ type PluginRuntimeOverrides = Partial<{
 // Keep boot above the resident IPC fast path, but never let a stale-marked
 // refresh turn a vault treadmill into a seconds-long plugin-start delay.
 const CLAUSTRUM_WARMUP_TIMEOUT_MS = 100
+const CLAUSTRUM_CUSTODY_VERIFY_TIMEOUT_MS = 15_000
 const CLAUSTRUM_TRANSIENT_WARM_BACKOFF_MS = 5_000
 const CLAUSTRUM_REAUTH_WARM_BACKOFF_MS = FALLBACK_BACKGROUND_TICK_MS
 
@@ -1688,6 +1692,7 @@ const anthropicAuthPlugin = async (
   const claustrumReauthAccounts = new Set<string>()
   const claustrumWarmScheduled = new Set<string>()
   const claustrumWarmBackoffUntil = new Map<string, number>()
+  const claustrumGateGenerations = new Map<string, number>()
   let claustrumConnectBackoffUntil = 0
   const claustrumAccounts = initialStorage
     ? initialStorage.accounts.filter(
@@ -1715,6 +1720,44 @@ const anthropicAuthPlugin = async (
     if (!handle) return false
     const cached = claustrumCredentialCache?.peek(handle)
     return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
+  }
+
+  const custodyStateFor = (
+    account: { id: string; role: 'main' | 'fallback' },
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    vaultServed = isFallbackAccountVaultServed(account.id, storage),
+  ): CustodyStatusState => {
+    if (account.role === 'main') return 'na'
+    if (!storage) return 'off'
+    if (!isClaustrumEnabledForAccount(storage, account.id)) return 'off'
+    if (claustrumReauthAccounts.has(account.id)) return 'on-vault-reauth'
+    if (vaultServed) {
+      return 'on-vault-served'
+    }
+    return 'on-cold'
+  }
+
+  const fallbackCustodyStateFor = (
+    accountId: string,
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+    vaultServed = isFallbackAccountVaultServed(accountId, storage),
+  ): Exclude<CustodyStatusState, 'na'> => {
+    const state = custodyStateFor(
+      { id: accountId, role: 'fallback' },
+      storage,
+      vaultServed,
+    )
+    return state === 'na' ? 'off' : state
+  }
+
+  const claustrumGateGeneration = (accountId: string) =>
+    claustrumGateGenerations.get(accountId) ?? 0
+
+  const bumpClaustrumGateGeneration = (accountId: string) => {
+    claustrumGateGenerations.set(
+      accountId,
+      claustrumGateGeneration(accountId) + 1,
+    )
   }
 
   function claustrumWarmBackoffActive(handle: string): boolean {
@@ -1810,8 +1853,13 @@ const anthropicAuthPlugin = async (
   ): Promise<void> {
     const cache = claustrumCredentialCache
     if (!cache) return
+    const generation = claustrumGateGeneration(accountId)
     try {
       const credential = await cache.get(handle)
+      if (generation !== claustrumGateGeneration(accountId)) {
+        cache.invalidate(handle)
+        return
+      }
       if (usableClaustrumAccessToken(credential, claustrumNow())) {
         await markClaustrumCredentialReady(accountId, handle)
       }
@@ -2026,7 +2074,12 @@ const anthropicAuthPlugin = async (
         continue
       }
       try {
+        const generation = claustrumGateGeneration(account.id)
         const credential = await cache.get(handle, minTtlMs)
+        if (generation !== claustrumGateGeneration(account.id)) {
+          cache.invalidate(handle)
+          continue
+        }
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
           log('[refresh] vault fallback credential unusable', {
             accountId: account.id,
@@ -2081,8 +2134,13 @@ const anthropicAuthPlugin = async (
           claustrumAccounts.map(async (account) => {
             const handle = account.claustrumHandle
             if (!handle) return
+            const generation = claustrumGateGeneration(account.id)
             try {
               const credential = await cache.get(handle)
+              if (generation !== claustrumGateGeneration(account.id)) {
+                cache.invalidate(handle)
+                return
+              }
               if (usableClaustrumAccessToken(credential, claustrumNow())) {
                 await markClaustrumCredentialReady(account.id, handle)
               }
@@ -2927,38 +2985,44 @@ const anthropicAuthPlugin = async (
           (account): account is OAuthAccount =>
             account.enabled !== false && isOAuthAccount(account),
         )
-        .map((account) => ({
-          id: account.id,
-          label: account.label,
-          tierLabel: formatOAuthAccountTier(account.profile),
-          // Token-aware read: if a fallback account was re-logged with the same
-          // id/label, an old in-memory quota snapshot must not be shown as the
-          // new account's quota.
-          quota: options.skipFallbackQuotaSeed
-            ? null
-            : account.access
-              ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
-              : null,
-          // A fallback with a permanently-dead refresh token (400 invalid_grant)
-          // is dropped by getUsableFallbackAccounts and silently degrades to
-          // main — surface it as "needs re-login". Only flag truly-dead tokens
-          // whose backoff is still active, not transient (429/5xx) backoff.
-          needsReauth:
-            account.lastRefreshError != null &&
-            refreshBackoffActive(
-              account.lastRefreshError,
-              account.id,
-              Date.now(),
-              tokenFingerprint(account.refresh),
-            ) &&
-            isPermanentRefreshError(account.lastRefreshError),
-          vaultReauth:
-            claustrumReauthAccounts.has(account.id) &&
-            Boolean(
-              account.access && account.expires && account.expires > Date.now(),
-            ),
-          enabled: account.enabled !== false,
-        })),
+        .map((account) => {
+          const vaultServed = isFallbackAccountVaultServed(account.id, storage)
+          const custodyState = fallbackCustodyStateFor(
+            account.id,
+            storage,
+            vaultServed,
+          )
+          return {
+            id: account.id,
+            label: account.label,
+            tierLabel: formatOAuthAccountTier(account.profile),
+            // Token-aware read: if a fallback account was re-logged with the same
+            // id/label, an old in-memory quota snapshot must not be shown as the
+            // new account's quota.
+            quota: options.skipFallbackQuotaSeed
+              ? null
+              : account.access
+                ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
+                : null,
+            // A fallback with a permanently-dead refresh token (400 invalid_grant)
+            // is dropped by getUsableFallbackAccounts and silently degrades to
+            // main — surface it as "needs re-login". Only flag truly-dead tokens
+            // whose backoff is still active, not transient (429/5xx) backoff.
+            needsReauth:
+              account.lastRefreshError != null &&
+              refreshBackoffActive(
+                account.lastRefreshError,
+                account.id,
+                Date.now(),
+                tokenFingerprint(account.refresh),
+              ) &&
+              isPermanentRefreshError(account.lastRefreshError),
+            vaultReauth: custodyState === 'on-vault-reauth',
+            vaultServed,
+            custodyState,
+            enabled: account.enabled !== false,
+          }
+        }),
       activeId: options.activeId,
       route: options.route,
       relay: (() => {
@@ -3916,15 +3980,209 @@ const anthropicAuthPlugin = async (
         AbortSignal.timeout(3_000),
       )
     }
-    const result = executeAccountCommand({
+    const statusProjection =
+      action.type === 'status'
+        ? ((await buildAccountDialogProjection(
+            storage,
+          )) satisfies AccountCommandStatusProjection)
+        : undefined
+    const result = await executeAccountCommand({
       argumentsText,
       storage: storage ?? { version: 1, accounts: [] },
       claustrum:
-        action.type === 'status'
+        action.type === 'status' && !statusProjection
           ? await detectClaustrumConnection(
               getConfiguredClaustrumConnectionFile(),
             )
           : undefined,
+      statusProjection,
+      custody: {
+        platform: 'opencode',
+        async set({ account, storage, enabled }) {
+          const refuse = (step: string, errorClass: string, text: string) => {
+            logger.warn('commands', 'custody gate refused', {
+              id: account.id,
+              step,
+              errorClass,
+            })
+            return { text, changed: false }
+          }
+          const handle = account.claustrumHandle
+
+          if (!enabled) {
+            bumpClaustrumGateGeneration(account.id)
+            const changed = await setClaustrumAccountGatePersistent({
+              id: account.id,
+              enabled: false,
+              path: accountStoragePath,
+            })
+            if (changed === 'missing') {
+              return refuse(
+                'persist',
+                'missing',
+                `Account "${account.id}" not found.`,
+              )
+            }
+            if (handle) claustrumCredentialCache?.invalidate(handle)
+            claustrumBlockedAccounts.delete(account.id)
+            claustrumReauthAccounts.delete(account.id)
+            if (handle) claustrumWarmBackoffUntil.delete(handle)
+            if (changed === 'unchanged') {
+              return {
+                text: `Custody already off for ${account.id}.`,
+                changed: false,
+              }
+            }
+            logger.info('commands', 'custody gate changed', {
+              id: account.id,
+              enabled: false,
+            })
+            return {
+              text: `Custody off for ${account.id} (plugin-served).`,
+              changed: true,
+            }
+          }
+
+          if (!handle) {
+            return refuse(
+              'handle',
+              'missing_handle',
+              `No custody handle for ${account.id}. Mint one with ck auth mint-handle and store it, then retry.`,
+            )
+          }
+          const detection = await detectClaustrumConnection(
+            getConfiguredClaustrumConnectionFile(),
+          )
+          if (detection.status !== 'available') {
+            const reason =
+              detection.status === 'absent'
+                ? 'connection file absent'
+                : detection.reason
+            return refuse(
+              'connection',
+              detection.status,
+              `Claustrum is not available (${reason}).`,
+            )
+          }
+
+          return fallbackManager.withAccountRefreshLock(
+            account.id,
+            async () => {
+              const cache = await ensureClaustrumCredentialCache()
+              if (!cache) {
+                return refuse(
+                  'connect',
+                  'transient',
+                  'Vault unavailable: transient. Retry.',
+                )
+              }
+              const minTtlMs = getRefreshBeforeExpiryMs(storage) + 30 * 60_000
+              const verificationGeneration = claustrumGateGeneration(account.id)
+              let timeout: ReturnType<typeof setTimeout> | undefined
+              const timeoutError = new Error(
+                'custody vault verification timed out',
+              )
+              try {
+                const timeoutPromise = new Promise<never>((_, reject) => {
+                  timeout = runtimeTimers.setTimeout(
+                    () => reject(timeoutError),
+                    CLAUSTRUM_CUSTODY_VERIFY_TIMEOUT_MS,
+                  )
+                  if ('unref' in timeout) timeout.unref()
+                })
+                const credential = await Promise.race([
+                  cache.get(handle, minTtlMs, {
+                    cacheIf: () =>
+                      verificationGeneration ===
+                      claustrumGateGeneration(account.id),
+                  }),
+                  timeoutPromise,
+                ])
+                if (!usableClaustrumAccessToken(credential, claustrumNow())) {
+                  return refuse(
+                    'credential',
+                    'unusable',
+                    'Vault unavailable: unusable. Retry.',
+                  )
+                }
+              } catch (error) {
+                if (error === timeoutError) {
+                  bumpClaustrumGateGeneration(account.id)
+                  cache.abandonPending(handle)
+                  return refuse(
+                    'credential',
+                    'timeout',
+                    'Vault unavailable: timeout. Retry.',
+                  )
+                }
+                if (error instanceof ClaustrumCredentialError) {
+                  if (error.errorClass === 'permanent') {
+                    return refuse(
+                      'credential',
+                      error.errorClass,
+                      'Vault reports the handle as unknown or revoked.',
+                    )
+                  }
+                  if (error.errorClass === 'auth_required') {
+                    return refuse(
+                      'credential',
+                      error.errorClass,
+                      `Vault credential needs re-login (ck auth login --id oauth:anthropic:${account.label ?? account.id}).`,
+                    )
+                  }
+                  return refuse(
+                    'credential',
+                    error.errorClass,
+                    `Vault unavailable: ${error.errorClass}. Retry.`,
+                  )
+                }
+                return refuse(
+                  'credential',
+                  'transient',
+                  'Vault unavailable: transient. Retry.',
+                )
+              } finally {
+                if (timeout) globalThis.clearTimeout(timeout)
+              }
+
+              const changed = await setClaustrumAccountGatePersistent({
+                id: account.id,
+                enabled: true,
+                path: accountStoragePath,
+              })
+              if (changed === 'missing') {
+                return refuse(
+                  'persist',
+                  'missing',
+                  `Account "${account.id}" not found.`,
+                )
+              }
+              if (changed === 'ineligible') {
+                return refuse(
+                  'persist',
+                  'ineligible',
+                  'Custody requires an OAuth fallback account.',
+                )
+              }
+              if (changed === 'unchanged') {
+                return {
+                  text: `Custody already on for ${account.id}.`,
+                  changed: false,
+                }
+              }
+              await markClaustrumCredentialReady(account.id, handle)
+              logger.info('commands', 'custody gate changed', {
+                id: account.id,
+                enabled: true,
+              })
+              return {
+                text: `Custody on for ${account.id} (vault-served).`,
+                changed: true,
+              }
+            },
+          )
+        },
+      },
     })
 
     if (result.updated) {
@@ -4026,31 +4284,46 @@ const anthropicAuthPlugin = async (
     const accounts = buildAccountList(
       updatedStorage ?? { version: 1, accounts: [] },
     )
-    return { text: result.text, accounts }
+    return { text: result.text, accounts, statusProjection }
   }
 
-  async function buildAccountDialogProjection(): Promise<{
+  async function buildAccountDialogProjection(
+    storageOverride?: Awaited<ReturnType<typeof loadAccounts>>,
+  ): Promise<{
     accounts: AccountDialogAccount[]
     claustrumDetection: string
   }> {
-    const storage = await loadAccounts(accountStoragePath)
-    const accounts = buildAccountList(storage ?? createEmptyStorage()).map(
-      (account) => ({
-        ...account,
-        claustrumGate:
-          account.role === 'main'
-            ? ('na' as const)
-            : isClaustrumEnabledForAccount(
-                  storage ?? createEmptyStorage(),
-                  account.id,
-                )
-              ? ('on' as const)
-              : ('off' as const),
-        vaultServed:
+    const storage = storageOverride ?? (await loadAccounts(accountStoragePath))
+    const accountStorage = storage ?? createEmptyStorage()
+    const accounts = buildAccountList(accountStorage).map((account) => {
+      const stored = accountStorage.accounts.find(
+        (candidate) => candidate.id === account.id,
+      )
+      const claustrumGate =
+        account.role === 'main'
+          ? ('na' as const)
+          : isClaustrumEnabledForAccount(accountStorage, account.id)
+            ? ('on' as const)
+            : ('off' as const)
+      const custodyState = custodyStateFor(account, storage)
+      return {
+        id: account.id,
+        label: account.label,
+        role: account.role,
+        enabled: account.enabled,
+        quotaPercent: account.quotaPercent,
+        ...(account.tierLabel && { tierLabel: account.tierLabel }),
+        claustrumGate,
+        custodyState,
+        vaultServed: custodyState === 'on-vault-served',
+        vaultReauth: custodyState === 'on-vault-reauth',
+        custodyEligible:
           account.role === 'fallback' &&
-          isFallbackAccountVaultServed(account.id, storage),
-      }),
-    )
+          stored !== undefined &&
+          isOAuthAccount(stored) &&
+          stored.enabled !== false,
+      }
+    })
     const detection = await detectClaustrumConnection(
       getConfiguredClaustrumConnectionFile(),
     )
@@ -4083,7 +4356,8 @@ const anthropicAuthPlugin = async (
     }
     if (command === 'claude-account') {
       const result = await executePersistentAccountCommand(args, sessionId)
-      const accountProjection = await buildAccountDialogProjection()
+      const accountProjection =
+        result.statusProjection ?? (await buildAccountDialogProjection())
       const knobs: Record<string, unknown> = {
         accounts: accountProjection.accounts,
         claustrumDetection: accountProjection.claustrumDetection,
@@ -7668,7 +7942,9 @@ const anthropicAuthPlugin = async (
     __quotaManager: quotaManager,
     __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,
     __fallbackRefreshReady: fallbackRefreshReady,
-    __claustrumCredentialCache: claustrumCredentialCache,
+    get __claustrumCredentialCache() {
+      return claustrumCredentialCache
+    },
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }

@@ -1,5 +1,8 @@
 /** @jsxImportSource @opentui/solid */
-import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
+import {
+  custodyStatusLabel,
+  type PrimeAccountStatus,
+} from '@cortexkit/anthropic-auth-core'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { AccountDialogAccount } from '../rpc/protocol'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
@@ -15,6 +18,17 @@ type KillswitchDialogConfig = {
   main?: Record<string, number>
   accounts?: Record<string, Record<string, number>>
 }
+
+type TuiAccountDialogAccount = Omit<
+  AccountDialogAccount,
+  'vaultReauth' | 'custodyState' | 'custodyEligible'
+> &
+  Partial<
+    Pick<
+      AccountDialogAccount,
+      'vaultReauth' | 'custodyState' | 'custodyEligible'
+    >
+  >
 
 export const PRIME_DIALOG_OPTIONS = [
   { title: 'Enable', value: 'on' },
@@ -49,22 +63,120 @@ export function buildKillswitchThresholdSeed(
   return seedParts.join(' ')
 }
 
-export function buildAccountDialogOption(account: AccountDialogAccount) {
+export function normalizeAccountDialogAccounts(
+  value: unknown,
+): TuiAccountDialogAccount[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((value) => {
+    if (!value || typeof value !== 'object') return []
+    const account = value as Record<string, unknown>
+    const quotaPercent = account.quotaPercent
+    if (
+      typeof account.id !== 'string' ||
+      typeof account.label !== 'string' ||
+      (account.role !== 'main' && account.role !== 'fallback') ||
+      typeof account.enabled !== 'boolean' ||
+      (quotaPercent !== null &&
+        (typeof quotaPercent !== 'number' || !Number.isFinite(quotaPercent))) ||
+      (account.claustrumGate !== 'on' &&
+        account.claustrumGate !== 'off' &&
+        account.claustrumGate !== 'na') ||
+      typeof account.vaultServed !== 'boolean'
+    ) {
+      return []
+    }
+    const normalized = {
+      id: account.id,
+      label: account.label,
+      role: account.role,
+      enabled: account.enabled,
+      quotaPercent,
+      ...(typeof account.tierLabel === 'string' && {
+        tierLabel: account.tierLabel,
+      }),
+      claustrumGate: account.claustrumGate,
+      vaultServed: account.vaultServed,
+    } satisfies TuiAccountDialogAccount
+    const custodyState = account.custodyState
+    if (
+      (custodyState === 'na' ||
+        custodyState === 'off' ||
+        custodyState === 'on-vault-served' ||
+        custodyState === 'on-vault-reauth' ||
+        custodyState === 'on-cold') &&
+      typeof account.vaultReauth === 'boolean' &&
+      typeof account.custodyEligible === 'boolean'
+    ) {
+      return [
+        {
+          ...normalized,
+          custodyState,
+          vaultReauth: account.vaultReauth,
+          custodyEligible: account.custodyEligible,
+        },
+      ]
+    }
+    return [normalized]
+  })
+}
+
+export function buildAccountDialogOption(account: TuiAccountDialogAccount) {
   const pct =
     account.quotaPercent != null
       ? ` ${Math.round(account.quotaPercent)}%`
       : ' \u2013%'
   const status = !account.enabled ? ' (disabled)' : ''
-  const gate = ` · gate ${account.claustrumGate === 'na' ? 'n/a' : account.claustrumGate}`
-  const vault =
-    account.role === 'main'
-      ? ' · vault n/a'
-      : ` · vault ${account.vaultServed ? 'served' : 'cold'}`
+  const custody = account.custodyState
+    ? custodyStatusLabel(account.custodyState).replace(
+        ' (OpenCode managed)',
+        '',
+      )
+    : undefined
   return {
-    title: `${account.label} [${account.role}]${status}${pct}${gate}${vault}`,
+    title: `${account.label} [${account.role}]${status}${pct}${custody ? ` · custody ${custody}` : ''}`,
     value: account.id,
     ...(account.tierLabel && { description: account.tierLabel }),
   }
+}
+
+export function buildManageAccountOptions(account: TuiAccountDialogAccount) {
+  const options: Array<{
+    title: string
+    value: string
+    description?: string
+  }> = []
+  const toggleLabel = account.enabled ? 'Disable' : 'Enable'
+  options.push({
+    title: toggleLabel,
+    value: account.enabled ? 'disable' : 'enable',
+    description: account.enabled
+      ? 'Stop using this fallback account'
+      : 'Allow this fallback account to be used',
+  })
+  options.push({
+    title: 'Move up',
+    value: 'move-up',
+    description: 'Higher priority in fallback order',
+  })
+  options.push({
+    title: 'Move down',
+    value: 'move-down',
+    description: 'Lower priority in fallback order',
+  })
+  if (account.custodyEligible) {
+    options.push({
+      title: account.claustrumGate === 'on' ? 'Custody off' : 'Custody on',
+      value: 'custody',
+      description: 'Choose whether the vault may serve this account',
+    })
+  }
+  options.push({
+    title: 'Remove\u2026',
+    value: 'remove',
+    description: 'Delete this account permanently',
+  })
+  options.push({ title: 'Back', value: 'back' })
+  return options
 }
 
 function showText(api: TuiPluginApi, text: string) {
@@ -377,8 +489,7 @@ export function openCommandDialog(
   }
 
   if (payload.command === 'claude-account') {
-    const accounts =
-      (payload.knobs.accounts as AccountDialogAccount[] | undefined) ?? []
+    const accounts = normalizeAccountDialogAccounts(payload.knobs.accounts)
     const claustrumDetection =
       (payload.knobs.claustrumDetection as string | undefined) ?? 'unknown'
 
@@ -386,7 +497,7 @@ export function openCommandDialog(
       text: string
       knobs: Record<string, unknown>
     }) => {
-      const updated = r.knobs.accounts as typeof accounts
+      const updated = normalizeAccountDialogAccounts(r.knobs.accounts)
       if (updated && updated.length > 0) {
         accounts.length = 0
         accounts.push(...updated)
@@ -737,37 +848,9 @@ export function openCommandDialog(
       const DialogConfirm = api.ui.DialogConfirm
       api.ui.dialog.setSize('xlarge')
 
-      const options: Array<{
-        title: string
-        value: string
-        description?: string
-      }> = []
-      if (!isMain) {
-        const toggleLabel = account.enabled ? 'Disable' : 'Enable'
-        options.push({
-          title: toggleLabel,
-          value: account.enabled ? 'disable' : 'enable',
-          description: account.enabled
-            ? 'Stop using this fallback account'
-            : 'Allow this fallback account to be used',
-        })
-        options.push({
-          title: 'Move up',
-          value: 'move-up',
-          description: 'Higher priority in fallback order',
-        })
-        options.push({
-          title: 'Move down',
-          value: 'move-down',
-          description: 'Lower priority in fallback order',
-        })
-        options.push({
-          title: 'Remove\u2026',
-          value: 'remove',
-          description: 'Delete this account permanently',
-        })
-      }
-      options.push({ title: 'Back', value: 'back' })
+      const options = isMain
+        ? [{ title: 'Back', value: 'back' }]
+        : buildManageAccountOptions(account)
 
       api.ui.dialog.replace(() => (
         <DialogSelect
@@ -799,18 +882,22 @@ export function openCommandDialog(
               return
             }
 
-            void apply('claude-account', `${option.value} ${account.id}`).then(
-              (r) => {
-                api.ui.toast({ message: r.text })
-                updateAccounts(r)
-                const updatedList = r.knobs.accounts as typeof accounts
-                const refreshed =
-                  (updatedList && updatedList.length > 0
-                    ? updatedList.find((a) => a.id === account.id)
-                    : undefined) ?? account
-                openManage(refreshed, isMain)
-              },
-            )
+            const args =
+              option.value === 'custody'
+                ? `custody ${account.id} ${account.claustrumGate === 'on' ? 'off' : 'on'}`
+                : `${option.value} ${account.id}`
+            void apply('claude-account', args).then((r) => {
+              api.ui.toast({ message: r.text })
+              updateAccounts(r)
+              const updatedList = normalizeAccountDialogAccounts(
+                r.knobs.accounts,
+              )
+              const refreshed =
+                (updatedList && updatedList.length > 0
+                  ? updatedList.find((a) => a.id === account.id)
+                  : undefined) ?? account
+              openManage(refreshed, isMain)
+            })
           }}
         />
       ))

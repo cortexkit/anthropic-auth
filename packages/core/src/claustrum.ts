@@ -638,6 +638,7 @@ export class ClaustrumCredentialCache {
   async get(
     handle: string,
     minTtlMs = this.#minTtlMs,
+    options: { cacheIf?: () => boolean } = {},
   ): Promise<ClaustrumCredential> {
     if (!Number.isSafeInteger(minTtlMs) || minTtlMs < 0) {
       throw new RangeError('minTtlMs must be a non-negative safe integer')
@@ -658,7 +659,7 @@ export class ClaustrumCredentialCache {
     const pending = this.#inFlight.get(handle)
     if (pending) return pending
 
-    const load = this.#load(handle, minTtlMs)
+    const load = this.#load(handle, minTtlMs, options.cacheIf)
     this.#inFlight.set(handle, load)
     try {
       return await load
@@ -669,6 +670,10 @@ export class ClaustrumCredentialCache {
 
   peek(handle: string): ClaustrumCredential | undefined {
     return this.#cache.get(handle)
+  }
+
+  abandonPending(handle: string): void {
+    this.#inFlight.delete(handle)
   }
 
   seedForTest(handle: string, credential: ClaustrumCredential): void {
@@ -787,7 +792,11 @@ export class ClaustrumCredentialCache {
       })
   }
 
-  async #load(handle: string, minTtlMs: number): Promise<ClaustrumCredential> {
+  async #load(
+    handle: string,
+    minTtlMs: number,
+    cacheIf?: () => boolean,
+  ): Promise<ClaustrumCredential> {
     let response: unknown
     try {
       response = await this.#client.call(
@@ -813,7 +822,8 @@ export class ClaustrumCredentialCache {
     }
     if (
       credential.expiresAtMs !== null &&
-      credential.expiresAtMs > this.#now()
+      credential.expiresAtMs > this.#now() &&
+      (cacheIf?.() ?? true)
     ) {
       this.#cache.set(handle, credential)
     }

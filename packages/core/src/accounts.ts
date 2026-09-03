@@ -1514,6 +1514,44 @@ export function isClaustrumEnabledForAccount(
   return storage.claustrum?.accounts?.[accountId]?.enabled === true
 }
 
+export async function setClaustrumAccountGatePersistent(input: {
+  id: string
+  enabled: boolean
+  path?: string
+}): Promise<'updated' | 'unchanged' | 'missing' | 'ineligible'> {
+  const path = input.path ?? getAccountStoragePath()
+  return enqueueSave(async () => {
+    const lock = await acquireAccountConfigWriteLock(path)
+    try {
+      const storage = await loadAccounts(path)
+      if (!storage) {
+        return 'missing'
+      }
+      const account = storage.accounts.find(
+        (candidate) => candidate.id === input.id,
+      )
+      if (!account) return 'missing'
+      if (!isOAuthAccount(account)) return 'ineligible'
+      if (isClaustrumEnabledForAccount(storage, input.id) === input.enabled) {
+        return 'unchanged'
+      }
+
+      const accounts = storage.claustrum?.accounts ?? {}
+      storage.claustrum = {
+        ...storage.claustrum,
+        accounts: {
+          ...accounts,
+          [input.id]: { ...accounts[input.id], enabled: input.enabled },
+        },
+      }
+      await saveAccountsWithConfigLock(storage, path, {})
+      return 'updated'
+    } finally {
+      await lock.release()
+    }
+  })
+}
+
 // ---------------------------------------------------------------------------
 // In-process save mutex — serializes all account-store writes so concurrent
 // read-modify-write callers (background timers that call saveAccountState with
@@ -1688,32 +1726,40 @@ async function saveAccountsLocked(
 ) {
   const lock = await acquireAccountConfigWriteLock(path)
   try {
-    const current = await loadAccounts(path)
-    const nextStorage: AccountStorage = {
-      ...storage,
-      accounts: mergeAccountsForSave(
-        current?.accounts ?? [],
-        storage.accounts,
-        options,
-      ),
-    }
-    const existing = await loadExistingTopLevelFields(path)
-    const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
-    await writeJsonAtomic(path, nextConfig)
-    // Config precedes state everywhere both locks are needed; reversing this
-    // order can deadlock profile mutations against full account saves.
-    const stateLock = await acquireAccountStateWriteLock(path)
-    try {
-      await saveAccountStateUnlocked(nextStorage, path, {
-        mainQuota: true,
-        mainRefresh: true,
-        accounts: true,
-      })
-    } finally {
-      await stateLock.release()
-    }
+    await saveAccountsWithConfigLock(storage, path, options)
   } finally {
     await lock.release()
+  }
+}
+
+async function saveAccountsWithConfigLock(
+  storage: AccountStorage,
+  path: string,
+  options: SaveAccountsOptions,
+) {
+  const current = await loadAccounts(path)
+  const nextStorage: AccountStorage = {
+    ...storage,
+    accounts: mergeAccountsForSave(
+      current?.accounts ?? [],
+      storage.accounts,
+      options,
+    ),
+  }
+  const existing = await loadExistingTopLevelFields(path)
+  const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+  await writeJsonAtomic(path, nextConfig)
+  // Config precedes state everywhere both locks are needed; reversing this
+  // order can deadlock profile mutations against full account saves.
+  const stateLock = await acquireAccountStateWriteLock(path)
+  try {
+    await saveAccountStateUnlocked(nextStorage, path, {
+      mainQuota: true,
+      mainRefresh: true,
+      accounts: true,
+    })
+  } finally {
+    await stateLock.release()
   }
 }
 
@@ -3811,6 +3857,7 @@ export class FallbackAccountManager {
   private readonly fetchImpl: typeof fetch
   private readonly configPath: string
   private readonly refreshPromises = new Map<string, Promise<OAuthAccount>>()
+  private readonly custodyVerificationAccounts = new Set<string>()
   private refreshTimer: ReturnType<typeof setInterval> | null = null
   private quotaTimer: ReturnType<typeof setInterval> | null = null
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
@@ -3919,6 +3966,27 @@ export class FallbackAccountManager {
     if (this.quotaTimer) this.clearIntervalImpl(this.quotaTimer)
     this.refreshTimer = null
     this.quotaTimer = null
+  }
+
+  async withAccountRefreshLock<T>(
+    accountId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const lock = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName(accountId),
+      ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+      path: this.configPath,
+      now: this.now,
+      renew: true,
+    })
+    if (!lock) throw new Error('Fallback OAuth refresh is already in progress')
+    this.custodyVerificationAccounts.add(accountId)
+    try {
+      return await fn()
+    } finally {
+      this.custodyVerificationAccounts.delete(accountId)
+      await lock.release()
+    }
   }
 
   async getUsableFallbackAccounts(
@@ -4078,6 +4146,16 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (this.custodyVerificationAccounts.has(account.id)) {
+        logger.debug(
+          'refresh',
+          'fallback oauth background skipped custody verification',
+          {
+            accountId: account.id,
+          },
+        )
+        continue
+      }
       if (
         !tokenNeedsRefresh(account, storage, this.now()) ||
         this.isFallbackAccountVaultEnabled(account.id, storage) ||
