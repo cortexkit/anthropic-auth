@@ -1366,8 +1366,17 @@ const anthropicAuthPlugin = async (
 
     for (const account of storage.accounts) {
       if (signal?.aborted) break
-      if (!isOAuthAccount(account) || !account.access) continue
-      const accessToken = account.access
+      if (!isOAuthAccount(account)) continue
+      const vaultEnabled =
+        Boolean(account.claustrumHandle) &&
+        isClaustrumEnabledForAccount(storage, account.id) &&
+        !claustrumBlockedAccounts.has(account.id)
+      const resolved = vaultEnabled
+        ? resolveClaustrumAccess(account, storage)
+        : undefined
+      if (vaultEnabled && (!resolved?.accessToken || !resolved.served)) continue
+      const accessToken = resolved?.accessToken ?? account.access
+      if (!accessToken) continue
       if (
         account.profile &&
         !oauthProfileMatchesIdentity(account.profile, account.id)

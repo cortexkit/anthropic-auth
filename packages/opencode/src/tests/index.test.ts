@@ -2174,6 +2174,74 @@ describe('fallback Claustrum credential resolution', () => {
     }
   })
 
+  test('profile hydration serves a resident vault credential', async () => {
+    const calls: CredentialCall[] = []
+    const profileStarted = deferred()
+    let profileUsedVault = false
+    let profileUsedSidecar = false
+    const storage = fallbackWithClaustrum({
+      claustrumHandle: 'handle-profile-hydration',
+      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+    } as never)
+    await useTempAccountFile(storage)
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get')
+        return credentialResponse(
+          'vault-profile-access',
+          53,
+          Date.now() + 2 * 60 * 60_000,
+        )
+      return { result: {} }
+    })
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (url.includes('/api/oauth/profile')) {
+        if (authorization.includes('vault-profile')) {
+          profileUsedVault = true
+          profileStarted.resolve()
+        }
+        if (authorization.includes('stored-fallback')) {
+          profileUsedSidecar = true
+          profileStarted.resolve()
+        }
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_team',
+              rate_limit_tier: 'default_claude_max_5x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await withDeadlockGuard(
+      profileStarted.promise,
+      500,
+      'fallback profile hydration did not run',
+    )
+
+    expect(profileUsedVault).toBe(true)
+    expect(profileUsedSidecar).toBe(false)
+    await plugin.dispose?.()
+  })
+
   test('disabled gate does not connect and uses the stored token', async () => {
     const calls: CredentialCall[] = []
     let connectorCalls = 0

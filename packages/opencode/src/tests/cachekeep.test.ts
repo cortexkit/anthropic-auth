@@ -331,6 +331,45 @@ describe('CacheKeepManager', () => {
     manager.stop()
   })
 
+  test('retains a tracked target when its prewarm credential is unavailable', async () => {
+    let now = new Date('2026-05-18T10:00:00').getTime()
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+    const manager = new CacheKeepManager({
+      loadStorage: () => Promise.resolve(hybridStorage()),
+      fetchImpl,
+      now: () => now,
+      prepareHeaders: () => undefined,
+    })
+    await manager.track({
+      sessionId: 'ses_cold_vault',
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      headers: new Headers({ authorization: 'Bearer sidecar-canary-cold' }),
+      bodyText: JSON.stringify({
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      storage: hybridStorage(),
+      cacheMode: 'hybrid',
+    })
+
+    now += 55 * 60_000
+    await manager.tick()
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(manager.trackedSessions().map((session) => session.id)).toEqual([
+      'ses_cold_vault',
+    ])
+    manager.stop()
+  })
+
   test('always mode keeps targets alive and prewarms across local midnight', async () => {
     let now = new Date('2026-05-18T23:58:00').getTime()
     const windowStorage: AccountStorage = {
