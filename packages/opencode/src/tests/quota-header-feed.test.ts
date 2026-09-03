@@ -7,6 +7,7 @@ import {
   readFile,
   rm,
   stat,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -554,5 +555,78 @@ describe('quota header feed', () => {
     expect(await first.list()).toEqual([
       entry({ observed_at_ms: 1_002, credential_id: 'new' }),
     ])
+  })
+
+  test('reaps stale sibling process leases without touching fresh or foreign files', async () => {
+    const now = Date.now()
+    await mkdir(directory, { recursive: true })
+    const staleNames = [
+      '101-11111111-1111-1111-1111-111111111111.json',
+      '102-22222222-2222-2222-2222-222222222222.json',
+      '103-33333333-3333-3333-3333-333333333333.json',
+    ]
+    const freshNames = [
+      '104-44444444-4444-4444-4444-444444444444.json',
+      '105-55555555-5555-5555-5555-555555555555.json',
+    ]
+    for (const name of [...staleNames, ...freshNames]) {
+      const path = join(directory, name)
+      await writeFile(path, '{}')
+      const age = staleNames.includes(name)
+        ? QUOTA_HEADER_FEED_LEASE_MS + 1
+        : QUOTA_HEADER_FEED_LEASE_MS - 1
+      await utimes(path, (now - age) / 1_000, (now - age) / 1_000)
+    }
+    await writeFile(join(directory, 'foreign-named-file.json'), '{}')
+    await utimes(
+      join(directory, 'foreign-named-file.json'),
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+    )
+
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: '106-66666666-6666-6666-6666-666666666666',
+      now: () => now,
+    })
+    await registry.publish({ ...entry(), accountKey: 'a' })
+
+    const names = await readdir(directory)
+    for (const name of staleNames) expect(names).not.toContain(name)
+    for (const name of freshNames) expect(names).toContain(name)
+    expect(names).toContain('foreign-named-file.json')
+    expect(names).toContain('106-66666666-6666-6666-6666-666666666666.json')
+  })
+
+  test('continues publishing when a sibling lease sweep cannot unlink a stale file', async () => {
+    const now = Date.now()
+    const stalePath = join(
+      directory,
+      '101-11111111-1111-1111-1111-111111111111.json',
+    )
+    await mkdir(directory, { recursive: true })
+    await writeFile(stalePath, '{}')
+    await utimes(
+      stalePath,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+    )
+    const ownFile = '102-22222222-2222-2222-2222-222222222222.json'
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: ownFile.slice(0, -'.json'.length),
+      now: () => now,
+      removeFile: async () => {
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+      },
+    })
+
+    await expect(
+      registry.publish({ ...entry(), accountKey: 'a' }),
+    ).resolves.toBeUndefined()
+    expect(await readdir(directory)).toContain(ownFile)
+    expect(await readdir(directory)).toContain(
+      '101-11111111-1111-1111-1111-111111111111.json',
+    )
   })
 })

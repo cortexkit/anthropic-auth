@@ -6,6 +6,7 @@ import {
   readFile,
   rename,
   rm,
+  stat,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -29,8 +30,11 @@ export const QUOTA_HEADER_FEED_SCHEMA_VERSION = 3
 export const QUOTA_HEADER_FEED_LEASE_MS = 180_000
 
 /**
- * Lease files are per process. Consumers must union entries across live files,
- * deduplicate by account, and never treat the newest file as a complete feed.
+ * Lease files are per process; each carries only the accounts whose response
+ * headers THAT process harvested. Consumers MUST union entries across all files
+ * inside `lease_horizon_ms`, deduplicating by account; "newest file wins" is wrong.
+ * `anthropic_account_uuid` is always present: null is unresolvable, while absence
+ * identifies an old producer. A fallback `account_ref` is store-local.
  */
 export type QuotaHeaderFeedIdentity =
   | { identity_source: 'credential_id'; credential_id: string }
@@ -306,6 +310,7 @@ export class QuotaHeaderFeedRegistry {
       now?: () => number
       leaseMs?: number
       instanceId?: string
+      removeFile?: (path: string) => Promise<void>
     } = {},
   ) {
     const instanceId = options.instanceId ?? `${process.pid}-${randomUUID()}`
@@ -352,6 +357,7 @@ export class QuotaHeaderFeedRegistry {
           this.options.directory ?? getDefaultQuotaHeaderFeedDirectory()
         await mkdir(directory, { recursive: true, mode: 0o700 })
         await chmod(directory, 0o700)
+        await this.reapStaleSiblingLeases(directory)
         let entries: Record<string, QuotaHeaderFeedEntry> = {}
         try {
           const record = JSON.parse(
@@ -379,6 +385,32 @@ export class QuotaHeaderFeedRegistry {
         }
       })
     return this.writeChain
+  }
+
+  private async reapStaleSiblingLeases(directory: string): Promise<void> {
+    const now = this.options.now?.() ?? Date.now()
+    const leaseMs = this.options.leaseMs ?? QUOTA_HEADER_FEED_LEASE_MS
+    let names: string[]
+    try {
+      names = await readdir(directory)
+    } catch {
+      return
+    }
+    await Promise.all(
+      names
+        .filter((name) => /^\d+-[0-9a-f-]+\.json$/i.test(name))
+        .map(async (name) => {
+          const path = join(directory, name)
+          if (path === this.filePath) return
+          try {
+            const file = await stat(path)
+            if (file.mtimeMs > now || now - file.mtimeMs < leaseMs) return
+            await (this.options.removeFile ?? ((target) => rm(target)))(path)
+          } catch {
+            // A missed cleanup must not prevent this process from refreshing its lease.
+          }
+        }),
+    )
   }
 
   async list(): Promise<QuotaHeaderFeedEntry[]> {
