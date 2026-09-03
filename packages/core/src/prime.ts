@@ -70,13 +70,9 @@ export type PrimeSendResult =
       status?: number
       ms?: number
       error: string
-      // Discriminates the failure kind so the manager can emit the
-      // spec Logging table's two distinct warn events: `prime token
-      // refresh failed` (warn · prime · { account, error }) for
-      // token-refresh failures, `prime fire failed` (warn · prime ·
-      // { account, status?, error }) for HTTP / fetch / identity
-      // failures during the request itself.
-      reason?: 'token-refresh' | 'send'
+      // `vault-cold` is an expected off-path cache warm state, not evidence
+      // of a failed provider request, so it must not emit the fire-failure warn.
+      reason?: 'token-refresh' | 'vault-cold' | 'send'
     }
 
 /**
@@ -946,7 +942,7 @@ export class PrimeManager {
     if (this.stopped) return
 
     if (!result.ok) {
-      // Spec Logging table: two distinct warn events.
+      // `vault-cold` is a cache-warm skip; it is not a provider failure.
       // - `prime token refresh failed` — token-refresh failure
       //   before the request fires (reason: 'token-refresh').
       // - `prime fire failed` — HTTP error / fetch throw /
@@ -955,6 +951,11 @@ export class PrimeManager {
         logger.warn('prime', 'prime token refresh failed', {
           account: evaluation.label,
           error: result.error,
+        })
+      } else if (result.reason === 'vault-cold') {
+        logger.debug('prime', 'prime vault credential cold', {
+          account: evaluation.label,
+          reason: result.reason,
         })
       } else {
         logger.warn('prime', 'prime fire failed', {
