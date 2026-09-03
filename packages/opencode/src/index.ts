@@ -2377,6 +2377,10 @@ const anthropicAuthPlugin = async (
   let aggregateCacheKeepSessions: ReturnType<
     CacheKeepManager['trackedSessions']
   > = []
+  const cacheKeepServedClaustrumCredentials = new Map<
+    string,
+    ClaustrumAccessResolution['served']
+  >()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     setIntervalImpl: runtimeTimers.setInterval,
@@ -2418,7 +2422,14 @@ const anthropicAuthPlugin = async (
         return bodyText
       }
     },
-    onResponse: ({ target, bodyText, status, data, receivedAt }) => {
+    onResponse: async ({ target, bodyText, status, data, receivedAt }) => {
+      const served = cacheKeepServedClaustrumCredentials.get(target.id)
+      cacheKeepServedClaustrumCredentials.delete(target.id)
+      if (status === 401 && served) {
+        await reportCapturedClaustrumAuthFailure(served, 'direct', {
+          preserveServedVersion: true,
+        })
+      }
       const prepared = cacheKeepDiagnosticsRequests.get(target.id)
       if (!prepared?.betasHash || !prepared.betas) {
         cacheKeepDiagnosticsRequests.delete(target.id)
@@ -2463,6 +2474,7 @@ const anthropicAuthPlugin = async (
     },
     prepareHeaders: async (headers, target) => {
       let accessToken: string | undefined
+      let servedClaustrumCredential: ClaustrumAccessResolution['served']
       const accountId = target.oauthAccountId
       if (accountId && accountId !== 'main') {
         const storage = await loadAccounts(accountStoragePath)
@@ -2477,16 +2489,29 @@ const anthropicAuthPlugin = async (
             `OAuth account ${accountId} is unavailable for cache prewarm`,
           )
         }
-        let current = account
-        try {
-          current = await fallbackManager.refreshAccount(account, storage)
-        } catch (error) {
-          logger.warn('cachekeep', 'fallback token refresh failed', {
-            accountId,
-            error: error instanceof Error ? error.message : String(error),
+        const vaultEnabled =
+          Boolean(account.claustrumHandle) &&
+          isClaustrumEnabledForAccount(storage, account.id) &&
+          !claustrumBlockedAccounts.has(account.id)
+        if (vaultEnabled) {
+          const resolved = resolveClaustrumAccess(account, storage, {
+            warm: false,
           })
+          if (!resolved.accessToken || !resolved.served) return undefined
+          accessToken = resolved.accessToken
+          servedClaustrumCredential = resolved.served
+        } else {
+          let current = account
+          try {
+            current = await fallbackManager.refreshAccount(account, storage)
+          } catch (error) {
+            logger.warn('cachekeep', 'fallback token refresh failed', {
+              accountId,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+          accessToken = current.access
         }
-        accessToken = current.access
         if (!accessToken) {
           throw new Error(
             `OAuth account ${accountId} has no access token for cache prewarm`,
@@ -2533,6 +2558,12 @@ const anthropicAuthPlugin = async (
         }
       } catch {
         setOAuthHeaders(headers, accessToken)
+      }
+      if (servedClaustrumCredential) {
+        cacheKeepServedClaustrumCredentials.set(
+          target.id,
+          servedClaustrumCredential,
+        )
       }
       return headers
     },

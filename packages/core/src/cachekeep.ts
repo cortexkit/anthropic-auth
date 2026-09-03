@@ -379,7 +379,7 @@ export class CacheKeepManager {
       prepareHeaders?: (
         headers: Headers,
         target: CacheKeepTarget,
-      ) => Promise<Headers> | Headers
+      ) => Promise<Headers | undefined> | Headers | undefined
       onTrackedSessionsChanged?: (
         sessions: readonly CacheKeepTrackedSession[],
       ) => Promise<void> | void
@@ -662,6 +662,13 @@ export class CacheKeepManager {
           prewarmTarget,
         )
       : new Headers(target.headers)
+    if (!headers) {
+      return {
+        ok: false,
+        reason: 'OAuth cache prewarm credential is unavailable',
+        transient: true,
+      }
+    }
     headers.delete('content-length')
     headers.delete('transfer-encoding')
     let response: Response

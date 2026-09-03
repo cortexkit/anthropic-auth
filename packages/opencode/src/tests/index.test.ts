@@ -2052,6 +2052,128 @@ describe('fallback Claustrum credential resolution', () => {
     return { authorizations, plugin, result }
   }
 
+  test('CacheKeep prewarm serves and reports a resident vault credential', async () => {
+    const originalNow = Date.now
+    const originalRuntimeOverrides = pluginRuntimeOverrides
+    let now = 1_000
+    const intervals: Array<{ callback: () => unknown; ms: number }> = []
+    const calls: CredentialCall[] = []
+    const prewarmStarted = deferred()
+    let prewarmUsedVault = false
+    let prewarmUsedSidecar = false
+    let bootstrapUsedSidecar = false
+    let tokenRequests = 0
+    try {
+      Date.now = mock(() => now) as unknown as typeof Date.now
+      resetCache1hState()
+      pluginRuntimeOverrides = {
+        setInterval: mock((callback: () => unknown, ms: number) => {
+          intervals.push({ callback, ms })
+          return { unref() {} } as unknown as ReturnType<typeof setInterval>
+        }) as unknown as typeof setInterval,
+        clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+      }
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+      const storage = fallbackWithClaustrum({
+        claustrumHandle: 'handle-cachekeep-prewarm',
+        claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      } as never)
+      storage.claudeCache = { enabled: true, mode: 'hybrid' }
+      storage.cacheKeep = { enabled: true, always: true, subagents: true }
+      storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+      await useTempAccountFile(storage)
+      const connector = connectorFor(calls, (method) => {
+        if (method === 'credential.get')
+          return credentialResponse(
+            'vault-cachekeep-access',
+            47,
+            now + 2 * 60 * 60_000,
+          )
+        return { result: {} }
+      })
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const url = extractUrl(input as string | URL | Request)
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        if (url.includes('/v1/oauth/token')) {
+          tokenRequests += 1
+          return Promise.resolve(new Response('{}', { status: 500 }))
+        }
+        if (url.includes('/claude_cli/bootstrap')) {
+          bootstrapUsedSidecar ||= authorization.includes('stored-fallback')
+          return Promise.resolve(
+            Response.json({ oauth_account: { account_uuid: 'fallback-1' } }),
+          )
+        }
+        const body = JSON.parse(String(init?.body)) as { max_tokens?: number }
+        if (body.max_tokens === 0) {
+          prewarmUsedVault = authorization.includes('vault-cachekeep')
+          prewarmUsedSidecar = authorization.includes('stored-fallback')
+          prewarmStarted.resolve()
+          return Promise.resolve(new Response('expired', { status: 401 }))
+        }
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"provider-real","model":"claude-opus-4-8","usage":{}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connector,
+      })
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: now + 100_000,
+          }),
+        { models: {} },
+      )
+      await (
+        await result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': 'ses-cachekeep-vault' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            stream: true,
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        })
+      ).text()
+      now += 55 * 60_000
+      const cacheKeepTick = intervals.at(-1)
+      if (!cacheKeepTick) throw new Error('missing cachekeep interval')
+      cacheKeepTick.callback()
+      await Bun.sleep(20)
+      await withDeadlockGuard(
+        prewarmStarted.promise,
+        500,
+        'cachekeep prewarm did not run',
+      )
+
+      expect(prewarmUsedVault).toBe(true)
+      expect(prewarmUsedSidecar).toBe(false)
+      expect(bootstrapUsedSidecar).toBe(false)
+      expect(tokenRequests).toBe(0)
+      expect(
+        calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toHaveLength(1)
+      expect(calls.some((call) => call.params.record_version === 47)).toBe(true)
+      await plugin.dispose?.()
+    } finally {
+      Date.now = originalNow
+      pluginRuntimeOverrides = originalRuntimeOverrides
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+      resetCache1hState()
+    }
+  })
+
   test('disabled gate does not connect and uses the stored token', async () => {
     const calls: CredentialCall[] = []
     let connectorCalls = 0
