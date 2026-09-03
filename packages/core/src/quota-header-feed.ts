@@ -28,6 +28,10 @@ import {
 export const QUOTA_HEADER_FEED_SCHEMA_VERSION = 3
 export const QUOTA_HEADER_FEED_LEASE_MS = 180_000
 
+/**
+ * Lease files are per process. Consumers must union entries across live files,
+ * deduplicate by account, and never treat the newest file as a complete feed.
+ */
 export type QuotaHeaderFeedIdentity =
   | { identity_source: 'credential_id'; credential_id: string }
   | { identity_source: 'account_ref'; account_ref: string }
@@ -59,11 +63,14 @@ type QuotaHeaderFeedMetadata = {
 
 export type QuotaHeaderFeedEntry = QuotaHeaderFeedIdentity &
   QuotaHeaderFeedMetadata & {
+    /** Always present: null means UUID resolution failed; absence denotes an old producer. */
+    anthropic_account_uuid: string | null
     quota: QuotaHeaderFeedQuota
   }
 
 export type QuotaHeaderFeedPublishEntry = QuotaHeaderFeedIdentity &
   QuotaHeaderFeedMetadata & {
+    anthropic_account_uuid: string | null
     quota: Omit<QuotaHeaderFeedQuota, 'provenance'> & {
       fieldSources?: QuotaFieldSources
     }
@@ -72,6 +79,7 @@ export type QuotaHeaderFeedPublishEntry = QuotaHeaderFeedIdentity &
 
 type FeedRecord = {
   version: typeof QUOTA_HEADER_FEED_SCHEMA_VERSION
+  lease_horizon_ms: number
   entries: Record<string, QuotaHeaderFeedEntry>
 }
 
@@ -105,6 +113,12 @@ function validIdentity(
   )
     return false
   if (!entry.quota || typeof entry.quota !== 'object') return false
+  if (
+    !Object.hasOwn(entry, 'anthropic_account_uuid') ||
+    (entry.anthropic_account_uuid !== null &&
+      typeof entry.anthropic_account_uuid !== 'string')
+  )
+    return false
   if (entry.identity_source === 'none') {
     return !('credential_id' in entry) && !('account_ref' in entry)
   }
@@ -302,15 +316,32 @@ export class QuotaHeaderFeedRegistry {
   }
 
   publish(entry: QuotaHeaderFeedPublishEntry): Promise<void> {
-    const { accountKey, quota, ...entryWithoutQuota } = entry
-    const cleanEntry = {
-      ...entryWithoutQuota,
-      quota: projectQuota(quota),
-    } as QuotaHeaderFeedEntry
+    const { accountKey, quota } = entry
     try {
-      validatePublishEntry(cleanEntry)
+      validatePublishEntry(entry)
     } catch (error) {
       return Promise.reject(error)
+    }
+    const identity =
+      entry.identity_source === 'credential_id'
+        ? {
+            identity_source: 'credential_id' as const,
+            credential_id: entry.credential_id,
+          }
+        : entry.identity_source === 'account_ref'
+          ? {
+              identity_source: 'account_ref' as const,
+              account_ref: entry.account_ref,
+            }
+          : { identity_source: 'none' as const }
+    const cleanEntry: QuotaHeaderFeedEntry = {
+      ...identity,
+      schema_version: entry.schema_version,
+      provider: entry.provider,
+      configured_account_count: entry.configured_account_count,
+      observed_at_ms: entry.observed_at_ms,
+      anthropic_account_uuid: entry.anthropic_account_uuid,
+      quota: projectQuota(quota),
     }
     if (!accountKey)
       return Promise.reject(new Error('Invalid quota header feed account key'))
@@ -338,7 +369,7 @@ export class QuotaHeaderFeedRegistry {
         try {
           await writeFile(
             tempPath,
-            `${JSON.stringify({ version: QUOTA_HEADER_FEED_SCHEMA_VERSION, entries })}\n`,
+            `${JSON.stringify({ version: QUOTA_HEADER_FEED_SCHEMA_VERSION, lease_horizon_ms: this.options.leaseMs ?? QUOTA_HEADER_FEED_LEASE_MS, entries })}\n`,
             { mode: 0o600 },
           )
           await chmod(tempPath, 0o600)

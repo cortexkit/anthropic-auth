@@ -1416,6 +1416,7 @@ const anthropicAuthPlugin = async (
       accountId: 'main' | string
       accessToken: string
       authLineageId?: string
+      anthropicAccountUuid?: string
       mainQuotaIdentity?: MainQuotaIdentityBinding
     },
     entry: QuotaEntry,
@@ -1482,6 +1483,7 @@ const anthropicAuthPlugin = async (
       ...entry.quota,
       accountIdentity: account.id,
     }
+    account.anthropicAccountUuid = served.anthropicAccountUuid
     await saveAccountState(storage, accountStoragePath, {
       accounts: [served.accountId],
     })
@@ -1523,6 +1525,7 @@ const anthropicAuthPlugin = async (
     served: {
       accountId: 'main' | string
       accessToken: string
+      anthropicAccountUuid?: string
       mainQuotaIdentity?: MainQuotaIdentityBinding
     },
     entry: QuotaEntry,
@@ -1573,6 +1576,7 @@ const anthropicAuthPlugin = async (
           provider: 'anthropic',
           configured_account_count: configuredAccountCount,
           observed_at_ms: observedAtMs,
+          anthropic_account_uuid: served.anthropicAccountUuid ?? null,
           quota,
           accountKey,
         }
@@ -1584,6 +1588,7 @@ const anthropicAuthPlugin = async (
             provider: 'anthropic',
             configured_account_count: configuredAccountCount,
             observed_at_ms: observedAtMs,
+            anthropic_account_uuid: served.anthropicAccountUuid ?? null,
             quota,
             accountKey,
           }
@@ -1594,6 +1599,7 @@ const anthropicAuthPlugin = async (
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
               observed_at_ms: observedAtMs,
+              anthropic_account_uuid: served.anthropicAccountUuid ?? null,
               quota,
               accountKey,
             }
@@ -1604,6 +1610,7 @@ const anthropicAuthPlugin = async (
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
               observed_at_ms: observedAtMs,
+              anthropic_account_uuid: served.anthropicAccountUuid ?? null,
               quota,
               accountKey,
             }
@@ -1622,6 +1629,7 @@ const anthropicAuthPlugin = async (
       accountId: 'main' | string
       accessToken: string
       authLineageId?: string
+      anthropicAccountUuid?: string
       mainQuotaIdentity?: MainQuotaIdentityBinding
     },
   ): void {
@@ -5681,11 +5689,24 @@ const anthropicAuthPlugin = async (
               }
             }
 
-            const relayConfig = getRelayConfig(await getRequestStorage())
+            const requestStorageForIdentity = await getRequestStorage()
+            const relayConfig = getRelayConfig(requestStorageForIdentity)
+            const persistedFallbackAccountUuid =
+              oauthAccountId === 'main'
+                ? undefined
+                : requestStorageForIdentity?.accounts.find(
+                    (account): account is OAuthAccount =>
+                      account.id === oauthAccountId && isOAuthAccount(account),
+                  )?.anthropicAccountUuid
             const served = {
               accountId: oauthAccountId,
               accessToken,
               authLineageId: fallbackAuthLineageId,
+              anthropicAccountUuid:
+                identity.accountUuid ??
+                (oauthAccountId === 'main'
+                  ? mainQuotaIdentity?.accountIdentity
+                  : persistedFallbackAccountUuid),
               ...(oauthAccountId === 'main' && mainQuotaIdentity
                 ? { mainQuotaIdentity }
                 : {}),

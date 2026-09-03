@@ -32,6 +32,7 @@ function entry(overrides: Record<string, unknown> = {}): QuotaHeaderFeedEntry {
     provider: 'anthropic',
     configured_account_count: 1,
     observed_at_ms: 1_000,
+    anthropic_account_uuid: null,
     quota,
     ...overrides,
   } as QuotaHeaderFeedEntry
@@ -77,6 +78,50 @@ describe('quota header feed', () => {
     expect(QUOTA_HEADER_FEED_SCHEMA_VERSION).toBe(3)
     expect(raw.entries.a.schema_version).toBe(3)
     expect(raw.entries.a.provider).toBe('anthropic')
+    expect(raw.lease_horizon_ms).toBe(QUOTA_HEADER_FEED_LEASE_MS)
+    expect(raw.entries.a).toHaveProperty('anthropic_account_uuid', null)
+  })
+
+  test('projects only the documented entry keys', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'entry-allowlist',
+    })
+    await registry.publish({
+      ...entry({
+        anthropic_account_uuid: 'uuid-1',
+        unexpected_entry_secret: 'must-not-publish',
+      }),
+      accountKey: 'a',
+    } as unknown as QuotaHeaderFeedPublishEntry)
+
+    const raw = JSON.parse(
+      await readFile(join(directory, 'entry-allowlist.json'), 'utf8'),
+    )
+    expect(raw.entries.a).toEqual({
+      identity_source: 'credential_id',
+      credential_id: 'cred-1',
+      schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
+      provider: 'anthropic',
+      configured_account_count: 1,
+      observed_at_ms: 1_000,
+      anthropic_account_uuid: 'uuid-1',
+      quota,
+    })
+    expect(JSON.stringify(raw)).not.toContain('must-not-publish')
+  })
+
+  test('publishes the configured lease horizon from the registry seam', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'lease-horizon',
+      leaseMs: 17,
+    })
+    await registry.publish({ ...entry(), accountKey: 'a' })
+    const raw = JSON.parse(
+      await readFile(join(directory, 'lease-horizon.json'), 'utf8'),
+    )
+    expect(raw.lease_horizon_ms).toBe(17)
   })
 
   test.each([1, 2, 999])(

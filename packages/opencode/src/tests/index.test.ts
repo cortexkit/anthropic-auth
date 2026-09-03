@@ -7,6 +7,7 @@ import {
   mock,
   test,
 } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import {
   chmod,
@@ -3588,6 +3589,7 @@ describe('quota header feed integration', () => {
         expect.objectContaining({
           identity_source: 'account_ref',
           account_ref: 'main-fixed-id',
+          anthropic_account_uuid: 'main-fixed-id',
           configured_account_count: 1,
           observed_at_ms: 1_000_000,
           quota: expect.objectContaining({
@@ -3595,6 +3597,7 @@ describe('quota header feed integration', () => {
           }),
         }),
       )
+      expect(record.lease_horizon_ms).toBe(180_000)
       expect(published).not.toHaveProperty('credential_id')
       for (const secret of [
         'main-access',
@@ -3614,6 +3617,195 @@ describe('quota header feed integration', () => {
     } finally {
       Date.now = originalNow
     }
+  })
+
+  test('publishes and persists a fallback Anthropic account UUID', async () => {
+    const fallbackUuid = '11111111-1111-1111-1111-111111111111'
+    const fallbackAccess = `sk-ant-oat-${randomUUID()}`
+    await useTempAccountFile(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: fallbackAccess,
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            quota: {
+              five_hour: {
+                usedPercent: 25,
+                remainingPercent: 75,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 30,
+                remainingPercent: 70,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+      }),
+    )
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({ oauth_account: { account_uuid: fallbackUuid } }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (authorization === `Bearer ${fallbackAccess}`) {
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+            }),
+          )
+        }
+        return Promise.resolve(new Response(null, { status: 429 }))
+      }
+      return Promise.resolve(Response.json({}))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    await response.text()
+
+    const [published] = await waitForFeedEntries(
+      (entries) =>
+        entries.some(
+          (entry: any) => entry.anthropic_account_uuid === fallbackUuid,
+        ),
+      'a fallback UUID feed entry',
+    )
+    expect(published).toEqual(
+      expect.objectContaining({
+        identity_source: 'account_ref',
+        account_ref: 'fallback-1',
+        anthropic_account_uuid: fallbackUuid,
+      }),
+    )
+    const persisted = await waitForAccountStorage(
+      (candidate) =>
+        (
+          candidate?.accounts.find(
+            (account) => account.id === 'fallback-1',
+          ) as any
+        )?.anthropicAccountUuid === fallbackUuid,
+    )
+    expect(
+      (
+        persisted?.accounts.find(
+          (account) => account.id === 'fallback-1',
+        ) as any
+      )?.anthropicAccountUuid,
+    ).toBe(fallbackUuid)
+  })
+
+  test('uses a persisted fallback Anthropic account UUID before bootstrap resolves it', async () => {
+    const fallbackUuid = '22222222-2222-2222-2222-222222222222'
+    const fallbackAccess = `sk-ant-oat-${randomUUID()}`
+    await useTempAccountFile(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: fallbackAccess,
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            anthropicAccountUuid: fallbackUuid,
+            quota: {
+              five_hour: {
+                usedPercent: 25,
+                remainingPercent: 75,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 30,
+                remainingPercent: 70,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+      }),
+    )
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/claude_cli/bootstrap'))
+        return Promise.resolve(Response.json({}))
+      if (url.includes('/v1/messages')) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (authorization === `Bearer ${fallbackAccess}`) {
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+            }),
+          )
+        }
+        return Promise.resolve(new Response(null, { status: 429 }))
+      }
+      return Promise.resolve(Response.json({}))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    await response.text()
+
+    const [published] = await waitForFeedEntries(
+      (entries) =>
+        entries.some(
+          (entry: any) => entry.anthropic_account_uuid === fallbackUuid,
+        ),
+      'a persisted fallback UUID feed entry',
+    )
+    expect(published).toEqual(
+      expect.objectContaining({
+        account_ref: 'fallback-1',
+        anthropic_account_uuid: fallbackUuid,
+      }),
+    )
+    const persisted = await waitForAccountStorage(
+      (candidate) =>
+        (
+          candidate?.accounts.find(
+            (account) => account.id === 'fallback-1',
+          ) as any
+        )?.anthropicAccountUuid === fallbackUuid,
+    )
+    expect(
+      (
+        persisted?.accounts.find(
+          (account) => account.id === 'fallback-1',
+        ) as any
+      )?.anthropicAccountUuid,
+    ).toBe(fallbackUuid)
   })
 
   test('cache-seeded poll fields survive a later header harvest into the feed', async () => {
