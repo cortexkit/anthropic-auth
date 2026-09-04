@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
+  CACHE_KEEP_TICK_MS,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
   saveAccountState,
   saveAccounts,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
+
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
@@ -30,6 +32,14 @@ const originalFetch = globalThis.fetch
 const originalNow = Date.now
 const activePlugins = new Set<{ dispose?: () => Promise<void> | void }>()
 const tempDirs = new Set<string>()
+const fixtureEnvKeys = [
+  'OPENCODE_ANTHROPIC_AUTH_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
+] as const
+const fixtureEnv = new Map(fixtureEnvKeys.map((key) => [key, process.env[key]]))
 
 afterEach(async () => {
   for (const plugin of activePlugins) await plugin.dispose?.()
@@ -42,7 +52,11 @@ afterEach(async () => {
   tempDirs.clear()
   globalThis.fetch = originalFetch
   Date.now = originalNow
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+  for (const key of fixtureEnvKeys) {
+    const value = fixtureEnv.get(key)
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
   resetCache1hState()
   resetClaudeCodeIdentityCachesForTest()
 })
@@ -446,7 +460,9 @@ describe('vault-served fallback outbound token census', () => {
     ;(
       fixture.intervals as IntervalRecord[] & { clock: (now: number) => void }
     ).clock(now + 55 * 60_000)
-    const cacheKeepTick = fixture.intervals.at(-1)
+    const cacheKeepTick = fixture.intervals.find(
+      (interval) => interval.ms === CACHE_KEEP_TICK_MS,
+    )
     if (!cacheKeepTick) throw new Error('missing CacheKeep interval')
     cacheKeepTick.callback()
     await waitFor(

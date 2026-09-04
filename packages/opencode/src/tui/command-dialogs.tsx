@@ -99,6 +99,8 @@ export function buildPrimeStatusRows(accounts: PrimeAccountStatus[]): string[] {
       const time = formatPrimeTime(account.lastPrimedAt)
       if (account.lastResult === 'error') {
         rows.push(`${account.label} \u00b7 primed ${time} err`)
+      } else if (account.lastResult === 'skipped') {
+        rows.push(`${account.label} \u00b7 primed ${time} skipped`)
       } else {
         rows.push(`${account.label} \u00b7 primed ${time} \u2713`)
       }

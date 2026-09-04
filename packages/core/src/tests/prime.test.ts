@@ -1539,6 +1539,47 @@ describe('PrimeManager — send failure', () => {
     expect(h.sendCalls).toEqual([])
     await h.cleanup()
   })
+
+  test('cold vault prime is recorded as a skipped attempt, not an error', async () => {
+    const fixture = makePrimeFixture({
+      mainQuota: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(500).toISOString(),
+          checkedAt: 1,
+        },
+      },
+    })
+    const now = 500 + 120_000
+    const h = await makeHarness({
+      storage: fixture.storage,
+      markerDir: markerRoot,
+      now,
+      quotaFresh: {
+        five_hour: {
+          usedPercent: 0,
+          remainingPercent: 100,
+          resetsAt: new Date(now - 1000).toISOString(),
+          checkedAt: 1,
+        },
+      },
+      send: () => ({
+        ok: false,
+        reason: 'vault-cold',
+        error: 'vault credential is unavailable',
+      }),
+    })
+
+    await h.manager.tick()
+
+    const stats = h.manager.stats()
+    expect(stats[0]?.lastResult).toBe('skipped')
+    const summary = buildPrimeStatusSummary({ enabled: true, accounts: stats })
+    expect(summary).toContain('skipped')
+    expect(summary).not.toContain('err')
+    await h.cleanup()
+  })
 })
 
 describe('PrimeManager — recordSuccess', () => {

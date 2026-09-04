@@ -133,6 +133,20 @@ describe('buildPrimeStatusRows', () => {
     expect(rows[0]).toContain('primed')
     expect(rows[0]).toContain('err')
   })
+
+  test('cold vault skip renders as a skip, not a successful prime', () => {
+    const rows = buildPrimeStatusRows([
+      {
+        id: 'work-alt',
+        label: 'work-alt',
+        nextDueAt: undefined,
+        lastPrimedAt: Date.now() - 60_000,
+        lastResult: 'skipped',
+      } as PrimeAccountStatus,
+    ])
+    expect(rows[0]).toContain('skip')
+    expect(rows[0]).not.toContain('\u2713')
+  })
 })
 
 describe('openCommandDialog — claude-prime modal interaction (M6)', () => {

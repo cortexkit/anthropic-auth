@@ -107,6 +107,19 @@ describe('prime display formatters', () => {
         lastResult: 'error',
       }),
     ).toEqual({ text: 'err', hasError: true })
+    const skipped = normalizeSidebarState({
+      prime: {
+        enabled: true,
+        accounts: [
+          { id: 'cold-vault', label: 'cold-vault', lastResult: 'skipped' },
+        ],
+      },
+    }).prime?.accounts[0]
+    expect(skipped).toBeDefined()
+    expect(formatPrimeAccountValue(skipped!)).toEqual({
+      text: 'skip',
+      hasError: false,
+    })
     expect(formatPrimeAccountValue({ id: 'idle', label: 'idle' })).toEqual({
       text: '\u2014',
       hasError: false,

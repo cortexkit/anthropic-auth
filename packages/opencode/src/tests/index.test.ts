@@ -2145,7 +2145,7 @@ describe('fallback Claustrum credential resolution', () => {
         })
       ).text()
       now += 55 * 60_000
-      const cacheKeepTick = intervals.at(-1)
+      const cacheKeepTick = intervals.find((interval) => interval.ms === 60_000)
       if (!cacheKeepTick) throw new Error('missing cachekeep interval')
       cacheKeepTick.callback()
       await Bun.sleep(20)
@@ -2172,6 +2172,199 @@ describe('fallback Claustrum credential resolution', () => {
       delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
       resetCache1hState()
     }
+  })
+
+  test('CacheKeep clears a failed vault attempt before a sidecar 401', async () => {
+    const calls: CredentialCall[] = []
+    const storage = fallbackWithClaustrum({
+      claustrumHandle: 'handle-cachekeep-abandon',
+      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+    } as never)
+    storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    storage.cacheKeep = { enabled: true, always: true, subagents: true }
+    storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+    await useTempAccountFile(storage)
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get') {
+        return credentialResponse('vault-cachekeep-abandon', 47)
+      }
+      return { result: {} }
+    })
+    let prewarms = 0
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({ oauth_account: { account_uuid: 'fallback-1' } }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        prewarms += 1
+        if (prewarms === 1) return Promise.reject(new Error('network reset'))
+        return Promise.resolve(new Response('unauthorized', { status: 401 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const cacheKeep = plugin.__cacheKeepManager
+    if (!cacheKeep) throw new Error('missing CacheKeep manager')
+    const request = {
+      sessionId: 'ses-cachekeep-abandon',
+      url: MESSAGES_URL,
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+    await cacheKeep.prewarmNow({ ...request, oauthAccountId: 'fallback-1' })
+    await cacheKeep.prewarmNow(request)
+
+    expect(
+      calls.filter((call) => call.method === 'credential.report_auth_failure'),
+    ).toHaveLength(0)
+    await plugin.dispose?.()
+  })
+
+  test('overlapping CacheKeep vault 401s report the credential each attempt served', async () => {
+    const calls: CredentialCall[] = []
+    const storage = fallbackWithClaustrum({
+      claustrumHandle: 'handle-cachekeep-overlap',
+      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+    } as never)
+    storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    storage.cacheKeep = { enabled: true, always: true, subagents: true }
+    storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+    await useTempAccountFile(storage)
+    let credentialGets = 0
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get') {
+        credentialGets += 1
+        return credentialResponse(
+          `vault-cachekeep-overlap-${credentialGets}`,
+          46 + credentialGets,
+        )
+      }
+      return { result: {} }
+    })
+    let startFirstPrewarm!: () => void
+    let startSecondPrewarm!: () => void
+    let releaseFirstPrewarm!: () => void
+    let releaseSecondPrewarm!: () => void
+    const firstPrewarmStarted = new Promise<void>((resolve) => {
+      startFirstPrewarm = resolve
+    })
+    const secondPrewarmStarted = new Promise<void>((resolve) => {
+      startSecondPrewarm = resolve
+    })
+    const firstPrewarmResponse = new Promise<Response>((resolve) => {
+      releaseFirstPrewarm = () =>
+        resolve(new Response('unauthorized', { status: 401 }))
+    })
+    const secondPrewarmResponse = new Promise<Response>((resolve) => {
+      releaseSecondPrewarm = () =>
+        resolve(new Response('unauthorized', { status: 401 }))
+    })
+    let prewarms = 0
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({ oauth_account: { account_uuid: 'fallback-1' } }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        prewarms += 1
+        if (prewarms === 1) {
+          startFirstPrewarm()
+          return firstPrewarmResponse
+        }
+        startSecondPrewarm()
+        return secondPrewarmResponse
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const cacheKeep = plugin.__cacheKeepManager
+    if (!cacheKeep) throw new Error('missing CacheKeep manager')
+    const request = {
+      sessionId: 'ses-cachekeep-overlap',
+      url: MESSAGES_URL,
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      oauthAccountId: 'fallback-1',
+    }
+    const first = cacheKeep.prewarmNow(request)
+    await withDeadlockGuard(
+      firstPrewarmStarted,
+      500,
+      `first overlapping CacheKeep prewarm did not start (${JSON.stringify({ credentialGets, prewarms })})`,
+    )
+    plugin.__claustrumCredentialCache.seedForTest('handle-cachekeep-overlap', {
+      payload: JSON.stringify({ access_token: 'vault-cachekeep-overlap-2' }),
+      expiresAtMs: Date.now() + 5 * 60 * 60_000,
+      recordVersion: 48,
+    })
+    const second = cacheKeep.prewarmNow(request)
+    await withDeadlockGuard(
+      secondPrewarmStarted,
+      500,
+      `second overlapping CacheKeep prewarm did not start (${JSON.stringify({ credentialGets, prewarms })})`,
+    )
+    releaseFirstPrewarm()
+    await first
+    releaseSecondPrewarm()
+    await second
+
+    expect(
+      calls
+        .filter((call) => call.method === 'credential.report_auth_failure')
+        .map((call) => call.params.record_version),
+    ).toEqual([47, 48])
+    await plugin.dispose?.()
   })
 
   test('profile hydration serves a resident vault credential', async () => {

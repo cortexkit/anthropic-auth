@@ -2387,7 +2387,7 @@ const anthropicAuthPlugin = async (
     CacheKeepManager['trackedSessions']
   > = []
   const cacheKeepServedClaustrumCredentials = new Map<
-    string,
+    number,
     ClaustrumAccessResolution['served']
   >()
   const cacheKeepManager = new CacheKeepManager({
@@ -2431,9 +2431,15 @@ const anthropicAuthPlugin = async (
         return bodyText
       }
     },
-    onResponse: async ({ target, bodyText, status, data, receivedAt }) => {
-      const served = cacheKeepServedClaustrumCredentials.get(target.id)
-      cacheKeepServedClaustrumCredentials.delete(target.id)
+    onResponse: async ({
+      target,
+      bodyText,
+      status,
+      data,
+      receivedAt,
+      attempt,
+    }) => {
+      const served = cacheKeepServedClaustrumCredentials.get(attempt.id)
       if (status === 401 && served) {
         await reportCapturedClaustrumAuthFailure(served, 'direct', {
           preserveServedVersion: true,
@@ -2481,7 +2487,10 @@ const anthropicAuthPlugin = async (
         cacheKeepDiagnosticsRequests.delete(target.id)
       }
     },
-    prepareHeaders: async (headers, target) => {
+    onComplete: ({ attempt }) => {
+      cacheKeepServedClaustrumCredentials.delete(attempt.id)
+    },
+    prepareHeaders: async (headers, target, attempt) => {
       let accessToken: string | undefined
       let servedClaustrumCredential: ClaustrumAccessResolution['served']
       const accountId = target.oauthAccountId
@@ -2570,7 +2579,7 @@ const anthropicAuthPlugin = async (
       }
       if (servedClaustrumCredential) {
         cacheKeepServedClaustrumCredentials.set(
-          target.id,
+          attempt.id,
           servedClaustrumCredential,
         )
       }
@@ -7739,6 +7748,7 @@ const anthropicAuthPlugin = async (
     },
     __primeManager: primeManager,
     __quotaManager: quotaManager,
+    __cacheKeepManager: cacheKeepManager,
     __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,
     __fallbackRefreshReady: fallbackRefreshReady,
     __claustrumCredentialCache: claustrumCredentialCache,
