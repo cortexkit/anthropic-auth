@@ -334,9 +334,11 @@ Reset times are rendered as relative durations, such as `resets in 10m` or `rese
 
 ### Quota header feed
 
-The optional quota header feed writes one lease file per process under `/tmp/opencode-anthropic-auth/quota-header-feed/`. A file contains only accounts whose response headers THAT process harvested. Consumers MUST union entries from every file inside `lease_horizon_ms`, then deduplicate by account. "Newest file wins" drops accounts seen by other processes.
+The optional quota header feed writes one lease file per process under `${TMPDIR:-/tmp}/opencode-anthropic-auth/quota-header-feed/`. Set `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR` to override the directory. A file contains only accounts whose response headers THAT process harvested. Consumers MUST union entries from every file inside `lease_horizon_ms`, then deduplicate by account. "Newest file wins" drops accounts seen by other processes.
 
-Each entry always includes `anthropic_account_uuid`. A UUID identifies the Anthropic account. `null` means this producer could not resolve it. An absent key identifies an older producer. On a fallback entry, `account_ref` is the store-local sidecar account ID, not the Anthropic UUID.
+For each account, the newest entry wins for quota values. Resolve `anthropic_account_uuid` from any entry in that account's group that carries it. During a rollout, an older pre-restart publisher can write the newest entry without that field beside newer code that has it.
+
+Each entry always includes `anthropic_account_uuid`; an absent key identifies an older producer. Its value is provider-derived or `null`, never a local substitute. A consumer that sees `null` must count a gap, not fall back to `account_ref`; that field is store-local and never a join key.
 
 ## Safety fallback (OpenCode)
 

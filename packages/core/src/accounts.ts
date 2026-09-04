@@ -3721,10 +3721,16 @@ export function upsertAccount(
       (account.label && candidate.label === account.label),
   )
   if (index >= 0) {
-    storage.accounts[index] = {
-      ...storage.accounts[index],
+    const existing = storage.accounts[index]
+    if (!existing) return
+    const lineageChanged =
+      existing.type === 'oauth' &&
+      account.type === 'oauth' &&
+      existing.authLineageId !== account.authLineageId
+    const updated: FallbackAccount = {
+      ...existing,
       ...account,
-      addedAt: storage.accounts[index]?.addedAt ?? account.addedAt,
+      addedAt: existing.addedAt ?? account.addedAt,
       ...(account.type === 'oauth' && {
         quota: account.quota,
         profile: account.profile,
@@ -3733,9 +3739,67 @@ export function upsertAccount(
         lastQuotaRefreshError: account.lastQuotaRefreshError,
       }),
     }
+    if (lineageChanged && updated.type === 'oauth') {
+      delete updated.anthropicAccountUuid
+    }
+    storage.accounts[index] = updated
     return
   }
   storage.accounts.push(account)
+}
+
+export function persistFallbackQuotaHeaderPersistent(
+  input: {
+    accountId: string
+    authLineageId?: string
+    quota: OAuthQuotaSnapshot
+    anthropicAccountUuid?: string
+  },
+  path = getAccountStoragePath(),
+): Promise<boolean> {
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = await loadAccounts(path)
+        const account = storage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === input.accountId && isOAuthAccount(candidate),
+        )
+        if (
+          !storage ||
+          !account ||
+          account.authLineageId !== input.authLineageId
+        ) {
+          return false
+        }
+        account.quota = {
+          ...input.quota,
+          accountIdentity: account.id,
+        }
+        if (input.anthropicAccountUuid !== undefined) {
+          account.anthropicAccountUuid = input.anthropicAccountUuid
+        }
+        await saveAccountStateUnlocked(storage, path, {
+          accounts: [input.accountId],
+        })
+        return true
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
+}
+
+export function fallbackAccountUuidForLineage(
+  account: OAuthAccount | undefined,
+  authLineageId?: string,
+): string | null {
+  if (!account || account.authLineageId !== authLineageId) return null
+  return account.anthropicAccountUuid ?? null
 }
 
 export function removeAccount(storage: AccountStorage, id: string): boolean {

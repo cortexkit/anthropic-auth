@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   stat,
   utimes,
@@ -596,6 +597,49 @@ describe('quota header feed', () => {
     for (const name of freshNames) expect(names).toContain(name)
     expect(names).toContain('foreign-named-file.json')
     expect(names).toContain('106-66666666-6666-6666-6666-666666666666.json')
+  })
+
+  test('does not unlink a fresh lease published after the stale lease was inspected', async () => {
+    const now = Date.now()
+    const siblingName = '101-11111111-1111-1111-1111-111111111111.json'
+    const siblingPath = join(directory, siblingName)
+    const replacementPath = join(directory, 'fresh-publisher.tmp')
+    await mkdir(directory, { recursive: true })
+    await writeFile(siblingPath, '{"stale":true}')
+    await utimes(
+      siblingPath,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+    )
+    expect(now - (await stat(siblingPath)).mtimeMs).toBeGreaterThanOrEqual(
+      QUOTA_HEADER_FEED_LEASE_MS,
+    )
+
+    let publisherRan = false
+    let publisherError: unknown
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: '102-22222222-2222-2222-2222-222222222222',
+      now: () => now,
+      beforeRemoveFile: async (path: string) => {
+        publisherRan = true
+        try {
+          await writeFile(replacementPath, '{"fresh":true}')
+          await utimes(replacementPath, now / 1_000, now / 1_000)
+          await rename(replacementPath, siblingPath)
+          expect(path).toBe(siblingPath)
+        } catch (error) {
+          publisherError = error
+          throw error
+        }
+      },
+    })
+
+    await registry.publish({ ...entry(), accountKey: 'a' })
+
+    expect(publisherRan).toBe(true)
+    expect(publisherError).toBeUndefined()
+    expect(await readFile(siblingPath, 'utf8')).toBe('{"fresh":true}')
   })
 
   test('continues publishing when a sibling lease sweep cannot unlink a stale file', async () => {

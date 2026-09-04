@@ -3531,7 +3531,96 @@ describe('quota header feed integration', () => {
     globalThis.fetch = originalFetch
   })
 
-  test('publishes a direct harvested response with the observation timestamp', async () => {
+  async function publishFallbackUuid({
+    fallbackUuid,
+    persistedUuid,
+    bootstrapResponse,
+  }: {
+    fallbackUuid: string
+    persistedUuid?: string
+    bootstrapResponse: unknown
+  }) {
+    const fallbackAccess = `sk-ant-oat-${randomUUID()}`
+    await useTempAccountFile(
+      createFallbackStorage({
+        quotaHeaderFeed: { enabled: true },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: fallbackAccess,
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            ...(persistedUuid && { anthropicAccountUuid: persistedUuid }),
+            quota: {
+              five_hour: {
+                usedPercent: 25,
+                remainingPercent: 75,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 30,
+                remainingPercent: 70,
+                checkedAt: Date.now(),
+              },
+            },
+          },
+        ],
+      }),
+    )
+    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+      const url = extractUrl(input)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(Response.json(bootstrapResponse))
+      }
+      if (url.includes('/v1/messages')) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (authorization === `Bearer ${fallbackAccess}`) {
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+            }),
+          )
+        }
+        return Promise.resolve(new Response(null, { status: 429 }))
+      }
+      return Promise.resolve(Response.json({}))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    await response.text()
+
+    const [published] = await waitForFeedEntries(
+      (entries) =>
+        entries.some(
+          (entry: any) => entry.anthropic_account_uuid === fallbackUuid,
+        ),
+      'a fallback UUID feed entry',
+    )
+    const persisted = await waitForAccountStorage(
+      (candidate) =>
+        (
+          candidate?.accounts.find(
+            (account) => account.id === 'fallback-1',
+          ) as any
+        )?.anthropicAccountUuid === fallbackUuid,
+    )
+    return { published, persisted }
+  }
+
+  test('non-oat main feed leaves provider UUID null while retaining its quota slot', async () => {
     const originalNow = Date.now
     let clock = 1_000_000
     Date.now = () => clock
@@ -3574,7 +3663,7 @@ describe('quota header feed integration', () => {
       clock += 1_000
 
       const feedDirectory = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR!
-      await waitForFeedEntries(
+      const [feedEntry] = await waitForFeedEntries(
         (entries) => entries.length === 1,
         'one published entry',
       )
@@ -3589,7 +3678,7 @@ describe('quota header feed integration', () => {
         expect.objectContaining({
           identity_source: 'account_ref',
           account_ref: 'main-fixed-id',
-          anthropic_account_uuid: 'main-fixed-id',
+          anthropic_account_uuid: null,
           configured_account_count: 1,
           observed_at_ms: 1_000_000,
           quota: expect.objectContaining({
@@ -3614,60 +3703,47 @@ describe('quota header feed integration', () => {
       }
       expect(raw).not.toContain('"credential_id":"main"')
       expect(raw).not.toContain('"account_ref":"main"')
+      expect(feedEntry).toEqual(
+        expect.objectContaining({
+          account_ref: 'main-fixed-id',
+          anthropic_account_uuid: null,
+        }),
+      )
+      const persisted = await waitForAccountStorage(
+        (storage) =>
+          storage?.quota?.mainQuota?.accountIdentity === 'main-fixed-id',
+      )
+      expect(persisted?.quota?.mainQuota?.accountIdentity).toBe('main-fixed-id')
     } finally {
       Date.now = originalNow
     }
   })
 
-  test('publishes and persists a fallback Anthropic account UUID', async () => {
-    const fallbackUuid = '11111111-1111-1111-1111-111111111111'
-    const fallbackAccess = `sk-ant-oat-${randomUUID()}`
+  test('oat main feed preserves its bootstrapped Anthropic account UUID', async () => {
+    const mainAccountId = 'main-oat-slot'
+    const providerAccountUuid = '33333333-3333-3333-3333-333333333333'
     await useTempAccountFile(
       createFallbackStorage({
+        mainAccountId,
         quotaHeaderFeed: { enabled: true },
-        accounts: [
-          {
-            id: 'fallback-1',
-            type: 'oauth',
-            access: fallbackAccess,
-            refresh: 'fallback-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            quota: {
-              five_hour: {
-                usedPercent: 25,
-                remainingPercent: 75,
-                checkedAt: Date.now(),
-              },
-              seven_day: {
-                usedPercent: 30,
-                remainingPercent: 70,
-                checkedAt: Date.now(),
-              },
-            },
-          },
-        ],
+        accounts: [],
       }),
     )
-    globalThis.fetch = mock((input: any, init?: RequestInit) => {
+    globalThis.fetch = mock((input: any) => {
       const url = extractUrl(input)
       if (url.includes('/claude_cli/bootstrap')) {
         return Promise.resolve(
-          Response.json({ oauth_account: { account_uuid: fallbackUuid } }),
+          Response.json({
+            oauth_account: { account_uuid: providerAccountUuid },
+          }),
         )
       }
-      if (url.includes('/v1/messages')) {
-        const authorization = new Headers(init?.headers).get('authorization')
-        if (authorization === `Bearer ${fallbackAccess}`) {
-          return Promise.resolve(
-            new Response('{}', {
-              status: 200,
-              headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
-            }),
-          )
-        }
-        return Promise.resolve(new Response(null, { status: 429 }))
-      }
-      return Promise.resolve(Response.json({}))
+      return Promise.resolve(
+        new Response('{}', {
+          status: 200,
+          headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+        }),
+      )
     }) as unknown as typeof fetch
 
     const plugin = await getPlugin()
@@ -3675,7 +3751,7 @@ describe('quota header feed integration', () => {
       () =>
         Promise.resolve({
           type: 'oauth' as const,
-          access: 'main-access',
+          access: 'sk-ant-oat-main-feed',
           refresh: 'main-refresh',
           expires: Date.now() + 100_000,
         }),
@@ -3687,24 +3763,159 @@ describe('quota header feed integration', () => {
     const [published] = await waitForFeedEntries(
       (entries) =>
         entries.some(
-          (entry: any) => entry.anthropic_account_uuid === fallbackUuid,
+          (entry: any) => entry.anthropic_account_uuid === providerAccountUuid,
         ),
-      'a fallback UUID feed entry',
+      'a bootstrapped main UUID feed entry',
     )
+    expect(published).toEqual(
+      expect.objectContaining({
+        account_ref: providerAccountUuid,
+        anthropic_account_uuid: providerAccountUuid,
+      }),
+    )
+  })
+
+  test('main feed drops a cached oat UUID after the current credential becomes non-oat', async () => {
+    const mainAccountId = 'main-oat-to-non-oat-slot'
+    const providerAccountUuid = '44444444-4444-4444-4444-444444444444'
+    let liveAccess = 'sk-ant-oat-main-feed-before-rotation'
+    await useTempAccountFile(
+      createFallbackStorage({
+        mainAccountId,
+        quotaHeaderFeed: { enabled: true },
+        accounts: [],
+      }),
+    )
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({
+            oauth_account: { account_uuid: providerAccountUuid },
+          }),
+        )
+      }
+      return Promise.resolve(
+        new Response('{}', {
+          status: 200,
+          headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+        }),
+      )
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: liveAccess,
+          refresh: `refresh-${liveAccess}`,
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()
+    await waitForFeedEntries(
+      (entries) =>
+        entries.some(
+          (entry: any) => entry.anthropic_account_uuid === providerAccountUuid,
+        ),
+      'a bootstrapped main UUID feed entry',
+    )
+
+    liveAccess = 'main-feed-non-oat-after-rotation'
+    await (await result.fetch(MESSAGES_URL, EMPTY_POST)).text()
+
+    const feedEntries = await waitForFeedEntries(
+      (entries) =>
+        entries.some(
+          (entry: any) =>
+            entry.account_ref === mainAccountId &&
+            entry.anthropic_account_uuid === null,
+        ),
+      'a non-oat main feed entry without a provider UUID',
+    )
+    const published = feedEntries.find(
+      (entry: any) =>
+        entry.account_ref === mainAccountId &&
+        entry.anthropic_account_uuid === null,
+    )
+    expect(published).toEqual(
+      expect.objectContaining({
+        account_ref: mainAccountId,
+        anthropic_account_uuid: null,
+      }),
+    )
+  })
+
+  test('fresh non-oat main install persists a quota slot and publishes no provider UUID', async () => {
+    await useTempAccountFile({
+      version: 1,
+      main: { type: 'opencode', provider: 'anthropic' },
+      quotaHeaderFeed: { enabled: true },
+      accounts: [],
+    })
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response('{}', {
+          status: 200,
+          headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+        }),
+      ),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'fresh-main-non-oat',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    await response.text()
+
+    const persisted = await waitForAccountStorage(
+      (storage) =>
+        storage?.mainAccountId !== undefined &&
+        storage.quota?.mainQuota?.accountIdentity === storage.mainAccountId,
+    )
+    const [published] = await waitForFeedEntries(
+      (entries) =>
+        entries.some(
+          (entry: any) =>
+            entry.account_ref === persisted?.mainAccountId &&
+            entry.anthropic_account_uuid === null,
+        ),
+      'a fresh non-oat main feed entry',
+    )
+    expect(persisted?.mainAccountId).toBeDefined()
+    expect(persisted?.quota?.mainQuota?.accountIdentity).toBe(
+      persisted?.mainAccountId,
+    )
+    expect(published).toEqual(
+      expect.objectContaining({
+        account_ref: persisted?.mainAccountId,
+        anthropic_account_uuid: null,
+      }),
+    )
+  })
+
+  test('publishes and persists a fallback Anthropic account UUID', async () => {
+    const fallbackUuid = '11111111-1111-1111-1111-111111111111'
+    const { published, persisted } = await publishFallbackUuid({
+      fallbackUuid,
+      bootstrapResponse: { oauth_account: { account_uuid: fallbackUuid } },
+    })
     expect(published).toEqual(
       expect.objectContaining({
         identity_source: 'account_ref',
         account_ref: 'fallback-1',
         anthropic_account_uuid: fallbackUuid,
       }),
-    )
-    const persisted = await waitForAccountStorage(
-      (candidate) =>
-        (
-          candidate?.accounts.find(
-            (account) => account.id === 'fallback-1',
-          ) as any
-        )?.anthropicAccountUuid === fallbackUuid,
     )
     expect(
       (
@@ -3717,87 +3928,16 @@ describe('quota header feed integration', () => {
 
   test('uses a persisted fallback Anthropic account UUID before bootstrap resolves it', async () => {
     const fallbackUuid = '22222222-2222-2222-2222-222222222222'
-    const fallbackAccess = `sk-ant-oat-${randomUUID()}`
-    await useTempAccountFile(
-      createFallbackStorage({
-        quotaHeaderFeed: { enabled: true },
-        accounts: [
-          {
-            id: 'fallback-1',
-            type: 'oauth',
-            access: fallbackAccess,
-            refresh: 'fallback-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            anthropicAccountUuid: fallbackUuid,
-            quota: {
-              five_hour: {
-                usedPercent: 25,
-                remainingPercent: 75,
-                checkedAt: Date.now(),
-              },
-              seven_day: {
-                usedPercent: 30,
-                remainingPercent: 70,
-                checkedAt: Date.now(),
-              },
-            },
-          },
-        ],
-      }),
-    )
-    globalThis.fetch = mock((input: any, init?: RequestInit) => {
-      const url = extractUrl(input)
-      if (url.includes('/claude_cli/bootstrap'))
-        return Promise.resolve(Response.json({}))
-      if (url.includes('/v1/messages')) {
-        const authorization = new Headers(init?.headers).get('authorization')
-        if (authorization === `Bearer ${fallbackAccess}`) {
-          return Promise.resolve(
-            new Response('{}', {
-              status: 200,
-              headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
-            }),
-          )
-        }
-        return Promise.resolve(new Response(null, { status: 429 }))
-      }
-      return Promise.resolve(Response.json({}))
-    }) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
-      { models: {} },
-    )
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
-    await response.text()
-
-    const [published] = await waitForFeedEntries(
-      (entries) =>
-        entries.some(
-          (entry: any) => entry.anthropic_account_uuid === fallbackUuid,
-        ),
-      'a persisted fallback UUID feed entry',
-    )
+    const { published, persisted } = await publishFallbackUuid({
+      fallbackUuid,
+      persistedUuid: fallbackUuid,
+      bootstrapResponse: {},
+    })
     expect(published).toEqual(
       expect.objectContaining({
         account_ref: 'fallback-1',
         anthropic_account_uuid: fallbackUuid,
       }),
-    )
-    const persisted = await waitForAccountStorage(
-      (candidate) =>
-        (
-          candidate?.accounts.find(
-            (account) => account.id === 'fallback-1',
-          ) as any
-        )?.anthropicAccountUuid === fallbackUuid,
     )
     expect(
       (
@@ -4214,12 +4354,11 @@ describe('quota header feed integration', () => {
       await waitForLogRecord(
         records,
         (record) =>
-          record.level === 'trace' &&
+          record.level === 'debug' &&
           record.channel === 'quota' &&
           record.message ===
             'skipped stale fallback quota persistence after lineage change' &&
           record.payload?.accountId === 'fallback-1' &&
-          record.payload?.storedLineage === 'lineage-b' &&
           record.payload?.servedLineage === 'lineage-a',
         'stale fallback quota persistence discard',
       )

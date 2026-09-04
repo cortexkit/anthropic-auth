@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   chmod,
+  lstat,
   mkdir,
   readdir,
   readFile,
@@ -311,6 +312,7 @@ export class QuotaHeaderFeedRegistry {
       leaseMs?: number
       instanceId?: string
       removeFile?: (path: string) => Promise<void>
+      beforeRemoveFile?: (path: string) => Promise<void>
     } = {},
   ) {
     const instanceId = options.instanceId ?? `${process.pid}-${randomUUID()}`
@@ -405,6 +407,10 @@ export class QuotaHeaderFeedRegistry {
           try {
             const file = await stat(path)
             if (file.mtimeMs > now || now - file.mtimeMs < leaseMs) return
+            await this.options.beforeRemoveFile?.(path)
+            const current = await lstat(path)
+            if (current.ino !== file.ino || current.mtimeMs !== file.mtimeMs)
+              return
             await (this.options.removeFile ?? ((target) => rm(target)))(path)
           } catch {
             // A missed cleanup must not prevent this process from refreshing its lease.
