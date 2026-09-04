@@ -20,6 +20,7 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   FallbackAccountManager,
+  fallbackAccountUuidForLineage,
   fetchOAuthAccountProfile,
   fetchOAuthQuotaSnapshot,
   formatOAuthAccountTier,
@@ -50,6 +51,7 @@ import {
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   PROFILE_TTL_MS,
+  persistFallbackQuotaHeaderPersistent,
   QuotaManager,
   quotaFieldSource,
   quotaSnapshotModelScopeIsExhausted,
@@ -6448,6 +6450,109 @@ describe('upsertAccount', () => {
     expect(merged.lastRefreshedAt).toBe(60)
     expect(merged.lastRefreshError?.message).toBe('new')
     expect(merged.lastQuotaRefreshError?.message).toBe('new-quota')
+  })
+
+  test('drops an Anthropic account UUID when an OAuth lineage is replaced', () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'refresh-a',
+      authLineageId: 'lineage-a',
+      anthropicAccountUuid: 'uuid-from-lineage-a',
+    })
+
+    upsertAccount(storage, {
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'refresh-b',
+      authLineageId: 'lineage-b',
+    })
+
+    expect(
+      (storage.accounts[0] as OAuthAccount).anthropicAccountUuid,
+    ).toBeUndefined()
+  })
+
+  test('keeps an Anthropic account UUID across a same-lineage token rotation', () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'refresh-a',
+      authLineageId: 'lineage-a',
+      anthropicAccountUuid: 'uuid-from-lineage-a',
+    })
+
+    upsertAccount(storage, {
+      id: 'oauth-1',
+      type: 'oauth',
+      refresh: 'refresh-b',
+      authLineageId: 'lineage-a',
+    })
+
+    expect((storage.accounts[0] as OAuthAccount).anthropicAccountUuid).toBe(
+      'uuid-from-lineage-a',
+    )
+  })
+})
+
+describe('fallback UUID lineage fences', () => {
+  test('does not use a persisted UUID from a replaced credential lineage', () => {
+    const account: OAuthAccount = {
+      id: 'fallback-1',
+      type: 'oauth',
+      refresh: 'refresh-a',
+      authLineageId: 'lineage-a',
+      anthropicAccountUuid: 'uuid-from-lineage-a',
+    }
+
+    expect(fallbackAccountUuidForLineage(account, 'lineage-b')).toBeNull()
+    expect(fallbackAccountUuidForLineage(account, 'lineage-a')).toBe(
+      'uuid-from-lineage-a',
+    )
+  })
+
+  test('does not persist a harvested UUID after the stored lineage was replaced', async () => {
+    await saveAccounts(
+      {
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            refresh: 'refresh-b',
+            authLineageId: 'lineage-b',
+          },
+        ],
+      },
+      accountPath,
+    )
+
+    expect(
+      await persistFallbackQuotaHeaderPersistent(
+        {
+          accountId: 'fallback-1',
+          authLineageId: 'lineage-a',
+          anthropicAccountUuid: 'uuid-from-lineage-a',
+          quota: {
+            source: 'headers',
+            checkedAt: 1_000,
+            five_hour: {
+              usedPercent: 25,
+              remainingPercent: 75,
+              checkedAt: 1_000,
+            },
+          },
+        },
+        accountPath,
+      ),
+    ).toBe(false)
+
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0])
+        .anthropicAccountUuid,
+    ).toBeUndefined()
   })
 })
 

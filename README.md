@@ -332,6 +332,14 @@ In OpenCode, this includes the main Anthropic account and sidecar fallback accou
 
 Reset times are rendered as relative durations, such as `resets in 10m` or `resets in 1h 15m`.
 
+### Quota header feed
+
+The optional quota header feed writes one lease file per process under `${TMPDIR:-/tmp}/opencode-anthropic-auth/quota-header-feed/`. Set `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR` to override the directory. A file contains only accounts whose response headers THAT process harvested. Consumers MUST union entries from every file inside `lease_horizon_ms`, then deduplicate by account. "Newest file wins" drops accounts seen by other processes.
+
+For each account, the newest entry wins for quota values. Resolve `anthropic_account_uuid` from any entry in that account's group that carries it. During a rollout, an older pre-restart publisher can write the newest entry without that field beside newer code that has it.
+
+Each entry always includes `anthropic_account_uuid`; an absent key identifies an older producer. Its value is provider-derived or `null`, never a local substitute. A consumer that sees `null` must count a gap, not fall back to `account_ref`; that field is store-local and never a join key.
+
 ## Safety fallback (OpenCode)
 
 Eligible Fable 5/5.1 and Opus 5 OAuth requests try Anthropic's server-side safety fallback first. The plugin sends `fallbacks: "default"` with Anthropic's server-side fallback beta, preserves fallback conversation boundaries in OpenCode history, and reports model handoffs and restoration in the TUI sidebar or OpenCode Desktop. Follow-up requests may remain on Anthropic's selected fallback model for approximately one hour.
