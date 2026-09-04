@@ -1366,8 +1366,17 @@ const anthropicAuthPlugin = async (
 
     for (const account of storage.accounts) {
       if (signal?.aborted) break
-      if (!isOAuthAccount(account) || !account.access) continue
-      const accessToken = account.access
+      if (!isOAuthAccount(account)) continue
+      const vaultEnabled =
+        Boolean(account.claustrumHandle) &&
+        isClaustrumEnabledForAccount(storage, account.id) &&
+        !claustrumBlockedAccounts.has(account.id)
+      const resolved = vaultEnabled
+        ? resolveClaustrumAccess(account, storage)
+        : undefined
+      if (vaultEnabled && (!resolved?.accessToken || !resolved.served)) continue
+      const accessToken = resolved?.accessToken ?? account.access
+      if (!accessToken) continue
       if (
         account.profile &&
         !oauthProfileMatchesIdentity(account.profile, account.id)
@@ -1928,6 +1937,65 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  async function reportCapturedClaustrumAuthFailure(
+    served: {
+      accountId: string
+      handle: string
+      recordVersion: number
+    },
+    reporterSource: ClaustrumReporterSource = 'direct',
+    options?: { preserveServedVersion?: boolean },
+  ): Promise<void> {
+    const cache = claustrumCredentialCache
+    if (!cache) return
+    if (
+      served.recordVersion <=
+      (claustrumLastReportedVersion.get(served.handle) ?? -1)
+    ) {
+      return
+    }
+    if (!options?.preserveServedVersion) {
+      const current = cache.peek(served.handle)
+      // Version match makes reports single-shot per served version. Accepted
+      // tradeoff: an unrelated cache eviction also suppresses a genuine
+      // report (worst case one delayed cycle until the next served 401).
+      if (!current || current.recordVersion !== served.recordVersion) return
+    }
+    const key = `${served.handle}\0${served.recordVersion}`
+    const pending = claustrumAuthFailureReports.get(key)
+    if (pending) {
+      await pending
+      return
+    }
+    const report = (async () => {
+      try {
+        await cache.reportAuthFailure(
+          served.handle,
+          401,
+          {
+            recordVersion: served.recordVersion,
+          },
+          reporterSource,
+        )
+        claustrumLastReportedVersion.set(served.handle, served.recordVersion)
+      } catch (error) {
+        handleClaustrumCredentialError(served.accountId, error, served.handle)
+        logger.warn('claustrum', 'failed to report credential failure', {
+          accountId: served.accountId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    })()
+    claustrumAuthFailureReports.set(key, report)
+    try {
+      await report
+    } finally {
+      if (claustrumAuthFailureReports.get(key) === report) {
+        claustrumAuthFailureReports.delete(key)
+      }
+    }
+  }
+
   async function ensureClaustrumCredentialCache(): Promise<ClaustrumCredentialCache | null> {
     if (claustrumCredentialCache) return claustrumCredentialCache
     const now = claustrumNow()
@@ -2318,6 +2386,10 @@ const anthropicAuthPlugin = async (
   let aggregateCacheKeepSessions: ReturnType<
     CacheKeepManager['trackedSessions']
   > = []
+  const cacheKeepServedClaustrumCredentials = new Map<
+    number,
+    ClaustrumAccessResolution['served']
+  >()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     setIntervalImpl: runtimeTimers.setInterval,
@@ -2359,7 +2431,20 @@ const anthropicAuthPlugin = async (
         return bodyText
       }
     },
-    onResponse: ({ target, bodyText, status, data, receivedAt }) => {
+    onResponse: async ({
+      target,
+      bodyText,
+      status,
+      data,
+      receivedAt,
+      attempt,
+    }) => {
+      const served = cacheKeepServedClaustrumCredentials.get(attempt.id)
+      if (status === 401 && served) {
+        await reportCapturedClaustrumAuthFailure(served, 'direct', {
+          preserveServedVersion: true,
+        })
+      }
       const prepared = cacheKeepDiagnosticsRequests.get(target.id)
       if (!prepared?.betasHash || !prepared.betas) {
         cacheKeepDiagnosticsRequests.delete(target.id)
@@ -2402,8 +2487,12 @@ const anthropicAuthPlugin = async (
         cacheKeepDiagnosticsRequests.delete(target.id)
       }
     },
-    prepareHeaders: async (headers, target) => {
+    onComplete: ({ attempt }) => {
+      cacheKeepServedClaustrumCredentials.delete(attempt.id)
+    },
+    prepareHeaders: async (headers, target, attempt) => {
       let accessToken: string | undefined
+      let servedClaustrumCredential: ClaustrumAccessResolution['served']
       const accountId = target.oauthAccountId
       if (accountId && accountId !== 'main') {
         const storage = await loadAccounts(accountStoragePath)
@@ -2418,16 +2507,29 @@ const anthropicAuthPlugin = async (
             `OAuth account ${accountId} is unavailable for cache prewarm`,
           )
         }
-        let current = account
-        try {
-          current = await fallbackManager.refreshAccount(account, storage)
-        } catch (error) {
-          logger.warn('cachekeep', 'fallback token refresh failed', {
-            accountId,
-            error: error instanceof Error ? error.message : String(error),
+        const vaultEnabled =
+          Boolean(account.claustrumHandle) &&
+          isClaustrumEnabledForAccount(storage, account.id) &&
+          !claustrumBlockedAccounts.has(account.id)
+        if (vaultEnabled) {
+          const resolved = resolveClaustrumAccess(account, storage, {
+            warm: false,
           })
+          if (!resolved.accessToken || !resolved.served) return undefined
+          accessToken = resolved.accessToken
+          servedClaustrumCredential = resolved.served
+        } else {
+          let current = account
+          try {
+            current = await fallbackManager.refreshAccount(account, storage)
+          } catch (error) {
+            logger.warn('cachekeep', 'fallback token refresh failed', {
+              accountId,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+          accessToken = current.access
         }
-        accessToken = current.access
         if (!accessToken) {
           throw new Error(
             `OAuth account ${accountId} has no access token for cache prewarm`,
@@ -2474,6 +2576,12 @@ const anthropicAuthPlugin = async (
         }
       } catch {
         setOAuthHeaders(headers, accessToken)
+      }
+      if (servedClaustrumCredential) {
+        cacheKeepServedClaustrumCredentials.set(
+          attempt.id,
+          servedClaustrumCredential,
+        )
       }
       return headers
     },
@@ -2564,6 +2672,7 @@ const anthropicAuthPlugin = async (
     const start = performance.now()
     let accessToken: string | undefined
     let resolvedModel: string | undefined
+    let servedClaustrumCredential: ClaustrumAccessResolution['served']
     try {
       if (accountId === 'main') {
         // Use the same refresh path the fresh-check uses, so a missing or
@@ -2598,22 +2707,41 @@ const anthropicAuthPlugin = async (
             error: `prime: OAuth account ${accountId} is unavailable`,
           }
         }
-        let current = account
-        try {
-          // R2: the fire path refreshes ONLY the token, not the quota.
-          // The fresh-check already performed the single usage-API
-          // call and persisted the result; the fire path reuses the
-          // in-memory quota via the headers / URL contract. This keeps
-          // the cycle at exactly one quota API call per account.
-          current = await fallbackManager.refreshAccount(account, storage)
-        } catch (error) {
-          return {
-            ok: false,
-            reason: 'token-refresh',
-            error: error instanceof Error ? error.message : String(error),
+        const vaultEnabled =
+          Boolean(account.claustrumHandle) &&
+          isClaustrumEnabledForAccount(storage, account.id) &&
+          !claustrumBlockedAccounts.has(account.id)
+        if (vaultEnabled) {
+          const resolved = resolveClaustrumAccess(account, storage, {
+            warm: false,
+          })
+          if (!resolved.accessToken || !resolved.served) {
+            return {
+              ok: false,
+              reason: 'vault-cold',
+              error: 'prime: vault credential is unavailable',
+            }
           }
+          accessToken = resolved.accessToken
+          servedClaustrumCredential = resolved.served
+        } else {
+          let current = account
+          try {
+            // R2: the fire path refreshes ONLY the token, not the quota.
+            // The fresh-check already performed the single usage-API
+            // call and persisted the result; the fire path reuses the
+            // in-memory quota via the headers / URL contract. This keeps
+            // the cycle at exactly one quota API call per account.
+            current = await fallbackManager.refreshAccount(account, storage)
+          } catch (error) {
+            return {
+              ok: false,
+              reason: 'token-refresh',
+              error: error instanceof Error ? error.message : String(error),
+            }
+          }
+          accessToken = current.access
         }
-        accessToken = current.access
         resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
       }
 
@@ -2657,6 +2785,13 @@ const anthropicAuthPlugin = async (
       if (!response.ok) {
         const reason =
           (await response.text().catch(() => '')) || `HTTP ${response.status}`
+        if (response.status === 401 && servedClaustrumCredential) {
+          await reportCapturedClaustrumAuthFailure(
+            servedClaustrumCredential,
+            'direct',
+            { preserveServedVersion: true },
+          )
+        }
         return { ok: false, status: response.status, ms, error: reason }
       }
       const data = (await response.json().catch(() => null)) as Record<
@@ -5326,66 +5461,13 @@ const anthropicAuthPlugin = async (
               recordVersion: number
             },
             reporterSource: ClaustrumReporterSource = 'direct',
+            options?: { preserveServedVersion?: boolean },
           ): Promise<void> {
-            const cache = claustrumCredentialCache
-            if (!cache) return
-            if (
-              served.recordVersion <=
-              (claustrumLastReportedVersion.get(served.handle) ?? -1)
-            ) {
-              return
-            }
-            const current = cache.peek(served.handle)
-            // Version match makes reports single-shot per served version. Accepted
-            // tradeoff: an unrelated cache eviction also suppresses a genuine
-            // report (worst case one delayed cycle until the next served 401).
-            if (!current || current.recordVersion !== served.recordVersion)
-              return
-            const key = `${served.handle}\0${served.recordVersion}`
-            const pending = claustrumAuthFailureReports.get(key)
-            if (pending) {
-              await pending
-              return
-            }
-            const report = (async () => {
-              try {
-                await cache.reportAuthFailure(
-                  served.handle,
-                  401,
-                  {
-                    recordVersion: served.recordVersion,
-                  },
-                  reporterSource,
-                )
-                claustrumLastReportedVersion.set(
-                  served.handle,
-                  served.recordVersion,
-                )
-              } catch (error) {
-                handleClaustrumCredentialError(
-                  served.accountId,
-                  error,
-                  served.handle,
-                )
-                logger.warn(
-                  'claustrum',
-                  'failed to report credential failure',
-                  {
-                    accountId: served.accountId,
-                    error:
-                      error instanceof Error ? error.message : String(error),
-                  },
-                )
-              }
-            })()
-            claustrumAuthFailureReports.set(key, report)
-            try {
-              await report
-            } finally {
-              if (claustrumAuthFailureReports.get(key) === report) {
-                claustrumAuthFailureReports.delete(key)
-              }
-            }
+            return reportCapturedClaustrumAuthFailure(
+              served,
+              reporterSource,
+              options,
+            )
           }
 
           async function sendWithAccessToken(
@@ -7666,6 +7748,7 @@ const anthropicAuthPlugin = async (
     },
     __primeManager: primeManager,
     __quotaManager: quotaManager,
+    __cacheKeepManager: cacheKeepManager,
     __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,
     __fallbackRefreshReady: fallbackRefreshReady,
     __claustrumCredentialCache: claustrumCredentialCache,

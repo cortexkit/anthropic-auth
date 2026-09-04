@@ -2052,6 +2052,389 @@ describe('fallback Claustrum credential resolution', () => {
     return { authorizations, plugin, result }
   }
 
+  test('CacheKeep prewarm serves and reports a resident vault credential', async () => {
+    const originalNow = Date.now
+    const originalRuntimeOverrides = pluginRuntimeOverrides
+    let now = 1_000
+    const intervals: Array<{ callback: () => unknown; ms: number }> = []
+    const calls: CredentialCall[] = []
+    const prewarmStarted = deferred()
+    let prewarmUsedVault = false
+    let prewarmUsedSidecar = false
+    let bootstrapUsedSidecar = false
+    let tokenRequests = 0
+    try {
+      Date.now = mock(() => now) as unknown as typeof Date.now
+      resetCache1hState()
+      pluginRuntimeOverrides = {
+        setInterval: mock((callback: () => unknown, ms: number) => {
+          intervals.push({ callback, ms })
+          return { unref() {} } as unknown as ReturnType<typeof setInterval>
+        }) as unknown as typeof setInterval,
+        clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+      }
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+      const storage = fallbackWithClaustrum({
+        claustrumHandle: 'handle-cachekeep-prewarm',
+        claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      } as never)
+      storage.claudeCache = { enabled: true, mode: 'hybrid' }
+      storage.cacheKeep = { enabled: true, always: true, subagents: true }
+      storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+      await useTempAccountFile(storage)
+      const connector = connectorFor(calls, (method) => {
+        if (method === 'credential.get')
+          return credentialResponse(
+            'vault-cachekeep-access',
+            47,
+            now + 2 * 60 * 60_000,
+          )
+        return { result: {} }
+      })
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const url = extractUrl(input as string | URL | Request)
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        if (url.includes('/v1/oauth/token')) {
+          tokenRequests += 1
+          return Promise.resolve(new Response('{}', { status: 500 }))
+        }
+        if (url.includes('/claude_cli/bootstrap')) {
+          bootstrapUsedSidecar ||= authorization.includes('stored-fallback')
+          return Promise.resolve(
+            Response.json({ oauth_account: { account_uuid: 'fallback-1' } }),
+          )
+        }
+        const body = JSON.parse(String(init?.body)) as { max_tokens?: number }
+        if (body.max_tokens === 0) {
+          prewarmUsedVault = authorization.includes('vault-cachekeep')
+          prewarmUsedSidecar = authorization.includes('stored-fallback')
+          prewarmStarted.resolve()
+          return Promise.resolve(new Response('expired', { status: 401 }))
+        }
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"provider-real","model":"claude-opus-4-8","usage":{}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { status: 200 },
+          ),
+        )
+      }) as unknown as typeof fetch
+
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connector,
+      })
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: now + 100_000,
+          }),
+        { models: {} },
+      )
+      await (
+        await result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': 'ses-cachekeep-vault' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            stream: true,
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        })
+      ).text()
+      now += 55 * 60_000
+      const cacheKeepTick = intervals.find((interval) => interval.ms === 60_000)
+      if (!cacheKeepTick) throw new Error('missing cachekeep interval')
+      cacheKeepTick.callback()
+      await Bun.sleep(20)
+      await withDeadlockGuard(
+        prewarmStarted.promise,
+        500,
+        'cachekeep prewarm did not run',
+      )
+
+      expect(prewarmUsedVault).toBe(true)
+      expect(prewarmUsedSidecar).toBe(false)
+      expect(bootstrapUsedSidecar).toBe(false)
+      expect(tokenRequests).toBe(0)
+      expect(
+        calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toHaveLength(1)
+      expect(calls.some((call) => call.params.record_version === 47)).toBe(true)
+      await plugin.dispose?.()
+    } finally {
+      Date.now = originalNow
+      pluginRuntimeOverrides = originalRuntimeOverrides
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+      resetCache1hState()
+    }
+  })
+
+  test('CacheKeep clears a failed vault attempt before a sidecar 401', async () => {
+    const calls: CredentialCall[] = []
+    const storage = fallbackWithClaustrum({
+      claustrumHandle: 'handle-cachekeep-abandon',
+      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+    } as never)
+    storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    storage.cacheKeep = { enabled: true, always: true, subagents: true }
+    storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+    await useTempAccountFile(storage)
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get') {
+        return credentialResponse('vault-cachekeep-abandon', 47)
+      }
+      return { result: {} }
+    })
+    let prewarms = 0
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({ oauth_account: { account_uuid: 'fallback-1' } }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        prewarms += 1
+        if (prewarms === 1) return Promise.reject(new Error('network reset'))
+        return Promise.resolve(new Response('unauthorized', { status: 401 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const cacheKeep = plugin.__cacheKeepManager
+    if (!cacheKeep) throw new Error('missing CacheKeep manager')
+    const request = {
+      sessionId: 'ses-cachekeep-abandon',
+      url: MESSAGES_URL,
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+    await cacheKeep.prewarmNow({ ...request, oauthAccountId: 'fallback-1' })
+    await cacheKeep.prewarmNow(request)
+
+    expect(
+      calls.filter((call) => call.method === 'credential.report_auth_failure'),
+    ).toHaveLength(0)
+    await plugin.dispose?.()
+  })
+
+  test('overlapping CacheKeep vault 401s report the credential each attempt served', async () => {
+    const calls: CredentialCall[] = []
+    const storage = fallbackWithClaustrum({
+      claustrumHandle: 'handle-cachekeep-overlap',
+      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+    } as never)
+    storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    storage.cacheKeep = { enabled: true, always: true, subagents: true }
+    storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+    await useTempAccountFile(storage)
+    let credentialGets = 0
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get') {
+        credentialGets += 1
+        return credentialResponse(
+          `vault-cachekeep-overlap-${credentialGets}`,
+          46 + credentialGets,
+        )
+      }
+      return { result: {} }
+    })
+    let startFirstPrewarm!: () => void
+    let startSecondPrewarm!: () => void
+    let releaseFirstPrewarm!: () => void
+    let releaseSecondPrewarm!: () => void
+    const firstPrewarmStarted = new Promise<void>((resolve) => {
+      startFirstPrewarm = resolve
+    })
+    const secondPrewarmStarted = new Promise<void>((resolve) => {
+      startSecondPrewarm = resolve
+    })
+    const firstPrewarmResponse = new Promise<Response>((resolve) => {
+      releaseFirstPrewarm = () =>
+        resolve(new Response('unauthorized', { status: 401 }))
+    })
+    const secondPrewarmResponse = new Promise<Response>((resolve) => {
+      releaseSecondPrewarm = () =>
+        resolve(new Response('unauthorized', { status: 401 }))
+    })
+    let prewarms = 0
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({ oauth_account: { account_uuid: 'fallback-1' } }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        prewarms += 1
+        if (prewarms === 1) {
+          startFirstPrewarm()
+          return firstPrewarmResponse
+        }
+        startSecondPrewarm()
+        return secondPrewarmResponse
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const cacheKeep = plugin.__cacheKeepManager
+    if (!cacheKeep) throw new Error('missing CacheKeep manager')
+    const request = {
+      sessionId: 'ses-cachekeep-overlap',
+      url: MESSAGES_URL,
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      oauthAccountId: 'fallback-1',
+    }
+    const first = cacheKeep.prewarmNow(request)
+    await withDeadlockGuard(
+      firstPrewarmStarted,
+      500,
+      `first overlapping CacheKeep prewarm did not start (${JSON.stringify({ credentialGets, prewarms })})`,
+    )
+    plugin.__claustrumCredentialCache.seedForTest('handle-cachekeep-overlap', {
+      payload: JSON.stringify({ access_token: 'vault-cachekeep-overlap-2' }),
+      expiresAtMs: Date.now() + 5 * 60 * 60_000,
+      recordVersion: 48,
+    })
+    const second = cacheKeep.prewarmNow(request)
+    await withDeadlockGuard(
+      secondPrewarmStarted,
+      500,
+      `second overlapping CacheKeep prewarm did not start (${JSON.stringify({ credentialGets, prewarms })})`,
+    )
+    releaseFirstPrewarm()
+    await first
+    releaseSecondPrewarm()
+    await second
+
+    expect(
+      calls
+        .filter((call) => call.method === 'credential.report_auth_failure')
+        .map((call) => call.params.record_version),
+    ).toEqual([47, 48])
+    await plugin.dispose?.()
+  })
+
+  test('profile hydration serves a resident vault credential', async () => {
+    const calls: CredentialCall[] = []
+    const profileStarted = deferred()
+    let profileUsedVault = false
+    let profileUsedSidecar = false
+    const storage = fallbackWithClaustrum({
+      claustrumHandle: 'handle-profile-hydration',
+      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+    } as never)
+    await useTempAccountFile(storage)
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get')
+        return credentialResponse(
+          'vault-profile-access',
+          53,
+          Date.now() + 2 * 60 * 60_000,
+        )
+      return { result: {} }
+    })
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (url.includes('/api/oauth/profile')) {
+        if (authorization.includes('vault-profile')) {
+          profileUsedVault = true
+          profileStarted.resolve()
+        }
+        if (authorization.includes('stored-fallback')) {
+          profileUsedSidecar = true
+          profileStarted.resolve()
+        }
+        return Promise.resolve(
+          Response.json({
+            organization: {
+              organization_type: 'claude_team',
+              rate_limit_tier: 'default_claude_max_5x',
+            },
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await withDeadlockGuard(
+      profileStarted.promise,
+      500,
+      'fallback profile hydration did not run',
+    )
+
+    expect(profileUsedVault).toBe(true)
+    expect(profileUsedSidecar).toBe(false)
+    await plugin.dispose?.()
+  })
+
   test('disabled gate does not connect and uses the stored token', async () => {
     const calls: CredentialCall[] = []
     let connectorCalls = 0
@@ -19086,6 +19469,39 @@ describe('claude-prime direct request', () => {
     globalThis.setInterval = originalSetInterval
   })
 
+  function primeCredentialResponse(
+    accessToken: string,
+    recordVersion: number,
+    expiresAtMs = Date.now() + 60_000,
+  ) {
+    return {
+      result: {
+        payload: Array.from(
+          new TextEncoder().encode(
+            JSON.stringify({ access_token: accessToken }),
+          ),
+        ),
+        expires_at_ms: expiresAtMs,
+        record_version: recordVersion,
+      },
+    }
+  }
+
+  function primeConnector(
+    calls: Array<{ method: string; params: Record<string, unknown> }>,
+    handler: (method: string, params: Record<string, unknown>) => unknown,
+  ) {
+    return async () =>
+      ({
+        call: async (_moduleId: string, method: string, params: unknown) => {
+          const normalized = (params ?? {}) as Record<string, unknown>
+          calls.push({ method, params: normalized })
+          return handler(method, normalized)
+        },
+        close: () => {},
+      }) as never
+  }
+
   test('main prime fires a direct messages request with the documented body shape', async () => {
     const now = Date.now() - 60_000
     const past = now - 120_000
@@ -19680,6 +20096,397 @@ describe('claude-prime direct request', () => {
     )
     expect(primeCall).toBeDefined()
     expect(primeCall?.auth).toContain('fb-access')
+  })
+
+  test('vault-served fallback prime sends the resident vault credential without refreshing the sidecar', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-prime-canary',
+            refresh: 'sidecar-prime-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'prime-vault-handle',
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: Date.now() - 60_000,
+              },
+            },
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method === 'credential.get') {
+        return primeCredentialResponse('vault-prime-access', 101)
+      }
+      return { result: {} }
+    })
+    const requestAuthorizations: string[] = []
+    let tokenEndpointCalls = 0
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (url.includes('/v1/messages')) {
+        requestAuthorizations.push(authorization)
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { input_tokens: 20, output_tokens: 1 } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        requestAuthorizations.push(authorization)
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
+      }
+      if (url.includes('/v1/oauth/token')) tokenEndpointCalls += 1
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    await mgr.tick()
+
+    expect(requestAuthorizations).toContain('Bearer vault-prime-access')
+    expect(requestAuthorizations).not.toContain('Bearer sidecar-prime-canary')
+    expect(tokenEndpointCalls).toBe(0)
+    await plugin.dispose?.()
+  })
+
+  test('a cold vault fallback skips prime without a fire-failed warning', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    const dueQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(past).toISOString(),
+        checkedAt: Date.now(),
+      },
+    }
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-cold-canary',
+            refresh: 'sidecar-cold-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'prime-cold-handle',
+            quota: dueQuota,
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method === 'credential.get') {
+        return primeCredentialResponse(
+          'expired-vault-prime-access',
+          102,
+          Date.now() - 1,
+        )
+      }
+      return { result: {} }
+    })
+    let sidecarPrimeRequests = 0
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages')
+      ) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (authorization === 'Bearer sidecar-cold-canary') {
+          sidecarPrimeRequests += 1
+        }
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    const directResult = await mgr.options.sendPrime('work-alt')
+    expect(directResult).toMatchObject({ ok: false, reason: 'vault-cold' })
+    expect(sidecarPrimeRequests).toBe(0)
+
+    const records: any[] = []
+    const { __setLogTestSink, setLogLevel } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    setLogLevel('debug')
+    __setLogTestSink((record: any) => records.push(record))
+    mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
+    await mgr.tick()
+    await mgr.tick()
+    __setLogTestSink(null)
+    setLogLevel('info')
+
+    expect(sidecarPrimeRequests).toBe(0)
+    expect(
+      records.filter((record) => record.message === 'prime fire failed'),
+    ).toHaveLength(0)
+    const coldRecords = records.filter(
+      (record) =>
+        record.channel === 'prime' && record.payload?.account === 'work-alt',
+    )
+    expect(coldRecords).toHaveLength(1)
+    expect(coldRecords[0]?.level).toBe('debug')
+    await plugin.dispose?.()
+  })
+
+  test('a vault prime 401 reports the credential version sent before a cache rotation', async () => {
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    const dueQuota = {
+      five_hour: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        resetsAt: new Date(past).toISOString(),
+        checkedAt: Date.now(),
+      },
+    }
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-401-canary',
+            refresh: 'sidecar-401-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'prime-401-handle',
+            quota: dueQuota,
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    let rotated = false
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method !== 'credential.get') return { result: {} }
+      return primeCredentialResponse(
+        rotated ? 'vault-prime-new-access' : 'vault-prime-401-access',
+        rotated ? 104 : 103,
+      )
+    })
+    const requestEntered = deferred()
+    const releaseResponse = deferred()
+    let sentAuthorization: string | undefined
+    globalThis.fetch = mock(async (input: unknown, init?: RequestInit) => {
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages')
+      ) {
+        const authorization = new Headers(init?.headers).get('authorization')
+        if (authorization === 'Bearer vault-prime-401-access') {
+          sentAuthorization = authorization
+          requestEntered.resolve()
+          await releaseResponse.promise
+          return new Response('{}', { status: 401 })
+        }
+        return new Response('{}', { status: 200 })
+      }
+      return new Response('not-mocked', { status: 599 })
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
+    const tick = mgr.tick()
+    await requestEntered.promise
+    const cache = plugin.__claustrumCredentialCache
+    cache.invalidate('prime-401-handle', 103)
+    rotated = true
+    await cache.get('prime-401-handle')
+    releaseResponse.resolve()
+    await tick
+
+    expect(sentAuthorization).toBe('Bearer vault-prime-401-access')
+    expect(credentialCalls).toContainEqual({
+      method: 'credential.report_auth_failure',
+      params: {
+        handle: 'prime-401-handle',
+        provider_status: 401,
+        record_version: 103,
+        reporter_source: 'direct',
+      },
+    })
+    await plugin.dispose?.()
+  })
+
+  test('a sidecar prime 401 is not reported as a vault credential failure', async () => {
+    const past = Date.now() - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            access: 'sidecar-401-access',
+            refresh: 'sidecar-401-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'sidecar-401-handle',
+            quota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: Date.now(),
+              },
+            },
+          },
+          {
+            id: 'vault-witness',
+            type: 'oauth',
+            access: 'witness-sidecar-access',
+            refresh: 'witness-sidecar-refresh',
+            expires: Date.now() + 5 * 60 * 60_000,
+            claustrumHandle: 'vault-witness-handle',
+          },
+        ],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
+        claustrum: { accounts: { 'vault-witness': { enabled: true } } },
+        prime: { enabled: true },
+      }),
+    )
+
+    const credentialCalls: Array<{
+      method: string
+      params: Record<string, unknown>
+    }> = []
+    const connector = primeConnector(credentialCalls, (method) => {
+      if (method === 'credential.get') {
+        return primeCredentialResponse('vault-witness-access', 105)
+      }
+      return { result: {} }
+    })
+    let authorization: string | undefined
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages')
+      ) {
+        authorization =
+          new Headers(init?.headers).get('authorization') ?? undefined
+        return Promise.resolve(new Response('{}', { status: 401 }))
+      }
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const mgr = (plugin as any).__primeManager
+    const result = await mgr.options.sendPrime('work-alt')
+
+    expect(result).toMatchObject({ ok: false, status: 401 })
+    expect(authorization).toBe('Bearer sidecar-401-access')
+    expect(
+      credentialCalls.some(
+        (call) => call.method === 'credential.report_auth_failure',
+      ),
+    ).toBe(false)
+    await plugin.dispose?.()
   })
 
   test('fallback refresh-token rotation keeps one prime claim per reset window', async () => {

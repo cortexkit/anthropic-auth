@@ -53,7 +53,7 @@ export type PrimeAccountStatus = {
   label: string
   nextDueAt?: number
   lastPrimedAt?: number | null
-  lastResult?: 'ok' | 'error'
+  lastResult?: 'ok' | 'error' | 'skipped'
   usage?: import('./accounts.ts').PrimeUsageCounters
   estimatedCostUsd?: number
 }
@@ -70,13 +70,9 @@ export type PrimeSendResult =
       status?: number
       ms?: number
       error: string
-      // Discriminates the failure kind so the manager can emit the
-      // spec Logging table's two distinct warn events: `prime token
-      // refresh failed` (warn · prime · { account, error }) for
-      // token-refresh failures, `prime fire failed` (warn · prime ·
-      // { account, status?, error }) for HTTP / fetch / identity
-      // failures during the request itself.
-      reason?: 'token-refresh' | 'send'
+      // `vault-cold` is an expected off-path cache warm state, not evidence
+      // of a failed provider request, so it must not emit the fire-failure warn.
+      reason?: 'token-refresh' | 'vault-cold' | 'send'
     }
 
 /**
@@ -137,7 +133,7 @@ export function buildPrimeAccountStatuses(
     now?: number
     transient?: ReadonlyMap<
       string,
-      { lastPrimedAt?: number; lastResult?: 'ok' | 'error' }
+      { lastPrimedAt?: number; lastResult?: 'ok' | 'error' | 'skipped' }
     >
   },
 ): PrimeAccountStatus[] {
@@ -226,7 +222,7 @@ function formatDue(nextDueAt: number | null | undefined): string {
 
 function formatPrimed(
   lastPrimedAt: number | null | undefined,
-  lastResult: 'ok' | 'error' | undefined,
+  lastResult: 'ok' | 'error' | 'skipped' | undefined,
 ): string {
   if (typeof lastPrimedAt !== 'number') return ''
   const time = new Date(lastPrimedAt).toLocaleTimeString([], {
@@ -234,6 +230,7 @@ function formatPrimed(
     minute: '2-digit',
   })
   if (lastResult === 'error') return `primed ${time} err`
+  if (lastResult === 'skipped') return `primed ${time} skipped`
   return `primed ${time} \u2713`
 }
 
@@ -566,7 +563,7 @@ export class PrimeManager {
   // (M4): skip is not the same as a successful prime.
   private transient = new Map<
     string,
-    { lastPrimedAt: number; lastResult: 'ok' | 'error' }
+    { lastPrimedAt: number; lastResult: 'ok' | 'error' | 'skipped' }
   >()
   // Latest cumulative counters returned by recordSuccess. Overlays the
   // persisted counters in stats() before the next load persists them.
@@ -946,7 +943,7 @@ export class PrimeManager {
     if (this.stopped) return
 
     if (!result.ok) {
-      // Spec Logging table: two distinct warn events.
+      // `vault-cold` is a cache-warm skip; it is not a provider failure.
       // - `prime token refresh failed` — token-refresh failure
       //   before the request fires (reason: 'token-refresh').
       // - `prime fire failed` — HTTP error / fetch throw /
@@ -955,6 +952,11 @@ export class PrimeManager {
         logger.warn('prime', 'prime token refresh failed', {
           account: evaluation.label,
           error: result.error,
+        })
+      } else if (result.reason === 'vault-cold') {
+        logger.debug('prime', 'prime vault credential cold', {
+          account: evaluation.label,
+          reason: result.reason,
         })
       } else {
         logger.warn('prime', 'prime fire failed', {
@@ -965,7 +967,7 @@ export class PrimeManager {
       }
       this.transient.set(evaluation.id, {
         lastPrimedAt: now,
-        lastResult: 'error',
+        lastResult: result.reason === 'vault-cold' ? 'skipped' : 'error',
       })
       return
     }

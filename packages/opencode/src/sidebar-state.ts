@@ -59,7 +59,7 @@ export interface PrimeSidebarAccountState {
   label: string
   nextDueAt?: number | null
   lastPrimedAt?: number | null
-  lastResult?: 'ok' | 'error'
+  lastResult?: 'ok' | 'error' | 'skipped'
   usage?: PrimeUsageCounters
   estimatedCostUsd?: number
 }
@@ -180,7 +180,11 @@ function normalizePrimeAccount(
   } else if (isFiniteNumber(value.lastPrimedAt)) {
     account.lastPrimedAt = value.lastPrimedAt
   }
-  if (value.lastResult === 'ok' || value.lastResult === 'error') {
+  if (
+    value.lastResult === 'ok' ||
+    value.lastResult === 'error' ||
+    value.lastResult === 'skipped'
+  ) {
     account.lastResult = value.lastResult
   }
   const usage = normalizePrimeUsage(value.usage)
@@ -843,6 +847,9 @@ export function formatPrimeAccountValue(account: PrimeSidebarAccountState): {
 } {
   if (account.lastResult === 'error') {
     return { text: 'err', hasError: true }
+  }
+  if (account.lastResult === 'skipped') {
+    return { text: 'skip', hasError: false }
   }
   if (account.nextDueAt && account.nextDueAt > Date.now()) {
     return { text: formatPrimeTime(account.nextDueAt), hasError: false }

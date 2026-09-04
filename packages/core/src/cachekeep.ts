@@ -336,6 +336,10 @@ export type CacheKeepTarget = {
   isSubagent: boolean
 }
 
+export type CacheKeepPrewarmAttempt = {
+  id: number
+}
+
 function cacheKeepRetryDelayMs(targetId: string, failureCount: number) {
   const exponential = Math.min(
     CACHE_KEEP_RETRY_MAX_MS,
@@ -367,6 +371,7 @@ export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
   private timer: ReturnType<typeof setInterval> | null = null
   private tickPromise: Promise<void> | null = null
+  private nextPrewarmAttemptId = 0
 
   constructor(
     private readonly options: {
@@ -379,7 +384,8 @@ export class CacheKeepManager {
       prepareHeaders?: (
         headers: Headers,
         target: CacheKeepTarget,
-      ) => Promise<Headers> | Headers
+        attempt: CacheKeepPrewarmAttempt,
+      ) => Promise<Headers | undefined> | Headers | undefined
       onTrackedSessionsChanged?: (
         sessions: readonly CacheKeepTrackedSession[],
       ) => Promise<void> | void
@@ -393,6 +399,11 @@ export class CacheKeepManager {
         status: number
         data: unknown
         receivedAt: number
+        attempt: CacheKeepPrewarmAttempt
+      }) => void | Promise<void>
+      onComplete?: (input: {
+        target: CacheKeepTarget
+        attempt: CacheKeepPrewarmAttempt
       }) => void | Promise<void>
     },
   ) {}
@@ -639,103 +650,119 @@ export class CacheKeepManager {
   private async sendPrewarm(
     target: CacheKeepTarget,
   ): Promise<CacheKeepPrewarmResult> {
-    let bodyText = target.bodyText
-    if (this.options.prepareBody) {
+    const attempt = { id: ++this.nextPrewarmAttemptId }
+    try {
+      let bodyText = target.bodyText
+      if (this.options.prepareBody) {
+        try {
+          bodyText = await this.options.prepareBody(bodyText, target)
+        } catch (error) {
+          logger.warn('cachekeep', 'prepare body failed', {
+            session: target.id,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+      const preparedTarget = { ...target, bodyText }
+      const prewarm = await buildCacheKeepPrewarmBody(bodyText)
+      if (!prewarm.ok) return prewarm
+
+      const fetchImpl = this.options.fetchImpl ?? fetch
+      const prewarmTarget = { ...preparedTarget, bodyText: prewarm.bodyText }
+      const headers = this.options.prepareHeaders
+        ? await this.options.prepareHeaders(
+            new Headers(target.headers),
+            prewarmTarget,
+            attempt,
+          )
+        : new Headers(target.headers)
+      if (!headers) {
+        return {
+          ok: false,
+          reason: 'OAuth cache prewarm credential is unavailable',
+          transient: true,
+        }
+      }
+      headers.delete('content-length')
+      headers.delete('transfer-encoding')
+      let response: Response
       try {
-        bodyText = await this.options.prepareBody(bodyText, target)
+        response = await fetchImpl(target.url, {
+          method: 'POST',
+          headers,
+          body: prewarm.bodyText,
+          signal: AbortSignal.timeout(
+            this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
+          ),
+        })
       } catch (error) {
-        logger.warn('cachekeep', 'prepare body failed', {
+        return {
+          ok: false,
+          reason: error instanceof Error ? error.message : String(error),
+          transient: true,
+        }
+      }
+      const receivedAt = this.options.now?.() ?? Date.now()
+      const raw = await response.text().catch(() => '')
+      let data: unknown = null
+      try {
+        data = raw ? JSON.parse(raw) : null
+      } catch {}
+      try {
+        await this.options.onResponse?.({
+          target,
+          bodyText: prewarm.bodyText,
+          status: response.status,
+          data,
+          receivedAt,
+          attempt,
+        })
+      } catch {}
+      try {
+        const dumpHandle = await dumpDirectRequest({
+          affinity: target.id,
+          route: 'cachekeep',
+          status: response.status,
+          bodyText: prewarm.bodyText,
+          url: target.url,
+          method: 'POST',
+          headers,
+          tag: 'cachekeep',
+        })
+        await dumpResponseArtifact(dumpHandle, {
+          status: response.status,
+          message: data,
+        })
+      } catch (error) {
+        logger.debug('cachekeep', 'dump failed', {
           session: target.id,
           error: error instanceof Error ? error.message : String(error),
         })
       }
-    }
-    const preparedTarget = { ...target, bodyText }
-    const prewarm = await buildCacheKeepPrewarmBody(bodyText)
-    if (!prewarm.ok) return prewarm
-
-    const fetchImpl = this.options.fetchImpl ?? fetch
-    const prewarmTarget = { ...preparedTarget, bodyText: prewarm.bodyText }
-    const headers = this.options.prepareHeaders
-      ? await this.options.prepareHeaders(
-          new Headers(target.headers),
-          prewarmTarget,
-        )
-      : new Headers(target.headers)
-    headers.delete('content-length')
-    headers.delete('transfer-encoding')
-    let response: Response
-    try {
-      response = await fetchImpl(target.url, {
-        method: 'POST',
-        headers,
-        body: prewarm.bodyText,
-        signal: AbortSignal.timeout(
-          this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
-        ),
-      })
-    } catch (error) {
-      return {
-        ok: false,
-        reason: error instanceof Error ? error.message : String(error),
-        transient: true,
-      }
-    }
-    const receivedAt = this.options.now?.() ?? Date.now()
-    const raw = await response.text().catch(() => '')
-    let data: unknown = null
-    try {
-      data = raw ? JSON.parse(raw) : null
-    } catch {}
-    try {
-      await this.options.onResponse?.({
-        target,
-        bodyText: prewarm.bodyText,
-        status: response.status,
-        data,
-        receivedAt,
-      })
-    } catch {}
-    try {
-      const dumpHandle = await dumpDirectRequest({
-        affinity: target.id,
-        route: 'cachekeep',
-        status: response.status,
-        bodyText: prewarm.bodyText,
-        url: target.url,
-        method: 'POST',
-        headers,
-        tag: 'cachekeep',
-      })
-      await dumpResponseArtifact(dumpHandle, {
-        status: response.status,
-        message: data,
-      })
-    } catch (error) {
-      logger.debug('cachekeep', 'dump failed', {
-        session: target.id,
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
-    if (!response.ok) {
-      return {
-        ok: false,
-        reason: raw || `HTTP ${response.status}`,
-        status: response.status,
-      }
-    }
-    const objectData =
-      data && typeof data === 'object' && !Array.isArray(data)
-        ? (data as Record<string, unknown>)
-        : null
-    const usage = objectData?.usage as
-      | {
-          input_tokens?: number
-          cache_creation_input_tokens?: number
-          cache_read_input_tokens?: number
+      if (!response.ok) {
+        return {
+          ok: false,
+          reason: raw || `HTTP ${response.status}`,
+          status: response.status,
         }
-      | undefined
-    return { ok: true, ...(usage && { usage }) }
+      }
+      const objectData =
+        data && typeof data === 'object' && !Array.isArray(data)
+          ? (data as Record<string, unknown>)
+          : null
+      const usage = objectData?.usage as
+        | {
+            input_tokens?: number
+            cache_creation_input_tokens?: number
+            cache_read_input_tokens?: number
+          }
+        | undefined
+      return { ok: true, ...(usage && { usage }) }
+    } finally {
+      try {
+        await this.options.onComplete?.({ target, attempt })
+      } catch {}
+    }
   }
 
   private async prewarm(target: CacheKeepTarget, now: number) {
