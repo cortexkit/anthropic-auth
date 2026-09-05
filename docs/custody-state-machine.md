@@ -99,7 +99,7 @@ Evaluated independently for main and for **each enabled OAuth fallback**.
 |---|---|---|
 | `mode` | `local` · `claustrum` | global, durable; the only global write in the barrier |
 | `binding` | `VALID` · `INVALID` · `ABSENT` | the account's entry `{label, handle, credentialId}` in our provider block of the shared handle manifest. `INVALID` = entry present, handle or credentialId fails validation |
-| `local` | `REAL` · `INERT` · `GONE` | main: `REAL` = usable material, `INERT` = recognise-set tombstone, `GONE` = `SLOT_ABSENT` or `SLOT_UNPARSEABLE`. Fallback: `REAL` = usable refresh material, `INERT` = refresh material absent, row otherwise valid, `GONE` = `ROW_UNPARSEABLE` (a row that is *absent* while a binding exists is the discovery operation, §7, not a coordinate) |
+| `local` | `REAL` · `INERT` · `GONE` | main: `REAL` = usable material, `INERT` = recognise-set tombstone, `GONE` = slot absent **as observed through the SDK**. An unparseable main slot is unobservable: `Auth.all()` runs `Record.filterMap(decode)` (`auth/index.ts:65-66`), so a slot failing the `Info` schema reads as `undefined` and any later host write rewrites the file without it; for main, `GONE ≡ SLOT_ABSENT`. Fallback: `REAL` = usable refresh material, `INERT` = refresh material absent, row otherwise valid, `GONE` = `ROW_UNPARSEABLE` (our own store, so the distinction survives there; a row that is *absent* while a binding exists is the discovery operation, §7, not a coordinate) |
 | `vault` | `USABLE` · `COLD` · `REAUTH` · `N/A` | resolved through the binding's handle. `COLD` = daemon unreachable or credential not resident (transient). `REAUTH` = record latched `needs_reauth`. `N/A` ⇔ `binding ∈ {ABSENT, INVALID}` |
 
 Two facts about `GONE` for main, both from OpenCode source (`339536bc22`), change what it means:
@@ -163,7 +163,7 @@ vault-owned family.
 | C6 | ABSENT | REAL | N/A | `NOT_ENROLLED` | **no** | **no** (this mode has no local refreshers) | none | none | `ck auth bind` after import, or `local` |
 | C7 | ABSENT | INERT | N/A | `ORPHAN_TOMBSTONE` (main) / `ORPHAN_INERT` (fallback) | **no** | nothing to refresh | none | none | `bind`, or `local` + re-login |
 | C8 | INVALID | any | N/A | `CORRUPT_BINDING` | **no** | **inert** | **none**: never auto-repair a manifest entry | none | `ck auth bind --replace`, or `local` |
-| C9 | VALID | GONE (main) | USABLE · COLD · REAUTH | `RESTORE_TOMBSTONE` → re-classify as C1 / C3 / C4 | per re-class | inert | `auth.json` ← WRITE set, **awaited in the factory before the loader pass**. `SLOT_UNPARSEABLE` logs a `warn` naming the fact, never the content, before overwriting. Write failure → `FAIL_CLOSED`, typed `main unavailable: slot unrestorable` | next boot | none on success |
+| C9 | VALID | GONE (main) | USABLE · COLD · REAUTH | `RESTORE_TOMBSTONE` → re-classify as C1 / C3 / C4 | per re-class | inert | `auth.json` ← WRITE set, **awaited in the factory before the loader pass**. **BLOCKED under §13.1** (same host-write race as the install). Write failure → `FAIL_CLOSED`, typed `main unavailable: slot unrestorable`. (An unparseable slot cannot be distinguished from an absent one through the SDK, so no separate warn is possible; the host itself drops such an entry on its next write) | next boot | none on success |
 | C10 | VALID | GONE (fallback = `ROW_UNPARSEABLE`) | any | `CORRUPT_ROW` | **no** | inert | **none**; state secrets retained | next reconcile | repair the row, or remove + re-discover |
 
 Invariants pinning the combinations not rowed:
@@ -341,10 +341,51 @@ Everything the barrier fences is ours: config, sidecar, manifest, per-account re
 - `RESTORE_TOMBSTONE` (C9) has the same race in the other direction: a login can land in the absent
   slot between the factory's read and its awaited write.
 
-The fingerprint is therefore **crash reconciliation only** (§4). What is needed is a
-synchronisation mechanism grounded in OpenCode source: a lock `Auth.set` honours, a compare-and-set
-primitive on the slot, an event that observes the write, or a host-side change. None was found in
-`339536bc22`; the search was not exhaustive.
+The fingerprint is therefore **crash reconciliation only** (§4).
+
+**Source of the race** (OpenCode `339536bc22`, `packages/opencode/src/auth/index.ts:73-89`):
+`Auth.set` is `all()` → spread → `writeJson`. No lock, no compare-and-set, no expected-value check,
+and the write itself is **not atomic**: `util/filesystem.ts:61-84` is an in-place `writeFile`, not
+temp-and-rename, so a concurrent reader can observe a partial file. No write event exists, and the
+loader is memoised init-once. There is nothing at the host to honour; the gap is tracked upstream as
+[anomalyco/opencode#46128](https://github.com/anomalyco/opencode/issues/46128) ("auth.json writes
+are unlocked whole-file rewrites", open). Consequences beyond our slot:
+
+- it rewrites the **whole file**, so two concurrent `set`s on *different* keys are last-writer-wins.
+  A tombstone write on `anthropic` can clobber a concurrent `openai` login and vice versa; any
+  plugin that writes its slot during another plugin's login loses one of them. This is a property
+  of the host's auth store, not of custody.
+- a fresh login that lands in the window is **lost** if the tombstone overwrites it (ordering B).
+  Whether that also kills the vault's family is provider-specific and, for Anthropic, **unverified**:
+  if a fresh Anthropic login invalidates the prior refresh lineage, ordering B leaves the account
+  dark; if lineages coexist (as they do for OpenAI), the cost is one re-login. The fingerprint
+  preserves the single-refresher invariant in both orderings; only losslessness differs. Either
+  way the transition stays blocked (§13.1).
+- **`OPENCODE_AUTH_CONTENT` is a deterministic clobber, not a race.** A child process started with
+  that variable (`workspace.ts:532-533`) reads auth from the env snapshot in preference to the file
+  (`auth/index.ts:59-61`), and every `Auth.set` it performs rewrites the file from that snapshot,
+  restoring pre-tombstone material for the child's whole lifetime. This is a **checkable
+  precondition** (scan `/proc/*/environ` for the variable before the transition), which is what §8's
+  "fail loudly" concretely means.
+
+**Mitigations that do not need a host primitive** (candidates; none closes the cross-process case):
+(1) a process-local mutex shared by the barrier and every plugin-owned login entry, the login
+holding it until a `client.auth.get` readback observes the host's write, which closes the
+same-process race because both sides are our code; (2) a post-write readback after each tombstone
+write, so ordering A is detected in the same run rather than on the next boot; (3) the cross-process
+residual (a login in another OpenCode window) **declared** in the transition's confirmation text,
+never hidden; (4) a **convergent write** for the main-slot install, proposed by the Claustrum seat on
+the #196 thread and buildable inside `ck auth migrate-plugin --allow-main` where the imported bytes
+are already in hand: import first → write the tombstone → settle → re-read; a slot **byte-equal to
+the imported material** means a clobber by an env-snapshot child (rewrite, bounded retries), while
+**different real material** means a newer family landed (refuse loud, never overwrite). The residual
+is detected, bounded, and loud, which is the most a host without a fence can give. Whether that
+satisfies §13.1's "source-backed synchronisation" is the maintainer's call.
+
+**What closes it** is small and belongs in OpenCode: a per-key compare-and-set,
+`Auth.set(key, info, { expect })` rejecting when `current[key] ≠ expect`, or an advisory lock that
+`set`/`remove` take. Not filed; a change to a third-party repo is the operator's and maintainer's
+call.
 
 ### 12.2 A raced login versus "bindings clear only after verified login"
 
@@ -355,8 +396,17 @@ not complete through **our** path with an in-process record, so under `local` it
 (`DARK_PENDING_VERIFIED_LOGIN`), not L1, and its binding does not clear. Either the verified-login
 rule admits some evidence other than our in-process record (and then what, and how is it
 distinguished from a restored backup, which is the case the rule exists for), or a raced login is
-never allowed to stand and the only resolution is a fresh vault import. The two rules are both
-individually correct and jointly unreconciled here.
+never allowed to stand and the only resolution is a fresh vault import.
+
+**Resolution proposed (strictness), for the maintainer's ruling:** a login that landed outside the
+plugin's own path (raced, restored backup, another process) is **never** verified. It lands L5; its
+binding never auto-clears; the only exits are the plugin's own in-process verified login (new
+family, clears) or `ck auth`. The rule exists to reject restored backups, and a raced login is
+indistinguishable from one by content, so it gets the same treatment. The openai-auth port adopted
+this. One sub-question stays open: whether L5 **serves** its access token until expiry (no refresh,
+which still satisfies §13.2) or refuses as the table currently says; both are consistent with the
+rulings, and the difference is availability versus caution on a credential the vault may have
+rotated.
 
 ### 12.3 Smaller
 
