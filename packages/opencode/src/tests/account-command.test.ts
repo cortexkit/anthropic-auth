@@ -809,7 +809,7 @@ describe('account command INFO logs (via plugin)', () => {
     ).toHaveLength(0)
   })
 
-  test('custody on refuses a missing handle without touching the account file', async () => {
+  test('retired custody syntax returns usage without touching the account file', async () => {
     const storage = baseStorage()
     await saveAccounts(storage, accountPath)
     const before = await readFile(accountPath, 'utf8')
@@ -820,9 +820,8 @@ describe('account command INFO logs (via plugin)', () => {
     await executeCommand(plugin, 'claude-account', 'custody fallback-1 on')
 
     const payload = drainNotifications(0, 'ses_test').at(-1)?.payload
-    expect(payload?.text).toBe(
-      'No manifest binding or legacy handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
-    )
+    expect(payload?.text).toContain('/claude-account claustrum')
+    expect(payload?.text).toContain('/claude-account local')
     expect(await readFile(accountPath, 'utf8')).toBe(before)
     expect((await stat(accountPath)).mtimeMs).toBe(beforeMtime)
   })

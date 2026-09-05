@@ -100,7 +100,6 @@ import {
   isClaudeFable51Model,
   isClaudeFableOrMythos51Model,
   isClaudeOpus5Model,
-  isClaustrumEnabledForAccount,
   isCostZeroingEnabled,
   isCustodyTombstoneOAuth,
   isDumpPersistentlyEnabled,
@@ -109,6 +108,7 @@ import {
   isFastModeSupportedModel,
   isKillswitchEnabled,
   isOAuthAccount,
+  isOAuthAccountVaultOwned,
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
@@ -1819,9 +1819,11 @@ const anthropicAuthPlugin = async (
     return storage.accounts.filter(
       (account): account is OAuthAccount =>
         isOAuthAccount(account) &&
-        account.enabled !== false &&
-        resolveAccountCustodyHandle(account, storage).status === 'resolved' &&
-        isClaustrumEnabledForAccount(storage, account.id),
+        isOAuthAccountVaultOwned(
+          storage,
+          account,
+          resolveAccountCustodyHandle(account, storage),
+        ),
     )
   }
 
@@ -1830,16 +1832,13 @@ const anthropicAuthPlugin = async (
     storage: Awaited<ReturnType<typeof loadAccounts>>,
   ): boolean => {
     if (!storage || claustrumBlockedAccounts.has(accountId)) return false
-    if (!isClaustrumEnabledForAccount(storage, accountId)) return false
     const account = storage.accounts.find(
       (candidate): candidate is OAuthAccount =>
-        candidate.id === accountId &&
-        candidate.enabled !== false &&
-        isOAuthAccount(candidate),
+        candidate.id === accountId && isOAuthAccount(candidate),
     )
     if (!account) return false
     const resolved = resolveAccountCustodyHandle(account, storage)
-    if (resolved.status !== 'resolved') return false
+    if (!isOAuthAccountVaultOwned(storage, account, resolved)) return false
     const handle = resolved.handle
     const cached = claustrumCredentialCache?.peek(handle)
     return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
@@ -1852,7 +1851,19 @@ const anthropicAuthPlugin = async (
   ): CustodyStatusState => {
     if (account.role === 'main') return 'na'
     if (!storage) return 'off'
-    if (!isClaustrumEnabledForAccount(storage, account.id)) return 'off'
+    const stored = storage.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === account.id && isOAuthAccount(candidate),
+    )
+    if (
+      !stored ||
+      !isOAuthAccountVaultOwned(
+        storage,
+        stored,
+        resolveAccountCustodyHandle(stored, storage),
+      )
+    )
+      return 'off'
     if (claustrumReauthAccounts.has(account.id)) return 'on-vault-reauth'
     if (vaultServed) {
       return 'on-vault-served'
@@ -1904,7 +1915,7 @@ const anthropicAuthPlugin = async (
       custodyHandle.status === 'resolved' ? custodyHandle.handle : undefined
     if (
       !handle ||
-      !isClaustrumEnabledForAccount(storage, account.id) ||
+      !isOAuthAccountVaultOwned(storage, account, custodyHandle) ||
       claustrumBlockedAccounts.has(account.id)
     ) {
       return { accessToken: account.access }
@@ -2011,13 +2022,18 @@ const anthropicAuthPlugin = async (
     isFallbackAccountVaultServed,
     resolveFallbackAccessToken,
     isFallbackAccountVaultEnabled: (accountId, storage) => {
-      if (!isClaustrumEnabledForAccount(storage, accountId)) return false
       const account = storage.accounts.find(
         (candidate): candidate is OAuthAccount =>
           candidate.id === accountId && isOAuthAccount(candidate),
       )
-      if (!account || account.enabled === false) return false
-      return resolveAccountCustodyHandle(account, storage).status === 'resolved'
+      return Boolean(
+        account &&
+          isOAuthAccountVaultOwned(
+            storage,
+            account,
+            resolveAccountCustodyHandle(account, storage),
+          ),
+      )
     },
     onBackgroundRefresh: refreshVaultBackedFallbacks,
     setIntervalImpl: runtimeTimers.setInterval,
@@ -2143,14 +2159,9 @@ const anthropicAuthPlugin = async (
     let sidebarChanged = false
 
     for (const account of storage.accounts) {
-      if (
-        account.enabled === false ||
-        !isOAuthAccount(account) ||
-        !isClaustrumEnabledForAccount(storage, account.id)
-      )
-        continue
+      if (account.enabled === false || !isOAuthAccount(account)) continue
       const custodyHandle = resolveAccountCustodyHandle(account, storage)
-      if (custodyHandle.status !== 'resolved') continue
+      if (!isOAuthAccountVaultOwned(storage, account, custodyHandle)) continue
       const handle = custodyHandle.handle
       if (!cache) cache = await ensureClaustrumCredentialCache()
       if (
@@ -4522,7 +4533,13 @@ const anthropicAuthPlugin = async (
       const claustrumGate =
         account.role === 'main'
           ? ('na' as const)
-          : isClaustrumEnabledForAccount(accountStorage, account.id)
+          : stored &&
+              isOAuthAccount(stored) &&
+              isOAuthAccountVaultOwned(
+                accountStorage,
+                stored,
+                resolveAccountCustodyHandle(stored, accountStorage),
+              )
             ? ('on' as const)
             : ('off' as const)
       const custodyState = custodyStateFor(account, storage)

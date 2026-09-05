@@ -4,7 +4,10 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
-import { CustodyTombstoneRefreshError } from './claustrum.ts'
+import {
+  type CustodyHandleResolution,
+  CustodyTombstoneRefreshError,
+} from './claustrum.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
@@ -1552,6 +1555,20 @@ export function getClaustrumMode(
   return storage?.claustrum?.mode === 'claustrum' ? 'claustrum' : 'local'
 }
 
+export function isOAuthAccountVaultOwned(
+  storage: AccountStorage | null,
+  account: FallbackAccount,
+  binding: CustodyHandleResolution | undefined,
+): boolean {
+  return (
+    getClaustrumMode(storage) === 'claustrum' &&
+    isOAuthAccount(account) &&
+    account.enabled !== false &&
+    binding?.status === 'resolved' &&
+    binding.source === 'manifest'
+  )
+}
+
 export async function setClaustrumModePersistent(
   mode: ClaustrumMode,
   path = getAccountStoragePath(),
@@ -2269,7 +2286,6 @@ export function clearClaustrumRefreshErrorPersistent(
           !storage ||
           !account ||
           account.claustrumHandle !== handle ||
-          !isClaustrumEnabledForAccount(storage, accountId) ||
           !account.lastRefreshError
         ) {
           return false

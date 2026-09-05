@@ -5,8 +5,8 @@ import type {
   OAuthAccount,
 } from '../accounts.ts'
 import {
-  isClaustrumEnabledForAccount,
   isOAuthAccount,
+  isOAuthAccountVaultOwned,
   setClaustrumModePersistent,
 } from '../accounts.ts'
 import type { ClaustrumDetection } from '../claustrum.ts'
@@ -285,11 +285,19 @@ export async function executeAccountCommand(input: {
       const projected = input.statusProjection?.accounts.find(
         (account) => account.id === a.id,
       )
+      const storedAccount = input.storage.accounts.find(
+        (account) => account.id === a.id,
+      )
       const custody = custodyStatusLabel(
         projected?.custodyState ??
           (a.id === mainId
             ? 'na'
-            : isClaustrumEnabledForAccount(input.storage, a.id)
+            : storedAccount &&
+                isOAuthAccountVaultOwned(
+                  input.storage,
+                  storedAccount,
+                  undefined,
+                )
               ? 'on-cold'
               : 'off'),
       )

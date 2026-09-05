@@ -38,6 +38,7 @@ import {
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  isOAuthAccountVaultOwned,
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   type KillswitchThresholds,
@@ -6869,9 +6870,23 @@ describe('setClaustrumAccountGatePersistent', () => {
 })
 
 describe('global Claustrum mode', () => {
-  test('defaults to local when no account config exists', async () => {
+  test('defaults to local without config and does not infer custody from a tombstone', async () => {
     expect(await loadAccounts(accountPath)).toBeNull()
     expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('local')
+    expect(
+      getClaustrumMode({
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'anthropic',
+            type: 'oauth',
+            access: '',
+            refresh: 'claustrum-tombstone:v1:anthropic',
+            expires: 0,
+          },
+        ],
+      }),
+    ).toBe('local')
   })
 
   test('loads legacy custody gates as local and preserves them through save', async () => {
@@ -6895,6 +6910,18 @@ describe('global Claustrum mode', () => {
 
     const loaded = await loadAccounts(accountPath)
     expect(getClaustrumMode(loaded)).toBe('local')
+    expect(
+      isOAuthAccountVaultOwned(
+        loaded!,
+        expectOAuthAccount(loaded?.accounts[0]),
+        {
+          status: 'resolved',
+          source: 'manifest',
+          handle: 'manifest-handle',
+          credentialId: 'anthropic:work-alt',
+        },
+      ),
+    ).toBe(false)
     await saveAccounts(loaded!, accountPath)
 
     expect(
@@ -6958,6 +6985,67 @@ describe('global Claustrum mode', () => {
     const config = JSON.parse(await readFile(accountPath, 'utf8'))
     expect(config.claustrum.mode).toBe('claustrum')
     expect(config.logging.level).toBe('debug')
+  })
+
+  test('owns only enabled OAuth accounts with a resolved manifest binding in Claustrum mode', () => {
+    const binding = {
+      status: 'resolved' as const,
+      source: 'manifest' as const,
+      handle: 'manifest-handle',
+      credentialId: 'anthropic:work-alt',
+    }
+
+    for (const mode of ['local', 'claustrum'] as const) {
+      for (const enabled of [false, true]) {
+        for (const kind of ['oauth', 'api'] as const) {
+          for (const resolved of [false, true]) {
+            const account: AccountStorage['accounts'][number] =
+              kind === 'oauth'
+                ? {
+                    id: 'work-alt',
+                    type: 'oauth',
+                    refresh: 'refresh-token',
+                    enabled,
+                  }
+                : {
+                    id: 'work-alt',
+                    type: 'api',
+                    apiKey: 'api-key',
+                    baseURL: 'https://api.example.test',
+                    enabled,
+                  }
+            const storage: AccountStorage = {
+              ...baseStorage(),
+              claustrum: { mode },
+              accounts: [account],
+            }
+
+            expect(
+              isOAuthAccountVaultOwned(
+                storage,
+                account,
+                resolved ? binding : undefined,
+              ),
+            ).toBe(
+              mode === 'claustrum' && enabled && kind === 'oauth' && resolved,
+            )
+          }
+        }
+      }
+    }
+
+    expect(
+      isOAuthAccountVaultOwned(
+        { ...baseStorage(), claustrum: { mode: 'claustrum' } },
+        {
+          id: 'work-alt',
+          type: 'oauth',
+          refresh: 'refresh-token',
+          enabled: true,
+        },
+        { status: 'resolved', source: 'legacy', handle: 'legacy-handle' },
+      ),
+    ).toBe(false)
   })
 })
 
