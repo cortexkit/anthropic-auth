@@ -6867,6 +6867,34 @@ describe('setClaustrumAccountGatePersistent', () => {
 })
 
 describe('clearClaustrumHandlePersistent', () => {
+  test('clears a handle from a whitespace-padded runtime state key', async () => {
+    const accountId = 'work-alt'
+    const handle = 'padded-state-handle'
+    await saveAccounts(baseStorage(), accountPath)
+    await addAccountPersistent(
+      {
+        id: accountId,
+        type: 'oauth',
+        refresh: 'refresh',
+        claustrumHandle: handle,
+      },
+      accountPath,
+    )
+    const statePath = getAccountStatePath(accountPath)
+    const state = JSON.parse(await readFile(statePath, 'utf8'))
+    state.accounts[' work-alt'] = state.accounts[accountId]
+    delete state.accounts[accountId]
+    await writeFile(statePath, JSON.stringify(state))
+
+    expect(
+      await clearClaustrumHandlePersistent({
+        id: accountId,
+        path: accountPath,
+      }),
+    ).toBe('updated')
+    expect(await readFile(statePath, 'utf8')).not.toContain(handle)
+  })
+
   test('does not resurrect a cleared handle when a stale writer rotates tokens', async () => {
     const accountId = 'custody-handle-fence'
     const handle = 'custody-handle-fence-secret'

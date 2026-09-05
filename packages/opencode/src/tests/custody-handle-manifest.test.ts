@@ -377,6 +377,8 @@ describe('CustodyHandleManifestReader', () => {
 })
 
 describe('writeCustodyHandleManifestEntry', () => {
+  afterEach(() => __setCustodyManifestLockTestOptions())
+
   test('refuses an entry that the manifest reader would reject', async () => {
     await withTempDirectory(async (directory) => {
       const parent = join(directory, 'manifest')

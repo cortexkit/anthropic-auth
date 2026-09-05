@@ -1581,10 +1581,27 @@ export async function clearClaustrumHandlePersistent(input: {
       try {
         const storage = await loadAccounts(path)
         if (!storage) return 'missing'
+        const statePath = getAccountStatePath(path)
+        const state = (await readJsonIfPresent(statePath)).value
+        const stateAccounts =
+          isRecord(state) && isRecord(state.accounts)
+            ? state.accounts
+            : undefined
+        const matchingStateKeys = Object.keys(stateAccounts ?? {}).filter(
+          (key) => key.trim() === input.id.trim(),
+        )
         const account = storage.accounts.find(
           (candidate) => candidate.id === input.id,
         )
-        if (!account) return 'missing'
+        if (!account) {
+          if (matchingStateKeys.length === 0) return 'missing'
+          for (const key of matchingStateKeys) {
+            const stateAccount = stateAccounts?.[key]
+            if (isRecord(stateAccount)) delete stateAccount.claustrumHandle
+          }
+          await writeJsonAtomic(statePath, pruneUndefined(state))
+          return 'updated'
+        }
         if (!isOAuthAccount(account)) return 'ineligible'
         if (!account.claustrumHandle) return 'updated'
 
@@ -1594,14 +1611,12 @@ export async function clearClaustrumHandlePersistent(input: {
           ...existing,
           ...configFromStorage(storage),
         })
-        const statePath = getAccountStatePath(path)
-        const state = (await readJsonIfPresent(statePath)).value
-        if (isRecord(state) && isRecord(state.accounts)) {
-          const stateAccount = state.accounts[input.id]
-          if (isRecord(stateAccount) && 'claustrumHandle' in stateAccount) {
-            delete stateAccount.claustrumHandle
-            await writeJsonAtomic(statePath, pruneUndefined(state))
+        if (matchingStateKeys.length > 0) {
+          for (const key of matchingStateKeys) {
+            const stateAccount = stateAccounts?.[key]
+            if (isRecord(stateAccount)) delete stateAccount.claustrumHandle
           }
+          await writeJsonAtomic(statePath, pruneUndefined(state))
         }
         return 'updated'
       } finally {

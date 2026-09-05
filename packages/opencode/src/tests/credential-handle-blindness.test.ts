@@ -516,6 +516,7 @@ describe('credential-handle blindness', () => {
         },
       )
       await plugin.__fallbackRefreshReady
+      // Plugin boot reapplies the persisted logging level, so debug must be reset afterward.
       setLogLevel('debug')
       plugin.__claustrumCredentialCache.seedForTest(manifestHandle, {
         payload: JSON.stringify({}),
