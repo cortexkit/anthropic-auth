@@ -2242,6 +2242,29 @@ const anthropicAuthPlugin = async (
   const startupClaustrumAccounts = initialStorage
     ? claustrumAccounts(initialStorage)
     : []
+  const startupDuplicateOAuthLabels = new Set<string>()
+  if (initialStorage) {
+    const labels = new Map<string, number>()
+    for (const account of initialStorage.accounts) {
+      if (
+        !isOAuthAccount(account) ||
+        account.enabled === false ||
+        !account.label
+      )
+        continue
+      labels.set(account.label, (labels.get(account.label) ?? 0) + 1)
+    }
+    for (const [label, count] of labels) {
+      if (count > 1) {
+        startupDuplicateOAuthLabels.add(label)
+        logger.warn(
+          'claustrum',
+          'skipping legacy handle migration for duplicate label',
+          { label },
+        )
+      }
+    }
+  }
   if (startupClaustrumAccounts.length > 0) {
     try {
       const claustrumIdentity = {
@@ -2281,6 +2304,8 @@ const anthropicAuthPlugin = async (
                 if (
                   custodyHandle.source === 'legacy' &&
                   custodyHandleManifestStatus === 'ready' &&
+                  account.label &&
+                  !startupDuplicateOAuthLabels.has(account.label) &&
                   // Refuse malformed labels before taking the cross-tenant lock.
                   isValidCustodyLabel(account.label)
                 ) {
@@ -4034,7 +4059,12 @@ const anthropicAuthPlugin = async (
 
     // -- add-oauth-start ---------------------------------------------------
     if (action.type === 'add-oauth-start') {
-      const authResult = await authorize('max')
+      if (
+        getClaustrumMode(await loadAccounts(accountStoragePath)) === 'claustrum'
+      ) {
+        throw new Error('Exit Claustrum mode first: /claude-account local')
+      }
+      const authResult = await authorizeImpl('max')
       const entry: OAuthPendingEntry = {
         state: authResult.state,
         verifier: authResult.verifier,
@@ -4814,7 +4844,10 @@ const anthropicAuthPlugin = async (
         const auth = await getAuth()
         if (auth.type === 'oauth') {
           if (isCustodyTombstoneOAuth(auth, 'anthropic')) {
-            if (getClaustrumMode(initialStorage) === 'claustrum') {
+            if (
+              getClaustrumMode(await loadAccounts(accountStoragePath)) ===
+              'claustrum'
+            ) {
               return {
                 fetch: async () => {
                   throw new Error(

@@ -32,6 +32,7 @@ import {
   ClaudeOAuthRefreshError,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
+  custodyTombstoneOAuth,
   extractBillingHeaderCCH,
   FALLBACK_BACKGROUND_TICK_MS,
   getAccountStatePath,
@@ -1355,6 +1356,27 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'uses the current custody mode when a later loader receives a tombstone',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({ label: 'loader-current-mode', gate: false }),
+      )
+      const plugin = await getPlugin()
+      try {
+        await runCustodyCommand(plugin, 'loader-current-mode', 'claustrum')
+        await expect(
+          plugin.auth.loader(
+            () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
+            { models: {} },
+          ),
+        ).resolves.toHaveProperty('fetch')
+      } finally {
+        await plugin.dispose?.()
+      }
+    },
+  )
+
+  test.serial(
     'reports a warmed manifest-only handle as vault served',
     async () => {
       await useTempAccountFile(manifestStorage({ label: 'manifest-served' }))
@@ -1514,6 +1536,77 @@ describe('fallback Claustrum credential resolution', () => {
         await plugin.dispose?.()
       } finally {
         __setLogTestSink(null)
+      }
+    },
+  )
+
+  test.serial(
+    'keeps duplicate-label legacy handles out of the startup manifest migration',
+    async () => {
+      const label = 'duplicate-migration'
+      const firstHandle = `ckh_${'D'.repeat(43)}`
+      const secondHandle = `ckh_${'E'.repeat(43)}`
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          accounts: [
+            {
+              id: 'duplicate-a',
+              label,
+              type: 'oauth',
+              access: 'first-access',
+              refresh: 'first-refresh',
+              expires: Date.now() + 5 * 60 * 60_000,
+              claustrumHandle: firstHandle,
+            },
+            {
+              id: 'duplicate-b',
+              label,
+              type: 'oauth',
+              access: 'second-access',
+              refresh: 'second-refresh',
+              expires: Date.now() + 5 * 60 * 60_000,
+              claustrumHandle: secondHandle,
+            },
+          ],
+        }),
+      )
+      const manifestPath = await writeManifest([])
+      const restore = await configureClaustrumConnection()
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      try {
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: manifestConnector(
+            [],
+            new Map([
+              [firstHandle, 'first-vault-access'],
+              [secondHandle, 'second-vault-access'],
+            ]),
+          ),
+        })
+        const persisted = await loadAccounts()
+        expect(
+          JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
+            .accounts,
+        ).toEqual([])
+        expect(
+          persisted?.accounts.map((account) =>
+            isOAuthAccount(account) ? account.claustrumHandle : undefined,
+          ),
+        ).toEqual([firstHandle, secondHandle])
+        expect(
+          logs.filter(
+            (record) =>
+              record.message ===
+                'skipping legacy handle migration for duplicate label' &&
+              record.payload?.label === label,
+          ),
+        ).toHaveLength(1)
+        await plugin.dispose?.()
+      } finally {
+        __setLogTestSink(null)
+        restore()
       }
     },
   )

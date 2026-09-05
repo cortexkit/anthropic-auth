@@ -449,6 +449,48 @@ describe('add-oauth error paths', () => {
     expect(parsed.type).toBe('add-oauth-start')
   })
 
+  test('add-oauth-start refuses Claustrum mode before authorization', async () => {
+    const { loadAccounts, saveAccounts } = await import(
+      '@cortexkit/anthropic-auth-core'
+    )
+    const storage = (await loadAccounts(accountPath))!
+    await saveAccounts(
+      { ...storage, claustrum: { mode: 'claustrum' } },
+      accountPath,
+    )
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/authorize',
+        redirectUri: 'http://localhost/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    const plugin = await getPlugin({ authorize } as any)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: 'add-oauth-start',
+        sessionID: 'ses_claustrum_add',
+      }),
+    ).rejects.toThrow('Exit Claustrum mode first: /claude-account local')
+    expect(authorize).not.toHaveBeenCalled()
+
+    await saveAccounts(
+      { ...storage, claustrum: { mode: 'local' } },
+      accountPath,
+    )
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-oauth-start',
+      'ses_local_add',
+    )
+    expect(authorize).toHaveBeenCalledTimes(1)
+    await plugin.dispose?.()
+  })
+
   test('pending entry is always cleared after finish (even on failure)', async () => {
     // This validates the finally-block behavior:
     // After calling add-oauth-finish with a real pending entry (from a real
