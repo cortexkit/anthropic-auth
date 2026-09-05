@@ -234,7 +234,7 @@ describe('credential-handle blindness', () => {
       fallbackOn: [429],
       quota: { enabled: false },
       dump: { enabled: true },
-      claustrum: { accounts: { 'work-alt': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [fallbackAccount],
     } as never
     await saveAccounts(storage, accountPath)
@@ -328,7 +328,7 @@ describe('credential-handle blindness', () => {
       version: 1,
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { 'work-alt': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           ...accountWithHandle(),
@@ -460,7 +460,7 @@ describe('credential-handle blindness', () => {
       {
         version: 1,
         quota: { enabled: false, failClosedOnUnknownQuota: false },
-        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             id: 'work-alt',
@@ -577,7 +577,7 @@ describe('credential-handle blindness', () => {
           checkIntervalMinutes: 5,
           failClosedOnUnknownQuota: false,
         },
-        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [fallbackAccount],
       } as never,
       accountPath,
@@ -672,7 +672,7 @@ describe('credential-handle blindness', () => {
         version: 1,
         routing: { mode: 'fallback-first' },
         quota: { enabled: false, failClosedOnUnknownQuota: false },
-        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             ...accountWithHandle(),
@@ -789,7 +789,7 @@ describe('credential-handle blindness', () => {
         routing: { mode: 'main-first' },
         fallbackOn: [429],
         quota: { enabled: false, failClosedOnUnknownQuota: false },
-        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             ...accountWithHandle(),
