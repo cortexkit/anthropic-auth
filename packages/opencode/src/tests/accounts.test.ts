@@ -26,6 +26,7 @@ import {
   formatOAuthAccountTier,
   getAccountStatePath,
   getCache1hPersistentMode,
+  getClaustrumMode,
   getFallbackReauthLabels,
   getLogLevel,
   getOrCreateMainAccountId,
@@ -73,6 +74,7 @@ import {
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
   setClaustrumAccountGatePersistent,
+  setClaustrumModePersistent,
   setFastModePersistentEnabled,
   setLogLevel,
   setLogLevelPersistent,
@@ -6863,6 +6865,99 @@ describe('setClaustrumAccountGatePersistent', () => {
     ).toBe('ineligible')
     expect(await readFile(accountPath, 'utf8')).toBe(before)
     expect((await stat(accountPath)).mtimeMs).toBe(beforeStat.mtimeMs)
+  })
+})
+
+describe('global Claustrum mode', () => {
+  test('defaults to local when no account config exists', async () => {
+    expect(await loadAccounts(accountPath)).toBeNull()
+    expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('local')
+  })
+
+  test('loads legacy custody gates as local and preserves them through save', async () => {
+    const legacyAccounts = { 'work-alt': { enabled: true } }
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            refresh: 'refresh-token',
+            enabled: true,
+          },
+        ],
+        claustrum: { accounts: legacyAccounts },
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect(getClaustrumMode(loaded)).toBe('local')
+    await saveAccounts(loaded!, accountPath)
+
+    expect(
+      JSON.parse(await readFile(accountPath, 'utf8')).claustrum.accounts,
+    ).toEqual(legacyAccounts)
+  })
+
+  test('defaults invalid persisted global modes to local', async () => {
+    for (const mode of ['vault', 42, null]) {
+      await writeFile(
+        accountPath,
+        JSON.stringify({ ...baseStorage(), claustrum: { mode } }),
+        'utf8',
+      )
+      expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('local')
+    }
+  })
+
+  test('persists global mode in config and retains it through a state save', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'rotation',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1_000,
+    })
+    await saveAccounts(storage, accountPath)
+
+    expect(await setClaustrumModePersistent('claustrum', accountPath)).toBe(
+      'changed',
+    )
+    expect(await setClaustrumModePersistent('claustrum', accountPath)).toBe(
+      'unchanged',
+    )
+    expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('claustrum')
+
+    const staleStorage = (await loadAccounts(accountPath))!
+    const account = expectOAuthAccount(staleStorage.accounts[0])
+    account.access = 'rotated-access'
+    account.refresh = 'rotated-refresh'
+    account.expires = 2_000
+    await saveAccountState(staleStorage, accountPath, { accounts: true })
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(config.claustrum.mode).toBe('claustrum')
+    expect(state.claustrum?.mode).toBeUndefined()
+  })
+
+  test('serializes a mode write with another config write without losing either field', async () => {
+    await saveAccounts(baseStorage(), accountPath)
+
+    await Promise.all([
+      setClaustrumModePersistent('claustrum', accountPath),
+      setLogLevelPersistent('debug', accountPath),
+    ])
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(config.claustrum.mode).toBe('claustrum')
+    expect(config.logging.level).toBe('debug')
   })
 })
 

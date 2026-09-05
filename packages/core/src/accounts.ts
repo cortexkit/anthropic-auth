@@ -78,8 +78,12 @@ export type ClaustrumAccountGate = {
   enabled?: boolean
 }
 
+export type ClaustrumMode = 'local' | 'claustrum'
+
 export type ClaustrumConfig = {
+  mode?: ClaustrumMode
   handlesFile?: string
+  // Kept loadable so configurations remain safe to downgrade to older releases.
   accounts?: Record<string, ClaustrumAccountGate>
 }
 
@@ -897,6 +901,10 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 
 function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
   if (!isRecord(value)) return undefined
+  const mode: ClaustrumMode | undefined =
+    value.mode === 'local' || value.mode === 'claustrum'
+      ? value.mode
+      : undefined
   const handlesFile =
     typeof value.handlesFile === 'string' && value.handlesFile.trim()
       ? value.handlesFile.trim()
@@ -918,10 +926,17 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
         }),
       )
     : undefined
-  if (!handlesFile && (!accounts || Object.keys(accounts).length === 0)) {
+  if (
+    !mode &&
+    !handlesFile &&
+    (!accounts || Object.keys(accounts).length === 0) &&
+    Object.keys(value).length === 0
+  ) {
     return undefined
   }
   return {
+    ...value,
+    ...(mode && { mode }),
     ...(handlesFile && { handlesFile }),
     ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
   }
@@ -1529,6 +1544,30 @@ export function isClaustrumEnabledForAccount(
   accountId: string,
 ): boolean {
   return storage.claustrum?.accounts?.[accountId]?.enabled === true
+}
+
+export function getClaustrumMode(
+  storage: AccountStorage | null,
+): ClaustrumMode {
+  return storage?.claustrum?.mode === 'claustrum' ? 'claustrum' : 'local'
+}
+
+export async function setClaustrumModePersistent(
+  mode: ClaustrumMode,
+  path = getAccountStoragePath(),
+): Promise<'changed' | 'unchanged'> {
+  return enqueueSave(async () => {
+    const lock = await acquireAccountConfigWriteLock(path)
+    try {
+      const storage = (await loadAccounts(path)) ?? createEmptyStorage()
+      if (getClaustrumMode(storage) === mode) return 'unchanged'
+      storage.claustrum = { ...storage.claustrum, mode }
+      await saveAccountsWithConfigLock(storage, path, {})
+      return 'changed'
+    } finally {
+      await lock.release()
+    }
+  })
 }
 
 export async function setClaustrumAccountGatePersistent(input: {
