@@ -1750,22 +1750,25 @@ const anthropicAuthPlugin = async (
       result.status === 'ready' ? result.manifest : undefined
   }
 
-  function resolveAccountCustodyHandle(
-    account: OAuthAccount,
-    storage: AccountStorage,
-  ): CustodyHandleResolution {
+  function duplicateOAuthLabels(storage: AccountStorage): Set<string> {
     const labels = new Map<string, number>()
     for (const candidate of storage.accounts) {
       if (!isOAuthAccount(candidate) || !candidate.label) continue
       labels.set(candidate.label, (labels.get(candidate.label) ?? 0) + 1)
     }
-    const duplicateOAuthLabels = new Set(
+    return new Set(
       [...labels].filter(([, count]) => count > 1).map(([label]) => label),
     )
+  }
+
+  function resolveAccountCustodyHandle(
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ): CustodyHandleResolution {
     const resolution = resolveCustodyHandle({
       account,
       manifest: custodyHandleManifest,
-      duplicateOAuthLabels,
+      duplicateOAuthLabels: duplicateOAuthLabels(storage),
     })
     if (resolution.status === 'resolved' && resolution.source === 'manifest') {
       custodyHandleResolutionWarnings.delete(`${account.id}\0legacy`)
@@ -2242,27 +2245,18 @@ const anthropicAuthPlugin = async (
   const startupClaustrumAccounts = initialStorage
     ? claustrumAccounts(initialStorage)
     : []
-  const startupDuplicateOAuthLabels = new Set<string>()
+  const startupDuplicateOAuthLabels = initialStorage
+    ? duplicateOAuthLabels(initialStorage)
+    : new Set<string>()
   if (initialStorage) {
-    const labels = new Map<string, number>()
-    for (const account of initialStorage.accounts) {
-      if (
-        !isOAuthAccount(account) ||
-        account.enabled === false ||
-        !account.label
+    for (const label of startupDuplicateOAuthLabels) {
+      logger.warn(
+        'claustrum',
+        'skipping legacy handle migration for duplicate label',
+        {
+          label,
+        },
       )
-        continue
-      labels.set(account.label, (labels.get(account.label) ?? 0) + 1)
-    }
-    for (const [label, count] of labels) {
-      if (count > 1) {
-        startupDuplicateOAuthLabels.add(label)
-        logger.warn(
-          'claustrum',
-          'skipping legacy handle migration for duplicate label',
-          { label },
-        )
-      }
     }
   }
   if (startupClaustrumAccounts.length > 0) {

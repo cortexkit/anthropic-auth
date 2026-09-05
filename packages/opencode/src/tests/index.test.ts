@@ -1364,12 +1364,23 @@ describe('fallback Claustrum credential resolution', () => {
       const plugin = await getPlugin()
       try {
         await runCustodyCommand(plugin, 'loader-current-mode', 'claustrum')
+        const claustrumResult = await plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
+          { models: {} },
+        )
+        await expect(
+          claustrumResult.fetch('https://example.test', {}),
+        ).rejects.toThrow(
+          'CUSTODY_SERVE: main vault serving is not yet available',
+        )
+
+        await runCustodyCommand(plugin, 'loader-current-mode', 'local')
         await expect(
           plugin.auth.loader(
             () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
             { models: {} },
           ),
-        ).resolves.toHaveProperty('fetch')
+        ).rejects.toThrow()
       } finally {
         await plugin.dispose?.()
       }
@@ -1563,6 +1574,7 @@ describe('fallback Claustrum credential resolution', () => {
               id: 'duplicate-b',
               label,
               type: 'oauth',
+              enabled: false,
               access: 'second-access',
               refresh: 'second-refresh',
               expires: Date.now() + 5 * 60 * 60_000,

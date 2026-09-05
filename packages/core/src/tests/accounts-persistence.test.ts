@@ -43,8 +43,26 @@ test('drops a persisted non-string Claustrum handlesFile', async () => {
     }),
   )
 
-  await expect(loadAccounts(path)).resolves.toMatchObject({ claustrum: {} })
   await expect(loadAccounts(path)).resolves.not.toMatchObject({
-    claustrum: { handlesFile: expect.anything() },
+    claustrum: expect.anything(),
+  })
+})
+
+test('drops a persisted blank Claustrum handlesFile', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
+  directories.push(directory)
+  const path = join(directory, 'anthropic-auth.json')
+
+  await writeFile(
+    path,
+    JSON.stringify({
+      version: 1,
+      accounts: [],
+      claustrum: { handlesFile: '   ' },
+    }),
+  )
+
+  await expect(loadAccounts(path)).resolves.not.toMatchObject({
+    claustrum: expect.anything(),
   })
 })

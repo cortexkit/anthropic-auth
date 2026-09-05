@@ -935,7 +935,7 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
     !mode &&
     !handlesFile &&
     (!accounts || Object.keys(accounts).length === 0) &&
-    Object.keys(value).length === 0
+    Object.keys(rest).length === 0
   ) {
     return undefined
   }
