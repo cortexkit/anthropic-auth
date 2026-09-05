@@ -11,6 +11,7 @@ import {
   custodyTombstoneKey,
   custodyTombstoneOAuth,
   FallbackAccountManager,
+  fetchOAuthQuotaSnapshot,
   getAccountStatePath,
   getFallbackReauthLabels,
   isCustodyTombstoneOAuth,
@@ -22,6 +23,7 @@ import {
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
+import { setOAuthHeaders } from '../transform'
 import { extractUrl, TOKEN_URL } from './test-fetch'
 
 const fixtureDir = join(import.meta.dir, 'fixtures', 'claustrum-golden')
@@ -215,7 +217,7 @@ describe('Claustrum custody tombstones', () => {
     expect(tokenEndpointCalls).toEqual([])
   })
 
-  test('refuses tombstone access before constructing an OAuth header', async () => {
+  test('refuses sentinel access during direct requests', async () => {
     const messageAuthorizations: string[] = []
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
       const url = extractUrl(input as string | URL | Request)
@@ -266,6 +268,36 @@ describe('Claustrum custody tombstones', () => {
         await plugin.dispose?.()
       },
     )
+  })
+
+  test('refuses a tombstone before the quota poll fetch', async () => {
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+
+    await expect(
+      fetchOAuthQuotaSnapshot({
+        accessToken: custodyTombstoneKey('openai'),
+        fetchImpl,
+      }),
+    ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  test('refuses a tombstone before CacheKeep prewarm headers', () => {
+    expect(() =>
+      setOAuthHeaders(new Headers(), custodyTombstoneKey('openai'), {
+        body: { model: 'claude-sonnet-4-5' },
+      }),
+    ).toThrow(CustodyTombstoneRefreshError)
+  })
+
+  test('refuses a tombstone before Prime fire headers', () => {
+    expect(() =>
+      setOAuthHeaders(new Headers(), custodyTombstoneKey('openai'), {
+        body: { model: 'claude-haiku-4-5' },
+      }),
+    ).toThrow(CustodyTombstoneRefreshError)
   })
 
   test('preserves validated superseded handles in the parsed manifest', () => {
@@ -490,10 +522,11 @@ describe('Claustrum custody tombstones', () => {
     })
 
     await createTempStorage(makeStorage('claustrum'), async () => {
+      const timers = disabledTimerOverrides()
       const plugin = (await AnthropicAuthPlugin(
         // @ts-expect-error: minimal mock for testing
         { client: createMockClient() },
-        disabledTimerOverrides(),
+        timers,
       )) as any
       await expect(
         plugin.auth.loader(
