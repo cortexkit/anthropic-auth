@@ -291,6 +291,16 @@ If Anthropic reports `invalid_grant`, that account must be logged in again. `/cl
 
 OpenCode can obtain an opted-in fallback OAuth account's access credential from a local [Claustrum](https://github.com/cortexkit/claustrum) daemon instead of refreshing that account independently. After provisioning the account's runtime handle, enable custody by account ID:
 
+Custody handles are resolved from Claustrum's shared handle manifest. Set `$CLAUSTRUM_OPENCODE_HANDLES` to override its path; otherwise it is `${XDG_CONFIG_HOME:-~/.config}/cortexkit/opencode-handles.json`. `claustrum.handlesFile` in `anthropic-auth.json` overrides both. The plugin uses the `provider: "anthropic"`, `serve: "anthropic-auth"` block and matches `credential_id` to `oauth:anthropic:<label>`. Fallback labels must be unique and match `^[a-z0-9][a-z0-9._-]{0,63}$`.
+
+Onboard a fallback once:
+
+1. Run `ck auth mint-handle …`; Claustrum prints the handle.
+2. Store it once through the existing handle-store path.
+3. Run `/claude-account custody <id> on`; OpenCode verifies the handle against the vault and writes the manifest entry.
+
+The legacy state-file `claustrumHandle` remains supported and is migrated into the manifest after a successful `custody on`. A handle minted after boot is picked up on the next custody tick. A foreign `serve` block is ignored with one warning. The manifest must be a user-owned regular file with mode `0600`, a safe parent, and no more than 256 KiB; unsafe files are treated as absent with one warning. Writers serialize through `<manifest>.lock`, shared with Claustrum's CLI.
+
 ```json
 {
   "claustrum": {
@@ -312,6 +322,7 @@ Pi accepts the command but refuses it with `Custody is OpenCode-only in this ver
 
 Custody currently applies only to fallback OAuth accounts. Main-account vault service is not implemented. If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state.
 
+For a vault-latched account, recover it with `ck auth login --id oauth:anthropic:<label>`. Custody remains fallback-only and OpenCode-only.
 ## Quota-aware routing
 
 When `quota.enabled` is true, the plugin checks Anthropic's OAuth usage endpoint and applies the configured remaining-quota thresholds to both main and fallback accounts.

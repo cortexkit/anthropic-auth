@@ -7,6 +7,7 @@ import {
   CustodyHandleManifestReader,
   readCustodyHandles,
   resolveCustodyHandle,
+  writeCustodyHandleManifestEntry,
 } from '@cortexkit/anthropic-auth-core'
 import { loadGoldenCustodyManifest } from './custody-handle-manifest.fixture.ts'
 
@@ -47,6 +48,24 @@ function reader(path: string, expectedUid?: number) {
     serve: 'anthropic-auth',
     expectedUid,
   })
+}
+
+const writerHandle = `ckh_${'D'.repeat(43)}`
+const replacementWriterHandle = `ckh_${'E'.repeat(43)}`
+const writerEntry = {
+  label: 'writer',
+  handle: writerHandle,
+  credentialId: 'oauth:anthropic:writer',
+}
+
+function serialize(value: unknown): string {
+  return JSON.stringify(value, null, 2)
+}
+
+function temporaryFiles(parent: string): Promise<string[]> {
+  return fs
+    .readdir(parent)
+    .then((names) => names.filter((name) => name.endsWith('.tmp')))
 }
 
 async function expectInvalid(
@@ -349,6 +368,325 @@ describe('CustodyHandleManifestReader', () => {
       await expectInvalid(manifestReader.read(), 'manifest mode must be 0600')
       expect(openSpy).toHaveBeenCalledTimes(2)
     })
+  })
+})
+
+describe('writeCustodyHandleManifestEntry', () => {
+  test('round-trips foreign provider blocks without changing their serialized JSON', async () => {
+    await withManifest(fixtureText, async (path) => {
+      const before = fixture.providers
+        .filter(
+          (provider) =>
+            provider.provider !== 'anthropic' ||
+            provider.serve !== 'anthropic-auth',
+        )
+        .map(serialize)
+
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({
+        status: 'written',
+      })
+
+      const after = JSON.parse(
+        await fs.readFile(path, 'utf8'),
+      ) as typeof fixture
+      expect(
+        after.providers
+          .filter(
+            (provider) =>
+              provider.provider !== 'anthropic' ||
+              provider.serve !== 'anthropic-auth',
+          )
+          .map(serialize),
+      ).toEqual(before)
+    })
+  })
+
+  test('inserts our entry into an absent manifest file', async () => {
+    await withTempDirectory(async (directory) => {
+      const parent = join(directory, 'manifest')
+      const path = join(parent, 'handles.json')
+      await fs.mkdir(parent)
+      await fs.chmod(parent, 0o700)
+
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({
+        status: 'written',
+      })
+      expect(JSON.parse(await fs.readFile(path, 'utf8'))).toEqual({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: writerEntry.label,
+                handle: writerEntry.handle,
+                credential_id: writerEntry.credentialId,
+              },
+            ],
+          },
+        ],
+      })
+    })
+  })
+
+  test('adds our block when no anthropic-auth block exists', async () => {
+    const input = {
+      version: 1,
+      providers: [
+        {
+          provider: 'deepseek',
+          serve: 'opencode-claustrum',
+          accounts: [],
+        },
+      ],
+    }
+    await withManifest(serialize(input), async (path) => {
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({
+        status: 'written',
+      })
+      const output = JSON.parse(await fs.readFile(path, 'utf8')) as typeof input
+      expect(output.providers).toHaveLength(2)
+      expect(output.providers[1]).toMatchObject({
+        provider: 'anthropic',
+        serve: 'anthropic-auth',
+      })
+    })
+  })
+
+  test('replaces a matching label without creating a second entry', async () => {
+    await withManifest(fixtureText, async (path) => {
+      await expect(
+        writeCustodyHandleManifestEntry({
+          path,
+          entry: {
+            ...writerEntry,
+            label: 'work-alt',
+            handle: replacementWriterHandle,
+          },
+        }),
+      ).resolves.toEqual({ status: 'written' })
+
+      const output = JSON.parse(
+        await fs.readFile(path, 'utf8'),
+      ) as typeof fixture
+      const ours = output.providers.find(
+        (provider) =>
+          provider.provider === 'anthropic' &&
+          provider.serve === 'anthropic-auth',
+      )
+      expect(
+        ours?.accounts.filter((entry) => entry.label === 'work-alt'),
+      ).toEqual([
+        {
+          label: 'work-alt',
+          handle: replacementWriterHandle,
+          credential_id: 'oauth:anthropic:writer',
+        },
+      ])
+    })
+  })
+
+  test('leaves bytes, mtime, and temporary files unchanged for an idempotent entry', async () => {
+    await withManifest(fixtureText, async (path) => {
+      await writeCustodyHandleManifestEntry({ path, entry: writerEntry })
+      const before = await fs.readFile(path, 'utf8')
+      const beforeStats = await fs.lstat(path)
+
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({
+        status: 'unchanged',
+      })
+
+      expect(await fs.readFile(path, 'utf8')).toBe(before)
+      expect((await fs.lstat(path)).mtimeMs).toBe(beforeStats.mtimeMs)
+      expect(await temporaryFiles(dirname(path))).toEqual([])
+    })
+  })
+
+  test('preserves a foreign anthropic serve while adding our anthropic-auth block', async () => {
+    const foreign = {
+      provider: 'anthropic',
+      serve: 'foreign-serve',
+      accounts: [
+        { label: 'foreign', handle: writerHandle, credential_id: 'foreign:id' },
+      ],
+    }
+    await withManifest(
+      serialize({ version: 1, providers: [foreign] }),
+      async (path) => {
+        await writeCustodyHandleManifestEntry({ path, entry: writerEntry })
+
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<Record<string, unknown>>
+        }
+        expect(output.providers).toHaveLength(2)
+        expect(serialize(output.providers[0])).toBe(serialize(foreign))
+        expect(output.providers[1]).toMatchObject({
+          provider: 'anthropic',
+          serve: 'anthropic-auth',
+        })
+      },
+    )
+  })
+
+  test('refuses unowned and unsafe parent directories without writing', async () => {
+    await withTempDirectory(async (directory) => {
+      const parent = join(directory, 'manifest')
+      const path = join(parent, 'handles.json')
+      await fs.mkdir(parent)
+      await fs.chmod(parent, 0o777)
+
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({
+        status: 'refused',
+        reason: 'manifest parent is world-writable',
+      })
+      expect(await temporaryFiles(parent)).toEqual([])
+      await expect(fs.lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await fs.chmod(parent, 0o700)
+      await expect(
+        writeCustodyHandleManifestEntry({
+          path,
+          entry: writerEntry,
+          expectedUid: (process.getuid?.() ?? 0) + 1,
+        }),
+      ).resolves.toEqual({
+        status: 'refused',
+        reason: 'manifest parent owner does not match',
+      })
+      expect(await temporaryFiles(parent)).toEqual([])
+    })
+  })
+
+  test('refuses an entry whose serialized manifest would exceed 256 KiB', async () => {
+    const padding = 'x'.repeat(256 * 1024 - 250)
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          {
+            provider: 'deepseek',
+            serve: 'opencode-claustrum',
+            accounts: [],
+            padding,
+          },
+        ],
+      }),
+      async (path) => {
+        const before = await fs.readFile(path, 'utf8')
+        await expect(
+          writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toEqual({
+          status: 'refused',
+          reason: 'manifest exceeds maximum size',
+        })
+        expect(await fs.readFile(path, 'utf8')).toBe(before)
+        expect(await temporaryFiles(dirname(path))).toEqual([])
+      },
+    )
+  })
+
+  test('keeps the original target intact when rename fails during atomic publication', async () => {
+    await withManifest(fixtureText, async (path) => {
+      const before = await fs.readFile(path, 'utf8')
+      spyOn(fs, 'rename').mockRejectedValue(
+        Object.assign(new Error('rename failed'), { code: 'EIO' }),
+      )
+
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({
+        status: 'refused',
+        reason: 'unreadable (EIO)',
+      })
+
+      expect(await fs.readFile(path, 'utf8')).toBe(before)
+      expect(await temporaryFiles(dirname(path))).toEqual([])
+    })
+  })
+
+  test('opens a 0600 temporary file before atomically writing a 0600 target', async () => {
+    await withManifest(fixtureText, async (path) => {
+      const originalOpen = fs.open
+      const openSpy = spyOn(fs, 'open').mockImplementation(originalOpen)
+
+      await writeCustodyHandleManifestEntry({ path, entry: writerEntry })
+
+      const temporaryOpen = openSpy.mock.calls.find(([target]) =>
+        String(target).endsWith('.tmp'),
+      )
+      const [, flags, mode] = temporaryOpen ?? []
+      expect((Number(flags) & fsConstants.O_CREAT) !== 0).toBe(true)
+      expect((Number(flags) & fsConstants.O_EXCL) !== 0).toBe(true)
+      expect((Number(flags) & fsConstants.O_WRONLY) !== 0).toBe(true)
+      expect(mode).toBe(0o600)
+      expect(Number((await fs.lstat(path)).mode) & 0o777).toBe(0o600)
+    })
+  })
+
+  test('redacts handle bytes from refusal reasons', async () => {
+    const canary = `ckh_${'F'.repeat(43)}`
+    await withManifest(`{"version":1,"${canary}":`, async (path) => {
+      const result = await writeCustodyHandleManifestEntry({
+        path,
+        entry: writerEntry,
+      })
+      expect(result.status).toBe('refused')
+      if (result.status !== 'refused')
+        throw new Error('expected writer refusal')
+      expect(result.reason.includes(canary)).toBe(false)
+    })
+  })
+
+  test('preserves existing superseded data without writing it for a replacement', async () => {
+    const superseded = `ckh_${'G'.repeat(43)}`
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: writerEntry.label,
+                handle: writerHandle,
+                credential_id: writerEntry.credentialId,
+                superseded: [superseded],
+              },
+            ],
+          },
+        ],
+      }),
+      async (path) => {
+        await writeCustodyHandleManifestEntry({
+          path,
+          entry: { ...writerEntry, handle: replacementWriterHandle },
+        })
+
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<{ accounts: Array<Record<string, unknown>> }>
+        }
+        expect(output.providers[0]?.accounts).toEqual([
+          {
+            label: writerEntry.label,
+            handle: replacementWriterHandle,
+            credential_id: writerEntry.credentialId,
+            superseded: [superseded],
+          },
+        ])
+      },
+    )
   })
 })
 

@@ -195,7 +195,13 @@ export type CustodyHandleManifest = {
 }
 
 export type CustodyHandleResolution =
-  | { status: 'resolved'; source: 'manifest' | 'legacy'; handle: string }
+  | {
+      status: 'resolved'
+      source: 'manifest'
+      handle: string
+      credentialId: string
+    }
+  | { status: 'resolved'; source: 'legacy'; handle: string }
   | {
       status: 'unresolved'
       reason:
@@ -281,7 +287,12 @@ export function resolveCustodyHandle(input: {
   if (manifest.superseded.has(entry.handle)) {
     return { status: 'unresolved', reason: 'superseded' }
   }
-  return { status: 'resolved', source: 'manifest', handle: entry.handle }
+  return {
+    status: 'resolved',
+    source: 'manifest',
+    handle: entry.handle,
+    credentialId: entry.credentialId,
+  }
 }
 
 export function readCustodyHandles(
@@ -540,6 +551,314 @@ export class CustodyHandleManifestReader {
     } finally {
       await handle?.close().catch(() => {})
     }
+  }
+}
+
+export type CustodyHandleManifestWriteResult =
+  | { status: 'written' | 'unchanged' }
+  | { status: 'refused'; reason: string }
+
+export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
+export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
+export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
+
+let custodyManifestLockTestOptions:
+  | Partial<{
+      ttlMs: number
+      retryMinMs: number
+      retryMaxMs: number
+    }>
+  | undefined
+
+export function __setCustodyManifestLockTestOptions(
+  options?: Partial<{
+    ttlMs: number
+    retryMinMs: number
+    retryMaxMs: number
+  }>,
+) {
+  custodyManifestLockTestOptions = options
+}
+
+class CustodyManifestLockBusyError extends Error {}
+
+export async function withCustodyManifestLock<T>(
+  path: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${path}.lock`
+  const now = Date.now
+  const ttlMs =
+    custodyManifestLockTestOptions?.ttlMs ?? CUSTODY_MANIFEST_LOCK_TTL_MS
+  const retryMinMs =
+    custodyManifestLockTestOptions?.retryMinMs ??
+    CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS
+  const retryMaxMs =
+    custodyManifestLockTestOptions?.retryMaxMs ??
+    CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS
+  const startedAt = now()
+
+  async function claim() {
+    try {
+      await fs.mkdir(lockPath, { mode: 0o700 })
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error
+      return false
+    }
+    await fs.writeFile(
+      join(lockPath, 'owner'),
+      `${JSON.stringify({
+        tenant: 'anthropic-auth',
+        pid: process.pid,
+        claimed_at_ms: now(),
+      })}\n`,
+      { encoding: 'utf8', mode: 0o600 },
+    )
+    return true
+  }
+
+  const deadline = startedAt + ttlMs
+  let claimed = false
+  while (!claimed) {
+    claimed = await claim()
+    if (claimed) break
+
+    let ownerClaimedAtMs: number | undefined
+    try {
+      const owner = JSON.parse(
+        await fs.readFile(join(lockPath, 'owner'), 'utf8'),
+      )
+      if (
+        isRecord(owner) &&
+        typeof owner.claimed_at_ms === 'number' &&
+        Number.isFinite(owner.claimed_at_ms)
+      ) {
+        ownerClaimedAtMs = owner.claimed_at_ms
+      }
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') continue
+      throw error
+    }
+    if (
+      ownerClaimedAtMs !== undefined &&
+      ownerClaimedAtMs + ttlMs <= startedAt
+    ) {
+      const claimedPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.stale`
+      try {
+        await fs.rename(lockPath, claimedPath)
+      } catch (error) {
+        if (errorCode(error) !== 'ENOENT') throw error
+      }
+      await fs.rm(claimedPath, { recursive: true, force: true }).catch(() => {})
+      continue
+    }
+    if (now() >= deadline)
+      throw new CustodyManifestLockBusyError('manifest lock busy')
+    const retryMs =
+      retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
+    await Bun.sleep(Math.min(retryMs, Math.max(1, deadline - now())))
+  }
+
+  const renewal = setInterval(
+    () => {
+      void fs.utimes(lockPath, new Date(), new Date()).catch(() => {})
+    },
+    Math.floor(CUSTODY_MANIFEST_LOCK_TTL_MS / 3),
+  )
+  if ('unref' in renewal) renewal.unref()
+  try {
+    return await fn()
+  } finally {
+    clearInterval(renewal)
+    await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+type CustodyHandleManifestWriteInput = {
+  path: string
+  entry: CustodyHandleAccount
+  expectedUid?: number
+}
+
+function refusal(
+  reason: string,
+): Extract<CustodyHandleManifestWriteResult, { status: 'refused' }> {
+  return { status: 'refused', reason }
+}
+
+function isOurManifestBlock(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    value.provider === 'anthropic' &&
+    value.serve === 'anthropic-auth'
+  )
+}
+
+export async function writeCustodyHandleManifestEntry(
+  input: CustodyHandleManifestWriteInput,
+): Promise<CustodyHandleManifestWriteResult> {
+  try {
+    return await withCustodyManifestLock(input.path, () =>
+      writeCustodyHandleManifestEntryLocked(input),
+    )
+  } catch (error) {
+    if (error instanceof CustodyManifestLockBusyError) {
+      return refusal('manifest lock busy')
+    }
+    return refusal(`unreadable (${errorCode(error)})`)
+  }
+}
+
+async function writeCustodyHandleManifestEntryLocked(
+  input: CustodyHandleManifestWriteInput,
+): Promise<CustodyHandleManifestWriteResult> {
+  const expectedUid = input.expectedUid ?? process.getuid?.() ?? userInfo().uid
+  const parent = dirname(input.path)
+  try {
+    const parentReason = validateManifestParent(
+      await fs.lstat(parent),
+      expectedUid,
+    )
+    if (parentReason) return refusal(parentReason)
+  } catch (error) {
+    return refusal(`unreadable (${errorCode(error)})`)
+  }
+
+  let document: Record<string, unknown>
+  let handle: fs.FileHandle | undefined
+  try {
+    const pathStats = await fs.lstat(input.path)
+    const pathReason = validateManifestFile(pathStats, expectedUid)
+    if (pathReason) return refusal(pathReason)
+
+    handle = await fs.open(
+      input.path,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    )
+    const openedReason = validateManifestFile(await handle.stat(), expectedUid)
+    if (openedReason) return refusal(openedReason)
+
+    const bytes = new Uint8Array(MAX_CUSTODY_MANIFEST_BYTES + 1)
+    const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, 0)
+    if (bytesRead > MAX_CUSTODY_MANIFEST_BYTES)
+      return refusal('manifest exceeds maximum size')
+
+    const parsed = parseJsonRedacted(
+      new TextDecoder().decode(bytes.subarray(0, bytesRead)),
+    )
+    if (
+      !isRecord(parsed) ||
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.providers)
+    ) {
+      return refusal('invalid manifest')
+    }
+    document = parsed
+
+    if (parsed.providers.some(isOurManifestBlock)) {
+      try {
+        readCustodyHandles(parsed, 'anthropic', 'anthropic-auth')
+      } catch {
+        return refusal('invalid manifest')
+      }
+    }
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') {
+      document = { version: 1, providers: [] }
+    } else if (error instanceof SyntaxError) {
+      return refusal('invalid JSON')
+    } else {
+      return refusal(`unreadable (${errorCode(error)})`)
+    }
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+
+  const providers = document.providers
+  if (!Array.isArray(providers)) return refusal('invalid manifest')
+  const blockIndex = providers.findIndex(isOurManifestBlock)
+  let nextProviders: unknown[]
+  if (blockIndex === -1) {
+    nextProviders = [
+      ...providers,
+      {
+        provider: 'anthropic',
+        serve: 'anthropic-auth',
+        accounts: [
+          {
+            label: input.entry.label,
+            handle: input.entry.handle,
+            credential_id: input.entry.credentialId,
+          },
+        ],
+      },
+    ]
+  } else {
+    const block = providers[blockIndex]
+    if (!isOurManifestBlock(block) || !Array.isArray(block.accounts))
+      return refusal('invalid manifest')
+    const matching = block.accounts.filter(
+      (account) => isRecord(account) && account.label === input.entry.label,
+    )
+    if (
+      matching.length === 1 &&
+      matching[0]?.handle === input.entry.handle &&
+      matching[0]?.credential_id === input.entry.credentialId
+    ) {
+      return { status: 'unchanged' }
+    }
+    const replacement = {
+      ...(matching.find(isRecord) ?? {}),
+      label: input.entry.label,
+      handle: input.entry.handle,
+      credential_id: input.entry.credentialId,
+    }
+    const accounts = block.accounts.flatMap((account) =>
+      isRecord(account) && account.label === input.entry.label ? [] : [account],
+    )
+    const firstMatch = block.accounts.findIndex(
+      (account) => isRecord(account) && account.label === input.entry.label,
+    )
+    accounts.splice(
+      firstMatch === -1 ? accounts.length : firstMatch,
+      0,
+      replacement,
+    )
+    nextProviders = providers.map((provider, index) =>
+      index === blockIndex ? { ...block, accounts } : provider,
+    )
+  }
+
+  const serialized = JSON.stringify(
+    { ...document, providers: nextProviders },
+    null,
+    2,
+  )
+  if (
+    new TextEncoder().encode(serialized).byteLength > MAX_CUSTODY_MANIFEST_BYTES
+  ) {
+    return refusal('manifest exceeds maximum size')
+  }
+
+  const temporaryPath = `${input.path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+  let temporaryHandle: fs.FileHandle | undefined
+  try {
+    temporaryHandle = await fs.open(
+      temporaryPath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+      0o600,
+    )
+    await temporaryHandle.writeFile(serialized)
+    await temporaryHandle.sync()
+    await temporaryHandle.close()
+    temporaryHandle = undefined
+    await fs.rename(temporaryPath, input.path)
+    return { status: 'written' }
+  } catch (error) {
+    return refusal(`unreadable (${errorCode(error)})`)
+  } finally {
+    await temporaryHandle?.close().catch(() => {})
+    await fs.unlink(temporaryPath).catch(() => {})
   }
 }
 
