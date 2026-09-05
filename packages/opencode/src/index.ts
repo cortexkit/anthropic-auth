@@ -179,7 +179,6 @@ import {
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
-  setClaustrumModePersistent,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModeEnabled,
@@ -4161,18 +4160,6 @@ const anthropicAuthPlugin = async (
             )
           : undefined,
       statusProjection,
-      transition: async (mode) => {
-        const changed = await setClaustrumModePersistent(
-          mode,
-          accountStoragePath,
-        )
-        return {
-          text:
-            changed === 'unchanged'
-              ? `Claustrum mode already ${mode}.`
-              : `Claustrum mode set to ${mode}.`,
-        }
-      },
     })
 
     if (result.updated) {
