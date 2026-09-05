@@ -84,7 +84,7 @@ afterAll(() => {
 })
 
 describe('claude-account persistence', () => {
-  test('refuses custody without changing Pi config or state', async () => {
+  test('refuses global custody modes without changing Pi config or state', async () => {
     const initial = {
       version: 1,
       claustrum: { accounts: { unrelated: { enabled: true } } },
@@ -109,12 +109,12 @@ describe('claude-account persistence', () => {
     const handler = commands.get('claude-account')?.handler
     const { ctx, notified } = mockNotify()
 
-    await handler!('custody oauth-work on', ctx)
-    await handler!('custody oauth-work off', ctx)
+    await handler!('claustrum', ctx)
+    await handler!('local', ctx)
 
     expect(notified).toEqual([
-      'Claustrum manifest service is OpenCode-only in this version.',
-      'Claustrum manifest service is OpenCode-only in this version.',
+      'Custody mode is managed from OpenCode; Pi does not participate.',
+      'Custody mode is managed from OpenCode; Pi does not participate.',
     ])
     expect(await readFile(accountPath, 'utf8')).toBe(beforeConfig)
     expect(await readFile(statePath, 'utf8')).toBe(beforeState)

@@ -4163,6 +4163,7 @@ const anthropicAuthPlugin = async (
     const result = await executeAccountCommand({
       argumentsText,
       storage: storage ?? { version: 1, accounts: [] },
+      path: accountStoragePath,
       claustrum:
         action.type === 'status' && !statusProjection
           ? await detectClaustrumConnection(

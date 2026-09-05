@@ -273,6 +273,10 @@ export function registerCommands(pi: ExtensionAPI) {
       const result = await executeAccountCommand({
         argumentsText: args ?? '',
         storage: storage ?? createEmptyStorage(),
+        path,
+        transition: async () => ({
+          text: 'Custody mode is managed from OpenCode; Pi does not participate.',
+        }),
         custody: {
           platform: 'unsupported',
           reason:

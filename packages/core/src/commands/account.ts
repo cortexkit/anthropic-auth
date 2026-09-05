@@ -1,9 +1,14 @@
 import type {
   AccountStorage,
+  ClaustrumMode,
   FallbackAccount,
   OAuthAccount,
 } from '../accounts.ts'
-import { isClaustrumEnabledForAccount, isOAuthAccount } from '../accounts.ts'
+import {
+  isClaustrumEnabledForAccount,
+  isOAuthAccount,
+  setClaustrumModePersistent,
+} from '../accounts.ts'
 import type { ClaustrumDetection } from '../claustrum.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
@@ -11,6 +16,7 @@ export const CLAUDE_ACCOUNT_COMMAND_NAME = 'claude-account'
 
 export type AccountCommandAction =
   | { type: 'status' }
+  | { type: 'claustrum-mode'; mode: ClaustrumMode }
   | { type: 'custody'; id: string; enabled: boolean }
   | { type: 'enable'; id: string }
   | { type: 'disable'; id: string }
@@ -57,6 +63,10 @@ export type AccountCommandResult = {
   }
 }
 
+export type ClaustrumModeTransition = (
+  mode: ClaustrumMode,
+) => Promise<AccountCommandResult>
+
 export function parseAccountCommandAction(
   argumentsText: string,
 ): AccountCommandAction {
@@ -72,21 +82,12 @@ export function parseAccountCommandAction(
   if (action === 'move-up' && rest) return { type: 'move-up', id: rest }
   if (action === 'move-down' && rest) return { type: 'move-down', id: rest }
   if (action === 'reset-backoff' && !rest) return { type: 'reset-backoff' }
-  const custodyId = parts[1]
-  const custodyState = parts[2]
-  if (
-    action === 'custody' &&
-    parts.length === 3 &&
-    custodyId !== undefined &&
-    (custodyState === 'on' || custodyState === 'off')
-  ) {
-    return {
-      type: 'custody',
-      id: custodyId,
-      enabled: custodyState === 'on',
-    }
+  if (action === 'claustrum' && !rest) {
+    return { type: 'claustrum-mode', mode: 'claustrum' }
   }
-
+  if (action === 'local' && !rest) {
+    return { type: 'claustrum-mode', mode: 'local' }
+  }
   if (action === 'add-apikey' && rest) {
     let remaining = rest
     let baseURL: string | undefined
@@ -245,7 +246,8 @@ const USAGE_TEXT = [
   '  /claude-account enable <id>           Enable a fallback account',
   '  /claude-account disable <id>          Disable a fallback account',
   '  /claude-account remove <id>           Remove a fallback account',
-  '  /claude-account custody <id> on|off    Set fallback custody gate',
+  '  /claude-account claustrum             Enable Claustrum mode',
+  '  /claude-account local                 Enable local mode',
   '  /claude-account move-up <id>          Move a fallback account up',
   '  /claude-account move-down <id>        Move a fallback account down',
   '  /claude-account reset-backoff          Clear main OAuth refresh and quota backoff',
@@ -260,6 +262,8 @@ export async function executeAccountCommand(input: {
   claustrum?: ClaustrumDetection
   custody?: AccountCustodyCapability
   statusProjection?: AccountCommandStatusProjection
+  path?: string
+  transition?: ClaustrumModeTransition
 }): Promise<AccountCommandResult> {
   const action = parseAccountCommandAction(input.argumentsText)
   const accounts = input.storage.accounts
@@ -299,6 +303,21 @@ export async function executeAccountCommand(input: {
 
   if (action.type === 'usage') {
     return { text: USAGE_TEXT }
+  }
+
+  if (action.type === 'claustrum-mode') {
+    const transition =
+      input.transition ??
+      (async (mode) => {
+        const result = await setClaustrumModePersistent(mode, input.path)
+        return {
+          text:
+            result === 'changed'
+              ? `Claustrum mode set to ${mode}.`
+              : `Claustrum mode already ${mode}.`,
+        }
+      })
+    return transition(action.mode)
   }
 
   if (action.type === 'add-apikey') {
