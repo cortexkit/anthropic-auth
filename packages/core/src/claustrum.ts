@@ -417,7 +417,8 @@ function validateManifestParent(
 ): string | null {
   const mode = Number(stats.mode)
   if (stats.uid !== expectedUid) return 'manifest parent owner does not match'
-  if ((mode & 0o002) !== 0 && (mode & 0o1000) === 0) {
+  if ((mode & 0o1000) !== 0) return null
+  if ((mode & 0o002) !== 0) {
     return 'manifest parent is world-writable'
   }
   return null
@@ -577,6 +578,7 @@ let custodyManifestLockTestOptions:
       retryMaxMs: number
       renewalIntervalMs: number
       afterStaleOwnerRead: () => void | Promise<void>
+      beforeRename: () => void | Promise<void>
     }>
   | undefined
 
@@ -587,6 +589,7 @@ export function __setCustodyManifestLockTestOptions(
     retryMaxMs: number
     renewalIntervalMs: number
     afterStaleOwnerRead: () => void | Promise<void>
+    beforeRename: () => void | Promise<void>
   }>,
 ) {
   custodyManifestLockTestOptions = options
@@ -646,7 +649,7 @@ function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
 
 export async function withCustodyManifestLock<T>(
   path: string,
-  fn: (assertLease: () => Promise<void>) => Promise<T>,
+  fn: (assertLease: () => Promise<void>, nonce: string) => Promise<T>,
 ): Promise<T> {
   const lockPath = `${path}.lock`
   const now = Date.now
@@ -794,7 +797,7 @@ export async function withCustodyManifestLock<T>(
   )
   if ('unref' in renewal) renewal.unref()
   try {
-    return await fn(assertLease)
+    return await fn(assertLease, nonce)
   } finally {
     clearInterval(renewal)
     if (!(await ownsCurrentLease())) {
@@ -841,8 +844,8 @@ export async function writeCustodyHandleManifestEntry(
     return refusal('invalid entry')
   }
   try {
-    return await withCustodyManifestLock(input.path, (assertLease) =>
-      writeCustodyHandleManifestEntryLocked(input, assertLease),
+    return await withCustodyManifestLock(input.path, (assertLease, nonce) =>
+      writeCustodyHandleManifestEntryLocked(input, assertLease, nonce),
     )
   } catch (error) {
     if (error instanceof CustodyManifestLockBusyError) {
@@ -861,6 +864,7 @@ export async function writeCustodyHandleManifestEntry(
 async function writeCustodyHandleManifestEntryLocked(
   input: CustodyHandleManifestWriteInput,
   assertLease: () => Promise<void>,
+  lockNonce: string,
 ): Promise<CustodyHandleManifestWriteResult> {
   const expectedUid = input.expectedUid ?? process.getuid?.() ?? userInfo().uid
   const parent = dirname(input.path)
@@ -990,7 +994,10 @@ async function writeCustodyHandleManifestEntryLocked(
     return refusal('manifest exceeds maximum size')
   }
 
-  const temporaryPath = `${input.path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+  // Eviction renames the lock directory, so its temp follows the evicted owner
+  // into quarantine instead of remaining able to overwrite a successor's manifest.
+  // Quarantine reclaim deletes the evicted temp; it contains ids, never secrets.
+  const temporaryPath = join(`${input.path}.lock`, `manifest.${lockNonce}.tmp`)
   let temporaryHandle: fs.FileHandle | undefined
   try {
     temporaryHandle = await fs.open(
@@ -1003,7 +1010,16 @@ async function writeCustodyHandleManifestEntryLocked(
     await temporaryHandle.close()
     temporaryHandle = undefined
     await assertLease()
-    await fs.rename(temporaryPath, input.path)
+    await custodyManifestLockTestOptions?.beforeRename?.()
+    try {
+      await fs.rename(temporaryPath, input.path)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT')
+        throw new CustodyManifestLockLeaseLostError(
+          'manifest lock renewal failed; write aborted',
+        )
+      throw error
+    }
     return { status: 'written' }
   } catch (error) {
     if (error instanceof CustodyManifestLockLeaseLostError) throw error

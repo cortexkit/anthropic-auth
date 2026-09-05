@@ -666,6 +666,95 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('publishes through a temporary file in its lock directory and leaves no temporary files', async () => {
+    await withManifest(fixtureText, async (path) => {
+      const originalRename = fs.rename
+      const renamedFrom: string[] = []
+      spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        if (String(to) === path) renamedFrom.push(String(from))
+        return originalRename(from, to)
+      })
+
+      await expect(
+        writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toEqual({ status: 'written' })
+
+      expect(renamedFrom).toHaveLength(1)
+      expect(dirname(renamedFrom[0] ?? '')).toBe(`${path}.lock`)
+      expect(await temporaryFiles(dirname(path))).toEqual([])
+      await expect(fs.lstat(`${path}.lock`)).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+    })
+  })
+
+  test.serial(
+    "an evicted writer's rename fails and cannot overwrite the successor's manifest",
+    async () => {
+      await withManifest(fixtureText, async (path) => {
+        const lockPath = `${path}.lock`
+        const originalNow = Date.now
+        const beforeRename = Promise.withResolvers<void>()
+        const resumeA = Promise.withResolvers<void>()
+        let now = 0
+        let aNonce: string | undefined
+        let pauseA = true
+        Date.now = () => now
+        __setCustodyManifestLockTestOptions({
+          ttlMs: 100,
+          retryMinMs: 1,
+          retryMaxMs: 1,
+          renewalIntervalMs: 1_000,
+          beforeRename: async () => {
+            if (!pauseA) return
+            pauseA = false
+            aNonce = JSON.parse(
+              await fs.readFile(join(lockPath, 'owner'), 'utf8'),
+            ).nonce
+            beforeRename.resolve()
+            await resumeA.promise
+          },
+        } as never)
+        try {
+          const a = writeCustodyHandleManifestEntry({
+            path,
+            entry: writerEntry,
+          })
+          await beforeRename.promise
+
+          now = 101
+          const successorEntry = {
+            ...writerEntry,
+            handle: replacementWriterHandle,
+          }
+          await expect(
+            writeCustodyHandleManifestEntry({ path, entry: successorEntry }),
+          ).resolves.toEqual({ status: 'written' })
+          resumeA.resolve()
+          await expect(a).resolves.toEqual({
+            status: 'refused',
+            reason: 'manifest lock renewal failed; write aborted',
+            code: 'renewal_failed',
+          })
+          expect(await fs.readFile(path, 'utf8')).toContain(
+            replacementWriterHandle,
+          )
+          expect(await fs.readFile(path, 'utf8')).not.toContain(writerHandle)
+          expect(aNonce).toBeDefined()
+          await expect(
+            fs.lstat(`${lockPath}.stale-0-${aNonce}/manifest.${aNonce}.tmp`),
+          ).resolves.toBeDefined()
+          await expect(fs.lstat(`${path}.tmp`)).rejects.toMatchObject({
+            code: 'ENOENT',
+          })
+        } finally {
+          resumeA.resolve()
+          Date.now = originalNow
+        }
+      })
+    },
+  )
+
   test.serial('aborts publication after a renewal failure', async () => {
     await withManifest(fixtureText, async (path) => {
       const before = await fs.readFile(path, 'utf8')
@@ -689,7 +778,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         const handle = await originalOpen(...args)
         if (
           String(args[0]).endsWith('.tmp') &&
-          !String(args[0]).startsWith(`${lockPath}/`)
+          String(args[0]).startsWith(`${lockPath}/`)
         ) {
           await Bun.sleep(40)
         }
@@ -753,7 +842,7 @@ describe('writeCustodyHandleManifestEntry', () => {
           const handle = await originalOpen(...args)
           if (
             String(args[0]).endsWith('.tmp') &&
-            !String(args[0]).startsWith(`${lockPath}/`)
+            String(args[0]).startsWith(`${lockPath}/`)
           ) {
             await Bun.sleep(40)
           }
