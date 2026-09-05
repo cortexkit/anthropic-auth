@@ -11,6 +11,7 @@ import {
   custodyTombstoneKey,
   custodyTombstoneOAuth,
   FallbackAccountManager,
+  fetchOAuthAccountProfile,
   fetchOAuthQuotaSnapshot,
   getAccountStatePath,
   getFallbackReauthLabels,
@@ -280,6 +281,20 @@ describe('Claustrum custody tombstones', () => {
 
     await expect(
       fetchOAuthQuotaSnapshot({
+        accessToken: custodyTombstoneKey('openai'),
+        fetchImpl,
+      }),
+    ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  test('refuses a tombstone before the profile fetch', async () => {
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+
+    await expect(
+      fetchOAuthAccountProfile({
         accessToken: custodyTombstoneKey('openai'),
         fetchImpl,
       }),

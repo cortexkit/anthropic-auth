@@ -1,4 +1,5 @@
 import type { OAuthAccountProfile } from './accounts.ts'
+import { assertNotCustodyTombstone } from './claustrum.ts'
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 
@@ -11,6 +12,8 @@ export async function fetchOAuthAccountProfile(input: {
   now?: () => number
   signal?: AbortSignal
 }): Promise<OAuthAccountProfile> {
+  // The bearer value is guarded where it becomes a header, like every other builder.
+  assertNotCustodyTombstone(input.accessToken, 'anthropic')
   const response = await (input.fetchImpl ?? fetch)(PROFILE_URL, {
     method: 'GET',
     signal: input.signal,
