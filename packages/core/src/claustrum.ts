@@ -150,6 +150,21 @@ export function custodyTombstoneKey(provider: string): string {
   return `${CUSTODY_TOMBSTONE_PREFIX}${provider}`
 }
 
+export function custodyTombstoneOAuth(provider: string): {
+  type: 'oauth'
+  access: ''
+  refresh: string
+  expires: 0
+} {
+  // An empty access value makes Claustrum's deployed sealer reject this loader marker.
+  return {
+    type: 'oauth',
+    access: '',
+    refresh: custodyTombstoneKey(provider),
+    expires: 0,
+  }
+}
+
 export function isCustodyTombstoneValue(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith(CUSTODY_TOMBSTONE_PREFIX)
 }
@@ -159,8 +174,7 @@ export function isCustodyTombstoneOAuth(
   provider: string,
 ): boolean {
   if (!isRecord(auth) || auth.type !== 'oauth') return false
-  const key = custodyTombstoneKey(provider)
-  return auth.refresh === key && auth.access === key
+  return auth.refresh === custodyTombstoneKey(provider)
 }
 
 export class CustodyTombstoneRefreshError extends Error {
@@ -171,6 +185,15 @@ export class CustodyTombstoneRefreshError extends Error {
       `${provider} main slot is vault-custodied; local refresh is forbidden — the vault-served main path is not yet implemented`,
     )
     this.name = 'CustodyTombstoneRefreshError'
+  }
+}
+
+export class CustodyTombstoneLoginError extends Error {
+  readonly code = 'custody_tombstone_login'
+
+  constructor(public readonly provider: string) {
+    super(`${provider} main slot is custodied; run /login to sign in locally`)
+    this.name = 'CustodyTombstoneLoginError'
   }
 }
 
