@@ -2058,7 +2058,7 @@ describe('fallback Claustrum credential resolution', () => {
       await useTempAccountFile(
         fallbackWithClaustrum({
           claustrumHandle: 'terminal-route-open',
-          claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+          claustrum: { mode: 'claustrum' },
         }),
       )
       const logs: LogTestRecord[] = []
@@ -2133,7 +2133,7 @@ describe('fallback Claustrum credential resolution', () => {
       await useTempAccountFile(
         fallbackWithClaustrum({
           claustrumHandle: 'latched-warm-backoff',
-          claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+          claustrum: { mode: 'claustrum' },
         }),
       )
       let now = 0
@@ -2196,7 +2196,7 @@ describe('fallback Claustrum credential resolution', () => {
   test('background refresh leaves a live vault account untouched while refreshing a plain control', async () => {
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-live-refresh-gate',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     const vaultAccount = storage.accounts[0] as OAuthAccount
     vaultAccount.expires = Date.now() - 1
@@ -2269,7 +2269,7 @@ describe('fallback Claustrum credential resolution', () => {
     const handle = 'handle-routing-race'
     const storage = createFallbackStorage({
       routing: { mode: 'main-first' },
-      claustrum: { accounts: { [accountId]: { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: accountId,
@@ -2311,7 +2311,7 @@ describe('fallback Claustrum credential resolution', () => {
     const accountId = 'credential-race'
     const handle = 'handle-credential-race'
     const storage = createFallbackStorage({
-      claustrum: { accounts: { [accountId]: { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: accountId,
@@ -2359,7 +2359,7 @@ describe('fallback Claustrum credential resolution', () => {
     const handle = 'handle-clear-control'
     await useTempAccountFile(
       createFallbackStorage({
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             id: accountId,
@@ -2399,7 +2399,7 @@ describe('fallback Claustrum credential resolution', () => {
       createFallbackStorage({
         routing: { mode: 'fallback-first' },
         quota: { enabled: false, failClosedOnUnknownQuota: false },
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             id: accountId,
@@ -2504,7 +2504,7 @@ describe('fallback Claustrum credential resolution', () => {
     const controlError = persistedRefreshError(controlId)
     await useTempAccountFile(
       createFallbackStorage({
-        claustrum: { accounts: { [controlId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         accounts: [
           {
             id: plainId,
@@ -2571,7 +2571,7 @@ describe('fallback Claustrum credential resolution', () => {
     const now = Date.now()
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-rotated-sidecar',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     const account = storage.accounts[0] as OAuthAccount
     account.expires = now - 1
@@ -2633,7 +2633,7 @@ describe('fallback Claustrum credential resolution', () => {
     let claustrumClock = 0
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-expired-resident',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     const account = storage.accounts[0] as OAuthAccount
     account.expires = Date.now() - 1
@@ -2730,7 +2730,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { 'vault-recovered': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-recovered',
@@ -2857,7 +2857,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { [accountId]: { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: accountId,
@@ -3232,7 +3232,7 @@ describe('fallback Claustrum credential resolution', () => {
         const { plugin } = await loadFallbackWithConnector(
           fallbackWithClaustrum({
             claustrumHandle: 'handle-empty-setting',
-            claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+            claustrum: { mode: 'claustrum' },
           } as never),
           connector,
           new Response('{}', { status: 200 }),
@@ -3254,7 +3254,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-enabled',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get')
@@ -3286,7 +3286,7 @@ describe('fallback Claustrum credential resolution', () => {
     const malformedPayload = JSON.stringify({ kind: 'opaque-credential' })
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-malformed-payload',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get') {
@@ -3320,7 +3320,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = fallbackWithClaustrum({
       routing: { mode: 'fallback-first' },
       claustrumHandle: 'handle-transient-backoff',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get') {
@@ -3352,7 +3352,7 @@ describe('fallback Claustrum credential resolution', () => {
   test('production cache construction supplies a bind identity to vault calls', async () => {
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-production-identity',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     await useTempAccountFile(storage)
     const wireCalls: Array<{
@@ -3416,7 +3416,7 @@ describe('fallback Claustrum credential resolution', () => {
         },
         mainQuotaCheckedAt: Date.now(),
       },
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'fallback-1',
@@ -3521,7 +3521,7 @@ describe('fallback Claustrum credential resolution', () => {
     const slowRefresh = deferred()
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-slow',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let credentialGets = 0
     const connector = connectorFor(calls, async (method) => {
@@ -3564,7 +3564,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'fallback-1',
@@ -3604,7 +3604,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-wedged',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, async (method) => {
       if (method === 'credential.get') await new Promise<void>(() => {})
@@ -3653,7 +3653,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-stale-marked',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let releaseWarm!: () => void
     const warmGate = new Promise<void>((resolve) => {
@@ -3711,7 +3711,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get')
@@ -3743,7 +3743,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-relay-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never) as AccountStorage
     storage.relay = {
       enabled: true,
@@ -3838,7 +3838,7 @@ describe('fallback Claustrum credential resolution', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'sticky-relay-vault': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'sticky-relay-vault',
@@ -3963,7 +3963,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-raced-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let credentialGets = 0
     const connector = connectorFor(calls, (method) => {
@@ -4021,7 +4021,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-outage',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, () => {
       throw new Error('vault unavailable')
@@ -4078,7 +4078,7 @@ describe('fallback Claustrum credential resolution', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'fallback-1',
@@ -4164,7 +4164,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-sidecar-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, () => {
       throw new Error('vault unavailable')
@@ -4190,7 +4190,7 @@ describe('fallback Claustrum credential resolution', () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-expired-sidecar-401',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, () =>
       credentialResponse('vault-expiring-access', 61, 1_010),
@@ -4245,7 +4245,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = createFallbackStorage({
       routing: { mode: 'main-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { accounts: { 'vault-only': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-only',
@@ -4356,7 +4356,7 @@ describe('fallback Claustrum credential resolution', () => {
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-stale-resident-401',
       expires: Date.now() + 5 * 60 * 60 * 1000,
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     } as never)
     let credentialGets = 0
     let releaseRefresh!: () => void
@@ -6076,7 +6076,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -6145,7 +6145,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = sidecarRefresh
@@ -6201,7 +6201,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -6255,7 +6255,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -6340,7 +6340,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = localRefresh
@@ -6579,7 +6579,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     globalThis.fetch = mock((input: unknown) =>
@@ -6663,7 +6663,7 @@ describe('AnthropicAuthPlugin', () => {
             claustrumHandle: handle,
           },
         ],
-        claustrum: { accounts: { [accountId]: { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
       }),
     )
     const newerSnapshot = await loadAccounts()
@@ -13787,7 +13787,7 @@ describe('auth.loader', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'vault-only-sticky': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-only-sticky',
@@ -13918,7 +13918,7 @@ describe('auth.loader', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { accounts: { 'vault-sticky': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
       accounts: [
         {
           id: 'vault-sticky',
@@ -19571,7 +19571,7 @@ describe('killswitch fetch gate', () => {
             failClosedOnUnknownQuota: false,
           },
           killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
-          claustrum: { accounts: { [accountId]: { enabled: true } } },
+          claustrum: { mode: 'claustrum' },
           accounts: [
             {
               id: accountId,
