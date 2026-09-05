@@ -159,7 +159,7 @@ describe('parseAccountCommandAction', () => {
   })
 
   test('recognizes only global mode verbs and rejects retired custody vocabulary', async () => {
-    const cases: Array<[string, unknown]> = [
+    const cases = [
       ['claustrum', { type: 'claustrum-mode', mode: 'claustrum' }],
       ['local', { type: 'claustrum-mode', mode: 'local' }],
       ['custody fallback-1 on', { type: 'usage' }],
@@ -168,8 +168,8 @@ describe('parseAccountCommandAction', () => {
       ['off', { type: 'usage' }],
     ]
 
-    for (const [input, expected] of cases) {
-      expect(parseAccountCommandAction(input)).toEqual(expected)
+    for (const [input, expected] of cases as Array<[string, unknown]>) {
+      expect(parseAccountCommandAction(input)).toEqual(expected as never)
     }
   })
 

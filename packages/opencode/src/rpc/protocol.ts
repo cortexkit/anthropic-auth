@@ -31,6 +31,8 @@ export interface AccountDialogAccount {
 export interface AccountDialogKnobs {
   accounts: AccountDialogAccount[]
   claustrumDetection: string
+  custodyMode?: 'local' | 'claustrum'
+  custodyModeKnown?: boolean
   [key: string]: unknown
 }
 

@@ -178,6 +178,7 @@ import {
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
   setClaustrumAccountGatePersistent,
+  setClaustrumModePersistent,
   setDumpEnabled,
   setDumpPersistentEnabled,
   setFastModeEnabled,
@@ -1839,6 +1840,7 @@ const anthropicAuthPlugin = async (
     if (!account) return false
     const resolved = resolveAccountCustodyHandle(account, storage)
     if (!isOAuthAccountVaultOwned(storage, account, resolved)) return false
+    if (resolved.status !== 'resolved') return false
     const handle = resolved.handle
     const cached = claustrumCredentialCache?.peek(handle)
     return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
@@ -2162,6 +2164,7 @@ const anthropicAuthPlugin = async (
       if (account.enabled === false || !isOAuthAccount(account)) continue
       const custodyHandle = resolveAccountCustodyHandle(account, storage)
       if (!isOAuthAccountVaultOwned(storage, account, custodyHandle)) continue
+      if (custodyHandle.status !== 'resolved') continue
       const handle = custodyHandle.handle
       if (!cache) cache = await ensureClaustrumCredentialCache()
       if (
@@ -4182,6 +4185,18 @@ const anthropicAuthPlugin = async (
             )
           : undefined,
       statusProjection,
+      transition: async (mode) => {
+        const changed = await setClaustrumModePersistent(
+          mode,
+          accountStoragePath,
+        )
+        return {
+          text:
+            changed === 'unchanged'
+              ? `Claustrum mode already ${mode}.`
+              : `Claustrum mode set to ${mode}.`,
+        }
+      },
       custody: {
         platform: 'opencode',
         async set({ account, storage, enabled }) {

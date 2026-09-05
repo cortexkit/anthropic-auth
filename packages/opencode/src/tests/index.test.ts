@@ -973,6 +973,14 @@ describe('fallback Claustrum credential resolution', () => {
 
   function fallbackWithClaustrum(overrides?: Record<string, unknown>) {
     const { claustrum, ...accountOverrides } = overrides ?? {}
+    const claustrumConfig =
+      claustrum && typeof claustrum === 'object'
+        ? (() => {
+            const { accounts: _legacyAccounts, ...config } =
+              claustrum as Record<string, unknown>
+            return { ...config, mode: 'claustrum' }
+          })()
+        : { mode: 'claustrum' }
     const account = {
       id: 'fallback-1',
       type: 'oauth' as const,
@@ -984,7 +992,7 @@ describe('fallback Claustrum credential resolution', () => {
     return createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: claustrum as AccountStorage['claustrum'],
+      claustrum: claustrumConfig as AccountStorage['claustrum'],
       accounts: [account as OAuthAccount],
     })
   }
@@ -1088,9 +1096,7 @@ describe('fallback Claustrum credential resolution', () => {
       label: input.label,
       enabled: true,
       ...(input.legacy && { claustrumHandle: input.legacy }),
-      claustrum: {
-        accounts: { [id]: { enabled: input.gate ?? true } },
-      },
+      claustrum: { mode: input.gate === false ? 'local' : 'claustrum' },
       ...(input.enabled === false && { enabled: false }),
     })
   }
