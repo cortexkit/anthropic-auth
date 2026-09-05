@@ -1078,6 +1078,7 @@ describe('fallback Claustrum credential resolution', () => {
     id?: string
     label: string
     enabled?: boolean
+    gate?: boolean
     legacy?: string
   }) {
     const id = input.id ?? 'fallback-1'
@@ -1551,7 +1552,6 @@ describe('fallback Claustrum credential resolution', () => {
     id?: string
     label: string
     handle: string
-    gate?: boolean
     gate?: boolean
     connector?: (
       calls: CredentialCall[],
