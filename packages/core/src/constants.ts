@@ -9,6 +9,7 @@ export const CODE_CALLBACK_URL =
   'https://platform.claude.com/oauth/code/callback'
 
 export const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
+export const CUSTODY_HANDLE_PATTERN = /^ckh_[A-Za-z0-9_-]{43}$/
 
 export const AXIOS_USER_AGENT = 'axios/1.15.2'
 

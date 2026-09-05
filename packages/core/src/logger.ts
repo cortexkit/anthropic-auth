@@ -1,6 +1,7 @@
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { CUSTODY_HANDLE_PATTERN } from './constants.ts'
 
 // -- Level ----------------------------------------------------------------
 
@@ -91,7 +92,7 @@ function rotateLogFile(): void {
 // -- Redaction ------------------------------------------------------------
 
 export const SECRET_KEY_EXACT =
-  /^(authorization|x-api-key|cookie|set-cookie|refresh|access|token)$/i
+  /^(authorization|x-api-key|cookie|set-cookie|refresh|access|token|handle)$/i
 
 export function isSecretKey(key: string): boolean {
   if (SECRET_KEY_EXACT.test(key)) return true
@@ -106,6 +107,7 @@ const REDACT_VALUE_PATTERNS = [
   /Bearer\s+\S+/,
   /sk-[A-Za-z0-9-]+/,
   /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/,
+  CUSTODY_HANDLE_PATTERN,
 ]
 
 function isRedactableValue(value: unknown): boolean {

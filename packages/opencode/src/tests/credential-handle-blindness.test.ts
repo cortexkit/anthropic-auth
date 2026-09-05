@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import {
+  chmod,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -8,11 +15,14 @@ import {
   dumpDirectRequest,
   dumpRelayRequest,
   dumpResponseArtifact,
+  getLogLevel,
   resetDumpState,
   saveAccountState,
   saveAccounts,
   setDumpEnabled,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
+
 import { AnthropicAuthPlugin } from '../index'
 import { startRpcServer } from '../rpc/rpc-server'
 import {
@@ -411,6 +421,123 @@ describe('credential-handle blindness', () => {
       ).toBe(false)
     } finally {
       __setLogTestSink(null)
+    }
+  })
+
+  test('manifest-source vault-unusable logs stay blind to the custody handle', async () => {
+    const manifestHandle = `ckh_${'M'.repeat(43)}`
+    const accountDir = await mkdtemp(
+      join(tmpdir(), 'opencode-handle-manifest-unusable-'),
+    )
+    accountDirs.push(accountDir)
+    const accountPath = join(accountDir, 'anthropic-auth.json')
+    const manifestPath = join(accountDir, 'handles.json')
+    const previousManifestPath = process.env.CLAUSTRUM_OPENCODE_HANDLES
+    const previousLogLevel = getLogLevel()
+    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'work',
+                handle: manifestHandle,
+                credential_id: 'oauth:anthropic:work',
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    await chmod(manifestPath, 0o600)
+    await saveAccounts(
+      {
+        version: 1,
+        quota: { enabled: false, failClosedOnUnknownQuota: false },
+        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            label: 'work',
+            refresh: 'refresh-token-not-for-use',
+            enabled: true,
+            access: 'fallback-access',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      } as never,
+      accountPath,
+    )
+    const logs: Array<Record<string, unknown>> = []
+    setLogLevel('debug')
+    __setLogTestSink((record) => logs.push(record as Record<string, unknown>))
+    const intervalHandlers: Array<() => unknown> = []
+    let credentialGets = 0
+    const connector = async () =>
+      ({
+        call: async (_moduleId: string, method: string) => {
+          if (method !== 'credential.get')
+            throw new Error(`unexpected method: ${method}`)
+          credentialGets += 1
+          return {
+            result: {
+              payload: Array.from(new TextEncoder().encode(JSON.stringify({}))),
+              expires_at_ms: Date.now() + 5 * 60 * 60 * 1000,
+              record_version: 1,
+            },
+          }
+        },
+        close: () => {},
+      }) as never
+    try {
+      const plugin = await (
+        AnthropicAuthPlugin as unknown as (
+          ctx: { client: unknown },
+          runtimeOverrides: {
+            claustrumConnector: typeof connector
+            setInterval: typeof setInterval
+          },
+        ) => Promise<any>
+      )(
+        { client: { auth: { set: mock(() => Promise.resolve()) } } },
+        {
+          claustrumConnector: connector,
+          setInterval: mock((handler: () => unknown) => {
+            intervalHandlers.push(handler)
+            return { unref() {} } as never
+          }) as never,
+        },
+      )
+      await plugin.__fallbackRefreshReady
+      setLogLevel('debug')
+      plugin.__claustrumCredentialCache.seedForTest(manifestHandle, {
+        payload: JSON.stringify({}),
+        expiresAtMs: Date.now() + 5 * 60 * 60 * 1000,
+        recordVersion: 2,
+      })
+      expect(intervalHandlers.length).toBeGreaterThan(0)
+      await Promise.all(intervalHandlers.map((handler) => handler()))
+      await plugin.dispose?.()
+
+      expect(credentialGets).toBeGreaterThan(0)
+      const unusable = logs.find(
+        (record) => record.message === 'vault fallback credential unusable',
+      )
+      expect(unusable).toBeDefined()
+      expect(JSON.stringify(unusable)).not.toContain(manifestHandle)
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(previousLogLevel)
+      if (previousManifestPath === undefined)
+        delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+      else process.env.CLAUSTRUM_OPENCODE_HANDLES = previousManifestPath
     }
   })
 

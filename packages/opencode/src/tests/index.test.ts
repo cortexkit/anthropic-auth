@@ -1579,7 +1579,207 @@ describe('fallback Claustrum credential resolution', () => {
   }
 
   test.serial(
-    'refuses a fresh manifest lock after its bounded wait and keeps the legacy handle',
+    're-migrates a legacy handle after a crash leaves custody already on',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({
+          label: 'retry-migration',
+          legacy: legacyHandle,
+          gate: true,
+        }),
+      )
+      const manifestPath = await writeManifest([])
+      const restore = await configureClaustrumConnection()
+      const calls: CredentialCall[] = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          calls,
+          new Map([[legacyHandle, 'retry-migration-access']]),
+        ),
+      })
+      try {
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'retry-migration',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toBe('Custody already on for fallback-1.')
+        expect(
+          JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
+            .accounts,
+        ).toContainEqual({
+          label: 'retry-migration',
+          handle: legacyHandle,
+          credential_id: 'oauth:anthropic:retry-migration',
+        })
+        expect(
+          await readFile(
+            getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+            'utf8',
+          ),
+        ).not.toContain(legacyHandle)
+      } finally {
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
+    'clears a crash-left state handle when custody on resolves from the manifest',
+    async () => {
+      const label = 'manifest-state-cleanup'
+      await useTempAccountFile(manifestStorage({ label, gate: true }))
+      await writeManifest([{ label, handle: manifestHandle }])
+      const restore = await configureClaustrumConnection()
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([[manifestHandle, 'manifest-state-cleanup-access']]),
+        ),
+      })
+      try {
+        await plugin.__fallbackRefreshReady
+        const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const storage = JSON.parse(await readFile(path, 'utf8')) as {
+          accounts: Array<Record<string, unknown>>
+        }
+        const account = storage.accounts.find(
+          (candidate) => candidate.id === 'fallback-1',
+        )!
+        account.claustrumHandle = legacyHandle
+        await writeFile(path, JSON.stringify(storage))
+        expect(await readFile(path, 'utf8')).toContain(legacyHandle)
+
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'manifest-state-cleanup',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toBe('Custody already on for fallback-1.')
+        expect(await readFile(path, 'utf8')).not.toContain(legacyHandle)
+      } finally {
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
+    'clears a crash-left manifest-resolved state handle on the custody tick',
+    async () => {
+      const label = 'manifest-tick-cleanup'
+      await useTempAccountFile(manifestStorage({ label, gate: true }))
+      await writeManifest([{ label, handle: manifestHandle }])
+      const restore = await configureClaustrumConnection()
+      const intervalHandlers: Array<() => void> = []
+      const plugin = await getPlugin(undefined, undefined, {
+        setInterval: mock((handler: () => void) => {
+          intervalHandlers.push(handler)
+          return { unref() {} }
+        }) as unknown as typeof setInterval,
+        clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([[manifestHandle, 'manifest-tick-cleanup-access']]),
+        ),
+      })
+      try {
+        await plugin.__fallbackRefreshReady
+        const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const storage = JSON.parse(await readFile(path, 'utf8')) as {
+          accounts: Array<Record<string, unknown>>
+        }
+        const account = storage.accounts.find(
+          (candidate) => candidate.id === 'fallback-1',
+        )!
+        account.claustrumHandle = legacyHandle
+        delete account.access
+        delete account.expires
+        await writeFile(path, JSON.stringify(storage))
+        expect(await readFile(path, 'utf8')).toContain(legacyHandle)
+
+        expect(intervalHandlers.length).toBeGreaterThan(0)
+        for (const handler of intervalHandlers) handler()
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if (!(await readFile(path, 'utf8')).includes(legacyHandle)) break
+          await Bun.sleep(10)
+        }
+        expect(await readFile(path, 'utf8')).not.toContain(legacyHandle)
+      } finally {
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
+    'skips an invalid-label legacy migration without disabling custody',
+    async () => {
+      await useTempAccountFile(
+        manifestStorage({
+          label: 'Work',
+          legacy: legacyHandle,
+          gate: false,
+        }),
+      )
+      const manifestPath = await writeManifest([])
+      const restore = await configureClaustrumConnection()
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([[legacyHandle, 'invalid-label-access']]),
+        ),
+      })
+      try {
+        expect(
+          (
+            await runCustodyCommand(
+              plugin,
+              'invalid-label-migration',
+              'custody fallback-1 on',
+            )
+          )?.text,
+        ).toBe('Custody on for fallback-1 (vault-served).')
+        expect(
+          JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
+            .accounts,
+        ).toEqual([])
+        expect(
+          await readFile(
+            getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+            'utf8',
+          ),
+        ).toContain(legacyHandle)
+        expect(
+          (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
+        ).toBe(true)
+        expect(
+          logs.some(
+            (record) =>
+              record.message === 'custody manifest migration skipped' &&
+              record.payload?.id === 'fallback-1' &&
+              record.payload?.reason === 'invalid-label',
+          ),
+        ).toBe(true)
+      } finally {
+        __setLogTestSink(null)
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
+
+  test.serial(
+    'reports a corrupt manifest lock after its bounded wait and keeps the legacy handle',
     async () => {
       await withShortManifestLockTiming(async () => {
         const { manifestPath, plugin, restore } =
@@ -1611,7 +1811,7 @@ describe('fallback Claustrum credential resolution', () => {
             logs.some(
               (record) =>
                 record.message === 'custody manifest write failed' &&
-                record.payload?.reason === 'manifest lock busy',
+                record.payload?.reason === 'manifest lock owner invalid',
             ),
           ).toBe(true)
           expect(
@@ -1640,7 +1840,11 @@ describe('fallback Claustrum credential resolution', () => {
       await mkdir(lockPath, { mode: 0o700 })
       await writeFile(
         join(lockPath, 'owner'),
-        `${JSON.stringify({ claimed_at_ms: Date.now() - 1_000, tenant: 'test' })}\n`,
+        `${JSON.stringify({
+          claimed_at_ms: Date.now() - 1_000,
+          nonce: 'stale-test',
+          tenant: 'test',
+        })}\n`,
       )
       const originalRename = fs.rename
       const staleRenames: string[] = []
@@ -1661,8 +1865,7 @@ describe('fallback Claustrum credential resolution', () => {
           )?.text,
         ).toContain('Custody on')
         expect(staleRenames).toHaveLength(1)
-        expect(staleRenames[0]).toStartWith(`${lockPath}.`)
-        expect(staleRenames[0]).toEndWith('.stale')
+        expect(staleRenames[0]).toMatch(/\.lock\.stale-\d+-[A-Za-z0-9_-]+$/)
       } finally {
         rename.mockRestore()
         await plugin.dispose?.()

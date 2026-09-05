@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
@@ -17,7 +18,9 @@ import {
   type SubscribeOptions,
   type Subscription,
 } from '@cortexkit/subc-client'
+
 import type { ClaustrumConfig, OAuthAccount } from './accounts.ts'
+import { CUSTODY_HANDLE_PATTERN } from './constants.ts'
 import { parseJsonRedacted } from './json'
 import { logger } from './logger'
 
@@ -222,11 +225,9 @@ type ParsedCustodyHandleManifest = {
 }
 
 const CUSTODY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
-// The suffix is base64url for 256 CSPRNG bits; its charset is not fixture-derived.
-const CUSTODY_HANDLE_PATTERN = /^ckh_[A-Za-z0-9_-]{43}$/
 const RESERVED_CUSTODY_IDS = new Set(['__proto__', 'constructor', 'prototype'])
 
-function isCustodyId(value: unknown): value is string {
+export function isValidCustodyLabel(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     CUSTODY_ID_PATTERN.test(value) &&
@@ -236,6 +237,10 @@ function isCustodyId(value: unknown): value is string {
 
 export function isValidCustodyHandle(value: unknown): value is string {
   return typeof value === 'string' && CUSTODY_HANDLE_PATTERN.test(value)
+}
+
+function isValidCustodyCredentialId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
 }
 
 function legacyOrUnresolved(
@@ -259,6 +264,7 @@ function legacyOrUnresolved(
  * | absent or invalid | present | legacy handle |
  * | no matching ready entry | present | legacy handle |
  * | foreign serve | any | unresolved |
+ * | superseded matching entry | any | unresolved |
  */
 export function resolveCustodyHandle(input: {
   account: OAuthAccount
@@ -270,7 +276,7 @@ export function resolveCustodyHandle(input: {
     return { status: 'unresolved', reason: 'foreign-serve' }
   }
   if (!account.label) return legacyOrUnresolved(account, 'missing-label')
-  if (!isCustodyId(account.label)) {
+  if (!isValidCustodyLabel(account.label)) {
     return legacyOrUnresolved(account, 'invalid-label')
   }
   if (duplicateOAuthLabels?.has(account.label)) {
@@ -300,7 +306,7 @@ export function readCustodyHandles(
   provider: string,
   serve: string,
 ): ParsedCustodyHandleManifest {
-  if (!isCustodyId(provider)) {
+  if (!isValidCustodyLabel(provider)) {
     throw new Error('invalid manifest provider')
   }
   if (
@@ -341,7 +347,7 @@ export function readCustodyHandles(
         !Object.hasOwn(entry, 'handle') ||
         !Object.hasOwn(entry, 'credential_id') ||
         typeof entry.label !== 'string' ||
-        !isCustodyId(entry.label)
+        !isValidCustodyLabel(entry.label)
       )
         throw new Error('invalid account label')
       if (
@@ -350,10 +356,7 @@ export function readCustodyHandles(
       ) {
         throw new Error('invalid account handle')
       }
-      if (
-        typeof entry.credential_id !== 'string' ||
-        entry.credential_id.length === 0
-      ) {
+      if (!isValidCustodyCredentialId(entry.credential_id)) {
         throw new Error('invalid account credential id')
       }
       if (Object.hasOwn(entry, 'superseded')) {
@@ -556,9 +559,14 @@ export class CustodyHandleManifestReader {
 
 export type CustodyHandleManifestWriteResult =
   | { status: 'written' | 'unchanged' }
-  | { status: 'refused'; reason: string }
+  | {
+      status: 'refused'
+      reason: string
+      code?: CustodyManifestLockErrorCode
+    }
 
 export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
+export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
 export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
 export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
 
@@ -567,6 +575,8 @@ let custodyManifestLockTestOptions:
       ttlMs: number
       retryMinMs: number
       retryMaxMs: number
+      renewalIntervalMs: number
+      afterStaleOwnerRead: () => void | Promise<void>
     }>
   | undefined
 
@@ -575,16 +585,68 @@ export function __setCustodyManifestLockTestOptions(
     ttlMs: number
     retryMinMs: number
     retryMaxMs: number
+    renewalIntervalMs: number
+    afterStaleOwnerRead: () => void | Promise<void>
   }>,
 ) {
   custodyManifestLockTestOptions = options
 }
 
-class CustodyManifestLockBusyError extends Error {}
+export const CUSTODY_MANIFEST_LOCK_ERROR_CODES = [
+  'lock_busy',
+  'owner_invalid',
+  'renewal_failed',
+] as const
+
+export type CustodyManifestLockErrorCode =
+  (typeof CUSTODY_MANIFEST_LOCK_ERROR_CODES)[number]
+
+export class CustodyManifestLockError extends Error {
+  constructor(
+    message: string,
+    readonly code: CustodyManifestLockErrorCode,
+  ) {
+    super(message)
+  }
+}
+
+export class CustodyManifestLockBusyError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'lock_busy')
+  }
+}
+
+export class CustodyManifestLockOwnerInvalidError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'owner_invalid')
+  }
+}
+
+export class CustodyManifestLockLeaseLostError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'renewal_failed')
+  }
+}
+
+function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
+  // A reader that rejects an upgraded writer's nonce cannot evict its dead lock and wedges itself; vendor this negative check in all three tenants before widening the nonce alphabet.
+  for (const character of nonce) {
+    const code = character.charCodeAt(0)
+    if (code < 0x20 || code === 0x7f) return false
+  }
+  return (
+    nonce.length > 0 &&
+    nonce.length <= 128 &&
+    nonce !== '.' &&
+    nonce !== '..' &&
+    !/[\\/:*?"<>|]/.test(nonce) &&
+    !/[. ]$/.test(nonce)
+  )
+}
 
 export async function withCustodyManifestLock<T>(
   path: string,
-  fn: () => Promise<T>,
+  fn: (assertLease: () => Promise<void>) => Promise<T>,
 ): Promise<T> {
   const lockPath = `${path}.lock`
   const now = Date.now
@@ -597,6 +659,38 @@ export async function withCustodyManifestLock<T>(
     custodyManifestLockTestOptions?.retryMaxMs ??
     CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS
   const startedAt = now()
+  const nonce = randomUUID()
+  const ownerPath = join(lockPath, 'owner')
+
+  async function writeOwner(claimedAtMs: number) {
+    const temporaryOwnerPath = join(
+      lockPath,
+      `owner.${process.pid}.${randomUUID()}.tmp`,
+    )
+    let handle: fs.FileHandle | undefined
+    try {
+      handle = await fs.open(
+        temporaryOwnerPath,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+        0o600,
+      )
+      await handle.writeFile(
+        `${JSON.stringify({
+          tenant: 'anthropic-auth',
+          pid: process.pid,
+          claimed_at_ms: claimedAtMs,
+          nonce,
+        })}\n`,
+      )
+      await handle.sync()
+      await handle.close()
+      handle = undefined
+      await fs.rename(temporaryOwnerPath, ownerPath)
+    } finally {
+      await handle?.close().catch(() => {})
+      await fs.unlink(temporaryOwnerPath).catch(() => {})
+    }
+  }
 
   async function claim() {
     try {
@@ -605,15 +699,12 @@ export async function withCustodyManifestLock<T>(
       if (errorCode(error) !== 'EEXIST') throw error
       return false
     }
-    await fs.writeFile(
-      join(lockPath, 'owner'),
-      `${JSON.stringify({
-        tenant: 'anthropic-auth',
-        pid: process.pid,
-        claimed_at_ms: now(),
-      })}\n`,
-      { encoding: 'utf8', mode: 0o600 },
-    )
+    try {
+      await writeOwner(now())
+    } catch (error) {
+      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+      throw error
+    }
     return true
   }
 
@@ -624,34 +715,42 @@ export async function withCustodyManifestLock<T>(
     if (claimed) break
 
     let ownerClaimedAtMs: number | undefined
+    let ownerNonce: string | undefined
+    let ownerInvalid = false
     try {
-      const owner = JSON.parse(
-        await fs.readFile(join(lockPath, 'owner'), 'utf8'),
-      )
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
       if (
         isRecord(owner) &&
         typeof owner.claimed_at_ms === 'number' &&
-        Number.isFinite(owner.claimed_at_ms)
+        Number.isFinite(owner.claimed_at_ms) &&
+        typeof owner.nonce === 'string' &&
+        isEvictableCustodyManifestLockNonce(owner.nonce)
       ) {
         ownerClaimedAtMs = owner.claimed_at_ms
-      }
+        ownerNonce = owner.nonce
+        await custodyManifestLockTestOptions?.afterStaleOwnerRead?.()
+      } else ownerInvalid = true
     } catch (error) {
-      if (errorCode(error) === 'ENOENT') continue
-      throw error
+      if (errorCode(error) !== 'ENOENT') ownerInvalid = true
     }
     if (
       ownerClaimedAtMs !== undefined &&
-      ownerClaimedAtMs + ttlMs <= startedAt
+      ownerNonce !== undefined &&
+      now() - ownerClaimedAtMs >= ttlMs
     ) {
-      const claimedPath = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.stale`
+      const claimedPath = `${lockPath}.stale-${ownerClaimedAtMs}-${ownerNonce}`
       try {
         await fs.rename(lockPath, claimedPath)
       } catch (error) {
-        if (errorCode(error) !== 'ENOENT') throw error
+        if (!['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(errorCode(error)))
+          throw error
       }
-      await fs.rm(claimedPath, { recursive: true, force: true }).catch(() => {})
       continue
     }
+    if (now() >= deadline && ownerInvalid)
+      throw new CustodyManifestLockOwnerInvalidError(
+        'manifest lock owner invalid',
+      )
     if (now() >= deadline)
       throw new CustodyManifestLockBusyError('manifest lock busy')
     const retryMs =
@@ -659,18 +758,52 @@ export async function withCustodyManifestLock<T>(
     await Bun.sleep(Math.min(retryMs, Math.max(1, deadline - now())))
   }
 
+  let renewalFailed = false
+  let renewalInFlight: Promise<void> | undefined
+  async function ownsCurrentLease(): Promise<boolean> {
+    if (renewalFailed) return false
+    try {
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+      return (
+        isRecord(owner) &&
+        owner.pid === process.pid &&
+        owner.nonce === nonce &&
+        typeof owner.claimed_at_ms === 'number' &&
+        Number.isFinite(owner.claimed_at_ms) &&
+        now() - owner.claimed_at_ms < ttlMs
+      )
+    } catch {
+      return false
+    }
+  }
+  async function assertLease(): Promise<void> {
+    await renewalInFlight
+    if (!(await ownsCurrentLease()))
+      throw new CustodyManifestLockLeaseLostError(
+        'manifest lock renewal failed; write aborted',
+      )
+  }
   const renewal = setInterval(
     () => {
-      void fs.utimes(lockPath, new Date(), new Date()).catch(() => {})
+      renewalInFlight = writeOwner(now()).catch(() => {
+        renewalFailed = true
+      })
     },
-    Math.floor(CUSTODY_MANIFEST_LOCK_TTL_MS / 3),
+    custodyManifestLockTestOptions?.renewalIntervalMs ??
+      Math.min(CUSTODY_MANIFEST_LOCK_RENEW_MS, Math.floor(ttlMs / 3)),
   )
   if ('unref' in renewal) renewal.unref()
   try {
-    return await fn()
+    return await fn(assertLease)
   } finally {
     clearInterval(renewal)
-    await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+    if (!(await ownsCurrentLease())) {
+      logger.warn('claustrum', 'manifest lock lease lost, not releasing', {
+        id: path,
+      })
+    } else {
+      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+    }
   }
 }
 
@@ -682,8 +815,11 @@ type CustodyHandleManifestWriteInput = {
 
 function refusal(
   reason: string,
+  code?: CustodyManifestLockErrorCode,
 ): Extract<CustodyHandleManifestWriteResult, { status: 'refused' }> {
-  return { status: 'refused', reason }
+  return code === undefined
+    ? { status: 'refused', reason }
+    : { status: 'refused', reason, code }
 }
 
 function isOurManifestBlock(value: unknown): value is Record<string, unknown> {
@@ -697,13 +833,26 @@ function isOurManifestBlock(value: unknown): value is Record<string, unknown> {
 export async function writeCustodyHandleManifestEntry(
   input: CustodyHandleManifestWriteInput,
 ): Promise<CustodyHandleManifestWriteResult> {
+  if (
+    !isValidCustodyLabel(input.entry.label) ||
+    !isValidCustodyHandle(input.entry.handle) ||
+    !isValidCustodyCredentialId(input.entry.credentialId)
+  ) {
+    return refusal('invalid entry')
+  }
   try {
-    return await withCustodyManifestLock(input.path, () =>
-      writeCustodyHandleManifestEntryLocked(input),
+    return await withCustodyManifestLock(input.path, (assertLease) =>
+      writeCustodyHandleManifestEntryLocked(input, assertLease),
     )
   } catch (error) {
     if (error instanceof CustodyManifestLockBusyError) {
-      return refusal('manifest lock busy')
+      return refusal('manifest lock busy', error.code)
+    }
+    if (error instanceof CustodyManifestLockOwnerInvalidError) {
+      return refusal('manifest lock owner invalid', error.code)
+    }
+    if (error instanceof CustodyManifestLockLeaseLostError) {
+      return refusal('manifest lock renewal failed; write aborted', error.code)
     }
     return refusal(`unreadable (${errorCode(error)})`)
   }
@@ -711,6 +860,7 @@ export async function writeCustodyHandleManifestEntry(
 
 async function writeCustodyHandleManifestEntryLocked(
   input: CustodyHandleManifestWriteInput,
+  assertLease: () => Promise<void>,
 ): Promise<CustodyHandleManifestWriteResult> {
   const expectedUid = input.expectedUid ?? process.getuid?.() ?? userInfo().uid
   const parent = dirname(input.path)
@@ -852,9 +1002,11 @@ async function writeCustodyHandleManifestEntryLocked(
     await temporaryHandle.sync()
     await temporaryHandle.close()
     temporaryHandle = undefined
+    await assertLease()
     await fs.rename(temporaryPath, input.path)
     return { status: 'written' }
   } catch (error) {
+    if (error instanceof CustodyManifestLockLeaseLostError) throw error
     return refusal(`unreadable (${errorCode(error)})`)
   } finally {
     await temporaryHandle?.close().catch(() => {})

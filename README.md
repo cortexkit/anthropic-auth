@@ -299,7 +299,7 @@ Onboard a fallback once:
 2. Store it once through the existing handle-store path.
 3. Run `/claude-account custody <id> on`; OpenCode verifies the handle against the vault and writes the manifest entry.
 
-The legacy state-file `claustrumHandle` remains supported and is migrated into the manifest after a successful `custody on`. A handle minted after boot is picked up on the next custody tick. A foreign `serve` block is ignored with one warning. The manifest must be a user-owned regular file with mode `0600`, a safe parent, and no more than 256 KiB; unsafe files are treated as absent with one warning. Writers serialize through `<manifest>.lock`, shared with Claustrum's CLI.
+The legacy state-file `claustrumHandle` remains supported and is migrated into the manifest after a successful `custody on`. A handle minted after boot is picked up on the next custody tick. A foreign `serve` block is ignored with one warning. The manifest must be a user-owned regular file with mode `0600`, a safe parent, and no more than 256 KiB. An unsafe or unparseable manifest is reported as `invalid` with one warning, and the account falls back to its stored handle. Writers serialize through `<manifest>.lock`, shared with Claustrum's CLI.
 
 ```json
 {
