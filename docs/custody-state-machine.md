@@ -5,8 +5,10 @@ mode transition; the PR comment stream (Rev 1, Rev 2, three addenda) is supersed
 reasoning is kept in-tree because a diff will not carry it and every row here was paid for by a
 ruling or an incident.
 
-Status: awaiting maintainer approval of the rows. Nothing in this file is implemented yet; the
-branch still carries the superseded per-account toggle.
+Status: **handed off.** At the maintainer's request (2026-09-05, PR #196) this document records the
+current findings and the unresolved questions (§12); design and implementation continue on the
+maintainer's side. Nothing in this file is implemented; the branch still carries the superseded
+per-account toggle, which will not be merged as-is.
 
 ## 1. Scope and vocabulary
 
@@ -114,7 +116,7 @@ Two facts about `GONE` for main, both from OpenCode source (`339536bc22`), chang
 |---|---|---|---|
 | **RECORD_VERSION** | the `record_version` captured from the resolution that served *this* request's token, passed unchanged to `report_auth_failure` for *this* response | per request, on a 401 | provenance only. **Never** a startup coordinate, never affects availability. `record_version` is `expected_version + 1` on every vault `commit_refresh` (`store.rs:1931-1951`); an earlier draft that compared it at startup would have made an account unavailable every time the vault did its job |
 | **IDENTITY** | vault `account_id` from `credential.get` **vs** the row's persisted `anthropicAccountUuid` | startup reconcile and each custody tick, only when `vault=USABLE` | **both present and unequal → `MISMATCH`** (refuse serve, no writes, surfaced). **Either absent → `UNLABELLED`**: serve; absence is not difference. The request-time bootstrap of the served token performs the same comparison per request and is the authoritative one (§4.1) |
-| **PRE-COMMIT FINGERPRINT** | `sha256(len(access) ‖ access ‖ len(refresh) ‖ refresh)` of each account's local material as read inside the barrier's fences | persisted with the mode write; re-checked immediately before each account's destructive commit and by `RESUME_TAKEOVER` | distinguishes crash-left pre-commit material (fingerprint matches → resume) from a **raced login** (differs → `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM`, §5). Needed because OpenCode's `Auth.set` (the login callback) sits **outside every lock we hold**, so content alone cannot tell the two apart, and the in-process login record does not survive the restart that the crash case is |
+| **PRE-COMMIT FINGERPRINT** | `sha256(len(access) ‖ access ‖ len(refresh) ‖ refresh)` of each account's local material as read inside the barrier's fences | persisted with the mode write; consulted by `RESUME_TAKEOVER` | **crash reconciliation only.** Distinguishes crash-left pre-commit material (fingerprint matches → resume) from material that changed after the barrier read (differs → `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM`, §5), because content alone cannot tell the two apart and the in-process login record does not survive the restart that the crash case is. **It does not make the host write safe** (§12.1): OpenCode's `Auth.set` sits outside every lock we hold, and a re-read immediately before `client.auth.set` is still check-then-write |
 
 `credentialId` is **not** a startup comparand: `credential.get` returns `payload`, `expires_at_ms`,
 `record_version`, `project_id?`, `account_id?`, `email?`, `org_name?` and **no credential id**
@@ -151,7 +153,7 @@ vault-owned family.
 |---|---|---|---|---|---|---|---|---|---|
 | C1 | VALID | INERT | USABLE | `CUSTODY_SERVE` | vault | inert | none | — | none |
 | C2 | VALID | REAL, fingerprint **matches** | USABLE | `RESUME_TAKEOVER` | vault, after this account's commit | inert | finish this account's commit under its lock: fallback → drop refresh material; main → `client.auth.set(tombstone)`, awaited | immediate | none |
-| C2′ | VALID | REAL, fingerprint **differs or absent** | any | `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` | **no** | inert | **none** | none | `local` (the login stands), or `ck auth migrate-plugin --replace` then re-enter |
+| C2′ | VALID | REAL, fingerprint **differs or absent** | any | `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` | **no** | inert | **none** | none | **unresolved** (§12.2): `ck auth migrate-plugin --replace` then re-enter is consistent with every rule; "exit to `local` and the login stands" is not |
 | C3 | VALID | INERT | COLD | `CUSTODY_UNAVAILABLE` | **no** (typed provider-unavailable) | inert | none | bounded custody retry on vault availability | none |
 | C3′ | VALID | REAL | COLD | `TAKEOVER_INCOMPLETE_VAULT_UNAVAILABLE` | **no** | inert | **none**: no rollback, no drop. The destructive commit waits for `USABLE` (→ C2) because dropping material without proof the vault holds the family is destruction without evidence | on vault availability | none required; `local` + re-login only to abandon custody |
 | C4 | VALID | any | REAUTH | `CUSTODY_CREDENTIAL_LATCHED` | **no** | inert | none | **none**: retry cannot fix a latched record | re-import into the vault; resumes without a mode change |
@@ -218,19 +220,19 @@ a state with a named verdict (§5) and a resume path.
    never coexists with `mode=local` during a normal commit, so observing that pair is evidence of
    tampering rather than an expected intermediate, and it is what makes `RESUME_TAKEOVER` possible
    at all (under mode-last every intermediate is indistinguishable from a hand-written tombstone).
-4. Idempotent per-account commits, fallbacks then main. For each: re-read the account's material
-   **immediately before** the write and abort *this account's* commit if the fingerprint differs
-   (raced login → C2′). Fallback → drop local refresh material (no-op if absent). Main →
+4. Idempotent per-account commits, fallbacks then main. Fallback → drop local refresh material
+   (no-op if absent); fallback rows live under our own locks, so this half is fenced. Main →
    `client.auth.set(WRITE set)`, awaited (no-op if the slot already satisfies the recognise-set).
+   **The main write is not fenced** against the host (§12.1). A fingerprint re-read immediately
+   before it narrows the window; it does not close it.
 5. Any failure after step 3: retain the mode, keep **all** local refresh inert (the binding alone
    inerts it, mode-independent), release, surface. The next reconcile resumes **only** incomplete
    accounts (C2), under their own locks; it never re-runs a transition for accounts already in C1.
 
-Against other processes: enable/disable and login take the config lock, so they serialise with
-steps 0–4; other tenants' manifest writes take the cross-tenant lock, so they serialise too; a
-generation bump observed at step 4 aborts **that** account's commit only, the others proceed, and
-resume covers it. The host's `Auth.set` serialises with nothing we hold, which is why step 4 re-reads
-and why resume is fingerprint-gated (§4).
+Against other processes: enable/disable and **our** login path take the config lock, so they
+serialise with steps 0–4; other tenants' manifest writes take the cross-tenant lock, so they
+serialise too; a generation bump observed at step 4 aborts **that** account's commit only, the others
+proceed, and resume covers it. The host's `Auth.set` serialises with nothing we hold (§12.1).
 
 Serving is per-account and independent of the barrier: main may serve from the vault while a
 fallback sits in C3, and the reverse. Nothing about serving account A depends on account B, so no
@@ -302,7 +304,7 @@ transition table). These differ on purpose and are stated so neither is read as 
    (a truthy sentinel in `access`) into a tree that currently cannot have it.
 3. **Identity provenance** (§4.1): operator-asserted at the vault for us, provider-asserted for them.
 
-## 11. Open items
+## 11. Open items (external)
 
 - Maintainer approval of §5–§8 (gates implementation of the transition).
 - Claustrum: `ck auth bind` (§8); sink-level tombstone refusal (defence in depth, after the
@@ -319,3 +321,46 @@ transition table). These differ on purpose and are stated so neither is read as 
   about the handover.
 - Manifest-lock contract: case-folding aliasing of nonces on case-insensitive volumes (raised with
   the contract owner, unruled).
+
+## 12. Unresolved questions (design, not implementation)
+
+These are open. The maintainer's ruling (2026-09-05) is that they need a source-backed answer before
+any code; this section records them so they are not lost in the handoff.
+
+### 12.1 The host-write race is not closed
+
+Everything the barrier fences is ours: config, sidecar, manifest, per-account refresh locks.
+`auth.json` is the host's, and OpenCode's `Auth.set` (the login callback,
+`provider/auth.ts:188-221` → `auth/index.ts:73-80`) takes no lock we can share. So for main:
+
+- a login can complete between the barrier's step 4 re-read and `client.auth.set`, and the fresh
+  family is **overwritten by the tombstone**. Re-reading a matching fingerprint immediately before
+  the write is still check-then-write; it shrinks the window to the width of one RPC, it does not
+  remove it.
+- `RESTORE_TOMBSTONE` (C9) has the same race in the other direction: a login can land in the absent
+  slot between the factory's read and its awaited write.
+
+The fingerprint is therefore **crash reconciliation only** (§4). What is needed is a
+synchronisation mechanism grounded in OpenCode source: a lock `Auth.set` honours, a compare-and-set
+primitive on the slot, an event that observes the write, or a host-side change. None was found in
+`339536bc22`; the search was not exhaustive.
+
+### 12.2 A raced login versus "bindings clear only after verified login"
+
+C2′ (`NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM`) describes real material under custody that the barrier did
+not classify: most plausibly a login that raced the transition. An earlier draft offered "exit to
+`local`; the login stands" as one operator resolution. That contradicts §6/§8: the raced login did
+not complete through **our** path with an in-process record, so under `local` it is L5
+(`DARK_PENDING_VERIFIED_LOGIN`), not L1, and its binding does not clear. Either the verified-login
+rule admits some evidence other than our in-process record (and then what, and how is it
+distinguished from a restored backup, which is the case the rule exists for), or a raced login is
+never allowed to stand and the only resolution is a fresh vault import. The two rules are both
+individually correct and jointly unreconciled here.
+
+### 12.3 Smaller
+
+- `OPENCODE_AUTH_CONTENT` (§8) makes the live `getAuth` re-read blind; "fail loudly" is stated, the
+  detection point is not.
+- The `enable` precondition under `claustrum` requires `USABLE`; whether a `REAUTH`-latched account
+  may be enabled-but-dark (so it resumes without a second operator action after re-import) is
+  unstated.
