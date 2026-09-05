@@ -7034,17 +7034,31 @@ describe('global Claustrum mode', () => {
       }
     }
 
+    const ownershipStorage = {
+      ...baseStorage(),
+      claustrum: { mode: 'claustrum' as const },
+    }
+    const ownershipAccount = {
+      id: 'work-alt',
+      type: 'oauth' as const,
+      refresh: 'refresh-token',
+      enabled: true,
+    }
     expect(
-      isOAuthAccountVaultOwned(
-        { ...baseStorage(), claustrum: { mode: 'claustrum' } },
-        {
-          id: 'work-alt',
-          type: 'oauth',
-          refresh: 'refresh-token',
-          enabled: true,
-        },
-        { status: 'resolved', source: 'legacy', handle: 'legacy-handle' },
-      ),
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, binding),
+    ).toBe(true)
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, {
+        status: 'resolved',
+        source: 'legacy',
+        handle: 'legacy-handle',
+      }),
+    ).toBe(true)
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, {
+        status: 'unresolved',
+        reason: 'missing-entry',
+      }),
     ).toBe(false)
   })
 })

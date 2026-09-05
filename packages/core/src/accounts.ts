@@ -1564,8 +1564,8 @@ export function isOAuthAccountVaultOwned(
     getClaustrumMode(storage) === 'claustrum' &&
     isOAuthAccount(account) &&
     account.enabled !== false &&
-    binding?.status === 'resolved' &&
-    binding.source === 'manifest'
+    // Source is provenance, not authorization; the resolver owns the binding decision.
+    binding?.status === 'resolved'
   )
 }
 
