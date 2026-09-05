@@ -1828,6 +1828,9 @@ async function saveAccountsWithConfigLock(
   const current = await loadAccounts(path)
   const nextStorage: AccountStorage = {
     ...storage,
+    ...(storage.claustrum && {
+      claustrum: { ...current?.claustrum, ...storage.claustrum },
+    }),
     accounts: mergeAccountsForSave(
       current?.accounts ?? [],
       storage.accounts,
