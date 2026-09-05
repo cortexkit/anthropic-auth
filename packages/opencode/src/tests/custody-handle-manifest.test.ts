@@ -311,6 +311,42 @@ describe('CustodyHandleManifestReader', () => {
     })
   })
 
+  test('rejects a group-writable parent directory without sticky mode', async () => {
+    await withManifest(fixtureText, async (path) => {
+      await fs.chmod(dirname(path), 0o770)
+      await expectInvalid(
+        reader(path).read(),
+        'manifest parent is group-writable',
+      )
+    })
+  })
+
+  test('accepts a private manifest parent directory', async () => {
+    await withManifest(fixtureText, async (path) => {
+      await fs.chmod(dirname(path), 0o700)
+      await expect(reader(path).read()).resolves.toMatchObject({
+        status: 'ready',
+      })
+    })
+  })
+
+  test('accepts a sticky group-writable manifest parent directory', async () => {
+    await withManifest(fixtureText, async (path) => {
+      const parent = dirname(path)
+      const originalLstat = fs.lstat
+      spyOn(fs, 'lstat').mockImplementation(async (target) => {
+        const stats = await originalLstat(target)
+        if (target !== parent) return stats
+        return Object.assign(Object.create(stats), {
+          mode: Number(stats.mode) | 0o1000,
+        })
+      })
+      await expect(reader(path).read()).resolves.toMatchObject({
+        status: 'ready',
+      })
+    })
+  })
+
   test('rejects a manifest larger than 256 KiB', async () => {
     await withManifest('x'.repeat(256 * 1024 + 1), async (path) => {
       await expectInvalid(reader(path).read(), 'manifest exceeds maximum size')

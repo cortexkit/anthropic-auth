@@ -421,6 +421,7 @@ function validateManifestParent(
   if ((mode & 0o002) !== 0) {
     return 'manifest parent is world-writable'
   }
+  if ((mode & 0o020) !== 0) return 'manifest parent is group-writable'
   return null
 }
 
