@@ -6,16 +6,19 @@ import { join } from 'node:path'
 import {
   assertNotCustodyTombstone,
   buildRefreshOperationError,
+  CustodyTombstoneLoginError,
   CustodyTombstoneRefreshError,
+  custodyTombstoneKey,
+  custodyTombstoneOAuth,
   FallbackAccountManager,
   getAccountStatePath,
   getFallbackReauthLabels,
   isCustodyTombstoneOAuth,
-  isCustodyTombstoneValue,
   isPermanentRefreshError,
   isValidCustodyHandle,
   loadAccounts,
   readCustodyHandles,
+  refreshClaudeOAuthToken,
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
@@ -90,74 +93,62 @@ afterEach(() => {
 })
 
 describe('Claustrum custody tombstones', () => {
-  test('recognizes only the provider-bound OAuth golden shape', () => {
-    const oauth = oauthFixture.entry
-    const oauthRefresh = oauth.refresh as string
-    expect(isCustodyTombstoneOAuth(oauth, oauthFixture.provider)).toBe(true)
-    expect(isCustodyTombstoneOAuth(oauth, apiFixture.provider)).toBe(false)
-    expect(isCustodyTombstoneValue(oauthRefresh)).toBe(true)
-    expect(isCustodyTombstoneOAuth(apiFixture.entry, apiFixture.provider)).toBe(
-      false,
-    )
-
-    expect(
-      isCustodyTombstoneOAuth(
-        {
-          ...oauth,
-          refresh: oauthRefresh.replace(':v1:', ':v2:'),
-        },
-        oauthFixture.provider,
-      ),
-    ).toBe(false)
-    expect(
-      isCustodyTombstoneOAuth(
-        { ...oauth, access: `${String(oauth.access)}-different` },
-        oauthFixture.provider,
-      ),
-    ).toBe(false)
-    expect(
-      isCustodyTombstoneOAuth(
-        { ...oauth, type: apiFixture.entry.type },
-        oauthFixture.provider,
-      ),
-    ).toBe(false)
-  })
-
-  test('rejects sentinel whitespace, provider variants, and split credentials', () => {
-    const oauth = oauthFixture.entry
-    const oauthRefresh = oauth.refresh as string
-    const anthropic2Refresh = oauthRefresh.replace(
-      oauthFixture.provider,
-      `${oauthFixture.provider}-2`,
-    )
-
-    expect(
-      isCustodyTombstoneOAuth(
-        { ...oauth, refresh: `${oauthRefresh} ` },
-        oauthFixture.provider,
-      ),
-    ).toBe(false)
-    expect(isCustodyTombstoneOAuth(oauth, `${oauthFixture.provider}-2`)).toBe(
-      false,
-    )
-    expect(
-      isCustodyTombstoneOAuth(
-        { ...oauth, refresh: anthropic2Refresh, access: anthropic2Refresh },
-        oauthFixture.provider,
-      ),
-    ).toBe(false)
-
-    const split = {
-      ...oauth,
-      access: String(oauth.access).replace(oauthRefresh, 'real-access-token'),
+  test('recognizes only provider-bound OAuth tombstones', () => {
+    const provider = oauthFixture.provider
+    const key = custodyTombstoneKey(provider)
+    const productionTombstone = {
+      type: 'oauth',
+      access: '',
+      refresh: key,
+      expires: 0,
     }
-    expect(isCustodyTombstoneOAuth(split, oauthFixture.provider)).toBe(false)
-    expect(() =>
-      assertNotCustodyTombstone(
-        (split as Record<string, unknown>).refresh,
-        oauthFixture.provider,
-      ),
-    ).toThrow(CustodyTombstoneRefreshError)
+    const cases: Array<{ name: string; auth: unknown; recognized: boolean }> = [
+      {
+        name: 'production empty-access tombstone',
+        auth: productionTombstone,
+        recognized: true,
+      },
+      {
+        name: 'vendored golden sentinel-access tombstone',
+        auth: oauthFixture.entry,
+        recognized: true,
+      },
+      { name: 'API entry', auth: apiFixture.entry, recognized: false },
+      {
+        name: 'wrong-provider sentinel',
+        auth: {
+          ...productionTombstone,
+          refresh: custodyTombstoneKey('openai'),
+        },
+        recognized: false,
+      },
+      {
+        name: 'sentinel with prefix added',
+        auth: { ...productionTombstone, refresh: `x${key}` },
+        recognized: false,
+      },
+      {
+        name: 'sentinel with suffix added',
+        auth: { ...productionTombstone, refresh: `${key}x` },
+        recognized: false,
+      },
+      {
+        name: 'ordinary refresh token',
+        auth: { ...productionTombstone, refresh: 'ordinary-refresh-token' },
+        recognized: false,
+      },
+      {
+        name: 'missing OAuth type',
+        auth: { access: '', refresh: key, expires: 0 },
+        recognized: false,
+      },
+    ]
+
+    for (const entry of cases) {
+      expect(isCustodyTombstoneOAuth(entry.auth, provider), entry.name).toBe(
+        entry.recognized,
+      )
+    }
   })
 
   test('throws a non-provider-refresh error before the token endpoint', () => {
@@ -180,6 +171,100 @@ describe('Claustrum custody tombstones', () => {
     expect(thrown).not.toHaveProperty('status')
     expect(String(thrown)).toContain(
       'vault-served main path is not yet implemented',
+    )
+  })
+
+  test('keeps loader recognition contained by both irreversible boundaries', async () => {
+    const provider = oauthFixture.provider
+    const recognized = [custodyTombstoneOAuth(provider), oauthFixture.entry]
+    const foreign = custodyTombstoneKey('openai')
+    const values = [
+      ...recognized.map((auth) => ({
+        auth,
+        value: String((auth as Record<string, unknown>).refresh),
+        recognized: true,
+      })),
+      {
+        auth: { type: 'oauth', access: '', refresh: foreign, expires: 0 },
+        value: foreign,
+        recognized: false,
+      },
+    ]
+    const tokenEndpointCalls: string[] = []
+    const fetchImpl = mock((input: unknown) => {
+      tokenEndpointCalls.push(extractUrl(input as string | URL | Request))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    // The innermost guard is wider because a value has no provider record to match exactly.
+    await expect(
+      Promise.all(
+        values.map(async ({ auth, value, recognized: expectedRecognition }) => {
+          expect(isCustodyTombstoneOAuth(auth, provider)).toBe(
+            expectedRecognition,
+          )
+          expect(() => assertNotCustodyTombstone(value, provider)).toThrow(
+            CustodyTombstoneRefreshError,
+          )
+          await expect(
+            refreshClaudeOAuthToken({ refreshToken: value, fetchImpl }),
+          ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+        }),
+      ),
+    ).resolves.toBeArray()
+    expect(tokenEndpointCalls).toEqual([])
+  })
+
+  test('refuses tombstone access before constructing an OAuth header', async () => {
+    const messageAuthorizations: string[] = []
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.includes('/v1/messages')) {
+        messageAuthorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    await createTempStorage(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: oauthFixture.provider },
+        refresh: { enabled: false },
+        quota: { enabled: false },
+        accounts: [],
+      },
+      async () => {
+        const auth = {
+          type: 'oauth',
+          access: 'ordinary-access',
+          refresh: 'ordinary-refresh',
+          expires: Date.now() + 60_000,
+        }
+        const plugin = (await AnthropicAuthPlugin(
+          // @ts-expect-error: minimal mock for testing
+          { client: createMockClient() },
+          disabledTimerOverrides(),
+        )) as any
+        const loaded = await plugin.auth.loader(() => Promise.resolve(auth), {
+          models: {},
+        } as never)
+        auth.access = String(oauthFixture.entry.access)
+
+        await expect(
+          loaded.fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            body: JSON.stringify({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 1,
+              messages: [{ role: 'user', content: 'hello' }],
+            }),
+          }),
+        ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+        expect(messageAuthorizations).toEqual([])
+        await plugin.dispose?.()
+      },
     )
   })
 
@@ -342,7 +427,7 @@ describe('Claustrum custody tombstones', () => {
     expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}=`)).toBe(false)
   })
 
-  test('main loader rejects the tombstone without network or refresh state', async () => {
+  test('local main loader sends a tombstone to /login without network or refresh state', async () => {
     const fetchCalls: string[] = []
     globalThis.fetch = mock((input: unknown) => {
       const url = extractUrl(input as string | URL | Request)
@@ -369,7 +454,7 @@ describe('Claustrum custody tombstones', () => {
             () => Promise.resolve(oauthFixture.entry as never),
             { models: {} } as never,
           ),
-        ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+        ).rejects.toBeInstanceOf(CustodyTombstoneLoginError)
         expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
 
         const statePath = getAccountStatePath(path)
@@ -386,6 +471,108 @@ describe('Claustrum custody tombstones', () => {
         await plugin.dispose?.()
       },
     )
+  })
+
+  test('loads a main tombstone under claustrum and directs local mode to /login', async () => {
+    const fetchCalls: string[] = []
+    globalThis.fetch = mock((input: unknown) => {
+      fetchCalls.push(extractUrl(input as string | URL | Request))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const makeStorage = (mode: 'claustrum' | 'local') => ({
+      version: 1,
+      main: { type: 'opencode', provider: oauthFixture.provider },
+      claustrum: { mode },
+      refresh: { enabled: true },
+      quota: { enabled: true },
+      accounts: [],
+    })
+
+    await createTempStorage(makeStorage('claustrum'), async () => {
+      const plugin = (await AnthropicAuthPlugin(
+        // @ts-expect-error: minimal mock for testing
+        { client: createMockClient() },
+        disabledTimerOverrides(),
+      )) as any
+      await expect(
+        plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
+          { models: {} } as never,
+        ),
+      ).resolves.toHaveProperty('fetch')
+      await plugin.dispose?.()
+    })
+
+    await createTempStorage(makeStorage('local'), async () => {
+      const plugin = (await AnthropicAuthPlugin(
+        // @ts-expect-error: minimal mock for testing
+        { client: createMockClient() },
+        disabledTimerOverrides(),
+      )) as any
+      await expect(
+        plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
+          { models: {} } as never,
+        ),
+      ).rejects.toBeInstanceOf(CustodyTombstoneLoginError)
+      await plugin.dispose?.()
+    })
+    expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
+  })
+
+  test('refuses Claude Pro/Max login before authorization while claustrum is committed', async () => {
+    const authorizeImpl = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/authorize',
+        redirectUri: 'http://localhost/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    const findProMaxMethod = (plugin: any) => {
+      const method = plugin.auth.methods.find(
+        (candidate: { label: string }) => candidate.label === 'Claude Pro/Max',
+      )
+      if (!method) throw new Error('missing Claude Pro/Max method')
+      return method
+    }
+    const storage = (mode: 'claustrum' | 'local') => ({
+      version: 1,
+      main: { type: 'opencode', provider: oauthFixture.provider },
+      claustrum: { mode },
+      refresh: { enabled: false },
+      quota: { enabled: false },
+      accounts: [],
+    })
+
+    await createTempStorage(storage('claustrum'), async () => {
+      const plugin = (await AnthropicAuthPlugin(
+        // @ts-expect-error: minimal mock for testing
+        { client: createMockClient() },
+        { ...disabledTimerOverrides(), authorize: authorizeImpl } as any,
+      )) as any
+      await expect(findProMaxMethod(plugin).authorize()).rejects.toThrow(
+        'Exit Claustrum mode first: /claude-account local',
+      )
+      expect(authorizeImpl).not.toHaveBeenCalled()
+      await plugin.dispose?.()
+    })
+
+    await createTempStorage(storage('local'), async () => {
+      const plugin = (await AnthropicAuthPlugin(
+        // @ts-expect-error: minimal mock for testing
+        { client: createMockClient() },
+        { ...disabledTimerOverrides(), authorize: authorizeImpl } as any,
+      )) as any
+      await expect(findProMaxMethod(plugin).authorize()).resolves.toMatchObject(
+        {
+          url: 'https://example.test/authorize',
+        },
+      )
+      expect(authorizeImpl).toHaveBeenCalledTimes(1)
+      await plugin.dispose?.()
+    })
   })
 
   test('fallback refresh rejects the tombstone without network or refresh classification', async () => {
