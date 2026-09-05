@@ -104,10 +104,11 @@ Evaluated independently for main and for **each enabled OAuth fallback**.
 
 Two facts about `GONE` for main, both from OpenCode source (`339536bc22`), change what it means:
 
-- neither `SLOT_ABSENT` nor `SLOT_UNPARSEABLE` reaches `auth.loader`, so reconciliation for main runs
-  in the **plugin factory**, which is invoked during the first Provider-state construction via
-  `plugin.list()` (`provider.ts:1436`) but **before** the provider reaches `auth.all()` and the
-  loader pass (`:1591-1622`). An **awaited** write from the factory is visible to the first loader.
+- an absent slot never reaches `auth.loader`, so any reconciliation that must observe main's slot
+  before the loader runs lives in the **plugin factory**, which is invoked during the first
+  Provider-state construction via `plugin.list()` (`provider.ts:1436`) but **before** the provider
+  reaches `auth.all()` and the loader pass (`:1591-1622`). An awaited write from the factory would be
+  visible to the first loader; the plugin currently issues no such write (§5, C9).
 - today `normalizeAccount` null-drops an unparseable fallback row and `Auth.all()` hides an absent
   or malformed slot. Reconciliation reads **raw** rows and slots so `GONE` is surfaced, and a `GONE`
   fallback's state secrets are **retained**, never pruned, never normalised into success.
@@ -163,7 +164,7 @@ vault-owned family.
 | C6 | ABSENT | REAL | N/A | `NOT_ENROLLED` | **no** | **no** (this mode has no local refreshers) | none | none | `ck auth bind` after import, or `local` |
 | C7 | ABSENT | INERT | N/A | `ORPHAN_TOMBSTONE` (main) / `ORPHAN_INERT` (fallback) | **no** | nothing to refresh | none | none | `bind`, or `local` + re-login |
 | C8 | INVALID | any | N/A | `CORRUPT_BINDING` | **no** | **inert** | **none**: never auto-repair a manifest entry | none | `ck auth bind --replace`, or `local` |
-| C9 | VALID | GONE (main) | USABLE · COLD · REAUTH | `RESTORE_TOMBSTONE` → re-classify as C1 / C3 / C4 | per re-class | inert | `auth.json` ← WRITE set, **awaited in the factory before the loader pass**. **BLOCKED under §13.1** (same host-write race as the install). Write failure → `FAIL_CLOSED`, typed `main unavailable: slot unrestorable`. (An unparseable slot cannot be distinguished from an absent one through the SDK, so no separate warn is possible; the host itself drops such an entry on its next write) | next boot | none on success |
+| C9 | VALID | GONE (main) | USABLE · COLD · REAUTH | `TAKEOVER_INCOMPLETE_SLOT_ABSENT` | **no** | inert | **none** (plugin-side install into an absent slot is **withdrawn**, see below) | next boot | `ck auth migrate-plugin` restores the slot; or the host, once a fenced write exists |
 | C10 | VALID | GONE (fallback = `ROW_UNPARSEABLE`) | any | `CORRUPT_ROW` | **no** | inert | **none**; state secrets retained | next reconcile | repair the row, or remove + re-discover |
 
 Invariants pinning the combinations not rowed:
@@ -176,12 +177,18 @@ Invariants pinning the combinations not rowed:
   a binding: that would fabricate custody).
 - The recognise-set (§2.2) makes "partial tombstone write" a tombstone for every verdict; there is
   no separate local-axis value for it.
-- C9 installs on **REAUTH** and **COLD** as well as **USABLE**: the tombstone grants nothing, so
-  installing never transfers authority; what it buys is that the loader runs and a typed verdict can
-  exist. Same reasoning for a `MISMATCH` discovered after restore (C9 → C5). This is a deliberate
-  divergence from the openai-auth table, which does not install on mismatch: their identity is
-  provider-asserted and a mismatch there is strong evidence the *binding* is wrong; ours is
-  operator-labelled (§4.1), and a typed `MISMATCH` beats the host's generic not-logged-in.
+- **C9 no longer installs.** An earlier revision restored the tombstone into an absent slot so the
+  loader would run and a typed verdict could exist. That write is withdrawn: with no lock, no CAS, a
+  non-atomic host write, and the torn-read amplifier (§12.1), an install into an "absent" slot is
+  the highest-blast-radius write this plugin could issue (it can wipe every provider's credentials),
+  and its payoff was a typed verdict in place of the host's generic not-logged-in. The absent slot is
+  named in status and restored by `ck auth migrate-plugin` or by the host once a fenced write lands
+  (#46128). Two rules bind **any** host-slot write the plugin ever issues: (1) read
+  `client.auth.all()` first and, if it is EMPTY, abort the write, warn once, retry next tick, since an
+  empty map on a machine with any configured provider is a torn read until proven otherwise; (2)
+  treat a slot as absent only after two reads at least 250 ms apart, both `undefined`, both with a
+  NON-EMPTY `all()`. The install-on-`MISMATCH` divergence from the openai-auth port (§10) is moot
+  while no install exists.
 
 ## 6. `mode = local`
 
@@ -191,7 +198,7 @@ No vault call is made in this mode (test: zero connector invocations under `mode
 | # | binding | local | verdict | serve | local refresh | durable writes | operator |
 |---|---|---|---|---|---|---|---|
 | L1 | ABSENT | REAL | `LOCAL_SERVE` | local | yes | none | none |
-| L2 | ABSENT | GONE | `DARK_PENDING_LOGIN` | no | no | none (`SLOT_UNPARSEABLE` logs the fact) | `/login` |
+| L2 | ABSENT | GONE | `DARK_PENDING_LOGIN` | no | no | none | `/login` |
 | L3 | ABSENT | INERT | `AWAITING_LOGIN` | no | nothing to refresh | none | `/login`. **Expected**: this is the post-`/claude-account local` state before re-login |
 | L4 | VALID | INERT · GONE | `AWAITING_LOGIN` with a lingering binding (exit ran; the clear did not land or was never reached) | no | inert (binding) | none | `/login`; the verified login clears the binding (§7) |
 | L5 | VALID | REAL | `DARK_PENDING_VERIFIED_LOGIN` | **no** | inert (binding) | none | `/login` through our own path |
@@ -299,7 +306,8 @@ loudly rather than degrading into it.
 Both plugins hold the same contract (write set, recognise/refuse split, fences, barrier shape,
 transition table). These differ on purpose and are stated so neither is read as an oversight:
 
-1. **Install on `MISMATCH` for a GONE main slot**: we install; they do not (§5 invariants).
+1. ~~Install on `MISMATCH` for a GONE main slot~~ — moot: both ports have withdrawn plugin-side
+   install into an absent slot (§5 invariants, §12.1). Converged.
 2. **Fallback artefact under custody**: we **drop** refresh material (`INERT` = absent); they write
    tombstoned rows. One recognise rule covers both because it keys on the refresh sentinel only.
    Do not "harmonise" by adding the sentinel to our fallback rows: that imports a masquerade risk
@@ -338,8 +346,9 @@ Everything the barrier fences is ours: config, sidecar, manifest, per-account re
   family is **overwritten by the tombstone**. Re-reading a matching fingerprint immediately before
   the write is still check-then-write; it shrinks the window to the width of one RPC, it does not
   remove it.
-- `RESTORE_TOMBSTONE` (C9) has the same race in the other direction: a login can land in the absent
-  slot between the factory's read and its awaited write.
+- restoring a tombstone into an absent slot (the former C9 install, now withdrawn) had the same race
+  in the other direction, plus the torn-read amplifier below: a login can land in the "absent" slot
+  between the factory's read and its write, and the read itself may have been torn.
 
 The fingerprint is therefore **crash reconciliation only** (§4).
 
@@ -356,11 +365,23 @@ are unlocked whole-file rewrites", open). Consequences beyond our slot:
   plugin that writes its slot during another plugin's login loses one of them. This is a property
   of the host's auth store, not of custody.
 - a fresh login that lands in the window is **lost** if the tombstone overwrites it (ordering B).
-  Whether that also kills the vault's family is provider-specific and, for Anthropic, **unverified**:
-  if a fresh Anthropic login invalidates the prior refresh lineage, ordering B leaves the account
-  dark; if lineages coexist (as they do for OpenAI), the cost is one re-login. The fingerprint
-  preserves the single-refresher invariant in both orderings; only losslessness differs. Either
-  way the transition stays blocked (§13.1).
+  Whether that also kills the vault's family is **unverified for both providers**: coexisting
+  lineages have been observed only for two *refreshes* of one grant, and a fresh login mints a
+  *new grant*, a different operation; an earlier claim that OpenAI lineages survive a fresh login
+  was withdrawn by its author on that basis. If a fresh login invalidates the prior lineage,
+  ordering B leaves the account dark; if not, the cost is one re-login. The probe that settles it
+  (refresh `R_old` once, complete a fresh login, refresh `R_old'` again) carries the hazard it
+  measures on a vault-held account and is operator-gated. The fingerprint preserves the
+  single-refresher invariant in both orderings; only losslessness differs. Either way the
+  transition stays blocked (§13.1).
+- **the torn-read amplifier turns a lost race into a wiped store.** `Auth.all()` is
+  `readJson(file).pipe(Effect.orElseSucceed(() => ({})))` (`auth/index.ts:65`) over a non-atomic
+  writer, so a read racing another writer's in-place `writeFile` can parse a truncated file and
+  yield an **empty auth map**. Two consequences: (i) a single `client.auth.get(key) === undefined`
+  is not evidence the slot is absent, it may be a torn read; (ii) any `Auth.set` issued from that
+  state spreads `{}` and rewrites `auth.json` containing **only the writer's key**, destroying every
+  other provider's credentials. A plugin that installs into an "absent" slot during another
+  plugin's login can wipe the store, not merely lose the race.
 - **`OPENCODE_AUTH_CONTENT` is a deterministic clobber, not a race.** A child process started with
   that variable (`workspace.ts:532-533`) reads auth from the env snapshot in preference to the file
   (`auth/index.ts:59-61`), and every `Auth.set` it performs rewrites the file from that snapshot,
@@ -418,8 +439,8 @@ rotated.
 ## 13. Implementation constraints (binding, from the 06:04Z go-ahead)
 
 1. **The host-write race stays open and the unsafe transition stays BLOCKED.** The main-slot
-   write (`client.auth.set` of the tombstone, §7 step 4 main; `RESTORE_TOMBSTONE`, C9) is not
-   fenced against OpenCode's `Auth.set`. Until a source-backed synchronisation exists, the command
+   write (`client.auth.set` of the tombstone, §7 step 4 main) is not fenced against OpenCode's
+   `Auth.set`, and plugin-side restoration into an absent slot is withdrawn outright (C9, §12.1). Until a source-backed synchronisation exists, the command
    **refuses** to perform that write with a typed error naming this as the reason; it does not
    describe the fingerprint as a fix and does not weaken the invariant so a test passes. The
    fallback half of the barrier (fenced by our own locks), the serving path, and every independent
