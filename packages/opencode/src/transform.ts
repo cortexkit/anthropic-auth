@@ -3,6 +3,7 @@ import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyThinkingBindingControls,
+  assertNotCustodyTombstone,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
@@ -168,6 +169,8 @@ export function setOAuthHeaders(
     identity?: ClaudeCodeIdentity
   } = {},
 ): Headers {
+  // This is the shared boundary where an access value becomes a bearer header.
+  assertNotCustodyTombstone(accessToken, 'anthropic')
   return applyClaudeCodeHeaders(headers, accessToken, {
     ...options,
     extraBetas: [

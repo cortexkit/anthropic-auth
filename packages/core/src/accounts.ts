@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
 import {
+  assertNotCustodyTombstone,
   type CustodyHandleResolution,
   CustodyTombstoneRefreshError,
 } from './claustrum.ts'
@@ -3789,6 +3790,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   fetchImpl?: typeof fetch
   now?: () => number
 }): Promise<OAuthQuotaSnapshot> {
+  assertNotCustodyTombstone(input.accessToken, 'anthropic')
   const fetchImpl = input.fetchImpl ?? fetch
   const response = await fetchImpl(QUOTA_URL, {
     method: 'GET',
