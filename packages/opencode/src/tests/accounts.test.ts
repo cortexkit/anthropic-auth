@@ -7034,6 +7034,32 @@ describe('global Claustrum mode', () => {
         reason: 'missing-entry',
       }),
     ).toBe(false)
+    expect(
+      isOAuthAccountVaultOwned(
+        {
+          ...ownershipStorage,
+          claustrum: {
+            mode: 'claustrum',
+            accounts: { 'work-alt': { enabled: true } },
+          },
+        },
+        ownershipAccount,
+        undefined,
+      ),
+    ).toBe(false)
+    expect(
+      isOAuthAccountVaultOwned(
+        {
+          ...ownershipStorage,
+          claustrum: {
+            mode: 'local',
+            accounts: { 'work-alt': { enabled: true } },
+          },
+        },
+        ownershipAccount,
+        binding,
+      ),
+    ).toBe(false)
   })
 })
 

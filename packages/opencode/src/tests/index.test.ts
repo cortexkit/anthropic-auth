@@ -3232,6 +3232,55 @@ describe('fallback Claustrum credential resolution', () => {
     }
   })
 
+  test.serial(
+    'does not route a manifest-resolved account through a legacy per-account flag',
+    async () => {
+      const calls: CredentialCall[] = []
+      const storage = createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        quota: { enabled: false, failClosedOnUnknownQuota: false },
+        accounts: [
+          {
+            id: 'work-alt',
+            label: 'work-alt',
+            type: 'oauth',
+            access: 'stored-fallback-access',
+            refresh: 'stored-fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+          },
+        ],
+      })
+      await useTempAccountFile(storage)
+      const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+      const config = JSON.parse(await readFile(accountPath, 'utf8'))
+      config.claustrum = { accounts: { 'work-alt': { enabled: true } } }
+      await writeFile(accountPath, JSON.stringify(config))
+      await writeManifest([{ label: 'work-alt', handle: manifestHandle }])
+      const { authorizations, plugin, result } =
+        await loadFallbackWithConnector(
+          storage,
+          manifestConnector(calls, new Map([[manifestHandle, 'vault-access']])),
+          new Response('{}', { status: 200 }),
+        )
+      const payload = await runCustodyCommand(plugin, 'legacy-flag', '')
+      const accounts = payload?.knobs.accounts as Array<{
+        id: string
+        claustrumGate: string
+      }>
+
+      expect(
+        accounts.find((account) => account.id === 'work-alt')?.claustrumGate,
+      ).toBe('off')
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(response.status).toBe(200)
+      expect(authorizations).toContain('Bearer stored-fallback-access')
+      expect(calls.filter((call) => call.method === 'credential.get')).toEqual(
+        [],
+      )
+      await plugin.dispose?.()
+    },
+  )
+
   test('treats an empty Claustrum connection setting as unset', async () => {
     const previousConnectionFile =
       process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE
