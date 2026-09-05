@@ -976,9 +976,12 @@ describe('fallback Claustrum credential resolution', () => {
         ? (() => {
             const { accounts: _legacyAccounts, ...config } =
               claustrum as Record<string, unknown>
-            return { ...config, mode: 'claustrum' }
+            // An explicit mode wins; only an unspecified mode defaults to claustrum.
+            return { mode: 'claustrum', ...config }
           })()
-        : { mode: 'claustrum' }
+        : claustrum === null
+          ? { mode: 'local' }
+          : { mode: 'claustrum' }
     const account = {
       id: 'fallback-1',
       type: 'oauth' as const,
@@ -3032,12 +3035,12 @@ describe('fallback Claustrum credential resolution', () => {
     return { authorizations, plugin, result }
   }
 
-  test('disabled gate does not connect and uses the stored token', async () => {
+  test('local mode does not connect and uses the stored token', async () => {
     const calls: CredentialCall[] = []
     let connectorCalls = 0
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-disabled',
-      claustrum: undefined,
+      claustrum: { mode: 'local' },
     })
     const connector = async () => {
       connectorCalls += 1
@@ -6474,7 +6477,7 @@ describe('AnthropicAuthPlugin', () => {
     expect(connectAttempts).toBe(0)
     const storage = await loadAccounts()
     if (!storage) throw new Error('missing test storage')
-    storage.claustrum = { accounts: { [accountId]: { enabled: true } } }
+    storage.claustrum = { mode: 'claustrum' }
     await saveAccounts(storage)
     await tick()
     expect(connectAttempts).toBe(1)
@@ -6521,7 +6524,7 @@ describe('AnthropicAuthPlugin', () => {
     await plugin.__fallbackRefreshReady
     const storage = await loadAccounts()
     if (!storage) throw new Error('missing test storage')
-    storage.claustrum = { accounts: { [accountId]: { enabled: true } } }
+    storage.claustrum = { mode: 'claustrum' }
     await saveAccounts(storage)
     await tick()
     await tick()
