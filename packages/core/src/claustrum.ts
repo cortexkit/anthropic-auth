@@ -589,26 +589,19 @@ export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
 export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
 export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
 
-let custodyManifestLockTestOptions:
-  | Partial<{
-      ttlMs: number
-      retryMinMs: number
-      retryMaxMs: number
-      renewalIntervalMs: number
-      afterStaleOwnerRead: () => void | Promise<void>
-      beforeRename: () => void | Promise<void>
-    }>
-  | undefined
+export type CustodyManifestLockTestOptions = Partial<{
+  ttlMs: number
+  retryMinMs: number
+  retryMaxMs: number
+  renewalIntervalMs: number
+  afterStaleOwnerRead: () => void | Promise<void>
+  beforeRename: () => void | Promise<void>
+}>
+
+let custodyManifestLockTestOptions: CustodyManifestLockTestOptions | undefined
 
 export function __setCustodyManifestLockTestOptions(
-  options?: Partial<{
-    ttlMs: number
-    retryMinMs: number
-    retryMaxMs: number
-    renewalIntervalMs: number
-    afterStaleOwnerRead: () => void | Promise<void>
-    beforeRename: () => void | Promise<void>
-  }>,
+  options?: CustodyManifestLockTestOptions,
 ) {
   custodyManifestLockTestOptions = options
 }

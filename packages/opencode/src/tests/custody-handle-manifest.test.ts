@@ -344,7 +344,7 @@ describe('CustodyHandleManifestReader', () => {
         const stats = await originalLstat(target)
         if (target !== parent) return stats
         return Object.assign(Object.create(stats), {
-          mode: Number(stats.mode) | 0o1000,
+          mode: 0o1770,
         })
       })
       await expect(reader(path).read()).resolves.toMatchObject({
@@ -493,6 +493,24 @@ describe('writeCustodyHandleManifestEntry', () => {
           )
           .map(serialize),
       ).toEqual(before)
+    })
+  })
+
+  test('preserves an oddly formatted foreign block structurally', async () => {
+    const foreign = {
+      provider: 'deepseek',
+      serve: 'opencode-claustrum',
+      accounts: [],
+      retained: { z: 0, a: [true, false] },
+    }
+    const input = ` { "providers" : [ { "retained" : { "z" : 0 , "a" : [ true , false ] }, "accounts" : [ ], "serve" : "opencode-claustrum", "provider" : "deepseek" } ], "version" : 1 } `
+    await withManifest(input, async (path) => {
+      await writeCustodyHandleManifestEntry({ path, entry: writerEntry })
+      const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+        providers: Array<Record<string, unknown>>
+      }
+      expect(output.providers[0]).toEqual(foreign)
+      expect(JSON.parse(await fs.readFile(path, 'utf8'))).toBeDefined()
     })
   })
 
@@ -756,7 +774,7 @@ describe('writeCustodyHandleManifestEntry', () => {
             beforeRename.resolve()
             await resumeA.promise
           },
-        } as never)
+        })
         try {
           const a = writeCustodyHandleManifestEntry({
             path,
@@ -810,7 +828,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         retryMinMs: 5,
         retryMaxMs: 5,
         renewalIntervalMs: 10,
-      } as never)
+      })
       spyOn(fs, 'rename').mockImplementation(async (from, to) => {
         if (String(to) === ownerPath && ++ownerRenames > 1)
           throw Object.assign(new Error('renewal failed'), { code: 'EIO' })
@@ -856,7 +874,7 @@ describe('writeCustodyHandleManifestEntry', () => {
           retryMinMs: 5,
           retryMaxMs: 5,
           renewalIntervalMs: 1_000,
-        } as never)
+        })
         spyOn(fs, 'rename').mockImplementation(async (from, to) => {
           const result = await originalRename(from, to)
           if (String(to) === ownerPath && !scheduledSuccessor) {
@@ -1010,7 +1028,7 @@ describe('withCustodyManifestLock', () => {
             ownerReads += 1
             now = ownerReads === 1 ? ttlMs + 1 : ttlMs + 500
           },
-        } as never)
+        })
         try {
           await fs.mkdir(lockPath, { mode: 0o700 })
           await fs.writeFile(
@@ -1060,7 +1078,7 @@ describe('withCustodyManifestLock', () => {
             retryMinMs: 1,
             retryMaxMs: 1,
             renewalIntervalMs: 1_000,
-          } as never)
+          })
 
           await expect(
             withCustodyManifestLock(path, async () => 'acquired'),
@@ -1070,6 +1088,47 @@ describe('withCustodyManifestLock', () => {
           ).resolves.toBeDefined()
         })
       }
+    },
+  )
+
+  test.serial(
+    'evicts a stale owner record with an unknown future key',
+    async () => {
+      await withTempDirectory(async (directory) => {
+        const path = join(directory, 'handles.json')
+        const lockPath = `${path}.lock`
+        const originalNow = Date.now
+        let now = 0
+        Date.now = () => now
+        __setCustodyManifestLockTestOptions({
+          ttlMs: 100,
+          retryMinMs: 1,
+          retryMaxMs: 1,
+          renewalIntervalMs: 1_000,
+        })
+        try {
+          await fs.mkdir(lockPath, { mode: 0o700 })
+          await fs.writeFile(
+            join(lockPath, 'owner'),
+            `${JSON.stringify({
+              tenant: 'future-tenant',
+              pid: process.pid,
+              claimed_at_ms: now,
+              nonce: 'future-owner',
+              future_field: 1,
+            })}\n`,
+          )
+          now = 101
+          await expect(
+            withCustodyManifestLock(path, async () => 'acquired'),
+          ).resolves.toBe('acquired')
+          await expect(
+            fs.lstat(`${lockPath}.stale-0-future-owner`),
+          ).resolves.toBeDefined()
+        } finally {
+          Date.now = originalNow
+        }
+      })
     },
   )
 
@@ -1110,7 +1169,7 @@ describe('withCustodyManifestLock', () => {
           retryMinMs: 1,
           retryMaxMs: 1,
           renewalIntervalMs: 1_000,
-        } as never)
+        })
 
         for (const [index, [, nonce]] of unsafeNonces.entries()) {
           const path = join(manifestDirectory, `handles-${index}.json`)
@@ -1166,7 +1225,7 @@ describe('withCustodyManifestLock', () => {
             retryMinMs: 1,
             retryMaxMs: 1,
             renewalIntervalMs: 1_000,
-          } as never)
+          })
           spyOn(fs, 'rename').mockImplementation(async (from, to) => {
             if (String(from) === lockPath) staleRenameTargets.push(String(to))
             return originalRename(from, to)
@@ -1195,7 +1254,7 @@ describe('withCustodyManifestLock', () => {
           retryMinMs: 5,
           retryMaxMs: 5,
           renewalIntervalMs: 30,
-        } as never)
+        })
         const order: string[] = []
         const firstEntered = Promise.withResolvers<void>()
         const releaseFirst = Promise.withResolvers<void>()
@@ -1231,7 +1290,7 @@ describe('withCustodyManifestLock', () => {
           retryMinMs: 5,
           retryMaxMs: 5,
           renewalIntervalMs: 1_000,
-        } as never)
+        })
         const firstEntered = Promise.withResolvers<void>()
         const releaseFirst = Promise.withResolvers<void>()
         const secondEntered = Promise.withResolvers<void>()
@@ -1277,7 +1336,7 @@ describe('withCustodyManifestLock', () => {
           retryMinMs: 5,
           retryMaxMs: 5,
           renewalIntervalMs: 1_000,
-        } as never)
+        })
         __setLogTestSink((record) => logs.push(record))
         try {
           await withCustodyManifestLock(path, async () => {
@@ -1317,7 +1376,7 @@ describe('withCustodyManifestLock', () => {
           retryMinMs: 5,
           retryMaxMs: 5,
           renewalIntervalMs: 1_000,
-        } as never)
+        })
 
         await expect(
           withCustodyManifestLock(path, async () => 'acquired'),
@@ -1338,7 +1397,7 @@ describe('withCustodyManifestLock', () => {
         retryMinMs: 5,
         retryMaxMs: 5,
         renewalIntervalMs: 1_000,
-      } as never)
+      })
 
       await expect(
         withCustodyManifestLock(path, async () => 'acquired'),
@@ -1360,7 +1419,7 @@ describe('withCustodyManifestLock', () => {
         retryMinMs: 1,
         retryMaxMs: 1,
         renewalIntervalMs: 5,
-      } as never)
+      })
       const first = withCustodyManifestLock(path, async () => {
         firstEntered.resolve()
         await releaseFirst.promise
@@ -1391,7 +1450,7 @@ describe('withCustodyManifestLock', () => {
           retryMinMs: 1,
           retryMaxMs: 1,
           renewalIntervalMs: 1_000,
-        } as never)
+        })
         spyOn(fs, 'open').mockImplementation(async (...arguments_) => {
           const handle = await originalOpen(...arguments_)
           if (dirname(String(arguments_[0])) === dirname(path)) now = 101
@@ -1425,7 +1484,7 @@ describe('withCustodyManifestLock', () => {
           retryMinMs: 1,
           retryMaxMs: 1,
           renewalIntervalMs: 1_000,
-        } as never)
+        })
         spyOn(fs, 'rename').mockImplementation(async (from, to) => {
           const result = await originalRename(from, to)
           if (String(to) === path) now = 101
@@ -1473,7 +1532,7 @@ describe('withCustodyManifestLock', () => {
             bObservedStaleOwner.resolve()
             await releaseBObservation.promise
           },
-        } as never)
+        })
         await fs.mkdir(lockPath, { mode: 0o700 })
         await fs.writeFile(
           ownerPath,
@@ -1564,7 +1623,7 @@ describe('withCustodyManifestLock', () => {
             bObservedStaleOwner.resolve()
             await releaseBObservation.promise
           },
-        } as never)
+        })
         await fs.mkdir(lockPath, { mode: 0o700 })
         await fs.writeFile(
           ownerPath,
