@@ -1868,115 +1868,134 @@ describe('fallback Claustrum credential resolution', () => {
     },
   )
 
-  // Two concurrent startup migrations lose the second manifest entry; read-modify-write happens outside the manifest lock.
-  test.todo('preserves two concurrent legacy migrations in one manifest', async () => {
-    await withShortManifestLockTiming(async () => {
-      const storageA = fallbackWithClaustrum({
-        id: 'fallback-a',
-        label: 'migration-a',
-        enabled: true,
-        claustrumHandle: `ckh_${'A'.repeat(43)}`,
-        claustrum: { mode: 'claustrum' },
-      })
-      await useTempAccountFile(storageA)
-      const accountPathA = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const manifestPath = await writeManifest([])
-      const restore = await configureClaustrumConnection()
-      const entered = deferred()
-      const release = deferred()
-      let credentialGets = 0
-      const concurrentCalls: CredentialCall[] = []
-      const concurrentConnector = connectorFor(
-        concurrentCalls,
-        async (method, params) => {
-          if (method !== 'credential.get')
-            throw new Error(`unexpected method: ${method}`)
-          credentialGets += 1
-          if (credentialGets === 2) entered.resolve()
-          await release.promise
-          return credentialResponse(
-            `migration-${String(params.handle).at(-1)}-access`,
-            1,
-          )
-        },
-      )
-      const pluginA = await getPlugin(undefined, undefined, {
-        claustrumConnector: concurrentConnector,
-      })
-
-      const accountPathB = join(tempConfigDir!, 'anthropic-auth-b.json')
-      const storageB = fallbackWithClaustrum({
-        id: 'fallback-b',
-        label: 'migration-b',
-        enabled: true,
-        claustrumHandle: `ckh_${'B'.repeat(43)}`,
-        claustrum: { mode: 'claustrum' },
-      })
-      await saveAccounts(storageB, accountPathB)
-      process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
-      process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-        tempConfigDir!,
-        'sidebar-state-b.json',
-      )
-      const pluginB = await getPlugin(undefined, undefined, {
-        claustrumConnector: concurrentConnector,
-      })
-      const originalRename = fs.rename
-      const secondManifestRename = deferred()
-      let manifestRenames = 0
-      const rename = spyOn(fs, 'rename').mockImplementation(
-        async (from, to) => {
-          if (to === manifestPath) {
-            manifestRenames += 1
-            if (manifestRenames === 2) secondManifestRename.resolve()
-            if (manifestRenames === 1)
-              await Promise.race([secondManifestRename.promise, Bun.sleep(100)])
-          }
-          return originalRename(from, to)
-        },
-      )
-      try {
-        await Promise.race([
-          entered.promise,
-          Bun.sleep(1_000).then(() => {
-            throw new Error(
-              `concurrent credential calls did not both start (${credentialGets})`,
+  // Concurrent startup migrations must converge on both manifest entries and clear both legacy sidecars.
+  test.serial(
+    'preserves two concurrent legacy migrations in one manifest',
+    async () => {
+      await withShortManifestLockTiming(async () => {
+        const storageA = fallbackWithClaustrum({
+          id: 'fallback-a',
+          label: 'migration-a',
+          enabled: true,
+          claustrumHandle: `ckh_${'A'.repeat(43)}`,
+          claustrum: { mode: 'claustrum' },
+        })
+        await useTempAccountFile(storageA)
+        const accountPathA = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const manifestPath = await writeManifest([])
+        const restore = await configureClaustrumConnection()
+        const entered = deferred()
+        const release = deferred()
+        let credentialGets = 0
+        const concurrentCalls: CredentialCall[] = []
+        const concurrentConnector = connectorFor(
+          concurrentCalls,
+          async (method, params) => {
+            if (method !== 'credential.get')
+              throw new Error(`unexpected method: ${method}`)
+            credentialGets += 1
+            if (credentialGets === 2) entered.resolve()
+            await release.promise
+            return credentialResponse(
+              `migration-${String(params.handle).at(-1)}-access`,
+              1,
             )
-          }),
-        ])
-        release.resolve()
-        await Promise.race([
-          secondManifestRename.promise,
-          Bun.sleep(1_000).then(() => {
-            throw new Error('concurrent migrations did not finish')
-          }),
-        ])
-        const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
-          providers: Array<{
-            provider: string
-            accounts: Array<{ label: string }>
-          }>
+          },
+        )
+        const pluginA = await getPlugin(undefined, undefined, {
+          claustrumConnector: concurrentConnector,
+        })
+
+        const accountPathB = join(tempConfigDir!, 'anthropic-auth-b.json')
+        const storageB = fallbackWithClaustrum({
+          id: 'fallback-b',
+          label: 'migration-b',
+          enabled: true,
+          claustrumHandle: `ckh_${'B'.repeat(43)}`,
+          claustrum: { mode: 'claustrum' },
+        })
+        await saveAccounts(storageB, accountPathB)
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
+        process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+          tempConfigDir!,
+          'sidebar-state-b.json',
+        )
+        const pluginB = await getPlugin(undefined, undefined, {
+          claustrumConnector: concurrentConnector,
+        })
+        const originalRename = fs.rename
+        const secondManifestRename = deferred()
+        let manifestRenames = 0
+        let migrationWaitAttempts = 0
+        const rename = spyOn(fs, 'rename').mockImplementation(
+          async (from, to) => {
+            if (to === manifestPath) {
+              manifestRenames += 1
+              if (manifestRenames === 1)
+                await Promise.race([
+                  secondManifestRename.promise,
+                  Bun.sleep(100),
+                ])
+            }
+            const result = await originalRename(from, to)
+            if (to === manifestPath && manifestRenames === 2)
+              secondManifestRename.resolve()
+            return result
+          },
+        )
+        try {
+          await Promise.race([
+            entered.promise,
+            Bun.sleep(1_000).then(() => {
+              throw new Error(
+                `concurrent credential calls did not both start (${credentialGets})`,
+              )
+            }),
+          ])
+          release.resolve()
+          await Promise.race([
+            secondManifestRename.promise,
+            Bun.sleep(1_000).then(() => {
+              throw new Error('concurrent migrations did not finish')
+            }),
+          ])
+          const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
+            providers: Array<{
+              provider: string
+              accounts: Array<{ label: string }>
+            }>
+          }
+          expect(
+            manifest.providers
+              .find((provider) => provider.provider === 'anthropic')
+              ?.accounts.map((account) => account.label)
+              .sort(),
+          ).toEqual(['migration-a', 'migration-b'])
+          for (; migrationWaitAttempts < 100; migrationWaitAttempts++) {
+            const [stateA, stateB] = await Promise.all([
+              readFile(getAccountStatePath(accountPathA), 'utf8'),
+              readFile(getAccountStatePath(accountPathB), 'utf8'),
+            ])
+            if (!stateA.includes('ckh_A') && !stateB.includes('ckh_B')) break
+            await Bun.sleep(10)
+          }
+          expect(migrationWaitAttempts).toBeGreaterThan(0)
+          expect(migrationWaitAttempts).toBeLessThan(100)
+          expect(
+            await readFile(getAccountStatePath(accountPathA), 'utf8'),
+          ).not.toContain('ckh_A')
+          expect(
+            await readFile(getAccountStatePath(accountPathB), 'utf8'),
+          ).not.toContain('ckh_B')
+        } finally {
+          rename.mockRestore()
+          await pluginA.dispose?.()
+          await pluginB.dispose?.()
+          restore()
         }
-        expect(
-          manifest.providers
-            .find((provider) => provider.provider === 'anthropic')
-            ?.accounts.map((account) => account.label)
-            .sort(),
-        ).toEqual(['migration-a', 'migration-b'])
-        expect(
-          await readFile(getAccountStatePath(accountPathA), 'utf8'),
-        ).not.toContain('ckh_A')
-        expect(
-          await readFile(getAccountStatePath(accountPathB), 'utf8'),
-        ).not.toContain('ckh_B')
-      } finally {
-        rename.mockRestore()
-        await pluginA.dispose?.()
-        await pluginB.dispose?.()
-        restore()
-      }
-    })
-  })
+      })
+    },
+  )
 
   async function runCustodyCommand(
     plugin: any,
