@@ -165,7 +165,10 @@ export function buildManageAccountOptions(account: TuiAccountDialogAccount) {
   })
   if (account.custodyEligible) {
     options.push({
-      title: account.claustrumGate === 'on' ? 'Use sidecar service' : 'Use vault service',
+      title:
+        account.claustrumGate === 'on'
+          ? 'Use sidecar service'
+          : 'Use vault service',
       value: 'custody',
       description: 'Choose whether the vault may serve this account',
     })
