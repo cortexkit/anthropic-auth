@@ -8,7 +8,10 @@ import {
   isOAuthAccountVaultOwned,
   setClaustrumModePersistent,
 } from '../accounts.ts'
-import type { ClaustrumDetection } from '../claustrum.ts'
+import type {
+  ClaustrumDetection,
+  CustodyHandleResolution,
+} from '../claustrum.ts'
 import { formatOAuthAccountTier } from '../oauth-profile.ts'
 
 export const CLAUDE_ACCOUNT_COMMAND_NAME = 'claude-account'
@@ -243,6 +246,7 @@ export async function executeAccountCommand(input: {
   storage: AccountStorage
   claustrum?: ClaustrumDetection
   statusProjection?: AccountCommandStatusProjection
+  resolveCustodyBinding?: (account: FallbackAccount) => CustodyHandleResolution
   path?: string
   transition?: ClaustrumModeTransition
 }): Promise<AccountCommandResult> {
@@ -275,10 +279,13 @@ export async function executeAccountCommand(input: {
       const storedAccount = input.storage.accounts.find(
         (account) => account.id === a.id,
       )
+      const binding = storedAccount
+        ? input.resolveCustodyBinding?.(storedAccount)
+        : undefined
       const custody =
         a.id !== mainId &&
         storedAccount &&
-        isOAuthAccountVaultOwned(input.storage, storedAccount, undefined)
+        isOAuthAccountVaultOwned(input.storage, storedAccount, binding)
           ? 'vault-bound'
           : projected?.claustrumGate === 'on'
             ? 'vault-bound'

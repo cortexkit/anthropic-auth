@@ -905,6 +905,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 
 function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
   if (!isRecord(value)) return undefined
+  const { handlesFile: _rawHandlesFile, ...rest } = value
   const mode: ClaustrumMode | undefined =
     value.mode === 'local' || value.mode === 'claustrum'
       ? value.mode
@@ -939,7 +940,7 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
     return undefined
   }
   return {
-    ...value,
+    ...rest,
     ...(mode && { mode }),
     ...(handlesFile && { handlesFile }),
     ...(accounts && Object.keys(accounts).length > 0 && { accounts }),

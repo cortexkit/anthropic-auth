@@ -4160,6 +4160,16 @@ const anthropicAuthPlugin = async (
             )
           : undefined,
       statusProjection,
+      resolveCustodyBinding:
+        action.type === 'status'
+          ? (account) =>
+              isOAuthAccount(account)
+                ? resolveAccountCustodyHandle(
+                    account,
+                    storage ?? createEmptyStorage(),
+                  )
+                : { status: 'unresolved', reason: 'missing-entry' }
+          : undefined,
     })
 
     if (result.updated) {

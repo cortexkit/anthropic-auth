@@ -393,6 +393,23 @@ describe('executeAccountCommand status', () => {
     expect(result.text).toContain('**Work account** [fallback] · vault-bound')
   })
 
+  test('renders a resolved custody binding without a status projection', async () => {
+    const storage = baseStorage()
+    storage.claustrum = { mode: 'claustrum' }
+
+    const result = await executeAccountCommand({
+      argumentsText: '',
+      storage,
+      resolveCustodyBinding: () => ({
+        status: 'resolved',
+        source: 'legacy',
+        handle: 'legacy-handle',
+      }),
+    } as never)
+
+    expect(result.text).toContain('**Work account** [fallback] · vault-bound')
+  })
+
   test('usage returns usage text', async () => {
     const storage = baseStorage()
     const result = await executeAccountCommand({
