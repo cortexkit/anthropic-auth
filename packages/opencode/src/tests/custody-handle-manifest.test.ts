@@ -8,6 +8,7 @@ import {
   __setLogTestSink,
   CUSTODY_MANIFEST_LOCK_TTL_MS,
   CustodyHandleManifestReader,
+  custodyCredentialId,
   readCustodyHandles,
   resolveCustodyHandle,
   withCustodyManifestLock,
@@ -188,6 +189,11 @@ describe('CustodyHandleManifestReader', () => {
         })
       },
     )
+  })
+
+  test('builds the canonical OAuth credential id from a custody label', () => {
+    expect(custodyCredentialId('work-alt')).toBe('oauth:anthropic:work-alt')
+    expect(() => custodyCredentialId('not a label')).toThrow('invalid-label')
   })
 
   test('rejects invalid handles with a fixed reason', async () => {

@@ -239,6 +239,12 @@ export function isValidCustodyHandle(value: unknown): value is string {
   return typeof value === 'string' && CUSTODY_HANDLE_PATTERN.test(value)
 }
 
+export function custodyCredentialId(label: string): string {
+  if (!isValidCustodyLabel(label))
+    throw new CustodyManifestSelectionError('invalid-label')
+  return `oauth:anthropic:${label}`
+}
+
 function isValidCustodyCredentialId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
@@ -287,7 +293,7 @@ export function resolveCustodyHandle(input: {
   const entry = manifest.accounts.find(
     (candidate) =>
       candidate.label === account.label &&
-      candidate.credentialId === `oauth:anthropic:${account.label}`,
+      candidate.credentialId === custodyCredentialId(account.label),
   )
   if (!entry) return legacyOrUnresolved(account, 'missing-entry')
   if (manifest.superseded.has(entry.handle)) {
@@ -386,9 +392,18 @@ type CustodyHandleManifestReadResult =
   | { status: 'ignored'; reason: 'foreign-serve' | 'missing-provider' }
   | { status: 'invalid'; reason: string }
 
-class CustodyManifestSelectionError extends Error {
-  constructor(readonly reason: 'foreign-serve' | 'missing-provider') {
-    super(reason)
+export const CUSTODY_MANIFEST_SELECTION_ERROR_CODES = [
+  'foreign-serve',
+  'invalid-label',
+  'missing-provider',
+] as const
+
+type CustodyManifestSelectionErrorCode =
+  (typeof CUSTODY_MANIFEST_SELECTION_ERROR_CODES)[number]
+
+export class CustodyManifestSelectionError extends Error {
+  constructor(readonly code: CustodyManifestSelectionErrorCode) {
+    super(code)
   }
 }
 
@@ -523,13 +538,15 @@ export class CustodyHandleManifestReader {
         )
       } catch (error) {
         if (error instanceof CustodyManifestSelectionError) {
-          const result = { status: 'ignored', reason: error.reason } as const
-          this.#cache = {
-            mtimeMs: openedStats.mtimeMs,
-            size: openedStats.size,
-            result,
+          if (error.code !== 'invalid-label') {
+            const result = { status: 'ignored', reason: error.code } as const
+            this.#cache = {
+              mtimeMs: openedStats.mtimeMs,
+              size: openedStats.size,
+              result,
+            }
+            return result
           }
-          return result
         }
         return {
           status: 'invalid',
@@ -759,7 +776,9 @@ export async function withCustodyManifestLock<T>(
       throw new CustodyManifestLockBusyError('manifest lock busy')
     const retryMs =
       retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
-    await Bun.sleep(Math.min(retryMs, Math.max(1, deadline - now())))
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, Math.min(retryMs, Math.max(1, deadline - now()))),
+    )
   }
 
   let renewalFailed = false

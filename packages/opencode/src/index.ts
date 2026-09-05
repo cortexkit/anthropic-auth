@@ -46,6 +46,7 @@ import {
   connectClaustrumCredentialCache,
   createEmptyStorage,
   createStickyNoRouteResponse,
+  custodyCredentialId,
   type DumpHandle,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
@@ -2298,7 +2299,7 @@ const anthropicAuthPlugin = async (
                     entry: {
                       label: account.label,
                       handle,
-                      credentialId: `oauth:anthropic:${account.label}`,
+                      credentialId: custodyCredentialId(account.label),
                     },
                   })
                   if (write.status === 'written') {
@@ -4307,7 +4308,7 @@ const anthropicAuthPlugin = async (
                     return refuse(
                       'credential',
                       error.errorClass,
-                      `Vault credential needs re-login (ck auth login --id ${custodyResolution.status === 'resolved' && custodyResolution.source === 'manifest' ? custodyResolution.credentialId : `oauth:anthropic:${account.label ?? account.id}`}).`,
+                      `Vault credential needs re-login (ck auth login --id ${custodyResolution.status === 'resolved' && custodyResolution.source === 'manifest' ? custodyResolution.credentialId : custodyCredentialId(account.label ?? account.id)}).`,
                     )
                   }
                   return refuse(
@@ -4361,7 +4362,7 @@ const anthropicAuthPlugin = async (
                     entry: {
                       label: account.label,
                       handle,
-                      credentialId: `oauth:anthropic:${account.label}`,
+                      credentialId: custodyCredentialId(account.label),
                     },
                   })
                   if (write.status === 'written') {

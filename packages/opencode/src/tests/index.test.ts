@@ -32,6 +32,7 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   clearClaustrumRefreshErrorPersistent,
+  custodyCredentialId,
   extractBillingHeaderCCH,
   FALLBACK_BACKGROUND_TICK_MS,
   getAccountStatePath,
@@ -1062,7 +1063,7 @@ describe('fallback Claustrum credential resolution', () => {
             accounts: entries.map(({ label, handle }) => ({
               label,
               handle,
-              credential_id: `oauth:anthropic:${label}`,
+              credential_id: custodyCredentialId(label),
             })),
           },
         ],
