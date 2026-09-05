@@ -5,6 +5,7 @@ import {
   type ApiKeyAccount,
   acquireRefreshFileLock,
   addAccountPersistent,
+  assertNotCustodyTombstone,
   authorize,
   buildAccountList,
   buildClaudeQuotaSummary,
@@ -38,7 +39,7 @@ import {
   CustodyHandleManifestReader,
   type CustodyHandleResolution,
   type CustodyStatusState,
-  CustodyTombstoneRefreshError,
+  CustodyTombstoneLoginError,
   clearClaustrumHandlePersistent,
   clearClaustrumRefreshErrorPersistent,
   computeXxhash64Hex,
@@ -868,6 +869,7 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
 }
 
 type PluginRuntimeOverrides = Partial<{
+  authorize: typeof authorize
   setTimeout: typeof globalThis.setTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
@@ -935,6 +937,7 @@ const anthropicAuthPlugin = async (
   const clearClaustrumRefreshErrorPersistentImpl =
     runtimeOverrides.clearClaustrumRefreshErrorPersistent ??
     clearClaustrumRefreshErrorPersistent
+  const authorizeImpl = runtimeOverrides.authorize ?? authorize
   startEventLoopLagMonitor()
   const { client } = ctx
   const profileFetch = globalThis.fetch
@@ -4814,12 +4817,16 @@ const anthropicAuthPlugin = async (
         const auth = await getAuth()
         if (auth.type === 'oauth') {
           if (isCustodyTombstoneOAuth(auth, 'anthropic')) {
-            logger.error(
-              'auth',
-              'custody tombstone on main slot; vault-served main not implemented',
-            )
-            // This branch becomes the vault path in the takeover PR.
-            throw new CustodyTombstoneRefreshError('anthropic')
+            if (getClaustrumMode(initialStorage) === 'claustrum') {
+              return {
+                fetch: async () => {
+                  throw new Error(
+                    'CUSTODY_SERVE: main vault serving is not yet available',
+                  )
+                },
+              }
+            }
+            throw new CustodyTombstoneLoginError('anthropic')
           }
           mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
           if (auth.access) {
@@ -5667,6 +5674,7 @@ const anthropicAuthPlugin = async (
             mainQuotaIdentity?: MainQuotaIdentityBinding,
             claustrumResolution?: ClaustrumAccessResolution,
           ) {
+            assertNotCustodyTombstone(accessToken, 'anthropic')
             const start = nowMs()
             const servedClaustrumCredential = claustrumResolution?.served
             let requestStorage = currentStorage
@@ -7874,7 +7882,15 @@ const anthropicAuthPlugin = async (
           label: 'Claude Pro/Max',
           type: 'oauth',
           authorize: async () => {
-            const result = await authorize('max')
+            if (
+              getClaustrumMode(await loadAccounts(accountStoragePath)) ===
+              'claustrum'
+            ) {
+              throw new Error(
+                'Exit Claustrum mode first: /claude-account local',
+              )
+            }
+            const result = await authorizeImpl('max')
             return {
               url: result.url,
               instructions: 'Paste the authorization code here:',
