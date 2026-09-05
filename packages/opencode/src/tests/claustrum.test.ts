@@ -269,7 +269,6 @@ describe('account status Claustrum surface', () => {
             vaultServed: false,
             vaultReauth: false,
             custodyState: 'na',
-            custodyEligible: false,
           },
           {
             id: 'account-a',
@@ -281,7 +280,6 @@ describe('account status Claustrum surface', () => {
             vaultServed: false,
             vaultReauth: false,
             custodyState: 'on-cold',
-            custodyEligible: true,
           },
           {
             id: 'account-b',
@@ -293,7 +291,6 @@ describe('account status Claustrum surface', () => {
             vaultServed: false,
             vaultReauth: false,
             custodyState: 'off',
-            custodyEligible: true,
           },
         ],
       },

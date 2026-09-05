@@ -176,13 +176,14 @@ export function custodyStatusLabel(state: CustodyStatusState): string {
 
 export type AccountCommandStatusProjection = {
   claustrumDetection: string
+  custodyMode?: 'local' | 'claustrum'
+  custodyModeKnown?: boolean
   accounts: Array<
     AccountListItem & {
       claustrumGate: 'on' | 'off' | 'na'
       vaultServed: boolean
       vaultReauth: boolean
       custodyState: CustodyStatusState
-      custodyEligible: boolean
     }
   >
 }

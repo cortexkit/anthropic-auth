@@ -3,7 +3,6 @@ import type { PrimeAccountStatus } from '@cortexkit/anthropic-auth-core'
 import {
   buildAccountDialogOption,
   buildKillswitchThresholdSeed,
-  buildManageAccountOptions,
   buildPrimeStatusRows,
   handlePrimeStatusOption,
   normalizeAccountDialogAccounts,
@@ -48,7 +47,6 @@ describe('buildAccountDialogOption', () => {
         vaultServed: true,
         vaultReauth: false,
         custodyState: 'on-vault-served',
-        custodyEligible: true,
       }),
     ).toEqual({
       title: 'Work [fallback] 22% · custody binding present · vault-served',
@@ -68,7 +66,6 @@ describe('buildAccountDialogOption', () => {
       vaultServed: false,
       vaultReauth: true,
       custodyState: 'on-vault-reauth',
-      custodyEligible: true,
     })
     expect(option.title).toContain('custody binding present · vault reauth')
     expect(option.title).not.toContain('handle')
@@ -85,7 +82,6 @@ describe('buildAccountDialogOption', () => {
       vaultServed: false,
       vaultReauth: false,
       custodyState: 'on-cold',
-      custodyEligible: true,
     })
 
     expect(option.title).toContain('custody binding present · cold')
@@ -102,7 +98,6 @@ describe('buildAccountDialogOption', () => {
       vaultServed: false,
       vaultReauth: false,
       custodyState: 'na',
-      custodyEligible: false,
     })
 
     expect(option.title).toContain('custody n/a')
@@ -126,33 +121,6 @@ describe('buildAccountDialogOption', () => {
       title: 'Work [fallback] –%',
       value: 'work',
     })
-  })
-})
-
-describe('buildManageAccountOptions', () => {
-  test('offers custody only for eligible OAuth fallback accounts', () => {
-    const base = {
-      id: 'work',
-      label: 'Work',
-      role: 'fallback' as const,
-      enabled: true,
-      quotaPercent: null,
-      claustrumGate: 'on' as const,
-      vaultServed: false,
-      vaultReauth: false,
-      custodyState: 'on-cold' as const,
-    }
-
-    expect(
-      buildManageAccountOptions({ ...base, custodyEligible: true }).map(
-        (option) => option.title,
-      ),
-    ).toContain('Use sidecar service')
-    expect(
-      buildManageAccountOptions({ ...base, custodyEligible: false }).map(
-        (option) => option.title,
-      ),
-    ).not.toContain('Use sidecar service')
   })
 })
 

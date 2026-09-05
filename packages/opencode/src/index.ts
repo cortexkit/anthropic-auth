@@ -39,12 +39,14 @@ import {
   type CustodyHandleResolution,
   type CustodyStatusState,
   CustodyTombstoneRefreshError,
+  clearClaustrumHandlePersistent,
   clearClaustrumRefreshErrorPersistent,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   connectClaustrumCredentialCache,
   createEmptyStorage,
   createStickyNoRouteResponse,
+  custodyCredentialId,
   type DumpHandle,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
@@ -112,6 +114,7 @@ import {
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
+  isValidCustodyLabel,
   KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
@@ -189,6 +192,7 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
   tokenFingerprint,
+  writeCustodyHandleManifestEntry,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
 
@@ -236,6 +240,7 @@ import {
 } from './rpc/notifications.ts'
 import {
   type AccountDialogAccount,
+  type AccountDialogKnobs,
   type ApplyRequest,
   type ApplyResult,
   COMMAND_MODAL_NAMES,
@@ -4272,10 +4277,7 @@ const anthropicAuthPlugin = async (
 
   async function buildAccountDialogProjection(
     storageOverride?: Awaited<ReturnType<typeof loadAccounts>>,
-  ): Promise<{
-    accounts: AccountDialogAccount[]
-    claustrumDetection: string
-  }> {
+  ): Promise<AccountDialogKnobs> {
     const storage = storageOverride ?? (await loadAccounts(accountStoragePath))
     const accountStorage = storage ?? createEmptyStorage()
     const accounts = buildAccountList(accountStorage).map((account) => {

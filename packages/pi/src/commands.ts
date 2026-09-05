@@ -277,11 +277,6 @@ export function registerCommands(pi: ExtensionAPI) {
         transition: async () => ({
           text: 'Custody mode is managed from OpenCode; Pi does not participate.',
         }),
-        custody: {
-          platform: 'unsupported',
-          reason:
-            'Claustrum manifest service is OpenCode-only in this version.',
-        },
         claustrum:
           action.type === 'status'
             ? await detectClaustrumConnection()

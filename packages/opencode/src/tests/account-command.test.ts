@@ -367,7 +367,6 @@ describe('executeAccountCommand status', () => {
             vaultServed: false,
             vaultReauth: false,
             custodyState: 'na',
-            custodyEligible: false,
           },
           {
             id: 'fallback-1',
@@ -379,7 +378,6 @@ describe('executeAccountCommand status', () => {
             vaultServed: false,
             vaultReauth: true,
             custodyState: 'on-vault-reauth',
-            custodyEligible: true,
           },
         ],
       },

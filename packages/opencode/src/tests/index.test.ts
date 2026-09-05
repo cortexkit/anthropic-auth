@@ -54,7 +54,6 @@ import {
   resetFastModeState,
   saveAccountState,
   saveAccounts,
-  setClaustrumAccountGatePersistent,
   setLogLevel,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -1336,7 +1335,7 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test.serial(
-    'warms a manifest handle when its gate turns on after boot',
+    'warms a manifest handle when claustrum mode turns on after boot',
     async () => {
       await useTempAccountFile(
         manifestStorage({ label: 'gate-after', gate: false }),
@@ -1355,10 +1354,7 @@ describe('fallback Claustrum credential resolution', () => {
         }) as never,
       })
       expect(calls).toHaveLength(0)
-      await setClaustrumAccountGatePersistent({
-        id: 'fallback-1',
-        enabled: true,
-      })
+      await runCustodyCommand(plugin, 'gate-after', 'claustrum')
       await handlers.at(-1)?.()
       await waitForMockCall({ mock: { calls } })
       expect(
@@ -3273,7 +3269,6 @@ describe('fallback Claustrum credential resolution', () => {
           | 'on-vault-served'
           | 'on-vault-reauth'
           | 'on-cold'
-        custodyEligible: boolean
       }>
       expect(payload?.command).toBe('claude-account')
       expect(payload?.knobs.claustrumDetection).toBe('available')
@@ -3299,10 +3294,6 @@ describe('fallback Claustrum credential resolution', () => {
         sidebarState.fallbacks.find((account) => account.id === 'fallback-1')
           ?.custodyState,
       ).toBe(dialogCustodyState === 'na' ? undefined : dialogCustodyState)
-      expect(
-        accounts.find((account) => account.id === 'fallback-1')
-          ?.custodyEligible,
-      ).toBe(true)
       const payloadBytes = JSON.stringify(payload)
       expect(payloadBytes).not.toContain(
         'ckh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',

@@ -1090,7 +1090,6 @@ describe('credential-handle blindness', () => {
         account.role === 'main'
           ? ('na' as const)
           : ('on-vault-served' as const),
-      custodyEligible: account.role === 'fallback',
     }))
     const server = await startRpcServer({
       dir: rpcDir,
