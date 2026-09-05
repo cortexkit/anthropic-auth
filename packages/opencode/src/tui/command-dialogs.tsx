@@ -21,14 +21,9 @@ type KillswitchDialogConfig = {
 
 type TuiAccountDialogAccount = Omit<
   AccountDialogAccount,
-  'vaultReauth' | 'custodyState' | 'custodyEligible'
+  'vaultReauth' | 'custodyState'
 > &
-  Partial<
-    Pick<
-      AccountDialogAccount,
-      'vaultReauth' | 'custodyState' | 'custodyEligible'
-    >
-  >
+  Partial<Pick<AccountDialogAccount, 'vaultReauth' | 'custodyState'>>
 
 export const PRIME_DIALOG_OPTIONS = [
   { title: 'Enable', value: 'on' },
@@ -104,15 +99,13 @@ export function normalizeAccountDialogAccounts(
         custodyState === 'on-vault-served' ||
         custodyState === 'on-vault-reauth' ||
         custodyState === 'on-cold') &&
-      typeof account.vaultReauth === 'boolean' &&
-      typeof account.custodyEligible === 'boolean'
+      typeof account.vaultReauth === 'boolean'
     ) {
       return [
         {
           ...normalized,
           custodyState,
           vaultReauth: account.vaultReauth,
-          custodyEligible: account.custodyEligible,
         },
       ]
     }
@@ -163,16 +156,6 @@ export function buildManageAccountOptions(account: TuiAccountDialogAccount) {
     value: 'move-down',
     description: 'Lower priority in fallback order',
   })
-  if (account.custodyEligible) {
-    options.push({
-      title:
-        account.claustrumGate === 'on'
-          ? 'Use sidecar service'
-          : 'Use vault service',
-      value: 'custody',
-      description: 'Choose whether the vault may serve this account',
-    })
-  }
   options.push({
     title: 'Remove\u2026',
     value: 'remove',
@@ -885,10 +868,7 @@ export function openCommandDialog(
               return
             }
 
-            const args =
-              option.value === 'custody'
-                ? `custody ${account.id} ${account.claustrumGate === 'on' ? 'off' : 'on'}`
-                : `${option.value} ${account.id}`
+            const args = `${option.value} ${account.id}`
             void apply('claude-account', args).then((r) => {
               api.ui.toast({ message: r.text })
               updateAccounts(r)

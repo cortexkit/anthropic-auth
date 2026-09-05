@@ -25,7 +25,6 @@ export interface AccountDialogAccount {
   vaultServed: boolean
   vaultReauth: boolean
   custodyState: 'na' | 'off' | 'on-vault-served' | 'on-vault-reauth' | 'on-cold'
-  custodyEligible: boolean
 }
 
 export interface AccountDialogKnobs {

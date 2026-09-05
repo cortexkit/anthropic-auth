@@ -1542,13 +1542,6 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
-export function isClaustrumEnabledForAccount(
-  storage: AccountStorage,
-  accountId: string,
-): boolean {
-  return storage.claustrum?.accounts?.[accountId]?.enabled === true
-}
-
 export function getClaustrumMode(
   storage: AccountStorage | null,
 ): ClaustrumMode {
@@ -1581,44 +1574,6 @@ export async function setClaustrumModePersistent(
       storage.claustrum = { ...storage.claustrum, mode }
       await saveAccountsWithConfigLock(storage, path, {})
       return 'changed'
-    } finally {
-      await lock.release()
-    }
-  })
-}
-
-export async function setClaustrumAccountGatePersistent(input: {
-  id: string
-  enabled: boolean
-  path?: string
-}): Promise<'updated' | 'unchanged' | 'missing' | 'ineligible'> {
-  const path = input.path ?? getAccountStoragePath()
-  return enqueueSave(async () => {
-    const lock = await acquireAccountConfigWriteLock(path)
-    try {
-      const storage = await loadAccounts(path)
-      if (!storage) {
-        return 'missing'
-      }
-      const account = storage.accounts.find(
-        (candidate) => candidate.id === input.id,
-      )
-      if (!account) return 'missing'
-      if (!isOAuthAccount(account)) return 'ineligible'
-      if (isClaustrumEnabledForAccount(storage, input.id) === input.enabled) {
-        return 'unchanged'
-      }
-
-      const accounts = storage.claustrum?.accounts ?? {}
-      storage.claustrum = {
-        ...storage.claustrum,
-        accounts: {
-          ...accounts,
-          [input.id]: { ...accounts[input.id], enabled: input.enabled },
-        },
-      }
-      await saveAccountsWithConfigLock(storage, path, {})
-      return 'updated'
     } finally {
       await lock.release()
     }
