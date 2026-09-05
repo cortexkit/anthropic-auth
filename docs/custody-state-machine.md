@@ -5,10 +5,12 @@ mode transition; the PR comment stream (Rev 1, Rev 2, three addenda) is supersed
 reasoning is kept in-tree because a diff will not carry it and every row here was paid for by a
 ruling or an incident.
 
-Status: **handed off.** At the maintainer's request (2026-09-05, PR #196) this document records the
-current findings and the unresolved questions (§12); design and implementation continue on the
-maintainer's side. Nothing in this file is implemented; the branch still carries the superseded
-per-account toggle, which will not be merged as-is.
+Status: **implementation baseline** (maintainer, 2026-09-05 06:04Z, PR #196). This document is the
+baseline for the implementation pass; the maintainer reviews the result and owns final integration
+and remaining corrections. The go-ahead is permission to build, **not** approval to merge or to
+activate takeover against live credentials; no live migration or release is authorised by it. Three
+constraints bind the implementation (§13). The branch still carries the superseded per-account
+toggle, which will not be merged as-is.
 
 ## 1. Scope and vocabulary
 
@@ -311,14 +313,13 @@ transition table). These differ on purpose and are stated so neither is read as 
   manifest-lock PR). The instrument re-point is **done and self-actuating** (2026-09-05 05:55Z):
   sealer and latch-watch read the tombstone predicate per tick, so nothing on that side is a
   flip-time action.
-- Migration-time gate, ours, two halves: (a) probe the **installed** `ck-auth` binary for the typed
-  tombstone refusal **with a real-material positive control in the same run**, and assert zero
-  audit-chain movement (an announcement is a trigger to run the probe, not evidence); (b) send the
-  exact flip time (UTC + epoch) to the Claustrum seat **before** `client.auth.set` runs, and treat
-  the handover as confirmed only when they return the `CUSTODY_MODE` edge from the sealer log and
-  the `EXCLUDE_NOW ''` edge from latch-watch with timestamps. Two independent instruments observing
-  the edge is the observation; our own "wrote tombstone" log line is a claim about the write, not
-  about the handover.
+- **Operator runbook for this deployment (not a runtime dependency; §13.3):** (a) probe the
+  **installed** `ck-auth` binary for the typed tombstone refusal **with a real-material positive
+  control in the same run**, and assert zero audit-chain movement (an announcement is a trigger to
+  run the probe, not evidence); (b) send the exact flip time (UTC + epoch) to the Claustrum seat
+  **before** the write, and treat the handover as observed only when they return the `CUSTODY_MODE`
+  edge from the sealer log and the `EXCLUDE_NOW ''` edge from latch-watch with timestamps. This is
+  how this operator verifies the live flip; the command's own completion contract is §13.3.
 - Manifest-lock contract: case-folding aliasing of nonces on case-insensitive volumes (raised with
   the contract owner, unruled).
 
@@ -364,3 +365,27 @@ individually correct and jointly unreconciled here.
 - The `enable` precondition under `claustrum` requires `USABLE`; whether a `REAUTH`-latched account
   may be enabled-but-dark (so it resumes without a second operator action after re-import) is
   unstated.
+## 13. Implementation constraints (binding, from the 06:04Z go-ahead)
+
+1. **The host-write race stays open and the unsafe transition stays BLOCKED.** The main-slot
+   write (`client.auth.set` of the tombstone, §7 step 4 main; `RESTORE_TOMBSTONE`, C9) is not
+   fenced against OpenCode's `Auth.set`. Until a source-backed synchronisation exists, the command
+   **refuses** to perform that write with a typed error naming this as the reason; it does not
+   describe the fingerprint as a fix and does not weaken the invariant so a test passes. The
+   fallback half of the barrier (fenced by our own locks), the serving path, and every independent
+   task proceed. Regression coverage must **demonstrate the exact interleaving** (a host write
+   between our re-read and our write, for both the tombstone install and absent-slot restoration)
+   and assert that the transition is blocked; a passing fingerprint-only test is not proof of
+   safety and must not be presented as one.
+2. **Returning to `local` never makes a surviving binding's material refreshable by itself.** A
+   raced or restored local credential under a live binding stays inert until a login verified
+   through our own path clears the binding (L4/L5). No wording anywhere says a raced login "stands".
+3. **Production correctness is separate from local operational observation.** The Claustrum-seat
+   steps in §11 (sending a flip time, receiving sealer/latch-watch log edges) are an **operator
+   runbook** for this deployment, not a runtime dependency of the command and not part of its
+   completion contract. Completion is machine-checkable inside the plugin: after the write, the slot
+   re-reads as the recognise-set; `credential.get` through the binding succeeds; status reports
+   `CUSTODY_SERVE`; zero local refresh attempts are observed for the account.
+
+Regression coverage required by the go-ahead: host-write interleaving (blocked, both directions),
+crash/resume, concurrent mode changes, verified-login binding clearance.
