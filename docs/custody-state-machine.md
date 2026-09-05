@@ -98,7 +98,7 @@ Evaluated independently for main and for **each enabled OAuth fallback**.
 | axis | values | notes |
 |---|---|---|
 | `mode` | `local` · `claustrum` | global, durable; the only global write in the barrier |
-| `binding` | `VALID` · `INVALID` · `ABSENT` | the account's entry `{label, handle, credentialId}` in our provider block of the shared handle manifest. `INVALID` = entry present, handle or credentialId fails validation `VALID` = a RESOLVED binding from the resolver, whichever source it came from: a manifest entry, or (transitionally, for the migration window and the crash-left / unreadable-manifest case) a plugin-written sidecar handle. Source is provenance, not authorization; the resolver owns the binding decision and startup migration converges sidecar handles into the manifest. What membership-by-manifest retires is the per-account *config flag* as an authority, not sidecar-held bindings. |
+| `binding` | `VALID` · `INVALID` · `ABSENT` | the account's entry `{label, handle, credentialId}` in our provider block of the shared handle manifest. `INVALID` = entry present, handle or credentialId fails validation. `VALID` = a RESOLVED binding from the resolver, whichever source it came from: a manifest entry, or (transitionally, for the migration window and the crash-left / unreadable-manifest case) a plugin-written sidecar handle. Source is provenance, not authorization; the resolver owns the binding decision and startup migration converges sidecar handles into the manifest. What membership-by-manifest retires is the per-account *config flag* as an authority, not sidecar-held bindings. |
 | `local` | `REAL` · `INERT` · `GONE` | main: `REAL` = usable material, `INERT` = recognise-set tombstone, `GONE` = slot absent **as observed through the SDK**. An unparseable main slot is unobservable: `Auth.all()` runs `Record.filterMap(decode)` (`auth/index.ts:65-66`), so a slot failing the `Info` schema reads as `undefined` and any later host write rewrites the file without it; for main, `GONE ≡ SLOT_ABSENT`. Fallback: `REAL` = usable refresh material, `INERT` = refresh material absent, row otherwise valid, `GONE` = `ROW_UNPARSEABLE` (our own store, so the distinction survives there; a row that is *absent* while a binding exists is the discovery operation, §7, not a coordinate) |
 | `vault` | `USABLE` · `COLD` · `REAUTH` · `N/A` | resolved through the binding's handle. `COLD` = daemon unreachable or credential not resident (transient). `REAUTH` = record latched `needs_reauth`. `N/A` ⇔ `binding ∈ {ABSENT, INVALID}` |
 
@@ -156,7 +156,7 @@ vault-owned family.
 |---|---|---|---|---|---|---|---|---|---|
 | C1 | VALID | INERT | USABLE | `CUSTODY_SERVE` | vault | inert | none | — | none |
 | C2 | VALID | REAL, fingerprint **matches** | USABLE | fallback: `RESUME_TAKEOVER` · main: `TAKEOVER_INCOMPLETE_MAIN_REAL` (§13.1) | fallback: vault, after its commit · main: **no** | inert | fallback → drop refresh material under its lock · main → **none** | fallback: immediate · main: none | main: `ck auth migrate-plugin --allow-main` |
-| C2′ | VALID | REAL, fingerprint **differs or absent** | any | `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` | **no** | inert | **none** | none | **unresolved** (§12.2): `ck auth migrate-plugin --replace` then re-enter is consistent with every rule; "exit to `local` and the login stands" is not |
+| C2′ | VALID | REAL, fingerprint **differs or absent** | any | `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` (for main under §13.1 this is the *classification* of the `TAKEOVER_INCOMPLETE_MAIN_REAL` refusal: material the barrier did not read, versus C2's crash-left material it did) | **no** | inert | **none** | none | **unresolved** (§12.2): `ck auth migrate-plugin --replace` then re-enter is consistent with every rule; "exit to `local` and the login stands" is not |
 | C3 | VALID | INERT | COLD | `CUSTODY_UNAVAILABLE` | **no** (typed provider-unavailable) | inert | none | bounded custody retry on vault availability | none |
 | C3′ | VALID | REAL | COLD | `TAKEOVER_INCOMPLETE_VAULT_UNAVAILABLE` | **no** | inert | **none**: no rollback, no drop. The destructive commit waits for `USABLE` (→ C2) because dropping material without proof the vault holds the family is destruction without evidence | on vault availability | none required; `local` + re-login only to abandon custody |
 | C4 | VALID | any | REAUTH | `CUSTODY_CREDENTIAL_LATCHED` | **no** | inert | none | **none**: retry cannot fix a latched record | re-import into the vault; resumes without a mode change |
@@ -449,8 +449,10 @@ rotated.
    (`main is still local; run ck auth migrate-plugin --allow-main first`) issued **before** step 3,
    so no mode write and no fallback commit happens (the barrier is all-or-nothing readiness).
    Consequently C2 (`RESUME_TAKEOVER`) applies to **fallbacks only**; a REAL main under
-   `mode=claustrum` is `TAKEOVER_INCOMPLETE_MAIN_REAL` (refuse, inert, no writes, same operator
-   recovery). When a source-backed synchronisation lands, the plugin-side write can be added
+   `mode=claustrum` is refused as `TAKEOVER_INCOMPLETE_MAIN_REAL` in both fingerprint cases (no
+   writes, inert), with the fingerprint still deciding the *classification* the refusal carries: a
+   match is crash-left pre-commit material (C2), a mismatch or absence is
+   `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` (C2′). Same operator recovery; different diagnosis. When a source-backed synchronisation lands, the plugin-side write can be added
    behind that same precondition without changing any verdict. The command does not describe the
    fingerprint as a fix and does not weaken the invariant so a test passes. The fallback half of the
    barrier (fenced by our own locks), the serving path, and every independent task proceed.
