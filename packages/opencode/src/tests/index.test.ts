@@ -1552,6 +1552,7 @@ describe('fallback Claustrum credential resolution', () => {
     label: string
     handle: string
     gate?: boolean
+    gate?: boolean
     connector?: (
       calls: CredentialCall[],
     ) => PluginRuntimeOverrides['claustrumConnector']
@@ -1562,6 +1563,11 @@ describe('fallback Claustrum credential resolution', () => {
         label: input.label,
         enabled: true,
         claustrumHandle: input.handle,
+        ...(input.gate && {
+          claustrum: {
+            accounts: { [input.id ?? 'fallback-1']: { enabled: true } },
+          },
+        }),
       }),
     )
     const manifestPath = await writeManifest([])
@@ -1577,6 +1583,34 @@ describe('fallback Claustrum credential resolution', () => {
     })
     return { calls, manifestPath, plugin, restore }
   }
+
+  test.serial(
+    'migrates a legacy handle into an empty manifest at startup',
+    async () => {
+      const { manifestPath, plugin, restore } =
+        await createLegacyMigrationPlugin({
+          label: 'startup-migration',
+          handle: legacyHandle,
+          gate: true,
+        })
+      try {
+        expect(
+          JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
+            .accounts,
+        ).toContainEqual({
+          label: 'startup-migration',
+          handle: legacyHandle,
+          credential_id: 'oauth:anthropic:startup-migration',
+        })
+        expect(
+          await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+        ).not.toContain(legacyHandle)
+      } finally {
+        await plugin.dispose?.()
+        restore()
+      }
+    },
+  )
 
   test.serial(
     're-migrates a legacy handle after a crash leaves custody already on',

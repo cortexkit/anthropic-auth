@@ -2288,6 +2288,32 @@ const anthropicAuthPlugin = async (
                 return
               }
               if (usableClaustrumAccessToken(credential, claustrumNow())) {
+                if (
+                  custodyHandle.source === 'legacy' &&
+                  custodyHandleManifestStatus === 'ready' &&
+                  isValidCustodyLabel(account.label)
+                ) {
+                  const write = await writeCustodyHandleManifestEntry({
+                    path: custodyHandleManifestPath,
+                    entry: {
+                      label: account.label,
+                      handle,
+                      credentialId: `oauth:anthropic:${account.label}`,
+                    },
+                  })
+                  if (write.status === 'written') {
+                    await clearClaustrumHandlePersistent({
+                      id: account.id,
+                      path: accountStoragePath,
+                    })
+                    await refreshCustodyHandleManifest()
+                  } else if (write.status === 'refused') {
+                    logger.warn('commands', 'manifest write failed', {
+                      id: account.id,
+                      reason: write.reason,
+                    })
+                  }
+                }
                 await markClaustrumCredentialReady(account.id, handle)
               }
             } catch (error) {
