@@ -2292,6 +2292,7 @@ const anthropicAuthPlugin = async (
                 if (
                   custodyHandle.source === 'legacy' &&
                   custodyHandleManifestStatus === 'ready' &&
+                  // Refuse malformed labels before taking the cross-tenant lock.
                   isValidCustodyLabel(account.label)
                 ) {
                   const write = await writeCustodyHandleManifestEntry({
@@ -4345,12 +4346,11 @@ const anthropicAuthPlugin = async (
                   'Vault service requires an OAuth fallback account.',
                 )
               }
-              // Keep the account lock until both persistence layers agree on the
-              // handle's owner: account refresh → manifest → config.
               if (
                 custodyResolution.status === 'resolved' &&
                 custodyResolution.source === 'legacy'
               ) {
+                // Refuse malformed labels before taking the cross-tenant lock.
                 if (!isValidCustodyLabel(account.label)) {
                   logger.warn('commands', 'manifest migration skipped', {
                     id: account.id,

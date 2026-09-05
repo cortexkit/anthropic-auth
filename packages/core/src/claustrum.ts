@@ -643,7 +643,8 @@ export class CustodyManifestLockLeaseLostError extends CustodyManifestLockError 
 }
 
 function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
-  // A reader that rejects an upgraded writer's nonce cannot evict its dead lock and wedges itself; vendor this negative check in all three tenants before widening the nonce alphabet.
+  // An allowlist freezes lock compatibility across independently upgrading readers;
+  // reject only unsafe characters so a widened nonce cannot wedge an older reader.
   for (const character of nonce) {
     const code = character.charCodeAt(0)
     if (code < 0x20 || code === 0x7f) return false
