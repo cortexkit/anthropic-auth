@@ -590,6 +590,26 @@ async function waitForAccountStorage(
   throw new Error(`Account storage did not match: ${JSON.stringify(storage)}`)
 }
 
+async function waitForSidecarHandlesAbsent(
+  entries: Array<{ path: string; handle: string }>,
+) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const sidecars = await Promise.all(
+      entries.map(({ path }) => readFile(path, 'utf8')),
+    )
+    if (
+      sidecars.every(
+        (sidecar, index) => !sidecar.includes(entries[index]!.handle),
+      )
+    )
+      return
+    await Bun.sleep(10)
+  }
+  throw new Error(
+    `Legacy handles remained in sidecars: ${entries.map(({ handle }) => handle).join(', ')}`,
+  )
+}
+
 async function seedSidebarRouting(
   activeId: string,
   route: string,
@@ -1926,16 +1946,10 @@ describe('fallback Claustrum credential resolution', () => {
         const originalRename = fs.rename
         const secondManifestRename = deferred()
         let manifestRenames = 0
-        let migrationWaitAttempts = 0
         const rename = spyOn(fs, 'rename').mockImplementation(
           async (from, to) => {
             if (to === manifestPath) {
               manifestRenames += 1
-              if (manifestRenames === 1)
-                await Promise.race([
-                  secondManifestRename.promise,
-                  Bun.sleep(100),
-                ])
             }
             const result = await originalRename(from, to)
             if (to === manifestPath && manifestRenames === 2)
@@ -1971,22 +1985,10 @@ describe('fallback Claustrum credential resolution', () => {
               ?.accounts.map((account) => account.label)
               .sort(),
           ).toEqual(['migration-a', 'migration-b'])
-          for (; migrationWaitAttempts < 100; migrationWaitAttempts++) {
-            const [stateA, stateB] = await Promise.all([
-              readFile(getAccountStatePath(accountPathA), 'utf8'),
-              readFile(getAccountStatePath(accountPathB), 'utf8'),
-            ])
-            if (!stateA.includes('ckh_A') && !stateB.includes('ckh_B')) break
-            await Bun.sleep(10)
-          }
-          expect(migrationWaitAttempts).toBeGreaterThan(0)
-          expect(migrationWaitAttempts).toBeLessThan(100)
-          expect(
-            await readFile(getAccountStatePath(accountPathA), 'utf8'),
-          ).not.toContain('ckh_A')
-          expect(
-            await readFile(getAccountStatePath(accountPathB), 'utf8'),
-          ).not.toContain('ckh_B')
+          await waitForSidecarHandlesAbsent([
+            { path: getAccountStatePath(accountPathA), handle: 'ckh_A' },
+            { path: getAccountStatePath(accountPathB), handle: 'ckh_B' },
+          ])
         } finally {
           rename.mockRestore()
           await pluginA.dispose?.()
