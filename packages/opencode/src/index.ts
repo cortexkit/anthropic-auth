@@ -239,7 +239,6 @@ import {
   pushNotification,
 } from './rpc/notifications.ts'
 import {
-  type AccountDialogAccount,
   type AccountDialogKnobs,
   type ApplyRequest,
   type ApplyResult,

@@ -3201,7 +3201,7 @@ describe('fallback Claustrum credential resolution', () => {
     const sessionID = 'account-modal-projection'
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'ckh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      claustrum: { mode: 'claustrum' },
     })
     await useTempAccountFile(storage)
     const connectionFile = join(tempConfigDir!, 'configured-claustrum.json')
@@ -3240,13 +3240,6 @@ describe('fallback Claustrum credential resolution', () => {
         { models: {} },
       )
       drainNotifications(0, sessionID)
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude-account',
-          arguments: 'custody fallback-1 on',
-          sessionID,
-        }),
-      )
       await drainSidebarWrites()
       const sidebarState = await getSidebarState()
       await expectHandledCommandResponse(
@@ -3272,6 +3265,8 @@ describe('fallback Claustrum credential resolution', () => {
       }>
       expect(payload?.command).toBe('claude-account')
       expect(payload?.knobs.claustrumDetection).toBe('available')
+      expect(payload?.knobs.custodyMode).toBe('claustrum')
+      expect(payload?.knobs.custodyModeKnown).toBe(true)
       expect(
         accounts.find((account) => account.id === 'main')?.claustrumGate,
       ).toBe('na')
@@ -3299,26 +3294,6 @@ describe('fallback Claustrum credential resolution', () => {
         'ckh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
       )
 
-      storage.claustrum = { accounts: { 'fallback-1': { enabled: false } } }
-      await saveAccounts(storage)
-      const offSessionID = 'account-modal-projection-off'
-      drainNotifications(0, offSessionID)
-      await expectHandledCommandResponse(
-        plugin['command.execute.before']({
-          command: 'claude-account',
-          arguments: '',
-          sessionID: offSessionID,
-        }),
-      )
-      const offPayload = drainNotifications(0, offSessionID).at(-1)?.payload
-      const offAccounts = offPayload?.knobs.accounts as Array<{
-        id: string
-        claustrumGate: string
-      }>
-      expect(
-        offAccounts.find((account) => account.id === 'fallback-1')
-          ?.claustrumGate,
-      ).toBe('off')
       await plugin.dispose?.()
     } finally {
       if (previousConnectionFile === undefined)

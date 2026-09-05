@@ -162,7 +162,7 @@ describe('parseAccountCommandAction', () => {
     const cases = [
       ['claustrum', { type: 'claustrum-mode', mode: 'claustrum' }],
       ['local', { type: 'claustrum-mode', mode: 'local' }],
-      ['custody fallback-1 on', { type: 'usage' }],
+      ['custody work-alt on', { type: 'usage' }],
       ['claustrum on', { type: 'usage' }],
       ['on', { type: 'usage' }],
       ['off', { type: 'usage' }],
@@ -171,6 +171,16 @@ describe('parseAccountCommandAction', () => {
     for (const [input, expected] of cases as Array<[string, unknown]>) {
       expect(parseAccountCommandAction(input)).toEqual(expected as never)
     }
+  })
+
+  test('names global mode verbs for retired custody vocabulary', async () => {
+    const result = await executeAccountCommand({
+      argumentsText: 'custody work-alt on',
+      storage: baseStorage(),
+    })
+
+    expect(result.text).toContain('claustrum')
+    expect(result.text).toContain('local')
   })
 
   test('remove with id', async () => {
@@ -341,12 +351,8 @@ describe('executeAccountCommand status', () => {
     expect(result.text).toContain('Disabled account')
     expect(result.text).toContain('42%')
     expect(result.text).toContain('(disabled)')
-    expect(result.text).toContain(
-      '**OpenCode anthropic** [main] 42% · manifest n/a (OpenCode-managed)',
-    )
-    expect(result.text).toContain(
-      '**Work account** [fallback] · manifest binding absent',
-    )
+    expect(result.text).toContain('**OpenCode anthropic** [main] 42% · local')
+    expect(result.text).toContain('**Work account** [fallback] · local')
   })
 
   test('renders the settled custody projection in account status text', async () => {
@@ -384,9 +390,7 @@ describe('executeAccountCommand status', () => {
     })
 
     expect(result.text).toContain('Claustrum: available')
-    expect(result.text).toContain(
-      '**Work account** [fallback] · manifest binding present · vault reauth',
-    )
+    expect(result.text).toContain('**Work account** [fallback] · vault-bound')
   })
 
   test('usage returns usage text', async () => {
