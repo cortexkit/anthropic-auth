@@ -180,15 +180,15 @@ export type CustodyStatusState =
 export function custodyStatusLabel(state: CustodyStatusState): string {
   switch (state) {
     case 'na':
-      return 'n/a (OpenCode managed)'
+      return 'n/a (OpenCode-managed)'
     case 'off':
-      return 'off'
+      return 'binding absent'
     case 'on-vault-served':
-      return 'on · vault-served'
+      return 'binding present · vault-served'
     case 'on-vault-reauth':
-      return 'on · vault reauth'
+      return 'binding present · vault reauth'
     case 'on-cold':
-      return 'on · cold'
+      return 'binding present · cold'
   }
 }
 
@@ -290,7 +290,7 @@ export async function executeAccountCommand(input: {
               : 'off'),
       )
       lines.push(
-        `- **${a.label}** [${a.role}]${tier}${status}${pct} · custody ${custody}`,
+        `- **${a.label}** [${a.role}]${tier}${status}${pct} · manifest ${custody}`,
       )
     }
     lines.push('', USAGE_TEXT)
@@ -322,19 +322,21 @@ export async function executeAccountCommand(input: {
     if (!target) return { text: `Account "${action.id}" not found.` }
     if (target.id === mainId) {
       return {
-        text: 'Cannot change custody for the main account.',
+        text: 'Vault service is not available for the main account.',
       }
     }
     if (!isOAuthAccount(target)) {
-      return { text: 'Custody requires an OAuth fallback account.' }
+      return { text: 'Vault service requires an OAuth fallback account.' }
     }
     if (action.enabled && !target.enabled) {
       return {
-        text: `Cannot enable custody for disabled account "${action.id}".`,
+        text: `Cannot verify vault service for disabled account "${action.id}".`,
       }
     }
     if (input.custody?.platform !== 'opencode') {
-      return { text: 'Custody is OpenCode-only in this version.' }
+      return {
+        text: 'Claustrum manifest service is OpenCode-only in this version.',
+      }
     }
 
     const result = await input.custody.set({

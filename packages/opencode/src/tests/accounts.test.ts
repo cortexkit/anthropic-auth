@@ -3799,7 +3799,8 @@ describe('FallbackAccountManager', () => {
         expect.objectContaining({
           level: 'debug',
           channel: 'refresh',
-          message: 'fallback oauth background skipped custody verification',
+          message:
+            'fallback OAuth background skipped vault-service verification',
         }),
       )
       expect(
@@ -7547,7 +7548,7 @@ describe('vault-served fallback refresh gating', () => {
         expect.objectContaining({
           level: 'warn',
           channel: 'refresh',
-          message: 'custody override: local fallback refresh',
+          message: 'vault service: local fallback refresh',
           payload: {
             accountId: 'vault-unavailable',
             reason: 'vault credential unavailable',

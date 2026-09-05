@@ -4084,7 +4084,7 @@ export class FallbackAccountManager {
           !this.isFallbackAccountVaultServed(next.id, storage)
         ) {
           if (this.isFallbackAccountVaultEnabled(next.id, storage)) {
-            logger.warn('refresh', 'custody override: local fallback refresh', {
+            logger.warn('refresh', 'vault service: local fallback refresh', {
               accountId: next.id,
               reason: 'vault credential unavailable',
             })
@@ -4222,7 +4222,7 @@ export class FallbackAccountManager {
       if (this.custodyVerificationAccounts.has(account.id)) {
         logger.debug(
           'refresh',
-          'fallback oauth background skipped custody verification',
+          'fallback OAuth background skipped vault-service verification',
           {
             accountId: account.id,
           },

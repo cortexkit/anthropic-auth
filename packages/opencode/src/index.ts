@@ -1733,7 +1733,7 @@ const anthropicAuthPlugin = async (
 
   function warnCustodyResolutionOnce(accountId: string, reason: string) {
     if (!claimCustodyWarningSlot(accountId, reason)) return
-    logger.warn('claustrum', 'custody handle resolution fallback', {
+    logger.warn('claustrum', 'manifest handle resolution fallback', {
       id: accountId,
       reason,
     })
@@ -1809,7 +1809,7 @@ const anthropicAuthPlugin = async (
     if (!claimCustodyWarningSlot(accountId, reason)) return
     logger.warn(
       'claustrum',
-      'failed to clear legacy custody handle after manifest resolution',
+      'failed to clear legacy handle after manifest resolution',
       { id: accountId, reason },
     )
   }
@@ -2179,14 +2179,14 @@ const anthropicAuthPlugin = async (
         ) {
           return
         }
-        logger.warn('refresh', 'custody override: local fallback refresh', {
+        logger.warn('refresh', 'vault service: local fallback refresh', {
           accountId: account.id,
           reason,
         })
         await fallbackManager
           .refreshAccount(account, storage, { persistError: true })
           .catch((error) => {
-            logger.warn('refresh', 'custody override local refresh failed', {
+            logger.warn('refresh', 'vault service local refresh failed', {
               accountId: account.id,
               error: error instanceof Error ? error.message : String(error),
             })
@@ -4146,7 +4146,7 @@ const anthropicAuthPlugin = async (
         platform: 'opencode',
         async set({ account, storage, enabled }) {
           const refuse = (step: string, errorClass: string, text: string) => {
-            logger.warn('commands', 'custody gate refused', {
+            logger.warn('commands', 'vault service verification refused', {
               id: account.id,
               step,
               errorClass,
@@ -4183,16 +4183,16 @@ const anthropicAuthPlugin = async (
             if (handle) claustrumWarmBackoffUntil.delete(handle)
             if (changed === 'unchanged') {
               return {
-                text: `Custody already off for ${account.id}.`,
+                text: `Vault service already inactive for ${account.id}.`,
                 changed: false,
               }
             }
-            logger.info('commands', 'custody gate changed', {
+            logger.info('commands', 'vault service state changed', {
               id: account.id,
               enabled: false,
             })
             return {
-              text: `Custody off for ${account.id} (plugin-served).`,
+              text: `Vault service inactive for ${account.id}; manifest bindings are unchanged.`,
               changed: true,
             }
           }
@@ -4201,7 +4201,7 @@ const anthropicAuthPlugin = async (
             return refuse(
               'handle',
               'missing_handle',
-              `No custody handle for ${account.id}. Mint one with ck auth mint-handle and store it, then retry.`,
+              `No manifest binding or legacy handle for ${account.id}. Mint one with ck auth mint-handle and store it, then retry.`,
             )
           }
           const detection = await detectClaustrumConnection(
@@ -4315,7 +4315,7 @@ const anthropicAuthPlugin = async (
                 return refuse(
                   'persist',
                   'ineligible',
-                  'Custody requires an OAuth fallback account.',
+                  'Vault service requires an OAuth fallback account.',
                 )
               }
               // Keep the account lock until both persistence layers agree on the
@@ -4325,14 +4325,10 @@ const anthropicAuthPlugin = async (
                 custodyResolution.source === 'legacy'
               ) {
                 if (!isValidCustodyLabel(account.label)) {
-                  logger.warn(
-                    'commands',
-                    'custody manifest migration skipped',
-                    {
-                      id: account.id,
-                      reason: 'invalid-label',
-                    },
-                  )
+                  logger.warn('commands', 'manifest migration skipped', {
+                    id: account.id,
+                    reason: 'invalid-label',
+                  })
                 } else {
                   const write = await writeCustodyHandleManifestEntry({
                     path: custodyHandleManifestPath,
@@ -4349,7 +4345,7 @@ const anthropicAuthPlugin = async (
                     })
                     await refreshCustodyHandleManifest()
                   } else if (write.status === 'refused') {
-                    logger.warn('commands', 'custody manifest write failed', {
+                    logger.warn('commands', 'manifest write failed', {
                       id: account.id,
                       reason: write.reason,
                     })
@@ -4362,17 +4358,17 @@ const anthropicAuthPlugin = async (
               )
               if (changed === 'unchanged') {
                 return {
-                  text: `Custody already on for ${account.id}.`,
+                  text: `Vault service already active for ${account.id}.`,
                   changed: false,
                 }
               }
               await markClaustrumCredentialReady(account.id, handle)
-              logger.info('commands', 'custody gate changed', {
+              logger.info('commands', 'vault service state changed', {
                 id: account.id,
                 enabled: true,
               })
               return {
-                text: `Custody on for ${account.id} (vault-served).`,
+                text: `Vault service active for ${account.id} (vault-served).`,
                 changed: true,
               }
             },

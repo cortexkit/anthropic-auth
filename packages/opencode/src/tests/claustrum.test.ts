@@ -458,9 +458,9 @@ describe('account status Claustrum surface', () => {
 
     expect(result.text).toContain('Claustrum: available')
     expect(result.text).toContain('account-a')
-    expect(result.text).toContain('custody on · cold')
+    expect(result.text).toContain('manifest binding present · cold')
     expect(result.text).toContain('account-b')
-    expect(result.text).toContain('custody off')
+    expect(result.text).toContain('manifest binding absent')
   })
 })
 

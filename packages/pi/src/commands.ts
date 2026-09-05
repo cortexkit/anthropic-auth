@@ -275,7 +275,8 @@ export function registerCommands(pi: ExtensionAPI) {
         storage: storage ?? createEmptyStorage(),
         custody: {
           platform: 'unsupported',
-          reason: 'Custody is OpenCode-only in this version.',
+          reason:
+            'Claustrum manifest service is OpenCode-only in this version.',
         },
         claustrum:
           action.type === 'status'

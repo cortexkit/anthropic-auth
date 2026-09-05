@@ -113,8 +113,8 @@ describe('claude-account persistence', () => {
     await handler!('custody oauth-work off', ctx)
 
     expect(notified).toEqual([
-      'Custody is OpenCode-only in this version.',
-      'Custody is OpenCode-only in this version.',
+      'Claustrum manifest service is OpenCode-only in this version.',
+      'Claustrum manifest service is OpenCode-only in this version.',
     ])
     expect(await readFile(accountPath, 'utf8')).toBe(beforeConfig)
     expect(await readFile(statePath, 'utf8')).toBe(beforeState)

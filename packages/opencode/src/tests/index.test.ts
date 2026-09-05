@@ -1079,7 +1079,6 @@ describe('fallback Claustrum credential resolution', () => {
     label: string
     enabled?: boolean
     legacy?: string
-    gate?: boolean
   }) {
     const id = input.id ?? 'fallback-1'
     return fallbackWithClaustrum({
@@ -1145,7 +1144,7 @@ describe('fallback Claustrum credential resolution', () => {
             'custody fallback-1 on',
           )
         )?.text,
-      ).toContain('Custody on')
+      ).toContain('Vault service active')
       expect(
         calls.filter((call) => call.method === 'credential.get'),
       ).toHaveLength(1)
@@ -1281,7 +1280,7 @@ describe('fallback Claustrum credential resolution', () => {
       expect(
         logs.filter(
           (record) =>
-            record.message === 'custody handle resolution fallback' &&
+            record.message === 'manifest handle resolution fallback' &&
             record.payload?.reason === 'foreign-serve',
         ),
       ).toHaveLength(1)
@@ -1320,7 +1319,7 @@ describe('fallback Claustrum credential resolution', () => {
     expect(
       logs.filter(
         (record) =>
-          record.message === 'custody handle resolution fallback' &&
+          record.message === 'manifest handle resolution fallback' &&
           record.payload?.reason === 'invalid-manifest',
       ),
     ).toHaveLength(1)
@@ -1466,7 +1465,7 @@ describe('fallback Claustrum credential resolution', () => {
               'custody fallback-1 on',
             )
           )?.text,
-        ).toContain('Custody on')
+        ).toContain('Vault service active')
         expect(stateAtManifestWrite).toContain(legacyHandle)
         expect(await readFile(accountStatePath, 'utf8')).not.toContain(
           legacyHandle,
@@ -1524,7 +1523,7 @@ describe('fallback Claustrum credential resolution', () => {
         expect(
           logs.filter(
             (record) =>
-              record.message === 'custody handle resolution fallback' &&
+              record.message === 'manifest handle resolution fallback' &&
               record.payload?.reason === 'legacy',
           ),
         ).toHaveLength(1)
@@ -1552,6 +1551,7 @@ describe('fallback Claustrum credential resolution', () => {
     id?: string
     label: string
     handle: string
+    gate?: boolean
     connector?: (
       calls: CredentialCall[],
     ) => PluginRuntimeOverrides['claustrumConnector']
@@ -1606,7 +1606,7 @@ describe('fallback Claustrum credential resolution', () => {
               'custody fallback-1 on',
             )
           )?.text,
-        ).toBe('Custody already on for fallback-1.')
+        ).toBe('Vault service already active for fallback-1.')
         expect(
           JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
             .accounts,
@@ -1662,7 +1662,7 @@ describe('fallback Claustrum credential resolution', () => {
               'custody fallback-1 on',
             )
           )?.text,
-        ).toBe('Custody already on for fallback-1.')
+        ).toBe('Vault service already active for fallback-1.')
         expect(await readFile(path, 'utf8')).not.toContain(legacyHandle)
       } finally {
         await plugin.dispose?.()
@@ -1748,7 +1748,7 @@ describe('fallback Claustrum credential resolution', () => {
               'custody fallback-1 on',
             )
           )?.text,
-        ).toBe('Custody on for fallback-1 (vault-served).')
+        ).toBe('Vault service active for fallback-1 (vault-served).')
         expect(
           JSON.parse(await readFile(manifestPath, 'utf8')).providers[0]
             .accounts,
@@ -1765,7 +1765,7 @@ describe('fallback Claustrum credential resolution', () => {
         expect(
           logs.some(
             (record) =>
-              record.message === 'custody manifest migration skipped' &&
+              record.message === 'manifest migration skipped' &&
               record.payload?.id === 'fallback-1' &&
               record.payload?.reason === 'invalid-label',
           ),
@@ -1806,11 +1806,11 @@ describe('fallback Claustrum credential resolution', () => {
           const elapsedMs = Date.now() - startedAt
           expect(elapsedMs).toBeGreaterThanOrEqual(120)
           expect(elapsedMs).toBeLessThan(1_000)
-          expect(payload?.text).toContain('Custody on')
+          expect(payload?.text).toContain('Vault service active')
           expect(
             logs.some(
               (record) =>
-                record.message === 'custody manifest write failed' &&
+                record.message === 'manifest write failed' &&
                 record.payload?.reason === 'manifest lock owner invalid',
             ),
           ).toBe(true)
@@ -1863,7 +1863,7 @@ describe('fallback Claustrum credential resolution', () => {
               'custody fallback-1 on',
             )
           )?.text,
-        ).toContain('Custody on')
+        ).toContain('Vault service active')
         expect(staleRenames).toHaveLength(1)
         expect(staleRenames[0]).toMatch(/\.lock\.stale-\d+-[A-Za-z0-9_-]+$/)
       } finally {
@@ -2001,8 +2001,8 @@ describe('fallback Claustrum credential resolution', () => {
             }),
           ])
           expect(payloads.map((payload) => payload?.text)).toEqual([
-            'Custody on for fallback-a (vault-served).',
-            'Custody on for fallback-b (vault-served).',
+            'Vault service active for fallback-a (vault-served).',
+            'Vault service active for fallback-b (vault-served).',
           ])
           const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
             providers: Array<{
@@ -3343,7 +3343,9 @@ describe('fallback Claustrum credential resolution', () => {
         }),
       )
       const onPayload = drainNotifications(0, sessionID).at(-1)?.payload
-      expect(onPayload?.text).toBe('Custody on for fallback-1 (vault-served).')
+      expect(onPayload?.text).toBe(
+        'Vault service active for fallback-1 (vault-served).',
+      )
       expect(
         calls.filter((call) => call.method === 'credential.get'),
       ).toHaveLength(1)
@@ -3362,7 +3364,7 @@ describe('fallback Claustrum credential resolution', () => {
         }),
       )
       expect(drainNotifications(0, sessionID).at(-1)?.payload.text).toBe(
-        'Custody off for fallback-1 (plugin-served).',
+        'Vault service inactive for fallback-1; manifest bindings are unchanged.',
       )
       expect(
         (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
@@ -3410,7 +3412,7 @@ describe('fallback Claustrum credential resolution', () => {
     )
 
     expect(payload?.text).toBe(
-      'No custody handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
+      'No manifest binding or legacy handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
     )
     expect(connectorCalls).toBe(0)
     expect(
@@ -3663,7 +3665,9 @@ describe('fallback Claustrum credential resolution', () => {
       resolveCredential(credentialResponse('vault-race-access', 1))
       const payload = await command
       await drainSidebarWrites()
-      expect(payload?.text).toBe('Custody on for fallback-1 (vault-served).')
+      expect(payload?.text).toBe(
+        'Vault service active for fallback-1 (vault-served).',
+      )
       expect(
         (await loadAccounts(path))?.claustrum?.accounts?.['fallback-1']
           ?.enabled,
@@ -3893,7 +3897,9 @@ describe('fallback Claustrum credential resolution', () => {
           )
         }),
       ])
-      expect(payload?.text).toBe('Custody on for fallback-1 (vault-served).')
+      expect(payload?.text).toBe(
+        'Vault service active for fallback-1 (vault-served).',
+      )
       const cache = plugin.__claustrumCredentialCache
       expect(cache?.peek(handle)?.recordVersion).toBe(2)
 
@@ -3956,7 +3962,7 @@ describe('fallback Claustrum credential resolution', () => {
         'custody fallback-1 off',
       )
       expect(offPayload?.text).toBe(
-        'Custody off for fallback-1 (plugin-served).',
+        'Vault service inactive for fallback-1; manifest bindings are unchanged.',
       )
       expect(
         (await loadAccounts())?.claustrum?.accounts?.['fallback-1']?.enabled,
@@ -7037,8 +7043,7 @@ describe('AnthropicAuthPlugin', () => {
     expect(localRefresh).toHaveBeenCalled()
     expect(
       logs.some(
-        (record) =>
-          record.message === 'custody override: local fallback refresh',
+        (record) => record.message === 'vault service: local fallback refresh',
       ),
     ).toBe(true)
     installDefaultFetchMock()

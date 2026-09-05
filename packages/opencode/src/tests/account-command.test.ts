@@ -327,11 +327,15 @@ describe('buildAccountList', () => {
 // ---------------------------------------------------------------------------
 describe('executeAccountCommand status', () => {
   test('labels every custody state from the shared formatter', () => {
-    expect(custodyStatusLabel('na')).toBe('n/a (OpenCode managed)')
-    expect(custodyStatusLabel('off')).toBe('off')
-    expect(custodyStatusLabel('on-vault-served')).toBe('on · vault-served')
-    expect(custodyStatusLabel('on-vault-reauth')).toBe('on · vault reauth')
-    expect(custodyStatusLabel('on-cold')).toBe('on · cold')
+    expect(custodyStatusLabel('na')).toBe('n/a (OpenCode-managed)')
+    expect(custodyStatusLabel('off')).toBe('binding absent')
+    expect(custodyStatusLabel('on-vault-served')).toBe(
+      'binding present · vault-served',
+    )
+    expect(custodyStatusLabel('on-vault-reauth')).toBe(
+      'binding present · vault reauth',
+    )
+    expect(custodyStatusLabel('on-cold')).toBe('binding present · cold')
   })
 
   test('bare status returns account list in text', async () => {
@@ -345,9 +349,11 @@ describe('executeAccountCommand status', () => {
     expect(result.text).toContain('42%')
     expect(result.text).toContain('(disabled)')
     expect(result.text).toContain(
-      '**OpenCode anthropic** [main] 42% · custody n/a (OpenCode managed)',
+      '**OpenCode anthropic** [main] 42% · manifest n/a (OpenCode-managed)',
     )
-    expect(result.text).toContain('**Work account** [fallback] · custody off')
+    expect(result.text).toContain(
+      '**Work account** [fallback] · manifest binding absent',
+    )
   })
 
   test('renders the settled custody projection in account status text', async () => {
@@ -388,7 +394,7 @@ describe('executeAccountCommand status', () => {
 
     expect(result.text).toContain('Claustrum: available')
     expect(result.text).toContain(
-      '**Work account** [fallback] · custody on · vault reauth',
+      '**Work account** [fallback] · manifest binding present · vault reauth',
     )
   })
 
@@ -513,7 +519,9 @@ describe('executeAccountCommand custody', () => {
       storage,
     })
 
-    expect(result.text).toBe('Cannot change custody for the main account.')
+    expect(result.text).toBe(
+      'Vault service is not available for the main account.',
+    )
     expect(result.updated).toBeUndefined()
   })
 
@@ -571,7 +579,9 @@ describe('executeAccountCommand custody', () => {
       },
     })
 
-    expect(result.text).toBe('Custody is OpenCode-only in this version.')
+    expect(result.text).toBe(
+      'Claustrum manifest service is OpenCode-only in this version.',
+    )
     expect(result.updated).toBeUndefined()
   })
 
@@ -912,7 +922,7 @@ describe('account command INFO logs (via plugin)', () => {
 
     const payload = drainNotifications(0, 'ses_test').at(-1)?.payload
     expect(payload?.text).toBe(
-      'No custody handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
+      'No manifest binding or legacy handle for fallback-1. Mint one with ck auth mint-handle and store it, then retry.',
     )
     expect(await readFile(accountPath, 'utf8')).toBe(before)
     expect((await stat(accountPath)).mtimeMs).toBe(beforeMtime)

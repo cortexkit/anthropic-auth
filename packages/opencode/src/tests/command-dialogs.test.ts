@@ -51,7 +51,7 @@ describe('buildAccountDialogOption', () => {
         custodyEligible: true,
       }),
     ).toEqual({
-      title: 'Work [fallback] 22% · custody on · vault-served',
+      title: 'Work [fallback] 22% · custody binding present · vault-served',
       value: 'work',
       description: 'Team · Max 5x',
     })
@@ -70,7 +70,7 @@ describe('buildAccountDialogOption', () => {
       custodyState: 'on-vault-reauth',
       custodyEligible: true,
     })
-    expect(option.title).toContain('custody on · vault reauth')
+    expect(option.title).toContain('custody binding present · vault reauth')
     expect(option.title).not.toContain('handle')
   })
 
@@ -88,7 +88,7 @@ describe('buildAccountDialogOption', () => {
       custodyEligible: true,
     })
 
-    expect(option.title).toContain('custody on · cold')
+    expect(option.title).toContain('custody binding present · cold')
   })
 
   test('renders the main account gate placeholder as n/a', () => {
@@ -147,12 +147,12 @@ describe('buildManageAccountOptions', () => {
       buildManageAccountOptions({ ...base, custodyEligible: true }).map(
         (option) => option.title,
       ),
-    ).toContain('Custody off')
+    ).toContain('Use sidecar service')
     expect(
       buildManageAccountOptions({ ...base, custodyEligible: false }).map(
         (option) => option.title,
       ),
-    ).not.toContain('Custody off')
+    ).not.toContain('Use sidecar service')
   })
 })
 

@@ -283,23 +283,13 @@ Fallback OAuth tokens refresh in the background so idle accounts do not expire b
 
 If Anthropic reports `invalid_grant`, that account must be logged in again. `/claude-account reset-backoff` manually clears the main account's refresh backoff and its matching quota backoff.
 
-### Optional Claustrum custody
+### Claustrum manifest service
 
-OpenCode can obtain an opted-in fallback OAuth account's access credential from a local [Claustrum](https://github.com/cortexkit/claustrum) daemon instead of refreshing that account independently. After provisioning the account's runtime handle, enable custody by account ID:
+In global Claustrum mode, `/claude-account claustrum` serves OAuth routes that have a binding present in the Claustrum handle manifest; `/claude-account local` returns authority to local OAuth refresh. The vault serves credentials, and the plugin discovers only its own provider block.
 
-```json
-{
-  "claustrum": {
-    "accounts": {
-      "personal-alt": { "enabled": true }
-    }
-  }
-}
-```
+The request path reads only a resident in-memory credential. Startup warming and periodic reconciliation perform vault I/O and keep idle credentials refreshed; a cold or unavailable vault falls back to the sidecar credential path. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the account modal show manifest-binding presence, current vault service, and vault reauthentication state without exposing capability handles.
 
-The request path reads only a resident in-memory credential. Startup warming and periodic custody ticks perform vault I/O and keep idle credentials refreshed; a cold or unavailable vault falls back to the sidecar credential path. Vault-served 401 reports carry the exact record version and response provenance, including relay-stream 401s, so a sidecar-served failure cannot invalidate a healthy vault credential. `/claude-account` and the account modal show the gate, current vault service, and vault reauthentication state without exposing capability handles.
-
-Custody currently applies only to fallback OAuth accounts. Main-account vault service is not implemented. If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state.
+If Claustrum has replaced the main host credential with its provider-bound tombstone, the plugin rejects refresh locally without contacting Anthropic or persisting a permanent `invalid_grant` state. API-key routes are unaffected.
 
 ## Quota-aware routing
 
