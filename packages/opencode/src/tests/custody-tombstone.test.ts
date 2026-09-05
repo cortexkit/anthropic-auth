@@ -183,18 +183,22 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
-  test('reads handles while tolerating and dropping superseded entries', () => {
+  test('preserves validated superseded handles in the parsed manifest', () => {
     const anthropicSource = handlesFixture.providers.find(
       (provider: { provider: string }) =>
         provider.provider === oauthFixture.provider,
     )
     if (!anthropicSource) throw new Error('missing anthropic fixture')
-    const anthropic = readCustodyHandles(handlesFixture, oauthFixture.provider)
-    expect(anthropic).toEqual({
-      provider: anthropicSource.provider,
-      serve: anthropicSource.serve,
-      shape: anthropicSource.shape,
-      accounts: anthropicSource.accounts.map(
+    const anthropic = readCustodyHandles(
+      handlesFixture,
+      oauthFixture.provider,
+      anthropicSource.serve,
+    )
+    expect(anthropic.version).toBe(1)
+    expect(anthropic.provider).toBe(anthropicSource.provider)
+    expect(anthropic.serve).toBe(anthropicSource.serve)
+    expect(anthropic.accounts).toEqual(
+      anthropicSource.accounts.map(
         (account: {
           label: string
           handle: string
@@ -205,23 +209,30 @@ describe('Claustrum custody tombstones', () => {
           credentialId: account.credential_id,
         }),
       ),
-    })
-    const deepseek = readCustodyHandles(handlesFixture, apiFixture.provider)
-    const deepseekBackup = deepseek.accounts[1]
-    if (!deepseekBackup) throw new Error('missing deepseek backup fixture')
-    expect(deepseekBackup).not.toHaveProperty('superseded')
+    )
     const deepseekSource = handlesFixture.providers.find(
       (provider) => provider.provider === apiFixture.provider,
     )
+    if (!deepseekSource) throw new Error('missing deepseek fixture')
+    const deepseek = readCustodyHandles(
+      handlesFixture,
+      apiFixture.provider,
+      deepseekSource.serve,
+    )
+    const deepseekBackup = deepseek.accounts[1]
+    if (!deepseekBackup) throw new Error('missing deepseek backup fixture')
     if (!deepseekSource?.accounts[1]) {
       throw new Error('missing deepseek backup fixture')
     }
     expect(deepseekBackup).toMatchObject({
       handle: deepseekSource.accounts[1].handle,
     })
+    expect(deepseek.superseded).toEqual(
+      new Set(deepseekSource.accounts[1].superseded),
+    )
   })
 
-  test('filters malformed handle accounts and tolerates unknown fields', () => {
+  test('rejects malformed handle accounts while tolerating unknown fields', () => {
     const fixture = structuredClone(handlesFixture) as {
       providers: Array<{
         provider: string
@@ -244,30 +255,28 @@ describe('Claustrum custody tombstones', () => {
       { ...account, extra: 'ignored' },
     ]
 
-    expect(readCustodyHandles(fixture, oauthFixture.provider).accounts).toEqual(
-      [
-        {
-          label: String(account.label),
-          handle: String(account.handle),
-          credentialId: String(account.credential_id),
-        },
-      ],
-    )
+    expect(() =>
+      readCustodyHandles(fixture, oauthFixture.provider, 'anthropic-auth'),
+    ).toThrow('invalid account label')
   })
 
   test('throws when the requested provider is absent', () => {
-    expect(() =>
-      readCustodyHandles(handlesFixture, `${oauthFixture.provider}-missing`),
-    ).toThrow(
-      `Missing custody handles for provider ${oauthFixture.provider}-missing`,
+    const fixture = structuredClone(handlesFixture)
+    fixture.providers = fixture.providers.filter(
+      (provider) => provider.provider !== oauthFixture.provider,
     )
+    expect(() =>
+      readCustodyHandles(fixture, oauthFixture.provider, 'anthropic-auth'),
+    ).toThrow('missing-provider')
   })
 
   test('rejects prototype provider ids without polluting Object.prototype', () => {
     const malicious = JSON.parse(
       '{"providers":[{"provider":"__proto__","accounts":[]}]}',
     )
-    expect(() => readCustodyHandles(malicious, '__proto__')).toThrow()
+    expect(() =>
+      readCustodyHandles(malicious, '__proto__', 'anthropic-auth'),
+    ).toThrow()
     expect(({} as { polluted?: unknown }).polluted).toBeUndefined()
   })
 
@@ -295,12 +304,16 @@ describe('Claustrum custody tombstones', () => {
       ...account,
       handle: `ckh_${apiFixture.provider}_main`,
     })
-    expect(readCustodyHandles(fixture, oauthFixture.provider).accounts).toEqual(
-      [],
-    )
+    expect(() =>
+      readCustodyHandles(fixture, oauthFixture.provider, 'anthropic-auth'),
+    ).toThrow('invalid account label')
 
     for (const provider of handlesFixture.providers) {
-      const parsed = readCustodyHandles(handlesFixture, provider.provider)
+      const parsed = readCustodyHandles(
+        handlesFixture,
+        provider.provider,
+        provider.serve,
+      )
       expect(parsed.accounts).toHaveLength(provider.accounts.length)
       for (const sourceAccount of provider.accounts) {
         expect(isValidCustodyHandle(sourceAccount.handle)).toBe(true)

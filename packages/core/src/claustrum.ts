@@ -1,5 +1,7 @@
-import { readFile } from 'node:fs/promises'
-import { userInfo } from 'node:os'
+import { constants as fsConstants } from 'node:fs'
+import * as fs from 'node:fs/promises'
+import { homedir, userInfo } from 'node:os'
+import { dirname, isAbsolute, join } from 'node:path'
 import {
   type BindIdentity,
   type CatalogEntry,
@@ -15,6 +17,8 @@ import {
   type SubscribeOptions,
   type Subscription,
 } from '@cortexkit/subc-client'
+import type { ClaustrumConfig, OAuthAccount } from './accounts.ts'
+import { parseJsonRedacted } from './json'
 import { logger } from './logger'
 
 export type ClaustrumEndpoint = {
@@ -44,6 +48,27 @@ export function getDefaultClaustrumConnectionPath(): string {
   return `/run/user/${uid}/subc-connection.json`
 }
 
+type CustodyHandlesEnvironment = Readonly<Record<string, string | undefined>>
+
+export function resolveCustodyHandlesPath(
+  config: Pick<ClaustrumConfig, 'handlesFile'> | undefined,
+  env: CustodyHandlesEnvironment,
+): string {
+  const configuredPath = config?.handlesFile?.trim()
+  if (configuredPath) return configuredPath
+
+  const environmentPath = env.CLAUSTRUM_OPENCODE_HANDLES
+  if (environmentPath && isAbsolute(environmentPath)) return environmentPath
+
+  const configHome =
+    env.XDG_CONFIG_HOME?.trim() || join(env.HOME || homedir(), '.config')
+  return join(configHome, 'cortexkit', 'opencode-handles.json')
+}
+
+export function getDefaultClaustrumHandlesPath(): string {
+  return resolveCustodyHandlesPath(undefined, process.env)
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -65,14 +90,14 @@ export async function detectClaustrumConnection(
 ): Promise<ClaustrumDetection> {
   let raw: string
   try {
-    raw = await readFile(path, 'utf8')
+    raw = await fs.readFile(path, 'utf8')
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
+    const code = errorCode(error)
     if (code === 'ENOENT') return { status: 'absent', path }
     return {
       status: 'malformed',
       path,
-      reason: `unreadable (${code ?? 'unknown'})`,
+      reason: `unreadable (${code})`,
     }
   }
 
@@ -162,10 +187,32 @@ export type CustodyHandleAccount = {
 }
 
 export type CustodyHandleManifest = {
+  version: 1
+  provider: 'anthropic'
+  serve: 'anthropic-auth'
+  accounts: ReadonlyArray<CustodyHandleAccount>
+  superseded: ReadonlySet<string>
+}
+
+export type CustodyHandleResolution =
+  | { status: 'resolved'; source: 'manifest' | 'legacy'; handle: string }
+  | {
+      status: 'unresolved'
+      reason:
+        | 'missing-label'
+        | 'invalid-label'
+        | 'duplicate-label'
+        | 'missing-entry'
+        | 'foreign-serve'
+        | 'superseded'
+    }
+
+type ParsedCustodyHandleManifest = {
+  version: 1
   provider: string
   serve: string
-  shape: string
-  accounts: CustodyHandleAccount[]
+  accounts: ReadonlyArray<CustodyHandleAccount>
+  superseded: ReadonlySet<string>
 }
 
 const CUSTODY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
@@ -185,49 +232,314 @@ export function isValidCustodyHandle(value: unknown): value is string {
   return typeof value === 'string' && CUSTODY_HANDLE_PATTERN.test(value)
 }
 
+function legacyOrUnresolved(
+  account: OAuthAccount,
+  reason: Extract<CustodyHandleResolution, { status: 'unresolved' }>['reason'],
+): CustodyHandleResolution {
+  if (account.claustrumHandle) {
+    return {
+      status: 'resolved',
+      source: 'legacy',
+      handle: account.claustrumHandle,
+    }
+  }
+  return { status: 'unresolved', reason }
+}
+
+/**
+ * | manifest state | legacy handle | result |
+ * | --- | --- | --- |
+ * | matching ready entry | any | manifest handle |
+ * | absent or invalid | present | legacy handle |
+ * | no matching ready entry | present | legacy handle |
+ * | foreign serve | any | unresolved |
+ */
+export function resolveCustodyHandle(input: {
+  account: OAuthAccount
+  manifest: CustodyHandleManifest | undefined
+  duplicateOAuthLabels?: ReadonlySet<string>
+}): CustodyHandleResolution {
+  const { account, manifest, duplicateOAuthLabels } = input
+  if (manifest && manifest.serve !== 'anthropic-auth') {
+    return { status: 'unresolved', reason: 'foreign-serve' }
+  }
+  if (!account.label) return legacyOrUnresolved(account, 'missing-label')
+  if (!isCustodyId(account.label)) {
+    return legacyOrUnresolved(account, 'invalid-label')
+  }
+  if (duplicateOAuthLabels?.has(account.label)) {
+    return legacyOrUnresolved(account, 'duplicate-label')
+  }
+  if (!manifest) return legacyOrUnresolved(account, 'missing-entry')
+
+  const entry = manifest.accounts.find(
+    (candidate) =>
+      candidate.label === account.label &&
+      candidate.credentialId === `oauth:anthropic:${account.label}`,
+  )
+  if (!entry) return legacyOrUnresolved(account, 'missing-entry')
+  if (manifest.superseded.has(entry.handle)) {
+    return { status: 'unresolved', reason: 'superseded' }
+  }
+  return { status: 'resolved', source: 'manifest', handle: entry.handle }
+}
+
 export function readCustodyHandles(
   json: unknown,
   provider: string,
-): CustodyHandleManifest {
+  serve: string,
+): ParsedCustodyHandleManifest {
   if (!isCustodyId(provider)) {
-    throw new Error(`Invalid custody provider id ${provider}`)
+    throw new Error('invalid manifest provider')
   }
-  const providers =
-    isRecord(json) && Array.isArray(json.providers) ? json.providers : []
-  const source = providers.find(
+  if (
+    !isRecord(json) ||
+    !Object.hasOwn(json, 'version') ||
+    json.version !== 1
+  ) {
+    throw new Error('invalid manifest version')
+  }
+  if (!Object.hasOwn(json, 'providers') || !Array.isArray(json.providers)) {
+    throw new Error('missing manifest providers')
+  }
+  const providerEntries = json.providers.filter(
     (entry): entry is Record<string, unknown> =>
       isRecord(entry) &&
       Object.hasOwn(entry, 'provider') &&
       entry.provider === provider,
   )
-  if (!source || !Array.isArray(source.accounts)) {
-    throw new Error(`Missing custody handles for provider ${provider}`)
+  if (providerEntries.length === 0) {
+    throw new CustodyManifestSelectionError('missing-provider')
   }
+  const source = providerEntries.find(
+    (entry) => Object.hasOwn(entry, 'serve') && entry.serve === serve,
+  )
+  if (!source) throw new CustodyManifestSelectionError('foreign-serve')
+  if (!Object.hasOwn(source, 'accounts') || !Array.isArray(source.accounts)) {
+    throw new Error('invalid manifest accounts')
+  }
+  const superseded = new Set<string>()
   return {
-    provider: String(source.provider),
-    serve: String(source.serve),
-    shape: String(source.shape),
-    accounts: source.accounts.flatMap((entry) => {
-      if (!isRecord(entry)) return []
+    version: 1,
+    provider,
+    serve,
+    accounts: source.accounts.map((entry) => {
+      if (!isRecord(entry)) throw new Error('invalid account entry')
       if (
         !Object.hasOwn(entry, 'label') ||
         !Object.hasOwn(entry, 'handle') ||
         !Object.hasOwn(entry, 'credential_id') ||
         typeof entry.label !== 'string' ||
-        typeof entry.handle !== 'string' ||
-        !isCustodyId(entry.label) ||
-        !isValidCustodyHandle(entry.handle) ||
-        typeof entry.credential_id !== 'string'
+        !isCustodyId(entry.label)
       )
-        return []
-      return [
-        {
-          label: entry.label,
-          handle: entry.handle,
-          credentialId: entry.credential_id,
-        },
-      ]
+        throw new Error('invalid account label')
+      if (
+        typeof entry.handle !== 'string' ||
+        !isValidCustodyHandle(entry.handle)
+      ) {
+        throw new Error('invalid account handle')
+      }
+      if (
+        typeof entry.credential_id !== 'string' ||
+        entry.credential_id.length === 0
+      ) {
+        throw new Error('invalid account credential id')
+      }
+      if (Object.hasOwn(entry, 'superseded')) {
+        if (!Array.isArray(entry.superseded)) {
+          throw new Error('invalid superseded handles')
+        }
+        for (const handle of entry.superseded) {
+          if (!isValidCustodyHandle(handle)) {
+            throw new Error('invalid superseded handle')
+          }
+          superseded.add(handle)
+        }
+      }
+      return {
+        label: entry.label,
+        handle: entry.handle,
+        credentialId: entry.credential_id,
+      }
     }),
+    superseded,
+  }
+}
+
+type CustodyHandleManifestReadResult =
+  | { status: 'ready'; manifest: CustodyHandleManifest }
+  | { status: 'absent' }
+  | { status: 'ignored'; reason: 'foreign-serve' | 'missing-provider' }
+  | { status: 'invalid'; reason: string }
+
+class CustodyManifestSelectionError extends Error {
+  constructor(readonly reason: 'foreign-serve' | 'missing-provider') {
+    super(reason)
+  }
+}
+
+const MAX_CUSTODY_MANIFEST_BYTES = 256 * 1024
+
+function errorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code
+  return typeof code === 'string' ? code : 'unknown'
+}
+
+function validateManifestFile(
+  stats: Awaited<ReturnType<typeof fs.lstat>>,
+  expectedUid: number,
+): string | null {
+  const mode = Number(stats.mode)
+  if (stats.isSymbolicLink()) return 'manifest is a symlink'
+  if (!stats.isFile()) return 'manifest is not a regular file'
+  if ((mode & 0o777) !== 0o600) return 'manifest mode must be 0600'
+  if (stats.uid !== expectedUid) return 'manifest owner does not match'
+  return null
+}
+
+function validateManifestParent(
+  stats: Awaited<ReturnType<typeof fs.lstat>>,
+  expectedUid: number,
+): string | null {
+  const mode = Number(stats.mode)
+  if (stats.uid !== expectedUid) return 'manifest parent owner does not match'
+  if ((mode & 0o002) !== 0 && (mode & 0o1000) === 0) {
+    return 'manifest parent is world-writable'
+  }
+  return null
+}
+
+export class CustodyHandleManifestReader {
+  #cache:
+    | {
+        mtimeMs: number
+        size: number
+        result: Extract<
+          CustodyHandleManifestReadResult,
+          { status: 'ready' | 'ignored' }
+        >
+      }
+    | undefined
+
+  readonly #options: {
+    path: string
+    provider: 'anthropic'
+    serve: 'anthropic-auth'
+    expectedUid?: number
+  }
+
+  constructor(options: {
+    path: string
+    provider: 'anthropic'
+    serve: 'anthropic-auth'
+    expectedUid?: number
+  }) {
+    this.#options = options
+  }
+
+  async read(): Promise<CustodyHandleManifestReadResult> {
+    const expectedUid =
+      this.#options.expectedUid ?? process.getuid?.() ?? userInfo().uid
+    let pathStats: Awaited<ReturnType<typeof fs.lstat>>
+    try {
+      pathStats = await fs.lstat(this.#options.path)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return { status: 'absent' }
+      return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
+    }
+
+    const fileReason = validateManifestFile(pathStats, expectedUid)
+    if (fileReason) return { status: 'invalid', reason: fileReason }
+
+    try {
+      const parentReason = validateManifestParent(
+        await fs.lstat(dirname(this.#options.path)),
+        expectedUid,
+      )
+      if (parentReason) return { status: 'invalid', reason: parentReason }
+    } catch (error) {
+      return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
+    }
+
+    let handle: fs.FileHandle | undefined
+    try {
+      handle = await fs.open(
+        this.#options.path,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+      )
+      // The validated descriptor, not the path, is the authority for content and metadata after open.
+      const openedStats = await handle.stat()
+      const openedFileReason = validateManifestFile(openedStats, expectedUid)
+      if (openedFileReason)
+        return { status: 'invalid', reason: openedFileReason }
+
+      if (
+        this.#cache?.mtimeMs === openedStats.mtimeMs &&
+        this.#cache.size === openedStats.size
+      ) {
+        return this.#cache.result
+      }
+
+      const bytes = new Uint8Array(MAX_CUSTODY_MANIFEST_BYTES + 1)
+      const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, 0)
+      if (bytesRead > MAX_CUSTODY_MANIFEST_BYTES) {
+        return { status: 'invalid', reason: 'manifest exceeds maximum size' }
+      }
+
+      let json: unknown
+      try {
+        json = parseJsonRedacted(
+          new TextDecoder().decode(bytes.subarray(0, bytesRead)),
+        )
+      } catch (error) {
+        return {
+          status: 'invalid',
+          reason: error instanceof Error ? error.message : 'invalid JSON',
+        }
+      }
+
+      let parsed: ParsedCustodyHandleManifest
+      try {
+        parsed = readCustodyHandles(
+          json,
+          this.#options.provider,
+          this.#options.serve,
+        )
+      } catch (error) {
+        if (error instanceof CustodyManifestSelectionError) {
+          const result = { status: 'ignored', reason: error.reason } as const
+          this.#cache = {
+            mtimeMs: openedStats.mtimeMs,
+            size: openedStats.size,
+            result,
+          }
+          return result
+        }
+        return {
+          status: 'invalid',
+          reason: error instanceof Error ? error.message : 'invalid manifest',
+        }
+      }
+
+      const manifest: CustodyHandleManifest = {
+        version: parsed.version,
+        provider: this.#options.provider,
+        serve: this.#options.serve,
+        accounts: parsed.accounts,
+        superseded: parsed.superseded,
+      }
+      const result = { status: 'ready', manifest } as const
+      this.#cache = {
+        mtimeMs: openedStats.mtimeMs,
+        size: openedStats.size,
+        result,
+      }
+      return result
+    } catch (error) {
+      return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
+    } finally {
+      await handle?.close().catch(() => {})
+    }
   }
 }
 

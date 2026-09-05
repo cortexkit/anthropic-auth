@@ -9,9 +9,14 @@ import {
   getDefaultClaustrumConnectionPath,
   isClaustrumEnabledForAccount,
   loadAccounts,
+  type OAuthAccount,
+  readCustodyHandles,
+  resolveCustodyHandle,
+  resolveCustodyHandlesPath,
   saveAccounts,
   setClaustrumAccountGatePersistent,
 } from '@cortexkit/anthropic-auth-core'
+import { loadGoldenCustodyManifest } from './custody-handle-manifest.fixture.ts'
 
 let tempDir: string
 let accountPath: string
@@ -178,6 +183,26 @@ describe('Claustrum connection detection', () => {
 })
 
 describe('per-account Claustrum gate', () => {
+  test('preserves a path-only handlesFile configuration through normalization', async () => {
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        claustrum: { handlesFile: '  /tmp/custody-handles.json  ' },
+      }),
+    )
+
+    const storage = await loadAccounts(accountPath)
+
+    expect(storage?.claustrum).toEqual({
+      handlesFile: '/tmp/custody-handles.json',
+    })
+    await saveAccounts(storage!, accountPath)
+    expect(JSON.parse(await readFile(accountPath, 'utf8')).claustrum).toEqual({
+      handlesFile: '/tmp/custody-handles.json',
+    })
+  })
+
   test('defaults off when config is absent', async () => {
     await saveAccounts(baseStorage(), accountPath)
 
@@ -347,6 +372,69 @@ describe('per-account Claustrum gate', () => {
     expect(after).toBe(before)
     expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs)
     expect(JSON.parse(after).claustrum).toBeUndefined()
+  })
+})
+
+describe('custody handle resolution', () => {
+  const account = (input: Partial<OAuthAccount> = {}): OAuthAccount => ({
+    id: 'uuid-not-a-label',
+    type: 'oauth',
+    refresh: 'refresh-token',
+    ...input,
+  })
+
+  test('resolves configured, environment, and XDG custody handle paths in order', () => {
+    expect(
+      resolveCustodyHandlesPath(
+        { handlesFile: '  /configured/handles.json  ' },
+        {
+          CLAUSTRUM_OPENCODE_HANDLES: '/environment/handles.json',
+          XDG_CONFIG_HOME: '/xdg',
+          HOME: '/home/tester',
+        },
+      ),
+    ).toBe('/configured/handles.json')
+    expect(
+      resolveCustodyHandlesPath(undefined, {
+        CLAUSTRUM_OPENCODE_HANDLES: '/environment/handles.json',
+        XDG_CONFIG_HOME: '/xdg',
+        HOME: '/home/tester',
+      }),
+    ).toBe('/environment/handles.json')
+    expect(
+      resolveCustodyHandlesPath(undefined, {
+        CLAUSTRUM_OPENCODE_HANDLES: 'relative/handles.json',
+        XDG_CONFIG_HOME: '/xdg',
+        HOME: '/home/tester',
+      }),
+    ).toBe('/xdg/cortexkit/opencode-handles.json')
+    expect(resolveCustodyHandlesPath(undefined, { HOME: '/home/tester' })).toBe(
+      '/home/tester/.config/cortexkit/opencode-handles.json',
+    )
+  })
+
+  test('matches the golden manifest by account label rather than UUID', async () => {
+    const { manifest: golden } = await loadGoldenCustodyManifest()
+    const parsed = readCustodyHandles(golden, 'anthropic', 'anthropic-auth')
+    const manifest = {
+      version: 1 as const,
+      provider: 'anthropic' as const,
+      serve: 'anthropic-auth' as const,
+      accounts: parsed.accounts,
+      superseded: parsed.superseded,
+    }
+    const entry = manifest.accounts[0]
+    if (!entry) throw new Error('golden manifest has no anthropic account')
+
+    const result = resolveCustodyHandle({
+      account: account({ label: entry.label }),
+      manifest,
+    })
+
+    expect(result.status).toBe('resolved')
+    if (result.status !== 'resolved')
+      throw new Error('expected resolved handle')
+    expect(result.source).toBe('manifest')
   })
 })
 

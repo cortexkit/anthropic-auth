@@ -79,6 +79,7 @@ export type ClaustrumAccountGate = {
 }
 
 export type ClaustrumConfig = {
+  handlesFile?: string
   accounts?: Record<string, ClaustrumAccountGate>
 }
 
@@ -894,23 +895,35 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 }
 
 function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
-  if (!isRecord(value) || !isRecord(value.accounts)) return undefined
-  const accounts = Object.fromEntries(
-    Object.entries(value.accounts).flatMap(([id, entry]) => {
-      if (!isRecord(entry)) return []
-      return [
-        [
-          id,
-          {
-            ...(typeof entry.enabled === 'boolean' && {
-              enabled: entry.enabled,
-            }),
-          },
-        ],
-      ]
-    }),
-  )
-  return Object.keys(accounts).length > 0 ? { accounts } : undefined
+  if (!isRecord(value)) return undefined
+  const handlesFile =
+    typeof value.handlesFile === 'string' && value.handlesFile.trim()
+      ? value.handlesFile.trim()
+      : undefined
+  const accounts = isRecord(value.accounts)
+    ? Object.fromEntries(
+        Object.entries(value.accounts).flatMap(([id, entry]) => {
+          if (!isRecord(entry)) return []
+          return [
+            [
+              id,
+              {
+                ...(typeof entry.enabled === 'boolean' && {
+                  enabled: entry.enabled,
+                }),
+              },
+            ],
+          ]
+        }),
+      )
+    : undefined
+  if (!handlesFile && (!accounts || Object.keys(accounts).length === 0)) {
+    return undefined
+  }
+  return {
+    ...(handlesFile && { handlesFile }),
+    ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
+  }
 }
 
 async function readJsonIfPresent(path: string): Promise<{
