@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -7,14 +7,11 @@ import {
   detectClaustrumConnection,
   executeAccountCommand,
   getDefaultClaustrumConnectionPath,
-  isClaustrumEnabledForAccount,
-  loadAccounts,
   type OAuthAccount,
   readCustodyHandles,
   resolveCustodyHandle,
   resolveCustodyHandlesPath,
   saveAccounts,
-  setClaustrumAccountGatePersistent,
 } from '@cortexkit/anthropic-auth-core'
 import { loadGoldenCustodyManifest } from './custody-handle-manifest.fixture.ts'
 
@@ -182,199 +179,6 @@ describe('Claustrum connection detection', () => {
   })
 })
 
-describe('per-account Claustrum gate', () => {
-  test('preserves a path-only handlesFile configuration through normalization', async () => {
-    await writeFile(
-      accountPath,
-      JSON.stringify({
-        ...baseStorage(),
-        claustrum: { handlesFile: '  /tmp/custody-handles.json  ' },
-      }),
-    )
-
-    const storage = await loadAccounts(accountPath)
-
-    expect(storage?.claustrum).toEqual({
-      handlesFile: '/tmp/custody-handles.json',
-    })
-    await saveAccounts(storage!, accountPath)
-    expect(JSON.parse(await readFile(accountPath, 'utf8')).claustrum).toEqual({
-      handlesFile: '/tmp/custody-handles.json',
-    })
-  })
-
-  test('defaults off when config is absent', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-
-    const storage = await loadAccounts(accountPath)
-
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(false)
-  })
-
-  test('defaults off when the gate config is malformed', async () => {
-    await writeFile(
-      accountPath,
-      JSON.stringify({ ...baseStorage(), claustrum: 'on' }),
-    )
-
-    const storage = await loadAccounts(accountPath)
-
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(false)
-  })
-
-  test('keeps gate state independent for each account', async () => {
-    await saveAccounts(
-      {
-        ...baseStorage(),
-        claustrum: {
-          accounts: {
-            'account-a': { enabled: true },
-            'account-b': { enabled: false },
-          },
-        },
-      },
-      accountPath,
-    )
-
-    const storage = await loadAccounts(accountPath)
-
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(true)
-    expect(isClaustrumEnabledForAccount(storage!, 'account-b')).toBe(false)
-  })
-
-  test('loads the current storage before enabling an account gate', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-
-    const result = await setClaustrumAccountGatePersistent({
-      id: 'account-a',
-      enabled: true,
-      path: accountPath,
-    })
-    const storage = await loadAccounts(accountPath)
-
-    expect(result).toBe('updated')
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(true)
-  })
-
-  test('disables an enabled account gate', async () => {
-    await saveAccounts(
-      {
-        ...baseStorage(),
-        claustrum: { accounts: { 'account-a': { enabled: true } } },
-      },
-      accountPath,
-    )
-
-    const result = await setClaustrumAccountGatePersistent({
-      id: 'account-a',
-      enabled: false,
-      path: accountPath,
-    })
-    const storage = await loadAccounts(accountPath)
-
-    expect(result).toBe('updated')
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(false)
-  })
-
-  test('preserves another account gate while changing the target', async () => {
-    await saveAccounts(
-      {
-        ...baseStorage(),
-        claustrum: {
-          accounts: {
-            'account-a': { enabled: true },
-            'account-b': { enabled: true },
-          },
-        },
-      },
-      accountPath,
-    )
-
-    await setClaustrumAccountGatePersistent({
-      id: 'account-a',
-      enabled: false,
-      path: accountPath,
-    })
-    const storage = await loadAccounts(accountPath)
-
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(false)
-    expect(isClaustrumEnabledForAccount(storage!, 'account-b')).toBe(true)
-  })
-
-  test('preserves concurrent gate mutations for different accounts', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-    const coreModule = new URL('../../../core/dist/index.js', import.meta.url)
-    const runMutation = (id: string) =>
-      Bun.spawn([
-        process.execPath,
-        '--eval',
-        `import { setClaustrumAccountGatePersistent } from ${JSON.stringify(coreModule.href)}; const result = await setClaustrumAccountGatePersistent({ id: ${JSON.stringify(id)}, enabled: true, path: ${JSON.stringify(accountPath)} }); if (result !== 'updated') process.exit(1);`,
-      ])
-
-    const first = runMutation('account-a')
-    const second = runMutation('account-b')
-    expect(await first.exited).toBe(0)
-    expect(await second.exited).toBe(0)
-
-    const storage = await loadAccounts(accountPath)
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(true)
-    expect(isClaustrumEnabledForAccount(storage!, 'account-b')).toBe(true)
-  })
-
-  test('preserves unrelated top-level configuration', async () => {
-    await writeFile(
-      accountPath,
-      JSON.stringify({ ...baseStorage(), custom: { retain: true } }),
-    )
-
-    await setClaustrumAccountGatePersistent({
-      id: 'account-a',
-      enabled: true,
-      path: accountPath,
-    })
-    const config = JSON.parse(await readFile(accountPath, 'utf8'))
-
-    expect(config.custom).toEqual({ retain: true })
-  })
-
-  test('does not write a missing account gate', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-    const before = await readFile(accountPath, 'utf8')
-    const beforeStat = await stat(accountPath)
-
-    const result = await setClaustrumAccountGatePersistent({
-      id: 'missing',
-      enabled: true,
-      path: accountPath,
-    })
-    const after = await readFile(accountPath, 'utf8')
-    const afterStat = await stat(accountPath)
-
-    expect(result).toBe('missing')
-    expect(after).toBe(before)
-    expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs)
-  })
-
-  test('does not write or create an entry when disabling an already-off gate', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-    const before = await readFile(accountPath, 'utf8')
-    const beforeStat = await stat(accountPath)
-
-    const result = await setClaustrumAccountGatePersistent({
-      id: 'account-a',
-      enabled: false,
-      path: accountPath,
-    })
-    const after = await readFile(accountPath, 'utf8')
-    const afterStat = await stat(accountPath)
-
-    expect(result).toBe('unchanged')
-    expect(after).toBe(before)
-    expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs)
-    expect(JSON.parse(after).claustrum).toBeUndefined()
-  })
-})
-
 describe('custody handle resolution', () => {
   const account = (input: Partial<OAuthAccount> = {}): OAuthAccount => ({
     id: 'uuid-not-a-label',
@@ -439,14 +243,12 @@ describe('custody handle resolution', () => {
 })
 
 describe('account status Claustrum surface', () => {
-  test('reports detection and each account gate without changing account behavior', async () => {
+  test('reports the global mode and projected vault binding', async () => {
     const result = await executeAccountCommand({
       argumentsText: '',
       storage: {
         ...baseStorage(),
-        claustrum: {
-          accounts: { 'account-a': { enabled: true } },
-        },
+        claustrum: { mode: 'claustrum' },
       },
       claustrum: {
         status: 'available',
@@ -454,13 +256,55 @@ describe('account status Claustrum surface', () => {
         wireVersion: 2,
         endpoints: [{ host: '127.0.0.1', port: 8757 }],
       },
+      statusProjection: {
+        claustrumDetection: 'available',
+        accounts: [
+          {
+            id: 'main',
+            label: 'OpenCode anthropic',
+            role: 'main',
+            enabled: true,
+            quotaPercent: null,
+            claustrumGate: 'na',
+            vaultServed: false,
+            vaultReauth: false,
+            custodyState: 'na',
+            custodyEligible: false,
+          },
+          {
+            id: 'account-a',
+            label: 'account-a',
+            role: 'fallback',
+            enabled: true,
+            quotaPercent: null,
+            claustrumGate: 'on',
+            vaultServed: false,
+            vaultReauth: false,
+            custodyState: 'on-cold',
+            custodyEligible: true,
+          },
+          {
+            id: 'account-b',
+            label: 'account-b',
+            role: 'fallback',
+            enabled: true,
+            quotaPercent: null,
+            claustrumGate: 'off',
+            vaultServed: false,
+            vaultReauth: false,
+            custodyState: 'off',
+            custodyEligible: true,
+          },
+        ],
+      },
     })
 
+    expect(result.text).toContain('Custody mode: claustrum')
     expect(result.text).toContain('Claustrum: available')
     expect(result.text).toContain('account-a')
-    expect(result.text).toContain('manifest binding present · cold')
+    expect(result.text).toContain('vault-bound')
     expect(result.text).toContain('account-b')
-    expect(result.text).toContain('manifest binding absent')
+    expect(result.text).toContain('local')
   })
 })
 

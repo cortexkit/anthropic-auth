@@ -74,7 +74,6 @@ import {
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
-  setClaustrumAccountGatePersistent,
   setClaustrumModePersistent,
   setFastModePersistentEnabled,
   setLogLevel,
@@ -6841,31 +6840,6 @@ describe('setAccountEnabledPersistent', () => {
     )
     const loaded = await loadAccounts()
     expect(loaded?.accounts[0]?.enabled).toBe(false)
-  })
-})
-
-describe('setClaustrumAccountGatePersistent', () => {
-  test('refuses an API fallback without writing custody state', async () => {
-    const storage = baseStorage()
-    storage.accounts.push({
-      id: 'api-fallback',
-      type: 'api',
-      apiKey: 'test-api-key',
-      baseURL: 'https://example.test',
-    })
-    await saveAccounts(storage, accountPath)
-    const before = await readFile(accountPath, 'utf8')
-    const beforeStat = await stat(accountPath)
-
-    expect(
-      await setClaustrumAccountGatePersistent({
-        id: 'api-fallback',
-        enabled: true,
-        path: accountPath,
-      }),
-    ).toBe('ineligible')
-    expect(await readFile(accountPath, 'utf8')).toBe(before)
-    expect((await stat(accountPath)).mtimeMs).toBe(beforeStat.mtimeMs)
   })
 })
 
