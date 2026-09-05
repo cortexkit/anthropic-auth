@@ -155,7 +155,7 @@ vault-owned family.
 | # | binding | local | vault | verdict | serve | local refresh | durable writes | retry | operator |
 |---|---|---|---|---|---|---|---|---|---|
 | C1 | VALID | INERT | USABLE | `CUSTODY_SERVE` | vault | inert | none | — | none |
-| C2 | VALID | REAL, fingerprint **matches** | USABLE | `RESUME_TAKEOVER` | vault, after this account's commit | inert | finish this account's commit under its lock: fallback → drop refresh material; main → `client.auth.set(tombstone)`, awaited | immediate | none |
+| C2 | VALID | REAL, fingerprint **matches** | USABLE | fallback: `RESUME_TAKEOVER` · main: `TAKEOVER_INCOMPLETE_MAIN_REAL` (§13.1) | fallback: vault, after its commit · main: **no** | inert | fallback → drop refresh material under its lock · main → **none** | fallback: immediate · main: none | main: `ck auth migrate-plugin --allow-main` |
 | C2′ | VALID | REAL, fingerprint **differs or absent** | any | `NEW_LOCAL_FAMILY_UNDER_CLAUSTRUM` | **no** | inert | **none** | none | **unresolved** (§12.2): `ck auth migrate-plugin --replace` then re-enter is consistent with every rule; "exit to `local` and the login stands" is not |
 | C3 | VALID | INERT | COLD | `CUSTODY_UNAVAILABLE` | **no** (typed provider-unavailable) | inert | none | bounded custody retry on vault availability | none |
 | C3′ | VALID | REAL | COLD | `TAKEOVER_INCOMPLETE_VAULT_UNAVAILABLE` | **no** | inert | **none**: no rollback, no drop. The destructive commit waits for `USABLE` (→ C2) because dropping material without proof the vault holds the family is destruction without evidence | on vault availability | none required; `local` + re-login only to abandon custody |
@@ -229,11 +229,11 @@ a state with a named verdict (§5) and a resume path.
    never coexists with `mode=local` during a normal commit, so observing that pair is evidence of
    tampering rather than an expected intermediate, and it is what makes `RESUME_TAKEOVER` possible
    at all (under mode-last every intermediate is indistinguishable from a hand-written tombstone).
-4. Idempotent per-account commits, fallbacks then main. Fallback → drop local refresh material
-   (no-op if absent); fallback rows live under our own locks, so this half is fenced. Main →
-   `client.auth.set(WRITE set)`, awaited (no-op if the slot already satisfies the recognise-set).
-   **The main write is not fenced** against the host (§12.1). A fingerprint re-read immediately
-   before it narrows the window; it does not close it.
+4. Idempotent per-account commits, fallbacks only. Fallback → drop local refresh material (no-op
+   if absent); fallback rows live under our own locks, so this half is fenced. Main → **no write**
+   (§13.1): the slot must already satisfy the recognise-set at step 2 or the barrier refused before
+   step 3. (A plugin-side `client.auth.set(WRITE set)` would not be fenced against the host,
+   §12.1; a fingerprint re-read immediately before it narrows the window without closing it.)
 5. Any failure after step 3: retain the mode, keep **all** local refresh inert (the binding alone
    inerts it, mode-independent), release, surface. The next reconcile resumes **only** incomplete
    accounts (C2), under their own locks; it never re-runs a transition for accounts already in C1.
@@ -440,11 +440,21 @@ rotated.
 
 1. **The host-write race stays open and the unsafe transition stays BLOCKED.** The main-slot
    write (`client.auth.set` of the tombstone, §7 step 4 main) is not fenced against OpenCode's
-   `Auth.set`, and plugin-side restoration into an absent slot is withdrawn outright (C9, §12.1). Until a source-backed synchronisation exists, the command
-   **refuses** to perform that write with a typed error naming this as the reason; it does not
-   describe the fingerprint as a fix and does not weaken the invariant so a test passes. The
-   fallback half of the barrier (fenced by our own locks), the serving path, and every independent
-   task proceed. Regression coverage must **demonstrate the exact interleaving** (a host write
+   `Auth.set`, and plugin-side restoration into an absent slot is withdrawn outright (C9, §12.1).
+   **What the command does today, under the block:** the plugin issues **no** main-slot write at
+   all. Main's tombstone is written by the operator-driven vault import
+   (`ck auth migrate-plugin --allow-main`, the settled ownership of main import), and the barrier
+   treats "main's slot already holds the recognise-set" as a **precondition**: at step 2, main
+   classifies C1 only if the slot is already INERT; a REAL main slot is a typed refusal
+   (`main is still local; run ck auth migrate-plugin --allow-main first`) issued **before** step 3,
+   so no mode write and no fallback commit happens (the barrier is all-or-nothing readiness).
+   Consequently C2 (`RESUME_TAKEOVER`) applies to **fallbacks only**; a REAL main under
+   `mode=claustrum` is `TAKEOVER_INCOMPLETE_MAIN_REAL` (refuse, inert, no writes, same operator
+   recovery). When a source-backed synchronisation lands, the plugin-side write can be added
+   behind that same precondition without changing any verdict. The command does not describe the
+   fingerprint as a fix and does not weaken the invariant so a test passes. The fallback half of the
+   barrier (fenced by our own locks), the serving path, and every independent task proceed.
+   Regression coverage must **demonstrate the exact interleaving** (a host write
    between our re-read and our write, for both the tombstone install and absent-slot restoration)
    and assert that the transition is blocked; a passing fingerprint-only test is not proof of
    safety and must not be presented as one.
@@ -454,9 +464,11 @@ rotated.
 3. **Production correctness is separate from local operational observation.** The Claustrum-seat
    steps in §11 (sending a flip time, receiving sealer/latch-watch log edges) are an **operator
    runbook** for this deployment, not a runtime dependency of the command and not part of its
-   completion contract. Completion is machine-checkable inside the plugin: after the write, the slot
-   re-reads as the recognise-set; `credential.get` through the binding succeeds; status reports
-   `CUSTODY_SERVE`; zero local refresh attempts are observed for the account.
+   completion contract. Completion is machine-checkable inside the plugin and, under §13.1,
+   contains no plugin write to main's slot: for **main**, the slot re-reads as the recognise-set
+   (the precondition, verified, not a write of ours); for each **fallback**, its local refresh
+   material re-reads as absent (our write); for every account, `credential.get` through the binding
+   succeeds, status reports `CUSTODY_SERVE`, and zero local refresh attempts are observed.
 
 Regression coverage required by the go-ahead: host-write interleaving (blocked, both directions),
 crash/resume, concurrent mode changes, verified-login binding clearance.
