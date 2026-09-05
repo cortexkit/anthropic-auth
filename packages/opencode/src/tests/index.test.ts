@@ -3023,9 +3023,13 @@ describe('fallback Claustrum credential resolution', () => {
     storage: AccountStorage,
     connector: (options: unknown) => Promise<unknown>,
     response: Response | (() => Response),
-    runtimeOverrides: Record<string, unknown> = {},
+    runtimeOverrides: Record<string, unknown> & {
+      beforePlugin?: () => Promise<void>
+    } = {},
   ) {
     await useTempAccountFile(storage)
+    const { beforePlugin, ...pluginOverrides } = runtimeOverrides
+    await beforePlugin?.()
     const authorizations: string[] = []
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
       if (
@@ -3041,7 +3045,7 @@ describe('fallback Claustrum credential resolution', () => {
     }) as unknown as typeof fetch
     const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: connector,
-      ...runtimeOverrides,
+      ...pluginOverrides,
     })
     const result = await plugin.auth.loader(
       () =>
@@ -3252,17 +3256,19 @@ describe('fallback Claustrum credential resolution', () => {
           },
         ],
       })
-      await useTempAccountFile(storage)
-      const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const config = JSON.parse(await readFile(accountPath, 'utf8'))
-      config.claustrum = { accounts: { 'work-alt': { enabled: true } } }
-      await writeFile(accountPath, JSON.stringify(config))
-      await writeManifest([{ label: 'work-alt', handle: manifestHandle }])
+      storage.claustrum = { accounts: { 'work-alt': { enabled: true } } }
       const { authorizations, plugin, result } =
         await loadFallbackWithConnector(
           storage,
           manifestConnector(calls, new Map([[manifestHandle, 'vault-access']])),
           new Response('{}', { status: 200 }),
+          {
+            beforePlugin: async () => {
+              await writeManifest([
+                { label: 'work-alt', handle: manifestHandle },
+              ])
+            },
+          },
         )
       const payload = await runCustodyCommand(plugin, 'legacy-flag', '')
       const accounts = payload?.knobs.accounts as Array<{
