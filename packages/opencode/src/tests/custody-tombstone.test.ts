@@ -198,7 +198,7 @@ describe('Claustrum custody tombstones', () => {
       return Promise.resolve(new Response('{}', { status: 200 }))
     }) as unknown as typeof fetch
 
-    // The innermost guard is wider because a value has no provider record to match exactly.
+    // Keep both depths in one table: separate tests drift apart invisibly.
     await expect(
       Promise.all(
         values.map(async ({ auth, value, recognized: expectedRecognition }) => {
@@ -211,6 +211,9 @@ describe('Claustrum custody tombstones', () => {
           await expect(
             refreshClaudeOAuthToken({ refreshToken: value, fetchImpl }),
           ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+          expect(() => setOAuthHeaders(new Headers(), value)).toThrow(
+            CustodyTombstoneRefreshError,
+          )
         }),
       ),
     ).resolves.toBeArray()
@@ -528,12 +531,18 @@ describe('Claustrum custody tombstones', () => {
         { client: createMockClient() },
         timers,
       )) as any
+      const intervalsBeforeLoader = (
+        timers.setInterval as typeof timers.setInterval & {
+          mock: { calls: unknown[] }
+        }
+      ).mock.calls.length
       await expect(
         plugin.auth.loader(
           () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
           { models: {} } as never,
         ),
       ).resolves.toHaveProperty('fetch')
+      expect(timers.setInterval).toHaveBeenCalledTimes(intervalsBeforeLoader)
       await plugin.dispose?.()
     })
 
