@@ -5221,12 +5221,8 @@ const anthropicAuthPlugin = async (
                       },
                     )
                     return createStrippedStream(response, {
-                      onRelayUpstreamError: ({ status, source }) => {
-                        if (status !== 401) return
-                        const served = claustrumServedCredentials.get(response)
-                        if (served)
-                          void reportClaustrumAuthFailure(served, source)
-                      },
+                      onRelayUpstreamError:
+                        createClaustrum401RelayHook(response),
                     })
                   }
                   return claustrumMainRefusal(
@@ -6066,6 +6062,20 @@ const anthropicAuthPlugin = async (
               if (claustrumAuthFailureReports.get(key) === report) {
                 claustrumAuthFailureReports.delete(key)
               }
+            }
+          }
+
+          function createClaustrum401RelayHook(response: Response) {
+            return ({
+              status,
+              source,
+            }: {
+              status: number
+              source: ClaustrumReporterSource
+            }) => {
+              if (status !== 401) return
+              const served = claustrumServedCredentials.get(response)
+              if (served) void reportClaustrumAuthFailure(served, source)
             }
           }
 
@@ -7166,11 +7176,7 @@ const anthropicAuthPlugin = async (
                           responseMode: 'json' as const,
                         }
                     : {}),
-                  onRelayUpstreamError: ({ status, source }) => {
-                    if (status !== 401) return
-                    const served = claustrumServedCredentials.get(response)
-                    if (served) void reportClaustrumAuthFailure(served, source)
-                  },
+                  onRelayUpstreamError: createClaustrum401RelayHook(response),
                   contentFilterModel: fablePlan?.requestedModel,
                   ...(!fablePlan?.downgraded && fablePlan
                     ? {
