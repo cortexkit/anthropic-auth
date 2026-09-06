@@ -639,7 +639,12 @@ describe('Claustrum custody tombstones', () => {
       )
       expect(realResponse.status).toBe(503)
       await expect(realResponse.json()).resolves.toMatchObject({
-        error: { code: 'TAKEOVER_INCOMPLETE_MAIN_REAL' },
+        error: {
+          code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
+          message: expect.stringContaining(
+            'ck auth migrate-plugin --allow-main',
+          ),
+        },
       })
       expect(fetchCalls).toHaveLength(0)
       await plugin.dispose?.()
