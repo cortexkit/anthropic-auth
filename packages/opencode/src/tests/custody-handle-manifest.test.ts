@@ -204,9 +204,12 @@ describe('CustodyHandleManifestReader', () => {
         ]
       }),
       async (path) => {
-        await expect(reader(path).read()).resolves.toEqual({
-          status: 'invalid',
-          reason: 'invalid account handle',
+        await expect(reader(path).read()).resolves.toMatchObject({
+          status: 'ready',
+          manifest: {
+            accounts: [],
+            corruptLabels: new Set(['work-alt']),
+          },
         })
       },
     )

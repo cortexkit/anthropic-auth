@@ -218,6 +218,7 @@ export type CustodyHandleManifest = {
   serve: 'anthropic-auth'
   accounts: ReadonlyArray<CustodyHandleAccount>
   superseded: ReadonlySet<string>
+  corruptLabels?: ReadonlySet<string>
 }
 
 export type CustodyHandleResolution =
@@ -247,6 +248,7 @@ type ParsedCustodyHandleManifest = {
   serve: string
   accounts: ReadonlyArray<CustodyHandleAccount>
   superseded: ReadonlySet<string>
+  corruptLabels: ReadonlySet<string>
 }
 
 const CUSTODY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
@@ -314,6 +316,9 @@ export function resolveCustodyHandle(input: {
     return legacyOrUnresolved(account, 'duplicate-label')
   }
   if (!manifest) return legacyOrUnresolved(account, 'missing-entry')
+  if (manifest.corruptLabels?.has(account.label)) {
+    return { status: 'unresolved', reason: 'corrupt-binding' }
+  }
 
   const entry = manifest.accounts.find(
     (candidate) =>
@@ -367,47 +372,59 @@ export function readCustodyHandles(
     throw new Error('invalid manifest accounts')
   }
   const superseded = new Set<string>()
+  const corruptLabels = new Set<string>()
+  const accounts: CustodyHandleAccount[] = []
+  for (const entry of source.accounts) {
+    if (!isRecord(entry)) throw new Error('invalid account entry')
+    if (!Object.hasOwn(entry, 'label') || typeof entry.label !== 'string') {
+      throw new Error('invalid account label')
+    }
+    if (!isValidCustodyLabel(entry.label)) {
+      throw new Error('invalid account label')
+    }
+    if (
+      !Object.hasOwn(entry, 'handle') ||
+      !Object.hasOwn(entry, 'credential_id') ||
+      typeof entry.handle !== 'string' ||
+      !isValidCustodyHandle(entry.handle) ||
+      !isValidCustodyCredentialId(entry.credential_id) ||
+      (provider === 'anthropic' &&
+        entry.credential_id !== custodyCredentialId(entry.label))
+    ) {
+      corruptLabels.add(entry.label)
+      continue
+    }
+    if (Object.hasOwn(entry, 'superseded')) {
+      if (!Array.isArray(entry.superseded)) {
+        corruptLabels.add(entry.label)
+        continue
+      }
+      let malformed = false
+      for (const handle of entry.superseded) {
+        if (!isValidCustodyHandle(handle)) {
+          malformed = true
+          break
+        }
+      }
+      if (malformed) {
+        corruptLabels.add(entry.label)
+        continue
+      }
+      for (const handle of entry.superseded) superseded.add(handle)
+    }
+    accounts.push({
+      label: entry.label,
+      handle: entry.handle,
+      credentialId: entry.credential_id,
+    })
+  }
   return {
     version: 1,
     provider,
     serve,
-    accounts: source.accounts.map((entry) => {
-      if (!isRecord(entry)) throw new Error('invalid account entry')
-      if (
-        !Object.hasOwn(entry, 'label') ||
-        !Object.hasOwn(entry, 'handle') ||
-        !Object.hasOwn(entry, 'credential_id') ||
-        typeof entry.label !== 'string' ||
-        !isValidCustodyLabel(entry.label)
-      )
-        throw new Error('invalid account label')
-      if (
-        typeof entry.handle !== 'string' ||
-        !isValidCustodyHandle(entry.handle)
-      ) {
-        throw new Error('invalid account handle')
-      }
-      if (!isValidCustodyCredentialId(entry.credential_id)) {
-        throw new Error('invalid account credential id')
-      }
-      if (Object.hasOwn(entry, 'superseded')) {
-        if (!Array.isArray(entry.superseded)) {
-          throw new Error('invalid superseded handles')
-        }
-        for (const handle of entry.superseded) {
-          if (!isValidCustodyHandle(handle)) {
-            throw new Error('invalid superseded handle')
-          }
-          superseded.add(handle)
-        }
-      }
-      return {
-        label: entry.label,
-        handle: entry.handle,
-        credentialId: entry.credential_id,
-      }
-    }),
+    accounts,
     superseded,
+    corruptLabels,
   }
 }
 
@@ -585,6 +602,7 @@ export class CustodyHandleManifestReader {
         serve: this.#options.serve,
         accounts: parsed.accounts,
         superseded: parsed.superseded,
+        corruptLabels: parsed.corruptLabels,
       }
       const result = { status: 'ready', manifest } as const
       this.#cache = {

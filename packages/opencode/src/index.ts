@@ -1782,7 +1782,6 @@ const anthropicAuthPlugin = async (
       return { status: 'unresolved', reason: 'foreign-serve' }
     } else if (custodyHandleManifestStatus === 'invalid') {
       warnCustodyResolutionOnce(account.id, 'invalid-manifest')
-      return { status: 'unresolved', reason: 'corrupt-binding' }
     } else if (
       resolution.status === 'resolved' &&
       resolution.source === 'legacy'

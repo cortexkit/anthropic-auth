@@ -367,7 +367,7 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
-  test('rejects malformed handle accounts while tolerating unknown fields', () => {
+  test('marks malformed account entries as corrupt while retaining valid entries', () => {
     const fixture = structuredClone(handlesFixture) as {
       providers: Array<{
         provider: string
@@ -390,9 +390,36 @@ describe('Claustrum custody tombstones', () => {
       { ...account, extra: 'ignored' },
     ]
 
-    expect(() =>
-      readCustodyHandles(fixture, oauthFixture.provider, 'anthropic-auth'),
-    ).toThrow('invalid account label')
+    const parsed = readCustodyHandles(
+      fixture,
+      oauthFixture.provider,
+      'anthropic-auth',
+    )
+    expect(parsed.corruptLabels).toEqual(new Set([String(account.label)]))
+    expect(parsed.accounts).toHaveLength(1)
+  })
+
+  test('marks non-canonical credential IDs as corrupt bindings', () => {
+    const fixture = structuredClone(handlesFixture) as {
+      providers: Array<{
+        provider: string
+        accounts: Array<Record<string, unknown>>
+      }>
+    }
+    const anthropic = fixture.providers.find(
+      (provider) => provider.provider === oauthFixture.provider,
+    )
+    if (!anthropic) throw new Error('missing anthropic fixture')
+    const account = anthropic.accounts[0]
+    if (!account) throw new Error('missing anthropic account fixture')
+    anthropic.accounts = [{ ...account, credential_id: 'wrong' }]
+
+    const parsed = readCustodyHandles(
+      fixture,
+      oauthFixture.provider,
+      'anthropic-auth',
+    )
+    expect(parsed.corruptLabels).toEqual(new Set([String(account.label)]))
   })
 
   test('throws when the requested provider is absent', () => {
