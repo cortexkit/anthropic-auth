@@ -6602,6 +6602,190 @@ describe('AnthropicAuthPlugin', () => {
     installDefaultFetchMock()
   })
 
+  test.serial(
+    'TUI fallback re-login fences the divergence marker at the served vault record version',
+    async () => {
+      const label = 'a'
+      const handle = `ckh_${'A'.repeat(43)}`
+      const token = 'relogin-a-access'
+      const refresh = 'relogin-a-refresh'
+      const calls: CredentialCall[] = []
+      await useTempAccountFile(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          quota: { enabled: false, failClosedOnUnknownQuota: false },
+          claustrum: { mode: 'claustrum' },
+          accounts: [
+            {
+              id: 'fallback-a',
+              label,
+              type: 'oauth',
+              access: 'sidecar-a-access',
+              refresh: 'sidecar-a-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              claustrumHandle: handle,
+            },
+          ],
+        }),
+      )
+      const manifestPath = join(tempConfigDir!, 'handles.json')
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 1,
+          providers: [
+            {
+              provider: 'anthropic',
+              serve: 'anthropic-auth',
+              accounts: [
+                {
+                  label,
+                  handle,
+                  credential_id: custodyCredentialId(label),
+                },
+              ],
+            },
+          ],
+        }),
+      )
+      await chmod(manifestPath, 0o600)
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+
+      const authorize = mock(() =>
+        Promise.resolve({
+          url: 'https://example.test/oauth?state=state',
+          redirectUri: 'https://example.test/callback',
+          state: 'state',
+          verifier: 'verifier',
+        }),
+      )
+      const authorizations: string[] = []
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        const url = extractUrl(input as string | URL | Request)
+        if (url === TOKEN_URL) {
+          return Promise.resolve(
+            Response.json({
+              access_token: token,
+              refresh_token: refresh,
+              expires_in: 3600,
+            }),
+          )
+        }
+        if (url.includes('/v1/messages')) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch
+
+      const client = createMockClient()
+      let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
+      try {
+        plugin = await getPlugin(client, undefined, {
+          authorize,
+          claustrumConnector: async () =>
+            ({
+              call: async (
+                _moduleId: string,
+                method: string,
+                params: unknown,
+              ) => {
+                calls.push({
+                  method,
+                  params: (params ?? {}) as Record<string, unknown>,
+                })
+                if (method !== 'credential.get') return { result: {} }
+                return {
+                  result: {
+                    payload: Array.from(
+                      new TextEncoder().encode(
+                        JSON.stringify({ access_token: 'vault-a-access' }),
+                      ),
+                    ),
+                    expires_at_ms: Date.now() + 60_000,
+                    record_version: 9,
+                  },
+                }
+              },
+              close: () => {},
+            }) as never,
+        })
+        await plugin.__fallbackRefreshReady
+        const result = await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth' as const,
+              access: 'main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 100_000,
+            }),
+          { models: {} },
+        )
+        const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        await response.text()
+        expect(authorizations).toContain('Bearer vault-a-access')
+        expect(
+          calls.some(
+            (call) =>
+              call.method === 'credential.get' && call.params.handle === handle,
+          ),
+        ).toBe(true)
+
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: 'local',
+            sessionID: 'tui-fallback-relogin',
+          }),
+        )
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: 'add-oauth-start',
+            sessionID: 'tui-fallback-relogin',
+          }),
+        )
+        expect(client.session.promptAsync.mock.calls.at(-1)?.[0]).toEqual(
+          expect.objectContaining({
+            body: expect.objectContaining({
+              parts: [
+                expect.objectContaining({
+                  text: expect.stringContaining('state=state'),
+                }),
+              ],
+            }),
+          }),
+        )
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: 'add-oauth-finish code#state --label a',
+            sessionID: 'tui-fallback-relogin',
+          }),
+        )
+
+        const stored = await loadAccounts()
+        expect(
+          stored?.accounts.find((account) => account.label === label),
+        ).toEqual(expect.objectContaining({ access: token, refresh }))
+        const state = JSON.parse(
+          await readFile(
+            getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+            'utf8',
+          ),
+        )
+        expect(
+          state.claustrumDivergence[custodyCredentialId(label)]
+            .minimumRecordVersion,
+        ).toBe(10)
+      } finally {
+        await plugin?.dispose?.()
+        installDefaultFetchMock()
+      }
+    },
+  )
+
   test('fresh install under local with a tombstoned slot', async () => {
     const access = 'fresh-local-access'
     const refresh = 'fresh-local-refresh'
