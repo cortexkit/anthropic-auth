@@ -459,8 +459,12 @@ describe('custody mode', () => {
         },
       }),
     ).rejects.toBeInstanceOf(CustodyLockBusyError)
-    expect(order).toEqual(['main-refresh', 'alpha-refresh'])
-    expect(released).toEqual(['main-refresh', 'manifest', 'transition'])
+    expect(order).toEqual(['opencode-main-oauth-refresh', 'alpha-refresh'])
+    expect(released).toEqual([
+      'opencode-main-oauth-refresh',
+      'manifest',
+      'transition',
+    ])
   })
 
   test('custody: takeover restores raw sidecars when a staged write fails', async () => {
