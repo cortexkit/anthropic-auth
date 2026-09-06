@@ -684,7 +684,7 @@ type FableRequestContext = {
 
 type ClaustrumAccessResolution = {
   accessToken?: string
-  credentialAccountId?: string
+  credentialAccountId?: ProviderAccountUuid
   served?: {
     accountId: string
     handle: string
@@ -711,6 +711,12 @@ type MainQuotaIdentityBinding = {
 type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
   stale: boolean
   state: CustodyStatusState
+}
+
+function providerIdentityFor(served: {
+  providerAccountUuid?: ProviderAccountUuid
+}): ProviderAccountUuid | null {
+  return served.providerAccountUuid ?? null
 }
 
 const FABLE_SWITCHED_TO_OPUS_NOTICE =
@@ -1256,13 +1262,12 @@ const anthropicAuthPlugin = async (
         currentStorage?.main?.profile?.providerAccountUuid ??
         (currentStorage?.main?.profile?.accountIdentity as
           | ProviderAccountUuid
-          | undefined) ??
-        (currentStorage?.mainAccountId as ProviderAccountUuid | undefined)
+          | undefined)
       const state: CustodyStatusState =
         getClaustrumMode(currentStorage) !== 'claustrum'
           ? 'na'
-          : (persistedProviderAccountUuid === undefined) !==
-              (providerAccountUuid === undefined)
+          : persistedProviderAccountUuid === undefined ||
+              providerAccountUuid === undefined
             ? 'unknown-identity'
             : persistedProviderAccountUuid !== undefined &&
                 providerAccountUuid !== undefined &&
@@ -1672,7 +1677,7 @@ const anthropicAuthPlugin = async (
       fieldSources: entry.quota.fieldSources,
     }
     const providerIdentity = {
-      anthropic_account_uuid: served.providerAccountUuid ?? null,
+      anthropic_account_uuid: providerIdentityFor(served),
     }
     const accountKey =
       credentialId ??
@@ -2155,6 +2160,7 @@ const anthropicAuthPlugin = async (
           handle,
           recordVersion: cached.recordVersion,
         },
+        credentialAccountId: cached.accountId as ProviderAccountUuid,
       }
     }
 
@@ -5087,7 +5093,8 @@ const anthropicAuthPlugin = async (
                       mainQuotaIdentity,
                       {
                         accessToken,
-                        credentialAccountId: cached.accountId,
+                        credentialAccountId:
+                          mainQuotaIdentity.providerAccountUuid,
                         served: {
                           accountId: 'main',
                           handle,
@@ -6261,16 +6268,27 @@ const anthropicAuthPlugin = async (
             }
 
             const relayConfig = getRelayConfig(await getRequestStorage())
+            const servedFallbackAccount =
+              oauthAccountId === 'main'
+                ? undefined
+                : requestStorage?.accounts.find(
+                    (account) =>
+                      account.id === oauthAccountId ||
+                      (isOAuthAccount(account) &&
+                        account.anthropicAccountUuid !== undefined),
+                  )
             const served = {
               accountId: oauthAccountId,
               accessToken,
               authLineageId: fallbackAuthLineageId,
-              ...(oauthAccountId === 'main' &&
-              mainQuotaIdentity?.providerAccountUuid
-                ? {
-                    providerAccountUuid: mainQuotaIdentity.providerAccountUuid,
-                  }
-                : {}),
+              providerAccountUuid:
+                oauthAccountId === 'main'
+                  ? mainQuotaIdentity?.providerAccountUuid
+                  : (claustrumResolution?.credentialAccountId ??
+                    (servedFallbackAccount &&
+                    isOAuthAccount(servedFallbackAccount)
+                      ? servedFallbackAccount.anthropicAccountUuid
+                      : undefined)),
               ...(oauthAccountId === 'main' && mainQuotaIdentity
                 ? { mainQuotaIdentity }
                 : {}),

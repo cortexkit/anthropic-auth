@@ -2580,7 +2580,7 @@ describe('fallback Claustrum credential resolution', () => {
         () =>
           Promise.resolve({
             type: 'oauth' as const,
-            access: 'main-access',
+            access: 'sk-ant-oat-main-access',
             refresh: 'main-refresh',
             expires: Date.now() + 100_000,
           }),
@@ -2657,7 +2657,7 @@ describe('fallback Claustrum credential resolution', () => {
         () =>
           Promise.resolve({
             type: 'oauth' as const,
-            access: 'main-access',
+            access: 'sk-ant-oat-main-access',
             refresh: 'main-refresh',
             expires: Date.now() + 100_000,
           }),
@@ -3418,11 +3418,25 @@ describe('fallback Claustrum credential resolution', () => {
   ])(
     'serves a vault fallback with %s',
     async (_caseName, anthropicAccountUuid) => {
+      const fallbackTestHandle = `handle-identity-allowed-${_caseName}-${Date.now()}`
       const calls: CredentialCall[] = []
-      const storage = fallbackWithClaustrum({
-        label: 'identity-allowed',
-        anthropicAccountUuid,
-      } as never)
+      const storage = createFallbackStorage({
+        routing: { mode: 'fallback-first' },
+        quota: { enabled: false, failClosedOnUnknownQuota: false },
+        quotaHeaderFeed: { enabled: true },
+        claustrum: { mode: 'claustrum' },
+        accounts: [
+          {
+            id: 'identity-allowed',
+            type: 'oauth',
+            access: 'stored-fallback-access',
+            refresh: 'stored-fallback-refresh',
+            expires: Date.now() + 5 * 60 * 60 * 1000,
+            anthropicAccountUuid,
+            claustrumHandle: fallbackTestHandle,
+          } as OAuthAccount,
+        ],
+      })
       const connector = connectorFor(calls, (method) => {
         if (method === 'credential.get')
           return credentialResponse(
@@ -3437,11 +3451,17 @@ describe('fallback Claustrum credential resolution', () => {
         await loadFallbackWithConnector(
           storage,
           connector,
-          new Response('{}', { status: 401 }),
+          new Response('{}', {
+            status: 401,
+            headers: {
+              'anthropic-ratelimit-unified-5h-utilization': '0.25',
+              'anthropic-ratelimit-unified-5h-reset': '1800000000',
+            },
+          }),
           {
             beforePlugin: async () => {
               await writeManifest([
-                { label: 'identity-allowed', handle: manifestHandle },
+                { label: 'identity-allowed', handle: fallbackTestHandle },
               ])
             },
           },
@@ -3454,6 +3474,18 @@ describe('fallback Claustrum credential resolution', () => {
         'Bearer vault-identity-allowed-access',
         'Bearer main-access',
       ])
+      const entries = await waitForFeedEntries(
+        (candidate) =>
+          candidate.some(
+            (entry) =>
+              (entry as any).anthropic_account_uuid ===
+              'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          ),
+        'the served fallback provider identity',
+      )
+      expect((entries[0] as any)?.anthropic_account_uuid).toBe(
+        'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      )
       await plugin.dispose?.()
     },
   )
@@ -3475,7 +3507,7 @@ describe('fallback Claustrum credential resolution', () => {
         () =>
           Promise.resolve({
             type: 'oauth' as const,
-            access: 'main-access',
+            access: 'sk-ant-oat-main-access',
             refresh: 'main-refresh',
             expires: Date.now() + 100_000,
           }),
@@ -4943,6 +4975,11 @@ describe('quota header feed integration', () => {
       expect(bootstrapRequests).toBe(0)
       expect(persisted?.mainAccountId).toBeDefined()
       expect((entries[0] as any)?.anthropic_account_uuid).toBeNull()
+      const resolution = await plugin.__resolveMainQuotaIdentityForTest(
+        'local-adapter-access',
+      )
+      expect(resolution.providerAccountUuid).toBeUndefined()
+      expect(resolution.state).toBe('na')
       await plugin.dispose?.()
     },
   )
