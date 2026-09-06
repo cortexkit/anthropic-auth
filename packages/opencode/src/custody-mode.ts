@@ -79,8 +79,8 @@ export class CustodyStateMismatchError extends Error {
 export class CustodyLockBusyError extends Error {
   readonly code = 'lock_busy'
 
-  constructor(readonly name: string) {
-    super(`custody transition lock busy: ${name}`)
+  constructor(readonly lockName: string) {
+    super(`custody transition lock busy: ${lockName}`)
   }
 }
 
@@ -103,7 +103,10 @@ export type PreflightClaustrumTakeoverInput = {
   now: number
   storage: {
     refresh?: { refreshBeforeExpiryMinutes?: number }
-    claustrumDivergence?: Record<string, { minimumRecordVersion: number }>
+    claustrumDivergence?: Record<
+      string,
+      { minimumRecordVersion: number; observedAt?: number }
+    >
   } | null
   main: Pick<PreflightRoute, 'id' | 'label' | 'enabled'>
   fallbacks: PreflightRoute[]
@@ -159,6 +162,12 @@ function findStrictBinding(
   return matches.length === 1 ? matches[0] : undefined
 }
 
+function isUsableCredential(
+  credential: CustodyCacheCredential | { state: string; expiresAt?: number },
+): credential is CustodyCacheCredential {
+  return credential.state === 'usable' && 'recordVersion' in credential
+}
+
 export async function preflightClaustrumTakeover(
   input: PreflightClaustrumTakeoverInput,
 ): Promise<ClaustrumTakeoverPlan> {
@@ -184,8 +193,7 @@ export async function preflightClaustrumTakeover(
     if (credential.state === 'timeout')
       throw new CustodyPreflightRefusedError(route.id, 'credential_timeout')
     if (
-      credential.state !== 'usable' ||
-      credential.expiresAt === undefined ||
+      !isUsableCredential(credential) ||
       credential.expiresAt < input.now + minTtlMs
     )
       throw new CustodyPreflightRefusedError(route.id, 'credential_unusable')
@@ -195,7 +203,7 @@ export async function preflightClaustrumTakeover(
           credentialId: binding.credentialId,
           recordVersion: credential.recordVersion,
         },
-        input.storage ?? {},
+        input.storage as Parameters<typeof custodyPreflightDivergenceCheck>[1],
       ).ok
     )
       throw new CustodyPreflightRefusedError(route.id, 'divergence_fenced')
@@ -279,6 +287,7 @@ export function reconcileCustodyStartup(input: {
     startupVerdicts[
       `${input.mode}|${input.main}|${input.fallbacks}|${input.evidence}`
     ]
+  if (!verdict) throw new CustodyStateMismatchError('FAIL_CLOSED', input)
   if (verdict === 'LOCAL_SERVE' || verdict === 'CLAUSTRUM_SERVE')
     return { verdict }
   throw new CustodyStateMismatchError(verdict, input)

@@ -288,15 +288,23 @@ describe('custody mode', () => {
         manifestPath: '/handles.json',
         fallbackAccountIds: ['zulu', 'alpha'],
         acquireTransition: async () => ({
-          release: async () => released.push('transition'),
+          release: async () => {
+            released.push('transition')
+          },
         }),
         acquireManifest: async () => ({
-          release: async () => released.push('manifest'),
+          release: async () => {
+            released.push('manifest')
+          },
         }),
         acquireRefresh: async ({ name }: { name: string }) => {
           order.push(name)
           if (name === 'alpha-refresh') return null
-          return { release: async () => released.push(name) }
+          return {
+            release: async () => {
+              released.push(name)
+            },
+          }
         },
       }),
     ).rejects.toBeInstanceOf(CustodyLockBusyError)
