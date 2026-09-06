@@ -597,6 +597,7 @@ describe('writeCustodyHandleManifestEntry', () => {
             ...writerEntry,
             label: 'work-alt',
             handle: replacementWriterHandle,
+            credentialId: custodyCredentialId('work-alt'),
           },
         }),
       ).resolves.toEqual({ status: 'written' })
@@ -615,7 +616,7 @@ describe('writeCustodyHandleManifestEntry', () => {
         {
           label: 'work-alt',
           handle: replacementWriterHandle,
-          credential_id: 'oauth:anthropic:writer',
+          credential_id: 'oauth:anthropic:work-alt',
         },
       ])
     })
@@ -1266,6 +1267,17 @@ describe('withCustodyManifestLock', () => {
     async () => {
       await withTempDirectory(async (directory) => {
         const path = join(directory, 'handles.json')
+        const originalNow = Date.now
+        const originalSetInterval = globalThis.setInterval
+        const originalClearInterval = globalThis.clearInterval
+        let now = 0
+        let renew: (() => void) | undefined
+        Date.now = () => now
+        globalThis.setInterval = ((handler: () => void) => {
+          renew = handler
+          return {} as ReturnType<typeof setInterval>
+        }) as typeof setInterval
+        globalThis.clearInterval = (() => {}) as typeof clearInterval
         __setCustodyManifestLockTestOptions({
           ttlMs: 100,
           retryMinMs: 5,
@@ -1282,16 +1294,26 @@ describe('withCustodyManifestLock', () => {
           order.push('first-exit')
         })
         await firstEntered.promise
-        await Bun.sleep(350)
+        for (now = 30; now <= 300; now += 30) {
+          renew?.()
+          await new Promise<void>((resolve) => setImmediate(resolve))
+        }
+        now = 350
         const second = withCustodyManifestLock(path, async () => {
           order.push('second-enter')
         })
 
-        await Bun.sleep(50)
-        expect(order).toEqual(['first-enter'])
-        releaseFirst.resolve()
-        await Promise.all([first, second])
-        expect(order).toEqual(['first-enter', 'first-exit', 'second-enter'])
+        try {
+          await new Promise<void>((resolve) => setImmediate(resolve))
+          expect(order).toEqual(['first-enter'])
+          releaseFirst.resolve()
+          await Promise.all([first, second])
+          expect(order).toEqual(['first-enter', 'first-exit', 'second-enter'])
+        } finally {
+          Date.now = originalNow
+          globalThis.setInterval = originalSetInterval
+          globalThis.clearInterval = originalClearInterval
+        }
       })
     },
   )

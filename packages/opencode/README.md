@@ -231,7 +231,7 @@ The `routing` block controls `/claude-routing`, `claudeCache` controls `/claude-
 
 `quotaHeaderFeed.enabled` is an OpenCode-only, restart-required opt-in. It publishes only allowlisted quota-window values, an opaque account reference, an observation timestamp, and the configured OAuth-account count; it never publishes tokens, raw headers, request bodies, model IDs, or refresh errors. Per-process lease files use owner-only permissions under `$TMPDIR/opencode-anthropic-auth/quota-header-feed`, expire after three minutes, and can be redirected with `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR`.
 
-`claustrum.accounts.<fallback-account-id>.enabled` is a per-account opt-in for fallback credential custody. It is inert unless that account's capability handle has been provisioned in `anthropic-auth-state.json`; handles are bearer credentials and must not be copied into the public config file.
+`claustrum.accounts` remains loadable only so configurations can safely downgrade to older releases; it does not gate custody per account. Capability handles are bearer credentials and must not be copied into the public config file.
 
 Runtime data is stored separately in `anthropic-auth-state.json`: fallback OAuth tokens, API-route keys, token refresh backoff, quota snapshots, and quota API backoff. Sticky session assignments use `anthropic-auth-routing-state.json` and store only SHA-256 hashes of session IDs. Background refresh and quota checks write only runtime state, so editing `anthropic-auth.json` does not get overwritten by another running plugin instance.
 

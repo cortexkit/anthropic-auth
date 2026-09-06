@@ -450,9 +450,8 @@ describe('add-oauth error paths', () => {
   })
 
   test('add-oauth-start refuses Claustrum mode before authorization', async () => {
-    const { loadAccounts, saveAccounts } = await import(
-      '@cortexkit/anthropic-auth-core'
-    )
+    const { loadAccounts, saveAccounts, setClaustrumModePersistent } =
+      await import('@cortexkit/anthropic-auth-core')
     const storage = (await loadAccounts(accountPath))!
     await saveAccounts(
       { ...storage, claustrum: { mode: 'claustrum' } },
@@ -477,10 +476,7 @@ describe('add-oauth error paths', () => {
     ).rejects.toThrow('Exit Claustrum mode first: /claude-account local')
     expect(authorize).not.toHaveBeenCalled()
 
-    await saveAccounts(
-      { ...storage, claustrum: { mode: 'local' } },
-      accountPath,
-    )
+    await setClaustrumModePersistent('local', accountPath)
     await executeCommand(
       plugin,
       'claude-account',
