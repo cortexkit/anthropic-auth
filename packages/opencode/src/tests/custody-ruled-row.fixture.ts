@@ -12,28 +12,7 @@ export type CredentialCall = {
   params: Record<string, unknown>
 }
 
-type RuledRowPlugin = {
-  __claustrumCredentialCache: {
-    get: (handle: string) => Promise<unknown>
-    invalidate: (handle: string) => void
-  } | null
-  __ensureClaustrumCredentialCacheForTest?: () => Promise<{
-    get: (handle: string) => Promise<unknown>
-    invalidate: (handle: string) => void
-  } | null>
-  auth: {
-    loader: (
-      getAuth: () => Promise<never>,
-      options: { models: Record<string, never> },
-    ) => Promise<{
-      fetch: (
-        input: string | URL | Request,
-        init?: RequestInit,
-      ) => Promise<Response>
-    }>
-  }
-  dispose?: () => Promise<void> | void
-}
+type RuledRowPlugin = any
 
 export const ruledMainHandle = `ckh_${'Z'.repeat(43)}`
 
@@ -146,9 +125,9 @@ export async function bootRuledClaustrumRow({
   >
   initialNow?: number
   runtimeOverrides?: Record<string, unknown>
-  createFallbackStorage: (storage: Partial<AccountStorage>) => AccountStorage
-  useTempAccountFile: (storage: AccountStorage) => Promise<void>
-  getPlugin: (
+  createFallbackStorage?: (storage: Partial<AccountStorage>) => AccountStorage
+  useTempAccountFile?: (storage: AccountStorage) => Promise<void>
+  getPlugin?: (
     accountStoragePath: string,
     runtimeOverrides: Record<string, unknown> & {
       claustrumNow: () => number
@@ -161,8 +140,8 @@ export async function bootRuledClaustrumRow({
       claustrumConnector: () => Promise<unknown>
     },
   ) => Promise<RuledRowPlugin>
-  extractUrl: (input: string | URL | Request) => string
-  tempConfigDir: () => string
+  extractUrl?: (input: string | URL | Request) => string
+  tempConfigDir?: () => string
 }) {
   let now = initialNow ?? Date.now()
   const calls: CredentialCall[] = []
@@ -173,13 +152,13 @@ export async function bootRuledClaustrumRow({
       : route === 'main-exhausted'
         ? { mode: 'main-first' }
         : { mode: 'sticky-balanced' }
-  await useTempAccountFile(
-    createFallbackStorage({
+  await useTempAccountFile!(
+    createFallbackStorage!({
       ...storageOverrides,
       main: {
         ...custodyTombstoneOAuth('anthropic'),
         claustrumHandle: ruledMainHandle,
-      },
+      } as never,
       claustrum: { mode: 'claustrum' },
       routing,
       quota,
@@ -208,12 +187,12 @@ export async function bootRuledClaustrumRow({
   if (!accountStoragePath) {
     throw new Error('ruled Claustrum row requires an account storage path')
   }
-  const manifestPath = await writeManifest(tempConfigDir(), [
+  const manifestPath = await writeManifest(tempConfigDir!(), [
     { label: 'main', handle: ruledMainHandle },
     ...fallbacks.map(({ label, handle }) => ({ label, handle })),
   ])
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-    if (extractUrl(input as string | URL | Request).includes('/v1/messages')) {
+    if (extractUrl!(input as string | URL | Request).includes('/v1/messages')) {
       authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
     }
     return (
@@ -238,7 +217,7 @@ export async function bootRuledClaustrumRow({
   }
   const plugin = await (bootPlugin
     ? bootPlugin(resolvedRuntimeOverrides)
-    : getPlugin(accountStoragePath, resolvedRuntimeOverrides))
+    : getPlugin!(accountStoragePath, resolvedRuntimeOverrides))
   const cache =
     plugin.__claustrumCredentialCache ??
     (await plugin.__ensureClaustrumCredentialCacheForTest?.())

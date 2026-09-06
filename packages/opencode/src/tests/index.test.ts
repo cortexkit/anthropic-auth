@@ -3253,7 +3253,7 @@ describe('fallback Claustrum credential resolution', () => {
       runtimeOverrides: {
         clearClaustrumRefreshErrorPersistent: async (...args: any[]) => {
           clearCalls.push(args[0])
-          return realClear(...args)
+          return (realClear as (...values: any[]) => Promise<unknown>)(...args)
         },
       },
     })

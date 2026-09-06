@@ -17,7 +17,6 @@ import {
   dumpResponseArtifact,
   getLogLevel,
   resetDumpState,
-  saveAccountState,
   saveAccounts,
   setDumpEnabled,
   setLogLevel,
