@@ -32,6 +32,7 @@ import {
   CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_START_COMMAND_NAME,
   type ClaustrumConnector,
+  type ClaustrumCredential,
   type ClaustrumCredentialCache,
   ClaustrumCredentialError,
   type ClaustrumReporterSource,

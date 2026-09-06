@@ -1024,6 +1024,7 @@ describe('fallback Claustrum credential resolution', () => {
     accessToken: string,
     recordVersion: number,
     expiresAtMs = Date.now() + 60_000,
+    accountId?: string,
   ) {
     return {
       result: {
@@ -1034,6 +1035,7 @@ describe('fallback Claustrum credential resolution', () => {
         ),
         expires_at_ms: expiresAtMs,
         record_version: recordVersion,
+        ...(accountId && { account_id: accountId }),
       },
     }
   }
@@ -3073,6 +3075,91 @@ describe('fallback Claustrum credential resolution', () => {
     expect(calls).toEqual([])
     await plugin.dispose?.()
   })
+
+  test('excludes a vault fallback whose asserted account identity mismatches its stored UUID', async () => {
+    const calls: CredentialCall[] = []
+    const storage = fallbackWithClaustrum({
+      label: 'identity-fenced',
+      anthropicAccountUuid: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+    } as never)
+    const connector = connectorFor(calls, (method) => {
+      if (method === 'credential.get')
+        return credentialResponse(
+          'vault-identity-fenced-access',
+          1,
+          Date.now() + 60_000,
+          'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        )
+      return { result: {} }
+    })
+    const { authorizations, plugin, result } = await loadFallbackWithConnector(
+      storage,
+      connector,
+      new Response('{}', { status: 401 }),
+      {
+        beforePlugin: async () => {
+          await writeManifest([
+            { label: 'identity-fenced', handle: manifestHandle },
+          ])
+        },
+      },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(401)
+    expect(authorizations).toEqual(['Bearer main-access'])
+    expect(
+      calls.filter((call) => call.method === 'credential.get'),
+    ).toHaveLength(1)
+    await plugin.dispose?.()
+  })
+
+  test.each([
+    ['equal UUIDs', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'],
+    ['no stored UUID', undefined],
+  ])(
+    'serves a vault fallback with %s',
+    async (_caseName, anthropicAccountUuid) => {
+      const calls: CredentialCall[] = []
+      const storage = fallbackWithClaustrum({
+        label: 'identity-allowed',
+        anthropicAccountUuid,
+      } as never)
+      const connector = connectorFor(calls, (method) => {
+        if (method === 'credential.get')
+          return credentialResponse(
+            'vault-identity-allowed-access',
+            2,
+            Date.now() + 60_000,
+            'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          )
+        return { result: {} }
+      })
+      const { authorizations, plugin, result } =
+        await loadFallbackWithConnector(
+          storage,
+          connector,
+          new Response('{}', { status: 401 }),
+          {
+            beforePlugin: async () => {
+              await writeManifest([
+                { label: 'identity-allowed', handle: manifestHandle },
+              ])
+            },
+          },
+        )
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(401)
+      expect(authorizations).toEqual([
+        'Bearer vault-identity-allowed-access',
+        'Bearer main-access',
+      ])
+      await plugin.dispose?.()
+    },
+  )
 
   test('account status inspects the configured Claustrum connection file', async () => {
     const storage = createFallbackStorage({ accounts: [] })
