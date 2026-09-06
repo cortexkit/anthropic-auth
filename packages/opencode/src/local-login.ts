@@ -6,6 +6,7 @@ import {
   type CustodyHandleManifestRemovalResult,
   isOAuthAccount,
   loadAccounts,
+  type OAuthAccount,
   removeCustodyHandleManifestEntry,
   resolveCustodyHandle,
 } from '@cortexkit/anthropic-auth-core'
@@ -168,10 +169,10 @@ export async function acknowledgeLocalOAuthLoginFromStorage(
   if (!completion) return 'not-cleared'
   const storage = await loadAccounts(options.accountStoragePath)
   const account = storage?.accounts.find(
-    (candidate) =>
+    (candidate): candidate is OAuthAccount =>
       candidate.id === completion.accountId && isOAuthAccount(candidate),
   )
-  if (!account?.label) return 'not-cleared'
+  if (!storage || !account?.label) return 'not-cleared'
 
   const manifestResult = await new CustodyHandleManifestReader({
     path: options.manifestPath,
