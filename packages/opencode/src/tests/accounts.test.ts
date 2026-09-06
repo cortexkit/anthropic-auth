@@ -6910,12 +6910,18 @@ describe('global Claustrum mode', () => {
         JSON.stringify({ ...baseStorage(), claustrum: { mode } }),
         'utf8',
       )
-      expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('local')
+      const loaded = await loadAccounts(accountPath)
+      expect(getClaustrumMode(loaded)).toBe('local')
+      await saveAccounts(loaded!, accountPath)
+      expect(
+        JSON.parse(await readFile(accountPath, 'utf8')).claustrum?.mode,
+      ).toBeUndefined()
     }
   })
 
   test('persists global mode in config and retains it through a state save', async () => {
     const storage = baseStorage()
+    storage.claustrum = { mode: 'local' }
     storage.accounts.push({
       id: 'rotation',
       type: 'oauth',
@@ -6925,6 +6931,8 @@ describe('global Claustrum mode', () => {
     })
     await saveAccounts(storage, accountPath)
 
+    const staleStorage = (await loadAccounts(accountPath))!
+
     expect(await setClaustrumModePersistent('claustrum', accountPath)).toBe(
       'changed',
     )
@@ -6933,12 +6941,11 @@ describe('global Claustrum mode', () => {
     )
     expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('claustrum')
 
-    const staleStorage = (await loadAccounts(accountPath))!
     const account = expectOAuthAccount(staleStorage.accounts[0])
     account.access = 'rotated-access'
     account.refresh = 'rotated-refresh'
     account.expires = 2_000
-    await saveAccountState(staleStorage, accountPath, { accounts: true })
+    await saveAccounts(staleStorage, accountPath)
 
     const config = JSON.parse(await readFile(accountPath, 'utf8'))
     const state = JSON.parse(

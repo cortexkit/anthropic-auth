@@ -905,7 +905,6 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 
 function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
   if (!isRecord(value)) return undefined
-  const { handlesFile: _rawHandlesFile, ...rest } = value
   const mode: ClaustrumMode | undefined =
     value.mode === 'local' || value.mode === 'claustrum'
       ? value.mode
@@ -934,13 +933,11 @@ function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
   if (
     !mode &&
     !handlesFile &&
-    (!accounts || Object.keys(accounts).length === 0) &&
-    Object.keys(rest).length === 0
+    (!accounts || Object.keys(accounts).length === 0)
   ) {
     return undefined
   }
   return {
-    ...rest,
     ...(mode && { mode }),
     ...(handlesFile && { handlesFile }),
     ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
@@ -1574,7 +1571,9 @@ export async function setClaustrumModePersistent(
       const storage = (await loadAccounts(path)) ?? createEmptyStorage()
       if (getClaustrumMode(storage) === mode) return 'unchanged'
       storage.claustrum = { ...storage.claustrum, mode }
-      await saveAccountsWithConfigLock(storage, path, {})
+      await saveAccountsWithConfigLock(storage, path, {
+        writeClaustrumMode: true,
+      })
       return 'changed'
     } finally {
       await lock.release()
@@ -1678,6 +1677,8 @@ export interface SaveAccountsOptions {
   /** Preserve disk order when a stale snapshot is missing newer accounts. */
   preserveExistingAccountOrder?: boolean
   setClaustrumHandleAccountIds?: readonly string[]
+  /** Internal marker for the sole persistent custody-mode writer. */
+  writeClaustrumMode?: boolean
 }
 
 function sameAccountIdentity(
@@ -1831,8 +1832,20 @@ async function saveAccountsWithConfigLock(
   const nextStorage: AccountStorage = {
     ...storage,
     ...(storage.claustrum && {
-      claustrum: { ...current?.claustrum, ...storage.claustrum },
+      claustrum: {
+        ...current?.claustrum,
+        ...storage.claustrum,
+        ...(options.writeClaustrumMode
+          ? { mode: storage.claustrum.mode }
+          : current?.claustrum?.mode
+            ? { mode: current.claustrum.mode }
+            : {}),
+      },
     }),
+    ...(!storage.claustrum &&
+      current?.claustrum && {
+        claustrum: current.claustrum,
+      }),
     accounts: mergeAccountsForSave(
       current?.accounts ?? [],
       storage.accounts,
@@ -1841,6 +1854,7 @@ async function saveAccountsWithConfigLock(
   }
   const existing = await loadExistingTopLevelFields(path)
   const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+  if (!nextStorage.claustrum) delete nextConfig.claustrum
   await writeJsonAtomic(path, nextConfig)
   // Config precedes state everywhere both locks are needed; reversing this
   // order can deadlock profile mutations against full account saves.

@@ -876,7 +876,8 @@ export async function writeCustodyHandleManifestEntry(
   if (
     !isValidCustodyLabel(input.entry.label) ||
     !isValidCustodyHandle(input.entry.handle) ||
-    !isValidCustodyCredentialId(input.entry.credentialId)
+    !isValidCustodyCredentialId(input.entry.credentialId) ||
+    input.entry.credentialId !== custodyCredentialId(input.entry.label)
   ) {
     return refusal('invalid entry')
   }

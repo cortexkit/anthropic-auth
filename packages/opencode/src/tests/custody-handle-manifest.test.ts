@@ -442,6 +442,23 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('refuses a valid-shaped credential id that is not canonical for its label', async () => {
+    await withTempDirectory(async (directory) => {
+      const parent = join(directory, 'manifest')
+      const path = join(parent, 'handles.json')
+      await fs.mkdir(parent)
+      await fs.chmod(parent, 0o700)
+
+      await expect(
+        writeCustodyHandleManifestEntry({
+          path,
+          entry: { ...writerEntry, credentialId: 'oauth:anthropic:other' },
+        }),
+      ).resolves.toEqual({ status: 'refused', reason: 'invalid entry' })
+      await expect(fs.lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+  })
+
   test('refuses dangling and resolved manifest symlinks without replacing them', async () => {
     for (const target of ['missing-target.json', 'real-target.json']) {
       await withTempDirectory(async (directory) => {
