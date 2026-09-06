@@ -2053,7 +2053,7 @@ describe('fallback Claustrum credential resolution', () => {
       })
       expect(calls).toHaveLength(0)
       await runCustodyCommand(plugin, 'gate-after', 'claustrum')
-      await handlers.at(-1)?.()
+      await Promise.all(handlers.map((handler) => handler()))
       await waitForMockCall({ mock: { calls } })
       expect(
         calls.filter((call) => call.method === 'credential.get'),
@@ -2129,6 +2129,7 @@ describe('fallback Claustrum credential resolution', () => {
     'keeps an eligible manifest-only fallback off the local refresh path',
     async () => {
       let tokenRequests = 0
+      const handlers: Array<() => unknown> = []
       const fixture = await bootRuledClaustrumRow({
         route: 'fallback-first',
         fallbacks: [
@@ -2150,6 +2151,12 @@ describe('fallback Claustrum credential resolution', () => {
             tokenRequests += 1
           return new Response('{}', { status: 200 })
         },
+        runtimeOverrides: {
+          setInterval: mock((handler: () => unknown) => {
+            handlers.push(handler)
+            return { unref() {} } as never
+          }) as never,
+        },
       })
       const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
       const current = (await loadAccounts(path))!
@@ -2159,6 +2166,7 @@ describe('fallback Claustrum credential resolution', () => {
       )!
       fallback.expires = Date.now() + 60_000
       await saveAccounts(current, path)
+      await handlers.at(-1)?.()
       await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
       expect(tokenRequests).toBe(0)
       await fixture.plugin.dispose?.()
@@ -4924,84 +4932,64 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test('reports a 401 using captured provenance after credential expiry', async () => {
-    const calls: CredentialCall[] = []
-    const storage = createFallbackStorage({
-      routing: { mode: 'fallback-first' },
-      quota: { enabled: false, failClosedOnUnknownQuota: false },
-      claustrum: { mode: 'claustrum' },
-      accounts: [
-        {
-          id: 'vault-only',
-          type: 'oauth',
-          refresh: 'vault-only-refresh',
-          expires: Date.now() + 5 * 60 * 60 * 1000,
-          claustrumHandle: 'handle-expiry-skew',
-        },
-      ],
-    })
-    let claustrumNow = 0
-    const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get')
-        return credentialResponse('vault-expiry-skew-access', 70, 1_000)
-      return { result: {} }
-    })
     const requestStarted = deferred()
     const releaseVaultResponse = deferred()
-    const authorizations: string[] = []
-    await useTempAccountFile(storage)
-    globalThis.fetch = mock(async (input: unknown, init?: RequestInit) => {
-      const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL) throw new Error('local refresh must not run')
-      if (url.includes('/v1/messages')) {
-        const authorization =
-          new Headers(init?.headers).get('authorization') ?? ''
-        authorizations.push(authorization)
-        if (authorization === 'Bearer vault-expiry-skew-access') {
-          requestStarted.resolve()
-          await releaseVaultResponse.promise
-          return new Response('{}', { status: 401 })
-        }
-        if (authorization === 'Bearer main-access')
-          return new Response('{}', { status: 200 })
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof fetch
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: connector,
-      claustrumNow: () => claustrumNow,
-    })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 5 * 60 * 60 * 1000,
+    const fallbackHandle = `ckh_${'V'.repeat(43)}`
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      initialNow: 0,
+      fallbacks: [
+        {
+          label: 'vault-only',
+          handle: fallbackHandle,
+          access: 'vault-expiry-skew-access',
+          account: { id: 'vault-only' },
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (String(params.handle) === ruledMainHandle)
+            return credentialResponse('vault-main-access', 1)
+          return credentialResponse('vault-expiry-skew-access', 70, 1_000)
         }),
-      { models: {} },
-    )
+      onFetch: async (input, init) => {
+        const url = extractUrl(input as string | URL | Request)
+        if (url === TOKEN_URL) throw new Error('local refresh must not run')
+        if (url.includes('/v1/messages')) {
+          const authorization =
+            new Headers(init?.headers).get('authorization') ?? ''
+          if (authorization === 'Bearer vault-expiry-skew-access') {
+            requestStarted.resolve()
+            await releaseVaultResponse.promise
+            return new Response('{}', { status: 401 })
+          }
+        }
+        return new Response('{}', { status: 200 })
+      },
+    })
 
-    const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
+    const responsePromise = fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
     await requestStarted.promise
-    claustrumNow = 2_000
+    fixture.setNow(2_000)
     releaseVaultResponse.resolve()
     const response = await responsePromise
 
     expect(response.status).toBe(200)
-    expect(authorizations).toEqual([
+    expect(fixture.authorizations).toEqual([
       'Bearer vault-expiry-skew-access',
-      'Bearer main-access',
+      'Bearer vault-main-access',
     ])
-    expect(calls).toContainEqual({
+    expect(fixture.calls).toContainEqual({
       method: 'credential.report_auth_failure',
       params: {
-        handle: 'handle-expiry-skew',
+        handle: fallbackHandle,
         provider_status: 401,
         record_version: 70,
         reporter_source: 'direct',
       },
     })
-    await plugin.dispose?.()
+    await fixture.plugin.dispose?.()
   })
 })
 

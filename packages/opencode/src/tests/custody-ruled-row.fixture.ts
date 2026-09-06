@@ -117,6 +117,7 @@ export async function bootRuledClaustrumRow({
   response,
   storageOverrides,
   initialNow,
+  runtimeOverrides,
   createFallbackStorage,
   useTempAccountFile,
   getPlugin,
@@ -139,12 +140,15 @@ export async function bootRuledClaustrumRow({
     'accounts' | 'claustrum' | 'quota' | 'routing'
   >
   initialNow?: number
+  runtimeOverrides?: Record<string, unknown>
   createFallbackStorage: (storage: Partial<AccountStorage>) => AccountStorage
   useTempAccountFile: (storage: AccountStorage) => Promise<void>
-  getPlugin: (runtimeOverrides: {
-    claustrumNow: () => number
-    claustrumConnector: () => Promise<unknown>
-  }) => Promise<RuledRowPlugin>
+  getPlugin: (
+    runtimeOverrides: Record<string, unknown> & {
+      claustrumNow: () => number
+      claustrumConnector: () => Promise<unknown>
+    },
+  ) => Promise<RuledRowPlugin>
   extractUrl: (input: string | URL | Request) => string
   tempConfigDir: () => string
 }) {
@@ -204,6 +208,7 @@ export async function bootRuledClaustrumRow({
     )
   }) as typeof fetch
   const plugin = await getPlugin({
+    ...runtimeOverrides,
     claustrumNow: () => now,
     claustrumConnector:
       connector?.(calls) ??
