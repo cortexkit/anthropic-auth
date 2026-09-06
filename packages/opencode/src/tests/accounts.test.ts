@@ -7713,7 +7713,7 @@ describe('vault-served fallback refresh gating', () => {
     expect(vault.lastRefreshError).toBeUndefined()
   })
 
-  test('a vault-enabled account whose vault is unavailable still refreshes locally', async () => {
+  test('a vault-owned account whose vault is unavailable does not refresh locally', async () => {
     const storage = baseStorage()
     storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
     storage.claustrum = {
@@ -7731,10 +7731,11 @@ describe('vault-served fallback refresh gating', () => {
       ),
       dueAccount(
         'vault-unavailable',
-        'outage-refresh',
+        'vault-unavailable-refresh',
         undefined,
         'handle-vault-unavailable',
       ),
+      dueAccount('plain-control', 'outage-refresh'),
     )
     await saveAccounts(storage, accountPath)
 
@@ -7751,10 +7752,8 @@ describe('vault-served fallback refresh gating', () => {
             JSON.parse(String(init?.body)) as { refresh_token: string }
           ).refresh_token
           refreshTokens.push(refreshToken)
-          if (refreshToken === 'vault-refresh') {
-            return new Response('{"error":"invalid_grant"}', { status: 400 })
-          }
-          return refreshResponse('vault-unavailable')
+          expect(refreshToken).toBe('outage-refresh')
+          return refreshResponse('plain-control')
         },
       ) as unknown as typeof fetch
 
@@ -7777,19 +7776,18 @@ describe('vault-served fallback refresh gating', () => {
       const unavailable = expectOAuthAccount(
         saved?.accounts.find((account) => account.id === 'vault-unavailable'),
       )
+      const plain = expectOAuthAccount(
+        saved?.accounts.find((account) => account.id === 'plain-control'),
+      )
       expect(refreshTokens).toEqual(['outage-refresh'])
       expect(served.access).toBe('vault-served-access')
       expect(served.lastRefreshError).toBeUndefined()
-      expect(unavailable.access).toBe('vault-unavailable-refreshed-access')
-      expect(logs).toContainEqual(
+      expect(unavailable.access).toBe('vault-unavailable-access')
+      expect(plain.access).toBe('plain-control-refreshed-access')
+      expect(logs).not.toContainEqual(
         expect.objectContaining({
-          level: 'warn',
-          channel: 'refresh',
           message: 'vault service: local fallback refresh',
-          payload: {
-            accountId: 'vault-unavailable',
-            reason: 'vault credential unavailable',
-          },
+          payload: expect.objectContaining({ accountId: 'vault-unavailable' }),
         }),
       )
     } finally {

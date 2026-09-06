@@ -53,7 +53,7 @@ describe('buildAccountDialogOption', () => {
         custodyState: 'on-vault-served',
       }),
     ).toEqual({
-      title: 'Work [fallback] 22% · custody binding present · vault-served',
+      title: 'Work [fallback] 22% · custody vault-served',
       value: 'work',
       description: 'Team · Max 5x',
     })
@@ -71,7 +71,7 @@ describe('buildAccountDialogOption', () => {
       vaultReauth: true,
       custodyState: 'on-vault-reauth',
     })
-    expect(option.title).toContain('custody binding present · vault reauth')
+    expect(option.title).toContain('custody vault reauth')
     expect(option.title).not.toContain('handle')
   })
 
@@ -88,7 +88,7 @@ describe('buildAccountDialogOption', () => {
       custodyState: 'on-cold',
     })
 
-    expect(option.title).toContain('custody binding present · cold')
+    expect(option.title).toContain('custody vault cold')
   })
 
   test('does not label the main account as custody-ineligible', () => {
@@ -291,7 +291,7 @@ describe('openCommandDialog — global custody mode', () => {
     )
     expect(dialog.options).toContainEqual(
       expect.objectContaining({
-        title: 'Work [fallback] 42% · custody binding present · vault-served',
+        title: 'Work [fallback] 42% · custody vault-served',
       }),
     )
   })

@@ -331,14 +331,10 @@ describe('buildAccountList', () => {
 describe('executeAccountCommand status', () => {
   test('labels every custody state from the shared formatter', () => {
     expect(custodyStatusLabel('na')).toBe('n/a (OpenCode-managed)')
-    expect(custodyStatusLabel('off')).toBe('binding absent')
-    expect(custodyStatusLabel('on-vault-served')).toBe(
-      'binding present · vault-served',
-    )
-    expect(custodyStatusLabel('on-vault-reauth')).toBe(
-      'binding present · vault reauth',
-    )
-    expect(custodyStatusLabel('on-cold')).toBe('binding present · cold')
+    expect(custodyStatusLabel('off')).toBe('not enrolled')
+    expect(custodyStatusLabel('on-vault-served')).toBe('vault-served')
+    expect(custodyStatusLabel('on-vault-reauth')).toBe('vault reauth')
+    expect(custodyStatusLabel('on-cold')).toBe('vault cold')
   })
 
   test('bare status returns account list in text', async () => {
@@ -390,7 +386,7 @@ describe('executeAccountCommand status', () => {
     })
 
     expect(result.text).toContain('Claustrum: available')
-    expect(result.text).toContain('**Work account** [fallback] · vault-bound')
+    expect(result.text).toContain('**Work account** [fallback] · vault reauth')
   })
 
   test('renders a resolved custody binding without a status projection', async () => {
@@ -407,7 +403,7 @@ describe('executeAccountCommand status', () => {
       }),
     } as never)
 
-    expect(result.text).toContain('**Work account** [fallback] · vault-bound')
+    expect(result.text).toContain('**Work account** [fallback] · vault cold')
   })
 
   test('usage returns usage text', async () => {
