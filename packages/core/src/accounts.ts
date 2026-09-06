@@ -53,6 +53,7 @@ export type AccountBase = {
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
+  anthropicAccountUuid?: string
   claustrumHandle?: string
   access?: string
   refresh: string
@@ -561,6 +562,11 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     authLineageId:
       typeof value.authLineageId === 'string' && value.authLineageId.trim()
         ? value.authLineageId
+        : undefined,
+    anthropicAccountUuid:
+      typeof value.anthropicAccountUuid === 'string' &&
+      value.anthropicAccountUuid.trim()
+        ? value.anthropicAccountUuid.trim()
         : undefined,
     claustrumHandle:
       typeof value.claustrumHandle === 'string' && value.claustrumHandle.trim()
@@ -1228,6 +1234,7 @@ function accountRuntimeState(account: FallbackAccount) {
   }
   return objectWithDefinedEntries({
     authLineageId: account.authLineageId,
+    anthropicAccountUuid: account.anthropicAccountUuid,
     claustrumHandle: account.claustrumHandle,
     access: account.access,
     refresh: account.refresh,

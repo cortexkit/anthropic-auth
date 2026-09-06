@@ -1190,6 +1190,27 @@ const anthropicAuthPlugin = async (
     await saveAccountState(storage, accountStoragePath, { mainQuota: true })
   }
 
+  async function persistFallbackAnthropicAccountUuid(
+    accountId: string,
+    anthropicAccountUuid: string,
+  ): Promise<void> {
+    const storage = await loadAccounts(accountStoragePath)
+    const account = storage?.accounts.find(
+      (candidate): candidate is OAuthAccount =>
+        candidate.id === accountId && isOAuthAccount(candidate),
+    )
+    if (
+      !storage ||
+      !account ||
+      account.anthropicAccountUuid === anthropicAccountUuid
+    )
+      return
+    account.anthropicAccountUuid = anthropicAccountUuid
+    await saveAccountState(storage, accountStoragePath, {
+      accounts: [accountId],
+    })
+  }
+
   async function resolveMainQuotaAccountIdentity(
     accessToken: string,
     model?: string,
@@ -1806,6 +1827,17 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  function hasClaustrumIdentityMismatch(
+    account: OAuthAccount,
+    credential: ClaustrumCredential | undefined,
+  ): boolean {
+    return Boolean(
+      account.anthropicAccountUuid &&
+        credential?.accountId &&
+        account.anthropicAccountUuid !== credential.accountId,
+    )
+  }
+
   function claustrumMainRefusal(
     state: 'cold' | 'reauth' | 'takeover-incomplete',
   ): Response {
@@ -1891,6 +1923,7 @@ const anthropicAuthPlugin = async (
     if (resolved.status !== 'resolved') return false
     const handle = resolved.handle
     const cached = claustrumCredentialCache?.peek(handle)
+    if (hasClaustrumIdentityMismatch(account, cached)) return false
     return Boolean(cached && usableClaustrumAccessToken(cached, claustrumNow()))
   }
 
@@ -1918,6 +1951,16 @@ const anthropicAuthPlugin = async (
     )
       return 'on-identity-mismatch'
     if (!isOAuthAccountVaultOwned(storage, stored, resolution)) return 'off'
+    const handle =
+      resolution.status === 'resolved' ? resolution.handle : undefined
+    if (
+      handle &&
+      hasClaustrumIdentityMismatch(
+        stored,
+        claustrumCredentialCache?.peek(handle),
+      )
+    )
+      return 'on-identity-mismatch'
     if (claustrumReauthAccounts.has(account.id)) return 'on-vault-reauth'
     if (vaultServed) {
       return 'on-vault-served'
@@ -1970,6 +2013,7 @@ const anthropicAuthPlugin = async (
     if (!cache) return {}
 
     const cached = cache.peek(handle)
+    if (hasClaustrumIdentityMismatch(account, cached)) return {}
     const cachedAccess = usableClaustrumAccessToken(cached, claustrumNow())
     if (cached && cachedAccess) {
       // Claustrum record_version is monotonic per handle: refresh_commit and
@@ -5811,6 +5855,22 @@ const anthropicAuthPlugin = async (
               modelForIdentity,
               oauthAccountId === 'main' ? mainAccountId : oauthAccountId,
             )
+            if (oauthAccountId !== 'main' && identity.accountUuid) {
+              void persistFallbackAnthropicAccountUuid(
+                oauthAccountId,
+                identity.accountUuid,
+              ).catch((error) => {
+                logger.warn(
+                  'claustrum',
+                  'failed to persist fallback identity',
+                  {
+                    accountId: oauthAccountId,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  },
+                )
+              })
+            }
             trace?.mark('resolve_claude_code_identity', {
               route,
               ms: roundMs(nowMs() - identityStart),
