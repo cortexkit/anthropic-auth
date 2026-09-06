@@ -13,6 +13,10 @@ export type CredentialCall = {
 }
 
 type RuledRowPlugin = {
+  __claustrumCredentialCache: {
+    get: (handle: string) => Promise<unknown>
+    invalidate: (handle: string) => void
+  }
   auth: {
     loader: (
       getAuth: () => Promise<never>,
@@ -128,7 +132,7 @@ export async function bootRuledClaustrumRow({
   route: 'fallback-first' | 'main-exhausted' | { sticky: string }
   quota?: AccountStorage['quota']
   connector?: (calls: CredentialCall[]) => () => Promise<unknown>
-  onFetch?: (input: unknown, init?: RequestInit) => Response
+  onFetch?: (input: unknown, init?: RequestInit) => Response | Promise<Response>
   response?: Response | (() => Response)
   storageOverrides?: Omit<
     Partial<AccountStorage>,
@@ -156,6 +160,10 @@ export async function bootRuledClaustrumRow({
   await useTempAccountFile(
     createFallbackStorage({
       ...storageOverrides,
+      main: {
+        ...custodyTombstoneOAuth('anthropic'),
+        claustrumHandle: ruledMainHandle,
+      },
       claustrum: { mode: 'claustrum' },
       routing,
       quota,
@@ -184,15 +192,15 @@ export async function bootRuledClaustrumRow({
     { label: 'main', handle: ruledMainHandle },
     ...fallbacks.map(({ label, handle }) => ({ label, handle })),
   ])
-  globalThis.fetch = ((input: unknown, init?: RequestInit) => {
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     if (extractUrl(input as string | URL | Request).includes('/v1/messages')) {
       authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
     }
-    return Promise.resolve(
-      onFetch?.(input, init) ??
-        (typeof response === 'function'
-          ? response()
-          : (response?.clone() ?? new Response('{}', { status: 200 }))),
+    return (
+      (await onFetch?.(input, init)) ??
+      (typeof response === 'function'
+        ? response()
+        : (response?.clone() ?? new Response('{}', { status: 200 })))
     )
   }) as typeof fetch
   const plugin = await getPlugin({
@@ -207,10 +215,23 @@ export async function bootRuledClaustrumRow({
         ]),
       ),
   })
-  const result = await plugin.auth.loader(
-    () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+  await plugin.__claustrumCredentialCache.get(ruledMainHandle)
+  await plugin.auth.loader(
+    () =>
+      Promise.resolve({
+        type: 'oauth' as const,
+        access: 'bootstrap-main-access',
+        refresh: 'bootstrap-main-refresh',
+        expires: Date.now() + 5 * 60 * 60 * 1_000,
+      }),
     { models: {} },
   )
+  const load = () =>
+    plugin.auth.loader(
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+      { models: {} },
+    )
+  const result = await load()
   return {
     authorizations,
     calls,

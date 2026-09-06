@@ -4512,76 +4512,75 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test('reports a 401 with the record version of the served credential', async () => {
-    const calls: CredentialCall[] = []
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-401',
-      claustrum: { mode: 'claustrum' },
-    } as never)
-    const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get')
-        return credentialResponse('vault-401-access', 23)
-      return { result: {} }
+    const fallbackHandle = `ckh_${'Q'.repeat(43)}`
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'vault-401',
+          handle: fallbackHandle,
+          access: 'vault-401-access',
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (String(params.handle) === ruledMainHandle)
+            return credentialResponse('vault-main-access', 1)
+          return credentialResponse('vault-401-access', 23)
+        }),
+      response: new Response('{}', { status: 401 }),
     })
-    const { plugin, result } = await loadFallbackWithConnector(
-      storage,
-      connector,
-      new Response('{}', { status: 401 }),
-    )
 
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(401)
-    expect(calls).toContainEqual({
+    expect(fixture.authorizations).toContain('Bearer vault-401-access')
+    expect(fixture.calls).toContainEqual({
       method: 'credential.report_auth_failure',
       params: {
-        handle: 'handle-401',
+        handle: fallbackHandle,
         provider_status: 401,
         record_version: 23,
         reporter_source: 'direct',
       },
     })
-    await plugin.dispose?.()
+    await fixture.plugin.dispose?.()
   })
 
   test('reports a vault 401 surfaced by the optimistic websocket relay', async () => {
-    const calls: CredentialCall[] = []
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-relay-401',
-      claustrum: { mode: 'claustrum' },
-    } as never) as AccountStorage
-    storage.relay = {
-      enabled: true,
-      url: 'https://relay.example.test',
-      token: 'relay-token',
-      fallbackToDirect: true,
-      transport: 'websocket',
-    }
-    const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get')
-        return credentialResponse('vault-relay-access', 73)
-      return { result: {} }
-    })
-    await useTempAccountFile(storage)
-    globalThis.fetch = mock(() =>
-      Promise.resolve(new Response('{}', { status: 500 })),
-    ) as unknown as typeof fetch
     const restoreWebSocket = installRelayResponseStart(401)
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: connector,
-    })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
+    const fallbackHandle = `ckh_${'S'.repeat(43)}`
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'vault-relay',
+          handle: fallbackHandle,
+          access: 'vault-relay-access',
+        },
+      ],
+      storageOverrides: {
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: true,
+          transport: 'websocket',
+        },
+      },
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (String(params.handle) === ruledMainHandle)
+            return credentialResponse('vault-main-access', 1)
+          return credentialResponse('vault-relay-access', 73)
         }),
-      { models: {} },
-    )
+      response: new Response('{}', { status: 500 }),
+    })
 
     try {
-      const response = await result.fetch(MESSAGES_URL, {
+      const response = await fixture.result.fetch(MESSAGES_URL, {
         method: 'POST',
         headers: { 'x-session-affinity': 'relay-vault-401' },
         body: JSON.stringify({
@@ -4596,16 +4595,16 @@ describe('fallback Claustrum credential resolution', () => {
       restoreWebSocket()
     }
 
-    expect(calls).toContainEqual({
+    expect(fixture.calls).toContainEqual({
       method: 'credential.report_auth_failure',
       params: {
-        handle: 'handle-relay-401',
+        handle: fallbackHandle,
         provider_status: 401,
         record_version: 73,
         reporter_source: 'relay_message_parse',
       },
     })
-    await plugin.dispose?.()
+    await fixture.plugin.dispose?.()
   })
 
   test('reports a sticky vault 401 surfaced by the optimistic websocket relay', async () => {
@@ -4622,15 +4621,22 @@ describe('fallback Claustrum credential resolution', () => {
         checkedAt,
       },
     }
-    const storage = createFallbackStorage({
-      routing: { mode: 'sticky-balanced' },
-      relay: {
-        enabled: true,
-        url: 'https://relay.example.test',
-        token: 'relay-token',
-        fallbackToDirect: true,
-        transport: 'websocket',
-      },
+    const restoreWebSocket = installRelayResponseStart(200, { status: 401 })
+    const fallbackHandle = `ckh_${'T'.repeat(43)}`
+    const fixture = await bootRuledClaustrumRow({
+      route: { sticky: 'sticky-relay-vault' },
+      fallbacks: [
+        {
+          label: 'sticky-relay-vault',
+          handle: fallbackHandle,
+          access: 'sticky-relay-access',
+          account: {
+            id: 'sticky-relay-vault',
+            expires: checkedAt + 5 * 60 * 60 * 1_000,
+            quota: fallbackQuota,
+          },
+        },
+      ],
       quota: {
         enabled: true,
         checkIntervalMinutes: 5,
@@ -4642,45 +4648,27 @@ describe('fallback Claustrum credential resolution', () => {
         },
         mainQuotaCheckedAt: checkedAt,
       },
-      claustrum: { mode: 'claustrum' },
-      accounts: [
-        {
-          id: 'sticky-relay-vault',
-          type: 'oauth',
-          refresh: 'sticky-relay-refresh',
-          expires: checkedAt + 5 * 60 * 60 * 1000,
-          claustrumHandle: 'handle-sticky-relay-401',
-          quota: fallbackQuota,
+      storageOverrides: {
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: true,
+          transport: 'websocket',
         },
-      ],
-    })
-    const calls: CredentialCall[] = []
-    const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get')
-        return credentialResponse('sticky-relay-access', 74)
-      return { result: {} }
-    })
-    await useTempAccountFile(storage)
-    globalThis.fetch = mock(() =>
-      Promise.resolve(new Response('{}', { status: 500 })),
-    ) as unknown as typeof fetch
-    const restoreWebSocket = installRelayResponseStart(200, { status: 401 })
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: connector,
-    })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: checkedAt + 5 * 60 * 60 * 1000,
+      },
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (String(params.handle) === ruledMainHandle)
+            return credentialResponse('vault-main-access', 1)
+          return credentialResponse('sticky-relay-access', 74)
         }),
-      { models: {} },
-    )
+      response: new Response('{}', { status: 500 }),
+    })
 
     try {
-      const response = await result.fetch(MESSAGES_URL, {
+      const response = await fixture.result.fetch(MESSAGES_URL, {
         method: 'POST',
         headers: { 'x-session-affinity': 'sticky-relay-vault-401' },
         body: JSON.stringify({
@@ -4695,16 +4683,16 @@ describe('fallback Claustrum credential resolution', () => {
       restoreWebSocket()
     }
 
-    expect(calls).toContainEqual({
+    expect(fixture.calls).toContainEqual({
       method: 'credential.report_auth_failure',
       params: {
-        handle: 'handle-sticky-relay-401',
+        handle: fallbackHandle,
         provider_status: 401,
         record_version: 74,
         reporter_source: 'relay_status_field',
       },
     })
-    await plugin.dispose?.()
+    await fixture.plugin.dispose?.()
   })
 
   test('does not report relay 401s for non-vault routes', async () => {
@@ -4764,61 +4752,61 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test('suppresses a raced 401 report when the cache already holds a newer version', async () => {
-    const calls: CredentialCall[] = []
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-raced-401',
-      claustrum: { mode: 'claustrum' },
-    } as never)
-    let credentialGets = 0
-    const connector = connectorFor(calls, (method) => {
-      if (method !== 'credential.get') return { result: {} }
-      credentialGets += 1
-      return credentialResponse(
-        credentialGets === 1 ? 'vault-old-access' : 'vault-new-access',
-        credentialGets === 1 ? 41 : 42,
-      )
-    })
-    await useTempAccountFile(storage)
-    let cache: any
-    globalThis.fetch = mock(async (input: unknown, init?: RequestInit) => {
-      const url = extractUrl(input as string | URL | Request)
-      if (url.includes('/v1/messages')) {
-        const authorization = new Headers(init?.headers).get('authorization')
-        if (
-          credentialGets === 1 &&
-          authorization === 'Bearer vault-old-access'
-        ) {
-          cache.invalidate('handle-raced-401', 41)
-          await cache.get('handle-raced-401')
-          return new Response('{}', { status: 401 })
-        }
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof fetch
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: connector,
-    })
-    cache = plugin.__claustrumCredentialCache
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
+    const fallbackHandle = `ckh_${'U'.repeat(43)}`
+    let fallbackGets = 0
+    let cache: {
+      invalidate: (handle: string, recordVersion?: number) => void
+      get: (handle: string) => Promise<unknown>
+    }
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'raced-401',
+          handle: fallbackHandle,
+          access: 'vault-old-access',
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (String(params.handle) === ruledMainHandle)
+            return credentialResponse('vault-main-access', 1)
+          fallbackGets += 1
+          return credentialResponse(
+            fallbackGets === 1 ? 'vault-old-access' : 'vault-new-access',
+            fallbackGets === 1 ? 41 : 42,
+          )
         }),
-      { models: {} },
-    )
+      onFetch: async (input, init) => {
+        const url = extractUrl(input as string | URL | Request)
+        if (url.includes('/v1/messages')) {
+          const authorization = new Headers(init?.headers).get('authorization')
+          if (
+            fallbackGets === 1 &&
+            authorization === 'Bearer vault-old-access'
+          ) {
+            cache.invalidate(fallbackHandle, 41)
+            await cache.get(fallbackHandle)
+            return new Response('{}', { status: 401 })
+          }
+        }
+        return new Response('{}', { status: 200 })
+      },
+    })
+    cache = fixture.plugin.__claustrumCredentialCache
 
-    expect(credentialGets).toBe(1)
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(fallbackGets).toBe(1)
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
-    expect(credentialGets).toBe(2)
+    expect(fallbackGets).toBe(2)
     expect(
-      calls.some((call) => call.method === 'credential.report_auth_failure'),
+      fixture.calls.some(
+        (call) => call.method === 'credential.report_auth_failure',
+      ),
     ).toBe(false)
-    await plugin.dispose?.()
+    await fixture.plugin.dispose?.()
   })
 
   test('cold custody never refreshes a sidecar after a 401', async () => {
