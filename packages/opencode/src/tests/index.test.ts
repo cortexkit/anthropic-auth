@@ -1024,17 +1024,7 @@ describe('fallback Claustrum credential resolution', () => {
     }
     return createFallbackStorage({
       routing: { mode: 'fallback-first' },
-      quota: {
-        enabled: true,
-        checkIntervalMinutes: 5,
-        minimumRemaining: { five_hour: 1, seven_day: 1 },
-        failClosedOnUnknownQuota: true,
-        mainQuota: {
-          five_hour: { usedPercent: 100, remainingPercent: 0, checkedAt },
-          seven_day: { usedPercent: 100, remainingPercent: 0, checkedAt },
-        },
-        mainQuotaCheckedAt: checkedAt,
-      },
+      quota: { enabled: false, failClosedOnUnknownQuota: false },
       claustrum: claustrumConfig as AccountStorage['claustrum'],
       accounts: [account as OAuthAccount],
     })
