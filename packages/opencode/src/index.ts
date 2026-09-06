@@ -713,9 +713,13 @@ type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
   state: CustodyStatusState
 }
 
-function providerIdentityFor(served: {
+type ServedQuotaIdentity = {
   providerAccountUuid?: ProviderAccountUuid
-}): ProviderAccountUuid | null {
+}
+
+function providerIdentityFor(
+  served: ServedQuotaIdentity,
+): ProviderAccountUuid | null {
   return served.providerAccountUuid ?? null
 }
 
