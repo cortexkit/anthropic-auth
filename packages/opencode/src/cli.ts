@@ -21,6 +21,7 @@ import {
 
 import {
   acknowledgeLocalOAuthLoginFromStorage,
+  lastVaultServedRecordVersion,
   localAuthFingerprint,
 } from './local-login.ts'
 
@@ -357,7 +358,13 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
       ),
       divergence: {
         statePath: getAccountStatePath(getAccountStoragePath()),
-        lastVaultServedRecordVersion: 0,
+        lastVaultServedRecordVersion: lastVaultServedRecordVersion({
+          accountId: account.id,
+          warn: (accountId) =>
+            console.warn(
+              `Fallback login had no served vault record for ${accountId}`,
+            ),
+        }),
       },
     },
   )

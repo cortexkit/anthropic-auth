@@ -138,24 +138,42 @@ describe('CLI login', () => {
     )
     await chmod(manifestPath, 0o600)
 
-    await withAccountEnv(
-      accountPath,
-      { CLAUSTRUM_OPENCODE_HANDLES: manifestPath },
-      () =>
-        login('cli-label', {
-          prompt: async () =>
-            'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
-          exchange: async () => ({
-            type: 'success' as const,
-            access: 'cli-access',
-            refresh: 'cli-refresh',
-            expires: Date.now() + 3600 * 1000,
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(' '))
+    }
+    try {
+      await withAccountEnv(
+        accountPath,
+        { CLAUSTRUM_OPENCODE_HANDLES: manifestPath },
+        () =>
+          login('cli-label', {
+            prompt: async () =>
+              'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
+            exchange: async () => ({
+              type: 'success' as const,
+              access: 'cli-access',
+              refresh: 'cli-refresh',
+              expires: Date.now() + 3600 * 1000,
+            }),
           }),
-        }),
-    )
+      )
+    } finally {
+      console.warn = originalWarn
+    }
 
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
     expect(manifest.providers[0].accounts).toEqual([])
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(
+      state.claustrumDivergence['oauth:anthropic:cli-label'],
+    ).toMatchObject({ minimumRecordVersion: 1 })
+    expect(warnings).toContain(
+      'Fallback login had no served vault record for cli-label',
+    )
   })
 
   test('continues from label prompt to OAuth callback prompt and saves account', async () => {

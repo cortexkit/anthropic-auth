@@ -253,6 +253,7 @@ type ParsedCustodyHandleManifest = {
 
 const CUSTODY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
 const RESERVED_CUSTODY_IDS = new Set(['__proto__', 'constructor', 'prototype'])
+const CUSTODY_CREDENTIAL_PREFIX = 'oauth:anthropic:'
 
 export function isValidCustodyLabel(value: unknown): value is string {
   return (
@@ -269,7 +270,7 @@ export function isValidCustodyHandle(value: unknown): value is string {
 export function custodyCredentialId(label: string): string {
   if (!isValidCustodyLabel(label))
     throw new CustodyManifestSelectionError('invalid-label')
-  return `oauth:anthropic:${label}`
+  return `${CUSTODY_CREDENTIAL_PREFIX}${label}`
 }
 
 function isValidCustodyCredentialId(value: unknown): value is string {

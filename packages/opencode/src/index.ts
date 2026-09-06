@@ -4398,9 +4398,7 @@ const anthropicAuthPlugin = async (
         await acknowledgeLocalOAuthLoginFromStorage(
           {
             accountId: account.id,
-            credentialId: account.label
-              ? custodyCredentialId(account.label)
-              : `oauth:anthropic:${account.id}`,
+            credentialId: custodyCredentialId(account.label ?? account.id),
             authFingerprint: localAuthFingerprint(
               result.access,
               result.refresh,
