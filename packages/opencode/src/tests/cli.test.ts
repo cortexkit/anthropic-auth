@@ -262,6 +262,28 @@ describe('CLI login', () => {
     )
   })
 
+  test('rejects an invalid label before saving an OAuth account', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+
+    await expect(
+      withAccountEnv(accountPath, {}, () =>
+        login('invalid label', {
+          prompt: async () => 'cli-code',
+          exchange: async () => ({
+            type: 'success' as const,
+            access: 'cli-access',
+            refresh: 'cli-refresh',
+            expires: Date.now() + 3600 * 1000,
+          }),
+        }),
+      ),
+    ).rejects.toThrow('invalid-label')
+
+    await expect(readFile(accountPath, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+
   test('preserves an account committed while the interactive OAuth flow is open', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const now = Date.now()

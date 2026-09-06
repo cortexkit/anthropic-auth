@@ -342,11 +342,12 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     lastUsed: now,
     lastRefreshedAt: now,
   } as const
+  const credentialId = custodyCredentialId(account.label ?? account.id)
   await addAccountPersistent(account)
   await acknowledgeLocalOAuthLoginFromStorage(
     {
       accountId: account.id,
-      credentialId: custodyCredentialId(account.label ?? account.id),
+      credentialId,
       authFingerprint: localAuthFingerprint(result.access, result.refresh),
       completedAt: now,
     },
