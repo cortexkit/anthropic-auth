@@ -1947,8 +1947,12 @@ describe('fallback Claustrum credential resolution', () => {
         },
       ],
     })
+    const manifestOpens = spyOn(fs, 'open')
     await fs.writeFile(fixture.manifestPath, '{')
+    manifestOpens.mockClear()
     await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(manifestOpens).not.toHaveBeenCalled()
+    manifestOpens.mockRestore()
     expect(fixture.authorizations).toContain('Bearer resident-access')
     await fixture.plugin.dispose?.()
   })
