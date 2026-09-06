@@ -671,6 +671,7 @@ function fireConcurrentFetches(result: { fetch: typeof fetch }) {
 }
 
 type PluginRuntimeOverrides = Partial<{
+  authorize: typeof import('@cortexkit/anthropic-auth-core').authorize
   setTimeout: typeof globalThis.setTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval

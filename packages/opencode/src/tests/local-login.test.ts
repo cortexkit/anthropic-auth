@@ -284,7 +284,11 @@ test.serial(
       ),
     ).rejects.toThrow('manifest removal failed')
     expect(
-      stateAtRemove?.claustrumDivergence?.[completion.credentialId],
+      (
+        stateAtRemove?.claustrumDivergence as
+          | Record<string, unknown>
+          | undefined
+      )?.[completion.credentialId],
     ).toEqual({
       minimumRecordVersion: 10,
       observedAt: expect.any(Number),
