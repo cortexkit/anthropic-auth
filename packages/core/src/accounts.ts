@@ -4119,21 +4119,19 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (
+        this.isFallbackAccountVaultEnabled(account.id, storage) &&
+        !this.isFallbackAccountVaultServed(account.id, storage)
+      ) {
+        continue
+      }
       let next = account
       try {
         if (
           tokenNeedsRefresh(next, storage, this.now()) &&
-          (!this.isFallbackAccountVaultEnabled(next.id, storage) ||
-            next.expires === undefined ||
-            next.expires <= this.now()) &&
+          !this.isFallbackAccountVaultEnabled(next.id, storage) &&
           !this.isFallbackAccountVaultServed(next.id, storage)
         ) {
-          if (this.isFallbackAccountVaultEnabled(next.id, storage)) {
-            logger.warn('refresh', 'vault service: local fallback refresh', {
-              accountId: next.id,
-              reason: 'vault credential unavailable',
-            })
-          }
           const refreshError = next.lastRefreshError
           if (
             refreshError &&
