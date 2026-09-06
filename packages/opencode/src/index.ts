@@ -231,6 +231,7 @@ import {
 } from './lane-start.ts'
 import {
   acknowledgeLocalOAuthLogin,
+  assertLocalLoginObservationAvailable,
   type CompletedLocalLogin,
   localAuthFingerprint,
 } from './local-login.ts'
@@ -8307,6 +8308,7 @@ const anthropicAuthPlugin = async (
                 'Exit Claustrum mode first: /claude-account local',
               )
             }
+            assertLocalLoginObservationAvailable(process.env)
             const result = await authorizeImpl('max')
             return {
               url: result.url,

@@ -12,6 +12,25 @@ export type CompletedLocalLogin = {
   completedAt: number
 }
 
+export class CustodyLoginObservationUnavailableError extends Error {
+  readonly code = 'custody_login_observation_unavailable'
+
+  constructor() {
+    super(
+      'Local login cannot be verified while OPENCODE_AUTH_CONTENT is set; unset it before signing in.',
+    )
+    this.name = 'CustodyLoginObservationUnavailableError'
+  }
+}
+
+export function assertLocalLoginObservationAvailable(
+  env: Record<string, string | undefined>,
+): void {
+  if (env.OPENCODE_AUTH_CONTENT !== undefined) {
+    throw new CustodyLoginObservationUnavailableError()
+  }
+}
+
 export type ObservedLocalAuth = {
   type: string
   access?: string

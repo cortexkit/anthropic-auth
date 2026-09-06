@@ -2,7 +2,9 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   acknowledgeLocalOAuthLogin,
+  assertLocalLoginObservationAvailable,
   type CompletedLocalLogin,
+  CustodyLoginObservationUnavailableError,
   localAuthFingerprint,
 } from '../local-login.ts'
 
@@ -88,4 +90,17 @@ describe('acknowledgeLocalOAuthLogin', () => {
     ).resolves.toBe('cleared')
     expect(calls).toEqual([{ path: '/manifest.json', entry }])
   })
+})
+
+test('fixed auth content rejects local login before OAuth', () => {
+  expect(() =>
+    assertLocalLoginObservationAvailable({ OPENCODE_AUTH_CONTENT: '{}' }),
+  ).toThrow(CustodyLoginObservationUnavailableError)
+  try {
+    assertLocalLoginObservationAvailable({ OPENCODE_AUTH_CONTENT: '{}' })
+  } catch (error) {
+    expect(error).toMatchObject({
+      code: 'custody_login_observation_unavailable',
+    })
+  }
 })
