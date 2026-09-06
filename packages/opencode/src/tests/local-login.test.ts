@@ -16,7 +16,10 @@ import {
   assertLocalLoginObservationAvailable,
   type CompletedLocalLogin,
   CustodyLoginObservationUnavailableError,
+  custodyDivergenceMarker,
+  custodyPreflightDivergenceCheck,
   localAuthFingerprint,
+  persistCustodyDivergenceState,
 } from '../local-login.ts'
 
 const completion: CompletedLocalLogin = {
@@ -188,6 +191,40 @@ test.serial(
     expect(calls).toHaveLength(0)
   },
 )
+
+test('divergence preflight rejects credential records older than the fence', () => {
+  const state = {
+    claustrumDivergence: {
+      'oauth:anthropic:main': custodyDivergenceMarker(7, 100),
+    },
+  }
+  expect(
+    custodyPreflightDivergenceCheck(
+      { credentialId: 'oauth:anthropic:main', recordVersion: 7 },
+      state,
+    ),
+  ).toEqual({ ok: false, message: 'missing fresh vault import' })
+  expect(
+    custodyPreflightDivergenceCheck(
+      { credentialId: 'oauth:anthropic:main', recordVersion: 8 },
+      state,
+    ),
+  ).toEqual({ ok: true })
+})
+
+test.serial('persists the divergence fence as state-only data', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'divergence-state-test-'))
+  tempDirs.add(directory)
+  const statePath = join(directory, 'anthropic-auth-state.json')
+  await writeFile(statePath, JSON.stringify({ version: 1, accounts: {} }))
+  await persistCustodyDivergenceState(statePath, 'oauth:anthropic:main', 7, 100)
+  const state = JSON.parse(await readFile(statePath, 'utf8'))
+  expect(state.claustrumDivergence['oauth:anthropic:main']).toEqual({
+    minimumRecordVersion: 8,
+    observedAt: 100,
+  })
+  expect(state.accounts).toEqual({})
+})
 
 test.serial(
   'authoritative storage read-back clears a matching CLI/TUI login',

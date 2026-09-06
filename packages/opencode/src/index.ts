@@ -71,6 +71,7 @@ import {
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
   formatRefreshBackoffMessage,
+  getAccountStatePath,
   getAccountStoragePath,
   getCache1hMode,
   getCache1hPersistentMode,
@@ -235,6 +236,7 @@ import {
   assertLocalLoginObservationAvailable,
   type CompletedLocalLogin,
   localAuthFingerprint,
+  persistCustodyDivergenceState,
 } from './local-login.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
@@ -1951,6 +1953,14 @@ const anthropicAuthPlugin = async (
           label: 'main',
           handle: resolution.handle,
           credentialId: resolution.credentialId ?? custodyCredentialId('main'),
+        },
+        beforeRemove: async () => {
+          await persistCustodyDivergenceState(
+            getAccountStatePath(accountStoragePath),
+            completion.credentialId,
+            claustrumLastReportedVersion.get(resolution.handle) ?? 0,
+            Date.now(),
+          )
         },
       })
       if (result === 'cleared' || result === 'refused') {

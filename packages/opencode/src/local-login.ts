@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { readFile, rename, writeFile } from 'node:fs/promises'
 import {
   type CustodyHandleAccount,
   CustodyHandleManifestReader,
@@ -14,6 +15,35 @@ export type CompletedLocalLogin = {
   credentialId: string
   authFingerprint: string
   completedAt: number
+}
+
+export type CustodyDivergence = {
+  minimumRecordVersion: number
+  observedAt: number
+}
+
+export type CustodyDivergenceState = {
+  claustrumDivergence?: Record<string, CustodyDivergence>
+}
+
+export function custodyDivergenceMarker(
+  lastVaultServedRecordVersion: number,
+  observedAt: number,
+): CustodyDivergence {
+  return {
+    minimumRecordVersion: lastVaultServedRecordVersion + 1,
+    observedAt,
+  }
+}
+
+export function custodyPreflightDivergenceCheck(
+  binding: { credentialId: string; recordVersion: number },
+  state: CustodyDivergenceState,
+): { ok: true } | { ok: false; message: 'missing fresh vault import' } {
+  const fence = state.claustrumDivergence?.[binding.credentialId]
+  return !fence || binding.recordVersion >= fence.minimumRecordVersion
+    ? { ok: true }
+    : { ok: false, message: 'missing fresh vault import' }
 }
 
 export class CustodyLoginObservationUnavailableError extends Error {
@@ -55,6 +85,7 @@ export type AcknowledgeLocalOAuthLoginOptions = {
     path: string
     entry: CustodyHandleAccount
   }) => Promise<CustodyHandleManifestRemovalResult>
+  beforeRemove?: () => Promise<void>
 }
 
 export type AcknowledgeLocalOAuthLoginFromStorageOptions = {
@@ -76,6 +107,7 @@ export async function acknowledgeLocalOAuthLogin(
   ) {
     return 'not-cleared'
   }
+  await options.beforeRemove?.()
   const result = await (options.remove ?? removeCustodyHandleManifestEntry)({
     path: options.manifestPath,
     entry: options.entry,
@@ -83,6 +115,37 @@ export async function acknowledgeLocalOAuthLogin(
   if (result === 'removed') return 'cleared'
   if (result === 'missing') return 'not-cleared'
   return 'refused'
+}
+
+export async function persistCustodyDivergenceState(
+  statePath: string,
+  credentialId: string,
+  lastVaultServedRecordVersion: number,
+  observedAt: number,
+): Promise<void> {
+  let state: Record<string, unknown> = { version: 1 }
+  try {
+    const parsed = JSON.parse(await readFile(statePath, 'utf8'))
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      state = parsed as Record<string, unknown>
+    }
+  } catch {}
+  const divergence =
+    state.claustrumDivergence &&
+    typeof state.claustrumDivergence === 'object' &&
+    !Array.isArray(state.claustrumDivergence)
+      ? (state.claustrumDivergence as Record<string, unknown>)
+      : {}
+  divergence[credentialId] = custodyDivergenceMarker(
+    lastVaultServedRecordVersion,
+    observedAt,
+  )
+  state.claustrumDivergence = divergence
+  const temporaryPath = `${statePath}.${process.pid}.tmp`
+  await writeFile(temporaryPath, JSON.stringify(state, null, 2), {
+    mode: 0o600,
+  })
+  await rename(temporaryPath, statePath)
 }
 
 export async function acknowledgeLocalOAuthLoginFromStorage(
