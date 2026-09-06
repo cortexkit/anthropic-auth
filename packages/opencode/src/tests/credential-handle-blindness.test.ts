@@ -32,7 +32,8 @@ import {
 } from '../sidebar-state'
 import { bootRuledClaustrumRow as bootSharedRuledClaustrumRow } from './custody-ruled-row.fixture'
 
-const HANDLE_SENTINEL = `ckh_${'H'.repeat(43)}`
+const HANDLE_SENTINEL = 'claustrum-handle-sentinel-7f2d'
+const RULED_HANDLE = `ckh_${'H'.repeat(43)}`
 const TOKEN_SENTINEL = 'claustrum-token-sentinel-9a41'
 
 const dumpInputContract: [
@@ -144,8 +145,12 @@ async function readNonEmpty(path: string): Promise<string> {
   return bytes
 }
 
-function seedCredentialForTest(cache: any, recordVersion: number) {
-  cache.seedForTest(HANDLE_SENTINEL, {
+function seedCredentialForTest(
+  cache: any,
+  recordVersion: number,
+  handle = HANDLE_SENTINEL,
+) {
+  cache.seedForTest(handle, {
     payload: JSON.stringify({ access_token: TOKEN_SENTINEL }),
     expiresAtMs: Date.now() + 5 * 60 * 60 * 1000,
     recordVersion,
@@ -372,7 +377,7 @@ describe('credential-handle blindness', () => {
         fallbacks: [
           {
             label: 'work',
-            handle: HANDLE_SENTINEL,
+            handle: RULED_HANDLE,
             access: 'vault-access',
             account: { id: 'work-alt' },
           },
@@ -402,9 +407,7 @@ describe('credential-handle blindness', () => {
                 }
               }
               if (method === 'credential.report_auth_failure') {
-                if (
-                  (params as { handle?: unknown }).handle === HANDLE_SENTINEL
-                ) {
+                if ((params as { handle?: unknown }).handle === RULED_HANDLE) {
                   reportParams.push(params)
                   throw new Error('report failed')
                 }
@@ -445,7 +448,7 @@ describe('credential-handle blindness', () => {
       )
       expect(reportParams).toEqual([
         {
-          handle: HANDLE_SENTINEL,
+          handle: RULED_HANDLE,
           provider_status: 401,
           record_version: 17,
           reporter_source: 'direct',
@@ -453,7 +456,7 @@ describe('credential-handle blindness', () => {
       ])
       expect(JSON.stringify(reportParams)).not.toContain('vault-access')
       expect(
-        logs.some((record) => JSON.stringify(record).includes(HANDLE_SENTINEL)),
+        logs.some((record) => JSON.stringify(record).includes(RULED_HANDLE)),
       ).toBe(false)
     } finally {
       __setLogTestSink(null)
@@ -588,7 +591,7 @@ describe('credential-handle blindness', () => {
       fallbacks: [
         {
           label: 'work',
-          handle: HANDLE_SENTINEL,
+          handle: RULED_HANDLE,
           access: 'vault-access',
           account: { id: 'work-alt' },
         },
@@ -610,7 +613,7 @@ describe('credential-handle blindness', () => {
               }
             }
             if (method === 'credential.report_auth_failure') {
-              if ((params as { handle?: unknown }).handle !== HANDLE_SENTINEL)
+              if ((params as { handle?: unknown }).handle !== RULED_HANDLE)
                 return { result: { ok: true } }
               reports.push(params as Record<string, unknown>)
               if (reports.length === 1) {
@@ -663,7 +666,7 @@ describe('credential-handle blindness', () => {
       fallbacks: [
         {
           label: 'work',
-          handle: HANDLE_SENTINEL,
+          handle: RULED_HANDLE,
           access: TOKEN_SENTINEL,
           account: { id: 'work-alt' },
         },
@@ -683,7 +686,7 @@ describe('credential-handle blindness', () => {
                     new TextEncoder().encode(
                       JSON.stringify({
                         access_token:
-                          handle === HANDLE_SENTINEL
+                          handle === RULED_HANDLE
                             ? TOKEN_SENTINEL
                             : 'vault-main-access',
                       }),
@@ -725,18 +728,18 @@ describe('credential-handle blindness', () => {
     await (await request()).text()
     expect(reports.map((report) => report.record_version)).toEqual([17])
 
-    seedCredentialForTest(plugin.__claustrumCredentialCache, 17)
+    seedCredentialForTest(plugin.__claustrumCredentialCache, 17, RULED_HANDLE)
     await result.__reportClaustrumAuthFailureForTest({
       accountId: 'work-alt',
-      handle: HANDLE_SENTINEL,
+      handle: RULED_HANDLE,
       recordVersion: 17,
     })
     expect(reports.map((report) => report.record_version)).toEqual([17])
 
-    seedCredentialForTest(plugin.__claustrumCredentialCache, 18)
+    seedCredentialForTest(plugin.__claustrumCredentialCache, 18, RULED_HANDLE)
     await result.__reportClaustrumAuthFailureForTest({
       accountId: 'work-alt',
-      handle: HANDLE_SENTINEL,
+      handle: RULED_HANDLE,
       recordVersion: 18,
     })
     await plugin.dispose?.()
