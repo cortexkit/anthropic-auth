@@ -1254,6 +1254,55 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'refuses a main vault credential whose identity differs from the persisted main identity',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          mainAccountId: 'persisted-main-identity',
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      await writeManifest([{ label: 'main', handle: manifestHandle }])
+      const calls: CredentialCall[] = []
+      let messageSends = 0
+      globalThis.fetch = mock(() => {
+        messageSends += 1
+        return Promise.resolve(new Response('unexpected', { status: 200 }))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connectorFor(calls, (method) => {
+          if (method === 'credential.get')
+            return credentialResponse(
+              'main-vault-access',
+              8,
+              Date.now() + 60_000,
+              'different-vault-identity',
+            )
+          return { result: {} }
+        }),
+      })
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(503)
+      expect(await response.json()).toMatchObject({
+        error: { code: 'claustrum_main_identity_mismatch' },
+      })
+      expect(messageSends).toBe(0)
+      expect(
+        calls.filter((call) => call.method === 'credential.get'),
+      ).not.toHaveLength(0)
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
     'prefers a manifest handle over a stale legacy handle',
     async () => {
       await useTempAccountFile(
