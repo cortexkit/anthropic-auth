@@ -1060,6 +1060,7 @@ describe('fallback Claustrum credential resolution', () => {
     enabled?: boolean
     gate?: boolean
     legacy?: string
+    tombstone?: boolean
   }) {
     const id = input.id ?? 'fallback-1'
     return fallbackWithClaustrum({
@@ -1067,6 +1068,7 @@ describe('fallback Claustrum credential resolution', () => {
       label: input.label,
       enabled: true,
       ...(input.legacy && { claustrumHandle: input.legacy }),
+      ...(input.tombstone && custodyTombstoneOAuth('anthropic')),
       claustrum: { mode: input.gate === false ? 'local' : 'claustrum' },
       ...(input.enabled === false && { enabled: false }),
     })
@@ -1440,6 +1442,45 @@ describe('fallback Claustrum credential resolution', () => {
       })
       await expect(plugin.__fallbackRefreshReady).resolves.toBe('not-started')
       expect(intervals).toEqual([])
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'holds fallback refresh for real Claustrum material before takeover resumes',
+    async () => {
+      const label = 'boot-real-fallback'
+      await useTempAccountFile(manifestStorage({ label }))
+      await writeManifest([
+        { label: 'main', handle: ruledMainHandle },
+        { label, handle: manifestHandle },
+      ])
+      const intervals: unknown[] = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          [],
+          new Map([
+            [ruledMainHandle, 'vault-main-access'],
+            [manifestHandle, 'startup-access'],
+          ]),
+        ),
+        setInterval: mock((handler: () => unknown) => {
+          intervals.push(handler)
+          return { unref() {} } as never
+        }) as never,
+      })
+      await expect(plugin.__fallbackRefreshReady).resolves.toBe('not-started')
+      expect(intervals).toEqual([])
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+      await expect(
+        result.fetch(MESSAGES_URL, EMPTY_POST),
+      ).rejects.toMatchObject({
+        code: 'custody_state_mismatch',
+        verdict: 'RESUME_TAKEOVER',
+      })
       await plugin.dispose?.()
     },
   )
@@ -2460,7 +2501,9 @@ describe('fallback Claustrum credential resolution', () => {
     'clears a crash-left state handle when startup resolves from the manifest',
     async () => {
       const label = 'manifest-state-cleanup'
-      await useTempAccountFile(manifestStorage({ label, legacy: legacyHandle }))
+      await useTempAccountFile(
+        manifestStorage({ label, legacy: legacyHandle, tombstone: true }),
+      )
       await writeManifest([{ label, handle: manifestHandle }])
       const restore = await configureClaustrumConnection()
       const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
@@ -2486,7 +2529,9 @@ describe('fallback Claustrum credential resolution', () => {
     'clears a crash-left manifest-resolved state handle on the custody tick',
     async () => {
       const label = 'manifest-tick-cleanup'
-      await useTempAccountFile(manifestStorage({ label, gate: true }))
+      await useTempAccountFile(
+        manifestStorage({ label, gate: true, tombstone: true }),
+      )
       await writeManifest([{ label, handle: manifestHandle }])
       const restore = await configureClaustrumConnection()
       const intervalHandlers: Array<() => void> = []
@@ -7080,7 +7125,7 @@ describe('AnthropicAuthPlugin', () => {
     const now = 1_000_000
     let currentNow = now
     const accountId = 'vault-fallback'
-    const handle = 'vault-handle'
+    const handle = `ckh_${'F'.repeat(43)}`
     const vaultExpiry = now + 60 * 60_000
     const credentialPayload = Array.from(
       new TextEncoder().encode(
@@ -7135,16 +7180,15 @@ describe('AnthropicAuthPlugin', () => {
         accounts: [
           {
             id: accountId,
-            type: 'oauth',
-            access: 'sidecar-access',
-            refresh: 'sidecar-refresh',
-            expires: Date.now() + 3 * 60 * 60_000,
+            label: accountId,
+            ...custodyTombstoneOAuth('anthropic'),
             claustrumHandle: handle,
           },
         ],
         claustrum: { mode: 'claustrum' },
       }),
     )
+    await writeSharedManifest(tempConfigDir!, [{ label: accountId, handle }])
     globalThis.fetch = localRefresh
     const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: async () => client,
@@ -7171,46 +7215,43 @@ describe('AnthropicAuthPlugin', () => {
 
   test('vault reauth leaves the account absent and projects the reauth state', async () => {
     const accountId = 'vault-reauth-fallback'
-    const handle = 'vault-reauth-handle'
+    const handle = `ckh_${'E'.repeat(43)}`
     let tick: (() => Promise<unknown>) | undefined
     const setInterval = mock((callback: () => Promise<unknown>) => {
       tick = callback
       return { unref() {} } as unknown as ReturnType<typeof setInterval>
     }) as unknown as typeof globalThis.setInterval
-    const localRefresh = mock(() =>
-      Promise.resolve(new Response('{}', { status: 200 })),
-    ) as unknown as typeof fetch
-    const client = {
-      call: mock(async () => ({
-        result: {
-          error: { class: 'auth_required', code: 'latched' },
+    const fixture = await bootSharedRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'reauth',
+          handle,
+          access: 'vault-reauth-access',
+          account: { id: accountId, claustrumHandle: handle },
         },
-      })),
-      close: mock(() => {}),
-    }
-
-    await useTempAccountFile(
-      createFallbackStorage({
-        quota: { enabled: false },
-        accounts: [
-          {
-            id: accountId,
-            type: 'oauth',
-            access: 'sidecar-access',
-            refresh: 'sidecar-refresh',
-            expires: Date.now() + 60 * 60_000,
-            claustrumHandle: handle,
-          },
-        ],
-        claustrum: { mode: 'claustrum' },
-      }),
-    )
-    globalThis.fetch = localRefresh
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: async () => client,
-      setInterval,
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (params.handle === handle)
+            return {
+              result: {
+                error: { class: 'auth_required', code: 'latched' },
+              },
+            }
+          return credentialResponse('vault-main-access', 1)
+        }),
+      runtimeOverrides: { setInterval },
+      bootPlugin: (overrides) =>
+        getPlugin(createMockClient(), tempConfigDir!, overrides),
+      createFallbackStorage,
+      useTempAccountFile,
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
     })
-    await plugin.__fallbackRefreshReady
+    const plugin = fixture.plugin
+    await expect(plugin.__fallbackRefreshReady).resolves.not.toBe('not-started')
     await tick?.()
     const sidebar = await waitForSidebarState((state) => {
       const account = state.fallbacks.find(
@@ -7222,36 +7263,146 @@ describe('AnthropicAuthPlugin', () => {
     const account = sidebar.fallbacks.find(
       (candidate) => candidate.id === accountId,
     )
-    expect(localRefresh).not.toHaveBeenCalled()
     expect(account?.vaultReauth).toBe(true)
     expect(account?.needsReauth).toBe(false)
-    const authorizations: string[] = []
-    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
-      const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL) throw new Error('local refresh must not run')
-      if (url.includes('/v1/messages')) {
-        authorizations.push(
-          new Headers(init?.headers).get('authorization') ?? '',
-        )
-      }
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
-      { models: {} },
-    )
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
     expect(response.status).toBe(200)
-    expect(authorizations).toEqual(['Bearer main-access'])
-    expect(authorizations).not.toContain('Bearer sidecar-access')
+    expect(fixture.authorizations).toEqual(['Bearer vault-main-access'])
+    expect(fixture.authorizations).not.toContain('Bearer vault-reauth-access')
     await plugin.dispose?.()
     installDefaultFetchMock()
+  })
+
+  test('re-probes a cold fallback without darkening the vault-served main route', async () => {
+    const handle = `ckh_${'C'.repeat(43)}`
+    let resident = false
+    let tick: (() => Promise<unknown>) | undefined
+    const setInterval = mock((callback: () => Promise<unknown>) => {
+      tick = callback
+      return { unref() {} } as unknown as ReturnType<typeof setInterval>
+    }) as unknown as typeof globalThis.setInterval
+    const fixture = await bootSharedRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'cold',
+          handle,
+          access: 'vault-cold-access',
+          account: { id: 'vault-cold-fallback', claustrumHandle: handle },
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (params.handle === handle && !resident)
+            return {
+              result: { error: { class: 'transient', code: 'offline' } },
+            }
+          return credentialResponse(
+            params.handle === handle
+              ? 'vault-cold-access'
+              : 'vault-main-access',
+            1,
+          )
+        }),
+      runtimeOverrides: { setInterval },
+      bootPlugin: (overrides) =>
+        getPlugin(createMockClient(), tempConfigDir!, overrides),
+      createFallbackStorage,
+      useTempAccountFile,
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
+    })
+    try {
+      await expect(fixture.plugin.__fallbackRefreshReady).resolves.not.toBe(
+        'not-started',
+      )
+      const coldResponse = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(coldResponse.status).toBe(200)
+      expect(fixture.authorizations).toEqual(['Bearer vault-main-access'])
+
+      resident = true
+      await tick?.()
+      const residentResponse = await fixture.result.fetch(
+        MESSAGES_URL,
+        EMPTY_POST,
+      )
+      expect(residentResponse.status).toBe(200)
+      expect(fixture.authorizations).toEqual([
+        'Bearer vault-main-access',
+        'Bearer vault-cold-access',
+      ])
+    } finally {
+      await fixture.plugin.dispose?.()
+      installDefaultFetchMock()
+    }
+  })
+
+  test('keeps warming healthy fallbacks when a sibling requires vault reauth', async () => {
+    const latchedHandle = `ckh_${'L'.repeat(43)}`
+    const warmHandle = `ckh_${'W'.repeat(43)}`
+    let tick: (() => Promise<unknown>) | undefined
+    const setInterval = mock((callback: () => Promise<unknown>) => {
+      tick = callback
+      return { unref() {} } as unknown as ReturnType<typeof setInterval>
+    }) as unknown as typeof globalThis.setInterval
+    const fixture = await bootSharedRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'latched',
+          handle: latchedHandle,
+          access: 'vault-latched-access',
+          account: { id: 'vault-latched', claustrumHandle: latchedHandle },
+        },
+        {
+          label: 'warm',
+          handle: warmHandle,
+          access: 'vault-warm-access',
+          account: { id: 'vault-warm', claustrumHandle: warmHandle },
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (params.handle === latchedHandle)
+            return {
+              result: {
+                error: { class: 'auth_required', code: 'needs_reauth' },
+              },
+            }
+          return credentialResponse(
+            params.handle === warmHandle
+              ? 'vault-warm-access'
+              : 'vault-main-access',
+            1,
+          )
+        }),
+      runtimeOverrides: { setInterval },
+      bootPlugin: (overrides) =>
+        getPlugin(createMockClient(), tempConfigDir!, overrides),
+      createFallbackStorage,
+      useTempAccountFile,
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
+    })
+    try {
+      await expect(fixture.plugin.__fallbackRefreshReady).resolves.not.toBe(
+        'not-started',
+      )
+      await tick?.()
+      expect(
+        fixture.calls.filter(
+          (call) =>
+            call.method === 'credential.get' &&
+            call.params.handle === warmHandle &&
+            typeof call.params.min_ttl_ms === 'number',
+        ).length,
+      ).toBeGreaterThanOrEqual(1)
+    } finally {
+      await fixture.plugin.dispose?.()
+      installDefaultFetchMock()
+    }
   })
 
   test('transient vault failure preserves an unexpired sidecar without local refresh', async () => {

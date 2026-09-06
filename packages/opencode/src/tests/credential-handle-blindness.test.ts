@@ -12,6 +12,7 @@ import { join } from 'node:path'
 import {
   __setLogTestSink,
   buildAccountList,
+  custodyTombstoneOAuth,
   dumpDirectRequest,
   dumpRelayRequest,
   dumpResponseArtifact,
@@ -433,12 +434,9 @@ describe('credential-handle blindness', () => {
         accounts: [
           {
             id: 'work-alt',
-            type: 'oauth',
             label: 'work',
-            refresh: 'refresh-token-not-for-use',
+            ...custodyTombstoneOAuth('anthropic'),
             enabled: true,
-            access: 'fallback-access',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
           },
         ],
       } as never,

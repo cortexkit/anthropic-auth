@@ -430,6 +430,14 @@ describe('custody mode', () => {
         evidence: 'N',
       }),
     ).toEqual({ verdict: 'FAIL_CLOSED', provisional: true })
+    expect(
+      reconcileCustodyStartup({
+        mode: 'C',
+        mainSlot: 'unknown',
+        fallbacks: 'T',
+        evidence: 'unknown',
+      }),
+    ).toEqual({ verdict: 'PENDING_MAIN_SLOT', provisional: true })
   })
 
   test('custody: locks acquire in total order and unwind on contention', async () => {
