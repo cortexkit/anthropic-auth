@@ -213,6 +213,10 @@ import {
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
 import {
+  CustodyStateMismatchError,
+  reconcileCustodyStartup,
+} from './custody-mode.ts'
+import {
   EFFORT_PLAN_REQUEST_HEADER,
   EffortMarkerCorrelationError,
   markOpenCodeEffortTransitions,
@@ -2077,6 +2081,60 @@ const anthropicAuthPlugin = async (
     )
   }
 
+  function fallbackCustodyDimensions(storage: AccountStorage | null) {
+    if (!storage) return { fallbacks: 'T' as const, evidence: 'V' as const }
+    const accounts = storage.accounts.filter(
+      (account): account is OAuthAccount =>
+        account.enabled !== false && isOAuthAccount(account),
+    )
+    if (!accounts.length)
+      return {
+        fallbacks:
+          getClaustrumMode(storage) === 'claustrum'
+            ? ('T' as const)
+            : ('R' as const),
+        evidence: 'V' as const,
+      }
+    const fallbacks = accounts.every((account) =>
+      isCustodyTombstoneOAuth(
+        { type: 'oauth', access: account.access, refresh: account.refresh },
+        'anthropic',
+      ),
+    )
+      ? ('T' as const)
+      : ('R' as const)
+    if (getClaustrumMode(storage) !== 'claustrum')
+      return { fallbacks, evidence: 'V' as const }
+    const bindings = accounts.map((account) =>
+      resolveAccountCustodyHandle(account, storage),
+    )
+    if (bindings.some((binding) => binding.status !== 'resolved'))
+      return { fallbacks: 'M' as const, evidence: 'N' as const }
+    const evidence = bindings.every((binding) => {
+      if (binding.status !== 'resolved') return false
+      return Boolean(
+        usableClaustrumAccessToken(
+          claustrumCredentialCache?.peek(binding.handle),
+          claustrumNow(),
+        ),
+      )
+    })
+      ? ('V' as const)
+      : ('N' as const)
+    return { fallbacks, evidence }
+  }
+
+  function mainCustodyDimension(auth: {
+    type: string
+    access?: string
+    refresh?: string
+  }) {
+    if (isCustodyTombstoneOAuth(auth, 'anthropic')) return 'T' as const
+    if (auth.type === 'oauth' && auth.access && auth.refresh)
+      return 'R' as const
+    return 'X' as const
+  }
+
   const isFallbackAccountVaultServed = (
     accountId: string,
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -2612,7 +2670,18 @@ const anthropicAuthPlugin = async (
       claustrumCredentialCache = null
     }
   }
-  const fallbackRefreshReady = fallbackManager.startBackgroundRefresh()
+  const fallbackDimensions = fallbackCustodyDimensions(initialStorage)
+  const provisionalCustody = reconcileCustodyStartup({
+    mode: getClaustrumMode(initialStorage) === 'claustrum' ? 'C' : 'L',
+    mainSlot: 'unknown',
+    ...fallbackDimensions,
+  })
+  // A main-only mismatch may surface after the loader sees the host slot; bound
+  // fallbacks are inert to local refresh, so only unbound local work can run here.
+  const fallbackRefreshReady =
+    provisionalCustody.verdict === 'FAIL_CLOSED'
+      ? Promise.resolve('not-started')
+      : fallbackManager.startBackgroundRefresh()
   const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
   const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
   type CacheDiagnosticsResponse = {
@@ -3600,6 +3669,7 @@ const anthropicAuthPlugin = async (
       }>)
     | null = null
   let completedLocalLogin: CompletedLocalLogin | undefined
+  let custodyStartupMismatchVerdict: string | undefined
   let mainAccountId: string | undefined
   let mainQuotaAccountId: string | undefined
   let mainServedAccessToken: string | undefined
@@ -4687,7 +4757,9 @@ const anthropicAuthPlugin = async (
       }
       return {
         command,
-        text: result.text,
+        text: custodyStartupMismatchVerdict
+          ? `${result.text}\n\n- Custody startup mismatch: ${custodyStartupMismatchVerdict}`
+          : result.text,
         knobs,
       }
     }
@@ -5142,8 +5214,61 @@ const anthropicAuthPlugin = async (
         latestGetAuth = getAuth
         const auth = await getAuth()
         if (completedLocalLogin) await acknowledgeMainLocalLogin(getAuth)
+        let custodyStorage = await loadAccounts(accountStoragePath)
+        if (
+          getClaustrumMode(custodyStorage) === 'claustrum' &&
+          isCustodyTombstoneOAuth(auth, 'anthropic')
+        ) {
+          await refreshVaultBackedOAuthAccounts(true)
+          custodyStorage = await loadAccounts(accountStoragePath)
+        }
+        const custodyMode = getClaustrumMode(custodyStorage)
+        const main = mainCustodyDimension(auth)
+        const fallbackDimensions = fallbackCustodyDimensions(custodyStorage)
+        const mainAccount = mainCustodyAccount(auth)
+        const mainBinding =
+          custodyMode === 'claustrum' && custodyStorage
+            ? resolveAccountCustodyHandle(mainAccount, custodyStorage)
+            : { status: 'unresolved' as const }
+        const mainEvidence =
+          custodyMode !== 'claustrum' ||
+          main !== 'T' ||
+          (mainBinding.status === 'resolved' &&
+            Boolean(
+              usableClaustrumAccessToken(
+                claustrumCredentialCache?.peek(mainBinding.handle),
+                claustrumNow(),
+              ),
+            ))
+            ? 'V'
+            : 'N'
+        if (
+          auth.type === 'oauth' &&
+          (custodyMode !== 'claustrum' ||
+            main === 'T' ||
+            mainBinding.status === 'resolved')
+        ) {
+          try {
+            reconcileCustodyStartup({
+              mode: custodyMode === 'claustrum' ? 'C' : 'L',
+              main,
+              fallbacks: fallbackDimensions.fallbacks,
+              evidence:
+                fallbackDimensions.evidence === 'N' || mainEvidence === 'N'
+                  ? 'N'
+                  : 'V',
+            })
+          } catch (error) {
+            if (!(error instanceof CustodyStateMismatchError)) throw error
+            custodyStartupMismatchVerdict = error.verdict
+            return {
+              fetch: async () => {
+                throw error
+              },
+            }
+          }
+        }
         if (auth.type === 'oauth') {
-          const custodyStorage = await loadAccounts(accountStoragePath)
           const mainCustody = mainCustodyAccount(auth)
           mainCustody.anthropicAccountUuid =
             custodyStorage?.main?.profile?.providerAccountUuid ??
@@ -5165,7 +5290,6 @@ const anthropicAuthPlugin = async (
           if (isCustodyTombstoneOAuth(auth, 'anthropic')) {
             mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
             if (getClaustrumMode(custodyStorage) === 'claustrum') {
-              await refreshVaultBackedOAuthAccounts(true)
               const handle =
                 mainBinding?.status === 'resolved'
                   ? mainBinding.handle

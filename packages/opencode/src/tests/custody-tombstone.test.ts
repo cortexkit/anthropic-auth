@@ -6,7 +6,6 @@ import { dirname, join } from 'node:path'
 import {
   assertNotCustodyTombstone,
   buildRefreshOperationError,
-  CustodyTombstoneLoginError,
   CustodyTombstoneRefreshError,
   custodyTombstoneKey,
   custodyTombstoneOAuth,
@@ -239,7 +238,15 @@ describe('Claustrum custody tombstones', () => {
         main: { type: 'opencode', provider: oauthFixture.provider },
         refresh: { enabled: false },
         quota: { enabled: false },
-        accounts: [],
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 60_000,
+          },
+        ],
       },
       async () => {
         const auth = {
@@ -504,7 +511,7 @@ describe('Claustrum custody tombstones', () => {
     expect(isValidCustodyHandle(`${validHandle.slice(0, -1)}=`)).toBe(false)
   })
 
-  test('local main loader sends a tombstone to /login without network or refresh state', async () => {
+  test('holds a local main tombstone dark without network or refresh state', async () => {
     const fetchCalls: string[] = []
     globalThis.fetch = mock((input: unknown) => {
       const url = extractUrl(input as string | URL | Request)
@@ -526,12 +533,19 @@ describe('Claustrum custody tombstones', () => {
           { client: createMockClient() },
           disabledTimerOverrides(),
         )) as any
+        const loaded = await plugin.auth.loader(
+          () => Promise.resolve(oauthFixture.entry as never),
+          { models: {} } as never,
+        )
         await expect(
-          plugin.auth.loader(
-            () => Promise.resolve(oauthFixture.entry as never),
-            { models: {} } as never,
-          ),
-        ).rejects.toBeInstanceOf(CustodyTombstoneLoginError)
+          loaded.fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            body: '{}',
+          }),
+        ).rejects.toMatchObject({
+          code: 'custody_state_mismatch',
+          verdict: 'REMAIN_DARK_PENDING_LOGIN',
+        })
         expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
 
         const statePath = getAccountStatePath(path)
@@ -570,7 +584,15 @@ describe('Claustrum custody tombstones', () => {
         main: { type: 'opencode', provider: oauthFixture.provider },
         refresh: { enabled: false },
         quota: { enabled: false },
-        accounts: [],
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            access: 'fallback-access',
+            refresh: 'fallback-refresh',
+            expires: Date.now() + 60_000,
+          },
+        ],
       },
       async () => {
         const plugin = (await AnthropicAuthPlugin(
@@ -600,7 +622,7 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
-  test('returns a typed cold refusal for a manifest-resolved main tombstone', async () => {
+  test('returns typed startup mismatches for an unusable manifest-resolved main', async () => {
     const fetchCalls: string[] = []
     globalThis.fetch = mock((input: unknown) => {
       fetchCalls.push(extractUrl(input as string | URL | Request))
@@ -658,16 +680,14 @@ describe('Claustrum custody tombstones', () => {
           }),
         { models: {} } as never,
       )
-      const response = await loaded.fetch(
-        'https://api.anthropic.com/v1/messages',
-        { method: 'POST', body: '{}' },
-      )
-      expect(response.status).toBe(503)
-      await expect(response.json()).resolves.toMatchObject({
-        error: {
-          code: 'claustrum_main_unavailable',
-          message: expect.stringContaining('/claude-account local'),
-        },
+      await expect(
+        loaded.fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: '{}',
+        }),
+      ).rejects.toMatchObject({
+        code: 'custody_state_mismatch',
+        verdict: 'FAIL_CLOSED',
       })
       expect(timers.setInterval).toHaveBeenCalledTimes(intervalsBeforeLoader)
       expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
@@ -683,18 +703,14 @@ describe('Claustrum custody tombstones', () => {
           }),
         { models: {} } as never,
       )
-      const realResponse = await realLoaded.fetch(
-        'https://api.anthropic.com/v1/messages',
-        { method: 'POST', body: '{}' },
-      )
-      expect(realResponse.status).toBe(503)
-      await expect(realResponse.json()).resolves.toMatchObject({
-        error: {
-          code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
-          message: expect.stringContaining(
-            'ck auth migrate-plugin --allow-main',
-          ),
-        },
+      await expect(
+        realLoaded.fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: '{}',
+        }),
+      ).rejects.toMatchObject({
+        code: 'custody_state_mismatch',
+        verdict: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
       })
       expect(fetchCalls).toHaveLength(0)
       await plugin.dispose?.()
@@ -706,12 +722,19 @@ describe('Claustrum custody tombstones', () => {
         { client: createMockClient() },
         disabledTimerOverrides(),
       )) as any
+      const localLoaded = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
+        { models: {} } as never,
+      )
       await expect(
-        plugin.auth.loader(
-          () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
-          { models: {} } as never,
-        ),
-      ).rejects.toBeInstanceOf(CustodyTombstoneLoginError)
+        localLoaded.fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: '{}',
+        }),
+      ).rejects.toMatchObject({
+        code: 'custody_state_mismatch',
+        verdict: 'REMAIN_DARK_PENDING_LOGIN',
+      })
       await plugin.dispose?.()
     })
     expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)

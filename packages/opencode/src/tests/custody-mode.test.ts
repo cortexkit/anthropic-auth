@@ -391,6 +391,17 @@ describe('custody mode', () => {
     }
   })
 
+  test('custody: provisional reconcile identifies fallback-driven darkness', () => {
+    expect(
+      reconcileCustodyStartup({
+        mode: 'C',
+        mainSlot: 'unknown',
+        fallbacks: 'T',
+        evidence: 'N',
+      }),
+    ).toEqual({ verdict: 'FAIL_CLOSED', provisional: true })
+  })
+
   test('custody: locks acquire in total order and unwind on contention', async () => {
     const order: string[] = []
     const released: string[] = []

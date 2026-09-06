@@ -277,12 +277,36 @@ const startupVerdicts: Record<string, string> = {
   'C|X|M|N': 'FAIL_CLOSED',
 }
 
-export function reconcileCustodyStartup(input: {
-  mode: ModeDimension
-  main: MainDimension
-  fallbacks: FallbackDimension
-  evidence: EvidenceDimension
-}): { verdict: string } {
+export function reconcileCustodyStartup(
+  input:
+    | {
+        mode: ModeDimension
+        main: MainDimension
+        fallbacks: FallbackDimension
+        evidence: EvidenceDimension
+      }
+    | {
+        mode: ModeDimension
+        mainSlot: 'unknown'
+        fallbacks: FallbackDimension
+        evidence: EvidenceDimension
+      },
+): { verdict: string; provisional?: boolean } {
+  if ('mainSlot' in input) {
+    const verdicts = new Set(
+      (['R', 'T', 'X'] as const).map(
+        (main) =>
+          startupVerdicts[
+            `${input.mode}|${main}|${input.fallbacks}|${input.evidence}`
+          ],
+      ),
+    )
+    if (verdicts.size === 1) {
+      const [verdict] = verdicts
+      return { verdict: verdict ?? 'FAIL_CLOSED', provisional: true }
+    }
+    return { verdict: 'PENDING_MAIN_SLOT', provisional: true }
+  }
   const verdict =
     startupVerdicts[
       `${input.mode}|${input.main}|${input.fallbacks}|${input.evidence}`
