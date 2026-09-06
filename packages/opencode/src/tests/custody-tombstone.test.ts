@@ -550,6 +550,56 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
+  test('never sends a foreign-provider main tombstone to the token endpoint after expiry', async () => {
+    const tokenCalls: string[] = []
+    let currentAuth: Record<string, unknown> = {
+      type: 'oauth',
+      access: 'live-main-access',
+      refresh: 'live-main-refresh',
+      expires: Date.now() + 60_000,
+    }
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) tokenCalls.push(url)
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    await createTempStorage(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: oauthFixture.provider },
+        refresh: { enabled: false },
+        quota: { enabled: false },
+        accounts: [],
+      },
+      async () => {
+        const plugin = (await AnthropicAuthPlugin(
+          // @ts-expect-error: minimal mock for testing
+          { client: createMockClient() },
+          disabledTimerOverrides(),
+        )) as any
+        const loaded = await plugin.auth.loader(
+          () => Promise.resolve(currentAuth as never),
+          { models: {} } as never,
+        )
+
+        currentAuth = {
+          ...custodyTombstoneOAuth('openai'),
+          access: 'expired-main-access',
+          expires: 0,
+        }
+        await expect(
+          loaded.fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            body: '{}',
+          }),
+        ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+        expect(tokenCalls).toEqual([])
+        await plugin.dispose?.()
+      },
+    )
+  })
+
   test('returns a typed cold refusal for a manifest-resolved main tombstone', async () => {
     const fetchCalls: string[] = []
     globalThis.fetch = mock((input: unknown) => {

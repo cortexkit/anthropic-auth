@@ -31,6 +31,7 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   CustodyHandleManifestReader,
+  CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
   custodyTombstoneOAuth,
@@ -13375,6 +13376,77 @@ describe('auth.loader', () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200])
     expect(tokenRefreshCount).toBe(1)
     expect(secondRefreshWait).not.toHaveBeenCalled()
+  })
+
+  test('sticky 401 retry refuses a foreign-provider tombstone before the token endpoint', async () => {
+    const checkedAt = Date.now()
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            checkedAt,
+            five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
+            seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
+          },
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('live-main-access'),
+        },
+      }),
+    )
+    let currentAuth: Record<string, unknown> = {
+      type: 'oauth',
+      access: 'live-main-access',
+      refresh: 'live-main-refresh',
+      expires: checkedAt + 8 * 60 * 60_000,
+    }
+    const messageAuthorizations: string[] = []
+    const tokenEndpointCalls: string[] = []
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        tokenEndpointCalls.push(url)
+        return Promise.resolve(new Response('unexpected', { status: 200 }))
+      }
+      if (url.includes('/v1/messages')) {
+        messageAuthorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        currentAuth = {
+          ...custodyTombstoneOAuth('openai'),
+          access: 'claustrum-tombstone:v1:openai',
+          expires: 0,
+        }
+        return Promise.resolve(new Response('unauthorized', { status: 401 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(currentAuth as never),
+      { models: {} },
+    )
+
+    await expect(
+      result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'tombstone-sticky-401' },
+        body: JSON.stringify({
+          model: 'claude-opus-5',
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      }),
+    ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+    expect(messageAuthorizations).toEqual(['Bearer live-main-access'])
+    expect(tokenEndpointCalls).toEqual([])
+    await plugin.dispose?.()
   })
 
   test('sticky 401 retries with a concurrently rotated main access token', async () => {
