@@ -12,9 +12,15 @@ import {
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
+  resolveCustodyHandlesPath,
   saveAccounts,
   WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
+
+import {
+  acknowledgeLocalOAuthLoginFromStorage,
+  localAuthFingerprint,
+} from './local-login.ts'
 
 function defaultStorage(): AccountStorage {
   return {
@@ -320,7 +326,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   }
 
   const now = Date.now()
-  await addAccountPersistent({
+  const account = {
     id: label || crypto.randomUUID(),
     label: label || undefined,
     type: 'oauth',
@@ -332,7 +338,23 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     addedAt: now,
     lastUsed: now,
     lastRefreshedAt: now,
-  })
+  } as const
+  await addAccountPersistent(account)
+  await acknowledgeLocalOAuthLoginFromStorage(
+    {
+      accountId: account.id,
+      credentialId: `oauth:anthropic:${account.label ?? account.id}`,
+      authFingerprint: localAuthFingerprint(result.access, result.refresh),
+      completedAt: now,
+    },
+    {
+      accountStoragePath: getAccountStoragePath(),
+      manifestPath: resolveCustodyHandlesPath(
+        (await loadAccounts())?.claustrum,
+        process.env,
+      ),
+    },
+  )
 
   console.log(`\nSaved fallback account${label ? ` "${label}"` : ''}.`)
 }

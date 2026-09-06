@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_FETCH_MOCK } from './test-fetch'
@@ -618,6 +618,38 @@ describe('add-oauth label threading', () => {
     const account = loaded!.accounts[0]!
     expect(account.type).toBe('oauth')
     expect(account.label).toBe('work')
+  })
+
+  test('add-oauth-finish clears the matching custody binding', async () => {
+    const manifestPath = join(tempDir, 'handles.json')
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'work',
+                handle: `ckh_${'D'.repeat(43)}`,
+                credential_id: 'oauth:anthropic:work',
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    try {
+      await runOAuthAddWithLabel('work')
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+      expect(manifest.providers[0].accounts).toEqual([])
+    } finally {
+      delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+    }
   })
 
   test('add-oauth-finish without --label leaves label undefined (UUID-name fallback)', async () => {

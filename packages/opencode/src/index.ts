@@ -231,6 +231,7 @@ import {
 } from './lane-start.ts'
 import {
   acknowledgeLocalOAuthLogin,
+  acknowledgeLocalOAuthLoginFromStorage,
   assertLocalLoginObservationAvailable,
   type CompletedLocalLogin,
   localAuthFingerprint,
@@ -4374,6 +4375,23 @@ const anthropicAuthPlugin = async (
           lastRefreshedAt: now,
         }
         await addAccountPersistent(account, accountStoragePath)
+        await acknowledgeLocalOAuthLoginFromStorage(
+          {
+            accountId: account.id,
+            credentialId: account.label
+              ? custodyCredentialId(account.label)
+              : `oauth:anthropic:${account.id}`,
+            authFingerprint: localAuthFingerprint(
+              result.access,
+              result.refresh,
+            ),
+            completedAt: now,
+          },
+          {
+            accountStoragePath,
+            manifestPath: custodyHandleManifestPath,
+          },
+        )
         logger.info('commands', 'account added', {
           id: account.id,
           label: account.label,

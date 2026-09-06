@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -114,6 +114,50 @@ describe('CLI api add', () => {
 })
 
 describe('CLI login', () => {
+  test('clears the matching custody binding after fallback OAuth login', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    const manifestPath = join(tempDir, 'handles.json')
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'cli-label',
+                handle: `ckh_${'D'.repeat(43)}`,
+                credential_id: 'oauth:anthropic:cli-label',
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    await chmod(manifestPath, 0o600)
+
+    await withAccountEnv(
+      accountPath,
+      { CLAUSTRUM_OPENCODE_HANDLES: manifestPath },
+      () =>
+        login('cli-label', {
+          prompt: async () =>
+            'https://platform.claude.com/oauth/code/callback?code=cli-code&state=stub',
+          exchange: async () => ({
+            type: 'success' as const,
+            access: 'cli-access',
+            refresh: 'cli-refresh',
+            expires: Date.now() + 3600 * 1000,
+          }),
+        }),
+    )
+
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    expect(manifest.providers[0].accounts).toEqual([])
+  })
+
   test('continues from label prompt to OAuth callback prompt and saves account', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
 
