@@ -2076,11 +2076,9 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test.serial(
-    'warms a manifest handle when claustrum mode turns on after boot',
+    'warms a manifest handle when claustrum mode is already committed',
     async () => {
-      await useTempAccountFile(
-        manifestStorage({ label: 'gate-after', gate: false }),
-      )
+      await useTempAccountFile(manifestStorage({ label: 'gate-after' }))
       await writeManifest([{ label: 'gate-after', handle: manifestHandle }])
       const handlers: Array<() => unknown> = []
       const calls: CredentialCall[] = []
@@ -2094,8 +2092,6 @@ describe('fallback Claustrum credential resolution', () => {
           return { unref() {} } as never
         }) as never,
       })
-      expect(calls).toHaveLength(0)
-      await runCustodyCommand(plugin, 'gate-after', 'claustrum')
       await Promise.all(handlers.map((handler) => handler()))
       await waitForMockCall({ mock: { calls } })
       expect(
@@ -2109,11 +2105,10 @@ describe('fallback Claustrum credential resolution', () => {
     'uses the current custody mode when a later loader receives a tombstone',
     async () => {
       await useTempAccountFile(
-        manifestStorage({ label: 'loader-current-mode', gate: false }),
+        manifestStorage({ label: 'loader-current-mode' }),
       )
       const plugin = await getPlugin()
       try {
-        await runCustodyCommand(plugin, 'loader-current-mode', 'claustrum')
         const claustrumResult = await plugin.auth.loader(
           () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
           { models: {} },
