@@ -221,9 +221,11 @@ a state with a named verdict (§5) and a resume path.
 1. **Inside** the locks: capture each account's custody generation; re-read the manifest, the raw
    account rows, and the raw auth slot; compute each account's PRE-COMMIT FINGERPRINT. Any preflight
    computed before this point is advisory and discarded (stale by construction under concurrency).
-2. Classify every enabled OAuth account as C1 or C2-eligible (VALID binding, USABLE vault, IDENTITY
-   not mismatched) while fenced. Any other class → release, **zero writes**, typed refusal naming the
-   first failing account and its class.
+2. Classify every enabled OAuth account while fenced. Fallbacks: C1 or C2-eligible (VALID binding,
+   USABLE vault, IDENTITY not mismatched). Main: the same three conditions **plus** the slot already
+   holds the recognise-set (§13.1) — a REAL main is `TAKEOVER_INCOMPLETE_MAIN_REAL` here, not
+   eligible. Any other class → release, **zero writes**, typed refusal naming the first failing
+   account and its class.
 3. Persist `mode=claustrum` **and** the per-account fingerprints in one config write (config lock
    held). This is the barrier's durable marker and the only global write. Mode-first: a tombstone
    never coexists with `mode=local` during a normal commit, so observing that pair is evidence of
