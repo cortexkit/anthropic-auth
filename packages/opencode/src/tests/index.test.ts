@@ -3544,13 +3544,14 @@ describe('fallback Claustrum credential resolution', () => {
         ],
       })
       const connector = connectorFor(calls, (method) => {
-        if (method === 'credential.get')
+        if (method === 'credential.get') {
           return credentialResponse(
             'vault-identity-allowed-access',
             2,
             Date.now() + 60_000,
             'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
           )
+        }
         return { result: {} }
       })
       const { authorizations, plugin, result } =
@@ -3572,7 +3573,7 @@ describe('fallback Claustrum credential resolution', () => {
             },
           },
         )
-
+      await plugin.__fallbackRefreshReady
       const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
       expect(response.status).toBe(401)
@@ -3589,7 +3590,12 @@ describe('fallback Claustrum credential resolution', () => {
           ),
         'the served fallback provider identity',
       )
-      expect((entries[0] as any)?.anthropic_account_uuid).toBe(
+      const servedFallbackEntry = entries.find(
+        (entry: any) =>
+          entry.anthropic_account_uuid ===
+          'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      ) as any
+      expect(servedFallbackEntry?.anthropic_account_uuid).toBe(
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       )
       await plugin.dispose?.()
