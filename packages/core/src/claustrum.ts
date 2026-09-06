@@ -1004,16 +1004,15 @@ export async function removeCustodyHandleManifestEntry(
         if (!isOurManifestBlock(block) || !Array.isArray(block.accounts)) {
           return 'refused'
         }
-        const matchIndex = block.accounts.findIndex(
-          (account) =>
-            isRecord(account) &&
-            account.label === input.entry.label &&
-            account.handle === input.entry.handle &&
-            account.credential_id === input.entry.credentialId,
-        )
+        const matchesEntry = (account: unknown) =>
+          isRecord(account) &&
+          account.label === input.entry.label &&
+          account.handle === input.entry.handle &&
+          account.credential_id === input.entry.credentialId
+        const matchIndex = block.accounts.findIndex(matchesEntry)
         if (matchIndex === -1) return 'missing'
         const accounts = block.accounts.filter(
-          (_, index) => index !== matchIndex,
+          (account) => !matchesEntry(account),
         )
         const serialized = JSON.stringify(
           {

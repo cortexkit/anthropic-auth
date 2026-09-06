@@ -1079,6 +1079,35 @@ describe('removeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('removes every duplicate of our manifest entry', async () => {
+    const account = {
+      label: writerEntry.label,
+      handle: writerEntry.handle,
+      credential_id: writerEntry.credentialId,
+    }
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [account, account],
+          },
+        ],
+      }),
+      async (path) => {
+        await expect(
+          removeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toBe('removed')
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<{ accounts: unknown[] }>
+        }
+        expect(output.providers[0]?.accounts).toEqual([])
+      },
+    )
+  })
+
   test.serial(
     'returns refused when the lease is lost before rename',
     async () => {
