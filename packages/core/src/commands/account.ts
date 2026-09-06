@@ -293,7 +293,7 @@ export async function executeAccountCommand(input: {
         : a.id !== mainId &&
             storedAccount &&
             isOAuthAccountVaultOwned(input.storage, storedAccount, binding)
-          ? 'vault cold'
+          ? custodyStatusLabel('on-cold')
           : 'local'
       lines.push(
         `- **${a.label}** [${a.role}]${tier}${status}${pct} · ${custody}`,

@@ -6373,6 +6373,9 @@ const anthropicAuthPlugin = async (
                 order: 0,
               })
             }
+            const usableFallbacksById = new Map(
+              usableFallbacks.map((candidate) => [candidate.id, candidate]),
+            )
             for (const [index, stored] of (
               latestStorage?.accounts ?? []
             ).entries()) {
@@ -6383,10 +6386,7 @@ const anthropicAuthPlugin = async (
                 isLocalManifestBoundFallback(stored, latestStorage)
               )
                 continue
-              const account =
-                usableFallbacks.find(
-                  (candidate) => candidate.id === stored.id,
-                ) ?? stored
+              const account = usableFallbacksById.get(stored.id) ?? stored
               const credential = resolveClaustrumAccess(account, latestStorage)
               const servedByClaustrum = Boolean(credential.served)
               if (
