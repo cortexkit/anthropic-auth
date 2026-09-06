@@ -154,9 +154,10 @@ describe('custody mode', () => {
       claustrum: { handlesFile: '/resolved-handles.json' },
       refresh: { refreshBeforeExpiryMinutes: 5 },
     }
+    const loadAccounts = spyOn(core, 'loadAccounts')
+    loadAccounts.mockResolvedValue(storage)
     const deps = createLiveCustodyDeps({
       storagePath: '/storage.json',
-      storage,
       cache,
       latestGetAuth: get,
       now,

@@ -46,21 +46,37 @@ export function createLiveCustodyDeps(input: {
   const inputNow = input.now
   const now = typeof inputNow === 'function' ? inputNow : () => inputNow
   const fallbackManager = input.fallbackManager
-  const manifestPath = core.resolveCustodyHandlesPath(
+  let storagePromise: Promise<core.AccountStorage | null> | undefined
+  let manifestPath = core.resolveCustodyHandlesPath(
     input.storage?.claustrum,
     process.env,
   )
-  const manifestReader = new core.CustodyHandleManifestReader({
-    path: manifestPath,
-    provider: 'anthropic',
-    serve: 'anthropic-auth',
-  })
+  let manifestReader: core.CustodyHandleManifestReader | undefined
+  const loadStorage = () =>
+    (storagePromise ??= Promise.resolve(
+      input.storage ?? core.loadAccounts(input.storagePath),
+    ))
+  const loadManifestReader = async () => {
+    const storage = await loadStorage()
+    const path = core.resolveCustodyHandlesPath(storage?.claustrum, process.env)
+    if (!manifestReader || path !== manifestPath) {
+      manifestPath = path
+      manifestReader = new core.CustodyHandleManifestReader({
+        path,
+        provider: 'anthropic',
+        serve: 'anthropic-auth',
+      })
+    }
+    return manifestReader
+  }
 
   return {
     hostAuth: { get: input.latestGetAuth },
-    manifestPath,
+    get manifestPath() {
+      return manifestPath
+    },
     async readBindings(routes: LiveRoute[]) {
-      const result = await manifestReader.read()
+      const result = await (await loadManifestReader()).read()
       const manifest = result.status === 'ready' ? result.manifest : undefined
       return routes.flatMap((route) => {
         const resolution = core.resolveCustodyHandle({
@@ -96,8 +112,7 @@ export function createLiveCustodyDeps(input: {
       main: Pick<LiveRoute, 'id' | 'label' | 'enabled'>,
       fallbacks: LiveRoute[],
     ) {
-      const storage =
-        input.storage ?? (await core.loadAccounts(input.storagePath))
+      const storage = await loadStorage()
       return {
         now: now(),
         storage,
@@ -113,7 +128,9 @@ export function createLiveCustodyDeps(input: {
     },
     locks: {
       storagePath: input.storagePath,
-      manifestPath,
+      get manifestPath() {
+        return manifestPath
+      },
       acquireTransition: ({ name, path }: { name: string; path: string }) =>
         core.acquireRefreshFileLock({
           name,
