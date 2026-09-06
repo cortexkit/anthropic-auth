@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'bun:test'
-import { custodyTombstoneOAuth } from '@cortexkit/anthropic-auth-core'
-
+import { describe, expect, spyOn, test } from 'bun:test'
+import * as core from '@cortexkit/anthropic-auth-core'
+import { createLiveCustodyDeps } from '../custody-live.ts'
 import {
   acquireCustodyTransitionLocks,
   CustodyLockBusyError,
@@ -46,9 +46,11 @@ function preflightInput(overrides: Record<string, unknown> = {}) {
       route('disabled', { enabled: false }),
       route('api', { type: 'api' }),
     ],
-    getAuth: () => {
-      calls.auth++
-      return real('access-main-secret', 'refresh-main-secret')
+    hostAuth: {
+      get: () => {
+        calls.auth++
+        return real('access-main-secret', 'refresh-main-secret')
+      },
     },
     bindings: [
       {
@@ -65,7 +67,7 @@ function preflightInput(overrides: Record<string, unknown> = {}) {
       },
     ],
     cache: {
-      get: async (handle: string, minTtlMs: number) => {
+      get: async (handle: string, { minTtlMs }: { minTtlMs: number }) => {
         calls.cache++
         calls.transport++
         return {
@@ -93,6 +95,103 @@ function preflightInput(overrides: Record<string, unknown> = {}) {
 }
 
 describe('custody mode', () => {
+  test('custody: live adapter maps host auth, manifest, cache, and locks', async () => {
+    const get = async () => real('access-main-secret', 'refresh-main-secret')
+    const order: string[] = []
+    const cacheGet = spyOn(
+      {
+        get: async (_handle: string, minTtlMs?: number) => ({
+          credentialId: 'oauth:anthropic:main',
+          recordVersion: 1,
+          access: 'vault-access',
+          refresh: 'vault-refresh',
+          expiresAt: now + (minTtlMs ?? 0) + 1,
+          state: 'usable' as const,
+        }),
+      },
+      'get',
+    )
+    const cache = { get: cacheGet }
+    const read = spyOn(core.CustodyHandleManifestReader.prototype, 'read')
+    read.mockResolvedValue({
+      status: 'ready',
+      manifest: {
+        version: 1,
+        provider: 'anthropic',
+        serve: 'anthropic-auth',
+        accounts: [
+          {
+            label: 'main',
+            handle: 'handle-main',
+            credentialId: 'oauth:anthropic:main',
+          },
+        ],
+        superseded: new Set(),
+      },
+    })
+    const manifestLock = spyOn(core, 'withCustodyManifestLock')
+    manifestLock.mockImplementation(async (path, fn) => {
+      order.push(`manifest:${path}`)
+      return fn(async () => {}, 'nonce')
+    })
+    const refreshLock = spyOn(core, 'acquireRefreshFileLock')
+    refreshLock.mockImplementation(async ({ name }) => {
+      order.push(name)
+      return { release: async () => {} }
+    })
+    const fallbackManager = {
+      withAccountRefreshLock: async <T>(
+        accountId: string,
+        fn: () => Promise<T>,
+      ) => {
+        order.push(accountId)
+        return fn()
+      },
+    }
+    const storage: core.AccountStorage = {
+      version: 1,
+      accounts: [],
+      claustrum: { handlesFile: '/resolved-handles.json' },
+      refresh: { refreshBeforeExpiryMinutes: 5 },
+    }
+    const deps = createLiveCustodyDeps({
+      storagePath: '/storage.json',
+      storage,
+      cache,
+      latestGetAuth: get,
+      now,
+      fallbackManager,
+    })
+
+    expect(deps.hostAuth.get).toBe(get)
+    expect(deps.hostAuth).not.toHaveProperty('set')
+    await deps.readBindings([{ id: 'main', label: 'main', type: 'oauth' }])
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(deps.manifestPath).toBe('/resolved-handles.json')
+    await preflightClaustrumTakeover(
+      await deps.preflightInput(
+        { id: 'main', label: 'main', enabled: true },
+        [],
+      ),
+    )
+    expect(cacheGet).toHaveBeenCalledWith(
+      'handle-main',
+      core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000,
+    )
+    const locks = await acquireCustodyTransitionLocks({
+      ...deps.locks,
+      fallbackAccountIds: ['zulu', 'alpha'],
+    })
+    await locks.release()
+    expect(order).toEqual([
+      'claustrum-mode-transition',
+      'manifest:/resolved-handles.json',
+      'main-refresh',
+      'alpha',
+      'zulu',
+    ])
+  })
+
   test('custody: preflight verifies every account before any write', async () => {
     const cases = [
       {
@@ -103,7 +202,10 @@ describe('custody mode', () => {
       {
         name: 'revoked credential',
         mutate: (input: any) =>
-          (input.cache.get = async (handle: string, minTtlMs: number) =>
+          (input.cache.get = async (
+            handle: string,
+            { minTtlMs }: { minTtlMs: number },
+          ) =>
             handle === 'handle-work'
               ? { state: 'revoked' }
               : {
@@ -119,7 +221,10 @@ describe('custody mode', () => {
       {
         name: 'reauth credential',
         mutate: (input: any) =>
-          (input.cache.get = async (handle: string, minTtlMs: number) =>
+          (input.cache.get = async (
+            handle: string,
+            { minTtlMs }: { minTtlMs: number },
+          ) =>
             handle === 'handle-work'
               ? { state: 'reauth' }
               : {
@@ -135,7 +240,10 @@ describe('custody mode', () => {
       {
         name: 'unusable credential',
         mutate: (input: any) =>
-          (input.cache.get = async (handle: string, minTtlMs: number) =>
+          (input.cache.get = async (
+            handle: string,
+            { minTtlMs }: { minTtlMs: number },
+          ) =>
             handle === 'handle-work'
               ? { state: 'usable', expiresAt: now }
               : {
@@ -193,8 +301,11 @@ describe('custody mode', () => {
   })
 
   test('custody: fresh install refuses before creating a store', async () => {
-    const tombstone = custodyTombstoneOAuth('anthropic')
-    const fresh = preflightInput({ storage: null, getAuth: () => tombstone })
+    const tombstone = core.custodyTombstoneOAuth('anthropic')
+    const fresh = preflightInput({
+      storage: null,
+      hostAuth: { get: () => tombstone },
+    })
     await expect(preflightClaustrumTakeover(fresh)).rejects.toMatchObject({
       code: 'custody_preflight_refused',
       reason: 'mode_not_committed_local_credential_unavailable',

@@ -110,12 +110,12 @@ export type PreflightClaustrumTakeoverInput = {
   } | null
   main: Pick<PreflightRoute, 'id' | 'label' | 'enabled'>
   fallbacks: PreflightRoute[]
-  getAuth: () => unknown
+  hostAuth: { get: () => unknown | Promise<unknown> }
   bindings: PreflightBinding[]
   cache: {
     get: (
       handle: string,
-      minTtlMs: number,
+      options: { minTtlMs: number },
     ) => Promise<CustodyCacheCredential | { state: string; expiresAt?: number }>
   }
 }
@@ -171,7 +171,7 @@ function isUsableCredential(
 export async function preflightClaustrumTakeover(
   input: PreflightClaustrumTakeoverInput,
 ): Promise<ClaustrumTakeoverPlan> {
-  const mainAuth = input.getAuth()
+  const mainAuth = await input.hostAuth.get()
   if (!input.storage && !localOAuthMaterial(mainAuth))
     throw new CustodyPreflightRefusedError(
       input.main.id,
@@ -185,7 +185,7 @@ export async function preflightClaustrumTakeover(
     const binding = findStrictBinding(route, input.bindings)
     if (!binding)
       throw new CustodyPreflightRefusedError(route.id, 'binding_missing')
-    const credential = await input.cache.get(binding.handle, minTtlMs)
+    const credential = await input.cache.get(binding.handle, { minTtlMs })
     if (credential.state === 'revoked')
       throw new CustodyPreflightRefusedError(route.id, 'credential_revoked')
     if (credential.state === 'reauth')
