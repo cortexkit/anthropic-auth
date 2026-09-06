@@ -6,11 +6,14 @@ import {
   type ClaudeCodeIdentity,
   getClaudeCodeIdentity,
   orderClaudeCodeBody,
+  type ProviderAccountUuid,
   REQUIRED_BETAS,
   resetClaudeCodeIdentityCachesForTest,
   resolveClaudeCodeIdentity,
   selectClaudeCodeBetas,
 } from '@cortexkit/anthropic-auth-core'
+
+const providerUuid = (value: string) => value as ProviderAccountUuid
 
 describe('Claude Code fingerprint helpers', () => {
   const originalFetch = globalThis.fetch
@@ -38,7 +41,7 @@ describe('Claude Code fingerprint helpers', () => {
       undefined,
       'isolation-main',
     )
-    expect(first.accountUuid).toBe('uuid-isolation')
+    expect(first.accountUuid).toBe(providerUuid('uuid-isolation'))
 
     const second = await resolveClaudeCodeIdentity(
       'sk-ant-oat-isolation-next',
@@ -67,7 +70,7 @@ describe('Claude Code fingerprint helpers', () => {
       undefined,
       'isolation-reset-main',
     )
-    expect(first.accountUuid).toBe('uuid-reset')
+    expect(first.accountUuid).toBe(providerUuid('uuid-reset'))
 
     resetClaudeCodeIdentityCachesForTest()
 
@@ -154,7 +157,7 @@ describe('Claude Code fingerprint helpers', () => {
   test('applies Claude Code headers and couples session id to metadata', () => {
     const identity: ClaudeCodeIdentity = {
       deviceId: 'a'.repeat(64),
-      accountUuid: '11111111-2222-4333-8444-555555555555',
+      accountUuid: providerUuid('11111111-2222-4333-8444-555555555555'),
       sessionId: '66666666-7777-4888-9999-aaaaaaaaaaaa',
     }
     const body: Record<string, unknown> = {
@@ -229,7 +232,7 @@ describe('Claude Code fingerprint helpers', () => {
       undefined,
       'main-slot',
     )
-    expect(successful.accountUuid).toBe('account-a')
+    expect(successful.accountUuid).toBe(providerUuid('account-a'))
 
     const failed = await resolveClaudeCodeIdentity(
       failedToken,
@@ -281,7 +284,7 @@ describe('Claude Code fingerprint helpers', () => {
       undefined,
       'main-slot',
     )
-    expect(initialIdentity.accountUuid).toBe('account-a')
+    expect(initialIdentity.accountUuid).toBe(providerUuid('account-a'))
     const pendingA = resolveClaudeCodeIdentity(tokenA, undefined, 'main-slot')
     await aStarted
     const identityB = await resolveClaudeCodeIdentity(
@@ -289,7 +292,7 @@ describe('Claude Code fingerprint helpers', () => {
       undefined,
       'main-slot',
     )
-    expect(identityB.accountUuid).toBe('account-b')
+    expect(identityB.accountUuid).toBe(providerUuid('account-b'))
 
     releaseA(new Response('bootstrap unavailable', { status: 503 }))
     const identityA = await pendingA
@@ -300,7 +303,7 @@ describe('Claude Code fingerprint helpers', () => {
       undefined,
       'main-slot',
     )
-    expect(compatibility.accountUuid).toBe('account-b')
+    expect(compatibility.accountUuid).toBe(providerUuid('account-b'))
   })
 
   test('orders serialized body fields like captured Claude Code requests', () => {
@@ -359,7 +362,9 @@ describe('Claude Code bootstrap identity lookup', () => {
       'bootstrap-account',
     )
 
-    expect(identity.accountUuid).toBe('11111111-2222-4333-8444-555555555555')
+    expect(identity.accountUuid).toBe(
+      providerUuid('11111111-2222-4333-8444-555555555555'),
+    )
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
@@ -423,8 +428,8 @@ describe('Claude Code bootstrap identity lookup', () => {
       'stable-main-slot',
     )
 
-    expect(first.accountUuid).toBe('main-account-a')
-    expect(second.accountUuid).toBe('main-account-b')
+    expect(first.accountUuid).toBe(providerUuid('main-account-a'))
+    expect(second.accountUuid).toBe(providerUuid('main-account-b'))
     expect(second.deviceId).toBe(first.deviceId)
     expect(second.sessionId).toBe(first.sessionId)
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -451,8 +456,8 @@ describe('Claude Code bootstrap identity lookup', () => {
       'uuid-account',
     )
 
-    expect(first.accountUuid).toBe(accountUuid)
-    expect(second.accountUuid).toBe(accountUuid)
+    expect(first.accountUuid).toBe(providerUuid(accountUuid))
+    expect(second.accountUuid).toBe(providerUuid(accountUuid))
     expect(second.deviceId).toBe(first.deviceId)
     expect(second.sessionId).toBe(first.sessionId)
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -534,7 +539,7 @@ describe('Claude Code bootstrap identity lookup', () => {
 
     expect(resolved.deviceId).toBe(legacy.deviceId)
     expect(resolved.sessionId).toBe(legacy.sessionId)
-    expect(resolved.accountUuid).toBe('legacy-bootstrap-uuid')
+    expect(resolved.accountUuid).toBe(providerUuid('legacy-bootstrap-uuid'))
   })
 
   test('does not reuse an in-flight bootstrap from a rotated credential', async () => {

@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { computeCcVersionSuffix } from '@cortexkit/anthropic-auth-core'
+import {
+  computeCcVersionSuffix,
+  type ProviderAccountUuid,
+} from '@cortexkit/anthropic-auth-core'
 import type { Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
 
@@ -517,7 +520,7 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     const identity = {
       deviceId: 'd'.repeat(64),
       accountIdentity: 'main',
-      accountUuid: 'account-uuid',
+      accountUuid: 'account-uuid' as ProviderAccountUuid,
       sessionId: 'identity-session',
     }
     const { body } = await buildAnthropicRequest(
@@ -614,7 +617,7 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
       {
         deviceId: 'd'.repeat(64),
         accountIdentity: 'main',
-        accountUuid: 'account-uuid',
+        accountUuid: 'account-uuid' as ProviderAccountUuid,
         sessionId: 'identity-session',
       },
     )

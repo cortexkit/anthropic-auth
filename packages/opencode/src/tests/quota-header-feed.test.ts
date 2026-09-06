@@ -32,6 +32,7 @@ function entry(overrides: Record<string, unknown> = {}): QuotaHeaderFeedEntry {
     provider: 'anthropic',
     configured_account_count: 1,
     observed_at_ms: 1_000,
+    anthropic_account_uuid: null,
     quota,
     ...overrides,
   } as QuotaHeaderFeedEntry

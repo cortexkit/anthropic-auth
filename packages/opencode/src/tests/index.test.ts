@@ -49,6 +49,7 @@ import {
   type OAuthQuotaSnapshot,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   PROFILE_TTL_MS,
+  type ProviderAccountUuid,
   primeStorageFingerprint,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
@@ -1308,6 +1309,17 @@ describe('fallback Claustrum credential resolution', () => {
         createFallbackStorage({
           claustrum: { mode: 'claustrum' },
           mainAccountId: 'persisted-main-identity',
+          main: {
+            type: 'opencode',
+            provider: 'anthropic',
+            profile: {
+              tier: 'default_claude_max_5x',
+              orgType: 'claude_team',
+              checkedAt: Date.now(),
+              providerAccountUuid:
+                'persisted-main-identity' as ProviderAccountUuid,
+            },
+          },
           quota: { enabled: false },
           accounts: [],
         }),
@@ -1361,7 +1373,7 @@ describe('fallback Claustrum credential resolution', () => {
         },
         {
           name: 'vault',
-          mainAccountId: 'persisted-main',
+          mainAccountId: undefined,
           credentialAccountId: undefined,
         },
       ]) {
@@ -1369,6 +1381,18 @@ describe('fallback Claustrum credential resolution', () => {
           createFallbackStorage({
             claustrum: { mode: 'claustrum' },
             mainAccountId: fixture.mainAccountId,
+            ...(fixture.name === 'vault' && {
+              main: {
+                type: 'opencode',
+                provider: 'anthropic',
+                profile: {
+                  tier: 'default_claude_max_5x',
+                  orgType: 'claude_team',
+                  checkedAt: Date.now(),
+                  providerAccountUuid: 'persisted-main' as ProviderAccountUuid,
+                },
+              },
+            }),
             quota: { enabled: false },
             accounts: [],
           }),
@@ -1397,6 +1421,10 @@ describe('fallback Claustrum credential resolution', () => {
 
         const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
         expect(response.status).toBe(200)
+        const resolution = await plugin.__resolveMainQuotaIdentityForTest(
+          `sk-ant-oat01-main-vault-access-${fixture.name}`,
+        )
+        expect(resolution.state).toBe('unknown-identity')
         await expectHandledCommandResponse(
           plugin['command.execute.before']({
             command: 'claude-account',
@@ -4710,6 +4738,215 @@ describe('quota header feed integration', () => {
     globalThis.fetch = originalFetch
   })
 
+  test.serial(
+    'fresh claustrum install persists the vault provider uuid instead of local identity material',
+    async () => {
+      const providerAccountUuid = 'provider-account-uuid'
+      const manifestHandle = `ckh_${'M'.repeat(43)}`
+      const tombstone = custodyTombstoneOAuth('anthropic')
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: true, failClosedOnUnknownQuota: false },
+          quotaHeaderFeed: { enabled: true },
+          mainAccountId: undefined,
+          accounts: [],
+        }),
+      )
+      const manifestPath = join(tempConfigDir!, 'handles.json')
+      await writeFile(
+        manifestPath,
+        JSON.stringify({
+          version: 1,
+          providers: [
+            {
+              provider: 'anthropic',
+              serve: 'anthropic-auth',
+              accounts: [
+                {
+                  label: 'main',
+                  handle: manifestHandle,
+                  credential_id: custodyCredentialId('main'),
+                },
+              ],
+            },
+          ],
+        }),
+      )
+      await chmod(manifestPath, 0o600)
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+      globalThis.fetch = mock(
+        (input: Parameters<typeof globalThis.fetch>[0]) => {
+          const url = extractUrl(input)
+          if (url.includes('/claude_cli/bootstrap')) {
+            return Promise.resolve(
+              Response.json({
+                oauth_account: { account_uuid: providerAccountUuid },
+              }),
+            )
+          }
+          if (url.includes('/api/oauth/profile')) {
+            return Promise.resolve(
+              Response.json({
+                organization: {
+                  rate_limit_tier: 'default_claude_max_5x',
+                  organization_type: 'claude_team',
+                },
+              }),
+            )
+          }
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: {
+                'anthropic-ratelimit-unified-5h-utilization': '0.25',
+                'anthropic-ratelimit-unified-5h-reset': '1800000000',
+              },
+            }),
+          )
+        },
+      ) as unknown as typeof fetch
+      const calls: CredentialCall[] = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: async () =>
+          ({
+            call: async (
+              _moduleId: string,
+              method: string,
+              params: unknown,
+            ) => {
+              calls.push({
+                method,
+                params: (params ?? {}) as Record<string, unknown>,
+              })
+              return method === 'credential.get'
+                ? {
+                    result: {
+                      payload: Array.from(
+                        new TextEncoder().encode(
+                          JSON.stringify({
+                            access_token: 'sk-ant-oat01-vault-main',
+                          }),
+                        ),
+                      ),
+                      expires_at_ms: Date.now() + 60_000,
+                      record_version: 1,
+                    },
+                  }
+                : { result: {} }
+            },
+            close: () => {},
+          }) as never,
+      })
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(tombstone as never),
+        { models: {} },
+      )
+
+      const response = await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+      })
+      await response.text()
+      await waitForFeedEntries(
+        (entries) =>
+          entries.some(
+            (entry: any) =>
+              entry.anthropic_account_uuid === providerAccountUuid,
+          ),
+        'the vault provider identity',
+      )
+      await expectHandledCommandResponse(
+        plugin['command.execute.before']({
+          command: 'claude-account',
+          arguments: '',
+          sessionID: 'fresh-claustrum-profile',
+        }),
+      )
+
+      const profileDeadline = performance.now() + 2_500
+      let persisted = await loadAccounts()
+      while (
+        persisted?.main?.profile?.providerAccountUuid !== providerAccountUuid &&
+        performance.now() < profileDeadline
+      ) {
+        await Bun.sleep(10)
+        persisted = await loadAccounts()
+      }
+      const rawStore = await readFile(
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+        'utf8',
+      )
+      const entries = await readFeedEntries()
+      const feedEntry = entries.find(
+        (entry: any) => entry.anthropic_account_uuid === providerAccountUuid,
+      ) as any
+      expect(persisted?.main?.profile?.providerAccountUuid).toBe(
+        providerAccountUuid as ProviderAccountUuid,
+      )
+      expect(feedEntry.anthropic_account_uuid).toBe(providerAccountUuid)
+      expect(rawStore).not.toContain(String(tombstone.refresh))
+      expect(feedEntry.anthropic_account_uuid).not.toBe(
+        persisted?.mainAccountId,
+      )
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'non-OAT compatibility identity stays a local quota key without a provider uuid',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          quota: { enabled: true, failClosedOnUnknownQuota: false },
+          quotaHeaderFeed: { enabled: true },
+          accounts: [],
+        }),
+      )
+      let bootstrapRequests = 0
+      globalThis.fetch = mock(
+        (input: Parameters<typeof globalThis.fetch>[0]) => {
+          const url = extractUrl(input)
+          if (url.includes('/claude_cli/bootstrap')) bootstrapRequests += 1
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: {
+                'anthropic-ratelimit-unified-5h-utilization': '0.25',
+                'anthropic-ratelimit-unified-5h-reset': '1800000000',
+              },
+            }),
+          )
+        },
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'local-adapter-access',
+            refresh: 'local-adapter-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+      const response = await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+      })
+      await response.text()
+      const entries = await waitForFeedEntries(
+        (candidate) => candidate.length === 1,
+        'the local compatibility entry',
+      )
+      const persisted = await loadAccounts()
+      expect(bootstrapRequests).toBe(0)
+      expect(persisted?.mainAccountId).toBeDefined()
+      expect((entries[0] as any)?.anthropic_account_uuid).toBeNull()
+      await plugin.dispose?.()
+    },
+  )
+
   test('publishes a direct harvested response with the observation timestamp', async () => {
     const originalNow = Date.now
     let clock = 1_000_000
@@ -5498,11 +5735,12 @@ describe('quota header feed integration', () => {
         await waitForFeedEntries(
           (entries) =>
             entries.length === 1 &&
-            (entries[0] as any)?.account_ref === accountIdentity,
+            (entries[0] as any)?.account_ref === 'main-slot',
           'one account-a published entry',
         )
       )[0] as any
-      expect(published.account_ref).toBe(accountIdentity)
+      expect(published.account_ref).toBe('main-slot')
+      expect(published.anthropic_account_uuid).toBe(accountIdentity)
       expect(published.observed_at_ms).toBe(requestCheckedAt)
       expect(published.observed_at_ms).not.toBe(otherCheckedAt)
     } finally {
@@ -5628,9 +5866,9 @@ describe('quota header feed integration', () => {
       )
       const quotaManager = plugin.__quotaManager
       const checkedAt = Date.now()
-      quotaManager.setMain('account-a', {
+      quotaManager.setMain('main-slot', {
         quota: {
-          accountIdentity: 'account-a',
+          accountIdentity: 'main-slot',
           five_hour: {
             usedPercent: 100,
             remainingPercent: 0,
@@ -5641,7 +5879,7 @@ describe('quota header feed integration', () => {
         checkedAt,
       })
       const priorPoll = quotaManager.refreshMain(
-        'account-a',
+        'main-slot',
         'sk-ant-oat-token-a',
       )
       await oldPollStarted
@@ -5656,43 +5894,43 @@ describe('quota header feed integration', () => {
           }),
         { models: {} },
       )
-      expect(quotaManager.getMain('account-b')).toBeNull()
+      expect(quotaManager.getMain('main-slot')).toBeNull()
       const replacementPoll = quotaManager.refreshMain(
-        'account-b',
+        'main-slot',
         'sk-ant-oat-token-b',
       )
       releaseOldPoll(new Response('rate limited', { status: 429 }))
       await expect(priorPoll).rejects.toThrow('429')
       await replacementPoll
 
-      expect(quotaManager.getMain('account-a')).toBeNull()
-      expect(quotaManager.getMain('account-b')?.quota.five_hour).toEqual(
+      expect(quotaManager.getMain('main-slot')?.quota.five_hour).toEqual(
         expect.objectContaining({ remainingPercent: 90 }),
       )
       expect(quotaManager.isBackedOff()).toBe(false)
 
       const response = await resultB.fetch(MESSAGES_URL, EMPTY_POST)
       await response.text()
-      expect(quotaManager.getMain('account-b')?.quota.accountIdentity).toBe(
-        'account-b',
+      expect(quotaManager.getMain('main-slot')?.quota.accountIdentity).toBe(
+        'main-slot',
       )
       const entries = await waitForFeedEntries(
         (candidate) =>
           candidate.length === 1 &&
-          candidate.some((entry: any) => entry.account_ref === 'account-b'),
-        'one account-b published entry',
+          candidate.some((entry: any) => entry.account_ref === 'main-slot'),
+        'one main-slot published entry',
       )
       expect(entries).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             identity_source: 'account_ref',
-            account_ref: 'account-b',
+            account_ref: 'main-slot',
+            anthropic_account_uuid: 'account-b',
           }),
         ]),
       )
       expect(entries).not.toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ account_ref: 'account-a' }),
+          expect.objectContaining({ anthropic_account_uuid: 'account-a' }),
         ]),
       )
     } finally {
@@ -5715,7 +5953,7 @@ describe('quota header feed integration', () => {
           checkIntervalMinutes: 5,
           failClosedOnUnknownQuota: true,
           mainQuota: {
-            accountIdentity: 'account-a',
+            accountIdentity: 'main-slot',
             five_hour: {
               usedPercent: 100,
               remainingPercent: 0,
@@ -5728,7 +5966,7 @@ describe('quota header feed integration', () => {
             checkedAt: now - 1_000,
             nextRetryAt: now + 60_000,
             retryCount: 1,
-            accountIdentity: 'account-a',
+            accountIdentity: 'main-slot',
           },
         },
       }),
@@ -5927,7 +6165,9 @@ describe('quota header feed integration', () => {
           expect.objectContaining({ account_ref: 'account-a' }),
         ]),
       )
-      expect(plugin.__quotaManager.getMain('account-a')).toBeNull()
+      expect(
+        plugin.__quotaManager.getMain('main-slot')?.quota.five_hour,
+      ).toBeUndefined()
     } finally {
       __setLogTestSink(null)
       setLogLevel('info')

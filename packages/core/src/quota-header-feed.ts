@@ -18,6 +18,7 @@ import {
   isOAuthAccount,
   type OAuthExtraUsageSnapshot,
   type OAuthQuotaSnapshot,
+  type ProviderAccountUuid,
   QUOTA_FIELD_NAMES,
   type QuotaFieldName,
   type QuotaFieldSource,
@@ -59,11 +60,13 @@ type QuotaHeaderFeedMetadata = {
 
 export type QuotaHeaderFeedEntry = QuotaHeaderFeedIdentity &
   QuotaHeaderFeedMetadata & {
+    anthropic_account_uuid: ProviderAccountUuid | null
     quota: QuotaHeaderFeedQuota
   }
 
 export type QuotaHeaderFeedPublishEntry = QuotaHeaderFeedIdentity &
   QuotaHeaderFeedMetadata & {
+    anthropic_account_uuid?: ProviderAccountUuid | null
     quota: Omit<QuotaHeaderFeedQuota, 'provenance'> & {
       fieldSources?: QuotaFieldSources
     }
@@ -105,6 +108,12 @@ function validIdentity(
   )
     return false
   if (!entry.quota || typeof entry.quota !== 'object') return false
+  if (
+    !Object.hasOwn(entry, 'anthropic_account_uuid') ||
+    (entry.anthropic_account_uuid !== null &&
+      typeof entry.anthropic_account_uuid !== 'string')
+  )
+    return false
   if (entry.identity_source === 'none') {
     return !('credential_id' in entry) && !('account_ref' in entry)
   }
@@ -305,6 +314,7 @@ export class QuotaHeaderFeedRegistry {
     const { accountKey, quota, ...entryWithoutQuota } = entry
     const cleanEntry = {
       ...entryWithoutQuota,
+      anthropic_account_uuid: entry.anthropic_account_uuid ?? null,
       quota: projectQuota(quota),
     } as QuotaHeaderFeedEntry
     try {

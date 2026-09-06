@@ -137,6 +137,7 @@ import {
   type PrimeManagerOptions,
   type PrimeRefreshResult,
   type PrimeSendResult,
+  type ProviderAccountUuid,
   parseAccountCommandAction,
   parseCache1hCommandAction,
   parseCacheKeepCommandAction,
@@ -702,12 +703,14 @@ type StickyOAuthRoute = {
 }
 
 type MainQuotaIdentityBinding = {
-  accountIdentity: string | undefined
+  quotaKey: string | undefined
+  providerAccountUuid?: ProviderAccountUuid
   generation: number
 }
 
 type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
   stale: boolean
+  state: CustodyStatusState
 }
 
 const FABLE_SWITCHED_TO_OPUS_NOTICE =
@@ -1151,6 +1154,7 @@ const anthropicAuthPlugin = async (
   async function reconcileMainQuotaAccountIdentity(
     accessToken: string,
     accountIdentity: string | undefined,
+    providerAccountUuid?: ProviderAccountUuid,
   ): Promise<void> {
     if (
       mainQuotaIdentityAccessToken === accessToken &&
@@ -1159,11 +1163,16 @@ const anthropicAuthPlugin = async (
       return
     }
 
+    const providerIdentityChanged =
+      mainProviderAccountUuid !== undefined &&
+      providerAccountUuid !== undefined &&
+      mainProviderAccountUuid !== providerAccountUuid
     mainQuotaIdentityAccessToken = accessToken
     mainQuotaAccountId = accountIdentity
     const clearedGeneration = quotaManager.setMainQuotaAccountIdentity(
       accountIdentity,
       accessToken.startsWith('sk-ant-oat'),
+      providerIdentityChanged,
     )
     if (accountIdentity === undefined) return
 
@@ -1194,7 +1203,7 @@ const anthropicAuthPlugin = async (
 
   async function persistFallbackAnthropicAccountUuid(
     accountId: string,
-    anthropicAccountUuid: string,
+    anthropicAccountUuid: ProviderAccountUuid,
   ): Promise<void> {
     const storage = await loadAccounts(accountStoragePath)
     const account = storage?.accounts.find(
@@ -1216,46 +1225,96 @@ const anthropicAuthPlugin = async (
   async function resolveMainQuotaAccountIdentity(
     accessToken: string,
     model?: string,
+    credentialAccountUuid?: string,
+    credentialRecordVersion?: number,
   ): Promise<MainQuotaIdentityResolution> {
-    const inFlight = mainQuotaIdentityResolutions.get(accessToken)
-    if (inFlight) return inFlight
+    const resolutionKey = accessToken
+    const inFlight = mainQuotaIdentityResolutions.get(resolutionKey)
+    if (inFlight) {
+      const resolved = await inFlight.promise
+      return credentialRecordVersion === inFlight.recordVersion
+        ? resolved
+        : { ...resolved, stale: true }
+    }
 
     const resolution = (async () => {
       const resolutionGeneration = ++mainQuotaIdentityResolutionGeneration
+      const quotaKey = mainAccountId
       const identity = await resolveClaudeCodeIdentity(
         accessToken,
         model,
-        mainAccountId,
+        credentialAccountUuid ?? quotaKey,
       )
       // Adapters that do not use Claude's OAuth token format cannot be bootstrapped;
       // keep the slot identity only for that compatibility path. Claude OAuth
       // credentials use the oat prefix and stay unknown when bootstrap fails.
-      const quotaIdentity =
+      const providerAccountUuid =
         identity.accountUuid ??
-        (!accessToken.startsWith('sk-ant-oat') ? mainAccountId : undefined)
+        (credentialAccountUuid as ProviderAccountUuid | undefined)
+      const currentStorage = await loadAccounts(accountStoragePath)
+      const persistedProviderAccountUuid =
+        currentStorage?.main?.profile?.providerAccountUuid ??
+        (currentStorage?.main?.profile?.accountIdentity as
+          | ProviderAccountUuid
+          | undefined) ??
+        (currentStorage?.mainAccountId as ProviderAccountUuid | undefined)
+      const state: CustodyStatusState =
+        getClaustrumMode(currentStorage) !== 'claustrum'
+          ? 'na'
+          : (persistedProviderAccountUuid === undefined) !==
+              (providerAccountUuid === undefined)
+            ? 'unknown-identity'
+            : persistedProviderAccountUuid !== undefined &&
+                providerAccountUuid !== undefined &&
+                persistedProviderAccountUuid !== providerAccountUuid
+              ? 'on-identity-mismatch'
+              : 'on-vault-served'
       if (resolutionGeneration !== mainQuotaIdentityResolutionGeneration) {
         const identityChanged =
           mainQuotaIdentityAccessToken !== accessToken ||
-          mainQuotaAccountId !== quotaIdentity
+          mainQuotaAccountId !== quotaKey
         return {
-          accountIdentity: quotaIdentity,
+          quotaKey,
+          providerAccountUuid,
           generation: quotaManager.getMainQuotaIdentityGeneration(),
           stale: identityChanged,
+          state,
         }
       }
-      await reconcileMainQuotaAccountIdentity(accessToken, quotaIdentity)
+      await reconcileMainQuotaAccountIdentity(
+        accessToken,
+        quotaKey,
+        providerAccountUuid,
+      )
+      if (
+        accessToken.startsWith('sk-ant-oat') &&
+        providerAccountUuid === undefined
+      ) {
+        quotaManager.clearMain()
+      }
+      mainProviderAccountUuid = providerAccountUuid
+      if (accessToken.startsWith('sk-ant-oat')) {
+        mainServedAccessToken = accessToken
+      }
       return {
-        accountIdentity: quotaIdentity,
+        quotaKey,
+        providerAccountUuid,
         generation: quotaManager.getMainQuotaIdentityGeneration(),
         stale: false,
+        state,
       }
     })()
-    mainQuotaIdentityResolutions.set(accessToken, resolution)
+    mainQuotaIdentityResolutions.set(resolutionKey, {
+      promise: resolution,
+      recordVersion: credentialRecordVersion,
+    })
     try {
       return await resolution
     } finally {
-      if (mainQuotaIdentityResolutions.get(accessToken) === resolution) {
-        mainQuotaIdentityResolutions.delete(accessToken)
+      if (
+        mainQuotaIdentityResolutions.get(resolutionKey)?.promise === resolution
+      ) {
+        mainQuotaIdentityResolutions.delete(resolutionKey)
       }
     }
   }
@@ -1273,6 +1332,7 @@ const anthropicAuthPlugin = async (
     accountId: string,
     accountIdentity: string | undefined,
     accessToken: string,
+    providerAccountUuid?: ProviderAccountUuid,
     signal?: AbortSignal,
   ) {
     if (signal?.aborted) return undefined
@@ -1282,6 +1342,7 @@ const anthropicAuthPlugin = async (
       const fetchAttempt = fetchOAuthAccountProfile({
         accessToken,
         accountIdentity,
+        providerAccountUuid,
         fetchImpl: profileFetch,
         signal,
       })
@@ -1319,6 +1380,7 @@ const anthropicAuthPlugin = async (
   async function persistProfileStateBestEffort(input: {
     accountId: 'main' | string
     accountIdentity?: string
+    providerAccountUuid?: ProviderAccountUuid
     accessToken: string
     profile: OAuthAccount['profile']
   }): Promise<boolean | undefined> {
@@ -1344,6 +1406,7 @@ const anthropicAuthPlugin = async (
     storage: AccountStorage,
     mainAccessToken?: string,
     signal?: AbortSignal,
+    mainProviderAccountUuid?: ProviderAccountUuid,
   ): Promise<AccountStorage> {
     if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1') {
       return storage
@@ -1353,12 +1416,14 @@ const anthropicAuthPlugin = async (
     if (
       mainAccessToken &&
       storage.main?.profile &&
-      !oauthProfileMatchesIdentity(storage.main.profile, mainIdentity)
+      mainProviderAccountUuid &&
+      storage.main.profile.providerAccountUuid !== mainProviderAccountUuid
     ) {
       storage.main.profile = undefined
       void persistProfileStateBestEffort({
         accountId: 'main',
         accountIdentity: mainIdentity,
+        providerAccountUuid: mainProviderAccountUuid,
         accessToken: mainAccessToken,
         profile: undefined,
       }).catch(() => {})
@@ -1376,6 +1441,7 @@ const anthropicAuthPlugin = async (
       void persistProfileStateBestEffort({
         accountId: 'main',
         accountIdentity: mainIdentity,
+        providerAccountUuid: mainProviderAccountUuid,
         accessToken: mainAccessToken,
         profile: storage.main.profile,
       }).catch(() => {})
@@ -1383,8 +1449,9 @@ const anthropicAuthPlugin = async (
     if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
       const profile = await hydrateProfileOnce(
         'main',
-        mainIdentity,
+        undefined,
         mainAccessToken,
+        mainProviderAccountUuid,
         signal,
       )
       if (profile) {
@@ -1396,6 +1463,7 @@ const anthropicAuthPlugin = async (
         void persistProfileStateBestEffort({
           accountId: 'main',
           accountIdentity: mainIdentity,
+          providerAccountUuid: mainProviderAccountUuid,
           accessToken: mainAccessToken,
           profile,
         }).catch(() => {})
@@ -1432,6 +1500,7 @@ const anthropicAuthPlugin = async (
         account.id,
         account.id,
         accessToken,
+        undefined,
         signal,
       )
       if (profile) {
@@ -1454,6 +1523,7 @@ const anthropicAuthPlugin = async (
       accountId: 'main' | string
       accessToken: string
       authLineageId?: string
+      providerAccountUuid?: ProviderAccountUuid
       mainQuotaIdentity?: MainQuotaIdentityBinding
     },
     entry: QuotaEntry,
@@ -1461,7 +1531,7 @@ const anthropicAuthPlugin = async (
     const storage =
       (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
     if (served.accountId === 'main') {
-      const accountIdentity = served.mainQuotaIdentity?.accountIdentity
+      const accountIdentity = served.mainQuotaIdentity?.quotaKey
       if (!accountIdentity || entry.quota.accountIdentity !== accountIdentity) {
         logger.trace(
           'quota',
@@ -1561,6 +1631,7 @@ const anthropicAuthPlugin = async (
     served: {
       accountId: 'main' | string
       accessToken: string
+      providerAccountUuid?: ProviderAccountUuid
       mainQuotaIdentity?: MainQuotaIdentityBinding
     },
     entry: QuotaEntry,
@@ -1568,7 +1639,9 @@ const anthropicAuthPlugin = async (
     if (!quotaHeaderFeedRegistry) return
     if (
       served.accountId === 'main' &&
-      !served.mainQuotaIdentity?.accountIdentity
+      (!served.mainQuotaIdentity?.quotaKey ||
+        (served.accessToken.startsWith('sk-ant-oat') &&
+          !served.providerAccountUuid))
     ) {
       // Observed-at staleness exposes silence; an unknown key must not replace verified data.
       return
@@ -1598,10 +1671,13 @@ const anthropicAuthPlugin = async (
       extraUsage: entry.quota.extraUsage,
       fieldSources: entry.quota.fieldSources,
     }
+    const providerIdentity = {
+      anthropic_account_uuid: served.providerAccountUuid ?? null,
+    }
     const accountKey =
       credentialId ??
       (served.accountId === 'main'
-        ? (served.mainQuotaIdentity?.accountIdentity ?? 'main')
+        ? (served.mainQuotaIdentity?.quotaKey ?? 'main')
         : served.accountId)
     const feedEntry: QuotaHeaderFeedPublishEntry = credentialId
       ? {
@@ -1611,17 +1687,19 @@ const anthropicAuthPlugin = async (
           provider: 'anthropic',
           configured_account_count: configuredAccountCount,
           observed_at_ms: observedAtMs,
+          ...providerIdentity,
           quota,
           accountKey,
         }
-      : served.accountId === 'main' && served.mainQuotaIdentity?.accountIdentity
+      : served.accountId === 'main' && served.mainQuotaIdentity?.quotaKey
         ? {
             identity_source: 'account_ref',
-            account_ref: served.mainQuotaIdentity.accountIdentity,
+            account_ref: served.mainQuotaIdentity.quotaKey,
             schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
             provider: 'anthropic',
             configured_account_count: configuredAccountCount,
             observed_at_ms: observedAtMs,
+            ...providerIdentity,
             quota,
             accountKey,
           }
@@ -1632,6 +1710,7 @@ const anthropicAuthPlugin = async (
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
               observed_at_ms: observedAtMs,
+              ...providerIdentity,
               quota,
               accountKey,
             }
@@ -1642,6 +1721,7 @@ const anthropicAuthPlugin = async (
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
               observed_at_ms: observedAtMs,
+              ...providerIdentity,
               quota,
               accountKey,
             }
@@ -1660,6 +1740,7 @@ const anthropicAuthPlugin = async (
       accountId: 'main' | string
       accessToken: string
       authLineageId?: string
+      providerAccountUuid?: ProviderAccountUuid
       mainQuotaIdentity?: MainQuotaIdentityBinding
     },
   ): void {
@@ -1680,7 +1761,7 @@ const anthropicAuthPlugin = async (
             mainQuotaIdentity.generation
         ) {
           logger.trace('quota', 'discarded stale main quota headers', {
-            boundIdentity: mainQuotaIdentity?.accountIdentity,
+            boundIdentity: mainQuotaIdentity?.quotaKey,
             currentGeneration: quotaManager.getMainQuotaIdentityGeneration(),
           })
           return
@@ -1689,7 +1770,7 @@ const anthropicAuthPlugin = async (
       const entry =
         served.accountId === 'main'
           ? quotaManager.pushMainFromHeaders(
-              mainQuotaIdentity?.accountIdentity,
+              mainQuotaIdentity?.quotaKey,
               incoming,
             )
           : quotaManager.pushFallbackFromHeaders(served.accountId, incoming, {
@@ -1952,7 +2033,11 @@ const anthropicAuthPlugin = async (
       const cached = mainHandle
         ? claustrumCredentialCache?.peek(mainHandle)
         : undefined
-      const persistedIdentity = mainAccountId ?? storage.mainAccountId
+      const persistedIdentity =
+        storage.main?.profile?.providerAccountUuid ??
+        (storage.main?.profile?.accountIdentity as
+          | ProviderAccountUuid
+          | undefined)
       const credentialIdentity = cached?.accountId
       if (
         (persistedIdentity === undefined) !==
@@ -3390,11 +3475,11 @@ const anthropicAuthPlugin = async (
   // so they never clobber the active account back to 'main'.
   async function refreshSidebarQuota() {
     const storage = await loadAccounts(accountStoragePath)
-    let access: string | undefined
+    let access: string | undefined = mainServedAccessToken
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        access = auth.access
+        access ??= auth.access
       } catch {
         // best-effort
       }
@@ -3415,8 +3500,7 @@ const anthropicAuthPlugin = async (
   ) {
     if (!accessToken) return
     if (storage?.quota?.enabled !== true) return
-    const accountIdentity =
-      mainQuotaIdentity?.accountIdentity ?? mainQuotaAccountId
+    const accountIdentity = mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId
     if (quotaManager.getMain(accountIdentity)) return
     if (sidebarMainQuotaRefreshInFlight) return
 
@@ -3440,11 +3524,16 @@ const anthropicAuthPlugin = async (
     | null = null
   let mainAccountId: string | undefined
   let mainQuotaAccountId: string | undefined
+  let mainServedAccessToken: string | undefined
+  let mainProviderAccountUuid: ProviderAccountUuid | undefined
   let mainQuotaIdentityAccessToken: string | undefined
   let mainQuotaIdentityResolutionGeneration = 0
   const mainQuotaIdentityResolutions = new Map<
     string,
-    Promise<MainQuotaIdentityResolution>
+    {
+      promise: Promise<MainQuotaIdentityResolution>
+      recordVersion?: number
+    }
   >()
   let sidebarMainQuotaRefreshInFlight = false
   let mainBackgroundRefreshTimer: ReturnType<typeof setInterval> | null = null
@@ -3527,14 +3616,14 @@ const anthropicAuthPlugin = async (
       try {
         const auth = await latestGetAuth()
         if (auth.type === 'oauth' && auth.access) {
-          mainAccessToken = auth.access
-          await resolveMainQuotaAccountIdentity(auth.access)
+          mainAccessToken = mainServedAccessToken ?? auth.access
+          await resolveMainQuotaAccountIdentity(mainAccessToken)
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
           // returns the last cached snapshot when the API is backed off.
           const quota = await quotaManager.refreshMain(
             mainQuotaAccountId,
-            auth.access,
+            mainAccessToken,
           )
           accounts.push({
             name: 'OpenCode anthropic',
@@ -3571,6 +3660,7 @@ const anthropicAuthPlugin = async (
       storage ?? createEmptyStorage(),
       mainAccessToken,
       AbortSignal.timeout(3_000),
+      mainProviderAccountUuid,
     )
     const mainSummary = accounts.find((account) => account.role === 'main')
     if (mainSummary) {
@@ -4250,13 +4340,15 @@ const anthropicAuthPlugin = async (
       if (latestGetAuth) {
         try {
           const auth = await latestGetAuth()
-          if (auth.type === 'oauth') mainAccessToken = auth.access
+          if (auth.type === 'oauth')
+            mainAccessToken = mainServedAccessToken ?? auth.access
         } catch {}
       }
       storage = await ensureProfilesForQuotaDisplay(
         storage,
         mainAccessToken,
         AbortSignal.timeout(3_000),
+        mainProviderAccountUuid,
       )
     }
     const statusProjection =
@@ -4931,7 +5023,11 @@ const anthropicAuthPlugin = async (
         if (auth.type === 'oauth') {
           const custodyStorage = await loadAccounts(accountStoragePath)
           const mainCustody = mainCustodyAccount(auth)
-          mainCustody.anthropicAccountUuid = custodyStorage?.mainAccountId
+          mainCustody.anthropicAccountUuid =
+            custodyStorage?.main?.profile?.providerAccountUuid ??
+            (custodyStorage?.main?.profile?.accountIdentity as
+              | ProviderAccountUuid
+              | undefined)
           const mainBinding =
             getClaustrumMode(custodyStorage) === 'claustrum' && custodyStorage
               ? resolveAccountCustodyHandle(mainCustody, custodyStorage)
@@ -4945,6 +5041,7 @@ const anthropicAuthPlugin = async (
             }
           }
           if (isCustodyTombstoneOAuth(auth, 'anthropic')) {
+            mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
             if (getClaustrumMode(custodyStorage) === 'claustrum') {
               await refreshVaultBackedOAuthAccounts(true)
               const handle =
@@ -4966,6 +5063,16 @@ const anthropicAuthPlugin = async (
                     if (hasClaustrumIdentityMismatch(mainCustody, cached)) {
                       return claustrumMainRefusal('identity-mismatch')
                     }
+                    const mainQuotaIdentity =
+                      await resolveMainQuotaAccountIdentity(
+                        accessToken,
+                        undefined,
+                        cached.accountId,
+                        cached.recordVersion,
+                      )
+                    mainServedAccessToken = accessToken
+                    mainProviderAccountUuid =
+                      mainQuotaIdentity.providerAccountUuid
                     const response = await sendWithAccessToken(
                       input,
                       init,
@@ -4977,7 +5084,7 @@ const anthropicAuthPlugin = async (
                       undefined,
                       undefined,
                       false,
-                      undefined,
+                      mainQuotaIdentity,
                       {
                         accessToken,
                         credentialAccountId: cached.accountId,
@@ -5902,7 +6009,11 @@ const anthropicAuthPlugin = async (
               accessToken,
               modelForIdentity,
               oauthAccountId === 'main'
-                ? (claustrumResolution?.credentialAccountId ?? mainAccountId)
+                ? (mainQuotaIdentity?.quotaKey ??
+                    claustrumResolution?.credentialAccountId ??
+                    (!accessToken.startsWith('sk-ant-oat')
+                      ? mainAccountId
+                      : undefined))
                 : oauthAccountId,
             )
             if (oauthAccountId !== 'main' && identity.accountUuid) {
@@ -6154,6 +6265,12 @@ const anthropicAuthPlugin = async (
               accountId: oauthAccountId,
               accessToken,
               authLineageId: fallbackAuthLineageId,
+              ...(oauthAccountId === 'main' &&
+              mainQuotaIdentity?.providerAccountUuid
+                ? {
+                    providerAccountUuid: mainQuotaIdentity.providerAccountUuid,
+                  }
+                : {}),
               ...(oauthAccountId === 'main' && mainQuotaIdentity
                 ? { mainQuotaIdentity }
                 : {}),
@@ -6252,7 +6369,7 @@ const anthropicAuthPlugin = async (
           ) {
             if (!accessToken) return false
             const entry = quotaManager.getMain(
-              mainQuotaIdentity?.accountIdentity ?? mainQuotaAccountId,
+              mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId,
             )
             // A genuine response header is live routing evidence like a 429, but
             // it gets no exemption from the shared freshness and token gates.
@@ -6270,7 +6387,7 @@ const anthropicAuthPlugin = async (
             if (!accessToken) return false
             try {
               await quotaManager.refreshMain(
-                mainQuotaIdentity?.accountIdentity ?? mainQuotaAccountId,
+                mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId,
                 accessToken,
                 mainQuotaIdentity?.generation,
               )
@@ -6361,7 +6478,7 @@ const anthropicAuthPlugin = async (
             requestedModelId?: string
             mainQuotaIdentity?: MainQuotaIdentityBinding
           }) {
-            const mainQuotaIdentity = input.mainQuotaIdentity?.accountIdentity
+            const mainQuotaIdentity = input.mainQuotaIdentity?.quotaKey
             const mainEntry = quotaManager.getMain(mainQuotaIdentity)
             let mainQuota = mainEntry?.quota
             if (
@@ -6396,8 +6513,8 @@ const anthropicAuthPlugin = async (
                 id: STICKY_ROUTING_MAIN_ACCOUNT_ID,
                 access: input.mainAccessToken,
                 quota: mainQuota,
-                identity: mainAccountId
-                  ? { kind: 'known', accountId: mainAccountId }
+                identity: mainQuotaIdentity
+                  ? { kind: 'known', accountId: mainQuotaIdentity }
                   : { kind: 'unknown' },
                 order: 0,
               })
@@ -7462,7 +7579,7 @@ const anthropicAuthPlugin = async (
                         quota =
                           route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                             ? await quotaManager.refreshMain(
-                                requestMainQuotaIdentity?.accountIdentity,
+                                requestMainQuotaIdentity?.quotaKey,
                                 route.access,
                                 requestMainQuotaIdentity?.generation,
                               )
@@ -7694,7 +7811,7 @@ const anthropicAuthPlugin = async (
               function showQuotaToastFromCache() {
                 if (storage?.quota?.showToasts !== true) return
                 const mainEntry = quotaManager.getMain(
-                  requestMainQuotaIdentity?.accountIdentity,
+                  requestMainQuotaIdentity?.quotaKey,
                 )
                 if (!mainEntry) return
                 // Prefer the shared QuotaManager cache for fallback quota so the
@@ -7735,17 +7852,17 @@ const anthropicAuthPlugin = async (
                   // Identity-aware read prevents routing with a previous main
                   // account's quota after a slot switch.
                   let routingQuotaEntry = quotaManager.getMain(
-                    requestMainQuotaIdentity?.accountIdentity,
+                    requestMainQuotaIdentity?.quotaKey,
                   )
                   let routingQuota = routingQuotaEntry?.quota
                   if (!routingQuota) {
                     routingQuota = await quotaManager.refreshMain(
-                      requestMainQuotaIdentity?.accountIdentity,
+                      requestMainQuotaIdentity?.quotaKey,
                       auth.access,
                       requestMainQuotaIdentity?.generation,
                     )
                     routingQuotaEntry = quotaManager.getMain(
-                      requestMainQuotaIdentity?.accountIdentity,
+                      requestMainQuotaIdentity?.quotaKey,
                     )
                     showQuotaToastFromCache()
                   } else if (
@@ -7768,12 +7885,12 @@ const anthropicAuthPlugin = async (
                       // below still refuses API-key routes because the entry is not
                       // fresh.
                       routingQuota = await quotaManager.refreshMain(
-                        requestMainQuotaIdentity?.accountIdentity,
+                        requestMainQuotaIdentity?.quotaKey,
                         auth.access,
                         requestMainQuotaIdentity?.generation,
                       )
                       routingQuotaEntry = quotaManager.getMain(
-                        requestMainQuotaIdentity?.accountIdentity,
+                        requestMainQuotaIdentity?.quotaKey,
                       )
                     } else {
                       // Stale OR every-N request boundary — background refresh,
@@ -7781,7 +7898,7 @@ const anthropicAuthPlugin = async (
                       // sidebar and show the toast once the new main quota lands.
                       void quotaManager
                         .refreshMain(
-                          requestMainQuotaIdentity?.accountIdentity,
+                          requestMainQuotaIdentity?.quotaKey,
                           auth.access,
                           requestMainQuotaIdentity?.generation,
                         )
@@ -7857,11 +7974,14 @@ const anthropicAuthPlugin = async (
               }
 
               let mainQuota = quotaManager.getMain(
-                requestMainQuotaIdentity?.accountIdentity,
+                requestMainQuotaIdentity?.quotaKey,
               )?.quota
               if (
                 storage?.quota?.failClosedOnUnknownQuota &&
-                !mainQuota &&
+                (mainQuota === undefined ||
+                  (auth.access.startsWith('sk-ant-oat') &&
+                    requestMainQuotaIdentity?.providerAccountUuid ===
+                      undefined)) &&
                 quotaManager.isBackedOff()
               ) {
                 const lastError = quotaManager.getLastApiError()
@@ -7911,7 +8031,7 @@ const anthropicAuthPlugin = async (
                     )
                     await Promise.all([
                       quotaManager.refreshMain(
-                        requestMainQuotaIdentity?.accountIdentity,
+                        requestMainQuotaIdentity?.quotaKey,
                         auth.access,
                         requestMainQuotaIdentity?.generation,
                       ),
@@ -7933,7 +8053,7 @@ const anthropicAuthPlugin = async (
                 // against fresh quota. The initial read above is null on the
                 // first request, before the refresh populates the cache.
                 mainQuota = quotaManager.getMain(
-                  requestMainQuotaIdentity?.accountIdentity,
+                  requestMainQuotaIdentity?.quotaKey,
                 )?.quota
               }
 
@@ -8166,6 +8286,7 @@ const anthropicAuthPlugin = async (
     },
     __primeManager: primeManager,
     __quotaManager: quotaManager,
+    __resolveMainQuotaIdentityForTest: resolveMainQuotaAccountIdentity,
     __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,
     __fallbackRefreshReady: fallbackRefreshReady,
     get __claustrumCredentialCache() {

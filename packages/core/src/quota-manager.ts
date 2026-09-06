@@ -130,6 +130,7 @@ export class QuotaManager {
   // --- Inflight deduplication ---
   private inflightMain: Promise<QuotaRefreshResult> | null = null
   private inflightMainAccountId: string | undefined
+  private inflightMainAccessToken: string | undefined
   private inflightFallbacks = new Map<string, Promise<QuotaRefreshResult>>()
 
   // --- Rate-limiting (scoped per route so a fallback 429 never backs off the
@@ -208,14 +209,21 @@ export class QuotaManager {
     this.main = entry
   }
 
+  clearMain(): void {
+    this.mainAccountId = undefined
+    this.main = null
+  }
+
   /** Bind quota state to the account behind the current main credential. */
   setMainQuotaAccountIdentity(
     accountIdentity: string | undefined,
     strict = true,
+    force = false,
   ): number | undefined {
     const previousIdentityKnown = this.mainQuotaIdentityKnown
     const previousAccountIdentity = this.mainAccountId
     const changed =
+      force ||
       !previousIdentityKnown ||
       this.mainAccountId !== accountIdentity ||
       this.mainQuotaIdentityStrict !== strict
@@ -225,7 +233,15 @@ export class QuotaManager {
 
     this.mainGeneration += 1
     this.mainAccountId = accountIdentity
-    if (
+    if (force) {
+      this.main = null
+      this.mainLastApiError = undefined
+      this.mainQuotaErrorGeneration += 1
+      this.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
+        this.mainQuotaErrorClearedAt,
+        this.now(),
+      )
+    } else if (
       accountIdentity !== undefined &&
       this.main?.quota.accountIdentity !== accountIdentity
     ) {
@@ -361,7 +377,11 @@ export class QuotaManager {
       if (this.mainQuotaIdentityKnown) this.mainGeneration += 1
     }
 
-    if (this.inflightMain && this.inflightMainAccountId === effectiveAccountId)
+    if (
+      this.inflightMain &&
+      this.inflightMainAccountId === effectiveAccountId &&
+      this.inflightMainAccessToken === credential
+    )
       return this.inflightMain
 
     // Rate-limit — if API recently 429'd, return stale or throw
@@ -373,6 +393,7 @@ export class QuotaManager {
     }
 
     this.inflightMainAccountId = effectiveAccountId
+    this.inflightMainAccessToken = credential
     const generation = this.mainGeneration
     this.inflightMain = this._fetchMain(
       effectiveAccountId,

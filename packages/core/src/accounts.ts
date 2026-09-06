@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
+import type { ProviderAccountUuid } from './claude-code.ts'
 import {
   assertNotCustodyTombstone,
   type CustodyHandleResolution,
@@ -19,6 +20,8 @@ import { parseJsonRedacted } from './json.ts'
 import { type LogLevel, log, logger } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
+
+export type { ProviderAccountUuid } from './claude-code.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -53,7 +56,7 @@ export type AccountBase = {
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
-  anthropicAccountUuid?: string
+  anthropicAccountUuid?: ProviderAccountUuid
   claustrumHandle?: string
   access?: string
   refresh: string
@@ -180,6 +183,7 @@ export type OAuthAccountProfile = {
   checkedAt: number
   /** Stable account identity; tokenFingerprint remains loadable for legacy state. */
   accountIdentity?: string
+  providerAccountUuid?: ProviderAccountUuid
   tokenFingerprint?: string
 }
 
@@ -566,7 +570,7 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
     anthropicAccountUuid:
       typeof value.anthropicAccountUuid === 'string' &&
       value.anthropicAccountUuid.trim()
-        ? value.anthropicAccountUuid.trim()
+        ? (value.anthropicAccountUuid.trim() as ProviderAccountUuid)
         : undefined,
     claustrumHandle:
       typeof value.claustrumHandle === 'string' && value.claustrumHandle.trim()
@@ -608,6 +612,11 @@ function normalizeOAuthAccountProfile(
     ...(typeof value.accountIdentity === 'string' &&
       value.accountIdentity.trim() && {
         accountIdentity: value.accountIdentity.trim(),
+      }),
+    ...(typeof value.providerAccountUuid === 'string' &&
+      value.providerAccountUuid.trim() && {
+        providerAccountUuid:
+          value.providerAccountUuid.trim() as ProviderAccountUuid,
       }),
     ...(typeof value.tokenFingerprint === 'string' &&
       value.tokenFingerprint.trim() && {
