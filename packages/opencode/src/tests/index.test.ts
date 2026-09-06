@@ -1149,6 +1149,9 @@ describe('fallback Claustrum credential resolution', () => {
     quota = { enabled: false, failClosedOnUnknownQuota: false },
     connector,
     onFetch,
+    response,
+    storageOverrides,
+    initialNow,
   }: {
     fallbacks: Array<{
       label: string
@@ -1160,7 +1163,14 @@ describe('fallback Claustrum credential resolution', () => {
     quota?: AccountStorage['quota']
     connector?: (calls: CredentialCall[]) => ReturnType<typeof connectorFor>
     onFetch?: (input: unknown, init?: RequestInit) => Response
+    response?: Response | (() => Response)
+    storageOverrides?: Omit<
+      Partial<AccountStorage>,
+      'accounts' | 'claustrum' | 'quota' | 'routing'
+    >
+    initialNow?: number
   }) {
+    let now = initialNow ?? Date.now()
     const calls: CredentialCall[] = []
     const authorizations: string[] = []
     const routing: AccountStorage['routing'] =
@@ -1171,6 +1181,7 @@ describe('fallback Claustrum credential resolution', () => {
           : { mode: 'sticky-balanced' }
     await useTempAccountFile(
       createFallbackStorage({
+        ...storageOverrides,
         claustrum: { mode: 'claustrum' },
         routing,
         quota,
@@ -1208,10 +1219,14 @@ describe('fallback Claustrum credential resolution', () => {
         )
       }
       return Promise.resolve(
-        onFetch?.(input, init) ?? new Response('{}', { status: 200 }),
+        onFetch?.(input, init) ??
+          (typeof response === 'function'
+            ? response()
+            : (response?.clone() ?? new Response('{}', { status: 200 }))),
       )
     }) as unknown as typeof fetch
     const plugin = await getPlugin(undefined, undefined, {
+      claustrumNow: () => now,
       claustrumConnector:
         connector?.(calls) ??
         manifestConnector(
@@ -1226,7 +1241,16 @@ describe('fallback Claustrum credential resolution', () => {
       () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
       { models: {} },
     )
-    return { authorizations, calls, manifestPath, plugin, result }
+    return {
+      authorizations,
+      calls,
+      manifestPath,
+      plugin,
+      result,
+      setNow(value: number) {
+        now = value
+      },
+    }
   }
 
   describe('vault-served main routes generically', () => {
@@ -3401,7 +3425,9 @@ describe('fallback Claustrum credential resolution', () => {
 
     const calls: CredentialCall[] = []
     const clearCalls: string[] = []
-    const connector = connectorFor(calls, (method) => {
+    const connector = connectorFor(calls, (method, params) => {
+      if (method === 'credential.get' && params.handle === ruledMainHandle)
+        return credentialResponse('vault-main-access', 1)
       if (method === 'credential.get')
         return credentialResponse('vault-access', 23)
       return { result: {} }
@@ -3818,6 +3844,43 @@ describe('fallback Claustrum credential resolution', () => {
     return { authorizations, plugin, result }
   }
 
+  async function loadRuledFallbackWithConnector(
+    storage: AccountStorage,
+    connector: (options: unknown) => Promise<unknown>,
+    response: Response | (() => Response),
+  ) {
+    const fallbacks = storage.accounts
+      .filter(isOAuthAccount)
+      .map((account, index) => {
+        const {
+          access: _access,
+          refresh: _refresh,
+          expires: _expires,
+          claustrumHandle: _claustrumHandle,
+          ...accountFixture
+        } = account
+        return {
+          label: account.label ?? account.id,
+          handle: `ckh_${String.fromCharCode(65 + index).repeat(43)}`,
+          access: `vault-${account.id}-access`,
+          account: accountFixture,
+        }
+      })
+    return bootRuledClaustrumRow({
+      fallbacks,
+      route:
+        storage.routing?.mode === 'sticky-balanced'
+          ? { sticky: 'ruled-sticky' }
+          : storage.routing?.mode === 'main-first'
+            ? 'main-exhausted'
+            : 'fallback-first',
+      quota: storage.quota,
+      storageOverrides: { quotaHeaderFeed: storage.quotaHeaderFeed },
+      connector: () => connector,
+      response,
+    })
+  }
+
   test('local mode does not serve or refresh a bound inert fallback', async () => {
     const calls: CredentialCall[] = []
     let connectorCalls = 0
@@ -3858,7 +3921,9 @@ describe('fallback Claustrum credential resolution', () => {
       label: 'identity-fenced',
       anthropicAccountUuid: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     } as never)
-    const connector = connectorFor(calls, (method) => {
+    const connector = connectorFor(calls, (method, params) => {
+      if (method === 'credential.get' && params.handle === ruledMainHandle)
+        return credentialResponse('vault-main-access', 1)
       if (method === 'credential.get')
         return credentialResponse(
           'vault-identity-fenced-access',
@@ -3868,26 +3933,23 @@ describe('fallback Claustrum credential resolution', () => {
         )
       return { result: {} }
     })
-    const { authorizations, plugin, result } = await loadFallbackWithConnector(
-      storage,
-      connector,
-      new Response('{}', { status: 401 }),
-      {
-        beforePlugin: async () => {
-          await writeManifest([
-            { label: 'identity-fenced', handle: manifestHandle },
-          ])
-        },
-      },
-    )
+    const { authorizations, plugin, result } =
+      await loadRuledFallbackWithConnector(
+        storage,
+        connector,
+        new Response('{}', { status: 401 }),
+      )
+    const initialCredentialGets = calls.filter(
+      (call) => call.method === 'credential.get',
+    ).length
 
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(401)
-    expect(authorizations).toEqual(['Bearer main-access'])
+    expect(authorizations).toEqual(['Bearer vault-main-access'])
     expect(
       calls.filter((call) => call.method === 'credential.get'),
-    ).toHaveLength(1)
+    ).toHaveLength(initialCredentialGets)
     await plugin.dispose?.()
   })
 
@@ -3916,8 +3978,10 @@ describe('fallback Claustrum credential resolution', () => {
           } as OAuthAccount,
         ],
       })
-      const connector = connectorFor(calls, (method) => {
+      const connector = connectorFor(calls, (method, params) => {
         if (method === 'credential.get') {
+          if (params.handle === ruledMainHandle)
+            return credentialResponse('vault-main-access', 2)
           return credentialResponse(
             'vault-identity-allowed-access',
             2,
@@ -3928,7 +3992,7 @@ describe('fallback Claustrum credential resolution', () => {
         return { result: {} }
       })
       const { authorizations, plugin, result } =
-        await loadFallbackWithConnector(
+        await loadRuledFallbackWithConnector(
           storage,
           connector,
           new Response('{}', {
@@ -3938,13 +4002,6 @@ describe('fallback Claustrum credential resolution', () => {
               'anthropic-ratelimit-unified-5h-reset': '1800000000',
             },
           }),
-          {
-            beforePlugin: async () => {
-              await writeManifest([
-                { label: 'identity-allowed', handle: fallbackTestHandle },
-              ])
-            },
-          },
         )
       await plugin.__fallbackRefreshReady
       const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
@@ -3952,7 +4009,7 @@ describe('fallback Claustrum credential resolution', () => {
       expect(response.status).toBe(401)
       expect(authorizations).toEqual([
         'Bearer vault-identity-allowed-access',
-        'Bearer main-access',
+        'Bearer vault-main-access',
       ])
       const entries = await waitForFeedEntries(
         (candidate) =>
@@ -4249,35 +4306,50 @@ describe('fallback Claustrum credential resolution', () => {
   test('does not use a JSON credential payload without a token as bearer auth', async () => {
     const calls: CredentialCall[] = []
     const malformedPayload = JSON.stringify({ kind: 'opaque-credential' })
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-malformed-payload',
-      claustrum: { mode: 'claustrum' },
-    } as never)
-    const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get') {
-        return {
-          result: {
-            payload: Array.from(new TextEncoder().encode(malformedPayload)),
-            expires_at_ms: Date.now() + 60_000,
-            record_version: 8,
-          },
-        }
-      }
-      return { result: {} }
+    let malformed = false
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      initialNow: 1_000,
+      response: new Response('{}', { status: 401 }),
+      fallbacks: [
+        {
+          label: 'malformed-payload',
+          handle: `ckh_${'P'.repeat(43)}`,
+          access: 'vault-warm-access',
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          if (params.handle === ruledMainHandle)
+            return credentialResponse('vault-main-access', 8, 10_000)
+          if (malformed) {
+            return {
+              result: {
+                payload: Array.from(new TextEncoder().encode(malformedPayload)),
+                expires_at_ms: 10_000,
+                record_version: 8,
+              },
+            }
+          }
+          return credentialResponse('vault-warm-access', 8, 2_000)
+        }),
     })
-
-    const { authorizations, plugin, result } = await loadFallbackWithConnector(
-      storage,
-      connector,
-      new Response('{}', { status: 401 }),
-    )
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    malformed = true
+    fixture.setNow(3_000)
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(401)
-    expect(authorizations).toContain('Bearer main-access')
-    expect(authorizations).not.toContain('Bearer stored-fallback-access')
-    expect(authorizations).not.toContain(`Bearer ${malformedPayload}`)
-    await plugin.dispose?.()
+    expect(fixture.authorizations).toContain('Bearer vault-main-access')
+    expect(fixture.authorizations).not.toContain(
+      'Bearer stored-fallback-access',
+    )
+    expect(fixture.authorizations).not.toContain(`Bearer ${malformedPayload}`)
+    await Bun.sleep(10)
+    expect(fixture.calls.some((call) => call.method === 'credential.get')).toBe(
+      true,
+    )
+    await fixture.plugin.dispose?.()
   })
 
   test('backs off repeated transport Claustrum warm failures per handle', async () => {
