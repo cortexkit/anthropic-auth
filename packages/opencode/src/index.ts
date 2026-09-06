@@ -5086,7 +5086,7 @@ const anthropicAuthPlugin = async (
       ) {
         latestGetAuth = getAuth
         const auth = await getAuth()
-        await acknowledgeMainLocalLogin(getAuth)
+        if (completedLocalLogin) await acknowledgeMainLocalLogin(getAuth)
         if (auth.type === 'oauth') {
           const custodyStorage = await loadAccounts(accountStoragePath)
           const mainCustody = mainCustodyAccount(auth)
