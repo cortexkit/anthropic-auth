@@ -1278,6 +1278,45 @@ describe('withCustodyManifestLock', () => {
   )
 
   test.serial(
+    'reaps aged stale lock quarantines after releasing the lock',
+    async () => {
+      await withTempDirectory(async (directory) => {
+        const path = join(directory, 'handles.json')
+        const lockPath = `${path}.lock`
+        const ageMs = 24 * 60 * 60 * 1000
+        const now = Date.now()
+        const aged = ['one', 'two', 'three'].map(
+          (nonce) => `${lockPath}.stale-0-${nonce}`,
+        )
+        const fresh = `${lockPath}.stale-0-fresh`
+        for (const quarantine of aged) {
+          await fs.mkdir(quarantine)
+          await fs.utimes(
+            quarantine,
+            (now - ageMs - 1) / 1000,
+            (now - ageMs - 1) / 1000,
+          )
+        }
+        await fs.mkdir(fresh)
+        await fs.utimes(
+          fresh,
+          (now - ageMs + 60 * 60 * 1000) / 1000,
+          (now - ageMs + 60 * 60 * 1000) / 1000,
+        )
+
+        await expect(
+          withCustodyManifestLock(path, async () => 'acquired'),
+        ).resolves.toBe('acquired')
+        for (const quarantine of aged)
+          await expect(fs.lstat(quarantine)).rejects.toMatchObject({
+            code: 'ENOENT',
+          })
+        await expect(fs.lstat(fresh)).resolves.toBeDefined()
+      })
+    },
+  )
+
+  test.serial(
     'evicts a stale owner record with an unknown future key',
     async () => {
       await withTempDirectory(async (directory) => {

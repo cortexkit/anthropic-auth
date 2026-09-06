@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { constants as fsConstants } from 'node:fs'
+import { type Dirent, constants as fsConstants } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -637,6 +637,8 @@ export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
 export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
 export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
 export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
+const CUSTODY_MANIFEST_STALE_LOCK_REAP_AGE_MS = 24 * 60 * 60 * 1000
+const CUSTODY_MANIFEST_STALE_LOCK_REAP_LIMIT = 32
 
 export type CustodyManifestLockTestOptions = Partial<{
   ttlMs: number
@@ -706,6 +708,41 @@ function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
     !/[\\/:*?"<>|]/.test(nonce) &&
     !/[. ]$/.test(nonce)
   )
+}
+
+async function reapStaleCustodyManifestLocks(lockPath: string): Promise<void> {
+  const parent = dirname(lockPath)
+  const prefix = `${lockPath.slice(lockPath.lastIndexOf('/') + 1)}.stale-`
+  let entries: Dirent[]
+  try {
+    entries = await fs.readdir(parent, { withFileTypes: true })
+  } catch (error) {
+    logger.debug('claustrum', 'stale manifest lock reaper failed', {
+      error: errorCode(error),
+    })
+    return
+  }
+  let reaped = 0
+  for (const entry of entries) {
+    if (reaped >= CUSTODY_MANIFEST_STALE_LOCK_REAP_LIMIT) return
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue
+    const quarantinePath = join(parent, entry.name)
+    try {
+      const stat = await fs.lstat(quarantinePath)
+      if (
+        !stat.isDirectory() ||
+        Date.now() - stat.mtimeMs < CUSTODY_MANIFEST_STALE_LOCK_REAP_AGE_MS
+      ) {
+        continue
+      }
+      await fs.rm(quarantinePath, { recursive: true, force: true })
+      reaped += 1
+    } catch (error) {
+      logger.debug('claustrum', 'stale manifest lock reaper failed', {
+        error: errorCode(error),
+      })
+    }
+  }
 }
 
 export async function withCustodyManifestLock<T>(
@@ -870,6 +907,7 @@ export async function withCustodyManifestLock<T>(
     } else {
       await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
     }
+    await reapStaleCustodyManifestLocks(lockPath)
   }
 }
 
