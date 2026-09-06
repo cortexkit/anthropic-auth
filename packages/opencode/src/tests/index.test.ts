@@ -2703,7 +2703,7 @@ describe('fallback Claustrum credential resolution', () => {
     expect(control?.lastRefreshError).toBeUndefined()
   })
 
-  test('custody override ignores a stale backoff after the sidecar refresh token rotates', async () => {
+  test('cold custody never refreshes a rotated sidecar token', async () => {
     const now = Date.now()
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-rotated-sidecar',
@@ -2748,20 +2748,8 @@ describe('fallback Claustrum credential resolution', () => {
       claustrumConnector: connector,
       claustrumNow: () => now,
     })
-    for (let attempt = 0; attempt < 50 && tokenCalls === 0; attempt++) {
-      await Bun.sleep(10)
-    }
-
-    expect(tokenCalls).toBe(1)
-    let refreshed: OAuthAccount | undefined
-    for (let attempt = 0; attempt < 50; attempt++) {
-      const saved = await loadAccounts(process.env.OPENCODE_ANTHROPIC_AUTH_FILE)
-      refreshed = saved?.accounts[0] as OAuthAccount | undefined
-      if (refreshed?.access === 'rotated-sidecar-access') break
-      await Bun.sleep(10)
-    }
-    expect(refreshed?.access).toBe('rotated-sidecar-access')
-    expect(refreshed?.lastRefreshError).toBeUndefined()
+    await plugin.__fallbackRefreshReady
+    expect(tokenCalls).toBe(0)
     await plugin.dispose?.()
   })
 
@@ -4234,7 +4222,7 @@ describe('fallback Claustrum credential resolution', () => {
     await plugin.dispose?.()
   })
 
-  test('refreshes the sidecar credential after a 401 when the vault is unavailable', async () => {
+  test('cold custody never refreshes a sidecar after a 401', async () => {
     const checkedAt = Date.now()
     const fallbackQuota = {
       five_hour: {
@@ -4339,12 +4327,9 @@ describe('fallback Claustrum credential resolution', () => {
       }),
     })
 
-    expect(response.status).toBe(200)
-    expect(tokenCalls).toBe(1)
-    expect(authorizations).toEqual([
-      'Bearer stored-fallback-access',
-      'Bearer refreshed-sidecar-access',
-    ])
+    expect(response.status).toBe(429)
+    expect(tokenCalls).toBe(0)
+    expect(authorizations).toEqual([])
     expect(
       calls.filter((call) => call.method === 'credential.report_auth_failure'),
     ).toHaveLength(0)
@@ -6406,10 +6391,9 @@ describe('AnthropicAuthPlugin', () => {
     installDefaultFetchMock()
   })
 
-  test('transient vault failure refreshes an expired sidecar with a custody override', async () => {
+  test('transient vault failure leaves an expired sidecar cold without local refresh', async () => {
     const accountId = 'vault-transient-expired'
     const handle = 'vault-transient-expired-handle'
-    const logs: LogTestRecord[] = []
     const localRefresh = mock(() =>
       Promise.resolve(
         new Response(
@@ -6450,20 +6434,13 @@ describe('AnthropicAuthPlugin', () => {
       }),
     )
     globalThis.fetch = localRefresh
-    __setLogTestSink((record) => logs.push(record))
     const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: async () => client,
       setInterval,
     })
     await plugin.__fallbackRefreshReady
     await tick?.()
-    __setLogTestSink(null)
-    expect(localRefresh).toHaveBeenCalled()
-    expect(
-      logs.some(
-        (record) => record.message === 'vault service: local fallback refresh',
-      ),
-    ).toBe(true)
+    expect(localRefresh).not.toHaveBeenCalled()
     installDefaultFetchMock()
   })
 

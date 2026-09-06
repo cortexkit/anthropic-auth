@@ -1908,6 +1908,7 @@ const anthropicAuthPlugin = async (
     const custodyHandle = resolveAccountCustodyHandle(account, storage)
     const handle =
       custodyHandle.status === 'resolved' ? custodyHandle.handle : undefined
+    if (getClaustrumMode(storage) === 'claustrum' && !handle) return {}
     if (
       !handle ||
       !isOAuthAccountVaultOwned(storage, account, custodyHandle) ||
@@ -1917,16 +1918,7 @@ const anthropicAuthPlugin = async (
     }
 
     const cache = claustrumCredentialCache
-    if (!cache) {
-      if (
-        account.access &&
-        account.expires !== undefined &&
-        account.expires > claustrumNow()
-      ) {
-        return { accessToken: account.access }
-      }
-      return {}
-    }
+    if (!cache) return {}
 
     const cached = cache.peek(handle)
     const cachedAccess = usableClaustrumAccessToken(cached, claustrumNow())
@@ -1954,13 +1946,6 @@ const anthropicAuthPlugin = async (
     // A cold vault cache must warm off-path; a usage poll cannot wait for IPC.
     if (options?.warm !== false && !claustrumWarmBackoffActive(handle)) {
       scheduleClaustrumWarm(account.id, handle)
-    }
-    if (
-      account.access &&
-      account.expires !== undefined &&
-      account.expires > claustrumNow()
-    ) {
-      return { accessToken: account.access }
     }
     return {}
   }
@@ -2025,7 +2010,7 @@ const anthropicAuthPlugin = async (
           ),
       )
     },
-    onBackgroundRefresh: refreshVaultBackedFallbacks,
+    onBackgroundRefresh: refreshVaultBackedOAuthAccounts,
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     onFallbackStorageChanged: () => {
@@ -2140,7 +2125,9 @@ const anthropicAuthPlugin = async (
     }
   }
 
-  async function refreshVaultBackedFallbacks(initial = false): Promise<void> {
+  async function refreshVaultBackedOAuthAccounts(
+    initial = false,
+  ): Promise<void> {
     await refreshCustodyHandleManifest()
     let cache = claustrumCredentialCache
     const storage = await loadAccounts(accountStoragePath)
@@ -2167,47 +2154,7 @@ const anthropicAuthPlugin = async (
         }
         continue
       }
-      const sidecarNearExpiry =
-        !account.access ||
-        !account.expires ||
-        account.expires - claustrumNow() <= getRefreshBeforeExpiryMs(storage)
-      const custodyOverrideRefresh = async (reason: string) => {
-        if (
-          refreshBackoffActive(
-            account.lastRefreshError,
-            account.id,
-            claustrumNow(),
-            account.refresh ? tokenFingerprint(account.refresh) : undefined,
-          )
-        ) {
-          return
-        }
-        logger.warn('refresh', 'vault service: local fallback refresh', {
-          accountId: account.id,
-          reason,
-        })
-        await fallbackManager
-          .refreshAccount(account, storage, { persistError: true })
-          .catch((error) => {
-            logger.warn('refresh', 'vault service local refresh failed', {
-              accountId: account.id,
-              error: error instanceof Error ? error.message : String(error),
-            })
-          })
-      }
-      if (!cache) {
-        if (sidecarNearExpiry) {
-          await custodyOverrideRefresh('vault unavailable')
-        }
-        continue
-      }
-      if (initial && !cache.peek(handle)) {
-        if (sidecarNearExpiry) {
-          await custodyOverrideRefresh('vault warmup pending')
-          sidebarChanged = true
-        }
-        continue
-      }
+      if (!cache) continue
       try {
         const credential = await cache.get(handle, minTtlMs)
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
@@ -2215,9 +2162,6 @@ const anthropicAuthPlugin = async (
             id: account.id,
             reason: 'unusable',
           })
-          if (sidecarNearExpiry) {
-            await custodyOverrideRefresh('vault credential unavailable')
-          }
         } else {
           try {
             await clearManifestResolvedLegacyHandle(account, custodyHandle)
@@ -2230,13 +2174,6 @@ const anthropicAuthPlugin = async (
       } catch (error) {
         handleClaustrumCredentialError(account.id, error, handle)
         sidebarChanged = true
-        const action =
-          error instanceof ClaustrumCredentialError ? error.action : 'retry'
-        if (action === 'reauth' || sidecarNearExpiry) {
-          await custodyOverrideRefresh(
-            action === 'reauth' ? 'vault reauth' : 'vault unavailable',
-          )
-        }
       }
     }
     if (sidebarChanged) void refreshSidebarQuota().catch(() => {})
