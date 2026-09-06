@@ -125,6 +125,7 @@ export async function bootRuledClaustrumRow({
   createFallbackStorage,
   useTempAccountFile,
   getPlugin,
+  bootPlugin,
   extractUrl,
   tempConfigDir,
 }: {
@@ -149,6 +150,12 @@ export async function bootRuledClaustrumRow({
   useTempAccountFile: (storage: AccountStorage) => Promise<void>
   getPlugin: (
     accountStoragePath: string,
+    runtimeOverrides: Record<string, unknown> & {
+      claustrumNow: () => number
+      claustrumConnector: () => Promise<unknown>
+    },
+  ) => Promise<RuledRowPlugin>
+  bootPlugin?: (
     runtimeOverrides: Record<string, unknown> & {
       claustrumNow: () => number
       claustrumConnector: () => Promise<unknown>
@@ -216,7 +223,7 @@ export async function bootRuledClaustrumRow({
         : (response?.clone() ?? new Response('{}', { status: 200 })))
     )
   }) as typeof fetch
-  const plugin = await getPlugin(accountStoragePath, {
+  const resolvedRuntimeOverrides = {
     ...runtimeOverrides,
     claustrumNow: () => now,
     claustrumConnector:
@@ -228,7 +235,10 @@ export async function bootRuledClaustrumRow({
           ...fallbacks.map(({ handle, access }) => [handle, access] as const),
         ]),
       ),
-  })
+  }
+  const plugin = await (bootPlugin
+    ? bootPlugin(resolvedRuntimeOverrides)
+    : getPlugin(accountStoragePath, resolvedRuntimeOverrides))
   const cache =
     plugin.__claustrumCredentialCache ??
     (await plugin.__ensureClaustrumCredentialCacheForTest?.())

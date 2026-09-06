@@ -14655,6 +14655,7 @@ describe('auth.loader', () => {
   })
 
   test('admits a sticky route with a vault credential and no sidecar access token', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     const checkedAt = Date.now()
     const fallbackQuota = {
       five_hour: {
@@ -14668,40 +14669,7 @@ describe('auth.loader', () => {
         checkedAt,
       },
     }
-    const storage = createFallbackStorage({
-      routing: { mode: 'sticky-balanced' },
-      quota: {
-        enabled: true,
-        checkIntervalMinutes: 5,
-        minimumRemaining: { five_hour: 1, seven_day: 1 },
-        failClosedOnUnknownQuota: false,
-        mainQuota: {
-          five_hour: {
-            usedPercent: 100,
-            remainingPercent: 0,
-            checkedAt,
-          },
-          seven_day: {
-            usedPercent: 100,
-            remainingPercent: 0,
-            checkedAt,
-          },
-        },
-        mainQuotaCheckedAt: checkedAt,
-      },
-      claustrum: { mode: 'claustrum' },
-      accounts: [
-        {
-          id: 'vault-only-sticky',
-          type: 'oauth',
-          refresh: 'vault-only-sticky-refresh',
-          expires: checkedAt + 5 * 60 * 60 * 1000,
-          claustrumHandle: 'handle-vault-only-sticky',
-          quota: fallbackQuota,
-        },
-      ],
-    })
-    const calls: CredentialCall[] = []
+    const handle = `ckh_${'S'.repeat(43)}`
     const vaultCredentialResponse = () => ({
       result: {
         payload: Array.from(
@@ -14717,52 +14685,62 @@ describe('auth.loader', () => {
     const pendingCredential = new Promise<unknown>((resolve) => {
       releaseCredential = () => resolve(vaultCredentialResponse())
     })
+    let blockFallbackCredential = false
     let credentialGets = 0
-    const connector = async () =>
-      ({
-        call: async (_moduleId: string, method: string, params: unknown) => {
-          calls.push({
-            method,
-            params: (params ?? {}) as Record<string, unknown>,
-          })
-          if (method === 'credential.get') {
-            credentialGets += 1
-            if (credentialGets === 1) return pendingCredential
-            return vaultCredentialResponse()
-          }
-          return { result: {} }
+    const fixture = await bootSharedRuledClaustrumRow({
+      route: { sticky: 'vault-only-sticky' },
+      quota: {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        minimumRemaining: { five_hour: 1, seven_day: 1 },
+        failClosedOnUnknownQuota: false,
+        mainQuota: {
+          five_hour: { usedPercent: 100, remainingPercent: 0, checkedAt },
+          seven_day: { usedPercent: 100, remainingPercent: 0, checkedAt },
         },
-        close: () => {},
-      }) as never
-    const authorizations: string[] = []
-    await useTempAccountFile(storage)
-    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
-      const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL)
-        return Promise.resolve(
-          new Response('refresh unavailable', { status: 500 }),
-        )
-      if (url.includes('/v1/messages')) {
-        authorizations.push(
-          new Headers(init?.headers).get('authorization') ?? '',
-        )
-      }
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: connector,
-      claustrumNow: () => 0,
+        mainQuotaCheckedAt: checkedAt,
+      },
+      fallbacks: [
+        {
+          label: 'sticky',
+          handle,
+          access: 'vault-only-sticky-access',
+          account: { id: 'vault-only-sticky', quota: fallbackQuota },
+        },
+      ],
+      connector: (calls) => async () =>
+        ({
+          call: async (_moduleId: string, method: string, params: unknown) => {
+            calls.push({
+              method,
+              params: (params ?? {}) as Record<string, unknown>,
+            })
+            if (method === 'credential.get') {
+              if ((params as { handle?: string }).handle === handle) {
+                if (!blockFallbackCredential) return vaultCredentialResponse()
+                credentialGets += 1
+                if (credentialGets === 1) return pendingCredential
+                return vaultCredentialResponse()
+              }
+              return credentialResponse(
+                'vault-main-access',
+                17,
+                Date.now() + 60_000,
+              )
+            }
+            return { result: {} }
+          },
+          close: () => {},
+        }) as never,
+      bootPlugin: (overrides) =>
+        getPlugin(createMockClient(), tempConfigDir!, overrides),
+      createFallbackStorage,
+      useTempAccountFile,
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
     })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: checkedAt + 5 * 60 * 60 * 1000,
-        }),
-      { models: {} },
-    )
+    fixture.plugin.__claustrumCredentialCache.invalidate(handle)
+    blockFallbackCredential = true
 
     const request = {
       method: 'POST',
@@ -14773,19 +14751,23 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     }
-    const coldResponse = await result.fetch(MESSAGES_URL, request)
+    const coldResponse = await fixture.result.fetch(MESSAGES_URL, request)
     expect(coldResponse.status).toBe(429)
     releaseCredential()
     await Bun.sleep(25)
     expect(credentialGets).toBe(1)
-    const response = await result.fetch(MESSAGES_URL, request)
+    const response = await fixture.result.fetch(MESSAGES_URL, request)
 
     expect(response.status).toBe(200)
-    expect(authorizations).toEqual(['Bearer vault-only-sticky-access'])
-    await plugin.dispose?.()
+    expect(fixture.authorizations).toEqual(['Bearer vault-only-sticky-access'])
+    expect(
+      fixture.plugin.__claustrumCredentialCache.peek(handle)?.recordVersion,
+    ).toBe(71)
+    await fixture.plugin.dispose?.()
   })
 
   test('does not retry a rejected sticky vault credential', async () => {
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     const checkedAt = Date.now()
     const fallbackQuota = {
       five_hour: {
@@ -14799,40 +14781,7 @@ describe('auth.loader', () => {
         checkedAt,
       },
     }
-    const storage = createFallbackStorage({
-      routing: { mode: 'sticky-balanced' },
-      quota: {
-        enabled: true,
-        checkIntervalMinutes: 5,
-        minimumRemaining: { five_hour: 1, seven_day: 1 },
-        failClosedOnUnknownQuota: false,
-        mainQuota: {
-          five_hour: {
-            usedPercent: 100,
-            remainingPercent: 0,
-            checkedAt,
-          },
-          seven_day: {
-            usedPercent: 100,
-            remainingPercent: 0,
-            checkedAt,
-          },
-        },
-        mainQuotaCheckedAt: checkedAt,
-      },
-      claustrum: { mode: 'claustrum' },
-      accounts: [
-        {
-          id: 'vault-sticky',
-          type: 'oauth',
-          refresh: 'vault-sticky-refresh',
-          expires: checkedAt + 5 * 60 * 60 * 1000,
-          claustrumHandle: 'handle-vault-sticky',
-          quota: fallbackQuota,
-        },
-      ],
-    })
-    const calls: CredentialCall[] = []
+    const handle = `ckh_${'R'.repeat(43)}`
     const rejectedVaultCredentialResponse = () => ({
       result: {
         payload: Array.from(
@@ -14849,58 +14798,66 @@ describe('auth.loader', () => {
       releaseInitialCredential = () =>
         resolve(rejectedVaultCredentialResponse())
     })
+    let blockFallbackCredential = false
     let credentialGets = 0
-    const connector = async () =>
-      ({
-        call: async (_moduleId: string, method: string, params: unknown) => {
-          calls.push({
-            method,
-            params: (params ?? {}) as Record<string, unknown>,
-          })
-          if (method === 'credential.get') {
-            credentialGets += 1
-            return credentialGets === 1
-              ? initialCredential
-              : new Promise<never>(() => {})
-          }
-          return { result: {} }
+    const fixture = await bootSharedRuledClaustrumRow({
+      route: { sticky: 'vault-sticky' },
+      initialNow: 0,
+      quota: {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        minimumRemaining: { five_hour: 1, seven_day: 1 },
+        failClosedOnUnknownQuota: false,
+        mainQuota: {
+          five_hour: { usedPercent: 100, remainingPercent: 0, checkedAt },
+          seven_day: { usedPercent: 100, remainingPercent: 0, checkedAt },
         },
-        close: () => {},
-      }) as never
-    const authorizations: string[] = []
-    await useTempAccountFile(storage)
-    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
-      const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL)
-        return Promise.resolve(
-          new Response('refresh unavailable', { status: 500 }),
-        )
-      if (url.includes('/v1/messages')) {
-        const authorization =
-          new Headers(init?.headers).get('authorization') ?? ''
-        authorizations.push(authorization)
-        return Promise.resolve(
-          new Response('{}', {
-            status: 401,
-          }),
-        )
-      }
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: connector,
-      claustrumNow: () => 0,
+        mainQuotaCheckedAt: checkedAt,
+      },
+      fallbacks: [
+        {
+          label: 'rejected',
+          handle,
+          access: 'rejected-vault-access',
+          account: { id: 'vault-sticky', quota: fallbackQuota },
+        },
+      ],
+      connector: (calls) => async () =>
+        ({
+          call: async (_moduleId: string, method: string, params: unknown) => {
+            calls.push({
+              method,
+              params: (params ?? {}) as Record<string, unknown>,
+            })
+            if (method === 'credential.get') {
+              if ((params as { handle?: string }).handle === handle) {
+                if (!blockFallbackCredential)
+                  return rejectedVaultCredentialResponse()
+                credentialGets += 1
+                return credentialGets === 1
+                  ? initialCredential
+                  : new Promise<never>(() => {})
+              }
+              return credentialResponse(
+                'vault-main-access',
+                17,
+                Date.now() + 60_000,
+              )
+            }
+            return { result: {} }
+          },
+          close: () => {},
+        }) as never,
+      response: new Response('{}', { status: 401 }),
+      bootPlugin: (overrides) =>
+        getPlugin(createMockClient(), tempConfigDir!, overrides),
+      createFallbackStorage,
+      useTempAccountFile,
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
     })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: checkedAt + 5 * 60 * 60 * 1000,
-        }),
-      { models: {} },
-    )
+    fixture.plugin.__claustrumCredentialCache.invalidate(handle)
+    blockFallbackCredential = true
     const request = {
       method: 'POST',
       headers: { 'x-session-affinity': 'rejected-vault-sticky-session' },
@@ -14911,18 +14868,20 @@ describe('auth.loader', () => {
       }),
     }
 
-    const coldResponse = await result.fetch(MESSAGES_URL, request)
+    const coldResponse = await fixture.result.fetch(MESSAGES_URL, request)
     expect(coldResponse.status).toBe(429)
     releaseInitialCredential()
     await Bun.sleep(25)
-    const response = await result.fetch(MESSAGES_URL, request)
+    const response = await fixture.result.fetch(MESSAGES_URL, request)
 
-    expect(authorizations).toEqual(['Bearer rejected-vault-access'])
+    expect(fixture.authorizations).toEqual(['Bearer rejected-vault-access'])
     expect(response.status).toBe(401)
     expect(
-      calls.filter((call) => call.method === 'credential.report_auth_failure'),
+      fixture.calls.filter(
+        (call) => call.method === 'credential.report_auth_failure',
+      ),
     ).toHaveLength(1)
-    await plugin.dispose?.()
+    await fixture.plugin.dispose?.()
   })
 
   test('admits and sends an OAuth route when an empty quota snapshot is fail-open', async () => {
