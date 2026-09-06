@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
@@ -506,6 +506,7 @@ describe('custody mode', () => {
         config: config.slice(),
         state: state.slice(),
       }),
+      writeManifestBindings: async () => {},
       writeSidecarAccount: async (account) => {
         writes.push(account.id)
         config = new TextEncoder().encode(`{"bound":"${account.id}"}\n`)
@@ -513,9 +514,10 @@ describe('custody mode', () => {
         state = new TextEncoder().encode(`{"inert":"${account.id}"}\n`)
       },
       verifyTarget: async () => true,
+      verifyCommitted: async () => true,
       restoreSidecars: async (snapshot) => {
-        config = snapshot.config.slice()
-        state = snapshot.state.slice()
+        config = snapshot.config!.slice()
+        state = snapshot.state!.slice()
       },
       verifyRollback: async () =>
         JSON.stringify(config) === JSON.stringify(before.config) &&
@@ -531,10 +533,117 @@ describe('custody mode', () => {
       stage: 'write_sidecar',
       accountId: 'work',
     })
-    expect(writes).toEqual(['main', 'work'])
+    expect(writes).toEqual(['work'])
     expect(config).toEqual(before.config)
     expect(state).toEqual(before.state)
     expect(mode).toBe('local')
     expect(JSON.stringify(error)).not.toContain('access-work-secret')
+  })
+
+  test('custody: live takeover tombstones fallback refresh and commits mode last', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'custody-live-takeover-'))
+    const storagePath = join(directory, 'accounts.json')
+    const manifestPath = join(directory, 'handles.json')
+    const mainHandle = `ckh_${'M'.repeat(43)}`
+    const workHandle = `ckh_${'W'.repeat(43)}`
+    const hostReads: string[] = []
+    let modeAtFinalVerification = 'local'
+    try {
+      await core.saveAccounts(
+        {
+          version: 1,
+          claustrum: { handlesFile: manifestPath, mode: 'local' },
+          accounts: [
+            {
+              id: 'work',
+              label: 'work',
+              type: 'oauth',
+              access: 'access-work-secret',
+              refresh: 'refresh-work-secret',
+              expires: now + 60_000,
+              claustrumHandle: workHandle,
+              enabled: true,
+            },
+          ],
+        },
+        storagePath,
+      )
+      await expect(
+        core.writeCustodyHandleManifestEntry({
+          path: manifestPath,
+          entry: {
+            label: 'main',
+            handle: mainHandle,
+            credentialId: core.custodyCredentialId('main'),
+          },
+        }),
+      ).resolves.toEqual({ status: 'written' })
+      const cache = {
+        get: async (handle: string, minTtlMs = 0) => ({
+          credentialId:
+            handle === mainHandle
+              ? core.custodyCredentialId('main')
+              : core.custodyCredentialId('work'),
+          recordVersion: 7,
+          access: 'vault-access',
+          refresh: 'vault-refresh',
+          expiresAt: now + minTtlMs + 1,
+          state: 'usable' as const,
+        }),
+      }
+      const fallbackManager = {
+        withAccountRefreshLock: async <T>(_id: string, fn: () => Promise<T>) =>
+          fn(),
+      }
+      const deps = createLiveCustodyDeps({
+        storagePath,
+        cache,
+        latestGetAuth: async () => {
+          hostReads.push('get')
+          return core.custodyTombstoneOAuth('anthropic')
+        },
+        now,
+        fallbackManager: fallbackManager as never,
+      })
+      const storage = await core.loadAccounts(storagePath)
+      const plan = await preflightClaustrumTakeover(
+        await deps.preflightInput(
+          { id: 'main', label: 'main', enabled: true },
+          storage?.accounts ?? [],
+        ),
+      )
+
+      await expect(
+        executeClaustrumTakeover(plan, deps.takeoverDeps(plan)),
+      ).resolves.toBe('changed')
+
+      const committed = await core.loadAccounts(storagePath)
+      const work = committed?.accounts.find((account) => account.id === 'work')
+      expect(work).toMatchObject({
+        access: '',
+        refresh: core.custodyTombstoneKey('anthropic'),
+        expires: 0,
+      })
+      expect(committed?.claustrum?.mode).toBe('claustrum')
+      modeAtFinalVerification = committed?.claustrum?.mode ?? 'local'
+      expect(modeAtFinalVerification).toBe('claustrum')
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+      expect(manifest.providers[0].accounts).toEqual([
+        {
+          label: 'main',
+          handle: mainHandle,
+          credential_id: core.custodyCredentialId('main'),
+        },
+        {
+          label: 'work',
+          handle: workHandle,
+          credential_id: core.custodyCredentialId('work'),
+        },
+      ])
+      expect(hostReads.length).toBeGreaterThan(1)
+      expect(deps.hostAuth).not.toHaveProperty('set')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 })

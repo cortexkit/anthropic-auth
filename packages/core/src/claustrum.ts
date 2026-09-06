@@ -1073,7 +1073,7 @@ export async function removeCustodyHandleManifestEntry(
   }
 }
 
-async function writeCustodyHandleManifestEntryLocked(
+export async function writeCustodyHandleManifestEntryLocked(
   input: CustodyHandleManifestWriteInput,
   assertLease: () => Promise<void>,
   lockNonce: string,

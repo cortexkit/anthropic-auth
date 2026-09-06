@@ -29,9 +29,11 @@ export type CustodyCacheCredential = {
 export type ClaustrumTakeoverPlan = {
   accounts: Array<{
     id: string
+    label: string
     handle: string
     credentialId: string
     recordVersion: number
+    bindingPersisted: boolean
     localAuthFingerprint: string
     cacheCredential: CustodyCacheCredential
   }>
@@ -99,6 +101,7 @@ type PreflightBinding = {
   label: string
   handle: string
   credentialId: string
+  source?: 'manifest' | 'legacy'
 }
 
 export type PreflightClaustrumTakeoverInput = {
@@ -249,9 +252,11 @@ export async function preflightClaustrumTakeover(
       )
     accounts.push({
       id: route.id,
+      label: binding.label,
       handle: binding.handle,
       credentialId: binding.credentialId,
       recordVersion: credential.recordVersion,
+      bindingPersisted: binding.source !== 'legacy',
       localAuthFingerprint: localAuthFingerprint(local.access, local.refresh),
       cacheCredential: credential,
     })
@@ -412,9 +417,11 @@ export class CustodyTransitionError extends Error {
   constructor(
     readonly stage:
       | 'reverify_fingerprint'
+      | 'write_manifest'
       | 'write_sidecar'
       | 'readback'
-      | 'mode_commit',
+      | 'mode_commit'
+      | 'post_commit_readback',
     readonly accountId?: string,
   ) {
     super(
@@ -442,8 +449,9 @@ export class CustodyTransitionRollbackError extends Error {
 }
 
 export type CustodySidecarSnapshot = {
-  config: Uint8Array
-  state: Uint8Array
+  config: Uint8Array | null
+  state: Uint8Array | null
+  manifest?: Uint8Array | null
 }
 
 export type ExecuteClaustrumTakeoverDeps = {
@@ -451,10 +459,12 @@ export type ExecuteClaustrumTakeoverDeps = {
   getLocalAuth: (accountId: string) => Promise<unknown>
   isCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
   snapshotSidecars: () => Promise<CustodySidecarSnapshot>
+  writeManifestBindings: (plan: ClaustrumTakeoverPlan) => Promise<void>
   writeSidecarAccount: (
     account: ClaustrumTakeoverPlan['accounts'][number],
   ) => Promise<void>
   verifyTarget: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
+  verifyCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
   restoreSidecars: (snapshot: CustodySidecarSnapshot) => Promise<void>
   verifyRollback: (snapshot: CustodySidecarSnapshot) => Promise<boolean>
   setMode: (mode: 'claustrum') => Promise<'changed' | 'unchanged'>
@@ -486,7 +496,13 @@ export async function executeClaustrumTakeover(
     const snapshot = await deps.snapshotSidecars()
     let accountId: string | undefined
     try {
+      try {
+        await deps.writeManifestBindings(plan)
+      } catch {
+        throw new CustodyTransitionError('write_manifest')
+      }
       for (const account of plan.accounts) {
+        if (account.id === 'main') continue
         accountId = account.id
         await deps.writeSidecarAccount(account)
       }
@@ -497,6 +513,9 @@ export async function executeClaustrumTakeover(
         await deps.setMode('claustrum')
       } catch {
         throw new CustodyTransitionError('mode_commit')
+      }
+      if (!(await deps.verifyCommitted(plan))) {
+        throw new CustodyTransitionError('post_commit_readback')
       }
       return 'changed'
     } catch (error) {
