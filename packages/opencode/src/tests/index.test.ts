@@ -1202,7 +1202,7 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
-    'reports a warm main vault 401 with its send-time record version',
+    'a main 401 after a concurrent vault refresh is suppressed rather than blamed on the new record',
     async () => {
       await useTempAccountFile(
         createFallbackStorage({
@@ -1214,28 +1214,75 @@ describe('fallback Claustrum credential resolution', () => {
       await writeManifest([{ label: 'main', handle: manifestHandle }])
       const calls: CredentialCall[] = []
       const authorizations: string[] = []
+      let recordVersion = 7
+      let releaseFirstResponse!: () => void
+      const firstResponse = new Promise<Response>((resolve) => {
+        releaseFirstResponse = () =>
+          resolve(new Response('denied', { status: 401 }))
+      })
+      let firstRequestStarted!: () => void
+      const firstRequestStartedPromise = new Promise<void>((resolve) => {
+        firstRequestStarted = resolve
+      })
+      let messageRequests = 0
+      let claustrumNow = 0
       globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
         authorizations.push(
           new Headers(init?.headers).get('authorization') ?? '',
         )
+        messageRequests += 1
+        if (messageRequests === 1) {
+          firstRequestStarted()
+          return firstResponse
+        }
         return Promise.resolve(new Response('denied', { status: 401 }))
       }) as unknown as typeof fetch
+      const ticks: Array<() => unknown> = []
       const plugin = await getPlugin(undefined, undefined, {
         claustrumConnector: connectorFor(calls, (method) => {
-          if (method === 'credential.get')
-            return credentialResponse('main-vault-access', 7)
+          if (method === 'credential.get') {
+            return credentialResponse(
+              `main-vault-access-v${recordVersion}`,
+              recordVersion,
+              claustrumNow + 1_000,
+            )
+          }
           return { result: {} }
         }),
+        claustrumNow: () => claustrumNow,
+        setInterval: mock((handler: () => unknown) => {
+          ticks.push(handler)
+          return { unref() {} } as never
+        }) as never,
       })
       const result = await plugin.auth.loader(
         () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
         { models: {} },
       )
 
-      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const staleResponse = result.fetch(MESSAGES_URL, EMPTY_POST)
+      await firstRequestStartedPromise
+      claustrumNow = 2_000
+      recordVersion = 8
+      await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+      releaseFirstResponse()
 
-      expect(response.status).toBe(401)
-      expect(authorizations).toEqual(['Bearer main-vault-access'])
+      expect((await staleResponse).status).toBe(401)
+      expect(
+        calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toEqual([])
+
+      const currentResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(currentResponse.status).toBe(401)
+      expect(authorizations).toEqual([
+        'Bearer main-vault-access-v7',
+        'Bearer main-vault-access-v8',
+      ])
       expect(
         calls.filter(
           (call) => call.method === 'credential.report_auth_failure',
@@ -1245,7 +1292,7 @@ describe('fallback Claustrum credential resolution', () => {
           params: expect.objectContaining({
             handle: manifestHandle,
             provider_status: 401,
-            record_version: 7,
+            record_version: 8,
             reporter_source: 'direct',
           }),
         }),
