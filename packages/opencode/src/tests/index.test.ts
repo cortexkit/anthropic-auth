@@ -1154,6 +1154,51 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test.serial(
+    'warms a manifest-resolved main at loader startup and tick',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      await writeManifest([{ label: 'main', handle: manifestHandle }])
+      const calls: CredentialCall[] = []
+      const ticks: Array<() => unknown> = []
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: manifestConnector(
+          calls,
+          new Map([[manifestHandle, 'main-vault-access']]),
+        ),
+        setInterval: mock((handler: () => unknown) => {
+          ticks.push(handler)
+          return { unref() {} } as never
+        }) as never,
+      })
+      await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+      await ticks[0]?.()
+
+      const gets = calls.filter((call) => call.method === 'credential.get')
+      expect(gets).toHaveLength(2)
+      expect(gets).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            params: expect.objectContaining({
+              handle: manifestHandle,
+              min_ttl_ms: 270 * 60_000,
+            }),
+          }),
+        ]),
+      )
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
     'prefers a manifest handle over a stale legacy handle',
     async () => {
       await useTempAccountFile(
@@ -1375,11 +1420,11 @@ describe('fallback Claustrum credential resolution', () => {
           () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
           { models: {} },
         )
-        await expect(
-          claustrumResult.fetch('https://example.test', {}),
-        ).rejects.toThrow(
-          'CUSTODY_SERVE: main vault serving is not yet available',
+        const coldResponse = await claustrumResult.fetch(
+          'https://example.test',
+          {},
         )
+        expect(coldResponse.status).toBe(503)
 
         await runCustodyCommand(plugin, 'loader-current-mode', 'local')
         await expect(
@@ -2995,11 +3040,12 @@ describe('fallback Claustrum credential resolution', () => {
     return { authorizations, plugin, result }
   }
 
-  test('local mode does not connect and uses the stored token', async () => {
+  test('local mode does not serve or refresh a bound inert fallback', async () => {
     const calls: CredentialCall[] = []
     let connectorCalls = 0
     const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-disabled',
+      label: 'bound-local',
+      claustrumHandle: manifestHandle,
       claustrum: { mode: 'local' },
     })
     const connector = async () => {
@@ -3011,11 +3057,18 @@ describe('fallback Claustrum credential resolution', () => {
       storage,
       connector,
       new Response('{}', { status: 200 }),
+      {
+        beforePlugin: async () => {
+          await writeManifest([
+            { label: 'bound-local', handle: manifestHandle },
+          ])
+        },
+      },
     )
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
-    expect(authorizations).toEqual(['Bearer stored-fallback-access'])
+    expect(authorizations).toEqual(['Bearer main-access'])
     expect(connectorCalls).toBe(0)
     expect(calls).toEqual([])
     await plugin.dispose?.()
@@ -3216,7 +3269,7 @@ describe('fallback Claustrum credential resolution', () => {
       ).toBe('off')
       const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
       expect(response.status).toBe(200)
-      expect(authorizations).toContain('Bearer stored-fallback-access')
+      expect(authorizations).toContain('Bearer main-access')
       expect(calls.filter((call) => call.method === 'credential.get')).toEqual(
         [],
       )

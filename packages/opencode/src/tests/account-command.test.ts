@@ -335,6 +335,12 @@ describe('executeAccountCommand status', () => {
     expect(custodyStatusLabel('on-vault-served')).toBe('vault-served')
     expect(custodyStatusLabel('on-vault-reauth')).toBe('vault reauth')
     expect(custodyStatusLabel('on-cold')).toBe('vault cold')
+    expect(custodyStatusLabel('on-identity-mismatch' as never)).toBe(
+      'identity mismatch',
+    )
+    expect(custodyStatusLabel('on-corrupt-binding' as never)).toBe(
+      'corrupt binding',
+    )
   })
 
   test('bare status returns account list in text', async () => {

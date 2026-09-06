@@ -24,7 +24,14 @@ export interface AccountDialogAccount {
   claustrumGate: 'on' | 'off' | 'na'
   vaultServed: boolean
   vaultReauth: boolean
-  custodyState: 'na' | 'off' | 'on-vault-served' | 'on-vault-reauth' | 'on-cold'
+  custodyState:
+    | 'na'
+    | 'off'
+    | 'on-vault-served'
+    | 'on-vault-reauth'
+    | 'on-cold'
+    | 'on-identity-mismatch'
+    | 'on-corrupt-binding'
 }
 
 export interface AccountDialogKnobs {

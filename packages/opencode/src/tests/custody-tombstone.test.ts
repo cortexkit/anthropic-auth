@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   assertNotCustodyTombstone,
   buildRefreshOperationError,
@@ -523,7 +523,7 @@ describe('Claustrum custody tombstones', () => {
     )
   })
 
-  test('loads a main tombstone under claustrum and directs local mode to /login', async () => {
+  test('returns a typed cold refusal for a manifest-resolved main tombstone', async () => {
     const fetchCalls: string[] = []
     globalThis.fetch = mock((input: unknown) => {
       fetchCalls.push(extractUrl(input as string | URL | Request))
@@ -539,7 +539,28 @@ describe('Claustrum custody tombstones', () => {
       accounts: [],
     })
 
-    await createTempStorage(makeStorage('claustrum'), async () => {
+    await createTempStorage(makeStorage('claustrum'), async (path) => {
+      const handlesPath = join(dirname(path), 'handles.json')
+      await writeFile(
+        handlesPath,
+        JSON.stringify({
+          version: 1,
+          providers: [
+            {
+              provider: 'anthropic',
+              serve: 'anthropic-auth',
+              accounts: [
+                {
+                  label: 'main',
+                  handle: `ckh_${'M'.repeat(43)}`,
+                  credential_id: 'anthropic:main',
+                },
+              ],
+            },
+          ],
+        }),
+      )
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = handlesPath
       const timers = disabledTimerOverrides()
       const plugin = (await AnthropicAuthPlugin(
         // @ts-expect-error: minimal mock for testing
@@ -551,13 +572,23 @@ describe('Claustrum custody tombstones', () => {
           mock: { calls: unknown[] }
         }
       ).mock.calls.length
-      await expect(
-        plugin.auth.loader(
-          () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
-          { models: {} } as never,
-        ),
-      ).resolves.toHaveProperty('fetch')
+      const loaded = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
+        { models: {} } as never,
+      )
+      const response = await loaded.fetch(
+        'https://api.anthropic.com/v1/messages',
+        { method: 'POST', body: '{}' },
+      )
+      expect(response.status).toBe(503)
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: 'claustrum_main_unavailable',
+          message: expect.stringContaining('/claude-account local'),
+        },
+      })
       expect(timers.setInterval).toHaveBeenCalledTimes(intervalsBeforeLoader)
+      expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
       await plugin.dispose?.()
     })
 

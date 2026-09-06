@@ -38,7 +38,13 @@ export interface SidebarAccountState {
   vaultReauth?: boolean
   // A gate alone does not prove the sidecar can serve a request.
   vaultServed?: boolean
-  custodyState?: 'off' | 'on-vault-served' | 'on-vault-reauth' | 'on-cold'
+  custodyState?:
+    | 'off'
+    | 'on-vault-served'
+    | 'on-vault-reauth'
+    | 'on-cold'
+    | 'on-identity-mismatch'
+    | 'on-corrupt-binding'
   tierLabel?: string
 }
 
