@@ -1847,25 +1847,29 @@ const anthropicAuthPlugin = async (
       state === 'reauth'
         ? {
             code: 'claustrum_main_reauth',
+            retryable: false,
             message:
               'Claustrum main credential requires re-import; run ck auth import --replace.',
           }
         : state === 'takeover-incomplete'
           ? {
               code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
+              retryable: false,
               message:
                 'Claustrum main binding is not active while local main material remains; run ck auth migrate-plugin --allow-main.',
             }
           : state === 'identity-mismatch'
             ? {
                 code: 'claustrum_main_identity_mismatch',
+                retryable: false,
                 message:
                   'Claustrum main credential identity differs from the persisted main identity; run ck auth set-identity.',
               }
             : {
                 code: 'claustrum_main_unavailable',
+                retryable: true,
                 message:
-                  'Claustrum main credential is cold; run /claude-account local to leave custody and sign in again.',
+                  'Claustrum main credential is cold; retry or run /claude-account local to leave custody and sign in again.',
               }
     return new Response(
       JSON.stringify({ type: 'error', error: { type: 'api_error', ...error } }),

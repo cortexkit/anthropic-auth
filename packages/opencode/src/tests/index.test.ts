@@ -1413,6 +1413,63 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'main reauth refusal is non-retryable while cold remains retryable',
+    async () => {
+      for (const fixture of [
+        {
+          name: 'reauth',
+          errorClass: 'auth_required',
+          code: 'claustrum_main_reauth',
+          retryable: false,
+          guidance: 'ck auth import --replace',
+        },
+        {
+          name: 'cold',
+          errorClass: 'transient',
+          code: 'claustrum_main_unavailable',
+          retryable: true,
+          guidance: 'retry',
+        },
+      ] as const) {
+        await useTempAccountFile(
+          createFallbackStorage({
+            claustrum: { mode: 'claustrum' },
+            quota: { enabled: false },
+            accounts: [],
+          }),
+        )
+        await writeManifest([{ label: 'main', handle: manifestHandle }])
+        const plugin = await getPlugin(undefined, undefined, {
+          claustrumConnector: connectorFor([], (method) => {
+            if (method === 'credential.get')
+              return {
+                result: {
+                  error: { class: fixture.errorClass, code: 'latched' },
+                },
+              }
+            return { result: {} }
+          }),
+        })
+        const result = await plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+          { models: {} },
+        )
+        const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        const body = await response.json()
+        expect(response.status).toBe(503)
+        expect(body).toMatchObject({
+          error: {
+            code: fixture.code,
+            retryable: fixture.retryable,
+            message: expect.stringContaining(fixture.guidance),
+          },
+        })
+        await plugin.dispose?.()
+      }
+    },
+  )
+
+  test.serial(
     'prefers a manifest handle over a stale legacy handle',
     async () => {
       await useTempAccountFile(
