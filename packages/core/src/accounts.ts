@@ -4429,7 +4429,11 @@ export class FallbackAccountManager {
     storage: AccountStorage,
     options: { force?: boolean; persistError?: boolean } = {},
   ): Promise<OAuthAccount> {
-    if (this.isFallbackAccountVaultServed(account.id, storage)) return account
+    if (
+      this.isFallbackAccountVaultServed(account.id, storage) ||
+      this.isFallbackAccountVaultEnabled(account.id, storage)
+    )
+      return account
     const existing = this.refreshPromises.get(account.id)
     if (existing) {
       const refreshed = await existing

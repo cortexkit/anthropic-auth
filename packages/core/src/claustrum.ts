@@ -237,6 +237,8 @@ export type CustodyHandleResolution =
         | 'missing-entry'
         | 'foreign-serve'
         | 'superseded'
+        | 'corrupt-binding'
+        | 'unknown-identity'
     }
 
 type ParsedCustodyHandleManifest = {

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -553,13 +553,14 @@ describe('Claustrum custody tombstones', () => {
                 {
                   label: 'main',
                   handle: `ckh_${'M'.repeat(43)}`,
-                  credential_id: 'anthropic:main',
+                  credential_id: 'oauth:anthropic:main',
                 },
               ],
             },
           ],
         }),
       )
+      await chmod(handlesPath, 0o600)
       process.env.CLAUSTRUM_OPENCODE_HANDLES = handlesPath
       const timers = disabledTimerOverrides()
       const plugin = (await AnthropicAuthPlugin(
@@ -573,7 +574,11 @@ describe('Claustrum custody tombstones', () => {
         }
       ).mock.calls.length
       const loaded = await plugin.auth.loader(
-        () => Promise.resolve(custodyTombstoneOAuth(oauthFixture.provider)),
+        () =>
+          Promise.resolve({
+            ...custodyTombstoneOAuth(oauthFixture.provider),
+            access: 'contaminated-local-access',
+          }),
         { models: {} } as never,
       )
       const response = await loaded.fetch(
@@ -589,6 +594,27 @@ describe('Claustrum custody tombstones', () => {
       })
       expect(timers.setInterval).toHaveBeenCalledTimes(intervalsBeforeLoader)
       expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
+      expect(fetchCalls).toHaveLength(0)
+
+      const realLoaded = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'real-local-access',
+            refresh: 'real-local-refresh',
+            expires: Date.now() + 60_000,
+          }),
+        { models: {} } as never,
+      )
+      const realResponse = await realLoaded.fetch(
+        'https://api.anthropic.com/v1/messages',
+        { method: 'POST', body: '{}' },
+      )
+      expect(realResponse.status).toBe(503)
+      await expect(realResponse.json()).resolves.toMatchObject({
+        error: { code: 'TAKEOVER_INCOMPLETE_MAIN_REAL' },
+      })
+      expect(fetchCalls).toHaveLength(0)
       await plugin.dispose?.()
     })
 
