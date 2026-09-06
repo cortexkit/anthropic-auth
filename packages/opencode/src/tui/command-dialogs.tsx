@@ -232,6 +232,13 @@ export function buildAccountDialogL1(value: unknown): {
   }
 }
 
+export function retainAccountDialogProjection(
+  current: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  return Array.isArray(incoming.accounts) ? incoming : current
+}
+
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
@@ -549,7 +556,7 @@ export function openCommandDialog(
       text: string
       knobs: Record<string, unknown>
     }) => {
-      accountKnobs = r.knobs
+      accountKnobs = retainAccountDialogProjection(accountKnobs, r.knobs)
       const updated = normalizeAccountDialogPayload(accountKnobs).accounts
       if (updated.length > 0) {
         accounts.length = 0

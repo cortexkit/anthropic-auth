@@ -10,6 +10,7 @@ import {
   handlePrimeStatusOption,
   normalizeAccountDialogPayload,
   PRIME_DIALOG_OPTIONS,
+  retainAccountDialogProjection,
 } from '../tui/command-dialogs'
 
 describe('buildKillswitchThresholdSeed', () => {
@@ -227,6 +228,21 @@ const accountRows: AccountDialogKnobs['accounts'] = [
 ]
 
 describe('openCommandDialog — global custody mode', () => {
+  test('keeps the last complete account projection when an apply result has no accounts', () => {
+    const projection = {
+      accounts: accountRows,
+      claustrumDetection: 'ready',
+      custodyMode: 'claustrum',
+      custodyModeKnown: true,
+    }
+
+    expect(
+      retainAccountDialogProjection(projection, {
+        error: 'provider unavailable',
+      }),
+    ).toBe(projection)
+  })
+
   test('shows claustrum and offers local custody', () => {
     const dialog = buildAccountDialogL1({
       accounts: accountRows,
