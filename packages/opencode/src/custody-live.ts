@@ -3,6 +3,7 @@ import * as core from '@cortexkit/anthropic-auth-core'
 import {
   type ClaustrumTakeoverPlan,
   type CustodySidecarSnapshot,
+  commitClaustrumMode,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
   reconcileCustodyStartup,
 } from './custody-mode.ts'
@@ -17,6 +18,8 @@ type LiveCacheCredential = {
   expiresAt: number
   state: 'usable' | 'revoked' | 'reauth' | 'timeout'
 }
+
+type RawCacheCredential = core.ClaustrumCredential | LiveCacheCredential
 
 type LiveRoute = {
   id: string
@@ -85,7 +88,7 @@ async function restoreBytes(path: string, bytes: Uint8Array | null) {
 export function createLiveCustodyDeps(input: {
   storagePath: string
   cache: {
-    get: (handle: string, minTtlMs?: number) => Promise<LiveCacheCredential>
+    get: (handle: string, minTtlMs?: number) => Promise<RawCacheCredential>
   }
   latestGetAuth: () => Promise<unknown>
   now: number | (() => number)
@@ -102,6 +105,7 @@ export function createLiveCustodyDeps(input: {
   )
   let manifestReader: core.CustodyHandleManifestReader | undefined
   let manifestLease: ManifestLease | undefined
+  const credentialIdsByHandle = new Map<string, string>()
   const loadStorage = () =>
     (storagePromise ??= Promise.resolve(
       input.storage ?? core.loadAccounts(input.storagePath),
@@ -118,6 +122,24 @@ export function createLiveCustodyDeps(input: {
       })
     }
     return manifestReader
+  }
+  const getCredential = async (handle: string, minTtlMs: number) => {
+    const credential = await input.cache.get(handle, minTtlMs)
+    if ('state' in credential) return credential
+    let payload: { access_token?: unknown; refresh_token?: unknown } = {}
+    try {
+      payload = JSON.parse(credential.payload)
+    } catch {}
+    return {
+      credentialId: credentialIdsByHandle.get(handle) ?? '',
+      recordVersion: credential.recordVersion,
+      access:
+        typeof payload.access_token === 'string' ? payload.access_token : '',
+      refresh:
+        typeof payload.refresh_token === 'string' ? payload.refresh_token : '',
+      expiresAt: credential.expiresAtMs ?? 0,
+      state: 'usable' as const,
+    }
   }
 
   return {
@@ -140,15 +162,17 @@ export function createLiveCustodyDeps(input: {
           manifest,
         })
         if (resolution.status !== 'resolved') return []
+        const credentialId =
+          resolution.source === 'manifest'
+            ? resolution.credentialId
+            : core.custodyCredentialId(route.label ?? route.id)
+        credentialIdsByHandle.set(resolution.handle, credentialId)
         return [
           {
             accountId: route.id,
             label: route.label ?? route.id,
             handle: resolution.handle,
-            credentialId:
-              resolution.source === 'manifest'
-                ? resolution.credentialId
-                : core.custodyCredentialId(route.label ?? route.id),
+            credentialId,
             source: resolution.source,
           },
         ]
@@ -156,7 +180,7 @@ export function createLiveCustodyDeps(input: {
     },
     cache: {
       get: (handle: string, options: { minTtlMs: number }) =>
-        input.cache.get(handle, options.minTtlMs),
+        getCredential(handle, options.minTtlMs),
     },
     async preflightInput(
       main: Pick<LiveRoute, 'id' | 'label' | 'enabled'>,
@@ -255,7 +279,7 @@ export function createLiveCustodyDeps(input: {
         const bindings = await readStrictBindings(plan)
         if (bindings.some((binding) => !binding)) return false
         for (const account of plan.accounts) {
-          const credential = await input.cache.get(
+          const credential = await getCredential(
             account.handle,
             core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000,
           )
@@ -385,8 +409,7 @@ export function createLiveCustodyDeps(input: {
             Buffer.from((await readBytes(manifestPath)) ?? []).equals(
               Buffer.from(snapshot.manifest ?? []),
             )),
-        setMode: (mode: 'claustrum') =>
-          core.setClaustrumModePersistent(mode, input.storagePath),
+        setMode: (_mode: 'claustrum') => commitClaustrumMode(input.storagePath),
       }
     },
   }

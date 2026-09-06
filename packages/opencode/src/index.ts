@@ -212,9 +212,14 @@ import {
   summarizeCacheTtl,
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
+import { createLiveCustodyDeps } from './custody-live.ts'
 import {
+  CustodyPreflightRefusedError,
   CustodyStateMismatchError,
+  executeClaustrumTakeover,
+  executeLocalExit,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
+  preflightClaustrumTakeover,
   reconcileCustodyStartup,
 } from './custody-mode.ts'
 import {
@@ -4611,6 +4616,76 @@ const anthropicAuthPlugin = async (
                   )
                 : { status: 'unresolved', reason: 'missing-entry' }
           : undefined,
+      transition: async (mode) => {
+        if (mode === 'local') {
+          const changed = await executeLocalExit({
+            path: accountStoragePath,
+          })
+          return {
+            text:
+              changed === 'changed'
+                ? 'Claustrum mode set to local. Bound credentials remain inert until verified login.'
+                : 'Claustrum mode already local. Bound credentials remain inert until verified login.',
+          }
+        }
+        if (!latestGetAuth) {
+          return { text: 'Custody takeover refused: main auth is unavailable.' }
+        }
+        const currentStorage =
+          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
+        const cache =
+          claustrumCredentialCache ?? (await ensureClaustrumCredentialCache())
+        if (!cache) {
+          return { text: 'Custody takeover refused: Claustrum is unavailable.' }
+        }
+        const live = createLiveCustodyDeps({
+          storagePath: accountStoragePath,
+          storage: currentStorage,
+          cache,
+          latestGetAuth,
+          now: claustrumNow,
+          fallbackManager,
+        })
+        try {
+          const plan = await preflightClaustrumTakeover(
+            await live.preflightInput(
+              { id: 'main', label: 'main', enabled: true },
+              currentStorage.accounts,
+            ),
+          )
+          const changed = await executeClaustrumTakeover(
+            plan,
+            live.takeoverDeps(plan),
+          )
+          await refreshCustodyHandleManifest()
+          const labels = plan.accounts
+            .map((account) => account.label)
+            .join(', ')
+          return {
+            text:
+              changed === 'changed'
+                ? `Claustrum custody committed for: ${labels}.`
+                : `Claustrum custody already committed for: ${labels}.`,
+          }
+        } catch (error) {
+          if (error instanceof CustodyPreflightRefusedError) {
+            const label =
+              error.accountId === 'main'
+                ? 'main'
+                : (currentStorage.accounts.find(
+                    (account) => account.id === error.accountId,
+                  )?.label ?? error.accountId)
+            const guidance =
+              error.reason === 'TAKEOVER_INCOMPLETE_MAIN_REAL'
+                ? '\nRun ck auth migrate-plugin --allow-main before retrying.'
+                : ''
+            return {
+              text: `Custody takeover refused:\n${label}: ${error.reason}${guidance}`,
+            }
+          }
+          throw error
+        }
+      },
     })
 
     if (result.updated) {

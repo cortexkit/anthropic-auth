@@ -3,11 +3,7 @@ import type {
   ClaustrumMode,
   FallbackAccount,
 } from '../accounts.ts'
-import {
-  getClaustrumMode,
-  isOAuthAccountVaultOwned,
-  setClaustrumModePersistent,
-} from '../accounts.ts'
+import { getClaustrumMode, isOAuthAccountVaultOwned } from '../accounts.ts'
 import type {
   ClaustrumDetection,
   CustodyHandleResolution,
@@ -311,18 +307,10 @@ export async function executeAccountCommand(input: {
   }
 
   if (action.type === 'claustrum-mode') {
-    const transition =
-      input.transition ??
-      (async (mode) => {
-        const result = await setClaustrumModePersistent(mode, input.path)
-        return {
-          text:
-            result === 'changed'
-              ? `Claustrum mode set to ${mode}.`
-              : `Claustrum mode already ${mode}.`,
-        }
-      })
-    return transition(action.mode)
+    if (!input.transition) {
+      return { text: 'Claustrum mode transition is unavailable.' }
+    }
+    return input.transition(action.mode)
   }
 
   if (action.type === 'add-apikey') {

@@ -434,7 +434,7 @@ describe('executeAccountCommand global Claustrum mode', () => {
     expect(result.text).toContain('/claude-account local')
   })
 
-  test('persists a requested global mode through its transition seam', async () => {
+  test('refuses to bypass the coordinator when no mode transition is supplied', async () => {
     const storage = baseStorage()
     await saveAccounts(storage, accountPath)
 
@@ -444,8 +444,23 @@ describe('executeAccountCommand global Claustrum mode', () => {
       path: accountPath,
     })
 
-    expect(result.text).toBe('Claustrum mode set to claustrum.')
-    expect((await loadAccounts(accountPath))?.claustrum?.mode).toBe('claustrum')
+    expect(result.text).toBe('Claustrum mode transition is unavailable.')
+    expect((await loadAccounts(accountPath))?.claustrum?.mode).toBeUndefined()
+  })
+
+  test('routes a requested global mode through its transition seam', async () => {
+    const modes: string[] = []
+    const result = await executeAccountCommand({
+      argumentsText: 'claustrum',
+      storage: baseStorage(),
+      transition: async (mode) => {
+        modes.push(mode)
+        return { text: 'coordinator committed' }
+      },
+    })
+
+    expect(result.text).toBe('coordinator committed')
+    expect(modes).toEqual(['claustrum'])
   })
 })
 
@@ -845,6 +860,31 @@ describe('account command INFO logs (via plugin)', () => {
     expect(payload?.text).toContain('/claude-account local')
     expect(await readFile(accountPath, 'utf8')).toBe(before)
     expect((await stat(accountPath)).mtimeMs).toBe(beforeMtime)
+  })
+
+  test('claustrum command refuses a real main with migration guidance and zero writes', async () => {
+    const storage = baseStorage()
+    await saveAccounts(storage, accountPath)
+    const plugin = await getPlugin()
+    await plugin.auth.loader(
+      async () => ({
+        type: 'oauth',
+        access: 'real-main-access',
+        refresh: 'real-main-refresh',
+        expires: Date.now() + 60_000,
+      }),
+      { models: {} },
+    )
+    const before = await readFile(accountPath, 'utf8')
+    drainNotifications(0, 'ses_test')
+
+    await executeCommand(plugin, 'claude-account', 'claustrum')
+
+    const text = drainNotifications(0, 'ses_test').at(-1)?.payload.text
+    expect(text).toContain('main: TAKEOVER_INCOMPLETE_MAIN_REAL')
+    expect(text).toContain('ck auth migrate-plugin --allow-main')
+    expect(await readFile(accountPath, 'utf8')).toBe(before)
+    expect(findCommandsLog('account enabled')).toBeUndefined()
   })
 
   test('does not retain a background interval unless the helper opts in', async () => {

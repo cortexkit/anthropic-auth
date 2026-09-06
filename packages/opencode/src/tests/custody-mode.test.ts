@@ -9,6 +9,7 @@ import {
   CustodyLockBusyError,
   CustodyStateMismatchError,
   executeClaustrumTakeover,
+  executeLocalExit,
   preflightClaustrumTakeover,
   reconcileCustodyStartup,
 } from '../custody-mode.ts'
@@ -645,5 +646,18 @@ describe('custody mode', () => {
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
+  })
+
+  test('custody: local exit changes only the persisted mode', async () => {
+    const calls: string[] = []
+    await expect(
+      executeLocalExit({
+        setMode: async (mode) => {
+          calls.push(mode)
+          return 'changed'
+        },
+      }),
+    ).resolves.toBe('changed')
+    expect(calls).toEqual(['local'])
   })
 })

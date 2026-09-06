@@ -1,6 +1,7 @@
 import {
   getRefreshBeforeExpiryMs,
   isCustodyTombstoneOAuth,
+  setClaustrumModePersistent,
 } from '@cortexkit/anthropic-auth-core'
 
 import {
@@ -470,6 +471,10 @@ export type ExecuteClaustrumTakeoverDeps = {
   setMode: (mode: 'claustrum') => Promise<'changed' | 'unchanged'>
 }
 
+export function commitClaustrumMode(path: string) {
+  return setClaustrumModePersistent('claustrum', path)
+}
+
 export async function executeClaustrumTakeover(
   plan: ClaustrumTakeoverPlan,
   deps: ExecuteClaustrumTakeoverDeps,
@@ -535,4 +540,13 @@ export async function executeClaustrumTakeover(
   } finally {
     await locks.release()
   }
+}
+
+export function executeLocalExit(deps: {
+  path?: string
+  setMode?: (mode: 'local') => Promise<'changed' | 'unchanged'>
+}) {
+  return deps.setMode
+    ? deps.setMode('local')
+    : setClaustrumModePersistent('local', deps.path)
 }
