@@ -1588,7 +1588,7 @@ export async function setClaustrumModePersistent(
       if (getClaustrumMode(storage) === mode) return 'unchanged'
       storage.claustrum = { ...storage.claustrum, mode }
       await saveAccountsWithConfigLock(storage, path, {
-        writeClaustrumMode: true,
+        [WRITE_CLAUSTRUM_MODE]: true,
       })
       return 'changed'
     } finally {
@@ -1687,14 +1687,18 @@ async function writeJsonAtomic(path: string, value: unknown) {
   }
 }
 
+const WRITE_CLAUSTRUM_MODE = Symbol('writeClaustrumMode')
+
 export interface SaveAccountsOptions {
   /** Account ids intentionally removed by this mutation. */
   removedAccountIds?: readonly string[]
   /** Preserve disk order when a stale snapshot is missing newer accounts. */
   preserveExistingAccountOrder?: boolean
   setClaustrumHandleAccountIds?: readonly string[]
-  /** Internal marker for the sole persistent custody-mode writer. */
-  writeClaustrumMode?: boolean
+}
+
+type InternalSaveAccountsOptions = SaveAccountsOptions & {
+  [WRITE_CLAUSTRUM_MODE]?: true
 }
 
 function sameAccountIdentity(
@@ -1829,7 +1833,7 @@ export async function getOrCreateMainAccountId(
 async function saveAccountsLocked(
   storage: AccountStorage,
   path: string,
-  options: SaveAccountsOptions,
+  options: InternalSaveAccountsOptions,
 ) {
   const lock = await acquireAccountConfigWriteLock(path)
   try {
@@ -1842,7 +1846,7 @@ async function saveAccountsLocked(
 async function saveAccountsWithConfigLock(
   storage: AccountStorage,
   path: string,
-  options: SaveAccountsOptions,
+  options: InternalSaveAccountsOptions,
 ) {
   const current = await loadAccounts(path)
   const nextStorage: AccountStorage = {
@@ -1851,7 +1855,7 @@ async function saveAccountsWithConfigLock(
       claustrum: {
         ...current?.claustrum,
         ...storage.claustrum,
-        ...(options.writeClaustrumMode
+        ...(options[WRITE_CLAUSTRUM_MODE]
           ? { mode: storage.claustrum.mode }
           : current?.claustrum?.mode
             ? { mode: current.claustrum.mode }

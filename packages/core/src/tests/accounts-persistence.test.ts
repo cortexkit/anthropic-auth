@@ -29,6 +29,23 @@ test('preserves the Claustrum mode when a save supplies only handlesFile', async
   })
 })
 
+test('saveAccounts cannot persist a Claustrum mode change', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
+  directories.push(directory)
+  const path = join(directory, 'anthropic-auth.json')
+  const storage = createEmptyStorage()
+
+  await saveAccounts({ ...storage, claustrum: { mode: 'claustrum' } }, path)
+  // @ts-expect-error Persistent custody mode changes have a private capability.
+  await saveAccounts({ ...storage, claustrum: { mode: 'local' } }, path, {
+    writeClaustrumMode: true,
+  })
+
+  await expect(loadAccounts(path)).resolves.toMatchObject({
+    claustrum: { mode: 'claustrum' },
+  })
+})
+
 test('drops a persisted non-string Claustrum handlesFile', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
   directories.push(directory)
