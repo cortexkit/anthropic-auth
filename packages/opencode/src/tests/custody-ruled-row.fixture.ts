@@ -12,7 +12,43 @@ export type CredentialCall = {
   params: Record<string, unknown>
 }
 
-type RuledRowPlugin = any
+type RuledRowCredentialCache = {
+  get: (handle: string) => Promise<unknown>
+}
+
+type RuledRowPlugin = {
+  auth?: {
+    loader?: (
+      getAuth: () => Promise<{
+        type: string
+        access?: string
+        refresh?: string
+        expires?: number
+      }>,
+      provider: { models: Record<string, { cost: unknown }> },
+    ) => Promise<{ fetch: typeof fetch }>
+  }
+  __claustrumCredentialCache?: RuledRowCredentialCache
+  __ensureClaustrumCredentialCacheForTest?: () => Promise<
+    RuledRowCredentialCache | undefined
+  >
+}
+
+class MissingRuledRowFixtureDependencyError extends Error {
+  constructor(dependency: string) {
+    super(`ruled Claustrum row requires ${dependency}`)
+    this.name = 'MissingRuledRowFixtureDependencyError'
+  }
+}
+
+function requireRuledRowDependency<T>(
+  value: T | undefined,
+  dependency: string,
+): T {
+  if (value === undefined)
+    throw new MissingRuledRowFixtureDependencyError(dependency)
+  return value
+}
 
 export const ruledMainHandle = `ckh_${'Z'.repeat(43)}`
 
@@ -91,7 +127,9 @@ export async function writeManifest(
   return path
 }
 
-export async function bootRuledClaustrumRow({
+export async function bootRuledClaustrumRow<
+  TPlugin extends RuledRowPlugin = RuledRowPlugin,
+>({
   fallbacks,
   route,
   quota = { enabled: false, failClosedOnUnknownQuota: false },
@@ -133,27 +171,40 @@ export async function bootRuledClaustrumRow({
       claustrumNow: () => number
       claustrumConnector: () => Promise<unknown>
     },
-  ) => Promise<RuledRowPlugin>
+  ) => Promise<TPlugin>
   bootPlugin?: (
     runtimeOverrides: Record<string, unknown> & {
       claustrumNow: () => number
       claustrumConnector: () => Promise<unknown>
     },
-  ) => Promise<RuledRowPlugin>
+  ) => Promise<TPlugin>
   extractUrl?: (input: string | URL | Request) => string
   tempConfigDir?: () => string
 }) {
   let now = initialNow ?? Date.now()
   const calls: CredentialCall[] = []
   const authorizations: string[] = []
+  const saveTemporaryAccountFile = requireRuledRowDependency(
+    useTempAccountFile,
+    'useTempAccountFile',
+  )
+  const makeFallbackStorage = requireRuledRowDependency(
+    createFallbackStorage,
+    'createFallbackStorage',
+  )
+  const getUrl = requireRuledRowDependency(extractUrl, 'extractUrl')
+  const getTempConfigDir = requireRuledRowDependency(
+    tempConfigDir,
+    'tempConfigDir',
+  )
   const routing: AccountStorage['routing'] =
     route === 'fallback-first'
       ? { mode: 'fallback-first' }
       : route === 'main-exhausted'
         ? { mode: 'main-first' }
         : { mode: 'sticky-balanced' }
-  await useTempAccountFile!(
-    createFallbackStorage!({
+  await saveTemporaryAccountFile(
+    makeFallbackStorage({
       ...storageOverrides,
       main: {
         ...custodyTombstoneOAuth('anthropic'),
@@ -187,12 +238,12 @@ export async function bootRuledClaustrumRow({
   if (!accountStoragePath) {
     throw new Error('ruled Claustrum row requires an account storage path')
   }
-  const manifestPath = await writeManifest(tempConfigDir!(), [
+  const manifestPath = await writeManifest(getTempConfigDir(), [
     { label: 'main', handle: ruledMainHandle },
     ...fallbacks.map(({ label, handle }) => ({ label, handle })),
   ])
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-    if (extractUrl!(input as string | URL | Request).includes('/v1/messages')) {
+    if (getUrl(input as string | URL | Request).includes('/v1/messages')) {
       authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
     }
     return (
@@ -215,9 +266,12 @@ export async function bootRuledClaustrumRow({
         ]),
       ),
   }
-  const plugin = await (bootPlugin
-    ? bootPlugin(resolvedRuntimeOverrides)
-    : getPlugin!(accountStoragePath, resolvedRuntimeOverrides))
+  const plugin = bootPlugin
+    ? await bootPlugin(resolvedRuntimeOverrides)
+    : await requireRuledRowDependency(getPlugin, 'getPlugin')(
+        accountStoragePath,
+        resolvedRuntimeOverrides,
+      )
   const cache =
     plugin.__claustrumCredentialCache ??
     (await plugin.__ensureClaustrumCredentialCacheForTest?.())
@@ -225,7 +279,7 @@ export async function bootRuledClaustrumRow({
     throw new Error('ruled Claustrum row failed to initialize credential cache')
   }
   await cache.get(ruledMainHandle)
-  await plugin.auth.loader(
+  await requireRuledRowDependency(plugin.auth?.loader, 'plugin.auth.loader')(
     () =>
       Promise.resolve({
         type: 'oauth' as const,
@@ -236,7 +290,7 @@ export async function bootRuledClaustrumRow({
     { models: {} },
   )
   const load = () =>
-    plugin.auth.loader(
+    requireRuledRowDependency(plugin.auth?.loader, 'plugin.auth.loader')(
       () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
       { models: {} },
     )
