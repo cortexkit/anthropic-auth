@@ -242,6 +242,57 @@ test.serial('persists the divergence fence as state-only data', async () => {
 })
 
 test.serial(
+  'writes the divergence fence before attempting manifest removal',
+  async () => {
+    const paths = await seedStorage('access-new', 'refresh-new')
+    let stateAtRemove: Record<string, unknown> | undefined
+    await expect(
+      acknowledgeLocalOAuthLogin(
+        completion,
+        {
+          type: 'oauth',
+          access: 'access-new',
+          refresh: 'refresh-new',
+        },
+        {
+          manifestPath: paths.manifestPath,
+          entry: {
+            label: 'main',
+            handle: `ckh_${'D'.repeat(43)}`,
+            credentialId: completion.credentialId,
+          },
+          divergence: {
+            statePath: join(
+              tempDirs.values().next().value as string,
+              'anthropic-auth-state.json',
+            ),
+            lastVaultServedRecordVersion: 9,
+          },
+          remove: async () => {
+            stateAtRemove = JSON.parse(
+              await readFile(
+                join(
+                  tempDirs.values().next().value as string,
+                  'anthropic-auth-state.json',
+                ),
+                'utf8',
+              ),
+            )
+            throw new Error('manifest removal failed')
+          },
+        },
+      ),
+    ).rejects.toThrow('manifest removal failed')
+    expect(
+      stateAtRemove?.claustrumDivergence?.[completion.credentialId],
+    ).toEqual({
+      minimumRecordVersion: 10,
+      observedAt: expect.any(Number),
+    })
+  },
+)
+
+test.serial(
   'authoritative storage read-back clears a matching CLI/TUI login',
   async () => {
     const paths = await seedStorage('access-new', 'refresh-new')
