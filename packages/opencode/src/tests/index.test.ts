@@ -6461,6 +6461,38 @@ describe('package metadata', () => {
 })
 
 describe('AnthropicAuthPlugin', () => {
+  test('fixed auth content refuses before creating the main OAuth URL', async () => {
+    await useTempAccountFile({ version: 1, accounts: [] })
+    const previous = process.env.OPENCODE_AUTH_CONTENT
+    process.env.OPENCODE_AUTH_CONTENT = '{}'
+    try {
+      const authorize = mock(() =>
+        Promise.resolve({
+          url: 'https://example.test/oauth',
+          redirectUri: 'https://example.test/callback',
+          state: 'state',
+          verifier: 'verifier',
+        }),
+      )
+      const plugin = await getPlugin(undefined, undefined, { authorize })
+      await expect(plugin.auth.methods[0].authorize()).rejects.toMatchObject({
+        code: 'custody_login_observation_unavailable',
+      })
+      expect(authorize).not.toHaveBeenCalled()
+      const state = JSON.parse(
+        await readFile(
+          getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+          'utf8',
+        ),
+      )
+      expect(state.accounts).toEqual({})
+      await plugin.dispose?.()
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_AUTH_CONTENT
+      else process.env.OPENCODE_AUTH_CONTENT = previous
+    }
+  })
+
   test('returns an object with auth properties', async () => {
     const plugin = await getPlugin()
     expect(plugin.auth).toBeDefined()
