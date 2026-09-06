@@ -299,7 +299,7 @@ describe('account status Claustrum surface', () => {
     expect(result.text).toContain('Custody mode: claustrum')
     expect(result.text).toContain('Claustrum: available')
     expect(result.text).toContain('account-a')
-    expect(result.text).toContain('vault-bound')
+    expect(result.text).toContain('vault cold')
     expect(result.text).toContain('account-b')
     expect(result.text).toContain('local')
   })
