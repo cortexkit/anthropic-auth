@@ -7,6 +7,7 @@ import { createLiveCustodyDeps } from '../custody-live.ts'
 import {
   acquireCustodyTransitionLocks,
   CustodyLockBusyError,
+  CustodyPreflightRefusedError,
   CustodyStateMismatchError,
   executeClaustrumTakeover,
   executeLocalExit,
@@ -415,6 +416,68 @@ describe('custody mode', () => {
       accountId: 'main',
       reason: 'TAKEOVER_INCOMPLETE_MAIN_BINDING',
     })
+  })
+
+  test('custody: preflight reports every fallback refusal in account order', async () => {
+    const input = preflightInput({
+      fallbacks: [route('work'), route('personal')],
+      bindings: [
+        {
+          accountId: 'main',
+          label: 'main',
+          handle: 'handle-main',
+          credentialId: 'oauth:anthropic:main',
+        },
+        {
+          accountId: 'work',
+          label: 'work',
+          handle: 'handle-work',
+          credentialId: 'oauth:anthropic:work',
+        },
+        {
+          accountId: 'personal',
+          label: 'personal',
+          handle: 'handle-personal',
+          credentialId: 'oauth:anthropic:personal',
+        },
+      ],
+      cache: {
+        get: async (handle: string) =>
+          handle === 'handle-work'
+            ? { state: 'reauth' }
+            : handle === 'handle-personal'
+              ? { state: 'timeout' }
+              : {
+                  credentialId: 'oauth:anthropic:main',
+                  recordVersion: 4,
+                  access: 'vault-access',
+                  refresh: 'vault-refresh',
+                  expiresAt: Number.MAX_SAFE_INTEGER,
+                  state: 'usable' as const,
+                },
+      },
+    })
+
+    const error = await preflightClaustrumTakeover(input).catch(
+      (error: unknown) => error,
+    )
+    expect(error).toBeInstanceOf(CustodyPreflightRefusedError)
+    expect((error as CustodyPreflightRefusedError).toJSON()).toMatchObject({
+      ok: false,
+      accountId: 'work',
+      reason: 'credential_reauth',
+      refusals: [
+        { label: 'work', reason: 'credential_reauth' },
+        { label: 'personal', reason: 'credential_timeout' },
+      ],
+    })
+    const printable = JSON.stringify(error)
+    for (const token of [
+      ...fixtureTokens,
+      ...fixtureHandles,
+      'handle-personal',
+    ])
+      expect(printable).not.toContain(token)
   })
 
   test('custody: startup matrix verdicts', () => {

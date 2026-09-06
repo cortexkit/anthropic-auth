@@ -881,8 +881,14 @@ describe('account command INFO logs (via plugin)', () => {
     await executeCommand(plugin, 'claude-account', 'claustrum')
 
     const text = drainNotifications(0, 'ses_test').at(-1)?.payload.text
-    expect(text).toContain('main: TAKEOVER_INCOMPLETE_MAIN_REAL')
-    expect(text).toContain('ck auth migrate-plugin --allow-main')
+    expect(text).toBe(
+      [
+        'Custody takeover refused:',
+        'main: TAKEOVER_INCOMPLETE_MAIN_REAL — Run ck auth migrate-plugin --allow-main before retrying.',
+        'Work account: binding_missing',
+        'Personal account: binding_missing',
+      ].join('\n'),
+    )
     expect(await readFile(accountPath, 'utf8')).toBe(before)
     expect(findCommandsLog('account enabled')).toBeUndefined()
   })

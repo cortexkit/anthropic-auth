@@ -42,18 +42,33 @@ export type ClaustrumTakeoverPlan = {
   toString: () => string
 }
 
+export type CustodyPreflightRefusal = {
+  label: string
+  reason: string
+  guidance?: string
+}
+
 export class CustodyPreflightRefusedError extends Error {
   readonly code = 'custody_preflight_refused'
 
   constructor(
     readonly accountId: string,
     readonly reason: string,
+    readonly refusals: CustodyPreflightRefusal[] = [
+      { label: accountId, reason },
+    ],
   ) {
     super(`custody preflight refused for account ${accountId}: ${reason}`)
   }
 
   toJSON() {
-    return { code: this.code, accountId: this.accountId, reason: this.reason }
+    return {
+      ok: false,
+      code: this.code,
+      accountId: this.accountId,
+      reason: this.reason,
+      refusals: this.refusals,
+    }
   }
 }
 
@@ -190,50 +205,78 @@ function isUsableCredential(
   return credential.state === 'usable' && 'recordVersion' in credential
 }
 
+type CollectedPreflightRefusal = CustodyPreflightRefusal & {
+  accountId: string
+}
+
 export async function preflightClaustrumTakeover(
   input: PreflightClaustrumTakeoverInput,
 ): Promise<ClaustrumTakeoverPlan> {
   const mainAuth = await input.hostAuth.get()
-  if (!isCustodyTombstoneOAuth(mainAuth, 'anthropic'))
-    throw new CustodyPreflightRefusedError(
-      input.main.id,
-      'TAKEOVER_INCOMPLETE_MAIN_REAL',
-    )
+  const mainIsTombstoned = isCustodyTombstoneOAuth(mainAuth, 'anthropic')
 
   const minTtlMs =
     getRefreshBeforeExpiryMs(input.storage as never) + 30 * 60_000
   const accounts: ClaustrumTakeoverPlan['accounts'] = []
+  const refusals: CollectedPreflightRefusal[] = []
+  const refuse = (route: PreflightRoute, reason: string) => {
+    refusals.push({
+      accountId: route.id,
+      label: route.label ?? route.id,
+      reason,
+      ...(route.id === input.main.id &&
+      reason === 'TAKEOVER_INCOMPLETE_MAIN_REAL'
+        ? {
+            guidance:
+              'Run ck auth migrate-plugin --allow-main before retrying.',
+          }
+        : {}),
+    })
+  }
+  if (!mainIsTombstoned)
+    refuse({ ...input.main, type: 'oauth' }, 'TAKEOVER_INCOMPLETE_MAIN_REAL')
+
   for (const route of enabledOAuthRoutes(input, mainAuth)) {
+    if (route.id === input.main.id && !mainIsTombstoned) continue
     const binding = findStrictBinding(route, input.bindings)
-    if (!binding)
-      throw new CustodyPreflightRefusedError(
-        route.id,
+    if (!binding) {
+      refuse(
+        route,
         route.id === input.main.id
           ? 'TAKEOVER_INCOMPLETE_MAIN_BINDING'
           : 'binding_missing',
       )
+      continue
+    }
     const credential = await input.cache.get(binding.handle, { minTtlMs })
-    if (credential.state === 'revoked')
-      throw new CustodyPreflightRefusedError(route.id, 'credential_revoked')
-    if (credential.state === 'reauth')
-      throw new CustodyPreflightRefusedError(route.id, 'credential_reauth')
-    if (credential.state === 'timeout')
-      throw new CustodyPreflightRefusedError(route.id, 'credential_timeout')
+    if (credential.state === 'revoked') {
+      refuse(route, 'credential_revoked')
+      continue
+    }
+    if (credential.state === 'reauth') {
+      refuse(route, 'credential_reauth')
+      continue
+    }
+    if (credential.state === 'timeout') {
+      refuse(route, 'credential_timeout')
+      continue
+    }
     if (
       !isUsableCredential(credential) ||
       credential.expiresAt < input.now + minTtlMs
-    )
-      throw new CustodyPreflightRefusedError(route.id, 'credential_unusable')
+    ) {
+      refuse(route, 'credential_unusable')
+      continue
+    }
     // Without a vault id, a same-account wrong-record response remains possible; C5's account_id-vs-persisted-anthropicAccountUuid fence is the live protection.
     if (credential.credentialId === undefined)
       input.debug?.(
         'custody identity check skipped: vault supplied no credential id',
       )
-    else if (credential.credentialId !== binding.credentialId)
-      throw new CustodyPreflightRefusedError(
-        route.id,
-        'credential_identity_mismatch',
-      )
+    else if (credential.credentialId !== binding.credentialId) {
+      refuse(route, 'credential_identity_mismatch')
+      continue
+    }
     if (
       !custodyPreflightDivergenceCheck(
         {
@@ -244,19 +287,23 @@ export async function preflightClaustrumTakeover(
           typeof custodyPreflightDivergenceCheck
         >[1],
       ).ok
-    )
-      throw new CustodyPreflightRefusedError(route.id, 'divergence_fenced')
+    ) {
+      refuse(route, 'divergence_fenced')
+      continue
+    }
     const local =
       route.id === input.main.id
         ? oauthFingerprintMaterial(route.local)
         : localOAuthMaterial(route.local)
-    if (!local)
-      throw new CustodyPreflightRefusedError(
-        route.id,
+    if (!local) {
+      refuse(
+        route,
         route.id === input.main.id
           ? 'TAKEOVER_INCOMPLETE_MAIN_SLOT'
           : 'local_credential_unavailable',
       )
+      continue
+    }
     accounts.push({
       id: route.id,
       label: binding.label,
@@ -267,6 +314,14 @@ export async function preflightClaustrumTakeover(
       localAuthFingerprint: localAuthFingerprint(local.access, local.refresh),
       cacheCredential: credential,
     })
+  }
+  const first = refusals.at(0)
+  if (first) {
+    throw new CustodyPreflightRefusedError(
+      first.accountId,
+      first.reason,
+      refusals.map(({ accountId: _, ...refusal }) => refusal),
+    )
   }
   return {
     accounts,

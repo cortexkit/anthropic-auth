@@ -4670,18 +4670,17 @@ const anthropicAuthPlugin = async (
           }
         } catch (error) {
           if (error instanceof CustodyPreflightRefusedError) {
-            const label =
-              error.accountId === 'main'
-                ? 'main'
-                : (currentStorage.accounts.find(
-                    (account) => account.id === error.accountId,
-                  )?.label ?? error.accountId)
-            const guidance =
-              error.reason === 'TAKEOVER_INCOMPLETE_MAIN_REAL'
-                ? '\nRun ck auth migrate-plugin --allow-main before retrying.'
-                : ''
+            const refusals = [
+              ...error.refusals.filter((refusal) => refusal.guidance),
+              ...error.refusals.filter((refusal) => !refusal.guidance),
+            ]
             return {
-              text: `Custody takeover refused:\n${label}: ${error.reason}${guidance}`,
+              text: `Custody takeover refused:\n${refusals
+                .map(
+                  ({ label, reason, guidance }) =>
+                    `${label}: ${reason}${guidance ? ` — ${guidance}` : ''}`,
+                )
+                .join('\n')}`,
             }
           }
           throw error
