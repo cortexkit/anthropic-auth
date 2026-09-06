@@ -10,6 +10,7 @@ import {
   CustodyHandleManifestReader,
   custodyCredentialId,
   readCustodyHandles,
+  removeCustodyHandleManifestEntry,
   resolveCustodyHandle,
   withCustodyManifestLock,
   writeCustodyHandleManifestEntry,
@@ -1020,6 +1021,104 @@ describe('writeCustodyHandleManifestEntry', () => {
       },
     )
   })
+})
+
+describe('removeCustodyHandleManifestEntry', () => {
+  afterEach(() => __setCustodyManifestLockTestOptions())
+
+  test('removes our entry while preserving a foreign tenant block byte-identically', async () => {
+    const foreign = {
+      provider: 'deepseek',
+      serve: 'opencode-claustrum',
+      accounts: [
+        { label: 'foreign', handle: writerHandle, credential_id: 'foreign:id' },
+      ],
+      retained: { z: 0, a: [true, false] },
+    }
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          foreign,
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: writerEntry.label,
+                handle: writerEntry.handle,
+                credential_id: writerEntry.credentialId,
+              },
+            ],
+          },
+        ],
+      }),
+      async (path) => {
+        const beforeForeign = serialize(foreign)
+        await expect(
+          removeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toBe('removed')
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<Record<string, unknown>>
+        }
+        expect(serialize(output.providers[0])).toBe(beforeForeign)
+        expect(output.providers[1]).toEqual({
+          provider: 'anthropic',
+          serve: 'anthropic-auth',
+          accounts: [],
+        })
+      },
+    )
+  })
+
+  test('returns missing when our entry is absent', async () => {
+    await withManifest(fixtureText, async (path) => {
+      await expect(
+        removeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+      ).resolves.toBe('missing')
+    })
+  })
+
+  test.serial(
+    'returns refused when the lease is lost before rename',
+    async () => {
+      await withManifest(fixtureText, async (path) => {
+        await writeCustodyHandleManifestEntry({ path, entry: writerEntry })
+        const before = await fs.readFile(path, 'utf8')
+        const lockPath = `${path}.lock`
+        const ownerPath = join(lockPath, 'owner')
+        const originalOpen = fs.open
+        const originalRename = fs.rename
+        let ownerRenames = 0
+        __setCustodyManifestLockTestOptions({
+          ttlMs: 100,
+          retryMinMs: 5,
+          retryMaxMs: 5,
+          renewalIntervalMs: 10,
+        })
+        spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+          if (String(to) === ownerPath && ++ownerRenames > 1)
+            throw Object.assign(new Error('renewal failed'), { code: 'EIO' })
+          return originalRename(from, to)
+        })
+        spyOn(fs, 'open').mockImplementation(async (...args) => {
+          const handle = await originalOpen(...args)
+          if (
+            String(args[0]).endsWith('.tmp') &&
+            String(args[0]).startsWith(`${lockPath}/`)
+          ) {
+            await Bun.sleep(40)
+          }
+          return handle
+        })
+
+        await expect(
+          removeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toBe('refused')
+        expect(await fs.readFile(path, 'utf8')).toBe(before)
+      })
+    },
+  )
 })
 
 describe('withCustodyManifestLock', () => {

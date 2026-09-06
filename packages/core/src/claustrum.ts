@@ -627,6 +627,11 @@ export type CustodyHandleManifestWriteResult =
       code?: CustodyManifestLockErrorCode
     }
 
+export type CustodyHandleManifestRemovalResult =
+  | 'removed'
+  | 'missing'
+  | 'refused'
+
 export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
 export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
 export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
@@ -916,6 +921,154 @@ export async function writeCustodyHandleManifestEntry(
       return refusal('manifest lock renewal failed; write aborted', error.code)
     }
     return refusal(`unreadable (${errorCode(error)})`)
+  }
+}
+
+export async function removeCustodyHandleManifestEntry(
+  input: CustodyHandleManifestWriteInput,
+): Promise<CustodyHandleManifestRemovalResult> {
+  if (
+    !isValidCustodyLabel(input.entry.label) ||
+    !isValidCustodyHandle(input.entry.handle) ||
+    !isValidCustodyCredentialId(input.entry.credentialId) ||
+    input.entry.credentialId !== custodyCredentialId(input.entry.label)
+  ) {
+    return 'refused'
+  }
+  try {
+    return await withCustodyManifestLock(
+      input.path,
+      async (assertLease, nonce) => {
+        const expectedUid =
+          input.expectedUid ?? process.getuid?.() ?? userInfo().uid
+        const parent = dirname(input.path)
+        try {
+          const parentReason = validateManifestParent(
+            await fs.lstat(parent),
+            expectedUid,
+          )
+          if (parentReason) return 'refused'
+        } catch (error) {
+          return errorCode(error) === 'ENOENT' ? 'missing' : 'refused'
+        }
+
+        let document: Record<string, unknown>
+        let handle: fs.FileHandle | undefined
+        try {
+          const pathStats = await fs.lstat(input.path)
+          const pathReason = validateManifestFile(pathStats, expectedUid)
+          if (pathReason) return 'refused'
+          handle = await fs.open(
+            input.path,
+            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+          )
+          const openedReason = validateManifestFile(
+            await handle.stat(),
+            expectedUid,
+          )
+          if (openedReason) return 'refused'
+          const bytes = new Uint8Array(MAX_CUSTODY_MANIFEST_BYTES + 1)
+          const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, 0)
+          if (bytesRead > MAX_CUSTODY_MANIFEST_BYTES) return 'refused'
+          const parsed = parseJsonRedacted(
+            new TextDecoder().decode(bytes.subarray(0, bytesRead)),
+          )
+          if (
+            !isRecord(parsed) ||
+            parsed.version !== 1 ||
+            !Array.isArray(parsed.providers)
+          ) {
+            return 'refused'
+          }
+          document = parsed
+          if (parsed.providers.some(isOurManifestBlock)) {
+            try {
+              readCustodyHandles(parsed, 'anthropic', 'anthropic-auth')
+            } catch {
+              return 'refused'
+            }
+          }
+        } catch (error) {
+          if (errorCode(error) === 'ENOENT') return 'missing'
+          return 'refused'
+        } finally {
+          await handle?.close().catch(() => {})
+        }
+
+        const providers = document.providers
+        if (!Array.isArray(providers)) return 'refused'
+        const blockIndex = providers.findIndex(isOurManifestBlock)
+        if (blockIndex === -1) return 'missing'
+        const block = providers[blockIndex]
+        if (!isOurManifestBlock(block) || !Array.isArray(block.accounts)) {
+          return 'refused'
+        }
+        const matchIndex = block.accounts.findIndex(
+          (account) =>
+            isRecord(account) &&
+            account.label === input.entry.label &&
+            account.handle === input.entry.handle &&
+            account.credential_id === input.entry.credentialId,
+        )
+        if (matchIndex === -1) return 'missing'
+        const accounts = block.accounts.filter(
+          (_, index) => index !== matchIndex,
+        )
+        const serialized = JSON.stringify(
+          {
+            ...document,
+            providers: providers.map((provider, index) =>
+              index === blockIndex ? { ...block, accounts } : provider,
+            ),
+          },
+          null,
+          2,
+        )
+        if (
+          new TextEncoder().encode(serialized).byteLength >
+          MAX_CUSTODY_MANIFEST_BYTES
+        ) {
+          return 'refused'
+        }
+
+        const temporaryPath = join(
+          `${input.path}.lock`,
+          `manifest.${nonce}.tmp`,
+        )
+        let temporaryHandle: fs.FileHandle | undefined
+        try {
+          temporaryHandle = await fs.open(
+            temporaryPath,
+            fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+            0o600,
+          )
+          await temporaryHandle.writeFile(serialized)
+          await temporaryHandle.sync()
+          await temporaryHandle.close()
+          temporaryHandle = undefined
+          await assertLease()
+          await custodyManifestLockTestOptions?.beforeRename?.()
+          try {
+            await fs.rename(temporaryPath, input.path)
+          } catch (error) {
+            if (errorCode(error) === 'ENOENT')
+              throw new CustodyManifestLockLeaseLostError(
+                'manifest lock renewal failed; write aborted',
+              )
+            throw error
+          }
+          return 'removed'
+        } catch (error) {
+          if (error instanceof CustodyManifestLockLeaseLostError) throw error
+          return 'refused'
+        } finally {
+          await temporaryHandle?.close().catch(() => {})
+          await fs.unlink(temporaryPath).catch(() => {})
+        }
+      },
+    )
+  } catch {
+    return 'refused'
   }
 }
 
