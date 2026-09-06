@@ -485,16 +485,24 @@ export class CustodyTransitionError extends Error {
       | 'mode_commit'
       | 'post_commit_readback',
     readonly accountId?: string,
+    readonly guidance?: string,
   ) {
     super(
-      accountId
-        ? `custody transition failed at ${stage} for account ${accountId}`
-        : `custody transition failed at ${stage}`,
+      `${
+        accountId
+          ? `custody transition failed at ${stage} for account ${accountId}`
+          : `custody transition failed at ${stage}`
+      }${guidance ? ` — ${guidance}` : ''}`,
     )
   }
 
   toJSON() {
-    return { code: this.code, stage: this.stage, accountId: this.accountId }
+    return {
+      code: this.code,
+      stage: this.stage,
+      accountId: this.accountId,
+      guidance: this.guidance,
+    }
   }
 }
 
@@ -529,7 +537,7 @@ export type ExecuteClaustrumTakeoverDeps = {
   verifyCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
   restoreSidecars: (snapshot: CustodySidecarSnapshot) => Promise<void>
   verifyRollback: (snapshot: CustodySidecarSnapshot) => Promise<boolean>
-  setMode: (mode: 'claustrum') => Promise<'changed' | 'unchanged'>
+  setMode: (mode: 'claustrum' | 'local') => Promise<'changed' | 'unchanged'>
 }
 
 export function commitClaustrumMode(path: string) {
@@ -561,6 +569,7 @@ export async function executeClaustrumTakeover(
 
     const snapshot = await deps.snapshotSidecars()
     let accountId: string | undefined
+    let modeCommitted = false
     try {
       try {
         await deps.writeManifestBindings(plan)
@@ -577,6 +586,7 @@ export async function executeClaustrumTakeover(
       }
       try {
         await deps.setMode('claustrum')
+        modeCommitted = true
       } catch {
         throw new CustodyTransitionError('mode_commit')
       }
@@ -585,6 +595,21 @@ export async function executeClaustrumTakeover(
       }
       return 'changed'
     } catch (error) {
+      if (
+        modeCommitted &&
+        error instanceof CustodyTransitionError &&
+        error.stage === 'post_commit_readback'
+      ) {
+        try {
+          await deps.setMode('local')
+        } catch {
+          throw new CustodyTransitionError(
+            'post_commit_readback',
+            undefined,
+            'mode is claustrum and unverified — run `/claude-account local`',
+          )
+        }
+      }
       try {
         await deps.restoreSidecars(snapshot)
         if (!(await deps.verifyRollback(snapshot))) {

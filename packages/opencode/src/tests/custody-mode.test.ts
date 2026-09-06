@@ -668,6 +668,108 @@ describe('custody mode', () => {
     expect(JSON.stringify(error)).not.toContain('access-work-secret')
   })
 
+  test('custody: failed committed readback reverts mode before restoring sidecars', async () => {
+    const plan = await preflightClaustrumTakeover(preflightInput())
+    const before = {
+      config: new TextEncoder().encode('{"access":"access-work-secret"}\n'),
+      state: new TextEncoder().encode('{"refresh":"refresh-work-secret"}\n'),
+    }
+    let config = before.config.slice()
+    let state = before.state.slice()
+    let mode: 'local' | 'claustrum' = 'local'
+
+    const error = await executeClaustrumTakeover(plan, {
+      locks: {
+        storagePath: '/storage.json',
+        manifestPath: '/handles.json',
+        fallbackAccountIds: ['work'],
+        acquireTransition: async () => ({ release: async () => {} }),
+        acquireManifest: async () => ({ release: async () => {} }),
+        acquireRefresh: async () => ({ release: async () => {} }),
+      },
+      getLocalAuth: async (accountId) =>
+        accountId === 'main'
+          ? core.custodyTombstoneOAuth('anthropic')
+          : real('access-work-secret', 'refresh-work-secret'),
+      isCommitted: async () => false,
+      snapshotSidecars: async () => ({
+        config: config.slice(),
+        state: state.slice(),
+      }),
+      writeManifestBindings: async () => {},
+      writeSidecarAccount: async () => {
+        config = new TextEncoder().encode('{"access":""}\n')
+        state = new TextEncoder().encode('{"refresh":"claustrum-tombstone"}\n')
+      },
+      verifyTarget: async () => true,
+      verifyCommitted: async () => false,
+      restoreSidecars: async (snapshot) => {
+        expect(mode).toBe('local')
+        config = snapshot.config!.slice()
+        state = snapshot.state!.slice()
+      },
+      verifyRollback: async () =>
+        JSON.stringify(config) === JSON.stringify(before.config) &&
+        JSON.stringify(state) === JSON.stringify(before.state),
+      setMode: async (target: 'local' | 'claustrum') => {
+        mode = target
+        return 'changed'
+      },
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({
+      code: 'custody_transition_failed',
+      stage: 'post_commit_readback',
+    })
+    expect(mode).toBe('local')
+    expect(config).toEqual(before.config)
+    expect(state).toEqual(before.state)
+  })
+
+  test('custody: failed committed readback leaves sidecars tombstoned when mode revert fails', async () => {
+    const plan = await preflightClaustrumTakeover(preflightInput())
+    let mode: 'local' | 'claustrum' = 'local'
+    let restored = false
+
+    const error = await executeClaustrumTakeover(plan, {
+      locks: {
+        storagePath: '/storage.json',
+        manifestPath: '/handles.json',
+        fallbackAccountIds: ['work'],
+        acquireTransition: async () => ({ release: async () => {} }),
+        acquireManifest: async () => ({ release: async () => {} }),
+        acquireRefresh: async () => ({ release: async () => {} }),
+      },
+      getLocalAuth: async (accountId) =>
+        accountId === 'main'
+          ? core.custodyTombstoneOAuth('anthropic')
+          : real('access-work-secret', 'refresh-work-secret'),
+      isCommitted: async () => false,
+      snapshotSidecars: async () => ({ config: null, state: null }),
+      writeManifestBindings: async () => {},
+      writeSidecarAccount: async () => {},
+      verifyTarget: async () => true,
+      verifyCommitted: async () => false,
+      restoreSidecars: async () => {
+        restored = true
+      },
+      verifyRollback: async () => true,
+      setMode: async (target: 'local' | 'claustrum') => {
+        if (target === 'local') throw new Error('disk full')
+        mode = target
+        return 'changed'
+      },
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({
+      code: 'custody_transition_failed',
+      stage: 'post_commit_readback',
+    })
+    expect(String(error)).toContain('mode is claustrum and unverified')
+    expect(mode).toBe('claustrum')
+    expect(restored).toBe(false)
+  })
+
   test('custody: takeover refuses changed local material before any write', async () => {
     const plan = await preflightClaustrumTakeover(preflightInput())
     let snapshots = 0
