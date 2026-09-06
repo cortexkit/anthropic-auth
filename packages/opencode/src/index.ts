@@ -1940,7 +1940,32 @@ const anthropicAuthPlugin = async (
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     vaultServed = isFallbackAccountVaultServed(account.id, storage),
   ): CustodyStatusState => {
-    if (account.role === 'main') return 'na'
+    if (account.role === 'main') {
+      if (!storage || getClaustrumMode(storage) !== 'claustrum') return 'na'
+      const mainHandle = custodyHandleManifest?.accounts.find(
+        (entry) => entry.label === 'main',
+      )?.handle
+      const cached = mainHandle
+        ? claustrumCredentialCache?.peek(mainHandle)
+        : undefined
+      const persistedIdentity = mainAccountId ?? storage.mainAccountId
+      const credentialIdentity = cached?.accountId
+      if (
+        (persistedIdentity === undefined) !==
+        (credentialIdentity === undefined)
+      )
+        return 'unknown-identity'
+      if (
+        persistedIdentity !== undefined &&
+        credentialIdentity !== undefined &&
+        persistedIdentity !== credentialIdentity
+      )
+        return 'on-identity-mismatch'
+      if (claustrumReauthAccounts.has('main')) return 'on-vault-reauth'
+      if (cached && usableClaustrumAccessToken(cached, claustrumNow()))
+        return 'on-vault-served'
+      return 'on-cold'
+    }
     if (!storage) return 'off'
     const stored = storage.accounts.find(
       (candidate): candidate is OAuthAccount =>

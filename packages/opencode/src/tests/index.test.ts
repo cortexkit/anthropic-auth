@@ -1351,6 +1351,68 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'unknown-identity is visible when either main identity side is absent',
+    async () => {
+      for (const fixture of [
+        {
+          name: 'persisted',
+          mainAccountId: undefined,
+          credentialAccountId: 'vault-main',
+        },
+        {
+          name: 'vault',
+          mainAccountId: 'persisted-main',
+          credentialAccountId: undefined,
+        },
+      ]) {
+        await useTempAccountFile(
+          createFallbackStorage({
+            claustrum: { mode: 'claustrum' },
+            mainAccountId: fixture.mainAccountId,
+            quota: { enabled: false },
+            accounts: [],
+          }),
+        )
+        await writeManifest([{ label: 'main', handle: manifestHandle }])
+        const client = createMockClient()
+        globalThis.fetch = mock(() =>
+          Promise.resolve(new Response('{}', { status: 200 })),
+        ) as unknown as typeof fetch
+        const plugin = await getPlugin(client, undefined, {
+          claustrumConnector: connectorFor([], (method) => {
+            if (method === 'credential.get')
+              return credentialResponse(
+                `sk-ant-oat01-main-vault-access-${fixture.name}`,
+                1,
+                Date.now() + 60_000,
+                fixture.credentialAccountId,
+              )
+            return { result: {} }
+          }),
+        })
+        const result = await plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+          { models: {} },
+        )
+
+        const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        expect(response.status).toBe(200)
+        await expectHandledCommandResponse(
+          plugin['command.execute.before']({
+            command: 'claude-account',
+            arguments: '',
+            sessionID: `unknown-main-identity-${fixture.name}`,
+          }),
+        )
+        const text = (client.session.promptAsync as any).mock.calls.at(-1)?.[0]
+          ?.body.parts[0]?.text
+        expect(text).toContain('unknown identity')
+        await plugin.dispose?.()
+      }
+    },
+  )
+
+  test.serial(
     'prefers a manifest handle over a stale legacy handle',
     async () => {
       await useTempAccountFile(

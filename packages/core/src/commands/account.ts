@@ -161,6 +161,7 @@ export type CustodyStatusState =
   | 'on-vault-served'
   | 'on-vault-reauth'
   | 'on-cold'
+  | 'unknown-identity'
   | 'on-identity-mismatch'
   | 'on-corrupt-binding'
 
@@ -176,6 +177,8 @@ export function custodyStatusLabel(state: CustodyStatusState): string {
       return 'vault reauth'
     case 'on-cold':
       return 'vault cold'
+    case 'unknown-identity':
+      return 'unknown identity'
     case 'on-identity-mismatch':
       return 'identity mismatch'
     case 'on-corrupt-binding':

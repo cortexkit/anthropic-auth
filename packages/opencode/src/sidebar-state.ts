@@ -43,6 +43,7 @@ export interface SidebarAccountState {
     | 'on-vault-served'
     | 'on-vault-reauth'
     | 'on-cold'
+    | 'unknown-identity'
     | 'on-identity-mismatch'
     | 'on-corrupt-binding'
   tierLabel?: string
