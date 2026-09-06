@@ -6494,6 +6494,113 @@ describe('AnthropicAuthPlugin', () => {
     }
   })
 
+  test('main acknowledge consumes the completion record after a refusal', async () => {
+    const access = 'local-login-access'
+    const refresh = 'local-login-refresh'
+    const manifestHandle = `ckh_${'R'.repeat(43)}`
+    const manifest = JSON.stringify({
+      version: 1,
+      providers: [
+        {
+          provider: 'anthropic',
+          serve: 'anthropic-auth',
+          accounts: [
+            {
+              label: 'main',
+              handle: manifestHandle,
+              credential_id: custodyCredentialId('main'),
+            },
+          ],
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'local' },
+        quota: { enabled: false },
+        accounts: [],
+      }),
+    )
+    const manifestPath = join(tempConfigDir!, 'handles.json')
+    await writeFile(manifestPath, manifest)
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/oauth',
+        redirectUri: 'https://example.test/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        return Promise.resolve(
+          Response.json({
+            access_token: access,
+            refresh_token: refresh,
+            expires_in: 3600,
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, { authorize })
+    const flow = await plugin.auth.methods[0].authorize()
+    await flow.callback('code=code&state=state')
+
+    let refuseRename = true
+    __setCustodyManifestLockTestOptions({
+      beforeRename: async () => {
+        if (!refuseRename) return
+        refuseRename = false
+        throw new Error('forced manifest refusal')
+      },
+    })
+    let reads = 0
+    const getAuth = mock(async () => {
+      reads += 1
+      if (reads === 1) {
+        return {
+          type: 'oauth',
+          access: 'different-access',
+          refresh: 'different-refresh',
+          expires: Date.now() + 100_000,
+        }
+      }
+      return {
+        type: 'oauth',
+        access,
+        refresh,
+        expires: Date.now() + 100_000,
+      }
+    })
+    await plugin.auth.loader(getAuth, { models: {} })
+    __setCustodyManifestLockTestOptions()
+
+    expect(
+      JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+    ).toHaveLength(1)
+
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access,
+          refresh,
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const retainedManifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    expect(retainedManifest.providers[0].accounts).toHaveLength(1)
+    await plugin.dispose?.()
+    installDefaultFetchMock()
+  })
+
   test('returns an object with auth properties', async () => {
     const plugin = await getPlugin()
     expect(plugin.auth).toBeDefined()
