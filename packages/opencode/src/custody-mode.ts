@@ -11,7 +11,7 @@ import {
 type ModeDimension = 'L' | 'C'
 type MainDimension = 'R' | 'T' | 'X'
 type FallbackDimension = 'R' | 'T' | 'M'
-type EvidenceDimension = 'V' | 'N'
+type EvidenceDimension = 'V' | 'N' | 'unknown'
 
 type Lock = { release: () => Promise<void> }
 
@@ -327,11 +327,12 @@ export function reconcileCustodyStartup(
       },
 ): { verdict: string; provisional?: boolean } {
   if ('mainSlot' in input) {
+    const evidence = input.evidence === 'unknown' ? 'V' : input.evidence
     const verdicts = new Set(
       (['R', 'T', 'X'] as const).map(
         (main) =>
           startupVerdicts[
-            `${input.mode}|${main}|${input.fallbacks}|${input.evidence}`
+            `${input.mode}|${main}|${input.fallbacks}|${evidence}`
           ],
       ),
     )

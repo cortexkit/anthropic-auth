@@ -2082,8 +2082,16 @@ const anthropicAuthPlugin = async (
     )
   }
 
-  function fallbackCustodyDimensions(storage: AccountStorage | null) {
-    if (!storage) return { fallbacks: 'T' as const, evidence: 'V' as const }
+  function fallbackCustodyDimensions(
+    storage: AccountStorage | null,
+    construction = false,
+  ) {
+    const constructionEvidence = construction ? ('unknown' as const) : undefined
+    if (!storage)
+      return {
+        fallbacks: 'T' as const,
+        evidence: constructionEvidence ?? ('V' as const),
+      }
     const accounts = storage.accounts.filter(
       (account): account is OAuthAccount =>
         account.enabled !== false && isOAuthAccount(account),
@@ -2094,7 +2102,7 @@ const anthropicAuthPlugin = async (
           getClaustrumMode(storage) === 'claustrum'
             ? ('T' as const)
             : ('R' as const),
-        evidence: 'V' as const,
+        evidence: constructionEvidence ?? ('V' as const),
       }
     const fallbacks = accounts.every((account) =>
       isCustodyTombstoneOAuth(
@@ -2105,12 +2113,16 @@ const anthropicAuthPlugin = async (
       ? ('T' as const)
       : ('R' as const)
     if (getClaustrumMode(storage) !== 'claustrum')
-      return { fallbacks, evidence: 'V' as const }
+      return { fallbacks, evidence: constructionEvidence ?? ('V' as const) }
     const bindings = accounts.map((account) =>
       resolveAccountCustodyHandle(account, storage),
     )
     if (bindings.some((binding) => binding.status !== 'resolved'))
-      return { fallbacks: 'M' as const, evidence: 'N' as const }
+      return {
+        fallbacks: 'M' as const,
+        evidence: constructionEvidence ?? ('N' as const),
+      }
+    if (construction) return { fallbacks, evidence: 'unknown' as const }
     const evidence = bindings.every((binding) => {
       if (binding.status !== 'resolved') return false
       return Boolean(
@@ -2696,18 +2708,22 @@ const anthropicAuthPlugin = async (
       claustrumCredentialCache = null
     }
   }
-  const fallbackDimensions = fallbackCustodyDimensions(initialStorage)
+  const fallbackDimensions = fallbackCustodyDimensions(initialStorage, true)
   const provisionalCustody = reconcileCustodyStartup({
     mode: getClaustrumMode(initialStorage) === 'claustrum' ? 'C' : 'L',
     mainSlot: 'unknown',
     ...fallbackDimensions,
   })
-  // A main-only mismatch may surface after the loader sees the host slot; bound
-  // fallbacks are inert to local refresh, so only unbound local work can run here.
-  const fallbackRefreshReady =
-    provisionalCustody.verdict === 'FAIL_CLOSED'
-      ? Promise.resolve('not-started')
-      : fallbackManager.startBackgroundRefresh()
+  // Vault residency is route-local: only real or unbound fallback material is
+  // structurally unsafe before the loader has a main slot.
+  const fallbackRefreshStructuralDark =
+    getClaustrumMode(initialStorage) === 'claustrum' &&
+    provisionalCustody.provisional === true &&
+    (fallbackDimensions.fallbacks === 'M' ||
+      fallbackDimensions.fallbacks === 'R')
+  const fallbackRefreshReady = fallbackRefreshStructuralDark
+    ? Promise.resolve('not-started')
+    : fallbackManager.startBackgroundRefresh()
   const cacheDiagnosticsTracker = new CacheDiagnosticsTracker()
   const cacheDiagnosticsBetaTracker = new CacheDiagnosticsBetaTracker()
   type CacheDiagnosticsResponse = {
@@ -5277,10 +5293,7 @@ const anthropicAuthPlugin = async (
               mode: custodyMode === 'claustrum' ? 'C' : 'L',
               main,
               fallbacks: fallbackDimensions.fallbacks,
-              evidence:
-                fallbackDimensions.evidence === 'N' || mainEvidence === 'N'
-                  ? 'N'
-                  : 'V',
+              evidence: mainEvidence,
             })
           } catch (error) {
             if (!(error instanceof CustodyStateMismatchError)) throw error
