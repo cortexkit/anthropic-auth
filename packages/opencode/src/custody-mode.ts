@@ -343,3 +343,111 @@ export async function acquireCustodyTransitionLocks(input: {
     },
   }
 }
+
+export class CustodyTransitionError extends Error {
+  readonly code = 'custody_transition_failed'
+
+  constructor(
+    readonly stage:
+      | 'reverify_fingerprint'
+      | 'write_sidecar'
+      | 'readback'
+      | 'mode_commit',
+    readonly accountId?: string,
+  ) {
+    super(
+      accountId
+        ? `custody transition failed at ${stage} for account ${accountId}`
+        : `custody transition failed at ${stage}`,
+    )
+  }
+
+  toJSON() {
+    return { code: this.code, stage: this.stage, accountId: this.accountId }
+  }
+}
+
+export class CustodyTransitionRollbackError extends Error {
+  readonly code = 'custody_transition_rollback_failed'
+
+  constructor() {
+    super('custody transition rollback failed')
+  }
+
+  toJSON() {
+    return { code: this.code }
+  }
+}
+
+export type CustodySidecarSnapshot = {
+  config: Uint8Array
+  state: Uint8Array
+}
+
+export type ExecuteClaustrumTakeoverDeps = {
+  locks: Parameters<typeof acquireCustodyTransitionLocks>[0]
+  getLocalAuth: (accountId: string) => Promise<unknown>
+  isCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
+  snapshotSidecars: () => Promise<CustodySidecarSnapshot>
+  writeSidecarAccount: (
+    account: ClaustrumTakeoverPlan['accounts'][number],
+  ) => Promise<void>
+  verifyTarget: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
+  restoreSidecars: (snapshot: CustodySidecarSnapshot) => Promise<void>
+  verifyRollback: (snapshot: CustodySidecarSnapshot) => Promise<boolean>
+  setMode: (mode: 'claustrum') => Promise<'changed' | 'unchanged'>
+}
+
+export async function executeClaustrumTakeover(
+  plan: ClaustrumTakeoverPlan,
+  deps: ExecuteClaustrumTakeoverDeps,
+): Promise<'changed' | 'unchanged'> {
+  const locks = await acquireCustodyTransitionLocks(deps.locks)
+  try {
+    if (await deps.isCommitted(plan)) return 'unchanged'
+
+    for (const account of plan.accounts) {
+      const local = localOAuthMaterial(await deps.getLocalAuth(account.id))
+      if (
+        !local ||
+        localAuthFingerprint(local.access, local.refresh) !==
+          account.localAuthFingerprint
+      ) {
+        throw new CustodyTransitionError('reverify_fingerprint', account.id)
+      }
+    }
+
+    const snapshot = await deps.snapshotSidecars()
+    let accountId: string | undefined
+    try {
+      for (const account of plan.accounts) {
+        accountId = account.id
+        await deps.writeSidecarAccount(account)
+      }
+      if (!(await deps.verifyTarget(plan))) {
+        throw new CustodyTransitionError('readback', accountId)
+      }
+      try {
+        await deps.setMode('claustrum')
+      } catch {
+        throw new CustodyTransitionError('mode_commit')
+      }
+      return 'changed'
+    } catch (error) {
+      try {
+        await deps.restoreSidecars(snapshot)
+        if (!(await deps.verifyRollback(snapshot))) {
+          throw new CustodyTransitionRollbackError()
+        }
+      } catch (rollbackError) {
+        if (rollbackError instanceof CustodyTransitionRollbackError)
+          throw rollbackError
+        throw new CustodyTransitionRollbackError()
+      }
+      if (error instanceof CustodyTransitionError) throw error
+      throw new CustodyTransitionError('write_sidecar', accountId)
+    }
+  } finally {
+    await locks.release()
+  }
+}

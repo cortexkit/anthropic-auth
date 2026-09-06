@@ -5,6 +5,7 @@ import {
   acquireCustodyTransitionLocks,
   CustodyLockBusyError,
   CustodyStateMismatchError,
+  executeClaustrumTakeover,
   preflightClaustrumTakeover,
   reconcileCustodyStartup,
 } from '../custody-mode.ts'
@@ -310,5 +311,66 @@ describe('custody mode', () => {
     ).rejects.toBeInstanceOf(CustodyLockBusyError)
     expect(order).toEqual(['main-refresh', 'alpha-refresh'])
     expect(released).toEqual(['main-refresh', 'manifest', 'transition'])
+  })
+
+  test('custody: takeover restores raw sidecars when a staged write fails', async () => {
+    const plan = await preflightClaustrumTakeover(preflightInput())
+    const before = {
+      config: new TextEncoder().encode('{"accounts":["before"]}\n'),
+      state: new TextEncoder().encode('{"state":"before"}\n'),
+    }
+    let config = before.config.slice()
+    let state = before.state.slice()
+    let mode = 'local'
+    const writes: string[] = []
+
+    const error = await executeClaustrumTakeover(plan, {
+      locks: {
+        storagePath: '/storage.json',
+        manifestPath: '/handles.json',
+        fallbackAccountIds: ['work'],
+        acquireTransition: async () => ({ release: async () => {} }),
+        acquireManifest: async () => ({ release: async () => {} }),
+        acquireRefresh: async () => ({ release: async () => {} }),
+      },
+      getLocalAuth: async (accountId) =>
+        accountId === 'main'
+          ? real('access-main-secret', 'refresh-main-secret')
+          : real('access-work-secret', 'refresh-work-secret'),
+      isCommitted: async () => false,
+      snapshotSidecars: async () => ({
+        config: config.slice(),
+        state: state.slice(),
+      }),
+      writeSidecarAccount: async (account) => {
+        writes.push(account.id)
+        config = new TextEncoder().encode(`{"bound":"${account.id}"}\n`)
+        if (account.id === 'work') throw new Error('disk full')
+        state = new TextEncoder().encode(`{"inert":"${account.id}"}\n`)
+      },
+      verifyTarget: async () => true,
+      restoreSidecars: async (snapshot) => {
+        config = snapshot.config.slice()
+        state = snapshot.state.slice()
+      },
+      verifyRollback: async () =>
+        JSON.stringify(config) === JSON.stringify(before.config) &&
+        JSON.stringify(state) === JSON.stringify(before.state),
+      setMode: async (target) => {
+        mode = target
+        return 'changed'
+      },
+    }).catch((error: unknown) => error)
+
+    expect(error).toMatchObject({
+      code: 'custody_transition_failed',
+      stage: 'write_sidecar',
+      accountId: 'work',
+    })
+    expect(writes).toEqual(['main', 'work'])
+    expect(config).toEqual(before.config)
+    expect(state).toEqual(before.state)
+    expect(mode).toBe('local')
+    expect(JSON.stringify(error)).not.toContain('access-work-secret')
   })
 })
