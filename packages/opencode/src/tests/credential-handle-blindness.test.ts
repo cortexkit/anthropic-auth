@@ -30,10 +30,7 @@ import {
   type SidebarState,
   setSidebarState,
 } from '../sidebar-state'
-import {
-  bootRuledClaustrumRow as bootSharedRuledClaustrumRow,
-  type CredentialCall,
-} from './custody-ruled-row.fixture'
+import { bootRuledClaustrumRow as bootSharedRuledClaustrumRow } from './custody-ruled-row.fixture'
 
 const HANDLE_SENTINEL = `ckh_${'H'.repeat(43)}`
 const TOKEN_SENTINEL = 'claustrum-token-sentinel-9a41'
@@ -583,101 +580,60 @@ describe('credential-handle blindness', () => {
   })
 
   test('deduplicates concurrent reports by served handle and record version', async () => {
-    const accountDir = await mkdtemp(
-      join(tmpdir(), 'opencode-handle-report-dedupe-'),
-    )
-    accountDirs.push(accountDir)
-    const accountPath = join(accountDir, 'anthropic-auth.json')
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
-
-    const checkedAt = Date.now()
-    const fallbackAccount = {
-      ...accountWithHandle(),
-      access: 'fallback-access',
-      expires: Date.now() + 5 * 60 * 60 * 1000,
-      quota: {
-        five_hour: {
-          usedPercent: 10,
-          remainingPercent: 90,
-          checkedAt,
-        },
-        seven_day: {
-          usedPercent: 10,
-          remainingPercent: 90,
-          checkedAt,
-        },
-      },
-    }
-    await saveAccounts(
-      {
-        version: 1,
-        routing: { mode: 'fallback-first' },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          failClosedOnUnknownQuota: false,
-        },
-        claustrum: { mode: 'claustrum' },
-        accounts: [fallbackAccount],
-      } as never,
-      accountPath,
-    )
-
     const reports: Array<Record<string, unknown>> = []
     const firstReportStarted = Promise.withResolvers<void>()
     const releaseFirstReport = Promise.withResolvers<void>()
-    const connector = async () =>
-      ({
-        call: async (_moduleId: string, method: string, params: unknown) => {
-          if (method === 'credential.get') {
-            return {
-              result: {
-                payload: Array.from(
-                  new TextEncoder().encode(
-                    JSON.stringify({ access_token: 'vault-access' }),
-                  ),
-                ),
-                expires_at_ms: Date.now() + 5 * 60 * 60 * 1000,
-                record_version: 17,
-              },
-            }
-          }
-          if (method === 'credential.report_auth_failure') {
-            reports.push(params as Record<string, unknown>)
-            if (reports.length === 1) {
-              firstReportStarted.resolve()
-              await releaseFirstReport.promise
-            }
-            return { result: { ok: true } }
-          }
-          throw new Error(`unexpected method: ${method}`)
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'work',
+          handle: HANDLE_SENTINEL,
+          access: 'vault-access',
+          account: { id: 'work-alt' },
         },
-        close: () => {},
-      }) as never
-
-    globalThis.fetch = mock(() =>
-      Promise.resolve(new Response('{}', { status: 401 })),
-    ) as unknown as typeof fetch
-
-    const plugin = await (
-      AnthropicAuthPlugin as unknown as (
-        ctx: { client: unknown },
-        runtimeOverrides: { claustrumConnector: typeof connector },
-      ) => Promise<any>
-    )(
-      { client: { auth: { set: mock(() => Promise.resolve()) } } },
-      { claustrumConnector: connector },
-    )
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
+      ],
+      connector: () => async () =>
+        ({
+          call: async (_moduleId: string, method: string, params: unknown) => {
+            if (method === 'credential.get') {
+              return {
+                result: {
+                  payload: Array.from(
+                    new TextEncoder().encode(
+                      JSON.stringify({ access_token: 'vault-access' }),
+                    ),
+                  ),
+                  expires_at_ms: Date.now() + 5 * 60 * 60 * 1000,
+                  record_version: 17,
+                },
+              }
+            }
+            if (method === 'credential.report_auth_failure') {
+              if ((params as { handle?: unknown }).handle !== HANDLE_SENTINEL)
+                return { result: { ok: true } }
+              reports.push(params as Record<string, unknown>)
+              if (reports.length === 1) {
+                firstReportStarted.resolve()
+                await releaseFirstReport.promise
+              }
+              return { result: { ok: true } }
+            }
+            throw new Error(`unexpected method: ${method}`)
+          },
+          close: () => {},
+        }) as never,
+      onFetch: (_input, init) =>
+        new Response('{}', {
+          status:
+            new Headers(init?.headers).get('authorization') ===
+            'Bearer vault-main-access'
+              ? 200
+              : 401,
         }),
-      { models: {} },
-    )
+    })
+    const plugin = fixture.plugin as any
+    const result = fixture.result
     const request = () =>
       result.fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
