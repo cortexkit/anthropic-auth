@@ -210,7 +210,9 @@ export async function preflightClaustrumTakeover(
           credentialId: binding.credentialId,
           recordVersion: credential.recordVersion,
         },
-        input.storage as Parameters<typeof custodyPreflightDivergenceCheck>[1],
+        (input.storage ?? {}) as Parameters<
+          typeof custodyPreflightDivergenceCheck
+        >[1],
       ).ok
     )
       throw new CustodyPreflightRefusedError(route.id, 'divergence_fenced')

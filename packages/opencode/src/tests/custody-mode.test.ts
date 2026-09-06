@@ -342,6 +342,14 @@ describe('custody mode', () => {
     expect(emptyStore.calls.locks).toBe(0)
   })
 
+  test('custody: preflight tolerates null storage with real local material', async () => {
+    const input = preflightInput({ storage: null })
+
+    await expect(preflightClaustrumTakeover(input)).resolves.toMatchObject({
+      accounts: [{ id: 'main' }, { id: 'work' }],
+    })
+  })
+
   test('custody: startup matrix verdicts', () => {
     const expected = new Map<string, string>([
       ['L|R|R|V', 'LOCAL_SERVE'],
