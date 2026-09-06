@@ -265,6 +265,25 @@ describe('custody mode', () => {
           }),
         reason: 'divergence_fenced',
       },
+      {
+        name: 'credential identity mismatch',
+        mutate: (input: any) =>
+          (input.cache.get = async (
+            handle: string,
+            { minTtlMs }: { minTtlMs: number },
+          ) => ({
+            credentialId:
+              handle === 'handle-work'
+                ? 'oauth:anthropic:other'
+                : 'oauth:anthropic:main',
+            recordVersion: 4,
+            access: `vault-secret-${handle}`,
+            refresh: `vault-refresh-${handle}`,
+            expiresAt: now + minTtlMs + 1,
+            state: 'usable',
+          })),
+        reason: 'credential_identity_mismatch',
+      },
     ]
 
     for (const entry of cases) {

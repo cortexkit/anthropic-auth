@@ -199,6 +199,11 @@ export async function preflightClaustrumTakeover(
       credential.expiresAt < input.now + minTtlMs
     )
       throw new CustodyPreflightRefusedError(route.id, 'credential_unusable')
+    if (credential.credentialId !== binding.credentialId)
+      throw new CustodyPreflightRefusedError(
+        route.id,
+        'credential_identity_mismatch',
+      )
     if (
       !custodyPreflightDivergenceCheck(
         {
