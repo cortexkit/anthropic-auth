@@ -158,7 +158,7 @@ export async function acknowledgeLocalOAuthLoginFromStorage(
     (candidate) =>
       candidate.id === completion.accountId && isOAuthAccount(candidate),
   )
-  if (!account || !account.label) return 'not-cleared'
+  if (!account?.label) return 'not-cleared'
 
   const manifestResult = await new CustodyHandleManifestReader({
     path: options.manifestPath,
