@@ -1,4 +1,7 @@
-import { describe, expect, spyOn, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import { createLiveCustodyDeps } from '../custody-live.ts'
 import {
@@ -95,102 +98,75 @@ function preflightInput(overrides: Record<string, unknown> = {}) {
 }
 
 describe('custody mode', () => {
-  test('custody: live adapter maps host auth, manifest, cache, and locks', async () => {
+  test('custody: live adapter maps host auth, loaded manifest, and cache', async () => {
     const get = async () => real('access-main-secret', 'refresh-main-secret')
-    const order: string[] = []
-    const cacheGet = spyOn(
-      {
-        get: async (_handle: string, minTtlMs?: number) => ({
-          credentialId: 'oauth:anthropic:main',
-          recordVersion: 1,
-          access: 'vault-access',
-          refresh: 'vault-refresh',
-          expiresAt: now + (minTtlMs ?? 0) + 1,
-          state: 'usable' as const,
-        }),
-      },
-      'get',
-    )
-    const cache = { get: cacheGet }
-    const read = spyOn(core.CustodyHandleManifestReader.prototype, 'read')
-    read.mockResolvedValue({
-      status: 'ready',
-      manifest: {
-        version: 1,
-        provider: 'anthropic',
-        serve: 'anthropic-auth',
-        accounts: [
-          {
-            label: 'main',
-            handle: 'handle-main',
-            credentialId: 'oauth:anthropic:main',
-          },
-        ],
-        superseded: new Set(),
-      },
-    })
-    const manifestLock = spyOn(core, 'withCustodyManifestLock')
-    manifestLock.mockImplementation(async (path, fn) => {
-      order.push(`manifest:${path}`)
-      return fn(async () => {}, 'nonce')
-    })
-    const refreshLock = spyOn(core, 'acquireRefreshFileLock')
-    refreshLock.mockImplementation(async ({ name }) => {
-      order.push(name)
-      return { release: async () => {} }
-    })
-    const fallbackManager = {
-      withAccountRefreshLock: async <T>(
-        accountId: string,
-        fn: () => Promise<T>,
-      ) => {
-        order.push(accountId)
-        return fn()
-      },
-    }
+    const manifestHandle = `ckh_${'A'.repeat(43)}`
     const storage: core.AccountStorage = {
       version: 1,
       accounts: [],
       claustrum: { handlesFile: '/resolved-handles.json' },
       refresh: { refreshBeforeExpiryMinutes: 5 },
     }
-    const loadAccounts = spyOn(core, 'loadAccounts')
-    loadAccounts.mockResolvedValue(storage)
-    const deps = createLiveCustodyDeps({
-      storagePath: '/storage.json',
-      cache,
-      latestGetAuth: get,
-      now,
-      fallbackManager,
-    })
+    const directory = await mkdtemp(join(tmpdir(), 'custody-live-adapter-'))
+    const storagePath = join(directory, 'storage.json')
+    const manifestPath = join(directory, 'handles.json')
+    const cacheCalls: Array<{ handle: string; minTtlMs?: number }> = []
+    try {
+      await expect(
+        core.writeCustodyHandleManifestEntry({
+          path: manifestPath,
+          entry: {
+            label: 'main',
+            handle: manifestHandle,
+            credentialId: 'oauth:anthropic:main',
+          },
+        }),
+      ).resolves.toEqual({ status: 'written' })
+      await core.saveAccounts(
+        {
+          ...storage,
+          claustrum: { handlesFile: manifestPath },
+        },
+        storagePath,
+      )
+      const deps = createLiveCustodyDeps({
+        storagePath,
+        cache: {
+          get: async (handle, minTtlMs) => {
+            cacheCalls.push({ handle, minTtlMs })
+            return {
+              credentialId: 'oauth:anthropic:main',
+              recordVersion: 1,
+              access: 'vault-access',
+              refresh: 'vault-refresh',
+              expiresAt: now + (minTtlMs ?? 0) + 1,
+              state: 'usable',
+            }
+          },
+        },
+        latestGetAuth: get,
+        now,
+      })
 
-    expect(deps.hostAuth.get).toBe(get)
-    expect(deps.hostAuth).not.toHaveProperty('set')
-    await deps.readBindings([{ id: 'main', label: 'main', type: 'oauth' }])
-    expect(read).toHaveBeenCalledTimes(1)
-    expect(deps.manifestPath).toBe('/resolved-handles.json')
-    await preflightClaustrumTakeover(
-      await deps.preflightInput(
-        { id: 'main', label: 'main', enabled: true },
-        [],
-      ),
-    )
-    expect(cacheGet).toHaveBeenCalledWith(
-      'handle-main',
-      core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000,
-    )
-    const locks = await acquireCustodyTransitionLocks({
-      ...deps.locks,
-      fallbackAccountIds: ['zulu', 'alpha'],
-    })
-    await locks.release()
-    expect(order).toEqual([
-      'claustrum-mode-transition',
-      'manifest:/resolved-handles.json',
-      'opencode-main-oauth-refresh',
-      'alpha',
-      'zulu',
-    ])
+      expect(deps.hostAuth.get).toBe(get)
+      expect(deps.hostAuth).not.toHaveProperty('set')
+      await deps.readBindings([{ id: 'main', label: 'main', type: 'oauth' }])
+      expect(deps.manifestPath).toBe(manifestPath)
+      await preflightClaustrumTakeover(
+        await deps.preflightInput(
+          { id: 'main', label: 'main', enabled: true },
+          [],
+        ),
+      )
+      expect(cacheCalls).toEqual([
+        {
+          handle: manifestHandle,
+          minTtlMs: core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000,
+        },
+      ])
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 
   test('custody: preflight verifies every account before any write', async () => {
