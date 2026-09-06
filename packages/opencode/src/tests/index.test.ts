@@ -1084,8 +1084,10 @@ describe('fallback Claustrum credential resolution', () => {
       ...options,
       createFallbackStorage,
       useTempAccountFile,
-      getPlugin: (runtimeOverrides) =>
-        getPlugin(undefined, undefined, runtimeOverrides as never),
+      getPlugin: (accountStoragePath, runtimeOverrides) => {
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountStoragePath
+        return getPlugin(undefined, undefined, runtimeOverrides as never)
+      },
       extractUrl,
       tempConfigDir: () => tempConfigDir!,
     })
@@ -3886,7 +3888,7 @@ describe('fallback Claustrum credential resolution', () => {
         ],
         createFallbackStorage,
         useTempAccountFile,
-        getPlugin: async (runtimeOverrides) => {
+        getPlugin: async (accountStoragePath, runtimeOverrides) => {
           const connectionFile = join(
             tempConfigDir!,
             'configured-claustrum.json',
@@ -3901,6 +3903,7 @@ describe('fallback Claustrum credential resolution', () => {
           )
           process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE =
             connectionFile
+          process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountStoragePath
           return getPlugin(
             createMockClient(),
             tempConfigDir!,

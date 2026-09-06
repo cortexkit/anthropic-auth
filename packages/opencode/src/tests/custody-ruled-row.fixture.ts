@@ -16,7 +16,11 @@ type RuledRowPlugin = {
   __claustrumCredentialCache: {
     get: (handle: string) => Promise<unknown>
     invalidate: (handle: string) => void
-  }
+  } | null
+  __ensureClaustrumCredentialCacheForTest?: () => Promise<{
+    get: (handle: string) => Promise<unknown>
+    invalidate: (handle: string) => void
+  } | null>
   auth: {
     loader: (
       getAuth: () => Promise<never>,
@@ -144,6 +148,7 @@ export async function bootRuledClaustrumRow({
   createFallbackStorage: (storage: Partial<AccountStorage>) => AccountStorage
   useTempAccountFile: (storage: AccountStorage) => Promise<void>
   getPlugin: (
+    accountStoragePath: string,
     runtimeOverrides: Record<string, unknown> & {
       claustrumNow: () => number
       claustrumConnector: () => Promise<unknown>
@@ -192,6 +197,10 @@ export async function bootRuledClaustrumRow({
       })) as OAuthAccount[],
     }),
   )
+  const accountStoragePath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+  if (!accountStoragePath) {
+    throw new Error('ruled Claustrum row requires an account storage path')
+  }
   const manifestPath = await writeManifest(tempConfigDir(), [
     { label: 'main', handle: ruledMainHandle },
     ...fallbacks.map(({ label, handle }) => ({ label, handle })),
@@ -207,7 +216,7 @@ export async function bootRuledClaustrumRow({
         : (response?.clone() ?? new Response('{}', { status: 200 })))
     )
   }) as typeof fetch
-  const plugin = await getPlugin({
+  const plugin = await getPlugin(accountStoragePath, {
     ...runtimeOverrides,
     claustrumNow: () => now,
     claustrumConnector:
@@ -220,7 +229,13 @@ export async function bootRuledClaustrumRow({
         ]),
       ),
   })
-  await plugin.__claustrumCredentialCache.get(ruledMainHandle)
+  const cache =
+    plugin.__claustrumCredentialCache ??
+    (await plugin.__ensureClaustrumCredentialCacheForTest?.())
+  if (!cache) {
+    throw new Error('ruled Claustrum row failed to initialize credential cache')
+  }
+  await cache.get(ruledMainHandle)
   await plugin.auth.loader(
     () =>
       Promise.resolve({
