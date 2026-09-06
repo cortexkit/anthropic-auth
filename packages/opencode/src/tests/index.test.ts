@@ -1432,6 +1432,52 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test.serial(
+    'bounds a tombstoned main loader when the vault stays cold',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      await writeManifest([{ label: 'main', handle: manifestHandle }])
+      let releaseCredential!: () => void
+      const credential = new Promise<unknown>((resolve) => {
+        releaseCredential = () =>
+          resolve(credentialResponse('late-main-access', 1))
+      })
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connectorFor([], (method) =>
+          method === 'credential.get' ? credential : { result: {} },
+        ),
+      })
+
+      try {
+        const startedAt = performance.now()
+        const result = (await withDeadlockGuard(
+          plugin.auth.loader(
+            () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+            { models: {} },
+          ),
+          150,
+          'tombstoned main loader exceeded 150ms',
+        )) as { fetch: typeof fetch }
+        expect(performance.now() - startedAt).toBeLessThan(150)
+        await expect(
+          result.fetch(MESSAGES_URL, EMPTY_POST),
+        ).rejects.toMatchObject({
+          code: 'custody_state_mismatch',
+          verdict: 'FAIL_CLOSED',
+        })
+      } finally {
+        releaseCredential()
+        await plugin.dispose?.()
+      }
+    },
+  )
+
+  test.serial(
     'holds fallback refresh when provisional custody is dark by fallback',
     async () => {
       await useTempAccountFile(manifestStorage({ label: 'boot-dark-fallback' }))
@@ -4483,26 +4529,35 @@ describe('fallback Claustrum credential resolution', () => {
         throw new Error('Claustrum warmup blocked plugin startup')
       }),
     ])
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
-      { models: {} },
-    )
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    try {
+      const startedAt = performance.now()
+      await withDeadlockGuard(
+        plugin.__fallbackRefreshReady,
+        150,
+        'startup vault warmup exceeded 150ms',
+      )
+      expect(performance.now() - startedAt).toBeLessThan(150)
 
-    expect(response.status).toBe(200)
-    expect(authorizations).toEqual(['Bearer main-access'])
-    expect(
-      calls.filter((call) => call.method === 'credential.get'),
-    ).toHaveLength(1)
-    releaseCold.resolve()
-    await Bun.sleep(0)
-    await plugin.dispose?.()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(response.status).toBe(200)
+      expect(authorizations).toEqual(['Bearer main-access'])
+      expect(
+        calls.filter((call) => call.method === 'credential.get'),
+      ).toHaveLength(1)
+    } finally {
+      releaseCold.resolve()
+      await plugin.dispose?.()
+    }
   })
 
   test('detaches a stale-marked startup refresh and uses its result when it lands', async () => {

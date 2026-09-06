@@ -2475,6 +2475,27 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  async function getStartupWarmCredential(
+    cache: ClaustrumCredentialCache,
+    handle: string,
+    minTtlMs: number,
+  ): Promise<ClaustrumCredential | undefined> {
+    let resolveTimeout!: () => void
+    const timeout = new Promise<undefined>((resolve) => {
+      resolveTimeout = () => resolve(undefined)
+    })
+    const timer = globalThis.setTimeout(
+      resolveTimeout,
+      CLAUSTRUM_WARMUP_TIMEOUT_MS,
+    )
+    if (typeof timer === 'object' && timer && 'unref' in timer) timer.unref()
+    try {
+      return await Promise.race([cache.get(handle, minTtlMs), timeout])
+    } finally {
+      globalThis.clearTimeout(timer)
+    }
+  }
+
   async function refreshVaultBackedOAuthAccounts(
     initial = false,
   ): Promise<void> {
@@ -2499,7 +2520,9 @@ const anthropicAuthPlugin = async (
           if (!cache) cache = await ensureClaustrumCredentialCache()
           if (cache) {
             try {
-              const credential = await cache.get(handle, minTtlMs)
+              const credential = initial
+                ? await getStartupWarmCredential(cache, handle, minTtlMs)
+                : await cache.get(handle, minTtlMs)
               if (usableClaustrumAccessToken(credential, claustrumNow())) {
                 await markClaustrumCredentialReady('main', handle)
               }
@@ -2532,7 +2555,9 @@ const anthropicAuthPlugin = async (
       }
       if (!cache) continue
       try {
-        const credential = await cache.get(handle, minTtlMs)
+        const credential = initial
+          ? await getStartupWarmCredential(cache, handle, minTtlMs)
+          : await cache.get(handle, minTtlMs)
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
           logger.debug('refresh', 'vault fallback credential unusable', {
             id: account.id,
