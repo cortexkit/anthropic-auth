@@ -143,6 +143,21 @@ function localOAuthMaterial(
   return { access, refresh }
 }
 
+function oauthFingerprintMaterial(
+  value: unknown,
+): { access: string; refresh: string } | undefined {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    (value as { type?: unknown }).type !== 'oauth'
+  )
+    return undefined
+  const { access, refresh } = value as { access?: unknown; refresh?: unknown }
+  if (typeof access !== 'string' || typeof refresh !== 'string')
+    return undefined
+  return { access, refresh }
+}
+
 function enabledOAuthRoutes(
   input: PreflightClaustrumTakeoverInput,
   mainAuth: unknown,
@@ -174,10 +189,10 @@ export async function preflightClaustrumTakeover(
   input: PreflightClaustrumTakeoverInput,
 ): Promise<ClaustrumTakeoverPlan> {
   const mainAuth = await input.hostAuth.get()
-  if (!input.storage && !localOAuthMaterial(mainAuth))
+  if (!isCustodyTombstoneOAuth(mainAuth, 'anthropic'))
     throw new CustodyPreflightRefusedError(
       input.main.id,
-      'mode_not_committed_local_credential_unavailable',
+      'TAKEOVER_INCOMPLETE_MAIN_REAL',
     )
 
   const minTtlMs =
@@ -186,7 +201,12 @@ export async function preflightClaustrumTakeover(
   for (const route of enabledOAuthRoutes(input, mainAuth)) {
     const binding = findStrictBinding(route, input.bindings)
     if (!binding)
-      throw new CustodyPreflightRefusedError(route.id, 'binding_missing')
+      throw new CustodyPreflightRefusedError(
+        route.id,
+        route.id === input.main.id
+          ? 'TAKEOVER_INCOMPLETE_MAIN_BINDING'
+          : 'binding_missing',
+      )
     const credential = await input.cache.get(binding.handle, { minTtlMs })
     if (credential.state === 'revoked')
       throw new CustodyPreflightRefusedError(route.id, 'credential_revoked')
@@ -216,11 +236,16 @@ export async function preflightClaustrumTakeover(
       ).ok
     )
       throw new CustodyPreflightRefusedError(route.id, 'divergence_fenced')
-    const local = localOAuthMaterial(route.local)
+    const local =
+      route.id === input.main.id
+        ? oauthFingerprintMaterial(route.local)
+        : localOAuthMaterial(route.local)
     if (!local)
       throw new CustodyPreflightRefusedError(
         route.id,
-        'local_credential_unavailable',
+        route.id === input.main.id
+          ? 'TAKEOVER_INCOMPLETE_MAIN_SLOT'
+          : 'local_credential_unavailable',
       )
     accounts.push({
       id: route.id,
@@ -443,7 +468,11 @@ export async function executeClaustrumTakeover(
     if (await deps.isCommitted(plan)) return 'unchanged'
 
     for (const account of plan.accounts) {
-      const local = localOAuthMaterial(await deps.getLocalAuth(account.id))
+      const current = await deps.getLocalAuth(account.id)
+      const local =
+        account.id === 'main'
+          ? oauthFingerprintMaterial(current)
+          : localOAuthMaterial(current)
       if (
         !local ||
         localAuthFingerprint(local.access, local.refresh) !==

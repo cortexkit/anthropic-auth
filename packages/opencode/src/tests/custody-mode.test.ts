@@ -52,7 +52,7 @@ function preflightInput(overrides: Record<string, unknown> = {}) {
     hostAuth: {
       get: () => {
         calls.auth++
-        return real('access-main-secret', 'refresh-main-secret')
+        return core.custodyTombstoneOAuth('anthropic')
       },
     },
     bindings: [
@@ -99,7 +99,7 @@ function preflightInput(overrides: Record<string, unknown> = {}) {
 
 describe('custody mode', () => {
   test('custody: live adapter maps host auth, loaded manifest, and cache', async () => {
-    const get = async () => real('access-main-secret', 'refresh-main-secret')
+    const get = async () => core.custodyTombstoneOAuth('anthropic')
     const manifestHandle = `ckh_${'A'.repeat(43)}`
     const storage: core.AccountStorage = {
       version: 1,
@@ -302,11 +302,10 @@ describe('custody mode', () => {
       storage: null,
       hostAuth: { get: () => tombstone },
     })
-    await expect(preflightClaustrumTakeover(fresh)).rejects.toMatchObject({
-      code: 'custody_preflight_refused',
-      reason: 'mode_not_committed_local_credential_unavailable',
+    await expect(preflightClaustrumTakeover(fresh)).resolves.toMatchObject({
+      accounts: [{ id: 'main' }, { id: 'work' }],
     })
-    expect(fresh.calls.transport).toBe(0)
+    expect(fresh.calls.transport).toBe(2)
     expect(fresh.calls.locks).toBe(0)
 
     const emptyStore = preflightInput({ storage: { version: 1 } })
@@ -318,11 +317,38 @@ describe('custody mode', () => {
     expect(emptyStore.calls.locks).toBe(0)
   })
 
-  test('custody: preflight tolerates null storage with real local material', async () => {
-    const input = preflightInput({ storage: null })
+  test('custody: preflight refuses a real main until the operator migrates it', async () => {
+    const input = preflightInput({
+      storage: null,
+      hostAuth: {
+        get: () => real('access-main-secret', 'refresh-main-secret'),
+      },
+    })
 
-    await expect(preflightClaustrumTakeover(input)).resolves.toMatchObject({
-      accounts: [{ id: 'main' }, { id: 'work' }],
+    await expect(preflightClaustrumTakeover(input)).rejects.toMatchObject({
+      code: 'custody_preflight_refused',
+      accountId: 'main',
+      reason: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
+    })
+  })
+
+  test('custody: preflight refuses a tombstoned main without its manifest binding', async () => {
+    const input = preflightInput({
+      hostAuth: { get: () => core.custodyTombstoneOAuth('anthropic') },
+      bindings: [
+        {
+          accountId: 'work',
+          label: 'work',
+          handle: 'handle-work',
+          credentialId: 'oauth:anthropic:work',
+        },
+      ],
+    })
+
+    await expect(preflightClaustrumTakeover(input)).rejects.toMatchObject({
+      code: 'custody_preflight_refused',
+      accountId: 'main',
+      reason: 'TAKEOVER_INCOMPLETE_MAIN_BINDING',
     })
   })
 
@@ -465,7 +491,7 @@ describe('custody mode', () => {
       },
       getLocalAuth: async (accountId) =>
         accountId === 'main'
-          ? real('access-main-secret', 'refresh-main-secret')
+          ? core.custodyTombstoneOAuth('anthropic')
           : real('access-work-secret', 'refresh-work-secret'),
       isCommitted: async () => false,
       snapshotSidecars: async () => ({
