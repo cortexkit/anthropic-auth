@@ -15,7 +15,7 @@ type LiveCacheCredential = {
   recordVersion: number
   access: string
   refresh: string
-  expiresAt: number
+  expiresAt: number | null
   state: 'usable' | 'revoked' | 'reauth' | 'timeout'
 }
 
@@ -141,7 +141,8 @@ export function createLiveCustodyDeps(input: {
         typeof payload.access_token === 'string' ? payload.access_token : '',
       refresh:
         typeof payload.refresh_token === 'string' ? payload.refresh_token : '',
-      expiresAt: credential.expiresAtMs ?? 0,
+      expiresAt:
+        credential.expiresAtMs === null ? null : (credential.expiresAtMs ?? 0),
       state: 'usable' as const,
     }
   }

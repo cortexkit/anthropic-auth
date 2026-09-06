@@ -23,7 +23,7 @@ export type CustodyCacheCredential = {
   recordVersion: number
   access: string
   refresh: string
-  expiresAt: number
+  expiresAt: number | null
   state: 'usable' | 'revoked' | 'reauth' | 'timeout'
 }
 
@@ -200,7 +200,9 @@ function findStrictBinding(
 }
 
 function isUsableCredential(
-  credential: CustodyCacheCredential | { state: string; expiresAt?: number },
+  credential:
+    | CustodyCacheCredential
+    | { state: string; expiresAt?: number | null },
 ): credential is CustodyCacheCredential {
   return credential.state === 'usable' && 'recordVersion' in credential
 }
@@ -263,7 +265,8 @@ export async function preflightClaustrumTakeover(
     }
     if (
       !isUsableCredential(credential) ||
-      credential.expiresAt < input.now + minTtlMs
+      (credential.expiresAt !== null &&
+        credential.expiresAt < input.now + minTtlMs)
     ) {
       refuse(route, 'credential_unusable')
       continue

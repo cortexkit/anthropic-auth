@@ -171,7 +171,7 @@ describe('custody mode', () => {
     }
   })
 
-  test('custody: live adapter skips identity comparison when the vault supplies no credential id', async () => {
+  test('custody: live adapter keeps non-expiring vault credentials usable', async () => {
     const get = async () => core.custodyTombstoneOAuth('anthropic')
     const manifestHandle = `ckh_${'A'.repeat(43)}`
     const storage: core.AccountStorage = {
@@ -210,7 +210,7 @@ describe('custody mode', () => {
               access_token: 'vault-access',
               refresh_token: 'vault-refresh',
             }),
-            expiresAtMs: now + (minTtlMs ?? 0) + 1,
+            expiresAtMs: null,
             recordVersion: 1,
             accountId: 'vault-account',
           }),
