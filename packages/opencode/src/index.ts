@@ -7555,6 +7555,10 @@ const anthropicAuthPlugin = async (
                       : 'cold'
                   }
                 }
+                if (requestMainRefusal) {
+                  auth.access = ''
+                  auth.expires = 0
+                }
               }
               let requestMainQuotaIdentity: MainQuotaIdentityBinding | undefined
               if (auth.access) {

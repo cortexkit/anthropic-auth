@@ -1115,6 +1115,7 @@ describe('fallback Claustrum credential resolution', () => {
         mainAccountId?: ProviderAccountUuid
         vaultAccountId?: string
         responseStatus?: number
+        responseStatuses?: number[]
         mainExpiresAt?: number
         fallbackExpiresAt?: number
       } = {},
@@ -1122,7 +1123,11 @@ describe('fallback Claustrum credential resolution', () => {
       let now = 1_000
       const calls: CredentialCall[] = []
       const authorizations: string[] = []
+      let mainSlotAccess = ''
+      let mainSlotExpires = 0
+      let mainExpiresAt = options.mainExpiresAt ?? 10_000
       const fallback = options.fallback !== false
+      const responseStatuses = [...(options.responseStatuses ?? [])]
       const checkedAt = Date.now()
       const quota = options.quota ?? {
         enabled: false,
@@ -1183,7 +1188,9 @@ describe('fallback Claustrum credential resolution', () => {
             new Headers(init?.headers).get('authorization') ?? '',
           )
           return Promise.resolve(
-            new Response('{}', { status: options.responseStatus ?? 200 }),
+            new Response('{}', {
+              status: responseStatuses.shift() ?? options.responseStatus ?? 200,
+            }),
           )
         }
         return Promise.resolve(new Response('{}', { status: 200 }))
@@ -1196,15 +1203,20 @@ describe('fallback Claustrum credential resolution', () => {
           return credentialResponse(
             isMain ? 'vault-main-access' : 'vault-fallback-access',
             isMain ? 17 : 29,
-            isMain
-              ? (options.mainExpiresAt ?? 10_000)
-              : (options.fallbackExpiresAt ?? 10_000),
+            isMain ? mainExpiresAt : (options.fallbackExpiresAt ?? 10_000),
             isMain ? options.vaultAccountId : 'fallback-provider-account',
           )
         }),
       })
       const result = await plugin.auth.loader(
-        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        () =>
+          Promise.resolve({
+            ...custodyTombstoneOAuth('anthropic'),
+            ...(mainSlotAccess && {
+              access: mainSlotAccess,
+              expires: mainSlotExpires,
+            }),
+          } as never),
         { models: {} },
       )
       return {
@@ -1215,8 +1227,42 @@ describe('fallback Claustrum credential resolution', () => {
         setNow(value: number) {
           now = value
         },
+        setMainSlotAccess(value: string) {
+          mainSlotAccess = value
+        },
+        setMainSlotExpires(value: number) {
+          mainSlotExpires = value
+        },
+        setMainExpiresAt(value: number) {
+          mainExpiresAt = value
+        },
       }
     }
+
+    test.serial(
+      'a refused vault main clears a legacy tombstone bearer before fallback routing',
+      async () => {
+        const fixture = await bootVaultMain({
+          routing: { mode: 'fallback-first' },
+          fallbackExpiresAt: 30_000,
+          responseStatuses: [429, 200],
+        })
+        fixture.setMainSlotAccess('claustrum-tombstone:v1:anthropic')
+        fixture.setMainSlotExpires(Date.now() + 30_000)
+        fixture.setMainExpiresAt(0)
+        fixture.setNow(20_000)
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(fixture.authorizations).toEqual([
+          'Bearer vault-fallback-access',
+          'Bearer vault-fallback-access',
+        ])
+        expect(response.status).toBe(200)
+        expect(fixture.authorizations).not.toContain(
+          'Bearer claustrum-tombstone:v1:anthropic',
+        )
+        await fixture.plugin.dispose?.()
+      },
+    )
 
     test.serial(
       'fallback-first sends the bound fallback credential',
