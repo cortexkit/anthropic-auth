@@ -86,12 +86,17 @@ export type AcknowledgeLocalOAuthLoginOptions = {
     entry: CustodyHandleAccount
   }) => Promise<CustodyHandleManifestRemovalResult>
   beforeRemove?: () => Promise<void>
+  divergence?: {
+    statePath: string
+    lastVaultServedRecordVersion: number
+  }
 }
 
 export type AcknowledgeLocalOAuthLoginFromStorageOptions = {
   accountStoragePath: string
   manifestPath: string
   remove?: AcknowledgeLocalOAuthLoginOptions['remove']
+  divergence?: AcknowledgeLocalOAuthLoginOptions['divergence']
 }
 
 export async function acknowledgeLocalOAuthLogin(
@@ -108,6 +113,14 @@ export async function acknowledgeLocalOAuthLogin(
     return 'not-cleared'
   }
   await options.beforeRemove?.()
+  if (options.divergence) {
+    await persistCustodyDivergenceState(
+      options.divergence.statePath,
+      completion.credentialId,
+      options.divergence.lastVaultServedRecordVersion,
+      Date.now(),
+    )
+  }
   const result = await (options.remove ?? removeCustodyHandleManifestEntry)({
     path: options.manifestPath,
     entry: options.entry,
@@ -198,6 +211,7 @@ export async function acknowledgeLocalOAuthLoginFromStorage(
         credentialId: resolution.credentialId,
       },
       remove: options.remove,
+      divergence: options.divergence,
     },
   )
 }

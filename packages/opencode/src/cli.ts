@@ -8,6 +8,7 @@ import {
   authorize,
   exchange,
   generateRelayToken,
+  getAccountStatePath,
   getAccountStoragePath,
   isOAuthAccount,
   isValidApiBaseURL,
@@ -353,6 +354,10 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
         (await loadAccounts())?.claustrum,
         process.env,
       ),
+      divergence: {
+        statePath: getAccountStatePath(getAccountStoragePath()),
+        lastVaultServedRecordVersion: 0,
+      },
     },
   )
 

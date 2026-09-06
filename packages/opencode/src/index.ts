@@ -4400,6 +4400,10 @@ const anthropicAuthPlugin = async (
           {
             accountStoragePath,
             manifestPath: custodyHandleManifestPath,
+            divergence: {
+              statePath: getAccountStatePath(accountStoragePath),
+              lastVaultServedRecordVersion: 0,
+            },
           },
         )
         logger.info('commands', 'account added', {
