@@ -28,7 +28,7 @@ type TuiAccountDialogAccount = Omit<
 type TuiAccountDialogPayload = {
   accounts: TuiAccountDialogAccount[]
   claustrumDetection: string
-  custodyMode?: 'local' | 'claustrum'
+  custodyMode?: 'local' | 'claustrum' | `mismatch: ${string}`
 }
 
 type AccountDialogOption = {
@@ -126,9 +126,10 @@ export function normalizeAccountDialogPayload(
     return [normalized]
   })
   const custodyMode =
-    payload.custodyModeKnown === true &&
-    (payload.custodyMode === 'local' || payload.custodyMode === 'claustrum')
-      ? payload.custodyMode
+    payload.custodyModeKnown === true && typeof payload.custodyMode === 'string'
+      ? payload.custodyMode === 'local' || payload.custodyMode === 'claustrum'
+        ? payload.custodyMode
+        : `mismatch: ${payload.custodyMode}`
       : undefined
   return {
     accounts,
@@ -196,7 +197,8 @@ export function buildAccountDialogL1(value: unknown): {
   modeAction?: { command: 'claude-account'; arguments: 'local' | 'claustrum' }
 } {
   const payload = normalizeAccountDialogPayload(value)
-  const modeAction = payload.custodyMode
+  const modeAction =
+    payload.custodyMode === 'local' || payload.custodyMode === 'claustrum'
     ? {
         command: 'claude-account' as const,
         arguments:

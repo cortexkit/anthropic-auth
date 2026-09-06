@@ -310,6 +310,18 @@ describe('openCommandDialog — global custody mode', () => {
     )
   })
 
+  test('renders a custody mismatch verdict without a control', () => {
+    const dialog = buildAccountDialogL1({
+      accounts: accountRows,
+      claustrumDetection: 'ready',
+      custodyMode: 'RESUME_TAKEOVER',
+      custodyModeKnown: true,
+    })
+
+    expect(dialog.header).toBe('Custody mode: mismatch: RESUME_TAKEOVER')
+    expect(dialog.modeAction).toBeUndefined()
+  })
+
   test('keeps custody out of per-account management and main caveats', () => {
     const mainOption = buildAccountDialogL1({
       accounts: accountRows,
