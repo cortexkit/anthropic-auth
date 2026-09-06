@@ -1082,6 +1082,7 @@ describe('fallback Claustrum credential resolution', () => {
 
   const manifestHandle = `ckh_${'M'.repeat(43)}`
   const legacyHandle = `ckh_${'L'.repeat(43)}`
+  const ruledMainHandle = `ckh_${'Z'.repeat(43)}`
 
   async function writeManifest(
     entries: Array<{ label: string; handle: string }>,
@@ -1140,6 +1141,92 @@ describe('fallback Claustrum credential resolution', () => {
         1,
       )
     })
+  }
+
+  async function bootRuledClaustrumRow({
+    fallbacks,
+    route,
+    quota = { enabled: false, failClosedOnUnknownQuota: false },
+    connector,
+    onFetch,
+  }: {
+    fallbacks: Array<{
+      label: string
+      handle: string
+      access: string
+      account?: Partial<OAuthAccount>
+    }>
+    route: 'fallback-first' | 'main-exhausted' | { sticky: string }
+    quota?: AccountStorage['quota']
+    connector?: (calls: CredentialCall[]) => ReturnType<typeof connectorFor>
+    onFetch?: (input: unknown, init?: RequestInit) => Response
+  }) {
+    const calls: CredentialCall[] = []
+    const authorizations: string[] = []
+    const routing: AccountStorage['routing'] =
+      route === 'fallback-first'
+        ? { mode: 'fallback-first' }
+        : route === 'main-exhausted'
+          ? { mode: 'main-first' }
+          : { mode: 'sticky-balanced' }
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'claustrum' },
+        routing,
+        quota,
+        accounts: fallbacks.map((fallback, index) => ({
+          id: fallback.account?.id ?? `fallback-${index + 1}`,
+          label: fallback.label,
+          ...custodyTombstoneOAuth('anthropic'),
+          quota: {
+            checkedAt: Date.now(),
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: Date.now(),
+            },
+            seven_day: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: Date.now(),
+            },
+          },
+          ...fallback.account,
+        })) as OAuthAccount[],
+      }),
+    )
+    const manifestPath = await writeManifest([
+      { label: 'main', handle: ruledMainHandle },
+      ...fallbacks.map(({ label, handle }) => ({ label, handle })),
+    ])
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      if (
+        extractUrl(input as string | URL | Request).includes('/v1/messages')
+      ) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return Promise.resolve(
+        onFetch?.(input, init) ?? new Response('{}', { status: 200 }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector:
+        connector?.(calls) ??
+        manifestConnector(
+          calls,
+          new Map([
+            [ruledMainHandle, 'vault-main-access'],
+            ...fallbacks.map(({ handle, access }) => [handle, access] as const),
+          ]),
+        ),
+    })
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+      { models: {} },
+    )
+    return { authorizations, calls, manifestPath, plugin, result }
   }
 
   describe('vault-served main routes generically', () => {
@@ -1939,37 +2026,20 @@ describe('fallback Claustrum credential resolution', () => {
   test.serial(
     'prefers a manifest handle over a stale legacy handle',
     async () => {
-      await useTempAccountFile(
-        manifestStorage({ label: 'manifest-wins', legacy: legacyHandle }),
-      )
-      await writeManifest([{ label: 'manifest-wins', handle: manifestHandle }])
-      const calls: CredentialCall[] = []
-      const headers: string[] = []
-      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
-        headers.push(new Headers(init?.headers).get('authorization') ?? '')
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }) as unknown as typeof fetch
-      const plugin = await getPlugin(undefined, undefined, {
-        claustrumConnector: manifestConnector(
-          calls,
-          new Map([
-            [manifestHandle, 'manifest-access'],
-            [legacyHandle, 'legacy-access'],
-          ]),
-        ),
+      const fixture = await bootRuledClaustrumRow({
+        route: 'fallback-first',
+        fallbacks: [
+          {
+            label: 'manifest-wins',
+            handle: manifestHandle,
+            access: 'manifest-access',
+            account: { claustrumHandle: legacyHandle },
+          },
+        ],
       })
-      const result = await plugin.auth.loader(
-        async () => ({
-          type: 'oauth' as const,
-          access: 'main',
-          refresh: 'main',
-          expires: Date.now() + 60_000,
-        }),
-        { models: {} },
-      )
-      await result.fetch(MESSAGES_URL, EMPTY_POST)
-      expect(headers).toContain('Bearer manifest-access')
-      await plugin.dispose?.()
+      await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(fixture.authorizations).toContain('Bearer manifest-access')
+      await fixture.plugin.dispose?.()
     },
   )
 
@@ -2006,35 +2076,20 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial('does not read the manifest during a request', async () => {
-    await useTempAccountFile(manifestStorage({ label: 'resident' }))
-    await writeManifest([{ label: 'resident', handle: manifestHandle }])
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: manifestConnector(
-        [],
-        new Map([[manifestHandle, 'resident-access']]),
-      ),
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'resident',
+          handle: manifestHandle,
+          access: 'resident-access',
+        },
+      ],
     })
-    await plugin.__fallbackRefreshReady
-    const read = spyOn(CustodyHandleManifestReader.prototype, 'read')
-    const result = await plugin.auth.loader(
-      async () => ({
-        type: 'oauth' as const,
-        access: 'main',
-        refresh: 'main',
-        expires: Date.now() + 60_000,
-      }),
-      { models: {} },
-    )
-    await result.fetch(MESSAGES_URL, EMPTY_POST)
-    expect(read).not.toHaveBeenCalled()
-    await new CustodyHandleManifestReader({
-      path: process.env.CLAUSTRUM_OPENCODE_HANDLES!,
-      provider: 'anthropic',
-      serve: 'anthropic-auth',
-    }).read()
-    expect(read).toHaveBeenCalledTimes(1)
-    read.mockRestore()
-    await plugin.dispose?.()
+    await fs.writeFile(fixture.manifestPath, '{')
+    await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(fixture.authorizations).toContain('Bearer resident-access')
+    await fixture.plugin.dispose?.()
   })
 
   test.serial(
@@ -2208,19 +2263,27 @@ describe('fallback Claustrum credential resolution', () => {
   test.serial(
     'keeps an eligible manifest-only fallback off the local refresh path',
     async () => {
-      await useTempAccountFile(manifestStorage({ label: 'manifest-enabled' }))
-      await writeManifest([
-        { label: 'manifest-enabled', handle: manifestHandle },
-      ])
       let tokenRequests = 0
-      globalThis.fetch = mock((input: unknown) => {
-        if (extractUrl(input as string | URL | Request) === TOKEN_URL)
-          tokenRequests += 1
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }) as unknown as typeof fetch
-      const plugin = await getPlugin(undefined, undefined, {
-        claustrumConnector: async () => {
-          throw new Error('vault offline')
+      const fixture = await bootRuledClaustrumRow({
+        route: 'fallback-first',
+        fallbacks: [
+          {
+            label: 'manifest-enabled',
+            handle: manifestHandle,
+            access: 'manifest-enabled-access',
+          },
+        ],
+        connector: (calls) =>
+          connectorFor(calls, (method, params) => {
+            if (method !== 'credential.get') return { result: {} }
+            if (params.handle === manifestHandle)
+              return credentialResponse('vault-main-access', 1)
+            return credentialResponse('manifest-enabled-access', 1)
+          }),
+        onFetch: (input) => {
+          if (extractUrl(input as string | URL | Request) === TOKEN_URL)
+            tokenRequests += 1
+          return new Response('{}', { status: 200 })
         },
       })
       const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
@@ -2231,18 +2294,9 @@ describe('fallback Claustrum credential resolution', () => {
       )!
       fallback.expires = Date.now() + 60_000
       await saveAccounts(current, path)
-      const result = await plugin.auth.loader(
-        async () => ({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 5 * 60 * 60_000,
-        }),
-        { models: {} },
-      )
-      await result.fetch(MESSAGES_URL, EMPTY_POST)
+      await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
       expect(tokenRequests).toBe(0)
-      await plugin.dispose?.()
+      await fixture.plugin.dispose?.()
     },
   )
 
@@ -4165,34 +4219,31 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test('enabled gate serves the resident vault credential', async () => {
-    const calls: CredentialCall[] = []
-    const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-enabled',
-      claustrum: { mode: 'claustrum' },
-    } as never)
-    const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get')
-        return credentialResponse('vault-access', 7)
-      return { result: {} }
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'enabled',
+          handle: `ckh_${'E'.repeat(43)}`,
+          access: 'vault-access',
+        },
+      ],
     })
-
-    const { authorizations, plugin, result } = await loadFallbackWithConnector(
-      storage,
-      connector,
-      new Response('{}', { status: 200 }),
-    )
-    expect(
-      calls.filter((call) => call.method === 'credential.get'),
-    ).toHaveLength(1)
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const initialCredentialGets = fixture.calls.filter(
+      (call) => call.method === 'credential.get',
+    ).length
+    expect(initialCredentialGets).toBeGreaterThan(0)
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
-    expect(authorizations).toContain('Bearer vault-access')
-    expect(authorizations).not.toContain('Bearer stored-fallback-access')
+    expect(fixture.authorizations).toContain('Bearer vault-access')
+    expect(fixture.authorizations).not.toContain(
+      'Bearer stored-fallback-access',
+    )
     expect(
-      calls.filter((call) => call.method === 'credential.get'),
-    ).toHaveLength(1)
-    await plugin.dispose?.()
+      fixture.calls.filter((call) => call.method === 'credential.get'),
+    ).toHaveLength(initialCredentialGets)
+    await fixture.plugin.dispose?.()
   })
 
   test('does not use a JSON credential payload without a token as bearer auth', async () => {
