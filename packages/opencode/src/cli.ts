@@ -6,6 +6,7 @@ import {
   type AccountStorage,
   addAccountPersistent,
   authorize,
+  custodyCredentialId,
   exchange,
   generateRelayToken,
   getAccountStatePath,
@@ -344,7 +345,7 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   await acknowledgeLocalOAuthLoginFromStorage(
     {
       accountId: account.id,
-      credentialId: `oauth:anthropic:${account.label ?? account.id}`,
+      credentialId: custodyCredentialId(account.label ?? account.id),
       authFingerprint: localAuthFingerprint(result.access, result.refresh),
       completedAt: now,
     },
