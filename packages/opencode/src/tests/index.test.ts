@@ -1142,6 +1142,279 @@ describe('fallback Claustrum credential resolution', () => {
     })
   }
 
+  describe('vault-served main routes generically', () => {
+    const fallbackHandle = `ckh_${'F'.repeat(43)}`
+    const request = (sessionId?: string) => ({
+      method: 'POST',
+      ...(sessionId && { headers: { 'x-session-affinity': sessionId } }),
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    })
+
+    async function bootVaultMain(
+      options: {
+        routing?: AccountStorage['routing']
+        quota?: AccountStorage['quota']
+        killswitch?: AccountStorage['killswitch']
+        fallback?: boolean
+        mainAccountId?: ProviderAccountUuid
+        vaultAccountId?: string
+        responseStatus?: number
+        mainExpiresAt?: number
+        fallbackExpiresAt?: number
+      } = {},
+    ) {
+      let now = 1_000
+      const calls: CredentialCall[] = []
+      const authorizations: string[] = []
+      const fallback = options.fallback !== false
+      const checkedAt = Date.now()
+      const quota = options.quota ?? {
+        enabled: false,
+        failClosedOnUnknownQuota: false,
+      }
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          routing: options.routing ?? { mode: 'main-first' },
+          quota,
+          ...(options.killswitch && { killswitch: options.killswitch }),
+          ...(options.mainAccountId && {
+            mainAccountId: options.mainAccountId,
+            main: {
+              type: 'opencode',
+              provider: 'anthropic',
+              profile: {
+                tier: 'default_claude_max_5x',
+                orgType: 'claude_team',
+                checkedAt,
+                providerAccountUuid: options.mainAccountId,
+              },
+            },
+          }),
+          accounts: fallback
+            ? [
+                {
+                  id: 'fallback-1',
+                  label: 'fallback',
+                  ...custodyTombstoneOAuth('anthropic'),
+                  quota: {
+                    checkedAt,
+                    five_hour: {
+                      usedPercent: 10,
+                      remainingPercent: 90,
+                      checkedAt,
+                    },
+                    seven_day: {
+                      usedPercent: 10,
+                      remainingPercent: 90,
+                      checkedAt,
+                    },
+                  },
+                },
+              ]
+            : [],
+        }),
+      )
+      await writeManifest([
+        { label: 'main', handle: manifestHandle },
+        ...(fallback ? [{ label: 'fallback', handle: fallbackHandle }] : []),
+      ])
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        if (
+          extractUrl(input as string | URL | Request).includes('/v1/messages')
+        ) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+          return Promise.resolve(
+            new Response('{}', { status: options.responseStatus ?? 200 }),
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumNow: () => now,
+        claustrumConnector: connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          const isMain = params.handle === manifestHandle
+          return credentialResponse(
+            isMain ? 'vault-main-access' : 'vault-fallback-access',
+            isMain ? 17 : 29,
+            isMain
+              ? (options.mainExpiresAt ?? 10_000)
+              : (options.fallbackExpiresAt ?? 10_000),
+            isMain ? options.vaultAccountId : 'fallback-provider-account',
+          )
+        }),
+      })
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+      return {
+        plugin,
+        result,
+        calls,
+        authorizations,
+        setNow(value: number) {
+          now = value
+        },
+      }
+    }
+
+    test.serial(
+      'fallback-first sends the bound fallback credential',
+      async () => {
+        const fixture = await bootVaultMain({
+          routing: { mode: 'fallback-first' },
+        })
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(200)
+        expect(fixture.authorizations).toEqual(['Bearer vault-fallback-access'])
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial('sticky-balanced keeps a fallback assignment', async () => {
+      const checkedAt = Date.now()
+      const fixture = await bootVaultMain({
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 1, seven_day: 1 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            checkedAt,
+            five_hour: { usedPercent: 100, remainingPercent: 0, checkedAt },
+            seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
+          },
+          mainQuotaCheckedAt: checkedAt,
+          mainQuotaToken: tokenFingerprint('vault-main-access'),
+        },
+      })
+      const response = await fixture.result.fetch(
+        MESSAGES_URL,
+        request('vault-main-sticky-fallback'),
+      )
+      expect(response.status).toBe(200)
+      expect(fixture.authorizations).toEqual(['Bearer vault-fallback-access'])
+      await fixture.plugin.dispose?.()
+    })
+
+    test.serial(
+      'a killswitch-tripped main yields to the fallback',
+      async () => {
+        const checkedAt = Date.now()
+        const fixture = await bootVaultMain({
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 1, seven_day: 1 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              checkedAt,
+              five_hour: { usedPercent: 98, remainingPercent: 2, checkedAt },
+              seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
+            },
+            mainQuotaCheckedAt: checkedAt,
+            mainQuotaToken: tokenFingerprint('vault-main-access'),
+          },
+          killswitch: { enabled: true, main: { five_hour: 5, seven_day: 5 } },
+        })
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(200)
+        expect(fixture.authorizations).toEqual(['Bearer vault-fallback-access'])
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial('a cold main yields to a warm fallback', async () => {
+      const fixture = await bootVaultMain({ mainExpiresAt: 2_000 })
+      fixture.setNow(3_000)
+      const response = await fixture.result.fetch(MESSAGES_URL, request())
+      expect(response.status).toBe(200)
+      expect(fixture.authorizations).toEqual(['Bearer vault-fallback-access'])
+      await fixture.plugin.dispose?.()
+    })
+
+    test.serial(
+      'a cold main with no fallback keeps the typed refusal',
+      async () => {
+        const fixture = await bootVaultMain({
+          fallback: false,
+          mainExpiresAt: 2_000,
+        })
+        fixture.setNow(3_000)
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(503)
+        expect(await response.text()).toBe(
+          '{"type":"error","error":{"type":"api_error","code":"claustrum_main_unavailable","retryable":true,"message":"Claustrum main credential is cold; retry or run /claude-account local to leave custody and sign in again."}}',
+        )
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'a mismatched main with no fallback keeps the typed refusal',
+      async () => {
+        const fixture = await bootVaultMain({
+          fallback: false,
+          mainAccountId: 'persisted-main' as ProviderAccountUuid,
+          vaultAccountId: 'different-main',
+        })
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(503)
+        expect(await response.text()).toBe(
+          '{"type":"error","error":{"type":"api_error","code":"claustrum_main_identity_mismatch","retryable":false,"message":"Claustrum main credential identity differs from the persisted main identity; run ck auth set-identity."}}',
+        )
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'main-first serves the vault record and reports its 401 version',
+      async () => {
+        const fixture = await bootVaultMain({
+          fallback: false,
+          responseStatus: 401,
+        })
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(401)
+        expect(fixture.authorizations).toEqual(['Bearer vault-main-access'])
+        expect(fixture.calls).toContainEqual({
+          method: 'credential.report_auth_failure',
+          params: {
+            handle: manifestHandle,
+            provider_status: 401,
+            record_version: 17,
+            reporter_source: 'direct',
+          },
+        })
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'served main quota identity comes from the vault account id',
+      async () => {
+        const fixture = await bootVaultMain({
+          vaultAccountId: 'vault-main-account',
+        })
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(200)
+        expect(fixture.plugin.__mainProviderAccountUuidForTest()).toBe(
+          'vault-main-account',
+        )
+        await fixture.plugin.dispose?.()
+      },
+    )
+  })
+
   test.serial('warms a manifest-only handle at startup', async () => {
     await useTempAccountFile(manifestStorage({ label: 'manifest-start' }))
     await writeManifest([{ label: 'manifest-start', handle: manifestHandle }])
