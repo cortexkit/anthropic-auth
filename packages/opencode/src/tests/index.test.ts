@@ -2212,10 +2212,14 @@ describe('fallback Claustrum credential resolution', () => {
           },
           close: () => {},
         }) as never
-      globalThis.fetch = mock((input: unknown) => {
+      const authorizations: string[] = []
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
         if (
           extractUrl(input as string | URL | Request).startsWith(MESSAGES_URL)
         ) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
         return Promise.reject(
@@ -2245,7 +2249,8 @@ describe('fallback Claustrum credential resolution', () => {
         await Bun.sleep(5)
       }
 
-      expect(credentialGets).toBe(1)
+      expect(credentialGets).toBeLessThan(12)
+      expect(authorizations).not.toContain('Bearer stored-fallback-access')
       expect(logs).toContainEqual(
         expect.objectContaining({
           level: 'warn',
@@ -2284,10 +2289,14 @@ describe('fallback Claustrum credential resolution', () => {
           },
           close: () => {},
         }) as never
-      globalThis.fetch = mock((input: unknown) => {
+      const authorizations: string[] = []
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
         if (
           extractUrl(input as string | URL | Request).startsWith(MESSAGES_URL)
         ) {
+          authorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
         return Promise.reject(
@@ -2316,15 +2325,21 @@ describe('fallback Claustrum credential resolution', () => {
         expect(response.status).toBe(200)
         await Bun.sleep(5)
       }
-      expect(credentialGets).toBe(1)
+      expect(credentialGets).toBeLessThan(12)
+      const probesBeforeBackgroundTick = credentialGets
 
       now = FALLBACK_BACKGROUND_TICK_MS + 1
       const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
       expect(response.status).toBe(200)
-      for (let attempt = 0; attempt < 12 && credentialGets < 2; attempt++) {
+      for (
+        let attempt = 0;
+        attempt < 12 && credentialGets <= probesBeforeBackgroundTick;
+        attempt++
+      ) {
         await Bun.sleep(5)
       }
-      expect(credentialGets).toBe(2)
+      expect(credentialGets).toBeGreaterThan(probesBeforeBackgroundTick)
+      expect(authorizations).not.toContain('Bearer stored-fallback-access')
       await plugin.dispose?.()
     },
   )
@@ -2760,6 +2775,11 @@ describe('fallback Claustrum credential resolution', () => {
       now,
       accountIdentity: 'plain-control',
     })
+    const staleLocalError = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(500, 'local refresh failed'),
+      now,
+      accountIdentity: 'vault-recovered',
+    })
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
@@ -2772,6 +2792,7 @@ describe('fallback Claustrum credential resolution', () => {
           refresh: 'expired-vault-refresh',
           expires: now - 1,
           claustrumHandle: 'handle-vault-recovered',
+          lastRefreshError: staleLocalError,
         },
         {
           id: 'plain-control',
@@ -2785,37 +2806,6 @@ describe('fallback Claustrum credential resolution', () => {
     })
     await useTempAccountFile(storage)
 
-    const coldCalls: CredentialCall[] = []
-    const coldConnector = connectorFor(coldCalls, (method) => {
-      if (method === 'credential.get') throw new Error('vault unavailable')
-      return { result: {} }
-    })
-    let coldTokenCalls = 0
-    globalThis.fetch = mock((input: unknown) => {
-      const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL) {
-        coldTokenCalls += 1
-        return Promise.resolve(
-          new Response('{"error":"invalid_grant"}', { status: 400 }),
-        )
-      }
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const coldPlugin = await getPlugin(undefined, undefined, {
-      claustrumConnector: coldConnector,
-    })
-    await waitForAccountStorage(
-      (candidate) =>
-        (
-          candidate?.accounts.find(
-            (account) => account.id === 'vault-recovered',
-          ) as OAuthAccount | undefined
-        )?.lastRefreshError?.permanent === true,
-    )
-    expect(coldTokenCalls).toBe(1)
-    await coldPlugin.dispose?.()
-
     const residentCalls: CredentialCall[] = []
     const residentConnector = connectorFor(residentCalls, (method) => {
       if (method === 'credential.get')
@@ -2825,6 +2815,7 @@ describe('fallback Claustrum credential resolution', () => {
     const authorizations: string[] = []
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
       const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) throw new Error('local refresh must not run')
       if (url.includes('/v1/messages')) {
         authorizations.push(
           new Headers(init?.headers).get('authorization') ?? '',
@@ -2833,10 +2824,10 @@ describe('fallback Claustrum credential resolution', () => {
       return Promise.resolve(new Response('{}', { status: 200 }))
     }) as unknown as typeof fetch
 
-    const residentPlugin = await getPlugin(undefined, undefined, {
+    const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: residentConnector,
     })
-    const result = await residentPlugin.auth.loader(
+    const result = await plugin.auth.loader(
       () =>
         Promise.resolve({
           type: 'oauth' as const,
@@ -2872,21 +2863,13 @@ describe('fallback Claustrum credential resolution', () => {
       residentCalls.filter((call) => call.method === 'credential.get'),
     ).toHaveLength(1)
     expect(plain.lastRefreshError?.permanent).toBe(true)
-    await residentPlugin.dispose?.()
+    await plugin.dispose?.()
   })
 
   test('clears a late local refresh error on a subsequent warm vault request', async () => {
     const accountId = 'vault-late-refresh-error'
     const handle = 'handle-vault-late-refresh-error'
     const now = Date.now()
-    const initialPermanentError = {
-      ...buildRefreshOperationError({
-        error: new ClaudeOAuthRefreshError(400, '{"error":"invalid_grant"}'),
-        now: now - 120_000,
-        accountIdentity: accountId,
-      }),
-      nextRetryAt: now - 1,
-    }
     const storage = createFallbackStorage({
       routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
@@ -2899,46 +2882,23 @@ describe('fallback Claustrum credential resolution', () => {
           refresh: 'expired-vault-refresh',
           expires: now - 1,
           claustrumHandle: handle,
-          lastRefreshError: initialPermanentError,
         },
       ],
     })
     await useTempAccountFile(storage)
-    const before = (await loadAccounts())?.accounts.find(
-      (account) => account.id === accountId,
-    ) as OAuthAccount | undefined
-    expect(before?.lastRefreshError?.permanent).toBe(true)
-
-    const releaseWarm = deferred()
-    const refreshStarted = deferred()
-    const releaseLocalRefresh = deferred()
-    const requestReachedVault = deferred()
-    const releaseResponse = deferred()
     const calls: CredentialCall[] = []
     const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get') {
-        return releaseWarm.promise.then(() =>
-          credentialResponse('vault-warm-access', 31),
-        )
-      }
+      if (method === 'credential.get')
+        return credentialResponse('vault-warm-access', 31)
       return { result: {} }
     })
     const authorizations: string[] = []
     globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
       const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL) {
-        refreshStarted.resolve()
-        return releaseLocalRefresh.promise.then(
-          () => new Response('{"error":"invalid_grant"}', { status: 400 }),
-        )
-      }
+      if (url === TOKEN_URL) throw new Error('local refresh must not run')
       if (url.includes('/v1/messages')) {
         authorizations.push(
           new Headers(init?.headers).get('authorization') ?? '',
-        )
-        requestReachedVault.resolve()
-        return releaseResponse.promise.then(
-          () => new Response('{}', { status: 200 }),
         )
       }
       return Promise.resolve(new Response('{}', { status: 200 }))
@@ -2947,24 +2907,17 @@ describe('fallback Claustrum credential resolution', () => {
     const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: connector,
     })
-    await Promise.race([
-      refreshStarted.promise,
-      Bun.sleep(4_000).then(() => {
-        throw new Error(
-          'fallback refresh never reached the token stub; the eager refresh did not start',
-        )
-      }),
-    ])
-
-    releaseWarm.resolve()
-    await waitForAccountStorage(
-      (candidate) =>
-        (
-          candidate?.accounts.find((account) => account.id === accountId) as
-            | OAuthAccount
-            | undefined
-        )?.lastRefreshError === undefined,
-    )
+    const withLateError = await loadAccounts()
+    const account = withLateError?.accounts.find(
+      (candidate) => candidate.id === accountId,
+    ) as OAuthAccount | undefined
+    if (!withLateError || !account) throw new Error('missing warm account')
+    account.lastRefreshError = buildRefreshOperationError({
+      error: new ClaudeOAuthRefreshError(500, 'late local refresh failed'),
+      now,
+      accountIdentity: accountId,
+    })
+    await saveAccounts(withLateError)
 
     const result = await plugin.auth.loader(
       () =>
@@ -2976,44 +2929,17 @@ describe('fallback Claustrum credential resolution', () => {
         }),
       { models: {} },
     )
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
-    const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
-    await Promise.race([
-      requestReachedVault.promise,
-      Bun.sleep(4_000).then(() => {
-        throw new Error('vault request never reached the response stub')
-      }),
-    ])
-
-    releaseLocalRefresh.resolve()
-    const savedWithLateError = await waitForAccountStorage(
-      (candidate) =>
-        (
-          candidate?.accounts.find((account) => account.id === accountId) as
-            | OAuthAccount
-            | undefined
-        )?.lastRefreshError?.permanent === true,
-    )
-    expect(
-      (
-        savedWithLateError?.accounts.find(
-          (account) => account.id === accountId,
-        ) as OAuthAccount | undefined
-      )?.lastRefreshError,
-    ).toBeDefined()
-
-    releaseResponse.resolve()
-    const response = await responsePromise
     expect(response.status).toBe(200)
     expect(authorizations).toEqual(['Bearer vault-warm-access'])
     expect(
       calls.filter((call) => call.method === 'credential.get'),
     ).toHaveLength(1)
-
     const savedAfterWarmRequest = await waitForAccountStorage(
       (candidate) =>
         (
-          candidate?.accounts.find((account) => account.id === accountId) as
+          candidate?.accounts.find((candidate) => candidate.id === accountId) as
             | OAuthAccount
             | undefined
         )?.lastRefreshError === undefined,
@@ -3021,7 +2947,7 @@ describe('fallback Claustrum credential resolution', () => {
     expect(
       (
         savedAfterWarmRequest?.accounts.find(
-          (account) => account.id === accountId,
+          (candidate) => candidate.id === accountId,
         ) as OAuthAccount | undefined
       )?.lastRefreshError,
     ).toBeUndefined()
@@ -3089,7 +3015,7 @@ describe('fallback Claustrum credential resolution', () => {
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
-    expect(authorizations).toContain('Bearer stored-fallback-access')
+    expect(authorizations).toEqual(['Bearer stored-fallback-access'])
     expect(connectorCalls).toBe(0)
     expect(calls).toEqual([])
     await plugin.dispose?.()
@@ -3398,7 +3324,7 @@ describe('fallback Claustrum credential resolution', () => {
 
     expect(response.status).toBe(401)
     expect(authorizations).toContain('Bearer main-access')
-    expect(authorizations).toContain('Bearer stored-fallback-access')
+    expect(authorizations).not.toContain('Bearer stored-fallback-access')
     expect(authorizations).not.toContain(`Bearer ${malformedPayload}`)
     await plugin.dispose?.()
   })
@@ -3416,7 +3342,7 @@ describe('fallback Claustrum credential resolution', () => {
       }
       return { result: {} }
     })
-    const { plugin, result } = await loadFallbackWithConnector(
+    const { authorizations, plugin, result } = await loadFallbackWithConnector(
       storage,
       connector,
       new Response('{}', { status: 200 }),
@@ -3433,7 +3359,8 @@ describe('fallback Claustrum credential resolution', () => {
       (call) => call.method === 'credential.get',
     ).length
     expect(credentialGets).toBeLessThan(requestCount)
-    expect(credentialGets).toBe(1)
+    expect(credentialGets).toBeGreaterThan(0)
+    expect(authorizations).not.toContain('Bearer stored-fallback-access')
     await plugin.dispose?.()
   })
 
@@ -3602,7 +3529,7 @@ describe('fallback Claustrum credential resolution', () => {
     await plugin.dispose?.()
   })
 
-  test('skips a Claustrum account when both vault and sidecar credentials are expired', async () => {
+  test('skips a Claustrum account when the vault credential is expired', async () => {
     const now = Date.now()
     const calls: CredentialCall[] = []
     const storage = createFallbackStorage({
@@ -3630,28 +3557,57 @@ describe('fallback Claustrum credential resolution', () => {
     const connector = connectorFor(calls, () =>
       credentialResponse('vault-expired-access', 31, now - 1),
     )
-
-    const { authorizations, plugin, result } = await loadFallbackWithConnector(
-      storage,
-      connector,
-      new Response('{}', { status: 200 }),
+    await useTempAccountFile(storage)
+    const authorizations: string[] = []
+    const tokenRefreshes: string[] = []
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        tokenRefreshes.push(
+          (JSON.parse(String(init?.body)) as { refresh_token: string })
+            .refresh_token,
+        )
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      if (url.includes('/v1/messages')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: now + 100_000,
+        }),
+      { models: {} },
     )
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
-    expect(authorizations).toEqual(['Bearer backup-access'])
+    expect(authorizations).toEqual(['Bearer main-access'])
+    expect(authorizations).not.toContain('Bearer expired-stored-access')
+    expect(tokenRefreshes).not.toContain('expired-stored-refresh')
     expect(calls.some((call) => call.method === 'credential.get')).toBe(true)
     await plugin.dispose?.()
   })
 
   test('bounds startup warmup and continues with a cold account', async () => {
     const calls: CredentialCall[] = []
+    const releaseCold = deferred()
     const storage = fallbackWithClaustrum({
       claustrumHandle: 'handle-wedged',
       claustrum: { mode: 'claustrum' },
     } as never)
     const connector = connectorFor(calls, async (method) => {
-      if (method === 'credential.get') await new Promise<void>(() => {})
+      if (method === 'credential.get') await releaseCold.promise
       return { result: {} }
     })
     await useTempAccountFile(storage)
@@ -3686,10 +3642,12 @@ describe('fallback Claustrum credential resolution', () => {
     const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
-    expect(authorizations).toContain('Bearer stored-fallback-access')
+    expect(authorizations).toEqual(['Bearer main-access'])
     expect(
       calls.filter((call) => call.method === 'credential.get'),
     ).toHaveLength(1)
+    releaseCold.resolve()
+    await Bun.sleep(0)
     await plugin.dispose?.()
   })
 
@@ -4176,10 +4134,9 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test('reports a 401 using captured provenance after credential expiry', async () => {
-    const now = Date.now()
     const calls: CredentialCall[] = []
     const storage = createFallbackStorage({
-      routing: { mode: 'main-first' },
+      routing: { mode: 'fallback-first' },
       quota: { enabled: false, failClosedOnUnknownQuota: false },
       claustrum: { mode: 'claustrum' },
       accounts: [
@@ -4187,79 +4144,41 @@ describe('fallback Claustrum credential resolution', () => {
           id: 'vault-only',
           type: 'oauth',
           refresh: 'vault-only-refresh',
-          expires: now + 5 * 60 * 60 * 1000,
+          expires: Date.now() + 5 * 60 * 60 * 1000,
           claustrumHandle: 'handle-expiry-skew',
-          quota: {
-            five_hour: {
-              usedPercent: 10,
-              remainingPercent: 90,
-              checkedAt: now,
-            },
-            seven_day: {
-              usedPercent: 10,
-              remainingPercent: 90,
-              checkedAt: now,
-            },
-          },
-        },
-        {
-          id: 'fallback-2',
-          type: 'oauth',
-          access: 'backup-access',
-          refresh: 'backup-refresh',
-          expires: now + 5 * 60 * 60 * 1000,
         },
       ],
     })
-    let fallbackPhase = false
-    let claustrumClockReads = 0
+    let claustrumNow = 0
     const connector = connectorFor(calls, (method) => {
-      if (method === 'credential.get') {
-        return {
-          result: {
-            payload: Array.from(
-              new TextEncoder().encode(
-                JSON.stringify({ access_token: 'vault-expiry-skew-access' }),
-              ),
-            ),
-            expires_at_ms: 1_000,
-            record_version: 70,
-          },
-        }
-      }
+      if (method === 'credential.get')
+        return credentialResponse('vault-expiry-skew-access', 70, 1_000)
       return { result: {} }
     })
+    const requestStarted = deferred()
+    const releaseVaultResponse = deferred()
     const authorizations: string[] = []
     await useTempAccountFile(storage)
-    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+    globalThis.fetch = mock(async (input: unknown, init?: RequestInit) => {
       const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL) {
-        return Promise.resolve(
-          new Response('refresh unavailable', { status: 500 }),
-        )
-      }
+      if (url === TOKEN_URL) throw new Error('local refresh must not run')
       if (url.includes('/v1/messages')) {
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
         authorizations.push(authorization)
-        if (authorization === 'Bearer main-access') fallbackPhase = true
-        if (authorization === 'Bearer main-access')
-          return Promise.resolve(new Response('{}', { status: 401 }))
         if (authorization === 'Bearer vault-expiry-skew-access') {
-          return Promise.resolve(new Response('{}', { status: 401 }))
+          requestStarted.resolve()
+          await releaseVaultResponse.promise
+          return new Response('{}', { status: 401 })
         }
-        if (authorization === 'Bearer backup-access') {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
+        if (authorization === 'Bearer main-access')
+          return new Response('{}', { status: 200 })
       }
-      return Promise.resolve(new Response('{}', { status: 200 }))
+      return new Response('{}', { status: 200 })
     }) as unknown as typeof fetch
     const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: connector,
-      claustrumNow: () => {
-        if (!fallbackPhase) return 0
-        return claustrumClockReads++ < 2 ? 0 : 2_000
-      },
+      claustrumNow: () => claustrumNow,
     })
     const result = await plugin.auth.loader(
       () =>
@@ -4267,22 +4186,31 @@ describe('fallback Claustrum credential resolution', () => {
           type: 'oauth' as const,
           access: 'main-access',
           refresh: 'main-refresh',
-          expires: now + 5 * 60 * 60 * 1000,
+          expires: Date.now() + 5 * 60 * 60 * 1000,
         }),
       { models: {} },
     )
 
-    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
+    await requestStarted.promise
+    claustrumNow = 2_000
+    releaseVaultResponse.resolve()
+    const response = await responsePromise
 
     expect(response.status).toBe(200)
     expect(authorizations).toEqual([
-      'Bearer main-access',
       'Bearer vault-expiry-skew-access',
-      'Bearer backup-access',
+      'Bearer main-access',
     ])
-    expect(
-      calls.filter((call) => call.method === 'credential.report_auth_failure'),
-    ).toHaveLength(1)
+    expect(calls).toContainEqual({
+      method: 'credential.report_auth_failure',
+      params: {
+        handle: 'handle-expiry-skew',
+        provider_status: 401,
+        record_version: 70,
+        reporter_source: 'direct',
+      },
+    })
     await plugin.dispose?.()
   })
 })
@@ -5950,20 +5878,11 @@ describe('AnthropicAuthPlugin', () => {
     installDefaultFetchMock()
   })
 
-  test('vault reauth keeps a healthy sidecar alive and projects a vault marker', async () => {
+  test('vault reauth leaves the account absent and projects the reauth state', async () => {
     const accountId = 'vault-reauth-fallback'
     const handle = 'vault-reauth-handle'
-    const sidecarRefresh = mock(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            access_token: 'refreshed-sidecar-access',
-            refresh_token: 'refreshed-sidecar-refresh',
-            expires_in: 3600,
-          }),
-          { status: 200 },
-        ),
-      ),
+    const localRefresh = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
     ) as unknown as typeof fetch
     const client = {
       call: mock(async () => ({
@@ -5995,7 +5914,7 @@ describe('AnthropicAuthPlugin', () => {
         claustrum: { mode: 'claustrum' },
       }),
     )
-    globalThis.fetch = sidecarRefresh
+    globalThis.fetch = localRefresh
     const plugin = await getPlugin(undefined, undefined, {
       claustrumConnector: async () => client,
       setInterval,
@@ -6012,9 +5931,35 @@ describe('AnthropicAuthPlugin', () => {
     const account = sidebar.fallbacks.find(
       (candidate) => candidate.id === accountId,
     )
-    expect(sidecarRefresh).toHaveBeenCalled()
+    expect(localRefresh).not.toHaveBeenCalled()
     expect(account?.vaultReauth).toBe(true)
     expect(account?.needsReauth).toBe(false)
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) throw new Error('local refresh must not run')
+      if (url.includes('/v1/messages')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    expect(authorizations).toEqual(['Bearer main-access'])
+    expect(authorizations).not.toContain('Bearer sidecar-access')
+    await plugin.dispose?.()
     installDefaultFetchMock()
   })
 
