@@ -18,6 +18,7 @@ import {
   CustodyLoginObservationUnavailableError,
   custodyDivergenceMarker,
   custodyPreflightDivergenceCheck,
+  lastVaultServedRecordVersion,
   localAuthFingerprint,
   persistCustodyDivergenceState,
 } from '../local-login.ts'
@@ -210,6 +211,20 @@ test('divergence preflight rejects credential records older than the fence', () 
       state,
     ),
   ).toEqual({ ok: true })
+})
+
+test('TUI fence version prefers served provenance then cache and warns on never served', () => {
+  expect(
+    lastVaultServedRecordVersion({
+      accountId: 'work',
+      servedVersion: 9,
+      cacheVersion: 3,
+    }),
+  ).toBe(9)
+  expect(
+    lastVaultServedRecordVersion({ accountId: 'work', cacheVersion: 9 }),
+  ).toBe(9)
+  expect(lastVaultServedRecordVersion({ accountId: 'work' })).toBe(0)
 })
 
 test.serial('persists the divergence fence as state-only data', async () => {

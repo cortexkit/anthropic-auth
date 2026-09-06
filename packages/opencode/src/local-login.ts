@@ -27,6 +27,18 @@ export type CustodyDivergenceState = {
   claustrumDivergence?: Record<string, CustodyDivergence>
 }
 
+export function lastVaultServedRecordVersion(input: {
+  accountId: string
+  servedVersion?: number
+  cacheVersion?: number
+  warn?: (accountId: string) => void
+}): number {
+  if (input.servedVersion !== undefined) return input.servedVersion
+  if (input.cacheVersion !== undefined) return input.cacheVersion
+  input.warn?.(input.accountId)
+  return 0
+}
+
 export function custodyDivergenceMarker(
   lastVaultServedRecordVersion: number,
   observedAt: number,

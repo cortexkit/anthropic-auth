@@ -235,6 +235,7 @@ import {
   acknowledgeLocalOAuthLoginFromStorage,
   assertLocalLoginObservationAvailable,
   type CompletedLocalLogin,
+  lastVaultServedRecordVersion,
   localAuthFingerprint,
   persistCustodyDivergenceState,
 } from './local-login.ts'
@@ -4385,6 +4386,15 @@ const anthropicAuthPlugin = async (
           lastRefreshedAt: now,
         }
         await addAccountPersistent(account, accountStoragePath)
+        const freshStorage = await loadAccounts(accountStoragePath)
+        const fallbackBinding = freshStorage
+          ? resolveAccountCustodyHandle(account, freshStorage)
+          : { status: 'unresolved' as const, reason: 'missing-entry' as const }
+        const fallbackHandle =
+          fallbackBinding.status === 'resolved' &&
+          fallbackBinding.source === 'manifest'
+            ? fallbackBinding.handle
+            : undefined
         await acknowledgeLocalOAuthLoginFromStorage(
           {
             accountId: account.id,
@@ -4402,7 +4412,22 @@ const anthropicAuthPlugin = async (
             manifestPath: custodyHandleManifestPath,
             divergence: {
               statePath: getAccountStatePath(accountStoragePath),
-              lastVaultServedRecordVersion: 0,
+              lastVaultServedRecordVersion: lastVaultServedRecordVersion({
+                accountId: account.id,
+                servedVersion: fallbackHandle
+                  ? claustrumLastReportedVersion.get(fallbackHandle)
+                  : undefined,
+                cacheVersion: fallbackHandle
+                  ? claustrumCredentialCache?.peek(fallbackHandle)
+                      ?.recordVersion
+                  : undefined,
+                warn: (accountId) =>
+                  logger.warn(
+                    'claustrum',
+                    'fallback login had no served vault record',
+                    { accountId },
+                  ),
+              }),
             },
           },
         )
