@@ -94,6 +94,7 @@ export function createLiveCustodyDeps(input: {
   now: number | (() => number)
   fallbackManager?: Pick<core.FallbackAccountManager, 'withAccountRefreshLock'>
   storage?: core.AccountStorage | null
+  writeManifestEntryLocked?: typeof core.writeCustodyHandleManifestEntryLocked
 }) {
   const inputNow = input.now
   const now = typeof inputNow === 'function' ? inputNow : () => inputNow
@@ -353,7 +354,10 @@ export function createLiveCustodyDeps(input: {
           for (const account of plan.accounts) {
             // Main is installed by the operator so this process never rewrites the host-authoritative binding.
             if (account.id === 'main' || account.bindingPersisted) continue
-            const result = await core.writeCustodyHandleManifestEntryLocked(
+            const result = await (
+              input.writeManifestEntryLocked ??
+              core.writeCustodyHandleManifestEntryLocked
+            )(
               {
                 path: manifestPath,
                 entry: {

@@ -541,6 +541,50 @@ describe('custody mode', () => {
     expect(JSON.stringify(error)).not.toContain('access-work-secret')
   })
 
+  test('custody: takeover refuses changed local material before any write', async () => {
+    const plan = await preflightClaustrumTakeover(preflightInput())
+    let snapshots = 0
+    let writes = 0
+    const error = await executeClaustrumTakeover(plan, {
+      locks: {
+        storagePath: '/storage.json',
+        manifestPath: '/handles.json',
+        fallbackAccountIds: ['work'],
+        acquireTransition: async () => ({ release: async () => {} }),
+        acquireManifest: async () => ({ release: async () => {} }),
+        acquireRefresh: async () => ({ release: async () => {} }),
+      },
+      getLocalAuth: async (accountId) =>
+        accountId === 'main'
+          ? core.custodyTombstoneOAuth('anthropic')
+          : real('changed-access', 'changed-refresh'),
+      isCommitted: async () => false,
+      snapshotSidecars: async () => {
+        snapshots++
+        return { config: null, state: null }
+      },
+      writeManifestBindings: async () => {
+        writes++
+      },
+      writeSidecarAccount: async () => {
+        writes++
+      },
+      verifyTarget: async () => true,
+      verifyCommitted: async () => true,
+      restoreSidecars: async () => {},
+      verifyRollback: async () => true,
+      setMode: async () => 'changed',
+    }).catch((caught: unknown) => caught)
+
+    expect(error).toMatchObject({
+      code: 'custody_transition_failed',
+      stage: 'reverify_fingerprint',
+      accountId: 'work',
+    })
+    expect(snapshots).toBe(0)
+    expect(writes).toBe(0)
+  })
+
   test('custody: live takeover tombstones fallback refresh and commits mode last', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'custody-live-takeover-'))
     const storagePath = join(directory, 'accounts.json')
@@ -548,6 +592,8 @@ describe('custody mode', () => {
     const mainHandle = `ckh_${'M'.repeat(43)}`
     const workHandle = `ckh_${'W'.repeat(43)}`
     const hostReads: string[] = []
+    const cacheModes: string[] = []
+    const manifestWrites: string[] = []
     let modeAtFinalVerification = 'local'
     try {
       await core.saveAccounts(
@@ -580,17 +626,22 @@ describe('custody mode', () => {
         }),
       ).resolves.toEqual({ status: 'written' })
       const cache = {
-        get: async (handle: string, minTtlMs = 0) => ({
-          credentialId:
-            handle === mainHandle
-              ? core.custodyCredentialId('main')
-              : core.custodyCredentialId('work'),
-          recordVersion: 7,
-          access: 'vault-access',
-          refresh: 'vault-refresh',
-          expiresAt: now + minTtlMs + 1,
-          state: 'usable' as const,
-        }),
+        get: async (handle: string, minTtlMs = 0) => {
+          cacheModes.push(
+            core.getClaustrumMode(await core.loadAccounts(storagePath)),
+          )
+          return {
+            credentialId:
+              handle === mainHandle
+                ? core.custodyCredentialId('main')
+                : core.custodyCredentialId('work'),
+            recordVersion: 7,
+            access: 'vault-access',
+            refresh: 'vault-refresh',
+            expiresAt: now + minTtlMs + 1,
+            state: 'usable' as const,
+          }
+        },
       }
       const fallbackManager = {
         withAccountRefreshLock: async <T>(_id: string, fn: () => Promise<T>) =>
@@ -605,6 +656,10 @@ describe('custody mode', () => {
         },
         now,
         fallbackManager: fallbackManager as never,
+        writeManifestEntryLocked: async (...args) => {
+          manifestWrites.push(args[0].entry.label)
+          return core.writeCustodyHandleManifestEntryLocked(...args)
+        },
       })
       const storage = await core.loadAccounts(storagePath)
       const plan = await preflightClaustrumTakeover(
@@ -628,6 +683,13 @@ describe('custody mode', () => {
       expect(committed?.claustrum?.mode).toBe('claustrum')
       modeAtFinalVerification = committed?.claustrum?.mode ?? 'local'
       expect(modeAtFinalVerification).toBe('claustrum')
+      expect(cacheModes.slice(-4)).toEqual([
+        'local',
+        'local',
+        'claustrum',
+        'claustrum',
+      ])
+      expect(manifestWrites).toEqual(['work'])
       const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
       expect(manifest.providers[0].accounts).toEqual([
         {
