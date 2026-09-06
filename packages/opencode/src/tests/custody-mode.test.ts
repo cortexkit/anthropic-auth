@@ -170,6 +170,70 @@ describe('custody mode', () => {
     }
   })
 
+  test('custody: live adapter skips identity comparison when the vault supplies no credential id', async () => {
+    const get = async () => core.custodyTombstoneOAuth('anthropic')
+    const manifestHandle = `ckh_${'A'.repeat(43)}`
+    const storage: core.AccountStorage = {
+      version: 1,
+      accounts: [],
+      claustrum: { handlesFile: '/resolved-handles.json' },
+      refresh: { refreshBeforeExpiryMinutes: 5 },
+    }
+    const directory = await mkdtemp(join(tmpdir(), 'custody-live-adapter-'))
+    const storagePath = join(directory, 'storage.json')
+    const manifestPath = join(directory, 'handles.json')
+    const debugMessages: string[] = []
+    try {
+      await expect(
+        core.writeCustodyHandleManifestEntry({
+          path: manifestPath,
+          entry: {
+            label: 'main',
+            handle: manifestHandle,
+            credentialId: 'oauth:anthropic:main',
+          },
+        }),
+      ).resolves.toEqual({ status: 'written' })
+      await core.saveAccounts(
+        {
+          ...storage,
+          claustrum: { handlesFile: manifestPath },
+        },
+        storagePath,
+      )
+      const deps = createLiveCustodyDeps({
+        storagePath,
+        cache: {
+          get: async (_handle, minTtlMs) => ({
+            payload: JSON.stringify({
+              access_token: 'vault-access',
+              refresh_token: 'vault-refresh',
+            }),
+            expiresAtMs: now + (minTtlMs ?? 0) + 1,
+            recordVersion: 1,
+            accountId: 'vault-account',
+          }),
+        },
+        latestGetAuth: get,
+        now,
+        debug: (message: string) => debugMessages.push(message),
+      })
+
+      const input = await deps.preflightInput(
+        { id: 'main', label: 'main', enabled: true },
+        [],
+      )
+      input.bindings[0]!.credentialId = 'oauth:anthropic:x'
+      const plan = await preflightClaustrumTakeover(input)
+      expect(plan).toMatchObject({ accounts: [{ id: 'main' }] })
+      expect(debugMessages).toEqual([
+        'custody identity check skipped: vault supplied no credential id',
+      ])
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   test('custody: preflight verifies every account before any write', async () => {
     const cases = [
       {

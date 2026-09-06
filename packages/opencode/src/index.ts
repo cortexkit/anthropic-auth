@@ -4645,6 +4645,7 @@ const anthropicAuthPlugin = async (
           latestGetAuth,
           now: claustrumNow,
           fallbackManager,
+          debug: (message) => logger.debug('claustrum', message),
         })
         try {
           const plan = await preflightClaustrumTakeover(

@@ -19,7 +19,7 @@ type Lock = { release: () => Promise<void> }
 export const OPENCODE_MAIN_OAUTH_REFRESH_LOCK = 'opencode-main-oauth-refresh'
 
 export type CustodyCacheCredential = {
-  credentialId: string
+  credentialId?: string
   recordVersion: number
   access: string
   refresh: string
@@ -124,6 +124,7 @@ export type PreflightClaustrumTakeoverInput = {
       options: { minTtlMs: number },
     ) => Promise<CustodyCacheCredential | { state: string; expiresAt?: number }>
   }
+  debug?: (message: string) => void
 }
 
 function localOAuthMaterial(
@@ -223,7 +224,12 @@ export async function preflightClaustrumTakeover(
       credential.expiresAt < input.now + minTtlMs
     )
       throw new CustodyPreflightRefusedError(route.id, 'credential_unusable')
-    if (credential.credentialId !== binding.credentialId)
+    // Without a vault id, a same-account wrong-record response remains possible; C5's account_id-vs-persisted-anthropicAccountUuid fence is the live protection.
+    if (credential.credentialId === undefined)
+      input.debug?.(
+        'custody identity check skipped: vault supplied no credential id',
+      )
+    else if (credential.credentialId !== binding.credentialId)
       throw new CustodyPreflightRefusedError(
         route.id,
         'credential_identity_mismatch',

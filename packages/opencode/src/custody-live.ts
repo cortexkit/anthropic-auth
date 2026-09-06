@@ -11,7 +11,7 @@ import {
 type Lock = { release: () => Promise<void> }
 
 type LiveCacheCredential = {
-  credentialId: string
+  credentialId?: string
   recordVersion: number
   access: string
   refresh: string
@@ -95,6 +95,7 @@ export function createLiveCustodyDeps(input: {
   fallbackManager?: Pick<core.FallbackAccountManager, 'withAccountRefreshLock'>
   storage?: core.AccountStorage | null
   writeManifestEntryLocked?: typeof core.writeCustodyHandleManifestEntryLocked
+  debug?: (message: string) => void
 }) {
   const inputNow = input.now
   const now = typeof inputNow === 'function' ? inputNow : () => inputNow
@@ -106,7 +107,6 @@ export function createLiveCustodyDeps(input: {
   )
   let manifestReader: core.CustodyHandleManifestReader | undefined
   let manifestLease: ManifestLease | undefined
-  const credentialIdsByHandle = new Map<string, string>()
   const loadStorage = () =>
     (storagePromise ??= Promise.resolve(
       input.storage ?? core.loadAccounts(input.storagePath),
@@ -127,12 +127,15 @@ export function createLiveCustodyDeps(input: {
   const getCredential = async (handle: string, minTtlMs: number) => {
     const credential = await input.cache.get(handle, minTtlMs)
     if ('state' in credential) return credential
+    const vaultCredentialId = (credential as { credentialId?: unknown })
+      .credentialId
     let payload: { access_token?: unknown; refresh_token?: unknown } = {}
     try {
       payload = JSON.parse(credential.payload)
     } catch {}
     return {
-      credentialId: credentialIdsByHandle.get(handle) ?? '',
+      credentialId:
+        typeof vaultCredentialId === 'string' ? vaultCredentialId : undefined,
       recordVersion: credential.recordVersion,
       access:
         typeof payload.access_token === 'string' ? payload.access_token : '',
@@ -167,7 +170,6 @@ export function createLiveCustodyDeps(input: {
           resolution.source === 'manifest'
             ? resolution.credentialId
             : core.custodyCredentialId(route.label ?? route.id)
-        credentialIdsByHandle.set(resolution.handle, credentialId)
         return [
           {
             accountId: route.id,
@@ -202,6 +204,7 @@ export function createLiveCustodyDeps(input: {
           ...fallbacks,
         ]),
         cache: this.cache,
+        debug: input.debug,
       }
     },
     locks: {
@@ -286,7 +289,8 @@ export function createLiveCustodyDeps(input: {
           )
           if (
             credential.state !== 'usable' ||
-            credential.credentialId !== account.credentialId ||
+            (credential.credentialId !== undefined &&
+              credential.credentialId !== account.credentialId) ||
             credential.recordVersion < account.recordVersion ||
             credential.expiresAt <
               now() + core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000
