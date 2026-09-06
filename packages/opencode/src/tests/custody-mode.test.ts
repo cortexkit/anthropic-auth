@@ -186,7 +186,7 @@ describe('custody mode', () => {
     expect(order).toEqual([
       'claustrum-mode-transition',
       'manifest:/resolved-handles.json',
-      'main-refresh',
+      'opencode-main-oauth-refresh',
       'alpha',
       'zulu',
     ])

@@ -15,6 +15,8 @@ type EvidenceDimension = 'V' | 'N'
 
 type Lock = { release: () => Promise<void> }
 
+export const OPENCODE_MAIN_OAUTH_REFRESH_LOCK = 'opencode-main-oauth-refresh'
+
 export type CustodyCacheCredential = {
   credentialId: string
   recordVersion: number
@@ -347,8 +349,11 @@ export async function acquireCustodyTransitionLocks(input: {
     await acquire('manifest', () =>
       input.acquireManifest({ path: input.manifestPath }),
     )
-    await acquire('main-refresh', () =>
-      input.acquireRefresh({ name: 'main-refresh', path: input.storagePath }),
+    await acquire(OPENCODE_MAIN_OAUTH_REFRESH_LOCK, () =>
+      input.acquireRefresh({
+        name: OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
+        path: input.storagePath,
+      }),
     )
     for (const id of [...input.fallbackAccountIds].sort())
       await acquire(`${id}-refresh`, () =>

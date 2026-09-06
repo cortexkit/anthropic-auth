@@ -214,6 +214,7 @@ import {
 } from './cache-diagnostics.ts'
 import {
   CustodyStateMismatchError,
+  OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
   reconcileCustodyStartup,
 } from './custody-mode.ts'
 import {
@@ -5524,7 +5525,7 @@ const anthropicAuthPlugin = async (
                     }
 
                     const fileLock = await acquireRefreshFileLock({
-                      name: 'opencode-main-oauth-refresh',
+                      name: OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
                       ttlMs: 2 * 60_000,
                       renew: true,
                     })

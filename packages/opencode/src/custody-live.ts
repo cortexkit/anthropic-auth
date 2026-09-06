@@ -1,4 +1,5 @@
 import * as core from '@cortexkit/anthropic-auth-core'
+import { OPENCODE_MAIN_OAUTH_REFRESH_LOCK } from './custody-mode.ts'
 
 type Lock = { release: () => Promise<void> }
 
@@ -124,7 +125,7 @@ export function createLiveCustodyDeps(input: {
       acquireManifest: ({ path }: { path: string }) =>
         retainLock((fn) => core.withCustodyManifestLock(path, fn)),
       acquireRefresh: ({ name, path }: { name: string; path: string }) =>
-        name === 'main-refresh' || !fallbackManager
+        name === OPENCODE_MAIN_OAUTH_REFRESH_LOCK || !fallbackManager
           ? core.acquireRefreshFileLock({
               name,
               path,
