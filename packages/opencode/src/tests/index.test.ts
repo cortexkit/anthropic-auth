@@ -1939,7 +1939,7 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial('does not read the manifest during a request', async () => {
-    const fixture = await bootRuledClaustrumRow({
+    const fixture = await bootSharedRuledClaustrumRow({
       route: 'fallback-first',
       fallbacks: [
         {
@@ -3225,7 +3225,7 @@ describe('fallback Claustrum credential resolution', () => {
     const fallbackHandle = `ckh_${'C'.repeat(43)}`
     const clearCalls: string[] = []
     const realClear = clearClaustrumRefreshErrorPersistent
-    const fixture = await bootRuledClaustrumRow({
+    const fixture = await bootSharedRuledClaustrumRow({
       route: 'fallback-first',
       fallbacks: [
         {
@@ -6845,48 +6845,6 @@ describe('AnthropicAuthPlugin', () => {
       const handle = `ckh_${'A'.repeat(43)}`
       const token = 'relogin-a-access'
       const refresh = 'relogin-a-refresh'
-      const calls: CredentialCall[] = []
-      await useTempAccountFile(
-        createFallbackStorage({
-          routing: { mode: 'fallback-first' },
-          quota: { enabled: false, failClosedOnUnknownQuota: false },
-          claustrum: { mode: 'claustrum' },
-          accounts: [
-            {
-              id: 'fallback-a',
-              label,
-              type: 'oauth',
-              access: 'sidecar-a-access',
-              refresh: 'sidecar-a-refresh',
-              expires: Date.now() + 5 * 60 * 60 * 1000,
-              claustrumHandle: handle,
-            },
-          ],
-        }),
-      )
-      const manifestPath = join(tempConfigDir!, 'handles.json')
-      await writeFile(
-        manifestPath,
-        JSON.stringify({
-          version: 1,
-          providers: [
-            {
-              provider: 'anthropic',
-              serve: 'anthropic-auth',
-              accounts: [
-                {
-                  label,
-                  handle,
-                  credential_id: custodyCredentialId(label),
-                },
-              ],
-            },
-          ],
-        }),
-      )
-      await chmod(manifestPath, 0o600)
-      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
-
       const authorize = mock(() =>
         Promise.resolve({
           url: 'https://example.test/oauth?state=state',
@@ -6895,88 +6853,64 @@ describe('AnthropicAuthPlugin', () => {
           verifier: 'verifier',
         }),
       )
-      const authorizations: string[] = []
-      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
-        const url = extractUrl(input as string | URL | Request)
-        if (url === TOKEN_URL) {
-          return Promise.resolve(
-            Response.json({
-              access_token: token,
-              refresh_token: refresh,
-              expires_in: 3600,
-            }),
-          )
-        }
-        if (url.includes('/v1/messages')) {
-          authorizations.push(
-            new Headers(init?.headers).get('authorization') ?? '',
-          )
-        }
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }) as unknown as typeof fetch
-
+      const servedRecordVersion = 9
       const client = createMockClient()
-      let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
+      const fixture = await bootSharedRuledClaustrumRow({
+        route: 'fallback-first',
+        fallbacks: [{ label, handle, access: 'vault-a-access' }],
+        connector: (calls) =>
+          connectorFor(calls, (method, params) => {
+            if (method !== 'credential.get') return { result: {} }
+            return credentialResponse(
+              params.handle === handle ? 'vault-a-access' : 'vault-main-access',
+              params.handle === handle ? servedRecordVersion : 1,
+            )
+          }),
+        onFetch: (input, init) => {
+          const url = extractUrl(input as string | URL | Request)
+          if (url === TOKEN_URL) {
+            return Promise.resolve(
+              Response.json({
+                access_token: token,
+                refresh_token: refresh,
+                expires_in: 3600,
+              }),
+            )
+          }
+          return new Response('{}', { status: 200 })
+        },
+        createFallbackStorage,
+        useTempAccountFile,
+        getPlugin: async (accountStoragePath, runtimeOverrides) => {
+          process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountStoragePath
+          return getPlugin(client, undefined, {
+            ...runtimeOverrides,
+            authorize,
+          } as never)
+        },
+        extractUrl,
+        tempConfigDir: () => tempConfigDir!,
+      })
       try {
-        plugin = await getPlugin(client, undefined, {
-          authorize,
-          claustrumConnector: async () =>
-            ({
-              call: async (
-                _moduleId: string,
-                method: string,
-                params: unknown,
-              ) => {
-                calls.push({
-                  method,
-                  params: (params ?? {}) as Record<string, unknown>,
-                })
-                if (method !== 'credential.get') return { result: {} }
-                return {
-                  result: {
-                    payload: Array.from(
-                      new TextEncoder().encode(
-                        JSON.stringify({ access_token: 'vault-a-access' }),
-                      ),
-                    ),
-                    expires_at_ms: Date.now() + 60_000,
-                    record_version: 9,
-                  },
-                }
-              },
-              close: () => {},
-            }) as never,
-        })
-        await plugin.__fallbackRefreshReady
-        const result = await plugin.auth.loader(
-          () =>
-            Promise.resolve({
-              type: 'oauth' as const,
-              access: 'main-access',
-              refresh: 'main-refresh',
-              expires: Date.now() + 100_000,
-            }),
-          { models: {} },
-        )
-        const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
         await response.text()
-        expect(authorizations).toContain('Bearer vault-a-access')
+        expect(fixture.authorizations).toContain('Bearer vault-a-access')
         expect(
-          calls.some(
+          fixture.calls.some(
             (call) =>
               call.method === 'credential.get' && call.params.handle === handle,
           ),
         ).toBe(true)
 
         await expectHandledCommandResponse(
-          plugin['command.execute.before']({
+          fixture.plugin['command.execute.before']({
             command: 'claude-account',
             arguments: 'local',
             sessionID: 'tui-fallback-relogin',
           }),
         )
         await expectHandledCommandResponse(
-          plugin['command.execute.before']({
+          fixture.plugin['command.execute.before']({
             command: 'claude-account',
             arguments: 'add-oauth-start',
             sessionID: 'tui-fallback-relogin',
@@ -6994,7 +6928,7 @@ describe('AnthropicAuthPlugin', () => {
           }),
         )
         await expectHandledCommandResponse(
-          plugin['command.execute.before']({
+          fixture.plugin['command.execute.before']({
             command: 'claude-account',
             arguments: 'add-oauth-finish code#state --label a',
             sessionID: 'tui-fallback-relogin',
@@ -7014,9 +6948,9 @@ describe('AnthropicAuthPlugin', () => {
         expect(
           state.claustrumDivergence[custodyCredentialId(label)]
             .minimumRecordVersion,
-        ).toBe(10)
+        ).toBe(servedRecordVersion + 1)
       } finally {
-        await plugin?.dispose?.()
+        await fixture.plugin.dispose?.()
         installDefaultFetchMock()
       }
     },
@@ -7238,6 +7172,11 @@ describe('AnthropicAuthPlugin', () => {
   test('vault reauth leaves the account absent and projects the reauth state', async () => {
     const accountId = 'vault-reauth-fallback'
     const handle = 'vault-reauth-handle'
+    let tick: (() => Promise<unknown>) | undefined
+    const setInterval = mock((callback: () => Promise<unknown>) => {
+      tick = callback
+      return { unref() {} } as unknown as ReturnType<typeof setInterval>
+    }) as unknown as typeof globalThis.setInterval
     const localRefresh = mock(() =>
       Promise.resolve(new Response('{}', { status: 200 })),
     ) as unknown as typeof fetch
@@ -7249,11 +7188,6 @@ describe('AnthropicAuthPlugin', () => {
       })),
       close: mock(() => {}),
     }
-    let tick: (() => Promise<unknown>) | undefined
-    const setInterval = mock((callback: () => Promise<unknown>) => {
-      tick = callback
-      return { unref() {} } as unknown as ReturnType<typeof setInterval>
-    }) as unknown as typeof globalThis.setInterval
 
     await useTempAccountFile(
       createFallbackStorage({
