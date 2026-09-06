@@ -6956,16 +6956,21 @@ describe('global Claustrum mode', () => {
   })
 
   test('serializes a mode write with another config write without losing either field', async () => {
-    await saveAccounts(baseStorage(), accountPath)
+    const originalLevel = getLogLevel()
+    try {
+      await saveAccounts(baseStorage(), accountPath)
 
-    await Promise.all([
-      setClaustrumModePersistent('claustrum', accountPath),
-      setLogLevelPersistent('debug', accountPath),
-    ])
+      await Promise.all([
+        setClaustrumModePersistent('claustrum', accountPath),
+        setLogLevelPersistent('debug', accountPath),
+      ])
 
-    const config = JSON.parse(await readFile(accountPath, 'utf8'))
-    expect(config.claustrum.mode).toBe('claustrum')
-    expect(config.logging.level).toBe('debug')
+      const config = JSON.parse(await readFile(accountPath, 'utf8'))
+      expect(config.claustrum.mode).toBe('claustrum')
+      expect(config.logging.level).toBe('debug')
+    } finally {
+      setLogLevel(originalLevel)
+    }
   })
 
   test('owns only enabled OAuth accounts with a resolved manifest binding in Claustrum mode', () => {

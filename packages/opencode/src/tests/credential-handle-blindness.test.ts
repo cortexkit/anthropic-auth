@@ -528,11 +528,12 @@ describe('credential-handle blindness', () => {
       await plugin.dispose?.()
 
       expect(credentialGets).toBeGreaterThan(0)
-      const unusable = logs.find(
-        (record) => record.message === 'vault fallback credential unusable',
-      )
-      expect(unusable).toBeDefined()
-      expect(JSON.stringify(unusable)).not.toContain(manifestHandle)
+      expect(
+        logs.some(
+          (record) => record.message === 'vault fallback credential unusable',
+        ),
+      ).toBe(true)
+      expect(JSON.stringify(logs)).not.toContain(manifestHandle)
     } finally {
       __setLogTestSink(null)
       setLogLevel(previousLogLevel)

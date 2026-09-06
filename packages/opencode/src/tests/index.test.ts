@@ -30,6 +30,7 @@ import {
   buildPrimeRequestBody,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
+  CustodyHandleManifestReader,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
   custodyTombstoneOAuth,
@@ -1234,7 +1235,7 @@ describe('fallback Claustrum credential resolution', () => {
       ),
     })
     await plugin.__fallbackRefreshReady
-    const open = spyOn(fs, 'open')
+    const read = spyOn(CustodyHandleManifestReader.prototype, 'read')
     const result = await plugin.auth.loader(
       async () => ({
         type: 'oauth' as const,
@@ -1245,8 +1246,14 @@ describe('fallback Claustrum credential resolution', () => {
       { models: {} },
     )
     await result.fetch(MESSAGES_URL, EMPTY_POST)
-    expect(open).not.toHaveBeenCalled()
-    open.mockRestore()
+    expect(read).not.toHaveBeenCalled()
+    await new CustodyHandleManifestReader({
+      path: process.env.CLAUSTRUM_OPENCODE_HANDLES!,
+      provider: 'anthropic',
+      serve: 'anthropic-auth',
+    }).read()
+    expect(read).toHaveBeenCalledTimes(1)
+    read.mockRestore()
     await plugin.dispose?.()
   })
 
