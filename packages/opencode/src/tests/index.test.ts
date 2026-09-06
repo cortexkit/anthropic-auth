@@ -31,6 +31,7 @@ import {
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
   CustodyHandleManifestReader,
+  CustodyTombstoneLoginError,
   CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
@@ -6597,6 +6598,114 @@ describe('AnthropicAuthPlugin', () => {
     )
     const retainedManifest = JSON.parse(await readFile(manifestPath, 'utf8'))
     expect(retainedManifest.providers[0].accounts).toHaveLength(1)
+    await plugin.dispose?.()
+    installDefaultFetchMock()
+  })
+
+  test('fresh install under local with a tombstoned slot', async () => {
+    const access = 'fresh-local-access'
+    const refresh = 'fresh-local-refresh'
+    const manifestHandle = `ckh_${'F'.repeat(43)}`
+    const manifest = JSON.stringify({
+      version: 1,
+      providers: [
+        {
+          provider: 'anthropic',
+          serve: 'anthropic-auth',
+          accounts: [
+            {
+              label: 'main',
+              handle: manifestHandle,
+              credential_id: custodyCredentialId('main'),
+            },
+          ],
+        },
+      ],
+    })
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'local' },
+        quota: { enabled: false },
+        accounts: [],
+      }),
+    )
+    const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+    const statePath = getAccountStatePath(accountPath)
+    await rm(statePath, { force: true })
+    const manifestPath = join(tempConfigDir!, 'handles.json')
+    await writeFile(manifestPath, manifest)
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/oauth',
+        redirectUri: 'https://example.test/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    const plugin = await getPlugin(undefined, undefined, { authorize })
+
+    await expect(
+      plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      ),
+    ).rejects.toBeInstanceOf(CustodyTombstoneLoginError)
+    await expect(readFile(statePath, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response('{}', { status: 200 })),
+    ) as unknown as typeof fetch
+    const restored = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'restored-access',
+          refresh: 'restored-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await restored.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(
+      JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+    ).toHaveLength(1)
+
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        return Promise.resolve(
+          Response.json({
+            access_token: access,
+            refresh_token: refresh,
+            expires_in: 3600,
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+    const flow = await plugin.auth.methods[0].authorize()
+    await flow.callback('code=code&state=state')
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access,
+          refresh,
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+
+    expect(
+      JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+    ).toHaveLength(0)
+    const stored = JSON.parse(await readFile(accountPath, 'utf8'))
+    expect(stored.mainAccountId).toBeString()
+    expect(stored.claustrum.mode).toBe('local')
     await plugin.dispose?.()
     installDefaultFetchMock()
   })
