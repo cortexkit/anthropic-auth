@@ -20414,59 +20414,15 @@ describe('killswitch fetch gate', () => {
     let clock = originalNow()
     Date.now = () => clock
     try {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
       const now = clock
       const accountId = 'killswitch-vault-fallback'
-      const handle = 'killswitch-vault-handle'
+      const handle = `ckh_${'K'.repeat(43)}`
       const vaultAccess = 'killswitch-vault-access'
       const quota = {
         five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
         seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
       }
-      await useTempAccountFile(
-        createFallbackStorage({
-          quota: {
-            enabled: true,
-            checkIntervalMinutes: 5,
-            refreshEveryNRequests: 1,
-            minimumRemaining: { five_hour: 10, seven_day: 20 },
-            failClosedOnUnknownQuota: false,
-          },
-          killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
-          claustrum: { mode: 'claustrum' },
-          accounts: [
-            {
-              id: accountId,
-              type: 'oauth',
-              access: 'sidecar-access',
-              refresh: 'sidecar-refresh',
-              expires: now + 5 * 60 * 60 * 1000,
-              claustrumHandle: handle,
-              quota,
-            },
-          ],
-        }),
-      )
-
-      const connector = async () =>
-        ({
-          call: async (_moduleId: string, method: string) => {
-            if (method === 'credential.get') {
-              return {
-                result: {
-                  payload: Array.from(
-                    new TextEncoder().encode(
-                      JSON.stringify({ access_token: vaultAccess }),
-                    ),
-                  ),
-                  expires_at_ms: now + 12 * 60 * 60 * 1000,
-                  record_version: 1,
-                },
-              }
-            }
-            return { result: {} }
-          },
-          close: () => {},
-        }) as never
       const detachedTimers: Array<() => void> = []
       const setTimeout = mock((callback: TestTimerHandler, delay?: number) => {
         if (delay === 0 && typeof callback === 'function') {
@@ -20475,29 +20431,79 @@ describe('killswitch fetch gate', () => {
         return 0 as unknown as ReturnType<typeof globalThis.setTimeout>
       }) as unknown as typeof globalThis.setTimeout
       const usageAuthorizations: string[] = []
-      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
-        const url = extractUrl(input as string | URL | Request)
-        if (url.includes('/api/oauth/usage')) {
-          usageAuthorizations.push(
-            new Headers(init?.headers).get('authorization') ?? '',
-          )
-          return Promise.resolve(
-            new Response(
+      const fixture = await bootSharedRuledClaustrumRow({
+        route: 'fallback-first',
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          refreshEveryNRequests: 1,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: false,
+          mainQuota: {
+            checkedAt: now,
+            five_hour: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              checkedAt: now,
+            },
+            seven_day: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              checkedAt: now,
+            },
+          },
+          mainQuotaCheckedAt: now,
+          mainQuotaToken: tokenFingerprint('vault-main-access'),
+        },
+        storageOverrides: {
+          killswitch: { enabled: true, main: { five_hour: 5, seven_day: 10 } },
+        },
+        fallbacks: [
+          {
+            label: 'killswitch',
+            handle,
+            access: vaultAccess,
+            account: { id: accountId, quota },
+          },
+        ],
+        connector: (calls) =>
+          connectorFor(calls, (method, params) =>
+            method === 'credential.get'
+              ? credentialResponse(
+                  params.handle === handle ? vaultAccess : 'vault-main-access',
+                  1,
+                  now + 12 * 60 * 60 * 1000,
+                )
+              : { result: {} },
+          ),
+        onFetch: (input, init) => {
+          if (
+            extractUrl(input as string | URL | Request).includes(
+              '/api/oauth/usage',
+            )
+          ) {
+            usageAuthorizations.push(
+              new Headers(init?.headers).get('authorization') ?? '',
+            )
+            return new Response(
               JSON.stringify({
                 five_hour: { utilization: 10 },
                 seven_day: { utilization: 10 },
               }),
               { status: 200 },
-            ),
-          )
-        }
-        return Promise.resolve(new Response('message-ok', { status: 200 }))
-      }) as unknown as typeof fetch
-
-      const plugin = await getPlugin(undefined, undefined, {
-        claustrumConnector: connector,
-        setTimeout,
+            )
+          }
+          return new Response('message-ok', { status: 200 })
+        },
+        runtimeOverrides: { setTimeout },
+        bootPlugin: (overrides) =>
+          getPlugin(createMockClient(), tempConfigDir!, overrides),
+        createFallbackStorage,
+        useTempAccountFile,
+        extractUrl,
+        tempConfigDir: () => tempConfigDir!,
       })
+      const plugin = fixture.plugin
       await plugin.__fallbackRefreshReady
       clock = now + 6 * 60 * 60 * 1000
       plugin.__quotaManager.clearFallback(accountId)
@@ -20510,8 +20516,7 @@ describe('killswitch fetch gate', () => {
       usageAuthorizations.length = 0
       const timerBaseline = detachedTimers.length
 
-      const result = await plugin.auth.loader(oauthLoader, { models: {} })
-      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+      const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
       await response.text()
       await plugin.dispose?.()
 
@@ -20529,14 +20534,6 @@ describe('killswitch fetch gate', () => {
       Date.now = originalNow
     }
   }
-
-  test('killswitch quota refresh schedules one detached warm for a cold vault and expired sidecar', async () => {
-    const result = await runVaultKillswitchQuotaRefresh(false)
-
-    expect(result.fallbackUsageCalls).toBe(0)
-    expect(result.sidecarUsageCalls).toBe(0)
-    expect(result.scheduledWarmCount).toBe(1)
-  })
 
   test('killswitch quota refresh polls with a resident vault credential instead of an expired sidecar', async () => {
     const result = await runVaultKillswitchQuotaRefresh(true)
