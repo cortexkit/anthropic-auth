@@ -5243,12 +5243,7 @@ const anthropicAuthPlugin = async (
             ))
             ? 'V'
             : 'N'
-        if (
-          auth.type === 'oauth' &&
-          (custodyMode !== 'claustrum' ||
-            main === 'T' ||
-            mainBinding.status === 'resolved')
-        ) {
+        if (auth.type === 'oauth') {
           try {
             reconcileCustodyStartup({
               mode: custodyMode === 'claustrum' ? 'C' : 'L',

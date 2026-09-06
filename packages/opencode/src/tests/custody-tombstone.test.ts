@@ -740,6 +740,59 @@ describe('Claustrum custody tombstones', () => {
     expect(fetchCalls.filter((url) => url === TOKEN_URL)).toHaveLength(0)
   })
 
+  test('reconciles a real main without a resolved binding before serving OAuth', async () => {
+    const fetchCalls: Array<{ url: string; authorization: string | null }> = []
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const request = input instanceof Request ? input : undefined
+      const headers = new Headers(init?.headers ?? request?.headers)
+      fetchCalls.push({
+        url: extractUrl(input as string | URL | Request),
+        authorization: headers.get('authorization'),
+      })
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    await createTempStorage(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: oauthFixture.provider },
+        claustrum: { mode: 'claustrum' },
+        refresh: { enabled: true },
+        quota: { enabled: true },
+        accounts: [],
+      },
+      async () => {
+        const plugin = (await AnthropicAuthPlugin(
+          // @ts-expect-error: minimal mock for testing
+          { client: createMockClient() },
+          disabledTimerOverrides(),
+        )) as any
+        const loaded = await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth' as const,
+              access: 'real-local-access',
+              refresh: 'real-local-refresh',
+              expires: Date.now() + 60_000,
+            }),
+          { models: {} } as never,
+        )
+
+        await expect(
+          loaded.fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            body: '{}',
+          }),
+        ).rejects.toMatchObject({
+          code: 'custody_state_mismatch',
+          verdict: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
+        })
+        expect(fetchCalls).toEqual([])
+        await plugin.dispose?.()
+      },
+    )
+  })
+
   test('refuses Claude Pro/Max login before authorization while claustrum is committed', async () => {
     const authorizeImpl = mock(() =>
       Promise.resolve({
