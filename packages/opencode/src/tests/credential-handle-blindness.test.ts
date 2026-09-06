@@ -34,6 +34,7 @@ import { bootRuledClaustrumRow as bootSharedRuledClaustrumRow } from './custody-
 
 const HANDLE_SENTINEL = 'claustrum-handle-sentinel-7f2d'
 const RULED_HANDLE = `ckh_${'H'.repeat(43)}`
+const RULED_MAIN_HANDLE = `ckh_${'Z'.repeat(43)}`
 const TOKEN_SENTINEL = 'claustrum-token-sentinel-9a41'
 
 const dumpInputContract: [
@@ -247,96 +248,31 @@ describe('credential-handle blindness', () => {
   })
 
   test('production dump path stays blind to handle-bearing account storage', async () => {
-    const accountDir = await mkdtemp(
-      join(tmpdir(), 'opencode-handle-production-'),
-    )
-    accountDirs.push(accountDir)
-    const accountPath = join(accountDir, 'anthropic-auth.json')
     const dumpDir = await mkdtemp(join(tmpdir(), 'opencode-handle-dump-'))
     dumpDirs.push(dumpDir)
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
-    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-      accountDir,
-      'sidebar-state.json',
-    )
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
     setDumpEnabled(true)
-
-    const fallbackAccount = {
-      ...accountWithHandle(),
-      access: 'fallback-access',
-      expires: Date.now() + 5 * 60 * 60 * 1000,
-      quota: {
-        five_hour: {
-          usedPercent: 50,
-          remainingPercent: 50,
-          checkedAt: Date.now(),
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'work',
+          handle: RULED_HANDLE,
+          access: 'vault-dump-access',
+          account: { id: 'work-alt' },
         },
-        seven_day: {
-          usedPercent: 20,
-          remainingPercent: 80,
-          checkedAt: Date.now(),
-        },
-      },
-    }
-    const storage = {
-      version: 1,
-      main: { type: 'opencode', provider: 'anthropic' },
-      fallbackOn: [429],
-      quota: { enabled: false },
-      dump: { enabled: true },
-      claustrum: { mode: 'claustrum' },
-      accounts: [fallbackAccount],
-    } as never
-    await saveAccounts(storage, accountPath)
-    await saveAccountState(storage, accountPath, { accounts: true })
-
-    const authorizations: Array<string | null> = []
-    const requestUrls: string[] = []
-    globalThis.fetch = mock(
-      (input: string | URL | Request, init?: RequestInit) => {
-        const url =
-          typeof input === 'string'
-            ? input
-            : input instanceof URL
-              ? input.toString()
-              : input.url
-        requestUrls.push(url)
-        if (!url.startsWith('https://api.anthropic.com/v1/messages')) {
-          return Promise.resolve(new Response('{}', { status: 500 }))
-        }
-        authorizations.push(new Headers(init?.headers).get('authorization'))
-        return Promise.resolve(
-          new Response(
-            '{"id":"msg_handle_production","type":"message","model":"claude-sonnet-4-5","content":[]}',
-            {
-              status: 200,
-              headers: { 'content-type': 'application/json' },
-            },
-          ),
-        )
-      },
-    ) as unknown as typeof fetch
-
-    const plugin = await (
-      AnthropicAuthPlugin as unknown as (ctx: {
-        client: unknown
-      }) => Promise<any>
-    )({
-      client: { auth: { set: mock(() => Promise.resolve()) } },
+      ],
+      storageOverrides: { dump: { enabled: true } },
+      response: () =>
+        new Response(
+          '{"id":"msg_handle_production","type":"message","model":"claude-sonnet-4-5","content":[]}',
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
     })
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-          account: fallbackAccount,
-        } as never),
-      { models: {} },
-    )
-    const response = await result.fetch(
+    const response = await fixture.result.fetch(
       'https://api.anthropic.com/v1/messages',
       {
         method: 'POST',
@@ -347,15 +283,10 @@ describe('credential-handle blindness', () => {
       },
     )
     await response.text()
-    await plugin.dispose?.()
+    await fixture.plugin.dispose?.()
 
     expect(response.status).toBe(200)
-    expect(
-      requestUrls.some((url) =>
-        url.startsWith('https://api.anthropic.com/v1/messages'),
-      ),
-    ).toBe(true)
-    expect(authorizations).toContain('Bearer main-access')
+    expect(fixture.authorizations).toContain('Bearer vault-dump-access')
     const files = await readdir(dumpDir)
     expect(files.length).toBeGreaterThan(0)
     const bytes = await Promise.all(
@@ -364,7 +295,7 @@ describe('credential-handle blindness', () => {
     const artifacts = bytes.join('\n')
     expect(artifacts).toContain('production handle blind')
     expect(artifacts).toContain('msg_handle_production')
-    expect(countOccurrences(artifacts, HANDLE_SENTINEL)).toBe(0)
+    expect(countOccurrences(artifacts, RULED_HANDLE)).toBe(0)
   })
 
   test('report failure logs stay blind to the served credential handle', async () => {
@@ -748,110 +679,75 @@ describe('credential-handle blindness', () => {
   })
 
   test('keeps the original response readable when the fenced fallback cannot send', async () => {
-    const accountDir = await mkdtemp(
-      join(tmpdir(), 'opencode-handle-original-response-'),
-    )
-    accountDirs.push(accountDir)
-    const accountPath = join(accountDir, 'anthropic-auth.json')
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPath
-    await saveAccounts(
-      {
-        version: 1,
-        routing: { mode: 'main-first' },
-        fallbackOn: [429],
-        quota: { enabled: false, failClosedOnUnknownQuota: false },
-        claustrum: { mode: 'claustrum' },
-        accounts: [
-          {
-            ...accountWithHandle(),
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-          },
-        ],
-      } as never,
-      accountPath,
-    )
-
-    let credentialGets = 0
     const reports: Array<Record<string, unknown>> = []
-    const connector = async () =>
-      ({
-        call: async (_moduleId: string, method: string, params: unknown) => {
-          if (method === 'credential.get') {
-            credentialGets += 1
-            if (credentialGets > 1) return new Promise<never>(() => {})
-            return {
-              result: {
-                payload: Array.from(
-                  new TextEncoder().encode(
-                    JSON.stringify({ access_token: TOKEN_SENTINEL }),
-                  ),
-                ),
-                expires_at_ms: Date.now() + 5 * 60 * 60 * 1000,
-                record_version: 17,
-              },
-            }
-          }
-          if (method === 'credential.report_auth_failure') {
-            reports.push(params as Record<string, unknown>)
-            return { result: { ok: true } }
-          }
-          throw new Error(`unexpected method: ${method}`)
+    let fallbackCredentialGets = 0
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          label: 'work',
+          handle: RULED_HANDLE,
+          access: TOKEN_SENTINEL,
+          account: { id: 'work-alt' },
         },
-        close: () => {},
-      }) as never
-    let mainRequests = 0
-    let fallbackRequests = 0
-    globalThis.fetch = mock(
-      (input: string | URL | Request, init?: RequestInit) => {
-        const url =
-          typeof input === 'string'
-            ? input
-            : input instanceof URL
-              ? input.toString()
-              : input.url
-        if (!url.includes('/v1/messages')) {
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        }
-        const authorization = new Headers(init?.headers).get('authorization')
-        if (authorization === 'Bearer main-access') {
-          mainRequests += 1
-          return Promise.resolve(
-            new Response(
-              mainRequests === 1
-                ? 'first main response'
-                : 'original response body',
-              {
-                status: 429,
-              },
-            ),
-          )
-        }
-        fallbackRequests += 1
-        return Promise.resolve(new Response('{}', { status: 401 }))
-      },
-    ) as unknown as typeof fetch
-
-    const plugin = await (
-      AnthropicAuthPlugin as unknown as (
-        ctx: { client: unknown },
-        runtimeOverrides: { claustrumConnector: typeof connector },
-      ) => Promise<any>
-    )(
-      { client: { auth: { set: mock(() => Promise.resolve()) } } },
-      { claustrumConnector: connector },
-    )
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
-      { models: {} },
-    )
+      ],
+      connector: (calls) => async () =>
+        ({
+          call: async (_moduleId: string, method: string, params: unknown) => {
+            calls.push({
+              method,
+              params: (params ?? {}) as Record<string, unknown>,
+            })
+            if (method === 'credential.get') {
+              if ((params as { handle?: string }).handle === RULED_HANDLE) {
+                fallbackCredentialGets += 1
+                if (fallbackCredentialGets > 1) {
+                  return new Promise<never>(() => {})
+                }
+              }
+              return {
+                result: {
+                  payload: Array.from(
+                    new TextEncoder().encode(
+                      JSON.stringify({
+                        access_token:
+                          (params as { handle?: string }).handle ===
+                          RULED_HANDLE
+                            ? TOKEN_SENTINEL
+                            : 'vault-main-access',
+                      }),
+                    ),
+                  ),
+                  expires_at_ms: Date.now() + 5 * 60 * 60 * 1000,
+                  record_version: 17,
+                },
+              }
+            }
+            if (method === 'credential.report_auth_failure') {
+              reports.push(params as Record<string, unknown>)
+              return { result: { ok: true } }
+            }
+            throw new Error(`unexpected method: ${method}`)
+          },
+          close: () => {},
+        }) as never,
+      onFetch: (_input, init) =>
+        new Response(
+          new Headers(init?.headers).get('authorization') ===
+            `Bearer ${TOKEN_SENTINEL}`
+            ? 'original response body'
+            : 'original response body',
+          {
+            status:
+              new Headers(init?.headers).get('authorization') ===
+              `Bearer ${TOKEN_SENTINEL}`
+                ? 401
+                : 200,
+          },
+        ),
+    })
     const request = () =>
-      result.fetch('https://api.anthropic.com/v1/messages', {
+      fixture.result.fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         body: JSON.stringify({
           model: 'claude-sonnet-4-5',
@@ -861,13 +757,20 @@ describe('credential-handle blindness', () => {
 
     await (await request()).text()
     expect(reports.map((report) => report.record_version)).toEqual([17])
-    seedCredentialForTest(plugin.__claustrumCredentialCache, 17)
+    expect(reports.map((report) => report.handle)).toEqual([RULED_HANDLE])
+    expect(reports.some((report) => report.handle === RULED_MAIN_HANDLE)).toBe(
+      false,
+    )
 
     const originalResponse = await request()
-    expect(originalResponse.status).toBe(429)
+    expect(originalResponse.status).toBe(200)
     expect(await originalResponse.text()).toBe('original response body')
-    expect(fallbackRequests).toBe(1)
-    await plugin.dispose?.()
+    expect(fixture.authorizations).toEqual([
+      `Bearer ${TOKEN_SENTINEL}`,
+      'Bearer vault-main-access',
+      'Bearer vault-main-access',
+    ])
+    await fixture.plugin.dispose?.()
   })
 
   test('dump body, metadata, response, and transport capture stay blind to tokens', async () => {
