@@ -1201,6 +1201,59 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'reports a warm main vault 401 with its send-time record version',
+    async () => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          claustrum: { mode: 'claustrum' },
+          quota: { enabled: false },
+          accounts: [],
+        }),
+      )
+      await writeManifest([{ label: 'main', handle: manifestHandle }])
+      const calls: CredentialCall[] = []
+      const authorizations: string[] = []
+      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        return Promise.resolve(new Response('denied', { status: 401 }))
+      }) as unknown as typeof fetch
+      const plugin = await getPlugin(undefined, undefined, {
+        claustrumConnector: connectorFor(calls, (method) => {
+          if (method === 'credential.get')
+            return credentialResponse('main-vault-access', 7)
+          return { result: {} }
+        }),
+      })
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+        { models: {} },
+      )
+
+      const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(401)
+      expect(authorizations).toEqual(['Bearer main-vault-access'])
+      expect(
+        calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          params: expect.objectContaining({
+            handle: manifestHandle,
+            provider_status: 401,
+            record_version: 7,
+            reporter_source: 'direct',
+          }),
+        }),
+      ])
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
     'prefers a manifest handle over a stale legacy handle',
     async () => {
       await useTempAccountFile(

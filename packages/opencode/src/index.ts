@@ -4928,7 +4928,7 @@ const anthropicAuthPlugin = async (
                     claustrumNow(),
                   )
                   if (accessToken && cached && handle) {
-                    return sendWithAccessToken(
+                    const response = await sendWithAccessToken(
                       input,
                       init,
                       accessToken,
@@ -4949,6 +4949,14 @@ const anthropicAuthPlugin = async (
                         },
                       },
                     )
+                    return createStrippedStream(response, {
+                      onRelayUpstreamError: ({ status, source }) => {
+                        if (status !== 401) return
+                        const served = claustrumServedCredentials.get(response)
+                        if (served)
+                          void reportClaustrumAuthFailure(served, source)
+                      },
+                    })
                   }
                   return claustrumMainRefusal(
                     claustrumReauthAccounts.has('main') ? 'reauth' : 'cold',
@@ -6152,6 +6160,12 @@ const anthropicAuthPlugin = async (
                 response,
                 servedClaustrumCredential,
               )
+              if (response.status === 401) {
+                await reportClaustrumAuthFailure(
+                  servedClaustrumCredential,
+                  'direct',
+                )
+              }
             }
             return response
           }
