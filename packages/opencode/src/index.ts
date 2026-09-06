@@ -229,6 +229,11 @@ import {
   LANE_START_REQUEST_HEADER,
   LaneStartTracker,
 } from './lane-start.ts'
+import {
+  acknowledgeLocalOAuthLogin,
+  type CompletedLocalLogin,
+  localAuthFingerprint,
+} from './local-login.ts'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
@@ -1919,6 +1924,55 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  async function acknowledgeMainLocalLogin(
+    getAuth: NonNullable<typeof latestGetAuth>,
+  ): Promise<void> {
+    const completion = completedLocalLogin
+    if (!completion) return
+    const storage = await loadAccounts(accountStoragePath)
+    if (getClaustrumMode(storage) !== 'local') return
+    const account = mainCustodyAccount(await getAuth().catch(() => ({})))
+    const resolution = storage
+      ? resolveAccountCustodyHandle(account, storage)
+      : { status: 'unresolved' as const, reason: 'missing-entry' as const }
+    if (resolution.status !== 'resolved' || resolution.source !== 'manifest') {
+      completedLocalLogin = undefined
+      return
+    }
+    const maxAttempts = 20
+    const intervalMs = 100
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const observed = await getAuth().catch(() => undefined)
+      const result = await acknowledgeLocalOAuthLogin(completion, observed, {
+        manifestPath: custodyHandleManifestPath,
+        entry: {
+          label: 'main',
+          handle: resolution.handle,
+          credentialId: resolution.credentialId ?? custodyCredentialId('main'),
+        },
+      })
+      if (result === 'cleared' || result === 'refused') {
+        completedLocalLogin = undefined
+        if (result === 'cleared') await refreshCustodyHandleManifest()
+        return
+      }
+      if (attempt + 1 < maxAttempts) {
+        await new Promise<void>((resolve) => {
+          const timer = runtimeTimers.setTimeout(resolve, intervalMs)
+          if (typeof timer === 'object' && timer && 'unref' in timer)
+            timer.unref()
+        })
+      }
+    }
+    completedLocalLogin = undefined
+    logger.warn('claustrum', 'local login observation exhausted', {
+      accountId: completion.accountId,
+      credentialId: completion.credentialId,
+      attempts: maxAttempts,
+      intervalMs,
+    })
+  }
+
   function hasClaustrumIdentityMismatch(
     account: OAuthAccount,
     credential: ClaustrumCredential | undefined,
@@ -3532,6 +3586,7 @@ const anthropicAuthPlugin = async (
         expires?: number
       }>)
     | null = null
+  let completedLocalLogin: CompletedLocalLogin | undefined
   let mainAccountId: string | undefined
   let mainQuotaAccountId: string | undefined
   let mainServedAccessToken: string | undefined
@@ -5030,6 +5085,7 @@ const anthropicAuthPlugin = async (
       ) {
         latestGetAuth = getAuth
         const auth = await getAuth()
+        await acknowledgeMainLocalLogin(getAuth)
         if (auth.type === 'oauth') {
           const custodyStorage = await loadAccounts(accountStoragePath)
           const mainCustody = mainCustodyAccount(auth)
@@ -8257,12 +8313,24 @@ const anthropicAuthPlugin = async (
               instructions: 'Paste the authorization code here:',
               method: 'code',
               callback: async (code: string) => {
-                return exchange(
+                const exchanged = await exchange(
                   code,
                   result.verifier,
                   result.redirectUri,
                   result.state,
                 )
+                if (exchanged.type === 'success') {
+                  completedLocalLogin = {
+                    accountId: 'main',
+                    credentialId: custodyCredentialId('main'),
+                    authFingerprint: localAuthFingerprint(
+                      exchanged.access,
+                      exchanged.refresh,
+                    ),
+                    completedAt: Date.now(),
+                  }
+                }
+                return exchanged
               },
             }
           },
