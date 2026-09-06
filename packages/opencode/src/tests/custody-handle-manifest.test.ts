@@ -535,6 +535,43 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
+  test('replaces a corrupt own-label entry with a canonical binding', async () => {
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: writerEntry.label,
+                handle: writerHandle,
+                credential_id: writerEntry.credentialId,
+                superseded: 'corrupt',
+              },
+            ],
+          },
+        ],
+      }),
+      async (path) => {
+        await expect(
+          writeCustodyHandleManifestEntry({ path, entry: writerEntry }),
+        ).resolves.toEqual({ status: 'written' })
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<{ accounts: Array<Record<string, unknown>> }>
+        }
+        expect(output.providers[0]?.accounts).toEqual([
+          {
+            label: writerEntry.label,
+            handle: writerEntry.handle,
+            credential_id: writerEntry.credentialId,
+          },
+        ])
+      },
+    )
+  })
+
   test('inserts our entry into an absent manifest file', async () => {
     await withTempDirectory(async (directory) => {
       const parent = join(directory, 'manifest')

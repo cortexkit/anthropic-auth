@@ -1090,6 +1090,7 @@ export async function writeCustodyHandleManifestEntryLocked(
   }
 
   let document: Record<string, unknown>
+  let corruptLabels: ReadonlySet<string> = new Set<string>()
   let handle: fs.FileHandle | undefined
   try {
     const pathStats = await fs.lstat(input.path)
@@ -1122,7 +1123,11 @@ export async function writeCustodyHandleManifestEntryLocked(
 
     if (parsed.providers.some(isOurManifestBlock)) {
       try {
-        readCustodyHandles(parsed, 'anthropic', 'anthropic-auth')
+        corruptLabels = readCustodyHandles(
+          parsed,
+          'anthropic',
+          'anthropic-auth',
+        ).corruptLabels
       } catch {
         return refusal('invalid manifest')
       }
@@ -1168,12 +1173,15 @@ export async function writeCustodyHandleManifestEntryLocked(
     if (
       matching.length === 1 &&
       matching[0]?.handle === input.entry.handle &&
-      matching[0]?.credential_id === input.entry.credentialId
+      matching[0]?.credential_id === input.entry.credentialId &&
+      !corruptLabels.has(input.entry.label)
     ) {
       return { status: 'unchanged' }
     }
     const replacement = {
-      ...(matching.find(isRecord) ?? {}),
+      ...(corruptLabels.has(input.entry.label)
+        ? {}
+        : (matching.find(isRecord) ?? {})),
       label: input.entry.label,
       handle: input.entry.handle,
       credential_id: input.entry.credentialId,
