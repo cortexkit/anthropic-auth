@@ -1939,7 +1939,7 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial('does not read the manifest during a request', async () => {
-    const fixture = await bootSharedRuledClaustrumRow({
+    const fixture = await bootRuledClaustrumRow({
       route: 'fallback-first',
       fallbacks: [
         {
@@ -3225,7 +3225,7 @@ describe('fallback Claustrum credential resolution', () => {
     const fallbackHandle = `ckh_${'C'.repeat(43)}`
     const clearCalls: string[] = []
     const realClear = clearClaustrumRefreshErrorPersistent
-    const fixture = await bootSharedRuledClaustrumRow({
+    const fixture = await bootRuledClaustrumRow({
       route: 'fallback-first',
       fallbacks: [
         {
