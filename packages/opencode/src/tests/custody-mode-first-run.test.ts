@@ -86,7 +86,7 @@ afterEach(async () => {
 })
 
 describe('fresh install under Claustrum', () => {
-  test.todo('fresh rostered fallback must route vault-first: accounts.ts:562 rejects no-state OAuth rows; custody-dimensions.ts:65-72 calls it R; accounts.ts:4234-4238 withholds non-resident vault rows; observed [Bearer vault-main-access, Bearer vault-main-access]', async () => {
+  test('fresh rostered fallback must route vault-first: accounts.ts:562 rejects no-state OAuth rows; custody-dimensions.ts:65-72 calls it R; accounts.ts:4234-4238 withholds non-resident vault rows; observed [Bearer vault-main-access, Bearer vault-main-access]', async () => {
     const root = await createFirstRunRoot()
     const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
     const statePath = accountPath.replace(/\.json$/, '-state.json')

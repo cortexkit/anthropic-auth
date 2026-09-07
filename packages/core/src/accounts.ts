@@ -559,7 +559,16 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 
   if (value.type !== 'oauth') return null
-  if (typeof value.refresh !== 'string' || !value.refresh.trim()) return null
+  const refresh = typeof value.refresh === 'string' ? value.refresh : ''
+  const rosterOnly =
+    value.enabled === true &&
+    typeof value.id === 'string' &&
+    Boolean(value.id.trim()) &&
+    typeof value.label === 'string' &&
+    Boolean(value.label.trim()) &&
+    value.access == null &&
+    (value.refresh == null || value.refresh === '')
+  if (!refresh.trim() && !rosterOnly) return null
 
   return {
     ...normalizeAccountBase(value),
@@ -578,7 +587,7 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
         ? value.claustrumHandle.trim()
         : undefined,
     access: typeof value.access === 'string' ? value.access : undefined,
-    refresh: value.refresh,
+    refresh,
     expires: typeof value.expires === 'number' ? value.expires : undefined,
     lastRefreshedAt:
       typeof value.lastRefreshedAt === 'number'
