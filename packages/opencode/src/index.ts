@@ -8736,7 +8736,6 @@ const anthropicAuthPlugin = async (
     get __claustrumCredentialCache() {
       return claustrumCredentialCache
     },
-    __ensureClaustrumCredentialCacheForTest: ensureClaustrumCredentialCache,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
 }

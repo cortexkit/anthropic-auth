@@ -29,9 +29,6 @@ type RuledRowPlugin = {
     ) => Promise<{ fetch: typeof fetch }>
   }
   __claustrumCredentialCache?: RuledRowCredentialCache
-  __ensureClaustrumCredentialCacheForTest?: () => Promise<
-    RuledRowCredentialCache | undefined
-  >
 }
 
 class MissingRuledRowFixtureDependencyError extends Error {
@@ -272,9 +269,7 @@ export async function bootRuledClaustrumRow<
         accountStoragePath,
         resolvedRuntimeOverrides,
       )
-  const cache =
-    plugin.__claustrumCredentialCache ??
-    (await plugin.__ensureClaustrumCredentialCacheForTest?.())
+  const cache = plugin.__claustrumCredentialCache
   if (!cache) {
     throw new Error('ruled Claustrum row failed to initialize credential cache')
   }
