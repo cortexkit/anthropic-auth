@@ -167,6 +167,8 @@ vault-owned family.
 | C9 | VALID | GONE (main) | USABLE · COLD · REAUTH | `TAKEOVER_INCOMPLETE_SLOT_ABSENT` | **no** | inert | **none** (plugin-side install into an absent slot is **withdrawn**, see below) | next boot | `ck auth migrate-plugin` restores the slot; or the host, once a fenced write exists |
 | C10 | VALID | GONE (fallback = `ROW_UNPARSEABLE`) | any | `CORRUPT_ROW` | **no** | inert | **none**; state secrets retained | next reconcile | repair the row, or remove + re-discover |
 
+At the loader, `evidence` means the main-slot vault evidence only. Fallback residency is route-local: a cold bound fallback is excluded for that request while other routes, including a resident main, continue to serve. Structural fallback dimensions (`R`/`M`) still produce `RESUME_TAKEOVER` or a binding-missing refusal independently of loader evidence.
+
 Invariants pinning the combinations not rowed:
 
 - `vault = N/A ⇔ binding ∈ {ABSENT, INVALID}`; a `VALID` binding always resolves to one of

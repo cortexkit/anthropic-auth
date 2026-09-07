@@ -1534,6 +1534,38 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'keeps a cold bound fallback route-local while the vault main serves',
+    async () => {
+      const fixture = await bootRuledClaustrumRow({
+        route: 'main-exhausted',
+        fallbacks: [
+          {
+            label: 'cold-fallback',
+            handle: manifestHandle,
+            access: 'unused-fallback-access',
+          },
+        ],
+        connector: (calls) =>
+          connectorFor(calls, (method, params) => {
+            if (method !== 'credential.get') return { result: {} }
+            return credentialResponse(
+              params.handle === ruledMainHandle
+                ? 'vault-main-access'
+                : 'cold-fallback-access',
+              1,
+              params.handle === ruledMainHandle ? Date.now() + 60_000 : 0,
+            )
+          }),
+      })
+      const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(200)
+      expect(fixture.authorizations).toEqual(['Bearer vault-main-access'])
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
     'holds a dark main at the loader before main refresh',
     async () => {
       await useTempAccountFile(
