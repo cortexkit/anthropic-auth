@@ -48,6 +48,12 @@ export type CustodyPreflightRefusal = {
   guidance?: string
 }
 
+export type MainCustodyRefusal =
+  | 'cold'
+  | 'reauth'
+  | 'takeover-incomplete'
+  | 'identity-mismatch'
+
 export class CustodyPreflightRefusedError extends Error {
   readonly code = 'custody_preflight_refused'
 

@@ -218,6 +218,7 @@ import {
   CustodyStateMismatchError,
   executeClaustrumTakeover,
   executeLocalExit,
+  type MainCustodyRefusal,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
   preflightClaustrumTakeover,
   reconcileCustodyStartup,
@@ -2010,9 +2011,7 @@ const anthropicAuthPlugin = async (
     )
   }
 
-  function claustrumMainRefusal(
-    state: 'cold' | 'reauth' | 'takeover-incomplete' | 'identity-mismatch',
-  ): Response {
+  function claustrumMainRefusal(state: MainCustodyRefusal): Response {
     const error =
       state === 'reauth'
         ? {
@@ -7539,9 +7538,7 @@ const anthropicAuthPlugin = async (
               }
               let requestMainClaustrum: ClaustrumAccessResolution | undefined
               let requestMainRefusal:
-                | 'cold'
-                | 'reauth'
-                | 'identity-mismatch'
+                | Exclude<MainCustodyRefusal, 'takeover-incomplete'>
                 | undefined
               if (claustrumMainRoute) {
                 const { account, handle } = claustrumMainRoute
