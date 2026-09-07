@@ -55,6 +55,7 @@ import {
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   PROFILE_TTL_MS,
+  type ProviderAccountUuid,
   persistFallbackQuotaHeaderPersistent,
   QuotaManager,
   quotaFieldSource,
@@ -86,6 +87,8 @@ import {
   tokenFingerprint,
   upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
+
+const providerUuid = (value: string) => value as ProviderAccountUuid
 
 let tempDir: string
 let accountPath: string
@@ -6623,7 +6626,7 @@ describe('upsertAccount', () => {
       type: 'oauth',
       refresh: 'refresh-a',
       authLineageId: 'lineage-a',
-      anthropicAccountUuid: 'uuid-from-lineage-a',
+      anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
     })
 
     upsertAccount(storage, {
@@ -6645,7 +6648,7 @@ describe('upsertAccount', () => {
       type: 'oauth',
       refresh: 'refresh-a',
       authLineageId: 'lineage-a',
-      anthropicAccountUuid: 'uuid-from-lineage-a',
+      anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
     })
 
     upsertAccount(storage, {
@@ -6656,7 +6659,7 @@ describe('upsertAccount', () => {
     })
 
     expect((storage.accounts[0] as OAuthAccount).anthropicAccountUuid).toBe(
-      'uuid-from-lineage-a',
+      providerUuid('uuid-from-lineage-a'),
     )
   })
 })
@@ -6668,7 +6671,7 @@ describe('fallback UUID lineage fences', () => {
       type: 'oauth',
       refresh: 'refresh-a',
       authLineageId: 'lineage-a',
-      anthropicAccountUuid: 'uuid-from-lineage-a',
+      anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
     }
 
     expect(fallbackAccountUuidForLineage(account, 'lineage-b')).toBeNull()
@@ -6698,7 +6701,7 @@ describe('fallback UUID lineage fences', () => {
         {
           accountId: 'fallback-1',
           authLineageId: 'lineage-a',
-          anthropicAccountUuid: 'uuid-from-lineage-a',
+          anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
           quota: {
             source: 'headers',
             checkedAt: 1_000,

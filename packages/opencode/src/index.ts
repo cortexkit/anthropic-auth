@@ -7390,7 +7390,9 @@ const anthropicAuthPlugin = async (
                   auth.expires = 0
                 }
               }
-              let requestMainQuotaIdentity: MainQuotaIdentityBinding | undefined
+              let requestMainQuotaIdentity:
+                | MainQuotaIdentityResolution
+                | undefined
               if (auth.access) {
                 const resolution = await resolveMainQuotaAccountIdentity(
                   auth.access,

@@ -5578,7 +5578,7 @@ describe('quota header feed integration', () => {
     bootstrapResponse,
   }: {
     fallbackUuid: string
-    persistedUuid?: string
+    persistedUuid?: ProviderAccountUuid
     bootstrapResponse: unknown
   }) {
     const fallbackAccess = `sk-ant-oat-${randomUUID()}`
@@ -5971,7 +5971,7 @@ describe('quota header feed integration', () => {
     const fallbackUuid = '22222222-2222-2222-2222-222222222222'
     const { published, persisted } = await publishFallbackUuid({
       fallbackUuid,
-      persistedUuid: fallbackUuid,
+      persistedUuid: fallbackUuid as ProviderAccountUuid,
       bootstrapResponse: {},
     })
     expect(published).toEqual(

@@ -454,7 +454,7 @@ describe('Claude Code bootstrap identity lookup', () => {
       'main-slot',
     )
 
-    expect(oatIdentity.accountUuid).toBe('main-oat-account-uuid')
+    expect(oatIdentity.accountUuid).toBe(providerUuid('main-oat-account-uuid'))
     expect(nonOatIdentity.accountUuid).toBeUndefined()
     expect(nonOatIdentity.deviceId).toBe(oatIdentity.deviceId)
     expect(nonOatIdentity.sessionId).toBe(oatIdentity.sessionId)
