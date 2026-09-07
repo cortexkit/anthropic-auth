@@ -728,7 +728,7 @@ describe('custody mode', () => {
 
   test('custody: failed committed readback leaves sidecars tombstoned when mode revert fails', async () => {
     const plan = await preflightClaustrumTakeover(preflightInput())
-    let mode: 'local' | 'claustrum' = 'local'
+    let mode: string = 'local'
     let restored = false
 
     const error = await executeClaustrumTakeover(plan, {

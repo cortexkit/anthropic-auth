@@ -2,24 +2,16 @@ import { readFile, rm, writeFile } from 'node:fs/promises'
 import * as core from '@cortexkit/anthropic-auth-core'
 import {
   type ClaustrumTakeoverPlan,
+  type CustodyCacheCredential,
   type CustodySidecarSnapshot,
-  commitClaustrumMode,
+  type ExecuteClaustrumTakeoverDeps,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
   reconcileCustodyStartup,
 } from './custody-mode.ts'
 
 type Lock = { release: () => Promise<void> }
 
-type LiveCacheCredential = {
-  credentialId?: string
-  recordVersion: number
-  access: string
-  refresh: string
-  expiresAt: number | null
-  state: 'usable' | 'revoked' | 'reauth' | 'timeout'
-}
-
-type RawCacheCredential = core.ClaustrumCredential | LiveCacheCredential
+type RawCacheCredential = core.ClaustrumCredential | CustodyCacheCredential
 
 type LiveRoute = {
   id: string
@@ -124,7 +116,10 @@ export function createLiveCustodyDeps(input: {
     }
     return manifestReader
   }
-  const getCredential = async (handle: string, minTtlMs: number) => {
+  const getCredential = async (
+    handle: string,
+    minTtlMs: number,
+  ): Promise<CustodyCacheCredential> => {
     const credential = await input.cache.get(handle, minTtlMs)
     if ('state' in credential) return credential
     const vaultCredentialId = (credential as { credentialId?: unknown })
@@ -246,7 +241,7 @@ export function createLiveCustodyDeps(input: {
         return fn()
       },
     },
-    takeoverDeps(plan: ClaustrumTakeoverPlan) {
+    takeoverDeps(plan: ClaustrumTakeoverPlan): ExecuteClaustrumTakeoverDeps {
       const readStrictBindings = async (plan: ClaustrumTakeoverPlan) => {
         const reader = new core.CustodyHandleManifestReader({
           path: manifestPath,
@@ -293,8 +288,9 @@ export function createLiveCustodyDeps(input: {
             (credential.credentialId !== undefined &&
               credential.credentialId !== account.credentialId) ||
             credential.recordVersion < account.recordVersion ||
-            credential.expiresAt <
-              now() + core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000
+            (credential.expiresAt !== null &&
+              credential.expiresAt <
+                now() + core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000)
           )
             return false
           if (account.id === 'main') continue
@@ -418,7 +414,8 @@ export function createLiveCustodyDeps(input: {
             Buffer.from((await readBytes(manifestPath)) ?? []).equals(
               Buffer.from(snapshot.manifest ?? []),
             )),
-        setMode: (_mode: 'claustrum') => commitClaustrumMode(input.storagePath),
+        setMode: (mode) =>
+          core.setClaustrumModePersistent(mode, input.storagePath),
       }
     },
   }
