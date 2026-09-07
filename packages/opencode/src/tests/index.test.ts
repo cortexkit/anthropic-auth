@@ -1534,6 +1534,58 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'never writes host auth during custody mode transitions',
+    async () => {
+      // Rollback has no client handle and restores through this sidecar-save path.
+      for (const mode of ['claustrum', 'local'] as const) {
+        const mockClient = createMockClient()
+        await useTempAccountFile(
+          createFallbackStorage({
+            claustrum: { mode: 'local' },
+            accounts: [
+              {
+                id: 'fallback-1',
+                label: 'host-write-fallback',
+                type: 'oauth',
+                access: 'fallback-sidecar-access',
+                refresh: 'fallback-sidecar-refresh',
+                expires: Date.now() + 5 * 60 * 60_000,
+              },
+            ],
+          }),
+        )
+        await writeManifest([
+          { label: 'main', handle: ruledMainHandle },
+          { label: 'host-write-fallback', handle: manifestHandle },
+        ])
+        const plugin = await getPlugin(mockClient, undefined, {
+          claustrumConnector: connectorFor([], (method, params) => {
+            if (method !== 'credential.get') return { result: {} }
+            return credentialResponse(
+              params.handle === ruledMainHandle
+                ? 'vault-main-access'
+                : 'vault-fallback-access',
+              1,
+              Date.now() + 5 * 60 * 60_000,
+            )
+          }),
+        })
+        try {
+          const result = await plugin.auth.loader(
+            () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+            { models: {} },
+          )
+          await runCustodyCommand(plugin, `host-write-${mode}`, mode)
+          await result.fetch(MESSAGES_URL, EMPTY_POST).catch(() => undefined)
+          expect(mockClient.auth.set).not.toHaveBeenCalled()
+        } finally {
+          await plugin.dispose?.()
+        }
+      }
+    },
+  )
+
+  test.serial(
     'keeps a cold bound fallback route-local while the vault main serves',
     async () => {
       const fixture = await bootRuledClaustrumRow({
