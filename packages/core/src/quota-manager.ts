@@ -131,6 +131,7 @@ export class QuotaManager {
   private inflightMain: Promise<QuotaRefreshResult> | null = null
   private inflightMainAccountId: string | undefined
   private inflightMainAccessToken: string | undefined
+  private inflightMainToken = 0
   private inflightFallbacks = new Map<string, Promise<QuotaRefreshResult>>()
 
   // --- Rate-limiting (scoped per route so a fallback 429 never backs off the
@@ -395,10 +396,12 @@ export class QuotaManager {
     this.inflightMainAccountId = effectiveAccountId
     this.inflightMainAccessToken = credential
     const generation = this.mainGeneration
+    const inflightToken = ++this.inflightMainToken
     this.inflightMain = this._fetchMain(
       effectiveAccountId,
       credential,
       generation,
+      inflightToken,
     )
     return this.inflightMain
   }
@@ -883,6 +886,7 @@ export class QuotaManager {
     mainAccountId: string | undefined,
     accessToken: string,
     generation: number,
+    inflightToken: number,
   ): Promise<QuotaRefreshResult> {
     return this._enqueueApiFetch(async () => {
       try {
@@ -990,7 +994,7 @@ export class QuotaManager {
           await fileLock.release()
         }
       } finally {
-        if (this.inflightMainAccountId === mainAccountId) {
+        if (this.inflightMainToken === inflightToken) {
           this.inflightMain = null
           this.inflightMainAccountId = undefined
         }
