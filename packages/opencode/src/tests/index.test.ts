@@ -3913,6 +3913,70 @@ describe('fallback Claustrum credential resolution', () => {
     },
   )
 
+  test('publishes the served fallback account UUID when another account is disabled', async () => {
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      quota: { enabled: false, failClosedOnUnknownQuota: false },
+      storageOverrides: { quotaHeaderFeed: { enabled: true } },
+      fallbacks: [
+        {
+          label: 'unserved',
+          handle: `ckh_${'U'.repeat(43)}`,
+          access: 'vault-unserved-access',
+          account: {
+            enabled: false,
+            anthropicAccountUuid:
+              '11111111-1111-1111-1111-111111111111' as ProviderAccountUuid,
+          },
+        },
+        {
+          label: 'served',
+          handle: `ckh_${'S'.repeat(43)}`,
+          access: 'vault-served-access',
+          account: {
+            anthropicAccountUuid:
+              '22222222-2222-2222-2222-222222222222' as ProviderAccountUuid,
+          },
+        },
+      ],
+      response: new Response('{}', {
+        status: 200,
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.25',
+          'anthropic-ratelimit-unified-5h-reset': '1800000000',
+        },
+      }),
+      createFallbackStorage,
+      useTempAccountFile,
+      getPlugin: (accountStoragePath, runtimeOverrides) => {
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountStoragePath
+        return getPlugin(undefined, undefined, runtimeOverrides as never)
+      },
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
+    })
+
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    expect(fixture.authorizations).toEqual(['Bearer vault-served-access'])
+    const entries = await waitForFeedEntries(
+      (candidate) =>
+        candidate.some(
+          (entry: any) =>
+            entry.anthropic_account_uuid ===
+            '22222222-2222-2222-2222-222222222222',
+        ),
+      'the served fallback account UUID',
+    )
+    expect(
+      entries.find((entry: any) => entry.anthropic_account_uuid !== undefined),
+    ).toMatchObject({
+      anthropic_account_uuid: '22222222-2222-2222-2222-222222222222',
+    })
+    await fixture.plugin.dispose?.()
+  })
+
   test('account status inspects the configured Claustrum connection file', async () => {
     const storage = createFallbackStorage({ accounts: [] })
     await useTempAccountFile(storage)

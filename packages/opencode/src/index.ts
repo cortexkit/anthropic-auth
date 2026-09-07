@@ -6583,10 +6583,7 @@ const anthropicAuthPlugin = async (
               oauthAccountId === 'main'
                 ? undefined
                 : requestStorage?.accounts.find(
-                    (account) =>
-                      account.id === oauthAccountId ||
-                      (isOAuthAccount(account) &&
-                        account.anthropicAccountUuid !== undefined),
+                    (account) => account.id === oauthAccountId,
                   )
             const served = {
               accountId: oauthAccountId,
