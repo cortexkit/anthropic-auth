@@ -80,7 +80,20 @@ export function fallbackCustodyDimensions(
       fallbacks: 'M' as const,
       evidence: constructionEvidence ?? ('N' as const),
     }
-  if (deps.construction) return { fallbacks, evidence: 'unknown' as const }
+  const custodyFallbacks = accounts.every(
+    (account, index) =>
+      isCustodyTombstoneOAuth(
+        { type: 'oauth', access: account.access, refresh: account.refresh },
+        'anthropic',
+      ) ||
+      (!account.access &&
+        !account.refresh &&
+        isOAuthAccountVaultOwned(storage, account, bindings[index])),
+  )
+    ? ('T' as const)
+    : ('R' as const)
+  if (deps.construction)
+    return { fallbacks: custodyFallbacks, evidence: 'unknown' as const }
   const evidence = bindings.every((binding) => {
     if (binding.status !== 'resolved') return false
     return Boolean(
@@ -89,7 +102,7 @@ export function fallbackCustodyDimensions(
   })
     ? ('V' as const)
     : ('N' as const)
-  return { fallbacks, evidence }
+  return { fallbacks: custodyFallbacks, evidence }
 }
 
 export function mainCustodyDimension(auth: {
