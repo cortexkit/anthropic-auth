@@ -112,11 +112,17 @@ export type AcknowledgeLocalOAuthLoginFromStorageOptions = {
   divergence?: AcknowledgeLocalOAuthLoginOptions['divergence']
 }
 
+export type AcknowledgeLocalOAuthLoginResult =
+  | 'cleared'
+  | 'not-cleared'
+  | 'refused'
+  | 'refused-transient'
+
 export async function acknowledgeLocalOAuthLogin(
   completion: CompletedLocalLogin | undefined,
   observedAuth: ObservedLocalAuth | undefined,
   options: AcknowledgeLocalOAuthLoginOptions,
-): Promise<'cleared' | 'not-cleared' | 'refused'> {
+): Promise<AcknowledgeLocalOAuthLoginResult> {
   if (!completion || observedAuth?.type !== 'oauth') return 'not-cleared'
   if (!observedAuth.access || !observedAuth.refresh) return 'not-cleared'
   if (
@@ -140,7 +146,7 @@ export async function acknowledgeLocalOAuthLogin(
   })
   if (result === 'removed') return 'cleared'
   if (result === 'missing') return 'not-cleared'
-  return 'refused'
+  return result.code === undefined ? 'refused' : 'refused-transient'
 }
 
 export async function persistCustodyDivergenceState(
@@ -177,7 +183,7 @@ export async function persistCustodyDivergenceState(
 export async function acknowledgeLocalOAuthLoginFromStorage(
   completion: CompletedLocalLogin | undefined,
   options: AcknowledgeLocalOAuthLoginFromStorageOptions,
-): Promise<'cleared' | 'not-cleared' | 'refused'> {
+): Promise<AcknowledgeLocalOAuthLoginResult> {
   if (!completion) return 'not-cleared'
   const storage = await loadAccounts(options.accountStoragePath)
   const account = storage?.accounts.find(

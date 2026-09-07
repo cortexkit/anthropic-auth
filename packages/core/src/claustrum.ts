@@ -631,7 +631,10 @@ export type CustodyHandleManifestWriteResult =
 export type CustodyHandleManifestRemovalResult =
   | 'removed'
   | 'missing'
-  | 'refused'
+  | {
+      status: 'refused'
+      code?: CustodyManifestLockErrorCode
+    }
 
 export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
 export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
@@ -972,10 +975,10 @@ export async function removeCustodyHandleManifestEntry(
     !isValidCustodyCredentialId(input.entry.credentialId) ||
     input.entry.credentialId !== custodyCredentialId(input.entry.label)
   ) {
-    return 'refused'
+    return { status: 'refused' }
   }
   try {
-    return await withCustodyManifestLock(
+    const result = await withCustodyManifestLock(
       input.path,
       async (assertLease, nonce) => {
         const expectedUid =
@@ -1105,8 +1108,12 @@ export async function removeCustodyHandleManifestEntry(
         }
       },
     )
-  } catch {
-    return 'refused'
+    return result === 'refused' ? { status: 'refused' } : result
+  } catch (error) {
+    if (error instanceof CustodyManifestLockError) {
+      return { status: 'refused', code: error.code }
+    }
+    return { status: 'refused' }
   }
 }
 

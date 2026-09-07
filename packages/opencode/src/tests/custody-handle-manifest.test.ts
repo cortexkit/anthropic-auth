@@ -1146,7 +1146,7 @@ describe('removeCustodyHandleManifestEntry', () => {
   })
 
   test.serial(
-    'returns refused when the lease is lost before rename',
+    'returns a transient refusal when the lease is lost before rename',
     async () => {
       await withManifest(fixtureText, async (path) => {
         await writeCustodyHandleManifestEntry({ path, entry: writerEntry })
@@ -1180,7 +1180,7 @@ describe('removeCustodyHandleManifestEntry', () => {
 
         await expect(
           removeCustodyHandleManifestEntry({ path, entry: writerEntry }),
-        ).resolves.toBe('refused')
+        ).resolves.toEqual({ status: 'refused', code: 'renewal_failed' })
         expect(await fs.readFile(path, 'utf8')).toBe(before)
       })
     },

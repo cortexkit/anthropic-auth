@@ -241,6 +241,7 @@ import {
   LaneStartTracker,
 } from './lane-start.ts'
 import {
+  type AcknowledgeLocalOAuthLoginOptions,
   acknowledgeLocalOAuthLogin,
   acknowledgeLocalOAuthLoginFromStorage,
   assertLocalLoginObservationAvailable,
@@ -910,6 +911,7 @@ type PluginRuntimeOverrides = Partial<{
   claustrumConnector: ClaustrumConnector
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
+  removeCustodyHandleManifestEntry: AcknowledgeLocalOAuthLoginOptions['remove']
 }>
 
 // Keep boot above the resident IPC fast path, but never let a stale-marked
@@ -1973,6 +1975,7 @@ const anthropicAuthPlugin = async (
             Date.now(),
           )
         },
+        remove: runtimeOverrides.removeCustodyHandleManifestEntry,
       })
       if (result === 'cleared' || result === 'refused') {
         completedLocalLogin = undefined

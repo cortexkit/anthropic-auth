@@ -50,6 +50,7 @@ import {
   PROFILE_TTL_MS,
   type ProviderAccountUuid,
   primeStorageFingerprint,
+  removeCustodyHandleManifestEntry,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
   resetDumpState,
@@ -685,6 +686,7 @@ type PluginRuntimeOverrides = Partial<{
   claustrumConnector: (options: unknown) => Promise<unknown>
   claustrumNow: () => number
   clearClaustrumRefreshErrorPersistent: typeof clearClaustrumRefreshErrorPersistent
+  removeCustodyHandleManifestEntry: typeof removeCustodyHandleManifestEntry
 }>
 
 type TestTimerHandler = Parameters<typeof globalThis.setTimeout>[0]
@@ -6922,6 +6924,102 @@ describe('AnthropicAuthPlugin', () => {
     expect(retainedManifest.providers[0].accounts).toHaveLength(1)
     await plugin.dispose?.()
     installDefaultFetchMock()
+  })
+
+  test('main acknowledge retries a transient manifest refusal', async () => {
+    const access = 'local-login-retry-access'
+    const refresh = 'local-login-retry-refresh'
+    const manifestHandle = `ckh_${'S'.repeat(43)}`
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'local' },
+        quota: { enabled: false },
+        accounts: [],
+      }),
+    )
+    const manifestPath = join(tempConfigDir!, 'handles.json')
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'main',
+                handle: manifestHandle,
+                credential_id: custodyCredentialId('main'),
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/oauth',
+        redirectUri: 'https://example.test/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    globalThis.fetch = mock((input: unknown) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url === TOKEN_URL) {
+        return Promise.resolve(
+          Response.json({
+            access_token: access,
+            refresh_token: refresh,
+            expires_in: 3600,
+          }),
+        )
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    let removalAttempts = 0
+    const plugin = await getPlugin(undefined, undefined, {
+      authorize,
+      setTimeout: mock((handler: TestTimerHandler) => {
+        handler()
+        return { unref() {} }
+      }) as unknown as typeof setTimeout,
+      removeCustodyHandleManifestEntry: async (
+        input: Parameters<typeof removeCustodyHandleManifestEntry>[0],
+      ) => {
+        removalAttempts += 1
+        if (removalAttempts === 1)
+          return { status: 'refused', code: 'lock_busy' } as const
+        return removeCustodyHandleManifestEntry(input)
+      },
+    } as unknown as PluginRuntimeOverrides)
+    try {
+      const flow = await plugin.auth.methods[0].authorize()
+      await flow.callback('code=code&state=state')
+      await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access,
+            refresh,
+            expires: Date.now() + 100_000,
+          }),
+        { models: {} },
+      )
+
+      expect(removalAttempts).toBe(2)
+      expect(
+        JSON.parse(await readFile(manifestPath, 'utf8')).providers[0].accounts,
+      ).toEqual([])
+    } finally {
+      await plugin.dispose?.()
+      installDefaultFetchMock()
+    }
   })
 
   test.serial(
