@@ -11,6 +11,10 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { AnthropicAuthPlugin } from '../index'
 import {
+  buildAccountDialogL1,
+  normalizeAccountDialogPayload,
+} from '../tui/command-dialogs'
+import {
   connectorFor,
   credentialResponse,
   ruledMainHandle,
@@ -200,5 +204,58 @@ describe('fresh install under Claustrum', () => {
     } finally {
       await plugin.dispose?.()
     }
+  })
+})
+
+describe('mixed-version account-dialog payloads', () => {
+  test('renders an unavailable custody mode for a v1.22-shaped payload', () => {
+    const payload = normalizeAccountDialogPayload({
+      accounts: [
+        {
+          id: 'work-alt',
+          label: 'work-alt',
+          role: 'fallback',
+          enabled: true,
+          quotaPercent: null,
+          claustrumGate: 'on',
+          vaultServed: false,
+          custodyState: 'on-cold',
+        },
+      ],
+      claustrumDetection: 'ready',
+    })
+
+    expect(buildAccountDialogL1(payload).header).toBe(
+      'Custody mode: unavailable from older server',
+    )
+    expect(JSON.stringify(payload)).not.toContain('ckh_')
+  })
+
+  test('accepts the v1.22 field subset from a current payload', () => {
+    const currentPayload = {
+      accounts: [
+        {
+          id: 'work-alt',
+          label: 'work-alt',
+          role: 'fallback',
+          enabled: true,
+          quotaPercent: 10,
+          claustrumGate: 'on',
+          vaultServed: true,
+          vaultReauth: false,
+          custodyState: 'on-vault-served',
+        },
+      ],
+      claustrumDetection: 'ready',
+      custodyMode: 'claustrum',
+      custodyModeKnown: true,
+    }
+    const {
+      custodyMode: _mode,
+      custodyModeKnown: _known,
+      ...v122
+    } = currentPayload
+
+    expect(() => normalizeAccountDialogPayload(v122)).not.toThrow()
   })
 })
