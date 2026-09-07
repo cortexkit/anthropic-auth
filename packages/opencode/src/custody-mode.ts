@@ -543,10 +543,6 @@ export type ExecuteClaustrumTakeoverDeps = {
   setMode: (mode: 'claustrum' | 'local') => Promise<'changed' | 'unchanged'>
 }
 
-export function commitClaustrumMode(path: string) {
-  return setClaustrumModePersistent('claustrum', path)
-}
-
 export async function executeClaustrumTakeover(
   plan: ClaustrumTakeoverPlan,
   deps: ExecuteClaustrumTakeoverDeps,
