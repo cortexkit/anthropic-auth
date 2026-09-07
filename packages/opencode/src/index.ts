@@ -3669,17 +3669,35 @@ const anthropicAuthPlugin = async (
   // Re-write the sidebar using the LAST known routing decision, refreshing only
   // the quota numbers. Used by async quota refreshes (main + background fallback)
   // so they never clobber the active account back to 'main'.
-  async function refreshSidebarQuota() {
+  async function resolveSidebarQuotaAccess() {
     const storage = await loadAccounts(accountStoragePath)
-    let access: string | undefined = mainServedAccessToken
+    let access: string | undefined
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
+        const mainBinding =
+          auth.type === 'oauth' &&
+          getClaustrumMode(storage) === 'claustrum' &&
+          storage
+            ? resolveAccountCustodyHandle(mainCustodyAccount(auth), storage)
+            : undefined
+        if (mainBinding?.status === 'resolved') {
+          access = usableClaustrumAccessToken(
+            claustrumCredentialCache?.peek(mainBinding.handle),
+            claustrumNow(),
+          )
+        }
         access ??= auth.access
       } catch {
         // best-effort
       }
     }
+    access ??= mainServedAccessToken
+    return { storage, access }
+  }
+
+  async function refreshSidebarQuota() {
+    const { storage, access } = await resolveSidebarQuotaAccess()
     writeSidebarState(storage, {
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
@@ -8711,6 +8729,7 @@ const anthropicAuthPlugin = async (
     __primeManager: primeManager,
     __quotaManager: quotaManager,
     __resolveMainQuotaIdentityForTest: resolveMainQuotaAccountIdentity,
+    __resolveSidebarQuotaAccessForTest: resolveSidebarQuotaAccess,
     __mainProviderAccountUuidForTest: () => mainProviderAccountUuid,
     __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,
     __fallbackRefreshReady: fallbackRefreshReady,

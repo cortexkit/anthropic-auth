@@ -8095,6 +8095,64 @@ describe('quota header feed extended integration', () => {
     expect(await readFeedEntries()).toEqual([])
   })
 
+  test('sidebar quota refresh uses the rotated main host token', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        main: { type: 'opencode', provider: 'anthropic' },
+      }),
+    )
+    let currentAccess = 'sk-ant-oat01-main-access-before-rotation'
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.startsWith(MESSAGES_URL)) {
+        return Promise.resolve(
+          new Response('{}', {
+            status: 200,
+            headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+          }),
+        )
+      }
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({
+            oauth_account: {
+              account_uuid: '44444444-4444-4444-4444-444444444444',
+            },
+          }),
+        )
+      }
+      return Promise.reject(new Error(`Unexpected test fetch: ${url}`))
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: currentAccess,
+          refresh: 'main-refresh',
+          expires: Date.now() + 100_000,
+        }),
+      { models: {} },
+    )
+    await drainSidebarWrites()
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    currentAccess = 'sk-ant-oat01-main-access-after-rotation'
+
+    const resolved = await (
+      plugin as {
+        __resolveSidebarQuotaAccessForTest: () => Promise<{
+          access: string | undefined
+        }>
+      }
+    ).__resolveSidebarQuotaAccessForTest()
+    expect(resolved.access).toBe('sk-ant-oat01-main-access-after-rotation')
+    await plugin.dispose?.()
+  })
+
   test('deduplicates main feed observations across access-token rotation', async () => {
     await useTempAccountFile(
       createFallbackStorage({
