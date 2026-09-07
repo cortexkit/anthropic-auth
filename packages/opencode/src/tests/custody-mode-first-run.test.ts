@@ -56,7 +56,12 @@ async function createFirstRunRoot() {
 function createClient() {
   return {
     auth: { set: mock(() => Promise.resolve()) },
-    session: { promptAsync: mock(() => Promise.resolve()) },
+    session: {
+      promptAsync: mock(
+        (_input: { body: { parts: Array<{ text?: string }> } }) =>
+          Promise.resolve(),
+      ),
+    },
   }
 }
 
