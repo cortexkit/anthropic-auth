@@ -939,6 +939,310 @@ describe('custody mode', () => {
     }
   })
 
+  test('custody: takeover waits for an in-flight fallback refresh before writing custody sidecars', async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), 'custody-live-refresh-lock-'),
+    )
+    const storagePath = join(directory, 'accounts.json')
+    const manifestPath = join(directory, 'handles.json')
+    const mainHandle = `ckh_${'M'.repeat(43)}`
+    const workHandle = `ckh_${'W'.repeat(43)}`
+    let releaseRefresh!: () => void
+    let resolveRefreshEntered!: () => void
+    let resolveTakeoverQueued!: () => void
+    let resolveManifestWritten!: () => void
+    const refreshReleased = new Promise<void>((resolve) => {
+      releaseRefresh = resolve
+    })
+    const refreshEntered = new Promise<void>((resolve) => {
+      resolveRefreshEntered = resolve
+    })
+    const takeoverQueued = new Promise<void>((resolve) => {
+      resolveTakeoverQueued = resolve
+    })
+    const manifestWritten = new Promise<void>((resolve) => {
+      resolveManifestWritten = resolve
+    })
+    let lockTail = Promise.resolve()
+    let refreshCall = false
+    let managerSawRefresh = false
+    const fallbackManager = {
+      withAccountRefreshLock: async <T>(_id: string, fn: () => Promise<T>) => {
+        if (refreshCall) managerSawRefresh = true
+        if (!refreshCall) resolveTakeoverQueued()
+        const prior = lockTail
+        let release!: () => void
+        lockTail = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        await prior
+        try {
+          return await fn()
+        } finally {
+          release()
+        }
+      },
+    }
+    try {
+      await core.saveAccounts(
+        {
+          version: 1,
+          claustrum: { handlesFile: manifestPath, mode: 'local' },
+          accounts: [
+            {
+              id: 'work',
+              label: 'work',
+              type: 'oauth',
+              access: 'access-work-secret',
+              refresh: 'refresh-work-secret',
+              expires: now + 60_000,
+              claustrumHandle: workHandle,
+              enabled: true,
+            },
+          ],
+        },
+        storagePath,
+      )
+      await core.writeCustodyHandleManifestEntry({
+        path: manifestPath,
+        entry: {
+          label: 'main',
+          handle: mainHandle,
+          credentialId: core.custodyCredentialId('main'),
+        },
+      })
+      const deps = createLiveCustodyDeps({
+        storagePath,
+        cache: {
+          get: async (handle: string, minTtlMs = 0) => ({
+            credentialId:
+              handle === mainHandle
+                ? core.custodyCredentialId('main')
+                : core.custodyCredentialId('work'),
+            recordVersion: 7,
+            access: 'vault-access',
+            refresh: 'vault-refresh',
+            expiresAt: now + minTtlMs + 1,
+            state: 'usable' as const,
+          }),
+        },
+        latestGetAuth: async () => core.custodyTombstoneOAuth('anthropic'),
+        now,
+        fallbackManager: fallbackManager as never,
+        writeManifestEntryLocked: async (...args) => {
+          const result = await core.writeCustodyHandleManifestEntryLocked(
+            ...args,
+          )
+          resolveManifestWritten()
+          return result
+        },
+      })
+      const storage = await core.loadAccounts(storagePath)
+      const plan = await preflightClaustrumTakeover(
+        await deps.preflightInput(
+          { id: 'main', label: 'main', enabled: true },
+          storage?.accounts ?? [],
+        ),
+      )
+      refreshCall = true
+      const refresh = deps.locks.withFallbackRefreshLock('work', async () => {
+        resolveRefreshEntered()
+        await refreshReleased
+      })
+      refreshCall = false
+      await refreshEntered
+      const before = await Promise.all([
+        readFile(storagePath, 'utf8'),
+        readFile(core.getAccountStatePath(storagePath), 'utf8').catch(() => ''),
+        readFile(manifestPath, 'utf8'),
+      ])
+      const takeover = executeClaustrumTakeover(plan, deps.takeoverDeps(plan))
+      await (managerSawRefresh ? takeoverQueued : manifestWritten)
+      expect(await readFile(storagePath, 'utf8')).toBe(before[0])
+      expect(
+        await readFile(core.getAccountStatePath(storagePath), 'utf8').catch(
+          () => '',
+        ),
+      ).toBe(before[1])
+      expect(await readFile(manifestPath, 'utf8')).toBe(before[2])
+
+      releaseRefresh()
+      await refresh
+      await expect(takeover).resolves.toBe('changed')
+      const committed = await core.loadAccounts(storagePath)
+      expect(committed?.claustrum?.mode).toBe('claustrum')
+      expect(
+        committed?.accounts.find((account) => account.id === 'work'),
+      ).toMatchObject({
+        access: '',
+        refresh: core.custodyTombstoneKey('anthropic'),
+        expires: 0,
+      })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('custody: fallback refresh cannot persist while a takeover holds its refresh lock', async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), 'custody-live-takeover-lock-'),
+    )
+    const storagePath = join(directory, 'accounts.json')
+    const manifestPath = join(directory, 'handles.json')
+    const mainHandle = `ckh_${'M'.repeat(43)}`
+    const workHandle = `ckh_${'W'.repeat(43)}`
+    let releaseTakeover!: () => void
+    let resolveTakeoverEntered!: () => void
+    let resolveRefreshQueued!: () => void
+    let resolveRefreshPersisted!: () => void
+    const takeoverReleased = new Promise<void>((resolve) => {
+      releaseTakeover = resolve
+    })
+    const takeoverEntered = new Promise<void>((resolve) => {
+      resolveTakeoverEntered = resolve
+    })
+    const refreshQueued = new Promise<void>((resolve) => {
+      resolveRefreshQueued = resolve
+    })
+    const refreshPersisted = new Promise<void>((resolve) => {
+      resolveRefreshPersisted = resolve
+    })
+    let lockTail = Promise.resolve()
+    let refreshInvocation = false
+    let managerSawRefresh = false
+    const fallbackManager = {
+      withAccountRefreshLock: async <T>(_id: string, fn: () => Promise<T>) => {
+        if (refreshInvocation) {
+          managerSawRefresh = true
+          resolveRefreshQueued()
+        }
+        const prior = lockTail
+        let release!: () => void
+        lockTail = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        await prior
+        try {
+          return await fn()
+        } finally {
+          release()
+        }
+      },
+    }
+    try {
+      await core.saveAccounts(
+        {
+          version: 1,
+          claustrum: { handlesFile: manifestPath, mode: 'local' },
+          accounts: [
+            {
+              id: 'work',
+              label: 'work',
+              type: 'oauth',
+              access: 'access-work-secret',
+              refresh: 'refresh-work-secret',
+              expires: now + 60_000,
+              claustrumHandle: workHandle,
+              enabled: true,
+            },
+          ],
+        },
+        storagePath,
+      )
+      await core.writeCustodyHandleManifestEntry({
+        path: manifestPath,
+        entry: {
+          label: 'main',
+          handle: mainHandle,
+          credentialId: core.custodyCredentialId('main'),
+        },
+      })
+      const deps = createLiveCustodyDeps({
+        storagePath,
+        cache: {
+          get: async (handle: string, minTtlMs = 0) => ({
+            credentialId:
+              handle === mainHandle
+                ? core.custodyCredentialId('main')
+                : core.custodyCredentialId('work'),
+            recordVersion: 7,
+            access: 'vault-access',
+            refresh: 'vault-refresh',
+            expiresAt: now + minTtlMs + 1,
+            state: 'usable' as const,
+          }),
+        },
+        latestGetAuth: async () => core.custodyTombstoneOAuth('anthropic'),
+        now,
+        fallbackManager: fallbackManager as never,
+        writeManifestEntryLocked: async (...args) => {
+          const result = await core.writeCustodyHandleManifestEntryLocked(
+            ...args,
+          )
+          resolveTakeoverEntered()
+          await takeoverReleased
+          return result
+        },
+      })
+      const storage = await core.loadAccounts(storagePath)
+      const plan = await preflightClaustrumTakeover(
+        await deps.preflightInput(
+          { id: 'main', label: 'main', enabled: true },
+          storage?.accounts ?? [],
+        ),
+      )
+      const takeover = executeClaustrumTakeover(plan, deps.takeoverDeps(plan))
+      await takeoverEntered
+      refreshInvocation = true
+      const refresh = deps.locks.withFallbackRefreshLock('work', async () => {
+        const current = await core.loadAccounts(storagePath)
+        const account = current?.accounts.find(
+          (candidate): candidate is core.OAuthAccount =>
+            candidate.id === 'work' && core.isOAuthAccount(candidate),
+        )
+        if (
+          !current ||
+          !account ||
+          core.isCustodyTombstoneOAuth(account, 'anthropic')
+        )
+          return 'skipped'
+        account.access = 'refresh-new-access'
+        account.refresh = 'refresh-new-refresh'
+        account.expires = now + 120_000
+        await core.saveAccountState(current, storagePath, {
+          accounts: ['work'],
+        })
+        resolveRefreshPersisted()
+        return 'persisted'
+      })
+      refreshInvocation = false
+      await (managerSawRefresh ? refreshQueued : refreshPersisted)
+      expect(await readFile(storagePath, 'utf8')).not.toContain(
+        'refresh-new-access',
+      )
+      expect(
+        await readFile(core.getAccountStatePath(storagePath), 'utf8').catch(
+          () => '',
+        ),
+      ).not.toContain('refresh-new-access')
+
+      releaseTakeover()
+      await expect(takeover).resolves.toBe('changed')
+      await expect(refresh).resolves.toBe('skipped')
+      const committed = await core.loadAccounts(storagePath)
+      expect(committed?.claustrum?.mode).toBe('claustrum')
+      expect(
+        committed?.accounts.find((account) => account.id === 'work'),
+      ).toMatchObject({
+        access: '',
+        refresh: core.custodyTombstoneKey('anthropic'),
+        expires: 0,
+      })
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   test('custody: local exit changes only the persisted mode', async () => {
     const calls: string[] = []
     await expect(
