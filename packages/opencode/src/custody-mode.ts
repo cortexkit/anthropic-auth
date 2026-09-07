@@ -271,7 +271,7 @@ export async function preflightClaustrumTakeover(
       refuse(route, 'credential_unusable')
       continue
     }
-    // Without a vault id, a same-account wrong-record response remains possible; C5's account_id-vs-persisted-anthropicAccountUuid fence is the live protection.
+    // Without a vault id, a same-account wrong-record response remains possible; the vault `account_id` vs persisted `anthropicAccountUuid` fence is the live protection.
     if (credential.credentialId === undefined)
       input.debug?.(
         'custody identity check skipped: vault supplied no credential id',
