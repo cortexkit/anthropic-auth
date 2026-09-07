@@ -42,9 +42,22 @@ export type ClaustrumTakeoverPlan = {
   toString: () => string
 }
 
+export type CustodyPreflightRefusalReason =
+  | 'TAKEOVER_INCOMPLETE_MAIN_REAL'
+  | 'TAKEOVER_INCOMPLETE_MAIN_BINDING'
+  | 'binding_missing'
+  | 'credential_revoked'
+  | 'credential_reauth'
+  | 'credential_timeout'
+  | 'credential_unusable'
+  | 'credential_identity_mismatch'
+  | 'divergence_fenced'
+  | 'TAKEOVER_INCOMPLETE_MAIN_SLOT'
+  | 'local_credential_unavailable'
+
 export type CustodyPreflightRefusal = {
   label: string
-  reason: string
+  reason: CustodyPreflightRefusalReason
   guidance?: string
 }
 
@@ -59,7 +72,7 @@ export class CustodyPreflightRefusedError extends Error {
 
   constructor(
     readonly accountId: string,
-    readonly reason: string,
+    readonly reason: CustodyPreflightRefusalReason,
     readonly refusals: CustodyPreflightRefusal[] = [
       { label: accountId, reason },
     ],
@@ -227,7 +240,10 @@ export async function preflightClaustrumTakeover(
     getRefreshBeforeExpiryMs(input.storage as never) + 30 * 60_000
   const accounts: ClaustrumTakeoverPlan['accounts'] = []
   const refusals: CollectedPreflightRefusal[] = []
-  const refuse = (route: PreflightRoute, reason: string) => {
+  const refuse = (
+    route: PreflightRoute,
+    reason: CustodyPreflightRefusalReason,
+  ) => {
     refusals.push({
       accountId: route.id,
       label: route.label ?? route.id,

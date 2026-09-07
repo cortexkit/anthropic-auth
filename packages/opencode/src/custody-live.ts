@@ -3,9 +3,14 @@ import * as core from '@cortexkit/anthropic-auth-core'
 import {
   type ClaustrumTakeoverPlan,
   type CustodyCacheCredential,
+  type CustodyPreflightRefusal,
+  CustodyPreflightRefusedError,
   type CustodySidecarSnapshot,
   type ExecuteClaustrumTakeoverDeps,
+  executeClaustrumTakeover,
+  executeLocalExit,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
+  preflightClaustrumTakeover,
   reconcileCustodyStartup,
 } from './custody-mode.ts'
 
@@ -20,6 +25,92 @@ type LiveRoute = {
   enabled?: boolean
   local?: unknown
   claustrumHandle?: string
+}
+
+type ClaustrumTakeoverCommandDeps = {
+  storagePath: string
+  loadStorage: () => Promise<core.AccountStorage | null>
+  getCache: () => Promise<{
+    get: (handle: string, minTtlMs?: number) => Promise<RawCacheCredential>
+  } | null>
+  latestGetAuth?: () => Promise<unknown>
+  now: () => number
+  fallbackManager?: Pick<core.FallbackAccountManager, 'withAccountRefreshLock'>
+  refreshManifest: () => Promise<void>
+  debug?: (message: string) => void
+}
+
+function formatCustodyPreflightRefusals(
+  refusals: CustodyPreflightRefusal[],
+): string {
+  const ordered = [
+    ...refusals.filter((refusal) => refusal.guidance),
+    ...refusals.filter((refusal) => !refusal.guidance),
+  ]
+  return ordered
+    .map(
+      ({ label, reason, guidance }) =>
+        `${label}: ${reason}${guidance ? ` — ${guidance}` : ''}`,
+    )
+    .join('\n')
+}
+
+export async function runClaustrumTakeoverCommand(
+  deps: ClaustrumTakeoverCommandDeps,
+  mode: 'local' | 'claustrum',
+): Promise<{ text: string }> {
+  if (mode === 'local') {
+    const changed = await executeLocalExit({ path: deps.storagePath })
+    return {
+      text:
+        changed === 'changed'
+          ? 'Claustrum mode set to local. Bound credentials remain inert until verified login.'
+          : 'Claustrum mode already local. Bound credentials remain inert until verified login.',
+    }
+  }
+  if (!deps.latestGetAuth)
+    return { text: 'Custody takeover refused: main auth is unavailable.' }
+
+  const storage = (await deps.loadStorage()) ?? core.createEmptyStorage()
+  const cache = await deps.getCache()
+  if (!cache)
+    return { text: 'Custody takeover refused: Claustrum is unavailable.' }
+
+  const live = createLiveCustodyDeps({
+    storagePath: deps.storagePath,
+    storage,
+    cache,
+    latestGetAuth: deps.latestGetAuth,
+    now: deps.now,
+    fallbackManager: deps.fallbackManager,
+    debug: deps.debug,
+  })
+  try {
+    const plan = await preflightClaustrumTakeover(
+      await live.preflightInput(
+        { id: 'main', label: 'main', enabled: true },
+        storage.accounts,
+      ),
+    )
+    const changed = await executeClaustrumTakeover(
+      plan,
+      live.takeoverDeps(plan),
+    )
+    await deps.refreshManifest()
+    const labels = plan.accounts.map((account) => account.label).join(', ')
+    return {
+      text:
+        changed === 'changed'
+          ? `Claustrum custody committed for: ${labels}.`
+          : `Claustrum custody already committed for: ${labels}.`,
+    }
+  } catch (error) {
+    if (error instanceof CustodyPreflightRefusedError)
+      return {
+        text: `Custody takeover refused:\n${formatCustodyPreflightRefusals(error.refusals)}`,
+      }
+    throw error
+  }
 }
 
 function retainLock(
