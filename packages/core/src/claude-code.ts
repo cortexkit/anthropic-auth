@@ -197,7 +197,9 @@ export async function resolveClaudeCodeIdentity(
     setBounded(identityCache, accessToken, identity)
   }
 
-  if (!accessToken.startsWith('sk-ant-oat')) return identity
+  if (!accessToken.startsWith('sk-ant-oat')) {
+    return clearCachedAccountUuid(cacheKey, identity)
+  }
 
   const now = Date.now()
   // A slot-stable identity survives account replacement; bootstrap is the

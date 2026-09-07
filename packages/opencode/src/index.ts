@@ -67,6 +67,7 @@ import {
   executeRoutingCommand,
   FALLBACK_BACKGROUND_TICK_MS,
   FallbackAccountManager,
+  fallbackAccountUuidForLineage,
   fetchOAuthAccountProfile,
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
@@ -148,6 +149,7 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
+  persistFallbackQuotaHeaderPersistent,
   primeStorageFingerprint,
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
@@ -733,18 +735,23 @@ type MainQuotaIdentityBinding = {
 }
 
 type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
+  providerAccountUuid: ProviderAccountUuid | undefined
   stale: boolean
   state: CustodyStatusState
 }
 
-type ServedQuotaIdentity = {
-  providerAccountUuid?: ProviderAccountUuid
+type ServedQuotaHeaders = {
+  accountId: 'main' | string
+  accessToken: string
+  authLineageId?: string
+  anthropicAccountUuid?: ProviderAccountUuid | null
+  mainQuotaIdentity?: MainQuotaIdentityBinding
 }
 
-function providerIdentityFor(
-  served: ServedQuotaIdentity,
-): ProviderAccountUuid | null {
-  return served.providerAccountUuid ?? null
+function asProviderAccountUuid(
+  value: string | null | undefined,
+): ProviderAccountUuid | undefined {
+  return value as ProviderAccountUuid | undefined
 }
 
 const FABLE_SWITCHED_TO_OPUS_NOTICE =
@@ -1188,12 +1195,12 @@ const anthropicAuthPlugin = async (
 
   async function reconcileMainQuotaAccountIdentity(
     accessToken: string,
-    accountIdentity: string | undefined,
+    quotaKey: string | undefined,
     providerAccountUuid?: ProviderAccountUuid,
   ): Promise<void> {
     if (
       mainQuotaIdentityAccessToken === accessToken &&
-      mainQuotaAccountId === accountIdentity
+      mainQuotaAccountId === quotaKey
     ) {
       return
     }
@@ -1203,20 +1210,20 @@ const anthropicAuthPlugin = async (
       providerAccountUuid !== undefined &&
       mainProviderAccountUuid !== providerAccountUuid
     mainQuotaIdentityAccessToken = accessToken
-    mainQuotaAccountId = accountIdentity
+    mainQuotaAccountId = quotaKey
     const clearedGeneration = quotaManager.setMainQuotaAccountIdentity(
-      accountIdentity,
+      quotaKey,
       accessToken.startsWith('sk-ant-oat'),
       providerIdentityChanged,
     )
-    if (accountIdentity === undefined) return
+    if (quotaKey === undefined) return
 
     const storage = await loadAccounts(accountStoragePath)
     const persistedError = storage?.quota?.mainLastQuotaApiError
     if (
       !storage ||
       !persistedError ||
-      persistedError.accountIdentity === accountIdentity ||
+      persistedError.accountIdentity === quotaKey ||
       (!accessToken.startsWith('sk-ant-oat') &&
         persistedError.accountIdentity === undefined)
     ) {
@@ -1274,33 +1281,39 @@ const anthropicAuthPlugin = async (
 
     const resolution = (async () => {
       const resolutionGeneration = ++mainQuotaIdentityResolutionGeneration
-      const quotaKey = mainAccountId
+      const mainSlotQuotaKey = mainAccountId
       const identity = await resolveClaudeCodeIdentity(
         accessToken,
         model,
-        credentialAccountUuid ?? quotaKey,
+        credentialAccountUuid ?? mainSlotQuotaKey,
       )
-      // Adapters that do not use Claude's OAuth token format cannot be bootstrapped;
-      // keep the slot identity only for that compatibility path. Claude OAuth
-      // credentials use the oat prefix and stay unknown when bootstrap fails.
-      const providerAccountUuid =
-        identity.accountUuid ??
-        (credentialAccountUuid as ProviderAccountUuid | undefined)
+      // Non-oat adapters retain their local slot for quota fencing, but it is
+      // not a provider identity and must never reach a provider-facing field.
+      const quotaKey = mainSlotQuotaKey
       const currentStorage = await loadAccounts(accountStoragePath)
       const persistedProviderAccountUuid =
         currentStorage?.main?.profile?.providerAccountUuid ??
         (currentStorage?.main?.profile?.accountIdentity as
           | ProviderAccountUuid
           | undefined)
+      const claimedProviderAccountUuid =
+        asProviderAccountUuid(credentialAccountUuid) ??
+        asProviderAccountUuid(identity.accountUuid)
+      const providerAccountUuid = credentialAccountUuid
+        ? claimedProviderAccountUuid
+        : accessToken.startsWith('sk-ant-oat')
+          ? (claimedProviderAccountUuid ??
+            asProviderAccountUuid(persistedProviderAccountUuid))
+          : undefined
       const state: CustodyStatusState =
         getClaustrumMode(currentStorage) !== 'claustrum'
           ? 'na'
           : persistedProviderAccountUuid === undefined ||
-              providerAccountUuid === undefined
+              claimedProviderAccountUuid === undefined
             ? 'unknown-identity'
             : persistedProviderAccountUuid !== undefined &&
-                providerAccountUuid !== undefined &&
-                persistedProviderAccountUuid !== providerAccountUuid
+                claimedProviderAccountUuid !== undefined &&
+                persistedProviderAccountUuid !== claimedProviderAccountUuid
               ? 'on-identity-mismatch'
               : 'on-vault-served'
       if (resolutionGeneration !== mainQuotaIdentityResolutionGeneration) {
@@ -1551,22 +1564,17 @@ const anthropicAuthPlugin = async (
   }
 
   const warnedQuotaNormalizeErrors = new Set<string>()
+  const warnedStaleFallbackQuotaPersists = new Set<string>()
 
   async function persistPushedQuota(
-    served: {
-      accountId: 'main' | string
-      accessToken: string
-      authLineageId?: string
-      providerAccountUuid?: ProviderAccountUuid
-      mainQuotaIdentity?: MainQuotaIdentityBinding
-    },
+    served: ServedQuotaHeaders,
     entry: QuotaEntry,
   ): Promise<QuotaEntry | null> {
     const storage =
       (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
     if (served.accountId === 'main') {
-      const accountIdentity = served.mainQuotaIdentity?.quotaKey
-      if (!accountIdentity || entry.quota.accountIdentity !== accountIdentity) {
+      const quotaKey = served.mainQuotaIdentity?.quotaKey
+      if (!quotaKey || entry.quota.accountIdentity !== quotaKey) {
         logger.trace(
           'quota',
           'skipped quota persistence without verified main account identity',
@@ -1576,14 +1584,14 @@ const anthropicAuthPlugin = async (
       storage.quota = storage.quota ?? {}
       storage.quota.mainQuota = {
         ...entry.quota,
-        accountIdentity,
+        accountIdentity: quotaKey,
       }
       storage.quota.mainQuotaCheckedAt = entry.checkedAt
       await saveAccountState(storage, accountStoragePath, { mainQuota: true })
       const reloaded = await loadAccounts(accountStoragePath)
       const persistedQuota = reloaded?.quota?.mainQuota
       const persistedQuotaBelongsToRequest = Boolean(
-        persistedQuota && persistedQuota.accountIdentity === accountIdentity,
+        persistedQuota && persistedQuota.accountIdentity === quotaKey,
       )
       const mergedQuota = persistedQuotaBelongsToRequest
         ? mergeHeaderQuotaForPersistence(persistedQuota, entry.quota)
@@ -1596,23 +1604,28 @@ const anthropicAuthPlugin = async (
           }
         : entry
     }
-    const account = storage.accounts.find(
-      (candidate): candidate is OAuthAccount =>
-        candidate.id === served.accountId && isOAuthAccount(candidate),
+    const persisted = await persistFallbackQuotaHeaderPersistent(
+      {
+        accountId: served.accountId,
+        authLineageId: served.authLineageId,
+        quota: entry.quota,
+        anthropicAccountUuid: served.anthropicAccountUuid ?? undefined,
+      },
+      accountStoragePath,
     )
-    if (!account) return null
-    // A lineage mismatch is a confirmed replacement; two absent markers remain
-    // legacy-compatible, while one-sided absence is too ambiguous to persist.
-    if (account.authLineageId !== served.authLineageId) {
-      logger.trace(
-        'quota',
-        'skipped stale fallback quota persistence after lineage change',
-        {
-          accountId: served.accountId,
-          storedLineage: account.authLineageId,
-          servedLineage: served.authLineageId,
-        },
-      )
+    if (!persisted) {
+      const key = `${served.accountId}:${served.authLineageId ?? ''}`
+      if (!warnedStaleFallbackQuotaPersists.has(key)) {
+        warnedStaleFallbackQuotaPersists.add(key)
+        logger.debug(
+          'quota',
+          'skipped stale fallback quota persistence after lineage change',
+          {
+            accountId: served.accountId,
+            servedLineage: served.authLineageId,
+          },
+        )
+      }
       // The persistence fence is authoritative; discard the optimistic cache
       // write unless a newer replacement observation already won the race.
       if (quotaManager.getAllFallbacks().get(served.accountId) === entry) {
@@ -1620,13 +1633,6 @@ const anthropicAuthPlugin = async (
       }
       return null
     }
-    account.quota = {
-      ...entry.quota,
-      accountIdentity: account.id,
-    }
-    await saveAccountState(storage, accountStoragePath, {
-      accounts: [served.accountId],
-    })
     return entry
   }
 
@@ -1662,21 +1668,11 @@ const anthropicAuthPlugin = async (
   }
 
   async function publishQuotaHeaderFeed(
-    served: {
-      accountId: 'main' | string
-      accessToken: string
-      providerAccountUuid?: ProviderAccountUuid
-      mainQuotaIdentity?: MainQuotaIdentityBinding
-    },
+    served: ServedQuotaHeaders,
     entry: QuotaEntry,
   ): Promise<void> {
     if (!quotaHeaderFeedRegistry) return
-    if (
-      served.accountId === 'main' &&
-      (!served.mainQuotaIdentity?.quotaKey ||
-        (served.accessToken.startsWith('sk-ant-oat') &&
-          !served.providerAccountUuid))
-    ) {
+    if (served.accountId === 'main' && !served.mainQuotaIdentity?.quotaKey) {
       // Observed-at staleness exposes silence; an unknown key must not replace verified data.
       return
     }
@@ -1705,9 +1701,6 @@ const anthropicAuthPlugin = async (
       extraUsage: entry.quota.extraUsage,
       fieldSources: entry.quota.fieldSources,
     }
-    const providerIdentity = {
-      anthropic_account_uuid: providerIdentityFor(served),
-    }
     const accountKey =
       credentialId ??
       (served.accountId === 'main'
@@ -1721,7 +1714,7 @@ const anthropicAuthPlugin = async (
           provider: 'anthropic',
           configured_account_count: configuredAccountCount,
           observed_at_ms: observedAtMs,
-          ...providerIdentity,
+          anthropic_account_uuid: served.anthropicAccountUuid ?? null,
           quota,
           accountKey,
         }
@@ -1733,7 +1726,7 @@ const anthropicAuthPlugin = async (
             provider: 'anthropic',
             configured_account_count: configuredAccountCount,
             observed_at_ms: observedAtMs,
-            ...providerIdentity,
+            anthropic_account_uuid: served.anthropicAccountUuid ?? null,
             quota,
             accountKey,
           }
@@ -1744,7 +1737,7 @@ const anthropicAuthPlugin = async (
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
               observed_at_ms: observedAtMs,
-              ...providerIdentity,
+              anthropic_account_uuid: served.anthropicAccountUuid ?? null,
               quota,
               accountKey,
             }
@@ -1755,7 +1748,7 @@ const anthropicAuthPlugin = async (
               provider: 'anthropic',
               configured_account_count: configuredAccountCount,
               observed_at_ms: observedAtMs,
-              ...providerIdentity,
+              anthropic_account_uuid: served.anthropicAccountUuid ?? null,
               quota,
               accountKey,
             }
@@ -1770,13 +1763,7 @@ const anthropicAuthPlugin = async (
 
   function harvestQuotaHeaders(
     headers: Headers,
-    served: {
-      accountId: 'main' | string
-      accessToken: string
-      authLineageId?: string
-      providerAccountUuid?: ProviderAccountUuid
-      mainQuotaIdentity?: MainQuotaIdentityBinding
-    },
+    served: ServedQuotaHeaders,
   ): void {
     try {
       if (!isQuotaBearingHeaderFrame(headers)) {
@@ -3584,13 +3571,13 @@ const anthropicAuthPlugin = async (
   ) {
     if (!accessToken) return
     if (storage?.quota?.enabled !== true) return
-    const accountIdentity = mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId
-    if (quotaManager.getMain(accountIdentity)) return
+    const quotaKey = mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId
+    if (quotaManager.getMain(quotaKey)) return
     if (sidebarMainQuotaRefreshInFlight) return
 
     sidebarMainQuotaRefreshInFlight = true
     void quotaManager
-      .refreshMain(accountIdentity, accessToken, mainQuotaIdentity?.generation)
+      .refreshMain(quotaKey, accessToken, mainQuotaIdentity?.generation)
       .then(() => refreshSidebarQuota())
       .catch(() => {})
       .finally(() => {
@@ -6114,7 +6101,7 @@ const anthropicAuthPlugin = async (
             fallbackAuthLineageId?: string,
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
-            mainQuotaIdentity?: MainQuotaIdentityBinding,
+            mainQuotaIdentity?: MainQuotaIdentityResolution,
             claustrumResolution?: ClaustrumAccessResolution,
           ) {
             assertNotCustodyTombstone(accessToken, 'anthropic')
@@ -6419,26 +6406,29 @@ const anthropicAuthPlugin = async (
               }
             }
 
-            const relayConfig = getRelayConfig(await getRequestStorage())
-            const servedFallbackAccount =
+            const requestStorageForIdentity = await getRequestStorage()
+            const relayConfig = getRelayConfig(requestStorageForIdentity)
+            const persistedFallbackAccount =
               oauthAccountId === 'main'
                 ? undefined
-                : requestStorage?.accounts.find(
-                    (account) => account.id === oauthAccountId,
+                : requestStorageForIdentity?.accounts.find(
+                    (account): account is OAuthAccount =>
+                      account.id === oauthAccountId && isOAuthAccount(account),
                   )
+            const persistedFallbackAccountUuid = fallbackAccountUuidForLineage(
+              persistedFallbackAccount,
+              fallbackAuthLineageId,
+            )
             const served = {
               accountId: oauthAccountId,
               accessToken,
               authLineageId: fallbackAuthLineageId,
-              providerAccountUuid:
+              anthropicAccountUuid:
                 oauthAccountId === 'main'
                   ? mainQuotaIdentity?.providerAccountUuid
                   : (claustrumResolution?.credentialAccountId ??
-                    identity.accountUuid ??
-                    (servedFallbackAccount &&
-                    isOAuthAccount(servedFallbackAccount)
-                      ? servedFallbackAccount.anthropicAccountUuid
-                      : undefined)),
+                    asProviderAccountUuid(identity.accountUuid) ??
+                    asProviderAccountUuid(persistedFallbackAccountUuid)),
               ...(oauthAccountId === 'main' && mainQuotaIdentity
                 ? { mainQuotaIdentity }
                 : {}),

@@ -298,12 +298,12 @@ describe('Claude Code fingerprint helpers', () => {
     const identityA = await pendingA
     expect(identityA.accountUuid).toBeUndefined()
 
-    const compatibility = await resolveClaudeCodeIdentity(
-      'compatibility-token-after-late-failure',
+    const sameCredential = await resolveClaudeCodeIdentity(
+      tokenB,
       undefined,
       'main-slot',
     )
-    expect(compatibility.accountUuid).toBe(providerUuid('account-b'))
+    expect(sameCredential.accountUuid).toBe(providerUuid('account-b'))
   })
 
   test('orders serialized body fields like captured Claude Code requests', () => {
@@ -433,6 +433,31 @@ describe('Claude Code bootstrap identity lookup', () => {
     expect(second.deviceId).toBe(first.deviceId)
     expect(second.sessionId).toBe(first.sessionId)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('drops a bootstrapped UUID when a slot receives a non-oat credential', async () => {
+    const oatToken = 'sk-ant-oat-main-to-non-oat'
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        oauth_account: { account_uuid: 'main-oat-account-uuid' },
+      }),
+    ) as unknown as typeof fetch
+
+    const oatIdentity = await resolveClaudeCodeIdentity(
+      oatToken,
+      undefined,
+      'main-slot',
+    )
+    const nonOatIdentity = await resolveClaudeCodeIdentity(
+      'main-non-oat-token',
+      undefined,
+      'main-slot',
+    )
+
+    expect(oatIdentity.accountUuid).toBe('main-oat-account-uuid')
+    expect(nonOatIdentity.accountUuid).toBeUndefined()
+    expect(nonOatIdentity.deviceId).toBe(oatIdentity.deviceId)
+    expect(nonOatIdentity.sessionId).toBe(oatIdentity.sessionId)
   })
 
   test('keeps device identity stable while refreshing bootstrap UUID per credential', async () => {
