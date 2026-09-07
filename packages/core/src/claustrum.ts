@@ -1,5 +1,8 @@
-import { readFile } from 'node:fs/promises'
-import { userInfo } from 'node:os'
+import { randomUUID } from 'node:crypto'
+import { type Dirent, constants as fsConstants } from 'node:fs'
+import * as fs from 'node:fs/promises'
+import { homedir, userInfo } from 'node:os'
+import { dirname, isAbsolute, join } from 'node:path'
 import {
   type BindIdentity,
   type CatalogEntry,
@@ -15,6 +18,10 @@ import {
   type SubscribeOptions,
   type Subscription,
 } from '@cortexkit/subc-client'
+
+import type { ClaustrumConfig, OAuthAccount } from './accounts.ts'
+import { CUSTODY_HANDLE_PATTERN } from './constants.ts'
+import { parseJsonRedacted } from './json'
 import { logger } from './logger'
 
 export type ClaustrumEndpoint = {
@@ -44,6 +51,27 @@ export function getDefaultClaustrumConnectionPath(): string {
   return `/run/user/${uid}/subc-connection.json`
 }
 
+type CustodyHandlesEnvironment = Readonly<Record<string, string | undefined>>
+
+export function resolveCustodyHandlesPath(
+  config: Pick<ClaustrumConfig, 'handlesFile'> | undefined,
+  env: CustodyHandlesEnvironment,
+): string {
+  const configuredPath = config?.handlesFile?.trim()
+  if (configuredPath) return configuredPath
+
+  const environmentPath = env.CLAUSTRUM_OPENCODE_HANDLES
+  if (environmentPath && isAbsolute(environmentPath)) return environmentPath
+
+  const configHome =
+    env.XDG_CONFIG_HOME?.trim() || join(env.HOME || homedir(), '.config')
+  return join(configHome, 'cortexkit', 'opencode-handles.json')
+}
+
+export function getDefaultClaustrumHandlesPath(): string {
+  return resolveCustodyHandlesPath(undefined, process.env)
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -65,14 +93,14 @@ export async function detectClaustrumConnection(
 ): Promise<ClaustrumDetection> {
   let raw: string
   try {
-    raw = await readFile(path, 'utf8')
+    raw = await fs.readFile(path, 'utf8')
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
+    const code = errorCode(error)
     if (code === 'ENOENT') return { status: 'absent', path }
     return {
       status: 'malformed',
       path,
-      reason: `unreadable (${code ?? 'unknown'})`,
+      reason: `unreadable (${code})`,
     }
   }
 
@@ -122,6 +150,21 @@ export function custodyTombstoneKey(provider: string): string {
   return `${CUSTODY_TOMBSTONE_PREFIX}${provider}`
 }
 
+export function custodyTombstoneOAuth(provider: string): {
+  type: 'oauth'
+  access: ''
+  refresh: string
+  expires: 0
+} {
+  // An empty access value makes Claustrum's deployed sealer reject this loader marker.
+  return {
+    type: 'oauth',
+    access: '',
+    refresh: custodyTombstoneKey(provider),
+    expires: 0,
+  }
+}
+
 export function isCustodyTombstoneValue(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith(CUSTODY_TOMBSTONE_PREFIX)
 }
@@ -131,8 +174,7 @@ export function isCustodyTombstoneOAuth(
   provider: string,
 ): boolean {
   if (!isRecord(auth) || auth.type !== 'oauth') return false
-  const key = custodyTombstoneKey(provider)
-  return auth.refresh === key && auth.access === key
+  return auth.refresh === custodyTombstoneKey(provider)
 }
 
 export class CustodyTombstoneRefreshError extends Error {
@@ -143,6 +185,15 @@ export class CustodyTombstoneRefreshError extends Error {
       `${provider} main slot is vault-custodied; local refresh is forbidden — the vault-served main path is not yet implemented`,
     )
     this.name = 'CustodyTombstoneRefreshError'
+  }
+}
+
+export class CustodyTombstoneLoginError extends Error {
+  readonly code = 'custody_tombstone_login'
+
+  constructor(public readonly provider: string) {
+    super(`${provider} main slot is custodied; run /login to sign in locally`)
+    this.name = 'CustodyTombstoneLoginError'
   }
 }
 
@@ -162,18 +213,49 @@ export type CustodyHandleAccount = {
 }
 
 export type CustodyHandleManifest = {
+  version: 1
+  provider: 'anthropic'
+  serve: 'anthropic-auth'
+  accounts: ReadonlyArray<CustodyHandleAccount>
+  superseded: ReadonlySet<string>
+  corruptLabels?: ReadonlySet<string>
+}
+
+export type CustodyHandleResolution =
+  | {
+      status: 'resolved'
+      source: 'manifest'
+      handle: string
+      credentialId: string
+    }
+  | { status: 'resolved'; source: 'legacy'; handle: string }
+  | {
+      status: 'unresolved'
+      reason:
+        | 'missing-label'
+        | 'invalid-label'
+        | 'duplicate-label'
+        | 'missing-entry'
+        | 'foreign-serve'
+        | 'superseded'
+        | 'corrupt-binding'
+        | 'unknown-identity'
+    }
+
+type ParsedCustodyHandleManifest = {
+  version: 1
   provider: string
   serve: string
-  shape: string
-  accounts: CustodyHandleAccount[]
+  accounts: ReadonlyArray<CustodyHandleAccount>
+  superseded: ReadonlySet<string>
+  corruptLabels: ReadonlySet<string>
 }
 
 const CUSTODY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
-// The suffix is base64url for 256 CSPRNG bits; its charset is not fixture-derived.
-const CUSTODY_HANDLE_PATTERN = /^ckh_[A-Za-z0-9_-]{43}$/
 const RESERVED_CUSTODY_IDS = new Set(['__proto__', 'constructor', 'prototype'])
+const CUSTODY_CREDENTIAL_PREFIX = 'oauth:anthropic:'
 
-function isCustodyId(value: unknown): value is string {
+export function isValidCustodyLabel(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     CUSTODY_ID_PATTERN.test(value) &&
@@ -185,49 +267,1030 @@ export function isValidCustodyHandle(value: unknown): value is string {
   return typeof value === 'string' && CUSTODY_HANDLE_PATTERN.test(value)
 }
 
+export function custodyCredentialId(label: string): string {
+  if (!isValidCustodyLabel(label))
+    throw new CustodyManifestSelectionError('invalid-label')
+  return `${CUSTODY_CREDENTIAL_PREFIX}${label}`
+}
+
+function isValidCustodyCredentialId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+function legacyOrUnresolved(
+  account: OAuthAccount,
+  reason: Extract<CustodyHandleResolution, { status: 'unresolved' }>['reason'],
+): CustodyHandleResolution {
+  if (account.claustrumHandle) {
+    return {
+      status: 'resolved',
+      source: 'legacy',
+      handle: account.claustrumHandle,
+    }
+  }
+  return { status: 'unresolved', reason }
+}
+
+/**
+ * | manifest state | legacy handle | result |
+ * | --- | --- | --- |
+ * | matching ready entry | any | manifest handle |
+ * | absent or invalid | present | legacy handle |
+ * | no matching ready entry | present | legacy handle |
+ * | foreign serve | any | unresolved |
+ * | superseded matching entry | any | unresolved |
+ */
+export function resolveCustodyHandle(input: {
+  account: OAuthAccount
+  manifest: CustodyHandleManifest | undefined
+  duplicateOAuthLabels?: ReadonlySet<string>
+}): CustodyHandleResolution {
+  const { account, manifest, duplicateOAuthLabels } = input
+  if (manifest && manifest.serve !== 'anthropic-auth') {
+    return { status: 'unresolved', reason: 'foreign-serve' }
+  }
+  if (!account.label) return legacyOrUnresolved(account, 'missing-label')
+  if (!isValidCustodyLabel(account.label)) {
+    return legacyOrUnresolved(account, 'invalid-label')
+  }
+  if (duplicateOAuthLabels?.has(account.label)) {
+    return legacyOrUnresolved(account, 'duplicate-label')
+  }
+  if (!manifest) return legacyOrUnresolved(account, 'missing-entry')
+  if (manifest.corruptLabels?.has(account.label)) {
+    return { status: 'unresolved', reason: 'corrupt-binding' }
+  }
+
+  const entry = manifest.accounts.find(
+    (candidate) =>
+      candidate.label === account.label &&
+      candidate.credentialId === custodyCredentialId(account.label),
+  )
+  if (!entry) return legacyOrUnresolved(account, 'missing-entry')
+  if (manifest.superseded.has(entry.handle)) {
+    return { status: 'unresolved', reason: 'superseded' }
+  }
+  return {
+    status: 'resolved',
+    source: 'manifest',
+    handle: entry.handle,
+    credentialId: entry.credentialId,
+  }
+}
+
 export function readCustodyHandles(
   json: unknown,
   provider: string,
-): CustodyHandleManifest {
-  if (!isCustodyId(provider)) {
-    throw new Error(`Invalid custody provider id ${provider}`)
+  serve: string,
+): ParsedCustodyHandleManifest {
+  if (!isValidCustodyLabel(provider)) {
+    throw new Error('invalid manifest provider')
   }
-  const providers =
-    isRecord(json) && Array.isArray(json.providers) ? json.providers : []
-  const source = providers.find(
+  if (
+    !isRecord(json) ||
+    !Object.hasOwn(json, 'version') ||
+    json.version !== 1
+  ) {
+    throw new Error('invalid manifest version')
+  }
+  if (!Object.hasOwn(json, 'providers') || !Array.isArray(json.providers)) {
+    throw new Error('missing manifest providers')
+  }
+  const providerEntries = json.providers.filter(
     (entry): entry is Record<string, unknown> =>
       isRecord(entry) &&
       Object.hasOwn(entry, 'provider') &&
       entry.provider === provider,
   )
-  if (!source || !Array.isArray(source.accounts)) {
-    throw new Error(`Missing custody handles for provider ${provider}`)
+  if (providerEntries.length === 0) {
+    throw new CustodyManifestSelectionError('missing-provider')
+  }
+  const source = providerEntries.find(
+    (entry) => Object.hasOwn(entry, 'serve') && entry.serve === serve,
+  )
+  if (!source) throw new CustodyManifestSelectionError('foreign-serve')
+  if (!Object.hasOwn(source, 'accounts') || !Array.isArray(source.accounts)) {
+    throw new Error('invalid manifest accounts')
+  }
+  const superseded = new Set<string>()
+  const corruptLabels = new Set<string>()
+  const accounts: CustodyHandleAccount[] = []
+  for (const entry of source.accounts) {
+    if (!isRecord(entry)) throw new Error('invalid account entry')
+    if (!Object.hasOwn(entry, 'label') || typeof entry.label !== 'string') {
+      throw new Error('invalid account label')
+    }
+    if (!isValidCustodyLabel(entry.label)) {
+      throw new Error('invalid account label')
+    }
+    if (
+      !Object.hasOwn(entry, 'handle') ||
+      !Object.hasOwn(entry, 'credential_id') ||
+      typeof entry.handle !== 'string' ||
+      !isValidCustodyHandle(entry.handle) ||
+      !isValidCustodyCredentialId(entry.credential_id) ||
+      (provider === 'anthropic' &&
+        entry.credential_id !== custodyCredentialId(entry.label))
+    ) {
+      corruptLabels.add(entry.label)
+      continue
+    }
+    if (Object.hasOwn(entry, 'superseded')) {
+      if (!Array.isArray(entry.superseded)) {
+        corruptLabels.add(entry.label)
+        continue
+      }
+      let malformed = false
+      for (const handle of entry.superseded) {
+        if (!isValidCustodyHandle(handle)) {
+          malformed = true
+          break
+        }
+      }
+      if (malformed) {
+        corruptLabels.add(entry.label)
+        continue
+      }
+      for (const handle of entry.superseded) superseded.add(handle)
+    }
+    accounts.push({
+      label: entry.label,
+      handle: entry.handle,
+      credentialId: entry.credential_id,
+    })
   }
   return {
-    provider: String(source.provider),
-    serve: String(source.serve),
-    shape: String(source.shape),
-    accounts: source.accounts.flatMap((entry) => {
-      if (!isRecord(entry)) return []
-      if (
-        !Object.hasOwn(entry, 'label') ||
-        !Object.hasOwn(entry, 'handle') ||
-        !Object.hasOwn(entry, 'credential_id') ||
-        typeof entry.label !== 'string' ||
-        typeof entry.handle !== 'string' ||
-        !isCustodyId(entry.label) ||
-        !isValidCustodyHandle(entry.handle) ||
-        typeof entry.credential_id !== 'string'
+    version: 1,
+    provider,
+    serve,
+    accounts,
+    superseded,
+    corruptLabels,
+  }
+}
+
+type CustodyHandleManifestReadResult =
+  | { status: 'ready'; manifest: CustodyHandleManifest }
+  | { status: 'absent' }
+  | { status: 'ignored'; reason: 'foreign-serve' | 'missing-provider' }
+  | { status: 'invalid'; reason: string }
+
+export const CUSTODY_MANIFEST_SELECTION_ERROR_CODES = [
+  'foreign-serve',
+  'invalid-label',
+  'missing-provider',
+] as const
+
+type CustodyManifestSelectionErrorCode =
+  (typeof CUSTODY_MANIFEST_SELECTION_ERROR_CODES)[number]
+
+export class CustodyManifestSelectionError extends Error {
+  constructor(readonly code: CustodyManifestSelectionErrorCode) {
+    super(code)
+  }
+}
+
+const MAX_CUSTODY_MANIFEST_BYTES = 256 * 1024
+
+function errorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code
+  return typeof code === 'string' ? code : 'unknown'
+}
+
+function validateManifestFile(
+  stats: Awaited<ReturnType<typeof fs.lstat>>,
+  expectedUid: number,
+): string | null {
+  const mode = Number(stats.mode)
+  if (stats.isSymbolicLink()) return 'manifest is a symlink'
+  if (!stats.isFile()) return 'manifest is not a regular file'
+  if ((mode & 0o777) !== 0o600) return 'manifest mode must be 0600'
+  if (stats.uid !== expectedUid) return 'manifest owner does not match'
+  return null
+}
+
+function validateManifestParent(
+  stats: Awaited<ReturnType<typeof fs.lstat>>,
+  expectedUid: number,
+): string | null {
+  const mode = Number(stats.mode)
+  if (stats.uid !== expectedUid) return 'manifest parent owner does not match'
+  if ((mode & 0o1000) !== 0) return null
+  if ((mode & 0o002) !== 0) {
+    return 'manifest parent is world-writable'
+  }
+  if ((mode & 0o020) !== 0) return 'manifest parent is group-writable'
+  return null
+}
+
+export class CustodyHandleManifestReader {
+  #cache:
+    | {
+        mtimeMs: number
+        size: number
+        result: Extract<
+          CustodyHandleManifestReadResult,
+          { status: 'ready' | 'ignored' }
+        >
+      }
+    | undefined
+
+  readonly #options: {
+    path: string
+    provider: 'anthropic'
+    serve: 'anthropic-auth'
+    expectedUid?: number
+  }
+
+  constructor(options: {
+    path: string
+    provider: 'anthropic'
+    serve: 'anthropic-auth'
+    expectedUid?: number
+  }) {
+    this.#options = options
+  }
+
+  async read(): Promise<CustodyHandleManifestReadResult> {
+    const expectedUid =
+      this.#options.expectedUid ?? process.getuid?.() ?? userInfo().uid
+    let pathStats: Awaited<ReturnType<typeof fs.lstat>>
+    try {
+      pathStats = await fs.lstat(this.#options.path)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return { status: 'absent' }
+      return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
+    }
+
+    const fileReason = validateManifestFile(pathStats, expectedUid)
+    if (fileReason) return { status: 'invalid', reason: fileReason }
+
+    try {
+      const parentReason = validateManifestParent(
+        await fs.lstat(dirname(this.#options.path)),
+        expectedUid,
       )
-        return []
-      return [
-        {
-          label: entry.label,
-          handle: entry.handle,
-          credentialId: entry.credential_id,
-        },
-      ]
-    }),
+      if (parentReason) return { status: 'invalid', reason: parentReason }
+    } catch (error) {
+      return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
+    }
+
+    let handle: fs.FileHandle | undefined
+    try {
+      handle = await fs.open(
+        this.#options.path,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+      )
+      // The validated descriptor, not the path, is the authority for content and metadata after open.
+      const openedStats = await handle.stat()
+      const openedFileReason = validateManifestFile(openedStats, expectedUid)
+      if (openedFileReason)
+        return { status: 'invalid', reason: openedFileReason }
+
+      if (
+        this.#cache?.mtimeMs === openedStats.mtimeMs &&
+        this.#cache.size === openedStats.size
+      ) {
+        return this.#cache.result
+      }
+
+      const bytes = new Uint8Array(MAX_CUSTODY_MANIFEST_BYTES + 1)
+      const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, 0)
+      if (bytesRead > MAX_CUSTODY_MANIFEST_BYTES) {
+        return { status: 'invalid', reason: 'manifest exceeds maximum size' }
+      }
+
+      let json: unknown
+      try {
+        json = parseJsonRedacted(
+          new TextDecoder().decode(bytes.subarray(0, bytesRead)),
+        )
+      } catch (error) {
+        return {
+          status: 'invalid',
+          reason: error instanceof Error ? error.message : 'invalid JSON',
+        }
+      }
+
+      let parsed: ParsedCustodyHandleManifest
+      try {
+        parsed = readCustodyHandles(
+          json,
+          this.#options.provider,
+          this.#options.serve,
+        )
+      } catch (error) {
+        if (error instanceof CustodyManifestSelectionError) {
+          if (error.code !== 'invalid-label') {
+            const result = { status: 'ignored', reason: error.code } as const
+            this.#cache = {
+              mtimeMs: openedStats.mtimeMs,
+              size: openedStats.size,
+              result,
+            }
+            return result
+          }
+        }
+        return {
+          status: 'invalid',
+          reason: error instanceof Error ? error.message : 'invalid manifest',
+        }
+      }
+
+      const manifest: CustodyHandleManifest = {
+        version: parsed.version,
+        provider: this.#options.provider,
+        serve: this.#options.serve,
+        accounts: parsed.accounts,
+        superseded: parsed.superseded,
+        corruptLabels: parsed.corruptLabels,
+      }
+      const result = { status: 'ready', manifest } as const
+      this.#cache = {
+        mtimeMs: openedStats.mtimeMs,
+        size: openedStats.size,
+        result,
+      }
+      return result
+    } catch (error) {
+      return { status: 'invalid', reason: `unreadable (${errorCode(error)})` }
+    } finally {
+      await handle?.close().catch(() => {})
+    }
+  }
+}
+
+export type CustodyHandleManifestWriteResult =
+  | { status: 'written' | 'unchanged' }
+  | {
+      status: 'refused'
+      reason: string
+      code?: CustodyManifestLockErrorCode
+    }
+
+export type CustodyHandleManifestRemovalResult =
+  | 'removed'
+  | 'missing'
+  | {
+      status: 'refused'
+      code?: CustodyManifestLockErrorCode
+    }
+
+export const CUSTODY_MANIFEST_LOCK_TTL_MS = 30_000
+export const CUSTODY_MANIFEST_LOCK_RENEW_MS = 10_000
+export const CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS = 50
+export const CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS = 150
+const CUSTODY_MANIFEST_STALE_LOCK_REAP_AGE_MS = 24 * 60 * 60 * 1000
+const CUSTODY_MANIFEST_STALE_LOCK_REAP_LIMIT = 32
+
+export type CustodyManifestLockTestOptions = Partial<{
+  ttlMs: number
+  retryMinMs: number
+  retryMaxMs: number
+  renewalIntervalMs: number
+  afterStaleOwnerRead: () => void | Promise<void>
+  beforeRename: () => void | Promise<void>
+}>
+
+let custodyManifestLockTestOptions: CustodyManifestLockTestOptions | undefined
+
+export function __setCustodyManifestLockTestOptions(
+  options?: CustodyManifestLockTestOptions,
+) {
+  custodyManifestLockTestOptions = options
+}
+
+export const CUSTODY_MANIFEST_LOCK_ERROR_CODES = [
+  'lock_busy',
+  'owner_invalid',
+  'renewal_failed',
+] as const
+
+export type CustodyManifestLockErrorCode =
+  (typeof CUSTODY_MANIFEST_LOCK_ERROR_CODES)[number]
+
+export class CustodyManifestLockError extends Error {
+  constructor(
+    message: string,
+    readonly code: CustodyManifestLockErrorCode,
+  ) {
+    super(message)
+  }
+}
+
+export class CustodyManifestLockBusyError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'lock_busy')
+  }
+}
+
+export class CustodyManifestLockOwnerInvalidError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'owner_invalid')
+  }
+}
+
+export class CustodyManifestLockLeaseLostError extends CustodyManifestLockError {
+  constructor(message: string) {
+    super(message, 'renewal_failed')
+  }
+}
+
+function isEvictableCustodyManifestLockNonce(nonce: string): boolean {
+  // An allowlist freezes lock compatibility across independently upgrading readers;
+  // reject only unsafe characters so a widened nonce cannot wedge an older reader.
+  for (const character of nonce) {
+    const code = character.charCodeAt(0)
+    if (code < 0x20 || code === 0x7f) return false
+  }
+  return (
+    nonce.length > 0 &&
+    nonce.length <= 128 &&
+    nonce !== '.' &&
+    nonce !== '..' &&
+    !/[\\/:*?"<>|]/.test(nonce) &&
+    !/[. ]$/.test(nonce)
+  )
+}
+
+async function reapStaleCustodyManifestLocks(lockPath: string): Promise<void> {
+  const parent = dirname(lockPath)
+  const prefix = `${lockPath.slice(lockPath.lastIndexOf('/') + 1)}.stale-`
+  let entries: Dirent[]
+  try {
+    entries = await fs.readdir(parent, { withFileTypes: true })
+  } catch (error) {
+    logger.debug('claustrum', 'stale manifest lock reaper failed', {
+      error: errorCode(error),
+    })
+    return
+  }
+  let reaped = 0
+  for (const entry of entries) {
+    if (reaped >= CUSTODY_MANIFEST_STALE_LOCK_REAP_LIMIT) return
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue
+    const quarantinePath = join(parent, entry.name)
+    try {
+      const stat = await fs.lstat(quarantinePath)
+      if (
+        !stat.isDirectory() ||
+        Date.now() - stat.mtimeMs < CUSTODY_MANIFEST_STALE_LOCK_REAP_AGE_MS
+      ) {
+        continue
+      }
+      await fs.rm(quarantinePath, { recursive: true, force: true })
+      reaped += 1
+    } catch (error) {
+      logger.debug('claustrum', 'stale manifest lock reaper failed', {
+        error: errorCode(error),
+      })
+    }
+  }
+}
+
+export async function withCustodyManifestLock<T>(
+  path: string,
+  fn: (assertLease: () => Promise<void>, nonce: string) => Promise<T>,
+): Promise<T> {
+  const lockPath = `${path}.lock`
+  const now = Date.now
+  const ttlMs =
+    custodyManifestLockTestOptions?.ttlMs ?? CUSTODY_MANIFEST_LOCK_TTL_MS
+  const retryMinMs =
+    custodyManifestLockTestOptions?.retryMinMs ??
+    CUSTODY_MANIFEST_LOCK_RETRY_MIN_MS
+  const retryMaxMs =
+    custodyManifestLockTestOptions?.retryMaxMs ??
+    CUSTODY_MANIFEST_LOCK_RETRY_MAX_MS
+  const startedAt = now()
+  const nonce = randomUUID()
+  const ownerPath = join(lockPath, 'owner')
+
+  async function writeOwner(claimedAtMs: number) {
+    const temporaryOwnerPath = join(
+      lockPath,
+      `owner.${process.pid}.${randomUUID()}.tmp`,
+    )
+    let handle: fs.FileHandle | undefined
+    try {
+      handle = await fs.open(
+        temporaryOwnerPath,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+        0o600,
+      )
+      await handle.writeFile(
+        `${JSON.stringify({
+          tenant: 'anthropic-auth',
+          pid: process.pid,
+          claimed_at_ms: claimedAtMs,
+          nonce,
+        })}\n`,
+      )
+      await handle.sync()
+      await handle.close()
+      handle = undefined
+      await fs.rename(temporaryOwnerPath, ownerPath)
+    } finally {
+      await handle?.close().catch(() => {})
+      await fs.unlink(temporaryOwnerPath).catch(() => {})
+    }
+  }
+
+  async function claim() {
+    try {
+      await fs.mkdir(lockPath, { mode: 0o700 })
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error
+      return false
+    }
+    try {
+      await writeOwner(now())
+    } catch (error) {
+      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+      throw error
+    }
+    return true
+  }
+
+  const deadline = startedAt + ttlMs
+  let claimed = false
+  while (!claimed) {
+    claimed = await claim()
+    if (claimed) break
+
+    let ownerClaimedAtMs: number | undefined
+    let ownerNonce: string | undefined
+    let ownerInvalid = false
+    try {
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+      if (
+        isRecord(owner) &&
+        typeof owner.claimed_at_ms === 'number' &&
+        Number.isFinite(owner.claimed_at_ms) &&
+        typeof owner.nonce === 'string' &&
+        isEvictableCustodyManifestLockNonce(owner.nonce)
+      ) {
+        ownerClaimedAtMs = owner.claimed_at_ms
+        ownerNonce = owner.nonce
+        await custodyManifestLockTestOptions?.afterStaleOwnerRead?.()
+      } else ownerInvalid = true
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') ownerInvalid = true
+    }
+    if (
+      ownerClaimedAtMs !== undefined &&
+      ownerNonce !== undefined &&
+      now() - ownerClaimedAtMs >= ttlMs
+    ) {
+      const claimedPath = `${lockPath}.stale-${ownerClaimedAtMs}-${ownerNonce}`
+      try {
+        await fs.rename(lockPath, claimedPath)
+      } catch (error) {
+        if (!['ENOENT', 'EEXIST', 'ENOTEMPTY'].includes(errorCode(error)))
+          throw error
+      }
+      continue
+    }
+    if (now() >= deadline && ownerInvalid)
+      throw new CustodyManifestLockOwnerInvalidError(
+        'manifest lock owner invalid',
+      )
+    if (now() >= deadline)
+      throw new CustodyManifestLockBusyError('manifest lock busy')
+    const retryMs =
+      retryMinMs + Math.floor(Math.random() * (retryMaxMs - retryMinMs + 1))
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, Math.min(retryMs, Math.max(1, deadline - now()))),
+    )
+  }
+
+  let renewalFailed = false
+  let renewalInFlight: Promise<void> | undefined
+  async function ownsCurrentLease(): Promise<boolean> {
+    if (renewalFailed) return false
+    try {
+      const owner = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+      return (
+        isRecord(owner) &&
+        owner.pid === process.pid &&
+        owner.nonce === nonce &&
+        typeof owner.claimed_at_ms === 'number' &&
+        Number.isFinite(owner.claimed_at_ms) &&
+        now() - owner.claimed_at_ms < ttlMs
+      )
+    } catch {
+      return false
+    }
+  }
+  async function assertLease(): Promise<void> {
+    await renewalInFlight
+    if (!(await ownsCurrentLease()))
+      throw new CustodyManifestLockLeaseLostError(
+        'manifest lock renewal failed; write aborted',
+      )
+  }
+  const renewal = setInterval(
+    () => {
+      renewalInFlight = writeOwner(now()).catch(() => {
+        renewalFailed = true
+      })
+    },
+    custodyManifestLockTestOptions?.renewalIntervalMs ??
+      Math.min(CUSTODY_MANIFEST_LOCK_RENEW_MS, Math.floor(ttlMs / 3)),
+  )
+  if ('unref' in renewal) renewal.unref()
+  try {
+    return await fn(assertLease, nonce)
+  } finally {
+    clearInterval(renewal)
+    if (!(await ownsCurrentLease())) {
+      logger.warn('claustrum', 'manifest lock lease lost, not releasing', {
+        id: path,
+      })
+    } else {
+      await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {})
+    }
+    await reapStaleCustodyManifestLocks(lockPath)
+  }
+}
+
+type CustodyHandleManifestWriteInput = {
+  path: string
+  entry: CustodyHandleAccount
+  expectedUid?: number
+}
+
+function refusal(
+  reason: string,
+  code?: CustodyManifestLockErrorCode,
+): Extract<CustodyHandleManifestWriteResult, { status: 'refused' }> {
+  return code === undefined
+    ? { status: 'refused', reason }
+    : { status: 'refused', reason, code }
+}
+
+function isOurManifestBlock(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    value.provider === 'anthropic' &&
+    value.serve === 'anthropic-auth'
+  )
+}
+
+export async function writeCustodyHandleManifestEntry(
+  input: CustodyHandleManifestWriteInput,
+): Promise<CustodyHandleManifestWriteResult> {
+  if (
+    !isValidCustodyLabel(input.entry.label) ||
+    !isValidCustodyHandle(input.entry.handle) ||
+    !isValidCustodyCredentialId(input.entry.credentialId) ||
+    input.entry.credentialId !== custodyCredentialId(input.entry.label)
+  ) {
+    return refusal('invalid entry')
+  }
+  try {
+    return await withCustodyManifestLock(input.path, (assertLease, nonce) =>
+      writeCustodyHandleManifestEntryLocked(input, assertLease, nonce),
+    )
+  } catch (error) {
+    if (error instanceof CustodyManifestLockBusyError) {
+      return refusal('manifest lock busy', error.code)
+    }
+    if (error instanceof CustodyManifestLockOwnerInvalidError) {
+      return refusal('manifest lock owner invalid', error.code)
+    }
+    if (error instanceof CustodyManifestLockLeaseLostError) {
+      return refusal('manifest lock renewal failed; write aborted', error.code)
+    }
+    return refusal(`unreadable (${errorCode(error)})`)
+  }
+}
+
+export async function removeCustodyHandleManifestEntry(
+  input: CustodyHandleManifestWriteInput,
+): Promise<CustodyHandleManifestRemovalResult> {
+  if (
+    !isValidCustodyLabel(input.entry.label) ||
+    !isValidCustodyHandle(input.entry.handle) ||
+    !isValidCustodyCredentialId(input.entry.credentialId) ||
+    input.entry.credentialId !== custodyCredentialId(input.entry.label)
+  ) {
+    return { status: 'refused' }
+  }
+  try {
+    const result = await withCustodyManifestLock(
+      input.path,
+      async (assertLease, nonce) => {
+        const expectedUid =
+          input.expectedUid ?? process.getuid?.() ?? userInfo().uid
+        const parent = dirname(input.path)
+        try {
+          const parentReason = validateManifestParent(
+            await fs.lstat(parent),
+            expectedUid,
+          )
+          if (parentReason) return 'refused'
+        } catch (error) {
+          return errorCode(error) === 'ENOENT' ? 'missing' : 'refused'
+        }
+
+        let document: Record<string, unknown>
+        let handle: fs.FileHandle | undefined
+        try {
+          const pathStats = await fs.lstat(input.path)
+          const pathReason = validateManifestFile(pathStats, expectedUid)
+          if (pathReason) return 'refused'
+          handle = await fs.open(
+            input.path,
+            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+          )
+          const openedReason = validateManifestFile(
+            await handle.stat(),
+            expectedUid,
+          )
+          if (openedReason) return 'refused'
+          const bytes = new Uint8Array(MAX_CUSTODY_MANIFEST_BYTES + 1)
+          const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, 0)
+          if (bytesRead > MAX_CUSTODY_MANIFEST_BYTES) return 'refused'
+          const parsed = parseJsonRedacted(
+            new TextDecoder().decode(bytes.subarray(0, bytesRead)),
+          )
+          if (
+            !isRecord(parsed) ||
+            parsed.version !== 1 ||
+            !Array.isArray(parsed.providers)
+          ) {
+            return 'refused'
+          }
+          document = parsed
+          if (parsed.providers.some(isOurManifestBlock)) {
+            try {
+              readCustodyHandles(parsed, 'anthropic', 'anthropic-auth')
+            } catch {
+              return 'refused'
+            }
+          }
+        } catch (error) {
+          if (errorCode(error) === 'ENOENT') return 'missing'
+          return 'refused'
+        } finally {
+          await handle?.close().catch(() => {})
+        }
+
+        const providers = document.providers
+        if (!Array.isArray(providers)) return 'refused'
+        const blockIndex = providers.findIndex(isOurManifestBlock)
+        if (blockIndex === -1) return 'missing'
+        const block = providers[blockIndex]
+        if (!isOurManifestBlock(block) || !Array.isArray(block.accounts)) {
+          return 'refused'
+        }
+        const matchesEntry = (account: unknown) =>
+          isRecord(account) &&
+          account.label === input.entry.label &&
+          account.handle === input.entry.handle &&
+          account.credential_id === input.entry.credentialId
+        const matchIndex = block.accounts.findIndex(matchesEntry)
+        if (matchIndex === -1) return 'missing'
+        const accounts = block.accounts.filter(
+          (account) => !matchesEntry(account),
+        )
+        const serialized = JSON.stringify(
+          {
+            ...document,
+            providers: providers.map((provider, index) =>
+              index === blockIndex ? { ...block, accounts } : provider,
+            ),
+          },
+          null,
+          2,
+        )
+        if (
+          new TextEncoder().encode(serialized).byteLength >
+          MAX_CUSTODY_MANIFEST_BYTES
+        ) {
+          return 'refused'
+        }
+
+        const temporaryPath = join(
+          `${input.path}.lock`,
+          `manifest.${nonce}.tmp`,
+        )
+        let temporaryHandle: fs.FileHandle | undefined
+        try {
+          temporaryHandle = await fs.open(
+            temporaryPath,
+            fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+            0o600,
+          )
+          await temporaryHandle.writeFile(serialized)
+          await temporaryHandle.sync()
+          await temporaryHandle.close()
+          temporaryHandle = undefined
+          await assertLease()
+          await custodyManifestLockTestOptions?.beforeRename?.()
+          try {
+            await fs.rename(temporaryPath, input.path)
+          } catch (error) {
+            if (errorCode(error) === 'ENOENT')
+              throw new CustodyManifestLockLeaseLostError(
+                'manifest lock renewal failed; write aborted',
+              )
+            throw error
+          }
+          return 'removed'
+        } catch (error) {
+          if (error instanceof CustodyManifestLockLeaseLostError) throw error
+          return 'refused'
+        } finally {
+          await temporaryHandle?.close().catch(() => {})
+          await fs.unlink(temporaryPath).catch(() => {})
+        }
+      },
+    )
+    return result === 'refused' ? { status: 'refused' } : result
+  } catch (error) {
+    if (error instanceof CustodyManifestLockError) {
+      return { status: 'refused', code: error.code }
+    }
+    return { status: 'refused' }
+  }
+}
+
+export async function writeCustodyHandleManifestEntryLocked(
+  input: CustodyHandleManifestWriteInput,
+  assertLease: () => Promise<void>,
+  lockNonce: string,
+): Promise<CustodyHandleManifestWriteResult> {
+  const expectedUid = input.expectedUid ?? process.getuid?.() ?? userInfo().uid
+  const parent = dirname(input.path)
+  try {
+    const parentReason = validateManifestParent(
+      await fs.lstat(parent),
+      expectedUid,
+    )
+    if (parentReason) return refusal(parentReason)
+  } catch (error) {
+    return refusal(`unreadable (${errorCode(error)})`)
+  }
+
+  let document: Record<string, unknown>
+  let corruptLabels: ReadonlySet<string> = new Set<string>()
+  let handle: fs.FileHandle | undefined
+  try {
+    const pathStats = await fs.lstat(input.path)
+    const pathReason = validateManifestFile(pathStats, expectedUid)
+    if (pathReason) return refusal(pathReason)
+
+    handle = await fs.open(
+      input.path,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    )
+    const openedReason = validateManifestFile(await handle.stat(), expectedUid)
+    if (openedReason) return refusal(openedReason)
+
+    const bytes = new Uint8Array(MAX_CUSTODY_MANIFEST_BYTES + 1)
+    const { bytesRead } = await handle.read(bytes, 0, bytes.byteLength, 0)
+    if (bytesRead > MAX_CUSTODY_MANIFEST_BYTES)
+      return refusal('manifest exceeds maximum size')
+
+    const parsed = parseJsonRedacted(
+      new TextDecoder().decode(bytes.subarray(0, bytesRead)),
+    )
+    if (
+      !isRecord(parsed) ||
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.providers)
+    ) {
+      return refusal('invalid manifest')
+    }
+    document = parsed
+
+    if (parsed.providers.some(isOurManifestBlock)) {
+      try {
+        corruptLabels = readCustodyHandles(
+          parsed,
+          'anthropic',
+          'anthropic-auth',
+        ).corruptLabels
+      } catch {
+        return refusal('invalid manifest')
+      }
+    }
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') {
+      document = { version: 1, providers: [] }
+    } else if (error instanceof SyntaxError) {
+      return refusal('invalid JSON')
+    } else {
+      return refusal(`unreadable (${errorCode(error)})`)
+    }
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+
+  const providers = document.providers
+  if (!Array.isArray(providers)) return refusal('invalid manifest')
+  const blockIndex = providers.findIndex(isOurManifestBlock)
+  let nextProviders: unknown[]
+  if (blockIndex === -1) {
+    nextProviders = [
+      ...providers,
+      {
+        provider: 'anthropic',
+        serve: 'anthropic-auth',
+        accounts: [
+          {
+            label: input.entry.label,
+            handle: input.entry.handle,
+            credential_id: input.entry.credentialId,
+          },
+        ],
+      },
+    ]
+  } else {
+    const block = providers[blockIndex]
+    if (!isOurManifestBlock(block) || !Array.isArray(block.accounts))
+      return refusal('invalid manifest')
+    const matching = block.accounts.filter(
+      (account) => isRecord(account) && account.label === input.entry.label,
+    )
+    if (
+      matching.length === 1 &&
+      matching[0]?.handle === input.entry.handle &&
+      matching[0]?.credential_id === input.entry.credentialId &&
+      !corruptLabels.has(input.entry.label)
+    ) {
+      return { status: 'unchanged' }
+    }
+    const replacement = {
+      ...(corruptLabels.has(input.entry.label)
+        ? {}
+        : (matching.find(isRecord) ?? {})),
+      label: input.entry.label,
+      handle: input.entry.handle,
+      credential_id: input.entry.credentialId,
+    }
+    const accounts = block.accounts.flatMap((account) =>
+      isRecord(account) && account.label === input.entry.label ? [] : [account],
+    )
+    const firstMatch = block.accounts.findIndex(
+      (account) => isRecord(account) && account.label === input.entry.label,
+    )
+    accounts.splice(
+      firstMatch === -1 ? accounts.length : firstMatch,
+      0,
+      replacement,
+    )
+    nextProviders = providers.map((provider, index) =>
+      index === blockIndex ? { ...block, accounts } : provider,
+    )
+  }
+
+  const serialized = JSON.stringify(
+    { ...document, providers: nextProviders },
+    null,
+    2,
+  )
+  if (
+    new TextEncoder().encode(serialized).byteLength > MAX_CUSTODY_MANIFEST_BYTES
+  ) {
+    return refusal('manifest exceeds maximum size')
+  }
+
+  // Eviction renames the lock directory, so its temp follows the evicted owner
+  // into quarantine instead of remaining able to overwrite a successor's manifest.
+  // Quarantine reclaim deletes the evicted temp; it contains ids, never secrets.
+  const temporaryPath = join(`${input.path}.lock`, `manifest.${lockNonce}.tmp`)
+  let temporaryHandle: fs.FileHandle | undefined
+  try {
+    temporaryHandle = await fs.open(
+      temporaryPath,
+      fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+      0o600,
+    )
+    await temporaryHandle.writeFile(serialized)
+    await temporaryHandle.sync()
+    await temporaryHandle.close()
+    temporaryHandle = undefined
+    await assertLease()
+    await custodyManifestLockTestOptions?.beforeRename?.()
+    try {
+      await fs.rename(temporaryPath, input.path)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT')
+        throw new CustodyManifestLockLeaseLostError(
+          'manifest lock renewal failed; write aborted',
+        )
+      throw error
+    }
+    return { status: 'written' }
+  } catch (error) {
+    if (error instanceof CustodyManifestLockLeaseLostError) throw error
+    return refusal(`unreadable (${errorCode(error)})`)
+  } finally {
+    await temporaryHandle?.close().catch(() => {})
+    await fs.unlink(temporaryPath).catch(() => {})
   }
 }
 
@@ -638,6 +1701,7 @@ export class ClaustrumCredentialCache {
   async get(
     handle: string,
     minTtlMs = this.#minTtlMs,
+    options: { cacheIf?: () => boolean } = {},
   ): Promise<ClaustrumCredential> {
     if (!Number.isSafeInteger(minTtlMs) || minTtlMs < 0) {
       throw new RangeError('minTtlMs must be a non-negative safe integer')
@@ -658,7 +1722,7 @@ export class ClaustrumCredentialCache {
     const pending = this.#inFlight.get(handle)
     if (pending) return pending
 
-    const load = this.#load(handle, minTtlMs)
+    const load = this.#load(handle, minTtlMs, options.cacheIf)
     this.#inFlight.set(handle, load)
     try {
       return await load
@@ -669,6 +1733,10 @@ export class ClaustrumCredentialCache {
 
   peek(handle: string): ClaustrumCredential | undefined {
     return this.#cache.get(handle)
+  }
+
+  abandonPending(handle: string): void {
+    this.#inFlight.delete(handle)
   }
 
   seedForTest(handle: string, credential: ClaustrumCredential): void {
@@ -787,7 +1855,11 @@ export class ClaustrumCredentialCache {
       })
   }
 
-  async #load(handle: string, minTtlMs: number): Promise<ClaustrumCredential> {
+  async #load(
+    handle: string,
+    minTtlMs: number,
+    cacheIf?: () => boolean,
+  ): Promise<ClaustrumCredential> {
     let response: unknown
     try {
       response = await this.#client.call(
@@ -813,7 +1885,8 @@ export class ClaustrumCredentialCache {
     }
     if (
       credential.expiresAtMs !== null &&
-      credential.expiresAtMs > this.#now()
+      credential.expiresAtMs > this.#now() &&
+      (cacheIf?.() ?? true)
     ) {
       this.#cache.set(handle, credential)
     }

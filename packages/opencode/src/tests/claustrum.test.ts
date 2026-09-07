@@ -7,10 +7,13 @@ import {
   detectClaustrumConnection,
   executeAccountCommand,
   getDefaultClaustrumConnectionPath,
-  isClaustrumEnabledForAccount,
-  loadAccounts,
+  type OAuthAccount,
+  readCustodyHandles,
+  resolveCustodyHandle,
+  resolveCustodyHandlesPath,
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
+import { loadGoldenCustodyManifest } from './custody-handle-manifest.fixture.ts'
 
 let tempDir: string
 let accountPath: string
@@ -163,7 +166,7 @@ describe('Claustrum connection detection', () => {
     })
   })
 
-  test('derives the default connection path from the current uid', () => {
+  test('derives the default connection path from the current uid', async () => {
     const originalGetuid = process.getuid
     Object.defineProperty(process, 'getuid', { value: () => 4242 })
     try {
@@ -176,56 +179,76 @@ describe('Claustrum connection detection', () => {
   })
 })
 
-describe('per-account Claustrum gate', () => {
-  test('defaults off when config is absent', async () => {
-    await saveAccounts(baseStorage(), accountPath)
-
-    const storage = await loadAccounts(accountPath)
-
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(false)
+describe('custody handle resolution', () => {
+  const account = (input: Partial<OAuthAccount> = {}): OAuthAccount => ({
+    id: 'uuid-not-a-label',
+    type: 'oauth',
+    refresh: 'refresh-token',
+    ...input,
   })
 
-  test('defaults off when the gate config is malformed', async () => {
-    await writeFile(
-      accountPath,
-      JSON.stringify({ ...baseStorage(), claustrum: 'on' }),
-    )
-
-    const storage = await loadAccounts(accountPath)
-
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(false)
-  })
-
-  test('keeps gate state independent for each account', async () => {
-    await saveAccounts(
-      {
-        ...baseStorage(),
-        claustrum: {
-          accounts: {
-            'account-a': { enabled: true },
-            'account-b': { enabled: false },
-          },
+  test('resolves configured, environment, and XDG custody handle paths in order', () => {
+    expect(
+      resolveCustodyHandlesPath(
+        { handlesFile: '  /configured/handles.json  ' },
+        {
+          CLAUSTRUM_OPENCODE_HANDLES: '/environment/handles.json',
+          XDG_CONFIG_HOME: '/xdg',
+          HOME: '/home/tester',
         },
-      },
-      accountPath,
+      ),
+    ).toBe('/configured/handles.json')
+    expect(
+      resolveCustodyHandlesPath(undefined, {
+        CLAUSTRUM_OPENCODE_HANDLES: '/environment/handles.json',
+        XDG_CONFIG_HOME: '/xdg',
+        HOME: '/home/tester',
+      }),
+    ).toBe('/environment/handles.json')
+    expect(
+      resolveCustodyHandlesPath(undefined, {
+        CLAUSTRUM_OPENCODE_HANDLES: 'relative/handles.json',
+        XDG_CONFIG_HOME: '/xdg',
+        HOME: '/home/tester',
+      }),
+    ).toBe('/xdg/cortexkit/opencode-handles.json')
+    expect(resolveCustodyHandlesPath(undefined, { HOME: '/home/tester' })).toBe(
+      '/home/tester/.config/cortexkit/opencode-handles.json',
     )
+  })
 
-    const storage = await loadAccounts(accountPath)
+  test('matches the golden manifest by account label rather than UUID', async () => {
+    const { manifest: golden } = await loadGoldenCustodyManifest()
+    const parsed = readCustodyHandles(golden, 'anthropic', 'anthropic-auth')
+    const manifest = {
+      version: 1 as const,
+      provider: 'anthropic' as const,
+      serve: 'anthropic-auth' as const,
+      accounts: parsed.accounts,
+      superseded: parsed.superseded,
+    }
+    const entry = manifest.accounts[0]
+    if (!entry) throw new Error('golden manifest has no anthropic account')
 
-    expect(isClaustrumEnabledForAccount(storage!, 'account-a')).toBe(true)
-    expect(isClaustrumEnabledForAccount(storage!, 'account-b')).toBe(false)
+    const result = resolveCustodyHandle({
+      account: account({ label: entry.label }),
+      manifest,
+    })
+
+    expect(result.status).toBe('resolved')
+    if (result.status !== 'resolved')
+      throw new Error('expected resolved handle')
+    expect(result.source).toBe('manifest')
   })
 })
 
 describe('account status Claustrum surface', () => {
-  test('reports detection and each account gate without changing account behavior', () => {
-    const result = executeAccountCommand({
+  test('reports the global mode and projected vault binding', async () => {
+    const result = await executeAccountCommand({
       argumentsText: '',
       storage: {
         ...baseStorage(),
-        claustrum: {
-          accounts: { 'account-a': { enabled: true } },
-        },
+        claustrum: { mode: 'claustrum' },
       },
       claustrum: {
         status: 'available',
@@ -233,13 +256,52 @@ describe('account status Claustrum surface', () => {
         wireVersion: 2,
         endpoints: [{ host: '127.0.0.1', port: 8757 }],
       },
+      statusProjection: {
+        claustrumDetection: 'available',
+        accounts: [
+          {
+            id: 'main',
+            label: 'OpenCode anthropic',
+            role: 'main',
+            enabled: true,
+            quotaPercent: null,
+            claustrumGate: 'na',
+            vaultServed: false,
+            vaultReauth: false,
+            custodyState: 'na',
+          },
+          {
+            id: 'account-a',
+            label: 'account-a',
+            role: 'fallback',
+            enabled: true,
+            quotaPercent: null,
+            claustrumGate: 'on',
+            vaultServed: false,
+            vaultReauth: false,
+            custodyState: 'on-cold',
+          },
+          {
+            id: 'account-b',
+            label: 'account-b',
+            role: 'fallback',
+            enabled: true,
+            quotaPercent: null,
+            claustrumGate: 'off',
+            vaultServed: false,
+            vaultReauth: false,
+            custodyState: 'off',
+          },
+        ],
+      },
     })
 
+    expect(result.text).toContain('Custody mode: claustrum')
     expect(result.text).toContain('Claustrum: available')
     expect(result.text).toContain('account-a')
-    expect(result.text).toContain('gate on')
+    expect(result.text).toContain('vault cold')
     expect(result.text).toContain('account-b')
-    expect(result.text).toContain('gate off')
+    expect(result.text).toContain('local')
   })
 })
 

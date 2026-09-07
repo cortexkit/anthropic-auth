@@ -2,6 +2,13 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Minor Changes
+
+- Document the global `/claude-account claustrum|local` custody mode, including its fail-closed OpenCode behavior and Pi refusal.
+- Document global Claustrum manifest onboarding, startup legacy-handle migration, and vault re-login recovery.
+
 ## 1.22.0
 
 ### Minor Changes

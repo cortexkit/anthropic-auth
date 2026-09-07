@@ -8,10 +8,14 @@ import {
   USER_AGENT,
 } from './constants.ts'
 
+export type ProviderAccountUuid = string & {
+  readonly __providerAccountUuid: unique symbol
+}
+
 export type ClaudeCodeIdentity = {
   deviceId: string
   accountIdentity?: string
-  accountUuid?: string
+  accountUuid?: ProviderAccountUuid
   sessionId: string
 }
 
@@ -59,10 +63,10 @@ export function getClaudeCodeIdentity(seed: string): ClaudeCodeIdentity {
 
 const BOOTSTRAP_IDENTITY_CACHE_TTL_MS = 24 * 60 * 60_000
 const BOOTSTRAP_IDENTITY_NEGATIVE_TTL_MS = 5 * 60_000
-const bootstrapFetches = new Map<string, Promise<string | null>>()
+const bootstrapFetches = new Map<string, Promise<ProviderAccountUuid | null>>()
 const bootstrapResults = new Map<
   string,
-  { accountUuid: string | null; expiresAt: number }
+  { accountUuid: ProviderAccountUuid | null; expiresAt: number }
 >()
 
 export function resetClaudeCodeIdentityCachesForTest() {
@@ -86,7 +90,7 @@ function accountCacheKey(accountUuid: string, accountIdentity: string) {
 function adoptCachedIdentity(
   cached: ClaudeCodeIdentity | undefined,
   accountIdentity: string,
-  accountUuid?: string,
+  accountUuid?: ProviderAccountUuid,
 ) {
   if (!cached) return undefined
   if (
@@ -118,7 +122,7 @@ function adoptCachedIdentity(
 function cacheAccountIdentity(
   identity: ClaudeCodeIdentity,
   accountIdentity: string,
-  accountUuid: string,
+  accountUuid: ProviderAccountUuid,
 ) {
   setBounded(identityCache, explicitCacheKey(accountIdentity), identity)
   setBounded(
@@ -128,7 +132,10 @@ function cacheAccountIdentity(
   )
 }
 
-async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
+async function fetchClaudeCodeAccountUuid(
+  accessToken: string,
+  model?: string,
+): Promise<ProviderAccountUuid | null> {
   if (!accessToken.startsWith('sk-ant-oat')) return null
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 5_000)
@@ -153,7 +160,9 @@ async function fetchClaudeCodeAccountUuid(accessToken: string, model?: string) {
       oauth_account?: { account_uuid?: unknown }
     } | null
     const accountUuid = data?.oauth_account?.account_uuid
-    return typeof accountUuid === 'string' && accountUuid ? accountUuid : null
+    return typeof accountUuid === 'string' && accountUuid
+      ? (accountUuid as ProviderAccountUuid)
+      : null
   } catch {
     return null
   } finally {
@@ -188,7 +197,9 @@ export async function resolveClaudeCodeIdentity(
     setBounded(identityCache, accessToken, identity)
   }
 
-  if (!accessToken.startsWith('sk-ant-oat')) return identity
+  if (!accessToken.startsWith('sk-ant-oat')) {
+    return clearCachedAccountUuid(cacheKey, identity)
+  }
 
   const now = Date.now()
   // A slot-stable identity survives account replacement; bootstrap is the

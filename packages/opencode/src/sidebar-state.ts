@@ -36,6 +36,16 @@ export interface SidebarAccountState {
   needsReauth: boolean
   // True when the vault copy needs re-importing while the sidecar remains usable.
   vaultReauth?: boolean
+  // A gate alone does not prove the sidecar can serve a request.
+  vaultServed?: boolean
+  custodyState?:
+    | 'off'
+    | 'on-vault-served'
+    | 'on-vault-reauth'
+    | 'on-cold'
+    | 'unknown-identity'
+    | 'on-identity-mismatch'
+    | 'on-corrupt-binding'
   tierLabel?: string
 }
 
@@ -338,6 +348,11 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           needsReauth:
             typeof entry.needsReauth === 'boolean' ? entry.needsReauth : false,
           ...(entry.vaultReauth === true && { vaultReauth: true }),
+          ...(entry.vaultServed === true && { vaultServed: true }),
+          ...(typeof entry.custodyState === 'string' && {
+            custodyState:
+              entry.custodyState as SidebarAccountState['custodyState'],
+          }),
           tierLabel:
             typeof entry.tierLabel === 'string' && entry.tierLabel.trim()
               ? entry.tierLabel.trim()

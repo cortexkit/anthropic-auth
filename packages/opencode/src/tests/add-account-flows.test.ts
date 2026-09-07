@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_FETCH_MOCK } from './test-fetch'
@@ -449,6 +449,44 @@ describe('add-oauth error paths', () => {
     expect(parsed.type).toBe('add-oauth-start')
   })
 
+  test('add-oauth-start refuses Claustrum mode before authorization', async () => {
+    const { loadAccounts, saveAccounts, setClaustrumModePersistent } =
+      await import('@cortexkit/anthropic-auth-core')
+    const storage = (await loadAccounts(accountPath))!
+    await saveAccounts(
+      { ...storage, claustrum: { mode: 'claustrum' } },
+      accountPath,
+    )
+    const authorize = mock(() =>
+      Promise.resolve({
+        url: 'https://example.test/authorize',
+        redirectUri: 'http://localhost/callback',
+        state: 'state',
+        verifier: 'verifier',
+      }),
+    )
+    const plugin = await getPlugin({ authorize } as any)
+
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude-account',
+        arguments: 'add-oauth-start',
+        sessionID: 'ses_claustrum_add',
+      }),
+    ).rejects.toThrow('Exit Claustrum mode first: /claude-account local')
+    expect(authorize).not.toHaveBeenCalled()
+
+    await setClaustrumModePersistent('local', accountPath)
+    await executeCommand(
+      plugin,
+      'claude-account',
+      'add-oauth-start',
+      'ses_local_add',
+    )
+    expect(authorize).toHaveBeenCalledTimes(1)
+    await plugin.dispose?.()
+  })
+
   test('pending entry is always cleared after finish (even on failure)', async () => {
     // This validates the finally-block behavior:
     // After calling add-oauth-finish with a real pending entry (from a real
@@ -580,6 +618,38 @@ describe('add-oauth label threading', () => {
     const account = loaded!.accounts[0]!
     expect(account.type).toBe('oauth')
     expect(account.label).toBe('work')
+  })
+
+  test('add-oauth-finish clears the matching custody binding', async () => {
+    const manifestPath = join(tempDir, 'handles.json')
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'work',
+                handle: `ckh_${'D'.repeat(43)}`,
+                credential_id: 'oauth:anthropic:work',
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    await chmod(manifestPath, 0o600)
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    try {
+      await runOAuthAddWithLabel('work')
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+      expect(manifest.providers[0].accounts).toEqual([])
+    } finally {
+      delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+    }
   })
 
   test('add-oauth-finish without --label leaves label undefined (UUID-name fallback)', async () => {

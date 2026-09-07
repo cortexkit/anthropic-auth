@@ -17,17 +17,29 @@ export type CommandModalName = (typeof COMMAND_MODAL_NAMES)[number]
 export interface AccountDialogAccount {
   id: string
   label: string
-  role: string
+  role: 'main' | 'fallback'
   enabled: boolean
   quotaPercent: number | null
   tierLabel?: string
   claustrumGate: 'on' | 'off' | 'na'
   vaultServed: boolean
+  vaultReauth: boolean
+  custodyState:
+    | 'na'
+    | 'off'
+    | 'on-vault-served'
+    | 'on-vault-reauth'
+    | 'on-cold'
+    | 'unknown-identity'
+    | 'on-identity-mismatch'
+    | 'on-corrupt-binding'
 }
 
 export interface AccountDialogKnobs {
   accounts: AccountDialogAccount[]
   claustrumDetection: string
+  custodyMode?: 'local' | 'claustrum'
+  custodyModeKnown?: boolean
   [key: string]: unknown
 }
 

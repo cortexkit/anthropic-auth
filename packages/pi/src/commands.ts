@@ -270,9 +270,13 @@ export function registerCommands(pi: ExtensionAPI) {
       const path = getPiAccountStoragePath()
       const storage = await loadAccounts(path)
       const action = parseAccountCommandAction(args ?? '')
-      const result = executeAccountCommand({
+      const result = await executeAccountCommand({
         argumentsText: args ?? '',
         storage: storage ?? createEmptyStorage(),
+        path,
+        transition: async () => ({
+          text: 'Custody mode is managed from OpenCode; Pi does not participate.',
+        }),
         claustrum:
           action.type === 'status'
             ? await detectClaustrumConnection()

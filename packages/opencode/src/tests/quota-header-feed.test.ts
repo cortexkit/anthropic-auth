@@ -5,8 +5,10 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   stat,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -32,6 +34,7 @@ function entry(overrides: Record<string, unknown> = {}): QuotaHeaderFeedEntry {
     provider: 'anthropic',
     configured_account_count: 1,
     observed_at_ms: 1_000,
+    anthropic_account_uuid: null,
     quota,
     ...overrides,
   } as QuotaHeaderFeedEntry
@@ -77,6 +80,50 @@ describe('quota header feed', () => {
     expect(QUOTA_HEADER_FEED_SCHEMA_VERSION).toBe(3)
     expect(raw.entries.a.schema_version).toBe(3)
     expect(raw.entries.a.provider).toBe('anthropic')
+    expect(raw.lease_horizon_ms).toBe(QUOTA_HEADER_FEED_LEASE_MS)
+    expect(raw.entries.a).toHaveProperty('anthropic_account_uuid', null)
+  })
+
+  test('projects only the documented entry keys', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'entry-allowlist',
+    })
+    await registry.publish({
+      ...entry({
+        anthropic_account_uuid: 'uuid-1',
+        unexpected_entry_secret: 'must-not-publish',
+      }),
+      accountKey: 'a',
+    } as unknown as QuotaHeaderFeedPublishEntry)
+
+    const raw = JSON.parse(
+      await readFile(join(directory, 'entry-allowlist.json'), 'utf8'),
+    )
+    expect(raw.entries.a).toEqual({
+      identity_source: 'credential_id',
+      credential_id: 'cred-1',
+      schema_version: QUOTA_HEADER_FEED_SCHEMA_VERSION,
+      provider: 'anthropic',
+      configured_account_count: 1,
+      observed_at_ms: 1_000,
+      anthropic_account_uuid: 'uuid-1',
+      quota,
+    })
+    expect(JSON.stringify(raw)).not.toContain('must-not-publish')
+  })
+
+  test('publishes the configured lease horizon from the registry seam', async () => {
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: 'lease-horizon',
+      leaseMs: 17,
+    })
+    await registry.publish({ ...entry(), accountKey: 'a' })
+    const raw = JSON.parse(
+      await readFile(join(directory, 'lease-horizon.json'), 'utf8'),
+    )
+    expect(raw.lease_horizon_ms).toBe(17)
   })
 
   test.each([1, 2, 999])(
@@ -509,5 +556,121 @@ describe('quota header feed', () => {
     expect(await first.list()).toEqual([
       entry({ observed_at_ms: 1_002, credential_id: 'new' }),
     ])
+  })
+
+  test('reaps stale sibling process leases without touching fresh or foreign files', async () => {
+    const now = Date.now()
+    await mkdir(directory, { recursive: true })
+    const staleNames = [
+      '101-11111111-1111-1111-1111-111111111111.json',
+      '102-22222222-2222-2222-2222-222222222222.json',
+      '103-33333333-3333-3333-3333-333333333333.json',
+    ]
+    const freshNames = [
+      '104-44444444-4444-4444-4444-444444444444.json',
+      '105-55555555-5555-5555-5555-555555555555.json',
+    ]
+    for (const name of [...staleNames, ...freshNames]) {
+      const path = join(directory, name)
+      await writeFile(path, '{}')
+      const age = staleNames.includes(name)
+        ? QUOTA_HEADER_FEED_LEASE_MS + 1
+        : QUOTA_HEADER_FEED_LEASE_MS - 1
+      await utimes(path, (now - age) / 1_000, (now - age) / 1_000)
+    }
+    await writeFile(join(directory, 'foreign-named-file.json'), '{}')
+    await utimes(
+      join(directory, 'foreign-named-file.json'),
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+    )
+
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: '106-66666666-6666-6666-6666-666666666666',
+      now: () => now,
+    })
+    await registry.publish({ ...entry(), accountKey: 'a' })
+
+    const names = await readdir(directory)
+    for (const name of staleNames) expect(names).not.toContain(name)
+    for (const name of freshNames) expect(names).toContain(name)
+    expect(names).toContain('foreign-named-file.json')
+    expect(names).toContain('106-66666666-6666-6666-6666-666666666666.json')
+  })
+
+  test('does not unlink a fresh lease published after the stale lease was inspected', async () => {
+    const now = Date.now()
+    const siblingName = '101-11111111-1111-1111-1111-111111111111.json'
+    const siblingPath = join(directory, siblingName)
+    const replacementPath = join(directory, 'fresh-publisher.tmp')
+    await mkdir(directory, { recursive: true })
+    await writeFile(siblingPath, '{"stale":true}')
+    await utimes(
+      siblingPath,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+    )
+    expect(now - (await stat(siblingPath)).mtimeMs).toBeGreaterThanOrEqual(
+      QUOTA_HEADER_FEED_LEASE_MS,
+    )
+
+    let publisherRan = false
+    let publisherError: unknown
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: '102-22222222-2222-2222-2222-222222222222',
+      now: () => now,
+      beforeRemoveFile: async (path: string) => {
+        publisherRan = true
+        try {
+          await writeFile(replacementPath, '{"fresh":true}')
+          await utimes(replacementPath, now / 1_000, now / 1_000)
+          await rename(replacementPath, siblingPath)
+          expect(path).toBe(siblingPath)
+        } catch (error) {
+          publisherError = error
+          throw error
+        }
+      },
+    })
+
+    await registry.publish({ ...entry(), accountKey: 'a' })
+
+    expect(publisherRan).toBe(true)
+    expect(publisherError).toBeUndefined()
+    expect(await readFile(siblingPath, 'utf8')).toBe('{"fresh":true}')
+  })
+
+  test('continues publishing when a sibling lease sweep cannot unlink a stale file', async () => {
+    const now = Date.now()
+    const stalePath = join(
+      directory,
+      '101-11111111-1111-1111-1111-111111111111.json',
+    )
+    await mkdir(directory, { recursive: true })
+    await writeFile(stalePath, '{}')
+    await utimes(
+      stalePath,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+      (now - QUOTA_HEADER_FEED_LEASE_MS - 1) / 1_000,
+    )
+    const ownFile = '102-22222222-2222-2222-2222-222222222222.json'
+    const registry = new QuotaHeaderFeedRegistry({
+      directory,
+      instanceId: ownFile.slice(0, -'.json'.length),
+      now: () => now,
+      removeFile: async () => {
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+      },
+    })
+
+    await expect(
+      registry.publish({ ...entry(), accountKey: 'a' }),
+    ).resolves.toBeUndefined()
+    expect(await readdir(directory)).toContain(ownFile)
+    expect(await readdir(directory)).toContain(
+      '101-11111111-1111-1111-1111-111111111111.json',
+    )
   })
 })

@@ -1685,7 +1685,7 @@ describe('QuotaManager', () => {
   })
 
   describe('refreshMain dedup (identity-keyed)', () => {
-    test('rotated access tokens under one main identity share one in-flight fetch', async () => {
+    test('rotated access tokens under one main identity use separate in-flight fetches', async () => {
       let fetchCalls = 0
       const fetchMock = mock(async () => {
         fetchCalls++
@@ -1703,7 +1703,7 @@ describe('QuotaManager', () => {
       ])
 
       expect(quotaA).toEqual(quotaB)
-      expect(fetchCalls).toBe(1)
+      expect(fetchCalls).toBe(2)
     })
 
     test('concurrent different-token refreshMain: each gets its own quota', async () => {

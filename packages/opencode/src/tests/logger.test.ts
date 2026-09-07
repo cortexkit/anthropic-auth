@@ -237,6 +237,15 @@ describe('redactPayload', () => {
     expect(result?.jwt).toBe('***REDACTED***')
   })
 
+  test('redacts custody handles by key and value', () => {
+    const handle = `ckh_${'H'.repeat(43)}`
+    const result = redactPayload({ handle, nested: { value: handle } })
+    expect(result).toEqual({
+      handle: '***REDACTED***',
+      nested: { value: '***REDACTED***' },
+    })
+  })
+
   test('keeps safe keys unchanged', () => {
     const result = redactPayload({
       input_tokens: 500,
