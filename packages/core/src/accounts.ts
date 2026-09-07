@@ -4240,11 +4240,12 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
-      if (
-        this.isFallbackAccountVaultEnabled(account.id, storage) &&
-        !this.isFallbackAccountVaultServed(account.id, storage)
-      ) {
-        continue
+      if (this.isFallbackAccountVaultEnabled(account.id, storage)) {
+        if (!this.isFallbackAccountVaultServed(account.id, storage)) continue
+        if (!account.access && !account.refresh) {
+          usable.push(account)
+          continue
+        }
       }
       let next = account
       try {
