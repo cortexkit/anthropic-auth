@@ -3977,6 +3977,70 @@ describe('fallback Claustrum credential resolution', () => {
     await fixture.plugin.dispose?.()
   })
 
+  test('uses the bootstrap UUID when a vault fallback omits account_id', async () => {
+    const bootstrapUuid = '33333333-3333-3333-3333-333333333333'
+    const fixture = await bootRuledClaustrumRow({
+      route: 'fallback-first',
+      quota: { enabled: false, failClosedOnUnknownQuota: false },
+      storageOverrides: { quotaHeaderFeed: { enabled: true } },
+      fallbacks: [
+        {
+          label: 'bootstrap-identity',
+          handle: `ckh_${'B'.repeat(43)}`,
+          access: 'sk-ant-oat01-vault-bootstrap-identity',
+        },
+      ],
+      connector: (calls) =>
+        connectorFor(calls, (method, params) => {
+          if (method !== 'credential.get') return { result: {} }
+          return credentialResponse(
+            params.handle === ruledMainHandle
+              ? 'vault-main-access'
+              : 'sk-ant-oat01-vault-bootstrap-identity',
+            1,
+          )
+        }),
+      onFetch: (input) => {
+        const url = extractUrl(input as string | URL | Request)
+        if (url.includes('/claude_cli/bootstrap')) {
+          return Response.json({
+            oauth_account: { account_uuid: bootstrapUuid },
+          })
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization': '0.25',
+            'anthropic-ratelimit-unified-5h-reset': '1800000000',
+          },
+        })
+      },
+      createFallbackStorage,
+      useTempAccountFile,
+      getPlugin: (accountStoragePath, runtimeOverrides) => {
+        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountStoragePath
+        return getPlugin(undefined, undefined, runtimeOverrides as never)
+      },
+      extractUrl,
+      tempConfigDir: () => tempConfigDir!,
+    })
+
+    const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(response.status).toBe(200)
+    const entries = await waitForFeedEntries(
+      (candidate) =>
+        candidate.some(
+          (entry: any) => entry.anthropic_account_uuid === bootstrapUuid,
+        ),
+      'the bootstrap fallback account UUID',
+    )
+    expect(
+      entries.find((entry: any) => entry.anthropic_account_uuid !== undefined),
+    ).toMatchObject({ anthropic_account_uuid: bootstrapUuid })
+    await fixture.plugin.dispose?.()
+  })
+
   test('account status inspects the configured Claustrum connection file', async () => {
     const storage = createFallbackStorage({ accounts: [] })
     await useTempAccountFile(storage)

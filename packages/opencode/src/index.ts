@@ -6593,6 +6593,7 @@ const anthropicAuthPlugin = async (
                 oauthAccountId === 'main'
                   ? mainQuotaIdentity?.providerAccountUuid
                   : (claustrumResolution?.credentialAccountId ??
+                    identity.accountUuid ??
                     (servedFallbackAccount &&
                     isOAuthAccount(servedFallbackAccount)
                       ? servedFallbackAccount.anthropicAccountUuid
