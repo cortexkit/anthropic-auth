@@ -1432,7 +1432,9 @@ function mergeAccountRuntimeState(
     ((typeof effectiveIncoming.access === 'string' &&
       effectiveIncoming.access.length > 0) ||
       (typeof effectiveIncoming.refresh === 'string' &&
-        effectiveIncoming.refresh !== custodyTombstoneKey('anthropic')))
+        effectiveIncoming.refresh !== custodyTombstoneKey('anthropic'))) &&
+    (!effectiveIncoming.authLineageId ||
+      effectiveIncoming.authLineageId === existingEntry.authLineageId)
   ) {
     logger.warn(
       'accounts',

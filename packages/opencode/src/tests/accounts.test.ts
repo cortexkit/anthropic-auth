@@ -322,6 +322,7 @@ describe('custody account-state persistence', () => {
             access: 'old-access',
             refresh: 'old-refresh',
             expires: 1_700_000_100_000,
+            authLineageId: 'refresh-lineage',
           },
         ],
       },
@@ -343,8 +344,61 @@ describe('custody account-state persistence', () => {
     stale.access = 'late-access'
     stale.refresh = 'late-refresh'
     stale.expires = 1_700_000_200_000
-    await saveAccountState(staleRefresh, accountPath, { accounts: ['work'] })
+    const logs: LogTestRecord[] = []
+    try {
+      __setLogTestSink((record) => logs.push(record))
+      await saveAccountState(staleRefresh, accountPath, { accounts: ['work'] })
+    } finally {
+      __setLogTestSink(null)
+    }
 
+    const persisted = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(persisted.accounts.work).toMatchObject({
+      access: '',
+      refresh: custodyTombstoneKey('anthropic'),
+      expires: 0,
+    })
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        level: 'warn',
+        message: 'discarded stale credential write over a custody tombstone',
+      }),
+    )
+  })
+
+  test('an unattributed credential writer cannot replace a custody tombstone', async () => {
+    await saveAccounts(
+      {
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work',
+            label: 'work',
+            type: 'oauth',
+            access: 'old-access',
+            refresh: 'old-refresh',
+          },
+        ],
+      },
+      accountPath,
+    )
+    const unattributed = (await loadAccounts(accountPath))!
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          work: {
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+          },
+        },
+      }),
+    )
+    await saveAccountState(unattributed, accountPath, { accounts: ['work'] })
     const persisted = JSON.parse(
       await readFile(getAccountStatePath(accountPath), 'utf8'),
     )

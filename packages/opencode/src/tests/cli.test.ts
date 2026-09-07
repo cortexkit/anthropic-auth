@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   addAccountPersistent,
+  custodyTombstoneKey,
   getAccountStatePath,
+  saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 
 import { addApiRoute, login, relaySetup } from '../cli'
@@ -137,6 +139,35 @@ describe('CLI login', () => {
       }),
     )
     await chmod(manifestPath, 0o600)
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [
+          {
+            id: 'cli-label',
+            label: 'cli-label',
+            type: 'oauth',
+            refresh: 'old-refresh',
+            authLineageId: 'old-lineage',
+          },
+        ],
+      },
+      accountPath,
+    )
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          'cli-label': {
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+            authLineageId: 'old-lineage',
+          },
+        },
+      }),
+    )
 
     const warnings: string[] = []
     const originalWarn = console.warn
@@ -171,6 +202,11 @@ describe('CLI login', () => {
     expect(
       state.claustrumDivergence['oauth:anthropic:cli-label'],
     ).toMatchObject({ minimumRecordVersion: 1 })
+    expect(state.accounts['cli-label']).toMatchObject({
+      access: 'cli-access',
+      refresh: 'cli-refresh',
+    })
+    expect(state.accounts['cli-label'].authLineageId).not.toBe('old-lineage')
     expect(warnings).toContain(
       'Fallback login had no served vault record for cli-label',
     )
