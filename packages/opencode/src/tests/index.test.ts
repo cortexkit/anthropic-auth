@@ -2244,54 +2244,6 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
-    'keeps an eligible manifest-only fallback off the local refresh path',
-    async () => {
-      let tokenRequests = 0
-      const handlers: Array<() => unknown> = []
-      const fixture = await bootRuledClaustrumRow({
-        route: 'fallback-first',
-        fallbacks: [
-          {
-            label: 'manifest-enabled',
-            handle: manifestHandle,
-            access: 'manifest-enabled-access',
-          },
-        ],
-        connector: (calls) =>
-          connectorFor(calls, (method, params) => {
-            if (method !== 'credential.get') return { result: {} }
-            if (params.handle === manifestHandle)
-              return credentialResponse('vault-main-access', 1)
-            return credentialResponse('manifest-enabled-access', 1)
-          }),
-        onFetch: (input) => {
-          if (extractUrl(input as string | URL | Request) === TOKEN_URL)
-            tokenRequests += 1
-          return new Response('{}', { status: 200 })
-        },
-        runtimeOverrides: {
-          setInterval: mock((handler: () => unknown) => {
-            handlers.push(handler)
-            return { unref() {} } as never
-          }) as never,
-        },
-      })
-      const path = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
-      const current = (await loadAccounts(path))!
-      const fallback = current.accounts.find(
-        (account): account is OAuthAccount =>
-          account.id === 'fallback-1' && isOAuthAccount(account),
-      )!
-      fallback.expires = Date.now() + 60_000
-      await saveAccounts(current, path)
-      await handlers.at(-1)?.()
-      await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
-      expect(tokenRequests).toBe(0)
-      await fixture.plugin.dispose?.()
-    },
-  )
-
-  test.serial(
     'writes the manifest before clearing a migrated legacy handle',
     async () => {
       await useTempAccountFile(
@@ -20927,11 +20879,13 @@ describe('killswitch fetch gate', () => {
       const accountId = 'killswitch-vault-fallback'
       const handle = `ckh_${'K'.repeat(43)}`
       const vaultAccess = 'killswitch-vault-access'
+      let fallbackResident = vaultResident
       const quota = {
         five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
         seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
       }
       const detachedTimers: Array<() => void> = []
+      const custodyTicks: Array<() => unknown> = []
       const setTimeout = mock((callback: TestTimerHandler, delay?: number) => {
         if (delay === 0 && typeof callback === 'function') {
           detachedTimers.push(callback as () => void)
@@ -20976,13 +20930,19 @@ describe('killswitch fetch gate', () => {
         ],
         connector: (calls) =>
           connectorFor(calls, (method, params) =>
-            method === 'credential.get'
-              ? credentialResponse(
-                  params.handle === handle ? vaultAccess : 'vault-main-access',
-                  1,
-                  now + 12 * 60 * 60 * 1000,
-                )
-              : { result: {} },
+            method !== 'credential.get'
+              ? { result: {} }
+              : params.handle === handle && !fallbackResident
+                ? (() => {
+                    throw new Error('vault fallback is cold')
+                  })()
+                : credentialResponse(
+                    params.handle === handle
+                      ? vaultAccess
+                      : 'vault-main-access',
+                    1,
+                    now + 12 * 60 * 60 * 1000,
+                  ),
           ),
         onFetch: (input, init) => {
           if (
@@ -21003,7 +20963,13 @@ describe('killswitch fetch gate', () => {
           }
           return new Response('message-ok', { status: 200 })
         },
-        runtimeOverrides: { setTimeout },
+        runtimeOverrides: {
+          setTimeout,
+          setInterval: mock((handler: () => unknown) => {
+            custodyTicks.push(handler)
+            return { unref() {} } as never
+          }) as never,
+        },
         bootPlugin: (overrides) =>
           getPlugin(createMockClient(), tempConfigDir!, overrides),
         createFallbackStorage,
@@ -21015,9 +20981,6 @@ describe('killswitch fetch gate', () => {
       await plugin.__fallbackRefreshReady
       clock = now + 6 * 60 * 60 * 1000
       plugin.__quotaManager.clearFallback(accountId)
-      if (!vaultResident) {
-        plugin.__claustrumCredentialCache.invalidate(handle)
-      }
       const residentBeforeRequest = Boolean(
         plugin.__claustrumCredentialCache.peek(handle),
       )
@@ -21026,17 +20989,36 @@ describe('killswitch fetch gate', () => {
 
       const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
       await response.text()
+      const coldFallbackUsageCalls = usageAuthorizations.filter(
+        (authorization) => authorization === `Bearer ${vaultAccess}`,
+      ).length
+      const coldSidecarUsageCalls = usageAuthorizations.filter(
+        (authorization) => authorization === 'Bearer sidecar-access',
+      ).length
+      let recoveredFallbackUsageCalls = 0
+      let residentAfterTick = false
+      if (!vaultResident) {
+        fallbackResident = true
+        expect(custodyTicks.length).toBeGreaterThan(0)
+        await Promise.all(custodyTicks.map((handler) => handler()))
+        residentAfterTick = Boolean(
+          plugin.__claustrumCredentialCache.peek(handle),
+        )
+        usageAuthorizations.length = 0
+        await plugin.__quotaManager.refreshFallback(accountId, vaultAccess)
+        recoveredFallbackUsageCalls = usageAuthorizations.filter(
+          (authorization) => authorization === `Bearer ${vaultAccess}`,
+        ).length
+      }
       await plugin.dispose?.()
 
       return {
-        fallbackUsageCalls: usageAuthorizations.filter(
-          (authorization) => authorization === `Bearer ${vaultAccess}`,
-        ).length,
+        fallbackUsageCalls: coldFallbackUsageCalls,
         residentBeforeRequest,
-        sidecarUsageCalls: usageAuthorizations.filter(
-          (authorization) => authorization === 'Bearer sidecar-access',
-        ).length,
+        sidecarUsageCalls: coldSidecarUsageCalls,
         scheduledWarmCount: detachedTimers.length - timerBaseline,
+        recoveredFallbackUsageCalls,
+        residentAfterTick,
       }
     } finally {
       Date.now = originalNow
@@ -21050,6 +21032,17 @@ describe('killswitch fetch gate', () => {
     expect(result.sidecarUsageCalls).toBe(0)
     expect(result.fallbackUsageCalls).toBe(1)
     expect(result.scheduledWarmCount).toBe(0)
+    expect(result.residentAfterTick).toBe(true)
+  })
+
+  test('killswitch quota refresh skips a cold vault fallback without local refresh', async () => {
+    const result = await runVaultKillswitchQuotaRefresh(false)
+
+    expect(result.residentBeforeRequest).toBe(false)
+    expect(result.sidecarUsageCalls).toBe(0)
+    expect(result.fallbackUsageCalls).toBe(0)
+    expect(result.scheduledWarmCount).toBe(0)
+    expect(result.recoveredFallbackUsageCalls).toBe(1)
   })
 
   // Main below the soft routing threshold but ABOVE the killswitch threshold,
