@@ -2244,6 +2244,103 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
+    'keeps a bound real fallback dark until takeover resumes',
+    async () => {
+      const refresh = 'bound-sidecar-refresh'
+      for (const mode of ['claustrum', 'local'] as const) {
+        const tokenRefreshes: string[] = []
+        const handlers: Array<() => unknown> = []
+        await useTempAccountFile(
+          createFallbackStorage({
+            claustrum: { mode },
+            routing: { mode: 'fallback-first' },
+            refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+            accounts: [
+              {
+                id: 'fallback-1',
+                label: 'bound-real',
+                type: 'oauth',
+                access: 'bound-sidecar-access',
+                refresh,
+                expires: Date.now() - 1,
+                claustrumHandle: manifestHandle,
+              },
+            ],
+          }),
+        )
+        await writeManifest([{ label: 'main', handle: ruledMainHandle }])
+        globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+          if (extractUrl(input as string | URL | Request) === TOKEN_URL) {
+            tokenRefreshes.push(
+              (JSON.parse(String(init?.body)) as { refresh_token: string })
+                .refresh_token,
+            )
+            return Promise.resolve(
+              Response.json({
+                access_token: 'refreshed-fallback-access',
+                refresh_token: 'refreshed-fallback-refresh',
+                expires_in: 3600,
+              }),
+            )
+          }
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }) as unknown as typeof fetch
+        const plugin = await getPlugin(undefined, undefined, {
+          setInterval: mock((handler: () => unknown) => {
+            handlers.push(handler)
+            return { unref() {} } as never
+          }) as never,
+          claustrumConnector: connectorFor([], (method, params) => {
+            if (method !== 'credential.get') return { result: {} }
+            return credentialResponse(
+              params.handle === ruledMainHandle
+                ? 'vault-main-access'
+                : 'vault-bound-access',
+              1,
+            )
+          }),
+        })
+        try {
+          const result = await plugin.auth.loader(
+            () =>
+              Promise.resolve(
+                mode === 'claustrum'
+                  ? custodyTombstoneOAuth('anthropic')
+                  : {
+                      type: 'oauth' as const,
+                      access: 'main-access',
+                      refresh: 'main-refresh',
+                      expires: Date.now() + 60_000,
+                    },
+              ),
+            { models: {} },
+          )
+          if (mode === 'claustrum') {
+            await expect(
+              result.fetch(MESSAGES_URL, EMPTY_POST),
+            ).rejects.toMatchObject({
+              code: 'custody_state_mismatch',
+              verdict: 'RESUME_TAKEOVER',
+            })
+            await handlers.at(-1)?.()
+            expect(tokenRefreshes).not.toContain(refresh)
+          } else {
+            await plugin.__fallbackRefreshReady
+            await handlers.at(-1)?.()
+            await result.fetch(MESSAGES_URL, EMPTY_POST)
+            await Bun.sleep(20)
+            expect(
+              tokenRefreshes.filter((token) => token === refresh),
+            ).toHaveLength(1)
+          }
+        } finally {
+          await plugin.dispose?.()
+        }
+      }
+    },
+  )
+
+  test.serial(
     'writes the manifest before clearing a migrated legacy handle',
     async () => {
       await useTempAccountFile(
