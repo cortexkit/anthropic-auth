@@ -21145,7 +21145,7 @@ describe('killswitch fetch gate', () => {
         (authorization) => authorization === 'Bearer sidecar-access',
       ).length
       let recoveredFallbackUsageCalls = 0
-      let residentAfterTick = false
+      let residentAfterTick = vaultResident
       if (!vaultResident) {
         fallbackResident = true
         expect(custodyTicks.length).toBeGreaterThan(0)
