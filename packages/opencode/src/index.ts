@@ -50,6 +50,7 @@ import {
   createEmptyStorage,
   createStickyNoRouteResponse,
   custodyCredentialId,
+  custodyCredentialIdFromResolution,
   type DumpHandle,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
@@ -1977,7 +1978,10 @@ const anthropicAuthPlugin = async (
   ): Promise<void> {
     const completion = completedLocalLogin
     if (!completion) return
-    const storage = await loadAccounts(accountStoragePath)
+    // Best-effort metadata read — same shape as the OAuth callback path
+    // (~8775). A corrupt store must not reject the post-login ack; fall
+    // through to the missing-entry branch the ternary below already handles.
+    const storage = await loadAccounts(accountStoragePath).catch(() => null)
     if (getClaustrumMode(storage) !== 'local') return
     const account = mainCustodyAccount(await getAuth().catch(() => ({})))
     const resolution = storage
@@ -1996,7 +2000,7 @@ const anthropicAuthPlugin = async (
         entry: {
           label: 'main',
           handle: resolution.handle,
-          credentialId: resolution.credentialId ?? custodyCredentialId('main'),
+          credentialId: custodyCredentialIdFromResolution(resolution, 'main'),
         },
         beforeRemove: async () => {
           await persistCustodyDivergenceState(
@@ -2056,7 +2060,7 @@ const anthropicAuthPlugin = async (
               code: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
               retryable: false,
               message:
-                "Claustrum main binding is not active while local main material remains; onboard main into the vault with Claustrum's tooling first.",
+                'Claustrum main binding is not active while local main material remains; mint a handle with `ck auth mint-handle` so this plugin can write the manifest entry.',
             }
           : state === 'identity-mismatch'
             ? {
@@ -2612,6 +2616,13 @@ const anthropicAuthPlugin = async (
                   // Refuse malformed labels before taking the cross-tenant lock.
                   isValidCustodyLabel(account.label)
                 ) {
+                  // Safe to derive here: this migrates a LEGACY handle into
+                  // our manifest block, and every legacy handle file on disk
+                  // today names a labelled credential whose real vault id
+                  // matches `oauth:anthropic:<label>` (the only one is
+                  // `.claustrum-handle-work-alt` -> `oauth:anthropic:work-alt`).
+                  // A legacy file naming an unlabelled credential would derive
+                  // to nothing and the removal branch would fail closed.
                   const write = await writeCustodyHandleManifestEntry({
                     path: custodyHandleManifestPath,
                     entry: {
@@ -4693,7 +4704,10 @@ const anthropicAuthPlugin = async (
         await acknowledgeLocalOAuthLoginFromStorage(
           {
             accountId: account.id,
-            credentialId: custodyCredentialId(account.label ?? account.id),
+            credentialId: custodyCredentialIdFromResolution(
+              fallbackBinding,
+              account.label ?? account.id,
+            ),
             authFingerprint: localAuthFingerprint(
               result.access,
               result.refresh,
@@ -8826,9 +8840,35 @@ const anthropicAuthPlugin = async (
                   result.state,
                 )
                 if (exchanged.type === 'success') {
+                  // Mirror `acknowledgeMainLocalLogin` (~1995): prefer the
+                  // manifest-resolved credential id so divergence state and
+                  // removal match the actual vault id, not the derived form.
+                  // This lookup only supplies the credential id; a corrupt or
+                  // partially-written store must NOT reject the OAuth callback
+                  // and discard the just-exchanged credentials — exactly the
+                  // case a re-logging-in user is trying to recover from.
+                  const reentryStorage = await loadAccounts(
+                    accountStoragePath,
+                  ).catch(() => null)
+                  const reentryResolution = reentryStorage
+                    ? resolveAccountCustodyHandle(
+                        mainCustodyAccount({
+                          access: exchanged.access,
+                          refresh: exchanged.refresh,
+                        }),
+                        reentryStorage,
+                      )
+                    : ({
+                        status: 'unresolved',
+                        reason: 'missing-entry',
+                      } as const)
+                  const reentryCredentialId = custodyCredentialIdFromResolution(
+                    reentryResolution,
+                    'main',
+                  )
                   completedLocalLogin = {
                     accountId: 'main',
-                    credentialId: custodyCredentialId('main'),
+                    credentialId: reentryCredentialId,
                     authFingerprint: localAuthFingerprint(
                       exchanged.access,
                       exchanged.refresh,

@@ -446,7 +446,7 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
-  test('refuses a valid-shaped credential id that is not canonical for its label', async () => {
+  test('accepts a non-canonical credential id via the writer', async () => {
     await withTempDirectory(async (directory) => {
       const parent = join(directory, 'manifest')
       const path = join(parent, 'handles.json')
@@ -456,10 +456,19 @@ describe('writeCustodyHandleManifestEntry', () => {
       await expect(
         writeCustodyHandleManifestEntry({
           path,
-          entry: { ...writerEntry, credentialId: 'oauth:anthropic:other' },
+          entry: { ...writerEntry, credentialId: 'oauth:anthropic' },
         }),
-      ).resolves.toEqual({ status: 'refused', reason: 'invalid entry' })
-      await expect(fs.lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
+      ).resolves.toEqual({ status: 'written' })
+      const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+        providers: Array<{ accounts: Array<Record<string, unknown>> }>
+      }
+      expect(output.providers[0]?.accounts).toEqual([
+        {
+          label: writerEntry.label,
+          handle: writerEntry.handle,
+          credential_id: 'oauth:anthropic',
+        },
+      ])
     })
   })
 
@@ -2001,7 +2010,8 @@ describe('resolveCustodyHandle', () => {
       | 'duplicate-label'
       | 'missing-entry'
       | 'foreign-serve'
-      | 'superseded',
+      | 'superseded'
+      | 'corrupt-binding',
   ) {
     expect(result.status).toBe('unresolved')
     if (result.status !== 'unresolved')
@@ -2101,21 +2111,67 @@ describe('resolveCustodyHandle', () => {
     )
   })
 
-  test('requires the canonical OAuth credential ID rather than the UUID', () => {
+  test("returns the entry's own credential id verbatim", () => {
     const result = resolveCustodyHandle({
-      account: account({ id: 'uuid-not-a-label', label: 'alice' }),
+      account: account({ id: 'uuid-not-a-label', label: 'main' }),
       manifest: manifest({
         accounts: [
           {
-            label: 'alice',
+            label: 'main',
             handle: activeHandle,
-            credential_id: 'uuid-not-a-label',
+            credential_id: 'oauth:anthropic',
           },
         ],
       }),
     })
 
-    expectUnresolvedReason(result, 'missing-entry')
+    expect(result.status).toBe('resolved')
+    if (result.status !== 'resolved')
+      throw new Error('expected resolved handle')
+    expect(result.source).toBe('manifest')
+    if (result.source !== 'manifest')
+      throw new Error('expected manifest source')
+    expect(result.credentialId).toBe('oauth:anthropic')
+  })
+
+  test('marks every duplicate-label entry as corrupt-binding and refuses to resolve', () => {
+    const parsed = readCustodyHandles(
+      {
+        version: 1,
+        providers: [
+          {
+            provider: 'anthropic',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'alice',
+                handle: activeHandle,
+                credential_id: 'oauth:anthropic:alice',
+              },
+              {
+                label: 'alice',
+                handle: otherHandle,
+                credential_id: 'oauth:anthropic:alice',
+              },
+            ],
+          },
+        ],
+      },
+      'anthropic',
+      'anthropic-auth',
+    )
+    expect(parsed.corruptLabels).toEqual(new Set(['alice']))
+    expect(parsed.accounts).toEqual([])
+
+    const result = resolveCustodyHandle({
+      account: account({ label: 'alice' }),
+      manifest: {
+        ...manifest(),
+        accounts: parsed.accounts,
+        corruptLabels: parsed.corruptLabels,
+      },
+    })
+    expectUnresolvedReason(result, 'corrupt-binding')
   })
 
   test('never falls back to legacy for a foreign serve', () => {

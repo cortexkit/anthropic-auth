@@ -12,9 +12,9 @@ const productionFiles = [
 ]
 
 const allowedGuidance = [
-  "Onboard the main account into the Claustrum vault with Claustrum's tooling (see its runbook) before retrying.",
+  'Mint a handle with `ck auth mint-handle`; this plugin then writes the manifest entry.',
   'Claustrum main credential requires re-import; run ck auth import --replace.',
-  "Claustrum main binding is not active while local main material remains; onboard main into the vault with Claustrum's tooling first.",
+  'Claustrum main binding is not active while local main material remains; mint a handle with `ck auth mint-handle` so this plugin can write the manifest entry.',
   'Claustrum main credential identity differs from the persisted main identity; run ck auth set-identity.',
 ]
 const forbidden = [

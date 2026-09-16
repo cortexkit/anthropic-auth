@@ -346,6 +346,12 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
     lastUsed: now,
     lastRefreshedAt: now,
   } as const
+  // Safe to derive here: this is the legacy handle migration path and every
+  // legacy handle file on disk today names a labelled credential whose real
+  // vault id matches `oauth:anthropic:<label>` (the only one is
+  // `.claustrum-handle-work-alt` -> `oauth:anthropic:work-alt`). If a legacy
+  // file naming an unlabelled credential ever appears, the derived id will
+  // resolve to nothing and the two-factor local-exit will fail closed.
   const credentialId = custodyCredentialId(account.label ?? account.id)
   await addAccountPersistent(account)
   await acknowledgeLocalOAuthLoginFromStorage(

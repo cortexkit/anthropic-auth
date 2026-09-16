@@ -217,15 +217,21 @@ export function createLiveCustodyDeps(input: {
   ): Promise<CustodyCacheCredential> => {
     const credential = await input.cache.get(handle, minTtlMs)
     if ('state' in credential) return credential
-    const vaultCredentialId = (credential as { credentialId?: unknown })
-      .credentialId
+    // Wire-format credentials (`core.ClaustrumCredential`) name the id in
+    // snake_case (`credential_id`); internal callers carry it as
+    // `credentialId`. Accept both so the runtime fence can compare.
+    const rawCredentialId =
+      (credential as { credentialId?: unknown; credential_id?: unknown })
+        .credentialId ??
+      (credential as { credential_id?: unknown }).credential_id
+    const vaultCredentialId =
+      typeof rawCredentialId === 'string' ? rawCredentialId : undefined
     let payload: { access_token?: unknown; refresh_token?: unknown } = {}
     try {
       payload = JSON.parse(credential.payload)
     } catch {}
     return {
-      credentialId:
-        typeof vaultCredentialId === 'string' ? vaultCredentialId : undefined,
+      credentialId: vaultCredentialId,
       recordVersion: credential.recordVersion,
       access:
         typeof payload.access_token === 'string' ? payload.access_token : '',

@@ -392,9 +392,11 @@ describe('Claustrum custody tombstones', () => {
     if (!anthropic) throw new Error('missing anthropic fixture')
     const account = anthropic.accounts[0]
     if (!account) throw new Error('missing anthropic account fixture')
-    const missingHandle = { ...account }
+    const missingHandle: Record<string, unknown> = { ...account }
+    missingHandle.label = 'missing-handle'
     delete missingHandle.handle
-    const missingCredentialId = { ...account }
+    const missingCredentialId: Record<string, unknown> = { ...account }
+    missingCredentialId.label = 'missing-credential-id'
     delete missingCredentialId.credential_id
     anthropic.accounts = [
       missingHandle,
@@ -407,11 +409,13 @@ describe('Claustrum custody tombstones', () => {
       oauthFixture.provider,
       'anthropic-auth',
     )
-    expect(parsed.corruptLabels).toEqual(new Set([String(account.label)]))
+    expect(parsed.corruptLabels).toEqual(
+      new Set(['missing-handle', 'missing-credential-id']),
+    )
     expect(parsed.accounts).toHaveLength(1)
   })
 
-  test('marks non-canonical credential IDs as corrupt bindings', () => {
+  test('accepts a non-canonical credential ID and carries it verbatim', () => {
     const fixture = structuredClone(handlesFixture) as {
       providers: Array<{
         provider: string
@@ -424,7 +428,35 @@ describe('Claustrum custody tombstones', () => {
     if (!anthropic) throw new Error('missing anthropic fixture')
     const account = anthropic.accounts[0]
     if (!account) throw new Error('missing anthropic account fixture')
-    anthropic.accounts = [{ ...account, credential_id: 'wrong' }]
+    anthropic.accounts = [{ ...account, credential_id: 'oauth:anthropic' }]
+
+    const parsed = readCustodyHandles(
+      fixture,
+      oauthFixture.provider,
+      'anthropic-auth',
+    )
+    expect(parsed.corruptLabels).toEqual(new Set())
+    expect(parsed.accounts).toHaveLength(1)
+    expect(parsed.accounts[0]?.credentialId).toBe('oauth:anthropic')
+  })
+
+  test('marks every duplicate-label entry as corrupt', () => {
+    const fixture = structuredClone(handlesFixture) as {
+      providers: Array<{
+        provider: string
+        accounts: Array<Record<string, unknown>>
+      }>
+    }
+    const anthropic = fixture.providers.find(
+      (provider) => provider.provider === oauthFixture.provider,
+    )
+    if (!anthropic) throw new Error('missing anthropic fixture')
+    const account = anthropic.accounts[0]
+    if (!account) throw new Error('missing anthropic account fixture')
+    anthropic.accounts = [
+      { ...account, credential_id: 'oauth:anthropic:a' },
+      { ...account, credential_id: 'oauth:anthropic:b' },
+    ]
 
     const parsed = readCustodyHandles(
       fixture,
@@ -432,6 +464,7 @@ describe('Claustrum custody tombstones', () => {
       'anthropic-auth',
     )
     expect(parsed.corruptLabels).toEqual(new Set([String(account.label)]))
+    expect(parsed.accounts).toEqual([])
   })
 
   test('throws when the requested provider is absent', () => {

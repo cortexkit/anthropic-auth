@@ -905,7 +905,7 @@ describe('account command INFO logs (via plugin)', () => {
       expect(text).toBe(
         [
           'Custody takeover refused:',
-          "main: TAKEOVER_INCOMPLETE_MAIN_REAL — Onboard the main account into the Claustrum vault with Claustrum's tooling (see its runbook) before retrying.",
+          'main: TAKEOVER_INCOMPLETE_MAIN_REAL — Mint a handle with `ck auth mint-handle`; this plugin then writes the manifest entry.',
           'Work account: binding_missing',
           'Personal account: binding_missing',
         ].join('\n'),

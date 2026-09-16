@@ -3,6 +3,7 @@ import { access, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
+  custodyCredentialId,
   custodyTombstoneOAuth,
   getAccountStatePath,
   loadAccounts,
@@ -771,6 +772,8 @@ describe('exit and terminating re-login', () => {
               main ? 'vault-main-access' : 'vault-fallback-access',
               main ? 3 : fallbackRecordVersion,
               20_000_000,
+              undefined,
+              main ? custodyCredentialId('main') : custodyCredentialId(label),
             )
           }),
         onFetch: (input) => {

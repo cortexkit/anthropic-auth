@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
@@ -9,6 +9,7 @@ import {
 } from '../custody-live.ts'
 import {
   acquireCustodyTransitionLocks,
+  CUSTODY_PREFLIGHT_MIN_TTL_MS,
   CustodyLockBusyError,
   CustodyPreflightRefusedError,
   CustodyStateMismatchError,
@@ -167,7 +168,7 @@ describe('custody mode', () => {
       expect(cacheCalls).toEqual([
         {
           handle: manifestHandle,
-          minTtlMs: core.getRefreshBeforeExpiryMs(storage) + 30 * 60_000,
+          minTtlMs: CUSTODY_PREFLIGHT_MIN_TTL_MS,
         },
       ])
     } finally {
@@ -187,7 +188,6 @@ describe('custody mode', () => {
     const directory = await mkdtemp(join(tmpdir(), 'custody-live-adapter-'))
     const storagePath = join(directory, 'storage.json')
     const manifestPath = join(directory, 'handles.json')
-    const debugMessages: string[] = []
     try {
       await expect(
         core.writeCustodyHandleManifestEntry({
@@ -210,18 +210,16 @@ describe('custody mode', () => {
         storagePath,
         cache: {
           get: async (_handle, minTtlMs) => ({
-            payload: JSON.stringify({
-              access_token: 'vault-access',
-              refresh_token: 'vault-refresh',
-            }),
-            expiresAtMs: null,
+            credentialId: 'oauth:anthropic:x',
             recordVersion: 1,
-            accountId: 'vault-account',
+            access: 'vault-access',
+            refresh: 'vault-refresh',
+            expiresAt: null,
+            state: 'usable',
           }),
         },
         latestGetAuth: get,
         now,
-        debug: (message: string) => debugMessages.push(message),
       })
 
       const input = await deps.preflightInput(
@@ -231,12 +229,29 @@ describe('custody mode', () => {
       input.bindings[0]!.credentialId = 'oauth:anthropic:x'
       const plan = await preflightClaustrumTakeover(input)
       expect(plan).toMatchObject({ accounts: [{ id: 'main' }] })
-      expect(debugMessages).toEqual([
-        'custody identity check skipped: vault supplied no credential id',
-      ])
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
+  })
+
+  test('custody: preflight refuses when the vault omits a credential id', async () => {
+    const input = preflightInput({
+      cache: {
+        get: async (_handle: string, _minTtlMs: number) => ({
+          handle: 'handle-main',
+          recordVersion: 4,
+          access: 'vault-access',
+          refresh: 'vault-refresh',
+          expiresAt: Number.MAX_SAFE_INTEGER,
+          state: 'usable' as const,
+        }),
+      },
+    })
+
+    await expect(preflightClaustrumTakeover(input)).rejects.toMatchObject({
+      code: 'custody_preflight_refused',
+      reason: 'credential_identity_mismatch',
+    })
   })
 
   test('custody: preflight verifies every account before any write', async () => {
@@ -395,11 +410,69 @@ describe('custody mode', () => {
       },
     })
 
-    await expect(preflightClaustrumTakeover(input)).rejects.toMatchObject({
-      code: 'custody_preflight_refused',
+    const error = await preflightClaustrumTakeover(input).catch(
+      (error: unknown) => error,
+    )
+    expect(error).toBeInstanceOf(CustodyPreflightRefusedError)
+    const serialized = (error as CustodyPreflightRefusedError).toJSON() as {
+      ok: boolean
+      accountId: string
+      reason: string
+      refusals: Array<{ label: string; reason: string; guidance?: unknown }>
+    }
+    expect(serialized).toMatchObject({
+      ok: false,
       accountId: 'main',
       reason: 'TAKEOVER_INCOMPLETE_MAIN_REAL',
     })
+    const guidance = serialized.refusals[0]?.guidance
+    expect(typeof guidance).toBe('string')
+    expect(guidance as string).toContain('ck auth mint-handle')
+    expect(guidance as string).not.toContain('migrate-plugin')
+  })
+
+  test('custody: preflight hands a small serving margin to cache.get even when expiry is far below the refresh floor', async () => {
+    const cacheCalls: Array<{ handle: string; minTtlMs: number }> = []
+    // Credential expires well beyond the small margin (5 min) but far below
+    // the previous 4.5 h refresh floor — the readiness check must accept it
+    // and ask the cache for a tiny min-t-tl, not rotate it.
+    const expiresAt = now + 60 * 60_000
+    const oldRefreshFloorMs =
+      core.getRefreshBeforeExpiryMs({
+        version: 1,
+        accounts: [],
+        refresh: { refreshBeforeExpiryMinutes: 240 },
+      }) +
+      30 * 60_000
+    const input = preflightInput({
+      storage: { refresh: { refreshBeforeExpiryMinutes: 240 } },
+      cache: {
+        get: async (handle: string, { minTtlMs }: { minTtlMs: number }) => {
+          cacheCalls.push({ handle, minTtlMs })
+          return {
+            credentialId:
+              handle === 'handle-main'
+                ? 'oauth:anthropic:main'
+                : 'oauth:anthropic:work',
+            recordVersion: 4,
+            access: `vault-secret-${handle}`,
+            refresh: `vault-refresh-${handle}`,
+            expiresAt,
+            state: 'usable' as const,
+          }
+        },
+      },
+    })
+
+    await expect(preflightClaustrumTakeover(input)).resolves.toMatchObject({
+      accounts: [{ id: 'main' }, { id: 'work' }],
+    })
+    for (const call of cacheCalls)
+      expect(call.minTtlMs).toBe(CUSTODY_PREFLIGHT_MIN_TTL_MS)
+    expect(cacheCalls).toHaveLength(2)
+    expect(cacheCalls.every((call) => call.minTtlMs < oldRefreshFloorMs)).toBe(
+      true,
+    )
   })
 
   test('custody: preflight refuses a tombstoned main without its manifest binding', async () => {
@@ -1271,5 +1344,134 @@ describe('custody mode', () => {
       }),
     ).resolves.toBe('changed')
     expect(calls).toEqual(['local'])
+  })
+})
+
+describe('custody end-to-end binding', () => {
+  test('writes, resolves, preflights, removes, and local-exits a non-derived credential id for main', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'custody-e2e-'))
+    const parent = join(directory, 'manifest')
+    const manifestPath = join(parent, 'handles.json')
+    const storagePath = join(directory, 'storage.json')
+    await mkdir(parent, { mode: 0o700 })
+    const handle = `ckh_${'M'.repeat(43)}`
+    const access = 'local-access'
+    const refresh = 'local-refresh'
+    try {
+      // 1) Real writer accepts a non-derived id and stores it verbatim.
+      const writeResult = await core.writeCustodyHandleManifestEntry({
+        path: manifestPath,
+        entry: {
+          label: 'main',
+          handle,
+          credentialId: 'oauth:anthropic',
+        },
+      })
+      expect(writeResult).toEqual({ status: 'written' })
+
+      // 2) Real reader + resolver carry the id back, no derivation.
+      const reader = new core.CustodyHandleManifestReader({
+        path: manifestPath,
+        provider: 'anthropic',
+        serve: 'anthropic-auth',
+      })
+      const manifestResult = await reader.read()
+      expect(manifestResult.status).toBe('ready')
+      if (manifestResult.status !== 'ready') throw new Error('not ready')
+      const resolution = core.resolveCustodyHandle({
+        account: {
+          id: 'main',
+          label: 'main',
+          type: 'oauth',
+          refresh: '',
+        },
+        manifest: manifestResult.manifest,
+      })
+      expect(resolution.status).toBe('resolved')
+      if (resolution.status !== 'resolved') throw new Error('not resolved')
+      expect(resolution.source).toBe('manifest')
+      if (resolution.source !== 'manifest') throw new Error('not manifest')
+      expect(resolution.credentialId).toBe('oauth:anthropic')
+
+      // 3) Real binding construction (mirrors `readBindings` and the index.ts
+      // ~8763/4636 sites): use the resolved id verbatim, derive only as a
+      // legacy-source fallback.
+      const bindingCredentialId =
+        resolution.source === 'manifest'
+          ? (resolution.credentialId ?? core.custodyCredentialId('main'))
+          : core.custodyCredentialId('main')
+
+      // 4) Real preflight, cache stub returning the same id.
+      const plan = await preflightClaustrumTakeover({
+        now,
+        storage: { refresh: { refreshBeforeExpiryMinutes: 5 } },
+        main: { id: 'main', label: 'main', enabled: true },
+        fallbacks: [],
+        hostAuth: { get: () => core.custodyTombstoneOAuth('anthropic') },
+        bindings: [
+          {
+            accountId: 'main',
+            label: 'main',
+            handle: resolution.handle,
+            credentialId: bindingCredentialId,
+            source: resolution.source,
+          },
+        ],
+        cache: {
+          get: async (_h, _opts) => ({
+            credentialId: 'oauth:anthropic',
+            recordVersion: 4,
+            access: 'vault-access',
+            refresh: 'vault-refresh',
+            expiresAt: now + 60 * 60_000,
+            state: 'usable' as const,
+          }),
+        },
+      })
+      expect(plan.accounts).toHaveLength(1)
+      expect(plan.accounts[0]?.credentialId).toBe('oauth:anthropic')
+      expect(plan.accounts[0]?.handle).toBe(handle)
+
+      // 5) Real local-exit path: persist a labelled main account, drive
+      // acknowledgeLocalOAuthLoginFromStorage with a completion credentialId
+      // keyed off the manifest resolution, and assert the binding is cleared.
+      await core.saveAccounts(
+        {
+          version: 1,
+          accounts: [
+            {
+              id: 'main',
+              label: 'main',
+              type: 'oauth',
+              access,
+              refresh,
+              enabled: true,
+            },
+          ],
+        },
+        storagePath,
+      )
+      const { acknowledgeLocalOAuthLoginFromStorage, localAuthFingerprint } =
+        await import('../local-login.ts')
+      const exitResult = await acknowledgeLocalOAuthLoginFromStorage(
+        {
+          accountId: 'main',
+          credentialId: bindingCredentialId,
+          authFingerprint: localAuthFingerprint(access, refresh),
+          completedAt: now,
+        },
+        {
+          accountStoragePath: storagePath,
+          manifestPath,
+        },
+      )
+      expect(exitResult).toBe('cleared')
+      const reloaded = await reader.read()
+      expect(reloaded.status).toBe('ready')
+      if (reloaded.status !== 'ready') throw new Error('not ready')
+      expect(reloaded.manifest.accounts).toEqual([])
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 })

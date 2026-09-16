@@ -1,5 +1,4 @@
 import {
-  getRefreshBeforeExpiryMs,
   isCustodyTombstoneOAuth,
   setClaustrumModePersistent,
 } from '@cortexkit/anthropic-auth-core'
@@ -17,6 +16,12 @@ type EvidenceDimension = 'V' | 'N' | 'unknown'
 type Lock = { release: () => Promise<void> }
 
 export const OPENCODE_MAIN_OAUTH_REFRESH_LOCK = 'opencode-main-oauth-refresh'
+
+// `cache.get` interprets `min_ttl_ms` as a staleness floor — a value below it
+// forces an upstream refresh. The preflight is a readiness check, so the floor
+// is intentionally tiny: just enough to ensure the credential can serve the
+// takeover without forcing the cache to rotate it during the check.
+export const CUSTODY_PREFLIGHT_MIN_TTL_MS = 5 * 60_000
 
 export type CustodyCacheCredential = {
   credentialId?: string
@@ -246,8 +251,11 @@ export async function preflightClaustrumTakeover(
   const mainAuth = await input.hostAuth.get()
   const mainIsTombstoned = isCustodyTombstoneOAuth(mainAuth, 'anthropic')
 
-  const minTtlMs =
-    getRefreshBeforeExpiryMs(input.storage as never) + 30 * 60_000
+  // `cache.get` treats `min_ttl_ms` as a staleness floor: a value below it
+  // forces an upstream refresh. A preflight must not rotate the credential it
+  // is about to use, so the floor is reduced to a small serving margin — the
+  // vault owns rotation and only needs "fresh enough to serve the takeover".
+  const minTtlMs = CUSTODY_PREFLIGHT_MIN_TTL_MS
   const accounts: ClaustrumTakeoverPlan['accounts'] = []
   const refusals: CollectedPreflightRefusal[] = []
   const refuse = (
@@ -262,7 +270,7 @@ export async function preflightClaustrumTakeover(
       reason === 'TAKEOVER_INCOMPLETE_MAIN_REAL'
         ? {
             guidance:
-              "Onboard the main account into the Claustrum vault with Claustrum's tooling (see its runbook) before retrying.",
+              'Mint a handle with `ck auth mint-handle`; this plugin then writes the manifest entry.',
           }
         : {}),
     })
@@ -303,12 +311,15 @@ export async function preflightClaustrumTakeover(
       refuse(route, 'credential_unusable')
       continue
     }
-    // Without a vault id, a same-account wrong-record response remains possible; the vault `account_id` vs persisted `anthropicAccountUuid` fence is the live protection.
-    if (credential.credentialId === undefined)
-      input.debug?.(
-        'custody identity check skipped: vault supplied no credential id',
-      )
-    else if (credential.credentialId !== binding.credentialId) {
+    // Refuse when the vault omits an id: skipping would make the manifest's
+    // `credential_id` decorative, since there is then nothing to compare it
+    // against. The current vault daemon always supplies the id on a successful
+    // get, so this branch is unreachable in production today.
+    if (credential.credentialId === undefined) {
+      refuse(route, 'credential_identity_mismatch')
+      continue
+    }
+    if (credential.credentialId !== binding.credentialId) {
       refuse(route, 'credential_identity_mismatch')
       continue
     }

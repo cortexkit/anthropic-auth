@@ -68,6 +68,7 @@ export function credentialResponse(
   recordVersion: number,
   expiresAtMs = Date.now() + 60_000,
   accountId?: string,
+  credentialId?: string,
 ) {
   return {
     result: {
@@ -77,6 +78,7 @@ export function credentialResponse(
       expires_at_ms: expiresAtMs,
       record_version: recordVersion,
       ...(accountId && { account_id: accountId }),
+      ...(credentialId && { credential_id: credentialId }),
     },
   }
 }
@@ -123,6 +125,14 @@ export async function writeManifest(
         {
           provider: 'anthropic',
           serve,
+          // Label-derived ids are a fixture convenience, not main's real shape.
+          // The vault holds exactly two anthropic credentials: the UNLABELLED
+          // `oauth:anthropic` (main) and `oauth:anthropic:work-alt`. Nothing about a
+          // production binding derives from the label — the manifest carries whatever
+          // id the handle was minted against, and the runtime fence compares it with
+          // what `credential.get` returns. Provider scoping only requires the second
+          // segment to be `anthropic`, so a labelled id is valid here and would still
+          // mismatch the vault in production. Read this before inferring a shape.
           accounts: entries.map(({ label, handle }) => ({
             label,
             handle,
