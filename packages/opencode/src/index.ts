@@ -625,6 +625,7 @@ async function sendIgnoredMessage(
     noReply?: boolean
     beforeActiveAssistant?: boolean
     canSend?: () => boolean
+    onMessageId?: (messageId: string) => void
   } = {},
 ): Promise<boolean> {
   const session = ctx.client.session as PluginSessionClient | undefined
@@ -653,6 +654,7 @@ async function sendIgnoredMessage(
   // A new user prompt can start while that request is in flight, so re-check the
   // caller's delivery lease immediately before inserting the ignored message.
   if (options.canSend && !options.canSend()) return false
+  if (request.body.messageID) options.onMessageId?.(request.body.messageID)
 
   if (typeof session?.promptAsync === 'function') {
     await session.promptAsync(request)
@@ -1087,6 +1089,8 @@ const anthropicAuthPlugin = async (
   const desktopNoticeSafeSessions = new Set<string>()
   const desktopNoticeLatestUserMessages = new Map<string, string>()
   const desktopNoticeIdleUserMessages = new Map<string, string>()
+  const desktopNoticeMessageIds = new Map<string, Set<string>>()
+  const desktopNoticeUserRevisions = new Map<string, number>()
   const desktopNoticeProbes = new Map<string, number>()
   const stickySessionRouter = new StickySessionRouter({
     path:
@@ -4044,6 +4048,11 @@ const anthropicAuthPlugin = async (
 
   function queueDesktopNotice(sessionId: string, text: string) {
     if (isTuiConnected(sessionId)) return
+    logger.debug('fable-fallback', 'Desktop notification queued', {
+      session: sessionId,
+      safe: desktopNoticeSafeSessions.has(sessionId),
+      text,
+    })
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
     // OpenCode awaits event handlers before it evaluates the loop exit condition.
     // Escape the post-idle session update, then probe outside that critical section.
@@ -4060,6 +4069,36 @@ const anthropicAuthPlugin = async (
     }
     if (desktopNoticeSafeSessions.has(sessionId)) {
       scheduleDesktopNoticeProbe(sessionId)
+    }
+  }
+
+  function rememberDesktopNoticeMessageId(
+    sessionId: string,
+    messageId: string,
+  ) {
+    const messageIds =
+      desktopNoticeMessageIds.get(sessionId) ?? new Set<string>()
+    messageIds.add(messageId)
+    while (messageIds.size > 8) {
+      const oldest = messageIds.values().next().value
+      if (oldest) messageIds.delete(oldest)
+      else break
+    }
+    desktopNoticeMessageIds.delete(sessionId)
+    desktopNoticeMessageIds.set(sessionId, messageIds)
+    while (desktopNoticeMessageIds.size > 128) {
+      const oldest = desktopNoticeMessageIds.keys().next().value
+      if (oldest) desktopNoticeMessageIds.delete(oldest)
+      else break
+    }
+  }
+
+  function grantDesktopNoticeLease(sessionId: string) {
+    desktopNoticeSafeSessions.add(sessionId)
+    while (desktopNoticeSafeSessions.size > 128) {
+      const oldest = desktopNoticeSafeSessions.values().next().value
+      if (oldest) desktopNoticeSafeSessions.delete(oldest)
+      else break
     }
   }
 
@@ -4090,6 +4129,12 @@ const anthropicAuthPlugin = async (
   }
 
   async function flushDesktopNoticesIfIdle(sessionId: string, attempt: number) {
+    logger.debug('fable-fallback', 'Desktop notification flush considered', {
+      session: sessionId,
+      attempt,
+      safe: desktopNoticeSafeSessions.has(sessionId),
+      pending: pendingDesktopNotices.has(sessionId),
+    })
     if (
       !desktopNoticeSafeSessions.has(sessionId) ||
       !pendingDesktopNotices.has(sessionId)
@@ -4150,13 +4195,28 @@ const anthropicAuthPlugin = async (
           return
         }
         try {
+          const userRevision = desktopNoticeUserRevisions.get(sessionId) ?? 0
           const sent = await sendIgnoredMessage(ctx, sessionId, text, {
             noReply: true,
             beforeActiveAssistant: true,
             canSend: () => desktopNoticeSafeSessions.has(sessionId),
+            onMessageId: (messageId) =>
+              rememberDesktopNoticeMessageId(sessionId, messageId),
           })
           if (!sent) return
           queue.shift()
+          if (
+            !desktopNoticeSafeSessions.has(sessionId) &&
+            pendingDesktopNotices.get(sessionId)?.[0] &&
+            (desktopNoticeUserRevisions.get(sessionId) ?? 0) === userRevision
+          ) {
+            // OpenCode marks its own noReply insertion busy without publishing a
+            // new idle event. Re-enter only through the same live-status probe;
+            // a genuine user message changes the revision and blocks this path.
+            grantDesktopNoticeLease(sessionId)
+            scheduleDesktopNoticeProbe(sessionId)
+            return
+          }
         } catch (error) {
           logger.warn('fable-fallback', 'Desktop notification failed', {
             session: sessionId,
@@ -5237,21 +5297,32 @@ const anthropicAuthPlugin = async (
       if (!sessionId) return
 
       if (value.type === 'message.updated' && info?.role === 'user') {
-        if (typeof info.id === 'string') {
-          desktopNoticeLatestUserMessages.set(sessionId, info.id)
-          if (
-            desktopNoticeSafeSessions.has(sessionId) &&
-            desktopNoticeIdleUserMessages.get(sessionId) !== info.id
-          ) {
-            // A new user message can precede OpenCode's busy status event. Revoke
-            // the idle-delivery lease immediately so an ignored notice cannot
-            // become the active request parent and duplicate a provider turn.
-            // Repeated updates for the user message that produced the current
-            // idle event are harmless and must not suppress delivery forever.
+        // promptAsync publishes ignored notices as user-message updates. They do
+        // not start a provider turn, so only genuine user messages revoke the lease.
+        const isDesktopNotice =
+          typeof info.id === 'string' &&
+          desktopNoticeMessageIds.get(sessionId)?.has(info.id)
+        if (!isDesktopNotice) {
+          desktopNoticeUserRevisions.set(
+            sessionId,
+            (desktopNoticeUserRevisions.get(sessionId) ?? 0) + 1,
+          )
+          if (typeof info.id === 'string') {
+            desktopNoticeLatestUserMessages.set(sessionId, info.id)
+            if (
+              desktopNoticeSafeSessions.has(sessionId) &&
+              desktopNoticeIdleUserMessages.get(sessionId) !== info.id
+            ) {
+              // A new user message can precede OpenCode's busy status event. Revoke
+              // the idle-delivery lease immediately so an ignored notice cannot
+              // become the active request parent and duplicate a provider turn.
+              // Repeated updates for the user message that produced the current
+              // idle event are harmless and must not suppress delivery forever.
+              desktopNoticeSafeSessions.delete(sessionId)
+            }
+          } else {
             desktopNoticeSafeSessions.delete(sessionId)
           }
-        } else {
-          desktopNoticeSafeSessions.delete(sessionId)
         }
       }
 
@@ -5274,12 +5345,7 @@ const anthropicAuthPlugin = async (
         // live status map is still idle. OpenCode 1.18 no longer guarantees a
         // session.updated event after session.idle, so that event cannot be used
         // as the release signal.
-        desktopNoticeSafeSessions.add(sessionId)
-        while (desktopNoticeSafeSessions.size > 128) {
-          const oldest = desktopNoticeSafeSessions.values().next().value
-          if (oldest) desktopNoticeSafeSessions.delete(oldest)
-          else break
-        }
+        grantDesktopNoticeLease(sessionId)
         scheduleDesktopNoticeProbe(sessionId)
       }
 
@@ -5297,6 +5363,8 @@ const anthropicAuthPlugin = async (
         desktopNoticeSafeSessions.delete(sessionId)
         desktopNoticeLatestUserMessages.delete(sessionId)
         desktopNoticeIdleUserMessages.delete(sessionId)
+        desktopNoticeMessageIds.delete(sessionId)
+        desktopNoticeUserRevisions.delete(sessionId)
         for (const recoveryKey of pendingRecoveryDesktopNotices.keys()) {
           if (recoveryKey.startsWith(`${sessionId}\0`)) {
             pendingRecoveryDesktopNotices.delete(recoveryKey)

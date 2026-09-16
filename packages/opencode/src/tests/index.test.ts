@@ -19040,6 +19040,13 @@ describe('auth.loader', () => {
         return {}
       },
     )
+    const switchNoticeCompletion = deferred()
+    let holdSwitchNotice = true
+    mockClient.session.promptAsync = mock(async () => {
+      if (!holdSwitchNotice) return
+      holdSwitchNotice = false
+      await switchNoticeCompletion.promise
+    })
     const plugin = await getPlugin(mockClient)
     const result = await plugin.auth.loader(
       () =>
@@ -19371,6 +19378,38 @@ describe('auth.loader', () => {
     const restored = await restoredPromise
     await restored.text()
     expect(normalModels.at(-1)).toBe('claude-fable-5')
+
+    await waitForSidebarState((state) =>
+      Boolean(
+        state.fableRecoveries?.some(
+          (recovery) =>
+            recovery.sessionId === 'ses_fable_filter' &&
+            recovery.mode === 'fable',
+        ),
+      ),
+    )
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: switchNotificationMessageId,
+            sessionID: 'ses_fable_filter',
+            role: 'user',
+          },
+        },
+      },
+    })
+    await plugin.event?.({
+      event: {
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_fable_filter',
+          status: { type: 'busy' },
+        },
+      },
+    })
+    switchNoticeCompletion.resolve()
 
     await waitForMockCall({
       mock: {
