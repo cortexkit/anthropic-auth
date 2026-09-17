@@ -31,6 +31,7 @@ import {
   buildPrimeRequestBody,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
+  ClaustrumCredentialError,
   CustodyTombstoneRefreshError,
   clearClaustrumRefreshErrorPersistent,
   custodyCredentialId,
@@ -6582,6 +6583,280 @@ describe('fallback Claustrum credential resolution', () => {
     })
     await fixture.plugin.dispose?.()
   })
+
+  test.serial(
+    'logs a rotated credential version for a successful 401 retry',
+    async () => {
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      let cache: {
+        invalidate: (handle: string, recordVersion?: number) => void
+        get: (handle: string) => Promise<unknown>
+      }
+      let plugin: { dispose?: () => Promise<void> } | undefined
+      const fallbackHandle = `ckh_${'R'.repeat(43)}`
+      let fallbackGets = 0
+      try {
+        const fixture = await bootRuledClaustrumRow({
+          route: 'fallback-first',
+          fallbacks: [
+            {
+              label: 'rotated-401',
+              handle: fallbackHandle,
+              access: 'vault-old-access',
+            },
+          ],
+          connector: (calls) =>
+            connectorFor(calls, (method, params) => {
+              if (method !== 'credential.get') return { result: {} }
+              if (String(params.handle) === ruledMainHandle)
+                return credentialResponse('vault-main-access', 1)
+              fallbackGets += 1
+              return credentialResponse(
+                fallbackGets === 1 ? 'vault-old-access' : 'vault-new-access',
+                fallbackGets === 1 ? 41 : 42,
+              )
+            }),
+          onFetch: async (input, init) => {
+            const url = extractUrl(input as string | URL | Request)
+            if (url.includes('/v1/messages')) {
+              const authorization = new Headers(init?.headers).get(
+                'authorization',
+              )
+              if (authorization === 'Bearer vault-old-access') {
+                cache.invalidate(fallbackHandle, 41)
+                await cache.get(fallbackHandle)
+                return new Response('{}', { status: 401 })
+              }
+            }
+            return new Response('{}', { status: 200 })
+          },
+        })
+        plugin = fixture.plugin
+        cache = fixture.plugin.__claustrumCredentialCache
+        const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+        expect(response.status).toBe(200)
+        const record = logs.find(
+          (candidate) => candidate.message === 'vault-served 401 recovery',
+        )
+        expect(record?.payload?.retryAttempted).toBe(true)
+        expect(record?.payload?.retryOutcome).toBe('retry-succeeded')
+        expect(record?.payload?.reportOutcome).toBe('not-attempted')
+        expect(record?.payload?.retryServedRecordVersion).toBeGreaterThan(
+          record?.payload?.servedRecordVersion as number,
+        )
+      } finally {
+        await plugin?.dispose?.()
+        __setLogTestSink(null)
+      }
+    },
+  )
+
+  test.serial(
+    'logs an unchanged credential version when a 401 is genuinely rejected',
+    async () => {
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      let plugin: { dispose?: () => Promise<void> } | undefined
+      try {
+        const fixture = await bootRuledClaustrumRow({
+          route: 'fallback-first',
+          fallbacks: [
+            {
+              label: 'unchanged-401',
+              handle: `ckh_${'N'.repeat(43)}`,
+              access: 'vault-unchanged-access',
+            },
+          ],
+          connector: (calls) =>
+            connectorFor(calls, (method, params) => {
+              if (method !== 'credential.get') return { result: {} }
+              if (String(params.handle) === ruledMainHandle)
+                return credentialResponse('vault-main-access', 1)
+              return credentialResponse('vault-unchanged-access', 52)
+            }),
+          response: new Response('{}', { status: 401 }),
+        })
+        plugin = fixture.plugin
+        const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+        expect(response.status).toBe(401)
+        expect(
+          fixture.calls.filter(
+            (call) => call.method === 'credential.report_auth_failure',
+          ),
+        ).not.toHaveLength(0)
+        const record = logs.find(
+          (candidate) => candidate.message === 'vault-served 401 recovery',
+        )
+        expect(record?.payload?.retryAttempted).toBe(false)
+        expect(record?.payload?.vaultGetAttempted).toBe(true)
+        expect(record?.payload?.retryOutcome).toBe('unchanged')
+        expect(record?.payload?.reportOutcome).toBe('reported')
+        expect(record?.payload?.servedRecordVersion).toBe(
+          record?.payload?.currentCachedRecordVersion,
+        )
+      } finally {
+        await plugin?.dispose?.()
+        __setLogTestSink(null)
+      }
+    },
+  )
+
+  test.serial('logs which branch suppressed a raced 401 report', async () => {
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+    let cache: {
+      invalidate: (handle: string, recordVersion?: number) => void
+      get: (handle: string) => Promise<unknown>
+    }
+    let plugin: { dispose?: () => Promise<void> } | undefined
+    const fallbackHandle = `ckh_${'P'.repeat(43)}`
+    let fallbackGets = 0
+    try {
+      const fixture = await bootRuledClaustrumRow({
+        route: 'fallback-first',
+        fallbacks: [
+          {
+            label: 'suppressed-401',
+            handle: fallbackHandle,
+            access: 'vault-old-access',
+          },
+        ],
+        connector: (calls) =>
+          connectorFor(calls, (method, params) => {
+            if (method !== 'credential.get') return { result: {} }
+            if (String(params.handle) === ruledMainHandle)
+              return credentialResponse('vault-main-access', 1)
+            fallbackGets += 1
+            if (fallbackGets === 1)
+              return credentialResponse('vault-old-access', 41)
+            if (fallbackGets === 2)
+              return credentialResponse('vault-new-access', 42)
+            throw new Error('retry credential unavailable')
+          }),
+        onFetch: async (input, init) => {
+          const url = extractUrl(input as string | URL | Request)
+          if (url.includes('/v1/messages')) {
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            if (authorization === 'Bearer vault-old-access') {
+              cache.invalidate(fallbackHandle, 41)
+              await cache.get(fallbackHandle)
+              return new Response('{}', { status: 401 })
+            }
+          }
+          return new Response('{}', { status: 200 })
+        },
+      })
+      plugin = fixture.plugin
+      cache = fixture.plugin.__claustrumCredentialCache
+      const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(response.status).toBe(200)
+      expect(
+        fixture.calls.some(
+          (call) =>
+            call.method === 'credential.report_auth_failure' &&
+            call.params.handle === fallbackHandle,
+        ),
+      ).toBe(false)
+      const record = logs.find(
+        (candidate) =>
+          candidate.message === 'vault-served 401 recovery' &&
+          String(candidate.payload?.reportOutcome).startsWith('suppressed-'),
+      )
+      expect(String(record?.payload?.reportOutcome)).toMatch(/^suppressed-/)
+      expect(record?.payload?.reportSuppressed).toBe(true)
+      expect(record?.payload?.reportSuppressedBy).toBe(
+        record?.payload?.reportOutcome,
+      )
+    } finally {
+      await plugin?.dispose?.()
+      __setLogTestSink(null)
+    }
+  })
+
+  test.serial(
+    'logs that no vault get was attempted during active retry backoff',
+    async () => {
+      const logs: LogTestRecord[] = []
+      __setLogTestSink((record) => logs.push(record))
+      let plugin: { dispose?: () => Promise<void> } | undefined
+      const fallbackHandle = `ckh_${'B'.repeat(43)}`
+      let failStartup = true
+      try {
+        const fixture = await bootRuledClaustrumRow({
+          route: { sticky: 'fallback-1' },
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 1, seven_day: 1 },
+            failClosedOnUnknownQuota: false,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: Date.now(),
+              },
+              seven_day: {
+                usedPercent: 100,
+                remainingPercent: 0,
+                checkedAt: Date.now(),
+              },
+            },
+            mainQuotaCheckedAt: Date.now(),
+          },
+          fallbacks: [
+            {
+              label: 'backoff-401',
+              handle: fallbackHandle,
+              access: 'vault-backoff-access',
+            },
+          ],
+          connector: (calls) =>
+            connectorFor(calls, (method, params) => {
+              if (method !== 'credential.get') return { result: {} }
+              if (String(params.handle) === ruledMainHandle)
+                return credentialResponse('vault-main-access', 1)
+              if (failStartup)
+                throw new ClaustrumCredentialError(
+                  'startup credential unavailable',
+                  'test_transient',
+                  'transient',
+                  'retry',
+                )
+              return credentialResponse('vault-backoff-access', 61)
+            }),
+          onFetch: (input, init) => {
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            if (authorization === 'Bearer vault-backoff-access')
+              return new Response('{}', { status: 401 })
+            return new Response('{}', { status: 200 })
+          },
+        })
+        plugin = fixture.plugin
+        const cache = fixture.plugin.__claustrumCredentialCache as any
+        failStartup = false
+        const servedCredential = await cache.get(fallbackHandle)
+        cache.seedForTest(fallbackHandle, servedCredential)
+
+        const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+        expect(response.status).toBe(401)
+        const record = logs.find(
+          (candidate) =>
+            candidate.message === 'vault-served 401 recovery' &&
+            candidate.payload?.retryOutcome === 'backoff-active',
+        )
+        if (!record) throw new Error(JSON.stringify(logs))
+        expect(record?.payload?.vaultGetAttempted).toBe(false)
+      } finally {
+        await plugin?.dispose?.()
+        __setLogTestSink(null)
+      }
+    },
+  )
 })
 
 async function readFeedEntries() {
