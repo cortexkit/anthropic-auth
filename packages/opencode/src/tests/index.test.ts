@@ -2652,7 +2652,7 @@ describe('fallback Claustrum credential resolution', () => {
       })
 
       expect(response.status).toBe(401)
-      expect(fixture.authorizations).toEqual([''])
+      expect(fixture.authorizations).toEqual(['Bearer vault-main-access-v17'])
       expect(
         fixture.calls.filter(
           (call) => call.method === 'credential.report_auth_failure',
