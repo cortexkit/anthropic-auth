@@ -6657,6 +6657,15 @@ describe('fallback Claustrum credential resolution', () => {
     await fixture.plugin.dispose?.()
   })
 
+  // The get-before-report arms below are the ONLY observer this path will ever
+  // have. The retry fires in the seconds between a vault rotation and the next
+  // proactive credential.get, so a healthy system never exercises it and
+  // production emits no signal either way. For code that runs daily, production
+  // is a second opinion and tests are a convenience; here they are the
+  // instrument. Weakening or deleting an arm is not a test change, it is
+  // removing the only thing that can report on this mechanism. They also pin the
+  // literal log message, which a peer system consumes -- a rename that keeps the
+  // fields but changes the string breaks that integration silently.
   test.serial(
     'logs a rotated credential version for a successful 401 retry',
     async () => {
