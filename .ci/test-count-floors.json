@@ -1,0 +1,17 @@
+{
+  "floors": {
+    "core": 199,
+    "opencode": 1894,
+    "pi": 114
+  },
+  "measurement": {
+    "head": "1b27511a3b59f9ac8f9640d5936cb0ee146925a8",
+    "dirtyPaths": 0
+  },
+  "evidence": {
+    "_note": "How each floor was established. Two runs agreeing proves only that they shared a subject — a contaminated tree reproduces perfectly. A derivation is a second instrument with a different failure mode, so it is independent of the run but NOT of the framework's counting convention: this repo has test.each sites where declaration-counting and runner-counting disagree. Neither is an oracle; agreement between the two is the evidence.",
+    "core": "measured twice, plus an independent git derivation of the expected delta against another ref",
+    "opencode": "measured twice, plus a per-file decomposition summing to the observed delta",
+    "pi": "measured twice only"
+  }
+}
