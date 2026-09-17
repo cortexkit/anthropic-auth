@@ -1225,6 +1225,7 @@ describe('fallback Claustrum credential resolution', () => {
       const authorizations: string[] = []
       const profileAuthorizations: string[] = []
       const quotaAuthorizations: string[] = []
+      const scheduledWarmCallbacks: Array<() => void> = []
       const client = createMockClient()
       let mainSlotAccess = ''
       let mainSlotExpires = 0
@@ -1316,6 +1317,12 @@ describe('fallback Claustrum credential resolution', () => {
       }) as unknown as typeof fetch
       const plugin = await getPlugin(client, undefined, {
         claustrumNow: () => now,
+        setTimeout: mock((callback: TestTimerHandler, delay?: number) => {
+          if (delay === 0 && typeof callback === 'function') {
+            scheduledWarmCallbacks.push(callback as () => void)
+          }
+          return { unref() {} } as unknown as ReturnType<typeof setTimeout>
+        }) as unknown as typeof setTimeout,
         claustrumConnector: connectorFor(calls, (method, params) => {
           if (method !== 'credential.get') return { result: {} }
           const isMain = params.handle === manifestHandle
@@ -1346,6 +1353,7 @@ describe('fallback Claustrum credential resolution', () => {
         authorizations,
         profileAuthorizations,
         quotaAuthorizations,
+        scheduledWarmCallbacks,
         setNow(value: number) {
           now = value
         },
@@ -1424,6 +1432,51 @@ describe('fallback Claustrum credential resolution', () => {
         expect(fixture.quotaAuthorizations).toContain(
           'Bearer vault-main-access',
         )
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'refreshes /claude-quota at startup for a vault-served main tombstone',
+      async () => {
+        const fixture = await bootVaultMain({ fallback: false })
+
+        await expectHandledCommandResponse(
+          fixture.plugin['command.execute.before']({
+            command: 'claude-quota',
+            arguments: '',
+            sessionID: 'vault-main-quota-startup',
+          }),
+        )
+
+        expect(fixture.quotaAuthorizations).toContain(
+          'Bearer vault-main-access',
+        )
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'does not reuse a main vault bearer after its 401 is reported',
+      async () => {
+        const fixture = await bootVaultMain({
+          fallback: false,
+          responseStatus: 401,
+        })
+
+        await fixture.result.fetch(MESSAGES_URL, request())
+        await expectHandledCommandResponse(
+          fixture.plugin['command.execute.before']({
+            command: 'claude-quota',
+            arguments: '',
+            sessionID: 'vault-main-stale-bearer',
+          }),
+        )
+
+        expect(fixture.quotaAuthorizations).not.toContain(
+          'Bearer vault-main-access',
+        )
+        expect(fixture.scheduledWarmCallbacks).toHaveLength(1)
         await fixture.plugin.dispose?.()
       },
     )
