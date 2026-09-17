@@ -490,6 +490,7 @@ export type AccountRefreshError = {
 }
 
 const DEFAULT_FALLBACK_ON = [401, 403, 429]
+// This vault-facing coupling is guarded by "keeps the vault-facing refresh TTL at 270 minutes" in accounts-persistence.test.ts.
 const MIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = MIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10

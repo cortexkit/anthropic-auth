@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
+import { strictEqual } from 'node:assert'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,6 +8,7 @@ import {
   type AccountStorage,
   createEmptyStorage,
   FallbackAccountManager,
+  getRefreshBeforeExpiryMs,
   hasNoLocalCredential,
   loadAccounts,
   type OAuthAccount,
@@ -30,6 +32,21 @@ test('recognizes an OAuth account with no local credential', () => {
   expect(hasNoLocalCredential({ refresh: '' })).toBe(true)
   expect(hasNoLocalCredential({ refresh: 'refresh' })).toBe(false)
   expect(hasNoLocalCredential({ access: '' })).toBe(false)
+})
+
+test('keeps the vault-facing refresh TTL at 270 minutes', () => {
+  const vaultMinTtlMs =
+    getRefreshBeforeExpiryMs(createEmptyStorage()) + 30 * 60_000
+  const expectedVaultMinTtlMs = 270 * 60_000
+  const guidance = [
+    'Vault coupling tripwire: this derived value sets the vault rotation period as token_lifetime - minTtl.',
+    "Lowering it lengthens the rotation period and repeatedly false-alarms the vault operator's stall detector.",
+    'Raising it is silent for the operator.',
+    'A lowering change requires advance notice to the vault operator with the new derived value.',
+    `The new derived value is ${vaultMinTtlMs / 60_000} minutes (${vaultMinTtlMs} ms).`,
+  ].join(' ')
+
+  strictEqual(vaultMinTtlMs, expectedVaultMinTtlMs, guidance)
 })
 
 test('preserves the Claustrum mode when a save supplies only handlesFile', async () => {
