@@ -2324,19 +2324,12 @@ const anthropicAuthPlugin = async (
   function liveMainVaultAccess(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
   ): string | undefined {
-    if (!storage || getClaustrumMode(storage) !== 'claustrum') return undefined
-    const account = mainCustodyAccount(custodyTombstoneOAuth('anthropic'))
-    const binding = resolveAccountCustodyHandle(account, storage)
-    if (
-      binding.status !== 'resolved' ||
-      !isOAuthAccountVaultOwned(storage, account, binding) ||
-      claustrumBlockedAccounts.has('main')
-    ) {
-      return undefined
-    }
-    const cached = claustrumCredentialCache?.peek(binding.handle)
-    if (hasClaustrumIdentityMismatch(account, cached)) return undefined
-    return usableClaustrumAccessToken(cached, claustrumNow())
+    return (
+      resolveClaustrumAccess(
+        mainCustodyAccount(custodyTombstoneOAuth('anthropic')),
+        storage,
+      ).accessToken || undefined
+    )
   }
 
   function resolveFallbackAccessToken(
@@ -2523,6 +2516,7 @@ const anthropicAuthPlugin = async (
           reporterSource,
         )
         claustrumLastReportedVersion.set(served.handle, served.recordVersion)
+        if (served.accountId === 'main') mainServedAccessToken = undefined
       } catch (error) {
         handleClaustrumCredentialError(served.accountId, error, served.handle)
         logger.warn('claustrum', 'failed to report credential failure', {
@@ -4100,7 +4094,9 @@ const anthropicAuthPlugin = async (
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        const servedMainAccessToken = mainServedAccessToken ?? auth.access
+        const latest = await loadAccounts(accountStoragePath)
+        const servedMainAccessToken =
+          mainServedAccessToken || auth.access || liveMainVaultAccess(latest)
         // Manual quota refresh accepts local OAuth access or the live bearer
         // serving a custody tombstone; an empty local slot alone remains refused.
         if (auth.type === 'oauth' && servedMainAccessToken) {
