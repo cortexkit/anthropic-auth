@@ -9,6 +9,7 @@ import {
   createEmptyStorage,
   FallbackAccountManager,
   getRefreshBeforeExpiryMs,
+  getVaultRefreshMinTtlMs,
   hasNoLocalCredential,
   loadAccounts,
   type OAuthAccount,
@@ -19,6 +20,8 @@ import { custodyTombstoneOAuth } from '../claustrum.ts'
 
 const directories: string[] = []
 
+// These paired tripwires cover both vault-facing minTtl routes: default
+// threshold/headroom derivation and the config-override floor.
 afterEach(async () => {
   await Promise.all(
     directories
@@ -35,8 +38,7 @@ test('recognizes an OAuth account with no local credential', () => {
 })
 
 test('keeps the vault-facing refresh TTL at 270 minutes', () => {
-  const vaultMinTtlMs =
-    getRefreshBeforeExpiryMs(createEmptyStorage()) + 30 * 60_000
+  const vaultMinTtlMs = getVaultRefreshMinTtlMs(createEmptyStorage())
   const expectedVaultMinTtlMs = 270 * 60_000
   // Anthropic OAuth access tokens live 8h; the vault refreshes a credential when
   // `now + minTtl >= expires_at`, so this value alone fixes the observed rotation
@@ -50,7 +52,7 @@ test('keeps the vault-facing refresh TTL at 270 minutes', () => {
   // token yields a 240m period), so bare numerals invite transposition by a reader
   // who lands on the assertion footer rather than the prose.
   const guidance = [
-    'Vault coupling tripwire: this derived value is passed as minTtl to Claustrum',
+    'Vault coupling tripwire (threshold + headroom route; paired with the config-floor tripwire below): this shared value is passed as minTtl to Claustrum',
     '`credential.get`, and the vault refreshes when `now + minTtl >= expires_at`,',
     'so it fixes the observed rotation period as token_lifetime - minTtl.',
     `CHANGED: minTtl ${vaultMinTtlMs / 60_000}m (was ${expectedVaultMinTtlMs / 60_000}m)`,
@@ -68,11 +70,11 @@ test('keeps the vault-facing refresh TTL at 270 minutes', () => {
 })
 
 test('floors a config override so it cannot lower the vault-facing minTtl', () => {
-  // The tripwire above watches the CONSTANT. This watches the other route to the
-  // same vault-facing value: the `refresh.refreshBeforeExpiryMinutes` config key.
-  // The floor in refreshBeforeExpiryMs is what makes the tripwire sufficient —
-  // without it, an operator could lower minTtl from config, lengthening the vault's
-  // rotation period, and the constant-watching tripwire would never fire.
+  // This watches the other route to the same vault-facing value: the
+  // `refresh.refreshBeforeExpiryMinutes` config key. The floor in
+  // refreshBeforeExpiryMs is what makes the paired tripwires sufficient — without
+  // it, an operator could lower minTtl from config, lengthening the vault's
+  // rotation period, and the threshold/headroom tripwire above would never fire.
   const storage = createEmptyStorage()
   storage.refresh = { ...storage.refresh, refreshBeforeExpiryMinutes: 60 }
   const floored = getRefreshBeforeExpiryMs(storage)
@@ -87,7 +89,7 @@ test('floors a config override so it cannot lower the vault-facing minTtl', () =
       'it is the only reason config cannot lower minTtl, and lowering minTtl LENGTHENS the',
       "vault's rotation period, which repeatedly false-alarms the vault operator's stall",
       'detector. Removing the floor makes that reachable from config alone, where the',
-      'constant-watching tripwire above cannot see it. If you removed it deliberately,',
+      'threshold/headroom tripwire above cannot see it. If you removed it deliberately,',
       'the vault operator holds a registered dependency on it and is owed notice.',
     ].join(' '),
   )
