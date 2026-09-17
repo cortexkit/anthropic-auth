@@ -105,11 +105,11 @@ import {
   getPersistedLogLevel,
   getPersistedMainQuota,
   getQuotaNextRefreshAt,
-  getRefreshBeforeExpiryMs,
   getRelayConfig,
   getRoutingMode,
   getStickyRoutingStatePath,
   getThinkingPrefixMismatchBehavior,
+  getVaultRefreshMinTtlMs,
   hashRefreshToken,
   type IdentityState,
   incrementPrimeUsagePersistent,
@@ -2796,7 +2796,7 @@ const anthropicAuthPlugin = async (
     const storage = enrollment.storage
     if (!storage) return
     cache = claustrumCredentialCache
-    const minTtlMs = getRefreshBeforeExpiryMs(storage) + 30 * 60_000
+    const minTtlMs = getVaultRefreshMinTtlMs(storage)
     let sidebarChanged = enrollment.enrolledAccountIds.length > 0
 
     const mainAuth =

@@ -508,9 +508,10 @@ export type AccountRefreshError = {
 }
 
 const DEFAULT_FALLBACK_ON = [401, 403, 429]
-// This vault-facing coupling is guarded by "keeps the vault-facing refresh TTL at 270 minutes" in accounts-persistence.test.ts.
 const MIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = MIN_REFRESH_BEFORE_EXPIRY_MINUTES
+// Claustrum requests extra headroom beyond the local refresh threshold.
+export const VAULT_REFRESH_HEADROOM_MINUTES = 30
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
 const MIN_REFRESH_RETRY_DELAY_MS = 5 * 60_000
 const MAX_REFRESH_RETRY_DELAY_MS = 60 * 60_000
@@ -3352,6 +3353,12 @@ function refreshBeforeExpiryMs(storage: AccountStorage | null) {
 
 export function getRefreshBeforeExpiryMs(storage: AccountStorage | null) {
   return refreshBeforeExpiryMs(storage)
+}
+
+export function getVaultRefreshMinTtlMs(storage: AccountStorage | null) {
+  return (
+    getRefreshBeforeExpiryMs(storage) + VAULT_REFRESH_HEADROOM_MINUTES * 60_000
+  )
 }
 
 export function getRefreshIntervalMs(storage: AccountStorage | null) {
