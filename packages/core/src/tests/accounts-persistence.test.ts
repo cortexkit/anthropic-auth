@@ -38,12 +38,22 @@ test('keeps the vault-facing refresh TTL at 270 minutes', () => {
   const vaultMinTtlMs =
     getRefreshBeforeExpiryMs(createEmptyStorage()) + 30 * 60_000
   const expectedVaultMinTtlMs = 270 * 60_000
+  // Anthropic OAuth access tokens live 8h; the vault refreshes a credential when
+  // `now + minTtl >= expires_at`, so this value alone fixes the observed rotation
+  // period. State the resulting PERIOD, not just the minTtl: the period is the
+  // number the vault operator needs to pre-seed their stall detector.
+  const tokenLifetimeMinutes = 480
+  const newPeriodMinutes = tokenLifetimeMinutes - vaultMinTtlMs / 60_000
+  const oldPeriodMinutes = tokenLifetimeMinutes - expectedVaultMinTtlMs / 60_000
   const guidance = [
-    'Vault coupling tripwire: this derived value sets the vault rotation period as token_lifetime - minTtl.',
-    "Lowering it lengthens the rotation period and repeatedly false-alarms the vault operator's stall detector.",
-    'Raising it is silent for the operator.',
-    'A lowering change requires advance notice to the vault operator with the new derived value.',
-    `The new derived value is ${vaultMinTtlMs / 60_000} minutes (${vaultMinTtlMs} ms).`,
+    'Vault coupling tripwire: this derived value is passed as minTtl to Claustrum',
+    '`credential.get`, and the vault refreshes when `now + minTtl >= expires_at`.',
+    `It therefore sets the observed rotation period to token_lifetime - minTtl =`,
+    `${tokenLifetimeMinutes} - ${vaultMinTtlMs / 60_000} = ${newPeriodMinutes} minutes`,
+    `(was ${oldPeriodMinutes} minutes at the expected ${expectedVaultMinTtlMs / 60_000}).`,
+    newPeriodMinutes > oldPeriodMinutes
+      ? 'THIS CHANGE LENGTHENS THE PERIOD, WHICH REQUIRES ADVANCE NOTICE: the vault operator alarms on MAX(recent gaps) + 30m, so the first longer gap trips a false stall alarm that REPEATS on a 30-minute cooldown until the refresh lands. Tell them the new period above before deploying so they can pre-seed it.'
+      : 'This change shortens the period, which is silent for the vault operator and needs no notice.',
   ].join(' ')
 
   strictEqual(vaultMinTtlMs, expectedVaultMinTtlMs, guidance)
