@@ -45,12 +45,20 @@ test('keeps the vault-facing refresh TTL at 270 minutes', () => {
   const tokenLifetimeMinutes = 480
   const newPeriodMinutes = tokenLifetimeMinutes - vaultMinTtlMs / 60_000
   const oldPeriodMinutes = tokenLifetimeMinutes - expectedVaultMinTtlMs / 60_000
+  // Every number below is labelled with its ROLE: minTtl and period are drawn from
+  // the same small set of values and routinely swap places (a 240m minTtl on an 8h
+  // token yields a 240m period), so bare numerals invite transposition by a reader
+  // who lands on the assertion footer rather than the prose.
   const guidance = [
     'Vault coupling tripwire: this derived value is passed as minTtl to Claustrum',
-    '`credential.get`, and the vault refreshes when `now + minTtl >= expires_at`.',
-    `It therefore sets the observed rotation period to token_lifetime - minTtl =`,
-    `${tokenLifetimeMinutes} - ${vaultMinTtlMs / 60_000} = ${newPeriodMinutes} minutes`,
-    `(was ${oldPeriodMinutes} minutes at the expected ${expectedVaultMinTtlMs / 60_000}).`,
+    '`credential.get`, and the vault refreshes when `now + minTtl >= expires_at`,',
+    'so it fixes the observed rotation period as token_lifetime - minTtl.',
+    `CHANGED: minTtl ${vaultMinTtlMs / 60_000}m (was ${expectedVaultMinTtlMs / 60_000}m)`,
+    `-> rotation period ${newPeriodMinutes}m (was ${oldPeriodMinutes}m).`,
+    `The +/- values below are minTtl in ms, NOT the period.`,
+    `token_lifetime is ASSUMED ${tokenLifetimeMinutes}m — neither side observes it`,
+    "(it lives inside the vault's encrypted envelope); if Anthropic changed it,",
+    'this arithmetic is stale even though the assertion fired correctly.',
     newPeriodMinutes > oldPeriodMinutes
       ? 'THIS CHANGE LENGTHENS THE PERIOD, WHICH REQUIRES ADVANCE NOTICE: the vault operator alarms on MAX(recent gaps) + 30m, so the first longer gap trips a false stall alarm that REPEATS on a 30-minute cooldown until the refresh lands. Tell them the new period above before deploying so they can pre-seed it.'
       : 'This change shortens the period, which is silent for the vault operator and needs no notice.',
