@@ -13,6 +13,7 @@ import {
   saveAccountState,
   saveAccounts,
 } from '../accounts.ts'
+import { custodyTombstoneOAuth } from '../claustrum.ts'
 
 const directories: string[] = []
 
@@ -145,6 +146,53 @@ test('excludes an empty-material vault fallback after its quota policy fails', a
 
   await expect(manager.getUsableFallbackAccounts(storage)).resolves.toEqual([])
   expect(authorizations).toEqual(['Bearer vault-fallback-access'])
+})
+
+test('keeps a live vault fallback on cached quota after a transient quota failure', async () => {
+  const now = 1_000_000
+  const account: OAuthAccount = {
+    id: 'vault-fallback',
+    enabled: true,
+    ...custodyTombstoneOAuth('anthropic'),
+    quota: {
+      checkedAt: now - 60_000,
+      five_hour: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: now - 60_000,
+      },
+      seven_day: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: now - 60_000,
+      },
+    },
+  }
+  const storage: AccountStorage = {
+    version: 1,
+    claustrum: { mode: 'claustrum' },
+    quota: {
+      enabled: true,
+      checkIntervalMinutes: 1,
+      minimumRemaining: { five_hour: 10, seven_day: 10 },
+      failClosedOnUnknownQuota: true,
+    },
+    accounts: [account],
+  }
+  const manager = new FallbackAccountManager({
+    now: () => now,
+    isFallbackAccountVaultEnabled: () => true,
+    isFallbackAccountVaultServed: () => true,
+    resolveFallbackAccessToken: () => ({
+      token: 'vault-fallback-access',
+      source: 'vault',
+    }),
+    fetchImpl: async () => new Response('unavailable', { status: 503 }),
+  })
+
+  await expect(manager.getUsableFallbackAccounts(storage)).resolves.toEqual([
+    account,
+  ])
 })
 
 test('keeps tombstone metadata when discarding a stale credential write', async () => {

@@ -64,6 +64,7 @@ import {
   createStickyNoRouteResponse,
   custodyCredentialId,
   custodyCredentialIdFromResolution,
+  custodyTombstoneOAuth,
   type DumpHandle,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
@@ -1709,6 +1710,9 @@ const anthropicAuthPlugin = async (
     }
     const now = Date.now()
     const mainIdentity = mainQuotaAccountId
+    const vaultMainAccessToken = liveMainVaultAccess(storage)
+    const servedMainAccessToken =
+      mainServedAccessToken || mainAccessToken || vaultMainAccessToken
     if (
       mainAccessToken &&
       storage.main?.profile &&
@@ -1742,11 +1746,16 @@ const anthropicAuthPlugin = async (
         profile: storage.main.profile,
       }).catch(() => {})
     }
-    if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
+    // Profile hydration may use local main access or the live token serving a
+    // custody tombstone; an empty tombstone slot is never a usable bearer.
+    if (
+      servedMainAccessToken &&
+      !oauthProfileIsFresh(storage.main?.profile, now)
+    ) {
       const profile = await hydrateProfileOnce(
         'main',
         undefined,
-        mainAccessToken,
+        servedMainAccessToken,
         mainProviderAccountUuid,
         signal,
       )
@@ -1760,7 +1769,7 @@ const anthropicAuthPlugin = async (
           accountId: 'main',
           accountIdentity: mainIdentity,
           providerAccountUuid: mainProviderAccountUuid,
-          accessToken: mainAccessToken,
+          accessToken: servedMainAccessToken,
           profile,
         }).catch(() => {})
       }
@@ -2500,6 +2509,24 @@ const anthropicAuthPlugin = async (
       scheduleClaustrumWarm(account.id, handle)
     }
     return {}
+  }
+
+  function liveMainVaultAccess(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+  ): string | undefined {
+    if (!storage || getClaustrumMode(storage) !== 'claustrum') return undefined
+    const account = mainCustodyAccount(custodyTombstoneOAuth('anthropic'))
+    const binding = resolveAccountCustodyHandle(account, storage)
+    if (
+      binding.status !== 'resolved' ||
+      !isOAuthAccountVaultOwned(storage, account, binding) ||
+      claustrumBlockedAccounts.has('main')
+    ) {
+      return undefined
+    }
+    const cached = claustrumCredentialCache?.peek(binding.handle)
+    if (hasClaustrumIdentityMismatch(account, cached)) return undefined
+    return usableClaustrumAccessToken(cached, claustrumNow())
   }
 
   function resolveFallbackAccessToken(
@@ -3932,11 +3959,18 @@ const anthropicAuthPlugin = async (
         const hydratedAccount = hydrated.accounts.find(
           (candidate) => candidate.id === account.id,
         )
+        const vaultServed = isFallbackAccountVaultServed(
+          account.id,
+          latest,
+          custodyDimensionsDeps,
+        )
+        // A profile belongs to matching local access or a live vault-served
+        // binding; tombstones deliberately have no local access to compare.
         if (
           !isOAuthAccount(account) ||
           !hydratedAccount ||
           !isOAuthAccount(hydratedAccount) ||
-          !account.access ||
+          (!account.access && !vaultServed) ||
           hydratedAccount.access !== account.access
         ) {
           return account
@@ -3946,8 +3980,12 @@ const anthropicAuthPlugin = async (
     }
     const latestMainProfile = latest.main?.profile
     const mainState = latest.main ?? hydrated.main
+    const servedMainAccessToken =
+      mainServedAccessToken || mainAccessToken || liveMainVaultAccess(latest)
+    // Hydrated main state is valid with local main access or the live bearer
+    // serving its custody tombstone; neither admits a credential-less main.
     if (
-      mainAccessToken &&
+      servedMainAccessToken &&
       mainState &&
       (!latestMainProfile ||
         oauthProfileMatchesIdentity(latestMainProfile, mainAccountId))
@@ -4295,8 +4333,11 @@ const anthropicAuthPlugin = async (
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        if (auth.type === 'oauth' && auth.access) {
-          mainAccessToken = mainServedAccessToken ?? auth.access
+        const servedMainAccessToken = mainServedAccessToken ?? auth.access
+        // Manual quota refresh accepts local OAuth access or the live bearer
+        // serving a custody tombstone; an empty local slot alone remains refused.
+        if (auth.type === 'oauth' && servedMainAccessToken) {
+          mainAccessToken = servedMainAccessToken
           await resolveMainQuotaAccountIdentity(mainAccessToken)
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
@@ -9284,7 +9325,9 @@ const anthropicAuthPlugin = async (
                   },
                 )
               }
-              // Killswitch — eagerly refresh quota so it can evaluate
+              // Killswitch — eagerly refresh quota for local credentials and
+              // live vault-served bindings so spend protection never evaluates
+              // a vault fallback on stale quota.
               if (isKillswitchEnabled(storage)) {
                 const needsRefresh = quotaManager.needsRefresh(
                   sessionRequestCount,
@@ -9296,7 +9339,12 @@ const anthropicAuthPlugin = async (
                       (a): a is OAuthAccount =>
                         a.enabled !== false &&
                         isOAuthAccount(a) &&
-                        Boolean(a.access),
+                        (Boolean(a.access) ||
+                          isFallbackAccountVaultServed(
+                            a.id,
+                            storage,
+                            custodyDimensionsDeps,
+                          )),
                     )
                     await Promise.all([
                       quotaManager.refreshMain(

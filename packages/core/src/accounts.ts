@@ -4119,9 +4119,15 @@ function canUseCachedQuotaAfterRefreshError(
   storage: AccountStorage | null,
   error: unknown,
   now: number,
+  vaultServed: boolean,
 ) {
   return (
-    Boolean(account.access && account.expires && account.expires > now) &&
+    // Cached quota remains attributable after a transient failure when either
+    // the local credential is live or a live Claustrum binding serves it.
+    Boolean(
+      (account.access && account.expires && account.expires > now) ||
+        vaultServed,
+    ) &&
     isTransientQuotaError(error) &&
     quotaSnapshotPassesPolicy(account.quota, storage) &&
     cachedQuotaSnapshotStillRelevant(account.quota, now)
@@ -4642,8 +4648,9 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      const vaultServed = this.isFallbackAccountVaultServed(account.id, storage)
       if (this.isFallbackAccountVaultEnabled(account.id, storage)) {
-        if (!this.isFallbackAccountVaultServed(account.id, storage)) continue
+        if (!vaultServed) continue
         if (
           hasNoLocalCredential(account) &&
           !storage.quota?.minimumRemaining &&
@@ -4658,7 +4665,7 @@ export class FallbackAccountManager {
         if (
           tokenNeedsRefresh(next, storage, this.now()) &&
           !this.isFallbackAccountVaultEnabled(next.id, storage) &&
-          !this.isFallbackAccountVaultServed(next.id, storage)
+          !vaultServed
         ) {
           const refreshError = next.lastRefreshError
           if (
@@ -4711,7 +4718,13 @@ export class FallbackAccountManager {
           usable.push(next)
       } catch (error) {
         if (
-          canUseCachedQuotaAfterRefreshError(next, storage, error, this.now())
+          canUseCachedQuotaAfterRefreshError(
+            next,
+            storage,
+            error,
+            this.now(),
+            vaultServed,
+          )
         ) {
           log(
             '[refresh] fallback quota using cached quota after refresh error',
