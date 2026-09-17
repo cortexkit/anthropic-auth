@@ -7185,6 +7185,12 @@ const anthropicAuthPlugin = async (
             const served = claustrumServedCredentials.get(response)
             if (response.status !== 401 || !served) return response
 
+            if (!isReplayableRequest(input, init?.body)) {
+              await reportClaustrumAuthFailure(served, 'direct')
+              return response
+            }
+
+            // The vault get and snapshot below must stay adjacent: reporting can invalidate the cache.
             const retry = await getAdvancedClaustrumCredentialAfter401(served)
             const currentCachedRecordVersion = claustrumCredentialCache?.peek(
               served.handle,
@@ -7240,6 +7246,9 @@ const anthropicAuthPlugin = async (
                 claustrumServedCredentials.get(retryResponse) ??
                 retryResolutionServed
               if (retryResponse.status !== 401) {
+                if (retryServed.accountId === 'main') {
+                  mainServedAccessToken = retryAccessToken
+                }
                 log401({
                   currentCachedRecordVersion,
                   vaultGetAttempted: retry.vaultGetAttempted,

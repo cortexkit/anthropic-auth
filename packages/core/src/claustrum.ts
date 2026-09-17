@@ -1908,6 +1908,11 @@ export class ClaustrumCredentialCache {
       this.#refreshBackoffUntil.delete(handle)
     }
 
+    if (options.bypassCache) {
+      // Keep a 401 verdict independent of refreshes that began before it.
+      return this.#load(handle, minTtlMs, options.cacheIf)
+    }
+
     const pending = this.#inFlight.get(handle)
     if (pending) return pending
 
@@ -2080,7 +2085,10 @@ export class ClaustrumCredentialCache {
       credential.expiresAtMs > this.#now() &&
       (cacheIf?.() ?? true)
     ) {
-      this.#cache.set(handle, credential)
+      const cached = this.#cache.get(handle)
+      if (!cached || credential.recordVersion >= cached.recordVersion) {
+        this.#cache.set(handle, credential)
+      }
     }
     return credential
   }

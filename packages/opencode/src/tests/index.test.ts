@@ -1167,7 +1167,10 @@ describe('fallback Claustrum credential resolution', () => {
       credentialGet?: (params: Record<string, unknown>) => unknown
       reportAuthFailure?: () => unknown
       timerHook?: (callback: TestTimerHandler, delay?: number) => void
-      onMessageRequest?: (count: number) => void
+      onMessageRequest?: (
+        count: number,
+        init?: RequestInit,
+      ) => void | Promise<void>
     } = {},
   ) {
     const calls: CredentialCall[] = []
@@ -1181,7 +1184,7 @@ describe('fallback Claustrum credential resolution', () => {
       }),
     )
     await writeManifest([{ label: 'main', handle: manifestHandle }])
-    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+    globalThis.fetch = mock(async (_input: unknown, init?: RequestInit) => {
       const url = String(
         _input instanceof Request ? _input.url : (_input as string | URL),
       )
@@ -1189,10 +1192,8 @@ describe('fallback Claustrum credential resolution', () => {
         return Promise.resolve(new Response('{}', { status: 200 }))
       }
       authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
-      options.onMessageRequest?.(authorizations.length)
-      return Promise.resolve(
-        new Response('{}', { status: responseStatuses.shift() ?? 401 }),
-      )
+      await options.onMessageRequest?.(authorizations.length, init)
+      return new Response('{}', { status: responseStatuses.shift() ?? 401 })
     }) as unknown as typeof fetch
     const plugin = await getPlugin(undefined, undefined, {
       setTimeout: mock((callback: TestTimerHandler, delay?: number) => {
@@ -1520,6 +1521,46 @@ describe('fallback Claustrum credential resolution', () => {
           'Bearer vault-main-access',
         )
         expect(fixture.scheduledWarmCallbacks).toHaveLength(1)
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'uses the rotated main vault bearer for quota after a successful 401 retry',
+      async () => {
+        let recordVersion = 17
+        const fixture = await bootVaultMain({
+          fallback: false,
+          responseStatuses: [401, 200],
+          credentialGet: () =>
+            credentialResponse(
+              `vault-main-access-v${recordVersion}`,
+              recordVersion,
+            ),
+        })
+        recordVersion = 18
+
+        const response = await fixture.result.fetch(MESSAGES_URL, request())
+        expect(response.status).toBe(200)
+        expect(fixture.authorizations).toEqual([
+          'Bearer vault-main-access-v17',
+          'Bearer vault-main-access-v18',
+        ])
+
+        await expectHandledCommandResponse(
+          fixture.plugin['command.execute.before']({
+            command: 'claude-quota',
+            arguments: '',
+            sessionID: 'vault-main-retried-bearer',
+          }),
+        )
+
+        expect(fixture.quotaAuthorizations).toContain(
+          'Bearer vault-main-access-v18',
+        )
+        expect(fixture.quotaAuthorizations).not.toContain(
+          'Bearer vault-main-access-v17',
+        )
         await fixture.plugin.dispose?.()
       },
     )
@@ -2513,6 +2554,114 @@ describe('fallback Claustrum credential resolution', () => {
             provider_status: 401,
             record_version: 17,
             reporter_source: 'direct',
+          }),
+        }),
+      ])
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'retries a 401 with the post-rotation version when a proactive refresh returns stale',
+    async () => {
+      let credentialGets = 0
+      let releaseProactiveRefresh!: () => void
+      const proactiveRefresh = new Promise<void>((resolve) => {
+        releaseProactiveRefresh = resolve
+      })
+      let proactiveRefreshStarted!: () => void
+      const proactiveRefreshStartedPromise = new Promise<void>((resolve) => {
+        proactiveRefreshStarted = resolve
+      })
+      let releaseFirstResponse!: () => void
+      const firstResponse = new Promise<void>((resolve) => {
+        releaseFirstResponse = resolve
+      })
+      let firstRequestStarted!: () => void
+      const firstRequestStartedPromise = new Promise<void>((resolve) => {
+        firstRequestStarted = resolve
+      })
+      const fixture = await bootMainVault401({
+        responseStatuses: [401, 200],
+        credentialGet: async () => {
+          credentialGets += 1
+          if (credentialGets === 1)
+            return credentialResponse('vault-main-access-v17', 17)
+          if (credentialGets === 2) {
+            proactiveRefreshStarted()
+            await proactiveRefresh
+            return credentialResponse('vault-main-access-v17', 17)
+          }
+          return credentialResponse('vault-main-access-v18', 18)
+        },
+        onMessageRequest: async (count) => {
+          if (count !== 1) return
+          firstRequestStarted()
+          await firstResponse
+        },
+      })
+      const cache = fixture.plugin.__claustrumCredentialCache
+
+      await cache.get(manifestHandle)
+      await proactiveRefreshStartedPromise
+      const responsePromise = fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+      await firstRequestStartedPromise
+      releaseFirstResponse()
+      await Promise.resolve()
+      releaseProactiveRefresh()
+      const response = await responsePromise
+
+      expect(response.status).toBe(200)
+      expect(fixture.authorizations).toEqual([
+        'Bearer vault-main-access-v17',
+        'Bearer vault-main-access-v18',
+      ])
+      expect(
+        fixture.calls.some(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toBe(false)
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'returns the original 401 instead of replaying a streamed vault request body',
+    async () => {
+      let recordVersion = 17
+      const fixture = await bootMainVault401({
+        responseStatuses: [401, 200],
+        credentialGet: () =>
+          credentialResponse(
+            `vault-main-access-v${recordVersion}`,
+            recordVersion,
+          ),
+      })
+      recordVersion = 18
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('one-shot body'))
+          controller.close()
+        },
+      })
+
+      const response = await fixture.result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: stream,
+        duplex: 'half',
+      })
+
+      expect(response.status).toBe(401)
+      expect(fixture.authorizations).toEqual([''])
+      expect(
+        fixture.calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          params: expect.objectContaining({
+            handle: manifestHandle,
+            record_version: 17,
           }),
         }),
       ])
