@@ -67,6 +67,32 @@ test('keeps the vault-facing refresh TTL at 270 minutes', () => {
   strictEqual(vaultMinTtlMs, expectedVaultMinTtlMs, guidance)
 })
 
+test('floors a config override so it cannot lower the vault-facing minTtl', () => {
+  // The tripwire above watches the CONSTANT. This watches the other route to the
+  // same vault-facing value: the `refresh.refreshBeforeExpiryMinutes` config key.
+  // The floor in refreshBeforeExpiryMs is what makes the tripwire sufficient —
+  // without it, an operator could lower minTtl from config, lengthening the vault's
+  // rotation period, and the constant-watching tripwire would never fire.
+  const storage = createEmptyStorage()
+  storage.refresh = { ...storage.refresh, refreshBeforeExpiryMinutes: 60 }
+  const floored = getRefreshBeforeExpiryMs(storage)
+
+  strictEqual(
+    floored,
+    240 * 60_000,
+    [
+      'Vault coupling tripwire (config route): a below-floor override of',
+      '`refresh.refreshBeforeExpiryMinutes` must clamp UP to the 240m floor, but this',
+      `build returned ${floored / 60_000}m. The floor is load-bearing for a peer system:`,
+      'it is the only reason config cannot lower minTtl, and lowering minTtl LENGTHENS the',
+      "vault's rotation period, which repeatedly false-alarms the vault operator's stall",
+      'detector. Removing the floor makes that reachable from config alone, where the',
+      'constant-watching tripwire above cannot see it. If you removed it deliberately,',
+      'the vault operator holds a registered dependency on it and is owed notice.',
+    ].join(' '),
+  )
+})
+
 test('preserves the Claustrum mode when a save supplies only handlesFile', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
   directories.push(directory)
