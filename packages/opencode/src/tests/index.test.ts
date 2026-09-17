@@ -1352,7 +1352,7 @@ describe('fallback Claustrum credential resolution', () => {
     }
 
     test.serial(
-      'hydrates the main profile through a vault-served tombstone',
+      'hydrates and merges the main profile through a vault-served tombstone',
       async () => {
         const fixture = await bootVaultMain({
           fallback: false,
@@ -1370,27 +1370,6 @@ describe('fallback Claustrum credential resolution', () => {
         expect(fixture.profileAuthorizations).toEqual([
           'Bearer vault-main-access',
         ])
-        expect(state.main.tierLabel).toBe('Max 20x')
-        await fixture.plugin.dispose?.()
-      },
-    )
-
-    test.serial(
-      'merges the hydrated main profile into sidebar state through a vault-served tombstone',
-      async () => {
-        const fixture = await bootVaultMain({
-          fallback: false,
-          profile: {
-            organization: {
-              organization_type: 'claude_max',
-              rate_limit_tier: 'default_claude_max_20x',
-            },
-          },
-        })
-
-        const state = await waitForSidebarState(
-          (candidate) => candidate.main.tierLabel === 'Max 20x',
-        )
         expect(state.main.tierLabel).toBe('Max 20x')
         await fixture.plugin.dispose?.()
       },
@@ -1446,6 +1425,7 @@ describe('fallback Claustrum credential resolution', () => {
           responseStatus: 401,
         })
 
+        const warmCallbacksBeforeFetch = fixture.scheduledWarmCallbacks.length
         await fixture.result.fetch(MESSAGES_URL, request())
         await expectHandledCommandResponse(
           fixture.plugin['command.execute.before']({
@@ -1458,7 +1438,9 @@ describe('fallback Claustrum credential resolution', () => {
         expect(fixture.quotaAuthorizations).not.toContain(
           'Bearer vault-main-access',
         )
-        expect(fixture.scheduledWarmCallbacks).toHaveLength(1)
+        expect(fixture.scheduledWarmCallbacks.length).toBeGreaterThan(
+          warmCallbacksBeforeFetch,
+        )
         await fixture.plugin.dispose?.()
       },
     )

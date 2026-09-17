@@ -4328,7 +4328,7 @@ export class FallbackAccountManager {
             storage,
             error,
             this.now(),
-            vaultServed,
+            this.isFallbackAccountVaultServed(next.id, storage),
           )
         ) {
           log(

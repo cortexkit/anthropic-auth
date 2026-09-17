@@ -5003,6 +5003,55 @@ describe('FallbackAccountManager', () => {
     expect(accounts.map((account) => account.id)).toEqual(['stale-good-quota'])
   })
 
+  test('does not use cached quota after vault access disappears during refresh', async () => {
+    const now = 10 * 60_000
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'vault-access-race',
+      type: 'oauth',
+      access: '',
+      refresh: '',
+      expires: 0,
+      claustrumHandle: 'vault-access-race-handle',
+      quota: {
+        checkedAt: 1_000,
+        five_hour: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+        seven_day: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 1_000,
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+      },
+    })
+
+    let vaultServed = true
+    const fetchImpl = mock(async () => {
+      vaultServed = false
+      return new Response('temporarily unavailable', { status: 503 })
+    }) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      fetchImpl,
+      now: () => now,
+      isFallbackAccountVaultEnabled: () => true,
+      isFallbackAccountVaultServed: () => vaultServed,
+      resolveFallbackAccessToken: () => ({
+        token: 'vault-access',
+        source: 'vault' as const,
+      }),
+    })
+
+    const accounts = await manager.getUsableFallbackAccounts(storage)
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(accounts).toEqual([])
+  })
+
   test('keeps a concurrent replacement account when its quota probe fails', async () => {
     const oldStorage = baseStorage()
     const oldAccount: OAuthAccount = {
