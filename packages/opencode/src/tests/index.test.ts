@@ -1160,6 +1160,62 @@ describe('fallback Claustrum credential resolution', () => {
     serve?: string,
   ) => writeSharedManifest(tempConfigDir!, entries, serve)
 
+  async function bootMainVault401(
+    options: {
+      responseStatuses?: number[]
+      credentialGet?: (params: Record<string, unknown>) => unknown
+      reportAuthFailure?: () => unknown
+      timerHook?: (callback: TestTimerHandler, delay?: number) => void
+      onMessageRequest?: (count: number) => void
+    } = {},
+  ) {
+    const calls: CredentialCall[] = []
+    const authorizations: string[] = []
+    const responseStatuses = [...(options.responseStatuses ?? [401])]
+    await useTempAccountFile(
+      createFallbackStorage({
+        claustrum: { mode: 'claustrum' },
+        quota: { enabled: false },
+        accounts: [],
+      }),
+    )
+    await writeManifest([{ label: 'main', handle: manifestHandle }])
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      const url = String(
+        _input instanceof Request ? _input.url : (_input as string | URL),
+      )
+      if (!url.startsWith(MESSAGES_URL)) {
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      }
+      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
+      options.onMessageRequest?.(authorizations.length)
+      return Promise.resolve(
+        new Response('{}', { status: responseStatuses.shift() ?? 401 }),
+      )
+    }) as unknown as typeof fetch
+    const plugin = await getPlugin(undefined, undefined, {
+      setTimeout: mock((callback: TestTimerHandler, delay?: number) => {
+        options.timerHook?.(callback, delay)
+        return { unref() {} } as unknown as ReturnType<typeof setTimeout>
+      }) as unknown as typeof setTimeout,
+      claustrumConnector: connectorFor(calls, (method, params) => {
+        if (method === 'credential.report_auth_failure') {
+          return options.reportAuthFailure?.() ?? { result: {} }
+        }
+        if (method !== 'credential.get') return { result: {} }
+        return (
+          options.credentialGet?.(params) ??
+          credentialResponse('vault-main-access-v17', 17)
+        )
+      }),
+    })
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+      { models: {} },
+    )
+    return { plugin, result, calls, authorizations }
+  }
+
   const bootRuledClaustrumRow = (
     options: Parameters<typeof bootSharedRuledClaustrumRow>[0],
   ) =>
@@ -1200,6 +1256,8 @@ describe('fallback Claustrum credential resolution', () => {
         mainExpiresAt?: number
         fallbackExpiresAt?: number
         profile?: Record<string, unknown>
+        credentialGet?: (params: Record<string, unknown>) => unknown
+        timerHook?: (callback: TestTimerHandler, delay?: number) => void
       } = {},
     ) {
       let now = 1_000
@@ -1300,6 +1358,7 @@ describe('fallback Claustrum credential resolution', () => {
       const plugin = await getPlugin(client, undefined, {
         claustrumNow: () => now,
         setTimeout: mock((callback: TestTimerHandler, delay?: number) => {
+          options.timerHook?.(callback, delay)
           if (delay === 0 && typeof callback === 'function') {
             scheduledWarmCallbacks.push(callback as () => void)
           }
@@ -1307,6 +1366,7 @@ describe('fallback Claustrum credential resolution', () => {
         }) as unknown as typeof setTimeout,
         claustrumConnector: connectorFor(calls, (method, params) => {
           if (method !== 'credential.get') return { result: {} }
+          if (options.credentialGet) return options.credentialGet(params)
           const isMain = params.handle === manifestHandle
           return credentialResponse(
             isMain ? 'vault-main-access' : 'vault-fallback-access',
@@ -2336,7 +2396,7 @@ describe('fallback Claustrum credential resolution', () => {
   )
 
   test.serial(
-    'a main 401 after a concurrent vault refresh is suppressed rather than blamed on the new record',
+    'retries a main 401 with an advanced vault record without reporting the stale version',
     async () => {
       await useTempAccountFile(
         createFallbackStorage({
@@ -2378,7 +2438,7 @@ describe('fallback Claustrum credential resolution', () => {
           firstRequestStarted()
           return firstResponse
         }
-        return Promise.resolve(new Response('denied', { status: 401 }))
+        return Promise.resolve(new Response('recovered', { status: 200 }))
       }) as unknown as typeof fetch
       const ticks: Array<() => unknown> = []
       const plugin = await getPlugin(undefined, undefined, {
@@ -2413,21 +2473,36 @@ describe('fallback Claustrum credential resolution', () => {
       )
       releaseFirstResponse()
 
-      expect((await staleResponse).status).toBe(401)
+      expect((await staleResponse).status).toBe(200)
       expect(
         calls.filter(
           (call) => call.method === 'credential.report_auth_failure',
         ),
       ).toEqual([])
-
-      const currentResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
-      expect(currentResponse.status).toBe(401)
       expect(authorizations).toEqual([
         'Bearer main-vault-access-v7',
         'Bearer main-vault-access-v8',
       ])
+      await plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'reports a genuinely rejected main vault record once after a fresh get keeps its version',
+    async () => {
+      const fixture = await bootMainVault401()
+      const getsBefore = fixture.calls.filter(
+        (call) => call.method === 'credential.get',
+      ).length
+
+      const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(401)
       expect(
-        calls.filter(
+        fixture.calls.filter((call) => call.method === 'credential.get'),
+      ).toHaveLength(getsBefore + 1)
+      expect(
+        fixture.calls.filter(
           (call) => call.method === 'credential.report_auth_failure',
         ),
       ).toEqual([
@@ -2435,12 +2510,126 @@ describe('fallback Claustrum credential resolution', () => {
           params: expect.objectContaining({
             handle: manifestHandle,
             provider_status: 401,
-            record_version: 8,
+            record_version: 17,
             reporter_source: 'direct',
           }),
         }),
       ])
-      await plugin.dispose?.()
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'reports only the retried vault record when the retry also receives a 401',
+    async () => {
+      let recordVersion = 17
+      const fixture = await bootMainVault401({
+        responseStatuses: [401, 401],
+        credentialGet: () =>
+          credentialResponse(
+            `vault-main-access-v${recordVersion}`,
+            recordVersion,
+          ),
+      })
+      recordVersion = 18
+
+      const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(401)
+      expect(fixture.authorizations).toEqual([
+        'Bearer vault-main-access-v17',
+        'Bearer vault-main-access-v18',
+      ])
+      expect(
+        fixture.calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          params: expect.objectContaining({ record_version: 18 }),
+        }),
+      ])
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'reports and returns a 401 when the retry vault get times out',
+    async () => {
+      let credentialGets = 0
+      const fixture = await bootMainVault401({
+        credentialGet: () => {
+          credentialGets += 1
+          if (credentialGets === 1)
+            return credentialResponse('vault-main-access-v17', 17)
+          return new Promise<never>(() => {})
+        },
+        timerHook: (callback, delay) => {
+          if (delay && typeof callback === 'function') queueMicrotask(callback)
+        },
+      })
+      const getsBefore = credentialGets
+
+      const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+
+      expect(response.status).toBe(401)
+      expect(credentialGets).toBe(getsBefore + 1)
+      expect(
+        fixture.calls.filter(
+          (call) => call.method === 'credential.report_auth_failure',
+        ),
+      ).toHaveLength(1)
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'honors the per-handle backoff after a retry get failure',
+    async () => {
+      let credentialGets = 0
+      let releaseReport!: () => void
+      const report = new Promise<unknown>((resolve) => {
+        releaseReport = () => resolve({ result: {} })
+      })
+      let reportStarted!: () => void
+      const reportStartedPromise = new Promise<void>((resolve) => {
+        reportStarted = resolve
+      })
+      let secondRequestStarted!: () => void
+      const secondRequestStartedPromise = new Promise<void>((resolve) => {
+        secondRequestStarted = resolve
+      })
+      const fixture = await bootMainVault401({
+        credentialGet: () => {
+          credentialGets += 1
+          if (credentialGets === 1)
+            return credentialResponse('vault-main-access-v17', 17)
+          return {
+            result: {
+              error: { code: 'refresh_failed', class: 'transient' },
+            },
+          }
+        },
+        reportAuthFailure: () => {
+          reportStarted()
+          return report
+        },
+        onMessageRequest: (count) => {
+          if (count === 2) secondRequestStarted()
+        },
+      })
+      const getsBefore = credentialGets
+
+      const first = fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+      await reportStartedPromise
+      const second = fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
+      await secondRequestStartedPromise
+      await Promise.resolve()
+      await Promise.resolve()
+      releaseReport()
+      await Promise.all([first, second])
+      expect(credentialGets).toBe(getsBefore + 1)
+      await fixture.plugin.dispose?.()
     },
   )
 
@@ -4933,7 +5122,7 @@ describe('fallback Claustrum credential resolution', () => {
     expect(authorizations).toEqual(['Bearer vault-main-access'])
     expect(
       calls.filter((call) => call.method === 'credential.get'),
-    ).toHaveLength(initialCredentialGets)
+    ).toHaveLength(initialCredentialGets + 1)
     await plugin.dispose?.()
   })
 
@@ -6167,7 +6356,7 @@ describe('fallback Claustrum credential resolution', () => {
     const response = await fixture.result.fetch(MESSAGES_URL, EMPTY_POST)
 
     expect(response.status).toBe(200)
-    expect(fallbackGets).toBe(2)
+    expect(fallbackGets).toBe(3)
     expect(
       fixture.calls.some(
         (call) => call.method === 'credential.report_auth_failure',

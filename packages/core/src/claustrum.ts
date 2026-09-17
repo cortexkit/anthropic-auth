@@ -1885,20 +1885,25 @@ export class ClaustrumCredentialCache {
   async get(
     handle: string,
     minTtlMs = this.#minTtlMs,
-    options: { cacheIf?: () => boolean } = {},
+    options: { cacheIf?: () => boolean; bypassCache?: boolean } = {},
   ): Promise<ClaustrumCredential> {
     if (!Number.isSafeInteger(minTtlMs) || minTtlMs < 0) {
       throw new RangeError('minTtlMs must be a non-negative safe integer')
     }
     const now = this.#now()
     const cached = this.#cache.get(handle)
-    if (cached && cached.expiresAtMs !== null && cached.expiresAtMs > now) {
+    if (
+      !options.bypassCache &&
+      cached &&
+      cached.expiresAtMs !== null &&
+      cached.expiresAtMs > now
+    ) {
       if (cached.expiresAtMs - now <= minTtlMs) {
         this.#refreshIfApproachingExpiry(handle, now, minTtlMs)
       }
       return cached
     }
-    if (cached) {
+    if (cached && !options.bypassCache) {
       this.#cache.delete(handle)
       this.#refreshBackoffUntil.delete(handle)
     }
