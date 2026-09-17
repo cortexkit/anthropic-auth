@@ -604,6 +604,31 @@ describe('ClaustrumCredentialCache', () => {
     expect(daemon.requestBodies).toHaveLength(2)
   })
 
+  test('bypasses a resident credential without discarding it when the fresh get fails', async () => {
+    const daemon = await startFakeDaemon()
+    daemon.responseBodies.push({
+      result: {
+        payload: Array.from(new TextEncoder().encode('served')),
+        expires_at_ms: 1_500,
+        record_version: 63,
+      },
+    })
+    const cache = await makeCredentialCache(daemon)
+    await cache.get(handle)
+    daemon.responseBodies.push({
+      result: { error: { code: 'refresh_failed', class: 'transient' } },
+    })
+
+    await expect(
+      cache.get(handle, 0, { bypassCache: true }),
+    ).rejects.toMatchObject({
+      action: 'retry',
+    })
+
+    expect(cache.peek(handle)).toMatchObject({ recordVersion: 63 })
+    expect(daemon.requestBodies).toHaveLength(2)
+  })
+
   test('uses the requested minimum TTL to refresh near expiry without refreshing above it', async () => {
     const daemon = await startFakeDaemon()
     daemon.responseBodies.push({
