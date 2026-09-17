@@ -7261,6 +7261,8 @@ const anthropicAuthPlugin = async (
                 fastModeEnabled: fastModeRequested,
                 subagent: subagentRequest,
               })
+            } else {
+              setOAuthHeaders(requestHeaders, accessToken, { identity })
             }
 
             const cacheDiagnosticsBetas =
