@@ -2669,12 +2669,14 @@ const anthropicAuthPlugin = async (
     recordVersion: number
   }): Promise<{
     outcome: Claustrum401RetryOutcome
+    vaultGetAttempted: boolean
     resolution?: ClaustrumAccessResolution
   }> {
     const cache = claustrumCredentialCache
-    if (!cache) return { outcome: 'cache-unavailable' }
+    if (!cache)
+      return { outcome: 'cache-unavailable', vaultGetAttempted: false }
     if (claustrumWarmBackoffActive(served.handle)) {
-      return { outcome: 'backoff-active' }
+      return { outcome: 'backoff-active', vaultGetAttempted: false }
     }
     try {
       // Bypass only the resident cache: the RPC itself must not rotate a token.
@@ -2690,7 +2692,7 @@ const anthropicAuthPlugin = async (
           served.handle,
           claustrumNow() + CLAUSTRUM_TRANSIENT_WARM_BACKOFF_MS,
         )
-        return { outcome: 'timed-out' }
+        return { outcome: 'timed-out', vaultGetAttempted: true }
       }
       const credential = result.credential
       const accessToken = usableClaustrumAccessToken(credential, claustrumNow())
@@ -2699,10 +2701,11 @@ const anthropicAuthPlugin = async (
         !accessToken ||
         credential.recordVersion <= served.recordVersion
       ) {
-        return { outcome: 'unchanged' }
+        return { outcome: 'unchanged', vaultGetAttempted: true }
       }
       return {
         outcome: 'advanced',
+        vaultGetAttempted: true,
         resolution: {
           accessToken,
           served: {
@@ -2719,7 +2722,7 @@ const anthropicAuthPlugin = async (
         accountId: served.accountId,
         error: error instanceof Error ? error.message : String(error),
       })
-      return { outcome: 'refresh-error' }
+      return { outcome: 'refresh-error', vaultGetAttempted: true }
     }
   }
 
@@ -7183,9 +7186,12 @@ const anthropicAuthPlugin = async (
             if (response.status !== 401 || !served) return response
 
             const retry = await getAdvancedClaustrumCredentialAfter401(served)
-            const currentCachedRecordVersion = () =>
-              claustrumCredentialCache?.peek(served.handle)?.recordVersion
+            const currentCachedRecordVersion = claustrumCredentialCache?.peek(
+              served.handle,
+            )?.recordVersion
             const log401 = (input: {
+              currentCachedRecordVersion?: number
+              vaultGetAttempted: boolean
               retryAttempted: boolean
               retryOutcome: Claustrum401RetryOutcome | 'retry-succeeded'
               reportOutcome: ClaustrumAuthFailureReportOutcome | 'not-attempted'
@@ -7196,8 +7202,9 @@ const anthropicAuthPlugin = async (
               logger.info('claustrum', 'vault-served 401 recovery', {
                 handle: served.handle,
                 servedRecordVersion: served.recordVersion,
-                currentCachedRecordVersion: currentCachedRecordVersion(),
+                currentCachedRecordVersion: input.currentCachedRecordVersion,
                 retryAttempted: input.retryAttempted,
+                vaultGetAttempted: input.vaultGetAttempted,
                 retryOutcome: input.retryOutcome,
                 ...(input.retryServedRecordVersion !== undefined && {
                   retryServedRecordVersion: input.retryServedRecordVersion,
@@ -7234,6 +7241,8 @@ const anthropicAuthPlugin = async (
                 retryResolutionServed
               if (retryResponse.status !== 401) {
                 log401({
+                  currentCachedRecordVersion,
+                  vaultGetAttempted: retry.vaultGetAttempted,
                   retryAttempted: true,
                   retryOutcome: 'retry-succeeded',
                   reportOutcome: 'not-attempted',
@@ -7246,6 +7255,8 @@ const anthropicAuthPlugin = async (
                 'direct',
               )
               log401({
+                currentCachedRecordVersion,
+                vaultGetAttempted: retry.vaultGetAttempted,
                 retryAttempted: true,
                 retryOutcome: retry.outcome,
                 reportOutcome,
@@ -7259,6 +7270,8 @@ const anthropicAuthPlugin = async (
               'direct',
             )
             log401({
+              currentCachedRecordVersion,
+              vaultGetAttempted: retry.vaultGetAttempted,
               retryAttempted: false,
               retryOutcome: retry.outcome,
               reportOutcome,
