@@ -1199,11 +1199,15 @@ describe('fallback Claustrum credential resolution', () => {
         responseStatuses?: number[]
         mainExpiresAt?: number
         fallbackExpiresAt?: number
+        profile?: Record<string, unknown>
       } = {},
     ) {
       let now = 1_000
       const calls: CredentialCall[] = []
       const authorizations: string[] = []
+      const profileAuthorizations: string[] = []
+      const quotaAuthorizations: string[] = []
+      const client = createMockClient()
       let mainSlotAccess = ''
       let mainSlotExpires = 0
       let mainExpiresAt = options.mainExpiresAt ?? 10_000
@@ -1262,9 +1266,25 @@ describe('fallback Claustrum credential resolution', () => {
         ...(fallback ? [{ label: 'fallback', handle: fallbackHandle }] : []),
       ])
       globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
-        if (
-          extractUrl(input as string | URL | Request).includes('/v1/messages')
-        ) {
+        const url = extractUrl(input as string | URL | Request)
+        if (url === PROFILE_URL) {
+          profileAuthorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+          return Promise.resolve(Response.json(options.profile ?? {}))
+        }
+        if (url === QUOTA_URL) {
+          quotaAuthorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+          return Promise.resolve(
+            Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            }),
+          )
+        }
+        if (url.includes('/v1/messages')) {
           authorizations.push(
             new Headers(init?.headers).get('authorization') ?? '',
           )
@@ -1276,7 +1296,7 @@ describe('fallback Claustrum credential resolution', () => {
         }
         return Promise.resolve(new Response('{}', { status: 200 }))
       }) as unknown as typeof fetch
-      const plugin = await getPlugin(undefined, undefined, {
+      const plugin = await getPlugin(client, undefined, {
         claustrumNow: () => now,
         claustrumConnector: connectorFor(calls, (method, params) => {
           if (method !== 'credential.get') return { result: {} }
@@ -1302,9 +1322,12 @@ describe('fallback Claustrum credential resolution', () => {
       )
       return {
         plugin,
+        client,
         result,
         calls,
         authorizations,
+        profileAuthorizations,
+        quotaAuthorizations,
         setNow(value: number) {
           now = value
         },
@@ -1319,6 +1342,73 @@ describe('fallback Claustrum credential resolution', () => {
         },
       }
     }
+
+    test.serial(
+      'hydrates the main profile through a vault-served tombstone',
+      async () => {
+        const fixture = await bootVaultMain({
+          fallback: false,
+          profile: {
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          },
+        })
+
+        const state = await waitForSidebarState(
+          (candidate) => candidate.main.tierLabel === 'Max 20x',
+        )
+        expect(fixture.profileAuthorizations).toEqual([
+          'Bearer vault-main-access',
+        ])
+        expect(state.main.tierLabel).toBe('Max 20x')
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'merges the hydrated main profile into sidebar state through a vault-served tombstone',
+      async () => {
+        const fixture = await bootVaultMain({
+          fallback: false,
+          profile: {
+            organization: {
+              organization_type: 'claude_max',
+              rate_limit_tier: 'default_claude_max_20x',
+            },
+          },
+        })
+
+        const state = await waitForSidebarState(
+          (candidate) => candidate.main.tierLabel === 'Max 20x',
+        )
+        expect(state.main.tierLabel).toBe('Max 20x')
+        await fixture.plugin.dispose?.()
+      },
+    )
+
+    test.serial(
+      'refreshes /claude-quota for a vault-served main tombstone',
+      async () => {
+        const fixture = await bootVaultMain({ fallback: false })
+
+        await fixture.result.fetch(MESSAGES_URL, request())
+
+        await expectHandledCommandResponse(
+          fixture.plugin['command.execute.before']({
+            command: 'claude-quota',
+            arguments: '',
+            sessionID: 'vault-main-quota',
+          }),
+        )
+
+        expect(fixture.quotaAuthorizations).toContain(
+          'Bearer vault-main-access',
+        )
+        await fixture.plugin.dispose?.()
+      },
+    )
 
     test.serial(
       'a refused vault main clears a legacy tombstone bearer before fallback routing',
@@ -2217,7 +2307,16 @@ describe('fallback Claustrum credential resolution', () => {
       })
       let messageRequests = 0
       let claustrumNow = 0
-      globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+        // Scope to the message path: profile hydration also runs on the served
+        // main token now that a custody tombstone no longer blocks it, and it
+        // must not consume the deferred first response or the token ledger.
+        const url = String(
+          input instanceof Request ? input.url : (input as string | URL),
+        )
+        if (!url.startsWith(MESSAGES_URL)) {
+          return Promise.resolve(new Response('denied', { status: 401 }))
+        }
         authorizations.push(
           new Headers(init?.headers).get('authorization') ?? '',
         )
@@ -5184,6 +5283,42 @@ describe('fallback Claustrum credential resolution', () => {
       expect(serialized).not.toContain(handle)
       expect(serialized).not.toContain(vaultAccess)
       expect(serialized).not.toContain('claustrum-tombstone:v1:anthropic')
+      await fixture.plugin.dispose?.()
+    },
+  )
+
+  test.serial(
+    'merges a hydrated fallback profile through a vault-served tombstone',
+    async () => {
+      const fixture = await bootRuledClaustrumRow({
+        route: 'fallback-first',
+        fallbacks: [
+          {
+            label: 'profiled',
+            handle: `ckh_${'P'.repeat(43)}`,
+            access: 'vault-profiled-access',
+          },
+        ],
+        onFetch: (input) =>
+          extractUrl(input as string | URL | Request) === PROFILE_URL
+            ? Response.json({
+                organization: {
+                  organization_type: 'claude_team',
+                  rate_limit_tier: 'default_claude_max_5x',
+                },
+              })
+            : new Response('{}', { status: 200 }),
+      })
+
+      const state = await waitForSidebarState(
+        (candidate) =>
+          candidate.fallbacks.find((account) => account.id === 'fallback-1')
+            ?.tierLabel === 'Team · Max 5x',
+      )
+      expect(
+        state.fallbacks.find((account) => account.id === 'fallback-1')
+          ?.tierLabel,
+      ).toBe('Team · Max 5x')
       await fixture.plugin.dispose?.()
     },
   )
@@ -22752,7 +22887,7 @@ describe('killswitch fetch gate', () => {
       }) as unknown as typeof globalThis.setTimeout
       const usageAuthorizations: string[] = []
       const fixture = await bootSharedRuledClaustrumRow({
-        route: 'fallback-first',
+        route: 'main-exhausted',
         quota: {
           enabled: true,
           checkIntervalMinutes: 5,
@@ -22762,13 +22897,13 @@ describe('killswitch fetch gate', () => {
           mainQuota: {
             checkedAt: now,
             five_hour: {
-              usedPercent: 100,
-              remainingPercent: 0,
+              usedPercent: 10,
+              remainingPercent: 90,
               checkedAt: now,
             },
             seven_day: {
-              usedPercent: 100,
-              remainingPercent: 0,
+              usedPercent: 10,
+              remainingPercent: 90,
               checkedAt: now,
             },
           },
@@ -22837,10 +22972,43 @@ describe('killswitch fetch gate', () => {
       })
       const plugin = fixture.plugin
       await plugin.__fallbackRefreshReady
+      const persisted = await loadAccounts()
+      if (!persisted) throw new Error('expected custody fixture storage')
+      const accountPath = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+      if (!accountPath) throw new Error('expected custody fixture account file')
+      await fs.writeFile(
+        accountPath,
+        JSON.stringify({
+          ...persisted,
+          accounts: persisted.accounts.map((account) =>
+            isOAuthAccount(account) && account.id === accountId
+              ? { ...account, ...custodyTombstoneOAuth('anthropic') }
+              : account,
+          ),
+        }),
+      )
+      expect(
+        (await loadAccounts())?.accounts.find(
+          (account): account is OAuthAccount =>
+            isOAuthAccount(account) && account.id === accountId,
+        )?.access,
+      ).toBe('')
       clock = now + 6 * 60 * 60 * 1000
       plugin.__quotaManager.clearFallback(accountId)
       const residentBeforeRequest = Boolean(
         plugin.__claustrumCredentialCache.peek(handle),
+      )
+      const eagerFallbackIds: string[][] = []
+      const refreshAllFallbacks =
+        plugin.__quotaManager.refreshAllFallbacks.bind(plugin.__quotaManager)
+      spyOn(plugin.__quotaManager, 'refreshAllFallbacks').mockImplementation(
+        async (
+          accounts: OAuthAccount[],
+          resolveAccessToken?: (account: OAuthAccount) => string | undefined,
+        ) => {
+          eagerFallbackIds.push(accounts.map((account) => account.id))
+          await refreshAllFallbacks(accounts, resolveAccessToken)
+        },
       )
       usageAuthorizations.length = 0
       const timerBaseline = detachedTimers.length
@@ -22871,6 +23039,7 @@ describe('killswitch fetch gate', () => {
       await plugin.dispose?.()
 
       return {
+        eagerFallbackIds,
         fallbackUsageCalls: coldFallbackUsageCalls,
         residentBeforeRequest,
         sidecarUsageCalls: coldSidecarUsageCalls,
@@ -22887,6 +23056,9 @@ describe('killswitch fetch gate', () => {
     const result = await runVaultKillswitchQuotaRefresh(true)
 
     expect(result.residentBeforeRequest).toBe(true)
+    expect(result.eagerFallbackIds).toContainEqual([
+      'killswitch-vault-fallback',
+    ])
     expect(result.sidecarUsageCalls).toBe(0)
     expect(result.fallbackUsageCalls).toBe(1)
     expect(result.scheduledWarmCount).toBe(0)
