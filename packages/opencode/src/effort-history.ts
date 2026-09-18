@@ -609,16 +609,16 @@ export function applyOpenCodeEffortMarkers(
   }
 
   for (const message of consumed.messages) {
-    if (message.transitions.length > 1) {
-      throw new EffortMarkerCorrelationError(
-        'Multiple internal Fable 5.1 effort markers on one user boundary',
-      )
-    }
-    const transition = message.transitions[0]
-    if (transition && transition.scope !== requestPlan.scope) {
-      throw new EffortMarkerCorrelationError(
-        'Fable 5.1 effort marker scope mismatch',
-      )
+    // Consecutive host user records collapse into one wire message, so a
+    // boundary may legitimately carry several transitions. The flat checks
+    // below pin their order and identity; every one still needs its scope
+    // verified, not just the first.
+    for (const transition of message.transitions) {
+      if (transition.scope !== requestPlan.scope) {
+        throw new EffortMarkerCorrelationError(
+          'Fable 5.1 effort marker scope mismatch',
+        )
+      }
     }
     if (message.anchors.length > 1) {
       throw new EffortMarkerCorrelationError(
@@ -719,7 +719,7 @@ export function applyOpenCodeEffortMarkers(
   let inserted = 0
   const rewritten: unknown[] = []
   for (const message of consumed.messages) {
-    const transition = message.transitions[0]
+    const transition = message.transitions.at(-1)
     if (transition && applyConfig) {
       rewritten.push({
         role: 'system',

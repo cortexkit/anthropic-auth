@@ -579,4 +579,188 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(markOpenCodeEffortTransitions(otherModel)).toBeNull()
     expect(markerTexts(otherModel)).toEqual([])
   })
+
+  test('accepts a merged boundary whose transitions are a correctly-ordered run and emits the last effort', () => {
+    const messages = [
+      user('msg_low', 'ses_merged', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    expect(plan?.markerCount).toBe(2)
+
+    const highMarker = markerTexts([messages[1]!])[0]
+    const maxMarker = markerTexts([messages[2]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+    expect(highMarker).toBeDefined()
+    expect(maxMarker).toBeDefined()
+    expect(anchor).toBeDefined()
+
+    const body: {
+      model: string
+      output_config: { effort: string }
+      messages: unknown[]
+    } = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: highMarker },
+            { type: 'text', text: maxMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toEqual({ found: 2, inserted: 1 })
+    expect(body.messages).toContainEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'max' },
+    })
+    expect(body.messages).not.toContainEqual({
+      role: 'system',
+      content: [],
+      output_config: { effort: 'high' },
+    })
+    expect(JSON.stringify(body)).not.toContain('cortexkit-internal-effort')
+  })
+
+  test('rejects a merged boundary whose transitions are out of order', () => {
+    const messages = [
+      user('msg_low', 'ses_merged_order', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged_order', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged_order', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    const highMarker = markerTexts([messages[1]!])[0]
+    const maxMarker = markerTexts([messages[2]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: maxMarker },
+            { type: 'text', text: highMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker non-prefix loss')
+  })
+
+  test('rejects a merged boundary whose transitions are duplicated', () => {
+    const messages = [
+      user('msg_low', 'ses_merged_dup', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged_dup', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged_dup', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    const highMarker = markerTexts([messages[1]!])[0]
+    const maxMarker = markerTexts([messages[2]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: highMarker },
+            { type: 'text', text: highMarker },
+            { type: 'text', text: maxMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 3')
+  })
+
+  test('rejects a foreign-scope marker at index 1 of a merged boundary', () => {
+    const messages = [
+      user('msg_low', 'ses_merged_scope', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_merged_scope', 'claude-fable-5-1', 'high'),
+      user('msg_max', 'ses_merged_scope', 'claude-fable-5-1', 'max'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    const highMarker = markerTexts([messages[1]!])[0]
+    const anchor = messages[2]!.parts
+      .map((part) => part.text)
+      .find((text) => text.startsWith(EFFORT_ANCHOR_PREFIX))
+
+    // A valid marker minted for a different session carries a foreign scope.
+    const foreignMessages = [
+      user('msg_foreign_low', 'ses_foreign_scope', 'claude-fable-5-1', 'low'),
+      user('msg_foreign_high', 'ses_foreign_scope', 'claude-fable-5-1', 'high'),
+    ]
+    markOpenCodeEffortTransitions(foreignMessages)
+    const foreignMarker = markerTexts([foreignMessages[1]!])[0]
+    expect(foreignMarker).toBeDefined()
+
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_low' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: highMarker },
+            { type: 'text', text: foreignMarker },
+            { type: 'text', text: anchor },
+          ],
+        },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toThrow('Fable 5.1 effort marker scope mismatch')
+  })
 })
