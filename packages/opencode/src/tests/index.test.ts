@@ -10122,6 +10122,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch
+    __setLogTestSink(null)
   })
 
   test('preserves effort boundaries when OpenCode lowers multiple assistant records into one message', async () => {
@@ -10448,7 +10449,11 @@ describe('Fable 5.1 request-scoped effort history', () => {
     const transitionMarker = internalTexts?.find((text) =>
       text.startsWith(EFFORT_MARKER_PREFIX),
     )
+    const anchorMarker = internalTexts?.find((text) =>
+      text.includes('cortexkit-internal-effort-anchor'),
+    )
     expect(transitionMarker).toBeString()
+    expect(anchorMarker).toBeString()
     const correlatedHeaders = { headers: {} as Record<string, string> }
     await plugin['chat.headers'](
       {
@@ -10523,6 +10528,56 @@ describe('Fable 5.1 request-scoped effort history', () => {
     expect((await duplicateTransition.json()).error.message).toBe(
       'Multiple internal Fable 5.1 effort markers on one user boundary',
     )
+
+    const refusalLogs: LogTestRecord[] = []
+    __setLogTestSink((record) => refusalLogs.push(record))
+    const misplacedAnchor = await auth.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: {
+        'x-session-affinity': 'ses_effort_misplaced_anchor',
+        ...(effortPlanHeader
+          ? { 'x-cortexkit-effort-plan': effortPlanHeader }
+          : {}),
+      },
+      body: JSON.stringify({
+        model: 'claude-fable-5-1',
+        output_config: { effort: 'high' },
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'correlation failure' },
+              { type: 'text', text: transitionMarker },
+              { type: 'text', text: anchorMarker },
+            ],
+          },
+          { role: 'user', content: 'unexpected boundary' },
+        ],
+      }),
+    })
+    expect(misplacedAnchor.status).toBe(400)
+    expect((await misplacedAnchor.json()).error.message).toBe(
+      'Missing or invalid internal Fable 5.1 effort anchor placement',
+    )
+    expect(refusalLogs).toContainEqual({
+      level: 'warn',
+      channel: 'effort-history',
+      message: 'refused uncorrelated Fable 5.1 request',
+      payload: expect.objectContaining({
+        check: 'anchor_placement',
+        anchorBoundaryId: 'msg_marked_high',
+        plannedBoundaryId: 'msg_marked_high',
+        lastUserMessageId: null,
+        anchorMessageIndex: 0,
+        lastUserMessageIndex: 1,
+        anchorsFound: 1,
+        markerCount: 1,
+        validToolContinuationSuffix: false,
+        expectedAnchorHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+        foundAnchorHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+        anchorMatchesExpected: true,
+      }),
+    })
     expect(messagesCalled).toBe(false)
   })
 })

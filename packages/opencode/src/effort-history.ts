@@ -48,7 +48,11 @@ type RequestEffortPlan = {
 }
 
 export class EffortMarkerCorrelationError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly check = 'unspecified',
+    readonly details: Record<string, unknown> = {},
+  ) {
     super(message)
     this.name = 'EffortMarkerCorrelationError'
   }
@@ -472,6 +476,67 @@ function consumeInternalMarkers(body: Record<string, unknown>): {
   return { messages }
 }
 
+function isToolResultContinuation(
+  messages: ParsedUserMessage[],
+  userMessageIndex: number,
+): boolean {
+  const userMessage = messages[userMessageIndex]?.value
+  const assistantMessage = messages[userMessageIndex - 1]?.value
+  if (
+    !isRecord(userMessage) ||
+    userMessage.role !== 'user' ||
+    !Array.isArray(userMessage.content) ||
+    userMessage.content.length === 0 ||
+    !isRecord(assistantMessage) ||
+    assistantMessage.role !== 'assistant' ||
+    !Array.isArray(assistantMessage.content)
+  ) {
+    return false
+  }
+  const toolUseIds = new Set(
+    assistantMessage.content.flatMap((block) =>
+      isRecord(block) &&
+      block.type === 'tool_use' &&
+      typeof block.id === 'string'
+        ? [block.id]
+        : [],
+    ),
+  )
+  return userMessage.content.every(
+    (block) =>
+      isRecord(block) &&
+      block.type === 'tool_result' &&
+      typeof block.tool_use_id === 'string' &&
+      toolUseIds.has(block.tool_use_id),
+  )
+}
+
+function hasOnlyToolContinuationsAfterAnchor(
+  messages: ParsedUserMessage[],
+  anchorMessageIndex: number,
+): boolean {
+  if (anchorMessageIndex < 0) return false
+  const trailingUserIndexes = messages.flatMap((message, index) =>
+    index > anchorMessageIndex &&
+    isRecord(message.value) &&
+    message.value.role === 'user'
+      ? [index]
+      : [],
+  )
+  return (
+    trailingUserIndexes.length > 0 &&
+    trailingUserIndexes.every((index) =>
+      isToolResultContinuation(messages, index),
+    )
+  )
+}
+
+function providerMessageId(value: unknown): string | null {
+  if (!isRecord(value)) return null
+  if (typeof value.id === 'string') return value.id
+  return typeof value.message_id === 'string' ? value.message_id : null
+}
+
 function resolveExpectedPlan(
   requestPlan: RequestEffortPlan,
   resolvedPlan: OpenCodeEffortMarkerPlan | undefined,
@@ -633,15 +698,41 @@ export function applyOpenCodeEffortMarkers(
     (message) => isRecord(message.value) && message.value.role === 'user',
   )
   const anchor = anchors[0]
+  const lastUserMessage = consumed.messages[lastUserMessageIndex]?.value
+  const validToolContinuationSuffix = hasOnlyToolContinuationsAfterAnchor(
+    consumed.messages,
+    anchorMessageIndex,
+  )
   if (
     requestPlan.markerCount > 0 &&
     (anchors.length !== 1 ||
-      anchorMessageIndex !== lastUserMessageIndex ||
+      (anchorMessageIndex !== lastUserMessageIndex &&
+        !validToolContinuationSuffix) ||
       !anchor ||
       anchor.scope !== requestPlan.scope)
   ) {
     throw new EffortMarkerCorrelationError(
-      'Missing or invalid internal Fable 5.1 effort anchor',
+      'Missing or invalid internal Fable 5.1 effort anchor placement',
+      'anchor_placement',
+      {
+        anchorBoundaryId: anchor?.boundary ?? null,
+        plannedBoundaryId: expectedPlan?.anchor?.boundary ?? null,
+        lastUserMessageId: providerMessageId(lastUserMessage),
+        anchorMessageIndex,
+        lastUserMessageIndex,
+        validToolContinuationSuffix,
+        anchorsFound: anchors.length,
+        markerCount: requestPlan.markerCount,
+        scope: requestPlan.scope,
+        foundScope: anchor?.scope ?? null,
+        expectedAnchorHash: expectedPlan?.anchor
+          ? digest(expectedPlan.anchor.token)
+          : null,
+        foundAnchorHash: anchor ? digest(anchor.token) : null,
+        anchorMatchesExpected:
+          expectedPlan?.anchor != null &&
+          anchor?.token === expectedPlan.anchor.token,
+      },
     )
   }
   if (requestPlan.markerCount === 0 && anchors.length !== 0) {
@@ -651,7 +742,22 @@ export function applyOpenCodeEffortMarkers(
   }
   if (expectedPlan?.anchor && anchor?.token !== expectedPlan.anchor.token) {
     throw new EffortMarkerCorrelationError(
-      'Missing or invalid internal Fable 5.1 effort anchor',
+      'Mismatched internal Fable 5.1 effort anchor token',
+      'anchor_token',
+      {
+        anchorBoundaryId: anchor?.boundary ?? null,
+        plannedBoundaryId: expectedPlan.anchor.boundary,
+        lastUserMessageId: providerMessageId(lastUserMessage),
+        anchorMessageIndex,
+        lastUserMessageIndex,
+        anchorsFound: anchors.length,
+        markerCount: requestPlan.markerCount,
+        scope: requestPlan.scope,
+        foundScope: anchor?.scope ?? null,
+        expectedAnchorHash: digest(expectedPlan.anchor.token),
+        foundAnchorHash: anchor ? digest(anchor.token) : null,
+        anchorMatchesExpected: false,
+      },
     )
   }
   let effectiveBaseline = requestPlan.baseline

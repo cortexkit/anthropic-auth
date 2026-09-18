@@ -326,6 +326,10 @@ const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 function effortMarkerFailureResponse(
   error: EffortMarkerCorrelationError,
 ): Response {
+  logger.warn('effort-history', 'refused uncorrelated Fable 5.1 request', {
+    check: error.check,
+    ...error.details,
+  })
   return new Response(
     JSON.stringify({
       type: 'error',
