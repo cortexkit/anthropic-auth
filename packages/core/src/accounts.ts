@@ -492,6 +492,8 @@ export type AccountRefreshError = {
 const DEFAULT_FALLBACK_ON = [401, 403, 429]
 const MIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_REFRESH_BEFORE_EXPIRY_MINUTES = MIN_REFRESH_BEFORE_EXPIRY_MINUTES
+// Claustrum requests extra headroom beyond the local refresh threshold.
+export const VAULT_REFRESH_HEADROOM_MINUTES = 30
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
 const MIN_REFRESH_RETRY_DELAY_MS = 5 * 60_000
 const MAX_REFRESH_RETRY_DELAY_MS = 60 * 60_000
@@ -3022,6 +3024,12 @@ export function getRefreshBeforeExpiryMs(storage: AccountStorage | null) {
   return refreshBeforeExpiryMs(storage)
 }
 
+export function getVaultRefreshMinTtlMs(storage: AccountStorage | null) {
+  return (
+    getRefreshBeforeExpiryMs(storage) + VAULT_REFRESH_HEADROOM_MINUTES * 60_000
+  )
+}
+
 export function getRefreshIntervalMs(storage: AccountStorage | null) {
   const minutes =
     storage?.refresh?.intervalMinutes ?? DEFAULT_REFRESH_INTERVAL_MINUTES
@@ -3724,9 +3732,15 @@ function canUseCachedQuotaAfterRefreshError(
   storage: AccountStorage | null,
   error: unknown,
   now: number,
+  vaultServed: boolean,
 ) {
   return (
-    Boolean(account.access && account.expires && account.expires > now) &&
+    // Cached quota remains attributable after a transient failure when either
+    // the local credential is live or a live Claustrum binding serves it.
+    Boolean(
+      (account.access && account.expires && account.expires > now) ||
+        vaultServed,
+    ) &&
     isTransientQuotaError(error) &&
     quotaSnapshotPassesPolicy(account.quota, storage) &&
     cachedQuotaSnapshotStillRelevant(account.quota, now)
@@ -4247,8 +4261,9 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      const vaultServed = this.isFallbackAccountVaultServed(account.id, storage)
       if (this.isFallbackAccountVaultEnabled(account.id, storage)) {
-        if (!this.isFallbackAccountVaultServed(account.id, storage)) continue
+        if (!vaultServed) continue
         if (
           hasNoLocalCredential(account) &&
           !storage.quota?.minimumRemaining &&
@@ -4263,7 +4278,7 @@ export class FallbackAccountManager {
         if (
           tokenNeedsRefresh(next, storage, this.now()) &&
           !this.isFallbackAccountVaultEnabled(next.id, storage) &&
-          !this.isFallbackAccountVaultServed(next.id, storage)
+          !vaultServed
         ) {
           const refreshError = next.lastRefreshError
           if (
@@ -4316,7 +4331,13 @@ export class FallbackAccountManager {
           usable.push(next)
       } catch (error) {
         if (
-          canUseCachedQuotaAfterRefreshError(next, storage, error, this.now())
+          canUseCachedQuotaAfterRefreshError(
+            next,
+            storage,
+            error,
+            this.now(),
+            this.isFallbackAccountVaultServed(next.id, storage),
+          )
         ) {
           log(
             '[refresh] fallback quota using cached quota after refresh error',

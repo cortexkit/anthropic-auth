@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
+import { strictEqual } from 'node:assert'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,15 +8,20 @@ import {
   type AccountStorage,
   createEmptyStorage,
   FallbackAccountManager,
+  getRefreshBeforeExpiryMs,
+  getVaultRefreshMinTtlMs,
   hasNoLocalCredential,
   loadAccounts,
   type OAuthAccount,
   saveAccountState,
   saveAccounts,
 } from '../accounts.ts'
+import { custodyTombstoneOAuth } from '../claustrum.ts'
 
 const directories: string[] = []
 
+// These paired tripwires cover both vault-facing minTtl routes: default
+// threshold/headroom derivation and the config-override floor.
 afterEach(async () => {
   await Promise.all(
     directories
@@ -29,6 +35,64 @@ test('recognizes an OAuth account with no local credential', () => {
   expect(hasNoLocalCredential({ refresh: '' })).toBe(true)
   expect(hasNoLocalCredential({ refresh: 'refresh' })).toBe(false)
   expect(hasNoLocalCredential({ access: '' })).toBe(false)
+})
+
+test('keeps the vault-facing refresh TTL at 270 minutes', () => {
+  const vaultMinTtlMs = getVaultRefreshMinTtlMs(createEmptyStorage())
+  const expectedVaultMinTtlMs = 270 * 60_000
+  // Anthropic OAuth access tokens live 8h; the vault refreshes a credential when
+  // `now + minTtl >= expires_at`, so this value alone fixes the observed rotation
+  // period. State the resulting PERIOD, not just the minTtl: the period is the
+  // number the vault operator needs to pre-seed their stall detector.
+  const tokenLifetimeMinutes = 480
+  const newPeriodMinutes = tokenLifetimeMinutes - vaultMinTtlMs / 60_000
+  const oldPeriodMinutes = tokenLifetimeMinutes - expectedVaultMinTtlMs / 60_000
+  // Every number below is labelled with its ROLE: minTtl and period are drawn from
+  // the same small set of values and routinely swap places (a 240m minTtl on an 8h
+  // token yields a 240m period), so bare numerals invite transposition by a reader
+  // who lands on the assertion footer rather than the prose.
+  const guidance = [
+    'Vault coupling tripwire (threshold + headroom route; paired with the config-floor tripwire below): this shared value is passed as minTtl to Claustrum',
+    '`credential.get`, and the vault refreshes when `now + minTtl >= expires_at`,',
+    'so it fixes the observed rotation period as token_lifetime - minTtl.',
+    `CHANGED: minTtl ${vaultMinTtlMs / 60_000}m (was ${expectedVaultMinTtlMs / 60_000}m)`,
+    `-> rotation period ${newPeriodMinutes}m (was ${oldPeriodMinutes}m).`,
+    `The +/- values below are minTtl in ms, NOT the period.`,
+    `token_lifetime is ASSUMED ${tokenLifetimeMinutes}m — neither side observes it`,
+    "(it lives inside the vault's encrypted envelope); if Anthropic changed it,",
+    'this arithmetic is stale even though the assertion fired correctly.',
+    newPeriodMinutes > oldPeriodMinutes
+      ? 'THIS CHANGE LENGTHENS THE PERIOD, WHICH REQUIRES ADVANCE NOTICE: the vault operator alarms on MAX(recent gaps) + 30m, so the first longer gap trips a false stall alarm that REPEATS on a 30-minute cooldown until the refresh lands. Tell them the new period above before deploying so they can pre-seed it.'
+      : 'This change shortens the period, which is silent for the vault operator and needs no notice.',
+  ].join(' ')
+
+  strictEqual(vaultMinTtlMs, expectedVaultMinTtlMs, guidance)
+})
+
+test('floors a config override so it cannot lower the vault-facing minTtl', () => {
+  // This watches the other route to the same vault-facing value: the
+  // `refresh.refreshBeforeExpiryMinutes` config key. The floor in
+  // refreshBeforeExpiryMs is what makes the paired tripwires sufficient — without
+  // it, an operator could lower minTtl from config, lengthening the vault's
+  // rotation period, and the threshold/headroom tripwire above would never fire.
+  const storage = createEmptyStorage()
+  storage.refresh = { ...storage.refresh, refreshBeforeExpiryMinutes: 60 }
+  const floored = getRefreshBeforeExpiryMs(storage)
+
+  strictEqual(
+    floored,
+    240 * 60_000,
+    [
+      'Vault coupling tripwire (config route): a below-floor override of',
+      '`refresh.refreshBeforeExpiryMinutes` must clamp UP to the 240m floor, but this',
+      `build returned ${floored / 60_000}m. The floor is load-bearing for a peer system:`,
+      'it is the only reason config cannot lower minTtl, and lowering minTtl LENGTHENS the',
+      "vault's rotation period, which repeatedly false-alarms the vault operator's stall",
+      'detector. Removing the floor makes that reachable from config alone, where the',
+      'threshold/headroom tripwire above cannot see it. If you removed it deliberately,',
+      'the vault operator holds a registered dependency on it and is owed notice.',
+    ].join(' '),
+  )
 })
 
 test('preserves the Claustrum mode when a save supplies only handlesFile', async () => {
@@ -141,6 +205,53 @@ test('excludes an empty-material vault fallback after its quota policy fails', a
 
   await expect(manager.getUsableFallbackAccounts(storage)).resolves.toEqual([])
   expect(authorizations).toEqual(['Bearer vault-fallback-access'])
+})
+
+test('keeps a live vault fallback on cached quota after a transient quota failure', async () => {
+  const now = 1_000_000
+  const account: OAuthAccount = {
+    id: 'vault-fallback',
+    enabled: true,
+    ...custodyTombstoneOAuth('anthropic'),
+    quota: {
+      checkedAt: now - 60_000,
+      five_hour: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: now - 60_000,
+      },
+      seven_day: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: now - 60_000,
+      },
+    },
+  }
+  const storage: AccountStorage = {
+    version: 1,
+    claustrum: { mode: 'claustrum' },
+    quota: {
+      enabled: true,
+      checkIntervalMinutes: 1,
+      minimumRemaining: { five_hour: 10, seven_day: 10 },
+      failClosedOnUnknownQuota: true,
+    },
+    accounts: [account],
+  }
+  const manager = new FallbackAccountManager({
+    now: () => now,
+    isFallbackAccountVaultEnabled: () => true,
+    isFallbackAccountVaultServed: () => true,
+    resolveFallbackAccessToken: () => ({
+      token: 'vault-fallback-access',
+      source: 'vault',
+    }),
+    fetchImpl: async () => new Response('unavailable', { status: 503 }),
+  })
+
+  await expect(manager.getUsableFallbackAccounts(storage)).resolves.toEqual([
+    account,
+  ])
 })
 
 test('keeps tombstone metadata when discarding a stale credential write', async () => {
