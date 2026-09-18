@@ -1,5 +1,7 @@
-import { describe, expect, test } from 'bun:test'
-import { basename, win32 } from 'node:path'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { exists, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, join, win32 } from 'node:path'
 
 import {
   __deriveCustodyManifestStaleLockPrefix,
@@ -8,7 +10,18 @@ import {
   custodyCredentialIdFromResolution,
   readCustodyHandles,
   resolveCustodyHandle,
+  writeCustodyHandleManifestEntry,
 } from '../claustrum.ts'
+
+const temporaryDirectories: string[] = []
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  )
+})
 
 describe('custody manifest stale-lock prefix', () => {
   test('derives prefixes from POSIX and Windows path basenames', () => {
@@ -305,5 +318,68 @@ describe('readCustodyHandles provider scope', () => {
     expect(parsed.accounts).toHaveLength(1)
     expect(parsed.accounts[0]?.credentialId).toBe('antigravity:google')
     expect(parsed.accounts[0]?.label).toBe('main')
+  })
+
+  test('resolves an `apikey:deepseek:main` id inside a deepseek block', () => {
+    const doc = makeManifest('deepseek', 'deepseek-auth')
+    doc.providers[0]!.accounts.push({
+      label: 'main',
+      handle: anthropicHandle,
+      credential_id: 'apikey:deepseek:main',
+    })
+
+    const parsed = readCustodyHandles(doc, 'deepseek', 'deepseek-auth')
+    expect(parsed.corruptLabels).toEqual(new Set())
+    expect(parsed.accounts).toHaveLength(1)
+    expect(parsed.accounts[0]?.credentialId).toBe('apikey:deepseek:main')
+    expect(parsed.accounts[0]?.label).toBe('main')
+  })
+
+  test('rejects credential ids with any empty colon-separated segment', () => {
+    const parseMalformed = (credentialId: string, label: string) => {
+      const doc = makeManifest('anthropic', 'anthropic-auth')
+      doc.providers[0]!.accounts.push({
+        label,
+        handle: anthropicHandle,
+        credential_id: credentialId,
+      })
+
+      const parsed = readCustodyHandles(doc, 'anthropic', 'anthropic-auth')
+      return parsed
+    }
+
+    expect(parseMalformed(':anthropic:x', 'empty-kind').corruptLabels).toEqual(
+      new Set(['empty-kind']),
+    )
+    expect(parseMalformed('oauth::x', 'empty-provider').corruptLabels).toEqual(
+      new Set(['empty-provider']),
+    )
+    expect(
+      parseMalformed('oauth:anthropic:', 'empty-label').corruptLabels,
+    ).toEqual(new Set(['empty-label']))
+    expect(
+      parseMalformed('oauth:anthropic::y', 'empty-middle-label').corruptLabels,
+    ).toEqual(new Set(['empty-middle-label']))
+    expect(parseMalformed('', 'empty-id').corruptLabels).toEqual(
+      new Set(['empty-id']),
+    )
+  })
+
+  test('writer refuses empty-segment credential ids before they reach disk', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'claustrum-manifest-'))
+    temporaryDirectories.push(directory)
+    const path = join(directory, 'handles.json')
+
+    await expect(
+      writeCustodyHandleManifestEntry({
+        path,
+        entry: {
+          label: 'main',
+          handle: anthropicHandle,
+          credentialId: 'oauth:anthropic:',
+        },
+      }),
+    ).resolves.toEqual({ status: 'refused', reason: 'invalid entry' })
+    expect(await exists(path)).toBe(false)
   })
 })

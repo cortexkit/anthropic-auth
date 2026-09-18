@@ -408,14 +408,16 @@ function isValidCustodyCredentialId(value: unknown): value is string {
 // NOT enumerate or constrain it: enumerating the kinds would reject live
 // credentials the moment a new one ships. The third-and-later segments are
 // the label, which is never consulted here — the label is the lookup key
-// elsewhere, not an authorization check.
+// elsewhere, not an authorization check. Empty segments are invalid because
+// the co-tenant parser rejects the whole manifest for a malformed row, while
+// ours can otherwise isolate it to the row that contains it.
 function isScopedCustodyCredentialId(
   value: unknown,
   provider: string,
 ): value is string {
   if (typeof value !== 'string' || value.length === 0) return false
   const segments = value.split(':')
-  return segments[1] === provider
+  return segments[1] === provider && segments.every((segment) => segment !== '')
 }
 
 function legacyOrUnresolved(
