@@ -63,7 +63,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { SubcCallError } from '@cortexkit/subc-client'
-import { EFFORT_MARKER_PREFIX } from '../effort-history'
+import { EFFORT_ANCHOR_PREFIX, EFFORT_MARKER_PREFIX } from '../effort-history'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
 import {
@@ -10448,6 +10448,9 @@ describe('Fable 5.1 request-scoped effort history', () => {
     const transitionMarker = internalTexts?.find((text) =>
       text.startsWith(EFFORT_MARKER_PREFIX),
     )
+    const anchorMarker = internalTexts?.find((text) =>
+      text.startsWith(EFFORT_ANCHOR_PREFIX),
+    )
     expect(transitionMarker).toBeString()
     const correlatedHeaders = { headers: {} as Record<string, string> }
     await plugin['chat.headers'](
@@ -10518,10 +10521,11 @@ describe('Fable 5.1 request-scoped effort history', () => {
     const duplicateTransition = await send('ses_effort_duplicate_transition', [
       transitionMarker,
       transitionMarker,
+      anchorMarker,
     ])
     expect(duplicateTransition.status).toBe(400)
     expect((await duplicateTransition.json()).error.message).toBe(
-      'Multiple internal Fable 5.1 effort markers on one user boundary',
+      'Fable 5.1 effort marker correlation failed: expected 1, found 2',
     )
     expect(messagesCalled).toBe(false)
   })
