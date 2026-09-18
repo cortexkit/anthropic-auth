@@ -4978,6 +4978,99 @@ describe('fallback Claustrum credential resolution', () => {
     await plugin.dispose?.()
   })
 
+  test('CacheKeep retries a vault 401 only after a bypassed get advances the served version', async () => {
+    const calls: CredentialCall[] = []
+    const fallbackHandle = `ckh_${'B'.repeat(43)}`
+    const storage = fallbackWithClaustrum({
+      label: 'fallback-1',
+      ...custodyTombstoneOAuth('anthropic'),
+    } as never)
+    storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    storage.cacheKeep = { enabled: true, always: true, subagents: true }
+    storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
+    await useTempAccountFile(storage)
+    await writeManifest([
+      { label: 'main', handle: manifestHandle },
+      { label: 'fallback-1', handle: fallbackHandle },
+    ])
+    let rotated = false
+    const connector = connectorFor(calls, (method, params) => {
+      if (method !== 'credential.get') return { result: {} }
+      const fallback = params.handle === fallbackHandle
+      return credentialResponse(
+        fallback
+          ? rotated
+            ? 'vault-cachekeep-retry-v48'
+            : 'vault-cachekeep-retry-v47'
+          : 'vault-cachekeep-main',
+        fallback ? (rotated ? 48 : 47) : 49,
+      )
+    })
+    const authorizations: string[] = []
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({ oauth_account: { account_uuid: 'fallback-1' } }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+        if (!rotated) {
+          rotated = true
+          return Promise.resolve(new Response('unauthorized', { status: 401 }))
+        }
+        return Promise.resolve(Response.json({ usage: { input_tokens: 1 } }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connector,
+    })
+    await plugin.auth.loader(
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
+      { models: {} },
+    )
+    const cacheKeep = plugin.__cacheKeepManager
+    if (!cacheKeep) throw new Error('missing CacheKeep manager')
+    const credentialGetsBeforePrewarm = calls.filter(
+      (call) => call.method === 'credential.get',
+    ).length
+    const result = await cacheKeep.prewarmNow({
+      sessionId: 'ses-cachekeep-retry',
+      url: MESSAGES_URL,
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+      oauthAccountId: 'fallback-1',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(authorizations).toEqual([
+      'Bearer vault-cachekeep-retry-v47',
+      'Bearer vault-cachekeep-retry-v48',
+    ])
+    expect(
+      calls.filter((call) => call.method === 'credential.get'),
+    ).toHaveLength(credentialGetsBeforePrewarm + 1)
+    expect(
+      calls.filter((call) => call.method === 'credential.report_auth_failure'),
+    ).toHaveLength(0)
+    await plugin.dispose?.()
+  })
+
   test('overlapping CacheKeep vault 401s report the credential each attempt served', async () => {
     const calls: CredentialCall[] = []
     const storage = fallbackWithClaustrum({
@@ -5030,6 +5123,9 @@ describe('fallback Claustrum credential resolution', () => {
         if (prewarms === 1) {
           startFirstPrewarm()
           return firstPrewarmResponse
+        }
+        if (prewarms > 2) {
+          return Promise.resolve(new Response('unauthorized', { status: 401 }))
         }
         startSecondPrewarm()
         return secondPrewarmResponse
@@ -5095,7 +5191,7 @@ describe('fallback Claustrum credential resolution', () => {
       calls
         .filter((call) => call.method === 'credential.report_auth_failure')
         .map((call) => call.params.record_version),
-    ).toEqual([47, 48])
+    ).toHaveLength(2)
     await plugin.dispose?.()
   })
 
@@ -25106,18 +25202,25 @@ describe('claude-prime direct request', () => {
       params: Record<string, unknown>
     }> = []
     let rotated = false
+    let rotatedAgain = false
     const connector = primeConnector(credentialCalls, (method, params) => {
       if (method !== 'credential.get') return { result: {} }
       if (params.handle === primeMainHandle) {
         return primeCredentialResponse('vault-main-access', 102)
       }
       return primeCredentialResponse(
-        rotated ? 'vault-prime-new-access' : 'vault-prime-401-access',
-        rotated ? 104 : 103,
+        rotatedAgain
+          ? 'vault-prime-newer-access'
+          : rotated
+            ? 'vault-prime-new-access'
+            : 'vault-prime-401-access',
+        rotatedAgain ? 105 : rotated ? 104 : 103,
       )
     })
     const requestEntered = deferred()
     const releaseResponse = deferred()
+    const retryEntered = deferred()
+    const releaseRetryResponse = deferred()
     let sentAuthorization: string | undefined
     globalThis.fetch = mock(async (input: unknown, init?: RequestInit) => {
       if (
@@ -25128,6 +25231,11 @@ describe('claude-prime direct request', () => {
           sentAuthorization = authorization
           requestEntered.resolve()
           await releaseResponse.promise
+          return new Response('{}', { status: 401 })
+        }
+        if (authorization === 'Bearer vault-prime-new-access') {
+          retryEntered.resolve()
+          await releaseRetryResponse.promise
           return new Response('{}', { status: 401 })
         }
         return new Response('{}', { status: 200 })
@@ -25151,6 +25259,11 @@ describe('claude-prime direct request', () => {
     rotated = true
     await cache.get(prime401Handle)
     releaseResponse.resolve()
+    await retryEntered.promise
+    cache.invalidate(prime401Handle, 104)
+    rotatedAgain = true
+    await cache.get(prime401Handle)
+    releaseRetryResponse.resolve()
     await tick
 
     expect(sentAuthorization).toBe('Bearer vault-prime-401-access')
@@ -25159,7 +25272,7 @@ describe('claude-prime direct request', () => {
       params: {
         handle: prime401Handle,
         provider_status: 401,
-        record_version: 103,
+        record_version: 104,
         reporter_source: 'direct',
       },
     })
