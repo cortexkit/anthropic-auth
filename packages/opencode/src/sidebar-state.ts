@@ -88,6 +88,12 @@ export interface SidebarState {
   route: string
   relay: { enabled: boolean; transport: string } | null
   fastMode: boolean
+  /**
+   * True when the boot-time fallback-account background refresh was withheld
+   * because vault residency was structurally unsafe before a main slot existed.
+   * Process-wide (one boot decision), not per-account.
+   */
+  fallbackRefreshStructuralDark?: boolean
   cacheKeep?: {
     enabled: boolean
     window?: string
@@ -434,6 +440,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
       typeof raw.fastMode === 'boolean'
         ? raw.fastMode
         : DEFAULT_SIDEBAR_STATE.fastMode,
+    ...(raw.fallbackRefreshStructuralDark === true && {
+      fallbackRefreshStructuralDark: true,
+    }),
     cacheKeep,
     prime: normalizePrimeSection(raw.prime),
     fableRecoveries: fableRecoveries.length > 0 ? fableRecoveries : undefined,
