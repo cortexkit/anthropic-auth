@@ -282,14 +282,15 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         },
       ],
     }
-    expect(() =>
+    expect(
       applyOpenCodeEffortMarkers(
         missingAnchorBody,
         true,
         encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
         plan as NonNullable<typeof plan>,
       ),
-    ).toThrow('Fable 5.1 effort marker correlation failed: expected 2, found 0')
+    ).toEqual({ found: 0, inserted: 0 })
+    expect(missingAnchorBody.output_config).toEqual({ effort: 'high' })
 
     const body = {
       model: 'claude-fable-5-1',
@@ -321,6 +322,89 @@ describe('OpenCode Fable 5.1 effort markers', () => {
         content: [{ type: 'text', text: 'msg_current' }],
       },
     ])
+  })
+
+  test('folds a full trim into the last consumed transition effort when the plan resolves', () => {
+    const messages = [
+      user('msg_low', 'ses_full_trim_fold', 'claude-fable-5-1', 'low'),
+      user('msg_medium', 'ses_full_trim_fold', 'claude-fable-5-1', 'medium'),
+      user('msg_high', 'ses_full_trim_fold', 'claude-fable-5-1', 'high'),
+      user('msg_current', 'ses_full_trim_fold', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    expect(plan?.markerCount).toBe(2)
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'low' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_current' }] },
+      ],
+    }
+
+    expect(
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+        plan as NonNullable<typeof plan>,
+      ),
+    ).toEqual({ found: 0, inserted: 0 })
+    // The folded baseline is the last consumed transition's effort ('high'),
+    // not the plan's original baseline ('low').
+    expect(body.output_config).toEqual({ effort: 'high' })
+  })
+
+  test('rejects a full trim without a resolvable plan', () => {
+    const messages = [
+      user('msg_low', 'ses_full_trim_untrusted', 'claude-fable-5-1', 'low'),
+      user('msg_high', 'ses_full_trim_untrusted', 'claude-fable-5-1', 'high'),
+    ]
+    const plan = markOpenCodeEffortTransitions(messages)
+    expect(plan).not.toBeNull()
+    const body = {
+      model: 'claude-fable-5-1',
+      output_config: { effort: 'high' },
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'msg_high' }] },
+      ],
+    }
+
+    expect(() =>
+      applyOpenCodeEffortMarkers(
+        body,
+        true,
+        encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
+      ),
+    ).toThrow('Fable 5.1 effort marker correlation failed: expected 1, found 0')
+  })
+
+  test('resolves a plan header after the same message is re-recorded with a trimmed timeline', () => {
+    const full = [
+      user('msg_low', 'ses_overwrite', 'claude-fable-5-1', 'low'),
+      user('msg_medium', 'ses_overwrite', 'claude-fable-5-1', 'medium'),
+      user('msg_high', 'ses_overwrite', 'claude-fable-5-1', 'high'),
+      user('msg_current', 'ses_overwrite', 'claude-fable-5-1', 'high'),
+    ]
+    const fullPlan = markOpenCodeEffortTransitions(full)
+    expect(fullPlan?.markerCount).toBe(2)
+    const tracker = new OpenCodeEffortPlanTracker()
+    tracker.record(fullPlan as NonNullable<typeof fullPlan>)
+    const header = encodeOpenCodeEffortPlan(
+      fullPlan as NonNullable<typeof fullPlan>,
+    )
+
+    // The host trims the history prefix between provider calls; the same current
+    // message is re-marked with a shorter timeline and overwrites the slot.
+    const trimmedPlan = markOpenCodeEffortTransitions(full.slice(2))
+    expect(trimmedPlan?.messageId).toBe('msg_current')
+    expect(trimmedPlan?.markerCount).toBe(0)
+    tracker.record(trimmedPlan as NonNullable<typeof trimmedPlan>)
+
+    // The header generated from the full plan must still resolve.
+    expect(tracker.resolveHeader(header)).toEqual(
+      fullPlan as NonNullable<typeof fullPlan>,
+    )
   })
 
   test('rejects non-prefix transition loss even with the resolved plan', () => {

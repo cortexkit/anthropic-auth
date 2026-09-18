@@ -7,6 +7,7 @@ import {
 
 const MAX_EFFORT_MARKERS = 512
 const MAX_TRACKED_EFFORT_PLANS = 1024
+const MAX_TRACKED_EFFORT_PLAN_HISTORY = 4096
 const MARKER_CHECK_HEX_LENGTH = 32
 const SCOPE_HEX_LENGTH = 32
 const MESSAGE_ID_PATTERN = '[A-Za-z0-9_-]{1,128}'
@@ -569,7 +570,11 @@ export function applyOpenCodeEffortMarkers(
 
   if (!hasCandidate) {
     if (!requestPlan) return { found: 0, inserted: 0 }
-    if (requestPlan.markerCount !== 0) {
+    // A full trim is the `trimmedPrefix === expectedTransitions.length` case:
+    // every transition was consumed by the host's prefix trim, so fold them all
+    // into the baseline. Without a resolvable plan the request is untrusted and
+    // stays fail-closed.
+    if (requestPlan.markerCount !== 0 && !expectedTransitions) {
       throw new EffortMarkerCorrelationError(
         `Fable 5.1 effort marker correlation failed: expected ${requestPlan.markerCount}, found 0`,
       )
@@ -743,18 +748,32 @@ export function applyOpenCodeEffortMarkers(
 
 export class OpenCodeEffortPlanTracker {
   private readonly plans = new Map<string, OpenCodeEffortMarkerPlan>()
+  // A message's plan is re-recorded whenever the host trims the history prefix
+  // between provider calls, so the single per-message slot can be overwritten
+  // while a header generated from the previous plan is still in flight. Keep a
+  // bounded identity-keyed history so resolveHeader can still find that plan.
+  private readonly history = new Map<string, OpenCodeEffortMarkerPlan>()
 
   record(plan: OpenCodeEffortMarkerPlan): void {
     const key = this.key(plan.sessionId, plan.messageId)
-    this.plans.delete(key)
-    this.plans.set(key, {
+    const stored = {
       ...plan,
       transitionTokens: [...plan.transitionTokens],
-    })
+    }
+    this.plans.delete(key)
+    this.plans.set(key, stored)
+    const encoded = encodeOpenCodeEffortPlan(stored)
+    this.history.delete(encoded)
+    this.history.set(encoded, stored)
     while (this.plans.size > MAX_TRACKED_EFFORT_PLANS) {
       const oldest = this.plans.keys().next().value
       if (typeof oldest !== 'string') break
       this.plans.delete(oldest)
+    }
+    while (this.history.size > MAX_TRACKED_EFFORT_PLAN_HISTORY) {
+      const oldest = this.history.keys().next().value
+      if (typeof oldest !== 'string') break
+      this.history.delete(oldest)
     }
   }
 
@@ -784,10 +803,7 @@ export class OpenCodeEffortPlanTracker {
     value: string | undefined,
   ): OpenCodeEffortMarkerPlan | undefined {
     if (!value) return undefined
-    for (const plan of this.plans.values()) {
-      if (encodeOpenCodeEffortPlan(plan) === value) return plan
-    }
-    return undefined
+    return this.history.get(value)
   }
 
   private key(sessionId: string, messageId: string): string {
