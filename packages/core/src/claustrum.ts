@@ -1867,6 +1867,10 @@ export class ClaustrumCredentialCache {
   readonly #identity?: BindIdentity
   readonly #now: () => number
   readonly #refreshBackoffUntil = new Map<string, number>()
+  readonly #latchedRefreshFailures = new Map<
+    string,
+    ClaustrumCredentialErrorClass
+  >()
   #minTtlMs: number
 
   constructor(
@@ -2043,7 +2047,22 @@ export class ClaustrumCredentialCache {
     const load = this.#load(handle, minTtlMs)
     this.#inFlight.set(handle, load)
     void load
-      .catch(() => {})
+      .catch((error) => {
+        if (
+          error instanceof ClaustrumCredentialError &&
+          (error.errorClass === 'permanent' ||
+            error.errorClass === 'auth_required') &&
+          this.#latchedRefreshFailures.get(handle) !== error.errorClass
+        ) {
+          this.#latchedRefreshFailures.set(handle, error.errorClass)
+          logger.warn('claustrum', 'credential background refresh latched', {
+            handle,
+            recordVersion: this.#cache.get(handle)?.recordVersion,
+            errorClass: error.errorClass,
+            code: error.code,
+          })
+        }
+      })
       .finally(() => {
         if (this.#inFlight.get(handle) === load) this.#inFlight.delete(handle)
       })
@@ -2090,6 +2109,7 @@ export class ClaustrumCredentialCache {
         this.#cache.set(handle, credential)
       }
     }
+    this.#latchedRefreshFailures.delete(handle)
     return credential
   }
 }

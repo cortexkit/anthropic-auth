@@ -3474,6 +3474,32 @@ const anthropicAuthPlugin = async (
         cacheKeepDiagnosticsRequests.delete(target.id)
       }
     },
+    retryHeadersAfter401: async ({ headers, target, bodyText, attempt }) => {
+      const served = cacheKeepServedClaustrumCredentials.get(attempt.id)
+      if (!served) return undefined
+      const retry = await getAdvancedClaustrumCredentialAfter401(served)
+      const resolution = retry.resolution
+      if (!resolution?.accessToken || !resolution.served) return undefined
+      const retryHeaders = new Headers(headers)
+      try {
+        const parsedBody = JSON.parse(bodyText) as Record<string, unknown>
+        const identity = await resolveClaudeCodeIdentity(
+          resolution.accessToken,
+          typeof parsedBody.model === 'string' ? parsedBody.model : undefined,
+          target.oauthAccountId === 'main'
+            ? mainAccountId
+            : (target.oauthAccountId ?? 'main'),
+        )
+        setOAuthHeaders(retryHeaders, resolution.accessToken, {
+          body: parsedBody,
+          identity,
+        })
+      } catch {
+        setOAuthHeaders(retryHeaders, resolution.accessToken)
+      }
+      cacheKeepServedClaustrumCredentials.set(attempt.id, resolution.served)
+      return retryHeaders
+    },
     onComplete: ({ attempt }) => {
       cacheKeepServedClaustrumCredentials.delete(attempt.id)
     },
@@ -3787,7 +3813,7 @@ const anthropicAuthPlugin = async (
       const body = await rewriteRequestBody(JSON.stringify(primeBody), {
         identity,
       })
-      const headers = new Headers({
+      let headers = new Headers({
         'content-type': 'application/json',
       })
       setOAuthHeaders(headers, accessToken, {
@@ -3804,12 +3830,40 @@ const anthropicAuthPlugin = async (
       const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
       const primeUrl =
         primeRequest.url?.toString() ?? primeRequest.input.toString()
-      const response = await fetch(primeUrl, {
+      let response = await fetch(primeUrl, {
         method: 'POST',
         headers,
         body,
         signal: AbortSignal.timeout(30_000),
       })
+      if (response.status === 401 && servedClaustrumCredential) {
+        const retry = await getAdvancedClaustrumCredentialAfter401(
+          servedClaustrumCredential,
+        )
+        const retryResolution = retry.resolution
+        if (retryResolution?.accessToken && retryResolution.served) {
+          await response.body?.cancel().catch(() => {})
+          const retryIdentity = await resolveClaudeCodeIdentity(
+            retryResolution.accessToken,
+            resolvedModel,
+            accountId === 'main' ? mainAccountId : accountId,
+          )
+          headers = new Headers({ 'content-type': 'application/json' })
+          setOAuthHeaders(headers, retryResolution.accessToken, {
+            body: JSON.parse(body),
+            identity: retryIdentity,
+          })
+          headers.delete('content-length')
+          headers.delete('transfer-encoding')
+          response = await fetch(primeUrl, {
+            method: 'POST',
+            headers,
+            body,
+            signal: AbortSignal.timeout(30_000),
+          })
+          servedClaustrumCredential = retryResolution.served
+        }
+      }
       const ms = Math.round(performance.now() - start)
       if (!response.ok) {
         const reason =

@@ -391,6 +391,12 @@ export class CacheKeepManager {
         target: CacheKeepTarget,
         attempt: CacheKeepPrewarmAttempt,
       ) => Promise<Headers | undefined> | Headers | undefined
+      retryHeadersAfter401?: (input: {
+        headers: Headers
+        target: CacheKeepTarget
+        bodyText: string
+        attempt: CacheKeepPrewarmAttempt
+      }) => Promise<Headers | undefined> | Headers | undefined
       onTrackedSessionsChanged?: (
         sessions: readonly CacheKeepTrackedSession[],
       ) => Promise<void> | void
@@ -716,6 +722,33 @@ export class CacheKeepManager {
           ok: false,
           reason: error instanceof Error ? error.message : String(error),
           transient: true,
+        }
+      }
+      if (response.status === 401 && this.options.retryHeadersAfter401) {
+        const retryHeaders = await this.options.retryHeadersAfter401({
+          headers,
+          target,
+          bodyText: prewarm.bodyText,
+          attempt,
+        })
+        if (retryHeaders) {
+          await response.body?.cancel().catch(() => {})
+          try {
+            response = await fetchImpl(target.url, {
+              method: 'POST',
+              headers: retryHeaders,
+              body: prewarm.bodyText,
+              signal: AbortSignal.timeout(
+                this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
+              ),
+            })
+          } catch (error) {
+            return {
+              ok: false,
+              reason: error instanceof Error ? error.message : String(error),
+              transient: true,
+            }
+          }
         }
       }
       const receivedAt = this.options.now?.() ?? Date.now()

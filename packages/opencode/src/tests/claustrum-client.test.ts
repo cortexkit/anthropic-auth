@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { chmod, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer, type Socket } from 'node:net'
@@ -854,6 +854,72 @@ describe('ClaustrumCredentialCache', () => {
       recordVersion: 1,
     })
     expect(daemon.requestBodies).toHaveLength(2)
+  })
+
+  test('logs a latched background refresh failure once until a successful refresh re-arms it', async () => {
+    let now = 0
+    const responses = [
+      { result: { error: { code: 'not_found', class: 'permanent' } } },
+      { result: { error: { code: 'not_found', class: 'permanent' } } },
+      {
+        result: {
+          payload: Array.from(new TextEncoder().encode('credential-v2')),
+          expires_at_ms: 500_000,
+          record_version: 74,
+        },
+      },
+      { result: { error: { code: 'not_found', class: 'permanent' } } },
+    ]
+    const cache = new ClaustrumCredentialCache(
+      {
+        call: mock(async () => responses.shift()),
+        close: () => {},
+      } as never,
+      { now: () => now },
+    )
+    cache.seedForTest(handle, {
+      payload: 'credential-v1',
+      expiresAtMs: 300_000,
+      recordVersion: 73,
+    })
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+    const flushBackgroundRefresh = async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+    }
+
+    now = 181_000
+    await cache.get(handle)
+    await flushBackgroundRefresh()
+    now = 242_000
+    await cache.get(handle)
+    await flushBackgroundRefresh()
+    expect(
+      logs.filter(
+        (record) => record.message === 'credential background refresh latched',
+      ),
+    ).toHaveLength(1)
+
+    now = 303_000
+    await cache.get(handle)
+    await flushBackgroundRefresh()
+    now = 381_000
+    await cache.get(handle)
+    await flushBackgroundRefresh()
+    const latched = logs.filter(
+      (record) => record.message === 'credential background refresh latched',
+    )
+    expect(latched).toHaveLength(2)
+    expect(latched).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          channel: 'claustrum',
+          payload: expect.objectContaining({ recordVersion: 73 }),
+        }),
+      ]),
+    )
   })
 
   test('does not retain a credential whose expiry is absent', async () => {
