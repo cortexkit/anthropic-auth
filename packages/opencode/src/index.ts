@@ -2801,6 +2801,15 @@ const anthropicAuthPlugin = async (
     provisionalCustody.provisional === true &&
     (fallbackDimensions.fallbacks === 'M' ||
       fallbackDimensions.fallbacks === 'R')
+  if (fallbackRefreshStructuralDark) {
+    // Withholding the refresh is invisible from outside; record the three
+    // dimensions that produced the decision so a stalled process is diagnosable.
+    logger.warn('claustrum', 'fallback refresh withheld at construction', {
+      custodyMode: getClaustrumMode(initialStorage),
+      provisional: provisionalCustody.provisional,
+      fallbacks: fallbackDimensions.fallbacks,
+    })
+  }
   const fallbackRefreshReady = fallbackRefreshStructuralDark
     ? Promise.resolve('not-started')
     : fallbackManager.startBackgroundRefresh()
@@ -3821,6 +3830,9 @@ const anthropicAuthPlugin = async (
           : null
       })(),
       fastMode: isFastModeEnabled(),
+      ...(fallbackRefreshStructuralDark && {
+        fallbackRefreshStructuralDark: true,
+      }),
       cacheKeep: {
         enabled: isCacheKeepHybridActive(storage),
         window: isCacheKeepAlways(storage)
