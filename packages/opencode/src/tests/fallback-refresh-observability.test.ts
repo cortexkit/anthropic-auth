@@ -31,8 +31,9 @@ const FALLBACK_HANDLE = `ckh_${'F'.repeat(43)}`
 
 // Structural-dark requires claustrum mode + provisional custody + a fallback
 // dimension of M or R. A fallback with real refresh material (not a tombstone)
-// and a resolved manifest binding classifies as R.
-async function bootStructuralDark() {
+// and a resolved manifest binding classifies as R; a tombstone fallback
+// classifies as T, which is the non-dark control.
+async function bootFixture({ dark }: { dark: boolean }) {
   const root = await mkdtemp(join(tmpdir(), 'fallback-refresh-observability-'))
   roots.push(root)
   const accountPath = join(root, 'anthropic-auth.json')
@@ -68,6 +69,24 @@ async function bootStructuralDark() {
   )
   await chmod(manifestPath, 0o600)
 
+  const fallbackAccount = dark
+    ? {
+        id: 'work-alt',
+        label: 'work',
+        type: 'oauth',
+        refresh: 'real-fallback-refresh',
+        access: 'real-fallback-access',
+        enabled: true,
+        claustrumHandle: FALLBACK_HANDLE,
+      }
+    : {
+        id: 'work-alt',
+        label: 'work',
+        ...custodyTombstoneOAuth('anthropic'),
+        enabled: true,
+        claustrumHandle: FALLBACK_HANDLE,
+      }
+
   await saveAccounts(
     {
       version: 1,
@@ -77,17 +96,7 @@ async function bootStructuralDark() {
         ...custodyTombstoneOAuth('anthropic'),
         claustrumHandle: MAIN_HANDLE,
       },
-      accounts: [
-        {
-          id: 'work-alt',
-          label: 'work',
-          type: 'oauth',
-          refresh: 'real-fallback-refresh',
-          access: 'real-fallback-access',
-          enabled: true,
-          claustrumHandle: FALLBACK_HANDLE,
-        },
-      ],
+      accounts: [fallbackAccount],
     } as never,
     accountPath,
   )
@@ -135,6 +144,25 @@ async function bootStructuralDark() {
   return { plugin, sidebarPath }
 }
 
+// The boot-time publish is fire-and-forget, so poll rather than assume the
+// write has landed by the time the plugin factory resolves.
+async function readSidebarWhen(
+  path: string,
+  predicate: (sidebar: Record<string, unknown>) => boolean,
+  timeoutMs = 2_000,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs
+  let last: Record<string, unknown> = {}
+  while (Date.now() < deadline) {
+    try {
+      last = JSON.parse(await readFile(path, 'utf8'))
+      if (predicate(last)) return last
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  return last
+}
+
 afterEach(async () => {
   restoreEnv('account', 'OPENCODE_ANTHROPIC_AUTH_FILE')
   restoreEnv('sidebar', 'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE')
@@ -151,7 +179,7 @@ describe('fallback refresh structural-dark observability', () => {
     setLogLevel('debug')
     __setLogTestSink((record) => logs.push(record as Record<string, unknown>))
     try {
-      const { plugin } = await bootStructuralDark()
+      const { plugin } = await bootFixture({ dark: true })
       try {
         const withheld = logs.find(
           (record) =>
@@ -174,7 +202,7 @@ describe('fallback refresh structural-dark observability', () => {
   })
 
   test('the sidebar carries the structural-dark flag', async () => {
-    const { plugin, sidebarPath } = await bootStructuralDark()
+    const { plugin, sidebarPath } = await bootFixture({ dark: true })
     try {
       // The loader sets latestGetAuth before its custody reconcile refuses; the
       // add-apikey command then routes through refreshSidebarAfterMutation, which
@@ -194,6 +222,54 @@ describe('fallback refresh structural-dark observability', () => {
       expect(sidebar.fallbackRefreshStructuralDark).toBe(true)
     } finally {
       await plugin.dispose?.()
+    }
+  })
+
+  test('the boot decision reaches the sidebar without a command', async () => {
+    const { plugin, sidebarPath } = await bootFixture({ dark: true })
+    try {
+      const sidebar = await readSidebarWhen(
+        sidebarPath,
+        (state) => state.fallbackRefreshStructuralDark === true,
+      )
+      expect(sidebar.fallbackRefreshStructuralDark).toBe(true)
+    } finally {
+      await plugin.dispose?.()
+    }
+  })
+
+  test('a non-dark boot emits no withheld warn and omits the sidebar flag', async () => {
+    const previousLogLevel = getLogLevel()
+    const logs: Array<Record<string, unknown>> = []
+    setLogLevel('debug')
+    __setLogTestSink((record) => logs.push(record as Record<string, unknown>))
+    try {
+      const { plugin, sidebarPath } = await bootFixture({ dark: false })
+      try {
+        expect(
+          logs.some(
+            (record) =>
+              record.channel === 'claustrum' &&
+              record.message === 'fallback refresh withheld at construction',
+          ),
+        ).toBe(false)
+
+        // The loader reaches its own sidebar write here (claustrum + tombstone
+        // main + tombstone fallback reconciles to CLAUSTRUM_SERVE, not a refusal).
+        await plugin.auth.loader(
+          () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
+          { models: {} },
+        )
+        await drainSidebarWrites()
+
+        const sidebar = JSON.parse(await readFile(sidebarPath, 'utf8'))
+        expect('fallbackRefreshStructuralDark' in sidebar).toBe(false)
+      } finally {
+        await plugin.dispose?.()
+      }
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(previousLogLevel)
     }
   })
 })

@@ -3830,6 +3830,9 @@ const anthropicAuthPlugin = async (
           : null
       })(),
       fastMode: isFastModeEnabled(),
+      // Set once at construction and never cleared: this stays true after the
+      // process recovers, so it records that the boot gate withheld the refresh,
+      // not that the refresh is currently dark.
       ...(fallbackRefreshStructuralDark && {
         fallbackRefreshStructuralDark: true,
       }),
@@ -5374,6 +5377,13 @@ const anthropicAuthPlugin = async (
       },
     },
   )
+
+  // The loader's own sidebar write is unreachable while structurally dark — the
+  // custody reconcile refuses before it — so publish the boot decision here. The
+  // cold-vault path already republishes via refreshVaultBackedOAuthAccounts.
+  if (fallbackRefreshStructuralDark) {
+    void refreshSidebarQuota().catch(() => {})
+  }
 
   return {
     'experimental.chat.messages.transform': async (
