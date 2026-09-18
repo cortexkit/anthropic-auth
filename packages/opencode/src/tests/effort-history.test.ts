@@ -5,6 +5,7 @@ import {
   EFFORT_MARKER_PREFIX,
   encodeOpenCodeEffortPlan,
   markOpenCodeEffortTransitions,
+  type OpenCodeEffortMarkerPlan,
   OpenCodeEffortPlanTracker,
 } from '../effort-history.ts'
 
@@ -404,6 +405,37 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     // The header generated from the full plan must still resolve.
     expect(tracker.resolveHeader(header)).toEqual(
       fullPlan as NonNullable<typeof fullPlan>,
+    )
+  })
+
+  test('evicts the oldest plan history entry once the cap is exceeded', () => {
+    const tracker = new OpenCodeEffortPlanTracker()
+    const historySize = () =>
+      (tracker as unknown as { history: Map<string, unknown> }).history.size
+    const plan = (index: number): OpenCodeEffortMarkerPlan => ({
+      scope: 'a'.repeat(32),
+      baseline: 'high',
+      markerCount: 0,
+      digest: index.toString(16).padStart(64, '0'),
+      transitionTokens: [],
+      sessionId: `ses_history_${index}`,
+      messageId: `msg_history_${index}`,
+    })
+    const cap = 4096
+    const oldest = plan(0)
+    const newest = plan(cap)
+
+    for (let index = 0; index <= cap; index += 1) {
+      tracker.record(plan(index))
+    }
+
+    expect(historySize()).toBe(cap)
+    // Insertion-order eviction: the oldest plan is gone, the newest survives.
+    expect(
+      tracker.resolveHeader(encodeOpenCodeEffortPlan(oldest)),
+    ).toBeUndefined()
+    expect(tracker.resolveHeader(encodeOpenCodeEffortPlan(newest))).toEqual(
+      newest,
     )
   })
 
