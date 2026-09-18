@@ -2801,6 +2801,15 @@ const anthropicAuthPlugin = async (
     provisionalCustody.provisional === true &&
     (fallbackDimensions.fallbacks === 'M' ||
       fallbackDimensions.fallbacks === 'R')
+  if (fallbackRefreshStructuralDark) {
+    // Withholding the refresh is invisible from outside; record the three
+    // dimensions that produced the decision so a stalled process is diagnosable.
+    logger.warn('claustrum', 'fallback refresh withheld at construction', {
+      custodyMode: getClaustrumMode(initialStorage),
+      provisional: provisionalCustody.provisional,
+      fallbacks: fallbackDimensions.fallbacks,
+    })
+  }
   const fallbackRefreshReady = fallbackRefreshStructuralDark
     ? Promise.resolve('not-started')
     : fallbackManager.startBackgroundRefresh()
@@ -3821,6 +3830,12 @@ const anthropicAuthPlugin = async (
           : null
       })(),
       fastMode: isFastModeEnabled(),
+      // Set once at construction and never cleared: this stays true after the
+      // process recovers, so it records that the boot gate withheld the refresh,
+      // not that the refresh is currently dark.
+      ...(fallbackRefreshStructuralDark && {
+        fallbackRefreshStructuralDark: true,
+      }),
       cacheKeep: {
         enabled: isCacheKeepHybridActive(storage),
         window: isCacheKeepAlways(storage)
@@ -5362,6 +5377,13 @@ const anthropicAuthPlugin = async (
       },
     },
   )
+
+  // The loader's own sidebar write is unreachable while structurally dark — the
+  // custody reconcile refuses before it — so publish the boot decision here. The
+  // cold-vault path already republishes via refreshVaultBackedOAuthAccounts.
+  if (fallbackRefreshStructuralDark) {
+    void refreshSidebarQuota().catch(() => {})
+  }
 
   return {
     'experimental.chat.messages.transform': async (
