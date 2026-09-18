@@ -10370,7 +10370,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     ])
   })
 
-  test('fails locally when request-correlated effort markers cannot be validated', async () => {
+  test('folds a resolvable full trim and fails locally when effort markers cannot be validated', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -10509,11 +10509,11 @@ describe('Fable 5.1 request-scoped effort history', () => {
       'Missing or invalid internal Fable 5.1 effort request plan',
     )
 
+    // A full trim with a resolvable plan is the trimmedPrefix === length case:
+    // every transition was consumed, so the request proceeds with the folded
+    // baseline instead of failing closed.
     const missingAllMarkers = await send('ses_effort_missing_all', [])
-    expect(missingAllMarkers.status).toBe(400)
-    expect((await missingAllMarkers.json()).error.message).toBe(
-      'Fable 5.1 effort marker correlation failed: expected 1, found 0',
-    )
+    expect(missingAllMarkers.status).toBe(200)
 
     const duplicateTransition = await send('ses_effort_duplicate_transition', [
       transitionMarker,
@@ -10523,7 +10523,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
     expect((await duplicateTransition.json()).error.message).toBe(
       'Multiple internal Fable 5.1 effort markers on one user boundary',
     )
-    expect(messagesCalled).toBe(false)
+    expect(messagesCalled).toBe(true)
   })
 })
 
