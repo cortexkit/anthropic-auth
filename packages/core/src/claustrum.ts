@@ -1867,6 +1867,10 @@ export class ClaustrumCredentialCache {
   readonly #identity?: BindIdentity
   readonly #now: () => number
   readonly #refreshBackoffUntil = new Map<string, number>()
+  readonly #latchedRefreshFailures = new Map<
+    string,
+    ClaustrumCredentialErrorClass
+  >()
   #minTtlMs: number
 
   constructor(
@@ -1885,22 +1889,32 @@ export class ClaustrumCredentialCache {
   async get(
     handle: string,
     minTtlMs = this.#minTtlMs,
-    options: { cacheIf?: () => boolean } = {},
+    options: { cacheIf?: () => boolean; bypassCache?: boolean } = {},
   ): Promise<ClaustrumCredential> {
     if (!Number.isSafeInteger(minTtlMs) || minTtlMs < 0) {
       throw new RangeError('minTtlMs must be a non-negative safe integer')
     }
     const now = this.#now()
     const cached = this.#cache.get(handle)
-    if (cached && cached.expiresAtMs !== null && cached.expiresAtMs > now) {
+    if (
+      !options.bypassCache &&
+      cached &&
+      cached.expiresAtMs !== null &&
+      cached.expiresAtMs > now
+    ) {
       if (cached.expiresAtMs - now <= minTtlMs) {
         this.#refreshIfApproachingExpiry(handle, now, minTtlMs)
       }
       return cached
     }
-    if (cached) {
+    if (cached && !options.bypassCache) {
       this.#cache.delete(handle)
       this.#refreshBackoffUntil.delete(handle)
+    }
+
+    if (options.bypassCache) {
+      // Keep a 401 verdict independent of refreshes that began before it.
+      return this.#load(handle, minTtlMs, options.cacheIf)
     }
 
     const pending = this.#inFlight.get(handle)
@@ -2033,7 +2047,22 @@ export class ClaustrumCredentialCache {
     const load = this.#load(handle, minTtlMs)
     this.#inFlight.set(handle, load)
     void load
-      .catch(() => {})
+      .catch((error) => {
+        if (
+          error instanceof ClaustrumCredentialError &&
+          (error.errorClass === 'permanent' ||
+            error.errorClass === 'auth_required') &&
+          this.#latchedRefreshFailures.get(handle) !== error.errorClass
+        ) {
+          this.#latchedRefreshFailures.set(handle, error.errorClass)
+          logger.warn('claustrum', 'credential background refresh latched', {
+            handle,
+            recordVersion: this.#cache.get(handle)?.recordVersion,
+            errorClass: error.errorClass,
+            code: error.code,
+          })
+        }
+      })
       .finally(() => {
         if (this.#inFlight.get(handle) === load) this.#inFlight.delete(handle)
       })
@@ -2075,8 +2104,12 @@ export class ClaustrumCredentialCache {
       credential.expiresAtMs > this.#now() &&
       (cacheIf?.() ?? true)
     ) {
-      this.#cache.set(handle, credential)
+      const cached = this.#cache.get(handle)
+      if (!cached || credential.recordVersion >= cached.recordVersion) {
+        this.#cache.set(handle, credential)
+      }
     }
+    this.#latchedRefreshFailures.delete(handle)
     return credential
   }
 }

@@ -51,6 +51,8 @@ import {
   createStickyNoRouteResponse,
   custodyCredentialId,
   custodyCredentialIdFromResolution,
+  custodyTombstoneOAuth,
+  DEFAULT_CLAUSTRUM_CREDENTIAL_MIN_TTL_MS,
   type DumpHandle,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
@@ -1519,6 +1521,9 @@ const anthropicAuthPlugin = async (
     }
     const now = Date.now()
     const mainIdentity = mainQuotaAccountId
+    const vaultMainAccessToken = liveMainVaultAccess(storage)
+    const servedMainAccessToken =
+      mainServedAccessToken || mainAccessToken || vaultMainAccessToken
     if (
       mainAccessToken &&
       storage.main?.profile &&
@@ -1552,11 +1557,16 @@ const anthropicAuthPlugin = async (
         profile: storage.main.profile,
       }).catch(() => {})
     }
-    if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
+    // Profile hydration may use local main access or the live token serving a
+    // custody tombstone; an empty tombstone slot is never a usable bearer.
+    if (
+      servedMainAccessToken &&
+      !oauthProfileIsFresh(storage.main?.profile, now)
+    ) {
       const profile = await hydrateProfileOnce(
         'main',
         undefined,
-        mainAccessToken,
+        servedMainAccessToken,
         mainProviderAccountUuid,
         signal,
       )
@@ -1570,7 +1580,7 @@ const anthropicAuthPlugin = async (
           accountId: 'main',
           accountIdentity: mainIdentity,
           providerAccountUuid: mainProviderAccountUuid,
-          accessToken: mainAccessToken,
+          accessToken: servedMainAccessToken,
           profile,
         }).catch(() => {})
       }
@@ -1890,7 +1900,10 @@ const anthropicAuthPlugin = async (
   }
 
   let claustrumCredentialCache: ClaustrumCredentialCache | null = null
-  const claustrumAuthFailureReports = new Map<string, Promise<void>>()
+  const claustrumAuthFailureReports = new Map<
+    string,
+    Promise<ClaustrumAuthFailureReportOutcome>
+  >()
   const claustrumLastReportedVersion = new Map<string, number>()
   const claustrumBlockedAccounts = new Set<string>()
   const claustrumReauthAccounts = new Set<string>()
@@ -2312,6 +2325,17 @@ const anthropicAuthPlugin = async (
     return {}
   }
 
+  function liveMainVaultAccess(
+    storage: Awaited<ReturnType<typeof loadAccounts>>,
+  ): string | undefined {
+    return (
+      resolveClaustrumAccess(
+        mainCustodyAccount(custodyTombstoneOAuth('anthropic')),
+        storage,
+      ).accessToken || undefined
+    )
+  }
+
   function resolveFallbackAccessToken(
     account: OAuthAccount,
     storage: Awaited<ReturnType<typeof loadAccounts>>,
@@ -2332,7 +2356,12 @@ const anthropicAuthPlugin = async (
     const cache = claustrumCredentialCache
     if (!cache) return
     try {
-      const credential = await cache.get(handle)
+      const credential = await getLoggedClaustrumCredential(
+        cache,
+        handle,
+        DEFAULT_CLAUSTRUM_CREDENTIAL_MIN_TTL_MS,
+        'on-demand',
+      )
       if (usableClaustrumAccessToken(credential, claustrumNow())) {
         await markClaustrumCredentialReady(accountId, handle)
       }
@@ -2455,6 +2484,15 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  type ClaustrumAuthFailureReportOutcome =
+    | 'unavailable'
+    | 'suppressed-monotonic'
+    | 'suppressed-freshness-missing'
+    | 'suppressed-freshness-version'
+    | 'reported'
+    | 'reported-by-pending'
+    | 'report-error'
+
   async function reportCapturedClaustrumAuthFailure(
     served: {
       accountId: string
@@ -2463,29 +2501,32 @@ const anthropicAuthPlugin = async (
     },
     reporterSource: ClaustrumReporterSource = 'direct',
     options?: { preserveServedVersion?: boolean },
-  ): Promise<void> {
+  ): Promise<ClaustrumAuthFailureReportOutcome> {
     const cache = claustrumCredentialCache
-    if (!cache) return
+    if (!cache) return 'unavailable'
     if (
       served.recordVersion <=
       (claustrumLastReportedVersion.get(served.handle) ?? -1)
     ) {
-      return
+      return 'suppressed-monotonic'
     }
     if (!options?.preserveServedVersion) {
       const current = cache.peek(served.handle)
       // Version match makes reports single-shot per served version. Accepted
       // tradeoff: an unrelated cache eviction also suppresses a genuine
       // report (worst case one delayed cycle until the next served 401).
-      if (!current || current.recordVersion !== served.recordVersion) return
+      if (!current) return 'suppressed-freshness-missing'
+      if (current.recordVersion !== served.recordVersion) {
+        return 'suppressed-freshness-version'
+      }
     }
     const key = `${served.handle}\0${served.recordVersion}`
     const pending = claustrumAuthFailureReports.get(key)
     if (pending) {
       await pending
-      return
+      return 'reported-by-pending'
     }
-    const report = (async () => {
+    const report = (async (): Promise<ClaustrumAuthFailureReportOutcome> => {
       try {
         await cache.reportAuthFailure(
           served.handle,
@@ -2496,17 +2537,20 @@ const anthropicAuthPlugin = async (
           reporterSource,
         )
         claustrumLastReportedVersion.set(served.handle, served.recordVersion)
+        if (served.accountId === 'main') mainServedAccessToken = undefined
+        return 'reported'
       } catch (error) {
         handleClaustrumCredentialError(served.accountId, error, served.handle)
         logger.warn('claustrum', 'failed to report credential failure', {
           accountId: served.accountId,
           error: error instanceof Error ? error.message : String(error),
         })
+        return 'report-error'
       }
     })()
     claustrumAuthFailureReports.set(key, report)
     try {
-      await report
+      return await report
     } finally {
       if (claustrumAuthFailureReports.get(key) === report) {
         claustrumAuthFailureReports.delete(key)
@@ -2546,14 +2590,37 @@ const anthropicAuthPlugin = async (
     }
   }
 
-  async function getStartupWarmCredential(
+  type ClaustrumCredentialGetCallSite =
+    | 'startup'
+    | 'periodic'
+    | 'on-demand'
+    | '401-retry'
+
+  async function getLoggedClaustrumCredential(
     cache: ClaustrumCredentialCache,
     handle: string,
     minTtlMs: number,
-  ): Promise<ClaustrumCredential | undefined> {
+    callSite: ClaustrumCredentialGetCallSite,
+    options?: { bypassCache?: boolean },
+  ): Promise<ClaustrumCredential> {
+    logger.debug('claustrum', 'credential get issued', {
+      handle,
+      minTtlMs,
+      callSite,
+    })
+    return cache.get(handle, minTtlMs, options)
+  }
+
+  async function getBoundedClaustrumCredential(
+    cache: ClaustrumCredentialCache,
+    handle: string,
+    minTtlMs: number,
+    callSite: ClaustrumCredentialGetCallSite,
+    options?: { bypassCache?: boolean },
+  ): Promise<{ credential?: ClaustrumCredential; timedOut: boolean }> {
     let resolveTimeout!: () => void
-    const timeout = new Promise<undefined>((resolve) => {
-      resolveTimeout = () => resolve(undefined)
+    const timeout = new Promise<{ timedOut: true }>((resolve) => {
+      resolveTimeout = () => resolve({ timedOut: true })
     })
     const timer = runtimeTimers.setTimeout(
       resolveTimeout,
@@ -2561,7 +2628,18 @@ const anthropicAuthPlugin = async (
     )
     if (typeof timer === 'object' && timer && 'unref' in timer) timer.unref()
     try {
-      return await Promise.race([cache.get(handle, minTtlMs), timeout])
+      const result = await Promise.race([
+        getLoggedClaustrumCredential(
+          cache,
+          handle,
+          minTtlMs,
+          callSite,
+          options,
+        ).then((credential) => ({ credential, timedOut: false as const })),
+        timeout,
+      ])
+      if (result.timedOut) cache.abandonPending(handle)
+      return result
     } finally {
       runtimeTimers.clearTimeout(timer)
     }
@@ -2575,6 +2653,77 @@ const anthropicAuthPlugin = async (
     const storage = await loadAccounts(accountStoragePath)
     if (!storage) return { storage: null, enrolledAccountIds: [] }
     return enrollManifestBoundAccounts(storage)
+  }
+
+  type Claustrum401RetryOutcome =
+    | 'advanced'
+    | 'unchanged'
+    | 'backoff-active'
+    | 'timed-out'
+    | 'refresh-error'
+    | 'cache-unavailable'
+
+  async function getAdvancedClaustrumCredentialAfter401(served: {
+    accountId: string
+    handle: string
+    recordVersion: number
+  }): Promise<{
+    outcome: Claustrum401RetryOutcome
+    vaultGetAttempted: boolean
+    resolution?: ClaustrumAccessResolution
+  }> {
+    const cache = claustrumCredentialCache
+    if (!cache)
+      return { outcome: 'cache-unavailable', vaultGetAttempted: false }
+    if (claustrumWarmBackoffActive(served.handle)) {
+      return { outcome: 'backoff-active', vaultGetAttempted: false }
+    }
+    try {
+      // Bypass only the resident cache: the RPC itself must not rotate a token.
+      const result = await getBoundedClaustrumCredential(
+        cache,
+        served.handle,
+        0,
+        '401-retry',
+        { bypassCache: true },
+      )
+      if (result.timedOut) {
+        claustrumWarmBackoffUntil.set(
+          served.handle,
+          claustrumNow() + CLAUSTRUM_TRANSIENT_WARM_BACKOFF_MS,
+        )
+        return { outcome: 'timed-out', vaultGetAttempted: true }
+      }
+      const credential = result.credential
+      const accessToken = usableClaustrumAccessToken(credential, claustrumNow())
+      if (
+        !credential ||
+        !accessToken ||
+        credential.recordVersion <= served.recordVersion
+      ) {
+        return { outcome: 'unchanged', vaultGetAttempted: true }
+      }
+      return {
+        outcome: 'advanced',
+        vaultGetAttempted: true,
+        resolution: {
+          accessToken,
+          served: {
+            accountId: served.accountId,
+            handle: served.handle,
+            recordVersion: credential.recordVersion,
+          },
+          credentialAccountId: asProviderAccountUuid(credential.accountId),
+        },
+      }
+    } catch (error) {
+      handleClaustrumCredentialError(served.accountId, error, served.handle)
+      logger.warn('claustrum', 'credential retry get failed', {
+        accountId: served.accountId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return { outcome: 'refresh-error', vaultGetAttempted: true }
+    }
   }
 
   async function refreshVaultBackedOAuthAccounts(
@@ -2603,8 +2752,20 @@ const anthropicAuthPlugin = async (
           if (cache) {
             try {
               const credential = initial
-                ? await getStartupWarmCredential(cache, handle, minTtlMs)
-                : await cache.get(handle, minTtlMs)
+                ? (
+                    await getBoundedClaustrumCredential(
+                      cache,
+                      handle,
+                      minTtlMs,
+                      'startup',
+                    )
+                  ).credential
+                : await getLoggedClaustrumCredential(
+                    cache,
+                    handle,
+                    minTtlMs,
+                    'periodic',
+                  )
               if (usableClaustrumAccessToken(credential, claustrumNow())) {
                 await markClaustrumCredentialReady('main', handle)
               }
@@ -2638,8 +2799,20 @@ const anthropicAuthPlugin = async (
       if (!cache) continue
       try {
         const credential = initial
-          ? await getStartupWarmCredential(cache, handle, minTtlMs)
-          : await cache.get(handle, minTtlMs)
+          ? (
+              await getBoundedClaustrumCredential(
+                cache,
+                handle,
+                minTtlMs,
+                'startup',
+              )
+            ).credential
+          : await getLoggedClaustrumCredential(
+              cache,
+              handle,
+              minTtlMs,
+              'periodic',
+            )
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
           logger.debug('refresh', 'vault fallback credential unusable', {
             id: account.id,
@@ -2713,7 +2886,14 @@ const anthropicAuthPlugin = async (
             if (custodyHandle.status !== 'resolved') return
             const handle = custodyHandle.handle
             try {
-              const credential = await cache.get(handle)
+              const credential = (
+                await getBoundedClaustrumCredential(
+                  cache,
+                  handle,
+                  DEFAULT_CLAUSTRUM_CREDENTIAL_MIN_TTL_MS,
+                  'startup',
+                )
+              ).credential
               if (usableClaustrumAccessToken(credential, claustrumNow())) {
                 if (
                   custodyHandle.source === 'legacy' &&
@@ -3104,6 +3284,32 @@ const anthropicAuthPlugin = async (
         cacheKeepDiagnosticsRequests.delete(target.id)
       }
     },
+    retryHeadersAfter401: async ({ headers, target, bodyText, attempt }) => {
+      const served = cacheKeepServedClaustrumCredentials.get(attempt.id)
+      if (!served) return undefined
+      const retry = await getAdvancedClaustrumCredentialAfter401(served)
+      const resolution = retry.resolution
+      if (!resolution?.accessToken || !resolution.served) return undefined
+      const retryHeaders = new Headers(headers)
+      try {
+        const parsedBody = JSON.parse(bodyText) as Record<string, unknown>
+        const identity = await resolveClaudeCodeIdentity(
+          resolution.accessToken,
+          typeof parsedBody.model === 'string' ? parsedBody.model : undefined,
+          target.oauthAccountId === 'main'
+            ? mainAccountId
+            : (target.oauthAccountId ?? 'main'),
+        )
+        setOAuthHeaders(retryHeaders, resolution.accessToken, {
+          body: parsedBody,
+          identity,
+        })
+      } catch {
+        setOAuthHeaders(retryHeaders, resolution.accessToken)
+      }
+      cacheKeepServedClaustrumCredentials.set(attempt.id, resolution.served)
+      return retryHeaders
+    },
     onComplete: ({ attempt }) => {
       cacheKeepServedClaustrumCredentials.delete(attempt.id)
     },
@@ -3391,7 +3597,7 @@ const anthropicAuthPlugin = async (
       const body = await rewriteRequestBody(JSON.stringify(primeBody), {
         identity,
       })
-      const headers = new Headers({
+      let headers = new Headers({
         'content-type': 'application/json',
       })
       setOAuthHeaders(headers, accessToken, {
@@ -3408,12 +3614,40 @@ const anthropicAuthPlugin = async (
       const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
       const primeUrl =
         primeRequest.url?.toString() ?? primeRequest.input.toString()
-      const response = await fetch(primeUrl, {
+      let response = await fetch(primeUrl, {
         method: 'POST',
         headers,
         body,
         signal: AbortSignal.timeout(30_000),
       })
+      if (response.status === 401 && servedClaustrumCredential) {
+        const retry = await getAdvancedClaustrumCredentialAfter401(
+          servedClaustrumCredential,
+        )
+        const retryResolution = retry.resolution
+        if (retryResolution?.accessToken && retryResolution.served) {
+          await response.body?.cancel().catch(() => {})
+          const retryIdentity = await resolveClaudeCodeIdentity(
+            retryResolution.accessToken,
+            resolvedModel,
+            accountId === 'main' ? mainAccountId : accountId,
+          )
+          headers = new Headers({ 'content-type': 'application/json' })
+          setOAuthHeaders(headers, retryResolution.accessToken, {
+            body: JSON.parse(body),
+            identity: retryIdentity,
+          })
+          headers.delete('content-length')
+          headers.delete('transfer-encoding')
+          response = await fetch(primeUrl, {
+            method: 'POST',
+            headers,
+            body,
+            signal: AbortSignal.timeout(30_000),
+          })
+          servedClaustrumCredential = retryResolution.served
+        }
+      }
       const ms = Math.round(performance.now() - start)
       if (!response.ok) {
         const reason =
@@ -3699,11 +3933,18 @@ const anthropicAuthPlugin = async (
         const hydratedAccount = hydrated.accounts.find(
           (candidate) => candidate.id === account.id,
         )
+        const vaultServed = isFallbackAccountVaultServed(
+          account.id,
+          latest,
+          custodyDimensionsDeps,
+        )
+        // A profile belongs to matching local access or a live vault-served
+        // binding; tombstones deliberately have no local access to compare.
         if (
           !isOAuthAccount(account) ||
           !hydratedAccount ||
           !isOAuthAccount(hydratedAccount) ||
-          !account.access ||
+          (!account.access && !vaultServed) ||
           hydratedAccount.access !== account.access
         ) {
           return account
@@ -3713,8 +3954,12 @@ const anthropicAuthPlugin = async (
     }
     const latestMainProfile = latest.main?.profile
     const mainState = latest.main ?? hydrated.main
+    const servedMainAccessToken =
+      mainServedAccessToken || mainAccessToken || liveMainVaultAccess(latest)
+    // Hydrated main state is valid with local main access or the live bearer
+    // serving its custody tombstone; neither admits a credential-less main.
     if (
-      mainAccessToken &&
+      servedMainAccessToken &&
       mainState &&
       (!latestMainProfile ||
         oauthProfileMatchesIdentity(latestMainProfile, mainAccountId))
@@ -4062,8 +4307,13 @@ const anthropicAuthPlugin = async (
     if (latestGetAuth) {
       try {
         const auth = await latestGetAuth()
-        if (auth.type === 'oauth' && auth.access) {
-          mainAccessToken = mainServedAccessToken ?? auth.access
+        const latest = await loadAccounts(accountStoragePath)
+        const servedMainAccessToken =
+          mainServedAccessToken || auth.access || liveMainVaultAccess(latest)
+        // Manual quota refresh accepts local OAuth access or the live bearer
+        // serving a custody tombstone; an empty local slot alone remains refused.
+        if (auth.type === 'oauth' && servedMainAccessToken) {
+          mainAccessToken = servedMainAccessToken
           await resolveMainQuotaAccountIdentity(mainAccessToken)
           // /claude-quota is a manual action: force a real fetch instead of
           // returning the cache. refreshMain still respects 429 backoff — it
@@ -6522,7 +6772,7 @@ const anthropicAuthPlugin = async (
             },
             reporterSource: ClaustrumReporterSource = 'direct',
             options?: { preserveServedVersion?: boolean },
-          ): Promise<void> {
+          ): Promise<ClaustrumAuthFailureReportOutcome> {
             return reportCapturedClaustrumAuthFailure(
               served,
               reporterSource,
@@ -6544,7 +6794,7 @@ const anthropicAuthPlugin = async (
             }
           }
 
-          async function sendWithAccessToken(
+          async function sendWithAccessTokenOnce(
             input: string | URL | Request,
             init: RequestInit | undefined,
             accessToken: string,
@@ -6788,6 +7038,8 @@ const anthropicAuthPlugin = async (
                 fastModeEnabled: fastModeRequested,
                 subagent: subagentRequest,
               })
+            } else {
+              setOAuthHeaders(requestHeaders, accessToken, { identity })
             }
 
             const cacheDiagnosticsBetas =
@@ -6954,13 +7206,141 @@ const anthropicAuthPlugin = async (
                 response,
                 servedClaustrumCredential,
               )
-              if (response.status === 401) {
-                await reportClaustrumAuthFailure(
-                  servedClaustrumCredential,
-                  'direct',
-                )
-              }
             }
+            return response
+          }
+
+          async function sendWithAccessToken(
+            input: string | URL | Request,
+            init: RequestInit | undefined,
+            accessToken: string,
+            trace?: PerfTrace,
+            route = 'unknown',
+            currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
+            oauthAccountId = 'main',
+            fallbackAuthLineageId?: string,
+            fableRequest?: FableRequestContext,
+            laneStartRequest = false,
+            mainQuotaIdentity?: MainQuotaIdentityResolution,
+            claustrumResolution?: ClaustrumAccessResolution,
+          ) {
+            const response = await sendWithAccessTokenOnce(
+              input,
+              init,
+              accessToken,
+              trace,
+              route,
+              currentStorage,
+              oauthAccountId,
+              fallbackAuthLineageId,
+              fableRequest,
+              laneStartRequest,
+              mainQuotaIdentity,
+              claustrumResolution,
+            )
+            const served = claustrumServedCredentials.get(response)
+            if (response.status !== 401 || !served) return response
+
+            if (!isReplayableRequest(input, init?.body)) {
+              await reportClaustrumAuthFailure(served, 'direct')
+              return response
+            }
+
+            // The vault get and snapshot below must stay adjacent: reporting can invalidate the cache.
+            const retry = await getAdvancedClaustrumCredentialAfter401(served)
+            const currentCachedRecordVersion = claustrumCredentialCache?.peek(
+              served.handle,
+            )?.recordVersion
+            const log401 = (input: {
+              currentCachedRecordVersion?: number
+              vaultGetAttempted: boolean
+              retryAttempted: boolean
+              retryOutcome: Claustrum401RetryOutcome | 'retry-succeeded'
+              reportOutcome: ClaustrumAuthFailureReportOutcome | 'not-attempted'
+              retryServedRecordVersion?: number
+            }) => {
+              const reportSuppressed =
+                input.reportOutcome.startsWith('suppressed')
+              logger.info('claustrum', 'vault-served 401 recovery', {
+                handle: served.handle,
+                servedRecordVersion: served.recordVersion,
+                currentCachedRecordVersion: input.currentCachedRecordVersion,
+                retryAttempted: input.retryAttempted,
+                vaultGetAttempted: input.vaultGetAttempted,
+                retryOutcome: input.retryOutcome,
+                ...(input.retryServedRecordVersion !== undefined && {
+                  retryServedRecordVersion: input.retryServedRecordVersion,
+                }),
+                reportOutcome: input.reportOutcome,
+                reportSuppressed,
+                ...(reportSuppressed && {
+                  reportSuppressedBy: input.reportOutcome,
+                }),
+              })
+            }
+
+            const retryResolution = retry.resolution
+            const retryAccessToken = retryResolution?.accessToken
+            const retryResolutionServed = retryResolution?.served
+            if (retryAccessToken && retryResolutionServed) {
+              await response.body?.cancel().catch(() => {})
+              const retryResponse = await sendWithAccessTokenOnce(
+                input,
+                init,
+                retryAccessToken,
+                trace,
+                route,
+                currentStorage,
+                oauthAccountId,
+                fallbackAuthLineageId,
+                fableRequest,
+                laneStartRequest,
+                mainQuotaIdentity,
+                retryResolution,
+              )
+              const retryServed =
+                claustrumServedCredentials.get(retryResponse) ??
+                retryResolutionServed
+              if (retryResponse.status !== 401) {
+                if (retryServed.accountId === 'main') {
+                  mainServedAccessToken = retryAccessToken
+                }
+                log401({
+                  currentCachedRecordVersion,
+                  vaultGetAttempted: retry.vaultGetAttempted,
+                  retryAttempted: true,
+                  retryOutcome: 'retry-succeeded',
+                  reportOutcome: 'not-attempted',
+                  retryServedRecordVersion: retryServed.recordVersion,
+                })
+                return retryResponse
+              }
+              const reportOutcome = await reportClaustrumAuthFailure(
+                retryServed,
+                'direct',
+              )
+              log401({
+                currentCachedRecordVersion,
+                vaultGetAttempted: retry.vaultGetAttempted,
+                retryAttempted: true,
+                retryOutcome: retry.outcome,
+                reportOutcome,
+                retryServedRecordVersion: retryServed.recordVersion,
+              })
+              return retryResponse
+            }
+
+            const reportOutcome = await reportClaustrumAuthFailure(
+              served,
+              'direct',
+            )
+            log401({
+              currentCachedRecordVersion,
+              vaultGetAttempted: retry.vaultGetAttempted,
+              retryAttempted: false,
+              retryOutcome: retry.outcome,
+              reportOutcome,
+            })
             return response
           }
 
@@ -8751,7 +9131,9 @@ const anthropicAuthPlugin = async (
                   },
                 )
               }
-              // Killswitch — eagerly refresh quota so it can evaluate
+              // Killswitch — eagerly refresh quota for local credentials and
+              // live vault-served bindings so spend protection never evaluates
+              // a vault fallback on stale quota.
               if (isKillswitchEnabled(storage)) {
                 const needsRefresh = quotaManager.needsRefresh(
                   sessionRequestCount,
@@ -8763,7 +9145,12 @@ const anthropicAuthPlugin = async (
                       (a): a is OAuthAccount =>
                         a.enabled !== false &&
                         isOAuthAccount(a) &&
-                        Boolean(a.access),
+                        (Boolean(a.access) ||
+                          isFallbackAccountVaultServed(
+                            a.id,
+                            storage,
+                            custodyDimensionsDeps,
+                          )),
                     )
                     await Promise.all([
                       quotaManager.refreshMain(
