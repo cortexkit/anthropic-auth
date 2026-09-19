@@ -129,6 +129,93 @@ describe('CustodyHandleManifestReader', () => {
     })
   })
 
+  test('reads our accounts while ignoring a foreign block with unknown account keys', async () => {
+    const foreign = {
+      provider: 'xai',
+      serve: 'opencode-claustrum',
+      accounts: [
+        {
+          label: 'main',
+          handle: `ckh_${'H'.repeat(43)}`,
+          credential_id: 'oauth:xai',
+          minTtlMs: 7_200_000,
+        },
+      ],
+    }
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          foreign,
+          {
+            provider: 'anthropic',
+            shape: 'oauth',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'work-alt',
+                handle: `ckh_${'A'.repeat(43)}`,
+                credential_id: 'oauth:anthropic:work-alt',
+              },
+            ],
+          },
+        ],
+      }),
+      async (path) => {
+        const result = await reader(path).read()
+        expect(result.status).toBe('ready')
+        if (result.status !== 'ready')
+          throw new Error('expected ready manifest')
+        expect(result.manifest.accounts).toEqual([
+          {
+            label: 'work-alt',
+            handle: `ckh_${'A'.repeat(43)}`,
+            credentialId: 'oauth:anthropic:work-alt',
+          },
+        ])
+        expect(result.manifest.corruptLabels).toEqual(new Set())
+      },
+    )
+  })
+
+  test('reads our accounts while ignoring hostile foreign provider entries', async () => {
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          {
+            provider: 'xai',
+            serve: 'opencode-claustrum',
+            accounts: 'not-an-array',
+          },
+          null,
+          42,
+          { provider: 'xai' },
+          {
+            provider: 'anthropic',
+            shape: 'oauth',
+            serve: 'anthropic-auth',
+            accounts: [
+              {
+                label: 'work-alt',
+                handle: `ckh_${'A'.repeat(43)}`,
+                credential_id: 'oauth:anthropic:work-alt',
+              },
+            ],
+          },
+        ],
+      }),
+      async (path) => {
+        const result = await reader(path).read()
+        expect(result.status).toBe('ready')
+        if (result.status !== 'ready')
+          throw new Error('expected ready manifest')
+        expect(result.manifest.accounts).toHaveLength(1)
+        expect(result.manifest.corruptLabels).toEqual(new Set())
+      },
+    )
+  })
+
   test('ignores an anthropic block with a foreign serve', async () => {
     await withManifest(
       withProvider((provider) => {
@@ -541,6 +628,55 @@ describe('writeCustodyHandleManifestEntry', () => {
           .map(serialize),
       ).toEqual(before)
     })
+  })
+
+  test('preserves a foreign block unknown key byte-identically when writing our account', async () => {
+    const foreign = {
+      provider: 'xai',
+      serve: 'opencode-claustrum',
+      accounts: [
+        {
+          label: 'main',
+          handle: `ckh_${'H'.repeat(43)}`,
+          credential_id: 'oauth:xai',
+          minTtlMs: 7_200_000,
+        },
+      ],
+    }
+    await withManifest(
+      serialize({
+        version: 1,
+        providers: [
+          foreign,
+          {
+            provider: 'anthropic',
+            shape: 'oauth',
+            serve: 'anthropic-auth',
+            accounts: [],
+          },
+        ],
+      }),
+      async (path) => {
+        const result = await writeCustodyHandleManifestEntry({
+          path,
+          entry: writerEntry,
+        })
+        expect(result).toEqual({ status: 'written' })
+
+        const output = JSON.parse(await fs.readFile(path, 'utf8')) as {
+          providers: Array<Record<string, unknown>>
+        }
+        const ours = output.providers.find(
+          (provider) =>
+            provider.provider === 'anthropic' &&
+            provider.serve === 'anthropic-auth',
+        ) as { accounts: Array<Record<string, unknown>> }
+        expect(ours.accounts.map((account) => account.label)).toContain(
+          writerEntry.label,
+        )
+        expect(serialize(output.providers[0])).toBe(serialize(foreign))
+      },
+    )
   })
 
   test('repairs a missing OAuth shape while retaining all accounts and foreign blocks', async () => {
