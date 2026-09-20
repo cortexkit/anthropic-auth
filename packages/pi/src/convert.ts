@@ -31,6 +31,129 @@ import type {
   Tool,
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
+import * as piAi from '@earendil-works/pi-ai'
+
+/**
+ * What `streamSimple` is handed, across pi versions.
+ *
+ * pi < 0.86 passes a raw `Context`: `systemPrompt` and `tools` populated, no
+ * `role: 'system'` messages. pi >= 0.86 passes a normalized `TranscriptContext`
+ * (`{ messages }` only): the prompt and the tool declarations are folded into a
+ * leading system message (`content` + `toolsAdded`), and later system messages
+ * may carry `toolsAdded` / `toolsRemoved` / `sections` deltas. Reading
+ * `context.systemPrompt` / `context.tools` on that shape yields `undefined` for
+ * both, so the request goes out with no host prompt and no tools — HTTP 200 and
+ * a reply from a bare model that says it has no bash tool.
+ */
+export type RequestContext = {
+  messages: Message[]
+  systemPrompt?: unknown
+  tools?: Tool[]
+}
+
+export type ResolvedRequestContext = {
+  systemPrompt: unknown
+  tools: Tool[]
+  messages: Message[]
+}
+
+type TranscriptSystemMessage = {
+  role: 'system'
+  content?: unknown
+  toolsAdded?: Tool[]
+  toolsRemoved?: { name: string }[]
+}
+
+function isTranscriptSystemMessage(
+  message: unknown,
+): message is TranscriptSystemMessage {
+  return (
+    typeof message === 'object' &&
+    message !== null &&
+    (message as { role?: unknown }).role === 'system'
+  )
+}
+
+/**
+ * Resolve the host prompt, tool list, and message list from either context shape.
+ *
+ * On pi >= 0.86 the transcript helpers exported by pi-ai (`collapseSystemMessages`,
+ * `getCurrentSystemPrompt`, `getCurrentTools`) replay every system message into
+ * the current prompt and tool set; they are the same functions pi's built-in
+ * providers use, so `sections` patches and tool removals resolve identically.
+ * They are reached through the namespace import and a `typeof` check rather
+ * than named imports: on pi-ai < 0.86 the exports do not exist, and a missing
+ * named export fails the whole extension at load.
+ *
+ * If a transcript carries system messages but the helpers are absent (only
+ * reachable in tests pinned to an older pi-ai), a minimal replay keeps the
+ * prompt and tools rather than dropping them: system text concatenated in
+ * order, `toolsRemoved` then `toolsAdded` applied per message.
+ *
+ * The raw `Context` fields win when there is no system message, so pi < 0.86
+ * is unchanged.
+ */
+/**
+ * The pi-ai transcript helpers, as an optional set. Production reads them off
+ * the `@earendil-works/pi-ai` namespace, which pi's extension loader aliases to
+ * the host's own bundled pi-ai — so their presence tracks the running pi, not
+ * this package's lockfile. Tests pass a stub (or `{}`) to pin which branch runs.
+ */
+export type TranscriptHelpers = {
+  collapseSystemMessages?: (context: { messages: Message[] }) => {
+    messages: Message[]
+  }
+  getCurrentSystemPrompt?: (messages: readonly { role: string }[]) => string
+  getCurrentTools?: (messages: readonly { role: string }[]) => Tool[]
+}
+
+export function resolveRequestContext(
+  context: RequestContext,
+  helpers: TranscriptHelpers = piAi as unknown as TranscriptHelpers,
+): ResolvedRequestContext {
+  const hasSystemMessages = context.messages.some(isTranscriptSystemMessage)
+  if (!hasSystemMessages) {
+    return {
+      systemPrompt: context.systemPrompt,
+      tools: context.tools ?? [],
+      messages: context.messages,
+    }
+  }
+
+  if (
+    typeof helpers.collapseSystemMessages === 'function' &&
+    typeof helpers.getCurrentSystemPrompt === 'function' &&
+    typeof helpers.getCurrentTools === 'function'
+  ) {
+    const transcript = helpers.collapseSystemMessages({
+      messages: context.messages,
+    })
+    return {
+      systemPrompt: helpers.getCurrentSystemPrompt(transcript.messages),
+      tools: helpers.getCurrentTools(transcript.messages),
+      messages: transcript.messages.filter(
+        (message) => !isTranscriptSystemMessage(message),
+      ),
+    }
+  }
+
+  const parts: string[] = []
+  const tools = new Map<string, Tool>()
+  for (const message of context.messages as unknown[]) {
+    if (!isTranscriptSystemMessage(message)) continue
+    const text = systemPromptText(message.content)
+    if (text.length > 0) parts.push(text)
+    for (const removed of message.toolsRemoved ?? []) tools.delete(removed.name)
+    for (const added of message.toolsAdded ?? []) tools.set(added.name, added)
+  }
+  return {
+    systemPrompt: parts.join('\n\n'),
+    tools: [...tools.values()],
+    messages: context.messages.filter(
+      (message) => !isTranscriptSystemMessage(message),
+    ),
+  }
+}
 
 // Anchor identifying Pi's documentation paragraph — the only part of the prompt
 // that Anthropic currently rejects in system[]. Unknown prompt shapes take the
@@ -545,7 +668,7 @@ function applyCacheMode(
 
 export async function buildAnthropicRequest(
   modelId: string,
-  context: Context,
+  context: Context | RequestContext,
   options: SimpleStreamOptions | undefined,
   cache: { enabled: boolean; mode: Cache1hMode },
   fastModeEnabled = false,
@@ -555,7 +678,8 @@ export async function buildAnthropicRequest(
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
   } = {},
 ): Promise<{ body: AnthropicRequestBody; bodyText: string }> {
-  const messages = convertMessages(context.messages, modelId)
+  const request = resolveRequestContext(context)
+  const messages = convertMessages(request.messages, modelId)
   // Strip trailing assistant messages — Anthropic rejects prefill on some models
   while (
     messages.length &&
@@ -577,7 +701,7 @@ export async function buildAnthropicRequest(
     },
     { type: 'text', text: CLAUDE_CODE_IDENTITY },
   ]
-  const systemPrompt = systemPromptText(context.systemPrompt)
+  const systemPrompt = systemPromptText(request.systemPrompt)
   if (systemPrompt.trim()) {
     // Pi's prompt cannot sit whole in the top-level system[] array: two lines of
     // its documentation paragraph (the docs/*.md enumeration and the "follow .md
@@ -618,7 +742,7 @@ export async function buildAnthropicRequest(
     messages,
   }
 
-  const tools = convertTools(context.tools)
+  const tools = convertTools(request.tools)
   if (tools?.length) body.tools = tools
 
   if (fastModeEnabled && isFastModeSupportedModel(modelId)) {

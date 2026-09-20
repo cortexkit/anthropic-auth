@@ -4,7 +4,7 @@ import {
   type ProviderAccountUuid,
 } from '@cortexkit/anthropic-auth-core'
 import type { Context, Message } from '@earendil-works/pi-ai'
-import { buildAnthropicRequest } from '../convert'
+import { buildAnthropicRequest, resolveRequestContext } from '../convert'
 
 function userMsg(text: string): Message {
   return { role: 'user', content: text, timestamp: 0 }
@@ -1241,4 +1241,148 @@ describe('buildAnthropicRequest — cache breakpoint budget', () => {
       })
     },
   )
+})
+
+// pi >= 0.86 hands streamSimple a normalized TranscriptContext: `{ messages }`
+// only, with the host prompt and tool declarations folded into a leading
+// role: 'system' message and later system messages carrying tool deltas.
+describe('resolveRequestContext — pi 0.86 transcript shape', () => {
+  const readTool = {
+    name: 'read',
+    description: 'Read a file',
+    parameters: { type: 'object', properties: {}, required: [] },
+  } as any
+  const bashTool = {
+    name: 'bash',
+    description: 'Run a command',
+    parameters: { type: 'object', properties: {}, required: [] },
+  } as any
+
+  function systemMsg(
+    content: string,
+    extra: Record<string, unknown> = {},
+  ): Message {
+    return { role: 'system', content, timestamp: 0, ...extra } as any
+  }
+
+  test('raw Context (pi < 0.86) is returned unchanged', () => {
+    const context = {
+      messages: [userMsg('hello')],
+      systemPrompt: 'test prompt',
+      tools: [readTool],
+    }
+    const resolved = resolveRequestContext(context as any)
+    expect(resolved.systemPrompt).toBe('test prompt')
+    expect(resolved.tools).toEqual([readTool])
+    expect(resolved.messages).toBe(context.messages)
+  })
+
+  test('reads the prompt and tools out of the leading system message', () => {
+    const resolved = resolveRequestContext({
+      messages: [
+        systemMsg('test prompt', { toolsAdded: [readTool] }),
+        userMsg('hello'),
+      ],
+    })
+    expect(resolved.systemPrompt).toBe('test prompt')
+    expect(resolved.tools).toEqual([readTool])
+    expect(resolved.messages).toEqual([userMsg('hello')])
+  })
+
+  test('replays later system messages: appended text, tool additions and removals', () => {
+    const resolved = resolveRequestContext({
+      messages: [
+        systemMsg('base', { toolsAdded: [readTool, bashTool] }),
+        userMsg('hello'),
+        assistantMsg('hi'),
+        systemMsg('more', { toolsRemoved: [{ name: 'read' }] }),
+        userMsg('again'),
+      ],
+    })
+    expect(resolved.systemPrompt).toBe('base\n\nmore')
+    expect(resolved.tools.map((tool) => tool.name)).toEqual(['bash'])
+    expect(resolved.messages.map((message) => message.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ])
+  })
+
+  // Which branch runs is decided by the host pi (its loader aliases pi-ai to the
+  // host's bundle), not by this package's lockfile, so both are pinned here with
+  // explicit helper sets rather than left to whatever pi-ai bun installed.
+  test('uses the pi-ai transcript helpers when the host exports them', () => {
+    const calls: string[] = []
+    const helpers = {
+      collapseSystemMessages: (context: { messages: Message[] }) => {
+        calls.push('collapse')
+        return {
+          messages: [
+            systemMsg('from helpers', { toolsAdded: [bashTool] }),
+            ...context.messages.filter(
+              (message) => (message as { role: string }).role !== 'system',
+            ),
+          ],
+        }
+      },
+      getCurrentSystemPrompt: () => {
+        calls.push('prompt')
+        return 'from helpers (rendered)'
+      },
+      getCurrentTools: () => {
+        calls.push('tools')
+        return [bashTool]
+      },
+    }
+    const resolved = resolveRequestContext(
+      {
+        messages: [
+          systemMsg('ignored by the stub', { toolsAdded: [readTool] }),
+          userMsg('hello'),
+        ],
+      },
+      helpers,
+    )
+    expect(calls).toEqual(['collapse', 'prompt', 'tools'])
+    expect(resolved.systemPrompt).toBe('from helpers (rendered)')
+    expect(resolved.tools).toEqual([bashTool])
+    expect(resolved.messages).toEqual([userMsg('hello')])
+  })
+
+  test('falls back to the local replay when the host has no helpers', () => {
+    const resolved = resolveRequestContext(
+      {
+        messages: [
+          systemMsg('base', { toolsAdded: [readTool] }),
+          userMsg('hello'),
+          systemMsg('more', { toolsAdded: [bashTool] }),
+        ],
+      },
+      {},
+    )
+    expect(resolved.systemPrompt).toBe('base\n\nmore')
+    expect(resolved.tools.map((tool) => tool.name)).toEqual(['read', 'bash'])
+  })
+
+  test('buildAnthropicRequest sends the prompt and tools from a transcript context', async () => {
+    const { body } = await buildAnthropicRequest(
+      TEST_MODEL_ID,
+      {
+        messages: [
+          systemMsg(PI_PROMPT, { toolsAdded: [bashTool] }),
+          userMsg('hello'),
+        ],
+      },
+      undefined,
+      defaultCache,
+    )
+    // system[] = billing header, identity, then the recognized host prompt.
+    expect(body.system).toHaveLength(3)
+    expect(String(body.system?.[2]?.text)).toContain('KEEP ONE')
+    expect(body.tools?.map((tool) => tool.name)).toEqual(['Bash'])
+    // The system message itself never reaches messages[].
+    expect(body.messages.every((message) => message.role !== 'system')).toBe(
+      true,
+    )
+  })
 })

@@ -71,7 +71,12 @@ import {
   type ToolCall,
 } from '@earendil-works/pi-ai'
 
-import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
+import {
+  buildAnthropicRequest,
+  fromClaudeCodeToolName,
+  type RequestContext,
+  resolveRequestContext,
+} from './convert.ts'
 import { getPiAccountStoragePath } from './paths.ts'
 
 function errorText(error: unknown) {
@@ -359,7 +364,7 @@ export async function* parseSse(
 
 async function sendAnthropicRequest(options: {
   model: Model<Api>
-  context: Context
+  context: Context | RequestContext
   streamOptions?: SimpleStreamOptions
   accessToken?: string
   apiAccount?: ApiKeyAccount
@@ -525,7 +530,7 @@ async function firstStreamingError(
 
 async function executeWithFallback(options: {
   model: Model<Api>
-  context: Context
+  context: Context | RequestContext
   streamOptions?: SimpleStreamOptions
   primaryAccessToken: string
   storagePath: string
@@ -1191,7 +1196,7 @@ async function executeWithFallback(options: {
 
 export function streamCortexKitAnthropic(
   model: Model<Api>,
-  context: Context,
+  context: Context | RequestContext,
   options?: SimpleStreamOptions,
   effortTransitions?: readonly MidConversationEffortTransition[],
 ): AssistantMessageEventStream {
@@ -1205,6 +1210,9 @@ export function streamCortexKitAnthropic(
       const accessToken = options?.apiKey ?? ''
       if (!accessToken) throw new Error('Missing Anthropic OAuth access token')
 
+      // pi >= 0.86 carries the tool declarations in the transcript's system
+      // messages, not on `context.tools` (see resolveRequestContext).
+      const { tools: contextTools } = resolveRequestContext(context)
       const storagePath = getPiAccountStoragePath()
       const response = await executeWithFallback({
         model,
@@ -1267,7 +1275,7 @@ export function streamCortexKitAnthropic(
             output.content.push({
               type: 'toolCall',
               id: String(block.id),
-              name: fromClaudeCodeToolName(String(block.name), context.tools),
+              name: fromClaudeCodeToolName(String(block.name), contextTools),
               arguments: {},
               partialJson: '',
               index: event.index,
