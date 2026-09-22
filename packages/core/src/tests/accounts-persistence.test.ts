@@ -250,7 +250,10 @@ test('keeps a live vault fallback on cached quota after a transient quota failur
       token: 'vault-fallback-access',
       source: 'vault',
     }),
-    fetchImpl: async () => new Response('unavailable', { status: 503 }),
+    fetchImpl: Object.assign(
+      async () => new Response('unavailable', { status: 503 }),
+      { preconnect: () => {} },
+    ) as unknown as typeof fetch,
   })
 
   await expect(manager.getUsableFallbackAccounts(storage)).resolves.toEqual([
