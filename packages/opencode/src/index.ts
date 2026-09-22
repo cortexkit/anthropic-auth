@@ -7548,6 +7548,7 @@ const anthropicAuthPlugin = async (
             laneStartRequest = false,
             mainQuotaIdentity?: MainQuotaIdentityResolution,
             claustrumResolution?: ClaustrumAccessResolution,
+            scopedAttempt?: ClaustrumScopedAttempt,
           ) {
             const response = await sendWithAccessTokenOnce(
               input,
@@ -7562,6 +7563,7 @@ const anthropicAuthPlugin = async (
               laneStartRequest,
               mainQuotaIdentity,
               claustrumResolution,
+              scopedAttempt,
             )
             const served = claustrumServedCredentials.get(response)
             if (response.status !== 401 || !served) return response
