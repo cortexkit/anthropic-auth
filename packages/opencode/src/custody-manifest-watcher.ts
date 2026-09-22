@@ -45,10 +45,12 @@ function registry(): WatcherRegistry {
 }
 
 function filenameMatches(
-  filename: string | Buffer | null,
+  filename: string | Buffer | null | undefined,
   expected: string,
 ): boolean {
-  return filename === null || filename.toString() === expected
+  // Node may omit the filename (undefined) when it cannot attribute the change
+  // to a specific entry; treat that like null and reconcile the whole directory.
+  return filename == null || filename.toString() === expected
 }
 
 function schedule(entry: WatcherEntry): void {

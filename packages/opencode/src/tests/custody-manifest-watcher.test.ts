@@ -63,6 +63,39 @@ describe('custody manifest watcher registry', () => {
     expect(closeCalls).toBe(1)
   })
 
+  test('treats an undefined filename as a directory-level change', async () => {
+    let fire:
+      | ((event: string, filename: string | undefined) => void)
+      | undefined
+    const watcher = Object.assign(new EventEmitter(), {
+      close() {},
+    }) as FSWatcher
+    const watchImpl = ((_path, _options, listener) => {
+      fire = listener as typeof fire
+      return watcher
+    }) as typeof watch
+    let calls = 0
+    const adoption = adoptCustodyManifestWatcher(
+      '/tmp/custody-watch/undefined-filename.json',
+      () => {
+        calls += 1
+      },
+      { watchImpl, debounceMs: 1 },
+    )
+
+    try {
+      await Bun.sleep(5)
+      const baseline = calls
+      // Node may omit the filename entirely; the watcher must reconcile
+      // rather than throw on the missing value.
+      expect(() => fire?.('change', undefined)).not.toThrow()
+      await Bun.sleep(5)
+      expect(calls).toBeGreaterThan(baseline)
+    } finally {
+      adoption.release()
+    }
+  })
+
   test('polling observes replacement when fs.watch is unavailable', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'custody-watch-'))
     const path = join(directory, 'handles.json')
