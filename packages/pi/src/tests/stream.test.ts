@@ -928,6 +928,55 @@ describe('Pi API fallback routing helpers', () => {
 })
 
 describe('Pi Anthropic stream content blocks', () => {
+  test('maps Claude Code tool names back to Pi transcript tool names', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-transcript-tools-'))
+    process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+
+    let sentTools: Array<{ name: string }> = []
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        if (!input.toString().includes('/v1/messages')) {
+          return new Response('{}', { status: 200 })
+        }
+        sentTools = JSON.parse(String(init?.body)).tools
+        return new Response(
+          [
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_1","name":"Bash","input":{}}}\n\n',
+            'data: {"type":"content_block_stop","index":0}\n\n',
+            'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}\n\n',
+          ].join(''),
+          { status: 200 },
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const context = {
+      messages: [
+        {
+          role: 'system',
+          content: 'test',
+          toolsAdded: [
+            {
+              name: 'bash',
+              description: 'Shell',
+              parameters: { type: 'object', properties: {} },
+            },
+          ],
+          timestamp: 0,
+        },
+        { role: 'user', content: 'run status', timestamp: 1 },
+      ],
+    } as any
+    const result = await streamCortexKitAnthropic(anthropicModel, context, {
+      apiKey: 'main-access',
+    }).result()
+
+    expect(sentTools.map((tool) => tool.name)).toEqual(['Bash'])
+    expect(result.stopReason).toBe('toolUse')
+    expect(result.content[0]).toMatchObject({ type: 'toolCall', name: 'bash' })
+  })
+
   test('preserves redacted thinking for same-model replay', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-redacted-thinking-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')

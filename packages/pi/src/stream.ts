@@ -74,8 +74,11 @@ import {
   type AssistantMessageEventStream,
   type Context,
   calculateCost,
+  collapseSystemMessages,
   createAssistantMessageEventStream,
+  getCurrentTools,
   type Model,
+  normalizeContext,
   type SimpleStreamOptions,
   type StopReason,
   type TextContent,
@@ -1520,6 +1523,9 @@ export function streamCortexKitAnthropic(
         getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum'
       )
         throw new Error('Missing Anthropic OAuth access token')
+      const tools = getCurrentTools(
+        collapseSystemMessages(normalizeContext(context)).messages,
+      )
       const response = await executeWithFallback({
         model,
         context,
@@ -1581,7 +1587,7 @@ export function streamCortexKitAnthropic(
             output.content.push({
               type: 'toolCall',
               id: String(block.id),
-              name: fromClaudeCodeToolName(String(block.name), context.tools),
+              name: fromClaudeCodeToolName(String(block.name), tools),
               arguments: {},
               partialJson: '',
               index: event.index,
