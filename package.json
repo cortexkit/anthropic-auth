@@ -33,7 +33,7 @@
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.2",
     "dedent": "^1.7.2",
-    "lefthook": "2.1.12",
+    "lefthook": "2.1.14",
     "miniflare": "^4.20260730.0",
     "typescript": "7.0.2"
   }
