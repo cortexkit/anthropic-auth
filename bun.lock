@@ -20,10 +20,10 @@
     },
     "packages/core": {
       "name": "@cortexkit/anthropic-auth-core",
-      "version": "1.22.0",
+      "version": "1.23.0",
       "dependencies": {
         "@cortexkit/claustrum-client": "0.3.0",
-        "@cortexkit/subc-client": "^0.11.1",
+        "@cortexkit/subc-client": "^0.13.1",
         "xxhash-wasm": "^1.1.0",
       },
     },
@@ -35,7 +35,7 @@
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-anthropic-auth",
-      "version": "1.22.0",
+      "version": "1.23.0",
       "bin": {
         "opencode-anthropic-auth": "dist/cli.js",
       },
@@ -56,7 +56,7 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-anthropic-auth",
-      "version": "1.22.0",
+      "version": "1.23.0",
       "dependencies": {
         "@cortexkit/anthropic-auth-core": "1.22.0",
       },
@@ -216,7 +216,7 @@
 
     "@cortexkit/pi-anthropic-auth": ["@cortexkit/pi-anthropic-auth@workspace:packages/pi"],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.11.1", "", {}, "sha512-+T2GzdIHMJKtvS5uPG3FydyGbdvREla7N3B3inLgnVWxsO8v77rzMbmPX63ZD9OcJtnkDZjO5eFbfeIF+RUFWA=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.13.1", "", {}, "sha512-fUPcVhBzBk1RRSLxo0o5Y+P3IVwlsz1MZik609zGDsr1vzA1TnEsIKlEQDz3U8JeuvcnUvKd5v1/F+gafI7+Ig=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 
