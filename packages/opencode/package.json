@@ -70,6 +70,6 @@
     "solid-js": "1.9.12"
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "3.0.111"
+    "@ai-sdk/anthropic": "4.0.58"
   }
 }
