@@ -16,7 +16,6 @@ const paths = await resolveNativePoolPaths(
   join(root, 'anthropic-auth-state.json'),
 )
 const hooks = {
-  lockOptions: { ttlMs: 100, timeoutMs: 3_000 },
   onWriteStep: async (step: 'before-write' | 'after-write') => {
     if (step === point) process.exit(19)
   },

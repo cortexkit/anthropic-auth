@@ -37,10 +37,12 @@ import {
   selectClaudeCodeBetas,
   signRequestBody,
   stripBillingLineageFromBody,
+  stripEmptyTrailingAssistantMessages,
   TEXT_REPLACEMENTS,
   THINKING_BINDING_CONTROLS_BETA,
   type ThinkingPrefixMismatchBehavior,
   TOOL_PREFIX,
+  TrailingAssistantHistoryError,
   usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -1173,22 +1175,6 @@ function applyCache1hStrategy(
 }
 
 /**
- * Strip trailing assistant messages. Anthropic rejects assistant-message
- * prefill on Claude Code OAuth models with: "This model does not support
- * assistant message prefill. The conversation must end with a user message."
- * A resumed/compacted session can end on an assistant turn (e.g. after a
- * failed tool round); pop those before signing.
- */
-function stripTrailingAssistantMessages(parsed: Record<string, unknown>) {
-  if (!Array.isArray(parsed.messages)) return
-  while (parsed.messages.length) {
-    const last = parsed.messages[parsed.messages.length - 1]
-    if (!isRecord(last) || last.role !== 'assistant') break
-    parsed.messages.pop()
-  }
-}
-
-/**
  * Anthropic can classify whitespace-only text after the latest assistant
  * tool_use as assistant prefill on a later tool continuation, even when the
  * request ends with a user tool_result message. Preserve older turns and
@@ -1332,7 +1318,7 @@ export async function rewriteRequestBody(
     const messagesBeforeStrip = Array.isArray(parsed.messages)
       ? parsed.messages.length
       : undefined
-    stripTrailingAssistantMessages(parsed)
+    stripEmptyTrailingAssistantMessages(parsed.messages)
     const removedWhitespaceBlocks =
       stripLatestAssistantToolUseTrailingWhitespace(parsed)
     const messagesAfterStrip = Array.isArray(parsed.messages)
@@ -1485,7 +1471,12 @@ export async function rewriteRequestBody(
 
     return signed
   } catch (error) {
-    if (error instanceof EffortMarkerCorrelationError) throw error
+    if (
+      error instanceof EffortMarkerCorrelationError ||
+      error instanceof TrailingAssistantHistoryError
+    ) {
+      throw error
+    }
     return body
   }
 }

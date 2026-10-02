@@ -9,9 +9,12 @@ import {
   REQUIRED_BETAS,
   selectClaudeCodeBetas,
   THINKING_BINDING_CONTROLS_BETA,
+  TRAILING_ASSISTANT_HISTORY_MESSAGE,
+  TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
 import dedent from 'dedent'
 import {
+  EffortMarkerCorrelationError,
   encodeOpenCodeEffortPlan,
   markOpenCodeEffortTransitions,
 } from '../effort-history'
@@ -3969,7 +3972,11 @@ describe('rewriteRequestBody', () => {
   // Prefill stripping — trailing assistant messages
   // -----------------------------------------------------------------------
 
-  test('strips single trailing assistant message', async () => {
+  // A meaningful trailing assistant message is refused rather than dropped.
+  // The wire format cannot tell a completed answer from a partial one, so
+  // dropping it could discard a finished answer and resend the question that
+  // produced it.
+  test('refuses a single meaningful trailing assistant message', async () => {
     const body = JSON.stringify({
       system: 'sys',
       messages: [
@@ -3977,12 +3984,28 @@ describe('rewriteRequestBody', () => {
         { role: 'assistant', content: [{ type: 'text', text: 'I will help' }] },
       ],
     })
-    const result = JSON.parse(await rewriteRequestBody(body))
-    expect(result.messages.length).toBe(1)
-    expect(result.messages[0].role).toBe('user')
+    const error = await rewriteRequestBody(body).then(
+      () => undefined,
+      (rejection: unknown) => rejection,
+    )
+    expect(error).toBeInstanceOf(TrailingAssistantHistoryError)
+    expect((error as Error).message).toBe(TRAILING_ASSISTANT_HISTORY_MESSAGE)
+    expect((error as TrailingAssistantHistoryError).details).toEqual({
+      messageCount: 2,
+      trailingMessageIndex: 1,
+      emptyMessagesAfter: 0,
+      contentShape: 'array',
+      contentBlockCount: 1,
+      contentBlockTypes: ['text'],
+    })
+    // The error must not echo conversation text.
+    expect(
+      JSON.stringify((error as TrailingAssistantHistoryError).details),
+    ).not.toContain('I will help')
+    expect((error as Error).message).not.toContain('I will help')
   })
 
-  test('strips multiple trailing assistant messages', async () => {
+  test('refuses multiple meaningful trailing assistant messages', async () => {
     const body = JSON.stringify({
       system: 'sys',
       messages: [
@@ -3991,9 +4014,238 @@ describe('rewriteRequestBody', () => {
         { role: 'assistant', content: [{ type: 'text', text: 'second' }] },
       ],
     })
-    const result = JSON.parse(await rewriteRequestBody(body))
-    expect(result.messages.length).toBe(1)
-    expect(result.messages[0].role).toBe('user')
+    await expect(rewriteRequestBody(body)).rejects.toBeInstanceOf(
+      TrailingAssistantHistoryError,
+    )
+  })
+
+  test('drops provably empty trailing assistant messages', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
+        { role: 'user', content: 'follow up' },
+        { role: 'assistant', content: '' },
+        { role: 'assistant', content: ' \n\t' },
+        { role: 'assistant', content: [] },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '' },
+            {
+              type: 'text',
+              text: '  \n',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      ],
+    })
+    const perf: Array<{ stage: string; data: Record<string, unknown> }> = []
+    const result = JSON.parse(
+      await rewriteRequestBody(body, {
+        perf: (stage, data) => perf.push({ stage, data: data ?? {} }),
+      }),
+    )
+    expect(result.messages).toEqual([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
+      { role: 'user', content: 'follow up' },
+    ])
+    expect(
+      perf.find((entry) => entry.stage === 'strip_trailing_assistant')?.data
+        .removedMessages,
+    ).toBe(4)
+  })
+
+  test('refuses a meaningful assistant hidden behind empty trailers', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'completed answer' },
+        { role: 'assistant', content: '   ' },
+        { role: 'assistant', content: [{ type: 'text', text: '' }] },
+      ],
+    })
+    const error = await rewriteRequestBody(body).then(
+      () => undefined,
+      (rejection: unknown) => rejection,
+    )
+    expect(error).toBeInstanceOf(TrailingAssistantHistoryError)
+    expect((error as TrailingAssistantHistoryError).details).toEqual({
+      messageCount: 4,
+      trailingMessageIndex: 1,
+      emptyMessagesAfter: 2,
+      contentShape: 'string',
+    })
+  })
+
+  test.each([
+    ['missing content', { role: 'assistant' }],
+    ['null content', { role: 'assistant', content: null }],
+    ['object content', { role: 'assistant', content: { type: 'text' } }],
+    ['non-record block', { role: 'assistant', content: ['   '] }],
+    [
+      'text block without text',
+      { role: 'assistant', content: [{ type: 'text' }] },
+    ],
+    [
+      'text block with non-string text',
+      { role: 'assistant', content: [{ type: 'text', text: 3 }] },
+    ],
+    [
+      'empty text block with citations',
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: '', citations: [{ type: 'x' }] }],
+      },
+    ],
+    [
+      'unknown block type',
+      { role: 'assistant', content: [{ type: 'future' }] },
+    ],
+    [
+      'empty text followed by an opaque block',
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: ' ' }, { type: 'opaque_block' }],
+      },
+    ],
+    [
+      'visible reasoning',
+      {
+        role: 'assistant',
+        content: [{ type: 'thinking', thinking: 'plan', signature: '' }],
+      },
+    ],
+    [
+      'signed empty thinking',
+      {
+        role: 'assistant',
+        content: [{ type: 'thinking', thinking: '', signature: 'sig' }],
+      },
+    ],
+    [
+      'redacted thinking',
+      {
+        role: 'assistant',
+        content: [{ type: 'redacted_thinking', data: 'opaque' }],
+      },
+    ],
+    [
+      'tool use',
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} }],
+      },
+    ],
+    [
+      'tool use followed by whitespace text',
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+          { type: 'text', text: ' ' },
+        ],
+      },
+    ],
+    [
+      'image',
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/png', data: 'AA==' },
+          },
+        ],
+      },
+    ],
+  ])('refuses a trailing assistant with %s', async (_label, trailing) => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [{ role: 'user', content: 'hello' }, trailing],
+    })
+    await expect(rewriteRequestBody(body)).rejects.toBeInstanceOf(
+      TrailingAssistantHistoryError,
+    )
+  })
+
+  test('reports only known block type names in refusal details', async () => {
+    const body = JSON.stringify({
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'hello' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'plan', signature: 'sig' },
+            { type: 'secret-looking-type' },
+            'raw',
+          ],
+        },
+      ],
+    })
+    const error = await rewriteRequestBody(body).then(
+      () => undefined,
+      (rejection: unknown) => rejection,
+    )
+    expect((error as TrailingAssistantHistoryError).details).toMatchObject({
+      contentShape: 'array',
+      contentBlockCount: 3,
+      contentBlockTypes: ['thinking', 'other', 'other'],
+    })
+  })
+
+  test('refuses before model normalization, effort, billing, cache and signing', async () => {
+    resetPinnedFirstUserTextsForTest()
+    const perf: string[] = []
+    const options = {
+      cache1hEnabled: true,
+      cache1hMode: 'hybrid' as const,
+      sessionId: 'ses_trailing_assistant_refusal',
+      // An invalid effort plan makes effort processing throw its own error
+      // if it is ever reached, so the error type proves the refusal ran first.
+      midConversationEffortEnabled: true,
+      midConversationEffortPlan: 'not-a-valid-plan',
+      perf: (stage: string) => perf.push(stage),
+    }
+    const userEnded = [{ role: 'user', content: 'hello' }]
+    await expect(
+      rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          output_config: { effort: 'high' },
+          messages: userEnded,
+        }),
+        { ...options, sessionId: undefined, perf: undefined },
+      ),
+    ).rejects.toBeInstanceOf(EffortMarkerCorrelationError)
+
+    const error = await rewriteRequestBody(
+      JSON.stringify({
+        model: 'claude-fable-5-1',
+        output_config: { effort: 'high' },
+        messages: [...userEnded, { role: 'assistant', content: 'answer' }],
+      }),
+      options,
+    ).then(
+      () => undefined,
+      (rejection: unknown) => rejection,
+    )
+
+    expect(error).toBeInstanceOf(TrailingAssistantHistoryError)
+    expect(perf).toEqual(['parse'])
+    expect(
+      hasPinnedFirstUserTextForTest('ses_trailing_assistant_refusal'),
+    ).toBe(false)
+  })
+
+  test('keeps the original body for malformed JSON', async () => {
+    const body = '{"messages": [{"role": "assistant", "content": "answer"}'
+    expect(await rewriteRequestBody(body)).toBe(body)
   })
 
   test('preserves assistant message followed by user message', async () => {
@@ -4115,7 +4367,7 @@ describe('rewriteRequestBody', () => {
     })
   })
 
-  test('strips trailing assistant after tool_result + assistant', async () => {
+  test('refuses a meaningful trailing assistant after tool_result', async () => {
     const body = JSON.stringify({
       system: 'sys',
       messages: [
@@ -4138,9 +4390,43 @@ describe('rewriteRequestBody', () => {
         },
       ],
     })
+    await expect(rewriteRequestBody(body)).rejects.toBeInstanceOf(
+      TrailingAssistantHistoryError,
+    )
+  })
+
+  test('preserves interior assistant content followed by tool_result', async () => {
+    const assistant = {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'plan', signature: 'sig' },
+        { type: 'redacted_thinking', data: 'opaque' },
+        { type: 'text', text: 'Running it.' },
+        { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+      ],
+    }
+    const body = JSON.stringify({
+      model: 'claude-opus-4-8',
+      system: 'sys',
+      messages: [
+        { role: 'user', content: 'do something' },
+        assistant,
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool_1', content: 'output' },
+          ],
+        },
+      ],
+    })
     const result = JSON.parse(await rewriteRequestBody(body))
-    expect(result.messages.length).toBe(3)
-    expect(result.messages[2].role).toBe('user')
+    expect(result.messages).toHaveLength(3)
+    expect(result.messages[1].content).toEqual([
+      { type: 'thinking', thinking: 'plan', signature: 'sig' },
+      { type: 'redacted_thinking', data: 'opaque' },
+      { type: 'text', text: 'Running it.' },
+      { type: 'tool_use', id: 'tool_1', name: 'mcp_Bash', input: {} },
+    ])
   })
 
   test('hybrid mode never sets cache_control on the message object when the n-2 anchor has no cacheable block', async () => {
@@ -4154,7 +4440,9 @@ describe('rewriteRequestBody', () => {
         { role: 'user', content: 'first' },
         { role: 'assistant', content: 'second' },
         { role: 'user', content: [] },
-        { role: 'assistant', content: 'last' },
+        // A provably empty trailer is still dropped, leaving the empty user
+        // message as the final one.
+        { role: 'assistant', content: '' },
       ],
     })
 

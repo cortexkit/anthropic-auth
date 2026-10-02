@@ -8,6 +8,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 - Add Claude Sonnet 5.5 (`claude-sonnet-5-5`) to Core, OpenCode, and Pi with its 1M context, 128K output, and official pricing. OpenCode and Pi request readable adaptive thinking. OpenCode maps explicit thinking opt-outs to Sonnet 5.5's `between_tools` mode, removes unsupported forced tool choice, and offers native `low` through `max` effort variants. Apply configured `error` or `drop_block` behavior to replayed Sonnet 5.5 and Opus 5.5 thinking when earlier messages, instructions, or tools have changed; the default account behavior stays unchanged. Pi exposes the model's supported `low`–`max` effort levels while refusing unsupported `minimal` and unavailable `off`.
 
+### Fixes
+
+- Stop silently discarding meaningful trailing assistant turns in OpenCode and Pi, which could replay the previous question. A shared Core guard removes only provably empty trailers and refuses other tails before billing, caching, signing, or model dispatch. OpenCode reports a terminal local 400 that cannot trigger account fallback, even when upstream 400 responses are configured for fallback; genuine provider responses retain that policy. Pi reports a terminal provider error without sending a model request.
+
 ## 2.0.0
 
 ### Breaking Changes

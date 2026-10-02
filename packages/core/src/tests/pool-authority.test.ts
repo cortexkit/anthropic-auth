@@ -243,6 +243,13 @@ for (const point of ['before-write', 'after-write'] as const) {
       )
       const stderr = await new Response(child.stderr).text()
       expect(await child.exited, stderr).toBe(19)
+      const lockPath = `${paths.journal}.migration-journal.lock`
+      const abandoned = JSON.parse(await readFile(lockPath, 'utf8'))
+      expect(abandoned.ownerId).toEqual(expect.any(String))
+      expect(abandoned.expiresAt).toEqual(expect.any(Number))
+      // The process is dead. Expire only its fixture marker so reclamation
+      // does not depend on elapsed wall time or shorten any live lease.
+      await writeFile(lockPath, JSON.stringify({ ...abandoned, expiresAt: 0 }))
       const expected = point === 'after-write' ? target : previous
       expect((await readNativeMigrationJournal(paths))?.phase).toBe(expected)
       if (expected === 'committed' || expected === 'retired') {
@@ -252,17 +259,43 @@ for (const point of ['before-write', 'after-write'] as const) {
           code: expected ? 'migration-incomplete' : 'migration-required',
         })
       }
-      const hooks = { lockOptions: { ttlMs: 100, timeoutMs: 3_000 } }
-      if (!previous) await beginNativeMigration(paths, input, hooks)
-      else await advanceNativeMigration(paths, previous, target, hooks)
+      // The successor reclaims the dead marker under normal lease settings.
+      if (!previous) await beginNativeMigration(paths, input)
+      else await advanceNativeMigration(paths, previous, target)
       for (let phase = index + 1; phase < phases.length; phase++) {
         const before = phases[phase - 1]
         const after = phases[phase]
         if (!before || !after) throw new Error('Invalid fixture stage')
-        await advanceNativeMigration(paths, before, after, hooks)
+        await advanceNativeMigration(paths, before, after)
       }
       await requireNativePoolAuthority(paths)
       expect((await readNativeMigrationJournal(paths))?.phase).toBe('retired')
     })
   }
 }
+
+test('expired successor lease refuses before publishing even while its owner bytes remain', async () => {
+  const paths = await fixture()
+  let matchedOwnerAfterExpiry = false
+  await expect(
+    beginNativeMigration(paths, input, {
+      lockOptions: { ttlMs: 100, timeoutMs: 3_000 },
+      onWriteStep: async (step) => {
+        if (step !== 'before-write') return
+        const lockPath = `${paths.journal}.migration-journal.lock`
+        const before = JSON.parse(await readFile(lockPath, 'utf8'))
+        await Bun.sleep(Math.max(0, before.expiresAt - Date.now() + 1))
+        const after = JSON.parse(await readFile(lockPath, 'utf8'))
+        matchedOwnerAfterExpiry =
+          before.ownerId === after.ownerId && after.expiresAt <= Date.now()
+      },
+    }),
+  ).rejects.toMatchObject({ name: 'LockOwnershipError' })
+  expect(matchedOwnerAfterExpiry).toBe(true)
+  expect(await readNativeMigrationJournal(paths)).toBeUndefined()
+  await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
+    code: 'migration-required',
+  })
+  await beginNativeMigration(paths, input)
+  expect((await readNativeMigrationJournal(paths))?.phase).toBe('building')
+})

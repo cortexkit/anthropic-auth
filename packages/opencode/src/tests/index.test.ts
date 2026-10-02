@@ -5,6 +5,7 @@ import {
   describe,
   expect,
   mock,
+  spyOn,
   test,
 } from 'bun:test'
 import { randomUUID } from 'node:crypto'
@@ -30,6 +31,7 @@ import {
   CustodyTombstoneRefreshError,
   custodyTombstoneOAuth,
   extractBillingHeaderCCH,
+  FallbackAccountManager,
   getAccountStatePath,
   getClaudeCodeIdentity,
   getOrCreatePrimeAuthLineageId,
@@ -49,6 +51,7 @@ import {
   saveAccountState,
   saveAccounts,
   setLogLevel,
+  TRAILING_ASSISTANT_HISTORY_MESSAGE,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { EFFORT_MARKER_PREFIX } from '../effort-history'
@@ -4448,6 +4451,277 @@ describe('Fable 5.1 request-scoped effort history', () => {
     expect(JSON.stringify(refusalLogs)).not.toContain(anchorMarker)
     expect(JSON.stringify(refusalLogs)).not.toContain(transitionMarker)
     expect(messagesCalled).toBe(false)
+  })
+})
+
+describe('meaningful trailing assistant history', () => {
+  const originalFetch = globalThis.fetch
+  let restoreFallbackSelection: (() => void) | undefined
+
+  afterEach(async () => {
+    restoreFallbackSelection?.()
+    restoreFallbackSelection = undefined
+    globalThis.fetch = originalFetch
+    __setLogTestSink(null)
+    await drainSidebarWrites()
+  })
+
+  const trailingAssistantBody = () =>
+    JSON.stringify({
+      model: 'claude-opus-4-8',
+      max_tokens: 64,
+      messages: [
+        { role: 'user', content: 'earlier question' },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'completed private answer' }],
+        },
+      ],
+    })
+
+  async function expectLocalRefusal(response: Response) {
+    expect(response.status).toBe(400)
+    expect(response.headers.get('retry-after')).toBeNull()
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: TRAILING_ASSISTANT_HISTORY_MESSAGE,
+      },
+    })
+  }
+
+  test('OAuth route refuses locally without model dispatch or fallback', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        fallbackOn: [400, 429],
+        refresh: {
+          enabled: false,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 30,
+        },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+      }),
+    )
+    const modelDispatches: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/claude_cli/bootstrap')) {
+          return Promise.resolve(
+            Response.json({
+              oauth_account: { account_uuid: 'trailing-account' },
+            }),
+          )
+        }
+        if (url.includes('/v1/messages')) {
+          const authorization = new Headers(init?.headers).get('authorization')
+          modelDispatches.push(authorization ?? '')
+          // An actual provider 400 remains eligible under the explicit policy,
+          // even when its error body matches the plugin's local refusal.
+          if (authorization === 'Bearer main-access') {
+            return Promise.resolve(
+              Response.json(
+                {
+                  type: 'error',
+                  error: {
+                    type: 'invalid_request_error',
+                    message: TRAILING_ASSISTANT_HISTORY_MESSAGE,
+                  },
+                },
+                { status: 400 },
+              ),
+            )
+          }
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+
+    const plugin = await getPlugin()
+    const auth = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    const fallbackSelection = spyOn(
+      FallbackAccountManager.prototype,
+      'getUsableFallbackAccounts',
+    )
+    restoreFallbackSelection = () => fallbackSelection.mockRestore()
+    await expectLocalRefusal(
+      await auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses_trailing_oauth' },
+        body: trailingAssistantBody(),
+      }),
+    )
+    expect(modelDispatches).toEqual([])
+    expect(fallbackSelection).not.toHaveBeenCalled()
+    await drainSidebarWrites()
+    expect((await getSidebarState()).activeId).not.toBe('fallback-1')
+    expect(logs).toContainEqual({
+      level: 'warn',
+      channel: 'transform',
+      message: 'refused request ending on assistant history',
+      payload: expect.objectContaining({
+        check: 'meaningful_trailing_assistant',
+        trailingMessageIndex: 1,
+      }),
+    })
+    expect(JSON.stringify(logs)).not.toContain('completed private answer')
+
+    // Control: the same fixture does fall back when the model is reached, so
+    // the refusal above stayed local because of the history check.
+    const control = await auth.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_trailing_oauth' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'new question' }],
+      }),
+    })
+    expect(control.status).toBe(200)
+    expect(modelDispatches).toEqual([
+      'Bearer main-access',
+      'Bearer fallback-access',
+    ])
+    expect(fallbackSelection).toHaveBeenCalled()
+  })
+
+  test('API-key route refuses locally without model dispatch', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        fallbackOn: [400, 429],
+        routing: { mode: 'fallback-first' },
+        refresh: {
+          enabled: false,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 30,
+        },
+        accounts: [
+          {
+            id: 'api-trailing',
+            type: 'api',
+            apiKey: 'api-trailing-key',
+            baseURL: 'https://api.example.test',
+            authHeader: 'x-api-key',
+          },
+        ],
+        quota: { enabled: false } as AccountStorage['quota'],
+      }),
+    )
+    const modelDispatches: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/v1/messages')) {
+          const headers = new Headers(init?.headers)
+          modelDispatches.push(
+            headers.get('x-api-key') ?? headers.get('authorization') ?? '',
+          )
+          // The main account reports an exhausted five-hour window, which makes
+          // fallback-first routing send later requests to the API-key account.
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers:
+                headers.get('authorization') === 'Bearer main-access'
+                  ? {
+                      'anthropic-ratelimit-unified-representative-claim':
+                        'five_hour',
+                      'anthropic-ratelimit-unified-5h-utilization': '1',
+                      'anthropic-ratelimit-unified-5h-reset': '1784246400',
+                      'anthropic-ratelimit-unified-7d-utilization': '0.4',
+                      'anthropic-ratelimit-unified-7d-reset': '1784628000',
+                    }
+                  : undefined,
+            }),
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+    const logs: LogTestRecord[] = []
+    __setLogTestSink((record) => logs.push(record))
+
+    const plugin = await getPlugin()
+    const auth = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const userEndedBody = JSON.stringify({
+      model: 'claude-opus-4-8',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'new question' }],
+    })
+
+    // Warm-up: main serves this request and reports its quota as exhausted.
+    await auth.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_trailing_api' },
+      body: userEndedBody,
+    })
+    expect(modelDispatches).toEqual(['Bearer main-access'])
+    modelDispatches.length = 0
+    await drainSidebarWrites()
+    expect((await getSidebarState()).activeId).toBe('main')
+
+    await expectLocalRefusal(
+      await auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses_trailing_api' },
+        body: trailingAssistantBody(),
+      }),
+    )
+    expect(modelDispatches).toEqual([])
+    // The refusal was produced by the API-key route: fallback-first records
+    // the account that answered. If the API-key route threw instead, the
+    // request would fall through to main and main would be recorded here.
+    await drainSidebarWrites()
+    expect(await getSidebarState()).toMatchObject({
+      activeId: 'api-trailing',
+      route: 'fallback-first',
+    })
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        level: 'warn',
+        channel: 'transform',
+        message: 'refused request ending on assistant history',
+      }),
+    )
+    expect(JSON.stringify(logs)).not.toContain('completed private answer')
+
+    // Control: a user-ended request in the same state reaches the API-key
+    // account, so only the history check kept the refused request local.
+    const control = await auth.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_trailing_api' },
+      body: userEndedBody,
+    })
+    expect(control.status).toBe(200)
+    expect(modelDispatches).toEqual(['api-trailing-key'])
   })
 })
 

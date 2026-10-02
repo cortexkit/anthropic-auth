@@ -42,6 +42,7 @@ export class MockRelayServer {
     this.token = options.token ?? this.token
     this.responseStartDelayMs = options.responseStartDelayMs ?? 0
     this.server = Bun.serve<{ affinity: string }>({
+      hostname: '127.0.0.1',
       port: 0,
       fetch: (request, server) => {
         const url = new URL(request.url)

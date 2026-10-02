@@ -3,6 +3,7 @@ import {
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   type ProviderAccountUuid,
+  TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
 import { type Context, type Message, Type } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
@@ -94,24 +95,21 @@ describe('fast mode model eligibility', () => {
   })
 })
 
-describe('buildAnthropicRequest — prefill stripping', () => {
-  test('strips single trailing assistant message', async () => {
-    const messages = await buildMessages([
-      userMsg('hello'),
-      assistantMsg('I will help'),
-    ])
-    expect(messages.length).toBe(1)
-    expect(messages[0]?.role).toBe('user')
+describe('buildAnthropicRequest — trailing assistant boundary', () => {
+  test('refuses a meaningful trailing assistant message', async () => {
+    await expect(
+      buildMessages([userMsg('hello'), assistantMsg('I will help')]),
+    ).rejects.toBeInstanceOf(TrailingAssistantHistoryError)
   })
 
-  test('strips multiple trailing assistant messages', async () => {
-    const messages = await buildMessages([
-      userMsg('hello'),
-      assistantMsg('first'),
-      assistantMsg('second'),
-    ])
-    expect(messages.length).toBe(1)
-    expect(messages[0]?.role).toBe('user')
+  test('refuses multiple meaningful trailing assistant messages', async () => {
+    await expect(
+      buildMessages([
+        userMsg('hello'),
+        assistantMsg('first'),
+        assistantMsg('second'),
+      ]),
+    ).rejects.toBeInstanceOf(TrailingAssistantHistoryError)
   })
 
   test('preserves assistant message followed by user message', async () => {
@@ -138,15 +136,15 @@ describe('buildAnthropicRequest — prefill stripping', () => {
     expect(messages[2]?.role).toBe('user') // tool_result maps to user role
   })
 
-  test('strips trailing assistant after tool_result + assistant', async () => {
-    const messages = await buildMessages([
-      userMsg('do something'),
-      toolCallMsg('tool_1', 'Bash'),
-      toolResultMsg('tool_1', 'output'),
-      assistantMsg('based on that output...'),
-    ])
-    expect(messages.length).toBe(3)
-    expect(messages[2]?.role).toBe('user')
+  test('refuses a meaningful trailing assistant after tool_result', async () => {
+    await expect(
+      buildMessages([
+        userMsg('do something'),
+        toolCallMsg('tool_1', 'Bash'),
+        toolResultMsg('tool_1', 'output'),
+        assistantMsg('based on that output...'),
+      ]),
+    ).rejects.toBeInstanceOf(TrailingAssistantHistoryError)
   })
 
   test('handles user-only conversation', async () => {
@@ -160,12 +158,66 @@ describe('buildAnthropicRequest — prefill stripping', () => {
     expect(messages.length).toBe(0)
   })
 
-  test('strips all-assistant conversation to empty', async () => {
+  test('refuses an all-assistant conversation with content', async () => {
+    await expect(
+      buildMessages([assistantMsg('first'), assistantMsg('second')]),
+    ).rejects.toBeInstanceOf(TrailingAssistantHistoryError)
+  })
+
+  test('refuses opaque foreign thinking before lowering can erase the tail', async () => {
+    const context: Context = {
+      tools: [],
+      messages: [
+        userMsg('original question'),
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: '',
+              thinkingSignature: 'opaque-foreign-signature',
+            },
+          ],
+          api: 'anthropic-messages',
+          provider: 'anthropic',
+          model: 'claude-opus-4-8',
+          stopReason: 'stop',
+          timestamp: 1,
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+        },
+      ],
+    }
+    const before = JSON.stringify(context)
+    await expect(
+      buildAnthropicRequest(
+        'claude-opus-5-5',
+        context,
+        undefined,
+        defaultCache,
+      ),
+    ).rejects.toBeInstanceOf(TrailingAssistantHistoryError)
+    expect(JSON.stringify(context)).toBe(before)
+  })
+
+  test('removes a provably empty assistant trailer', async () => {
     const messages = await buildMessages([
-      assistantMsg('first'),
-      assistantMsg('second'),
+      userMsg('hello'),
+      assistantMsg(' \n\t'),
     ])
-    expect(messages.length).toBe(0)
+    expect(messages).toEqual([{ role: 'user', content: 'hello' }])
   })
 })
 
@@ -435,11 +487,12 @@ describe('buildAnthropicRequest — Claude Code system[] shape', () => {
   })
 
   test('drops the documentation paragraph when there is no user message to carry it', async () => {
-    // convertMessages emits only user/assistant and trailing assistants are
-    // stripped, so a conversation with no user message converts to empty. The
-    // remaining paragraphs still go to system[], which is a shape Anthropic
-    // accepts; only the documentation paragraph is dropped.
-    const body = await buildBody([assistantMsg('only assistant')], PI_PROMPT)
+    await expect(
+      buildBody([assistantMsg('only assistant')], PI_PROMPT),
+    ).rejects.toBeInstanceOf(TrailingAssistantHistoryError)
+    // No user exists to carry the documentation block in an empty history.
+    // The instruction paragraphs still remain in system[].
+    const body = await buildBody([], PI_PROMPT)
     expect(body.messages).toHaveLength(0)
     expect(body.system).toHaveLength(3)
     expect(JSON.stringify(body.system)).not.toContain('MOVE THIS')

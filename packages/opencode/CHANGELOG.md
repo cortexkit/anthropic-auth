@@ -8,6 +8,10 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 - Publish Claude Sonnet 5.5 with its native API ID, official 1M/128K limits and pricing, and adaptive `low`–`max` effort variants. Preserve explicit no-up-front-thinking requests as bare `between_tools` at effort `high` or below, remove forced tool choice while retaining structured-output validation, and allow configured adaptive-thinking prefix controls on Sonnet 5.5 and Opus 5.5 continuations.
 
+### Patch Changes
+
+- Stop silently dropping a trailing assistant message that has content. When OpenCode's history briefly ends on the previous answer, the plugin used to delete that answer and resend the earlier question, repeating completed work. Only provably empty trailing assistant messages are still removed; any other trailing assistant content now fails locally with a non-retryable `invalid_request_error` 400 on both OAuth and API-key routes, before anything is sent to the model.
+
 ## 2.0.0
 
 ### Breaking Changes

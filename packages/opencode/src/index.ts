@@ -204,6 +204,7 @@ import {
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
+  TrailingAssistantHistoryError,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
@@ -309,19 +310,15 @@ const HTTP_BODY_TYPE_ID = '~effect/http/HttpBody'
 const ERROR_REPORTER_IGNORE = '~effect/ErrorReporter/ignore'
 const PRIME_MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 
-function effortMarkerFailureResponse(
-  error: EffortMarkerCorrelationError,
-): Response {
-  logger.warn('effort-history', 'refused uncorrelated Fable 5.1 request', {
-    check: error.check,
-    ...error.details,
-  })
-  return new Response(
+const localInvalidRequestResponses = new WeakSet<Response>()
+
+function localInvalidRequestResponse(message: string): Response {
+  const response = new Response(
     JSON.stringify({
       type: 'error',
       error: {
         type: 'invalid_request_error',
-        message: error.message,
+        message,
       },
     }),
     {
@@ -329,6 +326,43 @@ function effortMarkerFailureResponse(
       headers: { 'content-type': 'application/json' },
     },
   )
+  localInvalidRequestResponses.add(response)
+  return response
+}
+
+// Upstream status policy cannot repair a locally invalid conversation by
+// selecting another account. Keep genuine provider 400s configurable.
+function shouldFallbackResponse(
+  response: Response,
+  storage: AccountStorage | null,
+): boolean {
+  return (
+    (response.status !== 400 || !localInvalidRequestResponses.has(response)) &&
+    shouldFallbackStatus(response.status, storage)
+  )
+}
+
+function effortMarkerFailureResponse(
+  error: EffortMarkerCorrelationError,
+): Response {
+  logger.warn('effort-history', 'refused uncorrelated Fable 5.1 request', {
+    check: error.check,
+    ...error.details,
+  })
+  return localInvalidRequestResponse(error.message)
+}
+
+// A request whose history ends on a meaningful assistant message is answered
+// locally with a terminal 400 so the client shows the error instead of
+// retrying, falling back to another account, or reaching the model.
+function trailingAssistantHistoryFailureResponse(
+  error: TrailingAssistantHistoryError,
+): Response {
+  logger.warn('transform', 'refused request ending on assistant history', {
+    check: error.check,
+    ...error.details,
+  })
+  return localInvalidRequestResponse(error.message)
 }
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
@@ -5631,6 +5665,9 @@ const anthropicAuthPlugin = async (
                 if (error instanceof EffortMarkerCorrelationError) {
                   return effortMarkerFailureResponse(error)
                 }
+                if (error instanceof TrailingAssistantHistoryError) {
+                  return trailingAssistantHistoryFailureResponse(error)
+                }
                 throw error
               }
               configureApiRouteHeaders(requestHeaders, account)
@@ -5882,6 +5919,9 @@ const anthropicAuthPlugin = async (
               } catch (error) {
                 if (error instanceof EffortMarkerCorrelationError) {
                   return effortMarkerFailureResponse(error)
+                }
+                if (error instanceof TrailingAssistantHistoryError) {
+                  return trailingAssistantHistoryFailureResponse(error)
                 }
                 throw error
               }
@@ -6821,7 +6861,7 @@ const anthropicAuthPlugin = async (
                 )
               } else continue
               lastResponse = response
-              let fallbackAgain = shouldFallbackStatus(response.status, storage)
+              let fallbackAgain = shouldFallbackResponse(response, storage)
               if (!fallbackAgain) {
                 const inspected = await inspectStreamingRateLimit(
                   response,
@@ -6906,8 +6946,8 @@ const anthropicAuthPlugin = async (
             if (!hasPotentialFallbackRoute) return mainResponse
 
             let currentResponse = mainResponse
-            let shouldFallback = shouldFallbackStatus(
-              currentResponse.status,
+            let shouldFallback = shouldFallbackResponse(
+              currentResponse,
               storage,
             )
             let mainQuotaExhaustedByResponse = responseShowsMainQuotaExhausted(
@@ -7523,8 +7563,8 @@ const anthropicAuthPlugin = async (
                     }
                     const inspectResponse = async (response: Response) => {
                       let inspectedResponse = response
-                      let routeFailure = shouldFallbackStatus(
-                        response.status,
+                      let routeFailure = shouldFallbackResponse(
+                        response,
                         stickyRoutes.storage,
                       )
                       let streamingRateLimit = false
