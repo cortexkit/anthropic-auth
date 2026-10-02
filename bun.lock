@@ -27,6 +27,9 @@
         "@cortexkit/claustrum-client": "0.4.0",
         "xxhash-wasm": "^1.1.0",
       },
+      "devDependencies": {
+        "@cortexkit/common-auth": "^0.4.6",
+      },
     },
     "packages/e2e-tests": {
       "name": "@cortexkit/anthropic-auth-e2e",
@@ -213,6 +216,8 @@
     "@cortexkit/anthropic-auth-e2e": ["@cortexkit/anthropic-auth-e2e@workspace:packages/e2e-tests"],
 
     "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.4.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.16.0" } }, "sha512-xjUXf/lB3T8R7oaOu9T1Obnn47bAdN5UbyaTpywyiY4wdvTbqHBnB3qX0KpDFTeZ7m35tRPDevcWvOzJIgUhMw=="],
+
+    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.4.6", "", { "dependencies": { "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.5.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.5.12", "@opentui/solid": ">=0.5.12", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-/FFqtu6huWBU632GOAORQk/olkvI/1Tw3H0+zxA8cLWOfwiNc7kIptb3+3cQYlYBpH7lG4SAqhnFGFkJLo0lWQ=="],
 
     "@cortexkit/opencode-anthropic-auth": ["@cortexkit/opencode-anthropic-auth@workspace:packages/opencode"],
 
