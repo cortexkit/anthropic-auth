@@ -586,8 +586,9 @@ export async function buildAnthropicRequest(
     systemPrompt: getCurrentSystemPrompt(transcript.messages),
     tools: getCurrentTools(transcript.messages),
   }
-  // Lowering can discard opaque or incomplete blocks. Validate the retained
-  // host boundary first, then validate the wire boundary after empty users drop.
+  // Conversion can discard opaque or incomplete blocks. Check context.messages
+  // first so those losses cannot hide a meaningful final assistant turn. Check
+  // the Anthropic messages again after conversion removes empty user messages.
   assertNoMeaningfulTrailingAssistant(context.messages)
   const messages = convertMessages(context.messages, modelId)
   stripEmptyTrailingAssistantMessages(messages)

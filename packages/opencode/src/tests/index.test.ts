@@ -4635,8 +4635,9 @@ describe('meaningful trailing assistant history', () => {
           modelDispatches.push(
             headers.get('x-api-key') ?? headers.get('authorization') ?? '',
           )
-          // The main account reports an exhausted five-hour window, which makes
-          // fallback-first routing send later requests to the API-key account.
+          // Mark main's five-hour usage at 100%. Paid API-key fallback is
+          // allowed only after main's quota is confirmed exhausted; choosing
+          // fallback-first mode alone does not permit it.
           return Promise.resolve(
             new Response('{}', {
               status: 200,
@@ -4696,9 +4697,9 @@ describe('meaningful trailing assistant history', () => {
       }),
     )
     expect(modelDispatches).toEqual([])
-    // The refusal was produced by the API-key route: fallback-first records
-    // the account that answered. If the API-key route threw instead, the
-    // request would fall through to main and main would be recorded here.
+    // The API-key route must return its local 400, not throw. A throw would
+    // make routing try main and set sidebar activeId to 'main' instead of the
+    // API-key account id asserted below.
     await drainSidebarWrites()
     expect(await getSidebarState()).toMatchObject({
       activeId: 'api-trailing',

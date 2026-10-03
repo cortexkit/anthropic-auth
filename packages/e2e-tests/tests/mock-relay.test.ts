@@ -15,8 +15,9 @@ test('mock relay exclusively owns its advertised IPv4 endpoint', async () => {
     } catch (error) {
       refusal = error
     }
-    // A wildcard IPv6 listener permits this second IPv4 bind on macOS, so
-    // requests can reach the wrong server despite using the advertised port.
+    // If the relay binds only an IPv6 wildcard on macOS, this IPv4 listener
+    // can share its port and receive requests meant for the relay's 127.0.0.1
+    // endpoint. The relay must prevent that second listener from starting.
     expect(duplicate).toBeUndefined()
     expect(refusal).toHaveProperty('code', 'EADDRINUSE')
     const response = await fetch(url)

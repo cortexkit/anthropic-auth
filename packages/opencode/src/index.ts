@@ -330,8 +330,8 @@ function localInvalidRequestResponse(message: string): Response {
   return response
 }
 
-// Upstream status policy cannot repair a locally invalid conversation by
-// selecting another account. Keep genuine provider 400s configurable.
+// Selecting another account cannot repair locally invalid conversation history.
+// Provider-generated 400 responses still follow the configured fallbackOn list.
 function shouldFallbackResponse(
   response: Response,
   storage: AccountStorage | null,
