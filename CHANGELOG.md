@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Fixes
 
+- Fix OpenCode's hybrid 1-hour prompt caching when Magic Context adds an image of project memories. Place one cache breakpoint after the stable context and image, and another after the following history updates, so both prefixes can be reused. Requests without the image and the four-breakpoint limit remain unchanged.
 - Stop silently discarding meaningful trailing assistant turns in OpenCode and Pi, which could replay the previous question. A shared Core guard removes only provably empty trailers and refuses other tails before billing, caching, signing, or model dispatch. OpenCode reports a terminal local 400 that cannot trigger account fallback, even when upstream 400 responses are configured for fallback; genuine provider responses retain that policy. Pi reports a terminal provider error without sending a model request.
 
 ## 2.0.0

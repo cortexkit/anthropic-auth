@@ -3635,6 +3635,228 @@ describe('rewriteRequestBody', () => {
     })
   })
 
+  describe('hybrid mural prefix anchors', () => {
+    const base = {
+      type: 'text',
+      text: '<project-docs>stable docs</project-docs>\n<memory-mural>stable memory mural</memory-mural>',
+    }
+    const image = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'cG5n' },
+    }
+    const history = {
+      type: 'text',
+      text: '<session-history-since>recent history</session-history-since>',
+    }
+    const cacheControl = { type: 'ephemeral', ttl: '1h' }
+
+    function anchorPaths(result: {
+      cache_control?: unknown
+      system: Array<{ cache_control?: unknown }>
+      messages: Array<{
+        cache_control?: unknown
+        content: string | Array<{ cache_control?: unknown }>
+      }>
+    }) {
+      expect(result.cache_control).toBeUndefined()
+      const paths: string[] = []
+      result.system.forEach((block, index) => {
+        if (block.cache_control) {
+          expect(block.cache_control).toEqual(cacheControl)
+          paths.push(`system[${index}]`)
+        }
+      })
+      result.messages.forEach((message, index) => {
+        expect(message.cache_control).toBeUndefined()
+        if (!Array.isArray(message.content)) return
+        message.content.forEach((block, blockIndex) => {
+          if (block.cache_control) {
+            expect(block.cache_control).toEqual(cacheControl)
+            paths.push(`messages[${index}].content[${blockIndex}]`)
+          }
+        })
+      })
+      return paths
+    }
+
+    async function rewritePrefix(content: unknown[]) {
+      return JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            system: 'Stable system block',
+            messages: [
+              { role: 'user', content },
+              { role: 'assistant', content: 'assistant response' },
+              { role: 'user', content: 'latest user boundary' },
+            ],
+          }),
+          { cache1hEnabled: true, cache1hMode: 'hybrid' },
+        ),
+      )
+    }
+
+    test('anchors image and history in the three-block wire layout', async () => {
+      const result = await rewritePrefix([base, image, history])
+
+      expect(anchorPaths(result)).toEqual([
+        'system[2]',
+        'messages[0].content[1]',
+        'messages[0].content[2]',
+        'messages[2].content[0]',
+      ])
+    })
+
+    test.each([
+      ['session history', history.text, 1],
+      ['memory updates', '<memory-updates>delta</memory-updates>', 2],
+      ['user profile', '<new-user-profile>delta</new-user-profile>', 2],
+      ['placeholder', 'No recent history.', 3],
+    ] as const)(
+      'anchors %s after the mural image without anchoring live or truncated tails',
+      async (_label, text, tailCount) => {
+        const tails = [
+          { type: 'text', text: 'current user turn' },
+          { type: 'text', text: '[truncated tool output]' },
+          image,
+        ].slice(0, tailCount)
+        const content = [base, image, { type: 'text', text }, ...tails]
+        const result = await rewritePrefix(
+          content.map((block) => ({
+            ...block,
+            cache_control: { type: 'ephemeral' },
+          })),
+        )
+
+        expect(anchorPaths(result)).toEqual([
+          'system[2]',
+          'messages[0].content[1]',
+          'messages[0].content[2]',
+          'messages[2].content[0]',
+        ])
+        expect(
+          result.messages[0].content.map(
+            ({ cache_control, ...block }: Record<string, unknown>) => block,
+          ),
+        ).toEqual(content)
+      },
+    )
+
+    test('preserves ordinary image attachments without a mural marker', async () => {
+      const result = await rewritePrefix([
+        { type: 'text', text: 'Please inspect this image.' },
+        image,
+        history,
+        { type: 'text', text: 'current user turn' },
+      ])
+
+      expect(anchorPaths(result)).toEqual([
+        'system[2]',
+        'messages[0].content[0]',
+        'messages[0].content[1]',
+        'messages[2].content[0]',
+      ])
+    })
+
+    test.each([
+      ['marker without image', [base, history, { type: 'text', text: 'live' }]],
+      ['missing history', [base, image]],
+      [
+        'unfinished marker',
+        [{ type: 'text', text: '<memory-mural>unfinished' }, image, history],
+      ],
+      [
+        'reversed marker',
+        [
+          { type: 'text', text: '</memory-mural><memory-mural>' },
+          image,
+          history,
+        ],
+      ],
+      [
+        'nonadjacent image',
+        [base, { type: 'text', text: 'live' }, image, history],
+      ],
+      ['nontext history', [base, image, image, { type: 'text', text: 'live' }]],
+      [
+        'intervening thinking',
+        [
+          base,
+          image,
+          { type: 'thinking', thinking: 'reasoning' },
+          { type: 'text', text: 'live' },
+        ],
+      ],
+    ] satisfies Array<[string, unknown[]]>)(
+      'preserves default anchors for %s',
+      async (_label, content) => {
+        const result = await rewritePrefix(content)
+
+        expect(anchorPaths(result)).toEqual([
+          'system[2]',
+          'messages[0].content[0]',
+          'messages[0].content[1]',
+          'messages[2].content[0]',
+        ])
+      },
+    )
+
+    test.each([18, 19])(
+      'keeps four slots and the moving tail with %i intervening tool blocks',
+      async (toolCount) => {
+        const result = JSON.parse(
+          await rewriteRequestBody(
+            JSON.stringify({
+              system: 'Stable system block',
+              messages: [
+                {
+                  role: 'user',
+                  content: [
+                    base,
+                    image,
+                    history,
+                    { type: 'text', text: 'live' },
+                  ],
+                },
+                { role: 'assistant', content: 'assistant response' },
+                { role: 'user', content: 'previous user boundary' },
+                {
+                  role: 'assistant',
+                  content: Array.from({ length: toolCount }, (_, index) => ({
+                    type: 'tool_use',
+                    id: `tool_${index}`,
+                    name: 'Read',
+                    input: { filePath: `file-${index}.ts` },
+                  })),
+                },
+                { role: 'user', content: 'latest user boundary' },
+              ],
+            }),
+            { cache1hEnabled: true, cache1hMode: 'hybrid' },
+          ),
+        )
+
+        // Count the previous user block, intervening tool-use blocks and latest
+        // user block. At 21 blocks the previous user leaves the 20-block cache
+        // lookback, so its bridge anchor replaces the system anchor.
+        expect(anchorPaths(result)).toEqual(
+          toolCount === 18
+            ? [
+                'system[2]',
+                'messages[0].content[1]',
+                'messages[0].content[2]',
+                'messages[4].content[0]',
+              ]
+            : [
+                'messages[0].content[1]',
+                'messages[0].content[2]',
+                'messages[2].content[0]',
+                'messages[4].content[0]',
+              ],
+        )
+      },
+    )
+  })
+
   test('hybrid mode does not duplicate the moving marker when the latest user boundary is messages[1]', async () => {
     const body = JSON.stringify({
       system: 'Stable system block',
