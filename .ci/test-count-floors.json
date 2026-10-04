@@ -1,17 +1,17 @@
 {
   "floors": {
     "core": 325,
-    "opencode": 1726,
+    "opencode": 1741,
     "pi": 155
   },
   "measurement": {
-    "head": "c411b78cf7a6d0a0eef859aa8e5768d493a57081",
+    "head": "eb10f1479ff7fb91bdfbc2ce266666a569f41db5",
     "dirtyPaths": 0
   },
   "evidence": {
-    "_note": "Pinned Bun 1.3.14 runner totals after the shared trailing-assistant history guard. The measurement head precedes this floor-file update and was clean. Runner counts, not source declaration counts, are the authority at the gate.",
-    "core": "325 passing on clean CI run 37058885653 at commit c411b78c",
-    "opencode": "1726 passing on clean CI run 37058885653 at commit c411b78c",
-    "pi": "155 passing on clean CI run 37058885653 at commit c411b78c"
+    "_note": "Pinned Bun 1.3.14 runner totals after the mural cache anchor fix. The clean branch commit was measured locally; clean PR CI independently matched all totals. Runner counts, not source declaration counts, are the authority at the gate.",
+    "core": "325 passing at clean branch commit eb10f147; independently matched by clean CI run 37244390451",
+    "opencode": "1741 passing at clean branch commit eb10f147; independently matched by clean CI run 37244390451",
+    "pi": "155 passing at clean branch commit eb10f147; independently matched by clean CI run 37244390451"
   }
 }
