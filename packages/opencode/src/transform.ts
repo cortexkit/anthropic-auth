@@ -725,26 +725,37 @@ function getCacheableContentBlocks(message: Record<string, unknown>) {
   return { content, cacheableBlocks }
 }
 
-function setFirstMessageCacheAnchor(message: unknown) {
-  if (!isRecord(message)) return false
-  const cacheableContent = getCacheableContentBlocks(message)
-  if (!cacheableContent) return false
-
-  // Only materialize the normalized content array once we know we will anchor.
-  message.content = cacheableContent.content
-  return setWireCacheControl(cacheableContent.cacheableBlocks[0], true)
-}
-
-function setSecondMessageCacheAnchor(message: unknown) {
+function setSplitPrefixMessageCacheAnchors(message: unknown) {
   if (!isRecord(message)) return false
   const cacheableContent = getCacheableContentBlocks(message)
   if (!cacheableContent || cacheableContent.cacheableBlocks.length < 2) {
     return false
   }
 
+  const [base, image, history] = cacheableContent.content
+  // Magic Context's optional mural adds an image to the stable prefix. Anchor
+  // its end and the adjacent history text, whose contents may be any delta or
+  // placeholder. Require the complete wire layout rather than scanning past a
+  // missing block into a live turn or inspecting the image payload.
+  const hasMuralPrefix =
+    message.role === 'user' &&
+    isRecord(base) &&
+    base.type === 'text' &&
+    typeof base.text === 'string' &&
+    isRecord(image) &&
+    image.type === 'image' &&
+    isRecord(history) &&
+    history.type === 'text' &&
+    typeof history.text === 'string' &&
+    /<memory-mural>[\s\S]*?<\/memory-mural>/.test(base.text)
+  const anchors = hasMuralPrefix
+    ? [image, history]
+    : cacheableContent.cacheableBlocks.slice(0, 2)
+
   // Only materialize the normalized content array once we know we will anchor.
   message.content = cacheableContent.content
-  return setWireCacheControl(cacheableContent.cacheableBlocks[1], true)
+  for (const block of anchors) setWireCacheControl(block, true)
+  return true
 }
 
 function setMessageCacheAnchor(message: unknown) {
@@ -760,11 +771,6 @@ function setMessageCacheAnchor(message: unknown) {
   // Only materialize the normalized content array once we know we will anchor.
   message.content = cacheableContent.content
   return setWireCacheControl(lastCacheableBlock, true)
-}
-
-function hasMultipleCacheableContentBlocks(message: unknown) {
-  if (!isRecord(message)) return false
-  return (getCacheableContentBlocks(message)?.cacheableBlocks.length ?? 0) > 1
 }
 
 function messageContentBlockCount(message: unknown) {
@@ -967,17 +973,10 @@ function applyHybridCache1h(
   // from its last known tail to the current request.
   if (!bridge) setHybridSystemAnchor(parsed)
 
-  const firstMessageHasSplitPrefix = hasMultipleCacheableContentBlocks(
-    parsed.messages[0],
-  )
-  if (firstMessageHasSplitPrefix) {
-    // Magic Context can merge the stable prefix and volatile history prefix into
-    // the first two content blocks of messages[0]. Do not anchor the last block
-    // here: later blocks can be the live turn or truncated tail and change every
-    // request, which would make the useful history prefix fall back to m0 only.
-    setFirstMessageCacheAnchor(parsed.messages[0])
-    setSecondMessageCacheAnchor(parsed.messages[0])
-  } else {
+  // OpenCode can merge Magic Context's base context, history and current user
+  // into one message. Cache the two context boundaries, not the current user
+  // text, which changes each turn.
+  if (!setSplitPrefixMessageCacheAnchors(parsed.messages[0])) {
     setMessageCacheAnchor(parsed.messages[0])
     setMessageCacheAnchor(parsed.messages[1])
   }
