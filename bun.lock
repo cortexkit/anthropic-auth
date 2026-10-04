@@ -28,7 +28,7 @@
         "xxhash-wasm": "^1.1.0",
       },
       "devDependencies": {
-        "@cortexkit/common-auth": "^0.4.6",
+        "@cortexkit/common-auth": "^0.9.0",
       },
     },
     "packages/e2e-tests": {
@@ -217,7 +217,7 @@
 
     "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.5.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.16.0" } }, "sha512-+mRG/h3YZufrEs1p12W+Y+NSnWIUiBcpppMTgFA5tAQ7t8WIWoMEmn0Mf7Cp8251SKChW8dN3xOZqEM7N6gyAg=="],
 
-    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.4.6", "", { "dependencies": { "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.5.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.5.12", "@opentui/solid": ">=0.5.12", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-/FFqtu6huWBU632GOAORQk/olkvI/1Tw3H0+zxA8cLWOfwiNc7kIptb3+3cQYlYBpH7lG4SAqhnFGFkJLo0lWQ=="],
+    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.9.0", "", { "dependencies": { "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.4.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.5.11", "@opentui/solid": ">=0.5.11", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-FiolaobIdq8feMJyGaiQm1skefsxixsSyasB+vrKVOkU/HFxkuJGHDo7cUSFrmfNZRs31fWFJbVLcfVGoAfIVQ=="],
 
     "@cortexkit/opencode-anthropic-auth": ["@cortexkit/opencode-anthropic-auth@workspace:packages/opencode"],
 
