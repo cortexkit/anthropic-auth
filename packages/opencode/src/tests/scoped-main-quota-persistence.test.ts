@@ -33,6 +33,7 @@ const mainRow: ScopedInventoryRow = {
   accountId: PRIMARY_ACCOUNT_ID,
   categories: ['anthropic-native'],
   serves: ['anthropic'],
+  providerIds: [],
   credentialType: 'oauth',
   refreshAdapter: 'anthropic',
   operations: ['read'],

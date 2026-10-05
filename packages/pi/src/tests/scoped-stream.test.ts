@@ -80,6 +80,7 @@ const row = (id: string, accountId: string): ScopedInventoryRow => ({
   credentialType: 'oauth',
   categories: ['anthropic-native'],
   serves: ['anthropic'],
+  providerIds: [],
   refreshAdapter: 'anthropic',
   operations: ['read'],
   state: 'active',
