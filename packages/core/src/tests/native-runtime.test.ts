@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import { hashRefreshToken } from '../accounts.ts'
 import { toNativeQuotaMap } from '../native-quota-codec.ts'
 import {
   decodeNativeRuntime,
@@ -22,8 +23,10 @@ import {
   readNativeRuntime,
   updateNativeRuntime,
 } from '../native-runtime.ts'
+import { tokenFingerprint } from '../token-fingerprint.ts'
 
 const storageId = 'a'.repeat(64)
+const vaultAccountIdentity = '11111111-2222-4333-8444-555555555555'
 const roots: string[] = []
 
 async function fixture() {
@@ -60,42 +63,42 @@ const full = {
         nextRetryAt: 666,
         retryCount: 2,
         accountIdentity: 'synthetic-account-A',
-        tokenHash: 'access-hash',
-        refreshTokenFingerprint: 'refresh-fingerprint',
+        tokenHash: hashRefreshToken('synthetic-refresh'),
+        refreshTokenFingerprint: tokenFingerprint('synthetic-refresh'),
         status: 503,
         permanent: false,
       },
       refreshErrorClearedAt: 100,
       refreshLeaseId: 'lease-id',
       refreshLeaseUntil: 777,
-      refreshLeaseTokenHash: 'lease-token-hash',
+      refreshLeaseTokenHash: hashRefreshToken('synthetic-refresh'),
       lastQuotaRefreshError: {
         message: 'synthetic quota failure',
         checkedAt: 555,
         nextRetryAt: 888,
         retryCount: 1,
         accountIdentity: 'synthetic-account-A',
-        tokenHash: 'quota-token-hash',
-        refreshTokenFingerprint: 'refresh-fingerprint',
+        tokenHash: hashRefreshToken('synthetic-refresh'),
+        refreshTokenFingerprint: tokenFingerprint('synthetic-refresh'),
         status: 429,
         permanent: false,
       },
       quotaErrorGeneration: 3,
       quotaErrorClearedAt: 444,
       quotaCheckedAt: 234,
-      quotaToken: 'quota-observation-fingerprint',
+      quotaToken: tokenFingerprint('synthetic-access'),
       profile: {
         tier: 'max',
         orgType: 'individual',
         checkedAt: 123,
         accountIdentity: 'synthetic-account-A',
         providerAccountUuid: 'synthetic-account-A',
-        tokenFingerprint: 'profile-fingerprint',
+        tokenFingerprint: tokenFingerprint('synthetic-access'),
       },
-      profileToken: 'profile-observation-fingerprint',
       prime: { count: 5, inputTokens: 12345, outputTokens: 678, since: 90 },
       authLineageId: 'prime-lineage',
-      primeAuthLineageRefreshTokenFingerprint: 'prime-refresh-fingerprint',
+      primeAuthLineageRefreshTokenFingerprint:
+        tokenFingerprint('synthetic-refresh'),
     },
     'vault-route': {
       binding: {
@@ -103,11 +106,11 @@ const full = {
         storageId,
         routeId: 'vault-route',
         credentialId: 'credential-A',
-        accountIdentity: 'synthetic-vault-A',
+        accountIdentity: vaultAccountIdentity,
         recordVersion: 7,
       },
       quota: toNativeQuotaMap({
-        accountIdentity: 'synthetic-vault-A',
+        accountIdentity: vaultAccountIdentity,
         checkedAt: 999,
         scoped: [],
         source: 'headers',
@@ -117,8 +120,9 @@ const full = {
         tier: 'max',
         orgType: 'team',
         checkedAt: 998,
-        accountIdentity: 'synthetic-vault-A',
+        accountIdentity: vaultAccountIdentity,
       },
+      quotaToken: vaultAccountIdentity,
     },
   },
 }
@@ -155,7 +159,6 @@ test('runtime full-field fixture round-trips and accounts for every owned field'
       'quotaCheckedAt',
       'quotaToken',
       'profile',
-      'profileToken',
       'prime',
       'authLineageId',
       'primeAuthLineageRefreshTokenFingerprint',
@@ -165,6 +168,7 @@ test('runtime full-field fixture round-trips and accounts for every owned field'
     'binding',
     'profile',
     'quota',
+    'quotaToken',
   ])
   const text = await readFile(path, 'utf8')
   for (const forbidden of [
@@ -178,6 +182,276 @@ test('runtime full-field fixture round-trips and accounts for every owned field'
     expect(text).not.toContain(forbidden)
   expect((await stat(path)).mode & 0o777).toBe(0o600)
   expect((await stat(dirname(path))).mode & 0o777).toBe(0o700)
+})
+
+test('runtime credential metadata control rejects bearer and unexplained identifier forms without publication', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  const before = await readFile(path, 'utf8')
+  const local = full.accounts['local-row']
+  const bearer = `sk-ant-oat01-${'b'.repeat(80)}`
+  const malformed: unknown[] = []
+  for (const field of [
+    'quotaToken',
+    'refreshLeaseTokenHash',
+    'primeAuthLineageRefreshTokenFingerprint',
+    'profileToken',
+  ]) {
+    for (const token of [bearer, 'unexplained-token-label']) {
+      malformed.push({
+        ...full,
+        accounts: { 'local-row': { ...local, [field]: token } },
+      })
+    }
+  }
+  for (const errorField of ['lastRefreshError', 'lastQuotaRefreshError']) {
+    for (const tokenField of ['tokenHash', 'refreshTokenFingerprint']) {
+      malformed.push({
+        ...full,
+        accounts: {
+          'local-row': {
+            ...local,
+            [errorField]: { ...local.lastRefreshError, [tokenField]: bearer },
+          },
+        },
+      })
+    }
+  }
+  malformed.push({
+    ...full,
+    accounts: {
+      'local-row': {
+        ...local,
+        profile: { ...local.profile, tokenFingerprint: bearer },
+      },
+    },
+  })
+  for (const candidate of malformed) {
+    expect(() => decodeNativeRuntime(candidate, storageId)).toThrow(
+      'Anthropic runtime state is invalid',
+    )
+    await expect(
+      updateNativeRuntime(path, storageId, () =>
+        decodeNativeRuntime(candidate, storageId),
+      ),
+    ).rejects.toMatchObject({
+      code: 'invalid-runtime',
+      message: 'Anthropic runtime state is invalid',
+    })
+    expect(await readFile(path, 'utf8')).toBe(before)
+  }
+})
+
+test('runtime metadata preserves only the fingerprint width each established writer supplies', () => {
+  const local = full.accounts['local-row']
+  const short = tokenFingerprint('synthetic-access')
+  const long = hashRefreshToken('synthetic-refresh')
+  expect(short).toMatch(/^[a-f0-9]{16}$/)
+  expect(long).toMatch(/^[a-f0-9]{64}$/)
+  expect<unknown>(decodeNativeRuntime(full, storageId)).toEqual(full)
+  const wrongWidths: unknown[] = [
+    { ...local, quotaToken: long },
+    { ...local, refreshLeaseTokenHash: short },
+    { ...local, primeAuthLineageRefreshTokenFingerprint: long },
+    {
+      ...local,
+      lastRefreshError: { ...local.lastRefreshError, tokenHash: short },
+    },
+    {
+      ...local,
+      lastRefreshError: {
+        ...local.lastRefreshError,
+        refreshTokenFingerprint: long,
+      },
+    },
+    {
+      ...local,
+      lastQuotaRefreshError: {
+        ...local.lastQuotaRefreshError,
+        tokenHash: short,
+      },
+    },
+    {
+      ...local,
+      lastQuotaRefreshError: {
+        ...local.lastQuotaRefreshError,
+        refreshTokenFingerprint: long,
+      },
+    },
+    { ...local, profile: { ...local.profile, tokenFingerprint: long } },
+  ]
+  for (const candidate of wrongWidths)
+    expect(() =>
+      decodeNativeRuntime(
+        { ...full, accounts: { 'local-row': candidate } },
+        storageId,
+      ),
+    ).toThrow()
+})
+
+test('runtime vault quota identifiers must be UUIDs equal to the observed account', () => {
+  const custody = full.accounts['vault-route']
+  expect<unknown>(decodeNativeRuntime(full, storageId)).toEqual(full)
+  for (const token of [
+    tokenFingerprint('synthetic-access'),
+    'unexplained-account',
+    'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+  ]) {
+    expect(() =>
+      decodeNativeRuntime(
+        {
+          ...full,
+          accounts: { 'vault-route': { ...custody, quotaToken: token } },
+        },
+        storageId,
+      ),
+    ).toThrow()
+  }
+  const unexplained = {
+    ...custody,
+    binding: { ...custody.binding, accountIdentity: 'unexplained-account' },
+    quota: toNativeQuotaMap({ accountIdentity: 'unexplained-account' }),
+    profile: { ...custody.profile, accountIdentity: 'unexplained-account' },
+    quotaToken: 'unexplained-account',
+  }
+  expect(() =>
+    decodeNativeRuntime(
+      { ...full, accounts: { 'vault-route': unexplained } },
+      storageId,
+    ),
+  ).toThrow()
+})
+
+test('runtime refuses profileToken even when it resembles a known fingerprint', () => {
+  const local = full.accounts['local-row']
+  for (const token of [
+    tokenFingerprint('synthetic-access'),
+    hashRefreshToken('synthetic-refresh'),
+    vaultAccountIdentity,
+    'unexplained-profile-token',
+  ]) {
+    expect(() =>
+      decodeNativeRuntime(
+        {
+          ...full,
+          accounts: { 'local-row': { ...local, profileToken: token } },
+        },
+        storageId,
+      ),
+    ).toThrow()
+  }
+})
+
+test('runtime stage ownership control preserves an existing collision sentinel', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  const before = await readFile(path, 'utf8')
+  const uuid = '11111111-1111-4111-8111-111111111111'
+  const stage = `${path}.native-runtime.${uuid}.partial`
+  await writeFile(stage, 'another-writer-stage', { mode: 0o600 })
+  const module = new URL('../native-runtime.ts', import.meta.url).href
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      '-e',
+      `
+    import { mock } from 'bun:test';
+    import * as crypto from 'node:crypto';
+    let uuidCalls = 0;
+    let httpAttempts = 0;
+    globalThis.fetch = async () => { httpAttempts++; throw new Error('HTTP forbidden'); };
+    mock.module('node:crypto', () => ({ ...crypto, randomUUID: () => { uuidCalls++; return ${JSON.stringify(uuid)}; } }));
+    const { updateNativeRuntime } = await import(${JSON.stringify(module)});
+    let outcome = 'accepted';
+    try { await updateNativeRuntime(${JSON.stringify(path)}, ${JSON.stringify(storageId)}, current => current); }
+    catch (error) { outcome = error.code; }
+    console.log(JSON.stringify({ outcome, uuidCalls, httpAttempts }));
+  `,
+    ],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  expect(await child.exited).toBe(0)
+  expect(await new Response(child.stderr).text()).toBe('')
+  const result: unknown = JSON.parse(await new Response(child.stdout).text())
+  expect(result).toMatchObject({ outcome: 'runtime-io', httpAttempts: 0 })
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    !('uuidCalls' in result) ||
+    typeof result.uuidCalls !== 'number'
+  )
+    throw new Error('UUID substitution evidence missing')
+  expect(result.uuidCalls).toBeGreaterThan(0)
+  expect(await readFile(stage, 'utf8')).toBe('another-writer-stage')
+  expect(await readFile(path, 'utf8')).toBe(before)
+})
+
+test('runtime relinquishes the stage name after rename instead of deleting a successor file', async () => {
+  const path = await fixture()
+  let stage: string | undefined
+  await expect(
+    updateNativeRuntime(path, storageId, () => state(), {
+      beforeRename: async () => {
+        const names = (await readdir(dirname(path))).filter((name) =>
+          isNativeRuntimeStagingName(path, name),
+        )
+        expect(names.length).toBe(1)
+        const name = names[0]
+        if (!name) throw new Error('fixture stage missing')
+        stage = join(dirname(path), name)
+      },
+      afterRename: async () => {
+        if (!stage) throw new Error('fixture stage missing')
+        await writeFile(stage, 'successor-stage', { mode: 0o600, flag: 'wx' })
+        throw new Error('synthetic after-rename failure')
+      },
+    }),
+  ).rejects.toMatchObject({ code: 'publication-refused' })
+  if (!stage) throw new Error('fixture stage missing')
+  expect(await readFile(stage, 'utf8')).toBe('successor-stage')
+  expect<unknown>(await readNativeRuntime(path, storageId)).toEqual({
+    status: 'ready',
+    state: full,
+  })
+})
+
+test('runtime effective-owner control refuses foreign euid before and after opening', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  const before = await readFile(path, 'utf8')
+  const uid = (await stat(path)).uid
+  const module = new URL('../native-runtime.ts', import.meta.url).href
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      '-e',
+      `
+    const { readNativeRuntime } = await import(${JSON.stringify(module)});
+    let httpAttempts = 0;
+    globalThis.fetch = async () => { httpAttempts++; throw new Error('HTTP forbidden'); };
+    Object.defineProperty(process, 'getuid', { configurable: true, value: () => ${uid} });
+    async function run(opened) {
+      let euidCalls = 0;
+      Object.defineProperty(process, 'geteuid', { configurable: true, value: () => { euidCalls++; return ${uid} + (opened && euidCalls === 1 ? 0 : 1); } });
+      let outcome = 'accepted';
+      try { await readNativeRuntime(${JSON.stringify(path)}, ${JSON.stringify(storageId)}); }
+      catch (error) { outcome = error.code; }
+      return { outcome, euidCalls };
+    }
+    console.log(JSON.stringify({ initial: await run(false), opened: await run(true), httpAttempts }));
+  `,
+    ],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  expect(await child.exited).toBe(0)
+  expect(await new Response(child.stderr).text()).toBe('')
+  const result: unknown = JSON.parse(await new Response(child.stdout).text())
+  expect(result).toEqual({
+    initial: { outcome: 'unsafe-runtime', euidCalls: 1 },
+    opened: { outcome: 'unsafe-runtime', euidCalls: 2 },
+    httpAttempts: 0,
+  })
+  expect(await readFile(path, 'utf8')).toBe(before)
 })
 
 test('runtime extra-key control rejects unknown root and nested fields', () => {
@@ -538,7 +812,7 @@ test('runtime custody versions and quota/profile observation clocks cannot regre
         if (field === 'version') custody.binding.recordVersion = 6
         if (field === 'quota')
           custody.quota = toNativeQuotaMap({
-            accountIdentity: 'synthetic-vault-A',
+            accountIdentity: vaultAccountIdentity,
             checkedAt: 998,
             scoped: [],
             source: 'poll',

@@ -55,7 +55,8 @@ export interface NativeRuntimeEntry {
   quotaCheckedAt?: number
   quotaToken?: string
   profile?: OAuthAccountProfile
-  profileToken?: string
+  /** No supported writer supplies this field, so its value cannot safely be interpreted as an identifier. */
+  profileToken?: never
   prime?: PrimeUsageCounters
   authLineageId?: string
   primeAuthLineageRefreshTokenFingerprint?: string
@@ -137,6 +138,19 @@ function digest(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 }
 
+function tokenFingerprintValue(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{16}$/.test(value)
+}
+
+function accountUuid(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
+      value,
+    )
+  )
+}
+
 function binding(value: unknown): value is NativeRuntimeBinding {
   return (
     isNativeLocalPoolBinding(value) ||
@@ -179,8 +193,8 @@ function operationError(value: unknown): value is AccountOperationError {
     optional(value, 'nextRetryAt', time) &&
     optional(value, 'retryCount', counter) &&
     optional(value, 'accountIdentity', text) &&
-    optional(value, 'tokenHash', text) &&
-    optional(value, 'refreshTokenFingerprint', text) &&
+    optional(value, 'tokenHash', digest) &&
+    optional(value, 'refreshTokenFingerprint', tokenFingerprintValue) &&
     optional(
       value,
       'status',
@@ -203,7 +217,7 @@ function profile(value: unknown): value is OAuthAccountProfile {
     time(value.checkedAt) &&
     optional(value, 'accountIdentity', text) &&
     optional(value, 'providerAccountUuid', text) &&
-    optional(value, 'tokenFingerprint', text)
+    optional(value, 'tokenFingerprint', tokenFingerprintValue)
   )
 }
 
@@ -254,6 +268,7 @@ function entry(
       : value.binding.routeId) !== id
   )
     return false
+  const observedBinding = value.binding
   for (const key of [
     'lastUsed',
     'lastRefreshedAt',
@@ -264,17 +279,22 @@ function entry(
   ]) {
     if (!optional(value, key, time)) return false
   }
-  for (const key of [
-    'refreshLeaseId',
-    'refreshLeaseTokenHash',
-    'quotaToken',
-    'profileToken',
-    'authLineageId',
-    'primeAuthLineageRefreshTokenFingerprint',
-  ]) {
+  for (const key of ['refreshLeaseId', 'authLineageId']) {
     if (!optional(value, key, text)) return false
   }
   if (
+    Object.hasOwn(value, 'profileToken') ||
+    !optional(value, 'refreshLeaseTokenHash', digest) ||
+    !optional(
+      value,
+      'primeAuthLineageRefreshTokenFingerprint',
+      tokenFingerprintValue,
+    ) ||
+    !optional(value, 'quotaToken', (token) =>
+      observedBinding.kind === 'local'
+        ? tokenFingerprintValue(token)
+        : accountUuid(token) && token === observedBinding.accountIdentity,
+    ) ||
     !optional(value, 'quotaErrorGeneration', counter) ||
     !optional(value, 'profile', profile) ||
     !optional(value, 'prime', prime) ||
@@ -380,7 +400,7 @@ export async function readNativeRuntime(
     if (
       !info.isFile() ||
       (info.mode & 0o777) !== 0o600 ||
-      (typeof process.getuid === 'function' && info.uid !== process.getuid())
+      (typeof process.geteuid === 'function' && info.uid !== process.geteuid())
     )
       throw new NativeRuntimeError('unsafe-runtime')
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
@@ -391,8 +411,8 @@ export async function readNativeRuntime(
         opened.ino !== info.ino ||
         !opened.isFile() ||
         (opened.mode & 0o777) !== 0o600 ||
-        (typeof process.getuid === 'function' &&
-          opened.uid !== process.getuid())
+        (typeof process.geteuid === 'function' &&
+          opened.uid !== process.geteuid())
       )
         throw new NativeRuntimeError('unsafe-runtime')
       let contents: string
@@ -551,8 +571,10 @@ export async function updateNativeRuntime(
           dirname(path),
           `${basename(path)}.native-runtime.${randomUUID()}.partial`,
         )
+        let ownsStage = false
         try {
           const file = await open(stage, 'wx', 0o600)
+          ownsStage = true
           try {
             await file.writeFile(bytes, 'utf8')
             await file.sync()
@@ -566,6 +588,7 @@ export async function updateNativeRuntime(
           }
           await lock.assertOwned()
           await rename(stage, path)
+          ownsStage = false
           try {
             await hooks.afterRename?.()
           } catch {
@@ -573,7 +596,7 @@ export async function updateNativeRuntime(
           }
           return next
         } finally {
-          await rm(stage, { force: true })
+          if (ownsStage) await rm(stage, { force: true })
         }
       },
     )
