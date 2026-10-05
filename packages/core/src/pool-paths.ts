@@ -11,6 +11,7 @@ export interface NativePoolPaths {
   state: string
   runtime: string
   journal: string
+  roster: string
   storageId: string
 }
 
@@ -88,7 +89,23 @@ export async function resolveNativePoolPaths(
       'migration',
     ),
   )
-  const paths = [sourceConfig, sourceState, config, state, runtime, journal]
+  const roster = await canonicalPath(
+    sibling(
+      sourceState,
+      'anthropic-auth-state.json',
+      'anthropic-auth-custody-roster.json',
+      'roster',
+    ),
+  )
+  const paths = [
+    sourceConfig,
+    sourceState,
+    config,
+    state,
+    runtime,
+    journal,
+    roster,
+  ]
   if (new Set(paths).size !== paths.length) {
     throw new Error(
       'Anthropic account storage paths overlap; migration requires separate files',
@@ -104,6 +121,7 @@ export async function resolveNativePoolPaths(
     state,
     runtime,
     journal,
+    roster,
     storageId,
   }
 }

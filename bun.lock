@@ -25,6 +25,7 @@
       "version": "1.23.0",
       "dependencies": {
         "@cortexkit/claustrum-client": "0.5.0",
+        "jsonc-parser": "^3.3.1",
         "xxhash-wasm": "^1.1.0",
       },
       "devDependencies": {

@@ -11,7 +11,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { resolveNativePoolPaths } from '../pool-paths.ts'
-import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
+import {
+  createNativePoolStore,
+  type NativePoolStoreOptions,
+  nativePoolStoreLocks,
+} from '../pool-store.ts'
 
 const roots: string[] = []
 const quota = {
@@ -109,7 +113,7 @@ test('uses explicit shared locks and writes new credentials only through the sta
   expect((await stat(paths.state)).mode & 0o777).toBe(0o600)
 })
 
-test('strict mode cannot be disabled by additional caller options', async () => {
+test('strict mode cannot be disabled by additional caller options alongside every forwarded seam', async () => {
   const { paths, store } = await fixture()
   await store.initialize()
   await store.add({
@@ -121,7 +125,22 @@ test('strict mode cannot be disabled by additional caller options', async () => 
   delete state.accounts.a.commonAuthPool
   await writeFile(paths.state, JSON.stringify(state))
   const before = await bytes(paths)
-  const untrustedOptions = { paths, quota, requireCredentialStamps: false }
+  const seams: Pick<
+    NativePoolStoreOptions,
+    'onStep' | 'hold' | 'logger' | 'onLockEvent' | 'onLockStep'
+  > = {
+    onStep: () => {},
+    hold: () => {},
+    logger: { warn: () => {} },
+    onLockEvent: () => {},
+    onLockStep: () => {},
+  }
+  const untrustedOptions = {
+    paths,
+    quota,
+    ...seams,
+    requireCredentialStamps: false,
+  }
   const strict = createNativePoolStore(untrustedOptions)
   expect(await requiredRow(strict)).toMatchObject({
     candidate: false,
@@ -137,6 +156,113 @@ test('strict mode cannot be disabled by additional caller options', async () => 
   ).rejects.toMatchObject({ kind: 'unbound-credential' })
   expect(providerCalls).toBe(0)
   expect(await bytes(paths)).toEqual(before)
+})
+
+test('forwards published write, hold, logger and lock seams to real store operations', async () => {
+  const { paths } = await fixture()
+  const writes: unknown[] = []
+  const holds: unknown[] = []
+  const warnings: unknown[] = []
+  const locks: unknown[] = []
+  const lockSteps: unknown[] = []
+  const store = createNativePoolStore({
+    paths,
+    quota,
+    onStep: async (step, info) => {
+      writes.push({ step, ...info })
+    },
+    hold: async (point, rowId) => {
+      holds.push({ point, rowId })
+    },
+    logger: {
+      warn: (message, data) => {
+        warnings.push({ message, data })
+      },
+    },
+    onLockEvent: (event) => {
+      locks.push(event)
+    },
+    onLockStep: async (lock, step) => {
+      lockSteps.push({ ...lock, step })
+    },
+  })
+  await store.initialize()
+  await store.add({ id: 'a', credential: credential('a') })
+  expect(writes).toEqual([
+    { step: 'before-state-write', operation: 'add', rowId: 'a' },
+    { step: 'after-state-write', operation: 'add', rowId: 'a' },
+    { step: 'before-config-write', operation: 'add', rowId: 'a' },
+    { step: 'after-config-write', operation: 'add', rowId: 'a' },
+  ])
+  await expect(
+    store.refresh('a', async () => credential('b')),
+  ).resolves.toMatchObject({ status: 'rotated' })
+  expect(holds).toEqual([{ point: 'refresh-before-provider', rowId: 'a' }])
+  await expect(
+    store.refresh(
+      'a',
+      async () => {
+        throw new Error('synthetic provider failure')
+      },
+      {
+        onFailure: async () => {
+          throw new Error('synthetic hook failure')
+        },
+      },
+    ),
+  ).rejects.toMatchObject({ kind: 'provider' })
+  expect(warnings).toEqual([
+    {
+      message: 'store failure hook threw; the original failure stands',
+      data: {
+        operation: 'refresh',
+        rowId: 'a',
+        error: 'synthetic hook failure',
+      },
+    },
+  ])
+  for (const lock of nativePoolStoreLocks(paths)) {
+    expect(locks).toContainEqual({ type: 'acquired', ...lock })
+    expect(locks).toContainEqual({ type: 'released', ...lock })
+    expect(lockSteps).toContainEqual({
+      ...lock,
+      step: 'release-owner-confirmed',
+    })
+  }
+})
+
+test('construction, pure reads and migration additions never install a quota pull hook', async () => {
+  const { paths } = await fixture()
+  let pulls = 0
+  let pullFailures = 0
+  // Even wider caller objects cannot opt the offline facade into network pulls.
+  const untrustedOptions = {
+    paths,
+    quota,
+    pull: async () => {
+      pulls++
+      throw new Error('unexpected pull')
+    },
+    onPullFailure: () => {
+      pullFailures++
+    },
+  }
+  const store = createNativePoolStore(untrustedOptions)
+  await store.pullsSettled()
+  expect(pulls).toBe(0)
+  await store.read()
+  await store.initialize()
+  await store.add({ id: 'imported', credential: credential('legacy') })
+  await store.read()
+  await store.load()
+  store.requestReading('imported')
+  await store.pullsSettled()
+  expect(pulls).toBe(0)
+  expect(pullFailures).toBe(0)
+  expect(await requiredRow(store)).toMatchObject({
+    stamp: 'bound',
+    needsFirstReading: true,
+  })
 })
 
 test('refuses same-epoch access corruption before refresh or observation persistence', async () => {

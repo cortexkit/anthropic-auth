@@ -1,5 +1,12 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readdir, realpath, rm, symlink } from 'node:fs/promises'
+import {
+  mkdtemp,
+  readdir,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -32,6 +39,7 @@ test('derives an isolated namespace while preserving independent state directori
     state: join(root, 'secrets', 'anthropic-auth-pool-state.json'),
     runtime: join(root, 'secrets', 'anthropic-auth-native-state.json'),
     journal: join(root, 'secrets', 'anthropic-auth-migration.json'),
+    roster: join(root, 'secrets', 'anthropic-auth-custody-roster.json'),
   })
   expect(paths.storageId).toMatch(/^[a-f0-9]{64}$/)
   expect(await readdir(root)).toEqual([])
@@ -47,6 +55,7 @@ test('custom config and state names retain their respective namespaces', async (
   expect(paths.state).toBe(join(root, 'private', 'token.json.pool.json'))
   expect(paths.runtime).toBe(join(root, 'private', 'token.json.native.json'))
   expect(paths.journal).toBe(join(root, 'private', 'token.json.migration.json'))
+  expect(paths.roster).toBe(join(root, 'private', 'token.json.roster.json'))
 })
 
 test('storage identity includes both paths and normalizes directory aliases', async () => {
@@ -85,5 +94,47 @@ test('refuses source or derived file collisions without creating a file', async 
   await expect(
     resolveNativePoolPaths(config, join(root, 'anthropic-auth-pool.json')),
   ).rejects.toThrow('paths overlap')
+  expect(await readdir(root)).toEqual([])
+})
+
+test('refuses a legacy config colliding with the derived roster without creating files', async () => {
+  const root = await fixture()
+  await expect(
+    resolveNativePoolPaths(
+      join(root, 'anthropic-auth-custody-roster.json'),
+      join(root, 'anthropic-auth-state.json'),
+    ),
+  ).rejects.toThrow('paths overlap')
+  await expect(
+    resolveNativePoolPaths(
+      join(root, 'token.json.roster.json'),
+      join(root, 'token.json'),
+    ),
+  ).rejects.toThrow('paths overlap')
+  expect(await readdir(root)).toEqual([])
+})
+
+test('refuses roster aliases of every source and native file', async () => {
+  const root = await fixture()
+  const paths = await resolveNativePoolPaths(
+    join(root, 'anthropic-auth.json'),
+    join(root, 'anthropic-auth-state.json'),
+  )
+  for (const target of [
+    paths.legacyConfig,
+    paths.legacyState,
+    paths.config,
+    paths.state,
+    paths.runtime,
+    paths.journal,
+  ]) {
+    await writeFile(target, '{}')
+    await symlink(target, paths.roster)
+    await expect(
+      resolveNativePoolPaths(paths.legacyConfig, paths.legacyState),
+    ).rejects.toThrow('paths overlap')
+    await rm(paths.roster)
+    await rm(target)
+  }
   expect(await readdir(root)).toEqual([])
 })
