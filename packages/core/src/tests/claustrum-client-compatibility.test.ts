@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import {
   ClaustrumClient,
   type ClaustrumConnector,
+  ClaustrumCredentialError,
   type ClaustrumReporterSource,
   type CredentialStatus,
   type EnrollmentPollOutcome,
@@ -70,7 +71,14 @@ const producerContract: [
   Assert<
     RequiredKeys<
       ScopedInventoryRow,
-      'id' | 'recordVersion' | 'createdAtMs' | 'operations'
+      'id' | 'recordVersion' | 'createdAtMs' | 'operations' | 'providerIds'
+    >
+  >,
+  Assert<Equal<ScopedInventoryRow['providerIds'], readonly string[]>>,
+  Assert<
+    Equal<
+      ScopedInventoryRow['authMethod'],
+      'apikey' | 'chatgpt' | 'antigravity' | 'oauth' | undefined
     >
   >,
   Assert<
@@ -179,6 +187,8 @@ const producerContract: [
   true,
   true,
   true,
+  true,
+  true,
 ]
 
 test('published Claustrum client decodes scoped and enrollment replies', async () => {
@@ -186,6 +196,12 @@ test('published Claustrum client decodes scoped and enrollment replies', async (
   const accountId = 'provider-account-1'
   const enrollmentToken = '01'.repeat(32)
   const accessToken = 'synthetic-access-token'
+  const identity = {
+    project_root: '/synthetic-test/project',
+    harness: 'compatibility-test',
+    session: 'synthetic-session',
+  }
+  const callOptions: unknown[] = []
   const calls: Array<{ moduleId: string; method: string; params?: unknown }> =
     []
   let closes = 0
@@ -241,8 +257,14 @@ test('published Claustrum client decodes scoped and enrollment replies', async (
   }
   const connector: ClaustrumConnector = async () =>
     ({
-      call: async (moduleId: string, method: string, params?: unknown) => {
+      call: async (
+        moduleId: string,
+        method: string,
+        params?: unknown,
+        options?: unknown,
+      ) => {
         calls.push({ moduleId, method, params })
+        callOptions.push(options)
         const response = responses[method]
         if (response === undefined) {
           throw new Error(`Unexpected synthetic Claustrum method: ${method}`)
@@ -256,11 +278,7 @@ test('published Claustrum client decodes scoped and enrollment replies', async (
 
   const client = await ClaustrumClient.connect({
     connectionFile: '/synthetic-test/no-daemon-connection.json',
-    identity: {
-      project_root: '/synthetic-test/project',
-      harness: 'compatibility-test',
-      session: 'synthetic-session',
-    },
+    identity,
     connector,
     logger: () => {},
   })
@@ -274,6 +292,8 @@ test('published Claustrum client decodes scoped and enrollment replies', async (
         categories: ['anthropic-native'],
         credentialType: 'oauth',
         serves: ['anthropic'],
+        providerIds: [],
+        authMethod: undefined,
         refreshAdapter: 'anthropic',
         state: 'active',
         recordVersion: 7,
@@ -398,7 +418,78 @@ test('published Claustrum client decodes scoped and enrollment replies', async (
       },
     },
   ])
+  // Every request must explicitly suppress transport-inherited consumer identity.
+  expect(callOptions).toHaveLength(7)
+  for (const options of callOptions) {
+    expect(options).toEqual({ identity, consumerIdentity: null })
+  }
   expect(producerContract.every(Boolean)).toBe(true)
   client.close()
   expect(closes).toBe(1)
+})
+
+test('published Claustrum client decodes provider mappings and rejects malformed selection fields', async () => {
+  // Catalog ids are operator-assigned, not inferred from the credential label,
+  // model vendor, or refresh protocol. Keep those values distinct in the wire row.
+  const wireRow = {
+    id: 'oauth:anthropic:work',
+    type: 'oauth',
+    categories: ['anthropic-native'],
+    serves: ['anthropic'],
+    refresh_adapter: 'anthropic',
+    provider_ids: ['operator-catalog-primary', 'operator-catalog-secondary'],
+    auth_method: 'oauth',
+    operations: ['read'],
+    state: 'active',
+    record_version: 7,
+  }
+  let row: unknown = wireRow
+  let calls = 0
+  const client = await ClaustrumClient.connect({
+    connectionFile: '/synthetic-test/no-daemon-connection.json',
+    logger: () => {},
+    connector: async () =>
+      ({
+        call: async (moduleId: string, method: string, params?: unknown) => {
+          expect({ moduleId, method, params }).toEqual({
+            moduleId: 'claustrum',
+            method: 'credential.list_scoped',
+            params: {},
+          })
+          calls++
+          return { result: { credentials: [row], view: 'provider-view' } }
+        },
+        close: () => {},
+      }) as unknown as Awaited<ReturnType<ClaustrumConnector>>,
+  })
+  try {
+    const inventory = await client.listScoped()
+    expect(inventory.view).toBe('provider-view')
+    expect(inventory.rows).toHaveLength(1)
+    expect(inventory.rows[0]?.providerIds).toEqual([
+      'operator-catalog-primary',
+      'operator-catalog-secondary',
+    ])
+    expect(inventory.rows[0]?.authMethod).toBe('oauth')
+    // Omitted provider_ids is covered by the legacy reply above. A present
+    // malformed value must still refuse, not silently become an unmapped row.
+    for (const invalid of [
+      { provider_ids: null },
+      { provider_ids: 'operator-catalog-primary' },
+      { provider_ids: ['operator-catalog-primary', 42] },
+      { auth_method: 'unsupported-method' },
+    ]) {
+      row = { ...wireRow, ...invalid }
+      const pending = client.listScoped()
+      await expect(pending).rejects.toBeInstanceOf(ClaustrumCredentialError)
+      await expect(pending).rejects.toMatchObject({
+        code: 'invalid_response',
+        class: 'transient',
+        action: 'retry',
+      })
+    }
+    expect(calls).toBe(5)
+  } finally {
+    client.close()
+  }
 })

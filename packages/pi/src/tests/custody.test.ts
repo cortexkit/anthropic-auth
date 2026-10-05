@@ -43,6 +43,7 @@ async function fixture() {
           credentialType: 'oauth',
           categories: ['anthropic-native'],
           serves: ['anthropic'],
+          providerIds: [],
           refreshAdapter: 'anthropic',
           state: 'active',
           operations: ['read'],

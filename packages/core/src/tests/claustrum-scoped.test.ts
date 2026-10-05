@@ -43,6 +43,7 @@ const row: ScopedInventoryRow = {
   credentialType: 'oauth',
   refreshAdapter: 'anthropic',
   serves: ['anthropic'],
+  providerIds: [],
   operations: ['read'],
   state: 'active',
   recordVersion: 1,
