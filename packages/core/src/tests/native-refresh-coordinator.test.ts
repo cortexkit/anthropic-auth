@@ -1155,7 +1155,7 @@ for (const [name, cause, expectedCalls, classification] of [
     1,
     'invalid-grant',
   ],
-  ['rate limit', new ClaudeOAuthRefreshError(429, 'busy', '7'), 1, 'permanent'],
+  ['rate limit', new ClaudeOAuthRefreshError(429, 'busy', '7'), 1, 'transient'],
   [
     'permanent network',
     new Error('certificate validation failed'),
@@ -1196,6 +1196,76 @@ for (const [name, cause, expectedCalls, classification] of [
     expect((await f.row('a')).credential).toMatchObject(credential('a'))
   })
 }
+
+test('rate limit reconciliation preserves transient retry metadata and blocks a later same-token refresh', async () => {
+  let captures = 0
+  const f = await fixture({
+    hold: () => {
+      captures++
+    },
+  })
+  await f.add('a', 'A')
+  const binding = await f.binding('a')
+  const cause = new ClaudeOAuthRefreshError(429, 'busy', '7')
+  let calls = 0
+  let restriction: NativeRefreshRestriction = allowed
+  const c = f.coordinator({
+    refreshToken: async (input) => {
+      expect(input.maxRetries).toBe(0)
+      calls++
+      throw cause
+    },
+    readRestrictions: async () => restriction,
+    reconcile: async (event) => {
+      f.observations.push(event)
+      if (
+        event.status === 'failed' &&
+        event.failure.classification === 'transient' &&
+        event.credentialFingerprint
+      ) {
+        restriction = {
+          status: 'blocked',
+          reason: 'refresh-backoff',
+          credentialFingerprint: event.credentialFingerprint,
+        }
+      }
+    },
+  })
+  const first = await c.refresh({ mode: 'local', binding })
+  expect(first).toMatchObject({
+    status: 'failed',
+    persisted: false,
+    reconciliationFailed: false,
+  })
+  if (first.status !== 'failed') throw new Error('Expected failed result')
+  expect(first.error.cause).toBe(cause)
+  expect(f.observations).toHaveLength(1)
+  expect(f.observations[0]).toMatchObject({
+    status: 'failed',
+    credentialFingerprint: fingerprintOf(credential('a')),
+    failure: {
+      kind: 'provider',
+      classification: 'transient',
+      status: 429,
+      retryAfter: 7,
+    },
+    persisted: false,
+  })
+  expect(calls).toBe(1)
+  expect(captures).toBe(1)
+  expect(await c.refresh({ mode: 'local', binding })).toMatchObject({
+    status: 'refused',
+    reason: 'refresh-backoff',
+    persisted: false,
+  })
+  expect(calls).toBe(1)
+  expect(captures).toBe(1)
+  expect(f.observations.map((event) => event.status)).toEqual([
+    'failed',
+    'refused',
+  ])
+  expect((await f.row('a')).credential).toMatchObject(credential('a'))
+})
 
 test('same-token backoff reconciled after a transient attempt prevents the next physical call', async () => {
   const f = await fixture()

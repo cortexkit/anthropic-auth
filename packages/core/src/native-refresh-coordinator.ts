@@ -212,7 +212,7 @@ function failureOf(error: Error): NativeRefreshFailure {
       kind,
       classification: invalidGrant
         ? 'invalid-grant'
-        : cause.status >= 500
+        : cause.status === 429 || cause.status >= 500
           ? 'transient'
           : 'permanent',
       status: cause.status,
@@ -683,6 +683,7 @@ export function createNativeRefreshCoordinator(
             !request.signal?.aborted &&
             failure.kind === 'provider' &&
             failure.classification === 'transient' &&
+            failure.status !== 429 &&
             attempt < 3
           ) {
             await releaseHandoff()
