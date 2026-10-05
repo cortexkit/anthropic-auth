@@ -64,7 +64,7 @@
   "dependencies": {
     "@clack/prompts": "^1.6.0",
     "@cortexkit/anthropic-auth-core": "1.23.0",
-    "@opentui/core": "0.5.11",
+    "@opentui/core": "0.5.12",
     "@opentui/solid": "0.5.11",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.12"
