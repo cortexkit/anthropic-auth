@@ -6,6 +6,7 @@ import {
   expect,
 } from 'bun:test'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { spawn } from 'node:child_process'
 import {
   appendFileSync,
   existsSync,
@@ -23,7 +24,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import {
   LockOwnershipError,
@@ -79,6 +80,7 @@ import { TestLifetime } from './test-lifetime.ts'
 
 const roots: string[] = []
 const scenarioRoots = new WeakMap<TestLifetime, Set<string>>()
+const physicalChildRoots = new WeakMap<TestLifetime, Set<string>>()
 const testLifetime = new AsyncLocalStorage<TestLifetime>()
 let currentLifetime: TestLifetime | undefined
 
@@ -355,6 +357,9 @@ afterEach(async () => {
       ...(scenario ? (scenarioRoots.get(scenario) ?? []) : []),
     ].map((root) => rm(root, { recursive: true, force: true })),
   )
+  for (const root of scenario ? (physicalChildRoots.get(scenario) ?? []) : []) {
+    tracePhysicalChild('fixture:deleted', root)
+  }
   if (timeoutProbePool && timeoutProbeLog) {
     appendFileSync(
       timeoutProbeLog,
@@ -1700,6 +1705,350 @@ test('persisted reconciliation failure preserves committed fact and cleans learn
   )
 })
 
+// The child owns rejection detection, outside Bun's test-runner handlers. The
+// wrapper observes completion of the real acquisition attempt independently of
+// onContended, so omitting the event fails an assertion while finally still
+// releases the holder and awaits the refresh body.
+const physicalHandoffProbe = `
+  import assert from 'node:assert/strict';
+  import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+  import { setImmediate } from 'node:timers/promises';
+  import { mock } from 'bun:test';
+  import * as physical from '@cortexkit/common-auth/fs';
+  import { fingerprintOf } from '@cortexkit/common-auth/store';
+  const { root, mode } = JSON.parse(process.env.NATIVE_PHYSICAL_HANDOFF_PROBE);
+  const unhandled = [];
+  process.on('unhandledRejection', (error) => {
+    unhandled.push(String(error));
+    console.error('ESCAPED HANDOFF DIAGNOSTIC REJECTION', error);
+    process.exitCode = 1;
+  });
+  const attempts = [];
+  let spec;
+  let attempted;
+  const firstAttempt = new Promise((resolve) => { attempted = resolve; });
+  const acquire = physical.acquireRefreshFileLock;
+  mock.module('@cortexkit/common-auth/fs', () => ({
+    ...physical,
+    acquireRefreshFileLock: async (options) => {
+      if (options.name !== spec?.name) return acquire(options);
+      const attempt = { callback: options.onContended };
+      attempts.push(attempt);
+      try {
+        const lock = await acquire(options);
+        attempt.result = lock === null ? 'refused' : 'acquired';
+        return lock;
+      } catch (error) {
+        attempt.result = 'exception';
+        throw error;
+      } finally {
+        attempted();
+      }
+    },
+  }));
+  const { resolveNativePoolPaths } = await import('./packages/core/src/pool-paths.ts');
+  const { createNativePoolStore } = await import('./packages/core/src/pool-store.ts');
+  const { captureNativeLocalPoolBinding } = await import('./packages/core/src/pool-binding.ts');
+  const { createNativeRefreshCoordinator, nativeAccountProviderLock } = await import('./packages/core/src/native-refresh-coordinator.ts');
+  const { tokenFingerprint } = await import('./packages/core/src/token-fingerprint.ts');
+  const paths = await resolveNativePoolPaths(root + '/account.json', root + '/state.json');
+  const quota = { validate: () => true, merge: (_, value) => value };
+  const store = createNativePoolStore({ paths, quota });
+  await store.initialize();
+  await store.add({ id: 'a', credential: { type: 'oauth', access: 'old', refresh: 'old-refresh', expires: 4000000000000 } });
+  const read = await store.read();
+  assert.equal(read.status, 'ready');
+  const binding = captureNativeLocalPoolBinding(paths, read.rows[0]);
+  spec = nativeAccountProviderLock(paths, 'A');
+  const lockPath = physical.lockPathFor(spec.path, spec.name);
+  const markerPath = lockPath + '.evicting';
+  const nonLive = mode === 'non-live' || mode === 'exception';
+  let holder;
+  if (nonLive) {
+    await writeFile(lockPath, JSON.stringify({ ownerId: 'expired-owner', expiresAt: 0 }));
+    if (mode === 'non-live') {
+      await mkdir(markerPath);
+      await writeFile(markerPath + '/owner.json', JSON.stringify({ ownerId: 'marker-holder', createdAt: Date.now() }));
+    }
+  } else {
+    holder = await acquire({ ...spec, renew: true });
+    assert.ok(holder);
+    await holder.assertOwned();
+  }
+  const events = [];
+  const active = new Set(holder ? [spec.name] : []);
+  let bootstraps = 0;
+  let providers = 0;
+  let staleObserved = 0;
+  let persisted;
+  let proof;
+  const coordinator = createNativeRefreshCoordinator({
+    paths, quota,
+    ...(mode === 'absent' ? {} : { onLockEvent: (event) => {
+      if (event.name !== spec.name) return;
+      events.push(event);
+      if (event.type === 'acquired') active.add(event.name);
+      else if (event.type === 'released') active.delete(event.name);
+      if (mode === 'throw') throw new Error('diagnostic throw');
+      if (mode === 'reject') return Promise.reject(new Error('diagnostic rejection'));
+      if (mode === 'thenable') return { then: (_, reject) => reject(new Error('diagnostic thenable rejection')) };
+      if (mode === 'never') return new Promise(() => {});
+    } }),
+    onLockStep: (lock, step) => {
+      if (lock.name === spec.name && step === 'stale-lock-observed') {
+        staleObserved++;
+        if (mode === 'exception') throw new Error('handoff acquisition barrier failed');
+      }
+    },
+    refreshToken: async (input) => {
+      assert.equal(input.maxRetries, 0);
+      providers++;
+      return { type: 'oauth', access: 'new', refresh: 'new-refresh', expires: 4000000000000, expiresIn: 3600 };
+    },
+    resolveIdentity: async () => {
+      bootstraps++;
+      return { deviceId: 'd', sessionId: 's', accountUuid: 'A' };
+    },
+    readRestrictions: async (subject) => ({
+      restriction: { status: 'allowed' },
+      context: { subject, runtimeBinding: subject.binding, refreshErrorClearedAt: null, quotaErrorClearedAt: null, quotaErrorGeneration: null },
+    }),
+    reconcile: async (event) => {
+      if (event.status !== 'persisted') return;
+      persisted = event;
+      const current = await store.read();
+      assert.equal(current.status, 'ready');
+      const row = current.rows[0];
+      proof = { binding: captureNativeLocalPoolBinding(paths, row), credentialFingerprint: row.fingerprint, version: event.committed.version };
+    },
+    readAdmission: async () => proof ? { status: 'proven', validation: proof } : { status: 'unproven' },
+  });
+  const operation = coordinator.authorize({ mode: 'local', intent: 'refresh', binding });
+  try {
+    await Promise.race([firstAttempt, operation.then(() => { throw new Error('Refresh ended before the physical attempt'); })]);
+    assert.equal(attempts[0].result, mode === 'exception' ? 'exception' : 'refused');
+    if (mode === 'absent') assert.equal(attempts[0].callback, undefined);
+    if (nonLive || mode === 'absent') assert.deepEqual(events, []);
+    else {
+      assert.deepEqual(events, [{ type: 'contended', name: spec.name, path: spec.path }]);
+      assert.equal(typeof attempts[0].callback, 'function');
+      assert.equal(active.has(spec.name), true);
+      await holder.assertOwned();
+    }
+    if (nonLive) assert.equal(staleObserved, 1);
+    await holder?.release();
+    holder = undefined;
+    if (mode === 'non-live') await rm(markerPath, { recursive: true });
+    const result = await operation;
+    assert.equal(result.status, 'usable');
+    assert.equal(result.access, 'new');
+    assert.equal(bootstraps, 1);
+    assert.equal(providers, 1);
+    assert.equal(persisted.handoff, mode === 'exception' ? 'skipped-loss' : 'acquired');
+    assert.equal(persisted.bootstrap, 'resolved');
+    assert.equal(persisted.identity, 'A');
+    assert.equal(persisted.committed.version.accessFingerprint, tokenFingerprint('new'));
+    const loaded = await store.read();
+    assert.equal(loaded.status, 'ready');
+    assert.equal(loaded.rows[0].credential.access, 'new');
+    assert.equal(loaded.rows[0].credential.refresh, 'new-refresh');
+    assert.equal(loaded.rows[0].identity, 'A');
+    assert.equal(loaded.rows[0].fingerprint, fingerprintOf(loaded.rows[0].credential));
+    assert.equal(proof.credentialFingerprint, loaded.rows[0].fingerprint);
+    if (mode === 'absent') {
+      assert.ok(attempts.length >= 2);
+      assert.ok(attempts.every((attempt) => attempt.callback === undefined));
+      assert.deepEqual(events, []);
+    } else if (mode === 'exception') assert.deepEqual(events, []);
+    else {
+      const contention = events.slice(0, -2);
+      if (nonLive) assert.deepEqual(contention, []);
+      else {
+        assert.ok(contention.length > 0);
+        for (const event of contention) assert.deepEqual(event, { type: 'contended', name: spec.name, path: spec.path });
+      }
+      assert.deepEqual(events.slice(-2), [
+        { type: 'acquired', name: spec.name, path: spec.path },
+        { type: 'released', name: spec.name, path: spec.path },
+      ]);
+      assert.equal(active.size, 0);
+    }
+    assert.equal((await coordinator.authorize({ mode: 'local', intent: 'serve', binding: proof.binding })).status, 'usable');
+    assert.equal(providers, 1);
+    assert.equal(bootstraps, 1);
+    assert.equal(JSON.parse(await readFile(paths.state, 'utf8')).accounts.a.refresh, 'new-refresh');
+  } finally {
+    await holder?.release();
+    if (mode === 'non-live') await rm(markerPath, { recursive: true, force: true });
+    await Promise.allSettled([operation]);
+  }
+  await setImmediate();
+  await setImmediate();
+  assert.deepEqual(unhandled, []);
+  console.log('physical handoff probe passed: ' + mode);
+`
+
+function tracePhysicalChild(
+  event: string,
+  root: string,
+  details: Record<string, unknown> = {},
+) {
+  const log = process.env.NATIVE_PHYSICAL_CHILD_LIFETIME_LOG
+  if (log) {
+    appendFileSync(
+      log,
+      `${JSON.stringify({ event, root, fixtureExists: existsSync(root), ...details })}\n`,
+    )
+  }
+}
+
+async function physicalHandoffChild(
+  root: string,
+  workspace: string,
+  mode: string,
+): Promise<
+  | { status: 'cancelled' }
+  | { status: 'completed'; exit: number | null; stdout: string; stderr: string }
+> {
+  const lifetime = testLifetime.getStore()
+  if (!lifetime) throw new Error('Physical child requires a fixture lifetime')
+  let ownedRoots = physicalChildRoots.get(lifetime)
+  if (!ownedRoots) {
+    ownedRoots = new Set()
+    physicalChildRoots.set(lifetime, ownedRoots)
+  }
+  ownedRoots.add(root)
+  // The fixture owns cancellation and reaping rather than relying on Bun's
+  // test-runner cleanup of dangling subprocesses.
+  const child = spawn(process.execPath, ['--eval', physicalHandoffProbe], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      NATIVE_PHYSICAL_HANDOFF_PROBE: JSON.stringify({ root, mode }),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  tracePhysicalChild('child:spawned', root, { pid: child.pid, mode })
+  let drained = false
+  let cancellationReason: string | undefined
+  const cancel = lifetime.gate()
+  // Teardown opens this gate before waiting for the body. A stalled child must
+  // not keep TestLifetime.finish waiting forever with its fixture files alive.
+  const cancellation = cancel.wait.then(() => {
+    if (drained) return
+    cancellationReason ??= 'fixture teardown'
+    tracePhysicalChild('child:cancelled', root, {
+      pid: child.pid,
+      reason: cancellationReason,
+    })
+    child.kill('SIGKILL')
+  })
+  lifetime.trackDetached(cancellation)
+  async function drain(
+    stream: typeof child.stdout,
+    event: 'stdout:drained' | 'stderr:drained',
+  ) {
+    stream.setEncoding('utf8')
+    let output = ''
+    let readRejected = false
+    try {
+      for await (const chunk of stream) output += chunk
+      return output
+    } catch (error) {
+      readRejected = true
+      throw error
+    } finally {
+      tracePhysicalChild(event, root, {
+        [event === 'stdout:drained' ? 'stdout' : 'stderr']: output,
+        readRejected,
+      })
+    }
+  }
+  const exited = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('exit', (exit, signal) => {
+      tracePhysicalChild('child:exited', root, {
+        pid: child.pid,
+        exit,
+        signal,
+      })
+      resolve(exit)
+    })
+  })
+  const stdoutRead = drain(child.stdout, 'stdout:drained')
+  const stderrRead = drain(child.stderr, 'stderr:drained')
+  const completion = [exited, stdoutRead, stderrRead] as const
+  let cleanupFailure: unknown
+  const result = await (async () => {
+    try {
+      const [exit, stdout, stderr] = await Promise.all(completion)
+      drained = true
+      if (cancellationReason) return { status: 'cancelled' as const }
+      return { status: 'completed' as const, exit, stdout, stderr }
+    } finally {
+      try {
+        if (!drained) child.kill('SIGKILL')
+      } catch (error) {
+        cleanupFailure = error
+      }
+      // Promise.all fails fast on a read error. Join each pipe and the process
+      // separately before releasing the cancellation task or deleting fixtures.
+      await Promise.allSettled(completion)
+      drained = true
+      cancel.open()
+      try {
+        await cancellation
+      } catch (error) {
+        cleanupFailure ??= error
+      }
+      tracePhysicalChild('child:fully-drained', root, { pid: child.pid })
+    }
+  })()
+  // Cleanup errors are raised only after a successful body, never in place of
+  // the original acquisition or pipe-read error.
+  if (cleanupFailure) throw cleanupFailure
+  return result
+}
+
+for (const [mode, name] of [
+  [
+    'observe',
+    'physical handoff contention forwards exact producer diagnostics and release sequence',
+  ],
+  ['throw', 'physical handoff contention isolates throwing diagnostics'],
+  ['reject', 'physical handoff contention isolates rejected promises'],
+  ['thenable', 'physical handoff contention isolates rejected thenables'],
+  ['never', 'physical handoff contention ignores never-settling diagnostics'],
+  [
+    'absent',
+    'physical handoff omits the producer callback without an observer',
+  ],
+  [
+    'non-live',
+    'physical handoff non-live marker refusal does not fabricate contention',
+  ],
+  [
+    'exception',
+    'physical handoff acquisition exception does not fabricate contention',
+  ],
+] as const) {
+  test(name, async () => {
+    const f = await fixture()
+    const workspace = resolve(import.meta.dir, '../../../..')
+    try {
+      const result = await physicalHandoffChild(f.root, workspace, mode)
+      // Teardown cancellation follows an already reported runner timeout. End
+      // the body after joining the child, without producing late assertion errors.
+      if (result.status === 'cancelled') return
+      const { exit, stdout, stderr } = result
+      expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
+      expect(stdout).toContain(`physical handoff probe passed: ${mode}`)
+    } finally {
+      tracePhysicalChild('body:finally', f.root)
+    }
+  })
+}
+
 test('throwing handoff diagnostics preserve handoff and identity validation', async () => {
   const events: NativeLockEvent[] = []
   let bootstraps = 0
@@ -2049,9 +2398,17 @@ test(
           handoff: 'skipped-contention',
         }),
       )
-      // The old acquisition primitive gives no diagnostic reason for null.
-      // A timed-out wait must not invent acquired, released or contended events.
-      expect(handoffEvents).toEqual([])
+      // The held lease generates contended events, but timeout does not generate
+      // acquired or released events for the waiter.
+      expect(handoffEvents.length).toBeGreaterThan(0)
+      expect(
+        handoffEvents.every(
+          (event) =>
+            event.type === 'contended' &&
+            event.name === spec.name &&
+            event.path === spec.path,
+        ),
+      ).toBe(true)
     } finally {
       finish.release()
       await holder
