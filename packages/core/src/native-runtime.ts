@@ -823,8 +823,7 @@ function firstIdentityEntry(
 ): NativeRuntimeEntry {
   const { predecessor, context, proof } = publication
   if (
-    !old ||
-    old.binding.kind !== 'local' ||
+    old?.binding.kind !== 'local' ||
     !sameLocalBinding(old.binding, predecessor) ||
     (old.refreshErrorClearedAt ?? null) !== context.refreshErrorClearedAt ||
     (old.quotaErrorClearedAt ?? null) !== context.quotaErrorClearedAt ||
