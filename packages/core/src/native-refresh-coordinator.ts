@@ -613,6 +613,14 @@ export function createNativeRefreshCoordinator(
         ttlMs: POOL_LOCK_DEFAULTS.ttlMs,
         renew: true,
         now,
+        onContended: onLockEvent
+          ? () =>
+              onLockEvent({
+                type: 'contended',
+                name: spec.name,
+                path: spec.path,
+              })
+          : undefined,
         onStep: options.onLockStep
           ? (step) => options.onLockStep?.(spec, step)
           : undefined,
@@ -636,9 +644,9 @@ export function createNativeRefreshCoordinator(
         })
         return lock
       }
-      // The installed primitive's null result can mean refusals other than a
-      // live holder. Contention diagnostics need a producer acquisition event;
-      // guessing here would report ownership evidence the primitive never gave.
+      // acquireRefreshFileLock's onContended reports a live-holder refusal. A
+      // null can also mean a stale-eviction-marker refusal without a live holder;
+      // neither diagnostic is an ownership assertion.
       const remaining =
         POOL_LOCK_DEFAULTS.timeoutMs - (performance.now() - started)
       if (remaining <= 0)
