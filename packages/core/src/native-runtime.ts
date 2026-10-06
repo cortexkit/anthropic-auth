@@ -12,6 +12,10 @@ import type {
 import { quotaSnapshotCheckedAt } from './accounts.ts'
 import { parseJsonRedacted } from './json.ts'
 import {
+  isNativeLocalCredentialValidation,
+  type NativeLocalCredentialValidation,
+} from './native-credential-validation.ts'
+import {
   fromNativeQuotaMap,
   type NativeQuotaMap,
 } from './native-quota-codec.ts'
@@ -41,6 +45,7 @@ export type NativeRuntimeBinding =
  */
 export interface NativeRuntimeEntry {
   binding: NativeRuntimeBinding
+  credentialValidation?: NativeLocalCredentialValidation
   lastUsed?: number
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
@@ -233,6 +238,7 @@ function prime(value: unknown): value is PrimeUsageCounters {
 }
 
 const entryKeys: readonly string[] = [
+  'credentialValidation',
   'lastUsed',
   'lastRefreshedAt',
   'lastRefreshError',
@@ -269,6 +275,20 @@ function entry(
   )
     return false
   const observedBinding = value.binding
+  if (Object.hasOwn(value, 'credentialValidation')) {
+    const proof = value.credentialValidation
+    // A carried proof must not survive rebinding, even if token bytes repeat.
+    if (
+      observedBinding.kind !== 'local' ||
+      observedBinding.identity === undefined ||
+      !isNativeLocalCredentialValidation(proof) ||
+      proof.binding.storageId !== observedBinding.storageId ||
+      proof.binding.rowId !== observedBinding.rowId ||
+      proof.binding.credentialEpoch !== observedBinding.credentialEpoch ||
+      proof.binding.identity !== observedBinding.identity
+    )
+      return false
+  }
   for (const key of [
     'lastUsed',
     'lastRefreshedAt',
