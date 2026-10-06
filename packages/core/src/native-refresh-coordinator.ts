@@ -23,6 +23,7 @@ import {
   type NativeLocalCredentialVersion,
   nativeLocalCredentialValidationMatches,
 } from './native-credential-validation.ts'
+import { nativeLockObserver } from './native-lock-observer.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import {
   isNativeLocalPoolBinding,
@@ -507,6 +508,7 @@ export function createNativeRefreshCoordinator(
   const now = options.now ?? Date.now
   const provider = options.refreshToken ?? refreshClaudeOAuthToken
   const bootstrap = options.resolveIdentity ?? resolveClaudeCodeIdentity
+  const onLockEvent = nativeLockObserver(options.onLockEvent)
 
   async function rowFor(binding: NativeLocalPoolBinding) {
     const read = await store.read()
@@ -618,27 +620,25 @@ export function createNativeRefreshCoordinator(
       if (lock) {
         try {
           await lock.assertOwned()
-          options.onLockEvent?.({
-            type: 'acquired',
+        } catch (error) {
+          await lock.release().catch(() => {})
+          onLockEvent?.({
+            type: 'released',
             name: spec.name,
             path: spec.path,
           })
-          return lock
-        } catch (error) {
-          await lock.release().catch(() => {})
-          try {
-            options.onLockEvent?.({
-              type: 'released',
-              name: spec.name,
-              path: spec.path,
-            })
-          } catch {
-            /* Ignore observer failures; notification callbacks must not decide
-             * whether the lock owner can refresh a token. */
-          }
           throw error
         }
+        onLockEvent?.({
+          type: 'acquired',
+          name: spec.name,
+          path: spec.path,
+        })
+        return lock
       }
+      // The installed primitive's null result can mean refusals other than a
+      // live holder. Contention diagnostics need a producer acquisition event;
+      // guessing here would report ownership evidence the primitive never gave.
       const remaining =
         POOL_LOCK_DEFAULTS.timeoutMs - (performance.now() - started)
       if (remaining <= 0)
@@ -707,16 +707,11 @@ export function createNativeRefreshCoordinator(
           await lock.release().catch(() => {})
           if (identity) {
             const spec = nativeAccountProviderLock(options.paths, identity)
-            try {
-              options.onLockEvent?.({
-                type: 'released',
-                name: spec.name,
-                path: spec.path,
-              })
-            } catch {
-              /* A failed lock-event notification must not discard a replacement
-               * credential after the refresh token was consumed. */
-            }
+            onLockEvent?.({
+              type: 'released',
+              name: spec.name,
+              path: spec.path,
+            })
           }
         })()
       }

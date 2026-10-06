@@ -70,6 +70,7 @@ import {
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import {
   createNativePoolStore,
+  type NativeLockEvent,
   type NativePoolStoreOptions,
   nativePoolStoreLocks,
 } from '../pool-store.ts'
@@ -173,6 +174,22 @@ function barrier() {
   })
   return { promise, release }
 }
+
+function trackLock(active: Set<string>, event: NativeLockEvent) {
+  if (event.type === 'acquired') active.add(event.name)
+  else if (event.type === 'released') active.delete(event.name)
+}
+
+test('contended diagnostic preserves acquired evidence until explicit release', () => {
+  const active = new Set<string>()
+  const lock = { name: 'native-account-provider-synthetic', path: '/synthetic' }
+  trackLock(active, { type: 'acquired', ...lock })
+  expect(active.has(lock.name)).toBe(true)
+  trackLock(active, { type: 'contended', ...lock })
+  expect(active.has(lock.name)).toBe(true)
+  trackLock(active, { type: 'released', ...lock })
+  expect(active.has(lock.name)).toBe(false)
+})
 
 function credential(id: string) {
   return {
@@ -692,8 +709,7 @@ test('independent known accounts reach provider concurrently', async () => {
       onStep: (step, info) => phase(`${info.operation}:${info.rowId}:${step}`),
       onLockEvent: (event) => {
         phase(`${event.type}:${event.name}`)
-        if (event.type === 'acquired') active.add(event.name)
-        else active.delete(event.name)
+        trackLock(active, event)
         events.push(`${event.type}:${event.name}`)
       },
     })
@@ -1159,8 +1175,7 @@ test('callback-end identity alias joins during reconciliation and handoff enclos
   const active = new Set<string>()
   const f = await fixture({
     onLockEvent: (e) => {
-      if (e.type === 'acquired') active.add(e.name)
-      else active.delete(e.name)
+      trackLock(active, e)
     },
   })
   await f.add('a')
@@ -1685,16 +1700,13 @@ test('persisted reconciliation failure preserves committed fact and cleans learn
   )
 })
 
-test('handoff ownership loss is non-fatal and removes only the unknown job registration', async () => {
-  let breakHandoff = true
+test('throwing handoff diagnostics preserve handoff and identity validation', async () => {
+  const events: NativeLockEvent[] = []
+  let bootstraps = 0
   const f = await fixture({
     onLockEvent: (e) => {
-      if (
-        breakHandoff &&
-        e.type === 'acquired' &&
-        e.name.startsWith('native-account-provider')
-      ) {
-        breakHandoff = false
+      if (e.name.startsWith('native-account-provider')) {
+        events.push(e)
         throw new LockOwnershipError({ target: e.path, name: e.name })
       }
     },
@@ -1702,13 +1714,74 @@ test('handoff ownership loss is non-fatal and removes only the unknown job regis
   await f.add('a')
   expect(
     await f
-      .coordinator()
+      .coordinator({
+        resolveIdentity: async () => {
+          bootstraps++
+          return {
+            deviceId: 'd',
+            sessionId: 's',
+            accountUuid: accountUuid('A'),
+          }
+        },
+      })
       .refresh({ mode: 'local', binding: await f.binding('a') }),
   ).toMatchObject({ status: 'usable', access: 'access-new' })
   expect(f.observations).toContainEqual(
-    expect.objectContaining({ status: 'persisted', handoff: 'skipped-loss' }),
+    expect.objectContaining({
+      status: 'persisted',
+      handoff: 'acquired',
+      bootstrap: 'resolved',
+      identity: 'A',
+    }),
   )
+  expect(bootstraps).toBe(1)
+  const spec = nativeAccountProviderLock(f.paths, 'A')
+  expect(events).toEqual([
+    { type: 'acquired', name: spec.name, path: spec.path },
+    { type: 'released', name: spec.name, path: spec.path },
+  ])
   expect((await f.row('a')).credential).toMatchObject(credential('new'))
+})
+
+test('diagnostic isolation preserves awaited handoff lock-step barriers', async () => {
+  const f = await fixture()
+  await f.add('a')
+  const spec = nativeAccountProviderLock(f.paths, 'A')
+  const entered = barrier()
+  const finish = barrier()
+  let settled = false
+  let released = false
+  const c = f.coordinator({
+    onLockEvent: (event) => {
+      if (event.name === spec.name && event.type === 'released') released = true
+      return new Promise<void>(() => {})
+    },
+    onLockStep: async (lock, step) => {
+      if (lock.name === spec.name && step === 'release-owner-confirmed') {
+        entered.release()
+        await finish.promise
+      }
+    },
+  })
+  const operation = c
+    .refresh({ mode: 'local', binding: await f.binding('a') })
+    .then((result) => {
+      settled = true
+      return result
+    })
+  try {
+    await entered.promise
+    expect(settled).toBe(false)
+    expect(released).toBe(false)
+  } finally {
+    finish.release()
+    await operation
+  }
+  expect(await operation).toMatchObject({
+    status: 'usable',
+    access: 'access-new',
+  })
+  expect(released).toBe(true)
 })
 
 test('lost handoff after callback end persists successor, skips registration and releases ownership', async () => {
@@ -1841,8 +1914,7 @@ test('refusal and failure reconciliation run outside store locks and finish befo
   const active = new Set<string>()
   const f = await fixture({
     onLockEvent: (e) => {
-      if (e.type === 'acquired') active.add(e.name)
-      else active.delete(e.name)
+      trackLock(active, e)
     },
   })
   await f.add('a', 'A')
@@ -1960,9 +2032,14 @@ test(
       },
     )
     await locked.promise
+    const handoffEvents: NativeLockEvent[] = []
     try {
       const result = await f
-        .coordinator()
+        .coordinator({
+          onLockEvent: (event) => {
+            if (event.name === spec.name) handoffEvents.push(event)
+          },
+        })
         .refresh({ mode: 'local', binding: await f.binding('a') })
       expect(result).toMatchObject({ status: 'usable' })
       expect((await f.row('a')).credential).toMatchObject(credential('new'))
@@ -1972,6 +2049,9 @@ test(
           handoff: 'skipped-contention',
         }),
       )
+      // The old acquisition primitive gives no diagnostic reason for null.
+      // A timed-out wait must not invent acquired, released or contended events.
+      expect(handoffEvents).toEqual([])
     } finally {
       finish.release()
       await holder

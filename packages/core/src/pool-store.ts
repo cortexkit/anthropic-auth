@@ -3,7 +3,13 @@ import {
   openPoolStore,
 } from '@cortexkit/common-auth/store'
 
+import {
+  type NativeLockEvent,
+  nativeLockObserver,
+} from './native-lock-observer.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
+
+export type { NativeLockEvent } from './native-lock-observer.ts'
 
 interface NativeQuotaCodec {
   validate(value: unknown): boolean
@@ -13,10 +19,11 @@ interface NativeQuotaCodec {
 export interface NativePoolStoreOptions
   extends Pick<
     OpenPoolStoreOptions,
-    'now' | 'onStep' | 'hold' | 'logger' | 'onLockEvent' | 'onLockStep'
+    'now' | 'onStep' | 'hold' | 'logger' | 'onLockStep'
   > {
   paths: NativePoolPaths
   quota: NativeQuotaCodec
+  onLockEvent?: (event: NativeLockEvent) => void
 }
 
 /**
@@ -46,7 +53,7 @@ export function createNativePoolStore(options: NativePoolStoreOptions) {
     onStep: options.onStep,
     hold: options.hold,
     logger: options.logger,
-    onLockEvent: options.onLockEvent,
+    onLockEvent: nativeLockObserver(options.onLockEvent),
     onLockStep: options.onLockStep,
   })
 }

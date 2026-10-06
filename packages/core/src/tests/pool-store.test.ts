@@ -265,6 +265,48 @@ test('construction, pure reads and migration additions never install a quota pul
   })
 })
 
+test('diagnostic isolation preserves awaited store lock-step barriers', async () => {
+  const { paths } = await fixture()
+  let open!: () => void
+  const gate = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  let enter!: () => void
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve
+  })
+  let settled = false
+  const released: string[] = []
+  const store = createNativePoolStore({
+    paths,
+    quota,
+    onLockEvent: (event) => {
+      if (event.type === 'released') released.push(event.name)
+      return new Promise<void>(() => {})
+    },
+    onLockStep: async (lock, step) => {
+      if (lock.name === 'pool-state' && step === 'release-owner-confirmed') {
+        enter()
+        await gate
+      }
+    },
+  })
+  const operation = store.initialize().then((result) => {
+    settled = true
+    return result
+  })
+  try {
+    await entered
+    expect(settled).toBe(false)
+    expect(released).not.toContain('pool-state')
+  } finally {
+    open()
+    await operation
+  }
+  expect(settled).toBe(true)
+  expect(released).toContain('pool-state')
+})
+
 test('refuses same-epoch access corruption before refresh or observation persistence', async () => {
   const { paths, store } = await fixture()
   await store.initialize()

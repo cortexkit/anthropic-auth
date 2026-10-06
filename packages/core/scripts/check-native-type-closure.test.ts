@@ -262,7 +262,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     consumer,
     'consumer.ts',
     `
-    import { createNativePoolStore, resolveNativePoolPaths, type NativePoolStoreOptions } from '@cortexkit/anthropic-auth-core';
+    import { createNativePoolStore, resolveNativePoolPaths, type NativePoolStoreOptions, type NativeLockEvent } from '@cortexkit/anthropic-auth-core';
     import * as core from '@cortexkit/anthropic-auth-core';
     const paths = await resolveNativePoolPaths('./account.json', './state.json');
     const options: NativePoolStoreOptions = {
@@ -270,10 +270,24 @@ test('packed Core types and Node runtime work in a fresh consumer without common
       onStep: async (step, info) => { const name: string = step; const id: string | undefined = info.rowId; void [name, id]; },
       hold: (point, id) => { const name: 'refresh-before-provider' | 'pull-before-request' = point; void [name, id]; },
       logger: { warn: (message) => { const text: string = message; void text; } },
-      onLockEvent: (event) => { const phase: 'acquired' | 'released' = event.type; void phase; },
+      onLockEvent: (event) => {
+        const phase: 'acquired' | 'released' | 'contended' = event.type;
+        const diagnostic: NativeLockEvent = event;
+        const fields: string[] = [event.name, event.path];
+        void [phase, diagnostic, fields];
+      },
       onLockStep: async (lock, step) => { const text: string = lock.path + step; void text; },
     };
     const store = createNativePoolStore(options);
+    const wideObserver = (event: NativeLockEvent): void => { void event; };
+    const compatible: NativePoolStoreOptions = { ...options, onLockEvent: wideObserver };
+    const oldProducerRecord: { type: 'acquired' | 'released'; name: string; path: string } = { type: 'acquired', name: 'synthetic', path: paths.state };
+    compatible.onLockEvent?.(oldProducerRecord);
+    const contention: Parameters<NonNullable<NativePoolStoreOptions['onLockEvent']>>[0] = { type: 'contended', name: 'synthetic', path: paths.state };
+    options.onLockEvent?.(contention);
+    type ClosedEvent = NativeLockEvent['type'] extends 'acquired' | 'released' | 'contended' ? true : false;
+    const closed: ClosedEvent = true;
+    void closed;
     const roster: string = paths.roster;
     await store.add({ id: 'synthetic', credential: { type: 'oauth', access: 'synthetic-access', refresh: 'synthetic-refresh', expires: 4000000000000 } });
     const loaded = await store.read();
@@ -294,6 +308,34 @@ test('packed Core types and Node runtime work in a fresh consumer without common
   console.log(
     `Consumer tsc: ${checked.length} files checked, all within the fresh prefix`,
   )
+  await put(
+    consumer,
+    'narrow.ts',
+    `
+    import type { NativePoolStoreOptions } from '@cortexkit/anthropic-auth-core';
+    declare const options: NativePoolStoreOptions;
+    const narrowObserver = (event: { type: 'acquired' | 'released'; name: string; path: string }): void => { void event; };
+    const unsafe: NativePoolStoreOptions = { ...options, onLockEvent: narrowObserver };
+    void unsafe;
+    `,
+  )
+  const consumerConfig = JSON.parse(
+    await readFile(join(consumer, 'tsconfig.json'), 'utf8'),
+  )
+  consumerConfig.files.push('narrow.ts')
+  await put(consumer, 'tsconfig.json', JSON.stringify(consumerConfig))
+  const negative = Bun.spawnSync([tsc, '-p', 'tsconfig.json'], {
+    cwd: consumer,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const negativeOutput = negative.stdout.toString() + negative.stderr.toString()
+  console.log(negativeOutput)
+  expect(negative.exitCode).toBe(1)
+  expect(negativeOutput).toContain('narrow.ts')
+  expect(negativeOutput).toContain('TS2322')
+  expect(negativeOutput).toContain('"contended"')
+  console.log('Native observer strict boundary: narrow user callback rejected')
   await put(
     consumer,
     'runtime.mjs',
