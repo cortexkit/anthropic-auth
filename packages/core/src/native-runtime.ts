@@ -567,10 +567,13 @@ export function isNativeRuntimeStagingName(
   )
 }
 
-interface FirstIdentityPublication {
-  readonly predecessor: NativeLocalPoolBinding
+interface LocalValidationPublication {
   readonly context: NativeRefreshContext
   readonly proof: NativeLocalCredentialValidation
+}
+
+interface FirstIdentityPublication extends LocalValidationPublication {
+  readonly predecessor: NativeLocalPoolBinding
 }
 
 function sameLocalBinding(
@@ -689,9 +692,9 @@ export async function updateNativeRuntime(
   return writeNativeRuntime(path, storageId, change, hooks)
 }
 
-// Both publication paths use the same lock, strict decoder and atomic replacement.
-// Only the dedicated publisher supplies checked pool/runtime evidence authorizing
-// the first account UUID change; a generic write has no such authorization.
+// All runtime writes use the same lock, validation and atomic file replacement.
+// Only the first-identity path can attach an account UUID to an unidentified
+// entry. Known-account validation and generic writes cannot change that UUID.
 async function writeNativeRuntime(
   path: string,
   storageId: string,
@@ -779,10 +782,10 @@ function sameVersion(a: Record<string, unknown>, b: Record<string, unknown>) {
   )
 }
 
-function captureFirstIdentity(
+function captureLocalValidation(
   paths: NativePoolPaths,
   observation: NativeRefreshObservation,
-): FirstIdentityPublication {
+): LocalValidationPublication {
   const refuse = () => new NativeRuntimeError('publication-refused')
   // Copy before the first lock wait. Never fill missing evidence from a later row.
   const event = structuredClone(observation)
@@ -805,12 +808,6 @@ function captureFirstIdentity(
     context.subject.credentialFingerprint !== event.credentialFingerprint ||
     !dispatchVersion(context.subject.version) ||
     !sameVersion(context.subject.version, event.credentialVersion) ||
-    !isNativeLocalPoolBinding(context.runtimeBinding) ||
-    context.runtimeBinding.identity !== undefined ||
-    !sameLocalBinding(context.runtimeBinding, {
-      ...event.binding,
-      identity: undefined,
-    }) ||
     ![
       context.refreshErrorClearedAt,
       context.quotaErrorClearedAt,
@@ -818,7 +815,7 @@ function captureFirstIdentity(
     ].every((value) => value === null || counter(value))
   )
     throw refuse()
-  const destination = { ...context.runtimeBinding, identity: event.identity }
+  const destination = { ...event.binding, identity: event.identity }
   let proof: unknown
   if (event.status === 'persisted') {
     proof = {
@@ -844,7 +841,36 @@ function captureFirstIdentity(
     }
   }
   if (!isNativeLocalCredentialValidation(proof)) throw refuse()
-  return { predecessor: context.runtimeBinding, context, proof }
+  return { context, proof }
+}
+
+function captureFirstIdentity(
+  paths: NativePoolPaths,
+  observation: NativeRefreshObservation,
+): FirstIdentityPublication {
+  const publication = captureLocalValidation(paths, observation)
+  const predecessor = publication.context.runtimeBinding
+  if (
+    !isNativeLocalPoolBinding(predecessor) ||
+    predecessor.identity !== undefined ||
+    !sameLocalBinding(predecessor, {
+      ...publication.proof.binding,
+      identity: undefined,
+    })
+  )
+    throw new NativeRuntimeError('publication-refused')
+  return { ...publication, predecessor }
+}
+
+function capturedResetContextMatches(
+  old: NativeRuntimeEntry | undefined,
+  context: NativeRefreshContext,
+): boolean {
+  return (
+    (old?.refreshErrorClearedAt ?? null) === context.refreshErrorClearedAt &&
+    (old?.quotaErrorClearedAt ?? null) === context.quotaErrorClearedAt &&
+    (old?.quotaErrorGeneration ?? null) === context.quotaErrorGeneration
+  )
 }
 
 function firstIdentityEntry(
@@ -855,9 +881,7 @@ function firstIdentityEntry(
   if (
     old?.binding.kind !== 'local' ||
     !sameLocalBinding(old.binding, predecessor) ||
-    (old.refreshErrorClearedAt ?? null) !== context.refreshErrorClearedAt ||
-    (old.quotaErrorClearedAt ?? null) !== context.quotaErrorClearedAt ||
-    (old.quotaErrorGeneration ?? null) !== context.quotaErrorGeneration
+    !capturedResetContextMatches(old, context)
   )
     throw new NativeRuntimeError('publication-refused')
   const floor = (
@@ -910,6 +934,82 @@ export async function publishNativeLocalFirstIdentity(
   try {
     paths = { ...paths }
     const publication = captureFirstIdentity(paths, observation)
+    return await publishLocalValidation(
+      paths,
+      publication,
+      (old) => firstIdentityEntry(old, publication),
+      publication,
+    )
+  } catch (error) {
+    if (error instanceof NativeRuntimeError) throw error
+    throw new NativeRuntimeError('publication-refused')
+  }
+}
+
+function knownValidationEntry(
+  old: NativeRuntimeEntry | undefined,
+  publication: LocalValidationPublication,
+): NativeRuntimeEntry {
+  const { context, proof } = publication
+  if (!capturedResetContextMatches(old, context))
+    throw new NativeRuntimeError('publication-refused')
+  if (!old) {
+    if (context.runtimeBinding !== null)
+      throw new NativeRuntimeError('publication-refused')
+    return { binding: proof.binding, credentialValidation: proof }
+  }
+  if (
+    old.binding.kind !== 'local' ||
+    !isNativeLocalPoolBinding(context.runtimeBinding) ||
+    !sameLocalBinding(old.binding, context.runtimeBinding) ||
+    !sameLocalBinding(old.binding, proof.binding)
+  )
+    throw new NativeRuntimeError('publication-refused')
+  // The credentials were checked for the account already bound to this entry.
+  // Recording validation does not clear its errors, retry policy, usage or profile,
+  // even after token rotation.
+  return { ...old, credentialValidation: proof }
+}
+
+/**
+ * Record successful credential validation for a local account with a known UUID.
+ * Bootstrap must provide the state captured before its request and the exact
+ * credentials it checked. An unidentified entry requires first-identity publication.
+ * Recording validation for a disabled entry does not enable it or permit serving.
+ */
+export async function publishNativeLocalCredentialValidation(
+  paths: NativePoolPaths,
+  observation: NativeRefreshObservation,
+): Promise<NativeRuntimeState> {
+  try {
+    paths = { ...paths }
+    const publication = captureLocalValidation(paths, observation)
+    const { context, proof } = publication
+    if (
+      context.subject.binding.identity !== proof.binding.identity ||
+      (context.runtimeBinding !== null &&
+        (!isNativeLocalPoolBinding(context.runtimeBinding) ||
+          !sameLocalBinding(context.runtimeBinding, proof.binding)))
+    )
+      throw new NativeRuntimeError('publication-refused')
+    return await publishLocalValidation(paths, publication, (old) =>
+      knownValidationEntry(old, publication),
+    )
+  } catch (error) {
+    if (error instanceof NativeRuntimeError) throw error
+    throw new NativeRuntimeError('publication-refused')
+  }
+}
+
+// Both publication paths verify the pool and held locks before replacing state.
+// Selecting an entry cannot skip the checks that prevent stale state writes.
+async function publishLocalValidation(
+  paths: NativePoolPaths,
+  publication: LocalValidationPublication,
+  replacement: (old: NativeRuntimeEntry | undefined) => NativeRuntimeEntry,
+  firstIdentity?: FirstIdentityPublication,
+): Promise<NativeRuntimeState> {
+  try {
     const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
     const [config, state] = nativePoolStoreLocks(paths)
     const checkPool = async () => {
@@ -942,11 +1042,8 @@ export async function publishNativeLocalFirstIdentity(
               paths.runtime,
               paths.storageId,
               (current) => {
-                const id = publication.predecessor.rowId
-                current.accounts[id] = firstIdentityEntry(
-                  current.accounts[id],
-                  publication,
-                )
+                const id = publication.proof.binding.rowId
+                current.accounts[id] = replacement(current.accounts[id])
                 return current
               },
               {
@@ -958,7 +1055,7 @@ export async function publishNativeLocalFirstIdentity(
                   await stateLease.assertOwned()
                 },
               },
-              publication,
+              firstIdentity,
             )
           },
         ),
