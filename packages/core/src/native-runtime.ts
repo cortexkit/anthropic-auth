@@ -3,6 +3,7 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, rename, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { withLock } from '@cortexkit/common-auth/fs'
+import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
 
 import type {
   AccountOperationError,
@@ -14,15 +15,24 @@ import { parseJsonRedacted } from './json.ts'
 import {
   isNativeLocalCredentialValidation,
   type NativeLocalCredentialValidation,
+  nativeLocalCredentialValidationMatches,
 } from './native-credential-validation.ts'
 import {
   fromNativeQuotaMap,
   type NativeQuotaMap,
+  nativeQuotaCodec,
 } from './native-quota-codec.ts'
+import type {
+  NativeRefreshContext,
+  NativeRefreshObservation,
+} from './native-refresh-coordinator.ts'
 import {
   isNativeLocalPoolBinding,
   type NativeLocalPoolBinding,
+  nativeLocalPoolBindingMatches,
 } from './pool-binding.ts'
+import type { NativePoolPaths } from './pool-paths.ts'
+import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 
 /** Identifies the vault credential and Claude account that supplied an observation. This binding contains no access token. */
 export interface NativeCustodyRuntimeBinding {
@@ -526,10 +536,30 @@ export function isNativeRuntimeStagingName(
   )
 }
 
+interface FirstIdentityPublication {
+  readonly predecessor: NativeLocalPoolBinding
+  readonly context: NativeRefreshContext
+  readonly proof: NativeLocalCredentialValidation
+}
+
+function sameLocalBinding(
+  a: NativeLocalPoolBinding,
+  b: NativeLocalPoolBinding,
+) {
+  return (
+    a.storageId === b.storageId &&
+    a.rowId === b.rowId &&
+    a.credentialEpoch === b.credentialEpoch &&
+    a.identity === b.identity
+  )
+}
+
 function assertTransitions(
   previous: NativeRuntimeState,
   next: NativeRuntimeState,
+  firstIdentity?: FirstIdentityPublication,
 ): void {
+  let authorized = false
   for (const [id, incoming] of Object.entries(next.accounts)) {
     const old = previous.accounts[id]
     if (!old) continue
@@ -539,8 +569,20 @@ function assertTransitions(
         throw new NativeRuntimeError('runtime-conflict')
       if (incoming.binding.credentialEpoch > old.binding.credentialEpoch)
         continue
-      if (old.binding.identity !== incoming.binding.identity)
-        throw new NativeRuntimeError('runtime-conflict')
+      if (old.binding.identity !== incoming.binding.identity) {
+        if (
+          !firstIdentity ||
+          authorized ||
+          id !== firstIdentity.predecessor.rowId ||
+          old.binding.identity !== undefined ||
+          !sameLocalBinding(old.binding, firstIdentity.predecessor) ||
+          !sameLocalBinding(incoming.binding, firstIdentity.proof.binding)
+        )
+          throw new NativeRuntimeError('runtime-conflict')
+        authorized = true
+        // Adding the first account UUID still runs the checks below that preserve
+        // error-reset timestamps and reject errors older than a concurrent reset.
+      }
     } else if (
       old.binding.kind === 'custody' &&
       incoming.binding.kind === 'custody'
@@ -596,6 +638,8 @@ function assertTransitions(
         throw new NativeRuntimeError('runtime-conflict')
     }
   }
+  if (firstIdentity && !authorized)
+    throw new NativeRuntimeError('publication-refused')
 }
 
 /**
@@ -611,6 +655,21 @@ export async function updateNativeRuntime(
     current: NativeRuntimeState,
   ) => NativeRuntimeState | Promise<NativeRuntimeState>,
   hooks: NativeRuntimeWriteHooks = {},
+): Promise<NativeRuntimeState> {
+  return writeNativeRuntime(path, storageId, change, hooks)
+}
+
+// Both publication paths use the same lock, strict decoder and atomic replacement.
+// Only the dedicated publisher supplies checked pool/runtime evidence authorizing
+// the first account UUID change; a generic write has no such authorization.
+async function writeNativeRuntime(
+  path: string,
+  storageId: string,
+  change: (
+    current: NativeRuntimeState,
+  ) => NativeRuntimeState | Promise<NativeRuntimeState>,
+  hooks: NativeRuntimeWriteHooks,
+  firstIdentity?: FirstIdentityPublication,
 ): Promise<NativeRuntimeState> {
   checkPath(path)
   try {
@@ -628,7 +687,7 @@ export async function updateNativeRuntime(
           await change(structuredClone(current)),
           storageId,
         )
-        assertTransitions(current, next)
+        assertTransitions(current, next, firstIdentity)
         const bytes = `${JSON.stringify(next, null, 2)}\n`
         const stage = join(
           dirname(path),
@@ -666,5 +725,218 @@ export async function updateNativeRuntime(
   } catch (error) {
     if (error instanceof NativeRuntimeError) throw error
     throw new NativeRuntimeError('runtime-io')
+  }
+}
+
+function dispatchVersion(value: unknown): value is Record<string, unknown> {
+  return (
+    record(value) &&
+    keys(value, [], ['accessFingerprint', 'expires', 'lastRefreshedAt']) &&
+    optional(
+      value,
+      'accessFingerprint',
+      (item) => item === undefined || tokenFingerprintValue(item),
+    ) &&
+    optional(value, 'expires', (item) => item === undefined || counter(item)) &&
+    optional(value, 'lastRefreshedAt', counter)
+  )
+}
+
+function sameVersion(a: Record<string, unknown>, b: Record<string, unknown>) {
+  return ['accessFingerprint', 'expires', 'lastRefreshedAt'].every(
+    (key) =>
+      Object.hasOwn(a, key) === Object.hasOwn(b, key) && a[key] === b[key],
+  )
+}
+
+function captureFirstIdentity(
+  paths: NativePoolPaths,
+  observation: NativeRefreshObservation,
+): FirstIdentityPublication {
+  const refuse = () => new NativeRuntimeError('publication-refused')
+  // Copy before the first lock wait. Never fill missing evidence from a later row.
+  const event = structuredClone(observation)
+  const context = event.context
+  if (
+    !['persisted', 'validation-observed'].includes(event.status) ||
+    event.bootstrap !== 'resolved' ||
+    !('identity' in event) ||
+    !accountUuid(event.identity) ||
+    !isNativeLocalPoolBinding(event.binding) ||
+    event.binding.storageId !== paths.storageId ||
+    (event.binding.identity !== undefined &&
+      event.binding.identity !== event.identity) ||
+    !digest(event.credentialFingerprint) ||
+    !dispatchVersion(event.credentialVersion) ||
+    !context ||
+    !record(context.subject) ||
+    !isNativeLocalPoolBinding(context.subject.binding) ||
+    !sameLocalBinding(context.subject.binding, event.binding) ||
+    context.subject.credentialFingerprint !== event.credentialFingerprint ||
+    !dispatchVersion(context.subject.version) ||
+    !sameVersion(context.subject.version, event.credentialVersion) ||
+    !isNativeLocalPoolBinding(context.runtimeBinding) ||
+    context.runtimeBinding.identity !== undefined ||
+    !sameLocalBinding(context.runtimeBinding, {
+      ...event.binding,
+      identity: undefined,
+    }) ||
+    ![
+      context.refreshErrorClearedAt,
+      context.quotaErrorClearedAt,
+      context.quotaErrorGeneration,
+    ].every((value) => value === null || counter(value))
+  )
+    throw refuse()
+  const destination = { ...context.runtimeBinding, identity: event.identity }
+  let proof: unknown
+  if (event.status === 'persisted') {
+    proof = {
+      binding: destination,
+      credentialFingerprint: event.successorFingerprint,
+      version: event.successorVersion,
+    }
+    if (
+      !isNativeLocalCredentialValidation(proof) ||
+      !record(event.committed) ||
+      !keys(event.committed, ['credentialFingerprint', 'version']) ||
+      event.committed.credentialFingerprint !== proof.credentialFingerprint ||
+      !dispatchVersion(event.committed.version) ||
+      !sameVersion(event.committed.version, { ...proof.version })
+    )
+      throw refuse()
+  } else if (event.status === 'validation-observed') {
+    if (event.binding.identity !== event.identity) throw refuse()
+    proof = {
+      binding: destination,
+      credentialFingerprint: event.credentialFingerprint,
+      version: event.credentialVersion,
+    }
+  }
+  if (!isNativeLocalCredentialValidation(proof)) throw refuse()
+  return { predecessor: context.runtimeBinding, context, proof }
+}
+
+function firstIdentityEntry(
+  old: NativeRuntimeEntry | undefined,
+  publication: FirstIdentityPublication,
+): NativeRuntimeEntry {
+  const { predecessor, context, proof } = publication
+  if (
+    !old ||
+    old.binding.kind !== 'local' ||
+    !sameLocalBinding(old.binding, predecessor) ||
+    (old.refreshErrorClearedAt ?? null) !== context.refreshErrorClearedAt ||
+    (old.quotaErrorClearedAt ?? null) !== context.quotaErrorClearedAt ||
+    (old.quotaErrorGeneration ?? null) !== context.quotaErrorGeneration
+  )
+    throw new NativeRuntimeError('publication-refused')
+  const floor = (
+    marker: number | undefined,
+    error: AccountOperationError | undefined,
+  ) => {
+    const value =
+      marker === undefined
+        ? error?.checkedAt
+        : Math.max(marker, error?.checkedAt ?? marker)
+    // Runtime error times can be fractional, but coordinator reset timestamps
+    // must be nonnegative safe integers. Refuse an unrepresentable reset floor
+    // rather than rounding it into a different error-clear boundary.
+    if (value !== undefined && !counter(value))
+      throw new NativeRuntimeError('publication-refused')
+    return value
+  }
+  const refreshErrorClearedAt = floor(
+    old.refreshErrorClearedAt,
+    old.lastRefreshError,
+  )
+  const quotaErrorClearedAt = floor(
+    old.quotaErrorClearedAt,
+    old.lastQuotaRefreshError,
+  )
+  // The old profile, usage and errors have not been proven to belong to this
+  // account. Retain only evidence for the newly checked credentials and the
+  // reset timestamps/generation that prevent older results from restoring them.
+  return {
+    binding: proof.binding,
+    credentialValidation: proof,
+    ...(refreshErrorClearedAt !== undefined ? { refreshErrorClearedAt } : {}),
+    ...(quotaErrorClearedAt !== undefined ? { quotaErrorClearedAt } : {}),
+    ...(old.quotaErrorGeneration !== undefined
+      ? { quotaErrorGeneration: old.quotaErrorGeneration }
+      : {}),
+  }
+}
+
+/**
+ * Core-internal reconciliation of a successfully checked first local UUID.
+ * Matching a response to an account disabled after dispatch does not give that
+ * account permission to make another model request; admission checks still apply.
+ * No caller mutator or publication callback can widen this transition.
+ */
+export async function publishNativeLocalFirstIdentity(
+  paths: NativePoolPaths,
+  observation: NativeRefreshObservation,
+): Promise<NativeRuntimeState> {
+  try {
+    paths = { ...paths }
+    const publication = captureFirstIdentity(paths, observation)
+    const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+    const [config, state] = nativePoolStoreLocks(paths)
+    const checkPool = async () => {
+      const read = await store.read()
+      const row =
+        read.status === 'ready'
+          ? read.rows.find((row) => row.id === publication.proof.binding.rowId)
+          : undefined
+      if (
+        !row ||
+        !nativeLocalPoolBindingMatches(publication.proof.binding, paths, row) ||
+        !nativeLocalCredentialValidationMatches(
+          publication.proof,
+          publication.proof.binding,
+          row.credential,
+        )
+      )
+        throw new NativeRuntimeError('publication-refused')
+    }
+    return await withLock(
+      config.path,
+      { ...POOL_LOCK_DEFAULTS, name: config.name },
+      async (configLease) =>
+        withLock(
+          state.path,
+          { ...POOL_LOCK_DEFAULTS, name: state.name },
+          async (stateLease) => {
+            await checkPool()
+            return writeNativeRuntime(
+              paths.runtime,
+              paths.storageId,
+              (current) => {
+                const id = publication.predecessor.rowId
+                current.accounts[id] = firstIdentityEntry(
+                  current.accounts[id],
+                  publication,
+                )
+                return current
+              },
+              {
+                beforeRename: async () => {
+                  // Strict reads do not take row locks, repair storage or schedule pulls.
+                  // Keep both pool leases through the writer's runtime assertion/rename.
+                  await checkPool()
+                  await configLease.assertOwned()
+                  await stateLease.assertOwned()
+                },
+              },
+              publication,
+            )
+          },
+        ),
+    )
+  } catch (error) {
+    if (error instanceof NativeRuntimeError) throw error
+    // Pool/lease/parser exceptions can contain paths or input; do not relay them.
+    throw new NativeRuntimeError('publication-refused')
   }
 }

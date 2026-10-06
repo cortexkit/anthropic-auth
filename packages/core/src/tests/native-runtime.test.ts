@@ -13,6 +13,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fingerprintOf } from '@cortexkit/common-auth/store'
 
 import { hashRefreshToken } from '../accounts.ts'
 import { toNativeQuotaMap } from '../native-quota-codec.ts'
@@ -29,6 +30,79 @@ import { createTestLifetimeSuite, TestLifetime } from './test-lifetime.ts'
 const storageId = 'a'.repeat(64)
 const vaultAccountIdentity = '11111111-2222-4333-8444-555555555555'
 const { test, deferCleanup } = createTestLifetimeSuite()
+
+test('generic runtime writer refuses same-epoch identity changes even with exact proof and hooks', async () => {
+  const path = await fixture()
+  const unknown = {
+    kind: 'local' as const,
+    storageId,
+    rowId: 'row',
+    credentialEpoch: 1,
+  }
+  const known = { ...unknown, identity: vaultAccountIdentity }
+  await updateNativeRuntime(path, storageId, () => ({
+    version: 1,
+    storageId,
+    accounts: { row: { binding: unknown } },
+  }))
+  const before = await readFile(path, 'utf8')
+  let hookCalls = 0
+  await expect(
+    updateNativeRuntime(
+      path,
+      storageId,
+      (current) => {
+        current.accounts.row = {
+          binding: known,
+          credentialValidation: {
+            binding: known,
+            credentialFingerprint: fingerprintOf({
+              type: 'oauth',
+              refresh: 'synthetic-refresh',
+            }),
+            version: {
+              accessFingerprint: tokenFingerprint('synthetic-access'),
+              expires: 4_000_000_000_000,
+            },
+          },
+        }
+        return current
+      },
+      {
+        beforeRename: async () => {
+          hookCalls++
+        },
+      },
+    ),
+  ).rejects.toMatchObject({ code: 'runtime-conflict' })
+  expect(hookCalls).toBe(0)
+  expect(await readFile(path, 'utf8')).toBe(before)
+  // Seed an already-known predecessor independently. Without an epoch change,
+  // the writer must refuse to clear its account identity and later substitute
+  // another account, as well as refusing a direct substitution.
+  await writeFile(
+    path,
+    JSON.stringify({
+      version: 1,
+      storageId,
+      accounts: { row: { binding: known } },
+    }),
+    { mode: 0o600 },
+  )
+  const knownBytes = await readFile(path, 'utf8')
+  for (const destination of [
+    unknown,
+    { ...known, identity: 'another-account' },
+  ]) {
+    await expect(
+      updateNativeRuntime(path, storageId, (current) => {
+        current.accounts.row = { binding: destination }
+        return current
+      }),
+    ).rejects.toMatchObject({ code: 'runtime-conflict' })
+    expect(await readFile(path, 'utf8')).toBe(knownBytes)
+  }
+})
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'anthropic-native-runtime-'))
