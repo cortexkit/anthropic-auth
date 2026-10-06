@@ -24,7 +24,7 @@ import {
   updateNativeRuntime,
 } from '../native-runtime.ts'
 import { tokenFingerprint } from '../token-fingerprint.ts'
-import { createTestLifetimeSuite } from './test-lifetime.ts'
+import { createTestLifetimeSuite, TestLifetime } from './test-lifetime.ts'
 
 const storageId = 'a'.repeat(64)
 const vaultAccountIdentity = '11111111-2222-4333-8444-555555555555'
@@ -34,6 +34,16 @@ async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'anthropic-native-runtime-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   return join(root, 'private', 'native-state.json')
+}
+
+async function joinRuntimeUpdates(updates: Promise<NativeRuntimeState>[]) {
+  try {
+    return await Promise.all(updates)
+  } finally {
+    // Promise.all rejects before unfinished siblings settle. Keep the body alive
+    // until they finish using its fixture, without replacing the original error.
+    await Promise.allSettled(updates)
+  }
 }
 
 // The fixture includes both local and vaulted account metadata without OAuth tokens.
@@ -663,20 +673,141 @@ test('runtime malformed UTF-8 cannot silently change a persisted relay secret', 
 test('runtime concurrent updates read under its own lock without lost counters', async () => {
   const path = await fixture()
   await updateNativeRuntime(path, storageId, () => state())
-  await Promise.all(
-    Array.from({ length: 12 }, () =>
-      updateNativeRuntime(path, storageId, (current) => {
-        const local = current.accounts['local-row']
-        if (!local?.prime) throw new Error('fixture prime missing')
-        local.prime.count += 1
-        return current
-      }),
-    ),
+  const updates = Array.from({ length: 12 }, () =>
+    updateNativeRuntime(path, storageId, (current) => {
+      const local = current.accounts['local-row']
+      if (!local?.prime) throw new Error('fixture prime missing')
+      local.prime.count += 1
+      return current
+    }),
   )
+  await joinRuntimeUpdates(updates)
   const read = await readNativeRuntime(path, storageId)
   expect(read.status).toBe('ready')
   if (read.status !== 'ready') throw new Error('runtime missing')
   expect(read.state.accounts['local-row']?.prime?.count).toBe(17)
+})
+
+test('runtime sibling join keeps an active fixture until settlement and preserves the first failure', async () => {
+  const path = await fixture()
+  const root = dirname(dirname(path))
+  // Use separate locks so one runtime update can fail while the other waits
+  // inside the fixture directory that cleanup will remove.
+  const failedPath = join(dirname(path), 'refused-state.json')
+  await updateNativeRuntime(path, storageId, () => state())
+  await updateNativeRuntime(failedPath, storageId, () => state())
+  const before = await readFile(path, 'utf8')
+  const lifetime = new TestLifetime()
+  const resumeSibling = lifetime.gate()
+  const entered = Promise.withResolvers<void>()
+  const firstFailure = Promise.withResolvers<unknown>()
+  const removed = Promise.withResolvers<void>()
+  let siblingSettled = false
+  let cleanupStarted = false
+  let cleanupAfterSibling = false
+  let stageRead = 'pending'
+  let siblingRead = 'pending'
+  lifetime.deferCleanup(async () => {
+    cleanupStarted = true
+    cleanupAfterSibling = siblingSettled
+    try {
+      await rm(root, { recursive: true, force: true })
+    } finally {
+      removed.resolve()
+    }
+  })
+  const sibling = updateNativeRuntime(
+    path,
+    storageId,
+    (current) => ({ ...current, relay: { token: 'synthetic-sibling-relay' } }),
+    {
+      beforeRename: async () => {
+        const names = (await readdir(dirname(path))).filter((name) =>
+          isNativeRuntimeStagingName(path, name),
+        )
+        const name = names[0]
+        if (names.length !== 1 || !name)
+          throw new Error('fixture sibling stage missing')
+        const stage = join(dirname(path), name)
+        entered.resolve()
+        await resumeSibling.wait
+        // After teardown releases the sibling, yield through real file reads. If
+        // the test body has settled, fixture cleanup can start before these finish.
+        try {
+          await readFile(stage)
+          stageRead = 'present'
+        } catch (error) {
+          if (
+            !(
+              error instanceof Error &&
+              'code' in error &&
+              error.code === 'ENOENT'
+            )
+          )
+            throw error
+          stageRead = 'ENOENT'
+        }
+        // If cleanup started before this update settled, wait for fixture deletion
+        // to finish so the following read observes the completed removal.
+        if (cleanupStarted) await removed.promise
+        try {
+          siblingRead = await readFile(path, 'utf8')
+        } catch (error) {
+          if (
+            !(
+              error instanceof Error &&
+              'code' in error &&
+              error.code === 'ENOENT'
+            )
+          )
+            throw error
+          siblingRead = 'ENOENT'
+        }
+      },
+    },
+  ).finally(() => {
+    siblingSettled = true
+    // Unblock the failing update if this sibling stops before reaching its hook.
+    entered.resolve()
+  })
+  const first = updateNativeRuntime(
+    failedPath,
+    storageId,
+    (current) => current,
+    {
+      beforeRename: async () => {
+        await entered.promise
+        throw new Error('synthetic publication refusal')
+      },
+    },
+  ).catch((error: unknown) => {
+    firstFailure.resolve(error)
+    throw error
+  })
+  const updates = [first, sibling]
+  const body = lifetime.runBody(() => joinRuntimeUpdates(updates))
+  const observedBody = body.catch((error: unknown) => error)
+  const originalError = await firstFailure.promise
+  await lifetime.finish()
+  const bodyError = await observedBody
+  const results = await Promise.allSettled(updates)
+  expect(originalError).toMatchObject({
+    code: 'publication-refused',
+    message: 'Anthropic runtime publication was refused',
+  })
+  expect(bodyError).toBe(originalError)
+  expect(results[0]).toMatchObject({
+    status: 'rejected',
+    reason: originalError,
+  })
+  expect(cleanupAfterSibling).toBe(true)
+  expect(stageRead).toBe('present')
+  expect(siblingRead).toBe(before)
+  expect(results[1]).toMatchObject({
+    status: 'fulfilled',
+    value: { relay: { token: 'synthetic-sibling-relay' } },
+  })
+  await expect(stat(root)).rejects.toMatchObject({ code: 'ENOENT' })
 })
 
 test('runtime hook refusal before rename preserves exact old bytes and removes staging', async () => {
