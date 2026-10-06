@@ -18,6 +18,11 @@ import {
 
 import { ClaudeOAuthRefreshError, refreshClaudeOAuthToken } from './auth.ts'
 import { resolveClaudeCodeIdentity } from './claude-code.ts'
+import {
+  type NativeLocalCredentialValidation,
+  type NativeLocalCredentialVersion,
+  nativeLocalCredentialValidationMatches,
+} from './native-credential-validation.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import {
   isNativeLocalPoolBinding,
@@ -54,11 +59,7 @@ export type NativeRefreshRestriction =
   | { status: 'allowed' }
   | {
       status: 'blocked'
-      reason:
-        | 'quota-ineligible'
-        | 'account-disabled'
-        | 'local-mode-unavailable'
-        | 'identity-unproven'
+      reason: 'quota-ineligible' | 'account-disabled' | 'local-mode-unavailable'
     }
   | {
       status: 'blocked'
@@ -79,7 +80,7 @@ export type NativeRefreshHandoff =
   | 'skipped-cancelled'
 
 export interface NativeRefreshFailure {
-  kind: PoolFailureKind | 'caller-hook'
+  kind: PoolFailureKind | 'caller-hook' | 'validation'
   classification: 'transient' | 'invalid-grant' | 'permanent'
   status?: number
   retryAfter?: number
@@ -89,10 +90,57 @@ export interface NativeRefreshFailure {
  * Access can change while the refresh token and credential epoch stay the
  * same. These fields identify the exact stored OAuth version observed.
  */
-export interface NativeRefreshDispatchVersion {
-  readonly accessFingerprint?: string
-  readonly expires?: number
-  readonly lastRefreshedAt?: number
+export type NativeRefreshDispatchVersion = Partial<NativeLocalCredentialVersion>
+
+/**
+ * Identifies a captured pool row by storage, row id, credential epoch and
+ * recorded account UUID, together with its full refresh-token fingerprint and
+ * access fingerprint, expiry and optional refresh timestamp. Neither token is
+ * included; access fingerprint and expiry may be absent before recovery.
+ */
+export interface NativeRefreshSubject {
+  readonly binding: NativeLocalPoolBinding
+  readonly credentialFingerprint: string
+  readonly version: NativeRefreshDispatchVersion
+}
+
+export type NativeKnownCredentialSubject = NativeLocalCredentialValidation
+
+/**
+ * Records the runtime binding and error-reset timestamps/generation observed
+ * for the captured pool row. Null means no binding or no reset value was
+ * present; a recorded timestamp or generation of zero must remain distinct.
+ */
+export interface NativeRefreshContext {
+  readonly subject: NativeRefreshSubject
+  readonly runtimeBinding: NativeLocalPoolBinding | null
+  readonly refreshErrorClearedAt: number | null
+  readonly quotaErrorClearedAt: number | null
+  readonly quotaErrorGeneration: number | null
+}
+
+export interface NativeRefreshPolicy {
+  readonly restriction: NativeRefreshRestriction
+  readonly context: NativeRefreshContext
+}
+
+export type NativeServingAdmission =
+  | { status: 'proven'; validation: NativeLocalCredentialValidation }
+  | { status: 'unproven' }
+  | {
+      status: 'blocked'
+      reason:
+        | 'quota-ineligible'
+        | 'account-disabled'
+        | 'local-mode-unavailable'
+        | 'refresh-backoff'
+        | 'invalid-grant'
+        | 'validation-backoff'
+    }
+
+export interface NativeCommittedMaterial {
+  readonly credentialFingerprint: string
+  readonly version: NativeRefreshDispatchVersion
 }
 
 interface ObservationBase {
@@ -104,11 +152,23 @@ interface ObservationBase {
   attempt: number
   credentialFingerprint?: string
   credentialVersion?: NativeRefreshDispatchVersion
+  /**
+   * Runtime binding and error-reset values read before the provider exchange or
+   * account lookup. Later serving checks must not replace these values: doing
+   * so could let an older network result overwrite an intervening error reset.
+   */
+  context?: NativeRefreshContext
   bootstrap: NativeIdentityBootstrap
   handoff: NativeRefreshHandoff
 }
 
-/** Token-free observations. In particular bootstrap exceptions are never forwarded. */
+/**
+ * Observations contain no tokens or exceptions from the provider account lookup.
+ * Only a successful account lookup reported by a persisted or
+ * validation-observed event can support new validation evidence. An adopted
+ * event merely records credentials already present on the requesting pool row;
+ * it performs no account lookup. Failed events cannot create validation evidence.
+ */
 export type NativeRefreshObservation = ObservationBase &
   (
     | {
@@ -116,11 +176,17 @@ export type NativeRefreshObservation = ObservationBase &
         identity?: string
         successorFingerprint: string
         successorVersion: NativeRefreshDispatchVersion
+        committed: NativeCommittedMaterial
       }
     | {
         status: 'adopted'
         successorFingerprint: string
         successorVersion: NativeRefreshDispatchVersion
+      }
+    | {
+        status: 'validation-observed'
+        identity: string
+        context: NativeRefreshContext
       }
     | { status: 'refused'; reason: string; consumed: boolean }
     | {
@@ -129,47 +195,59 @@ export type NativeRefreshObservation = ObservationBase &
         returnedIdentity: string
         successorFingerprint: string
         successorVersion: NativeRefreshDispatchVersion
+        committed: NativeCommittedMaterial
       }
     | {
         status: 'failed'
         failure: NativeRefreshFailure
         persisted: boolean
-        committedVersion?: NativeRefreshDispatchVersion
+        committed?: NativeCommittedMaterial
       }
   )
 
 export interface NativeRefreshHooks {
   /**
-   * Read current local-mode, account-disable, quota and refresh-error
-   * restrictions from native state. Apply token-bound errors only to their
-   * matching credential fingerprint. Also report when a previously persisted
-   * successor still lacks account validation. Do not read host credentials or
-   * mutate the store. This callback runs outside shared store locks.
-   * Before exchange, capture the native error-clear markers for that
-   * observation. Do not replace them when later policy reads return newer state.
+   * Read native local-mode, account-disable, quota and refresh-error restrictions
+   * for the captured row. Credential-bound errors apply only to the matching
+   * full refresh-token fingerprint; absent account-validation evidence must not
+   * prevent a refresh exchange. Echo the supplied row binding, refresh-token
+   * fingerprint and access version. Include the observed runtime binding,
+   * refreshErrorClearedAt, quotaErrorClearedAt and quotaErrorGeneration, using
+   * null for absent values. Before each physical exchange the coordinator keeps
+   * a new frozen copy after lock waits, outside pool-config/pool-state locks.
+   * Do not read host credentials or mutate the store.
    */
-  readRestrictions(
-    binding: NativeLocalPoolBinding,
-  ): Promise<NativeRefreshRestriction>
+  readRestrictions(subject: NativeRefreshSubject): Promise<NativeRefreshPolicy>
   /**
-   * Write credential-related refresh errors and validation state only while
-   * holding pool-config, pool-state, then native-runtime locks. Re-read the
-   * selected row and check its account/epoch, refresh fingerprint, and the
-   * error-clear markers captured before the exchange. Check access fingerprint,
-   * expiry and lastRefreshedAt too: credentialVersion identifies the credential
-   * captured before the exchange; successorVersion identifies the pool
-   * credential after a successful exchange or a concurrently completed
-   * rotation; committedVersion identifies a replacement saved before a later
-   * failure. Match the appropriate version before applying an observation. If
-   * that version is unavailable or a clear marker changed, do not update
-   * credential-related state. Newly learned identities apply only to the row
-   * that received them. Clear stale token errors only after confirming the
-   * replacement is saved or adopting a current credential from the pool. A
-   * quarantined or unvalidated credential must not serve. Keep a saved
-   * successor unvalidated if account checks failed. Reconciliation finishes
-   * before refresh returns, outside shared store locks; ordinary row/provider
-   * locks remain held. Do not re-enter row operations or wait for callers
-   * joining this job.
+   * Read serving restrictions and validation evidence for the supplied row
+   * binding, full refresh-token fingerprint and access version, without token
+   * input or state writes. The binding has a recorded account UUID, but that
+   * UUID alone does not establish that the presented credential was validated.
+   * Returned evidence must match the credentials on the captured requesting row.
+   */
+  readAdmission(
+    subject: NativeKnownCredentialSubject,
+  ): Promise<NativeServingAdmission>
+  /**
+   * Acquire pool-config, pool-state, then native-runtime before saving refresh
+   * errors or validation evidence. Re-read the observation's pool row and check
+   * storage, row id, credential epoch, recorded UUID, full refresh-token
+   * fingerprint, access fingerprint, expiry and lastRefreshedAt presence/value.
+   * credentialVersion names the credential captured before network work;
+   * successorVersion names the observed replacement; committed names the
+   * replacement actually saved before a later failure. A failed observation
+   * without committed credentials must not infer a replacement from a newer row.
+   * Compare the runtime binding and error-reset timestamps/generation with
+   * context. Changed reset values mean the older observation cannot overwrite
+   * state cleared while its exchange or lookup was pending. Learned UUIDs belong
+   * only to the row receiving the replacement. Clear obsolete credential-bound
+   * errors only after confirming which replacement is stored. Failed account
+   * lookups leave stored replacements without new validation evidence; observing
+   * an already advanced row or a failed operation cannot create that evidence.
+   * Reconciliation completes before authorize returns. Shared config/state locks
+   * have been released; successful serialized exchanges still hold row/provider
+   * leases, but failed and validation-only observations do not promise them.
+   * Do not start row operations or wait for callers joining the pending job.
    */
   reconcile(observation: NativeRefreshObservation): Promise<void>
 }
@@ -182,6 +260,7 @@ export interface NativeRefreshCoordinatorOptions
 }
 
 export interface NativeRefreshRequest {
+  intent: 'serve' | 'refresh'
   mode: 'local' | 'claustrum'
   binding: NativeLocalPoolBinding
   /** A 401's dispatched access token, used only for replacement adoption. */
@@ -192,14 +271,17 @@ export interface NativeRefreshRequest {
 export type NativeRefreshResult =
   | {
       status: 'usable'
-      source: 'rotated' | 'adopted'
+      source: 'current' | 'validated' | 'rotated' | 'adopted'
       binding: NativeLocalPoolBinding
       /**
-       * Read from the requesting row after the job completes. An alias must
-       * not receive the credential refreshed for a different row.
+       * Token from the row addressed by request.binding.rowId whose validation
+       * evidence was checked. A caller for another row with the same account UUID
+       * may share recovery work, but must not receive the job owner's row token.
        */
       access: string
       expires: number
+      subject: NativeKnownCredentialSubject
+      validation: NativeLocalCredentialValidation
     }
   | { status: 'refused'; reason: string; persisted: boolean }
   | {
@@ -210,7 +292,7 @@ export type NativeRefreshResult =
     }
   | {
       status: 'failed'
-      error: Error
+      failure: NativeRefreshFailure
       persisted: boolean
       reconciliationFailed: boolean
     }
@@ -218,9 +300,8 @@ export type NativeRefreshResult =
 type JobResult =
   | {
       status: 'completed'
-      source: 'rotated' | 'adopted'
+      source: 'current' | 'validated' | 'rotated' | 'adopted'
       identity?: string
-      proven: boolean
       persisted: boolean
     }
   | Exclude<NativeRefreshResult, { status: 'usable' }>
@@ -242,7 +323,7 @@ function unregister(job: Job, key: string) {
 function failureOf(error: Error): NativeRefreshFailure {
   const cause = error instanceof PoolOperationError ? error.cause : error
   const kind = error instanceof PoolOperationError ? error.kind : 'caller-hook'
-  if (cause instanceof ClaudeOAuthRefreshError) {
+  if (kind === 'provider' && cause instanceof ClaudeOAuthRefreshError) {
     const invalidGrant = /\binvalid_grant\b/.test(cause.body)
     return {
       kind,
@@ -282,7 +363,9 @@ function dispatchVersion(
       ? tokenFingerprint(credential.access)
       : undefined,
     expires: credential.expires,
-    lastRefreshedAt: credential.lastRefreshedAt,
+    ...(Object.hasOwn(credential, 'lastRefreshedAt')
+      ? { lastRefreshedAt: credential.lastRefreshedAt }
+      : {}),
   })
 }
 
@@ -315,12 +398,99 @@ function sameDispatch(left: PoolRow, right: PoolRow): boolean {
     b?.type === 'oauth' &&
     a.access === b.access &&
     a.refresh === b.refresh &&
-    a.expires === b.expires
+    a.expires === b.expires &&
+    Object.hasOwn(a, 'lastRefreshedAt') ===
+      Object.hasOwn(b, 'lastRefreshedAt') &&
+    a.lastRefreshedAt === b.lastRefreshedAt
   )
 }
 
 function exhaustive(outcome: never): never {
   throw new Error(`Unsupported refresh outcome: ${String(outcome)}`)
+}
+
+function sameBinding(a: NativeLocalPoolBinding, b: NativeLocalPoolBinding) {
+  return (
+    isNativeLocalPoolBinding(a) &&
+    isNativeLocalPoolBinding(b) &&
+    a.storageId === b.storageId &&
+    a.rowId === b.rowId &&
+    a.credentialEpoch === b.credentialEpoch &&
+    a.identity === b.identity
+  )
+}
+
+function sameSubject(a: NativeRefreshSubject, b: NativeRefreshSubject) {
+  return (
+    sameBinding(a.binding, b.binding) &&
+    a.credentialFingerprint === b.credentialFingerprint &&
+    a.version.accessFingerprint === b.version.accessFingerprint &&
+    a.version.expires === b.version.expires &&
+    Object.hasOwn(a.version, 'lastRefreshedAt') ===
+      Object.hasOwn(b.version, 'lastRefreshedAt') &&
+    a.version.lastRefreshedAt === b.version.lastRefreshedAt
+  )
+}
+
+function copySubject<T extends NativeRefreshSubject>(subject: T): T {
+  return Object.freeze({
+    ...subject,
+    binding: Object.freeze({ ...subject.binding }),
+    version: Object.freeze({ ...subject.version }),
+  })
+}
+
+function subjectOf(
+  binding: NativeLocalPoolBinding,
+  row: PoolRow,
+): NativeRefreshSubject {
+  if (row.credential?.type !== 'oauth' || !row.fingerprint)
+    throw new LocalRefreshRefusal('access-unavailable')
+  return copySubject({
+    binding,
+    credentialFingerprint: row.fingerprint,
+    version: dispatchVersion(row.credential),
+  })
+}
+
+function committedOf(credential: StoredCredential): NativeCommittedMaterial {
+  return Object.freeze({
+    credentialFingerprint: fingerprintOf(credential),
+    version: dispatchVersion(credential),
+  })
+}
+
+function freezeContext(
+  context: NativeRefreshContext,
+  subject: NativeRefreshSubject,
+): NativeRefreshContext {
+  if (
+    !sameSubject(context.subject, subject) ||
+    (context.runtimeBinding !== null &&
+      !isNativeLocalPoolBinding(context.runtimeBinding)) ||
+    ![
+      context.refreshErrorClearedAt,
+      context.quotaErrorClearedAt,
+      context.quotaErrorGeneration,
+    ].every(
+      (value) =>
+        value === null || (Number.isSafeInteger(value) && Number(value) >= 0),
+    )
+  )
+    throw new Error('Native policy context does not match the captured subject')
+  // Copy only the supplied row/credential identifiers, observed runtime binding
+  // and error-reset values. The hook cannot attach tokens to the observation or
+  // change its captured reset values by later mutating its returned object.
+  return Object.freeze({
+    subject: copySubject(subject),
+    runtimeBinding:
+      context.runtimeBinding === null
+        ? null
+        : Object.freeze({ ...context.runtimeBinding }),
+    refreshErrorClearedAt: context.refreshErrorClearedAt,
+    quotaErrorClearedAt: context.quotaErrorClearedAt,
+    quotaErrorGeneration: context.quotaErrorGeneration,
+  })
 }
 
 /** Independent local machinery: construction performs no network or migration. */
@@ -337,6 +507,92 @@ export function createNativeRefreshCoordinator(
     return read.status === 'ready'
       ? read.rows.find((row) => row.id === binding.rowId)
       : undefined
+  }
+
+  async function readPolicy(
+    subject: NativeRefreshSubject,
+  ): Promise<NativeRefreshPolicy> {
+    let policy: NativeRefreshPolicy
+    try {
+      policy = await options.readRestrictions(subject)
+    } catch (cause) {
+      throw new Error('Native policy callback failed', { cause })
+    }
+    return Object.freeze({
+      restriction: Object.freeze({ ...policy.restriction }),
+      context: freezeContext(policy.context, subject),
+    })
+  }
+
+  async function admit(
+    request: NativeRefreshRequest,
+    expected: NativeLocalPoolBinding,
+    row: PoolRow | undefined,
+    source: Extract<NativeRefreshResult, { status: 'usable' }>['source'],
+    persisted: boolean,
+  ): Promise<NativeRefreshResult> {
+    const refuse = (reason: string): NativeRefreshResult => ({
+      status: 'refused',
+      reason,
+      persisted,
+    })
+    if (
+      !row ||
+      !nativeLocalPoolBindingMatches(expected, options.paths, row) ||
+      !row.enabled ||
+      !row.candidate
+    )
+      return refuse('row-ineligible')
+    if (expected.identity === undefined) return refuse('identity-unproven')
+    const credential = row.credential
+    if (
+      credential?.type !== 'oauth' ||
+      !credential.access ||
+      typeof credential.expires !== 'number' ||
+      credential.expires <= now()
+    )
+      return refuse('access-unavailable')
+    if (credential.access === request.rejectedAccessToken)
+      return refuse('rejected-access-unchanged')
+    const subject: NativeKnownCredentialSubject = copySubject({
+      binding: { ...expected, identity: expected.identity },
+      credentialFingerprint: fingerprintOf(credential),
+      version: {
+        ...dispatchVersion(credential),
+        accessFingerprint: tokenFingerprint(credential.access),
+        expires: credential.expires,
+      },
+    })
+    let admission: NativeServingAdmission
+    try {
+      admission = await options.readAdmission(subject)
+    } catch (cause) {
+      throw new Error('Native admission callback failed', { cause })
+    }
+    if (admission.status === 'blocked') return refuse(admission.reason)
+    if (admission.status !== 'proven') return refuse('proof-missing')
+    if (
+      !nativeLocalCredentialValidationMatches(
+        admission.validation,
+        expected,
+        credential,
+      )
+    )
+      return refuse('proof-mismatch')
+    if (request.signal?.aborted) return refuse('cancelled')
+    if (credential.expires <= now()) return refuse('access-unavailable')
+    // Return the token from the same requesting row whose binding, refresh-token
+    // fingerprint and access version just matched the validation evidence. Do
+    // not substitute a newer row after awaiting the admission hook.
+    return Object.freeze({
+      status: 'usable',
+      source,
+      binding: subject.binding,
+      access: credential.access,
+      expires: credential.expires,
+      subject,
+      validation: copySubject(admission.validation),
+    })
   }
 
   async function handoffLock(identity: string): Promise<RefreshFileLock> {
@@ -404,16 +660,13 @@ export function createNativeRefreshCoordinator(
     let handoff: NativeRefreshHandoff = 'not-needed'
     let fingerprint: string | undefined
     let credentialVersion: NativeRefreshDispatchVersion | undefined
-    let committedVersion: NativeRefreshDispatchVersion | undefined
+    let committed: NativeCommittedMaterial | undefined
+    let context: NativeRefreshContext | undefined
     let held: RefreshFileLock | undefined
     let releasing: Promise<void> | undefined
     let removeAbortListener: (() => void) | undefined
     let aliasKey: string | undefined
     let reconciliationFailed = false
-
-    function identityProven() {
-      return bootstrapStatus === 'resolved'
-    }
 
     function observation(): ObservationBase {
       return {
@@ -421,6 +674,7 @@ export function createNativeRefreshCoordinator(
         attempt,
         credentialFingerprint: fingerprint,
         credentialVersion,
+        context,
         bootstrap: bootstrapStatus,
         handoff,
       }
@@ -431,7 +685,9 @@ export function createNativeRefreshCoordinator(
         await options.reconcile(event)
       } catch (error) {
         reconciliationFailed = true
-        throw error
+        throw new Error('Native reconciliation callback failed', {
+          cause: error,
+        })
       }
     }
 
@@ -469,11 +725,19 @@ export function createNativeRefreshCoordinator(
 
     try {
       for (attempt = 1; attempt <= 3; attempt++) {
+        // Clear the previous attempt's UUID, refresh lineage, access version and
+        // runtime context before awaiting another row read. If the next policy
+        // read fails, its failed observation must not reuse earlier reset values.
         consumed = false
         let endpointCalled = false
+        identity = undefined
+        fingerprint = undefined
+        credentialVersion = undefined
+        committed = undefined
+        context = undefined
+        aliasKey = undefined
         bootstrapStatus = 'unavailable'
         handoff = 'not-needed'
-        const restriction = await options.readRestrictions(binding)
         let captured: PoolRow | undefined
         const seen = await rowFor(binding)
         fingerprint = seen?.fingerprint
@@ -481,6 +745,7 @@ export function createNativeRefreshCoordinator(
           seen?.credential?.type === 'oauth'
             ? dispatchVersion(seen.credential)
             : undefined
+        let policy: NativeRefreshPolicy | undefined
         const initialReason =
           !seen || !nativeLocalPoolBindingMatches(binding, options.paths, seen)
             ? 'binding-changed'
@@ -488,7 +753,7 @@ export function createNativeRefreshCoordinator(
               ? 'cancelled'
               : !seen.candidate || !seen.enabled
                 ? 'row-ineligible'
-                : restrictionReason(restriction, seen.fingerprint)
+                : undefined
         if (initialReason) {
           await reconcile({
             ...observation(),
@@ -498,25 +763,130 @@ export function createNativeRefreshCoordinator(
           })
           return { status: 'refused', reason: initialReason, persisted: false }
         }
+        if (!seen) throw new Error('Captured row unavailable')
+        policy = await readPolicy(subjectOf(binding, seen))
+        const policyReason = restrictionReason(
+          policy.restriction,
+          seen.fingerprint,
+        )
+        if (policyReason) {
+          await reconcile({
+            ...observation(),
+            status: 'refused',
+            reason: policyReason,
+            consumed: false,
+          })
+          return { status: 'refused', reason: policyReason, persisted: false }
+        }
         if (
           binding.identity !== undefined &&
-          request.rejectedAccessToken !== undefined &&
+          (request.intent === 'serve' ||
+            request.rejectedAccessToken !== undefined) &&
           seen?.credential?.type === 'oauth' &&
           seen.credential.access &&
           seen.credential.access !== request.rejectedAccessToken &&
           (seen.credential.expires ?? 0) > now()
         ) {
-          await reconcile({
-            ...observation(),
-            status: 'adopted',
-            successorFingerprint: fingerprintOf(seen.credential),
-            successorVersion: dispatchVersion(seen.credential),
-          })
+          const admission = await admit(
+            request,
+            binding,
+            seen,
+            'adopted',
+            false,
+          )
+          if (admission.status === 'usable') {
+            // The adopted observation records credentials already present on the
+            // requesting pool row. No account lookup was performed, so observing
+            // that row cannot produce new validation evidence.
+            await reconcile({
+              ...observation(),
+              status: 'adopted',
+              successorFingerprint: fingerprintOf(seen.credential),
+              successorVersion: dispatchVersion(seen.credential),
+            })
+          } else if (
+            admission.status === 'refused' &&
+            admission.reason === 'proof-missing'
+          ) {
+            // Check the captured access token against the UUID already recorded
+            // on its pool row, outside store/publication locks and without
+            // rewriting identity. Saving evidence must still match that row's
+            // binding, refresh lineage, access fingerprint, expiry and timestamp.
+            context = policy.context
+            let validatedIdentity: string | undefined
+            let validationFailure: NativeRefreshFailure | undefined
+            try {
+              validatedIdentity = (
+                await bootstrap(seen.credential.access, undefined, undefined)
+              ).accountUuid
+              bootstrapStatus = validatedIdentity ? 'resolved' : 'unavailable'
+              if (!validatedIdentity)
+                validationFailure = {
+                  kind: 'validation',
+                  classification: 'transient',
+                }
+            } catch (caught) {
+              bootstrapStatus = 'failed'
+              validationFailure = {
+                kind: 'validation',
+                classification:
+                  isTransientNetworkError(caught) ||
+                  (caught instanceof ClaudeOAuthRefreshError &&
+                    (caught.status === 429 || caught.status >= 500))
+                    ? 'transient'
+                    : 'permanent',
+              }
+            }
+            if (validationFailure) {
+              Object.freeze(validationFailure)
+              try {
+                await reconcile({
+                  ...observation(),
+                  status: 'failed',
+                  failure: validationFailure,
+                  persisted: false,
+                })
+              } catch {
+                // Failure to save the account-lookup result must preserve the
+                // lookup's failure classification, not report a refresh-endpoint
+                // authentication failure instead.
+              }
+              return {
+                status: 'failed',
+                failure: validationFailure,
+                persisted: false,
+                reconciliationFailed,
+              }
+            }
+            if (validatedIdentity !== binding.identity) {
+              await reconcile({
+                ...observation(),
+                status: 'refused',
+                reason: 'validation-contradicted',
+                consumed: false,
+              })
+              return {
+                status: 'refused',
+                reason: 'validation-contradicted',
+                persisted: false,
+              }
+            }
+            await reconcile({
+              ...observation(),
+              status: 'validation-observed',
+              identity: binding.identity,
+              context,
+            })
+          } else return admission
           return {
             status: 'completed',
-            source: 'adopted',
+            source:
+              admission.status === 'usable'
+                ? request.rejectedAccessToken
+                  ? 'adopted'
+                  : 'current'
+                : 'validated',
             identity: binding.identity,
-            proven: true,
             persisted: false,
           }
         }
@@ -529,10 +899,11 @@ export function createNativeRefreshCoordinator(
               fingerprint = row.fingerprint
               credentialVersion = dispatchVersion(credential)
               // This read is outside pool locks. Recheck policy after file-lock waits.
-              const currentRestriction = await options.readRestrictions(binding)
+              policy = await readPolicy(subjectOf(binding, row))
+              context = policy.context
               const reason = request.signal?.aborted
                 ? 'cancelled'
-                : restrictionReason(currentRestriction, fingerprint)
+                : restrictionReason(policy.restriction, fingerprint)
               if (reason) throw new LocalRefreshRefusal(reason)
               endpointCalled = true
               const successor = await provider({
@@ -544,9 +915,18 @@ export function createNativeRefreshCoordinator(
               // reject the callback: the refresh token has already been consumed.
               consumed = true
               try {
-                identity = (
+                const returnedIdentity = (
                   await bootstrap(successor.access, undefined, undefined)
                 ).accountUuid
+                // An empty or whitespace-padded account UUID cannot identify a
+                // shared account job. Treat the lookup as unavailable and still
+                // save the replacement: the provider consumed the refresh token.
+                identity =
+                  typeof returnedIdentity === 'string' &&
+                  returnedIdentity.length > 0 &&
+                  returnedIdentity.trim() === returnedIdentity
+                    ? returnedIdentity
+                    : undefined
                 bootstrapStatus = identity ? 'resolved' : 'unavailable'
               } catch {
                 bootstrapStatus = 'failed'
@@ -630,11 +1010,13 @@ export function createNativeRefreshCoordinator(
                 if (consumed) return undefined
                 if (request.signal?.aborted) return 'cancelled'
                 if (!row.candidate || !row.enabled) return 'row-ineligible'
-                return restrictionReason(restriction, row.fingerprint)
+                return policy
+                  ? restrictionReason(policy.restriction, row.fingerprint)
+                  : undefined
               },
               onPersisted: async (_id, credential) => {
                 persisted = true
-                committedVersion = dispatchVersion(credential)
+                committed = committedOf(credential)
                 try {
                   if (held) {
                     try {
@@ -647,8 +1029,9 @@ export function createNativeRefreshCoordinator(
                     ...observation(),
                     status: 'persisted',
                     identity,
-                    successorFingerprint: fingerprintOf(credential),
-                    successorVersion: committedVersion,
+                    successorFingerprint: committed.credentialFingerprint,
+                    successorVersion: committed.version,
+                    committed,
                   })
                 } finally {
                   await releaseHandoff()
@@ -662,7 +1045,6 @@ export function createNativeRefreshCoordinator(
                 status: 'completed',
                 source: 'rotated',
                 identity: outcome.identity,
-                proven: identityProven(),
                 persisted: true,
               }
             case 'refused':
@@ -679,14 +1061,15 @@ export function createNativeRefreshCoordinator(
               }
             case 'identity-contradicted':
               persisted = true
-              committedVersion = dispatchVersion(outcome.credential)
+              committed = committedOf(outcome.credential)
               await reconcile({
                 ...observation(),
                 status: 'identity-contradicted',
                 expectedIdentity: outcome.expectedIdentity,
                 returnedIdentity: outcome.returnedIdentity,
-                successorFingerprint: fingerprintOf(outcome.credential),
-                successorVersion: committedVersion,
+                successorFingerprint: committed.credentialFingerprint,
+                successorVersion: committed.version,
+                committed,
               })
               return {
                 status: 'identity-contradicted',
@@ -707,7 +1090,7 @@ export function createNativeRefreshCoordinator(
             error instanceof PoolOperationError &&
             error.committed?.type === 'oauth'
           )
-            committedVersion = dispatchVersion(error.committed)
+            committed = committedOf(error.committed)
           if (
             !endpointCalled &&
             error instanceof PoolOperationError &&
@@ -730,6 +1113,7 @@ export function createNativeRefreshCoordinator(
             failure.kind = 'caller-hook'
             failure.classification = 'permanent'
           }
+          Object.freeze(failure)
           // Pass the failure observation to reconciliation only after the
           // store operation has released its locks.
           try {
@@ -738,7 +1122,7 @@ export function createNativeRefreshCoordinator(
               status: 'failed',
               failure,
               persisted,
-              committedVersion,
+              committed,
             })
           } catch {
             /* If reconciliation fails, preserve the original error classification
@@ -759,7 +1143,7 @@ export function createNativeRefreshCoordinator(
             if (aliasKey) unregister(job, aliasKey)
             continue
           }
-          return { status: 'failed', error, persisted, reconciliationFailed }
+          return { status: 'failed', failure, persisted, reconciliationFailed }
         } finally {
           await releaseHandoff()
         }
@@ -767,28 +1151,43 @@ export function createNativeRefreshCoordinator(
       throw new Error('Unreachable refresh attempt budget')
     } catch (caught) {
       const error = asError(caught)
+      persisted ||=
+        error instanceof PoolOperationError &&
+        (error.committed !== undefined || error.phase === 'after-first-write')
+      if (
+        error instanceof PoolOperationError &&
+        error.committed?.type === 'oauth'
+      )
+        committed = committedOf(error.committed)
       try {
         await reconcile({
           ...observation(),
           status: 'failed',
           failure: failureOf(error),
           persisted,
-          committedVersion,
+          committed,
         })
       } catch {
         /* If observation publication fails, do not return any credential as usable. */
       }
-      return { status: 'failed', error, persisted, reconciliationFailed }
+      return {
+        status: 'failed',
+        failure: failureOf(error),
+        persisted,
+        reconciliationFailed,
+      }
     } finally {
       await releaseHandoff()
     }
   }
 
-  async function refresh(
+  async function authorize(
     request: NativeRefreshRequest,
   ): Promise<NativeRefreshResult> {
     if (request.mode !== 'local')
       return { status: 'refused', reason: 'custody-mode', persisted: false }
+    if (request.intent !== 'serve' && request.intent !== 'refresh')
+      return { status: 'refused', reason: 'invalid-intent', persisted: false }
     if (
       !isNativeLocalPoolBinding(request.binding) ||
       request.binding.storageId !== options.paths.storageId
@@ -801,6 +1200,38 @@ export function createNativeRefreshCoordinator(
       return { status: 'refused', reason: 'cancelled', persisted: false }
     const key = nativeLocalRefreshJobKey(request.binding)
     let job = jobs.get(key)
+    if (!job && request.intent === 'serve') {
+      try {
+        const current = await admit(
+          request,
+          request.binding,
+          await rowFor(request.binding),
+          'current',
+          false,
+        )
+        if (
+          current.status !== 'refused' ||
+          ![
+            'proof-missing',
+            'identity-unproven',
+            'access-unavailable',
+            'rejected-access-unchanged',
+          ].includes(current.reason)
+        )
+          return current
+      } catch (caught) {
+        return {
+          status: 'failed',
+          failure: failureOf(asError(caught)),
+          persisted: false,
+          reconciliationFailed: false,
+        }
+      }
+      // While the admission hook was awaited, another caller may have started
+      // recovery for the same storage, credential epoch and account UUID (or
+      // unknown-identity row). Check for that job before starting duplicate work.
+      job = jobs.get(key)
+    }
     if (!job) {
       job = {
         keys: new Set([key]),
@@ -824,12 +1255,6 @@ export function createNativeRefreshCoordinator(
         persisted: result.persisted,
       }
     if (result.status !== 'completed') return result
-    if (!result.proven)
-      return {
-        status: 'refused',
-        reason: 'identity-unproven',
-        persisted: result.persisted,
-      }
     try {
       const expected =
         request.binding.identity === undefined && result.source === 'rotated'
@@ -838,56 +1263,23 @@ export function createNativeRefreshCoordinator(
               ...(result.identity ? { identity: result.identity } : {}),
             }
           : request.binding
-      const restriction = await options.readRestrictions(expected)
       const row = await rowFor(request.binding)
-      if (
-        !row ||
-        !nativeLocalPoolBindingMatches(expected, options.paths, row) ||
-        !row.enabled ||
-        !row.candidate
+      return await admit(
+        request,
+        expected,
+        row,
+        result.source,
+        result.persisted,
       )
-        return {
-          status: 'refused',
-          reason: 'row-ineligible',
-          persisted: result.persisted,
-        }
-      const reason = restrictionReason(restriction, row.fingerprint)
-      if (reason)
-        return { status: 'refused', reason, persisted: result.persisted }
-      const credential = row.credential
-      if (
-        credential?.type !== 'oauth' ||
-        !credential.access ||
-        typeof credential.expires !== 'number' ||
-        credential.expires <= now()
-      )
-        return {
-          status: 'refused',
-          reason: 'access-unavailable',
-          persisted: result.persisted,
-        }
-      if (credential.access === request.rejectedAccessToken)
-        return {
-          status: 'refused',
-          reason: 'rejected-access-unchanged',
-          persisted: result.persisted,
-        }
-      return {
-        status: 'usable',
-        source: result.source,
-        binding: Object.freeze(expected),
-        access: credential.access,
-        expires: credential.expires,
-      }
     } catch (error) {
       return {
         status: 'failed',
-        error: asError(error),
+        failure: failureOf(asError(error)),
         persisted: result.persisted,
         reconciliationFailed: false,
       }
     }
   }
 
-  return { refresh }
+  return { authorize }
 }

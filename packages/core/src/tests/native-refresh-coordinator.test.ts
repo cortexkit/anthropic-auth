@@ -6,7 +6,14 @@ import {
   expect,
 } from 'bun:test'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { appendFileSync, existsSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs'
 import {
   mkdtemp,
   readFile,
@@ -39,12 +46,20 @@ import type {
   resolveClaudeCodeIdentity,
 } from '../claude-code.ts'
 import {
+  type NativeLocalCredentialValidation,
+  nativeLocalCredentialValidationMatches,
+} from '../native-credential-validation.ts'
+import {
   createNativeRefreshCoordinator,
+  type NativeRefreshContext,
   type NativeRefreshCoordinatorOptions,
   type NativeRefreshDispatchVersion,
   type NativeRefreshObservation,
+  type NativeRefreshPolicy,
+  type NativeRefreshRequest,
   type NativeRefreshRestriction,
   type NativeRefreshResult,
+  type NativeRefreshSubject,
   nativeAccountProviderLock,
 } from '../native-refresh-coordinator.ts'
 import {
@@ -59,30 +74,10 @@ import {
   nativePoolStoreLocks,
 } from '../pool-store.ts'
 import { tokenFingerprint } from '../token-fingerprint.ts'
+import { TestLifetime } from './test-lifetime.ts'
 
 const roots: string[] = []
-class TestLifetime {
-  readonly roots = new Set<string>()
-  readonly gates = new Set<() => void>()
-  readonly calls = new Set<Promise<unknown>>()
-  body?: Promise<void>
-  closing = false
-
-  track<T>(call: Promise<T>): Promise<T> {
-    this.calls.add(call)
-    void call.finally(() => this.calls.delete(call)).catch(() => {})
-    return call
-  }
-
-  async finish() {
-    this.closing = true
-    for (const release of this.gates) release()
-    this.gates.clear()
-    await this.body?.catch(() => {})
-    while (this.calls.size) await Promise.allSettled([...this.calls])
-  }
-}
-
+const scenarioRoots = new WeakMap<TestLifetime, Set<string>>()
 const testLifetime = new AsyncLocalStorage<TestLifetime>()
 let currentLifetime: TestLifetime | undefined
 
@@ -96,18 +91,23 @@ function test(
     () => {
       const scenario = new TestLifetime()
       currentLifetime = scenario
-      const running = testLifetime.run(scenario, async () => {
-        await body()
-      })
-      scenario.body = running
-      return running
+      return testLifetime.run(scenario, () => scenario.runBody(body))
     },
     timeout,
   )
 }
 
 function track<T>(call: Promise<T>): Promise<T> {
-  return testLifetime.getStore()?.track(call) ?? call
+  // A Bun deadline can end while the body or its store operations still run.
+  // Return the original promise so assertions see any rejection, and separately
+  // wait for its settlement before removing the test's pool fixture files.
+  testLifetime.getStore()?.trackDetached(
+    call.then(
+      () => {},
+      () => {},
+    ),
+  )
+  return call
 }
 const quota = {
   validate: (v: unknown) => typeof v === 'number',
@@ -115,14 +115,62 @@ const quota = {
 }
 const allowed: NativeRefreshRestriction = { status: 'allowed' }
 
+function policyFor(
+  subject: NativeRefreshSubject,
+  restriction = allowed,
+): NativeRefreshPolicy {
+  return {
+    restriction,
+    context: {
+      subject,
+      runtimeBinding: subject.binding,
+      refreshErrorClearedAt: null,
+      quotaErrorClearedAt: null,
+      quotaErrorGeneration: null,
+    },
+  }
+}
+
+function proofFor(
+  binding: NativeLocalCredentialValidation['binding'],
+  row: PoolRow,
+): NativeLocalCredentialValidation {
+  const c = row.credential
+  if (c?.type !== 'oauth' || !c.access || !c.expires)
+    throw new Error('Proof requires OAuth material')
+  return {
+    binding,
+    credentialFingerprint: fingerprintOf(c),
+    version: {
+      accessFingerprint: tokenFingerprint(c.access),
+      expires: c.expires,
+      ...(Object.hasOwn(c, 'lastRefreshedAt')
+        ? { lastRefreshedAt: c.lastRefreshedAt }
+        : {}),
+    },
+  }
+}
+
+type FixtureOverrides = Omit<
+  Partial<NativeRefreshCoordinatorOptions>,
+  'readRestrictions'
+> & {
+  readRestrictions?: (
+    subject: NativeRefreshSubject,
+  ) => Promise<NativeRefreshRestriction | NativeRefreshPolicy>
+  publishProof?: boolean
+}
+
 function barrier() {
+  const scenario = testLifetime.getStore()
+  if (scenario) {
+    const gate = scenario.gate()
+    return { promise: gate.wait, release: gate.open }
+  }
   let release!: () => void
   const promise = new Promise<void>((resolve) => {
     release = resolve
   })
-  const scenario = testLifetime.getStore()
-  if (scenario?.closing) release()
-  else scenario?.gates.add(release)
   return { promise, release }
 }
 
@@ -151,8 +199,14 @@ const provider: typeof refreshClaudeOAuthToken = async () => ({
 async function fixture(seams: Partial<NativePoolStoreOptions> = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'native-refresh-')))
   const scenario = testLifetime.getStore()
-  if (scenario) scenario.roots.add(root)
-  else roots.push(root)
+  if (scenario) {
+    let ownedRoots = scenarioRoots.get(scenario)
+    if (!ownedRoots) {
+      ownedRoots = new Set()
+      scenarioRoots.set(scenario, ownedRoots)
+    }
+    ownedRoots.add(root)
+  } else roots.push(root)
   const paths = await resolveNativePoolPaths(
     join(root, 'anthropic-auth.json'),
     join(root, 'anthropic-auth-state.json'),
@@ -183,38 +237,106 @@ async function fixture(seams: Partial<NativePoolStoreOptions> = {}) {
     await store.add({ id, identity: account, credential: credential(id) })
   }
   const observations: NativeRefreshObservation[] = []
-  function coordinator(
-    overrides: Partial<NativeRefreshCoordinatorOptions> = {},
-  ) {
+  const proofs = new Map<string, NativeLocalCredentialValidation>()
+  async function seedProof(id: string) {
+    const b = await binding(id)
+    if (b.identity === undefined)
+      throw new Error('Seeded evidence requires known identity')
+    const proof = proofFor({ ...b, identity: b.identity }, await row(id))
+    proofs.set(id, proof)
+    return proof
+  }
+  function coordinator(overrides: FixtureOverrides = {}) {
     const coordinator = createNativeRefreshCoordinator({
       ...options,
       refreshToken: provider,
       resolveIdentity: identity,
-      readRestrictions: async () => allowed,
-      reconcile: async (event) => {
-        observations.push(event)
-      },
       ...overrides,
+      readRestrictions: async (subject) => {
+        const result = (await overrides.readRestrictions?.(subject)) ?? allowed
+        return 'restriction' in result ? result : policyFor(subject, result)
+      },
+      readAdmission:
+        overrides.readAdmission ??
+        (async (subject) => {
+          const proof = proofs.get(subject.binding.rowId)
+          return proof
+            ? { status: 'proven', validation: proof }
+            : { status: 'unproven' }
+        }),
+      reconcile: async (event) => {
+        if (overrides.reconcile) await overrides.reconcile(event)
+        else observations.push(event)
+        // For newly observed credentials, the fixture saves validation evidence
+        // only after a successful provider account lookup and a matching current
+        // row binding, refresh lineage and access version. A completed job or an
+        // adopted observation cannot create that evidence.
+        if (
+          overrides.publishProof === false ||
+          event.bootstrap !== 'resolved' ||
+          (event.status !== 'persisted' &&
+            event.status !== 'validation-observed') ||
+          !event.identity
+        )
+          return
+        const current = await row(event.binding.rowId)
+        const b = { ...event.binding, identity: event.identity }
+        const material =
+          event.status === 'persisted'
+            ? event.committed
+            : event.context?.subject
+        if (
+          !nativeLocalPoolBindingMatches(b, paths, current) ||
+          !material ||
+          current.fingerprint !== material.credentialFingerprint ||
+          !dispatchMatches(material.version, current)
+        )
+          return
+        proofs.set(
+          current.id,
+          proofFor({ ...b, identity: event.identity }, current),
+        )
+      },
     })
     return {
-      refresh: (request: Parameters<typeof coordinator.refresh>[0]) =>
-        track(coordinator.refresh(request)),
+      // These refresh tests ask for an exchange even when access is unexpired.
+      // The helper supplies refresh intent; the production factory exposes only
+      // authorize, requiring each caller to select serve or refresh explicitly.
+      refresh: (request: Omit<NativeRefreshRequest, 'intent'>) =>
+        track(coordinator.authorize({ ...request, intent: 'refresh' })),
+      authorize: (request: NativeRefreshRequest) =>
+        track(coordinator.authorize(request)),
     }
   }
-  return { root, paths, store, row, binding, add, observations, coordinator }
+  return {
+    root,
+    paths,
+    store,
+    row,
+    binding,
+    add,
+    observations,
+    coordinator,
+    proofs,
+    seedProof,
+  }
 }
 
 afterEach(async () => {
   const scenario = currentLifetime
+  traceTimeoutProbe('afterEach:entered')
   const unscopedRoots = roots.splice(0)
   // Bun reports a timeout without cancelling the test body. Open that body's
   // waiting gates, wait for the body and pending store calls, then delete the
   // test's files.
+  traceTimeoutProbe('lifetime:finish-start')
   await scenario?.finish()
+  traceTimeoutProbe('lifetime:finish-complete')
   await Promise.all(
-    [...unscopedRoots, ...(scenario?.roots ?? [])].map((root) =>
-      rm(root, { recursive: true, force: true }),
-    ),
+    [
+      ...unscopedRoots,
+      ...(scenario ? (scenarioRoots.get(scenario) ?? []) : []),
+    ].map((root) => rm(root, { recursive: true, force: true })),
   )
   if (timeoutProbePool && timeoutProbeLog) {
     appendFileSync(
@@ -239,6 +361,8 @@ function dispatchMatches(
     version.accessFingerprint ===
       (credential.access ? tokenFingerprint(credential.access) : undefined) &&
     version.expires === credential.expires &&
+    Object.hasOwn(version, 'lastRefreshedAt') ===
+      Object.hasOwn(credential, 'lastRefreshedAt') &&
     version.lastRefreshedAt === credential.lastRefreshedAt
   )
 }
@@ -287,8 +411,6 @@ for (const terminal of ['persisted', 'failed'] as const) {
       const release = barrier()
       const finishProvider = barrier()
       const clearMarkers = { refreshErrorClearedAt: 7, quotaErrorClearedAt: 9 }
-      const capturedClearMarkers = { ...clearMarkers }
-      let markersCaptured = false
       let observation: VersionedObservation | undefined
       let freshAccepted = false
       let staleAccepted = false
@@ -303,16 +425,16 @@ for (const terminal of ['persisted', 'failed'] as const) {
       })
       let expectedVersion: NativeRefreshDispatchVersion | undefined
       const c = f.coordinator({
-        readRestrictions: async () => {
+        readRestrictions: async (subject) => {
           const native = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
-          if (!markersCaptured) {
-            capturedClearMarkers.refreshErrorClearedAt =
-              native.refreshErrorClearedAt
-            capturedClearMarkers.quotaErrorClearedAt =
-              native.quotaErrorClearedAt
-            markersCaptured = true
+          return {
+            ...policyFor(subject),
+            context: {
+              ...policyFor(subject).context,
+              refreshErrorClearedAt: native.refreshErrorClearedAt,
+              quotaErrorClearedAt: native.quotaErrorClearedAt,
+            },
           }
-          return allowed
         },
         refreshToken: async () => {
           if (terminal === 'failed') {
@@ -352,9 +474,8 @@ for (const terminal of ['persisted', 'failed'] as const) {
               nativeLocalPoolBindingMatches(binding, f.paths, row) &&
               row.fingerprint === expectedFingerprint &&
               native.refreshErrorClearedAt ===
-                capturedClearMarkers.refreshErrorClearedAt &&
-              native.quotaErrorClearedAt ===
-                capturedClearMarkers.quotaErrorClearedAt
+                event.context?.refreshErrorClearedAt &&
+              native.quotaErrorClearedAt === event.context?.quotaErrorClearedAt
             const version =
               terminal === 'persisted'
                 ? observation?.successorVersion
@@ -416,7 +537,9 @@ for (const terminal of ['persisted', 'failed'] as const) {
       release.release()
       finishProvider.release()
       const result = await job
-      expect(result.status).toBe(terminal === 'persisted' ? 'usable' : 'failed')
+      expect(result.status).toBe(
+        terminal === 'persisted' ? 'refused' : 'failed',
+      )
       expect(oldFieldsAccepted).toBe(true)
       expect(staleAccepted).toBe(false)
       expect(JSON.parse(await readFile(f.paths.runtime, 'utf8'))).toEqual({
@@ -477,6 +600,17 @@ test('captured clear markers fence a failure even when its dispatch version stil
   let freshAccepted = false
   let published = false
   const c = f.coordinator({
+    readRestrictions: async (subject) => {
+      const markers = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
+      return {
+        ...policyFor(subject),
+        context: {
+          ...policyFor(subject).context,
+          refreshErrorClearedAt: markers.refreshErrorClearedAt,
+          quotaErrorClearedAt: markers.quotaErrorClearedAt,
+        },
+      }
+    },
     refreshToken: async () => {
       throw new ClaudeOAuthRefreshError(429, 'busy', '7')
     },
@@ -487,7 +621,7 @@ test('captured clear markers fence a failure even when its dispatch version stil
       const currentMarkers = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
       freshAccepted =
         dispatchMatches(event.credentialVersion, row) &&
-        capturedMarkers.refreshErrorClearedAt ===
+        event.context?.refreshErrorClearedAt ===
           currentMarkers.refreshErrorClearedAt
       entered.release()
       await release.promise
@@ -501,9 +635,9 @@ test('captured clear markers fence a failure even when its dispatch version stil
           nativeLocalPoolBindingMatches(binding, f.paths, row) &&
           event.credentialFingerprint === row.fingerprint &&
           versionMatched &&
-          capturedMarkers.refreshErrorClearedAt ===
+          event.context?.refreshErrorClearedAt ===
             currentMarkers.refreshErrorClearedAt &&
-          capturedMarkers.quotaErrorClearedAt ===
+          event.context?.quotaErrorClearedAt ===
             currentMarkers.quotaErrorClearedAt
       })
     },
@@ -636,8 +770,8 @@ test('concurrency fixture reports terminal refusal and releases the waiting prov
       await finish.promise
       return provider({ refreshToken: 'synthetic' })
     },
-    readRestrictions: async (binding) =>
-      binding.rowId === 'b'
+    readRestrictions: async (subject) =>
+      subject.binding.rowId === 'b'
         ? { status: 'blocked', reason: 'quota-ineligible' }
         : allowed,
   })
@@ -674,6 +808,13 @@ test('concurrency fixture reports terminal refusal and releases the waiting prov
 
 const timeoutProbePool = process.env.NATIVE_REFRESH_TIMEOUT_POOL
 const timeoutProbeLog = process.env.NATIVE_REFRESH_TIMEOUT_LOG
+function traceTimeoutProbe(event: string, data: Record<string, unknown> = {}) {
+  if (!timeoutProbeLog) return
+  appendFileSync(
+    timeoutProbeLog,
+    `${JSON.stringify({ event, at: Date.now(), monotonic: performance.now(), ...data })}\n`,
+  )
+}
 let timeoutProbeFinallySeen = false
 let timeoutProbeCleanupCount = 0
 if (timeoutProbePool && timeoutProbeLog) {
@@ -685,7 +826,7 @@ if (timeoutProbePool && timeoutProbeLog) {
       event: string,
       data: Record<string, string | boolean> = {},
     ) => {
-      appendFileSync(timeoutProbeLog, `${JSON.stringify({ event, ...data })}\n`)
+      traceTimeoutProbe(event, data)
     }
     beforeAll(async () => {
       roots.push(timeoutProbePool)
@@ -698,12 +839,27 @@ if (timeoutProbePool && timeoutProbeLog) {
       if (read.status !== 'ready' || !read.rows[0])
         throw new Error('Prepared probe row required')
       const binding = captureNativeLocalPoolBinding(paths, read.rows[0])
+      let proof: NativeLocalCredentialValidation | undefined
       const coordinator = createNativeRefreshCoordinator({
         paths,
         quota,
-        readRestrictions: async () => allowed,
+        readRestrictions: async (subject) => policyFor(subject),
+        readAdmission: async () =>
+          proof
+            ? { status: 'proven', validation: proof }
+            : { status: 'unproven' },
         reconcile: async (event) => {
           record(`reconcile:${event.status}`)
+          if (
+            event.status === 'persisted' &&
+            event.identity &&
+            event.bootstrap === 'resolved'
+          ) {
+            const current = await store.read()
+            const row = current.status === 'ready' ? current.rows[0] : undefined
+            if (!row) throw new Error('Persisted row required')
+            proof = proofFor({ ...binding, identity: event.identity }, row)
+          }
         },
         resolveIdentity: identity,
         refreshToken: async () => {
@@ -714,7 +870,7 @@ if (timeoutProbePool && timeoutProbeLog) {
           return provider({ refreshToken: 'synthetic' })
         },
       })
-      job = coordinator.refresh({ mode: 'local', binding })
+      job = coordinator.authorize({ mode: 'local', binding, intent: 'refresh' })
       await entered.promise
     })
     test('runner timeout probe deadline', async () => {
@@ -744,6 +900,7 @@ if (timeoutProbePool && timeoutProbeLog) {
 }
 
 test('real Bun timeout preserves active fixture files until the body actually finishes', async () => {
+  const parentStarted = Date.now()
   const pool = await fixture()
   await pool.add('probe', 'A')
   const ledger = await fixture()
@@ -768,11 +925,38 @@ test('real Bun timeout preserves active fixture files until the body actually fi
       stdin: 'ignore',
     },
   )
-  const [exit, stderr] = await Promise.all([
+  let diagnostics: string | undefined
+  const retain = (stderr?: string, stdout?: string) => {
+    if (!diagnostics) {
+      const root = join(
+        process.cwd(),
+        'node_modules/.cache/native-coordinator-diagnostics',
+      )
+      mkdirSync(root, { recursive: true })
+      diagnostics = mkdtempSync(join(root, 'timeout-'))
+      console.error(`BUN-TIMEOUT-DIAGNOSTICS ${diagnostics}`)
+    }
+    const events = readFileSync(log, 'utf8')
+    writeFileSync(join(diagnostics, 'events.jsonl'), events)
+    if (stderr !== undefined) writeFileSync(join(diagnostics, 'stderr'), stderr)
+    if (stdout !== undefined) writeFileSync(join(diagnostics, 'stdout'), stdout)
+    appendFileSync(
+      join(diagnostics, 'snapshots.jsonl'),
+      `${JSON.stringify({ at: Date.now(), parentStarted, exitCode: child.exitCode, stderr, stdout, events })}\n`,
+    )
+  }
+  // Retain the hook ledger before the five-second deadline without adding pipe
+  // readers. Output is saved at EOF, including output truncated by a killed child.
+  const diagnostic = setTimeout(
+    () => retain(),
+    Math.max(0, parentStarted + 4_000 - Date.now()),
+  )
+  const [exit, stderr, stdout] = await Promise.all([
     child.exited,
     new Response(child.stderr).text(),
     new Response(child.stdout).text(),
   ])
+  clearTimeout(diagnostic)
   const events = (await readFile(log, 'utf8'))
     .trim()
     .split('\n')
@@ -785,8 +969,15 @@ test('real Bun timeout preserves active fixture files until the body actually fi
           status?: string
         },
     )
-  if (!events.find((event) => event.event === 'cleanup:1')?.finallySeen)
-    console.error(`BUN-TIMEOUT-PROBE ${JSON.stringify(events)}`)
+  if (
+    exit !== 1 ||
+    !stderr.includes('1 pass') ||
+    !stderr.includes('1 fail') ||
+    stderr.includes('Unhandled error') ||
+    !events.find((event) => event.event === 'cleanup:1')?.finallySeen ||
+    events.find((event) => event.event === 'cleanup:1')?.poolExists !== false
+  )
+    retain(stderr, stdout)
   expect(exit).toBe(1)
   expect(stderr).toContain('runner timeout probe deadline')
   expect(stderr).toContain('1 pass')
@@ -813,36 +1004,38 @@ test('lifetime waits for body reads and detached published-store writes and open
   let detached:
     | ReturnType<ReturnType<typeof createNativePoolStore>['add']>
     | undefined
-  scenario.body = testLifetime.run(scenario, async () => {
-    const f = await fixture({
-      onStep: async (step) => {
-        if (step !== 'before-state-write') return
-        const parked = barrier()
-        entered.release()
-        await parked.promise
-        const late = barrier()
-        await late.promise
-        lateGateOpened = true
-      },
-    })
-    store = f.store
-    detached = f.store.add({
-      id: 'detached',
-      identity: 'A',
-      credential: credential('detached'),
-    })
-    const bodyGate = barrier()
-    await bodyGate.promise
-    await f.store.read()
-    finalRead = true
-  })
+  const body = testLifetime.run(scenario, () =>
+    scenario.runBody(async () => {
+      const f = await fixture({
+        onStep: async (step) => {
+          if (step !== 'before-state-write') return
+          const parked = barrier()
+          entered.release()
+          await parked.promise
+          const late = barrier()
+          await late.promise
+          lateGateOpened = true
+        },
+      })
+      store = createNativePoolStore({ paths: f.paths, quota })
+      detached = f.store.add({
+        id: 'detached',
+        identity: 'A',
+        credential: credential('detached'),
+      })
+      const bodyGate = barrier()
+      await bodyGate.promise
+      await f.store.read()
+      finalRead = true
+    }),
+  )
   try {
     await entered.promise
     await scenario.finish()
+    await body
     await detached
     expect(finalRead).toBe(true)
     expect(lateGateOpened).toBe(true)
-    expect(scenario.calls.size).toBe(0)
     expect(await store?.read()).toMatchObject({
       status: 'ready',
       rows: [expect.objectContaining({ id: 'detached', stamp: 'bound' })],
@@ -850,7 +1043,7 @@ test('lifetime waits for body reads and detached published-store writes and open
   } finally {
     await scenario.finish()
     await Promise.all(
-      [...scenario.roots].map((root) =>
+      [...(scenarioRoots.get(scenario) ?? [])].map((root) =>
         rm(root, { recursive: true, force: true }),
       ),
     )
@@ -1117,6 +1310,7 @@ test('stale-token 401 adopts pure-store replacement without a provider call and 
   const binding = await f.binding('a')
   const stale = fingerprintOf(credential('a'))
   await f.store.rotate('a', credential('new'))
+  await f.seedProof('a')
   let calls = 0
   let blocked = true
   const c = f.coordinator({
@@ -1152,6 +1346,7 @@ test('adoption is per-caller and never serves the access token that caller rejec
   await f.add('a', 'A')
   const binding = await f.binding('a')
   await f.store.rotate('a', credential('new'))
+  await f.seedProof('a')
   const entered = barrier()
   const finish = barrier()
   let calls = 0
@@ -1190,7 +1385,7 @@ test('adoption is per-caller and never serves the access token that caller rejec
   expect(calls).toBe(0)
 })
 
-test('same-token invalid grant and identity-unproven restrictions cannot be cleared by adoption', async () => {
+test('same-token invalid grant restriction cannot be cleared by adoption', async () => {
   const f = await fixture()
   await f.add('a', 'A')
   const binding = await f.binding('a')
@@ -1202,7 +1397,6 @@ test('same-token invalid grant and identity-unproven restrictions cannot be clea
       reason: 'invalid-grant',
       credentialFingerprint: fingerprintOf(credential('new')),
     },
-    { status: 'blocked', reason: 'identity-unproven' },
   ] satisfies NativeRefreshRestriction[]) {
     const c = f.coordinator({
       refreshToken: async () => {
@@ -1220,7 +1414,7 @@ test('same-token invalid grant and identity-unproven restrictions cannot be clea
     ).toMatchObject({ status: 'refused', reason: restriction.reason })
   }
   expect(calls).toBe(0)
-  expect(f.observations.map((e) => e.status)).toEqual(['refused', 'refused'])
+  expect(f.observations.map((e) => e.status)).toEqual(['refused'])
 })
 
 test('custody, stale epoch and pre-exchange cancellation refuse without provider calls', async () => {
@@ -1456,14 +1650,14 @@ test('persisted reconciliation failure preserves committed fact and cleans learn
     reconciliationFailed: true,
   })
   if (result.status !== 'failed') throw new Error('Expected failure')
-  expect(result.error).toBeInstanceOf(PoolOperationError)
-  expect(result.error).toMatchObject({
+  expect(result.failure).toMatchObject({
     kind: 'after-persist-hook',
-    committed: credential('new'),
   })
+  expect(JSON.stringify(result)).not.toContain('access-new')
+  expect(JSON.stringify(result)).not.toContain('refresh-new')
   expect(f.observations.map((e) => e.status)).toEqual(['persisted', 'failed'])
   const failed = f.observations.find((event) => event.status === 'failed')
-  expect(failed?.committedVersion?.accessFingerprint).toBe(
+  expect(failed?.committed?.version.accessFingerprint).toBe(
     tokenFingerprint('access-new'),
   )
   expect(failed?.credentialVersion?.accessFingerprint).toBe(
@@ -1479,7 +1673,7 @@ test('persisted reconciliation failure preserves committed fact and cleans learn
       binding: await f.binding('a'),
       rejectedAccessToken: 'old',
     }),
-  ).toMatchObject({ status: 'usable', source: 'adopted' })
+  ).toMatchObject({ status: 'usable', source: 'validated' })
   const spec = nativeAccountProviderLock(f.paths, 'A')
   await withLock(
     spec.path,
@@ -1872,7 +2066,7 @@ for (const [name, cause, expectedCalls, classification] of [
     })
     expect(result).toMatchObject({ status: 'failed', persisted: false })
     if (result.status !== 'failed') throw new Error('Expected failed result')
-    expect(result.error.cause).toBe(cause)
+    expect(result.failure).toMatchObject({ kind: 'provider', classification })
     expect(calls).toBe(expectedCalls)
     expect(captures).toBe(expectedCalls)
     expect(f.observations).toHaveLength(expectedCalls)
@@ -1925,7 +2119,10 @@ test('rate limit reconciliation preserves transient retry metadata and blocks a 
     reconciliationFailed: false,
   })
   if (first.status !== 'failed') throw new Error('Expected failed result')
-  expect(first.error.cause).toBe(cause)
+  expect(first.failure).toMatchObject({
+    kind: 'provider',
+    classification: 'transient',
+  })
   expect(f.observations).toHaveLength(1)
   expect(f.observations[0]).toMatchObject({
     status: 'failed',
@@ -1986,6 +2183,17 @@ test('restriction change after exchange cannot discard rotation but does prevent
   let restriction: NativeRefreshRestriction = allowed
   const guarded = f.coordinator({
     readRestrictions: async () => restriction,
+    readAdmission: async (subject) => {
+      if (
+        restriction.status === 'blocked' &&
+        restriction.reason === 'quota-ineligible'
+      )
+        return { status: 'blocked', reason: 'quota-ineligible' }
+      const validation = f.proofs.get(subject.binding.rowId)
+      return validation
+        ? { status: 'proven', validation }
+        : { status: 'unproven' }
+    },
     resolveIdentity: async () => {
       restriction = { status: 'blocked', reason: 'quota-ineligible' }
       return identity('x', undefined, undefined)
@@ -2050,3 +2258,1167 @@ test('epoch-separated job cannot join an old job, and old terminal cleanup canno
   expect((await joined).status).toBe('usable')
   expect(calls).toBe(2)
 })
+
+test('seeded positive proof serves current material without a job or exchange', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const validation = await f.seedProof('a')
+  const c = f.coordinator({
+    refreshToken: async () => {
+      throw new Error('Unexpected exchange')
+    },
+    resolveIdentity: async () => {
+      throw new Error('Unexpected bootstrap')
+    },
+    readRestrictions: async () => {
+      throw new Error('Serving is not exchange eligibility')
+    },
+  })
+  const result = await c.authorize({
+    intent: 'serve',
+    mode: 'local',
+    binding: await f.binding('a'),
+  })
+  expect(result).toMatchObject({
+    status: 'usable',
+    source: 'current',
+    access: 'access-a',
+    subject: validation,
+    validation,
+  })
+  if (result.status !== 'usable') throw new Error('Expected receipt')
+  expect(
+    nativeLocalCredentialValidationMatches(
+      result.validation,
+      result.binding,
+      (await f.row('a')).credential,
+    ),
+  ).toBe(true)
+  expect(Object.isFrozen(result)).toBe(true)
+  expect(Object.isFrozen(result.subject.version)).toBe(true)
+  expect(Object.isFrozen(result.validation.binding)).toBe(true)
+  expect(JSON.stringify(result.subject)).not.toContain('access-a')
+  expect(f.observations).toEqual([])
+  const publicFactory = createNativeRefreshCoordinator({
+    paths: f.paths,
+    quota,
+    readRestrictions: async (subject) => policyFor(subject),
+    readAdmission: async () => ({ status: 'proven', validation }),
+    reconcile: async () => {},
+  })
+  expect(Object.keys(publicFactory)).toEqual(['authorize'])
+})
+
+test('explicit refresh exchanges proven unexpired material but a proven 401 successor adopts', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  await f.seedProof('a')
+  let exchanges = 0
+  let bootstraps = 0
+  const c = f.coordinator({
+    refreshToken: async () => {
+      exchanges++
+      return provider({ refreshToken: 'x' })
+    },
+    resolveIdentity: async () => {
+      bootstraps++
+      return identity('x', undefined, undefined)
+    },
+  })
+  const binding = await f.binding('a')
+  expect(
+    await c.authorize({ intent: 'refresh', mode: 'local', binding }),
+  ).toMatchObject({ status: 'usable', source: 'rotated', access: 'access-new' })
+  expect(exchanges).toBe(1)
+  expect(bootstraps).toBe(1)
+  expect(
+    await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding,
+      rejectedAccessToken: 'access-a',
+    }),
+  ).toMatchObject({ status: 'usable', source: 'adopted' })
+  expect(exchanges).toBe(1)
+  expect(bootstraps).toBe(1)
+})
+
+test('positive admission refuses a forged exact-version echo', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const proof = await f.seedProof('a')
+  const forged = {
+    ...proof,
+    version: { ...proof.version, expires: proof.version.expires + 1 },
+  }
+  const c = f.coordinator({
+    readAdmission: async () => ({ status: 'proven', validation: forged }),
+  })
+  expect(
+    await c.authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: await f.binding('a'),
+    }),
+  ).toMatchObject({
+    status: 'refused',
+    reason: 'proof-mismatch',
+    persisted: false,
+  })
+  expect(f.observations).toEqual([])
+})
+
+for (const defect of [
+  'missing',
+  'malformed',
+  'lineage',
+  'binding',
+  'access',
+  'stamp-presence',
+  'stamp-value',
+] as const) {
+  test(`positive admission rejects ${defect} evidence even after successful recovery`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const binding = await f.binding('a')
+    const c = f.coordinator({
+      readAdmission: async () => {
+        const proof = f.proofs.get('a')
+        if (!proof || defect === 'missing') return { status: 'unproven' }
+        const validation =
+          defect === 'malformed'
+            ? JSON.parse('{"version":{}}')
+            : defect === 'lineage'
+              ? { ...proof, credentialFingerprint: '0'.repeat(64) }
+              : defect === 'binding'
+                ? { ...proof, binding: { ...proof.binding, rowId: 'other' } }
+                : defect === 'access'
+                  ? {
+                      ...proof,
+                      version: {
+                        ...proof.version,
+                        accessFingerprint: '0'.repeat(16),
+                      },
+                    }
+                  : defect === 'stamp-value'
+                    ? {
+                        ...proof,
+                        version: {
+                          ...proof.version,
+                          lastRefreshedAt:
+                            (proof.version.lastRefreshedAt ?? 0) + 1,
+                        },
+                      }
+                    : {
+                        ...proof,
+                        version: {
+                          accessFingerprint: proof.version.accessFingerprint,
+                          expires: proof.version.expires,
+                        },
+                      }
+        return { status: 'proven', validation }
+      },
+    })
+    expect(
+      await c.authorize({ intent: 'refresh', mode: 'local', binding }),
+    ).toMatchObject({
+      status: 'refused',
+      reason: defect === 'missing' ? 'proof-missing' : 'proof-mismatch',
+      persisted: true,
+    })
+    expect((await f.row('a')).credential).toMatchObject(credential('new'))
+  })
+}
+
+test('changed-access 401 successor stays unservable when validation publication is declined', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  await f.store.rotate('a', credential('advanced'))
+  let bootstraps = 0
+  const c = f.coordinator({
+    publishProof: false,
+    refreshToken: async () => {
+      throw new Error('Do not exchange advanced material')
+    },
+    resolveIdentity: async (access) => {
+      expect(access).toBe('access-advanced')
+      bootstraps++
+      return identity(access, undefined, undefined)
+    },
+  })
+  expect(
+    await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+      rejectedAccessToken: 'access-a',
+    }),
+  ).toMatchObject({ status: 'refused', reason: 'proof-missing' })
+  expect(bootstraps).toBe(1)
+  expect(f.observations.map((e) => e.status)).toEqual(['validation-observed'])
+  expect(f.proofs.size).toBe(0)
+})
+
+test('validation-only success never writes pool identity or dispatch material', async () => {
+  const events: string[] = []
+  const f = await fixture({
+    onStep: (_step, info) => {
+      events.push(info.operation)
+    },
+  })
+  await f.add('a', 'A')
+  const configBefore = await readFile(f.paths.config, 'utf8')
+  const stateBefore = await readFile(f.paths.state, 'utf8')
+  events.length = 0
+  let bootstraps = 0
+  const c = f.coordinator({
+    refreshToken: async () => {
+      throw new Error('No exchange')
+    },
+    resolveIdentity: async (access) => {
+      expect(access).toBe('access-a')
+      bootstraps++
+      return identity(access, undefined, undefined)
+    },
+  })
+  const request = {
+    intent: 'serve' as const,
+    mode: 'local' as const,
+    binding: await f.binding('a'),
+  }
+  expect(await c.authorize(request)).toMatchObject({
+    status: 'usable',
+    source: 'validated',
+    access: 'access-a',
+  })
+  expect(await c.authorize(request)).toMatchObject({
+    status: 'usable',
+    source: 'current',
+  })
+  expect(bootstraps).toBe(1)
+  expect(events).not.toContain('recordIdentity')
+  expect(events).not.toContain('refresh')
+  expect(await readFile(f.paths.config, 'utf8')).toBe(configBefore)
+  expect(await readFile(f.paths.state, 'utf8')).toBe(stateBefore)
+  expect(f.observations[0]).toMatchObject({
+    status: 'validation-observed',
+    context: { subject: f.proofs.get('a') },
+  })
+})
+
+for (const bootstrapResult of [
+  'unavailable',
+  'transient',
+  'mismatch',
+] as const) {
+  test(`validation-only ${bootstrapResult} cannot prove identity or leak exceptions`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const before = await readFile(f.paths.state, 'utf8')
+    const c = f.coordinator({
+      resolveIdentity: async () => {
+        if (bootstrapResult === 'transient')
+          throw Object.assign(new Error('access-a refresh-a socket'), {
+            code: 'ECONNRESET',
+          })
+        return {
+          deviceId: 'd',
+          sessionId: 's',
+          ...(bootstrapResult === 'mismatch'
+            ? { accountUuid: accountUuid('B') }
+            : {}),
+        }
+      },
+    })
+    const result = await c.authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: await f.binding('a'),
+    })
+    expect(result).toMatchObject(
+      bootstrapResult === 'mismatch'
+        ? { status: 'refused', reason: 'validation-contradicted' }
+        : {
+            status: 'failed',
+            failure: { kind: 'validation', classification: 'transient' },
+            persisted: false,
+          },
+    )
+    expect(f.proofs.size).toBe(0)
+    expect(await readFile(f.paths.state, 'utf8')).toBe(before)
+    expect(JSON.stringify([result, f.observations])).not.toContain('access-a')
+    expect(JSON.stringify([result, f.observations])).not.toContain('refresh-a')
+  })
+}
+
+test('exact-version validation backoff suppresses bootstrap but not a changed version', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  let backoff: NativeRefreshSubject | undefined
+  let bootstraps = 0
+  const c = f.coordinator({
+    readAdmission: async (subject) => {
+      const proof = f.proofs.get('a')
+      if (proof) return { status: 'proven', validation: proof }
+      if (backoff && JSON.stringify(backoff) === JSON.stringify(subject))
+        return { status: 'blocked', reason: 'validation-backoff' }
+      return { status: 'unproven' }
+    },
+    resolveIdentity: async () => {
+      if (++bootstraps === 1)
+        throw Object.assign(new Error('reset'), { code: 'ECONNRESET' })
+      return identity('x', undefined, undefined)
+    },
+    reconcile: async (event) => {
+      if (event.status === 'failed') backoff = event.context?.subject
+    },
+  })
+  const request = {
+    intent: 'serve' as const,
+    mode: 'local' as const,
+    binding: await f.binding('a'),
+  }
+  expect(await c.authorize(request)).toMatchObject({
+    status: 'failed',
+    failure: { kind: 'validation' },
+  })
+  expect(backoff).toBeDefined()
+  expect(await c.authorize(request)).toMatchObject({
+    status: 'refused',
+    reason: 'validation-backoff',
+  })
+  expect(bootstraps).toBe(1)
+  await f.store.rotate('a', { ...credential('a'), access: 'advanced' })
+  expect(await c.authorize(request)).toMatchObject({
+    status: 'usable',
+    source: 'validated',
+    access: 'advanced',
+  })
+  expect(bootstraps).toBe(2)
+})
+
+for (const material of ['unknown', 'expired', 'missing', 'rejected'] as const) {
+  test(`serve uses serialized exchange for ${material} material despite missing proof`, async () => {
+    let captures = 0
+    const f = await fixture({
+      hold: () => {
+        captures++
+      },
+    })
+    await f.add('a', material === 'unknown' ? undefined : 'A')
+    if (material === 'expired')
+      await f.store.rotate('a', { ...credential('a'), expires: 1 })
+    if (material === 'missing')
+      await f.store.rotate('a', {
+        type: 'oauth',
+        refresh: 'refresh-a',
+        expires: credential('a').expires,
+      })
+    let exchanges = 0
+    const c = f.coordinator({
+      refreshToken: async () => {
+        exchanges++
+        return provider({ refreshToken: 'x' })
+      },
+    })
+    expect(
+      await c.authorize({
+        intent: 'serve',
+        mode: 'local',
+        binding: await f.binding('a'),
+        ...(material === 'rejected' ? { rejectedAccessToken: 'access-a' } : {}),
+      }),
+    ).toMatchObject({ status: 'usable', source: 'rotated' })
+    expect(exchanges).toBe(1)
+    expect(captures).toBe(1)
+  })
+}
+
+for (const change of ['access', 'expiry', 'stamp', 'stamp-absence'] as const) {
+  test(`validation-only publication fences same-epoch ${change} change`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const initial = await f.row('a')
+    const binding = await f.binding('a')
+    const entered = barrier()
+    const finish = barrier()
+    const c = f.coordinator({
+      resolveIdentity: async () => {
+        entered.release()
+        await finish.promise
+        return identity('x', undefined, undefined)
+      },
+    })
+    const pending = c.authorize({ intent: 'serve', mode: 'local', binding })
+    await entered.promise
+    if (change === 'stamp-absence') {
+      const state = JSON.parse(await readFile(f.paths.state, 'utf8'))
+      delete state.accounts.a.lastRefreshedAt
+      await writeFile(f.paths.state, JSON.stringify(state))
+    } else {
+      await f.store.rotate('a', {
+        ...credential('a'),
+        ...(change === 'access'
+          ? { access: 'advanced' }
+          : change === 'expiry'
+            ? { expires: credential('a').expires - 1 }
+            : {}),
+      })
+    }
+    const advanced = await f.row('a')
+    expect(advanced.fingerprint).toBe(initial.fingerprint)
+    expect(advanced.credentialEpoch).toBe(binding.credentialEpoch)
+    finish.release()
+    expect(await pending).toMatchObject({
+      status: 'refused',
+      reason: 'proof-missing',
+    })
+    expect(f.proofs.size).toBe(0)
+    expect(f.observations.map((e) => e.status)).toEqual(['validation-observed'])
+  })
+}
+
+for (const echo of ['captured', 'newer'] as const) {
+  test(`admission with ${echo} proof never substitutes a newer row after comparison`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const proof = await f.seedProof('a')
+    const c = f.coordinator({
+      readAdmission: async (subject) => {
+        expect(subject).toEqual(proof)
+        await f.store.rotate('a', { ...credential('a'), access: 'advanced' })
+        const newer = await f.seedProof('a')
+        return {
+          status: 'proven',
+          validation: echo === 'captured' ? proof : newer,
+        }
+      },
+    })
+    const result = await c.authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: await f.binding('a'),
+    })
+    expect(result).toMatchObject(
+      echo === 'captured'
+        ? { status: 'usable', access: 'access-a', validation: proof }
+        : { status: 'refused', reason: 'proof-mismatch' },
+    )
+    expect((await f.row('a')).credential).toMatchObject({ access: 'advanced' })
+  })
+}
+
+test('each joined caller admits its own independently proven concurrent exact version', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const entered = barrier()
+  const finish = barrier()
+  const c = f.coordinator({
+    reconcile: async (e) => {
+      if (e.status === 'persisted') {
+        entered.release()
+        await finish.promise
+      }
+    },
+  })
+  const binding = await f.binding('a')
+  const owner = c.authorize({ intent: 'refresh', mode: 'local', binding })
+  await entered.promise
+  const joined = f
+    .coordinator()
+    .authorize({ intent: 'serve', mode: 'local', binding })
+  // The provider looked up access-new. Replace row a with access-independent and
+  // seed separate validation evidence for that version. The older account lookup
+  // must not validate the changed access token just because refresh lineage agrees.
+  await unlink(lockPathFor(f.paths.state, 'row-A'))
+  const spec = nativeAccountProviderLock(f.paths, 'A')
+  await unlink(lockPathFor(spec.path, spec.name))
+  await f.store.rotate('a', { ...credential('new'), access: 'independent' })
+  const proof = await f.seedProof('a')
+  finish.release()
+  for (const result of await Promise.all([owner, joined]))
+    expect(result).toMatchObject({
+      status: 'usable',
+      access: 'independent',
+      validation: proof,
+      subject: proof,
+    })
+})
+
+test('publication context survives adapter mutation and final admission', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  let captured: NativeRefreshContext | undefined
+  let reads = 0
+  const c = f.coordinator({
+    readRestrictions: async (subject) => {
+      const policy = policyFor(subject)
+      const context = {
+        ...policy.context,
+        refreshErrorClearedAt: ++reads,
+        quotaErrorGeneration: 0,
+      }
+      if (reads === 2) captured = context
+      return { ...policy, context }
+    },
+    refreshToken: async () => {
+      if (!captured) throw new Error('Context must precede provider')
+      // Change the policy hook's returned error-reset timestamp and generation.
+      // The persisted observation must retain the values read before exchange.
+      Object.assign(captured, {
+        refreshErrorClearedAt: 999,
+        quotaErrorGeneration: null,
+      })
+      return provider({ refreshToken: 'x' })
+    },
+  })
+  expect(
+    await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    }),
+  ).toMatchObject({ status: 'usable' })
+  const context = f.observations.find((e) => e.status === 'persisted')?.context
+  expect(context).toMatchObject({
+    refreshErrorClearedAt: 2,
+    quotaErrorClearedAt: null,
+    quotaErrorGeneration: 0,
+  })
+  expect(context).not.toBe(captured)
+  expect(Object.isFrozen(context)).toBe(true)
+  expect(Object.isFrozen(context?.subject.binding)).toBe(true)
+  expect(Object.isFrozen(context?.subject.version)).toBe(true)
+  expect(reads).toBe(2)
+})
+
+test('context echo mismatch refuses before provider and cannot publish credential facts', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  let calls = 0
+  const c = f.coordinator({
+    readRestrictions: async (subject) => {
+      const policy = policyFor(subject)
+      return {
+        ...policy,
+        context: {
+          ...policy.context,
+          subject: {
+            ...subject,
+            version: { ...subject.version, lastRefreshedAt: 0 },
+          },
+        },
+      }
+    },
+    refreshToken: async () => {
+      calls++
+      return provider({ refreshToken: 'x' })
+    },
+  })
+  expect(
+    await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    }),
+  ).toMatchObject({ status: 'failed', failure: { kind: 'caller-hook' } })
+  expect(calls).toBe(0)
+  expect(f.observations[0]?.context).toBeUndefined()
+  expect(f.proofs.size).toBe(0)
+})
+
+test('overlapping instances and retries retain distinct per-attempt marker contexts', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  await f.add('b', 'B')
+  const entered = barrier()
+  const finish = barrier()
+  let marker = 7
+  let aCalls = 0
+  const readRestrictions = async (subject: NativeRefreshSubject) => ({
+    ...policyFor(subject),
+    context: { ...policyFor(subject).context, refreshErrorClearedAt: marker },
+  })
+  const a = f.coordinator({
+    readRestrictions,
+    refreshToken: async () => {
+      if (++aCalls === 1) {
+        entered.release()
+        await finish.promise
+        throw new ClaudeOAuthRefreshError(503, 'retry')
+      }
+      return provider({ refreshToken: 'x' })
+    },
+    reconcile: async (e) => {
+      f.observations.push(e)
+      if (e.status === 'failed') marker = 11
+    },
+  })
+  const b = f.coordinator({
+    readRestrictions,
+    resolveIdentity: async () => ({
+      deviceId: 'd',
+      sessionId: 's',
+      accountUuid: accountUuid('B'),
+    }),
+  })
+  const owner = a.authorize({
+    intent: 'refresh',
+    mode: 'local',
+    binding: await f.binding('a'),
+  })
+  await entered.promise
+  marker = 9
+  expect(
+    await b.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('b'),
+    }),
+  ).toMatchObject({ status: 'usable' })
+  finish.release()
+  expect(await owner).toMatchObject({ status: 'usable' })
+  expect(
+    f.observations.map((e) => [
+      e.binding.rowId,
+      e.attempt,
+      e.context?.refreshErrorClearedAt,
+    ]),
+  ).toEqual([
+    ['b', 1, 9],
+    ['a', 1, 7],
+    ['a', 2, 11],
+  ])
+  const subjects = f.observations.map((e) => e.context?.subject.binding.rowId)
+  expect(subjects).toEqual(['b', 'a', 'a'])
+})
+
+test('physical exchange captures markers after row provider and shared store waits', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const entered = barrier()
+  const finish = barrier()
+  let marker = 1
+  let reads = 0
+  const spec = nativeAccountProviderLock(f.paths, 'A')
+  const holder = track(
+    withLock(
+      spec.path,
+      { ...POOL_LOCK_DEFAULTS, name: spec.name },
+      async () => {
+        entered.release()
+        await finish.promise
+      },
+    ),
+  )
+  await entered.promise
+  const preliminary = barrier()
+  const c = f.coordinator({
+    readRestrictions: async (subject) => {
+      if (++reads === 1) preliminary.release()
+      return {
+        ...policyFor(subject),
+        context: {
+          ...policyFor(subject).context,
+          refreshErrorClearedAt: marker,
+        },
+      }
+    },
+    hold: async () => {
+      // The store has captured row a's credential under the provider lease and
+      // released config/state locks. Change the reset timestamp before the
+      // exchange callback reads policy, so it must observe 3 rather than 1.
+      marker = 3
+    },
+  })
+  const pending = c.authorize({
+    intent: 'refresh',
+    mode: 'local',
+    binding: await f.binding('a'),
+  })
+  await preliminary.promise
+  marker = 2
+  finish.release()
+  await holder
+  expect(await pending).toMatchObject({ status: 'usable' })
+  expect(
+    f.observations.find((e) => e.status === 'persisted')?.context
+      ?.refreshErrorClearedAt,
+  ).toBe(3)
+})
+
+test('failed retry recapture cannot reuse the previous attempt context', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  let reads = 0
+  const c = f.coordinator({
+    readRestrictions: async (subject) => {
+      if (++reads === 3) throw new Error('capture failed access-a refresh-a')
+      return policyFor(subject)
+    },
+    refreshToken: async () => {
+      throw new ClaudeOAuthRefreshError(503, 'retry')
+    },
+  })
+  expect(
+    await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    }),
+  ).toMatchObject({ status: 'failed', failure: { kind: 'caller-hook' } })
+  expect(f.observations).toHaveLength(2)
+  expect(f.observations[0]?.context).toBeDefined()
+  expect(f.observations[1]).toMatchObject({ attempt: 2, status: 'failed' })
+  expect(f.observations[1]?.context).toBeUndefined()
+})
+
+test('strict refresh stamp prevents overwriting a concurrent repeated dispatch', async () => {
+  let time = 1_000
+  const f = await fixture({ now: () => time })
+  await f.add('a', 'A')
+  const binding = await f.binding('a')
+  const entered = barrier()
+  const finish = barrier()
+  const c = f.coordinator({
+    resolveIdentity: async () => {
+      entered.release()
+      await finish.promise
+      return identity('x', undefined, undefined)
+    },
+  })
+  const pending = c.authorize({ intent: 'refresh', mode: 'local', binding })
+  await entered.promise
+  // Rewrite row a's lastRefreshedAt without changing access, refresh or expiry.
+  // Keep row/provider leases intact so sameDispatch's timestamp comparison must
+  // refuse the overwrite, rather than an earlier lock-ownership check doing so.
+  const state = JSON.parse(await readFile(f.paths.state, 'utf8'))
+  state.accounts.a.lastRefreshedAt = ++time
+  await writeFile(f.paths.state, JSON.stringify(state))
+  expect((await f.row('a')).credential).toMatchObject({
+    lastRefreshedAt: 1_001,
+  })
+  finish.release()
+  expect(await pending).toMatchObject({
+    status: 'refused',
+    reason: 'dispatch-changed',
+    persisted: false,
+  })
+  expect((await f.row('a')).credential).toMatchObject({
+    access: 'access-a',
+    lastRefreshedAt: 1_001,
+  })
+  expect(f.observations.map((e) => e.status)).toEqual(['refused'])
+})
+
+test('failed committed attribution retains actual stored lineage and exact version', async () => {
+  let interrupt = false
+  const f = await fixture({
+    onStep: (step, info) => {
+      if (
+        interrupt &&
+        info.operation === 'refresh' &&
+        step === 'before-config-write'
+      )
+        throw new Error('access-new refresh-new interruption')
+    },
+  })
+  await f.add('a', 'A')
+  const binding = await f.binding('a')
+  const before = await f.row('a')
+  interrupt = true
+  const result = await f
+    .coordinator({
+      resolveIdentity: async () => ({
+        deviceId: 'd',
+        sessionId: 's',
+        accountUuid: accountUuid('B'),
+      }),
+    })
+    .authorize({ intent: 'refresh', mode: 'local', binding })
+  expect(result).toMatchObject({ status: 'failed', persisted: true })
+  const stored = await f.row('a')
+  expect(stored.credential).toMatchObject(credential('new'))
+  expect(f.observations).toHaveLength(1)
+  const failed = f.observations[0]
+  if (failed?.status !== 'failed')
+    throw new Error('Failed observation required')
+  expect(failed.committed?.credentialFingerprint).toBe(
+    fingerprintOf(credential('new')),
+  )
+  expect(failed.committed?.credentialFingerprint).not.toBe(before.fingerprint)
+  expect(dispatchMatches(failed.committed?.version, stored)).toBe(true)
+  expect(failed.context?.subject.credentialFingerprint).toBe(before.fingerprint)
+  expect(Object.isFrozen(failed.committed)).toBe(true)
+  expect(f.proofs.size).toBe(0)
+  expect(JSON.stringify([result, failed])).not.toContain('access-new')
+  expect(JSON.stringify([result, failed])).not.toContain('refresh-new')
+})
+
+test('after-first-write without committed material never guesses a committed subject', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const c = f.coordinator({
+    hold: async () => {
+      throw new PoolOperationError({
+        operation: 'refresh',
+        rowId: 'a',
+        phase: 'after-first-write',
+        retryable: false,
+        kind: 'after-persist-hook',
+        cause: new Error('secret access-a refresh-a'),
+      })
+    },
+  })
+  expect(
+    await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    }),
+  ).toMatchObject({ status: 'failed', persisted: true })
+  expect(f.observations).toHaveLength(1)
+  const failed = f.observations[0]
+  if (failed?.status !== 'failed')
+    throw new Error('Failed observation required')
+  expect(failed.persisted).toBe(true)
+  expect(failed.committed).toBeUndefined()
+  expect(f.proofs.size).toBe(0)
+})
+
+test('hook exceptions are not upstream authentication failures or public bearer carriers', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  await f.seedProof('a')
+  const error = new PoolOperationError({
+    operation: 'refresh',
+    rowId: 'a',
+    phase: 'after-first-write',
+    retryable: false,
+    kind: 'provider',
+    committed: credential('secret'),
+    cause: new ClaudeOAuthRefreshError(400, 'invalid_grant access-secret'),
+  })
+  const result = await f
+    .coordinator({
+      readAdmission: async () => {
+        throw error
+      },
+    })
+    .authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: await f.binding('a'),
+    })
+  expect(result).toEqual({
+    status: 'failed',
+    failure: { kind: 'caller-hook', classification: 'permanent' },
+    persisted: false,
+    reconciliationFailed: false,
+  })
+  expect(JSON.stringify(result)).not.toContain('secret')
+  const failedValidation = await f
+    .coordinator({
+      readAdmission: async () => ({ status: 'unproven' }),
+      resolveIdentity: async () => {
+        throw Object.assign(new Error('access-secret'), { code: 'ECONNRESET' })
+      },
+      reconcile: async () => {
+        throw error
+      },
+    })
+    .authorize({
+      intent: 'serve',
+      mode: 'local',
+      binding: await f.binding('a'),
+    })
+  expect(failedValidation).toMatchObject({
+    status: 'failed',
+    failure: { kind: 'validation', classification: 'transient' },
+    reconciliationFailed: true,
+  })
+})
+
+test('a marker clear during validation declines stale proof publication', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  let marker: number | null = null
+  const entered = barrier()
+  const finish = barrier()
+  let published = false
+  const c = f.coordinator({
+    publishProof: false,
+    readRestrictions: async (subject) => ({
+      ...policyFor(subject),
+      context: { ...policyFor(subject).context, refreshErrorClearedAt: marker },
+    }),
+    resolveIdentity: async () => {
+      entered.release()
+      await finish.promise
+      return identity('x', undefined, undefined)
+    },
+    reconcile: async (event) => {
+      f.observations.push(event)
+      if (
+        event.status !== 'validation-observed' ||
+        event.context?.refreshErrorClearedAt !== marker
+      )
+        return
+      const row = await f.row('a')
+      const subject = event.context.subject
+      if (
+        !nativeLocalPoolBindingMatches(subject.binding, f.paths, row) ||
+        row.fingerprint !== subject.credentialFingerprint ||
+        !dispatchMatches(subject.version, row)
+      )
+        return
+      await f.seedProof('a')
+      published = true
+    },
+  })
+  const pending = c.authorize({
+    intent: 'serve',
+    mode: 'local',
+    binding: await f.binding('a'),
+  })
+  await entered.promise
+  marker = 0
+  finish.release()
+  expect(await pending).toMatchObject({
+    status: 'refused',
+    reason: 'proof-missing',
+  })
+  expect(published).toBe(false)
+  expect(f.observations[0]?.context?.refreshErrorClearedAt).toBeNull()
+  expect(f.proofs.size).toBe(0)
+})
+
+test('exchange recaptures a same-epoch access expiry and stamp change after preliminary policy', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  let reads = 0
+  let captured: NativeRefreshSubject | undefined
+  const c = f.coordinator({
+    readRestrictions: async (subject) => {
+      if (++reads === 1)
+        await f.store.rotate('a', {
+          ...credential('a'),
+          access: 'advanced',
+          expires: credential('a').expires - 1,
+        })
+      else captured = subject
+      return policyFor(subject)
+    },
+    refreshToken: async () => {
+      const current = await f.row('a')
+      expect(captured?.version).toMatchObject({
+        accessFingerprint: tokenFingerprint('advanced'),
+        expires: credential('a').expires - 1,
+      })
+      expect(dispatchMatches(captured?.version, current)).toBe(true)
+      return provider({ refreshToken: 'x' })
+    },
+  })
+  expect(
+    await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    }),
+  ).toMatchObject({ status: 'usable' })
+  expect(f.observations[0]?.context?.subject).toEqual(captured)
+})
+
+test('a failed admission after persistence is sanitized without discarding reconciliation facts', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const result = await f
+    .coordinator({
+      readAdmission: async () => {
+        throw new Error('access-new refresh-new admission failed')
+      },
+    })
+    .authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    })
+  expect(result).toEqual({
+    status: 'failed',
+    failure: { kind: 'caller-hook', classification: 'permanent' },
+    persisted: true,
+    reconciliationFailed: false,
+  })
+  expect((await f.row('a')).credential).toMatchObject(credential('new'))
+  expect(f.observations[0]).toMatchObject({
+    status: 'persisted',
+    committed: { credentialFingerprint: fingerprintOf(credential('new')) },
+  })
+  expect(JSON.stringify(result)).not.toContain('access-new')
+})
+
+test('malformed bootstrap identity cannot discard an already consumed successor', async () => {
+  const f = await fixture()
+  await f.add('a')
+  const result = await f
+    .coordinator({
+      resolveIdentity: async () => ({
+        deviceId: 'd',
+        sessionId: 's',
+        accountUuid: accountUuid(' '),
+      }),
+    })
+    .authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    })
+  expect(result).toMatchObject({
+    status: 'refused',
+    reason: 'identity-unproven',
+    persisted: true,
+  })
+  expect((await f.row('a')).credential).toMatchObject(credential('new'))
+  expect((await f.row('a')).identity).toBeUndefined()
+  expect(f.observations[0]).toMatchObject({
+    status: 'persisted',
+    bootstrap: 'unavailable',
+    committed: { credentialFingerprint: fingerprintOf(credential('new')) },
+  })
+})
+
+test('positive proof does not override closed serving eligibility restrictions', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  await f.seedProof('a')
+  const binding = await f.binding('a')
+  for (const reason of [
+    'quota-ineligible',
+    'account-disabled',
+    'local-mode-unavailable',
+    'refresh-backoff',
+    'invalid-grant',
+    'validation-backoff',
+  ] as const) {
+    const result = await f
+      .coordinator({
+        readAdmission: async () => ({ status: 'blocked', reason }),
+        refreshToken: async () => {
+          throw new Error('Serving block must not exchange')
+        },
+      })
+      .authorize({ intent: 'serve', mode: 'local', binding })
+    expect(result).toEqual({ status: 'refused', reason, persisted: false })
+  }
+  expect(f.observations).toEqual([])
+})
+
+for (const initialStamp of ['absent', 'zero'] as const) {
+  const change = initialStamp === 'absent' ? 'absent-to-zero' : 'zero-to-absent'
+
+  test(`context echo rejects ${change} refresh timestamp substitution`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const state = JSON.parse(await readFile(f.paths.state, 'utf8'))
+    if (initialStamp === 'absent') delete state.accounts.a.lastRefreshedAt
+    else state.accounts.a.lastRefreshedAt = 0
+    await writeFile(f.paths.state, JSON.stringify(state))
+    const before = await f.row('a')
+    expect(before.stamp).toBe('bound')
+    expect(Object.hasOwn(before.credential ?? {}, 'lastRefreshedAt')).toBe(
+      initialStamp === 'zero',
+    )
+    let calls = 0
+    const c = f.coordinator({
+      readRestrictions: async (subject) => {
+        expect(Object.hasOwn(subject.version, 'lastRefreshedAt')).toBe(
+          initialStamp === 'zero',
+        )
+        const version = { ...subject.version }
+        // Echo the same pool row, refresh lineage, access fingerprint and expiry,
+        // but replace an absent refresh timestamp with zero or zero with absence.
+        if (initialStamp === 'absent') version.lastRefreshedAt = 0
+        else delete version.lastRefreshedAt
+        const policy = policyFor(subject)
+        return {
+          ...policy,
+          context: { ...policy.context, subject: { ...subject, version } },
+        }
+      },
+      refreshToken: async () => {
+        calls++
+        return provider({ refreshToken: 'x' })
+      },
+    })
+    const result = await c.authorize({
+      intent: 'refresh',
+      mode: 'local',
+      binding: await f.binding('a'),
+    })
+    expect(result).toMatchObject({
+      status: 'failed',
+      failure: { kind: 'caller-hook', classification: 'permanent' },
+      persisted: false,
+    })
+    expect(calls).toBe(0)
+    expect((await f.row('a')).credential).toEqual(before.credential)
+    expect(f.observations).toHaveLength(1)
+    expect(f.observations[0]?.context).toBeUndefined()
+    expect(f.proofs.size).toBe(0)
+  })
+
+  test(`commit comparison rejects ${change} refresh timestamp foreign write`, async () => {
+    const f = await fixture()
+    await f.add('a', 'A')
+    const initialState = JSON.parse(await readFile(f.paths.state, 'utf8'))
+    if (initialStamp === 'absent')
+      delete initialState.accounts.a.lastRefreshedAt
+    else initialState.accounts.a.lastRefreshedAt = 0
+    await writeFile(f.paths.state, JSON.stringify(initialState))
+    const before = await f.row('a')
+    expect(before.stamp).toBe('bound')
+    expect(Object.hasOwn(before.credential ?? {}, 'lastRefreshedAt')).toBe(
+      initialStamp === 'zero',
+    )
+    const binding = await f.binding('a')
+    const entered = barrier()
+    const finish = barrier()
+    const c = f.coordinator({
+      resolveIdentity: async () => {
+        entered.release()
+        await finish.promise
+        return identity('x', undefined, undefined)
+      },
+    })
+    const pending = c.authorize({ intent: 'refresh', mode: 'local', binding })
+    await entered.promise
+    // Change only row a's recorded refresh timestamp while the provider's
+    // replacement waits for its account lookup. Keep row/provider leases intact
+    // so comparing the captured and current credentials decides the refusal.
+    const currentState = JSON.parse(await readFile(f.paths.state, 'utf8'))
+    if (initialStamp === 'absent') currentState.accounts.a.lastRefreshedAt = 0
+    else delete currentState.accounts.a.lastRefreshedAt
+    await writeFile(f.paths.state, JSON.stringify(currentState))
+    const changed = await f.row('a')
+    expect(changed.stamp).toBe('bound')
+    expect(changed.fingerprint).toBe(before.fingerprint)
+    expect(changed.credentialEpoch).toBe(before.credentialEpoch)
+    expect(Object.hasOwn(changed.credential ?? {}, 'lastRefreshedAt')).toBe(
+      initialStamp === 'absent',
+    )
+    finish.release()
+    expect(await pending).toMatchObject({
+      status: 'refused',
+      reason: 'dispatch-changed',
+      persisted: false,
+    })
+    expect((await f.row('a')).credential).toEqual(changed.credential)
+    expect(f.observations).toHaveLength(1)
+    expect(f.observations[0]).toMatchObject({
+      status: 'refused',
+      reason: 'dispatch-changed',
+      consumed: true,
+    })
+    expect(f.proofs.size).toBe(0)
+  })
+}
