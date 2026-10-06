@@ -39,6 +39,20 @@ export type NativeRuntimeBinding =
   | NativeCustodyRuntimeBinding
 
 /**
+ * A failed account check is recorded against the exact credentials it used.
+ * This lets a retry delay apply only to those credentials, without treating
+ * the failure as evidence that the account check succeeded.
+ */
+export interface NativeLocalValidationRetry {
+  readonly subject: Pick<
+    NativeLocalCredentialValidation,
+    'binding' | 'credentialFingerprint' | 'version'
+  >
+  readonly checkedAt: number
+  readonly nextRetryAt: number
+}
+
+/**
  * Per-account retry errors, profiles, quota-priming usage and observation
  * identifiers stored separately from credentials. Vault quota is stored here;
  * local quota stays in the pool.
@@ -46,6 +60,7 @@ export type NativeRuntimeBinding =
 export interface NativeRuntimeEntry {
   binding: NativeRuntimeBinding
   credentialValidation?: NativeLocalCredentialValidation
+  validationRetry?: NativeLocalValidationRetry
   lastUsed?: number
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
@@ -209,6 +224,27 @@ function operationError(value: unknown): value is AccountOperationError {
   )
 }
 
+function localValidationRetry(
+  value: unknown,
+  observedBinding: NativeRuntimeBinding,
+): value is NativeLocalValidationRetry {
+  return (
+    record(value) &&
+    keys(value, ['subject', 'checkedAt', 'nextRetryAt']) &&
+    observedBinding.kind === 'local' &&
+    observedBinding.identity !== undefined &&
+    // This validator checks credential fields, not whether an account check succeeded.
+    isNativeLocalCredentialValidation(value.subject) &&
+    value.subject.binding.storageId === observedBinding.storageId &&
+    value.subject.binding.rowId === observedBinding.rowId &&
+    value.subject.binding.credentialEpoch === observedBinding.credentialEpoch &&
+    value.subject.binding.identity === observedBinding.identity &&
+    counter(value.checkedAt) &&
+    counter(value.nextRetryAt) &&
+    value.nextRetryAt >= value.checkedAt
+  )
+}
+
 function profile(value: unknown): value is OAuthAccountProfile {
   return (
     record(value) &&
@@ -239,6 +275,7 @@ function prime(value: unknown): value is PrimeUsageCounters {
 
 const entryKeys: readonly string[] = [
   'credentialValidation',
+  'validationRetry',
   'lastUsed',
   'lastRefreshedAt',
   'lastRefreshError',
@@ -275,6 +312,12 @@ function entry(
   )
     return false
   const observedBinding = value.binding
+  if (
+    !optional(value, 'validationRetry', (retry) =>
+      localValidationRetry(retry, observedBinding),
+    )
+  )
+    return false
   if (Object.hasOwn(value, 'credentialValidation')) {
     const proof = value.credentialValidation
     // A carried proof must not survive rebinding, even if token bytes repeat.
