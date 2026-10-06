@@ -210,6 +210,189 @@ function state(): NativeRuntimeState {
   return decodeNativeRuntime(structuredClone(full), storageId)
 }
 
+test('native local refresh lineage round-trips explicitly without inferring legacy aliases', async () => {
+  const parent = join(
+    import.meta.dir,
+    '../../../../node_modules/.cache/native-local-runtime-readers',
+  )
+  await mkdir(parent, { recursive: true, mode: 0o700 })
+  const root = await mkdtemp(join(parent, 'refresh-errors-'))
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
+  const path = join(root, 'runtime.json')
+  const local = full.accounts['local-row']
+  const credentialFingerprint = fingerprintOf({
+    type: 'oauth',
+    refresh: 'synthetic-refresh',
+  })
+  expect(credentialFingerprint).not.toBe(local.lastRefreshError.tokenHash)
+  const native = {
+    ...full,
+    accounts: {
+      'local-row': {
+        ...local,
+        lastRefreshError: { ...local.lastRefreshError, credentialFingerprint },
+        refreshErrorClearedAt: 0,
+        quotaErrorClearedAt: 0,
+        quotaErrorGeneration: 0,
+      },
+    },
+  }
+  const before = structuredClone(native)
+  expect<unknown>(
+    await updateNativeRuntime(path, storageId, () =>
+      decodeNativeRuntime(native, storageId),
+    ),
+  ).toEqual(native)
+  expect<unknown>(await readNativeRuntime(path, storageId)).toEqual({
+    status: 'ready',
+    state: native,
+  })
+  expect(native).toEqual(before)
+  const old = decodeNativeRuntime(full, storageId).accounts['local-row']!
+    .lastRefreshError!
+  expect(Object.hasOwn(old, 'credentialFingerprint')).toBe(false)
+  expect(old.tokenHash).toBe(hashRefreshToken('synthetic-refresh'))
+  expect(old.refreshTokenFingerprint).toBe(
+    tokenFingerprint('synthetic-refresh'),
+  )
+})
+
+test('native local refresh lineage rejects malformed fingerprints without widening quota or custody', () => {
+  const local = full.accounts['local-row']
+  for (const credentialFingerprint of [
+    undefined,
+    null,
+    0,
+    [],
+    {},
+    '',
+    'a'.repeat(16),
+    'A'.repeat(64),
+    ` ${'a'.repeat(64)}`,
+    'sk-ant-oat01-synthetic-secret',
+  ]) {
+    expect(() =>
+      decodeNativeRuntime(
+        {
+          ...full,
+          accounts: {
+            'local-row': {
+              ...local,
+              lastRefreshError: {
+                ...local.lastRefreshError,
+                credentialFingerprint,
+              },
+            },
+          },
+        },
+        storageId,
+      ),
+    ).toThrow('Anthropic runtime state is invalid')
+  }
+  const credentialFingerprint = fingerprintOf({
+    type: 'oauth',
+    refresh: 'synthetic-refresh',
+  })
+  expect(() =>
+    decodeNativeRuntime(
+      {
+        ...full,
+        accounts: {
+          'local-row': {
+            ...local,
+            lastQuotaRefreshError: {
+              ...local.lastQuotaRefreshError,
+              credentialFingerprint,
+            },
+          },
+        },
+      },
+      storageId,
+    ),
+  ).toThrow('Anthropic runtime state is invalid')
+  expect(() =>
+    decodeNativeRuntime(
+      {
+        ...full,
+        accounts: {
+          'vault-route': {
+            ...full.accounts['vault-route'],
+            lastRefreshError: {
+              message: 'synthetic error',
+              checkedAt: 1,
+              credentialFingerprint,
+            },
+          },
+        },
+      },
+      storageId,
+    ),
+  ).toThrow('Anthropic runtime state is invalid')
+  for (const checkedAt of [0, 100]) {
+    expect(() =>
+      decodeNativeRuntime(
+        {
+          ...full,
+          accounts: {
+            'local-row': {
+              ...local,
+              refreshErrorClearedAt: checkedAt,
+              lastRefreshError: {
+                ...local.lastRefreshError,
+                credentialFingerprint,
+                checkedAt,
+              },
+            },
+          },
+        },
+        storageId,
+      ),
+    ).toThrow('Anthropic runtime state is invalid')
+  }
+})
+
+test('native local refresh lineage retains monotonic error reset floors', async () => {
+  const parent = join(
+    import.meta.dir,
+    '../../../../node_modules/.cache/native-local-runtime-readers',
+  )
+  await mkdir(parent, { recursive: true, mode: 0o700 })
+  const root = await mkdtemp(join(parent, 'refresh-floors-'))
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
+  const path = join(root, 'runtime.json')
+  const initial = state()
+  initial.accounts['local-row']!.lastRefreshError!.credentialFingerprint =
+    fingerprintOf({ type: 'oauth', refresh: 'synthetic-refresh' })
+  await updateNativeRuntime(path, storageId, () => initial)
+  const before = await readFile(path, 'utf8')
+  for (const change of [
+    'older',
+    'remove-without-clear',
+    'remove-before-clear',
+  ] as const) {
+    await expect(
+      updateNativeRuntime(path, storageId, (current) => {
+        const local = current.accounts['local-row']!
+        if (change === 'older') local.lastRefreshError!.checkedAt--
+        else {
+          delete local.lastRefreshError
+          if (change === 'remove-before-clear')
+            local.refreshErrorClearedAt = 332
+        }
+        return current
+      }),
+    ).rejects.toMatchObject({ code: 'runtime-conflict' })
+    expect(await readFile(path, 'utf8')).toBe(before)
+  }
+  const cleared = await updateNativeRuntime(path, storageId, (current) => {
+    delete current.accounts['local-row']!.lastRefreshError
+    current.accounts['local-row']!.refreshErrorClearedAt = 333
+    return current
+  })
+  expect(cleared.accounts['local-row']!.refreshErrorClearedAt).toBe(333)
+  expect(cleared.accounts['local-row']!.lastRefreshError).toBeUndefined()
+})
+
 test('runtime full-field fixture round-trips and accounts for every owned field', async () => {
   const path = await fixture()
   expect(await readNativeRuntime(path, storageId)).toEqual({

@@ -63,6 +63,17 @@ export interface NativeLocalValidationRetry {
 }
 
 /**
+ * Match refresh failures using fingerprintOf({ type: 'oauth', refresh }),
+ * the full refresh-credential fingerprint. The legacy tokenHash hashes the raw refresh token, and
+ * refreshTokenFingerprint is a short hash; neither is an alias for this value.
+ * Errors without the explicit full fingerprint preserve error-reset timestamps
+ * but cannot restrict a credential.
+ */
+export interface NativeLocalRefreshError extends AccountOperationError {
+  credentialFingerprint?: string
+}
+
+/**
  * Per-account retry errors, profiles, quota-priming usage and observation
  * identifiers stored separately from credentials. Vault quota is stored here;
  * local quota stays in the pool.
@@ -73,7 +84,7 @@ export interface NativeRuntimeEntry {
   validationRetry?: NativeLocalValidationRetry
   lastUsed?: number
   lastRefreshedAt?: number
-  lastRefreshError?: AccountOperationError
+  lastRefreshError?: NativeLocalRefreshError
   refreshErrorClearedAt?: number
   refreshLeaseId?: string
   refreshLeaseUntil?: number
@@ -202,7 +213,10 @@ function binding(value: unknown): value is NativeRuntimeBinding {
   )
 }
 
-function operationError(value: unknown): value is AccountOperationError {
+function operationError(
+  value: unknown,
+  extraKeys: readonly string[] = [],
+): value is AccountOperationError {
   return (
     record(value) &&
     keys(
@@ -216,6 +230,7 @@ function operationError(value: unknown): value is AccountOperationError {
         'refreshTokenFingerprint',
         'status',
         'permanent',
+        ...extraKeys,
       ],
     ) &&
     typeof value.message === 'string' &&
@@ -231,6 +246,14 @@ function operationError(value: unknown): value is AccountOperationError {
       (entry) => counter(entry) && entry >= 100 && entry <= 599,
     ) &&
     optional(value, 'permanent', (entry) => typeof entry === 'boolean')
+  )
+}
+
+function localRefreshError(value: unknown): value is NativeLocalRefreshError {
+  return (
+    operationError(value, ['credentialFingerprint']) &&
+    record(value) &&
+    optional(value, 'credentialFingerprint', digest)
   )
 }
 
@@ -371,7 +394,11 @@ function entry(
     !optional(value, 'quotaErrorGeneration', counter) ||
     !optional(value, 'profile', profile) ||
     !optional(value, 'prime', prime) ||
-    !optional(value, 'lastRefreshError', operationError) ||
+    !optional(
+      value,
+      'lastRefreshError',
+      observedBinding.kind === 'local' ? localRefreshError : operationError,
+    ) ||
     !optional(value, 'lastQuotaRefreshError', operationError)
   )
     return false
@@ -410,7 +437,11 @@ function entry(
   for (const [errorKey, clearKey] of errorFences) {
     const error = value[errorKey]
     const clear = value[clearKey]
-    if (operationError(error) && time(clear) && error.checkedAt <= clear)
+    const checkError =
+      errorKey === 'lastRefreshError' && observedBinding.kind === 'local'
+        ? localRefreshError
+        : operationError
+    if (checkError(error) && time(clear) && error.checkedAt <= clear)
       return false
   }
   return true
@@ -617,21 +648,20 @@ function assertTransitions(
         quotaSnapshotCheckedAt(fromNativeQuotaMap(old.quota))
     )
       throw new NativeRuntimeError('runtime-conflict')
-    for (const [older, newer, clear] of [
-      [
-        old.lastRefreshError,
-        incoming.lastRefreshError,
-        incoming.refreshErrorClearedAt,
-      ],
-      [
-        old.lastQuotaRefreshError,
-        incoming.lastQuotaRefreshError,
-        incoming.quotaErrorClearedAt,
-      ],
-    ]) {
+    for (const [errorKey, clearKey] of [
+      ['lastRefreshError', 'refreshErrorClearedAt'],
+      ['lastQuotaRefreshError', 'quotaErrorClearedAt'],
+    ] as const) {
+      const older = old[errorKey]
+      const newer = incoming[errorKey]
+      const clear = incoming[clearKey]
+      const checkError =
+        errorKey === 'lastRefreshError' && incoming.binding.kind === 'local'
+          ? localRefreshError
+          : operationError
       if (
-        operationError(older) &&
-        (!operationError(newer)
+        checkError(older) &&
+        (!checkError(newer)
           ? !time(clear) || clear < older.checkedAt
           : newer.checkedAt < older.checkedAt)
       )
