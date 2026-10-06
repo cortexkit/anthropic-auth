@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { expect } from 'bun:test'
 import {
   chmod,
   lstat,
@@ -24,22 +24,17 @@ import {
   updateNativeRuntime,
 } from '../native-runtime.ts'
 import { tokenFingerprint } from '../token-fingerprint.ts'
+import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const storageId = 'a'.repeat(64)
 const vaultAccountIdentity = '11111111-2222-4333-8444-555555555555'
-const roots: string[] = []
+const { test, deferCleanup } = createTestLifetimeSuite()
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'anthropic-native-runtime-'))
-  roots.push(root)
+  deferCleanup(() => rm(root, { recursive: true, force: true }))
   return join(root, 'private', 'native-state.json')
 }
-
-afterEach(async () => {
-  await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-  )
-})
 
 // The fixture includes both local and vaulted account metadata without OAuth tokens.
 const full = {
