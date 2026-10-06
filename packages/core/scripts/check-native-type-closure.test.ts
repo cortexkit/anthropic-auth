@@ -76,7 +76,7 @@ test('recognizes import, export, inline import types and reference edges without
   ])
 })
 
-test('copies the complete published relative declaration graph including cycles and directives', async () => {
+test('rejects unsupported published producer versions before copying declarations', async () => {
   const root = await fixture()
   const dist = join(root, 'dist')
   const producer = join(root, 'producer')
@@ -85,6 +85,33 @@ test('copies the complete published relative declaration graph including cycles 
     'package.json',
     JSON.stringify({
       version: '0.9.0',
+      exports: { './store': { types: './dist/store.d.ts' } },
+    }),
+  )
+  await put(producer, 'LICENSE', 'Synthetic test license')
+  await put(producer, 'dist/store.d.ts', 'export interface Store {}')
+  await put(dist, 'index.js', 'export const ready = true;')
+  await put(
+    dist,
+    'index.d.ts',
+    `export type { Store } from '@cortexkit/common-auth/store';`,
+  )
+
+  await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
+    'Expected published common-auth 0.10.0, got 0.9.0',
+  )
+  expect(await readdir(dist)).not.toContain('internal-types')
+})
+
+test('copies the complete published relative declaration graph including cycles and directives', async () => {
+  const root = await fixture()
+  const dist = join(root, 'dist')
+  const producer = join(root, 'producer')
+  await put(
+    producer,
+    'package.json',
+    JSON.stringify({
+      version: '0.10.0',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
