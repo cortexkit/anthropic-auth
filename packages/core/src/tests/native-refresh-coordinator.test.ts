@@ -1,5 +1,20 @@
-import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import {
+  afterEach,
+  beforeAll,
+  test as bunTest,
+  describe,
+  expect,
+} from 'bun:test'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { appendFileSync, existsSync } from 'node:fs'
+import {
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -12,6 +27,7 @@ import {
   fingerprintOf,
   POOL_LOCK_DEFAULTS,
   PoolOperationError,
+  type PoolRow,
 } from '@cortexkit/common-auth/store'
 
 import {
@@ -25,21 +41,74 @@ import type {
 import {
   createNativeRefreshCoordinator,
   type NativeRefreshCoordinatorOptions,
+  type NativeRefreshDispatchVersion,
   type NativeRefreshObservation,
   type NativeRefreshRestriction,
+  type NativeRefreshResult,
   nativeAccountProviderLock,
 } from '../native-refresh-coordinator.ts'
 import {
   captureNativeLocalPoolBinding,
+  nativeLocalPoolBindingMatches,
   nativeLocalRefreshJobKey,
 } from '../pool-binding.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import {
   createNativePoolStore,
   type NativePoolStoreOptions,
+  nativePoolStoreLocks,
 } from '../pool-store.ts'
+import { tokenFingerprint } from '../token-fingerprint.ts'
 
 const roots: string[] = []
+class TestLifetime {
+  readonly roots = new Set<string>()
+  readonly gates = new Set<() => void>()
+  readonly calls = new Set<Promise<unknown>>()
+  body?: Promise<void>
+  closing = false
+
+  track<T>(call: Promise<T>): Promise<T> {
+    this.calls.add(call)
+    void call.finally(() => this.calls.delete(call)).catch(() => {})
+    return call
+  }
+
+  async finish() {
+    this.closing = true
+    for (const release of this.gates) release()
+    this.gates.clear()
+    await this.body?.catch(() => {})
+    while (this.calls.size) await Promise.allSettled([...this.calls])
+  }
+}
+
+const testLifetime = new AsyncLocalStorage<TestLifetime>()
+let currentLifetime: TestLifetime | undefined
+
+function test(
+  name: string,
+  body: () => void | Promise<void>,
+  timeout?: number,
+) {
+  bunTest(
+    name,
+    () => {
+      const scenario = new TestLifetime()
+      currentLifetime = scenario
+      const running = testLifetime.run(scenario, async () => {
+        await body()
+      })
+      scenario.body = running
+      return running
+    },
+    timeout,
+  )
+}
+
+function track<T>(call: Promise<T>): Promise<T> {
+  return testLifetime.getStore()?.track(call) ?? call
+}
 const quota = {
   validate: (v: unknown) => typeof v === 'number',
   merge: (_v: unknown, observation: unknown) => observation,
@@ -51,6 +120,9 @@ function barrier() {
   const promise = new Promise<void>((resolve) => {
     release = resolve
   })
+  const scenario = testLifetime.getStore()
+  if (scenario?.closing) release()
+  else scenario?.gates.add(release)
   return { promise, release }
 }
 
@@ -78,13 +150,24 @@ const provider: typeof refreshClaudeOAuthToken = async () => ({
 
 async function fixture(seams: Partial<NativePoolStoreOptions> = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'native-refresh-')))
-  roots.push(root)
+  const scenario = testLifetime.getStore()
+  if (scenario) scenario.roots.add(root)
+  else roots.push(root)
   const paths = await resolveNativePoolPaths(
     join(root, 'anthropic-auth.json'),
     join(root, 'anthropic-auth-state.json'),
   )
   const options = { ...seams, paths, quota }
-  const store = createNativePoolStore(options)
+  const store = new Proxy(createNativePoolStore(options), {
+    get(target, property) {
+      const member = Reflect.get(target, property)
+      if (typeof member !== 'function') return member
+      return (...args: unknown[]) => {
+        const result = Reflect.apply(member, target, args)
+        return result instanceof Promise ? track(result) : result
+      }
+    },
+  })
   await store.initialize()
   async function row(id: string) {
     const read = await store.read()
@@ -103,7 +186,7 @@ async function fixture(seams: Partial<NativePoolStoreOptions> = {}) {
   function coordinator(
     overrides: Partial<NativeRefreshCoordinatorOptions> = {},
   ) {
-    return createNativeRefreshCoordinator({
+    const coordinator = createNativeRefreshCoordinator({
       ...options,
       refreshToken: provider,
       resolveIdentity: identity,
@@ -113,14 +196,333 @@ async function fixture(seams: Partial<NativePoolStoreOptions> = {}) {
       },
       ...overrides,
     })
+    return {
+      refresh: (request: Parameters<typeof coordinator.refresh>[0]) =>
+        track(coordinator.refresh(request)),
+    }
   }
   return { root, paths, store, row, binding, add, observations, coordinator }
 }
 
 afterEach(async () => {
+  const scenario = currentLifetime
+  const unscopedRoots = roots.splice(0)
+  // Bun reports a timeout without cancelling the test body. Open that body's
+  // waiting gates, wait for the body and pending store calls, then delete the
+  // test's files.
+  await scenario?.finish()
   await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+    [...unscopedRoots, ...(scenario?.roots ?? [])].map((root) =>
+      rm(root, { recursive: true, force: true }),
+    ),
   )
+  if (timeoutProbePool && timeoutProbeLog) {
+    appendFileSync(
+      timeoutProbeLog,
+      `${JSON.stringify({ event: `cleanup:${++timeoutProbeCleanupCount}`, finallySeen: timeoutProbeFinallySeen, poolExists: existsSync(timeoutProbePool) })}\n`,
+    )
+  }
+})
+
+type VersionedObservation = NativeRefreshObservation & {
+  successorVersion?: NativeRefreshDispatchVersion
+}
+
+function dispatchMatches(
+  version: NativeRefreshDispatchVersion | undefined,
+  row: PoolRow,
+) {
+  const credential = row.credential
+  return (
+    version !== undefined &&
+    credential?.type === 'oauth' &&
+    version.accessFingerprint ===
+      (credential.access ? tokenFingerprint(credential.access) : undefined) &&
+    version.expires === credential.expires &&
+    version.lastRefreshedAt === credential.lastRefreshedAt
+  )
+}
+
+async function publicationLocks<T>(
+  f: Awaited<ReturnType<typeof fixture>>,
+  publish: (assertOwned: () => Promise<void>) => Promise<T>,
+) {
+  const [config, state] = nativePoolStoreLocks(f.paths)
+  return withLock(
+    config.path,
+    { ...POOL_LOCK_DEFAULTS, name: config.name },
+    async (configLock) =>
+      withLock(
+        state.path,
+        { ...POOL_LOCK_DEFAULTS, name: state.name },
+        async (stateLock) =>
+          withLock(
+            f.paths.runtime,
+            { ...POOL_LOCK_DEFAULTS, name: 'native-runtime' },
+            async (runtimeLock) => {
+              const assertOwned = async () => {
+                await configLock.assertOwned()
+                await stateLock.assertOwned()
+                await runtimeLock.assertOwned()
+              }
+              await assertOwned()
+              return publish(assertOwned)
+            },
+          ),
+      ),
+  )
+}
+
+for (const terminal of ['persisted', 'failed'] as const) {
+  for (const replacement of ['access-only', 'same-material'] as const) {
+    const change =
+      replacement === 'access-only'
+        ? 'access-only same-epoch rotation'
+        : 'a newer refresh stamp with repeated dispatch material'
+    test(`${terminal} observation fences ${change} after row and provider lease loss`, async () => {
+      const f = await fixture()
+      await f.add('a', 'A')
+      const binding = await f.binding('a')
+      const entered = barrier()
+      const release = barrier()
+      const finishProvider = barrier()
+      const clearMarkers = { refreshErrorClearedAt: 7, quotaErrorClearedAt: 9 }
+      const capturedClearMarkers = { ...clearMarkers }
+      let markersCaptured = false
+      let observation: VersionedObservation | undefined
+      let freshAccepted = false
+      let staleAccepted = false
+      let oldFieldsAccepted = false
+      await publicationLocks(f, async (assertOwned) => {
+        await assertOwned()
+        await writeFile(
+          f.paths.runtime,
+          JSON.stringify({ ...clearMarkers, error: 'older-observation' }),
+          { mode: 0o600 },
+        )
+      })
+      let expectedVersion: NativeRefreshDispatchVersion | undefined
+      const c = f.coordinator({
+        readRestrictions: async () => {
+          const native = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
+          if (!markersCaptured) {
+            capturedClearMarkers.refreshErrorClearedAt =
+              native.refreshErrorClearedAt
+            capturedClearMarkers.quotaErrorClearedAt =
+              native.quotaErrorClearedAt
+            markersCaptured = true
+          }
+          return allowed
+        },
+        refreshToken: async () => {
+          if (terminal === 'failed') {
+            entered.release()
+            await finishProvider.promise
+            throw new ClaudeOAuthRefreshError(400, 'invalid_grant')
+          }
+          return {
+            ...credential('a'),
+            access: 'access-first-successor',
+            expiresIn: 3600,
+          }
+        },
+        reconcile: async (event) => {
+          observation = event
+          if (terminal === 'persisted') {
+            const row = await f.row('a')
+            if (row.credential?.type !== 'oauth')
+              throw new Error('OAuth fixture required')
+            expectedVersion = {
+              accessFingerprint: tokenFingerprint('access-first-successor'),
+              expires: row.credential.expires,
+              lastRefreshedAt: row.credential.lastRefreshedAt,
+            }
+            freshAccepted = dispatchMatches(observation.successorVersion, row)
+            entered.release()
+            await release.promise
+          }
+          await publicationLocks(f, async (assertOwned) => {
+            const row = await f.row('a')
+            const native = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
+            const expectedFingerprint =
+              event.status === 'persisted'
+                ? event.successorFingerprint
+                : event.credentialFingerprint
+            oldFieldsAccepted =
+              nativeLocalPoolBindingMatches(binding, f.paths, row) &&
+              row.fingerprint === expectedFingerprint &&
+              native.refreshErrorClearedAt ===
+                capturedClearMarkers.refreshErrorClearedAt &&
+              native.quotaErrorClearedAt ===
+                capturedClearMarkers.quotaErrorClearedAt
+            const version =
+              terminal === 'persisted'
+                ? observation?.successorVersion
+                : observation?.credentialVersion
+            staleAccepted = oldFieldsAccepted && dispatchMatches(version, row)
+            if (staleAccepted) {
+              await assertOwned()
+              await writeFile(
+                f.paths.runtime,
+                JSON.stringify({
+                  ...native,
+                  error: 'stale-observation-overwrite',
+                }),
+                { mode: 0o600 },
+              )
+            }
+          })
+        },
+      })
+      const before = await f.row('a')
+      if (before.credential?.type !== 'oauth')
+        throw new Error('OAuth fixture required')
+      if (terminal === 'failed') {
+        expectedVersion = {
+          accessFingerprint: tokenFingerprint('access-a'),
+          expires: before.credential.expires,
+          lastRefreshedAt: before.credential.lastRefreshedAt,
+        }
+      }
+      const job = c.refresh({ mode: 'local', binding })
+      await entered.promise
+      await unlink(lockPathFor(f.paths.state, 'row-A'))
+      const providerLock = nativeAccountProviderLock(f.paths, 'A')
+      await unlink(lockPathFor(providerLock.path, providerLock.name))
+      await f.store.rotate('a', {
+        ...credential('a'),
+        access:
+          replacement === 'access-only'
+            ? 'access-second-successor'
+            : terminal === 'persisted'
+              ? 'access-first-successor'
+              : 'access-a',
+      })
+      const rotated = await f.row('a')
+      expect(rotated).toMatchObject({
+        stamp: 'bound',
+        credentialEpoch: binding.credentialEpoch,
+        identity: binding.identity,
+      })
+      expect(rotated.fingerprint).toBe(before.fingerprint)
+      await publicationLocks(f, async (assertOwned) => {
+        await assertOwned()
+        await writeFile(
+          f.paths.runtime,
+          JSON.stringify({ ...clearMarkers, error: 'newer-observation' }),
+          { mode: 0o600 },
+        )
+      })
+      release.release()
+      finishProvider.release()
+      const result = await job
+      expect(result.status).toBe(terminal === 'persisted' ? 'usable' : 'failed')
+      expect(oldFieldsAccepted).toBe(true)
+      expect(staleAccepted).toBe(false)
+      expect(JSON.parse(await readFile(f.paths.runtime, 'utf8'))).toEqual({
+        ...clearMarkers,
+        error: 'newer-observation',
+      })
+      expect(observation).toMatchObject(
+        terminal === 'persisted'
+          ? { successorVersion: expectedVersion }
+          : { credentialVersion: expectedVersion },
+      )
+      if (terminal === 'persisted') expect(freshAccepted).toBe(true)
+      else
+        expect(dispatchMatches(observation?.credentialVersion, before)).toBe(
+          true,
+        )
+      expect(
+        Object.isFrozen(
+          terminal === 'persisted'
+            ? observation?.successorVersion
+            : observation?.credentialVersion,
+        ),
+      ).toBe(true)
+    })
+  }
+}
+
+async function waitForProviders(
+  entered: Promise<void>,
+  jobs: Promise<NativeRefreshResult>[],
+  trace: () => string,
+) {
+  await Promise.race([
+    entered,
+    ...jobs.map(async (job) => {
+      const result = await job
+      throw new Error(
+        `Refresh ended before both providers entered: ${result.status}\n${trace()}`,
+      )
+    }),
+  ])
+}
+
+test('captured clear markers fence a failure even when its dispatch version still matches', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const binding = await f.binding('a')
+  const entered = barrier()
+  const release = barrier()
+  const capturedMarkers = { refreshErrorClearedAt: 7, quotaErrorClearedAt: 9 }
+  await publicationLocks(f, async (assertOwned) => {
+    await assertOwned()
+    await writeFile(f.paths.runtime, JSON.stringify(capturedMarkers), {
+      mode: 0o600,
+    })
+  })
+  let versionMatched = false
+  let freshAccepted = false
+  let published = false
+  const c = f.coordinator({
+    refreshToken: async () => {
+      throw new ClaudeOAuthRefreshError(429, 'busy', '7')
+    },
+    reconcile: async (event) => {
+      if (event.status !== 'failed')
+        throw new Error('Failure observation expected')
+      const row = await f.row('a')
+      const currentMarkers = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
+      freshAccepted =
+        dispatchMatches(event.credentialVersion, row) &&
+        capturedMarkers.refreshErrorClearedAt ===
+          currentMarkers.refreshErrorClearedAt
+      entered.release()
+      await release.promise
+      await publicationLocks(f, async () => {
+        const row = await f.row('a')
+        const currentMarkers = JSON.parse(
+          await readFile(f.paths.runtime, 'utf8'),
+        )
+        versionMatched = dispatchMatches(event.credentialVersion, row)
+        published =
+          nativeLocalPoolBindingMatches(binding, f.paths, row) &&
+          event.credentialFingerprint === row.fingerprint &&
+          versionMatched &&
+          capturedMarkers.refreshErrorClearedAt ===
+            currentMarkers.refreshErrorClearedAt &&
+          capturedMarkers.quotaErrorClearedAt ===
+            currentMarkers.quotaErrorClearedAt
+      })
+    },
+  })
+  const job = c.refresh({ mode: 'local', binding })
+  await entered.promise
+  await publicationLocks(f, async (assertOwned) => {
+    const currentMarkers = JSON.parse(await readFile(f.paths.runtime, 'utf8'))
+    currentMarkers.refreshErrorClearedAt++
+    await assertOwned()
+    await writeFile(f.paths.runtime, JSON.stringify(currentMarkers), {
+      mode: 0o600,
+    })
+  })
+  release.release()
+  expect((await job).status).toBe('failed')
+  expect(freshAccepted).toBe(true)
+  expect(versionMatched).toBe(true)
+  expect(published).toBe(false)
 })
 
 test('account lock spec uses canonical store and identity, not epoch or row namespace', async () => {
@@ -137,44 +539,322 @@ test('account lock spec uses canonical store and identity, not epoch or row name
 })
 
 test('independent known accounts reach provider concurrently', async () => {
-  const active = new Set<string>()
-  const events: string[] = []
-  const f = await fixture({
-    onLockEvent: (event) => {
-      if (event.type === 'acquired') active.add(event.name)
-      else active.delete(event.name)
-      events.push(`${event.type}:${event.name}`)
-    },
-  })
+  const started = performance.now()
+  const trace: string[] = []
+  const phase = (label: string) => {
+    trace.push(`${(performance.now() - started).toFixed(2)}ms ${label}`)
+  }
+  const finish = barrier()
+  const jobs: Promise<NativeRefreshResult>[] = []
+  const diagnostic = setTimeout(
+    () => console.error(`INDEPENDENT-TRACE pending\n${trace.join('\n')}`),
+    4_000,
+  )
+  try {
+    phase('fixture:start')
+    const active = new Set<string>()
+    const events: string[] = []
+    const f = await fixture({
+      onStep: (step, info) => phase(`${info.operation}:${info.rowId}:${step}`),
+      onLockEvent: (event) => {
+        phase(`${event.type}:${event.name}`)
+        if (event.type === 'acquired') active.add(event.name)
+        else active.delete(event.name)
+        events.push(`${event.type}:${event.name}`)
+      },
+    })
+    phase('fixture:initialized')
+    phase('add-a:start')
+    await f.add('a', 'A')
+    phase('add-a:end')
+    phase('add-b:start')
+    await f.add('b', 'B')
+    phase('add-b:end')
+    const both = barrier()
+    let calls = 0
+    const c = f.coordinator({
+      refreshToken: async (input) => {
+        phase(`provider:${calls + 1}`)
+        expect(input.maxRetries).toBe(0)
+        if (++calls === 2) both.release()
+        await finish.promise
+        return { ...credential(input.refreshToken), expiresIn: 3600 }
+      },
+      resolveIdentity: async (access) => ({
+        deviceId: 'd',
+        sessionId: 's',
+        accountUuid: accountUuid(access.endsWith('a') ? 'A' : 'B'),
+      }),
+    })
+    phase('binding-a:start')
+    const aBinding = await f.binding('a')
+    phase('binding-a:end')
+    phase('binding-b:start')
+    const bBinding = await f.binding('b')
+    phase('binding-b:end/launch-both')
+    const a = c.refresh({ mode: 'local', binding: aBinding }).then((result) => {
+      phase(`terminal-a:${result.status}`)
+      return result
+    })
+    const b = c.refresh({ mode: 'local', binding: bBinding }).then((result) => {
+      phase(`terminal-b:${result.status}`)
+      return result
+    })
+    jobs.push(a, b)
+    await waitForProviders(both.promise, jobs, () => trace.join('\n'))
+    phase('providers:both')
+    finish.release()
+    expect((await a).status).toBe('usable')
+    expect((await b).status).toBe('usable')
+    expect(calls).toBe(2)
+    expect(events).toContain(
+      `acquired:${nativeAccountProviderLock(f.paths, 'A').name}`,
+    )
+    expect(active.size).toBe(0)
+    phase('complete')
+  } catch (error) {
+    console.error(`INDEPENDENT-TRACE failed\n${trace.join('\n')}`)
+    throw error
+  } finally {
+    finish.release()
+    await Promise.allSettled(jobs)
+    clearTimeout(diagnostic)
+  }
+})
+
+test('concurrency fixture reports terminal refusal and releases the waiting provider before cleanup', async () => {
+  const f = await fixture()
   await f.add('a', 'A')
   await f.add('b', 'B')
-  const both = barrier()
+  const aBinding = await f.binding('a')
+  const bBinding = await f.binding('b')
+  const entered = barrier()
   const finish = barrier()
-  let calls = 0
   const c = f.coordinator({
-    refreshToken: async (input) => {
-      expect(input.maxRetries).toBe(0)
-      if (++calls === 2) both.release()
+    refreshToken: async () => {
+      entered.release()
       await finish.promise
-      return { ...credential(input.refreshToken), expiresIn: 3600 }
+      return provider({ refreshToken: 'synthetic' })
     },
-    resolveIdentity: async (access) => ({
-      deviceId: 'd',
-      sessionId: 's',
-      accountUuid: accountUuid(access.endsWith('a') ? 'A' : 'B'),
-    }),
+    readRestrictions: async (binding) =>
+      binding.rowId === 'b'
+        ? { status: 'blocked', reason: 'quota-ineligible' }
+        : allowed,
   })
-  const a = c.refresh({ mode: 'local', binding: await f.binding('a') })
-  const b = c.refresh({ mode: 'local', binding: await f.binding('b') })
-  await both.promise
-  finish.release()
+  const a = c.refresh({ mode: 'local', binding: aBinding })
+  await entered.promise
+  const b = c.refresh({ mode: 'local', binding: bBinding })
+  const neverBothEntered = barrier()
+  try {
+    await expect(
+      waitForProviders(
+        neverBothEntered.promise,
+        [a, b],
+        () => 'provider-A waiting; row-B refused',
+      ),
+    ).rejects.toThrow('Refresh ended before both providers entered: refused')
+  } finally {
+    finish.release()
+    await Promise.allSettled([a, b])
+  }
   expect((await a).status).toBe('usable')
-  expect((await b).status).toBe('usable')
-  expect(calls).toBe(2)
-  expect(events).toContain(
-    `acquired:${nativeAccountProviderLock(f.paths, 'A').name}`,
+  expect(await b).toMatchObject({
+    status: 'refused',
+    reason: 'quota-ineligible',
+  })
+  const lock = nativeAccountProviderLock(f.paths, 'A')
+  await withLock(
+    lock.path,
+    { ...POOL_LOCK_DEFAULTS, name: lock.name },
+    async (owned) => {
+      await owned.assertOwned()
+    },
   )
-  expect(active.size).toBe(0)
+})
+
+const timeoutProbePool = process.env.NATIVE_REFRESH_TIMEOUT_POOL
+const timeoutProbeLog = process.env.NATIVE_REFRESH_TIMEOUT_LOG
+let timeoutProbeFinallySeen = false
+let timeoutProbeCleanupCount = 0
+if (timeoutProbePool && timeoutProbeLog) {
+  describe('runner timeout probe', () => {
+    const entered = barrier()
+    const release = barrier()
+    let job: Promise<NativeRefreshResult>
+    const record = (
+      event: string,
+      data: Record<string, string | boolean> = {},
+    ) => {
+      appendFileSync(timeoutProbeLog, `${JSON.stringify({ event, ...data })}\n`)
+    }
+    beforeAll(async () => {
+      roots.push(timeoutProbePool)
+      const paths = await resolveNativePoolPaths(
+        join(timeoutProbePool, 'anthropic-auth.json'),
+        join(timeoutProbePool, 'anthropic-auth-state.json'),
+      )
+      const store = createNativePoolStore({ paths, quota })
+      const read = await store.read()
+      if (read.status !== 'ready' || !read.rows[0])
+        throw new Error('Prepared probe row required')
+      const binding = captureNativeLocalPoolBinding(paths, read.rows[0])
+      const coordinator = createNativeRefreshCoordinator({
+        paths,
+        quota,
+        readRestrictions: async () => allowed,
+        reconcile: async (event) => {
+          record(`reconcile:${event.status}`)
+        },
+        resolveIdentity: identity,
+        refreshToken: async () => {
+          record('provider:entered')
+          entered.release()
+          await release.promise
+          record('provider:returned')
+          return provider({ refreshToken: 'synthetic' })
+        },
+      })
+      job = coordinator.refresh({ mode: 'local', binding })
+      await entered.promise
+    })
+    test('runner timeout probe deadline', async () => {
+      const timer = setTimeout(release.release, 200)
+      try {
+        const result = await job
+        record('body:returned', { status: result.status })
+      } finally {
+        timeoutProbeFinallySeen = true
+        record('body:finally')
+        clearTimeout(timer)
+      }
+    }, 50)
+    test('runner timeout probe observer', async () => {
+      const result = await job
+      record('observer:returned', { status: result.status })
+      expect(result.status).toBe('usable')
+      const successor = await fixture()
+      await successor.add('successor', 'A')
+      const next = await successor.coordinator().refresh({
+        mode: 'local',
+        binding: await successor.binding('successor'),
+      })
+      expect(next.status).toBe('usable')
+    })
+  })
+}
+
+test('real Bun timeout preserves active fixture files until the body actually finishes', async () => {
+  const pool = await fixture()
+  await pool.add('probe', 'A')
+  const ledger = await fixture()
+  const log = join(ledger.root, 'timeout-probe.jsonl')
+  await writeFile(log, '', { mode: 0o600 })
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      'test',
+      import.meta.file,
+      '--test-name-pattern',
+      'runner timeout probe',
+    ],
+    {
+      env: {
+        ...process.env,
+        NATIVE_REFRESH_TIMEOUT_POOL: pool.root,
+        NATIVE_REFRESH_TIMEOUT_LOG: log,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+      stdin: 'ignore',
+    },
+  )
+  const [exit, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stderr).text(),
+    new Response(child.stdout).text(),
+  ])
+  const events = (await readFile(log, 'utf8'))
+    .trim()
+    .split('\n')
+    .map(
+      (line) =>
+        JSON.parse(line) as {
+          event: string
+          finallySeen?: boolean
+          poolExists?: boolean
+          status?: string
+        },
+    )
+  if (!events.find((event) => event.event === 'cleanup:1')?.finallySeen)
+    console.error(`BUN-TIMEOUT-PROBE ${JSON.stringify(events)}`)
+  expect(exit).toBe(1)
+  expect(stderr).toContain('runner timeout probe deadline')
+  expect(stderr).toContain('1 pass')
+  expect(stderr).toContain('1 fail')
+  expect(stderr).not.toContain('Unhandled error')
+  expect(events.find((event) => event.event === 'cleanup:1')).toMatchObject({
+    finallySeen: true,
+    poolExists: false,
+  })
+  expect(events.find((event) => event.event === 'body:returned')).toMatchObject(
+    { status: 'usable' },
+  )
+  expect(
+    events.findIndex((event) => event.event === 'body:finally'),
+  ).toBeLessThan(events.findIndex((event) => event.event === 'cleanup:1'))
+})
+
+test('lifetime waits for body reads and detached published-store writes and opens late gates', async () => {
+  const scenario = new TestLifetime()
+  const entered = barrier()
+  let finalRead = false
+  let lateGateOpened = false
+  let store: ReturnType<typeof createNativePoolStore> | undefined
+  let detached:
+    | ReturnType<ReturnType<typeof createNativePoolStore>['add']>
+    | undefined
+  scenario.body = testLifetime.run(scenario, async () => {
+    const f = await fixture({
+      onStep: async (step) => {
+        if (step !== 'before-state-write') return
+        const parked = barrier()
+        entered.release()
+        await parked.promise
+        const late = barrier()
+        await late.promise
+        lateGateOpened = true
+      },
+    })
+    store = f.store
+    detached = f.store.add({
+      id: 'detached',
+      identity: 'A',
+      credential: credential('detached'),
+    })
+    const bodyGate = barrier()
+    await bodyGate.promise
+    await f.store.read()
+    finalRead = true
+  })
+  try {
+    await entered.promise
+    await scenario.finish()
+    await detached
+    expect(finalRead).toBe(true)
+    expect(lateGateOpened).toBe(true)
+    expect(scenario.calls.size).toBe(0)
+    expect(await store?.read()).toMatchObject({
+      status: 'ready',
+      rows: [expect.objectContaining({ id: 'detached', stamp: 'bound' })],
+    })
+  } finally {
+    await scenario.finish()
+    await Promise.all(
+      [...scenario.roots].map((root) =>
+        rm(root, { recursive: true, force: true }),
+      ),
+    )
+  }
 })
 
 test('unknown rows serialize under provider-anthropic until reconciliation completes', async () => {
@@ -782,6 +1462,13 @@ test('persisted reconciliation failure preserves committed fact and cleans learn
     committed: credential('new'),
   })
   expect(f.observations.map((e) => e.status)).toEqual(['persisted', 'failed'])
+  const failed = f.observations.find((event) => event.status === 'failed')
+  expect(failed?.committedVersion?.accessFingerprint).toBe(
+    tokenFingerprint('access-new'),
+  )
+  expect(failed?.credentialVersion?.accessFingerprint).toBe(
+    tokenFingerprint('access-a'),
+  )
   expect(calls).toBe(1)
   expect((await f.row('a')).credential).toMatchObject(credential('new'))
   // After disposal removes the old job registration, a refresh for the newly
