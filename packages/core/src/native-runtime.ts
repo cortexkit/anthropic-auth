@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { lstat, mkdir, open, rename, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
+import { types as utilTypes } from 'node:util'
 import { withLock } from '@cortexkit/common-auth/fs'
-import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
+import { fingerprintOf, POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
 
 import type {
   AccountOperationError,
@@ -25,6 +26,7 @@ import {
 import type {
   NativeRefreshContext,
   NativeRefreshObservation,
+  NativeRefreshSubject,
 } from './native-refresh-coordinator.ts'
 import {
   isNativeLocalPoolBinding,
@@ -33,6 +35,7 @@ import {
 } from './pool-binding.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
+import { tokenFingerprint } from './token-fingerprint.ts'
 
 /** Identifies the vault credential and Claude account that supplied an observation. This binding contains no access token. */
 export interface NativeCustodyRuntimeBinding {
@@ -934,9 +937,15 @@ export async function publishNativeLocalFirstIdentity(
   try {
     paths = { ...paths }
     const publication = captureFirstIdentity(paths, observation)
-    return await publishLocalValidation(
+    return await publishLocalEntry(
       paths,
-      publication,
+      publication.proof,
+      (material) =>
+        nativeLocalCredentialValidationMatches(
+          publication.proof,
+          publication.proof.binding,
+          material,
+        ),
       (old) => firstIdentityEntry(old, publication),
       publication,
     )
@@ -992,8 +1001,12 @@ export async function publishNativeLocalCredentialValidation(
           !sameLocalBinding(context.runtimeBinding, proof.binding)))
     )
       throw new NativeRuntimeError('publication-refused')
-    return await publishLocalValidation(paths, publication, (old) =>
-      knownValidationEntry(old, publication),
+    return await publishLocalEntry(
+      paths,
+      proof,
+      (material) =>
+        nativeLocalCredentialValidationMatches(proof, proof.binding, material),
+      (old) => knownValidationEntry(old, publication),
     )
   } catch (error) {
     if (error instanceof NativeRuntimeError) throw error
@@ -1001,33 +1014,450 @@ export async function publishNativeLocalCredentialValidation(
   }
 }
 
-// Both publication paths verify the pool and held locks before replacing state.
-// Selecting an entry cannot skip the checks that prevent stale state writes.
-async function publishLocalValidation(
+export interface NativeLocalFailurePolicy {
+  readonly checkedAt: number
+  /** A nextRetryAt equal to checkedAt adds no delay beyond the recorded failure time. */
+  readonly nextRetryAt?: number
+  readonly retryCount?: number
+}
+
+export type NativeLocalFailureSkipReason =
+  | 'not-a-failure'
+  | 'no-context'
+  | 'not-attributable'
+  | 'missing-committed'
+
+export type NativeLocalFailureAttribution =
+  | { readonly kind: 'none'; readonly reason: NativeLocalFailureSkipReason }
+  | {
+      readonly kind: 'refresh-error'
+      readonly target: 'captured' | 'committed'
+      readonly subject: NativeRefreshSubject
+      readonly permanent: boolean
+      readonly message:
+        | 'Local refresh failed'
+        | 'Local account-check recovery required'
+      readonly status?: number
+    }
+  | {
+      readonly kind: 'validation-retry'
+      readonly target: 'captured' | 'committed'
+      readonly subject: NativeLocalValidationRetry['subject']
+    }
+
+export type NativeLocalFailureSupersededReason =
+  | 'row-binding'
+  | 'row-credential'
+  | 'entry-binding'
+  | 'reset-context'
+  | 'already-proven'
+  | 'older-than-stored'
+
+export type NativeLocalFailurePublication =
+  | {
+      readonly status: 'published'
+      readonly attribution: Exclude<
+        NativeLocalFailureAttribution,
+        { kind: 'none' }
+      >
+      readonly state: NativeRuntimeState
+    }
+  | {
+      readonly status: 'skipped'
+      readonly reason: NativeLocalFailureSkipReason
+    }
+  | {
+      readonly status: 'superseded'
+      readonly reason: NativeLocalFailureSupersededReason
+    }
+
+function completeFailureVersion(value: unknown): boolean {
+  return (
+    dispatchVersion(value) &&
+    tokenFingerprintValue(value.accessFingerprint) &&
+    counter(value.expires) &&
+    value.expires > 0
+  )
+}
+
+// Observations must be plain records throughout. Read property descriptors so
+// caller-defined getters do not run while capturing them. Refuse proxies before
+// inspecting them, and discard inspection errors that can contain caller data.
+function capturePlainFailureData<T>(input: T): T {
+  const active = new WeakSet<object>()
+  const copy = (value: unknown, depth: number): unknown => {
+    if (
+      value === null ||
+      value === undefined ||
+      ['string', 'number', 'boolean'].includes(typeof value)
+    )
+      return value
+    if (
+      typeof value !== 'object' ||
+      utilTypes.isProxy(value) ||
+      depth > 32 ||
+      active.has(value)
+    )
+      throw new NativeRuntimeError('publication-refused')
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null)
+      throw new NativeRuntimeError('publication-refused')
+    active.add(value)
+    try {
+      const descriptors = Object.getOwnPropertyDescriptors(value)
+      const captured: Record<string, unknown> = Object.create(null)
+      for (const key of Reflect.ownKeys(descriptors)) {
+        if (typeof key !== 'string')
+          throw new NativeRuntimeError('publication-refused')
+        const descriptor = descriptors[key]
+        if (!descriptor || !Object.hasOwn(descriptor, 'value'))
+          throw new NativeRuntimeError('publication-refused')
+        Object.defineProperty(captured, key, {
+          value: copy(descriptor.value, depth + 1),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        })
+      }
+      return captured
+    } finally {
+      active.delete(value)
+    }
+  }
+  try {
+    return copy(input, 0) as T
+  } catch {
+    throw new NativeRuntimeError('publication-refused')
+  }
+}
+
+/**
+ * Classify the captured observation only. Saved credentials identify which
+ * account needs recovery, but do not prove a failed refresh or a completed
+ * account check. Refuse malformed action inputs rather than infer them from disk.
+ */
+export function classifyNativeLocalFailure(
+  observation: NativeRefreshObservation,
+): NativeLocalFailureAttribution {
+  try {
+    return classifyCapturedLocalFailure(capturePlainFailureData(observation))
+  } catch {
+    // Return a new generic error if capture or classification fails. Do not
+    // retain an exception whose message or cause can contain caller data.
+    throw new NativeRuntimeError('publication-refused')
+  }
+}
+
+function classifyCapturedLocalFailure(
+  event: NativeRefreshObservation,
+): NativeLocalFailureAttribution {
+  if (event.status !== 'failed' && event.status !== 'persisted')
+    return { kind: 'none', reason: 'not-a-failure' }
+  if (event.context === undefined) return { kind: 'none', reason: 'no-context' }
+  if (!record(event.context))
+    throw new NativeRuntimeError('publication-refused')
+  if (
+    event.status === 'failed' &&
+    (!record(event.failure) ||
+      !keys(
+        event.failure,
+        ['kind', 'classification'],
+        ['status', 'retryAfter'],
+      ) ||
+      !text(event.failure.kind) ||
+      !['transient', 'invalid-grant', 'permanent'].includes(
+        event.failure.classification,
+      ) ||
+      (event.failure.status !== undefined &&
+        (!counter(event.failure.status) ||
+          event.failure.status < 100 ||
+          event.failure.status > 599)) ||
+      (event.failure.retryAfter !== undefined &&
+        !time(event.failure.retryAfter)) ||
+      typeof event.persisted !== 'boolean')
+  )
+    throw new NativeRuntimeError('publication-refused')
+  if (event.status === 'failed' && event.persisted && !event.committed)
+    return { kind: 'none', reason: 'missing-committed' }
+  if (
+    event.bootstrap === 'resolved' ||
+    (event.status === 'failed' &&
+      (event.failure.kind === 'caller-hook' ||
+        (!event.persisted &&
+          !['provider', 'validation'].includes(event.failure.kind))))
+  )
+    return { kind: 'none', reason: 'not-attributable' }
+  const context = event.context
+  if (
+    !isNativeLocalPoolBinding(event.binding) ||
+    !digest(event.credentialFingerprint) ||
+    !dispatchVersion(event.credentialVersion) ||
+    !record(context.subject) ||
+    !isNativeLocalPoolBinding(context.subject.binding) ||
+    !sameLocalBinding(context.subject.binding, event.binding) ||
+    context.subject.credentialFingerprint !== event.credentialFingerprint ||
+    !dispatchVersion(context.subject.version) ||
+    !sameVersion(context.subject.version, event.credentialVersion) ||
+    (context.runtimeBinding !== null &&
+      !isNativeLocalPoolBinding(context.runtimeBinding)) ||
+    ![
+      context.refreshErrorClearedAt,
+      context.quotaErrorClearedAt,
+      context.quotaErrorGeneration,
+    ].every((value) => value === null || counter(value))
+  )
+    throw new NativeRuntimeError('publication-refused')
+  const saved = event.status === 'persisted' || event.persisted
+  const committed = event.committed
+  if (
+    saved &&
+    (!record(committed) ||
+      !keys(committed, ['credentialFingerprint', 'version']) ||
+      !digest(committed.credentialFingerprint) ||
+      !completeFailureVersion(committed.version))
+  )
+    throw new NativeRuntimeError('publication-refused')
+  if (
+    event.status === 'persisted' &&
+    (!dispatchVersion(event.successorVersion) ||
+      event.successorFingerprint !== committed?.credentialFingerprint ||
+      !sameVersion(event.successorVersion, { ...committed?.version }))
+  )
+    throw new NativeRuntimeError('publication-refused')
+  if (event.status === 'failed' && !saved && event.committed !== undefined)
+    throw new NativeRuntimeError('publication-refused')
+  const subject: NativeRefreshSubject = {
+    binding: { ...event.binding },
+    credentialFingerprint: saved
+      ? committed!.credentialFingerprint
+      : event.credentialFingerprint,
+    version: { ...(saved ? committed!.version : event.credentialVersion) },
+  }
+  const target = saved ? 'committed' : 'captured'
+  if (
+    (saved && subject.binding.identity !== undefined) ||
+    (event.status === 'failed' && event.failure.kind === 'validation')
+  ) {
+    // A retry record identifies credentials still awaiting validation;
+    // it cannot grant permission to send requests.
+    if (!isNativeLocalCredentialValidation(subject))
+      throw new NativeRuntimeError('publication-refused')
+    return { kind: 'validation-retry', target, subject }
+  }
+  if (saved)
+    return {
+      kind: 'refresh-error',
+      target,
+      subject,
+      permanent: false,
+      message: 'Local account-check recovery required',
+    }
+  if (event.status !== 'failed')
+    throw new NativeRuntimeError('publication-refused')
+  const status = event.failure.status
+  if (
+    status !== undefined &&
+    (!Number.isInteger(status) || status < 100 || status > 599)
+  )
+    throw new NativeRuntimeError('publication-refused')
+  return {
+    kind: 'refresh-error',
+    target,
+    subject,
+    permanent:
+      event.failure.classification === 'invalid-grant' && status === 400,
+    message: 'Local refresh failed',
+    ...(status !== undefined ? { status } : {}),
+  }
+}
+
+// Recovery can omit access or expiry, but a match does not validate credentials
+// or permit requests. An undefined access fingerprint or expiry requires the
+// credential field to be absent. An absent refresh timestamp is not a stored zero.
+function failureMaterialMatches(
+  subject: NativeRefreshSubject,
+  material: Parameters<typeof nativeLocalCredentialValidationMatches>[2],
+): boolean {
+  if (!material || material.type !== 'oauth' || !text(material.refresh))
+    return false
+  const version = subject.version
+  return (
+    subject.credentialFingerprint ===
+      fingerprintOf({ type: 'oauth', refresh: material.refresh }) &&
+    (version.accessFingerprint === undefined
+      ? !Object.hasOwn(material, 'access')
+      : text(material.access) &&
+        version.accessFingerprint === tokenFingerprint(material.access)) &&
+    (version.expires === undefined
+      ? !Object.hasOwn(material, 'expires')
+      : version.expires === material.expires) &&
+    Object.hasOwn(version, 'lastRefreshedAt') ===
+      Object.hasOwn(material, 'lastRefreshedAt') &&
+    version.lastRefreshedAt === material.lastRefreshedAt
+  )
+}
+
+/**
+ * Publish the failure only for its captured credential version or saved successor.
+ * This write neither validates credentials nor repairs identity, clears earlier
+ * errors, or changes their clear timestamps. Credentials and runtime metadata
+ * are saved separately; a thrown runtime write does not prove credential rollback.
+ */
+export async function publishNativeLocalRefreshFailure(
   paths: NativePoolPaths,
-  publication: LocalValidationPublication,
+  observation: NativeRefreshObservation,
+  policy: NativeLocalFailurePolicy,
+): Promise<NativeLocalFailurePublication> {
+  let reason: NativeLocalFailureSupersededReason | undefined
+  const superseded = (value: NativeLocalFailureSupersededReason): never => {
+    reason = value
+    throw new NativeRuntimeError('publication-refused')
+  }
+  try {
+    paths = capturePlainFailureData(paths)
+    const event = capturePlainFailureData(observation)
+    policy = capturePlainFailureData(policy)
+    const attribution = classifyNativeLocalFailure(event)
+    if (attribution.kind === 'none')
+      return { status: 'skipped', reason: attribution.reason }
+    const { subject } = attribution
+    const context = event.context!
+    if (
+      subject.binding.storageId !== paths.storageId ||
+      !counter(policy.checkedAt) ||
+      (policy.nextRetryAt !== undefined &&
+        (!counter(policy.nextRetryAt) ||
+          policy.nextRetryAt < policy.checkedAt)) ||
+      (policy.retryCount !== undefined && !counter(policy.retryCount)) ||
+      ((attribution.kind === 'validation-retry' || !attribution.permanent) &&
+        policy.nextRetryAt === undefined)
+    )
+      throw new NativeRuntimeError('publication-refused')
+    const state = await publishLocalEntry(
+      paths,
+      subject,
+      (material) => failureMaterialMatches(subject, material),
+      (old) => {
+        if (
+          (!old && context.runtimeBinding !== null) ||
+          (old &&
+            (old.binding.kind !== 'local' ||
+              !isNativeLocalPoolBinding(context.runtimeBinding) ||
+              !sameLocalBinding(old.binding, context.runtimeBinding) ||
+              !sameLocalBinding(old.binding, subject.binding)))
+        )
+          superseded('entry-binding')
+        if (!capturedResetContextMatches(old, context))
+          superseded('reset-context')
+        if (
+          old?.refreshErrorClearedAt !== undefined &&
+          policy.checkedAt <= old.refreshErrorClearedAt
+        )
+          throw new NativeRuntimeError('publication-refused')
+        const entry: NativeRuntimeEntry = old
+          ? { ...old }
+          : { binding: subject.binding }
+        if (attribution.kind === 'validation-retry') {
+          const sameSubject = (value: NativeLocalValidationRetry['subject']) =>
+            sameLocalBinding(value.binding, subject.binding) &&
+            value.credentialFingerprint === subject.credentialFingerprint &&
+            sameVersion({ ...value.version }, { ...subject.version })
+          if (
+            old?.credentialValidation &&
+            sameSubject(old.credentialValidation)
+          )
+            superseded('already-proven')
+          if (
+            old?.validationRetry &&
+            sameSubject(old.validationRetry.subject) &&
+            (old.validationRetry.checkedAt > policy.checkedAt ||
+              (old.validationRetry.checkedAt === policy.checkedAt &&
+                old.validationRetry.nextRetryAt !== policy.nextRetryAt))
+          )
+            superseded('older-than-stored')
+          entry.validationRetry = {
+            subject: attribution.subject,
+            checkedAt: policy.checkedAt,
+            nextRetryAt: policy.nextRetryAt!,
+          }
+        } else {
+          if (
+            old?.lastRefreshError &&
+            policy.checkedAt < old.lastRefreshError.checkedAt
+          )
+            superseded('older-than-stored')
+          entry.lastRefreshError = {
+            message: attribution.message,
+            credentialFingerprint: subject.credentialFingerprint,
+            permanent: attribution.permanent,
+            checkedAt: policy.checkedAt,
+            ...(subject.binding.identity !== undefined
+              ? { accountIdentity: subject.binding.identity }
+              : {}),
+            ...(attribution.status !== undefined
+              ? { status: attribution.status }
+              : {}),
+            ...(policy.nextRetryAt !== undefined
+              ? { nextRetryAt: policy.nextRetryAt }
+              : {}),
+            ...(policy.retryCount !== undefined
+              ? { retryCount: policy.retryCount }
+              : {}),
+          }
+        }
+        return entry
+      },
+      undefined,
+      superseded,
+    )
+    return { status: 'published', attribution, state }
+  } catch (error) {
+    // The runtime writer replaces pre-rename exceptions with a generic error.
+    // Return a captured row-change reason only for that refusal; filesystem
+    // and lease faults must remain errors, not harmless supersession.
+    if (
+      reason &&
+      error instanceof NativeRuntimeError &&
+      error.code === 'publication-refused'
+    )
+      return { status: 'superseded', reason }
+    if (error instanceof NativeRuntimeError) throw error
+    throw new NativeRuntimeError('publication-refused')
+  }
+}
+
+// Hold pool config and state leases while checking the selected credential row
+// and until runtime rename. All publishers share these checks; choosing another
+// runtime entry must not bypass them.
+async function publishLocalEntry(
+  paths: NativePoolPaths,
+  subject: NativeRefreshSubject,
+  matches: (
+    material: Parameters<typeof nativeLocalCredentialValidationMatches>[2],
+  ) => boolean,
   replacement: (old: NativeRuntimeEntry | undefined) => NativeRuntimeEntry,
   firstIdentity?: FirstIdentityPublication,
+  superseded?: (reason: 'row-binding' | 'row-credential') => never,
 ): Promise<NativeRuntimeState> {
   try {
     const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
     const [config, state] = nativePoolStoreLocks(paths)
     const checkPool = async () => {
       const read = await store.read()
-      const row =
-        read.status === 'ready'
-          ? read.rows.find((row) => row.id === publication.proof.binding.rowId)
-          : undefined
-      if (
-        !row ||
-        !nativeLocalPoolBindingMatches(publication.proof.binding, paths, row) ||
-        !nativeLocalCredentialValidationMatches(
-          publication.proof,
-          publication.proof.binding,
-          row.credential,
-        )
-      )
+      // Unreadable or invalid pool files do not prove a concurrent row change.
+      // Refuse the write as a storage fault and discard parser details that
+      // can contain credentials.
+      if (read.status !== 'ready')
         throw new NativeRuntimeError('publication-refused')
+      const row = read.rows.find((row) => row.id === subject.binding.rowId)
+      if (!row || !nativeLocalPoolBindingMatches(subject.binding, paths, row)) {
+        superseded?.('row-binding')
+        throw new NativeRuntimeError('publication-refused')
+      }
+      if (!matches(row.credential)) {
+        superseded?.('row-credential')
+        throw new NativeRuntimeError('publication-refused')
+      }
     }
     return await withLock(
       config.path,
@@ -1042,7 +1472,7 @@ async function publishLocalValidation(
               paths.runtime,
               paths.storageId,
               (current) => {
-                const id = publication.proof.binding.rowId
+                const id = subject.binding.rowId
                 current.accounts[id] = replacement(current.accounts[id])
                 return current
               },

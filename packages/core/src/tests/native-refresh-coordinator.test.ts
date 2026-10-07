@@ -2469,10 +2469,10 @@ for (const [name, cause, expectedCalls, classification] of [
     'invalid-grant',
   ],
   [
-    'invalid_grant even on 5xx',
+    '5xx invalid_grant body remains transient and non-dead',
     new ClaudeOAuthRefreshError(503, 'invalid_grant'),
-    1,
-    'invalid-grant',
+    3,
+    'transient',
   ],
   ['rate limit', new ClaudeOAuthRefreshError(429, 'busy', '7'), 1, 'transient'],
   [
@@ -2490,6 +2490,18 @@ for (const [name, cause, expectedCalls, classification] of [
       },
     })
     await f.add('a', 'A')
+    if (name === '5xx invalid_grant body remains transient and non-dead') {
+      const { updateNativeRuntime } = await import('../native-runtime.ts')
+      const binding = await f.binding('a')
+      await updateNativeRuntime(
+        f.paths.runtime,
+        f.paths.storageId,
+        (current) => {
+          current.accounts.a = { binding }
+          return current
+        },
+      )
+    }
     let calls = 0
     const c = f.coordinator({
       refreshToken: async (input) => {
@@ -2513,6 +2525,30 @@ for (const [name, cause, expectedCalls, classification] of [
       failure: { kind: 'provider', classification },
     })
     expect((await f.row('a')).credential).toMatchObject(credential('a'))
+    if (name === '5xx invalid_grant body remains transient and non-dead') {
+      const { publishNativeLocalRefreshFailure } = await import(
+        '../native-runtime.ts'
+      )
+      expect(result.failure.status).toBe(503)
+      const event = f.observations.at(-1)
+      if (!event) throw new Error('Missing provider failure observation')
+      const publication = await publishNativeLocalRefreshFailure(
+        f.paths,
+        event,
+        {
+          checkedAt: 100,
+          nextRetryAt: 100,
+        },
+      )
+      expect(publication).toMatchObject({
+        status: 'published',
+        state: {
+          accounts: {
+            a: { lastRefreshError: { status: 503, permanent: false } },
+          },
+        },
+      })
+    }
   })
 }
 
