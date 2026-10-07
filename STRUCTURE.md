@@ -60,7 +60,7 @@ anthropic-auth/
 **`packages/pi/src/`:**
 - Purpose: Pi extension — registers CortexKit Anthropic provider override
 - Contains: Extension entry point, command registration, request building, streaming provider
-- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, bounded process-local billing-suffix pinning, origin-aware thinking-signature filtering, configurable Fable 5.1, Opus 5.5, and Sonnet 5.5 adaptive-thinking prefix behavior, mid-conversation effort markers, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `transcript.ts` (host-independent system-prompt and tool replay for Pi and Oh My Pi), `effort-history.ts` (compaction-aware Pi thinking-level timeline), `paths.ts` (Pi-specific path resolution)
+- Key files: `index.ts` (provider and model-catalog registration), `stream.ts` (streaming request handling including redacted-thinking preservation), `commands.ts` (slash command registration), `convert.ts` (Claude Code-compatible request conversion, a bounded in-memory map that holds the Claude Code billing-version suffix stable for each session, origin-aware thinking-signature filtering, configurable Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5 adaptive-thinking prefix behavior, mid-conversation effort markers, redacted-thinking replay, Pi documentation-prompt relocation, and cache breakpoint placement), `transcript.ts` (host-independent system-prompt and tool replay for Pi and Oh My Pi), `effort-history.ts` (compaction-aware Pi thinking-level timeline), `paths.ts` (Pi-specific path resolution)
 
 **`packages/e2e-tests/`:**
 - Purpose: Integration tests with mock Anthropic, relay, and Claustrum servers
@@ -118,8 +118,8 @@ anthropic-auth/
 - `packages/core/src/cache1h.ts`: 1h prompt cache configuration and commands
 - `packages/core/src/fast.ts`: Fast mode configuration and commands
 - `packages/core/src/dump.ts`: Request/response dump capture logic, response metadata artifacts, same-session on-disk byte-diff baseline recovery after restart, CacheKeep/Prime prewarm tagging, and commands
-- `packages/core/src/models.ts`: Supported Claude models and specs, including Fable/Mythos 5.1 release metadata and pricing, context-window qualifier normalization (`[1m]`) for model-family checks, and the Haiku 4.5 prime model
-- `packages/core/src/thinking-binding.ts`: Shared replay detection and configurable `account-default`/`error`/`drop_block` controls for Fable 5.1, Opus 5.5, and Sonnet 5.5 signed/redacted thinking
+- `packages/core/src/models.ts`: Supported Claude models and specs, including Fable/Mythos 5.1 release metadata and pricing, Haiku 5.5 metadata and its 100K request-wide pricing tier, context-window qualifier normalization (`[1m]`) for model-family checks, and the Haiku 4.5 prime model
+- `packages/core/src/thinking-binding.ts`: Shared replay detection and configurable `account-default`/`error`/`drop_block` controls for Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5 signed/redacted thinking
 - `packages/core/src/mid-conversation-output-config.ts`: Shared Fable 5.1 effort normalization and empty-system-marker insertion while keeping the cached top-level effort stable
 - `packages/core/src/logger.ts`: Shared structured logger
 - `packages/core/src/json.ts`: Shared JSON parsing helpers that redact parser source context while preserving path, line, and column diagnostics

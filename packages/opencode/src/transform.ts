@@ -11,6 +11,7 @@ import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_HAIKU_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_5_ADAPTIVE_THINKING,
@@ -21,6 +22,7 @@ import {
   hasThinkingBindingControls,
   isClaudeFableOrMythos5Model,
   isClaudeFableOrMythos51Model,
+  isClaudeHaiku55Model,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet5Model,
@@ -1124,6 +1126,32 @@ function normalizeOpus5Request(
   return { replacedExisting: hadThinking, display: 'summarized' }
 }
 
+/** Haiku 5.5 accepts forced tool choice, but not manual thinking or sampling overrides. */
+function normalizeHaiku55Request(
+  parsed: Record<string, unknown>,
+): { replacedExisting: boolean; display: 'summarized' | 'disabled' } | null {
+  if (!isClaudeHaiku55Model(parsed.model)) return null
+  delete parsed.temperature
+  delete parsed.top_p
+  delete parsed.top_k
+  const hadThinking = Object.hasOwn(parsed, 'thinking')
+  if (isRecord(parsed.thinking) && parsed.thinking.type === 'disabled') {
+    parsed.thinking = { type: 'disabled' }
+    const outputConfig = parsed.output_config
+    // Keep thinking disabled, but lower xhigh/max effort to high because
+    // Haiku rejects those effort levels when thinking is disabled.
+    if (
+      isRecord(outputConfig) &&
+      (outputConfig.effort === 'xhigh' || outputConfig.effort === 'max')
+    ) {
+      outputConfig.effort = 'high'
+    }
+    return { replacedExisting: hadThinking, display: 'disabled' }
+  }
+  parsed.thinking = { ...CLAUDE_HAIKU_5_5_ADAPTIVE_THINKING }
+  return { replacedExisting: hadThinking, display: 'summarized' }
+}
+
 export function prepareFableCacheWarmSource(
   bodyText: string,
   fableModel = CLAUDE_FABLE_5_MODEL_ID,
@@ -1342,6 +1370,7 @@ export async function rewriteRequestBody(
     const fableMythosThinking = normalizeFableMythosRequest(parsed)
     const sonnet5Thinking = normalizeSonnet5FamilyRequest(parsed)
     const opus5Thinking = normalizeOpus5Request(parsed)
+    const haiku55Thinking = normalizeHaiku55Request(parsed)
     options.perf?.('model_normalize', {
       ms: rewriteRoundMs(rewriteNowMs() - modelNormalizeStart),
       model: typeof parsed.model === 'string' ? parsed.model : undefined,
@@ -1354,6 +1383,8 @@ export async function rewriteRequestBody(
       replacedSonnet5Thinking: sonnet5Thinking?.replacedExisting ?? false,
       opus5ThinkingDisplay: opus5Thinking?.display,
       replacedOpus5Thinking: opus5Thinking?.replacedExisting ?? false,
+      haiku55ThinkingDisplay: haiku55Thinking?.display,
+      replacedHaiku55Thinking: haiku55Thinking?.replacedExisting ?? false,
       removedNonAnthropicThinking,
       serverSideFallbackEnabled: serverSideFallback.enabled,
       serverFallbackMarkersRestored: serverSideFallback.restoredMarkers,

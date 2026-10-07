@@ -85,6 +85,43 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
     })
   })
 
+  test('exposes Claude Haiku 5.5 with adaptive efforts and the exact 100K price tier', async () => {
+    const { pi, providers } = mockPi()
+    await cortexKitPiAnthropicAuth(pi)
+    const haiku55 = providers
+      .get('anthropic')
+      ?.models?.find((model) => model.id === 'claude-haiku-5-5')
+    expect(haiku55).toMatchObject({
+      id: 'claude-haiku-5-5',
+      name: 'Claude Haiku 5.5',
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        xhigh: 'xhigh',
+        max: 'max',
+      },
+      input: ['text', 'image'],
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+      cost: {
+        input: 0.1,
+        output: 0.5,
+        cacheRead: 0.01,
+        cacheWrite: 0.125,
+        tiers: [
+          {
+            inputTokensAbove: 100_000,
+            input: 0.5,
+            output: 2.5,
+            cacheRead: 0.05,
+            cacheWrite: 0.625,
+          },
+        ],
+      },
+    })
+  })
+
   test('exposes Claude Sonnet 5.5 with native limits and prices', async () => {
     const { pi, providers } = mockPi()
     await cortexKitPiAnthropicAuth(pi)
