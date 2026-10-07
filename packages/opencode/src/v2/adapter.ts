@@ -141,7 +141,7 @@ export type NativeAnthropicAuthorization<P> =
       readonly accessToken: string
       /** The Claude Code identity of the account, when the source knows it. */
       readonly identity?: ClaudeCodeIdentity
-      /** Extra header edits. Credential headers here are ignored. */
+      /** Additional OAuth request headers; authorization and x-api-key edits are ignored so they cannot replace the authorized bearer. */
       readonly headers?: HeaderEdits
       readonly provenance: P
     }
