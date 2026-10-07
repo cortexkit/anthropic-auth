@@ -1,0 +1,56 @@
+# Commands select exact expect_red tests; --broad runs the Core or Pi package set below.
+prebuild = [
+  { name = "core-current-source", command = ["bun", "run", "--cwd", "packages/core", "build"] },
+]
+
+[[control]]
+id = "history-refuses-meaningful-assistant"
+guards = "Meaningful assistant trailers must be refused without deleting history or replaying the preceding question."
+file = "packages/core/src/request-history.ts"
+old = "if (!isProvablyEmptyContent(last.content)) {"
+new = "if (!isProvablyEmptyContent(last.content) && end < 0) { // NON-VACUITY BREAK: accept and remove meaningful trailers"
+test_file = "packages/core/src/tests/request-history.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/request-history.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["refuses unknown or meaningful content 0 without mutating history"]
+expect_message = "error: expect(received).toThrow(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "fast-excludes-opus-46-47"
+guards = "Fast mode excludes Opus 4.6 and 4.7 while retaining Opus 4.8, 5 and 5.5."
+file = "packages/core/src/constants.ts"
+old = "model.startsWith('claude-opus-4-8') || model.startsWith('claude-opus-5')"
+new = "model.startsWith('claude-opus-4-') || model.startsWith('claude-opus-5') /* NON-VACUITY BREAK: widen unsupported models */"
+test_file = "packages/core/src/tests/fast.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/fast.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["fast mode eligibility for claude-opus-4-6 is false", "fast mode eligibility for claude-opus-4-7 is false", "fast mode eligibility for claude-opus-4-7[1m] is false"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "thinking-binding-excludes-api-key"
+guards = "Pi must not apply Core thinking-binding controls without an OAuth identity, including signed history on API-key routes."
+file = "packages/pi/src/convert.ts"
+old = '''  if (identity) {
+    applyThinkingBindingControls('''
+new = '''  // NON-VACUITY BREAK: decorate API-key routes with an explicit override
+  if (!identity) applyThinkingBindingControls(body, 'drop_block')
+  if (identity) {
+    applyThinkingBindingControls('''
+test_file = "packages/pi/src/tests/convert.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/convert.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["buildAnthropicRequest — Fable/Mythos thinking > does not add Fable 5.1 binding controls to an API-key request"]
+expect_message = "error: expect(received).toBeUndefined()"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
+broad_report = "tmp/mutations/pi.xml"
+broad_id = "{name}"
