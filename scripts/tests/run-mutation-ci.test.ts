@@ -78,7 +78,7 @@ test('unknown events and missing or injectable PR bases refuse', () => {
     '',
     'main',
     '-HEAD',
-    base + '; echo unsafe',
+    `${base}; echo unsafe`,
     'A'.repeat(40),
   ])
     expect(() =>
@@ -331,9 +331,9 @@ test('parsed workflow has isolated read-only PR/main/nightly jobs and retained a
   const job = workflow.jobs.guards
   if (!record(job) || !Array.isArray(job.steps) || !record(job.env))
     throw new Error('Invalid mutation job')
-  expect(job.env.MUTATION_EVENT).toBe('${{ github.event_name }}')
+  expect(job.env.MUTATION_EVENT).toBe(`\${{ github.event_name }}`)
   expect(job.env.MUTATION_BASE).toBe(
-    '${{ github.event.pull_request.base.sha }}',
+    `\${{ github.event.pull_request.base.sha }}`,
   )
   const steps: unknown[] = job.steps
   const checkout = steps.find(
