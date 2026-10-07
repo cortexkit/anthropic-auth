@@ -1,6 +1,7 @@
 import type { AccountStorage } from './accounts.ts'
 import {
   isClaudeFable51Model,
+  isClaudeHaiku55Model,
   isClaudeOpus55Model,
   isClaudeSonnet55Model,
 } from './models.ts'
@@ -56,7 +57,8 @@ export function applyThinkingBindingControls(
   if (
     !isClaudeFable51Model(body.model) &&
     !isClaudeOpus55Model(body.model) &&
-    !isClaudeSonnet55Model(body.model)
+    !isClaudeSonnet55Model(body.model) &&
+    !isClaudeHaiku55Model(body.model)
   )
     return false
   if (!hasReplayableThinkingBlocks(body)) return false

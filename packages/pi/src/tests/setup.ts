@@ -4,6 +4,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 let testDir: string | undefined
+const activeBodies = new Set<Promise<unknown>>()
+
+/** Bun deadlines do not cancel async bodies; keep their fixture alive until they settle. */
+export function trackPiTestBody<T>(body: Promise<T>): Promise<T> {
+  activeBodies.add(body)
+  void body.then(
+    () => activeBodies.delete(body),
+    () => activeBodies.delete(body),
+  )
+  return body
+}
 const HOST_PATH_ENV_VARS = [
   'OPENCODE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_FILE',
@@ -32,6 +43,9 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  if (testDir) await rm(testDir, { recursive: true, force: true })
+  const retiredDir = testDir
+  const retiredBodies = [...activeBodies]
   testDir = undefined
+  await Promise.allSettled(retiredBodies)
+  if (retiredDir) await rm(retiredDir, { recursive: true, force: true })
 })
