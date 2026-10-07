@@ -331,7 +331,9 @@ function failureOf(error: Error): NativeRefreshFailure {
   const cause = error instanceof PoolOperationError ? error.cause : error
   const kind = error instanceof PoolOperationError ? error.kind : 'caller-hook'
   if (kind === 'provider' && cause instanceof ClaudeOAuthRefreshError) {
-    const invalidGrant = /\binvalid_grant\b/.test(cause.body)
+    // Only a 400 invalid_grant response establishes a dead refresh token.
+    const invalidGrant =
+      cause.status === 400 && /\binvalid_grant\b/.test(cause.body)
     return {
       kind,
       classification: invalidGrant
