@@ -722,23 +722,27 @@ async function sendIgnoredMessage(
 }
 
 function cleanAbort(): never {
-  // OpenCode currently has no handled/cancel return contract for
-  // command.execute.before. Throw an Error for legacy hosts, but duck-type an
-  // Effect HttpServerResponse.empty({ status: 204 }) so OpenCode 1.17+ treats
-  // handled slash commands as a clean no-content response instead of logging a
-  // plugin error.
-  const sentinel = new Error(HANDLED_SENTINEL) as Error &
-    Record<string, unknown>
-  sentinel[HTTP_SERVER_RESPONSE_TYPE_ID] = HTTP_SERVER_RESPONSE_TYPE_ID
-  sentinel[ERROR_REPORTER_IGNORE] = true
-  sentinel.status = 204
-  sentinel.statusText = undefined
-  sentinel.headers = {}
-  sentinel.cookies = {
-    [HTTP_COOKIES_TYPE_ID]: HTTP_COOKIES_TYPE_ID,
-    cookies: {},
-  }
-  sentinel.body = { [HTTP_BODY_TYPE_ID]: HTTP_BODY_TYPE_ID, _tag: 'Empty' }
+  // OpenCode has no return value that says "this slash command was handled"
+  // in command.execute.before, so the plugin throws. Older hosts only see an
+  // Error. OpenCode 1.17+ recognises the fields below as Effect's empty HTTP
+  // response (status 204, body tag `Empty`) and answers the command with no
+  // content; the reporter-ignore marker keeps Effect's error reporter from
+  // logging the handled command as a plugin failure.
+  // The fields are set while the error is built rather than assigned
+  // afterwards, because Effect's typing of the global Error makes the
+  // reporter-ignore marker read-only.
+  const sentinel = Object.assign(new Error(HANDLED_SENTINEL), {
+    [HTTP_SERVER_RESPONSE_TYPE_ID]: HTTP_SERVER_RESPONSE_TYPE_ID,
+    [ERROR_REPORTER_IGNORE]: true,
+    status: 204,
+    statusText: undefined,
+    headers: {},
+    cookies: {
+      [HTTP_COOKIES_TYPE_ID]: HTTP_COOKIES_TYPE_ID,
+      cookies: {},
+    },
+    body: { [HTTP_BODY_TYPE_ID]: HTTP_BODY_TYPE_ID, _tag: 'Empty' },
+  })
   throw sentinel
 }
 
