@@ -1,0 +1,52 @@
+name: Mutation guards
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MUTATION_EVENT: ${{ github.event_name }}
+      MUTATION_BASE: ${{ github.event.pull_request.base.sha }}
+      MUTATION_HOME: ${{ github.workspace }}/node_modules/.cache/ckdev-mutate-0.9.0
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      - run: bun install --frozen-lockfile
+      - name: Install pinned mutation runner
+        shell: bash
+        run: |
+          CARGO_HOME="$MUTATION_HOME/cargo-home" \
+          CARGO_TARGET_DIR="$MUTATION_HOME/target" \
+          cargo install --locked --git https://github.com/cortexkit/commons \
+            --rev dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73 \
+            --root "$MUTATION_HOME/install" cortexkit-mutate
+          echo "$MUTATION_HOME/install/bin" >> "$GITHUB_PATH"
+      - name: Verify CI selection and report guards
+        run: bun test scripts/tests/run-mutation-ci.test.ts scripts/tests/run-mutation-bun.test.ts
+      - name: Replay mutation guards
+        run: bun scripts/run-mutation-ci.ts
+      - name: Retain reports and raw test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tmp/mutations/
+          if-no-files-found: warn

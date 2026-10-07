@@ -199,3 +199,24 @@ the source hashes and exact-byte restoration checks, the staged source diff, and
 the runner's row reports. Store the archive outside ephemeral build caches so
 reviewers can inspect the evidence and source comments before a commit. CI
 integration is separate from this catalogue.
+
+## Automated replay
+
+The read-only `Mutation guards` workflow uses a separate checkout from the regular
+CI job. Pull requests run `ckdev-mutate run --diff <base>`, comparing the committed
+base to `HEAD`. The runner selects changed row targets, guarding test files and
+parsed catalogue entries. Root prebuild changes also select all rows.
+
+Changes to the Bun wrapper, its self-tests, the CI driver/workflow or shared test
+configuration force `--all`, because the runner does not follow helper dependencies.
+Main pushes run all named checks. Scheduled and manually requested jobs also use
+`--broad` for full Core/Pi package audits. These domains still exclude OpenCode,
+workspace-wide and process E2E collateral.
+
+The CI driver verifies the runner version and requires tests to detect each
+mutation (`CAUGHT`, `CAUGHT_BROADLY` or `HUB`), rather than accepting skipped or
+equivalent rows. Full replays must report every configured row. A PR with no affected
+rows may report an empty selection; it is not recorded as a caught mutation.
+Reports, invocation/status records and raw test evidence are uploaded even when
+a replay fails. Runner installation is pinned to the public commons revision and
+kept in checkout-local ignored storage; no private repository token is required.
