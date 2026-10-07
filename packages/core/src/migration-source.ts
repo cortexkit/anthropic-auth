@@ -4,7 +4,11 @@ import { lstat, open } from 'node:fs/promises'
 
 import { parseJsonRedacted } from './json.ts'
 
-export type NativeMigrationSourceRole = 'config' | 'state' | 'hostAuth'
+export type NativeMigrationSourceRole =
+  | 'config'
+  | 'state'
+  | 'hostAuth'
+  | 'routing'
 
 export interface NativeMigrationSourceSnapshot {
   readonly role: NativeMigrationSourceRole
@@ -74,6 +78,8 @@ interface SourceReadHooks {
 /**
  * Capture exact import bytes without the legacy loader's missing-entry recovery.
  * Ownership and legacy schema decisions still belong to the offline importer.
+ * Pass the configured path, not a canonicalized leaf: lstat must see any leaf
+ * symlink, and the snapshot retains that path for the same guard during recheck.
  */
 export async function readNativeMigrationSource(
   role: NativeMigrationSourceRole,
