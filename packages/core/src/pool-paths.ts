@@ -15,8 +15,12 @@ export interface NativePoolPaths {
   storageId: string
 }
 
-/** Resolve existing parent aliases without creating any migration files. */
-async function canonicalPath(path: string): Promise<string> {
+/**
+ * Resolve existing parent aliases and nonexistent leaves without creating files.
+ * This can follow a leaf symlink, so it does not establish configured-leaf safety.
+ * Source capture and recheck must retain the configured path for the lstat guard.
+ */
+export async function canonicalPath(path: string): Promise<string> {
   const absolute = resolve(path)
   try {
     return await realpath(absolute)

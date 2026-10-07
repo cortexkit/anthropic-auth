@@ -15,9 +15,11 @@ import { join } from 'node:path'
 import { inspect } from 'node:util'
 
 import {
+  NativeMigrationSourceError,
   readNativeMigrationSource,
   requireUnchangedNativeMigrationSource,
 } from '../migration-source.ts'
+import { canonicalPath } from '../pool-paths.ts'
 
 const roots: string[] = []
 
@@ -60,6 +62,73 @@ test('captures exact bytes, filesystem ownership information and frozen nested i
   expect(() => Object.assign(auth, { access: 'replaced' })).toThrow(TypeError)
   await requireUnchangedNativeMigrationSource(snapshot)
   expect(await readFile(path, 'utf8')).toBe(text)
+})
+
+test('captures and rechecks routing inputs with role-preserving changed-source refusal', async () => {
+  const { path } = await fixture()
+  const text =
+    '{"routes":{"session":"account-a"},"access":"synthetic-routing-access"}\n'
+  await writeFile(path, text, { mode: 0o600 })
+  const snapshot = await readNativeMigrationSource('routing', path)
+  expect(snapshot.role).toBe('routing')
+  expect(snapshot.path).toBe(path)
+  expect(snapshot.digest).toBe(createHash('sha256').update(text).digest('hex'))
+  expect(snapshot.data).toEqual({
+    routes: { session: 'account-a' },
+    access: 'synthetic-routing-access',
+  })
+  expect(Object.isFrozen(snapshot.data?.routes)).toBe(true)
+  expect(JSON.stringify(snapshot)).not.toContain('synthetic-routing-access')
+  expect(inspect(snapshot)).not.toContain('synthetic-routing-access')
+  await requireUnchangedNativeMigrationSource(snapshot)
+  expect(await readFile(path, 'utf8')).toBe(text)
+
+  const changed =
+    '{"routes":{"session":"account-b"},"access":"synthetic-routing-replacement"}\n'
+  await writeFile(path, changed)
+  let caught: unknown
+  try {
+    await requireUnchangedNativeMigrationSource(snapshot)
+  } catch (error) {
+    caught = error
+  }
+  expect(caught).toBeInstanceOf(NativeMigrationSourceError)
+  expect(caught).toMatchObject({ role: 'routing', code: 'source-changed' })
+  expect(inspect(caught)).not.toContain('synthetic-routing-access')
+  expect(inspect(caught)).not.toContain('synthetic-routing-replacement')
+  expect(await readFile(path, 'utf8')).toBe(changed)
+})
+
+test('configured leaf symlinks remain refused during capture and recheck after canonicalization', async () => {
+  const { root, path } = await fixture()
+  const alias = join(root, 'directory-alias')
+  await symlink(root, alias, 'dir')
+  const configured = join(alias, 'source.json')
+  const text = '{"routes":{"session":"account-a"}}\n'
+  await writeFile(path, text, { mode: 0o600 })
+  const snapshot = await readNativeMigrationSource('routing', configured)
+  expect(snapshot.path).toBe(configured)
+  expect(await canonicalPath(configured)).toBe(path)
+  await requireUnchangedNativeMigrationSource(snapshot)
+
+  const target = join(root, 'target.json')
+  await writeFile(target, text, { mode: 0o600 })
+  await rm(path)
+  await symlink(target, path)
+  expect(await canonicalPath(configured)).toBe(target)
+  let opened = false
+  await expect(
+    readNativeMigrationSource('routing', configured, {
+      onOpened: async () => {
+        opened = true
+      },
+    }),
+  ).rejects.toMatchObject({ role: 'routing', code: 'unsafe-source' })
+  expect(opened).toBe(false)
+  await expect(
+    requireUnchangedNativeMigrationSource(snapshot),
+  ).rejects.toMatchObject({ role: 'routing', code: 'unsafe-source' })
+  expect(await readFile(target, 'utf8')).toBe(text)
 })
 
 test('records missing inputs distinctly and rejects an input that appears after capture', async () => {

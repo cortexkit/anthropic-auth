@@ -10,7 +10,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { resolveNativePoolPaths } from '../pool-paths.ts'
+import { canonicalPath, resolveNativePoolPaths } from '../pool-paths.ts'
 
 const roots: string[] = []
 
@@ -83,6 +83,23 @@ test('storage identity includes both paths and normalizes directory aliases', as
     join(alias, 'anthropic-auth-state.json'),
   )
   expect(same).toEqual(paths)
+})
+
+test('canonicalPath resolves directory aliases for existing and nonexistent leaves', async () => {
+  const root = await fixture()
+  const aliasRoot = await fixture()
+  const alias = join(aliasRoot, 'link')
+  await symlink(root, alias, 'dir')
+  const existing = join(root, 'source.json')
+  await writeFile(existing, '{}')
+  expect(await canonicalPath(existing)).toBe(existing)
+  expect(await canonicalPath(join(alias, 'source.json'))).toBe(existing)
+  const missing = join(root, 'missing', 'nested', 'source.json')
+  expect(await canonicalPath(missing)).toBe(missing)
+  expect(
+    await canonicalPath(join(alias, 'missing', 'nested', 'source.json')),
+  ).toBe(missing)
+  expect(await readdir(root)).toEqual(['source.json'])
 })
 
 test('refuses source or derived file collisions without creating a file', async () => {
