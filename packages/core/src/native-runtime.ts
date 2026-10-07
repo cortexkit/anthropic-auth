@@ -1226,12 +1226,17 @@ function classifyCapturedLocalFailure(
     throw new NativeRuntimeError('publication-refused')
   if (event.status === 'failed' && !saved && event.committed !== undefined)
     throw new NativeRuntimeError('publication-refused')
+  const material = saved
+    ? committed
+    : {
+        credentialFingerprint: event.credentialFingerprint,
+        version: event.credentialVersion,
+      }
+  if (!material) throw new NativeRuntimeError('publication-refused')
   const subject: NativeRefreshSubject = {
     binding: { ...event.binding },
-    credentialFingerprint: saved
-      ? committed!.credentialFingerprint
-      : event.credentialFingerprint,
-    version: { ...(saved ? committed!.version : event.credentialVersion) },
+    credentialFingerprint: material.credentialFingerprint,
+    version: { ...material.version },
   }
   const target = saved ? 'committed' : 'captured'
   if (
@@ -1278,8 +1283,7 @@ function failureMaterialMatches(
   subject: NativeRefreshSubject,
   material: Parameters<typeof nativeLocalCredentialValidationMatches>[2],
 ): boolean {
-  if (!material || material.type !== 'oauth' || !text(material.refresh))
-    return false
+  if (material?.type !== 'oauth' || !text(material.refresh)) return false
   const version = subject.version
   return (
     subject.credentialFingerprint ===
@@ -1321,8 +1325,9 @@ export async function publishNativeLocalRefreshFailure(
     if (attribution.kind === 'none')
       return { status: 'skipped', reason: attribution.reason }
     const { subject } = attribution
-    const context = event.context!
+    const context = event.context
     if (
+      !context ||
       subject.binding.storageId !== paths.storageId ||
       !counter(policy.checkedAt) ||
       (policy.nextRetryAt !== undefined &&
@@ -1358,6 +1363,9 @@ export async function publishNativeLocalRefreshFailure(
           ? { ...old }
           : { binding: subject.binding }
         if (attribution.kind === 'validation-retry') {
+          const nextRetryAt = policy.nextRetryAt
+          if (nextRetryAt === undefined)
+            throw new NativeRuntimeError('publication-refused')
           const sameSubject = (value: NativeLocalValidationRetry['subject']) =>
             sameLocalBinding(value.binding, subject.binding) &&
             value.credentialFingerprint === subject.credentialFingerprint &&
@@ -1378,7 +1386,7 @@ export async function publishNativeLocalRefreshFailure(
           entry.validationRetry = {
             subject: attribution.subject,
             checkedAt: policy.checkedAt,
-            nextRetryAt: policy.nextRetryAt!,
+            nextRetryAt,
           }
         } else {
           if (
