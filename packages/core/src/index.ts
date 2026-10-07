@@ -23,8 +23,89 @@ export * from './mid-conversation-output-config.ts'
 export * from './model-remap.ts'
 export * from './models.ts'
 export * from './native-credential-validation.ts'
+export type {
+  NativeCustody,
+  NativeCustodyClient,
+  NativeCustodyError,
+  NativeCustodyErrorCode,
+  NativeCustodyIdentity,
+  NativeCustodyInventory,
+  NativeCustodyLogger,
+  NativeCustodyOptions,
+  NativeCustodyReceipt,
+  NativeCustodyReporterSource,
+  NativeCustodyRetry,
+} from './native-custody.ts'
+export { createNativeCustody } from './native-custody.ts'
+export type {
+  NativeLocalAttributedFailure,
+  NativeLocalCredentialService,
+  NativeLocalCredentialServiceOptions,
+  NativeLocalFailurePolicyInput,
+} from './native-local-credential-service.ts'
+export { createNativeLocalCredentialService } from './native-local-credential-service.ts'
+export type { NativeLocalExternalPolicy } from './native-local-runtime-readers.ts'
+export type {
+  NativeMenuActionValues,
+  NativeMenuCapabilityOutcome,
+  NativeMenuDispatch,
+  NativeMenuDispatchActionId,
+  NativeMenuDispatchOptions,
+  NativeMenuDispatchRequest,
+  NativeMenuDispatchValues,
+  NativeMenuExecutionContext,
+  NativeMenuExecutionResult,
+  NativeMenuExecutor,
+  NativeMenuExecutorOptions,
+  NativeMenuExecutorRefusalCode,
+  NativeMenuKillswitchEntry,
+  NativeMenuNoValues,
+  NativeMenuRequest,
+  NativeMenuSessionActionId,
+} from './native-menu-executor.ts'
+export { createNativeMenuExecutor } from './native-menu-executor.ts'
+export type {
+  NativeMenuAction,
+  NativeMenuActionId,
+  NativeMenuCacheMode,
+  NativeMenuChoiceParameter,
+  NativeMenuCommandId,
+  NativeMenuCustodyMode,
+  NativeMenuGroup,
+  NativeMenuGroupId,
+  NativeMenuHost,
+  NativeMenuLogLevel,
+  NativeMenuModel,
+  NativeMenuParameter,
+  NativeMenuParameterId,
+  NativeMenuRefusalCode,
+  NativeMenuRoutingMode,
+  NativeMenuStatus,
+} from './native-menu-model.ts'
+export { getNativeMenuModel } from './native-menu-model.ts'
+export type {
+  NativeCommittedMaterial,
+  NativeIdentityBootstrap,
+  NativeRefreshContext,
+  NativeRefreshDispatchVersion,
+  NativeRefreshFailure,
+  NativeRefreshHandoff,
+  NativeRefreshObservation,
+  NativeRefreshRequest,
+  NativeRefreshRestriction,
+  NativeRefreshResult,
+  NativeRefreshSubject,
+  NativeServingAdmission,
+} from './native-refresh-coordinator.ts'
+export type {
+  NativeLocalFailureAttribution,
+  NativeLocalFailurePolicy,
+  NativeLocalFailureSkipReason,
+} from './native-runtime.ts'
 export * from './oauth-profile.ts'
 export * from './pkce.ts'
+export type { NativeLocalPoolBinding } from './pool-binding.ts'
+export { captureNativeLocalPoolBinding } from './pool-binding.ts'
 export * from './pool-paths.ts'
 export * from './pool-store.ts'
 export * from './prime.ts'

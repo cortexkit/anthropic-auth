@@ -291,6 +291,22 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     `
     import { createNativePoolStore, resolveNativePoolPaths, type NativePoolStoreOptions, type NativeLockEvent } from '@cortexkit/anthropic-auth-core';
     import * as core from '@cortexkit/anthropic-auth-core';
+    import type {
+      NativeLocalCredentialService, NativeLocalCredentialServiceOptions, NativeRefreshRequest, NativeRefreshResult,
+      NativeCustody, NativeCustodyOptions, NativeCustodyIdentity, NativeCustodyReceipt,
+      NativeMenuExecutor, NativeMenuExecutorOptions, NativeMenuHost, NativeMenuModel,
+    } from '@cortexkit/anthropic-auth-core';
+    const localFactory: (options: NativeLocalCredentialServiceOptions) => NativeLocalCredentialService = core.createNativeLocalCredentialService;
+    const custodyFactory: (options: NativeCustodyOptions) => NativeCustody = core.createNativeCustody;
+    const menuFactory: (options: NativeMenuExecutorOptions) => NativeMenuExecutor = core.createNativeMenuExecutor;
+    const menuModel: (host: NativeMenuHost) => NativeMenuModel = core.getNativeMenuModel;
+    type LocalAuthorize = (request: NativeRefreshRequest) => Promise<NativeRefreshResult>;
+    type CustodyAuthorize = (identity: NativeCustodyIdentity, signal?: AbortSignal) => Promise<NativeCustodyReceipt>;
+    type NativeAuthorize = NativeLocalCredentialService['authorize'] extends LocalAuthorize ? true : false;
+    type ScopedAuthorize = NativeCustody['authorize'] extends CustodyAuthorize ? true : false;
+    const localContract: NativeAuthorize = true;
+    const scopedContract: ScopedAuthorize = true;
+    void [localFactory, custodyFactory, menuFactory, menuModel, localContract, scopedContract];
     const paths = await resolveNativePoolPaths('./account.json', './state.json');
     const options: NativePoolStoreOptions = {
       paths, quota: { validate: () => true, merge: (_, value) => value },
@@ -368,6 +384,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     'runtime.mjs',
     `
     import { createNativePoolStore, resolveNativePoolPaths } from '@cortexkit/anthropic-auth-core';
+    import * as core from '@cortexkit/anthropic-auth-core';
     import assert from 'node:assert/strict';
     const paths = await resolveNativePoolPaths('./account.json', './state.json');
     assert.equal(paths.roster.endsWith('state.json.roster.json'), true);
@@ -377,7 +394,14 @@ test('packed Core types and Node runtime work in a fresh consumer without common
     assert.equal(loaded.status, 'ready');
     assert.equal(loaded.rows[0].stamp, 'bound');
     assert.equal(loaded.rows[0].credential.access, 'synthetic-access');
-    console.log('Node ' + process.version + ': 4 packed runtime assertions passed');
+    for (const factory of ['createNativeLocalCredentialService', 'createNativeCustody', 'getNativeMenuModel', 'createNativeMenuExecutor', 'captureNativeLocalPoolBinding']) assert.equal(typeof core[factory], 'function', factory);
+    for (const host of ['opencode', 'pi']) {
+      const model = core.getNativeMenuModel(host);
+      assert.equal(model.host, host);
+      assert.ok(model.groups.length > 0);
+    }
+    for (const internal of ['updateNativeRuntime', 'publishNativeLocalSuccess', 'publishNativeLocalFailure', 'assertNativePoolAuthority', 'createNativeRefreshCoordinator']) assert.equal(Object.hasOwn(core, internal), false, internal);
+    console.log('Node ' + process.version + ': 18 packed runtime assertions passed');
   `,
   )
   console.log(await run(['node', 'runtime.mjs'], consumer))
