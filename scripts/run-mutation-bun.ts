@@ -6,7 +6,14 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
+
+// Credential fixtures check every ancestor. Use system temporary storage,
+// not a checkout that may have a legitimate group-writable parent.
+export async function createMutationSandbox() {
+  return mkdtemp(resolve(tmpdir(), 'anthropic-auth-mutation-'))
+}
 
 export function testEnvironment(
   sandbox: string,
@@ -158,9 +165,14 @@ export function parseExecution(
   const ordinals = new Map<string, number>()
   const events: ExecutionEvent[] = []
   for (const line of eventLines) {
-    const fileHeader = /^(src\/tests\/[^:\r\n]+\.test\.ts):$/.exec(line)
+    const fileHeader =
+      /^(?:::group::)?(src\/tests\/[^:\r\n]+\.test\.ts):$/.exec(line)
     if (fileHeader) {
       testFile = fileHeader[1]
+      continue
+    }
+    if (line === '::endgroup::') {
+      testFile = undefined
       continue
     }
     if (!/^\((?:pass|fail)\) /.test(line)) continue
@@ -616,7 +628,7 @@ if (import.meta.main) {
         resolve(audits, broad ? 'package-' : 'named-'),
       )
       const retained = artifactDir
-      sandbox = await mkdtemp(resolve(tmp, 'mutation-bun-'))
+      sandbox = await createMutationSandbox()
       const env = testEnvironment(sandbox, process.env)
       const dependencies: Dependencies = {
         spawn: (argv, cwd) => {

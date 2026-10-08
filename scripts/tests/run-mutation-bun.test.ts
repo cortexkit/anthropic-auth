@@ -1,5 +1,10 @@
 import { expect, test } from 'bun:test'
+import { realpath, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname } from 'node:path'
+import { createTestLifetimeSuite } from '../../packages/core/src/tests/test-lifetime.ts'
 import {
+  createMutationSandbox,
   type ExecutionEvent,
   exactPattern,
   executedCount,
@@ -1059,4 +1064,45 @@ test('refuses a failure shifted between repeated Bun cases at the same source lo
   expect(retained).toBe(moved)
   expect(output.out()).toBe(header)
   expect(output.err().startsWith(transcript.stderr)).toBe(true)
+})
+
+const filesystemTests = createTestLifetimeSuite()
+filesystemTests.test(
+  'credential sandbox has a private directory under system temporary storage',
+  async () => {
+    const sandbox = await createMutationSandbox()
+    filesystemTests.deferCleanup(() =>
+      rm(sandbox, { recursive: true, force: true }),
+    )
+    expect(await realpath(dirname(sandbox))).toBe(await realpath(tmpdir()))
+    expect((await stat(sandbox)).mode & 0o777).toBe(0o700)
+  },
+)
+
+test('native GitHub group headers preserve exact file identity and outcome checks', () => {
+  const transcript = green()
+  const grouped = {
+    ...transcript,
+    stderr: transcript.stderr
+      .replace('src/tests/fast.test.ts:', '::group::src/tests/fast.test.ts:')
+      .replace(' 1 pass', '::endgroup::\n\n 1 pass'),
+  }
+  expect(parseExecution(name, grouped)).toEqual(
+    parseExecution(name, transcript),
+  )
+  expect(executedCount(name, grouped)).toBe(1)
+})
+
+test('closed GitHub groups cannot attribute unrelated result lines to an earlier file', () => {
+  const transcript = green()
+  const grouped = {
+    ...transcript,
+    stderr: transcript.stderr.replace(
+      'src/tests/fast.test.ts:',
+      '::group::src/tests/fast.test.ts:\n::endgroup::',
+    ),
+  }
+  expect(() => parseExecution(name, grouped)).toThrow(
+    'missing test file header',
+  )
 })
