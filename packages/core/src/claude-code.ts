@@ -146,6 +146,7 @@ async function fetchClaudeCodeAccountUuid(
 
     const response = await fetch(url, {
       method: 'GET',
+      redirect: 'error',
       headers: {
         accept: 'application/json, text/plain, */*',
         authorization: `Bearer ${accessToken}`,
