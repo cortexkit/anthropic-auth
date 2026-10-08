@@ -27,9 +27,15 @@ import { createNativePoolStore } from '../pool-store.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup } = createTestLifetimeSuite()
+const preparedProof = {
+  version: 1 as const,
+  rows: [],
+  runtimeDigest: 'f'.repeat(64),
+}
 const expectations = {
   expectedHostAuth: 'd'.repeat(64),
   expectedRouting: 'e'.repeat(64),
+  preparedProof,
 }
 
 function captureInput(paths: NativePoolPaths): NativeMigrationInput {
@@ -230,13 +236,13 @@ test('concurrent starts publish one journal without rewriting its baselines', as
   )
 })
 
-test('v2 persists exactly nine token-free fields and explicit captured bindings', async () => {
+test('v3 persists ten fields including an initially absent prepared proof', async () => {
   const paths = await fixture()
   const input = captureInput(paths)
   const journal = await beginNativeMigration(paths, input)
   const text = await readFile(paths.journal, 'utf8')
   expect(JSON.parse(text)).toEqual({
-    version: 2,
+    version: 3,
     storageId: paths.storageId,
     host: 'opencode',
     phase: 'building',
@@ -250,8 +256,9 @@ test('v2 persists exactly nine token-free fields and explicit captured bindings'
     hostAuthPath: input.hostAuthPath,
     expectedHostAuth: 'unprepared',
     expectedRouting: 'unprepared',
+    preparedProof: null,
   })
-  expect(Object.keys(journal)).toHaveLength(9)
+  expect(Object.keys(journal)).toHaveLength(10)
   expect(Object.keys(journal.sources).sort()).toEqual([
     'config',
     'hostAuth',
@@ -299,7 +306,7 @@ test('canonical Anthropic entry digests persist without any credential strings',
     expect(text).not.toContain(secret)
 })
 
-test('v1 journals refuse unchanged rather than supplying v2 defaults', async () => {
+test('v1 journals refuse unchanged rather than supplying v3 defaults', async () => {
   const paths = await fixture()
   const input = captureInput(paths)
   const text = JSON.stringify({
@@ -639,6 +646,7 @@ test('expectation recording publishes one complete pair at verified with no-writ
     ...verified,
     expectedHostAuth: 'd'.repeat(64),
     expectedRouting: 'e'.repeat(64),
+    preparedProof,
   })
   expect(await readNativeMigrationJournal(paths)).toEqual(recorded)
   expect(writes).toBe(1)
@@ -739,7 +747,11 @@ test('absent routing and absent entry remain distinct from unprepared expectatio
     recordNativeMigrationExpectations(paths, expectations),
   ).rejects.toMatchObject({ code: 'journal-conflict' })
   expect(await readFile(paths.journal, 'utf8')).toBe(before)
-  const absent = { expectedHostAuth: 'absent', expectedRouting: null }
+  const absent = {
+    expectedHostAuth: 'absent',
+    expectedRouting: null,
+    preparedProof,
+  }
   const prepared = await recordNativeMigrationExpectations(paths, absent)
   expect(prepared).toMatchObject(absent)
   await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
@@ -820,7 +832,11 @@ test('concurrent expectation recorders publish only one immutable pair', async (
   await expect(
     recordNativeMigrationExpectations(
       paths,
-      { expectedHostAuth: 'absent', expectedRouting: 'f'.repeat(64) },
+      {
+        expectedHostAuth: 'absent',
+        expectedRouting: 'f'.repeat(64),
+        preparedProof,
+      },
       hooks,
     ),
   ).rejects.toMatchObject({ code: 'journal-conflict' })
@@ -944,7 +960,7 @@ for (const point of ['before-write', 'after-write'] as const) {
 
     const text = await readFile(paths.journal, 'utf8')
     const raw = JSON.parse(text)
-    expect(Object.keys(raw)).toHaveLength(9)
+    expect(Object.keys(raw)).toHaveLength(10)
     expect(raw.phase).toBe('verified')
     expect([raw.expectedHostAuth, raw.expectedRouting]).toEqual(
       point === 'before-write'

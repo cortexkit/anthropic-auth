@@ -9,6 +9,7 @@ export type NativeMigrationSourceRole =
   | 'state'
   | 'hostAuth'
   | 'routing'
+  | 'journal'
 
 export interface NativeMigrationSourceSnapshot {
   readonly role: NativeMigrationSourceRole

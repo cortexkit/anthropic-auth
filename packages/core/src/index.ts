@@ -101,6 +101,18 @@ export type {
 } from './native-menu-model.ts'
 export { getNativeMenuModel } from './native-menu-model.ts'
 export type {
+  NativeMigrationCustody,
+  NativeMigrationHooks,
+  NativeMigrationOptions,
+  NativeMigrationPreflight,
+} from './native-migration.ts'
+export {
+  NativeMigrationError,
+  prepareNativeMigration,
+  releaseNativeMigrationPreflight,
+  runNativeMigration,
+} from './native-migration.ts'
+export type {
   NativeCommittedMaterial,
   NativeIdentityBootstrap,
   NativeRefreshContext,

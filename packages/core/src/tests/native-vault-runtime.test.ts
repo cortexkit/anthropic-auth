@@ -1,5 +1,5 @@
 import { expect } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   mutateVaultRoster,
@@ -17,6 +17,7 @@ import {
 } from '../native-vault-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
+import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup, gate } = createTestLifetimeSuite()
@@ -50,24 +51,7 @@ async function fixture() {
   const root = await mkdtemp(join(parent, 'fixture-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
-  await writeFile(
-    paths.journal,
-    JSON.stringify({
-      version: 2,
-      storageId: paths.storageId,
-      host: 'opencode',
-      phase: 'committed',
-      sources: { config: null, state: null, hostAuth: 'absent', routing: null },
-      routingPaths: {
-        source: join(root, 'old-routing'),
-        destination: join(root, 'routing'),
-      },
-      hostAuthPath: join(root, 'host-auth'),
-      expectedHostAuth: 'absent',
-      expectedRouting: null,
-    }),
-    { mode: 0o600 },
-  )
+  await initializeNativeTestAuthority(paths)
   const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
   await store.initialize()
   const projected = projectVaultRoster(
@@ -482,6 +466,7 @@ test('custody runtime seed rejects unowned publication and descriptor callbacks 
   const f = await fixture()
   const roster = await f.runtime.refresh()
   const routeId = roster!.rows[0]!.routeId
+  const before = await readFile(f.paths.runtime)
   const state = {
     version: 1 as const,
     storageId: f.paths.storageId,
@@ -506,9 +491,7 @@ test('custody runtime seed rejects unowned publication and descriptor callbacks 
       },
     }),
   ).rejects.toMatchObject({ code: 'publication-refused' })
-  expect(
-    (await readNativeRuntime(f.paths.runtime, f.paths.storageId)).status,
-  ).toBe('missing')
+  expect(await readFile(f.paths.runtime)).toEqual(before)
   let reads = 0
   Object.defineProperty(state.accounts[routeId], 'lastUsed', {
     get: () => {
@@ -521,6 +504,7 @@ test('custody runtime seed rejects unowned publication and descriptor callbacks 
     publishNativeVaultRuntimeSeed(f.paths, state),
   ).rejects.toMatchObject({ code: 'publication-refused' })
   expect(reads).toBe(0)
+  expect(await readFile(f.paths.runtime)).toEqual(before)
 })
 
 test('vault route disable persists decline and a held roster prevents replaced-account runtime publication', async () => {

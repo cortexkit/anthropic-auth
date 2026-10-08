@@ -15,6 +15,7 @@ import * as runtimeWriter from '../native-runtime.ts'
 import { readNativeRuntime } from '../native-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
+import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
@@ -31,24 +32,7 @@ async function fixture(
   const root = await mkdtemp(join(parent, 'fixture-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
-  await writeFile(
-    paths.journal,
-    JSON.stringify({
-      version: 2,
-      storageId: paths.storageId,
-      host: 'opencode',
-      phase: 'committed',
-      sources: { config: null, state: null, hostAuth: 'absent', routing: null },
-      routingPaths: {
-        source: join(root, 'old-routing'),
-        destination: join(root, 'routing'),
-      },
-      hostAuthPath: join(root, 'host-auth'),
-      expectedHostAuth: 'absent',
-      expectedRouting: null,
-    }),
-    { mode: 0o600 },
-  )
+  await initializeNativeTestAuthority(paths)
   const store = createNativePoolStore({
     paths,
     quota: nativeQuotaCodec,

@@ -133,7 +133,14 @@ async function checkWindowsPaths(): Promise<void> {
 const root = process.argv[2]
 const action = process.argv[3]
 const point = process.argv[4]
-if (!root || !action || (point !== 'before-write' && point !== 'after-write'))
+if (
+  !root ||
+  !action ||
+  !point ||
+  (action !== 'native-controller' &&
+    point !== 'before-write' &&
+    point !== 'after-write')
+)
   throw new Error('Invalid fixture arguments')
 if (action === 'windows-paths') {
   await checkWindowsPaths()
@@ -148,6 +155,53 @@ const paths = await resolveNativePoolPaths(
   join(root, 'anthropic-auth.json'),
   join(root, 'anthropic-auth-state.json'),
 )
+if (action === 'native-readd') {
+  const { createNativePoolStore } = await import('../pool-store.ts')
+  const { nativeQuotaCodec } = await import('../native-quota-codec.ts')
+  await createNativePoolStore({ paths, quota: nativeQuotaCodec }).add({
+    id: 'primary-route',
+    credential: {
+      type: 'oauth',
+      access: 'synthetic-access-main',
+      refresh: 'synthetic-refresh-main',
+      expires: 2000,
+    },
+  })
+  process.exit(0)
+}
+if (action === 'native-controller') {
+  const { runNativeMigration } = await import('../native-migration.ts')
+  const host = process.argv[5] === 'pi' ? 'pi' : 'opencode'
+  await runNativeMigration(
+    {
+      paths,
+      host,
+      hostAuthPath: join(root, 'host-auth.json'),
+      routingSourcePath: join(root, 'legacy-routing.json'),
+      routingDestinationPath: join(root, 'native-routing.json'),
+      env: {},
+      removePiAnthropicAuth: true,
+      processFence: async () => {},
+    },
+    {
+      onStep: async (step) => {
+        if (step === point) process.exit(19)
+      },
+      hostWrite: {
+        beforeRename: async () => {
+          if (point === 'host:before-rename') process.exit(19)
+        },
+        afterRename: async () => {
+          if (point === 'host:after-rename') process.exit(19)
+        },
+        afterUnlink: async () => {
+          if (point === 'host:after-unlink') process.exit(19)
+        },
+      },
+    },
+  )
+  throw new Error('Expected controller fixture exit')
+}
 const hooks = {
   onWriteStep: async (step: 'before-write' | 'after-write') => {
     if (step === point) process.exit(19)
@@ -175,7 +229,11 @@ if (action === 'building') {
 } else if (action === 'expectations') {
   await recordNativeMigrationExpectations(
     paths,
-    { expectedHostAuth: 'd'.repeat(64), expectedRouting: 'e'.repeat(64) },
+    {
+      expectedHostAuth: 'd'.repeat(64),
+      expectedRouting: 'e'.repeat(64),
+      preparedProof: { version: 1, rows: [], runtimeDigest: 'f'.repeat(64) },
+    },
     hooks,
   )
 } else {
