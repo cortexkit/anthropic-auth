@@ -7,27 +7,27 @@ while replay is active, and never point builds at a live host installation.
 
 ## Toolchain and scope
 
-Use Bun **1.3.14** and **ckdev-mutate 0.9.0**, pinned to commons
-`dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73` (the reviewed release).
-`ckdev-mutate 0.9.0` passes descriptive test names as single arguments, including
+Use Bun **1.3.14** and **ckdev-mutate 0.9.2**, pinned to the [CortexKit Commons repository](https://github.com/cortexkit/commons)
+at `b491012199d98b09fd167e00783df297d35a62b8` (the reviewed release).
+`ckdev-mutate 0.9.2` passes descriptive test names as single arguments, including
 interior spaces, and reads JUnit results from the full owning-package test run.
 The rows need no alternate test names or compatibility layer.
 
 Install the runner under the checkout-local ignored directory
-`node_modules/.cache/ckdev-mutate`. Keep `CARGO_HOME`, `CARGO_TARGET_DIR` and the
+`node_modules/.cache/ckdev-mutate-0.9.2`. Keep `CARGO_HOME`, `CARGO_TARGET_DIR` and the
 install `--root` there, and do not overwrite a global executable. The command
-below installs ckdev-mutate 0.9.0 from the exact commons revision above:
+below installs ckdev-mutate 0.9.2 from that exact source revision:
 
 ```sh
-CARGO_HOME="$PWD/node_modules/.cache/ckdev-mutate/cargo-home" \
-CARGO_TARGET_DIR="$PWD/node_modules/.cache/ckdev-mutate/target" \
+CARGO_HOME="$PWD/node_modules/.cache/ckdev-mutate-0.9.2/cargo-home" \
+CARGO_TARGET_DIR="$PWD/node_modules/.cache/ckdev-mutate-0.9.2/target" \
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73 \
-  --root "$PWD/node_modules/.cache/ckdev-mutate/install" cortexkit-mutate
+  --rev b491012199d98b09fd167e00783df297d35a62b8 \
+  --root "$PWD/node_modules/.cache/ckdev-mutate-0.9.2/install" cortexkit-mutate
 ```
 
-Verify that `ckdev-mutate --version` reports 0.9.0 and its Cargo install metadata
-records revision `dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73`. Put its install `bin`
+Verify that `ckdev-mutate --version` reports 0.9.2 and its Cargo install metadata
+records revision `b491012199d98b09fd167e00783df297d35a62b8`. Put its install `bin`
 directory and Bun 1.3.14 on `PATH`, including for nested build scripts.
 
 These proofs send no HTTP requests to model providers and use no real credentials.
