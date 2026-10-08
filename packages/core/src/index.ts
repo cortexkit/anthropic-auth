@@ -22,6 +22,23 @@ export * from './logging.ts'
 export * from './mid-conversation-output-config.ts'
 export * from './model-remap.ts'
 export * from './models.ts'
+export type {
+  NativeAccountRuntime,
+  NativeAccountRuntimeOptions,
+  NativeAccountWriteInput,
+  NativeApiSubject,
+  NativeLocalAuthorizeOptions,
+  NativeRelayUpdate,
+} from './native-account-runtime.ts'
+export {
+  createNativeAccountRuntime,
+  nativeAccountPolicy,
+} from './native-account-runtime.ts'
+export type {
+  NativeAccountMetadataPatch,
+  NativeAccountSnapshot,
+  NativeAccountView,
+} from './native-account-view.ts'
 export * from './native-credential-validation.ts'
 export type {
   NativeCustody,
@@ -124,6 +141,17 @@ export {
   parseApplyRequest,
   runPiCommandMenu,
 } from './native-ui.ts'
+export type {
+  NativeVaultRuntime,
+  NativeVaultRuntimeOptions,
+} from './native-vault-runtime.ts'
+export {
+  acquireNativeVaultRuntime,
+  createNativeVaultRuntime,
+  discoverNativeVaultInventory,
+  publishNativeVaultRosterSeed,
+  publishNativeVaultRuntimeSeed,
+} from './native-vault-runtime.ts'
 export * from './oauth-profile.ts'
 export * from './pkce.ts'
 export type { NativeMigrationJournal } from './pool-authority.ts'
