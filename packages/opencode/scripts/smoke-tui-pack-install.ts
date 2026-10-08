@@ -169,6 +169,7 @@ try {
   const stubbedRuntimeProbe = `
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { readFile } from "node:fs/promises";
 
 const packageRoot = process.argv[1];
 const runtimeSpecifiers = ${JSON.stringify(runtimeSpecifiers)};
@@ -190,11 +191,33 @@ Bun.plugin({
   },
 });
 
+const loadedPaths = [];
+Bun.plugin({
+  name: "observe-compiled-tui-load",
+  setup(build) {
+    build.onLoad({ filter: /tui[.]tsx$/ }, async (args) => {
+      loadedPaths.push(args.path.split(String.fromCharCode(92)).join("/"));
+      return { contents: await readFile(args.path, "utf8"), loader: "tsx" };
+    });
+  },
+});
+process.env.OPENCODE_TUI_PREFERENCES_FILE = join(packageRoot, "absent-smoke-preferences.jsonc");
+process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(packageRoot, "absent-smoke-rpc");
 const entry = await import(pathToFileURL(join(packageRoot, "src/tui/entry.mjs")).href);
 if (entry.default?.id !== "cortexkit.anthropic-auth" || typeof entry.default?.tui !== "function") {
   throw new Error("compiled TUI entry export shape is invalid");
 }
-console.log("stubbed runtime probe loaded the compiled TUI path");
+let registrations = 0;
+await entry.default.tui({
+  slots: { register(value) { if (typeof value.slots.sidebar_content !== "function") throw new Error("missing sidebar"); registrations++; } },
+  state: { path: { directory: packageRoot } },
+  route: { current: () => ({ type: "home" }) },
+});
+if (registrations !== 1 || !loadedPaths.some((path) => path.includes("tui-compiled")) || loadedPaths.some((path) => path.endsWith("/src/tui.tsx"))) {
+  throw new Error("compiled TUI invocation used the wrong loader path");
+}
+console.log("stubbed runtime probe invoked the actual compiled TUI path");
+process.exit(0);
 `
   run('bun', ['-e', stubbedRuntimeProbe, installedPackageRoot], installRoot)
   check('stubbed host runtime imports the compiled TUI path', true)
@@ -202,17 +225,36 @@ console.log("stubbed runtime probe loaded the compiled TUI path");
   const rawFallbackProbe = `
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { readFile } from "node:fs/promises";
 
 const packageRoot = process.argv[1];
-const raw = await import(pathToFileURL(join(packageRoot, "src/tui.tsx")).href);
+const loadedPaths = [];
+Bun.plugin({
+  name: "observe-raw-tui-load",
+  setup(build) {
+    build.onLoad({ filter: /tui[.]tsx$/ }, async (args) => {
+      loadedPaths.push(args.path.split(String.fromCharCode(92)).join("/"));
+      return { contents: await readFile(args.path, "utf8"), loader: "tsx" };
+    });
+  },
+});
+process.env.OPENCODE_TUI_PREFERENCES_FILE = join(packageRoot, "absent-smoke-preferences.jsonc");
+process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(packageRoot, "absent-smoke-rpc");
 const entry = await import(pathToFileURL(join(packageRoot, "src/tui/entry.mjs")).href);
-if (entry.default !== raw.default) {
-  throw new Error("loader did not fall back to raw TSX under bare Bun");
-}
 if (entry.default?.id !== "cortexkit.anthropic-auth" || typeof entry.default?.tui !== "function") {
   throw new Error("raw TUI fallback export shape is invalid");
 }
-console.log("raw TSX fallback loaded the TUI entry");
+let registrations = 0;
+await entry.default.tui({
+  slots: { register(value) { if (typeof value.slots.sidebar_content !== "function") throw new Error("missing sidebar"); registrations++; } },
+  state: { path: { directory: packageRoot } },
+  route: { current: () => ({ type: "home" }) },
+});
+if (registrations !== 1 || !loadedPaths.some((path) => path.endsWith("/src/tui.tsx")) || loadedPaths.some((path) => path.includes("tui-compiled"))) {
+  throw new Error("bare Bun TUI invocation did not use the raw TSX fallback");
+}
+console.log("bare Bun invoked the actual raw TSX fallback");
+process.exit(0);
 `
   run('bun', ['-e', rawFallbackProbe, installedPackageRoot], installRoot)
   check('bare Bun imports the raw-TSX fallback', true)
