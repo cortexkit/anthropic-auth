@@ -183,7 +183,7 @@ async function ciFixture() {
     binary,
     `#!/usr/bin/env bun
 import { writeFileSync } from 'node:fs'
-if(process.argv[2] === '--version') { console.log(process.env.FAKE_VERSION ?? 'ckdev-mutate 0.9.0'); process.exit(0) }
+if(process.argv[2] === '--version') { console.log(process.env.FAKE_VERSION ?? ${JSON.stringify(MUTATION_RUNNER_VERSION)}); process.exit(0) }
 writeFileSync('runner-argv.json', JSON.stringify(process.argv.slice(2)))
 const report = process.argv[process.argv.indexOf('--report') + 1]
 const rows = process.env.FAKE_EMPTY === '1' ? [] : ['history','fast','binding'].map(id => ({ id, outcome:'CAUGHT', breadth_observed:process.argv.includes('--broad') }))

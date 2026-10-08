@@ -1,9 +1,9 @@
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
-export const MUTATION_RUNNER_VERSION = 'ckdev-mutate 0.9.0'
+export const MUTATION_RUNNER_VERSION = 'ckdev-mutate 0.9.2'
 export const MUTATION_RUNNER_REVISION =
-  'dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73'
+  'b491012199d98b09fd167e00783df297d35a62b8'
 
 const forceAllPaths = new Set([
   'scripts/run-mutation-bun.ts',
