@@ -1106,3 +1106,25 @@ test('closed GitHub groups cannot attribute unrelated result lines to an earlier
     'missing test file header',
   )
 })
+
+test('genuine negated assertion failures retain the normal selected-test contract', () => {
+  const transcript = red()
+  const negated = {
+    ...transcript,
+    stderr: transcript.stderr.replace(
+      'error: expect(received).toBe(expected)',
+      'error: expect(received).not.toHaveProperty(path)',
+    ),
+  }
+  expect(executedCount(name, negated)).toBe(1)
+  expect(parseExecution(name, negated).events[0]?.status).toBe('fail')
+  expect(() =>
+    executedCount(name, {
+      ...negated,
+      stderr: negated.stderr.replace(
+        'not.toHaveProperty',
+        'not.not.toHaveProperty',
+      ),
+    }),
+  ).toThrow('genuine selected expect assertion')
+})

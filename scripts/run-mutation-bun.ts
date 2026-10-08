@@ -235,7 +235,9 @@ export function parseExecution(
     errors.length !== failed ||
     errors.some(
       (line) =>
-        !/^error: expect\(received\)\.[A-Za-z]+\([^\r\n]*\)$/.test(line),
+        !/^error: expect\(received\)\.(?:not\.)?[A-Za-z]+\([^\r\n]*\)$/.test(
+          line,
+        ),
     )
   )
     throw new Error('Not a genuine selected expect assertion failure')
