@@ -1,36 +1,24 @@
 import {
+  type AccountStorage,
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
   applyCustomHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
-  type ClaustrumScopedAttempt,
-  ClaustrumScopedRuntime,
-  type ClaustrumScopedRuntimeOptions,
-  connectClaustrumScopedClient,
   createStickyNoRouteResponse,
-  decideScopedRetryAfter401,
   decideStickyQuotaFailure,
   dumpDirectRequest,
   FAST_MODE_BETA,
-  FallbackAccountManager,
-  fetchOAuthQuotaSnapshot,
   getCache1hPersistentMode,
   getClaudeCodeIdentityForVerifiedAccount,
-  getClaustrumMode,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
-  getHostClaustrumEnrollmentPaths,
-  getOrCreateMainAccountId,
   getQuotaCheckIntervalMs,
-  getRelayConfig,
   getRoutingMode,
   getScopedQuotaWindowForModel,
-  getStickyRoutingStatePath,
   getThinkingPrefixMismatchBehavior,
   hasThinkingBindingControls,
-  isApiKeyAccount,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isDumpPersistentlyEnabled,
@@ -40,22 +28,23 @@ import {
   isPermanentRefreshError,
   isValidApiBaseURL,
   killswitchPassesPolicy,
-  loadAccounts,
   logger,
   MID_CONVERSATION_OUTPUT_CONFIG_BETA,
   type MidConversationEffortTransition,
   mergeAnthropicBetas,
+  type NativeAccountSnapshot,
+  type NativeAccountView,
+  type NativeApiSubject,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
   QuotaManager,
   type QuotaState,
+  quotaBackoffActive,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
-  refreshBackoffActive,
-  resolveClaudeCodeIdentity,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
   StickySessionRouter,
@@ -66,7 +55,6 @@ import {
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
   THINKING_BINDING_CONTROLS_BETA,
-  tokenFingerprint,
   usesMidConversationOutputConfig,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -84,13 +72,18 @@ import {
   type Tool,
   type ToolCall,
 } from '@earendil-works/pi-ai'
-
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
-import { requirePiEnrollment } from './custody.ts'
 import {
-  getPiAccountStoragePath,
-  getPiClaustrumConnectionOptions,
-} from './paths.ts'
+  getPiNativeRuntime,
+  type PiNativeAttempt,
+  piAttemptAccessToken,
+} from './native.ts'
+import { getPiAccountStoragePath } from './paths.ts'
+import {
+  buildPiOAuthMessagesUrl,
+  fetchPiOAuth,
+  requirePiOAuthOrigin,
+} from './transport.ts'
 
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
@@ -99,65 +92,11 @@ function errorText(error: unknown) {
 let cacheKeepRegistry: CacheKeepSessionRegistry | undefined
 let cacheKeepRegistryDirectory: string | undefined
 const stickyRouters = new Map<string, StickySessionRouter>()
-const quotaManagers = new Map<string, QuotaManager>()
-const fallbackManagers = new Map<string, FallbackAccountManager>()
-const mainAccountIdInitializations = new Map<
+const quotaManagers = new Map<
   string,
-  Promise<string | undefined>
+  { identityKey: string; manager: QuotaManager }
 >()
 const PI_SERVICE_CACHE_LIMIT = 16
-const scopedRuntimes = new Map<string, ClaustrumScopedRuntime>()
-
-export function getPiScopedRuntime(
-  storagePath = getPiAccountStoragePath(),
-  overrides: Partial<
-    Pick<
-      ClaustrumScopedRuntimeOptions,
-      'connect' | 'pollIntervalMs' | 'setTimeoutImpl' | 'clearTimeoutImpl'
-    >
-  > = {},
-): ClaustrumScopedRuntime {
-  const existing = scopedRuntimes.get(storagePath)
-  if (existing) return existing
-  let warned = false
-  const { connect, ...runtimeOverrides } = overrides
-  const runtime = new ClaustrumScopedRuntime({
-    storagePath,
-    tokenPath: getHostClaustrumEnrollmentPaths('pi').tokenPath,
-    connect: async () => {
-      await requirePiEnrollment()
-      return connect
-        ? connect()
-        : connectClaustrumScopedClient(
-            getPiClaustrumConnectionOptions(storagePath),
-          )
-    },
-    onRoster: () => {
-      warned = false
-    },
-    onError: () => {
-      if (!warned)
-        logger.warn('claustrum', 'Pi scoped credential service unavailable')
-      warned = true
-    },
-    ...runtimeOverrides,
-  })
-  while (scopedRuntimes.size >= PI_SERVICE_CACHE_LIMIT) {
-    const oldest = scopedRuntimes.keys().next().value
-    if (oldest === undefined) break
-    scopedRuntimes.get(oldest)?.close()
-    scopedRuntimes.delete(oldest)
-  }
-  scopedRuntimes.set(storagePath, runtime)
-  return runtime
-}
-
-export function closePiScopedRuntime(
-  storagePath = getPiAccountStoragePath(),
-): void {
-  scopedRuntimes.get(storagePath)?.close()
-  scopedRuntimes.delete(storagePath)
-}
 
 function setBoundedService<T>(map: Map<string, T>, key: string, value: T) {
   map.delete(key)
@@ -169,80 +108,95 @@ function setBoundedService<T>(map: Map<string, T>, key: string, value: T) {
   }
 }
 
-function ensurePiMainAccountId(storagePath: string) {
-  let initialization = mainAccountIdInitializations.get(storagePath)
-  if (!initialization) {
-    initialization = getOrCreateMainAccountId(storagePath).catch((error) => {
-      if (mainAccountIdInitializations.get(storagePath) === initialization) {
-        mainAccountIdInitializations.delete(storagePath)
-      }
-      throw error
-    })
-    setBoundedService(mainAccountIdInitializations, storagePath, initialization)
-  }
-  return initialization
-}
-
 function getPiRoutingServices(
   storagePath: string,
-  storage: Awaited<ReturnType<typeof loadAccounts>>,
+  snapshot: NativeAccountSnapshot,
 ) {
-  let quotaManager = quotaManagers.get(storagePath)
-  let fallbackManager = fallbackManagers.get(storagePath)
-  if (!quotaManager || !fallbackManager) {
+  const storage = snapshot.policyStorage
+  const native = getPiNativeRuntime(storagePath)
+  const identityKey = JSON.stringify(
+    snapshot.accounts.map((account) => [
+      account.id,
+      account.accountIdentity,
+      account.source,
+      account.credentialId,
+      account.binding?.rowId,
+      account.binding?.credentialEpoch,
+    ]),
+  )
+  const existing = quotaManagers.get(storagePath)
+  let quotaManager =
+    existing?.identityKey === identityKey ? existing.manager : undefined
+  if (!quotaManager) {
     quotaManager = new QuotaManager({
       storage,
       fetchQuotaSnapshot: async (request) => {
-        const current = await loadAccounts(storagePath)
-        if (getClaustrumMode(current) === 'claustrum') {
-          const id = request.kind === 'main' ? 'main' : request.accountId
-          if (!id)
-            throw new Error('Claustrum quota request has no account identity')
-          return getPiScopedRuntime(storagePath).fetchQuota(id)
-        }
-        if (!request.accessToken)
-          throw new Error('Missing local OAuth quota credential')
-        return fetchOAuthQuotaSnapshot({ accessToken: request.accessToken })
+        const id = request.kind === 'main' ? 'main' : request.accountId
+        if (!id) throw new Error('Native quota request has no account identity')
+        return (await native.service()).fetchQuota(id, fetchPiOAuth)
       },
     })
-    fallbackManager = new FallbackAccountManager({
-      configPath: storagePath,
-      quotaManager,
-      isFallbackAccountVaultEnabled: (_id, current) =>
-        getClaustrumMode(current) === 'claustrum',
-      isFallbackAccountVaultServed: (id, current) => {
-        const account = current.accounts.find(
-          (candidate) => candidate.id === id,
-        )
-        return (
-          getClaustrumMode(current) === 'claustrum' &&
-          Boolean(
-            account &&
-              isOAuthAccount(account) &&
-              account.claustrumScopedCredentialId &&
-              account.claustrumScopedState === 'active',
-          )
-        )
-      },
-      resolveFallbackAccessToken: (account, current) =>
-        getClaustrumMode(current) === 'claustrum'
-          ? undefined
-          : account.access
-            ? { token: account.access, source: 'sidecar' }
-            : undefined,
+    setBoundedService(quotaManagers, storagePath, {
+      identityKey,
+      manager: quotaManager,
     })
-    setBoundedService(quotaManagers, storagePath, quotaManager)
-    setBoundedService(fallbackManagers, storagePath, fallbackManager)
   } else {
     quotaManager.updateStorage(storage)
   }
-  return { quotaManager, fallbackManager }
+  const quotas = quotaManager
+  const getUsableFallbackAccounts = async (
+    current: AccountStorage,
+    options: { modelId?: string } = {},
+  ) => {
+    const snapshot = await native.view()
+    const accounts = new Map(
+      snapshot.accounts.map((account) => [account.id, account]),
+    )
+    const usable: OAuthAccount[] = []
+    for (const account of current.accounts) {
+      const view = accounts.get(account.id)
+      if (!isOAuthAccount(account) || !view?.enabled || view.type !== 'oauth')
+        continue
+      if (view.source === 'vault' && view.state !== 'active') continue
+      if (
+        isPermanentRefreshError(view.lastRefreshError) ||
+        (view.source === 'local' &&
+          (view.lastRefreshError?.nextRetryAt ?? 0) > Date.now())
+      )
+        continue
+      const needsProbe =
+        view.source !== 'vault' ||
+        Boolean(current.quota?.minimumRemaining) ||
+        isKillswitchEnabled(current)
+      if (
+        needsProbe &&
+        quotas.isFallbackStale(
+          account.id,
+          undefined,
+          options.modelId,
+          account,
+        ) &&
+        !quotaBackoffActive(account.lastQuotaRefreshError, Date.now())
+      ) {
+        try {
+          await quotas.refreshFallback(account.id, '', account)
+        } catch {}
+      }
+      const quota =
+        quotas.getFallback(account.id, account)?.quota ?? account.quota
+      if (
+        (!needsProbe || quotaSnapshotPassesPolicy(quota, current)) &&
+        quotaSnapshotPassesModelScope(quota, options.modelId)
+      )
+        usable.push({ ...account, quota })
+    }
+    return usable
+  }
+  return { quotaManager, getUsableFallbackAccounts }
 }
 
-function getPiStickyRouter(storagePath: string) {
-  const path =
-    process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
-    getStickyRoutingStatePath(storagePath)
+async function getPiStickyRouter(storagePath: string) {
+  const path = await getPiNativeRuntime(storagePath).routingPath()
   let router = stickyRouters.get(path)
   if (!router) {
     router = new StickySessionRouter({ path })
@@ -255,7 +209,7 @@ export async function clearPiStickyRoutingSession(
   storagePath: string,
   sessionId: string,
 ) {
-  await getPiStickyRouter(storagePath).clear(sessionId)
+  await (await getPiStickyRouter(storagePath)).clear(sessionId)
 }
 
 function getPiCacheKeepRegistry() {
@@ -269,132 +223,103 @@ function getPiCacheKeepRegistry() {
   return cacheKeepRegistry
 }
 
-const scopedPrewarmAttempts = new Map<
+const nativePrewarmAttempts = new Map<
   number,
-  { runtime: ClaustrumScopedRuntime; receipt: ClaustrumScopedAttempt }
+  {
+    runtime: ReturnType<typeof getPiNativeRuntime>
+    served: PiNativeAttempt
+    reported: boolean
+  }
 >()
 const cacheKeepManager = new CacheKeepManager({
-  loadStorage: () => loadAccounts(getPiAccountStoragePath()),
+  fetchImpl: fetchPiOAuth,
+  loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
   onTrackedSessionsChanged: (sessions) =>
     getPiCacheKeepRegistry().publish(sessions),
   prepareHeaders: async (headers, target, attempt) => {
-    const storagePath = target.accountStoragePath ?? getPiAccountStoragePath()
-    const current = await loadAccounts(storagePath)
-    if (target.accountStoragePath && !current) return undefined
-    if (getClaustrumMode(current) === 'claustrum') {
-      const runtime = getPiScopedRuntime(storagePath)
-      const id = target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
-      const receipt = await runtime.authorize(id, attempt.signal)
-      if (
-        !target.oauthAccountIdentity ||
-        receipt.accountId !== target.oauthAccountIdentity
-      ) {
-        throw new Error('CacheKeep account identity changed')
-      }
-      const body = JSON.parse(target.bodyText) as Record<string, unknown>
-      const identity = getClaudeCodeIdentityForVerifiedAccount(
-        id === STICKY_ROUTING_MAIN_ACCOUNT_ID
-          ? (current?.mainAccountId ?? id)
-          : id,
-        receipt.accountId as ProviderAccountUuid,
+    requirePiOAuthOrigin(target.url)
+    const runtime = getPiNativeRuntime(
+      target.accountStoragePath ?? getPiAccountStoragePath(),
+    )
+    const id = target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
+    const current = await runtime.view()
+    const body = JSON.parse(target.bodyText) as Record<string, unknown>
+    const served = await runtime.authorize(
+      id,
+      attempt.signal,
+      typeof body.model === 'string' ? body.model : undefined,
+    )
+    if (
+      !target.oauthAccountIdentity ||
+      served.accountIdentity !== target.oauthAccountIdentity
+    )
+      throw new Error('CacheKeep account identity changed')
+    const identity = getClaudeCodeIdentityForVerifiedAccount(
+      id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+        ? (current.policyStorage.mainAccountId ?? id)
+        : id,
+      served.accountIdentity as ProviderAccountUuid,
+    )
+    headers.delete('anthropic-beta')
+    applyClaudeCodeHeaders(headers, piAttemptAccessToken(served), {
+      body,
+      identity,
+      extraBetas: [
+        CACHE_KEEP_EXTENDED_TTL_BETA,
+        ...(hasThinkingBindingControls(body)
+          ? [THINKING_BINDING_CONTROLS_BETA]
+          : []),
+      ],
+    })
+    if (body.speed === 'fast')
+      headers.set(
+        'anthropic-beta',
+        mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
       )
-      headers.delete('anthropic-beta')
-      applyClaudeCodeHeaders(headers, receipt.accessToken, {
-        body,
-        identity,
-        extraBetas: [
-          CACHE_KEEP_EXTENDED_TTL_BETA,
-          ...(hasThinkingBindingControls(body)
-            ? [THINKING_BINDING_CONTROLS_BETA]
-            : []),
-        ],
-      })
-      if (body.speed === 'fast')
-        headers.set(
-          'anthropic-beta',
-          mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
-        )
-      scopedPrewarmAttempts.set(attempt.id, { runtime, receipt })
-      return headers
-    }
-    const authorization = headers.get('authorization') ?? ''
-    const match = /^Bearer\s+(.+)$/i.exec(authorization)
-    const accessToken = match?.[1]
-    if (!accessToken) return undefined
-    try {
-      const body = JSON.parse(target.bodyText) as Record<string, unknown>
-      await ensurePiMainAccountId(storagePath)
-      const storage = await loadAccounts(storagePath)
-      const identity = await resolveClaudeCodeIdentity(
-        accessToken,
-        typeof body.model === 'string' ? body.model : undefined,
-        target.oauthAccountId ?? storage?.mainAccountId,
-      )
-      headers.delete('anthropic-beta')
-      applyClaudeCodeHeaders(headers, accessToken, {
-        body,
-        identity,
-        extraBetas: [
-          CACHE_KEEP_EXTENDED_TTL_BETA,
-          ...(hasThinkingBindingControls(body)
-            ? [THINKING_BINDING_CONTROLS_BETA]
-            : []),
-        ],
-      })
-      if (body.speed === 'fast') {
-        headers.set(
-          'anthropic-beta',
-          mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
-        )
-      }
-    } catch {
-      applyClaudeCodeHeaders(headers, accessToken)
-    }
+    nativePrewarmAttempts.set(attempt.id, { runtime, served, reported: false })
     return headers
   },
   retryOnUnauthorized: async ({ target, headers, attempt }) => {
-    const entry = scopedPrewarmAttempts.get(attempt.id)
+    const entry = nativePrewarmAttempts.get(attempt.id)
     if (!entry) return undefined
-    let current: ClaustrumScopedAttempt | undefined
-    try {
-      current = await entry.runtime.authorize(
+    await entry.runtime.report(entry.served, 401, 'direct').catch(() => {
+      logger.warn('native-auth', 'Pi CacheKeep auth-failure report unavailable')
+    })
+    entry.reported = true
+    const retryBody = JSON.parse(target.bodyText) as Record<string, unknown>
+    const rotated = await entry.runtime
+      .retry(
         target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+        entry.served,
         attempt.signal,
+        typeof retryBody.model === 'string' ? retryBody.model : undefined,
       )
-    } catch {
-      // No verified replacement: fall through so the decision records
-      // reauthorize-failed, then keep the original 401.
-    }
-    if (!decideScopedRetryAfter401('pi-cachekeep', entry.receipt, current))
-      return undefined
-    logger.info(
-      'claustrum',
-      'retrying Pi CacheKeep after scoped credential rotation',
-      {
-        accountId: target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
-        previousVersion: entry.receipt.recordVersion,
-        newVersion: current.recordVersion,
-      },
-    )
+      .catch(() => undefined)
+    if (!rotated) return undefined
     const rotatedHeaders = new Headers(headers)
-    rotatedHeaders.set('authorization', `Bearer ${current.accessToken}`)
-    scopedPrewarmAttempts.set(attempt.id, {
+    rotatedHeaders.set(
+      'authorization',
+      `Bearer ${piAttemptAccessToken(rotated)}`,
+    )
+    nativePrewarmAttempts.set(attempt.id, {
       runtime: entry.runtime,
-      receipt: current,
+      served: rotated,
+      reported: false,
     })
     return rotatedHeaders
   },
   onResponse: async ({ attempt, status }) => {
-    const entry = scopedPrewarmAttempts.get(attempt.id)
-    if (entry && status === 401)
-      await entry.runtime
-        .reportFailure(entry.receipt, status, 'direct')
-        .catch(() => {
-          logger.warn('claustrum', 'Pi CacheKeep scoped 401 report unavailable')
-        })
+    const entry = nativePrewarmAttempts.get(attempt.id)
+    if (entry && status === 401 && !entry.reported)
+      await entry.runtime.report(entry.served, status, 'direct').catch(() => {
+        logger.warn(
+          'native-auth',
+          'Pi CacheKeep auth-failure report unavailable',
+        )
+      })
   },
   onComplete: ({ attempt }) => {
-    scopedPrewarmAttempts.delete(attempt.id)
+    nativePrewarmAttempts.delete(attempt.id)
   },
 })
 
@@ -560,49 +485,42 @@ async function sendAnthropicRequest(options: {
   model: Model<Api>
   context: Context
   streamOptions?: SimpleStreamOptions
-  accessToken?: string
-  apiAccount?: ApiKeyAccount
+  apiAccount?: NativeAccountView
   storagePath: string
   oauthAccountId?: string
   route?: string
   effortTransitions?: readonly MidConversationEffortTransition[]
   onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
-  await ensurePiMainAccountId(options.storagePath)
-  const storage = await loadAccounts(options.storagePath)
+  const native = getPiNativeRuntime(options.storagePath)
+  const snapshot = await native.view()
+  const storage = snapshot.policyStorage
   setDumpEnabled(isDumpPersistentlyEnabled(storage))
-  const accountIdentity =
-    options.oauthAccountId === STICKY_ROUTING_MAIN_ACCOUNT_ID
-      ? storage?.mainAccountId
-      : options.oauthAccountId
-  const scoped =
-    !options.apiAccount && getClaustrumMode(storage) === 'claustrum'
-      ? getPiScopedRuntime(options.storagePath)
-      : undefined
   const routeId = options.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
-  const roster = scoped
-    ? (scoped.snapshot() ?? (await scoped.refresh()))
+  const selected = snapshot.accounts.find((account) => account.id === routeId)
+  let verifiedUuid = options.apiAccount ? undefined : selected?.accountIdentity
+  if (!options.apiAccount && !verifiedUuid) {
+    if (selected?.source === 'vault')
+      throw new Error('Pi vault route identity is unasserted')
+    // The local service may learn a UUID by validating an unidentified row.
+    // This lookup supplies identity only; dispatch still authorizes afresh.
+    verifiedUuid = (
+      await native.authorize(
+        routeId,
+        options.streamOptions?.signal,
+        options.model.id,
+      )
+    ).accountIdentity
+  }
+  let nextAttempt: PiNativeAttempt | undefined
+  const identity = verifiedUuid
+    ? getClaudeCodeIdentityForVerifiedAccount(
+        routeId === STICKY_ROUTING_MAIN_ACCOUNT_ID
+          ? (storage.mainAccountId ?? routeId)
+          : routeId,
+        verifiedUuid as ProviderAccountUuid,
+      )
     : undefined
-  const verifiedUuid =
-    routeId === STICKY_ROUTING_MAIN_ACCOUNT_ID
-      ? roster?.primary?.accountId
-      : roster?.accounts.find((account) => account.id === routeId)
-          ?.anthropicAccountUuid
-  if (scoped && !verifiedUuid)
-    throw new Error('Claustrum route has no verified provider identity')
-  const identity =
-    scoped && verifiedUuid
-      ? getClaudeCodeIdentityForVerifiedAccount(
-          accountIdentity ?? routeId,
-          verifiedUuid as ProviderAccountUuid,
-        )
-      : options.accessToken
-        ? await resolveClaudeCodeIdentity(
-            options.accessToken,
-            options.model.id,
-            accountIdentity,
-          )
-        : undefined
   const { body, bodyText, hostTools } = await buildAnthropicRequest(
     options.model.id,
     options.context,
@@ -623,86 +541,124 @@ async function sendAnthropicRequest(options: {
   options.onResolvedTools?.(hostTools)
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
-    ? configureApiRouteHeaders(options.apiAccount, fastMode)
-    : applyClaudeCodeHeaders(
-        new Headers(),
-        scoped ? '' : (options.accessToken ?? ''),
-        {
-          body,
-          identity,
-          extraBetas: [
-            ...(hasThinkingBindingControls(body)
-              ? [THINKING_BINDING_CONTROLS_BETA]
-              : []),
-            ...(usesMidConversationOutputConfig(body)
-              ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
-              : []),
-          ],
-        },
-      )
-  if (!options.apiAccount && fastMode) {
+    ? new Headers()
+    : applyClaudeCodeHeaders(new Headers(), '', {
+        body,
+        identity,
+        extraBetas: [
+          ...(hasThinkingBindingControls(body)
+            ? [THINKING_BINDING_CONTROLS_BETA]
+            : []),
+          ...(usesMidConversationOutputConfig(body)
+            ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA]
+            : []),
+        ],
+      })
+  if (!options.apiAccount && fastMode)
     headers.set(
       'anthropic-beta',
       mergeAnthropicBetas(headers.get('anthropic-beta'), [FAST_MODE_BETA]),
     )
-  }
   const relayAffinity = options.streamOptions?.sessionId ?? null
-
-  const input = options.apiAccount
-    ? buildExplicitBaseMessagesUrl(options.apiAccount.baseURL)
-    : new URL('/v1/messages?beta=true', options.model.baseUrl)
+  let input = options.apiAccount
+    ? new URL('https://api.anthropic.com/v1/messages')
+    : buildPiOAuthMessagesUrl(options.model.baseUrl)
   const init: RequestInit = {
     method: 'POST',
     headers,
     body: bodyText,
     signal: options.streamOptions?.signal,
+    ...(!options.apiAccount && { redirect: 'error' as const }),
   }
+  if (!options.apiAccount)
+    await cacheKeepManager.track({
+      sessionId: relayAffinity,
+      url: input.toString(),
+      headers,
+      bodyText,
+      storage,
+      cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
+      oauthAccountId: routeId,
+      oauthAccountIdentity: verifiedUuid,
+      accountStoragePath: options.storagePath,
+    })
 
-  await cacheKeepManager.track({
-    sessionId: relayAffinity,
-    url: input.toString(),
-    headers,
-    bodyText,
-    storage,
-    cacheMode:
-      !options.apiAccount && isCacheKeepHybridActive(storage)
-        ? 'hybrid'
-        : 'disabled',
-    oauthAccountId: options.oauthAccountId,
-    oauthAccountIdentity: verifiedUuid ?? identity?.accountUuid,
-    accountStoragePath: options.storagePath,
-  })
-
+  const reported = new Set<PiNativeAttempt>()
+  let retried401 = false
+  let lastTransport: 'direct' | 'relay' | undefined
+  const used = new Set<PiNativeAttempt>()
   const report = async (
-    attempt: ClaustrumScopedAttempt,
+    attempt: PiNativeAttempt,
     status: number,
     source: 'direct' | 'relay_status_field',
   ) => {
-    if (!scoped || status !== 401) return
-    await scoped.reportFailure(attempt, status, source).catch(() => {
-      logger.warn('claustrum', 'Pi scoped auth-failure report unavailable')
+    if (status !== 401 || reported.has(attempt)) return
+    reported.add(attempt)
+    await native.report(attempt, status, source).catch(() => {
+      logger.warn('native-auth', 'Pi auth-failure report unavailable')
     })
   }
+  const markUsed = async (attempt: PiNativeAttempt) => {
+    if (used.has(attempt)) return
+    used.add(attempt)
+    await native.markUsed(attempt).catch(() => {
+      logger.warn('native-auth', 'Pi account usage publication unavailable')
+    })
+  }
+  const takeAttempt = async () => {
+    const attempt =
+      nextAttempt ??
+      (await native.authorize(
+        routeId,
+        init.signal ?? undefined,
+        options.model.id,
+      ))
+    nextAttempt = undefined
+    if (attempt.accountIdentity !== verifiedUuid)
+      throw new Error('Pi native OAuth route identity changed')
+    return attempt
+  }
   const directFetch = async () => {
-    // Every physical attempt, including relay-to-direct fallback, is authorized.
-    let attempt = scoped
-      ? await scoped.authorize(routeId, options.streamOptions?.signal)
-      : undefined
-    if (attempt) headers.set('authorization', `Bearer ${attempt.accessToken}`)
+    let attempt: PiNativeAttempt | undefined
+    let apiSubject: NativeApiSubject | undefined
+    if (options.apiAccount) {
+      const credential = await (await native.service()).authorizeApi(
+        options.apiAccount.id,
+        init.signal ?? undefined,
+      )
+      apiSubject = credential.subject
+      input = buildExplicitBaseMessagesUrl(credential.baseURL)
+      const authorized = configureApiRouteHeaders(
+        {
+          ...credential,
+          id: options.apiAccount.id,
+        },
+        fastMode,
+      )
+      init.headers = authorized
+    } else {
+      attempt = await takeAttempt()
+      headers.set('authorization', `Bearer ${piAttemptAccessToken(attempt)}`)
+    }
+    lastTransport = 'direct'
     try {
       let response = await fetch(input, init)
-      if (attempt && response.status === 401 && !init.signal?.aborted) {
-        let rotated: ClaustrumScopedAttempt | undefined
-        try {
-          rotated = await scoped?.authorize(
-            routeId,
-            options.streamOptions?.signal,
-          )
-        } catch {
-          // A failed lookup is not proof of a replacement: report the token
-          // that received the genuine 401 below, without using local material.
-        }
-        if (decideScopedRetryAfter401('pi-model', attempt, rotated)) {
+      if (attempt && response.status === 401) {
+        // Report the rejected credential version before retrying, even if its replacement later succeeds.
+        await report(attempt, response.status, 'direct')
+        const rotated =
+          !retried401 && !init.signal?.aborted
+            ? await native
+                .retry(
+                  routeId,
+                  attempt,
+                  init.signal ?? undefined,
+                  options.model.id,
+                )
+                .catch(() => undefined)
+            : undefined
+        if (rotated) {
+          retried401 = true
           await dumpDirectRequest({
             affinity: relayAffinity,
             route: options.route ?? 'oauth',
@@ -713,22 +669,27 @@ async function sendAnthropicRequest(options: {
             headers,
           })
           await response.body?.cancel().catch(() => {})
-          logger.info(
-            'claustrum',
-            'retrying after scoped credential rotation',
-            {
-              accountId: routeId,
-              previousVersion: attempt.recordVersion,
-              newVersion: rotated.recordVersion,
-              transport: 'direct',
-            },
-          )
           attempt = rotated
-          headers.set('authorization', `Bearer ${rotated.accessToken}`)
+          headers.set(
+            'authorization',
+            `Bearer ${piAttemptAccessToken(rotated)}`,
+          )
           response = await fetch(input, init)
         }
       }
-      if (attempt) await report(attempt, response.status, 'direct')
+      if (attempt) {
+        await report(attempt, response.status, 'direct')
+        if (response.ok) await markUsed(attempt)
+      }
+      if (apiSubject && response.ok)
+        await (await native.service())
+          .publishApi(apiSubject, { lastUsed: Date.now() })
+          .catch(() => {
+            logger.warn(
+              'native-auth',
+              'Pi API account usage publication unavailable',
+            )
+          })
       await dumpDirectRequest({
         affinity: relayAffinity,
         route:
@@ -738,7 +699,7 @@ async function sendAnthropicRequest(options: {
         bodyText,
         url: input.toString(),
         method: init.method,
-        headers,
+        headers: init.headers,
       })
       return response
     } catch (error) {
@@ -751,77 +712,75 @@ async function sendAnthropicRequest(options: {
         bodyText,
         url: input.toString(),
         method: init.method,
-        headers,
+        headers: init.headers,
       })
       throw error
     }
   }
-
   if (options.apiAccount) return directFetch()
 
-  let relay401Attempt: ClaustrumScopedAttempt | undefined
-  let relayReturned = false
-  const sendRelayAttempt = () =>
+  let relay401Attempt: PiNativeAttempt | undefined
+  let relayAttempt: PiNativeAttempt | undefined
+  const relayReports: Promise<void>[] = []
+  const sendRelayAttempt = async () =>
     sendViaRelay({
-      config: getRelayConfig(storage),
+      config: await (await native.service()).getRelayConfig(),
       input,
       init,
       headers,
       body: bodyText,
       fallback: directFetch,
       affinity: relayAffinity,
-      authorizeAttempt: scoped
-        ? async () => {
-            const attempt = await scoped.authorize(
-              routeId,
-              options.streamOptions?.signal,
-            )
-            const authorizedHeaders = new Headers(headers)
-            authorizedHeaders.set(
-              'authorization',
-              `Bearer ${attempt.accessToken}`,
-            )
-            return {
-              headers: authorizedHeaders,
-              onUpstreamStatus: (status) => {
-                if (status !== 401) return
-                relay401Attempt = attempt
-                // WebSocket upstream status can arrive after the response was
-                // returned; HTTP status is held until a rotation check finishes.
-                if (relayReturned)
-                  void report(attempt, status, 'relay_status_field')
-              },
+      authorizeAttempt: async () => {
+        const attempt = await takeAttempt()
+        relayAttempt = attempt
+        lastTransport = 'relay'
+        const authorizedHeaders = new Headers(headers)
+        authorizedHeaders.set(
+          'authorization',
+          `Bearer ${piAttemptAccessToken(attempt)}`,
+        )
+        return {
+          headers: authorizedHeaders,
+          onUpstreamStatus: (status) => {
+            if (status === 401) {
+              relay401Attempt = attempt
+              // A WebSocket status may arrive after the response has been returned.
+              relayReports.push(report(attempt, status, 'relay_status_field'))
             }
-          }
-        : undefined,
+          },
+        }
+      },
     })
   let response = await sendRelayAttempt()
+  await Promise.all(relayReports)
   if (
-    scoped &&
     relay401Attempt &&
     response.status === 401 &&
+    !retried401 &&
     !init.signal?.aborted
   ) {
-    let rotated: ClaustrumScopedAttempt | undefined
-    try {
-      rotated = await scoped.authorize(routeId, options.streamOptions?.signal)
-    } catch {
-      // Report the actual rejected record below if no replacement can be read.
-    }
-    if (decideScopedRetryAfter401('pi-model-relay', relay401Attempt, rotated)) {
+    const rotated = await native
+      .retry(
+        routeId,
+        relay401Attempt,
+        init.signal ?? undefined,
+        options.model.id,
+      )
+      .catch(() => undefined)
+    if (rotated) {
+      retried401 = true
       await response.body?.cancel().catch(() => {})
-      logger.info('claustrum', 'retrying after scoped credential rotation', {
-        accountId: routeId,
-        previousVersion: relay401Attempt.recordVersion,
-        newVersion: rotated.recordVersion,
-        transport: 'relay',
-      })
+      // Use the replacement credential for the next request attempt only. A
+      // relay-to-direct fallback obtains a separate authorization.
+      nextAttempt = rotated
       relay401Attempt = undefined
       response = await sendRelayAttempt()
+      await Promise.all(relayReports)
     }
   }
-  relayReturned = true
-  if (relay401Attempt) await report(relay401Attempt, 401, 'relay_status_field')
+  if (response.ok && lastTransport === 'relay' && relayAttempt)
+    await markUsed(relayAttempt)
   return response
 }
 
@@ -866,42 +825,34 @@ async function executeWithFallback(options: {
   model: Model<Api>
   context: Context
   streamOptions?: SimpleStreamOptions
-  primaryAccessToken: string
   storagePath: string
   effortTransitions?: readonly MidConversationEffortTransition[]
   onResolvedTools?: (tools: Tool[]) => void
 }): Promise<Response> {
-  await ensurePiMainAccountId(options.storagePath)
-  let storage = await loadAccounts(options.storagePath)
-  const scoped =
-    getClaustrumMode(storage) === 'claustrum'
-      ? getPiScopedRuntime(options.storagePath)
-      : undefined
-  let roster = scoped ? await scoped.refresh() : undefined
-  if (scoped && !roster)
-    throw new Error('Claustrum custody changed during request preparation')
-  if (roster) storage = roster.storage
-  const primaryCredential = scoped ? '' : options.primaryAccessToken
-  const scopedReady = (account: OAuthAccount) =>
-    Boolean(
-      scoped &&
-        account.enabled !== false &&
-        account.claustrumScopedCredentialId &&
-        account.claustrumScopedState === 'active',
+  const native = getPiNativeRuntime(options.storagePath)
+  let snapshot = await native.view()
+  let storage = snapshot.policyStorage
+  const accountView = (id: string) =>
+    snapshot.accounts.find((account) => account.id === id)
+  const nativeReady = (id: string) => {
+    const account = accountView(id)
+    return Boolean(
+      account?.type === 'oauth' &&
+        account.enabled &&
+        (account.source !== 'vault' || account.state === 'active') &&
+        !isPermanentRefreshError(account.lastRefreshError) &&
+        (account.source !== 'local' ||
+          (account.lastRefreshError?.nextRetryAt ?? 0) <= Date.now()),
     )
-  const primaryAvailable = () =>
-    !scoped ||
-    (roster?.primary?.state === 'active' &&
-      !storage?.claustrum?.disabledAccountIdentities?.includes(
-        roster.primary.accountId,
-      ))
-  const { quotaManager, fallbackManager: manager } = getPiRoutingServices(
+  }
+  const primaryAvailable = () => nativeReady(STICKY_ROUTING_MAIN_ACCOUNT_ID)
+  let { quotaManager, getUsableFallbackAccounts } = getPiRoutingServices(
     options.storagePath,
-    storage,
+    snapshot,
   )
-  let mainAccountId = scoped
-    ? roster?.primary?.accountId
-    : storage?.mainAccountId
+  let mainAccountId = accountView(
+    STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  )?.accountIdentity
   quotaManager.seedMainFromStorage(storage, mainAccountId)
   quotaManager.seedFallbacksFromAccounts(
     (storage?.accounts ?? []).filter(isOAuthAccount),
@@ -909,7 +860,6 @@ async function executeWithFallback(options: {
 
   type PiStickyRoute = {
     id: string
-    access: string
     quota?: OAuthQuotaSnapshot
     order: number
     account?: OAuthAccount
@@ -939,18 +889,22 @@ async function executeWithFallback(options: {
     )
   }
 
+  async function refreshRoutingSnapshot() {
+    snapshot = await native.view()
+    storage = snapshot.policyStorage
+    mainAccountId = accountView(STICKY_ROUTING_MAIN_ACCOUNT_ID)?.accountIdentity
+    ;({ quotaManager, getUsableFallbackAccounts } = getPiRoutingServices(
+      options.storagePath,
+      snapshot,
+    ))
+    quotaManager.seedMainFromStorage(storage, mainAccountId)
+    quotaManager.seedFallbacksFromAccounts(
+      storage.accounts.filter(isOAuthAccount),
+    )
+  }
+
   async function buildStickyRoutes(modelId: string) {
-    if (scoped) {
-      roster = await scoped.refresh()
-      if (!roster) throw new Error('Claustrum custody changed during routing')
-      storage = roster.storage
-      mainAccountId = roster.primary?.accountId
-      quotaManager.updateStorage(storage)
-      quotaManager.seedMainFromStorage(storage, mainAccountId)
-      quotaManager.seedFallbacksFromAccounts(
-        storage.accounts.filter(isOAuthAccount),
-      )
-    }
+    await refreshRoutingSnapshot()
     const mainEntry = quotaManager.getMain(mainAccountId)
     let mainQuota = mainEntry?.quota
     if (
@@ -963,27 +917,19 @@ async function executeWithFallback(options: {
       )
     ) {
       try {
-        mainQuota = await quotaManager.refreshMain(
-          mainAccountId,
-          primaryCredential,
-        )
+        mainQuota = await quotaManager.refreshMain(mainAccountId, '')
       } catch {}
     }
-    const usableFallbacks = await manager.getUsableFallbackAccounts(storage, {
+    const usableFallbacks = await getUsableFallbackAccounts(storage, {
       modelId,
     })
     const usableById = new Map(
       usableFallbacks.map((account) => [account.id, account]),
     )
     const allRoutes: PiStickyRoute[] = []
-    if (
-      primaryAvailable() &&
-      (scoped ||
-        !isPermanentRefreshError(storage?.refresh?.mainLastRefreshError))
-    ) {
+    if (primaryAvailable()) {
       allRoutes.push({
         id: STICKY_ROUTING_MAIN_ACCOUNT_ID,
-        access: primaryCredential,
         quota: mainQuota,
         order: 0,
       })
@@ -991,12 +937,7 @@ async function executeWithFallback(options: {
     for (const [index, configured] of (storage?.accounts ?? []).entries()) {
       if (configured.enabled === false || !isOAuthAccount(configured)) continue
       const account = usableById.get(configured.id) ?? configured
-      if (
-        scoped
-          ? !scopedReady(account)
-          : !account.access || isPermanentRefreshError(account.lastRefreshError)
-      )
-        continue
+      if (!nativeReady(account.id)) continue
       let accountQuota =
         quotaManager.getFallback(account.id, account)?.quota ?? account.quota
       if (
@@ -1005,14 +946,13 @@ async function executeWithFallback(options: {
         try {
           accountQuota = await quotaManager.refreshFallback(
             account.id,
-            scoped ? '' : (account.access ?? ''),
+            '',
             account,
           )
         } catch {}
       }
       allRoutes.push({
         id: account.id,
-        access: scoped ? '' : (account.access ?? ''),
         quota: accountQuota,
         order: index + 1,
         account,
@@ -1024,7 +964,7 @@ async function executeWithFallback(options: {
           route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
             ? storage?.refresh?.mainLastRefreshError
             : route.account?.lastRefreshError
-        if (!scoped && isPermanentRefreshError(refreshError)) return []
+        if (isPermanentRefreshError(refreshError)) return []
         if (
           stickyQuotaSnapshotIsFresh(
             route.quota,
@@ -1090,12 +1030,10 @@ async function executeWithFallback(options: {
   }
 
   async function primaryQuotaRefreshConfirmsExhausted() {
-    if (!primaryAvailable()) return false
+    await refreshRoutingSnapshot()
+    if (!primaryAvailable() || !mainAccountId) return false
     try {
-      const quota = await quotaManager.refreshMain(
-        mainAccountId,
-        primaryCredential,
-      )
+      const quota = await quotaManager.refreshMain(mainAccountId, '')
       const entry = quotaManager.getMain(mainAccountId)
       return Boolean(
         entry &&
@@ -1108,12 +1046,10 @@ async function executeWithFallback(options: {
   }
 
   async function primaryQuotaRefreshConfirmsModelScopeExhausted() {
+    await refreshRoutingSnapshot()
     if (!primaryAvailable()) return false
     try {
-      const quota = await quotaManager.refreshMain(
-        mainAccountId,
-        primaryCredential,
-      )
+      const quota = await quotaManager.refreshMain(mainAccountId, '')
       const entry = quotaManager.getMain(mainAccountId)
       return Boolean(
         entry &&
@@ -1147,101 +1083,55 @@ async function executeWithFallback(options: {
   async function tryFallbackAccounts(
     routeOptions: { includeApiRoutes?: boolean; apiOnly?: boolean } = {},
   ) {
-    const usableOAuth = await manager.getUsableFallbackAccounts(storage, {
+    const usableOAuth = await getUsableFallbackAccounts(storage, {
       modelId: options.model.id,
     })
     const usableOAuthById = new Map(
       usableOAuth.map((account) => [account.id, account]),
     )
-    for (const configured of storage?.accounts ?? []) {
+    for (const configured of storage.accounts) {
       if (configured.enabled === false) continue
-      let response: Response | null = null
-      let account: OAuthAccount | ApiKeyAccount | undefined = isOAuthAccount(
-        configured,
-      )
-        ? usableOAuthById.get(configured.id)
-        : configured
-      if (!account) {
+      let response: Response | undefined
+      if (isOAuthAccount(configured)) {
+        if (routeOptions.apiOnly || !nativeReady(configured.id)) continue
+        const account = usableOAuthById.get(configured.id) ?? configured
+        const quota =
+          quotaManager.getFallback(account.id, account)?.quota ?? account.quota
         if (
-          !isOAuthAccount(configured) ||
-          (scoped
-            ? !scopedReady(configured)
-            : !configured.access ||
-              (configured.expires !== undefined &&
-                configured.expires <= Date.now()) ||
-              isPermanentRefreshError(configured.lastRefreshError) ||
-              refreshBackoffActive(
-                configured.lastRefreshError,
-                configured.id,
-                Date.now(),
-                tokenFingerprint(configured.refresh),
-              ))
+          !usableOAuthById.has(account.id) &&
+          quotaSnapshotHasStandardWindows(quota)
         )
           continue
-        account = configured
-        const quota =
-          quotaManager.getFallback(configured.id, configured)?.quota ??
-          configured.quota
-        if (quotaSnapshotHasStandardWindows(quota)) continue
         if (
           isKillswitchEnabled(storage) &&
-          !killswitchPassesPolicy(
-            quota,
-            storage,
-            configured.id,
-            options.model.id,
-          )
-        )
-          continue
-      } else if (
-        isOAuthAccount(account) &&
-        isKillswitchEnabled(storage) &&
-        !killswitchPassesPolicy(
-          quotaManager.getFallback(account.id, account)?.quota ?? account.quota,
-          storage,
-          account.id,
-          options.model.id,
-        )
-      ) {
-        continue
-      }
-
-      if (isOAuthAccount(account)) {
-        if (
-          routeOptions.apiOnly === true ||
-          (scoped ? !scopedReady(account) : !account.access)
+          !killswitchPassesPolicy(quota, storage, account.id, options.model.id)
         )
           continue
         response = await sendAnthropicRequest({
           ...options,
-          accessToken: scoped ? undefined : account.access,
           oauthAccountId: account.id,
         })
-      } else if (
-        routeOptions.includeApiRoutes === true &&
-        isApiKeyAccount(account) &&
-        account.enabled !== false &&
-        account.apiKey &&
-        isValidApiBaseURL(account.baseURL)
-      ) {
+      } else if (routeOptions.includeApiRoutes) {
+        const account = accountView(configured.id)
+        if (
+          !account?.enabled ||
+          account.type !== 'api' ||
+          !isValidApiBaseURL(account.baseURL)
+        )
+          continue
         response = await sendAnthropicRequest({
           ...options,
           apiAccount: account,
         })
       }
       if (!response) continue
-
       const preflight = await firstStreamingError(response)
-      if (preflight instanceof Response && preflight.ok) {
-        await manager.markUsed(account)
-        return preflight
-      }
+      if (preflight instanceof Response && preflight.ok) return preflight
       if (
         preflight instanceof Response &&
         !shouldFallbackStatus(preflight.status, storage)
-      ) {
+      )
         return preflight
-      }
       await response.body?.cancel().catch(() => {})
     }
     return null
@@ -1250,15 +1140,13 @@ async function executeWithFallback(options: {
   const routingMode = getRoutingMode(storage)
   if (routingMode === 'sticky-balanced' && options.streamOptions?.sessionId) {
     const sessionId = options.streamOptions.sessionId
-    const router = getPiStickyRouter(options.storagePath)
+    const router = await getPiStickyRouter(options.storagePath)
     const initialInputBytes = Math.max(
       1,
       Buffer.byteLength(JSON.stringify(options.context)),
     )
     let routes = await buildStickyRoutes(options.model.id)
-    const mainPermanentlyUnavailable = scoped
-      ? !primaryAvailable()
-      : isPermanentRefreshError(storage?.refresh?.mainLastRefreshError)
+    const mainPermanentlyUnavailable = !primaryAvailable()
     const incompleteQuotaPool =
       (routes.allRoutes.length === 0 && !mainPermanentlyUnavailable) ||
       routes.allRoutes.some(
@@ -1289,9 +1177,7 @@ async function executeWithFallback(options: {
     }
     if (!resolution) {
       return createStickyNoRouteResponse({
-        mainRefreshError: scoped
-          ? undefined
-          : storage?.refresh?.mainLastRefreshError,
+        mainRefreshError: storage?.refresh?.mainLastRefreshError,
         fallbackReauthLabels: getFallbackReauthLabels(storage),
         routeQuotas: routes.allRoutes.flatMap((route) =>
           route.quota ? [route.quota] : [],
@@ -1306,19 +1192,14 @@ async function executeWithFallback(options: {
       const sendRoute = (selected: PiStickyRoute) =>
         sendAnthropicRequest({
           ...options,
-          accessToken: selected.access,
           oauthAccountId: selected.id,
           route: `sticky:${selected.id}`,
         })
       const completeRoute = async (
-        selected: PiStickyRoute,
+        _selected: PiStickyRoute,
         response: Response,
-        markUsed = true,
-      ) => {
-        if (markUsed && selected.account)
-          await manager.markUsed(selected.account)
-        return response
-      }
+        _markUsed = true,
+      ) => response
       const proactiveQuotaDecision = stickyQuotaSnapshotIsFresh(
         route.quota,
         storage,
@@ -1359,53 +1240,14 @@ async function executeWithFallback(options: {
         )
       }
 
-      let response = await sendRoute(route)
-      let preflight = await firstStreamingError(response)
+      const response = await sendRoute(route)
+      const preflight = await firstStreamingError(response)
       if (preflight instanceof Response && preflight.ok) {
         return completeRoute(route, preflight)
       }
 
-      let permanentAuthFailure =
-        preflight instanceof Response &&
-        preflight.status === 401 &&
-        (Boolean(scoped) || route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID)
-      if (
-        preflight instanceof Response &&
-        preflight.status === 401 &&
-        route.account &&
-        storage &&
-        !scoped
-      ) {
-        const authRouteId = route.id
-        try {
-          const refreshed = await manager.refreshAccount(
-            route.account,
-            storage,
-            {
-              force: true,
-            },
-          )
-          if (refreshed.access) {
-            route = { ...route, access: refreshed.access, account: refreshed }
-          }
-          await preflight.body?.cancel().catch(() => {})
-          response = await sendRoute(route)
-          preflight = await firstStreamingError(response)
-          if (preflight instanceof Response && preflight.ok) {
-            return completeRoute(route, preflight)
-          }
-          permanentAuthFailure =
-            preflight instanceof Response && preflight.status === 401
-        } catch (error) {
-          const latest = await loadAccounts(options.storagePath)
-          const refreshError = latest?.accounts.find(
-            (account): account is OAuthAccount =>
-              account.id === authRouteId && isOAuthAccount(account),
-          )?.lastRefreshError
-          if (!isPermanentRefreshError(refreshError)) throw error
-          permanentAuthFailure = true
-        }
-      }
+      const permanentAuthFailure =
+        preflight instanceof Response && preflight.status === 401
 
       let migrate =
         (preflight instanceof Response && preflight.status === 403) ||
@@ -1415,12 +1257,8 @@ async function executeWithFallback(options: {
         try {
           quota =
             route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
-              ? await quotaManager.refreshMain(mainAccountId, route.access)
-              : await quotaManager.refreshFallback(
-                  route.id,
-                  route.access,
-                  route.account,
-                )
+              ? await quotaManager.refreshMain(mainAccountId, '')
+              : await quotaManager.refreshFallback(route.id, '', route.account)
         } catch {
           // Retain affinity when the quota probe itself is unavailable.
           quota = undefined
@@ -1555,10 +1393,7 @@ async function executeWithFallback(options: {
     let mainQuota = quotaManager.getMain(mainAccountId)?.quota
     if (!mainQuota || quotaManager.isMainStale(options.model.id)) {
       try {
-        mainQuota = await quotaManager.refreshMain(
-          mainAccountId,
-          primaryCredential,
-        )
+        mainQuota = await quotaManager.refreshMain(mainAccountId, '')
       } catch {}
     }
     if (
@@ -1589,7 +1424,6 @@ async function executeWithFallback(options: {
 
   const primary = await sendAnthropicRequest({
     ...options,
-    accessToken: primaryCredential,
     oauthAccountId: STICKY_ROUTING_MAIN_ACCOUNT_ID,
   })
   const primaryPreflight = await firstStreamingError(primary)
@@ -1634,19 +1468,13 @@ export function streamCortexKitAnthropic(
     stream.push({ type: 'start', partial: output })
 
     try {
-      const accessToken = options?.apiKey ?? ''
+      buildPiOAuthMessagesUrl(model.baseUrl)
       const storagePath = getPiAccountStoragePath()
-      if (
-        !accessToken &&
-        getClaustrumMode(await loadAccounts(storagePath)) !== 'claustrum'
-      )
-        throw new Error('Missing Anthropic OAuth access token')
       let hostTools: Tool[] = []
       const response = await executeWithFallback({
         model,
         context,
         streamOptions: options,
-        primaryAccessToken: accessToken,
         storagePath,
         effortTransitions,
         onResolvedTools: (tools) => {

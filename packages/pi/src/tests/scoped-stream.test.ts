@@ -4,13 +4,9 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   __setLogTestSink,
-  type ClaustrumScopedClient,
+  type NativeCustodyClient as ClaustrumScopedClient,
   getLogLevel,
   type LogTestRecord,
-  loadAccounts,
-  saveAccounts,
-  setAccountEnabledPersistent,
-  setClaustrumModePersistent,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -32,18 +28,24 @@ import {
   type ProviderConfig,
 } from '@earendil-works/pi-coding-agent'
 import cortexKitPiAnthropicAuth from '../index.ts'
+import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import {
   __prewarmPiCacheKeepForTest,
-  closePiScopedRuntime,
-  getPiScopedRuntime,
   streamCortexKitAnthropic,
 } from '../stream.ts'
+import {
+  fixtureAccountIdentity,
+  readNativePiFixture,
+  saveNativePiFixture,
+  setNativePiFixtureMode,
+} from './native-fixture.ts'
+import { trackPiTestBody } from './setup.ts'
 
 const originalFetch = globalThis.fetch
 let dir: string | undefined
 let path: string | undefined
 afterEach(async () => {
-  if (path) closePiScopedRuntime(path)
+  if (path) closePiNativeRuntime(path)
   globalThis.fetch = originalFetch
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   delete process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
@@ -103,7 +105,7 @@ async function fixture(
     JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
     { mode: 0o600 },
   )
-  await saveAccounts(
+  await saveNativePiFixture(
     {
       version: 1,
       accounts: [
@@ -128,9 +130,9 @@ async function fixture(
         : {}),
     },
     path,
+    { primary: false },
   )
-  await setClaustrumModePersistent('claustrum', path)
-  const rows = [row('oauth:anthropic', 'main-provider')]
+  const rows = [row('oauth:anthropic', fixtureAccountIdentity('main'))]
   const gets: Array<Parameters<ClaustrumScopedClient['getScoped']>[0]> = []
   const reports: Array<
     Parameters<ClaustrumScopedClient['reportAuthFailureScoped']>[0]
@@ -153,7 +155,19 @@ async function fixture(
     },
     close: () => {},
   }
-  getPiScopedRuntime(path, { connect: async () => client, pollIntervalMs: 0 })
+  const native = getPiNativeRuntime(path, { connect: async () => client })
+  await setNativePiFixtureMode(path, 'claustrum')
+  const roster = await (await native.service()).vault.refresh()
+  const primary = roster?.rows.find(
+    (account) => account.credentialId === 'oauth:anthropic',
+  )
+  if (!primary?.accountIdentity)
+    throw new Error('Fixture vault primary identity is missing')
+  await setNativePiFixtureMode(path, 'claustrum', {
+    routeId: primary.routeId,
+    credentialId: primary.credentialId,
+    accountIdentity: primary.accountIdentity,
+  })
   return { rows, gets, reports, client, path }
 }
 
@@ -178,13 +192,11 @@ test('Pi sends using scoped credentials without host auth, and never bootstraps 
     },
     { preconnect: originalFetch.preconnect },
   )
-  expect(
-    (
-      await streamCortexKitAnthropic(model, context, {
-        sessionId: 'scoped-first',
-      }).result()
-    ).stopReason,
-  ).toBe('stop')
+  const first = await streamCortexKitAnthropic(model, context, {
+    sessionId: 'scoped-first',
+  }).result()
+  expect(first.errorMessage).toBeUndefined()
+  expect(first.stopReason).toBe('stop')
   expect(
     (
       await streamCortexKitAnthropic(model, context, {
@@ -200,9 +212,9 @@ test('Pi sends using scoped credentials without host auth, and never bootstraps 
   expect(
     sent.every((request) => request.url.endsWith('/v1/messages?beta=true')),
   ).toBe(true)
-  expect(sent[0]?.body).toContain('main-provider')
+  expect(sent[0]?.body).toContain(fixtureAccountIdentity('main'))
   expect(f.gets).toHaveLength(2)
-  expect(JSON.stringify(await loadAccounts(f.path))).not.toContain(
+  expect(JSON.stringify(await readNativePiFixture(f.path))).not.toContain(
     'vault-test-access',
   )
 })
@@ -231,7 +243,7 @@ test('a revoked scoped credential never falls back to local auth or a paid API r
     apiKey: 'must-not-use-local-key',
   }).result()
   expect(result.stopReason).toBe('error')
-  expect(result.errorMessage).toContain('enrollment_revoked')
+  expect(result.errorMessage).toContain('Native custody refused: unavailable')
   expect(sends).toBe(1)
 })
 
@@ -243,15 +255,16 @@ test('fallback-first discovers a new account on the next turn and honors a live 
   expect(
     (await streamCortexKitAnthropic(model, context).result()).stopReason,
   ).toBe('stop')
-  f.rows.push(row('oauth:anthropic:new', 'new-provider'))
+  f.rows.push(row('oauth:anthropic:new', fixtureAccountIdentity('new')))
   expect(
     (await streamCortexKitAnthropic(model, context).result()).stopReason,
   ).toBe('stop')
-  const added = (await loadAccounts(f.path))?.accounts.find(
-    (account) => account.type === 'oauth',
+  const native = getPiNativeRuntime(f.path)
+  const added = (await native.view()).accounts.find(
+    (account) => account.credentialId === 'oauth:anthropic:new',
   )
   if (!added) throw new Error('new account was not persisted')
-  await setAccountEnabledPersistent(added.id, false, f.path)
+  await (await native.service()).setEnabled(added.id, false)
   expect(
     (await streamCortexKitAnthropic(model, context).result()).stopReason,
   ).toBe('stop')
@@ -260,7 +273,9 @@ test('fallback-first discovers a new account on the next turn and honors a live 
     'oauth:anthropic:new',
     'oauth:anthropic',
   ])
-  expect(await readFile(f.path, 'utf8')).not.toContain('vault-test-access')
+  await expect(readFile(f.path, 'utf8')).rejects.toMatchObject({
+    code: 'ENOENT',
+  })
 })
 
 test.each([500, 401])(
@@ -274,7 +289,7 @@ test.each([500, 401])(
       const version = Math.min(f.gets.length, 2)
       return {
         credentialId: input.credentialId,
-        accountId: 'main-provider',
+        accountId: fixtureAccountIdentity('main'),
         material: `vault-test-access-${version}`,
         recordVersion: version,
         expiresAtMs: Date.now() + 600_000,
@@ -321,7 +336,7 @@ test.each([500, 401])(
 
 test('scoped model switches reuse the existing sticky allocator and its Opus reserve preference', async () => {
   const f = await fixture('sticky-balanced')
-  f.rows.push(row('oauth:anthropic:work', 'work-provider'))
+  f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
   const served: string[] = []
   globalThis.fetch = Object.assign(
     async (
@@ -492,9 +507,8 @@ test.each(hostCredentials)(
     try {
       await cortexKitPiAnthropicAuth(pi, {
         connectScoped: async () => ({ ...f.client }),
-        pollIntervalMs: 0,
       })
-      await getPiScopedRuntime(f.path).refresh()
+      await getPiNativeRuntime(f.path).view()
       expect(provider?.auth.oauth).toBeUndefined()
       if (credential?.type === 'oauth') {
         expect(await host.getAuth('anthropic')).toBeUndefined()
@@ -503,7 +517,7 @@ test.each(hostCredentials)(
       } else {
         expect(await host.getAuth('anthropic')).toEqual({
           auth: {},
-          source: 'Claustrum',
+          source: 'CortexKit Native',
         })
         const registered = host.getModel('anthropic', model.id)
         if (!registered)
@@ -512,16 +526,16 @@ test.each(hostCredentials)(
           (await host.completeSimple(registered, context)).stopReason,
         ).toBe('stop')
         expect(sends).toBe(1)
-        const accountCommand = commands.get('claude-account')
+        const accountCommand = commands.get('claude')
         if (!accountCommand)
-          throw new Error('Account command was not registered')
+          throw new Error('Claude menu command was not registered')
         const ctx = {
           ui: { notify: () => {} },
         } as unknown as ExtensionCommandContext
         await accountCommand.handler('local', ctx)
-        expect(host.getProvider('anthropic')?.auth.oauth).toBeDefined()
+        expect(host.getProvider('anthropic')?.auth.oauth).toBeUndefined()
         await accountCommand.handler('claustrum', ctx)
-        await getPiScopedRuntime(f.path).refresh()
+        await getPiNativeRuntime(f.path).view()
         expect(host.getProvider('anthropic')?.auth.oauth).toBeUndefined()
         expect(
           (await host.completeSimple(registered, context)).stopReason,
@@ -548,7 +562,7 @@ test.each([200, 401])(
       gets.push(version)
       return {
         credentialId,
-        accountId: 'main-provider',
+        accountId: fixtureAccountIdentity('main'),
         material: `rotated-pi-${version}`,
         recordVersion: version,
         expiresAtMs: Date.now() + 600_000,
@@ -594,16 +608,17 @@ test.each([200, 401])(
     expect(sent).toEqual(['Bearer rotated-pi-1', 'Bearer rotated-pi-2'])
     expect(gets).toEqual([1, 2])
     expect(f.reports.map((report) => report.recordVersion)).toEqual(
-      finalStatus === 401 ? [2] : [],
+      finalStatus === 401 ? [1, 2] : [1],
     )
-    // Pi's direct-model retry decision reaches the shared diagnostics line.
+    // Retry diagnostics must not include access or refresh tokens, or the
+    // provider's raw error text.
     expect(
       records
-        .filter((record) => record.message === 'scoped 401 re-authorized')
+        .filter((record) => record.message === 'Pi 401 retry decision')
         .map((record) => record.payload),
     ).toContainEqual(
       expect.objectContaining({
-        site: 'pi-model',
+        source: 'vault',
         servedVersion: 1,
         currentVersion: 2,
         retry: true,
@@ -622,7 +637,7 @@ test.each([200, 401])(
       relayTokens: string[] = []
     f.client.getScoped = async ({ credentialId }) => ({
       credentialId,
-      accountId: 'main-provider',
+      accountId: fixtureAccountIdentity('main'),
       material: `relay-pi-${version}`,
       recordVersion: version,
       expiresAtMs: Date.now() + 600_000,
@@ -665,7 +680,7 @@ test.each([200, 401])(
     }).result()
     expect(result.stopReason).toBe(finalStatus === 401 ? 'error' : 'stop')
     expect(relayTokens).toEqual(['Bearer relay-pi-1', 'Bearer relay-pi-2'])
-    expect(reports).toEqual(finalStatus === 401 ? [2] : [])
+    expect(reports).toEqual(finalStatus === 401 ? [1, 2] : [1])
   },
 )
 
@@ -677,7 +692,7 @@ test.each([200, 401])(
     const sent: string[] = []
     f.client.getScoped = async ({ credentialId }) => ({
       credentialId,
-      accountId: 'main-provider',
+      accountId: fixtureAccountIdentity('main'),
       material: `pi-cachekeep-v${version}`,
       recordVersion: version,
       expiresAtMs: Date.now() + 600_000,
@@ -724,13 +739,397 @@ test.each([200, 401])(
         messages: [{ role: 'user', content: 'warm' }],
       }),
       oauthAccountId: 'main',
-      oauthAccountIdentity: 'main-provider',
+      oauthAccountIdentity: fixtureAccountIdentity('main'),
       accountStoragePath: f.path,
     })
     expect(result.ok).toBe(finalStatus === 200)
     expect(sent).toEqual(['Bearer pi-cachekeep-v1', 'Bearer pi-cachekeep-v2'])
     expect(f.reports.map((report) => report.recordVersion)).toEqual(
-      finalStatus === 401 ? [2] : [],
+      finalStatus === 401 ? [1, 2] : [1],
     )
   },
+)
+
+test.each([200, 401])(
+  'Pi WebSocket relay retries a strict-newer native receipt once and reports every rejected version; final status %i',
+  async (finalStatus) =>
+    trackPiTestBody(
+      (async () => {
+        const f = await fixture()
+        let version = 1
+        const sent: string[] = []
+        f.client.getScoped = async ({ credentialId }) => ({
+          credentialId,
+          accountId: fixtureAccountIdentity('main'),
+          material: `pi-ws-v${version}`,
+          recordVersion: version,
+          expiresAtMs: Date.now() + 600_000,
+        })
+        const sse = await success().text()
+        const server = Bun.serve({
+          hostname: '127.0.0.1',
+          port: 0,
+          fetch: (request, server) =>
+            server.upgrade(request)
+              ? undefined
+              : new Response('unexpected HTTP', { status: 500 }),
+          websocket: {
+            open: (socket) => {
+              socket.send(
+                JSON.stringify({ type: 'ready', protocol: 2, state: null }),
+              )
+            },
+            message: (socket, data) => {
+              const payload = JSON.parse(String(data)) as {
+                id: string
+                upstream: { headers: Record<string, string> }
+              }
+              const token = payload.upstream.headers.authorization ?? ''
+              sent.push(token)
+              const status = token === 'Bearer pi-ws-v1' ? 401 : finalStatus
+              version = 2
+              socket.send(
+                JSON.stringify({
+                  type: 'response_start',
+                  id: payload.id,
+                  status,
+                  headers: { 'content-type': 'text/event-stream' },
+                }),
+              )
+              if (status === 200)
+                socket.send(
+                  JSON.stringify({
+                    type: 'chunk',
+                    id: payload.id,
+                    base64: Buffer.from(sse).toString('base64'),
+                  }),
+                )
+              socket.send(JSON.stringify({ type: 'done', id: payload.id }))
+            },
+          },
+        })
+        const abort = new AbortController()
+        const deadline = setTimeout(() => abort.abort(), 4_000)
+        try {
+          await (await getPiNativeRuntime(f.path).service()).updateRelay({
+            enabled: true,
+            url: server.url.href,
+            token: 'synthetic-ws-relay-secret',
+            transport: 'websocket',
+            fallbackToDirect: false,
+          })
+          const result = await streamCortexKitAnthropic(model, context, {
+            sessionId: `pi-ws-${finalStatus}`,
+            signal: abort.signal,
+          }).result()
+          expect(result.stopReason).toBe(finalStatus === 200 ? 'stop' : 'error')
+          expect(sent).toEqual(['Bearer pi-ws-v1', 'Bearer pi-ws-v2'])
+          expect(
+            f.reports.map((report) => [
+              report.recordVersion,
+              report.reporterSource,
+            ]),
+          ).toEqual(
+            finalStatus === 200
+              ? [[1, 'relay_status_field']]
+              : [
+                  [1, 'relay_status_field'],
+                  [2, 'relay_status_field'],
+                ],
+          )
+        } finally {
+          clearTimeout(deadline)
+          abort.abort()
+          server.stop(true)
+        }
+      })(),
+    ),
+)
+
+test('Pi WebSocket reconnect authorizes the replacement physical attempt without reporting a transport failure', () =>
+  trackPiTestBody(
+    (async () => {
+      const f = await fixture()
+      const sent: string[] = []
+      const sse = await success().text()
+      const server = Bun.serve({
+        hostname: '127.0.0.1',
+        port: 0,
+        fetch: (request, server) =>
+          server.upgrade(request)
+            ? undefined
+            : new Response('unexpected HTTP', { status: 500 }),
+        websocket: {
+          open: (socket) => {
+            socket.send(
+              JSON.stringify({ type: 'ready', protocol: 2, state: null }),
+            )
+          },
+          message: (socket, data) => {
+            const payload = JSON.parse(String(data)) as {
+              id: string
+              upstream: { headers: Record<string, string> }
+            }
+            sent.push(payload.upstream.headers.authorization ?? '')
+            if (sent.length === 1) {
+              socket.close(1011, 'interrupted before upstream')
+              return
+            }
+            socket.send(
+              JSON.stringify({
+                type: 'response_start',
+                id: payload.id,
+                status: 200,
+                headers: { 'content-type': 'text/event-stream' },
+              }),
+            )
+            socket.send(
+              JSON.stringify({
+                type: 'chunk',
+                id: payload.id,
+                base64: Buffer.from(sse).toString('base64'),
+              }),
+            )
+            socket.send(JSON.stringify({ type: 'done', id: payload.id }))
+          },
+        },
+      })
+      const abort = new AbortController()
+      const deadline = setTimeout(() => abort.abort(), 4_000)
+      try {
+        await (await getPiNativeRuntime(f.path).service()).updateRelay({
+          enabled: true,
+          url: server.url.href,
+          token: 'synthetic-ws-reconnect-secret',
+          transport: 'websocket',
+          fallbackToDirect: false,
+        })
+        expect(
+          (
+            await streamCortexKitAnthropic(model, context, {
+              sessionId: 'pi-ws-reconnect',
+              signal: abort.signal,
+            }).result()
+          ).stopReason,
+        ).toBe('stop')
+        expect(sent).toEqual([
+          'Bearer vault-test-access-1',
+          'Bearer vault-test-access-2',
+        ])
+        expect(f.gets).toHaveLength(2)
+        expect(f.reports).toEqual([])
+      } finally {
+        clearTimeout(deadline)
+        abort.abort()
+        server.stop(true)
+      }
+    })(),
+  ))
+
+test('Pi refuses an unchanged native vault version after 401 without local or paid API rescue', async () => {
+  const f = await fixture()
+  f.client.getScoped = async ({ credentialId }) => ({
+    credentialId,
+    accountId: fixtureAccountIdentity('main'),
+    material: 'synthetic-unchanged-vault-access',
+    recordVersion: 1,
+    expiresAtMs: Date.now() + 600_000,
+  })
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async () => {
+      sends++
+      return new Response('same version rejected', { status: 401 })
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        apiKey: 'synthetic-host-rescue',
+      }).result()
+    ).stopReason,
+  ).toBe('error')
+  expect(sends).toBe(1)
+  expect(f.reports.map((report) => report.recordVersion)).toEqual([1])
+})
+
+test.each([
+  'https://unapproved.invalid/v1',
+  'http://api.anthropic.com',
+  'https://user:password@api.anthropic.com/v1',
+  'https://api.anthropic.com:8443/v1',
+  'blob:https://api.anthropic.com/opaque',
+  'not a URL',
+])(
+  'Pi rejects native OAuth recipient %s before authorization or dispatch',
+  async (baseUrl) => {
+    const f = await fixture()
+    let sends = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        sends++
+        return success()
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const result = await streamCortexKitAnthropic(
+      { ...model, baseUrl },
+      context,
+    ).result()
+    expect(result.stopReason).toBe('error')
+    expect(result.errorMessage).toContain('official Anthropic HTTPS origin')
+    expect(f.gets).toEqual([])
+    expect(sends).toBe(0)
+  },
+)
+
+test('Pi accepts the official versioned OAuth endpoint with redirects disabled', async () => {
+  const f = await fixture()
+  const requests: Array<{
+    url: string
+    redirect: RequestInit['redirect']
+  }> = []
+  globalThis.fetch = Object.assign(
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      requests.push({ url: String(input), redirect: init?.redirect })
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  expect(
+    (
+      await streamCortexKitAnthropic(
+        { ...model, baseUrl: 'https://api.anthropic.com/v1' },
+        context,
+      ).result()
+    ).stopReason,
+  ).toBe('stop')
+  expect(requests).toEqual([
+    {
+      url: 'https://api.anthropic.com/v1/messages?beta=true',
+      redirect: 'error',
+    },
+  ])
+  expect(f.gets).toHaveLength(1)
+})
+
+test('Pi refuses a foreign CacheKeep target before authorizing a native receipt', async () => {
+  const f = await fixture()
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async () => {
+      sends++
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const result = await __prewarmPiCacheKeepForTest({
+    sessionId: 'pi-foreign-prewarm',
+    url: 'https://unapproved.invalid/v1/messages',
+    headers: new Headers(),
+    bodyText: JSON.stringify({ model: model.id, max_tokens: 0, messages: [] }),
+    oauthAccountId: 'main',
+    oauthAccountIdentity: fixtureAccountIdentity('main'),
+    accountStoragePath: f.path,
+  })
+  expect(result.ok).toBe(false)
+  expect(f.gets).toEqual([])
+  expect(sends).toBe(0)
+})
+
+test.each([
+  { name: 'Fable', id: 'claude-fable-5-1', allowed: false },
+  { name: 'Sonnet', id: 'claude-sonnet-5-5', allowed: true },
+])(
+  'Pi final native vault admission rechecks the pending request model: $name',
+  (requested) =>
+    trackPiTestBody(
+      (async () => {
+        const f = await fixture()
+        const runtime = await getPiNativeRuntime(f.path).service()
+        const receipt = await runtime.authorizeVault('main')
+        const checkedAt = Date.now()
+        const quota = (remaining: number, at: number) => ({
+          accountIdentity: fixtureAccountIdentity('main'),
+          checkedAt: at,
+          source: 'poll' as const,
+          five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: at },
+          seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: at },
+          scoped: [
+            {
+              id: 'fable-weekly',
+              title: 'Fable weekly',
+              modelName: 'Fable',
+              usedPercent: 100 - remaining,
+              remainingPercent: remaining,
+              checkedAt: at,
+            },
+          ],
+        })
+        expect(
+          await runtime.vault.publish(receipt, {
+            quota: quota(100, checkedAt),
+          }),
+        ).toBe(true)
+        await runtime.updateSettings((settings) => ({
+          ...settings,
+          killswitch: {
+            enabled: true,
+            main: { five_hour: 5, seven_day: 10, scoped: 0 },
+          },
+        }))
+        let entered: () => void = () => {}
+        let release: () => void = () => {}
+        const pending = new Promise<void>((resolve) => {
+          entered = resolve
+        })
+        const resume = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        const get = f.client.getScoped
+        f.client.getScoped = async (input) => {
+          entered()
+          await resume
+          return get(input)
+        }
+        const sent: string[] = []
+        globalThis.fetch = Object.assign(
+          async (input: Parameters<typeof fetch>[0]) => {
+            sent.push(String(input))
+            if (!String(input).includes('/v1/messages'))
+              throw new Error(
+                'Unexpected quota dispatch in final admission control',
+              )
+            return success()
+          },
+          { preconnect: originalFetch.preconnect },
+        )
+        const response = streamCortexKitAnthropic(
+          { ...model, id: requested.id, name: requested.name },
+          context,
+        ).result()
+        try {
+          await pending
+          expect(
+            await runtime.vault.publish(receipt, {
+              quota: quota(0, checkedAt + 1),
+            }),
+          ).toBe(true)
+        } finally {
+          release()
+        }
+        const result = await response
+        expect(result.stopReason).toBe(requested.allowed ? 'stop' : 'error')
+        expect(sent).toEqual(
+          requested.allowed
+            ? ['https://api.anthropic.com/v1/messages?beta=true']
+            : [],
+        )
+        expect(f.reports).toEqual([])
+      })(),
+    ),
 )
