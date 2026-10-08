@@ -24,6 +24,8 @@ jobs:
       - run: bun run build
       - run: bun test scripts/check-pi-dist-imports.test.ts
       - run: bun run check:pi-dist-imports
+      - run: bun run --cwd packages/core test:scripts
+      - run: bun test scripts/tests/run-mutation-ci.test.ts scripts/tests/run-mutation-bun.test.ts
       - run: bun run check:claustrum-golden
         env:
           GITHUB_TOKEN: ${{ github.token }}
