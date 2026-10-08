@@ -296,8 +296,7 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
         menu: await model(invocation, scrub, readable),
       })
       if (
-        !request ||
-        request.command !== 'claude' ||
+        request?.command !== 'claude' ||
         !action ||
         request.itemId !== undefined ||
         (request.sessionId !== undefined &&
