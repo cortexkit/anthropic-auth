@@ -102,6 +102,8 @@ export type {
   NativeLocalFailurePolicy,
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
+export type { NativeUiOptions } from './native-ui.ts'
+export { createNativeUi, runPiCommandMenu } from './native-ui.ts'
 export * from './oauth-profile.ts'
 export * from './pkce.ts'
 export type { NativeMigrationJournal } from './pool-authority.ts'
