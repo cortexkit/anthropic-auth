@@ -7,7 +7,6 @@ import {
   CLAUDE_HAIKU_5_5_MODEL_ID,
   CLAUDE_HAIKU_5_5_PRICING,
   hasThinkingBindingControls,
-  saveAccounts,
   THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -20,6 +19,7 @@ import {
 import { buildAnthropicRequest } from '../convert.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
+import { saveNativePiFixture } from './native-fixture.ts'
 import { trackPiTestBody } from './setup.ts'
 
 const context: Context = {
@@ -86,7 +86,7 @@ const pricedModel: Model<'cortexkit-anthropic-messages'> = {
   name: 'Claude Haiku 5.5',
   api: 'cortexkit-anthropic-messages',
   provider: 'anthropic',
-  baseUrl: 'https://example.invalid',
+  baseUrl: 'https://api.anthropic.com',
   reasoning: true,
   input: ['text', 'image'],
   contextWindow: CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
@@ -243,7 +243,7 @@ test('Pi Haiku first turns, account-default replay and API-key replay receive no
 test('Pi Haiku physical OAuth dispatch carries its prefix control and beta together', () =>
   trackPiTestBody(
     (async () => {
-      await saveAccounts(
+      await saveNativePiFixture(
         {
           version: 1,
           main: { type: 'opencode', provider: 'anthropic' },

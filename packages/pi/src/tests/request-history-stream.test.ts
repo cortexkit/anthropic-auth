@@ -2,10 +2,7 @@ import { afterEach, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-  saveAccounts,
-  TRAILING_ASSISTANT_HISTORY_MESSAGE,
-} from '@cortexkit/anthropic-auth-core'
+import { TRAILING_ASSISTANT_HISTORY_MESSAGE } from '@cortexkit/anthropic-auth-core'
 import type {
   Api,
   AssistantMessage,
@@ -13,6 +10,7 @@ import type {
   Model,
 } from '@earendil-works/pi-ai'
 import { streamCortexKitAnthropic } from '../stream.ts'
+import { saveNativePiFixture } from './native-fixture.ts'
 
 const originalFetch = globalThis.fetch
 const originalPath = process.env.PI_ANTHROPIC_AUTH_FILE
@@ -64,7 +62,7 @@ for (const apiKey of ['sk-ant-oat-fixture-history', 'fixture-api-key']) {
       directory = await mkdtemp(join(tmpdir(), 'pi-history-boundary-'))
       const storagePath = join(directory, 'anthropic-auth.json')
       process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-      await saveAccounts(
+      await saveNativePiFixture(
         {
           version: 1,
           main: { type: 'opencode', provider: 'anthropic' },
