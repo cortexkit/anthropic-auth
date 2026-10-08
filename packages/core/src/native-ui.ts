@@ -10,9 +10,28 @@ import {
   type SectionSlot,
 } from '@cortexkit/common-auth/commands'
 
+export type {
+  CommandApplyRequest,
+  CommandApplyResult,
+  CommandDialogPayload,
+  CommandInvocation,
+  CommandMenu,
+  CommandMenuModel,
+  KnobValue,
+  KnobValues,
+  MenuAction,
+  MenuItem,
+  MenuKnob,
+  MenuSection,
+  NotifyKind,
+  SectionSlot,
+} from '@cortexkit/common-auth/commands'
 // Export the menu renderer from @cortexkit/anthropic-auth-core so the Pi
 // extension does not need a separate common-auth installation.
-export { runPiCommandMenu } from '@cortexkit/common-auth/commands'
+export {
+  parseApplyRequest,
+  runPiCommandMenu,
+} from '@cortexkit/common-auth/commands'
 
 import {
   createNativeMenuExecutor,

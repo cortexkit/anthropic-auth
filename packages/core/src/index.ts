@@ -102,8 +102,28 @@ export type {
   NativeLocalFailurePolicy,
   NativeLocalFailureSkipReason,
 } from './native-runtime.ts'
-export type { NativeUiOptions } from './native-ui.ts'
-export { createNativeUi, runPiCommandMenu } from './native-ui.ts'
+export type {
+  CommandApplyRequest,
+  CommandApplyResult,
+  CommandDialogPayload,
+  CommandInvocation,
+  CommandMenu,
+  CommandMenuModel,
+  KnobValue,
+  KnobValues,
+  MenuAction,
+  MenuItem,
+  MenuKnob,
+  MenuSection,
+  NativeUiOptions,
+  NotifyKind,
+  SectionSlot,
+} from './native-ui.ts'
+export {
+  createNativeUi,
+  parseApplyRequest,
+  runPiCommandMenu,
+} from './native-ui.ts'
 export * from './oauth-profile.ts'
 export * from './pkce.ts'
 export type { NativeMigrationJournal } from './pool-authority.ts'
