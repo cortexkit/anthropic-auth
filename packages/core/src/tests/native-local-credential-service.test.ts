@@ -108,12 +108,15 @@ async function writeJournal(paths: NativePoolPaths, authority: Authority) {
     authority === 'invalid'
       ? '{"version":2'
       : JSON.stringify({
-          version: 2,
+          version: 3,
           storageId: paths.storageId,
           ...migrationInput(paths),
           phase: committed ? 'committed' : 'building',
           expectedHostAuth: committed ? 'absent' : 'unprepared',
           expectedRouting: committed ? null : 'unprepared',
+          preparedProof: committed
+            ? { version: 1, rows: [], runtimeDigest: 'f'.repeat(64) }
+            : null,
         }),
     { mode: 0o600 },
   )

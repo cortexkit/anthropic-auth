@@ -1,8 +1,14 @@
-import { readFile } from 'node:fs/promises'
 import { isAbsolute, normalize, parse, sep } from 'node:path'
 import { withLock, writeJsonAtomic } from '@cortexkit/common-auth/fs'
 
-import { parseJsonRedacted } from './json.ts'
+import { readNativeMigrationSource } from './migration-source.ts'
+import {
+  captureNativeMigrationJson,
+  decodeNativeMigrationPreparedProof,
+  type NativeMigrationPreparedProof,
+  nativeMigrationCanonicalJson,
+  requireNativeMigrationDataObject,
+} from './native-migration-proof.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 
 const PHASES = [
@@ -37,10 +43,11 @@ export interface NativeMigrationInput {
 export interface NativeMigrationExpectations {
   expectedHostAuth: string
   expectedRouting: string | null
+  preparedProof: NativeMigrationPreparedProof
 }
 
 export interface NativeMigrationJournal {
-  version: 2
+  version: 3
   storageId: string
   host: 'opencode' | 'pi'
   phase: NativeMigrationPhase
@@ -49,6 +56,7 @@ export interface NativeMigrationJournal {
   hostAuthPath: string
   expectedHostAuth: string
   expectedRouting: string | null
+  preparedProof: NativeMigrationPreparedProof | null
 }
 
 export class NativeAuthorityError extends Error {
@@ -75,6 +83,22 @@ export class NativeAuthorityError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function captureJournalJson(value: unknown): unknown {
+  try {
+    return captureNativeMigrationJson(value)
+  } catch {
+    throw new NativeAuthorityError('invalid-journal')
+  }
+}
+
+function decodePreparedProof(value: unknown): NativeMigrationPreparedProof {
+  try {
+    return decodeNativeMigrationPreparedProof(value)
+  } catch {
+    throw new NativeAuthorityError('invalid-journal')
+  }
 }
 
 function isPhase(value: unknown): value is NativeMigrationPhase {
@@ -139,9 +163,10 @@ function isRoutingPaths(value: unknown): value is NativeMigrationRoutingPaths {
 }
 
 function decodeJournal(
-  value: unknown,
+  input: unknown,
   storageId: string,
 ): NativeMigrationJournal {
+  const value = captureJournalJson(input)
   if (
     !isRecord(value) ||
     !hasKeys(value, [
@@ -154,8 +179,9 @@ function decodeJournal(
       'hostAuthPath',
       'expectedHostAuth',
       'expectedRouting',
+      'preparedProof',
     ]) ||
-    value.version !== 2 ||
+    value.version !== 3 ||
     value.storageId !== storageId ||
     (value.host !== 'opencode' && value.host !== 'pi') ||
     !isPhase(value.phase) ||
@@ -170,8 +196,13 @@ function decodeJournal(
     throw new NativeAuthorityError('invalid-journal')
   }
   const unprepared = value.expectedHostAuth === 'unprepared'
+  const preparedProof =
+    value.preparedProof === null
+      ? null
+      : decodePreparedProof(value.preparedProof)
   if (
     unprepared !== (value.expectedRouting === 'unprepared') ||
+    unprepared !== (preparedProof === null) ||
     (value.phase === 'building' && !unprepared) ||
     (value.phase !== 'building' && value.phase !== 'verified' && unprepared) ||
     (!unprepared &&
@@ -180,7 +211,7 @@ function decodeJournal(
     throw new NativeAuthorityError('invalid-journal')
   }
   return {
-    version: 2,
+    version: 3,
     storageId,
     host: value.host,
     phase: value.phase,
@@ -197,22 +228,23 @@ function decodeJournal(
     hostAuthPath: value.hostAuthPath,
     expectedHostAuth: value.expectedHostAuth,
     expectedRouting: value.expectedRouting,
+    preparedProof,
   }
 }
 
 export async function readNativeMigrationJournal(
   paths: NativePoolPaths,
 ): Promise<NativeMigrationJournal | undefined> {
-  let text: string
   try {
-    text = await readFile(paths.journal, 'utf8')
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT')
-      return undefined
-    throw new NativeAuthorityError('invalid-journal')
-  }
-  try {
-    return decodeJournal(parseJsonRedacted(text), paths.storageId)
+    const snapshot = await readNativeMigrationSource('journal', paths.journal)
+    if (!snapshot.data) return undefined
+    if (
+      !snapshot.metadata ||
+      (snapshot.metadata.mode & 0o777) !== 0o600 ||
+      (process.getuid && snapshot.metadata.uid !== process.getuid())
+    )
+      throw new NativeAuthorityError('invalid-journal')
+    return decodeJournal(snapshot.data, paths.storageId)
   } catch {
     throw new NativeAuthorityError('invalid-journal')
   }
@@ -230,6 +262,8 @@ export async function requireNativePoolAuthority(
 }
 
 interface JournalHooks {
+  /** Outer controller and pool leases remain held through the atomic journal rename. */
+  assertOwned?: () => Promise<void>
   lockOptions?: { ttlMs: number; timeoutMs: number }
   onWriteStep?: (
     step: 'before-write' | 'after-write',
@@ -243,13 +277,25 @@ async function writeJournal(
   assertOwned: () => Promise<void>,
   hooks: JournalHooks,
 ): Promise<void> {
-  await writeJsonAtomic(paths.journal, journal, {
+  // Hooks observe a detached immutable value, not the object the controller will
+  // use for its next phase. A hook cannot alter the proof being published.
+  const snapshot = decodeJournal(journal, paths.storageId)
+  if (snapshot.preparedProof) {
+    for (const row of snapshot.preparedProof.rows) Object.freeze(row)
+    Object.freeze(snapshot.preparedProof.rows)
+    Object.freeze(snapshot.preparedProof)
+  }
+  Object.freeze(snapshot.sources)
+  Object.freeze(snapshot.routingPaths)
+  Object.freeze(snapshot)
+  await writeJsonAtomic(paths.journal, snapshot, {
     beforeRename: async () => {
-      await hooks.onWriteStep?.('before-write', journal)
+      await hooks.onWriteStep?.('before-write', snapshot)
+      await hooks.assertOwned?.()
       await assertOwned()
     },
   })
-  await hooks.onWriteStep?.('after-write', journal)
+  await hooks.onWriteStep?.('after-write', snapshot)
 }
 
 /** Migration resume retains the original digests and resolved paths so a retry cannot adopt changed inputs or redirect writes. */
@@ -258,9 +304,14 @@ export async function beginNativeMigration(
   input: NativeMigrationInput,
   hooks: JournalHooks = {},
 ): Promise<NativeMigrationJournal> {
+  try {
+    requireNativeMigrationDataObject(input)
+  } catch {
+    throw new NativeAuthorityError('invalid-journal')
+  }
   const initial = decodeJournal(
     {
-      version: 2,
+      version: 3,
       storageId: paths.storageId,
       host: input.host,
       phase: 'building',
@@ -269,6 +320,7 @@ export async function beginNativeMigration(
       hostAuthPath: input.hostAuthPath,
       expectedHostAuth: 'unprepared',
       expectedRouting: 'unprepared',
+      preparedProof: null,
     },
     paths.storageId,
   )
@@ -311,17 +363,23 @@ export async function recordNativeMigrationExpectations(
   expectations: NativeMigrationExpectations,
   hooks: JournalHooks = {},
 ): Promise<NativeMigrationJournal> {
+  const captured = captureJournalJson(expectations)
   if (
-    !isRecord(expectations) ||
-    !hasKeys(expectations, ['expectedHostAuth', 'expectedRouting']) ||
-    !isHostEntry(expectations.expectedHostAuth) ||
-    !isFileDigest(expectations.expectedRouting)
+    !isRecord(captured) ||
+    !hasKeys(captured, [
+      'expectedHostAuth',
+      'expectedRouting',
+      'preparedProof',
+    ]) ||
+    !isHostEntry(captured.expectedHostAuth) ||
+    !isFileDigest(captured.expectedRouting)
   ) {
     throw new NativeAuthorityError('invalid-journal')
   }
   // Capture values before waiting for the lock; callers cannot change the pair
   // between validation and publication by mutating their input object.
-  const { expectedHostAuth, expectedRouting } = expectations
+  const { expectedHostAuth, expectedRouting } = captured
+  const preparedProof = decodePreparedProof(captured.preparedProof)
   return withLock(
     paths.journal,
     {
@@ -343,13 +401,20 @@ export async function recordNativeMigrationExpectations(
       if (current.expectedHostAuth !== 'unprepared') {
         if (
           current.expectedHostAuth !== expectedHostAuth ||
-          current.expectedRouting !== expectedRouting
+          current.expectedRouting !== expectedRouting ||
+          nativeMigrationCanonicalJson(current.preparedProof) !==
+            nativeMigrationCanonicalJson(preparedProof)
         ) {
           throw new NativeAuthorityError('journal-conflict')
         }
         return current
       }
-      const updated = { ...current, expectedHostAuth, expectedRouting }
+      const updated = {
+        ...current,
+        expectedHostAuth,
+        expectedRouting,
+        preparedProof,
+      }
       await writeJournal(paths, updated, () => lock.assertOwned(), hooks)
       return updated
     },
