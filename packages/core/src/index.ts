@@ -104,6 +104,8 @@ export type {
 } from './native-runtime.ts'
 export * from './oauth-profile.ts'
 export * from './pkce.ts'
+export type { NativeMigrationJournal } from './pool-authority.ts'
+export { readNativeMigrationJournal } from './pool-authority.ts'
 export type { NativeLocalPoolBinding } from './pool-binding.ts'
 export { captureNativeLocalPoolBinding } from './pool-binding.ts'
 export * from './pool-paths.ts'
