@@ -1,3 +1,7 @@
+import type {
+  CommandApplyRequest,
+  CommandApplyResult,
+} from '@cortexkit/anthropic-auth-core'
 import { discoverPortFile } from './port-file'
 import type { ApplyRequest, ApplyResult, RpcNotification } from './protocol'
 
@@ -7,6 +11,7 @@ export interface RpcClient {
     sessionId: string,
   ) => Promise<RpcNotification[]>
   apply: (request: ApplyRequest) => Promise<ApplyResult>
+  applyMenu: (request: CommandApplyRequest) => Promise<CommandApplyResult>
 }
 
 async function call<T>(
@@ -57,6 +62,18 @@ export function createRpcClient(dir: string, expectedPid?: number): RpcClient {
         expectedPid,
       )
       return out ?? { text: 'apply failed', knobs: {} }
+    },
+    async applyMenu(request) {
+      if (request.command !== 'claude' || !request.sessionId?.trim())
+        throw new TypeError('A claude menu sessionId is required')
+      const out = await call<CommandApplyResult>(
+        dir,
+        'apply-menu',
+        { ...request },
+        expectedPid,
+      )
+      if (!out) throw new Error('Menu apply unavailable; outcome unknown')
+      return out
     },
   }
 }

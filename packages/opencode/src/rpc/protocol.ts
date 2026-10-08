@@ -1,4 +1,7 @@
-import type { ClaustrumEnrollmentStatus } from '@cortexkit/anthropic-auth-core'
+import type {
+  ClaustrumEnrollmentStatus,
+  CommandDialogPayload,
+} from '@cortexkit/anthropic-auth-core'
 
 export const COMMAND_MODAL_NAMES = [
   'claude-account',
@@ -53,12 +56,10 @@ export interface OpenDialogPayload {
   knobs: Record<string, unknown>
 }
 
-export interface RpcNotification {
-  id: number
-  type: 'open-dialog'
-  payload: OpenDialogPayload
-  sessionId: string
-}
+export type RpcNotification = { id: number; sessionId: string } & (
+  | { type: 'open-dialog'; payload: OpenDialogPayload }
+  | { type: 'open-menu'; payload: CommandDialogPayload }
+)
 
 export interface ApplyRequest {
   command: CommandModalName

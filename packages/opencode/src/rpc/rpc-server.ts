@@ -6,6 +6,11 @@ import {
   type ServerResponse,
 } from 'node:http'
 import { join } from 'node:path'
+import {
+  type CommandApplyRequest,
+  type CommandApplyResult,
+  parseApplyRequest,
+} from '@cortexkit/anthropic-auth-core'
 import type { drainNotifications } from './notifications'
 import { writePortFile } from './port-file'
 import type { ApplyRequest, ApplyResult } from './protocol'
@@ -19,7 +24,10 @@ export interface RpcServerHandle {
 export interface RpcServerOptions {
   dir: string
   drain: typeof drainNotifications
-  apply: (request: ApplyRequest) => Promise<ApplyResult>
+  /** Structured-menu hosts need no text parser; internal text consumers may still supply one. */
+  apply?: (request: ApplyRequest) => Promise<ApplyResult>
+  /** Run menu actions through the host's credential service, not legacy account-file writes. */
+  applyMenu?: (request: CommandApplyRequest) => Promise<CommandApplyResult>
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -87,14 +95,23 @@ export async function startRpcServer(
         return json(200, { messages })
       }
       if (method === 'apply') {
+        if (!options.apply)
+          return json(501, { error: 'text apply unavailable' })
         const result = await options.apply(params as unknown as ApplyRequest)
         return json(200, result)
       }
+      if (method === 'apply-menu') {
+        const request = parseApplyRequest(params)
+        if (request?.command !== 'claude' || !request.sessionId?.trim())
+          return json(400, { error: 'invalid menu request' })
+        if (!options.applyMenu) return json(501, { error: 'menu unavailable' })
+        return json(200, await options.applyMenu(request))
+      }
       return json(404, { error: 'unknown method' })
-    } catch (error) {
+    } catch {
       if (!res.headersSent && !res.writableEnded && !res.destroyed) {
         json(500, {
-          error: error instanceof Error ? error.message : String(error),
+          error: 'RPC request failed',
         })
       }
     }
