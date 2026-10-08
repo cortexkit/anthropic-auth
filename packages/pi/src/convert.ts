@@ -8,6 +8,7 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING,
+  CLAUDE_HAIKU_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_5_ADAPTIVE_THINKING,
   CLAUDE_OPUS_5_ADAPTIVE_THINKING,
   CLAUDE_SONNET_5_5_ADAPTIVE_THINKING,
@@ -15,6 +16,7 @@ import {
   ClaudeCodeFirstUserTextTracker,
   type ClaudeCodeIdentity,
   isClaudeFableOrMythos5Model,
+  isClaudeHaiku55Model,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
   isClaudeSonnet5Model,
@@ -78,7 +80,16 @@ export type AnthropicRequestBody = {
   tools?: Array<Record<string, unknown>>
   thinking?:
     | { type: 'enabled'; budget_tokens: number }
-    | { type: 'adaptive'; display: 'summarized' }
+    | {
+        type: 'adaptive'
+        display: 'summarized'
+        block_binding?: {
+          prefix_mismatch_behavior: Exclude<
+            ThinkingPrefixMismatchBehavior,
+            'account-default'
+          >
+        }
+      }
   output_config?: { effort: string }
   cache_control?: { type: 'ephemeral'; ttl?: '1h' }
   speed?: 'fast'
@@ -657,6 +668,7 @@ export async function buildAnthropicRequest(
   const isFableOrMythos5 = isClaudeFableOrMythos5Model(modelId)
   const isSonnet5 = isClaudeSonnet5Model(modelId)
   const isSonnet55 = isClaudeSonnet55Model(modelId)
+  const isHaiku55 = isClaudeHaiku55Model(modelId)
   const isOpus5 = isClaudeOpus5Model(modelId)
   const isOpus55 = isClaudeOpus55Model(modelId)
   // Request summaries so the host can display adaptive reasoning.
@@ -665,6 +677,8 @@ export async function buildAnthropicRequest(
   // constants let each model's thinking configuration change independently.
   if (isFableOrMythos5) {
     body.thinking = { ...CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING }
+  } else if (isHaiku55) {
+    body.thinking = { ...CLAUDE_HAIKU_5_5_ADAPTIVE_THINKING }
   } else if (isSonnet55) {
     body.thinking = { ...CLAUDE_SONNET_5_5_ADAPTIVE_THINKING }
   } else if (isSonnet5) {
@@ -676,10 +690,19 @@ export async function buildAnthropicRequest(
   }
 
   if (options?.reasoning) {
-    if (isSonnet55 && options.reasoning === 'minimal') {
-      throw new Error('Claude Sonnet 5.5 does not support minimal effort')
+    if ((isSonnet55 || isHaiku55) && options.reasoning === 'minimal') {
+      throw new Error(
+        `${isHaiku55 ? 'Claude Haiku 5.5' : 'Claude Sonnet 5.5'} does not support minimal effort`,
+      )
     }
-    if (isFableOrMythos5 || isSonnet5 || isSonnet55 || isOpus5 || isOpus55) {
+    if (
+      isFableOrMythos5 ||
+      isSonnet5 ||
+      isSonnet55 ||
+      isHaiku55 ||
+      isOpus5 ||
+      isOpus55
+    ) {
       body.output_config = { effort: options.reasoning }
     } else {
       const budgets: Record<string, number> = {

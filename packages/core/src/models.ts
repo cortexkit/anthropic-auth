@@ -177,6 +177,41 @@ export function isClaudeSonnet55Model(model: unknown) {
   )
 }
 
+export const CLAUDE_HAIKU_5_5_MODEL_ID = 'claude-haiku-5-5'
+export const CLAUDE_HAIKU_5_5_RELEASE_DATE = '2026-10-07'
+export const CLAUDE_HAIKU_5_5_CONTEXT_WINDOW = 1_000_000
+export const CLAUDE_HAIKU_5_5_MAX_OUTPUT_TOKENS = 128_000
+export const CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD = 100_000
+
+export const CLAUDE_HAIKU_5_5_PRICING = {
+  input: 0.1,
+  output: 0.5,
+  cacheRead: 0.01,
+  cacheWrite5m: 0.125,
+  cacheWrite1h: 0.2,
+} as const
+
+/** Haiku 5.5's higher rates apply to every token in requests with more than 100K input tokens, including cached input. */
+export const CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING = {
+  input: 0.5,
+  output: 2.5,
+  cacheRead: 0.05,
+  cacheWrite5m: 0.625,
+  cacheWrite1h: 1,
+} as const
+
+export const CLAUDE_HAIKU_5_5_ADAPTIVE_THINKING =
+  CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING
+
+export function isClaudeHaiku55Model(model: unknown) {
+  if (typeof model !== 'string') return false
+  const normalized = normalizeAnthropicModelId(model)
+  return (
+    normalized === CLAUDE_HAIKU_5_5_MODEL_ID ||
+    /^claude-haiku-5-5-\d{8}$/.test(normalized)
+  )
+}
+
 export const CLAUDE_OPUS_5_MODEL_ID = 'claude-opus-5'
 
 /**

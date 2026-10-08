@@ -27,6 +27,13 @@ import {
   CLAUDE_FABLE_MYTHOS_5_PRICING,
   CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_HAIKU_4_5_MODEL_ID,
+  CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
+  CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING,
+  CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
+  CLAUDE_HAIKU_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_HAIKU_5_5_MODEL_ID,
+  CLAUDE_HAIKU_5_5_PRICING,
+  CLAUDE_HAIKU_5_5_RELEASE_DATE,
   CLAUDE_LOGGING_COMMAND_NAME,
   CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
   CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
@@ -110,6 +117,7 @@ import {
   isCacheKeepSubagentsEnabled,
   isClaudeFable51Model,
   isClaudeFableOrMythos51Model,
+  isClaudeHaiku55Model,
   isClaudeOpus5FamilyModel,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
@@ -208,6 +216,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
+import type { Model as ProviderModelV2 } from '@opencode-ai/sdk/v2'
 import {
   BILLING_LINEAGE_REQUEST_HEADER,
   BillingLineageTracker,
@@ -888,6 +897,31 @@ type AnthropicProviderModel = {
   [key: string]: unknown
 }
 
+function haiku55ModelCost(): ProviderModelV2['cost'] {
+  return {
+    input: CLAUDE_HAIKU_5_5_PRICING.input,
+    output: CLAUDE_HAIKU_5_5_PRICING.output,
+    cache: {
+      read: CLAUDE_HAIKU_5_5_PRICING.cacheRead,
+      write: CLAUDE_HAIKU_5_5_PRICING.cacheWrite5m,
+    },
+    tiers: [
+      {
+        tier: {
+          type: 'context',
+          size: CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
+        },
+        input: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.input,
+        output: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.output,
+        cache: {
+          read: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.cacheRead,
+          write: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.cacheWrite5m,
+        },
+      },
+    ],
+  }
+}
+
 function addNativeClaudeModels<
   T extends Record<string, AnthropicProviderModel>,
 >(models: T) {
@@ -935,6 +969,32 @@ function addNativeClaudeModels<
         ]
       }),
     ),
+    ...(models[CLAUDE_HAIKU_5_5_MODEL_ID]
+      ? {}
+      : {
+          [CLAUDE_HAIKU_5_5_MODEL_ID]: {
+            ...base,
+            id: CLAUDE_HAIKU_5_5_MODEL_ID,
+            name: 'Claude Haiku 5.5',
+            api: base.api
+              ? { ...base.api, id: CLAUDE_HAIKU_5_5_MODEL_ID }
+              : undefined,
+            cost: haiku55ModelCost(),
+            limit: {
+              ...(base.limit ?? {}),
+              context: CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
+              output: CLAUDE_HAIKU_5_5_MAX_OUTPUT_TOKENS,
+            },
+            capabilities: {
+              ...(base.capabilities ?? {}),
+              reasoning: true,
+              attachment: true,
+              toolcall: true,
+            },
+            release_date: CLAUDE_HAIKU_5_5_RELEASE_DATE,
+            variants: createNativeAdaptiveEffortVariants(),
+          },
+        }),
     ...(models[CLAUDE_SONNET_5_5_MODEL_ID]
       ? {}
       : {
@@ -1034,7 +1094,8 @@ function applyNativeAdaptiveEffortVariants<
         id,
         isClaudeOpus5FamilyModel(modelId) ||
         isClaudeFable51Model(modelId) ||
-        isClaudeSonnet55Model(modelId)
+        isClaudeSonnet55Model(modelId) ||
+        isClaudeHaiku55Model(modelId)
           ? { ...model, variants: createNativeAdaptiveEffortVariants() }
           : model,
       ]

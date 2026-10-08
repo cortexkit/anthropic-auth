@@ -4801,6 +4801,29 @@ describe('provider.models', () => {
     })
     expect(result?.['claude-mythos-5-1']?.variants).toBeUndefined()
     expect(result?.['claude-mythos-5-1']?.name).toBe('Claude Mythos 5.1')
+    expect(result?.['claude-haiku-5-5']?.api?.id).toBe('claude-haiku-5-5')
+    expect(result?.['claude-haiku-5-5']?.name).toBe('Claude Haiku 5.5')
+    expect(result?.['claude-haiku-5-5']?.release_date).toBe('2026-10-07')
+    expect(result?.['claude-haiku-5-5']?.limit).toMatchObject({
+      context: 1_000_000,
+      output: 128_000,
+    })
+    expect(result?.['claude-haiku-5-5']?.cost).toEqual({
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    })
+    expect(Object.keys(result?.['claude-haiku-5-5']?.variants ?? {})).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+    expect(result?.['claude-haiku-5-5']?.variants?.max).toEqual({
+      thinking: { type: 'adaptive', display: 'summarized' },
+      effort: 'max',
+    })
     expect(result?.['claude-sonnet-5-5']?.api?.id).toBe('claude-sonnet-5-5')
     expect(result?.['claude-sonnet-5-5']?.release_date).toBe('2026-09-28')
     expect(result?.['claude-sonnet-5-5']?.cost).toEqual({
@@ -4870,6 +4893,19 @@ describe('provider.models', () => {
       input: 2,
       output: 10,
       cache: { read: 0.2, write: 2.5 },
+    })
+    expect(result?.['claude-haiku-5-5']?.cost).toEqual({
+      input: 0.1,
+      output: 0.5,
+      cache: { read: 0.01, write: 0.125 },
+      tiers: [
+        {
+          tier: { type: 'context', size: 100_000 },
+          input: 0.5,
+          output: 2.5,
+          cache: { read: 0.05, write: 0.625 },
+        },
+      ],
     })
   })
 

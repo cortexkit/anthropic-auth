@@ -310,8 +310,10 @@ describe('OpenCode Anthropic auth e2e', () => {
       .requests()
       .filter(
         (request) =>
-          request.body.model !== 'claude-haiku-4-5-20251001' &&
-          request.body.max_tokens !== 0,
+          request.body.max_tokens !== 0 &&
+          !JSON.stringify(request.body).includes(
+            'Generate a title for this conversation',
+          ),
       )
     expect(generationRequests.map((request) => request.body.model)).toEqual([
       'claude-fable-5',
