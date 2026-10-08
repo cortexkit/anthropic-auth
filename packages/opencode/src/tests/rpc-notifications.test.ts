@@ -16,6 +16,34 @@ const payload = (command: OpenDialogPayload['command']): OpenDialogPayload => ({
 describe('notifications', () => {
   beforeEach(() => resetNotificationsForTest())
 
+  test('single claude menus retain their discriminator and per-session drain fence', () => {
+    const menu = { command: 'claude', title: 'Claude', sections: [] }
+    pushNotification({ command: 'claude', menu }, 'session-a')
+    pushNotification({ command: 'claude', menu }, 'session-b')
+    const notices = drainNotifications(0, 'session-a')
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toMatchObject({
+      type: 'open-menu',
+      sessionId: 'session-a',
+      payload: { command: 'claude', menu },
+    })
+    expect(drainNotifications(notices[0]?.id ?? 0, 'session-a')).toEqual([])
+    expect(drainNotifications(0, 'session-b')).toHaveLength(1)
+  })
+
+  test('menu producers cannot publish a legacy command alias', () => {
+    expect(() =>
+      pushNotification(
+        {
+          command: 'claude-account',
+          menu: { command: 'claude-account', title: 'Legacy', sections: [] },
+        },
+        's1',
+      ),
+    ).toThrow('Only the claude menu')
+    expect(drainNotifications(0, 's1')).toEqual([])
+  })
+
   test('a session-scoped drain prunes only its own acknowledged notices', () => {
     pushNotification(payload('claude-quota'), 's1')
     pushNotification(payload('claude-dump'), 's2')

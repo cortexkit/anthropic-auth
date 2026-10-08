@@ -34,7 +34,10 @@ import {
   SEVEN_DAY_MS,
   type SidebarState,
 } from './sidebar-state.js'
-import { openCommandDialog } from './tui/command-dialogs.js'
+import {
+  openCommandDialog,
+  openNativeMenuDialog,
+} from './tui/command-dialogs.js'
 import {
   type AnthropicAuthTuiPrefs,
   type AppearancePrefs,
@@ -920,23 +923,48 @@ const tui: TuiPlugin = async (api) => {
       getRpcDir(api.state.path.directory ?? ''),
       process.pid,
     )
-    let lastNotificationId = 0
+    const lastNotificationIdBySession = new Map<string, number>()
     let rpcInFlight = false
-    setInterval(() => {
-      if (rpcInFlight) return
+    const currentSessionId = () => {
       const current = (api.route as { current?: unknown }).current
       const resolved =
         typeof current === 'function' ? (current as () => unknown)() : current
-      const sessionId = (
-        resolved as { params?: { sessionID?: string } } | undefined
-      )?.params?.sessionID
+      return (resolved as { params?: { sessionID?: string } } | undefined)
+        ?.params?.sessionID
+    }
+    setInterval(() => {
+      if (rpcInFlight) return
+      const sessionId = currentSessionId()
       if (!sessionId) return
       rpcInFlight = true
       void rpcClient
-        .pending(lastNotificationId, sessionId)
+        .pending(lastNotificationIdBySession.get(sessionId) ?? 0, sessionId)
         .then((messages) => {
+          // A route change while draining must not open a different session's
+          // dialog or acknowledge notices that were never displayed.
+          if (currentSessionId() !== sessionId) return
           for (const message of [...messages].sort((a, b) => a.id - b.id)) {
-            lastNotificationId = Math.max(lastNotificationId, message.id)
+            if (message.sessionId !== sessionId) continue
+            lastNotificationIdBySession.set(
+              sessionId,
+              Math.max(
+                lastNotificationIdBySession.get(sessionId) ?? 0,
+                message.id,
+              ),
+            )
+            if (message.type === 'open-menu') {
+              openNativeMenuDialog(
+                api,
+                message.payload,
+                (request) => {
+                  if (currentSessionId() !== sessionId)
+                    return Promise.reject(new Error('Menu session changed'))
+                  return rpcClient.applyMenu({ ...request, sessionId })
+                },
+                () => currentSessionId() === sessionId,
+              )
+              continue
+            }
             if (message.payload.command === 'claude-quota') {
               api.ui.dialog.setSize('xlarge')
               api.ui.dialog.replace(() => (
