@@ -428,14 +428,14 @@ export type AccountStateSaveScope = {
 
 type OAuthUsageWindow = {
   utilization?: number
-  resets_at?: string
+  resets_at?: string | null
 }
 
 type OAuthUsageLimit = {
   kind?: string
   group?: string
   percent?: number
-  resets_at?: string
+  resets_at?: string | null
   is_active?: boolean
   scope?: {
     model?: {
@@ -4002,7 +4002,7 @@ function mapScopedWeeklyLimits(
       modelName,
       usedPercent,
       remainingPercent: clampPercent(100 - usedPercent),
-      resetsAt: limit.resets_at,
+      resetsAt: limit.resets_at ?? undefined,
       checkedAt,
     })
   }
@@ -4076,7 +4076,7 @@ function mapUsageWindow(
   return {
     usedPercent,
     remainingPercent: clampPercent(100 - usedPercent),
-    resetsAt: window.resets_at,
+    resetsAt: window.resets_at ?? undefined,
     checkedAt,
   }
 }
