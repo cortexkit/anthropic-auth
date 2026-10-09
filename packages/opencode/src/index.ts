@@ -78,8 +78,10 @@ import {
   getHostClaustrumEnrollmentPaths,
   getKillswitchConfig,
   getPersistedLogLevel,
+  getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
   getRoutingMode,
+  getScopedQuotaWindowForModel,
   getStickyRoutingStatePath,
   getThinkingPrefixMismatchBehavior,
   type IdentityState,
@@ -1386,7 +1388,10 @@ const anthropicAuthPlugin = async (
     return getClaudeCodeIdentityForVerifiedAccount(accountUuid, accountUuid)
   }
   class NativeModelPolicyError extends Error {
-    constructor(readonly account: NativeAccountView) {
+    constructor(
+      readonly account: NativeAccountView,
+      readonly checkIntervalMs: number,
+    ) {
       super(
         'OAuth account cannot serve the requested model under current quota policy',
       )
@@ -1439,7 +1444,7 @@ const anthropicAuthPlugin = async (
           (!lastMainAttempt &&
             !quotaSnapshotPassesModelScope(view.quota, modelId)))
       )
-        throw new NativeModelPolicyError(view)
+        throw new NativeModelPolicyError(view, getQuotaCheckIntervalMs(storage))
     }
     checkModelPolicy(account, snapshot.policyStorage)
     let result: NativeOAuthAuthorization
@@ -5318,11 +5323,22 @@ const anthropicAuthPlugin = async (
           } catch (error) {
             if (error instanceof NativeModelPolicyError) {
               denied = error.account
-              // A missing usage snapshot may itself trigger the killswitch.
-              // Its neutral usage poll is not permission to send this model.
+              // Recheck a stale limit for this model before moving the request
+              // to another account. A neutral usage poll grants no permission
+              // to send the model; authorization checks the new reading again.
+              const scopedWindow = getScopedQuotaWindowForModel(
+                denied.quota,
+                modelId,
+              )
+              const scopedStale =
+                scopedWindow !== undefined &&
+                (!Number.isFinite(scopedWindow.checkedAt) ||
+                  (scopedWindow.checkedAt ?? 0) + error.checkIntervalMs <=
+                    Date.now())
               if (
-                !quotaSnapshotHasStandardWindows(denied.quota) &&
-                !quotaSnapshotModelScopeIsExhausted(denied.quota, modelId)
+                scopedStale ||
+                (!quotaSnapshotHasStandardWindows(denied.quota) &&
+                  !quotaSnapshotModelScopeIsExhausted(denied.quota, modelId))
               ) {
                 try {
                   await nativeAccounts.fetchQuota('main', undefined, signal)

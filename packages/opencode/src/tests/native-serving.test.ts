@@ -996,8 +996,13 @@ test('native Prime performs one fresh usage poll before one minimal Haiku send',
   prime.stop()
 })
 
-for (const fallback of [false, true]) {
-  test(`model-scoped primary exhaustion ${fallback ? 'uses eligible OAuth fallback without primary authorization' : 'retains the ordered last-main attempt'}`, async () => {
+for (const [fallback, scopedAge] of [
+  [false, 0],
+  [true, 0],
+  [false, 60 * 60_000],
+  [true, 60 * 60_000],
+] as const) {
+  test(`model-scoped primary exhaustion (${scopedAge ? 'stale' : 'fresh'}, fallback=${fallback}) preserves ordered admission`, async () => {
     const fixture = await migrateServingFixture('claustrum', fallback)
     const runtime = createNativeAccountRuntime({
       paths: fixture.paths,
@@ -1028,7 +1033,7 @@ for (const fallback of [false, true]) {
                 modelName: 'Fable',
                 remainingPercent: 0,
                 usedPercent: 100,
-                checkedAt: Date.now(),
+                checkedAt: Date.now() - scopedAge,
                 resetsAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
               },
             ],
@@ -1044,7 +1049,7 @@ for (const fallback of [false, true]) {
     })
     const response = await sendNative(plugin, 'claude-fable-5-1')
     expect(response.status).toBe(200)
-    if (fallback)
+    if (fallback && scopedAge === 0)
       expect(fixture.authorizedGets).not.toContain('oauth:anthropic')
     else expect(fixture.authorizedGets).toContain('oauth:anthropic')
     const sent = fixture.records.filter((record) =>
@@ -1052,7 +1057,7 @@ for (const fallback of [false, true]) {
     )
     expect(sent).toHaveLength(1)
     expect(sent[0]?.authorization).toBe(
-      fallback
+      fallback && scopedAge === 0
         ? 'Bearer sk-ant-oat01-vault-fallback-v1'
         : 'Bearer sk-ant-oat01-vault-main-v1',
     )
