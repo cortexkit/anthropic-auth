@@ -1392,12 +1392,20 @@ const anthropicAuthPlugin = async (
       )
     }
   }
+  class NativeCredentialUnavailableError extends Error {
+    constructor(
+      readonly account: NativeAccountView,
+      status: string,
+    ) {
+      super(`Native OAuth authorization refused: ${status}`)
+    }
+  }
   async function authorizeOAuth(
     routeId: string,
     signal?: AbortSignal,
     rejectedAccessToken?: string,
     modelId?: string,
-    intent: 'serve' | 'refresh' = 'serve',
+    intent: 'serve' | 'refresh' | 'last-main' = 'serve',
   ): Promise<NativeOAuthAuthorization> {
     assertNativeEnvironment()
     signal?.throwIfAborted()
@@ -1412,6 +1420,13 @@ const anthropicAuthPlugin = async (
       view: NativeAccountView,
       storage: AccountStorage,
     ) => {
+      // Ordered routing can try main after eligible fallbacks are exhausted.
+      // A cached scoped limit must not remove that final provider attempt;
+      // explicit killswitch limits still block it before dispatch.
+      const lastMainAttempt =
+        intent === 'last-main' &&
+        routeId === 'main' &&
+        getRoutingMode(storage) !== 'sticky-balanced'
       if (
         modelId &&
         ((isKillswitchEnabled(storage) &&
@@ -1421,7 +1436,8 @@ const anthropicAuthPlugin = async (
             routeId === 'main' ? undefined : routeId,
             modelId,
           )) ||
-          !quotaSnapshotPassesModelScope(view.quota, modelId))
+          (!lastMainAttempt &&
+            !quotaSnapshotPassesModelScope(view.quota, modelId)))
       )
         throw new NativeModelPolicyError(view)
     }
@@ -1439,11 +1455,16 @@ const anthropicAuthPlugin = async (
       const authorization = await nativeAccounts.authorizeLocal(routeId, {
         signal,
         rejectedAccessToken,
-        intent: rejectedAccessToken ? 'refresh' : intent,
+        intent: rejectedAccessToken
+          ? 'refresh'
+          : intent === 'last-main'
+            ? 'serve'
+            : intent,
       })
       if (authorization.status !== 'usable')
-        throw new Error(
-          `Native OAuth authorization refused: ${authorization.status}`,
+        throw new NativeCredentialUnavailableError(
+          account,
+          authorization.status,
         )
       result = {
         accessToken: authorization.access,
@@ -5266,6 +5287,7 @@ const anthropicAuthPlugin = async (
               nativeLocalSource: undefined,
               nativeScopedAttempt: undefined,
               modelDenied: false,
+              credentialUnavailable: false,
             }
           if (!isCustodyTombstoneOAuth(currentActivation, 'anthropic')) {
             throw new Error(
@@ -5274,6 +5296,7 @@ const anthropicAuthPlugin = async (
           }
           let credential: NativeOAuthAuthorization | undefined
           let denied: NativeAccountView | undefined
+          let unavailable: NativeAccountView | undefined
           try {
             credential = await authorizeOAuth(
               'main',
@@ -5302,8 +5325,14 @@ const anthropicAuthPlugin = async (
                 } catch (retryError) {
                   if (retryError instanceof NativeModelPolicyError)
                     denied = retryError.account
+                  else if (
+                    retryError instanceof NativeCredentialUnavailableError
+                  )
+                    unavailable = retryError.account
                 }
               }
+            } else if (error instanceof NativeCredentialUnavailableError) {
+              unavailable = error.account
             }
           }
           signal?.throwIfAborted()
@@ -5313,8 +5342,11 @@ const anthropicAuthPlugin = async (
             expires: credential?.expires ?? 0,
             refresh: undefined,
             nativeAccountIdentity:
-              credential?.accountIdentity ?? denied?.accountIdentity,
+              credential?.accountIdentity ??
+              denied?.accountIdentity ??
+              unavailable?.accountIdentity,
             modelDenied: Boolean(denied),
+            credentialUnavailable: Boolean(unavailable),
             nativeLocalSource: credential?.localSource,
             nativeScopedAttempt: credential?.scopedAttempt,
           }
@@ -5916,6 +5948,7 @@ const anthropicAuthPlugin = async (
               init?.signal ?? undefined,
               undefined,
               modelForIdentity,
+              oauthAccountId === 'main' ? 'last-main' : 'serve',
             )
             accessToken = nativeAuthorization.accessToken
             if (
@@ -6130,6 +6163,7 @@ const anthropicAuthPlugin = async (
                 init?.signal ?? undefined,
                 rejectedAccessToken,
                 modelForIdentity,
+                oauthAccountId === 'main' ? 'last-main' : 'serve',
               )
               if (
                 current.accountIdentity !== requestAuthority.accountIdentity ||
@@ -7428,9 +7462,13 @@ const anthropicAuthPlugin = async (
                   mainServedAccessToken = auth.access
                   mainProviderAccountUuid = resolution.providerAccountUuid
                 }
-              } else if (auth.modelDenied && requestMainProviderUuid) {
-                // The saved account UUID identifies which quota to inspect;
-                // it does not authorize credentials for this denied model.
+              } else if (
+                (auth.modelDenied || auth.credentialUnavailable) &&
+                requestMainProviderUuid
+              ) {
+                // A known account keeps its quota in the routing inventory
+                // even when model policy or credential backoff blocks serving.
+                // This metadata does not authorize a model request.
                 // An API fallback still requires its separate primary-account
                 // credential check and fresh account-wide exhaustion proof.
                 await reconcileMainQuotaAccountIdentity(
@@ -7567,7 +7605,8 @@ const anthropicAuthPlugin = async (
                     storage,
                     mainAccessToken: auth.access,
                     mainRefreshToken: auth.refresh,
-                    mainPolicyDenied: auth.modelDenied,
+                    mainPolicyDenied:
+                      auth.modelDenied || auth.credentialUnavailable,
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
@@ -7858,7 +7897,8 @@ const anthropicAuthPlugin = async (
                         storage: stickyRoutes.storage,
                         mainAccessToken: auth.access,
                         mainRefreshToken: auth.refresh,
-                        mainPolicyDenied: auth.modelDenied,
+                        mainPolicyDenied:
+                          auth.modelDenied || auth.credentialUnavailable,
                         requestedModelId: routingModelId,
                         mainQuotaIdentity: requestMainQuotaIdentity,
                       })
@@ -8490,7 +8530,7 @@ const anthropicAuthPlugin = async (
                   init,
                   fallbackAccounts,
                   storage,
-                  deniedResponse,
+                  undefined,
                   trace,
                   {
                     onSuccess: (account) =>
@@ -8501,7 +8541,36 @@ const anthropicAuthPlugin = async (
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   },
                 )
-                return wrapResponse(response ?? deniedResponse)
+                if (response) return wrapResponse(response)
+                const lastMainAttempt =
+                  getRoutingMode(storage) !== 'sticky-balanced' &&
+                  quotaSnapshotModelScopeIsExhausted(
+                    mainQuota,
+                    credentialModelId,
+                  ) &&
+                  quotaSnapshotPassesPolicy(mainQuota, storage) &&
+                  killswitchPassesPolicy(
+                    mainQuota,
+                    storage,
+                    undefined,
+                    credentialModelId,
+                  )
+                if (!lastMainAttempt) return wrapResponse(deniedResponse)
+                return wrapResponse(
+                  await sendWithAccessToken(
+                    input,
+                    init,
+                    '',
+                    trace,
+                    'main',
+                    storage,
+                    'main',
+                    undefined,
+                    fableRequest,
+                    laneStartRequest,
+                    requestMainQuotaIdentity,
+                  ),
+                )
               }
               const mainResponse = await sendWithAccessToken(
                 input,

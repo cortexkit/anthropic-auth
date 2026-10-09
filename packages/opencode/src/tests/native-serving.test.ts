@@ -997,7 +997,7 @@ test('native Prime performs one fresh usage poll before one minimal Haiku send',
 })
 
 for (const fallback of [false, true]) {
-  test(`model-only primary denial ${fallback ? 'preserves eligible OAuth fallback' : 'returns local 429'} without primary token authorization`, async () => {
+  test(`model-scoped primary exhaustion ${fallback ? 'uses eligible OAuth fallback without primary authorization' : 'retains the ordered last-main attempt'}`, async () => {
     const fixture = await migrateServingFixture('claustrum', fallback)
     const runtime = createNativeAccountRuntime({
       paths: fixture.paths,
@@ -1043,16 +1043,19 @@ for (const fallback of [false, true]) {
       claustrumScopedConnect: async () => fixture.scopedClient,
     })
     const response = await sendNative(plugin, 'claude-fable-5-1')
-    expect(response.status).toBe(fallback ? 200 : 429)
-    expect(fixture.authorizedGets).not.toContain('oauth:anthropic')
+    expect(response.status).toBe(200)
+    if (fallback)
+      expect(fixture.authorizedGets).not.toContain('oauth:anthropic')
+    else expect(fixture.authorizedGets).toContain('oauth:anthropic')
     const sent = fixture.records.filter((record) =>
       record.url.includes('/v1/messages'),
     )
-    expect(sent).toHaveLength(fallback ? 1 : 0)
-    if (fallback)
-      expect(sent[0]?.authorization).toBe(
-        'Bearer sk-ant-oat01-vault-fallback-v1',
-      )
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.authorization).toBe(
+      fallback
+        ? 'Bearer sk-ant-oat01-vault-fallback-v1'
+        : 'Bearer sk-ant-oat01-vault-main-v1',
+    )
     expect(
       fixture.records.some((record) => record.url.includes('/oauth/token')),
     ).toBe(false)
