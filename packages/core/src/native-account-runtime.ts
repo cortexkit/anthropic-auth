@@ -30,6 +30,13 @@ import {
   nativeVaultPrimaryRow,
   projectNativeAccountViews,
 } from './native-account-view.ts'
+import {
+  applyCommittedNativeSettingsEffects,
+  captureNativeSettingsEffectFields,
+  logCommittedNativeAccountAdded,
+  logCommittedNativeAccountChange,
+  type NativeSettingsEffectFields,
+} from './native-command-effects.ts'
 import { nativeLocalCredentialValidationMatches } from './native-credential-validation.ts'
 import {
   NativeCustodyError,
@@ -167,7 +174,11 @@ export interface NativeAccountRuntime {
   }>
   setEnabled(routeId: string, enabled: boolean): Promise<void>
   remove(routeId: string): Promise<void>
-  reorder(routeIds: readonly string[]): Promise<void>
+  /**
+   * `movedRouteId` names the account the caller moved; it identifies the
+   * account in the change's INFO log and does not affect the order written.
+   */
+  reorder(routeIds: readonly string[], movedRouteId?: string): Promise<void>
   captureLocalSubject(routeId: string): Promise<NativeRefreshSubject>
   publishLocal(
     subject: NativeKnownCredentialSubject,
@@ -746,6 +757,10 @@ export function createNativeAccountRuntime(
         throw new NativeCustodyError('route-unavailable')
       const old = await poolRow(id)
       let resultId = id
+      // Only an add that wrote a new roster row reports an added account: a
+      // replacement, a re-add of a stored secret ('rotated') or the completion
+      // of an existing credential-less row ('completed') does not.
+      let created = false
       if (input.replace && old) {
         if (!old.credentialEpoch)
           throw new NativeRuntimeError('publication-refused')
@@ -768,6 +783,8 @@ export function createNativeAccountRuntime(
           label: input.label,
         })
         resultId = added.id
+        created =
+          added.outcome === 'added' || added.outcome === 'added-disabled'
       }
       if (input.routeId === 'main')
         await store.updateSettings((settings) => {
@@ -777,6 +794,7 @@ export function createNativeAccountRuntime(
       const next = await runtime.read()
       const row = next.accounts.find((row) => row.binding?.rowId === resultId)
       if (!row) throw new NativeCustodyError('route-unavailable')
+      if (created) logCommittedNativeAccountAdded(row)
       return row
     },
     addApi: (input) =>
@@ -793,7 +811,10 @@ export function createNativeAccountRuntime(
       }),
     async updateSettings(mutator) {
       await authority()
-      return store.updateSettings(async (settings) => {
+      // Filled from the copy the committed attempt started from; effects run
+      // only after the write has been committed and changed the settings.
+      const captured: { before?: NativeSettingsEffectFields } = {}
+      const result = await store.updateSettings(async (settings) => {
         function activation(value: Record<string, unknown>) {
           const custody = value.claustrum as Record<string, unknown> | undefined
           return [
@@ -806,6 +827,7 @@ export function createNativeAccountRuntime(
           ]
         }
         const before = JSON.stringify(activation(settings))
+        captured.before = captureNativeSettingsEffectFields(settings)
         const result = await mutator(settings)
         const next = captureNativePlainData(result ?? settings) as Record<
           string,
@@ -815,31 +837,53 @@ export function createNativeAccountRuntime(
           throw new NativeCustodyError('route-unavailable')
         return next
       })
+      if (result.outcome === 'updated' && captured.before)
+        applyCommittedNativeSettingsEffects(captured.before, result.settings)
+      return result
     },
     async setEnabled(routeId, enabled) {
       const current = await runtime.read()
       const row = current.accounts.find((row) => row.id === routeId)
-      if (row?.source === 'vault') return vault.setEnabled(routeId, enabled)
-      const id = await physicalId(routeId)
-      if (enabled) await store.enable(id)
-      else await store.disable(id, 'user-disabled')
+      if (row?.source === 'vault') await vault.setEnabled(routeId, enabled)
+      else {
+        const id = await physicalId(routeId)
+        if (enabled) await store.enable(id)
+        else await store.disable(id, 'user-disabled')
+      }
+      if (row && row.enabled !== enabled)
+        logCommittedNativeAccountChange(
+          enabled ? 'account enabled' : 'account disabled',
+          row,
+        )
     },
     async remove(routeId) {
       const current = await runtime.read()
-      if (
-        current.accounts.find((row) => row.id === routeId)?.source === 'vault'
-      ) {
+      const row = current.accounts.find((row) => row.id === routeId)
+      if (row?.source === 'vault') {
+        // Vault membership is managed by the vault, so removing a vault row
+        // declines its route; the committed change is a disable.
         await vault.setEnabled(routeId, false)
+        if (row.enabled)
+          logCommittedNativeAccountChange('account disabled', row)
         return
       }
-      await store.remove(await physicalId(routeId))
+      const removed = await store.remove(await physicalId(routeId))
+      if (row && removed.outcome === 'removed')
+        logCommittedNativeAccountChange('account removed', row)
     },
-    async reorder(routeIds) {
+    async reorder(routeIds, movedRouteId) {
       await authority()
       const snapshot = await runtime.read()
       const read = await store.read()
       if (read.status !== 'ready')
         throw new NativeRuntimeError('publication-refused')
+      const logReordered = () =>
+        logCommittedNativeAccountChange(
+          'account reordered',
+          snapshot.accounts.find((row) => row.id === movedRouteId) ?? {
+            id: movedRouteId,
+          },
+        )
       if (snapshot.mode === 'claustrum') {
         const order = [...routeIds]
         if (
@@ -889,6 +933,11 @@ export function createNativeAccountRuntime(
         await store.updateSettings((settings) => {
           settings.nativeAccountOrder = order
         })
+        if (
+          JSON.stringify(order) !==
+          JSON.stringify(snapshot.accounts.map((row) => row.id))
+        )
+          logReordered()
         return
       }
       const ids = await Promise.all(routeIds.map(physicalId))
@@ -896,7 +945,7 @@ export function createNativeAccountRuntime(
         (row) => row.id === snapshot.settings.mainAccountId,
       )
       if (main && !ids.includes(main.id)) ids.unshift(main.id)
-      await store.reorder(ids)
+      if ((await store.reorder(ids)).outcome === 'reordered') logReordered()
     },
     async captureLocalSubject(routeId) {
       await authority()

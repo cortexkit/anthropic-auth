@@ -1286,7 +1286,8 @@ const anthropicAuthPlugin = async (
   const reorderAccountsPersistent = (
     routeIds: string[],
     _path = accountStoragePath,
-  ) => nativeAccounts.reorder(routeIds)
+    movedRouteId?: string,
+  ) => nativeAccounts.reorder(routeIds, movedRouteId)
 
   let initialStorage: AccountStorage | null = null
   let nativeStartupError: unknown
@@ -3839,8 +3840,9 @@ const anthropicAuthPlugin = async (
   async function executePersistentLoggingCommand(argumentsText: string) {
     const action = parseLoggingCommandAction(argumentsText)
     if (action.type === 'level') {
+      // The native runtime logs a committed level change and applies it to
+      // this process's logger.
       await setLogLevelPersistent(action.level)
-      logger.info('commands', 'log level changed', { level: action.level })
       return executeLoggingCommand({ argumentsText, level: action.level })
     }
 
@@ -3951,11 +3953,7 @@ const anthropicAuthPlugin = async (
         baseURL: resolvedBaseURL,
         authHeader: resolvedAuthHeader,
       })
-      logger.info('commands', 'account added', {
-        id: account.id,
-        label: account.label,
-        type: 'apikey',
-      })
+      // The native runtime logs the committed 'account added' event.
 
       const updatedStorage = await loadAccounts(accountStoragePath)
       await refreshSidebarAfterMutation(updatedStorage)
@@ -4052,11 +4050,7 @@ const anthropicAuthPlugin = async (
             expires: result.expires,
           },
         })
-        logger.info('commands', 'account added', {
-          id: account.id,
-          label: account.label,
-          type: 'oauth',
-        })
+        // The native runtime logs the committed 'account added' event.
 
         const updatedStorage = await loadAccounts(accountStoragePath)
         await refreshSidebarAfterMutation(updatedStorage)
@@ -4148,43 +4142,25 @@ const anthropicAuthPlugin = async (
       },
     })
 
+    // The native runtime logs each committed account change below.
     if (result.updated) {
       if (
         result.updated.action === 'enable' ||
         result.updated.action === 'disable'
       ) {
-        const enabled = result.updated.action === 'enable'
         await setAccountEnabledPersistent(
           result.updated.id,
-          enabled,
+          result.updated.action === 'enable',
           accountStoragePath,
         )
-        const updatedId = result.updated.id
-        const account = storage?.accounts.find((a) => a.id === updatedId)
-        logger.info('commands', `account ${result.updated.action}d`, {
-          id: updatedId,
-          label: account?.label,
-          enabled,
-        })
       } else if (result.updated.action === 'remove') {
         await removeAccountPersistent(result.updated.id, accountStoragePath)
-        const updatedId = result.updated.id
-        const account = storage?.accounts.find((a) => a.id === updatedId)
-        logger.info('commands', 'account removed', {
-          id: updatedId,
-          label: account?.label,
-        })
       } else if (result.updated.action === 'reorder') {
         await reorderAccountsPersistent(
           result.updated.newOrder ?? result.updated.previousOrder ?? [],
           accountStoragePath,
+          result.updated.id,
         )
-        const updatedId = result.updated.id
-        const account = storage?.accounts.find((a) => a.id === updatedId)
-        logger.info('commands', 'account reordered', {
-          id: updatedId,
-          label: account?.label,
-        })
       } else if (result.updated.action === 'reset-backoff') {
         await resetNativeBackoff('main')
         quotaManager.clearMainBackoff()
@@ -4387,23 +4363,8 @@ const anthropicAuthPlugin = async (
       accountIds,
     })
     if (result.updatedConfig) {
+      // The native runtime logs the committed killswitch changes.
       await setKillswitchPersistent(result.updatedConfig)
-      if (config.enabled !== result.updatedConfig.enabled) {
-        logger.info('commands', 'killswitch changed', {
-          enabled: result.updatedConfig.enabled === true,
-        })
-      }
-      if (
-        JSON.stringify(config.main) !==
-          JSON.stringify(result.updatedConfig.main) ||
-        JSON.stringify(config.accounts) !==
-          JSON.stringify(result.updatedConfig.accounts)
-      ) {
-        logger.info('commands', 'killswitch thresholds changed', {
-          thresholds:
-            result.updatedConfig.main ?? result.updatedConfig.accounts,
-        })
-      }
     }
     return {
       command,
@@ -4450,7 +4411,7 @@ const anthropicAuthPlugin = async (
             throw new Error('Native account order changed')
           order[target] = request.values.id
           order[index] = neighbor
-          await nativeAccounts.reorder(order)
+          await nativeAccounts.reorder(order, request.values.id)
         }
         text = 'Native account order updated.'
         break

@@ -3,6 +3,12 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { ProviderAccountUuid } from '../claude-code.ts'
 import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
+import {
   createNativeAccountRuntime,
   nativeAccountPolicy,
 } from '../native-account-runtime.ts'
@@ -713,4 +719,276 @@ test('cross-process remove and readd same native route and UUID creates new Prim
     await f.runtime.getOrCreateAuthLineage('main', readded.subject),
   ).not.toBe(lineage)
   expect((await f.runtime.read()).accounts[0]?.prime?.count).toBe(1)
+})
+
+/**
+ * Capture the INFO records the runtime emits on the `commands` channel. The
+ * live logger level starts at info and the previous level and sink are
+ * restored after the test. Bun runs tests with NODE_ENV=test, under which the
+ * logger delivers records only to this sink and writes no log file.
+ */
+function captureCommandLogs() {
+  expect(process.env.NODE_ENV).toBe('test')
+  const previousLevel = getLogLevel()
+  const records: LogTestRecord[] = []
+  setLogLevel('info')
+  __setLogTestSink((record) => {
+    if (record.channel === 'commands') records.push(record)
+  })
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+  })
+  return {
+    /** Records captured since the previous call, as message and payload. */
+    take() {
+      const taken = records.map(({ level, message, payload }) => ({
+        level,
+        message,
+        payload,
+      }))
+      records.length = 0
+      return taken
+    },
+  }
+}
+
+test('committed killswitch and logging-level settings changes log once and update the live level only after commit', async () => {
+  const f = await fixture()
+  const logs = captureCommandLogs()
+
+  await f.runtime.updateSettings((settings) => {
+    settings.killswitch = {
+      enabled: true,
+      main: { five_hour: 3, seven_day: 8 },
+    }
+  })
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'killswitch changed',
+      payload: { enabled: true },
+    },
+    {
+      level: 'info',
+      message: 'killswitch thresholds changed',
+      payload: { thresholds: { five_hour: 3, seven_day: 8 } },
+    },
+  ])
+
+  // Rewriting the same values commits nothing and reports nothing.
+  await f.runtime.updateSettings((settings) => ({
+    ...settings,
+    killswitch: { enabled: true, main: { five_hour: 3, seven_day: 8 } },
+  }))
+  expect(logs.take()).toEqual([])
+
+  // Turning the switch off keeps the thresholds: only the switch is reported.
+  await f.runtime.updateSettings((settings) => ({
+    ...settings,
+    killswitch: { ...(settings.killswitch as object), enabled: false },
+  }))
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'killswitch changed',
+      payload: { enabled: false },
+    },
+  ])
+
+  // A settings change unrelated to these fields has no effect.
+  await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(logs.take()).toEqual([])
+  expect(getLogLevel()).toBe('info')
+
+  await f.runtime.updateSettings((settings) => {
+    settings.logging = { level: 'debug' }
+  })
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'log level changed',
+      payload: { level: 'debug' },
+    },
+  ])
+  expect(getLogLevel()).toBe('debug')
+  expect((await f.runtime.read()).settings.logging).toEqual({ level: 'debug' })
+
+  // Lowering verbosity is still recorded, at the level in force before it.
+  await f.runtime.updateSettings((settings) => {
+    settings.logging = { level: 'warn' }
+  })
+  expect(logs.take()).toEqual([
+    { level: 'info', message: 'log level changed', payload: { level: 'warn' } },
+  ])
+  expect(getLogLevel()).toBe('warn')
+  setLogLevel('info')
+
+  // Selecting the stored level again writes nothing and changes nothing.
+  await f.runtime.updateSettings((settings) => {
+    settings.logging = { level: 'warn' }
+  })
+  expect(logs.take()).toEqual([])
+  expect(getLogLevel()).toBe('info')
+})
+
+test('refused or failed settings writes log nothing and leave the live level unchanged', async () => {
+  const f = await fixture()
+  const logs = captureCommandLogs()
+
+  // The mutator throws after editing its copy: nothing is committed.
+  await expect(
+    f.runtime.updateSettings((settings) => {
+      settings.logging = { level: 'trace' }
+      settings.killswitch = { enabled: true }
+      throw new Error('synthetic mutator failure')
+    }),
+  ).rejects.toThrow('synthetic mutator failure')
+  // The runtime refuses a write that also changes custody activation.
+  await expect(
+    f.runtime.updateSettings((settings) => {
+      settings.logging = { level: 'trace' }
+      settings.killswitch = { enabled: true }
+      settings.mainAccountId = 'other'
+    }),
+  ).rejects.toThrow()
+
+  expect(logs.take()).toEqual([])
+  expect(getLogLevel()).toBe('info')
+  const stored = (await f.runtime.read()).settings
+  expect(stored.logging).toBeUndefined()
+  expect(stored.killswitch).toBeUndefined()
+})
+
+test('committed account enable, disable, remove and reorder log the changed account without credential material', async () => {
+  const f = await fixture()
+  for (const [routeId, label] of [
+    ['fallback-a', 'Work'],
+    ['fallback-b', undefined],
+  ] as const)
+    await f.runtime.addApi({
+      routeId,
+      apiKey: `synthetic-api-${routeId}`,
+      ...(label && { label }),
+    })
+  const logs = captureCommandLogs()
+
+  await f.runtime.setEnabled('fallback-a', false)
+  await f.runtime.setEnabled('fallback-a', false)
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account disabled',
+      payload: { id: 'fallback-a', label: 'Work', enabled: false },
+    },
+  ])
+  await f.runtime.setEnabled('fallback-a', true)
+  await f.runtime.setEnabled('fallback-a', true)
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account enabled',
+      payload: { id: 'fallback-a', label: 'Work', enabled: true },
+    },
+  ])
+
+  const fallbackOrder = async () =>
+    (await f.runtime.read()).accounts
+      .filter((row) => row.id !== 'main')
+      .map((row) => row.id)
+  expect(await fallbackOrder()).toEqual(['fallback-a', 'fallback-b'])
+  await f.runtime.reorder(['fallback-b', 'fallback-a'], 'fallback-b')
+  expect(await fallbackOrder()).toEqual(['fallback-b', 'fallback-a'])
+  // The order already on disk: nothing is written or reported.
+  await f.runtime.reorder(['fallback-b', 'fallback-a'], 'fallback-b')
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account reordered',
+      payload: { id: 'fallback-b', label: undefined },
+    },
+  ])
+
+  // A route that does not exist is refused and reported by no log.
+  await expect(f.runtime.remove('missing-route')).rejects.toThrow()
+  await expect(f.runtime.setEnabled('missing-route', false)).rejects.toThrow()
+  expect(logs.take()).toEqual([])
+
+  await f.runtime.remove('fallback-a')
+  expect(await fallbackOrder()).toEqual(['fallback-b'])
+  const removed = logs.take()
+  expect(removed).toEqual([
+    {
+      level: 'info',
+      message: 'account removed',
+      payload: { id: 'fallback-a', label: 'Work' },
+    },
+  ])
+  expect(JSON.stringify(removed)).not.toContain('synthetic-api')
+})
+
+test('only an add that creates a new account row logs account added, without credential material', async () => {
+  const f = await fixture()
+  const logs = captureCommandLogs()
+
+  await f.runtime.addApi({
+    routeId: 'fallback-a',
+    apiKey: 'synthetic-api-secret-a',
+    baseURL: 'https://example.test',
+    authHeader: 'x-api-key',
+    label: 'Work',
+  })
+  const added = logs.take()
+  expect(added).toEqual([
+    {
+      level: 'info',
+      message: 'account added',
+      payload: { id: 'fallback-a', label: 'Work', type: 'apikey' },
+    },
+  ])
+  const text = JSON.stringify(added)
+  for (const secret of ['synthetic-api-secret-a', 'example.test', 'x-api-key'])
+    expect(text).not.toContain(secret)
+
+  // Replacing the route's credential creates no account.
+  await f.runtime.addApi({
+    routeId: 'fallback-a',
+    apiKey: 'synthetic-api-secret-b',
+    replace: true,
+  })
+  // Re-adding a stored secret under another id rotates the existing row.
+  await f.runtime.addApi({
+    routeId: 'fallback-dup',
+    apiKey: 'synthetic-api-secret-b',
+  })
+  // An add over an existing route without replace is refused.
+  await expect(
+    f.runtime.addApi({ routeId: 'fallback-a', apiKey: 'synthetic-api-other' }),
+  ).rejects.toThrow()
+  expect(logs.take()).toEqual([])
+  expect(
+    (await f.runtime.read()).accounts
+      .filter((row) => row.id !== 'main')
+      .map((row) => row.id),
+  ).toEqual(['fallback-a'])
+
+  await f.runtime.loginOAuth({
+    routeId: 'fallback-oauth',
+    credential: {
+      access: 'synthetic-oauth-access',
+      refresh: 'synthetic-oauth-refresh',
+      expires: now + 3_600_000,
+    },
+  })
+  const oauth = logs.take()
+  expect(oauth).toEqual([
+    {
+      level: 'info',
+      message: 'account added',
+      payload: { id: 'fallback-oauth', label: undefined, type: 'oauth' },
+    },
+  ])
+  expect(JSON.stringify(oauth)).not.toContain('synthetic-oauth')
 })
