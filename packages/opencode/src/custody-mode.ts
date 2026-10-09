@@ -1,5 +1,3 @@
-export const OPENCODE_MAIN_OAUTH_REFRESH_LOCK = 'opencode-main-oauth-refresh'
-
 export class CustodyStateMismatchError extends Error {
   readonly code = 'custody_state_mismatch'
   constructor(
@@ -22,14 +20,31 @@ export class CustodyStateMismatchError extends Error {
   }
 }
 
-/** Only a scoped roster and a non-secret host tombstone can activate custody. */
+/**
+ * L/C select local/Claustrum custody. Main R/T/X means stored tokens, an empty
+ * activation marker, or neither; fallback R/T/M means local accounts, tokenless
+ * vault accounts, or missing roster metadata. V/N marks verified/missing evidence.
+ * Only migrated OAuth uses these checks; ordinary OpenCode API keys are untouched.
+ * The activation marker enables the provider but cannot authenticate a request.
+ * Before each send, validate the local account and current tokens or obtain
+ * fresh authorization for that account from the vault.
+ */
 export function reconcileCustodyStartup(input: {
   mode: 'L' | 'C'
   main: 'R' | 'T' | 'X'
   fallbacks: 'R' | 'T' | 'M'
   evidence: 'V' | 'N'
+  authority?: 'committed' | 'retired'
 }): { verdict: 'LOCAL_SERVE' | 'CLAUSTRUM_SERVE' } {
-  if (input.mode === 'L' && input.main === 'R' && input.fallbacks === 'R') {
+  if (input.authority !== 'committed' && input.authority !== 'retired') {
+    throw new CustodyStateMismatchError('MIGRATION_REQUIRED', input)
+  }
+  if (
+    input.mode === 'L' &&
+    input.main === 'T' &&
+    input.fallbacks === 'R' &&
+    input.evidence === 'V'
+  ) {
     return { verdict: 'LOCAL_SERVE' }
   }
   if (
