@@ -21,6 +21,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import type { PrimeManager } from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
   type AccountStorage,
@@ -4538,8 +4539,22 @@ describe('quota header feed extended integration', () => {
       createFallbackStorage({
         quotaHeaderFeed: { enabled: true },
         accounts: [
-          { id: 'disabled-oauth', type: 'oauth', refresh: 'r', enabled: false },
-          { id: 'enabled-oauth', type: 'oauth', refresh: 'r', enabled: true },
+          {
+            id: 'disabled-oauth',
+            type: 'oauth',
+            access: 'sk-ant-oat01-disabled-access',
+            refresh: 'disabled-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+            enabled: false,
+          },
+          {
+            id: 'enabled-oauth',
+            type: 'oauth',
+            access: 'sk-ant-oat01-enabled-access',
+            refresh: 'enabled-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+            enabled: true,
+          },
           {
             id: 'api-key',
             type: 'api',
@@ -4553,6 +4568,7 @@ describe('quota header feed extended integration', () => {
         headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
       }),
     )
+    expect(response.status).toBe(200)
     await response.text()
     const entries = await waitForFeedEntries(
       (candidate) => candidate.length === 1,
@@ -20135,6 +20151,110 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   })
 })
 
+async function primeWarningsAfterQuotaCheck(
+  fallback: boolean,
+  change: (
+    runtime: ReturnType<typeof createNativeAccountRuntime>,
+  ) => Promise<void>,
+  getHostAuth = () =>
+    Promise.resolve({ type: 'oauth' as const, ...syntheticMainHostAuth() }),
+) {
+  const dueQuota = {
+    five_hour: {
+      usedPercent: 0,
+      remainingPercent: 100,
+      resetsAt: new Date(Date.now() - 180_000).toISOString(),
+      checkedAt: Date.now(),
+    },
+  }
+  await useTempAccountFile(
+    bindPoolAccounts(
+      createFallbackStorage({
+        accounts: fallback
+          ? [
+              {
+                id: 'work-alt',
+                type: 'oauth',
+                access: 'sk-ant-oat01-fb-access',
+                refresh: 'fb-refresh',
+                expires: Date.now() + 8 * 60 * 60_000,
+                quota: dueQuota,
+              },
+            ]
+          : [],
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          mainQuota: fallback
+            ? {
+                five_hour: {
+                  ...dueQuota.five_hour,
+                  resetsAt: new Date(
+                    Date.now() + 5 * 60 * 60_000,
+                  ).toISOString(),
+                },
+              }
+            : dueQuota,
+        },
+        prime: { enabled: true },
+      }),
+    ),
+  )
+  let modelRequests = 0
+  let refreshRequests = 0
+  globalThis.fetch = mock(
+    withNativeBootstrap((input: Parameters<typeof fetch>[0]) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        refreshRequests += 1
+        return new Response('temporary refresh failure', { status: 503 })
+      }
+      if (url.includes('/v1/messages')) {
+        modelRequests += 1
+        return Response.json({ usage: { input_tokens: 1, output_tokens: 1 } })
+      }
+      if (url.includes('/api/oauth/usage'))
+        return freshPrimeQuotaResponse({
+          five_hour: { utilization: 0, resets_at: dueQuota.five_hour.resetsAt },
+        })
+      throw new Error(`Unexpected test endpoint: ${url}`)
+    }),
+  ) as unknown as typeof fetch
+  const plugin = await getPlugin()
+  await plugin.auth.loader(getHostAuth, { models: {} })
+  const runtime = createNativeAccountRuntime({
+    paths: migratedPool!.paths,
+    host: 'opencode',
+  })
+  const manager = (plugin as unknown as { __primeManager: PrimeManager })
+    .__primeManager
+  let changed = false
+  // Change account availability after the manager obtained its claim identity.
+  // Keep the real send adapter to verify its failure classification and logs.
+  manager.options.refreshQuota = async () => {
+    await change(runtime)
+    changed = true
+    return { quota: dueQuota, fresh: true }
+  }
+  const { __setLogTestSink, getLogLevel, setLogLevel } = await import(
+    '@cortexkit/anthropic-auth-core'
+  )
+  const records: LogTestRecord[] = []
+  const previousLevel = getLogLevel()
+  setLogLevel('warn')
+  __setLogTestSink((record) => records.push(record))
+  try {
+    await manager.tick()
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+    runtime.close()
+  }
+  expect(changed).toBe(true)
+  expect(modelRequests).toBe(0)
+  return { records, refreshRequests }
+}
+
 describe('claude-prime — warn dedup (R3)', () => {
   // R3: on a fresh-check-ok-but-fire-time-token-refresh-fails path,
   // both the adapter-side `prime fire failed` warn (index.ts main
@@ -20158,314 +20278,69 @@ describe('claude-prime — warn dedup (R3)', () => {
   })
 
   test('R3: a fire-time main token refresh failure produces exactly one warn·prime·prime token refresh failed record (distinct from the generic fire-failed event)', async () => {
-    // Force a genuine token-refresh failure during the fire path. The
-    // getAuth returns no access token + a past expiry, so
-    // `getCurrentMainAccessToken` invokes `latestRefreshMainAccessToken`,
-    // which is mocked to throw. This is the ONLY way to exercise the
-    // `prime token refresh failed` event from the main path.
-    const records: any[] = []
-    globalThis.fetch = mock((input: any) => {
-      const url = typeof input === 'string' ? input : input.url
-      if (url.includes('/v1/messages')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          ),
-        )
-      }
-      if (url.includes('/api/oauth/usage')) {
-        return freshPrimeQuotaResponse({
-          five_hour: {
-            utilization: 0,
-            resets_at: new Date(Date.now() - 1_000).toISOString(),
-            checked_at: Date.now(),
-          },
-        })
-      }
-      return Promise.resolve(new Response('not-mocked', { status: 599 }))
-    }) as unknown as typeof fetch
-
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(Date.now() - 180_000).toISOString(),
-              checkedAt: 1,
-            },
-          },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
-    )
-
-    const plugin = await getPlugin()
-    // The init loader calls getAuth once (call 1). Prime lineage
-    // reconciliation observes the refresh token (call 2), then the fresh-check
-    // calls getAuth (call 3) — return a valid token. The fire path calls getAuth
-    // (call 4) — return a no-access / past-expiry auth so the refresh path is
-    // exercised. The refresh function
-    // fetches the token endpoint which the mock returns 599 for —
-    // this is the genuine token-refresh failure.
-    let authCallCount = 0
-    await plugin.auth.loader(
-      () => {
-        authCallCount += 1
-        if (authCallCount <= 2) {
-          return Promise.resolve({
-            type: 'oauth',
-            access: 'sk-ant-oat01-main-access',
+    const { records, refreshRequests } = await primeWarningsAfterQuotaCheck(
+      false,
+      async (runtime) => {
+        await runtime.loginOAuth({
+          routeId: 'main',
+          replace: true,
+          accountIdentity: poolMainIdentity(),
+          credential: {
+            access: '',
             refresh: 'main-refresh',
-            expires: Date.now() + 3600_000,
-          })
-        }
-        return Promise.resolve({
-          type: 'oauth',
-          access: undefined,
-          refresh: 'main-refresh',
-          expires: Date.now() - 1000,
+            expires: Date.now() - 1_000,
+          },
         })
       },
-      { models: {} },
     )
-
-    // Capture logs via the dist sink (prime.ts compiled to dist/prime.js
-    // imports dist/logger.js; the dist sink captures all events).
-    const { __setLogTestSink, setLogLevel } = await import(
-      '@cortexkit/anthropic-auth-core'
-    )
-    const setDistSink = __setLogTestSink
-    setLogLevel('warn')
-    setDistSink((r: any) => records.push(r))
-
-    const mgr = (plugin as any).__primeManager
-    // The fresh-check succeeds because the main quota is already
-    // stored. The fire path's `getCurrentMainAccessToken` calls
-    // `latestRefreshMainAccessToken` (because the cached access
-    // is missing/expired) and that function throws. This is the
-    // genuine token-refresh failure path.
-    //
-    // NOTE: the loader captures `getAuth` in a closure. The
-    // refresh function is also captured. We can't easily replace
-    // it from outside, so we rely on the getAuth returning a
-    // no-access / past-expiry auth, which forces the refresh
-    // path. The refresh function is the loader's own
-    // `refreshMainAccessToken`, which internally calls the
-    // Anthropic refresh endpoint. The mock fetch returns 599 for
-    // everything except /v1/messages, so the token refresh
-    // endpoint fetch fails with a network error, and the refresh
-    // function throws — which IS a token-refresh failure.
-    records.length = 0
-    await mgr.tick()
-    setDistSink(null)
-    setLogLevel('info')
-
-    // The token-refresh path throws because the mock fetch returns
-    // 599 for the token endpoint. The adapter catches the throw
-    // and tags it as `reason: 'token-refresh'` (the
-    // `isPrimeTokenRefresh` flag is set by the refresh wrapper in
-    // `getCurrentMainAccessToken`). The manager emits the distinct
-    // `prime token refresh failed` event.
-    const tokenRefreshWarns = records.filter(
-      (r) =>
-        r.channel === 'prime' &&
-        r.level === 'warn' &&
-        r.message === 'prime token refresh failed',
-    )
-    expect(tokenRefreshWarns).toHaveLength(1)
-    const fireFailedWarns = records.filter(
-      (r) =>
-        r.channel === 'prime' &&
-        r.level === 'warn' &&
-        r.message === 'prime fire failed',
-    )
-    expect(fireFailedWarns).toHaveLength(0)
+    expect(refreshRequests).toBe(3)
+    expect(
+      records.filter(
+        (record) =>
+          record.channel === 'prime' &&
+          record.level === 'warn' &&
+          record.message === 'prime token refresh failed',
+      ),
+    ).toHaveLength(1)
+    expect(
+      records.filter((record) => record.message === 'prime fire failed'),
+    ).toHaveLength(0)
   })
 
   test('R3-precision: a fire-time main auth-unavailable (latestGetAuth null) failure logs the GENERIC `prime fire failed` (NOT `prime token refresh failed`)', async () => {
-    // The main `getCurrentMainAccessToken` throws BEFORE reaching the
-    // refresh path (auth loader is null). This is NOT a token-refresh
-    // failure — it is a lifecycle / availability failure — and the
-    // manager must log the generic `prime fire failed` event, not the
-    // distinct `prime token refresh failed` event.
-    const records: any[] = []
-    globalThis.fetch = mock((input: any) => {
-      const url = typeof input === 'string' ? input : input.url
-      if (url.includes('/v1/messages')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({ usage: { input_tokens: 0, output_tokens: 0 } }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          ),
-        )
-      }
-      if (url.includes('/api/oauth/usage')) {
-        return freshPrimeQuotaResponse({
-          five_hour: {
-            utilization: 0,
-            resets_at: new Date(Date.now() - 1_000).toISOString(),
-            checked_at: Date.now(),
-          },
-        })
-      }
-      return Promise.resolve(new Response('not-mocked', { status: 599 }))
-    }) as unknown as typeof fetch
-
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(Date.now() - 180_000).toISOString(),
-              checkedAt: 1,
-            },
-          },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
-    )
-
-    const plugin = await getPlugin()
-    // Provide a getAuth so lineage reconciliation and the fresh-check succeed,
-    // but make the fire path's `latestGetAuth()` throw before any refresh is
-    // attempted. `getCurrentMainAccessToken` will throw from the
-    // `await latestGetAuth()` line, which is NOT a refresh failure.
-    let authCallCount = 0
-    await plugin.auth.loader(
+    let activationUnavailable = false
+    const { records, refreshRequests } = await primeWarningsAfterQuotaCheck(
+      false,
+      async () => {
+        activationUnavailable = true
+      },
       () => {
-        authCallCount += 1
-        if (authCallCount >= 3) {
+        if (activationUnavailable)
           return Promise.reject(
             new Error('prime: main auth loader is not available'),
           )
-        }
-        return Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 3600_000,
-        })
+        return Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() })
       },
-      { models: {} },
     )
-
-    const { __setLogTestSink, setLogLevel } = await import(
-      '@cortexkit/anthropic-auth-core'
-    )
-    const setDistSink = __setLogTestSink
-    setLogLevel('warn')
-    setDistSink((r: any) => records.push(r))
-
-    const mgr = (plugin as any).__primeManager
-    records.length = 0
-    await mgr.tick()
-    setDistSink(null)
-    setLogLevel('info')
-
-    const tokenRefreshWarns = records.filter(
-      (r) =>
-        r.channel === 'prime' &&
-        r.level === 'warn' &&
-        r.message === 'prime token refresh failed',
-    )
-    expect(tokenRefreshWarns).toHaveLength(0)
-    const fireFailedWarns = records.filter(
-      (r) =>
-        r.channel === 'prime' &&
-        r.level === 'warn' &&
-        r.message === 'prime fire failed',
-    )
-    expect(fireFailedWarns).toHaveLength(1)
+    expect(refreshRequests).toBe(0)
+    expect(
+      records.filter(
+        (record) => record.message === 'prime token refresh failed',
+      ),
+    ).toHaveLength(0)
+    expect(
+      records.filter((record) => record.message === 'prime fire failed'),
+    ).toHaveLength(1)
   })
 
   test('R3-precision: a fallback removed between fresh-check and fire logs `prime fire failed`', async () => {
-    const records: any[] = []
-    const dueQuota = {
-      five_hour: {
-        usedPercent: 0,
-        remainingPercent: 100,
-        resetsAt: new Date(Date.now() - 180_000).toISOString(),
-        checkedAt: Date.now(),
+    const { records, refreshRequests } = await primeWarningsAfterQuotaCheck(
+      true,
+      async (runtime) => {
+        await runtime.remove('work-alt')
       },
-    }
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'work-alt',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fb-access',
-            refresh: 'fb-refresh',
-            expires: Date.now() + 10 * 60 * 60 * 1000,
-            quota: dueQuota,
-          },
-        ],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(),
-              checkedAt: Date.now(),
-            },
-          },
-          mainQuotaCheckedAt: Date.now(),
-          mainQuotaToken: 'sk-ant-oat01-main-access',
-        },
-        prime: { enabled: true },
-      }),
     )
-
-    const plugin = await getPlugin()
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 3600_000,
-        }),
-      { models: {} },
-    )
-    const mgr = (plugin as any).__primeManager
-    mgr.options.refreshQuota = async () => {
-      const storage = await readAccountStorage()
-      if (!storage) throw new Error('missing test storage')
-      storage.accounts = []
-      await saveAccounts(storage)
-      return { quota: dueQuota, fresh: true }
-    }
-
-    const { __setLogTestSink, setLogLevel } = await import(
-      '@cortexkit/anthropic-auth-core'
-    )
-    setLogLevel('warn')
-    __setLogTestSink((record: any) => records.push(record))
-    await mgr.tick()
-    __setLogTestSink(null)
-    setLogLevel('info')
-
+    expect(refreshRequests).toBe(0)
     expect(
       records.filter(
         (record) => record.message === 'prime token refresh failed',
@@ -20477,80 +20352,26 @@ describe('claude-prime — warn dedup (R3)', () => {
   })
 
   test('R3: a fallback refreshAccount failure logs `prime token refresh failed`', async () => {
-    const records: any[] = []
-    const dueQuota = {
-      five_hour: {
-        usedPercent: 0,
-        remainingPercent: 100,
-        resetsAt: new Date(Date.now() - 180_000).toISOString(),
-        checkedAt: Date.now(),
-      },
-    }
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'work-alt',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fb-access',
+    const { records, refreshRequests } = await primeWarningsAfterQuotaCheck(
+      true,
+      async (runtime) => {
+        const identity = (await runtime.read()).accounts.find(
+          (account) => account.id === 'work-alt',
+        )?.accountIdentity
+        expect(identity).toBeDefined()
+        await runtime.loginOAuth({
+          routeId: 'work-alt',
+          replace: true,
+          accountIdentity: identity,
+          credential: {
+            access: '',
             refresh: 'fb-refresh',
-            expires: Date.now() + 5 * 60 * 60_000,
-            quota: dueQuota,
+            expires: Date.now() - 1_000,
           },
-        ],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(),
-              checkedAt: Date.now(),
-            },
-          },
-          mainQuotaCheckedAt: Date.now(),
-          mainQuotaToken: 'sk-ant-oat01-main-access',
-        },
-        prime: { enabled: true },
-      }),
+        })
+      },
     )
-    globalThis.fetch = mock(() =>
-      Promise.resolve(
-        new Response('{"error":"invalid_grant"}', { status: 400 }),
-      ),
-    ) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 3600_000,
-        }),
-      { models: {} },
-    )
-    const storage = await readAccountStorage()
-    const fallback = storage!.accounts.find(
-      (account) => account.id === 'work-alt',
-    )!
-    if (fallback.type !== 'oauth') throw new Error('expected OAuth account')
-    fallback.expires = Date.now() - 1_000
-    await saveAccounts(storage!)
-    const mgr = (plugin as any).__primeManager
-    mgr.options.refreshQuota = async () => ({ quota: dueQuota, fresh: true })
-
-    const { __setLogTestSink, setLogLevel } = await import(
-      '@cortexkit/anthropic-auth-core'
-    )
-    setLogLevel('warn')
-    __setLogTestSink((record: any) => records.push(record))
-    await mgr.tick()
-    __setLogTestSink(null)
-    setLogLevel('info')
-
+    expect(refreshRequests).toBe(3)
     expect(
       records.filter(
         (record) => record.message === 'prime token refresh failed',

@@ -1408,6 +1408,7 @@ const anthropicAuthPlugin = async (
     constructor(
       readonly account: NativeAccountView,
       status: string,
+      readonly tokenRefreshFailed = false,
     ) {
       super(`Native OAuth authorization refused: ${status}`)
     }
@@ -1480,6 +1481,8 @@ const anthropicAuthPlugin = async (
         throw new NativeCredentialUnavailableError(
           account,
           authorization.status,
+          authorization.status === 'failed' &&
+            authorization.failure.kind === 'provider',
         )
       result = {
         accessToken: authorization.access,
@@ -3049,7 +3052,8 @@ const anthropicAuthPlugin = async (
     } catch (error) {
       return {
         ok: false,
-        ...(!accessToken && { reason: 'token-refresh' as const }),
+        ...(error instanceof NativeCredentialUnavailableError &&
+          error.tokenRefreshFailed && { reason: 'token-refresh' as const }),
         ms: Math.round(performance.now() - start),
         error: error instanceof Error ? error.message : String(error),
       }
