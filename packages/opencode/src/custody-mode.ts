@@ -1,5 +1,3 @@
-export const OPENCODE_MAIN_OAUTH_REFRESH_LOCK = 'opencode-main-oauth-refresh'
-
 export class CustodyStateMismatchError extends Error {
   readonly code = 'custody_state_mismatch'
   constructor(
@@ -22,14 +20,31 @@ export class CustodyStateMismatchError extends Error {
   }
 }
 
-/** Only a scoped roster and a non-secret host tombstone can activate custody. */
+/**
+ * Native OAuth startup requires a completed migration, an inert host auth
+ * marker and verified credential storage. Local mode requires local account
+ * rows; vault mode requires a token-free account inventory. Other combinations
+ * refuse startup. The letter dimensions describe those states in diagnostics.
+ * Ordinary OpenCode API keys remain untouched. The host marker enables the
+ * provider but cannot authenticate: each send still validates local credentials
+ * or gets fresh authorization for the selected vault account.
+ */
 export function reconcileCustodyStartup(input: {
   mode: 'L' | 'C'
   main: 'R' | 'T' | 'X'
   fallbacks: 'R' | 'T' | 'M'
   evidence: 'V' | 'N'
+  authority?: 'committed' | 'retired'
 }): { verdict: 'LOCAL_SERVE' | 'CLAUSTRUM_SERVE' } {
-  if (input.mode === 'L' && input.main === 'R' && input.fallbacks === 'R') {
+  if (input.authority !== 'committed' && input.authority !== 'retired') {
+    throw new CustodyStateMismatchError('MIGRATION_REQUIRED', input)
+  }
+  if (
+    input.mode === 'L' &&
+    input.main === 'T' &&
+    input.fallbacks === 'R' &&
+    input.evidence === 'V'
+  ) {
     return { verdict: 'LOCAL_SERVE' }
   }
   if (

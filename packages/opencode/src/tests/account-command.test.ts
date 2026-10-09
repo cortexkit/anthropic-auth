@@ -1004,9 +1004,16 @@ describe('account command INFO logs (via plugin)', () => {
 
     await executeCommand(plugin, 'claude-account', 'custody fallback-1 on')
 
-    const payload = drainNotifications(0, 'ses_test').at(-1)?.payload
-    expect(payload?.text).toContain('/claude-account claustrum')
-    expect(payload?.text).toContain('/claude-account local')
+    const notice = drainNotifications(0, 'ses_test').at(-1)
+    expect(notice).toBeDefined()
+    if (
+      notice?.type !== 'open-dialog' ||
+      notice.payload.command !== 'claude-account'
+    )
+      throw new Error('Expected legacy account guidance payload')
+    const payload = notice.payload
+    expect(payload.text).toContain('/claude-account claustrum')
+    expect(payload.text).toContain('/claude-account local')
     expect(await readFile(accountPath, 'utf8')).toBe(before)
     expect((await fs.stat(accountPath)).mtimeMs).toBe(beforeMtime)
   })
@@ -1026,9 +1033,15 @@ describe('account command INFO logs (via plugin)', () => {
     const before = await readFile(accountPath, 'utf8')
     drainNotifications(0, 'ses_test')
     await executeCommand(plugin, 'claude-account', 'claustrum')
-    expect(drainNotifications(0, 'ses_test').at(-1)?.payload.text).toContain(
-      'setup',
+    const notice = drainNotifications(0, 'ses_test').at(-1)
+    expect(notice).toBeDefined()
+    if (
+      notice?.type !== 'open-dialog' ||
+      notice.payload.command !== 'claude-account'
     )
+      throw new Error('Expected legacy account guidance payload')
+    const payload = notice.payload
+    expect(payload.text).toContain('setup')
     expect(await readFile(accountPath, 'utf8')).toBe(before)
   })
 
