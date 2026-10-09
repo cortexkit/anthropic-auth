@@ -3,11 +3,14 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  __setLogTestSink,
   type authorize,
   CacheKeepManager,
   createNativeAccountRuntime,
   custodyTombstoneOAuth,
   discoverNativeVaultInventory,
+  getLogLevel,
+  type LogTestRecord,
   type NativeCustodyClient,
   PrimeManager,
   publishNativeVaultRosterSeed,
@@ -15,6 +18,7 @@ import {
   resetClaudeCodeIdentityCachesForTest,
   resolveNativePoolPaths,
   runNativeMigration,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $ } from 'bun'
@@ -762,7 +766,7 @@ for (const transport of ['http', 'websocket'] as const) {
   })
 }
 
-test('vault direct 401 retry reports each rejected physical credential version exactly', async () => {
+test('vault direct 401 retry reports only the final rejected physical credential version', async () => {
   const fixture = await migrateServingFixture('claustrum')
   let attempts = 0
   network.mockImplementation(async (input, init) => {
@@ -798,10 +802,7 @@ test('vault direct 401 retry reports each rejected physical credential version e
       credentialId: report.credentialId,
       recordVersion: report.recordVersion,
     })),
-  ).toEqual([
-    { credentialId: 'oauth:anthropic', recordVersion: 1 },
-    { credentialId: 'oauth:anthropic', recordVersion: 2 },
-  ])
+  ).toEqual([{ credentialId: 'oauth:anthropic', recordVersion: 2 }])
   expect(
     fixture.records
       .filter((record) => record.url.includes('/v1/messages'))
@@ -1188,3 +1189,389 @@ test('native serving suite lifetime joins detached fixture reads before body-own
   })
   readGate.open()
 })
+
+// Every vault send site reports a 401 only for the receipt whose response is
+// final. A strictly newer replay makes the served version obsolete whatever
+// the replay's outcome; without one, the served version is the final record.
+const rotatedDecision = { currentVersion: 2, retry: true, reason: 'rotated' }
+const final401Cases = [
+  {
+    outcome: 'replay succeeds',
+    reports: [],
+    wire: [1, 2],
+    decision: rotatedDecision,
+  },
+  {
+    outcome: 'replay is also rejected',
+    reports: [2],
+    wire: [1, 2],
+    decision: rotatedDecision,
+  },
+  {
+    outcome: 'replay has a network error',
+    reports: [],
+    wire: [1, 2],
+    decision: rotatedDecision,
+  },
+  {
+    outcome: 'vault holds the same version',
+    reports: [1],
+    wire: [1],
+    decision: { currentVersion: 1, retry: false, reason: 'version-not-newer' },
+  },
+  {
+    outcome: 're-authorization fails',
+    reports: [1],
+    wire: [1],
+    decision: {
+      currentVersion: null,
+      retry: false,
+      reason: 'reauthorize-failed',
+    },
+  },
+] as const
+type Final401Case = (typeof final401Cases)[number]
+type ServingFixture = Awaited<ReturnType<typeof migrateServingFixture>>
+
+/** A synthetic Anthropic endpoint that rejects the first send it receives. */
+function final401Upstream(fixture: ServingFixture, scenario: Final401Case) {
+  const wire: string[] = []
+  // An Anthropic request id is what lets a relayed status count as upstream.
+  const provenance = { 'request-id': 'req_synthetic_final_401' }
+  const rejection = () =>
+    Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: 'Synthetic physical rejection',
+        },
+      },
+      { status: 401, headers: provenance },
+    )
+  const handle = async (init?: RequestInit) => {
+    wire.push(new Headers(init?.headers).get('authorization') ?? '')
+    if (wire.length === 1) {
+      if (scenario.outcome === 're-authorization fails')
+        fixture.scopedClient.getScoped = async () => {
+          throw new Error('synthetic vault unavailable')
+        }
+      else if (scenario.outcome !== 'vault holds the same version')
+        fixture.rotateVault()
+      return rejection()
+    }
+    if (scenario.outcome === 'replay has a network error')
+      throw new TypeError('synthetic replay network failure')
+    if (scenario.outcome === 'replay is also rejected') return rejection()
+    return Response.json(
+      {
+        id: 'synthetic-message',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'native-serving-ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+      { headers: provenance },
+    )
+  }
+  return { wire, handle }
+}
+
+async function scoped401Decisions(run: () => Promise<unknown>) {
+  const records: LogTestRecord[] = []
+  const previousLevel = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  try {
+    await run()
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+  }
+  return records.filter(
+    (record) => record.message === 'scoped 401 re-authorized',
+  )
+}
+
+function expectFinal401Record(
+  fixture: ServingFixture,
+  scenario: Pick<Final401Case, 'decision'> & {
+    reports: readonly number[]
+    wire: readonly number[]
+  },
+  wire: string[],
+  decisions: LogTestRecord[],
+  site: string,
+) {
+  expect(wire).toEqual(
+    scenario.wire.map(
+      (version) => `Bearer sk-ant-oat01-vault-main-v${version}`,
+    ),
+  )
+  expect(
+    fixture.scopedReports.map((report) => ({
+      credentialId: report.credentialId,
+      recordVersion: report.recordVersion,
+    })),
+  ).toEqual(
+    scenario.reports.map((recordVersion) => ({
+      credentialId: 'oauth:anthropic',
+      recordVersion,
+    })),
+  )
+  expect(decisions.map((record) => record.payload)).toEqual([
+    {
+      site,
+      credentialId: 'oauth:anthropic',
+      servedVersion: 1,
+      ...scenario.decision,
+    },
+  ])
+  expect(JSON.stringify(decisions)).not.toContain('sk-ant-oat01')
+  expect(JSON.stringify(decisions)).not.toContain('synthetic vault')
+}
+
+const primeWindows = () =>
+  Response.json({
+    five_hour: {
+      utilization: 0,
+      resets_at: new Date(Date.now() - 120_000).toISOString(),
+    },
+    seven_day: {
+      utilization: 0,
+      resets_at: new Date(Date.now() + 7 * 24 * 60 * 60_000).toISOString(),
+    },
+  })
+
+const cacheKeepPrewarmBody = JSON.stringify({
+  model: 'claude-sonnet-4-6',
+  max_tokens: 1,
+  messages: [
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: 'Synthetic warm',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    },
+  ],
+})
+
+async function enablePrime(fixture: ServingFixture) {
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  try {
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      prime: { enabled: true },
+    }))
+  } finally {
+    runtime.close()
+  }
+}
+
+async function tickPrime(plugin: PluginHooks) {
+  await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
+  const prime: unknown = Reflect.get(plugin, '__primeManager')
+  if (!(prime instanceof PrimeManager))
+    throw new Error('Native host Prime manager is unavailable')
+  try {
+    return await scoped401Decisions(() => prime.tick().catch(() => {}))
+  } finally {
+    prime.stop()
+  }
+}
+
+for (const scenario of final401Cases) {
+  test(`vault direct model 401 reports only the final record when the ${scenario.outcome}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const upstream = final401Upstream(fixture, scenario)
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      return url.includes('/v1/messages')
+        ? upstream.handle(init)
+        : fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    let status: unknown
+    const decisions = await scoped401Decisions(async () => {
+      status = await sendNative(plugin).then(
+        (response) => response.status,
+        (error: unknown) => error,
+      )
+    })
+    if (scenario.outcome === 'replay succeeds') expect(status).toBe(200)
+    else if (scenario.outcome === 'replay has a network error')
+      expect(status).not.toBe(200)
+    else expect(status).toBe(401)
+    expectFinal401Record(fixture, scenario, upstream.wire, decisions, 'model')
+  })
+
+  test(`vault HTTP relay 401 reports only the final record when the ${scenario.outcome}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const relay = new MockRelayServer()
+    relays.add(relay)
+    const address = await relay.start({ token: 'synthetic-native-relay-token' })
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+    })
+    try {
+      await runtime.updateRelay({
+        enabled: true,
+        url: address.url,
+        token: 'synthetic-native-relay-token',
+        transport: 'http',
+        fallbackToDirect: false,
+      })
+    } finally {
+      runtime.close()
+    }
+    const upstream = final401Upstream(fixture, scenario)
+    // A replay that cannot reach the relay at all is this transport's network
+    // error; the relay itself never forwards it upstream.
+    const relayNetworkError = scenario.outcome === 'replay has a network error'
+    let replayRefused = false
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (url.startsWith(address.url)) {
+        if (
+          relayNetworkError &&
+          String(init?.body).includes('sk-ant-oat01-vault-main-v2')
+        ) {
+          replayRefused = true
+          throw new TypeError('synthetic relay network failure')
+        }
+        return originalFetch(input, init)
+      }
+      return url.includes('/v1/messages')
+        ? upstream.handle(init)
+        : fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    let status: unknown
+    const decisions = await scoped401Decisions(async () => {
+      status = await sendNative(plugin).then(
+        (response) => response.status,
+        (error: unknown) => error,
+      )
+    })
+    if (scenario.outcome === 'replay succeeds') expect(status).toBe(200)
+    else if (scenario.outcome === 'replay has a network error')
+      expect(status).not.toBe(200)
+    else expect(status).toBe(401)
+    expect(replayRefused).toBe(relayNetworkError)
+    const forwarded = relayNetworkError ? { ...scenario, wire: [1] } : scenario
+    expect(relay.acceptedRequests()).toBe(forwarded.wire.length)
+    expectFinal401Record(
+      fixture,
+      forwarded,
+      upstream.wire,
+      decisions,
+      'model-relay',
+    )
+  })
+
+  test(`vault CacheKeep prewarm 401 reports only the final record when the ${scenario.outcome}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+    })
+    let storage: Awaited<ReturnType<typeof runtime.read>>['policyStorage']
+    try {
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+      }))
+      storage = (await runtime.read()).policyStorage
+    } finally {
+      runtime.close()
+    }
+    const upstream = final401Upstream(fixture, scenario)
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      return url.includes('/v1/messages')
+        ? upstream.handle(init)
+        : fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
+    const cacheKeep: unknown = Reflect.get(plugin, '__cacheKeepManager')
+    if (!(cacheKeep instanceof CacheKeepManager))
+      throw new Error('Native host CacheKeep manager is unavailable')
+    const target = {
+      sessionId: 'synthetic-final-401-session',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers({ 'content-type': 'application/json' }),
+      bodyText: cacheKeepPrewarmBody,
+      oauthAccountId: 'main',
+    }
+    cacheKeep.track({ ...target, storage, cacheMode: 'hybrid' })
+    const decisions = await scoped401Decisions(() =>
+      cacheKeep.prewarmNow({ ...target, isSubagent: false }),
+    )
+    expectFinal401Record(
+      fixture,
+      scenario,
+      upstream.wire,
+      decisions,
+      'cachekeep',
+    )
+  })
+
+  test(`vault Prime 401 reports only the final record when the ${scenario.outcome}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    await enablePrime(fixture)
+    const upstream = final401Upstream(fixture, scenario)
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (url.includes('/api/oauth/usage')) return primeWindows()
+      return url.includes('/v1/messages')
+        ? upstream.handle(init)
+        : fixture.fetchProvider(input, init)
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    const decisions = await tickPrime(plugin)
+    expectFinal401Record(fixture, scenario, upstream.wire, decisions, 'prime')
+  })
+
+  test(`vault Prime quota preflight 401 reports only the final record when the ${scenario.outcome}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    await enablePrime(fixture)
+    const usage = final401Upstream(fixture, scenario)
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (!url.includes('/api/oauth/usage'))
+        return fixture.fetchProvider(input, init)
+      const response = await usage.handle(init)
+      return response.ok ? primeWindows() : response
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+    })
+    const decisions = await tickPrime(plugin)
+    expectFinal401Record(
+      fixture,
+      scenario,
+      usage.wire,
+      decisions,
+      'quota-profile',
+    )
+  })
+}
