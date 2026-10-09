@@ -38,7 +38,6 @@ import {
   FallbackAccountManager,
   getAccountStatePath,
   getClaudeCodeIdentityForVerifiedAccount,
-  getOrCreatePrimeAuthLineageId,
   hashRefreshToken,
   isCustodyTombstoneOAuth,
   isOAuthAccount,
@@ -547,9 +546,12 @@ function syntheticFallbackAccountUuid(index: number) {
  * account, are re-keyed to that UUID, as the legacy writer would have keyed
  * them had it known the account.
  */
-function bindPoolAccounts(storage: AccountStorage): AccountStorage {
-  if (storage.quota?.mainQuota) bindMainQuotaToAccount(storage)
-  else bindMainAccount(storage)
+function bindPoolAccounts(
+  storage: AccountStorage,
+  access = 'sk-ant-oat01-main-access',
+): AccountStorage {
+  if (storage.quota?.mainQuota) bindMainQuotaToAccount(storage, access)
+  else bindMainAccount(storage, access)
   storage.accounts.forEach((account, index) => {
     if (account.type !== 'oauth') return
     const uuid =
@@ -806,8 +808,17 @@ async function legacyAccountFiles(storage: AccountStorage) {
   process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = statePath
   try {
     await saveAccounts(storage, configPath)
-    if (storage.main?.profile)
-      await saveAccountState(storage, configPath, { mainProfile: true })
+    if (
+      storage.main?.profile ||
+      storage.prime?.mainAuthLineageId ||
+      storage.prime?.main
+    )
+      await saveAccountState(storage, configPath, {
+        mainProfile: Boolean(storage.main?.profile),
+        mainPrime: Boolean(
+          storage.prime?.mainAuthLineageId || storage.prime?.main,
+        ),
+      })
     return {
       config: await readFile(configPath, 'utf8'),
       state: await readFile(statePath, 'utf8').catch(() => undefined),
@@ -1061,7 +1072,10 @@ async function replacePoolMainLogin(
 ) {
   const pool = migratedPool
   if (!pool) throw new Error('This test has no migrated pool')
-  if (options.sameAccount) mainAccountIssues(credential.access)
+  if (options.sameAccount) {
+    mainAccountIssues(credential.access)
+    poolLogins.push({ ...credential, identity: poolMainIdentity() })
+  }
   const runtime = createNativeAccountRuntime({
     paths: pool.paths,
     host: 'opencode',
@@ -18906,242 +18920,251 @@ describe('claude-prime direct request', () => {
   })
 
   test('main refresh through the plugin keeps the lineage and prime claim', async () => {
-    const now = Date.now() - 60_000
-    const past = now - 120_000
+    const past = Date.now() - 180_000
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(past).toISOString(),
-              checkedAt: 1,
+      bindPoolAccounts(
+        createFallbackStorage({
+          accounts: [],
+          prime: { enabled: true },
+          quota: {
+            ...createFallbackStorage().quota,
+            mainQuota: {
+              five_hour: {
+                usedPercent: 0,
+                remainingPercent: 100,
+                resetsAt: new Date(past).toISOString(),
+                checkedAt: 1,
+              },
             },
           },
-          mainQuotaCheckedAt: 1,
-          mainQuotaToken: 'fp-main',
-        },
-        prime: { enabled: true },
-      }),
-    )
-
-    const intervalHandlers: Array<() => void> = []
-    const setIntervalMock = mock((handler: () => void) => {
-      intervalHandlers.push(handler)
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-    let hostAuth = {
-      type: 'oauth',
-      access: 'sk-ant-oat01-main-access-a',
-      refresh: 'main-refresh-a',
-      expires: Date.now() + 5 * 60 * 60_000,
-    }
-    const mockClient = createMockClient()
-    const mainRefreshPublished = deferred()
-    let lineageObservedBeforePublish: string | undefined
-    let lineageObservedDuringPublish: string | undefined
-    ;(mockClient.auth as any).set = mock(
-      async (input: {
-        body: {
-          type: string
-          access: string
-          refresh: string
-          expires: number
-        }
-      }) => {
-        lineageObservedBeforePublish = await getOrCreatePrimeAuthLineageId(
-          'main',
-          process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-        )
-        hostAuth = { ...input.body }
-        lineageObservedDuringPublish = await getOrCreatePrimeAuthLineageId(
-          'main',
-          process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-        )
-        mainRefreshPublished.resolve()
+        }),
+        'sk-ant-oat01-main-access-a',
+      ),
+      {
+        access: 'sk-ant-oat01-main-access-a',
+        refresh: 'main-refresh-a',
+        expires: Date.now() + 5 * 60 * 60_000,
       },
     )
-    let sends = 0
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'main-refresh-b',
-              access_token: 'sk-ant-oat01-main-access-b',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      if (url.includes('/v1/messages')) {
-        sends += 1
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              usage: { input_tokens: 20, output_tokens: 1 },
-            }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          ),
-        )
-      }
-      if (url.includes('/api/oauth/usage')) {
-        return freshPrimeQuotaResponse({
-          five_hour: {
-            utilization: 0,
-            resets_at: new Date(now - 1_000).toISOString(),
-          },
-        })
-      }
-      return Promise.resolve(new Response('not-mocked', { status: 599 }))
-    }) as unknown as typeof fetch
-
-    const plugin = await getPlugin(mockClient, undefined, {
-      setInterval: setIntervalMock,
+    mainAccountIssues('sk-ant-oat01-main-access-b')
+    let primeSends = 0
+    let tokenExchanges = 0
+    const foregroundAuthorizations: Array<string | null> = []
+    globalThis.fetch = mock(
+      withNativeBootstrap(
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/v1/oauth/token')) {
+            tokenExchanges += 1
+            return Promise.resolve(
+              Response.json({
+                access_token: 'sk-ant-oat01-main-access-b',
+                refresh_token: 'main-refresh-b',
+                expires_in: 5 * 60 * 60,
+              }),
+            )
+          }
+          if (url.includes('/api/oauth/usage'))
+            return freshPrimeQuotaResponse({
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(past).toISOString(),
+              },
+            })
+          if (url.includes('/v1/messages')) {
+            const body = JSON.parse(String(init?.body))
+            if (body.model === 'claude-haiku-4-5' && body.max_tokens === 1) {
+              primeSends += 1
+              return Promise.resolve(
+                Response.json({
+                  usage: { input_tokens: 20, output_tokens: 1 },
+                }),
+              )
+            }
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            foregroundAuthorizations.push(authorization)
+            return Promise.resolve(
+              new Response('{}', {
+                status:
+                  authorization === 'Bearer sk-ant-oat01-main-access-a'
+                    ? 401
+                    : 200,
+              }),
+            )
+          }
+          throw new Error(`Unexpected test endpoint: ${url}`)
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-main-access-a',
+          refresh: 'main-refresh-a',
+          expires: Date.now() + 5 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const manager = (
+      plugin as unknown as { __primeManager: { tick(): Promise<void> } }
+    ).__primeManager
+    await manager.tick()
+    const before = (await readAccountStorage())?.prime?.mainAuthLineageId
+    expect(before).toMatch(/^[0-9a-f-]{36}$/)
+    expect(tokenExchanges).toBe(0)
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
     })
-    await plugin.auth.loader(() => Promise.resolve(hostAuth), { models: {} })
-    const manager = (plugin as any).__primeManager
+    expect(response.status).toBe(200)
+    expect(tokenExchanges).toBe(1)
+    expect(foregroundAuthorizations).toEqual([
+      'Bearer sk-ant-oat01-main-access-a',
+      'Bearer sk-ant-oat01-main-access-b',
+    ])
+    expect(await poolMainAccess()).toBe('sk-ant-oat01-main-access-b')
     await manager.tick()
-    const before = JSON.parse(
-      await readFile(getAccountStatePath(), 'utf8'),
-    ) as {
-      main?: {
-        primeAuthLineageId?: string
-        primeAuthLineageRefreshTokenFingerprint?: string
-      }
-    }
-
-    hostAuth.expires = Date.now() - 1
-    const mainRefreshHandler = intervalHandlers.at(-1)
-    expect(mainRefreshHandler).toBeDefined()
-    mainRefreshHandler!()
-    await withDeadlockGuard(
-      mainRefreshPublished.promise,
-      4_000,
-      'main background refresh did not publish rotated auth',
+    expect(primeSends).toBe(1)
+    expect((await readAccountStorage())?.prime?.mainAuthLineageId).toBe(before)
+    await expectHostActivationNonSecret(
+      'sk-ant-oat01-main-access-a',
+      'sk-ant-oat01-main-access-b',
+      'main-refresh-a',
+      'main-refresh-b',
     )
-    await waitForAccountStorage(
-      (storage) =>
-        hostAuth.access === 'sk-ant-oat01-main-access-b' &&
-        storage?.refresh?.mainRefreshLeaseId === undefined,
-    )
-    await manager.tick()
-
-    const after = JSON.parse(
-      await readFile(getAccountStatePath(), 'utf8'),
-    ) as typeof before
-    expect(sends).toBe(1)
-    expect(lineageObservedBeforePublish).toBe(before.main?.primeAuthLineageId)
-    expect(lineageObservedDuringPublish).toBe(before.main?.primeAuthLineageId)
-    expect(after.main?.primeAuthLineageId).toBe(before.main?.primeAuthLineageId)
-    expect(after.main?.primeAuthLineageRefreshTokenFingerprint).toBeUndefined()
   })
 
-  test('a main refresh lease adopter preserves the legacy lineage binding', async () => {
+  test('a late main 401 adopts externally rotated credentials and preserves the imported Prime lineage', async () => {
     const lineage = 'main-lineage-a'
     const refreshToken = 'main-refresh-a'
-    const storage = createFallbackStorage({
-      accounts: [],
-      refresh: {
-        enabled: true,
-        refreshBeforeExpiryMinutes: 30,
-        mainRefreshLeaseId: 'other-process',
-        mainRefreshLeaseUntil: Date.now() + 60_000,
-        mainRefreshLeaseTokenHash: hashRefreshToken(refreshToken),
+    await useTempAccountFile(
+      bindMainAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: { ...createFallbackStorage().quota, enabled: false },
+          refresh: {
+            enabled: true,
+            refreshBeforeExpiryMinutes: 30,
+            mainRefreshLeaseId: 'other-process',
+            mainRefreshLeaseUntil: Date.now() + 60_000,
+            mainRefreshLeaseTokenHash: hashRefreshToken(refreshToken),
+          },
+          prime: {
+            enabled: true,
+            mainAuthLineageId: lineage,
+            mainAuthLineageRefreshTokenFingerprint:
+              tokenFingerprint(refreshToken),
+          },
+        }),
+        'sk-ant-oat01-main-access-a',
+      ),
+      {
+        access: 'sk-ant-oat01-main-access-a',
+        refresh: refreshToken,
+        expires: Date.now() + 5 * 60 * 60_000,
       },
-      prime: {
-        enabled: true,
-        mainAuthLineageId: lineage,
-        mainAuthLineageRefreshTokenFingerprint: tokenFingerprint(refreshToken),
-      },
-    })
-    await useTempAccountFile(storage)
-    await saveAccountState(storage, process.env.OPENCODE_ANTHROPIC_AUTH_FILE, {
-      mainRefresh: true,
-      mainPrime: true,
-    })
-
-    let hostAuth = {
-      type: 'oauth',
-      access: 'sk-ant-oat01-main-access-a',
-      refresh: refreshToken,
-      expires: Date.now() + 5 * 60 * 60_000,
-    }
-    let observedExpiredRefresh!: () => void
-    const expiredRefreshRead = new Promise<void>((resolve) => {
-      observedExpiredRefresh = resolve
-    })
-    let expiredReads = 0
-    const getAuth = () => {
-      // The request reads auth once on entry, then re-reads before checking the
-      // other process's refresh lease. A wall-clock sleep cannot guarantee it
-      // reached that second read under a busy test runner.
-      if (hostAuth.expires < Date.now() && ++expiredReads === 2) {
-        observedExpiredRefresh()
-      }
-      return Promise.resolve({ ...hostAuth })
-    }
-    let observedAuthorization: string | null = null
+    )
     globalThis.fetch = mock(
-      withNativeAdmission((_input: any, init?: RequestInit) => {
-        observedAuthorization = new Headers(init?.headers).get('authorization')
-        return Promise.resolve(
-          new Response('{}', {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          }),
-        )
-      }),
+      withNativeAdmission(() => Response.json({})),
     ) as unknown as typeof fetch
-
-    const plugin = await getPlugin()
-    try {
-      const result = await plugin.auth.loader(getAuth, { models: {} })
-      hostAuth.expires = Date.now() - 1
-      const request = result.fetch(MESSAGES_URL, EMPTY_POST)
-      try {
-        await withDeadlockGuard(
-          expiredRefreshRead,
-          4_000,
-          'request did not read the expiring token before adopting the refresh lease',
-        )
-        hostAuth = {
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access-b',
-          refresh: 'main-refresh-b',
-          expires: Date.now() + 60 * 60_000,
-        }
-        const response = await request
-
-        expect(response.status).toBe(200)
-        expect(String(observedAuthorization)).toContain(
-          'sk-ant-oat01-main-access-b',
-        )
-        const state = JSON.parse(
-          await readFile(getAccountStatePath(), 'utf8'),
-        ) as {
-          main?: {
-            primeAuthLineageId?: string
-            primeAuthLineageRefreshTokenFingerprint?: string
+    expect(await poolMainAccess()).toBe('sk-ant-oat01-main-access-a')
+    const firstRequest = bodyLifetime().gate()
+    const releaseRejectedResponse = bodyLifetime().gate()
+    const controller = new AbortController()
+    let reachedModel = false
+    const authorizations: Array<string | null> = []
+    let pluginTokenExchanges = 0
+    globalThis.fetch = mock(
+      withNativeBootstrap(
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/v1/oauth/token')) {
+            pluginTokenExchanges += 1
+            throw new Error(
+              'The plugin must adopt the externally rotated token',
+            )
           }
-        }
-        expect(state.main?.primeAuthLineageId).toBe(lineage)
-        expect(state.main?.primeAuthLineageRefreshTokenFingerprint).toBe(
-          tokenFingerprint(refreshToken),
+          if (url.includes('/v1/messages')) {
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            authorizations.push(authorization)
+            if (authorization === 'Bearer sk-ant-oat01-main-access-a') {
+              reachedModel = true
+              firstRequest.open()
+              return releaseRejectedResponse.wait.then(
+                () => new Response('{}', { status: 401 }),
+              )
+            }
+            return Promise.resolve(new Response('{}', { status: 200 }))
+          }
+          if (url.includes('/api/oauth/usage'))
+            return freshPrimeQuotaResponse({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            })
+          throw new Error(`Unexpected test endpoint: ${url}`)
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-main-access-a',
+          refresh: refreshToken,
+          expires: Date.now() + 5 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const request = result.fetch(MESSAGES_URL, {
+      ...EMPTY_POST,
+      signal: controller.signal,
+    })
+    try {
+      await Promise.race([
+        firstRequest.wait,
+        request.then(() => {
+          throw new Error('Request completed before the rejection fixture')
+        }),
+      ])
+      if (!reachedModel)
+        throw new Error(
+          'Model request did not reach the fixture before cancellation',
         )
-      } finally {
-        await request.catch(() => {})
-      }
+      await refreshPoolMainElsewhere({
+        access: 'sk-ant-oat01-main-access-b',
+        refresh: 'main-refresh-b',
+        expires: Date.now() + 5 * 60 * 60_000,
+      })
+      releaseRejectedResponse.open()
+      expect((await request).status).toBe(200)
+      expect(authorizations).toEqual([
+        'Bearer sk-ant-oat01-main-access-a',
+        'Bearer sk-ant-oat01-main-access-b',
+      ])
+      expect(pluginTokenExchanges).toBe(0)
+      expect((await readAccountStorage())?.prime?.mainAuthLineageId).toBe(
+        lineage,
+      )
+      await expectHostActivationNonSecret(
+        'sk-ant-oat01-main-access-a',
+        'sk-ant-oat01-main-access-b',
+        refreshToken,
+        'main-refresh-b',
+      )
     } finally {
-      await plugin.dispose?.()
+      controller.abort()
+      releaseRejectedResponse.open()
+      await request.catch(() => {})
     }
   })
 
@@ -19914,80 +19937,82 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
       force: true,
     }).catch(() => {})
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'work-alt',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fb-access',
-            refresh: 'fb-refresh',
-            // expires must exceed the 4h refresh-before-expiry window so
-            // the token is NOT marked as needing refresh (otherwise the
-            // refresh path would make a second fetch to /v1/oauth/token).
-            expires: Date.now() + 10 * 60 * 60 * 1000,
-            quota: {
+      bindPoolAccounts(
+        createFallbackStorage({
+          accounts: [
+            {
+              id: 'work-alt',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fb-access',
+              refresh: 'fb-refresh',
+              // expires must exceed the 4h refresh-before-expiry window so
+              // the token is NOT marked as needing refresh (otherwise the
+              // refresh path would make a second fetch to /v1/oauth/token).
+              expires: Date.now() + 10 * 60 * 60 * 1000,
+              quota: {
+                five_hour: {
+                  usedPercent: 0,
+                  remainingPercent: 100,
+                  resetsAt: new Date(past).toISOString(),
+                  // A one-minute-old reading is within the five-minute poll
+                  // interval. Startup must not start another usage request;
+                  // this test counts only the poll triggered by Prime.
+                  checkedAt: Date.now() - 60 * 1000,
+                },
+              },
+            },
+          ],
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
               five_hour: {
                 usedPercent: 0,
                 remainingPercent: 100,
-                resetsAt: new Date(past).toISOString(),
-                // Recent (1min) so the background refresh's
-                // `isFallbackStale` guard does NOT fire a competing
-                // refresh in the same millisecond — without this the
-                // prime fresh-check's baseline equals the fetched
-                // checkedAt and `fresh` is false.
-                checkedAt: Date.now() - 60 * 1000,
+                resetsAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(),
+                checkedAt: Date.now(),
               },
             },
+            mainQuotaCheckedAt: Date.now(),
+            mainQuotaToken: 'sk-ant-oat01-main-access',
           },
-        ],
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: {
-              usedPercent: 0,
-              remainingPercent: 100,
-              resetsAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(),
-              checkedAt: Date.now(),
-            },
-          },
-          mainQuotaCheckedAt: Date.now(),
-          mainQuotaToken: 'sk-ant-oat01-main-access',
-        },
-        prime: { enabled: true },
-      }),
+          prime: { enabled: true },
+        }),
+      ),
     )
 
     let usageCalls = 0
     let primeCalls = 0
-    globalThis.fetch = mock((input: any) => {
-      const url = typeof input === 'string' ? input : input.url
-      if (url.includes('/v1/messages')) {
-        primeCalls += 1
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({ usage: { input_tokens: 20, output_tokens: 1 } }),
-            { status: 200, headers: { 'content-type': 'application/json' } },
-          ),
-        )
-      }
-      if (url.includes('/api/oauth/usage')) {
-        usageCalls += 1
-        return freshPrimeQuotaResponse(
-          {
-            five_hour: {
-              utilization: 0,
-              resets_at: new Date(Date.now() - 1_000).toISOString(),
-              checked_at: Date.now(),
+    globalThis.fetch = mock(
+      withNativeBootstrap((input: Parameters<typeof fetch>[0]) => {
+        const url = extractUrl(input)
+        if (url.includes('/v1/messages')) {
+          primeCalls += 1
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({ usage: { input_tokens: 20, output_tokens: 1 } }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            ),
+          )
+        }
+        if (url.includes('/api/oauth/usage')) {
+          usageCalls += 1
+          return freshPrimeQuotaResponse(
+            {
+              five_hour: {
+                utilization: 0,
+                resets_at: new Date(Date.now() - 1_000).toISOString(),
+                checked_at: Date.now(),
+              },
             },
-          },
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        )
-      }
-      return Promise.resolve(new Response('not-mocked', { status: 599 }))
-    }) as unknown as typeof fetch
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        return Promise.resolve(new Response('not-mocked', { status: 599 }))
+      }),
+    ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
     await plugin.auth.loader(
