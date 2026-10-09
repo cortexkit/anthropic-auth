@@ -3,6 +3,8 @@ import type {
   CommandApplyRequest,
   KnobValues,
 } from '@cortexkit/common-auth/commands'
+import { authorize, exchange } from '../auth.ts'
+import { TOKEN_URL } from '../constants.ts'
 import type { NativeMenuDispatchRequest } from '../native-menu-executor.ts'
 import type {
   NativeMenuActionId,
@@ -540,5 +542,289 @@ describe('native UI contract', () => {
     expect(result.code).toBe('execution-failed')
     expect(JSON.stringify(result)).not.toContain('secret-')
     expect(result.menu.sections[0]?.lines[0]).toContain('status unavailable')
+  })
+})
+
+describe('OAuth sign-in link', () => {
+  type TokenCall = { url: string; body: Record<string, unknown> }
+
+  // Replace fetch so only the token endpoint answers, from a local fixture.
+  // Any other URL throws, so these tests never reach the network.
+  async function withTokenFixture<T>(
+    run: (calls: TokenCall[]) => Promise<T>,
+  ): Promise<T> {
+    const calls: TokenCall[] = []
+    const nativeFetch = globalThis.fetch
+    const tokenFetch: typeof fetch = Object.assign(
+      async (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        const url = input instanceof Request ? input.url : String(input)
+        if (url !== TOKEN_URL)
+          throw new Error(`unexpected network request: ${url}`)
+        calls.push({ url, body: JSON.parse(String(init?.body)) })
+        return Response.json({
+          access_token: 'synthetic-access',
+          refresh_token: 'synthetic-refresh',
+          expires_in: 3600,
+        })
+      },
+      { preconnect: nativeFetch.preconnect },
+    )
+    globalThis.fetch = tokenFetch
+    try {
+      return await run(calls)
+    } finally {
+      globalThis.fetch = nativeFetch
+    }
+  }
+
+  // Mirrors the OpenCode host: start keeps the real authorize() result as
+  // pending sign-in state and shows its URL; finish exchanges the pasted
+  // code#state against that pending state.
+  function signInMenu(
+    statusText: (url: string | undefined) => string = () => 'public',
+  ) {
+    let pending: Awaited<ReturnType<typeof authorize>> | undefined
+    const menu = createNativeUi({
+      host: 'opencode',
+      interactive: true,
+      dispatch: async (request) => {
+        if (request.action === 'add-oauth-start') {
+          pending = await authorize('max')
+          return {
+            ok: true,
+            text: `Open this URL in your browser:\n${pending.url}`,
+          }
+        }
+        if (request.action === 'add-oauth-finish' && pending) {
+          const result = await exchange(
+            request.values.code,
+            pending.verifier,
+            pending.redirectUri,
+            pending.state,
+          )
+          return result.type === 'success'
+            ? { ok: true, text: 'OAuth account added.' }
+            : {
+                ok: true,
+                text: 'OAuth authentication failed. Please check the code and try again.',
+              }
+        }
+        return { ok: false, text: 'unexpected' }
+      },
+      readStatus: async (_command, context) => {
+        const text = statusText(pending?.url)
+        context.notify(text, 'info')
+        return text
+      },
+    })
+    return { menu, pending: () => pending }
+  }
+
+  test('successful start shows the real authorize URL unchanged and finish correlates its state', async () => {
+    await withTokenFixture(async (calls) => {
+      const notifications: string[] = []
+      const session = {
+        sessionId: 'oauth-session',
+        notify(text: string) {
+          notifications.push(text)
+        },
+      }
+      const { menu, pending } = signInMenu((url) =>
+        url ? `Pending sign-in: ${url}` : 'No pending sign-in',
+      )
+      const started = await menu.apply(
+        {
+          command: 'claude',
+          sectionId: 'Accounts',
+          actionId: 'add-oauth-start',
+          values: {},
+        },
+        session,
+      )
+      const auth = pending()
+      expect(auth).toBeDefined()
+      if (!auth) return
+      expect(started.ok).toBe(true)
+      expect(started.text).toBe(`Open this URL in your browser:\n${auth.url}`)
+      const shown = new URL(started.text.split('\n')[1] ?? '')
+      expect(shown.searchParams.get('state')).toBe(auth.state)
+      expect(shown.searchParams.get('code_challenge')).toMatch(
+        /^[A-Za-z0-9_-]{43}$/,
+      )
+      // The PKCE verifier stays with the host; only its public challenge shows.
+      expect(JSON.stringify({ started, notifications })).not.toContain(
+        auth.verifier,
+      )
+      // Only the result text is exempt: status lines and notifications that
+      // quote the same link still have its state masked.
+      expect(JSON.stringify(started.menu)).toContain('***REDACTED***')
+      expect(JSON.stringify(started.menu)).not.toContain(auth.state)
+      expect(notifications.length).toBeGreaterThan(0)
+      for (const text of notifications) expect(text).not.toContain(auth.state)
+
+      // A person pastes the code with the state copied from the shown URL.
+      const finished = await menu.apply(
+        {
+          command: 'claude',
+          sectionId: 'Accounts',
+          actionId: 'add-oauth-finish',
+          values: {
+            code: `synthetic-code#${shown.searchParams.get('state')}`,
+          },
+        },
+        session,
+      )
+      expect(finished.text).toBe('OAuth account added.')
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.body).toMatchObject({
+        code: 'synthetic-code',
+        state: auth.state,
+        grant_type: 'authorization_code',
+        redirect_uri: auth.redirectUri,
+        code_verifier: auth.verifier,
+      })
+    })
+  })
+
+  // A menu whose capability answers every action with the given outcome.
+  function fixedOutcome(outcome: { ok: boolean; text: string }) {
+    let dispatches = 0
+    const menu = createNativeUi({
+      host: 'opencode',
+      interactive: true,
+      dispatch: async () => {
+        dispatches++
+        return outcome
+      },
+      readStatus: async () => 'public',
+    })
+    return { menu, dispatches: () => dispatches }
+  }
+
+  async function startText(
+    text: string,
+    ok = true,
+    actionId: NativeMenuActionId = 'add-oauth-start',
+  ): Promise<string> {
+    const { menu } = fixedOutcome({ ok, text })
+    const result = await menu.apply(
+      {
+        command: 'claude',
+        sectionId: fixtures[actionId][0],
+        actionId,
+        values: fixtures[actionId][1],
+      },
+      invocation,
+    )
+    return result.text
+  }
+
+  test('text around a valid link and any changed or untrusted link stay redacted', async () => {
+    const auth = await authorize('max')
+    const state = auth.state
+    const hex = 'a'.repeat(40)
+    const around = await startText(
+      `Open this URL:\n${auth.url}\nBearer synthetic-bearer sk-ant-synthetic-key ${hex}`,
+    )
+    expect(around).toBe(
+      `Open this URL:\n${auth.url}\n***REDACTED*** ***REDACTED*** ***REDACTED***`,
+    )
+
+    const variant = (change: (url: URL) => void) => {
+      const url = new URL(auth.url)
+      change(url)
+      return url.href
+    }
+    const untrusted = {
+      'other host': auth.url.replace(
+        'https://claude.com/',
+        'https://claude.com.example.invalid/',
+      ),
+      'plain http': auth.url.replace('https://', 'http://'),
+      'explicit port': auth.url.replace(
+        'https://claude.com/',
+        'https://claude.com:8443/',
+      ),
+      'embedded credentials': auth.url.replace(
+        'https://',
+        'https://person:pw@',
+      ),
+      'other path': auth.url.replace('/cai/oauth/authorize', '/oauth/token'),
+      fragment: `${auth.url}#token=synthetic`,
+      'extra secret parameter': variant((url) =>
+        url.searchParams.set('client_secret', 'synthetic-client-secret'),
+      ),
+      'duplicate state': variant((url) =>
+        url.searchParams.append('state', 'b'.repeat(32)),
+      ),
+      'reflected callback': variant((url) =>
+        url.searchParams.set('redirect_uri', 'https://example.invalid/cb'),
+      ),
+      'other client': variant((url) =>
+        url.searchParams.set('client_id', 'synthetic-client'),
+      ),
+      'unexpected state shape': variant((url) =>
+        url.searchParams.set('state', `${state}${state}`),
+      ),
+      'missing challenge': variant((url) =>
+        url.searchParams.delete('code_challenge'),
+      ),
+    }
+    for (const [name, link] of Object.entries(untrusted)) {
+      const text = await startText(`Open this URL:\n${link}`)
+      expect({ name, leaked: text.includes(state) }).toEqual({
+        name,
+        leaked: false,
+      })
+    }
+    // Two different links cannot both be the pending login; neither shows.
+    const second = await authorize('max')
+    const both = await startText(`${auth.url}\n${second.url}`)
+    expect(both).not.toContain(state)
+    expect(both).not.toContain(second.state)
+  })
+
+  test('a valid link is masked outside a successful checked OAuth start', async () => {
+    const auth = await authorize('max')
+    const text = `Open this URL in your browser:\n${auth.url}`
+    expect(await startText(text, false)).not.toContain(auth.state)
+    for (const actionId of ['add-oauth-finish', 'cache-on'] as const)
+      expect(await startText(text, true, actionId)).not.toContain(auth.state)
+
+    const { menu, dispatches } = fixedOutcome({ ok: true, text })
+    const request = {
+      command: 'claude',
+      sectionId: 'Accounts',
+      actionId: 'add-oauth-start',
+    }
+    const refusals = [
+      // An OAuth start takes no input, so submitted values are refused.
+      await menu.apply(
+        { ...request, values: { code: 'synthetic-code' } },
+        invocation,
+      ),
+      await menu.apply({ ...request, sessionId: 'other-session' }, invocation),
+      await menu.apply({ ...request, actionId: 'add-oauth-begin' }, invocation),
+      await menu.apply({ ...request, sectionId: 'Quota' }, invocation),
+    ]
+    expect(refusals.map((result) => result.code)).toEqual([
+      'unknown-parameter',
+      'invalid-request',
+      'invalid-request',
+      'invalid-request',
+    ])
+    expect(dispatches()).toBe(0)
+    const headless = createNativeUi({
+      host: 'opencode',
+      interactive: false,
+      dispatch: async () => ({ ok: true, text }),
+      readStatus: async () => 'public',
+    })
+    expect((await headless.apply(request, invocation)).code).toBe(
+      'interactive-required',
+    )
   })
 })
