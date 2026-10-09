@@ -613,6 +613,12 @@ export function createNativeAccountRuntime(
         account.type !== 'oauth'
       )
         return { status: 'refused', reason: 'row-ineligible', persisted: false }
+      if (account.state === 'unsupported-access')
+        return {
+          status: 'refused',
+          reason: 'unsupported-access',
+          persisted: false,
+        }
       const metadata = await readNativeRuntime(paths.runtime, paths.storageId)
       const previous =
         metadata.status === 'ready'

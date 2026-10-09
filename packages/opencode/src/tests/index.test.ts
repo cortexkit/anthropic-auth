@@ -37,7 +37,7 @@ import {
   extractBillingHeaderCCH,
   FallbackAccountManager,
   getAccountStatePath,
-  getClaudeCodeIdentity,
+  getClaudeCodeIdentityForVerifiedAccount,
   getOrCreatePrimeAuthLineageId,
   hashRefreshToken,
   isCustodyTombstoneOAuth,
@@ -1452,6 +1452,22 @@ async function expectNonOatMainRefused(access: string) {
   ).rejects.toThrow(/API key/i)
   expect(modelRequests).toEqual([])
   expect(await readFeedEntries()).toEqual([])
+  const runtime = createNativeAccountRuntime({
+    paths: migratedPool!.paths,
+    host: 'opencode',
+  })
+  try {
+    expect(await runtime.authorizeLocal('main')).toEqual({
+      status: 'refused',
+      reason: 'unsupported-access',
+      persisted: false,
+    })
+    expect(
+      (await readAccountStorage())?.refresh?.mainLastRefreshError,
+    ).toBeUndefined()
+  } finally {
+    runtime.close()
+  }
 }
 
 /**
@@ -2205,6 +2221,12 @@ describe('quota header feed integration', () => {
     const fallbackAccess = `sk-ant-oat-${randomUUID()}`
     await useTempAccountFile(
       createFallbackStorage({
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+        },
         quotaHeaderFeed: { enabled: true },
         accounts: [
           {
@@ -2230,6 +2252,32 @@ describe('quota header feed integration', () => {
         ],
       }),
     )
+    if (persistedUuid) {
+      // First confirm the token's account UUID through the bootstrap endpoint.
+      // Its saved validation then permits serving when a later account lookup
+      // returns no UUID; a stored UUID alone must never authorize the token.
+      const answer = withNativeAdmission(() => Response.json({}))
+      globalThis.fetch = Object.assign(
+        mock(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const response = await answer(input, init)
+          if (!(response instanceof Response))
+            throw new Error('Admission fixture must return a Response')
+          return response
+        }),
+        { preconnect: originalFetch.preconnect },
+      )
+      const runtime = createNativeAccountRuntime({
+        paths: migratedPool!.paths,
+        host: 'opencode',
+      })
+      try {
+        expect((await runtime.authorizeLocal('fallback-1')).status).toBe(
+          'usable',
+        )
+      } finally {
+        runtime.close()
+      }
+    }
     // Answer token exchanges and the primary account's bootstrap normally.
     // Let this test control the fallback credential's bootstrap response.
     globalThis.fetch = mock(
@@ -18650,7 +18698,12 @@ describe('claude-prime direct request', () => {
     const body = JSON.parse(bodyText)
     const canonicalBody = await rewriteRequestBody(
       JSON.stringify(buildPrimeRequestBody()),
-      { identity: getClaudeCodeIdentity('sk-ant-oat01-main-access') },
+      {
+        identity: getClaudeCodeIdentityForVerifiedAccount(
+          syntheticMainAccountUuid,
+          syntheticMainAccountUuid,
+        ),
+      },
     )
     expect(bodyText).toBe(canonicalBody)
     expect(body.model).toBe('claude-haiku-4-5')

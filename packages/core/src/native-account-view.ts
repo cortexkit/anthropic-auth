@@ -516,6 +516,11 @@ export function projectNativeAccountViews(input: {
       id,
       type: row.type,
       source: 'local',
+      ...(row.credential?.type === 'oauth' &&
+      row.credential.access &&
+      !row.credential.access.startsWith('sk-ant-oat')
+        ? { state: 'unsupported-access' }
+        : {}),
       enabled: row.enabled && row.candidate,
       label: row.label,
       addedAt: row.addedAt,

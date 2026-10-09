@@ -268,3 +268,26 @@ for (const quotaIdentity of [
     }
   })
 }
+
+for (const access of ['sk-ant-oat01-synthetic', 'synthetic-api-key', '']) {
+  test(`local projection classifies unsupported access without exposing it (${access ? (access.startsWith('sk-ant-oat') ? 'oauth' : 'unsupported') : 'missing'})`, () => {
+    const credential = {
+      type: 'oauth' as const,
+      access,
+      refresh: 'synthetic-refresh',
+      expires: 1000,
+    }
+    const snapshot = projectNativeAccountViews({
+      paths,
+      rows: [{ ...row, credential }],
+      settings: { mainAccountId: row.id },
+    })
+    expect(snapshot.accounts[0]?.state).toBe(
+      access && !access.startsWith('sk-ant-oat')
+        ? 'unsupported-access'
+        : undefined,
+    )
+    expect(JSON.stringify(snapshot)).not.toContain('synthetic-api-key')
+    expect(JSON.stringify(snapshot)).not.toContain('synthetic-refresh')
+  })
+}

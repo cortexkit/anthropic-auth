@@ -1397,6 +1397,13 @@ const anthropicAuthPlugin = async (
       )
     }
   }
+  class NativeUnsupportedCredentialError extends Error {
+    constructor() {
+      super(
+        'Native OAuth requires a Claude Pro/Max credential. An API key belongs in OpenCode stock Anthropic authentication.',
+      )
+    }
+  }
   class NativeCredentialUnavailableError extends Error {
     constructor(
       readonly account: NativeAccountView,
@@ -1419,6 +1426,8 @@ const anthropicAuthPlugin = async (
     const account = snapshot.accounts.find(
       (candidate) => candidate.id === routeId,
     )
+    if (account?.state === 'unsupported-access')
+      throw new NativeUnsupportedCredentialError()
     if (account?.type !== 'oauth' || !account.enabled) {
       throw new Error('Native OAuth account is unavailable')
     }
@@ -5348,6 +5357,7 @@ const anthropicAuthPlugin = async (
               primarySnapshot,
             )
           } catch (error) {
+            if (error instanceof NativeUnsupportedCredentialError) throw error
             if (error instanceof NativeModelPolicyError) {
               denied = error.account
               // Recheck a stale limit for this model before moving the request
