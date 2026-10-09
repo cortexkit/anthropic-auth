@@ -3,6 +3,12 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { ProviderAccountUuid } from '../claude-code.ts'
 import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
+import {
   createNativeAccountRuntime,
   nativeAccountPolicy,
 } from '../native-account-runtime.ts'
@@ -713,4 +719,508 @@ test('cross-process remove and readd same native route and UUID creates new Prim
     await f.runtime.getOrCreateAuthLineage('main', readded.subject),
   ).not.toBe(lineage)
   expect((await f.runtime.read()).accounts[0]?.prime?.count).toBe(1)
+})
+
+/**
+ * Capture the INFO records the runtime emits on the `commands` channel. The
+ * live logger level starts at info and the previous level and sink are
+ * restored after the test. Bun runs tests with NODE_ENV=test, under which the
+ * logger delivers records only to this sink and writes no log file.
+ */
+function captureCommandLogs() {
+  expect(process.env.NODE_ENV).toBe('test')
+  const previousLevel = getLogLevel()
+  const records: LogTestRecord[] = []
+  setLogLevel('info')
+  __setLogTestSink((record) => {
+    if (record.channel === 'commands') records.push(record)
+  })
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+  })
+  return {
+    /** Records captured since the previous call, as message and payload. */
+    take() {
+      const taken = records.map(({ level, message, payload }) => ({
+        level,
+        message,
+        payload,
+      }))
+      records.length = 0
+      return taken
+    },
+  }
+}
+
+test('committed killswitch changes log once, and the thresholds payload holds only numeric threshold fields', async () => {
+  const f = await fixture()
+  const logs = captureCommandLogs()
+
+  await f.runtime.updateSettings((settings) => {
+    settings.killswitch = {
+      enabled: true,
+      main: { five_hour: 3, seven_day: 8 },
+    }
+  })
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'killswitch changed',
+      payload: { enabled: true },
+    },
+    {
+      level: 'info',
+      message: 'killswitch thresholds changed',
+      payload: { thresholds: { five_hour: 3, seven_day: 8 } },
+    },
+  ])
+
+  // Writing the same values again leaves the settings unchanged, so nothing
+  // is logged.
+  await f.runtime.updateSettings((settings) => ({
+    ...settings,
+    killswitch: { enabled: true, main: { five_hour: 3, seven_day: 8 } },
+  }))
+  expect(logs.take()).toEqual([])
+
+  // Turning the switch off keeps the thresholds, so only the switch is logged.
+  await f.runtime.updateSettings((settings) => ({
+    ...settings,
+    killswitch: { ...(settings.killswitch as object), enabled: false },
+  }))
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'killswitch changed',
+      payload: { enabled: false },
+    },
+  ])
+
+  // Settings are hand-editable JSON, so a killswitch entry may hold other
+  // fields, including secret-looking ones. Adding only such fields is not a
+  // threshold change, so nothing is logged, and the threshold logs below
+  // must not contain them either.
+  const leaks = {
+    token: 'sk-ant-leak-token',
+    note: 'Bearer leak-bearer',
+    nested: { refresh: 'leak-refresh' },
+    five_hour_text: 'leak-text',
+  }
+  await f.runtime.updateSettings((settings) => ({
+    ...settings,
+    killswitch: {
+      enabled: false,
+      main: { five_hour: 3, seven_day: 8, ...leaks },
+    },
+  }))
+  expect(logs.take()).toEqual([])
+  await f.runtime.updateSettings((settings) => ({
+    ...settings,
+    killswitch: {
+      enabled: false,
+      main: { five_hour: 4, seven_day: 'nine', '1w': 9, ...leaks },
+    },
+  }))
+  // Without main thresholds, the per-account thresholds are logged instead.
+  await f.runtime.updateSettings((settings) => ({
+    ...settings,
+    killswitch: {
+      enabled: false,
+      accounts: { 'fallback-a': { scoped: 2, ...leaks }, broken: 'leak-entry' },
+    },
+  }))
+  const thresholdLogs = logs.take()
+  expect(thresholdLogs).toEqual([
+    {
+      level: 'info',
+      message: 'killswitch thresholds changed',
+      payload: { thresholds: { five_hour: 4, '1w': 9 } },
+    },
+    {
+      level: 'info',
+      message: 'killswitch thresholds changed',
+      payload: { thresholds: { 'fallback-a': { scoped: 2 } } },
+    },
+  ])
+  expect(JSON.stringify(thresholdLogs)).not.toContain('leak')
+})
+
+test('setLoggingLevel stores the level and aligns the live logger level once, including when only the live level differs', async () => {
+  const f = await fixture()
+  const logs = captureCommandLogs()
+  const stored = async () => (await f.runtime.read()).settings.logging
+
+  // A new stored level changes the live level and is logged once.
+  await f.runtime.setLoggingLevel('debug')
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'log level changed',
+      payload: { level: 'debug' },
+    },
+  ])
+  expect(getLogLevel()).toBe('debug')
+  expect(await stored()).toEqual({ level: 'debug' })
+
+  // The record of a change to warn is written while debug is still live, so
+  // lowering the verbosity is still logged.
+  await f.runtime.setLoggingLevel('warn')
+  expect(logs.take()).toEqual([
+    { level: 'info', message: 'log level changed', payload: { level: 'warn' } },
+  ])
+  expect(getLogLevel()).toBe('warn')
+
+  // Selecting the level that is both stored and live changes nothing.
+  await f.runtime.setLoggingLevel('warn')
+  expect(logs.take()).toEqual([])
+  expect(getLogLevel()).toBe('warn')
+
+  // Something else in the process changed the live level. Writes of other
+  // settings, or of the same stored level through updateSettings, leave it.
+  setLogLevel('info')
+  await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  await f.runtime.updateSettings((settings) => {
+    settings.logging = { level: 'warn' }
+  })
+  expect(logs.take()).toEqual([])
+  expect(getLogLevel()).toBe('info')
+
+  // Selecting the stored level again brings the live level back to it.
+  await f.runtime.setLoggingLevel('warn')
+  expect(logs.take()).toEqual([
+    { level: 'info', message: 'log level changed', payload: { level: 'warn' } },
+  ])
+  expect(getLogLevel()).toBe('warn')
+  expect(await stored()).toEqual({ level: 'warn' })
+})
+
+test('refused or failed settings writes log nothing and leave the live level unchanged', async () => {
+  const f = await fixture()
+  const logs = captureCommandLogs()
+
+  // The mutator throws after editing its copy, so nothing is written.
+  await expect(
+    f.runtime.updateSettings((settings) => {
+      settings.logging = { level: 'trace' }
+      settings.killswitch = { enabled: true }
+      throw new Error('synthetic mutator failure')
+    }),
+  ).rejects.toThrow('synthetic mutator failure')
+  // The runtime refuses a settings write that would also change which account
+  // is main, so nothing is written.
+  await expect(
+    f.runtime.updateSettings((settings) => {
+      settings.logging = { level: 'trace' }
+      settings.killswitch = { enabled: true }
+      settings.mainAccountId = 'other'
+    }),
+  ).rejects.toThrow()
+  // setLoggingLevel applies nothing when its settings write fails.
+  const write = spyOn(f.runtime, 'updateSettings').mockImplementationOnce(() =>
+    Promise.reject(new Error('synthetic write failure')),
+  )
+  deferCleanup(() => write.mockRestore())
+  await expect(f.runtime.setLoggingLevel('trace')).rejects.toThrow(
+    'synthetic write failure',
+  )
+  expect(write).toHaveBeenCalledTimes(1)
+
+  expect(logs.take()).toEqual([])
+  expect(getLogLevel()).toBe('info')
+  const stored = (await f.runtime.read()).settings
+  expect(stored.logging).toBeUndefined()
+  expect(stored.killswitch).toBeUndefined()
+})
+
+test('committed account enable, disable, remove and reorder log the changed account without credential material', async () => {
+  const f = await fixture()
+  for (const [routeId, label] of [
+    ['fallback-a', 'Work'],
+    ['fallback-b', undefined],
+  ] as const)
+    await f.runtime.addApi({
+      routeId,
+      apiKey: `synthetic-api-${routeId}`,
+      ...(label && { label }),
+    })
+  const logs = captureCommandLogs()
+
+  await f.runtime.setEnabled('fallback-a', false)
+  await f.runtime.setEnabled('fallback-a', false)
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account disabled',
+      payload: { id: 'fallback-a', label: 'Work', enabled: false },
+    },
+  ])
+  await f.runtime.setEnabled('fallback-a', true)
+  await f.runtime.setEnabled('fallback-a', true)
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account enabled',
+      payload: { id: 'fallback-a', label: 'Work', enabled: true },
+    },
+  ])
+
+  const fallbackOrder = async () =>
+    (await f.runtime.read()).accounts
+      .filter((row) => row.id !== 'main')
+      .map((row) => row.id)
+  expect(await fallbackOrder()).toEqual(['fallback-a', 'fallback-b'])
+  await f.runtime.reorder(['fallback-b', 'fallback-a'], 'fallback-b')
+  expect(await fallbackOrder()).toEqual(['fallback-b', 'fallback-a'])
+  // Asking for the order that is already stored writes nothing, so only the
+  // first reorder above is logged.
+  await f.runtime.reorder(['fallback-b', 'fallback-a'], 'fallback-b')
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account reordered',
+      payload: { id: 'fallback-b', label: undefined },
+    },
+  ])
+
+  // Removing or disabling an account id that does not exist is refused, and
+  // nothing is logged.
+  await expect(f.runtime.remove('missing-route')).rejects.toThrow()
+  await expect(f.runtime.setEnabled('missing-route', false)).rejects.toThrow()
+  expect(logs.take()).toEqual([])
+
+  await f.runtime.remove('fallback-a')
+  expect(await fallbackOrder()).toEqual(['fallback-b'])
+  const removed = logs.take()
+  expect(removed).toEqual([
+    {
+      level: 'info',
+      message: 'account removed',
+      payload: { id: 'fallback-a', label: 'Work' },
+    },
+  ])
+  expect(JSON.stringify(removed)).not.toContain('synthetic-api')
+})
+
+test('only an add that creates a new account row logs account added, without credential material', async () => {
+  const f = await fixture()
+  const logs = captureCommandLogs()
+
+  await f.runtime.addApi({
+    routeId: 'fallback-a',
+    apiKey: 'synthetic-api-secret-a',
+    baseURL: 'https://example.test',
+    authHeader: 'x-api-key',
+    label: 'Work',
+  })
+  const added = logs.take()
+  expect(added).toEqual([
+    {
+      level: 'info',
+      message: 'account added',
+      payload: { id: 'fallback-a', label: 'Work', type: 'apikey' },
+    },
+  ])
+  const text = JSON.stringify(added)
+  for (const secret of ['synthetic-api-secret-a', 'example.test', 'x-api-key'])
+    expect(text).not.toContain(secret)
+
+  // Replacing the credential of an existing account id creates no account.
+  await f.runtime.addApi({
+    routeId: 'fallback-a',
+    apiKey: 'synthetic-api-secret-b',
+    replace: true,
+  })
+  // Adding a key that is already stored, under a new account id, updates the
+  // account that holds it instead of creating one.
+  await f.runtime.addApi({
+    routeId: 'fallback-dup',
+    apiKey: 'synthetic-api-secret-b',
+  })
+  // An add to an existing account id without replace is refused.
+  await expect(
+    f.runtime.addApi({ routeId: 'fallback-a', apiKey: 'synthetic-api-other' }),
+  ).rejects.toThrow()
+  expect(logs.take()).toEqual([])
+  expect(
+    (await f.runtime.read()).accounts
+      .filter((row) => row.id !== 'main')
+      .map((row) => row.id),
+  ).toEqual(['fallback-a'])
+
+  await f.runtime.loginOAuth({
+    routeId: 'fallback-oauth',
+    credential: {
+      access: 'synthetic-oauth-access',
+      refresh: 'synthetic-oauth-refresh',
+      expires: now + 3_600_000,
+    },
+  })
+  const oauth = logs.take()
+  expect(oauth).toEqual([
+    {
+      level: 'info',
+      message: 'account added',
+      payload: { id: 'fallback-oauth', label: undefined, type: 'oauth' },
+    },
+  ])
+  expect(JSON.stringify(oauth)).not.toContain('synthetic-oauth')
+})
+
+test('two writers enabling the same disabled account log one change, judged by the write rather than an earlier read', async () => {
+  const f = await fixture()
+  await f.runtime.addApi({
+    routeId: 'fallback-a',
+    apiKey: 'synthetic-api-fallback-a',
+    label: 'Work',
+  })
+  await f.runtime.setEnabled('fallback-a', false)
+  // A second account runtime shares the same credential/configuration files,
+  // representing another process.
+  const other = createNativeAccountRuntime({ paths: f.paths, host: 'opencode' })
+  deferCleanup(() => other.close())
+  const logs = captureCommandLogs()
+
+  // Writer A reads the account while it is still disabled. Before A writes,
+  // writer B enables the account completely; A's enable then changes nothing.
+  const read = f.runtime.read.bind(f.runtime)
+  let interleaved = false
+  const readSpy = spyOn(f.runtime, 'read').mockImplementation(async () => {
+    const snapshot = await read()
+    if (!interleaved) {
+      interleaved = true
+      expect(
+        snapshot.accounts.find((row) => row.id === 'fallback-a')?.enabled,
+      ).toBe(false)
+      await other.setEnabled('fallback-a', true)
+    }
+    return snapshot
+  })
+  deferCleanup(() => readSpy.mockRestore())
+  await f.runtime.setEnabled('fallback-a', true)
+  readSpy.mockRestore()
+
+  expect(interleaved).toBe(true)
+  expect(
+    (await f.runtime.read()).accounts.find((row) => row.id === 'fallback-a')
+      ?.enabled,
+  ).toBe(true)
+  // Only writer B changed the account.
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account enabled',
+      payload: { id: 'fallback-a', label: 'Work', enabled: true },
+    },
+  ])
+
+  // A change made without interference is still logged once.
+  await f.runtime.setEnabled('fallback-a', false)
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account disabled',
+      payload: { id: 'fallback-a', label: 'Work', enabled: false },
+    },
+  ])
+})
+
+test('local enable and disable log only a flag change made by their own write', async () => {
+  const f = await fixture()
+  await f.runtime.addApi({
+    routeId: 'fallback-a',
+    apiKey: 'synthetic-api-fallback-a',
+    label: 'Work',
+  })
+  const poolRow = async (id: string) => {
+    const read = await f.store.read()
+    if (read.status !== 'ready') throw new Error('Fixture pool unreadable')
+    const row = read.rows.find((row) => row.id === id)
+    if (!row) throw new Error(`Missing fixture row ${id}`)
+    return row
+  }
+  // Interrupt a credential replacement after its state write, leaving the
+  // row torn: the next write on the pool first repairs it with its own
+  // config write.
+  const tear = async (id: string) => {
+    const row = await poolRow(id)
+    const credentialEpoch = row.credentialEpoch
+    if (credentialEpoch === undefined)
+      throw new Error(`Fixture row ${id} has no credential epoch`)
+    const crashing = createNativePoolStore({
+      paths: f.paths,
+      quota: nativeQuotaCodec,
+      now: () => now,
+      onStep: async (step, info) => {
+        if (step === 'before-config-write' && info.operation === 'replace')
+          throw new Error('synthetic interrupted replace')
+      },
+    })
+    await expect(
+      crashing.replace(
+        id,
+        {
+          type: 'api',
+          apiKey: `synthetic-api-${id}-replacement`,
+          baseURL: 'https://api.anthropic.com',
+        },
+        {},
+        {
+          attribution: { credentialEpoch, identity: row.identity },
+        },
+      ),
+    ).rejects.toThrow()
+    expect((await poolRow(id)).torn).toBe(true)
+  }
+  const logs = captureCommandLogs()
+
+  // Repairing a torn, already-enabled row is the only config write; the
+  // enable itself changes nothing.
+  await tear('fallback-a')
+  await f.runtime.setEnabled('fallback-a', true)
+  expect((await poolRow('fallback-a')).torn).toBeUndefined()
+  expect(logs.take()).toEqual([])
+
+  // A torn, disabled row is repaired and then enabled: one change.
+  await f.runtime.setEnabled('fallback-a', false)
+  logs.take()
+  await tear('fallback-a')
+  await f.runtime.setEnabled('fallback-a', true)
+  expect((await poolRow('fallback-a')).enabled).toBe(true)
+  expect(logs.take()).toEqual([
+    {
+      level: 'info',
+      message: 'account enabled',
+      payload: { id: 'fallback-a', label: 'Work', enabled: true },
+    },
+  ])
+
+  // An enabled row that still carries a disabled reason: the enable writes
+  // the config to clear the reason, but the enabled flag does not change.
+  // The reason lives in the row's pool entry beside the roster row.
+  const config = JSON.parse(await readFile(f.paths.config, 'utf8'))
+  config.commonAuthPool.rows['fallback-a'].disabledReason = 'synthetic-reason'
+  await writeFile(f.paths.config, JSON.stringify(config))
+  expect((await poolRow('fallback-a')).disabledReason).toBe('synthetic-reason')
+  await f.runtime.setEnabled('fallback-a', true)
+  expect((await poolRow('fallback-a')).disabledReason).toBeUndefined()
+  expect(logs.take()).toEqual([])
+
+  // An OAuth row holding the main account's identity is stored disabled, and
+  // the store refuses to enable it: nothing is logged.
+  await f.store.add({
+    id: 'fallback-dup',
+    identity: uuid,
+    credential: {
+      type: 'oauth',
+      access: 'synthetic-dup-access',
+      refresh: 'synthetic-dup-refresh',
+      expires: now + 3_600_000,
+    },
+  })
+  expect((await poolRow('fallback-dup')).enabled).toBe(false)
+  await expect(f.runtime.setEnabled('fallback-dup', true)).rejects.toThrow()
+  expect(logs.take()).toEqual([])
 })
