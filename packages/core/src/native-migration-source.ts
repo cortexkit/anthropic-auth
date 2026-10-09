@@ -328,7 +328,12 @@ function quota(
   accountIdentity: string | undefined,
 ): NativeQuotaMap | undefined {
   if (source === undefined) return undefined
-  if (!isNativeOAuthQuotaSnapshot(source)) refuse()
+  // Quota is cached usage data, not credential authority. Omit a reading the
+  // native format cannot represent rather than blocking valid credentials from
+  // migrating. Do not infer timestamps, usage or ownership; fresh quota polling
+  // must establish any missing observation. Credential and configuration
+  // validation remains unchanged.
+  if (!isNativeOAuthQuotaSnapshot(source)) return undefined
   // Slot labels such as "main" are not Claude UUIDs. Importing them would make
   // the next genuine UUID observation fail the codec's ownership check.
   if (
