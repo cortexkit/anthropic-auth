@@ -1468,13 +1468,20 @@ const anthropicAuthPlugin = async (
       logger.warn('claustrum', 'native auth-failure report unavailable')
     })
   }
+  // Re-authorize after a 401 before anything is reported. When the vault admits
+  // a strictly newer version of the same credential and account, the served
+  // version is obsolete: the caller replays once and reports only the receipt
+  // whose response is final. A refusal leaves the served receipt final.
   async function prepareVaultRetry(
     receipt: NativeCustodyReceipt,
+    site: 'model' | 'model-relay' | 'cachekeep' | 'prime',
     signal?: AbortSignal,
-    source: 'direct' | 'relay_status_field' = 'direct',
   ) {
-    await reportVault401(receipt, source)
-    const result = await nativeAccounts.vault.prepareRetry(receipt, signal)
+    const result = await nativeAccounts.vault.prepareRetry(
+      receipt,
+      signal,
+      site,
+    )
     return result.retry ? result.receipt : undefined
   }
 
@@ -2453,7 +2460,11 @@ const anthropicAuthPlugin = async (
       } catch {}
       if (
         served.scopedAttempt &&
-        !(await prepareVaultRetry(served.scopedAttempt, attempt.signal))
+        !(await prepareVaultRetry(
+          served.scopedAttempt,
+          'cachekeep',
+          attempt.signal,
+        ))
       )
         return undefined
       const current = await authorizeOAuth(
@@ -2695,7 +2706,7 @@ const anthropicAuthPlugin = async (
       if (response.status === 401 && scopedAttempt && !signal.aborted) {
         let current: NativeCustodyReceipt | undefined
         try {
-          current = await prepareVaultRetry(scopedAttempt, signal)
+          current = await prepareVaultRetry(scopedAttempt, 'prime', signal)
         } catch {
           // The first 401 belongs to the original physical attempt unless
           // the vault confirms a newer version of this same account.
@@ -6073,6 +6084,10 @@ const anthropicAuthPlugin = async (
             }
             const sendStart = nowMs()
             let relay401Attempt: NativeCustodyReceipt | undefined
+            // Set once this dispatch has made its final retry decision. Before
+            // that, a relayed upstream 401 is only recorded: the dispatch may
+            // still replay on a newer version, which makes this one obsolete.
+            let relayReturned = false
             const reportScoped401 = reportVault401
             const sendOnce = () =>
               sendViaRelay({
@@ -6107,11 +6122,12 @@ const anthropicAuthPlugin = async (
                     onUpstreamStatus: (status: number) => {
                       if (status !== 401 || !nextAttempt) return
                       relay401Attempt = nextAttempt
-                      // The relay can return an optimistic 200 before Anthropic
-                      // answers. If Anthropic later rejects the tokens, report
-                      // the vault credential and version used for this send,
-                      // not a newer version obtained after the rejection.
-                      void reportScoped401(nextAttempt, 'relay_status_field')
+                      // A WebSocket can deliver a real upstream 401 after its
+                      // optimistic response was handed to the host. Report
+                      // then the exact version used for this send, never a
+                      // newer version obtained after the rejection.
+                      if (relayReturned)
+                        void reportScoped401(nextAttempt, 'relay_status_field')
                     },
                   }
                 },
@@ -6140,8 +6156,8 @@ const anthropicAuthPlugin = async (
               try {
                 rotated = await prepareVaultRetry(
                   relay401Attempt,
+                  'model-relay',
                   init?.signal ?? undefined,
-                  'relay_status_field',
                 )
               } catch {
                 // Keep the 401 and report the exact relay-served record below.
@@ -6176,6 +6192,7 @@ const anthropicAuthPlugin = async (
               try {
                 rotated = await prepareVaultRetry(
                   directAttempt,
+                  'model',
                   init?.signal ?? undefined,
                 )
               } catch {
@@ -6251,6 +6268,7 @@ const anthropicAuthPlugin = async (
             if (usedDirectFetch && directAttempt && response.status === 401) {
               await reportScoped401(directAttempt, 'direct')
             }
+            relayReturned = true
             if (!usedDirectFetch && relay401Attempt) {
               await reportScoped401(relay401Attempt, 'relay_status_field')
             }
