@@ -6,6 +6,12 @@ import {
   projectVaultRoster,
   readVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
 import type { NativeCustodyClient } from '../native-custody.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { readNativeRuntime, updateNativeRuntime } from '../native-runtime.ts'
@@ -325,7 +331,7 @@ test('closing a pending vault list cannot publish its late result', async () => 
   expect(await readVaultRoster(f.paths.roster)).toBeUndefined()
 })
 
-test('vault background 401 reports each exact rejected receipt and retries only once on strict newer version', async () => {
+test('vault background 401 reports only the final rejected receipt and retries only once on strict newer version', async () => {
   const f = await fixture()
   const headers: string[] = []
   const transport: typeof fetch = Object.assign(
@@ -341,7 +347,7 @@ test('vault background 401 reports each exact rejected receipt and retries only 
     'Bearer synthetic-bearer-7',
     'Bearer synthetic-bearer-8',
   ])
-  expect(f.reports.map((report) => report.recordVersion)).toEqual([7, 8])
+  expect(f.reports.map((report) => report.recordVersion)).toEqual([8])
   expect(f.counts.gets).toBe(2)
   const served = await f.runtime.authorize('main')
   f.version(9)
@@ -351,6 +357,123 @@ test('vault background 401 reports each exact rejected receipt and retries only 
   })
   expect(await f.runtime.prepareRetry(served)).toMatchObject({ retry: false })
 })
+
+// A 401 is reported only for the receipt whose response is final. A strictly
+// newer replay makes the served version obsolete whatever the replay's outcome.
+const finalReportCases = [
+  {
+    outcome: 'replay succeeds',
+    reports: [],
+    http: 2,
+    decision: { currentVersion: 8, retry: true, reason: 'rotated' },
+  },
+  {
+    outcome: 'replay is also rejected',
+    reports: [8],
+    http: 2,
+    decision: { currentVersion: 8, retry: true, reason: 'rotated' },
+  },
+  {
+    outcome: 'replay has a network error',
+    reports: [],
+    http: 2,
+    decision: { currentVersion: 8, retry: true, reason: 'rotated' },
+  },
+  {
+    outcome: 'vault holds the same version',
+    reports: [7],
+    http: 1,
+    decision: {
+      currentVersion: 7,
+      retry: false,
+      reason: 'version-not-newer',
+    },
+  },
+  {
+    outcome: 're-authorization fails',
+    reports: [7],
+    http: 1,
+    decision: {
+      currentVersion: null,
+      retry: false,
+      reason: 'reauthorize-failed',
+    },
+  },
+] as const
+
+for (const scenario of finalReportCases) {
+  test(`vault quota 401 reports only the final rejected record when the ${scenario.outcome}`, async () => {
+    const f = await fixture()
+    let failGets = false
+    const runtime = createNativeVaultRuntime({
+      ...f.options,
+      connect: async () => ({
+        ...f.client,
+        getScoped: async (input) => {
+          if (failGets) throw new Error('synthetic vault unavailable')
+          return f.client.getScoped(input)
+        },
+      }),
+    })
+    deferCleanup(() => runtime.close())
+    const headers: string[] = []
+    const transport: typeof fetch = Object.assign(
+      async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        headers.push(new Headers(init?.headers).get('authorization') ?? '')
+        if (headers.length === 1) {
+          if (scenario.outcome === 're-authorization fails') failGets = true
+          else if (scenario.outcome !== 'vault holds the same version')
+            f.version(8)
+          return new Response('{}', { status: 401 })
+        }
+        if (scenario.outcome === 'replay has a network error')
+          throw new TypeError('synthetic replay network failure')
+        if (scenario.outcome === 'replay is also rejected')
+          return new Response('{}', { status: 401 })
+        return new Response('{}', { status: 200 })
+      },
+      { preconnect: fetch.preconnect },
+    )
+    const records: LogTestRecord[] = []
+    const previousLevel = getLogLevel()
+    setLogLevel('debug')
+    __setLogTestSink((record) => records.push(record))
+    let outcome: unknown
+    try {
+      outcome = await runtime.fetchQuota('main', transport).then(
+        () => 'ok',
+        (error: unknown) => error,
+      )
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(previousLevel)
+    }
+    if (scenario.outcome === 'replay succeeds') expect(outcome).toBe('ok')
+    else expect(outcome).toBeInstanceOf(Error)
+    expect(headers).toEqual(
+      ['Bearer synthetic-bearer-7', 'Bearer synthetic-bearer-8'].slice(
+        0,
+        scenario.http,
+      ),
+    )
+    expect(f.reports.map((report) => report.recordVersion)).toEqual([
+      ...scenario.reports,
+    ])
+    const decisions = records.filter(
+      (record) => record.message === 'scoped 401 re-authorized',
+    )
+    expect(decisions.map((record) => record.payload)).toEqual([
+      {
+        site: 'quota-profile',
+        credentialId: id,
+        servedVersion: 7,
+        ...scenario.decision,
+      },
+    ])
+    expect(JSON.stringify(decisions)).not.toContain('synthetic-bearer')
+    expect(JSON.stringify(decisions)).not.toContain('synthetic vault')
+  })
+}
 
 test('vault receipt ownership and version fences reject copied, replaced and delayed observations', async () => {
   const f = await fixture()
@@ -602,7 +725,7 @@ test('vault failed failure-report telemetry cannot block its one fresh retry or 
     status: 401,
   })
   expect(http).toBe(2)
-  expect(f.reports.map((report) => report.recordVersion)).toEqual([7, 8])
+  expect(f.reports.map((report) => report.recordVersion)).toEqual([8])
 })
 
 test('vault quota success and failure cannot inherit another account runtime clear floor', async () => {

@@ -15,6 +15,7 @@ import {
   type PrimeUsageDelta,
 } from './accounts.ts'
 import { resolveClaustrumConnectionPath } from './claustrum.ts'
+import { logger } from './logger.ts'
 import {
   applyNativeMetadataPatch,
   captureNativeMetadataPatch,
@@ -64,6 +65,14 @@ export interface NativeVaultRuntimeOptions {
   now?: () => number
 }
 
+/** Send classes that may replay once after a vault credential's 401, named in diagnostics. */
+export type NativeScoped401Site =
+  | 'model'
+  | 'model-relay'
+  | 'cachekeep'
+  | 'prime'
+  | 'quota-profile'
+
 export interface NativeVaultRuntime {
   read(): Promise<NativeVaultRosterDocument | undefined>
   refresh(signal?: AbortSignal): Promise<NativeVaultRosterDocument | undefined>
@@ -76,9 +85,17 @@ export interface NativeVaultRuntime {
     status: number,
     source: NativeCustodyReporterSource,
   ): Promise<void>
+  /**
+   * Re-authorize after a 401 and admit one replay only for a strictly newer
+   * version of the same credential and account. With a `site`, the decision is
+   * logged as 'scoped 401 re-authorized' (versions and reason only, never
+   * credential material). It never reports the 401: the caller reports only
+   * the receipt whose response is final.
+   */
   prepareRetry(
     receipt: NativeCustodyReceipt,
     signal?: AbortSignal,
+    site?: NativeScoped401Site,
   ): Promise<NativeCustodyRetry>
   publish(
     receipt: NativeCustodyReceipt,
@@ -332,33 +349,52 @@ export function createNativeVaultRuntime(
       requireIssued(receipt)
       await custody.reportFailure(receipt, status, source)
     },
-    async prepareRetry(served, signal) {
+    async prepareRetry(served, signal, site) {
       const route = requireIssued(served)
-      if (retryUsed.has(served))
-        return { retry: false, reason: 'version-not-newer' }
-      retryUsed.add(served)
-      let next: NativeCustodyReceipt
-      try {
-        next = await runtime.authorize(route.logicalId, signal)
-      } catch (error) {
-        check(signal)
-        return {
-          retry: false,
-          reason: 'reauthorize-failed',
-          code:
-            error instanceof NativeCustodyError ? error.code : 'unavailable',
+      // The re-authorized receipt, kept beside the decision for diagnostics.
+      const decide = async (): Promise<
+        [NativeCustodyRetry, NativeCustodyReceipt | undefined]
+      > => {
+        if (retryUsed.has(served))
+          return [{ retry: false, reason: 'version-not-newer' }, undefined]
+        retryUsed.add(served)
+        let next: NativeCustodyReceipt
+        try {
+          next = await runtime.authorize(route.logicalId, signal)
+        } catch (error) {
+          check(signal)
+          const code =
+            error instanceof NativeCustodyError ? error.code : 'unavailable'
+          return [
+            { retry: false, reason: 'reauthorize-failed', code },
+            undefined,
+          ]
         }
+        if (next.credentialId !== served.credentialId)
+          return [{ retry: false, reason: 'credential-changed' }, next]
+        if (next.assertedAccountIdentity !== served.assertedAccountIdentity)
+          return [{ retry: false, reason: 'account-changed' }, next]
+        if (!(next.recordVersion > served.recordVersion))
+          return [{ retry: false, reason: 'version-not-newer' }, next]
+        // Mark the retry-issued receipt too, so handing it back cannot restart
+        // the request's one permitted strict-newer-version 401 retry.
+        retryUsed.add(next)
+        return [{ retry: true, receipt: next }, next]
       }
-      if (next.credentialId !== served.credentialId)
-        return { retry: false, reason: 'credential-changed' }
-      if (next.assertedAccountIdentity !== served.assertedAccountIdentity)
-        return { retry: false, reason: 'account-changed' }
-      if (!(next.recordVersion > served.recordVersion))
-        return { retry: false, reason: 'version-not-newer' }
-      // Mark the retry-issued receipt too, so handing it back cannot restart the
-      // request's one permitted strict-newer-version 401 retry.
-      retryUsed.add(next)
-      return { retry: true, receipt: next }
+      const [result, current] = await decide()
+      // Record each retry decision so a 401 reported against an old version
+      // can be matched with the vault refresh that replaced it. The credential
+      // id and versions identify the record; no token or raw error is logged.
+      if (site)
+        logger.debug('claustrum', 'scoped 401 re-authorized', {
+          site,
+          credentialId: served.credentialId,
+          servedVersion: served.recordVersion,
+          currentVersion: current?.recordVersion ?? null,
+          retry: result.retry,
+          reason: result.retry ? 'rotated' : result.reason,
+        })
+      return result
     },
     publish(receipt, rawPatch) {
       const patch = captureNativeMetadataPatch(rawPatch)
@@ -617,30 +653,45 @@ export function createNativeVaultRuntime(
         let response = await fetchImpl(input, { ...init, signal: combined })
         responseStatus = response.status
         if (response.status === 401 && !combined.aborted) {
-          // Cleanup and best-effort telemetry can await. Complete them before
-          // final retry admission so a decline/revocation during either wins.
+          // Body cleanup can await. Complete it before final retry admission
+          // so a decline or revocation during it wins.
           await response.body?.cancel().catch(() => {})
-          await runtime.reportFailure(served, 401, 'direct').catch(() => {
-            check(combined)
-          })
-          check(combined)
-          const retry = await runtime.prepareRetry(served, combined)
-          if (retry.retry) {
-            served = retry.receipt
-            const headers = new Headers(init?.headers)
-            headers.set('authorization', `Bearer ${served.accessToken}`)
-            responseStatus = undefined
-            response = await fetchImpl(input, {
-              ...init,
-              headers,
-              signal: combined,
+          const report = (receipt: NativeCustodyReceipt) =>
+            runtime.reportFailure(receipt, 401, 'direct').catch(() => {
+              check(combined)
             })
-            responseStatus = response.status
-            if (response.status === 401)
-              await runtime.reportFailure(served, 401, 'direct').catch(() => {
-                check(combined)
-              })
+          // Ask for a strictly newer version before reporting anything. When
+          // one exists the served version is already obsolete, so only the
+          // receipt whose response is final may be reported as rejected.
+          const rejected = served
+          let retry: NativeCustodyRetry
+          try {
+            retry = await runtime.prepareRetry(
+              rejected,
+              combined,
+              'quota-profile',
+            )
+          } catch (error) {
+            await report(rejected)
+            throw error
           }
+          if (!retry.retry) {
+            await report(rejected)
+            return response
+          }
+          served = retry.receipt
+          const headers = new Headers(init?.headers)
+          headers.set('authorization', `Bearer ${served.accessToken}`)
+          responseStatus = undefined
+          // A transport failure here propagates unreported: it is not evidence
+          // that the newer version was rejected.
+          response = await fetchImpl(input, {
+            ...init,
+            headers,
+            signal: combined,
+          })
+          responseStatus = response.status
+          if (response.status === 401) await report(served)
         }
         return response
       },
@@ -712,7 +763,8 @@ export function acquireNativeVaultRuntime(
     authorize: (id, signal) => use().authorize(id, signal),
     reportFailure: (receipt, status, source) =>
       use().reportFailure(receipt, status, source),
-    prepareRetry: (receipt, signal) => use().prepareRetry(receipt, signal),
+    prepareRetry: (receipt, signal, site) =>
+      use().prepareRetry(receipt, signal, site),
     publish: (receipt, patch) => use().publish(receipt, patch),
     fetchQuota: (id, transport, signal) =>
       use().fetchQuota(id, transport, signal),
