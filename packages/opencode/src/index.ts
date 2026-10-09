@@ -4417,8 +4417,18 @@ const anthropicAuthPlugin = async (
         break
       }
       case 'add-apikey':
-        await nativeAccounts.addApi({ ...request.values })
-        text = 'Native API fallback route added.'
+        // The plugin's own API-key flow applies OpenCode's fallback defaults
+        // (the label as route id, the kie.ai base URL and a bearer header);
+        // the generic native runtime defaults would otherwise apply.
+        text = (
+          await executePersistentAccountCommand('', request.sessionId, {
+            type: 'add-apikey',
+            apiKey: request.values.apiKey,
+            label: request.values.label ?? undefined,
+            baseURL: request.values.baseURL ?? undefined,
+            authHeader: request.values.authHeader ?? undefined,
+          })
+        ).text
         break
       case 'add-oauth-start':
         text = (
