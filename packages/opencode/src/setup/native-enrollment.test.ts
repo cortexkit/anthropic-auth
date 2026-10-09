@@ -1,5 +1,12 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -161,4 +168,65 @@ test('approval and grant failures retain fixed errors without runner stderr or e
       expect(String(caught)).not.toContain('synthetic-secret')
       expect(String(caught)).not.toContain('b'.repeat(64))
     })
+})
+
+test('a terminal enrollment is reset without proposing; only a later explicit setup run proposes again', async () => {
+  await fixture(async (root) => {
+    const paths = {
+      tokenPath: join(root, 'enrollment.json'),
+      statePath: join(root, 'enrollment-state.json'),
+    }
+    await writeFile(
+      paths.statePath,
+      JSON.stringify({
+        version: 1,
+        phase: 'blocked',
+        proposedName: 'anthropic-auth-pi',
+        errorCode: 'superseded',
+        updatedAt: 1,
+      }),
+      { mode: 0o600 },
+    )
+    const calls: string[] = []
+    const client = {
+      enrollPropose: async () => {
+        calls.push('propose')
+        return { requestId: 'synthetic-request-id' }
+      },
+      enrollPoll: async () => {
+        calls.push('poll')
+        return { status: 'pending' as const }
+      },
+    }
+    const runner: CommandRunner = {
+      run: async (_command, args) => {
+        calls.push(args.slice(0, 3).join(' '))
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    }
+    await expect(
+      enrollNativeVaultForHost('pi', {
+        paths,
+        env: {},
+        runner,
+        processFence: async () => {},
+        client,
+      }),
+    ).rejects.toMatchObject({ code: 'enrollment-reset' })
+    expect(calls).toEqual([])
+    await expect(stat(paths.tokenPath)).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+    // The next explicit run starts a new request from the reset state.
+    await expect(
+      enrollNativeVaultForHost('pi', {
+        paths,
+        env: {},
+        runner,
+        processFence: async () => {},
+        client,
+      }),
+    ).rejects.toMatchObject({ code: 'enrollment-refused' })
+    expect(calls.slice(0, 2)).toEqual(['propose', 'poll'])
+  })
 })

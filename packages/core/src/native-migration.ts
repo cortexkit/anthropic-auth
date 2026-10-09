@@ -110,6 +110,12 @@ export interface NativeMigrationOptions {
   removePiAnthropicAuth: boolean
   custody?: NativeMigrationCustody
   preflight?: NativeMigrationPreflight
+  /**
+   * Offline setup sets this when the user explicitly chose vault custody. It
+   * applies only when no journal exists yet; it keeps the pool unauthorized
+   * after this migration commits until runNativeCustodyActivation commits.
+   */
+  requestVaultActivation?: boolean
 }
 
 /** Result of read-only checks for the selected storage and host. Contains no account data or credential digests. */
@@ -398,7 +404,11 @@ async function runtimeState(
   return result.state
 }
 
-async function importedRuntimeProjection(
+/**
+ * The public, secret-free state a prepared proof binds besides the rows:
+ * runtime metadata, settings, account flags and quota, and the vault roster.
+ */
+export async function importedRuntimeProjection(
   paths: NativePoolPaths,
   store: ReturnType<typeof createNativePoolStore>,
   rows: PoolRow[],
@@ -656,13 +666,18 @@ export async function runNativeMigration(
             )
           },
         }
+        // Once a switch to vault custody is requested or prepared, the
+        // activation controller owns the host auth file. Repairing it here
+        // could delete a credential that controller must refuse to adopt.
         if (journal?.phase === 'retired') {
-          await repair(operation, assertMigration, hooks)
+          if (journal.activation === null)
+            await repair(operation, assertMigration, hooks)
           return journal
         }
         if (journal?.phase === 'committed') {
           journal = await retire(operation, journal, assertMigration, hooks)
-          await repair(operation, assertMigration, hooks)
+          if (journal.activation === null)
+            await repair(operation, assertMigration, hooks)
           return journal
         }
         if (!journal) {
@@ -685,6 +700,9 @@ export async function runNativeMigration(
                 source: captured.routingSourcePath,
                 destination: captured.routingDestinationPath,
               },
+              ...(operation.requestVaultActivation
+                ? { activation: 'requested' as const }
+                : {}),
             },
             journalHooks,
           )

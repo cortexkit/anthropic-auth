@@ -123,6 +123,7 @@ import {
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativeMenuDispatch,
   type NativeUiOptions,
+  nativeMigrationAuthorityPhase,
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
@@ -5192,10 +5193,7 @@ const anthropicAuthPlugin = async (
               main,
               fallbacks: fallbackDimensions.fallbacks,
               evidence: mainEvidence,
-              authority:
-                journal?.phase === 'committed' || journal?.phase === 'retired'
-                  ? journal.phase
-                  : undefined,
+              authority: nativeMigrationAuthorityPhase(journal),
             })
           } catch (error) {
             if (!(error instanceof CustodyStateMismatchError)) throw error

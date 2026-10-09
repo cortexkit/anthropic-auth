@@ -560,7 +560,7 @@ async function migrateServingFixture(
       : {}),
   })
   expect(journal.phase).toBe('retired')
-  expect(journal.version).toBe(3)
+  expect(journal.version).toBe(4)
   expect(JSON.parse(await readFile(hostAuthPath, 'utf8')).other).toEqual({
     type: 'api',
     key: 'synthetic-unrelated-provider',

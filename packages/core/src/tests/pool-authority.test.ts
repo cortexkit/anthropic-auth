@@ -14,11 +14,15 @@ import { fileURLToPath } from 'node:url'
 
 import { inspectNativeHostAuthEntry } from '../native-host-auth.ts'
 import {
+  advanceNativeCustodyActivation,
   advanceNativeMigration,
   beginNativeMigration,
+  type NativeCustodyActivationPlan,
   type NativeMigrationInput,
   type NativeMigrationPhase,
+  nativeMigrationAuthorityPhase,
   readNativeMigrationJournal,
+  recordNativeCustodyActivation,
   recordNativeMigrationExpectations,
   requireNativePoolAuthority,
 } from '../pool-authority.ts'
@@ -236,13 +240,13 @@ test('concurrent starts publish one journal without rewriting its baselines', as
   )
 })
 
-test('v3 persists ten fields including an initially absent prepared proof', async () => {
+test('v4 persists eleven fields including an initially absent prepared proof and activation', async () => {
   const paths = await fixture()
   const input = captureInput(paths)
   const journal = await beginNativeMigration(paths, input)
   const text = await readFile(paths.journal, 'utf8')
   expect(JSON.parse(text)).toEqual({
-    version: 3,
+    version: 4,
     storageId: paths.storageId,
     host: 'opencode',
     phase: 'building',
@@ -257,8 +261,9 @@ test('v3 persists ten fields including an initially absent prepared proof', asyn
     expectedHostAuth: 'unprepared',
     expectedRouting: 'unprepared',
     preparedProof: null,
+    activation: null,
   })
-  expect(Object.keys(journal)).toHaveLength(10)
+  expect(Object.keys(journal)).toHaveLength(11)
   expect(Object.keys(journal.sources).sort()).toEqual([
     'config',
     'hostAuth',
@@ -306,7 +311,7 @@ test('canonical Anthropic entry digests persist without any credential strings',
     expect(text).not.toContain(secret)
 })
 
-test('v1 journals refuse unchanged rather than supplying v3 defaults', async () => {
+test('v1 journals refuse unchanged rather than supplying v4 defaults', async () => {
   const paths = await fixture()
   const input = captureInput(paths)
   const text = JSON.stringify({
@@ -960,7 +965,7 @@ for (const point of ['before-write', 'after-write'] as const) {
 
     const text = await readFile(paths.journal, 'utf8')
     const raw = JSON.parse(text)
-    expect(Object.keys(raw)).toHaveLength(10)
+    expect(Object.keys(raw)).toHaveLength(11)
     expect(raw.phase).toBe('verified')
     expect([raw.expectedHostAuth, raw.expectedRouting]).toEqual(
       point === 'before-write'
@@ -1075,4 +1080,197 @@ test('expired expectation publisher refuses without changing either verified exp
   expect(
     await recordNativeMigrationExpectations(paths, expectations),
   ).toMatchObject({ phase: 'verified', ...expectations })
+})
+
+async function retiredJournal(
+  paths: NativePoolPaths,
+  activation?: 'requested',
+): Promise<void> {
+  await beginNativeMigration(paths, {
+    ...captureInput(paths),
+    ...(activation ? { activation } : {}),
+  })
+  await advanceNativeMigration(paths, 'building', 'verified')
+  await recordNativeMigrationExpectations(paths, expectations)
+  await advanceNativeMigration(paths, 'verified', 'activation-installed')
+  await advanceNativeMigration(paths, 'activation-installed', 'committed')
+  await advanceNativeMigration(paths, 'committed', 'retired')
+}
+
+function activationPlan(): NativeCustodyActivationPlan {
+  return {
+    kind: 'activation',
+    phase: 'prepared',
+    primary: {
+      routeId: 'main-route',
+      credentialId: 'oauth:anthropic',
+      accountIdentity: 'account-main',
+    },
+    roster: {
+      version: 1,
+      view: 'view-1',
+      complete: true,
+      rows: [
+        {
+          routeId: 'main-route',
+          credentialId: 'oauth:anthropic',
+          credentialType: 'oauth',
+          accountIdentity: 'account-main',
+          state: 'active',
+          label: 'main-route',
+          enabled: true,
+          addedAt: 0,
+        },
+      ],
+      declined: [],
+    },
+    localProof: {
+      version: 1,
+      rows: [
+        {
+          id: 'main-route',
+          credentialEpoch: 1,
+          identity: 'account-main',
+          stamp: 'bound',
+          credentialDigest: '1'.repeat(64),
+        },
+      ],
+      runtimeDigest: '2'.repeat(64),
+    },
+    removeIds: ['main-route'],
+    settings: { source: '3'.repeat(64), target: '4'.repeat(64) },
+    runtime: { source: '5'.repeat(64), target: '6'.repeat(64) },
+    hostAuth: { source: 'absent', expected: '7'.repeat(64) },
+  }
+}
+
+test('older v3 native journals fail closed unchanged', async () => {
+  const paths = await fixture()
+  await retiredJournal(paths)
+  const current = JSON.parse(await readFile(paths.journal, 'utf8'))
+  const { activation: _activation, ...v3 } = { ...current, version: 3 }
+  const text = JSON.stringify(v3)
+  await writeFile(paths.journal, text, { mode: 0o600 })
+  await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
+    code: 'invalid-journal',
+  })
+  for (const value of [
+    { ...current, version: 3 },
+    { ...v3, version: 4 },
+  ]) {
+    await writeFile(paths.journal, JSON.stringify(value), { mode: 0o600 })
+    await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
+      code: 'invalid-journal',
+    })
+  }
+})
+
+test('a requested vault activation keeps a retired migration unauthorized', async () => {
+  const paths = await fixture()
+  await retiredJournal(paths, 'requested')
+  const journal = await readNativeMigrationJournal(paths)
+  expect(journal?.phase).toBe('retired')
+  expect(journal?.activation).toEqual({ kind: 'requested' })
+  expect(nativeMigrationAuthorityPhase(journal)).toBeUndefined()
+  await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
+    code: 'migration-incomplete',
+  })
+  // Resuming a begin with a different activation request is a conflict.
+  await expect(
+    beginNativeMigration(paths, captureInput(paths)),
+  ).rejects.toMatchObject({ code: 'journal-conflict' })
+})
+
+test('activation phases block authority until committed and only move forward', async () => {
+  const paths = await fixture()
+  await retiredJournal(paths)
+  await requireNativePoolAuthority(paths)
+  const plan = activationPlan()
+  await recordNativeCustodyActivation(paths, plan)
+  await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
+    code: 'migration-incomplete',
+  })
+  const prepared = await readFile(paths.journal, 'utf8')
+  // An identical retry writes nothing; any other plan conflicts unchanged.
+  await recordNativeCustodyActivation(paths, plan)
+  expect(await readFile(paths.journal, 'utf8')).toBe(prepared)
+  await expect(
+    recordNativeCustodyActivation(paths, {
+      ...plan,
+      removeIds: [],
+    }),
+  ).rejects.toMatchObject({ code: 'journal-conflict' })
+  await expect(
+    advanceNativeCustodyActivation(paths, 'prepared', 'committed'),
+  ).rejects.toMatchObject({ code: 'journal-conflict' })
+  expect(await readFile(paths.journal, 'utf8')).toBe(prepared)
+  await advanceNativeCustodyActivation(paths, 'prepared', 'published')
+  await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
+    code: 'migration-incomplete',
+  })
+  await expect(
+    advanceNativeCustodyActivation(paths, 'published', 'prepared'),
+  ).rejects.toMatchObject({ code: 'journal-conflict' })
+  await advanceNativeCustodyActivation(paths, 'published', 'committed')
+  await requireNativePoolAuthority(paths)
+  const committed = await readNativeMigrationJournal(paths)
+  expect(nativeMigrationAuthorityPhase(committed)).toBe('retired')
+  expect(committed?.activation).toMatchObject({ phase: 'committed' })
+  // The completed migration history is kept, never reset.
+  expect(committed?.preparedProof).toEqual(preparedProof)
+  expect(committed?.expectedHostAuth).toBe(expectations.expectedHostAuth)
+})
+
+test('activation is recorded only on a retired migration', async () => {
+  const paths = await fixture()
+  await beginNativeMigration(paths, captureInput(paths))
+  const before = await readFile(paths.journal, 'utf8')
+  await expect(
+    recordNativeCustodyActivation(paths, activationPlan()),
+  ).rejects.toMatchObject({ code: 'journal-conflict' })
+  expect(await readFile(paths.journal, 'utf8')).toBe(before)
+})
+
+test('closed activation decoder rejects incoherent or extra fields unchanged', async () => {
+  const paths = await fixture()
+  await retiredJournal(paths)
+  await recordNativeCustodyActivation(paths, activationPlan())
+  const journal = JSON.parse(await readFile(paths.journal, 'utf8'))
+  const plan = journal.activation
+  const invalid = [
+    { ...journal, phase: 'committed' },
+    { ...journal, activation: { ...plan, token: 'x' } },
+    { ...journal, activation: { ...plan, phase: 'requested' } },
+    { ...journal, activation: { ...plan, removeIds: ['unknown-row'] } },
+    { ...journal, activation: { kind: 'requested', extra: true } },
+    {
+      ...journal,
+      activation: {
+        ...plan,
+        primary: { ...plan.primary, credentialId: 'oauth:anthropic:other' },
+      },
+    },
+    {
+      ...journal,
+      activation: {
+        ...plan,
+        roster: {
+          ...plan.roster,
+          rows: [{ ...plan.roster.rows[0], access: 'synthetic-access' }],
+        },
+      },
+    },
+    {
+      ...journal,
+      activation: { ...plan, hostAuth: { ...plan.hostAuth, expected: 'x' } },
+    },
+  ]
+  for (const value of invalid) {
+    const text = JSON.stringify(value)
+    await writeFile(paths.journal, text, { mode: 0o600 })
+    await expect(requireNativePoolAuthority(paths)).rejects.toMatchObject({
+      code: 'invalid-journal',
+    })
+    expect(await readFile(paths.journal, 'utf8')).toBe(text)
+  }
 })
