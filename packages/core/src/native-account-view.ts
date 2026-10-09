@@ -1,5 +1,5 @@
 import { types } from 'node:util'
-import type { PoolRow } from '@cortexkit/common-auth/store'
+import { fingerprintOf, type PoolRow } from '@cortexkit/common-auth/store'
 
 import {
   type AccountOperationError,
@@ -491,6 +491,16 @@ export function projectNativeAccountViews(input: {
     const stored = input.runtime?.accounts[row.id]
     const entry = binding && sameLocal(stored, binding) ? stored : undefined
     const id = row.id === settings.mainAccountId ? 'main' : row.id
+    const localMetadata = metadata(entry)
+    // A refresh-token rotation can keep the account and epoch unchanged.
+    // An error from the previous token must not exclude the new credential.
+    if (
+      entry?.lastRefreshError?.credentialFingerprint &&
+      (!row.credential ||
+        entry.lastRefreshError.credentialFingerprint !==
+          fingerprintOf(row.credential))
+    )
+      delete localMetadata.lastRefreshError
     accounts.push({
       id,
       type: row.type,
@@ -500,7 +510,7 @@ export function projectNativeAccountViews(input: {
       addedAt: row.addedAt,
       accountIdentity: row.identity,
       binding,
-      ...metadata(entry),
+      ...localMetadata,
       ...(row.type === 'oauth' && row.quota !== undefined
         ? { quota: fromNativeQuotaMap(row.quota) }
         : {}),

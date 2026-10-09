@@ -2304,6 +2304,17 @@ const anthropicAuthPlugin = async (
           continue
         try {
           const credential = await authorizeOAuth(account.id)
+          // Proactive refresh must honor an existing account backoff even when
+          // the still-valid access token enters the refresh-before-expiry window.
+          if (
+            refreshBackoffActive(
+              account.lastRefreshError,
+              account.accountIdentity,
+              Date.now(),
+              undefined,
+            )
+          )
+            continue
           if (
             credential.localSource !== 'rotated' &&
             credential.localSource !== 'adopted' &&

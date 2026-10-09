@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import type { PoolRow } from '@cortexkit/common-auth/store'
+import { fingerprintOf, type PoolRow } from '@cortexkit/common-auth/store'
 import {
   applyNativeMetadataPatch,
   nativeAccountReadError,
@@ -185,3 +185,54 @@ test('native lastUsed publication is monotonic for older asynchronous observatio
       .lastUsed,
   ).toBe(200)
 })
+
+for (const lineage of ['current', 'previous', 'unbound'] as const) {
+  test(`local account projection keeps only current or unbound refresh errors (${lineage})`, () => {
+    if (!row.credential) throw new Error('Expected an OAuth fixture')
+    const credentialEpoch = row.credentialEpoch
+    if (credentialEpoch === undefined)
+      throw new Error('Expected a bound fixture')
+    const currentFingerprint = fingerprintOf(row.credential)
+    const state: NativeRuntimeState = {
+      version: 1,
+      storageId: paths.storageId,
+      accounts: {
+        [row.id]: {
+          binding: {
+            kind: 'local',
+            storageId: paths.storageId,
+            rowId: row.id,
+            credentialEpoch,
+            identity: uuid,
+          },
+          lastRefreshError: {
+            message: 'Synthetic refresh rejection',
+            checkedAt: 200,
+            nextRetryAt: 10000,
+            retryCount: 1,
+            accountIdentity: uuid,
+            permanent: true,
+            ...(lineage === 'unbound'
+              ? {}
+              : {
+                  credentialFingerprint:
+                    lineage === 'current' ? currentFingerprint : 'b'.repeat(64),
+                }),
+          },
+          lastUsed: 100,
+        },
+      },
+    }
+    const snapshot = projectNativeAccountViews({
+      paths,
+      rows: [row],
+      settings: { mainAccountId: row.id },
+      runtime: state,
+    })
+    expect(snapshot.accounts[0]?.lastUsed).toBe(100)
+    if (lineage === 'previous')
+      expect(snapshot.accounts[0]?.lastRefreshError).toBeUndefined()
+    else expect(snapshot.accounts[0]?.lastRefreshError?.permanent).toBe(true)
+    expect(JSON.stringify(snapshot)).not.toContain(currentFingerprint)
+  })
+}
