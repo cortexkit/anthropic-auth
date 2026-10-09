@@ -11,6 +11,7 @@ export async function initializeNativeTestAuthority(
   await runNativeMigration({
     paths,
     host,
+    removePiAnthropicAuth: false,
     hostAuthPath: join(root, 'host-auth'),
     routingSourcePath: join(root, 'old-routing'),
     routingDestinationPath: join(root, 'routing'),

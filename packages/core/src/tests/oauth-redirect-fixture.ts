@@ -12,7 +12,7 @@ let redirected = 0
 const server = Bun.serve({
   hostname: '127.0.0.1',
   port: 0,
-  fetch(request) {
+  fetch(request, activeServer): Response {
     if (new URL(request.url).pathname === '/redirected') {
       redirected++
       return Response.json({
@@ -26,7 +26,7 @@ const server = Bun.serve({
     if (status !== 200)
       return new Response(null, {
         status,
-        headers: { location: new URL('/redirected', server.url).href },
+        headers: { location: new URL('/redirected', activeServer.url).href },
       })
     return Response.json({
       access_token: 'synthetic-access',
