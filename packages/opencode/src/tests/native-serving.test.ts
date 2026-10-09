@@ -996,75 +996,85 @@ test('native Prime performs one fresh usage poll before one minimal Haiku send',
   prime.stop()
 })
 
-for (const [fallback, scopedAge] of [
-  [false, 0],
-  [true, 0],
-  [false, 60 * 60_000],
-  [true, 60 * 60_000],
-] as const) {
-  test(`model-scoped primary exhaustion (${scopedAge ? 'stale' : 'fresh'}, fallback=${fallback}) preserves ordered admission`, async () => {
-    const fixture = await migrateServingFixture('claustrum', fallback)
-    const runtime = createNativeAccountRuntime({
-      paths: fixture.paths,
-      host: 'opencode',
-      vault: { connect: async () => fixture.scopedClient },
-    })
-    try {
-      const receipt = await runtime.authorizeVault('main')
-      expect(
-        await runtime.vault.publish(receipt, {
-          quota: {
-            accountIdentity: mainIdentity,
-            checkedAt: Date.now(),
-            five_hour: {
-              remainingPercent: 90,
-              usedPercent: 10,
+for (const mode of ['main-first', 'fallback-first'] as const) {
+  for (const [fallback, scopedAge] of [
+    [false, 0],
+    [true, 0],
+    [false, 60 * 60_000],
+    [true, 60 * 60_000],
+  ] as const) {
+    test(`model-scoped primary exhaustion (${scopedAge ? 'stale' : 'fresh'}, fallback=${fallback}, mode=${mode}) preserves ordered admission`, async () => {
+      const fixture = await migrateServingFixture('claustrum', fallback)
+      const runtime = createNativeAccountRuntime({
+        paths: fixture.paths,
+        host: 'opencode',
+        vault: { connect: async () => fixture.scopedClient },
+      })
+      try {
+        await runtime.updateSettings((settings) => ({
+          ...settings,
+          routing: { mode },
+        }))
+        const receipt = await runtime.authorizeVault('main')
+        expect(
+          await runtime.vault.publish(receipt, {
+            quota: {
+              accountIdentity: mainIdentity,
               checkedAt: Date.now(),
-            },
-            seven_day: {
-              remainingPercent: 90,
-              usedPercent: 10,
-              checkedAt: Date.now(),
-            },
-            scoped: [
-              {
-                id: 'claude-weekly-scoped-fable',
-                title: 'Fable only',
-                modelName: 'Fable',
-                remainingPercent: 0,
-                usedPercent: 100,
-                checkedAt: Date.now() - scopedAge,
-                resetsAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
+              five_hour: {
+                remainingPercent: 90,
+                usedPercent: 10,
+                checkedAt: Date.now(),
               },
-            ],
-          },
-        }),
-      ).toBe(true)
-    } finally {
-      runtime.close()
-    }
-    fixture.authorizedGets.length = 0
-    const plugin = await createPlugin({
-      claustrumScopedConnect: async () => fixture.scopedClient,
+              seven_day: {
+                remainingPercent: 90,
+                usedPercent: 10,
+                checkedAt: Date.now(),
+              },
+              scoped: [
+                {
+                  id: 'claude-weekly-scoped-fable',
+                  title: 'Fable only',
+                  modelName: 'Fable',
+                  remainingPercent: 0,
+                  usedPercent: 100,
+                  checkedAt: Date.now() - scopedAge,
+                  resetsAt: new Date(
+                    Date.now() + 24 * 60 * 60_000,
+                  ).toISOString(),
+                },
+              ],
+            },
+          }),
+        ).toBe(true)
+      } finally {
+        runtime.close()
+      }
+      fixture.authorizedGets.length = 0
+      const plugin = await createPlugin({
+        claustrumScopedConnect: async () => fixture.scopedClient,
+      })
+      const response = await sendNative(plugin, 'claude-fable-5-1')
+      expect(response.status).toBe(200)
+      const usesFallback =
+        fallback && (mode === 'fallback-first' || scopedAge === 0)
+      if (usesFallback)
+        expect(fixture.authorizedGets).not.toContain('oauth:anthropic')
+      else expect(fixture.authorizedGets).toContain('oauth:anthropic')
+      const sent = fixture.records.filter((record) =>
+        record.url.includes('/v1/messages'),
+      )
+      expect(sent).toHaveLength(1)
+      expect(sent[0]?.authorization).toBe(
+        usesFallback
+          ? 'Bearer sk-ant-oat01-vault-fallback-v1'
+          : 'Bearer sk-ant-oat01-vault-main-v1',
+      )
+      expect(
+        fixture.records.some((record) => record.url.includes('/oauth/token')),
+      ).toBe(false)
     })
-    const response = await sendNative(plugin, 'claude-fable-5-1')
-    expect(response.status).toBe(200)
-    if (fallback && scopedAge === 0)
-      expect(fixture.authorizedGets).not.toContain('oauth:anthropic')
-    else expect(fixture.authorizedGets).toContain('oauth:anthropic')
-    const sent = fixture.records.filter((record) =>
-      record.url.includes('/v1/messages'),
-    )
-    expect(sent).toHaveLength(1)
-    expect(sent[0]?.authorization).toBe(
-      fallback && scopedAge === 0
-        ? 'Bearer sk-ant-oat01-vault-fallback-v1'
-        : 'Bearer sk-ant-oat01-vault-main-v1',
-    )
-    expect(
-      fixture.records.some((record) => record.url.includes('/oauth/token')),
-    ).toBe(false)
-  })
+  }
 }
 
 test('OAuth SDK callback commits native credentials and returns only inert activation', async () => {

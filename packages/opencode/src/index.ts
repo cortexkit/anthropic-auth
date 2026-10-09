@@ -1411,10 +1411,11 @@ const anthropicAuthPlugin = async (
     rejectedAccessToken?: string,
     modelId?: string,
     intent: 'serve' | 'refresh' | 'last-main' = 'serve',
+    accountSnapshot?: NativeAccountSnapshot,
   ): Promise<NativeOAuthAuthorization> {
     assertNativeEnvironment()
     signal?.throwIfAborted()
-    const snapshot = await nativeAccounts.read()
+    const snapshot = accountSnapshot ?? (await nativeAccounts.read())
     const account = snapshot.accounts.find(
       (candidate) => candidate.id === routeId,
     )
@@ -3351,17 +3352,14 @@ const anthropicAuthPlugin = async (
             id: account.id,
             label: account.label,
             tierLabel: formatOAuthAccountTier(account.profile),
-            // Token-aware read: local access or a live vault-served tombstone
-            // qualifies the lineage-bound cache read. If a fallback account was
-            // re-logged with the same id/label, an old in-memory quota snapshot
-            // must not be shown as the new account's quota; vault-served
-            // tombstones have no local access by design, but their live binding
-            // proves the snapshot belongs to the currently served account.
+            // Native account reads verify the quota's current account binding.
+            // Local and vault projections both omit bearer material, so an
+            // empty access field must not hide their verified quota readings.
             quota: options.skipFallbackQuotaSeed
               ? null
-              : account.access || vaultServed
-                ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
-                : null,
+              : (quotaManager.getFallback(account.id, account)?.quota ??
+                account.quota ??
+                null),
             // A fallback with a permanently-dead refresh token (400 invalid_grant)
             // is dropped by getUsableFallbackAccounts and silently degrades to
             // main — surface it as "needs re-login". Only flag truly-dead tokens
@@ -5291,7 +5289,11 @@ const anthropicAuthPlugin = async (
           }
         }
         const journal = await readNativeMigrationJournal(nativePaths)
-        const getAuth = async (modelId?: string, signal?: AbortSignal) => {
+        const getAuth = async (
+          modelId?: string,
+          signal?: AbortSignal,
+          deferCredential = false,
+        ) => {
           const currentActivation = await hostGetAuth()
           if (currentActivation.type !== 'oauth')
             return {
@@ -5304,11 +5306,34 @@ const anthropicAuthPlugin = async (
               nativeScopedAttempt: undefined,
               modelDenied: false,
               credentialUnavailable: false,
+              deferred: false,
             }
           if (!isCustodyTombstoneOAuth(currentActivation, 'anthropic')) {
             throw new Error(
               'Native OAuth requires inert OpenCode activation; run offline setup',
             )
+          }
+          const primarySnapshot = await nativeAccounts.read()
+          if (
+            deferCredential &&
+            getRoutingMode(primarySnapshot.policyStorage) === 'fallback-first'
+          ) {
+            const primary = primarySnapshot.accounts.find(
+              (account) => account.id === 'main',
+            )
+            signal?.throwIfAborted()
+            return {
+              type: 'oauth',
+              access: '',
+              expires: 0,
+              refresh: undefined,
+              nativeAccountIdentity: primary?.accountIdentity,
+              nativeLocalSource: undefined,
+              nativeScopedAttempt: undefined,
+              modelDenied: false,
+              credentialUnavailable: false,
+              deferred: true,
+            }
           }
           let credential: NativeOAuthAuthorization | undefined
           let denied: NativeAccountView | undefined
@@ -5319,6 +5344,8 @@ const anthropicAuthPlugin = async (
               signal,
               undefined,
               modelId,
+              'serve',
+              primarySnapshot,
             )
           } catch (error) {
             if (error instanceof NativeModelPolicyError) {
@@ -5374,6 +5401,7 @@ const anthropicAuthPlugin = async (
               unavailable?.accountIdentity,
             modelDenied: Boolean(denied),
             credentialUnavailable: Boolean(unavailable),
+            deferred: false,
             nativeLocalSource: credential?.localSource,
             nativeScopedAttempt: credential?.scopedAttempt,
           }
@@ -7438,6 +7466,7 @@ const anthropicAuthPlugin = async (
               const auth = await getAuth(
                 credentialModelId,
                 init?.signal ?? undefined,
+                true,
               )
               trace.mark('get_auth', {
                 ms: roundMs(nowMs() - authStart),
@@ -7490,7 +7519,9 @@ const anthropicAuthPlugin = async (
                   mainProviderAccountUuid = resolution.providerAccountUuid
                 }
               } else if (
-                (auth.modelDenied || auth.credentialUnavailable) &&
+                (auth.modelDenied ||
+                  auth.credentialUnavailable ||
+                  auth.deferred) &&
                 requestMainProviderUuid
               ) {
                 // A known account keeps its quota in the routing inventory
@@ -8064,6 +8095,14 @@ const anthropicAuthPlugin = async (
                 }
               }
 
+              // Fallback-first reached main only after its fallback attempts.
+              // Resolve current access now; absence from the earlier metadata
+              // view is not evidence that the stored token needs refreshing.
+              if (auth.deferred)
+                Object.assign(
+                  auth,
+                  await getAuth(credentialModelId, init?.signal ?? undefined),
+                )
               if (
                 !auth.modelDenied &&
                 (!auth.access || !auth.expires || auth.expires < Date.now())
