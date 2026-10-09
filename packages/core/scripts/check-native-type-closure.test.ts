@@ -98,7 +98,7 @@ test('rejects unsupported published producer versions before copying declaration
   )
 
   await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-    'Expected published common-auth 0.11.5, got 0.9.0',
+    'Expected published common-auth 0.11.7, got 0.9.0',
   )
   expect(await readdir(dist)).not.toContain('internal-types')
 })
@@ -111,7 +111,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.11.5',
+      version: '0.11.7',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
