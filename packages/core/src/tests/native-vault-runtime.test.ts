@@ -1,4 +1,4 @@
-import { expect } from 'bun:test'
+import { expect, spyOn } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -12,6 +12,7 @@ import {
   type LogTestRecord,
   setLogLevel,
 } from '../logger.ts'
+import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import type { NativeCustodyClient } from '../native-custody.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { readNativeRuntime, updateNativeRuntime } from '../native-runtime.ts'
@@ -763,4 +764,157 @@ test('vault quota success and failure cannot inherit another account runtime cle
     if (status === 200) expect(entry?.quotaErrorClearedAt).toBe(now)
     else expect(entry?.lastQuotaRefreshError?.checkedAt).toBe(now)
   }
+})
+
+/**
+ * Capture the INFO records native runtimes emit on the `commands` channel,
+ * starting from the info level, and restore the previous level and sink after
+ * the test. Bun runs tests with NODE_ENV=test, under which the logger
+ * delivers records only to this sink and writes no log file.
+ */
+function captureCommandLogs() {
+  expect(process.env.NODE_ENV).toBe('test')
+  const previousLevel = getLogLevel()
+  const records: LogTestRecord[] = []
+  setLogLevel('info')
+  __setLogTestSink((record) => {
+    if (record.channel === 'commands') records.push(record)
+  })
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previousLevel)
+  })
+  return {
+    /** Message and payload of each record captured since the previous call. */
+    take() {
+      const taken = records.map(({ message, payload }) => ({
+        message,
+        payload,
+      }))
+      records.length = 0
+      return taken
+    },
+  }
+}
+
+/** A native account runtime over the fixture's pool and vault roster. */
+function accountRuntime(f: Awaited<ReturnType<typeof fixture>>) {
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    vault: {
+      now: f.options.now,
+      connect: f.options.connect,
+      readToken: f.options.readToken,
+    },
+  })
+  deferCleanup(() => runtime.close())
+  return runtime
+}
+
+test('vault setEnabled reports whether the route flag changed, judged on the roster under its lock', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  const row = async () => (await readVaultRoster(f.paths.roster))?.rows[0]
+
+  expect(await f.runtime.setEnabled('main', false)).toBe(true)
+  expect(await f.runtime.setEnabled('main', false)).toBe(false)
+  expect((await row())?.enabled).toBe(false)
+  expect((await readVaultRoster(f.paths.roster))?.declined).toEqual([
+    { credentialId: id, accountIdentity: uuid },
+  ])
+
+  expect(await f.runtime.setEnabled('main', true)).toBe(true)
+  expect(await f.runtime.setEnabled('main', true)).toBe(false)
+  expect((await row())?.enabled).toBe(true)
+  expect((await readVaultRoster(f.paths.roster))?.declined).toEqual([])
+
+  await expect(
+    f.runtime.setEnabled('missing-route', false),
+  ).rejects.toMatchObject({ code: 'route-unavailable' })
+})
+
+test('two native runtimes disabling the same vault account log one change, judged under the roster lock', async () => {
+  const f = await fixture()
+  await f.runtime.refresh()
+  const a = accountRuntime(f)
+  const b = accountRuntime(f)
+  const logs = captureCommandLogs()
+
+  // Two operations disable the same account. The first reads it enabled; the
+  // second completes the decline before the first writes, so the first
+  // changes no enabled flag.
+  const read = a.read.bind(a)
+  let interleaved = false
+  const readSpy = spyOn(a, 'read').mockImplementation(async () => {
+    const snapshot = await read()
+    if (!interleaved) {
+      interleaved = true
+      expect(snapshot.accounts.find((row) => row.id === 'main')?.enabled).toBe(
+        true,
+      )
+      await b.setEnabled('main', false)
+    }
+    return snapshot
+  })
+  deferCleanup(() => readSpy.mockRestore())
+  await a.setEnabled('main', false)
+  readSpy.mockRestore()
+  expect(interleaved).toBe(true)
+  expect(logs.take()).toEqual([
+    {
+      message: 'account disabled',
+      payload: expect.objectContaining({ id: 'main', enabled: false }),
+    },
+  ])
+
+  // Removing a vault account declines it: the change is logged as a disable,
+  // once, and removing it again changes nothing.
+  await a.setEnabled('main', true)
+  await a.remove('main')
+  await a.remove('main')
+  expect(logs.take()).toEqual([
+    {
+      message: 'account enabled',
+      payload: expect.objectContaining({ id: 'main', enabled: true }),
+    },
+    {
+      message: 'account disabled',
+      payload: expect.objectContaining({ id: 'main', enabled: false }),
+    },
+  ])
+})
+
+test('vault account reorder logs once when the locked roster or stored order changes', async () => {
+  const f = await fixture()
+  f.rows([
+    listed,
+    { ...listed, id: 'oauth:anthropic:work', accountId: uuid2 },
+    {
+      ...listed,
+      id: 'oauth:anthropic:personal',
+      accountId: '33333333-2222-4333-8444-555555555555',
+    },
+  ])
+  await f.runtime.refresh()
+  const a = accountRuntime(f)
+  const fallbacks = async () =>
+    (await a.read()).accounts
+      .filter((row) => row.id !== 'main')
+      .map((row) => row.id)
+  const [first, second] = await fallbacks()
+  if (!first || !second) throw new Error('Missing fixture fallback routes')
+  const logs = captureCommandLogs()
+
+  await a.reorder([second, first], second)
+  expect(await fallbacks()).toEqual([second, first])
+  // Asking for the order already stored writes nothing new, so only the
+  // reorder above is logged.
+  await a.reorder([second, first], second)
+  expect(logs.take()).toEqual([
+    {
+      message: 'account reordered',
+      payload: expect.objectContaining({ id: second }),
+    },
+  ])
 })

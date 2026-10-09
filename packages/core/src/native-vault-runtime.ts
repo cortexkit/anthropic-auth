@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { ClaustrumClient } from '@cortexkit/claustrum-client'
 import {
-  acceptVaultRoute,
-  declineVaultRoute,
+  acceptAccount,
+  ClaustrumConsumerError,
+  declineAccount,
   mutateVaultRoster,
   readVaultRoster,
   refreshVaultRoster,
@@ -111,7 +112,11 @@ export interface NativeVaultRuntime {
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
   ): Promise<OAuthAccountProfile>
-  setEnabled(routeId: string, enabled: boolean): Promise<void>
+  /**
+   * Accept or decline a vault route for the user. Resolves to whether the
+   * route's enabled flag changed, judged on the roster under its write lock.
+   */
+  setEnabled(routeId: string, enabled: boolean): Promise<boolean>
   resetBackoff(
     receipt: NativeCustodyReceipt,
     kind?: 'refresh' | 'quota' | 'all',
@@ -533,10 +538,40 @@ export function createNativeVaultRuntime(
       const roster = await readVaultRoster(paths.roster)
       const row = await rowFor(roster, routeId)
       if (!row) throw new NativeCustodyError('route-unavailable')
-      await (enabled ? acceptVaultRoute : declineVaultRoute)(
-        paths.roster,
-        row.routeId,
-      )
+      // Update acceptance and the enabled flag together under the roster write
+      // lock. Compare that held flag before changing it so repeated enable or
+      // disable calls report no change. It makes the same roster change as
+      // common-auth's acceptVaultRoute and declineVaultRoute.
+      return mutateVaultRoster(paths.roster, (current) => {
+        const held = current?.rows.find(
+          (entry) => entry.routeId === row.routeId,
+        )
+        if (!current || !held)
+          throw new ClaustrumConsumerError(
+            'route-unavailable',
+            'Claustrum route is not in the roster',
+          )
+        return {
+          next: {
+            ...current,
+            declined: enabled
+              ? acceptAccount(
+                  current.declined,
+                  [held.credentialId, ...(held.aliases ?? [])],
+                  held.accountIdentity,
+                )
+              : declineAccount(
+                  current.declined,
+                  held.credentialId,
+                  held.accountIdentity,
+                ),
+            rows: current.rows.map((entry) =>
+              entry === held ? { ...entry, enabled } : entry,
+            ),
+          },
+          result: held.enabled !== enabled,
+        }
+      })
     },
     close() {
       if (shutdown.signal.aborted) return

@@ -24,7 +24,6 @@ import {
   type NativeMenuDispatch,
   type NativeMenuKillswitchEntry,
   setDumpEnabled,
-  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import type { PiNativeCommands } from './commands.ts'
 import { createPiCustodyCommands } from './custody.ts'
@@ -113,7 +112,7 @@ export function createPiNativeCommands(
           return { ok: false, text: 'Native account order is unavailable.' }
         order[index] = other
         order[target] = id
-        await runtime.reorder(order)
+        await runtime.reorder(order, request.values.id)
         return { ok: true, text: 'Native account order updated.' }
       }
       case 'add-apikey':
@@ -304,8 +303,8 @@ export function createPiNativeCommands(
         return { ok: true, text: 'Native request dumping setting updated.' }
       }
       case 'logging-level':
-        await setSection('logging', { level: request.values.level })
-        setLogLevel(request.values.level)
+        // The native runtime stores the level and applies it to the logger.
+        await runtime.setLoggingLevel(request.values.level)
         return { ok: true, text: 'Native logging level updated.' }
       case 'fast-on':
       case 'fast-off':
