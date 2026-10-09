@@ -34,6 +34,12 @@ export {
 } from '@cortexkit/common-auth/commands'
 
 import {
+  AUTHORIZE_URLS,
+  CLIENT_ID,
+  CODE_CALLBACK_URL,
+  OAUTH_SCOPES,
+} from './constants.ts'
+import {
   createNativeMenuExecutor,
   type NativeMenuDispatch,
   type NativeMenuExecutionResult,
@@ -148,6 +154,81 @@ function knob(parameter: NativeMenuParameter): MenuKnob {
         placeholder: '[{"account":"main","fh":5,"sd":10,"scoped":0}]',
       }
   }
+}
+
+/**
+ * The query parameters authorize() sets with fixed values. A sign-in link
+ * also carries its per-login PKCE challenge and state, and nothing else.
+ */
+const SIGN_IN_QUERY: Readonly<Record<string, string>> = {
+  code: 'true',
+  client_id: CLIENT_ID,
+  response_type: 'code',
+  redirect_uri: CODE_CALLBACK_URL,
+  scope: OAUTH_SCOPES.join(' '),
+  code_challenge_method: 'S256',
+}
+const SIGN_IN_KEYS = [...Object.keys(SIGN_IN_QUERY), 'code_challenge', 'state']
+const SIGN_IN_ENDPOINTS: ReadonlySet<string> = new Set(
+  Object.values(AUTHORIZE_URLS),
+)
+/** Base64url of a SHA-256 digest, the S256 challenge generatePKCE() makes. */
+const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/
+/** A UUID's 32 lowercase hex digits, the state authorize() generates. */
+const SIGN_IN_STATE = /^[0-9a-f]{32}$/
+
+/**
+ * True only for a URL exactly as authorize() builds it: a known Anthropic
+ * authorize endpoint, the fixed client, callback and scopes, one PKCE
+ * challenge and one state of the generated shapes, written in canonical form
+ * with no credentials, port, fragment or extra parameter.
+ */
+function isSignInLink(candidate: string): boolean {
+  let url: URL
+  try {
+    url = new URL(candidate)
+  } catch {
+    return false
+  }
+  if (
+    url.href !== candidate ||
+    candidate.includes('#') ||
+    url.username !== '' ||
+    url.password !== '' ||
+    !SIGN_IN_ENDPOINTS.has(`${url.origin}${url.pathname}`)
+  )
+    return false
+  const keys = [...url.searchParams.keys()]
+  if (
+    keys.length !== SIGN_IN_KEYS.length ||
+    !SIGN_IN_KEYS.every((key) => keys.includes(key))
+  )
+    return false
+  return (
+    Object.entries(SIGN_IN_QUERY).every(
+      ([key, value]) => url.searchParams.get(key) === value,
+    ) &&
+    PKCE_CHALLENGE.test(url.searchParams.get('code_challenge') ?? '') &&
+    SIGN_IN_STATE.test(url.searchParams.get('state') ?? '')
+  )
+}
+
+/**
+ * Text for a successful OAuth start. The person must open the authorize URL
+ * with its state intact, or the pasted code cannot be matched to the pending
+ * login. The redactor masks the 32-hex-digit state as a possible secret, so
+ * exactly one link that passes isSignInLink is kept verbatim and the text
+ * around it is still scrubbed. The state and PKCE challenge are public parts
+ * of the browser request; the PKCE verifier never appears in the link. Any
+ * other text, or more than one distinct link, is scrubbed in full.
+ */
+function showSignInLink(text: string, scrub: (text: string) => string) {
+  const links = new Set(
+    (text.match(/https:\/\/\S+/g) ?? []).filter(isSignInLink),
+  )
+  const [link] = links
+  if (links.size !== 1 || link === undefined) return scrub(text)
+  return text.split(link).map(scrub).join(link)
 }
 
 function outcome(result: NativeMenuExecutionResult): {
@@ -306,10 +387,15 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
           safe = safe.split(value).join('[REDACTED]')
         return redact(safe)
       }
-      const finish = async (result: ReturnType<typeof outcome>) => ({
+      const finish = async (
+        result: ReturnType<typeof outcome>,
+        signInLink = false,
+      ) => ({
         command: 'claude',
         ...result,
-        text: scrub(result.text),
+        text: signInLink
+          ? showSignInLink(result.text, scrub)
+          : scrub(result.text),
         // Without readable data fields there is no safe way to identify a
         // submitted secret. Do not invoke status callbacks that could echo it.
         menu: await model(invocation, scrub, readable),
@@ -361,7 +447,15 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
           sessionId: invocation.sessionId,
         },
       )
-      return finish(outcome(result))
+      // Only the checked OAuth start that the host reports as successful may
+      // show its sign-in link. Status lines and notifications stay scrubbed.
+      return finish(
+        outcome(result),
+        result.status === 'executed' &&
+          result.action === 'add-oauth-start' &&
+          result.ok &&
+          protectedValues.length === 0,
+      )
     },
   }
 }
