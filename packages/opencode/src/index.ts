@@ -6580,14 +6580,19 @@ const anthropicAuthPlugin = async (
             accessToken?: string,
             mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
-            if (!accessToken) return false
+            if (!accessToken && !mainQuotaIdentity?.providerAccountUuid)
+              return false
             const entry = quotaManager.getMain(
               mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId,
             )
-            // A genuine response header is live routing evidence like a 429, but
-            // it gets no exemption from the shared freshness and token gates.
+            // Native metadata can establish account-owned exhaustion before
+            // primary credential authorization. The API send still validates
+            // that credential and rechecks this quota before dispatch.
             return Boolean(
               entry &&
+                (accessToken ||
+                  entry.quota.accountIdentity ===
+                    mainQuotaIdentity?.providerAccountUuid) &&
                 entry.refreshAfter > Date.now() &&
                 quotaSnapshotIsExhausted(entry.quota),
             )
@@ -8098,11 +8103,27 @@ const anthropicAuthPlugin = async (
               // Fallback-first reached main only after its fallback attempts.
               // Resolve current access now; absence from the earlier metadata
               // view is not evidence that the stored token needs refreshing.
-              if (auth.deferred)
+              if (auth.deferred) {
                 Object.assign(
                   auth,
                   await getAuth(credentialModelId, init?.signal ?? undefined),
                 )
+                if (auth.access) {
+                  const resolution = await resolveMainQuotaAccountIdentity(
+                    auth.access,
+                    credentialModelId,
+                    auth.nativeAccountIdentity,
+                    auth.nativeScopedAttempt?.recordVersion,
+                  )
+                  if (resolution.stale)
+                    throw new Error(
+                      'Main OAuth identity changed while resolving request credentials',
+                    )
+                  requestMainQuotaIdentity = resolution
+                  mainServedAccessToken = auth.access
+                  mainProviderAccountUuid = resolution.providerAccountUuid
+                }
+              }
               if (
                 !auth.modelDenied &&
                 (!auth.access || !auth.expires || auth.expires < Date.now())
