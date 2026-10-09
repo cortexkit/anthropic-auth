@@ -1260,9 +1260,13 @@ const anthropicAuthPlugin = async (
     updateNativeSection('dump', { enabled })
   const setFastModePersistentEnabled = (enabled: boolean) =>
     updateNativeSection('claudeFast', { enabled })
-  const setLogLevelPersistent = (
-    level: NonNullable<AccountStorage['logging']>['level'],
-  ) => updateNativeSection('logging', { level })
+  // Stores the level, then aligns this process's live logger level with it.
+  const setLogLevelPersistent = async (
+    level: NonNullable<NonNullable<AccountStorage['logging']>['level']>,
+  ) => {
+    await nativeAccounts.setLoggingLevel(level)
+    return loadAccounts()
+  }
   const setPrimePersistentEnabled = (
     enabled: boolean,
     _path = accountStoragePath,
@@ -3840,8 +3844,8 @@ const anthropicAuthPlugin = async (
   async function executePersistentLoggingCommand(argumentsText: string) {
     const action = parseLoggingCommandAction(argumentsText)
     if (action.type === 'level') {
-      // The native runtime logs a committed level change and applies it to
-      // this process's logger.
+      // The native runtime stores the level, applies it to this process's
+      // logger and logs a live level change.
       await setLogLevelPersistent(action.level)
       return executeLoggingCommand({ argumentsText, level: action.level })
     }
@@ -4417,9 +4421,11 @@ const anthropicAuthPlugin = async (
         break
       }
       case 'add-apikey':
-        // The plugin's own API-key flow applies OpenCode's fallback defaults
-        // (the label as route id, the kie.ai base URL and a bearer header);
-        // the generic native runtime defaults would otherwise apply.
+        // Use this plugin's established API-route defaults when values are
+        // omitted: route id = the label, or a random UUID without one; base URL
+        // = https://api.kie.ai/claude; auth header = authorization-bearer.
+        // The generic native addApi would instead use a random UUID and
+        // https://api.anthropic.com with no auth header set.
         text = (
           await executePersistentAccountCommand('', request.sessionId, {
             type: 'add-apikey',

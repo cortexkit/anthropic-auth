@@ -17,6 +17,7 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
 } from './accounts.ts'
+import type { LogLevel } from './logger.ts'
 import {
   applyNativeMetadataPatch,
   captureNativeMetadataPatch,
@@ -32,6 +33,7 @@ import {
 } from './native-account-view.ts'
 import {
   applyCommittedNativeSettingsEffects,
+  applyNativeLogLevel,
   captureNativeSettingsEffectFields,
   logCommittedNativeAccountAdded,
   logCommittedNativeAccountChange,
@@ -172,6 +174,12 @@ export interface NativeAccountRuntime {
     settings: Record<string, unknown>
     outcome: 'updated' | 'unchanged'
   }>
+  /**
+   * Store `level` as the logging level, then make it this process's live
+   * logger level if it is not already, even when the stored value was
+   * unchanged. Nothing is applied when the write fails.
+   */
+  setLoggingLevel(level: LogLevel): Promise<void>
   setEnabled(routeId: string, enabled: boolean): Promise<void>
   remove(routeId: string): Promise<void>
   /**
@@ -841,35 +849,86 @@ export function createNativeAccountRuntime(
         applyCommittedNativeSettingsEffects(captured.before, result.settings)
       return result
     },
+    async setLoggingLevel(level) {
+      // A changed stored level is applied and logged by updateSettings; an
+      // unchanged one still brings a different live level in line with it.
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        logging: {
+          ...(settings.logging &&
+          typeof settings.logging === 'object' &&
+          !Array.isArray(settings.logging)
+            ? settings.logging
+            : {}),
+          level,
+        },
+      }))
+      applyNativeLogLevel(level)
+    },
     async setEnabled(routeId, enabled) {
+      // The earlier read only chooses the vault or the pool and supplies the
+      // label; whether the flag changed is judged under the write's locks.
       const current = await runtime.read()
       const row = current.accounts.find((row) => row.id === routeId)
-      if (row?.source === 'vault') await vault.setEnabled(routeId, enabled)
-      else {
-        const id = await physicalId(routeId)
-        if (enabled) await store.enable(id)
-        else await store.disable(id, 'user-disabled')
+      const account = { id: routeId, label: row?.label }
+      const change = enabled ? 'account enabled' : 'account disabled'
+      if (row?.source === 'vault') {
+        if (await vault.setEnabled(routeId, enabled))
+          logCommittedNativeAccountChange(change, account)
+        return
       }
-      if (row && row.enabled !== enabled)
-        logCommittedNativeAccountChange(
-          enabled ? 'account enabled' : 'account disabled',
-          row,
-        )
+      const id = await physicalId(routeId)
+      const operation = enabled ? 'enable' : 'disable'
+      // Enable and disable return account metadata, not whether its enabled
+      // flag changed. A store opened for this one operation therefore reads the
+      // row just before each of its config writes, while all of the store's
+      // locks are held. An enable
+      // of a row that is already enabled writes no config. Repairing a row
+      // torn by an interrupted write can write the config first, so the last
+      // read wins; reads show a torn row as completed, so the repair itself is
+      // never taken for the operation's change.
+      const captured: { before?: boolean } = {}
+      const transition = createNativePoolStore({
+        paths,
+        quota: nativeQuotaCodec,
+        now,
+        onStep: async (step, info) => {
+          if (
+            step !== 'before-config-write' ||
+            info.operation !== operation ||
+            info.rowId !== id
+          )
+            return
+          captured.before = undefined
+          try {
+            const read = await store.read()
+            if (read.status === 'ready')
+              captured.before = read.rows.find((row) => row.id === id)?.enabled
+          } catch {
+            // An unreadable pool leaves the change unknown, so nothing is logged.
+          }
+        },
+      })
+      if (enabled) await transition.enable(id)
+      else await transition.disable(id, 'user-disabled')
+      if (captured.before !== undefined && captured.before !== enabled)
+        logCommittedNativeAccountChange(change, account)
     },
     async remove(routeId) {
       const current = await runtime.read()
       const row = current.accounts.find((row) => row.id === routeId)
+      const account = { id: routeId, label: row?.label }
       if (row?.source === 'vault') {
         // Vault membership is managed by the vault, so removing a vault row
         // declines its route; the committed change is a disable.
-        await vault.setEnabled(routeId, false)
-        if (row.enabled)
-          logCommittedNativeAccountChange('account disabled', row)
+        if (await vault.setEnabled(routeId, false))
+          logCommittedNativeAccountChange('account disabled', account)
         return
       }
+      // 'removed' means this call dropped the account's roster row.
       const removed = await store.remove(await physicalId(routeId))
-      if (row && removed.outcome === 'removed')
-        logCommittedNativeAccountChange('account removed', row)
+      if (removed.outcome === 'removed')
+        logCommittedNativeAccountChange('account removed', account)
     },
     async reorder(routeIds, movedRouteId) {
       await authority()
@@ -897,46 +956,49 @@ export function createNativeAccountRuntime(
           order.some((id) => !snapshot.accounts.some((row) => row.id === id))
         )
           throw new NativeCustodyError('invalid-state')
-        await mutateVaultRoster(paths.roster, (roster) => {
-          if (!roster) throw new NativeCustodyError('route-unavailable')
-          const primary = nativeVaultPrimaryRow(
-            roster,
-            nativeVaultPrimaryPin(snapshot.settings),
-          )
-          const ids = order
-            .filter(
-              (id) =>
-                snapshot.accounts.find((row) => row.id === id)?.source ===
-                'vault',
+        const rosterReordered = await mutateVaultRoster(
+          paths.roster,
+          (roster) => {
+            if (!roster) throw new NativeCustodyError('route-unavailable')
+            const primary = nativeVaultPrimaryRow(
+              roster,
+              nativeVaultPrimaryPin(snapshot.settings),
             )
-            .map((id) => (id === 'main' ? primary?.routeId : id))
-          if (
-            ids.length !== roster.rows.length ||
-            ids.some((id) => !roster.rows.some((row) => row.routeId === id))
-          )
-            throw new NativeCustodyError('identity-changed')
-          return {
-            next: {
-              ...roster,
-              rows: ids.map((id) => {
-                const row = roster.rows.find((row) => row.routeId === id)
-                if (!row) throw new NativeCustodyError('identity-changed')
-                return row
-              }),
-            },
-            result: undefined,
-          }
-        })
+            const ids = order
+              .filter(
+                (id) =>
+                  snapshot.accounts.find((row) => row.id === id)?.source ===
+                  'vault',
+              )
+              .map((id) => (id === 'main' ? primary?.routeId : id))
+            if (
+              ids.length !== roster.rows.length ||
+              ids.some((id) => !roster.rows.some((row) => row.routeId === id))
+            )
+              throw new NativeCustodyError('identity-changed')
+            return {
+              next: {
+                ...roster,
+                rows: ids.map((id) => {
+                  const row = roster.rows.find((row) => row.routeId === id)
+                  if (!row) throw new NativeCustodyError('identity-changed')
+                  return row
+                }),
+              },
+              // Compared against the roster read under its write lock.
+              result: ids.some(
+                (id, index) => roster.rows[index]?.routeId !== id,
+              ),
+            }
+          },
+        )
         // Ordering spans the pool account config and the native vault roster.
         // Their writes are not a two-file atomic transaction: an interruption
         // can leave mixed presentation order, but neither roster loses a member.
-        await store.updateSettings((settings) => {
+        const settingsWrite = await store.updateSettings((settings) => {
           settings.nativeAccountOrder = order
         })
-        if (
-          JSON.stringify(order) !==
-          JSON.stringify(snapshot.accounts.map((row) => row.id))
-        )
+        if (rosterReordered || settingsWrite.outcome === 'updated')
           logReordered()
         return
       }

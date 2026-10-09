@@ -303,8 +303,8 @@ export function createPiNativeCommands(
         return { ok: true, text: 'Native request dumping setting updated.' }
       }
       case 'logging-level':
-        // The native runtime applies a committed level change to the logger.
-        await setSection('logging', { level: request.values.level })
+        // The native runtime stores the level and applies it to the logger.
+        await runtime.setLoggingLevel(request.values.level)
         return { ok: true, text: 'Native logging level updated.' }
       case 'fast-on':
       case 'fast-off':
