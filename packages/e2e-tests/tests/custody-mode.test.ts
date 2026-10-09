@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 import { afterEach, describe, expect, it } from 'bun:test'
-import { custodyTombstoneKey, isOAuthAccount, loadAccounts, setRoutingMode } from '@cortexkit/anthropic-auth-core'
+import { createNativeAccountRuntime, custodyTombstoneOAuth, type NativePoolPaths, readNativeMigrationJournal, resolveNativePoolPaths } from '@cortexkit/anthropic-auth-core'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -31,6 +31,37 @@ const credential = (access: string, accountId: string, recordVersion: number): F
 const mainId = 'oauth:anthropic'
 const workId = 'oauth:anthropic:work'
 
+// Read migrated account settings and cached quota/profile data through the
+// native account runtime, not the retired sidecar files. Reading this status
+// must not connect to Claustrum or retrieve an OAuth bearer token.
+async function readNativeAccounts(paths: NativePoolPaths) {
+  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+  try {
+    return await runtime.read()
+  } finally {
+    runtime.close()
+  }
+}
+async function setNativeRoutingMode(mode: string, paths: NativePoolPaths) {
+  const runtime = createNativeAccountRuntime({ paths, host: 'opencode' })
+  try {
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      routing: { ...(settings.routing as Record<string, unknown> | undefined), mode },
+    }))
+  } finally {
+    runtime.close()
+  }
+}
+const hasVaultAccount = (snapshot: Awaited<ReturnType<typeof readNativeAccounts>>, credentialId: string) =>
+  snapshot.accounts.some((a) => a.source === 'vault' && a.credentialId === credentialId)
+async function readIfPresent(path: string) {
+  return readFile(path, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  })
+}
+
 describe('zero-bind scoped custody', () => {
   it('discovers, authorizes and serves a new account without handles or a restart', async () => {
     const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-scoped-e2e-'))
@@ -41,9 +72,9 @@ describe('zero-bind scoped custody', () => {
     const daemon = await startFakeClaustrumDaemon({ directory: root, scopedCredentials: credentials })
     daemons.push(daemon)
     harness = await E2EHarness.create({
+      nativeAccounts: { kind: 'vault' },
       childEnv: {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
-        OPENCODE_AUTH_CONTENT: JSON.stringify({ anthropic: { type: 'oauth', access: '', refresh: custodyTombstoneKey('anthropic'), expires: 0 } }),
       },
       beforeSpawn: async (env) => {
         const path = join(env.configDir, 'anthropic-auth.json')
@@ -62,32 +93,39 @@ describe('zero-bind scoped custody', () => {
     expect(daemon.credentialGets).toContain(mainId)
     expect(daemon.scopedLists).toBeGreaterThan(0)
     credentials[workId] = credential('scoped-work', 'account-work', 12)
-    const accountPath = join(harness.opencode.env.configDir, 'anthropic-auth.json')
+    const pool = harness.opencode.native!.paths
     await harness.waitFor(async () => {
-      const storage = await loadAccounts(accountPath)
-      return storage?.accounts.some((a) => isOAuthAccount(a) && a.claustrumScopedCredentialId === workId) ? true : undefined
+      const snapshot = await readNativeAccounts(pool)
+      return hasVaultAccount(snapshot, workId) ? true : undefined
     }, { timeoutMs: 15_000, label: 'new scoped account persisted' })
-    const beforeMode = await loadAccounts(accountPath)
-    expect(beforeMode?.accounts.some((a) => isOAuthAccount(a) && a.claustrumScopedCredentialId === workId),
-      JSON.stringify({ rows: beforeMode?.accounts.map((a) => [a.id, isOAuthAccount(a) ? a.claustrumScopedCredentialId : 'api']),
-        raw: JSON.parse(await readFile(accountPath, 'utf8')).accounts?.map((a: { id: string }) => a.id),
+    const beforeMode = await readNativeAccounts(pool)
+    expect(hasVaultAccount(beforeMode, workId),
+      JSON.stringify({ rows: beforeMode.accounts.map((a) => [a.id, a.source === 'vault' ? a.credentialId : a.type]),
+        roster: await readIfPresent(pool.roster),
         scopedLists: daemon.scopedLists, vaultIds: Object.keys(credentials) }),
     ).toBe(true)
-    await setRoutingMode('fallback-first', accountPath)
-    const afterMode = await loadAccounts(accountPath)
-    expect(afterMode?.accounts.some((a) => isOAuthAccount(a) && a.claustrumScopedCredentialId === workId)).toBe(true)
+    await setNativeRoutingMode('fallback-first', pool)
+    const afterMode = await readNativeAccounts(pool)
+    expect(hasVaultAccount(afterMode, workId)).toBe(true)
     const second = await harness.createSession()
     await harness.sendPrompt(second, 'serve new fallback')
     await harness.waitForSessionText(second, 'new account served')
     expect(harness.anthropic.requests().at(-1)?.headers.authorization).toBe('Bearer scoped-work')
     expect(daemon.credentialGets).toContain(workId)
     expect(harness.anthropic.tokenRequests()).toBe(0)
-    const state = await readFile(join(harness.opencode.env.configDir, 'anthropic-auth-state.json'), 'utf8')
+    // Require the account-observation file so a missing file cannot make the
+    // token-exclusion assertion pass vacuously. Inspect configuration,
+    // credential and roster files too when present; this vault-only fixture
+    // does not require a file containing local OAuth credentials.
+    const state = [
+      await readFile(pool.runtime, 'utf8'),
+      ...(await Promise.all([pool.config, pool.state, pool.roster].map(readIfPresent))),
+    ].join('\n')
     expect(state).not.toContain('scoped-main')
     expect(state).not.toContain('scoped-work')
   }, 120_000)
 
-  it('refuses legacy handle-mode even when a vault daemon has a healthy credential', async () => {
+  it('refuses a legacy handle-only config with native migration-required authority until explicit setup', async () => {
     const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-legacy-e2e-'))
     roots.push(root)
     const daemon = await startFakeClaustrumDaemon({ directory: root,
@@ -95,9 +133,15 @@ describe('zero-bind scoped custody', () => {
     })
     daemons.push(daemon)
     harness = await E2EHarness.create({
+      // Deliberately unmigrated: offline setup refuses this handle-only config
+      // (custody mode without a primary account). OpenCode's real auth.json
+      // holds a non-secret OAuth-shaped marker that activates this plugin, and
+      // there is no completed credential-transfer journal. The plugin must end
+      // the turn with the exact setup-required error, without a retry, a
+      // provider or vault request, or an enrollment attempt.
+      nativeAccounts: { kind: 'unmigrated', hostAuth: { anthropic: custodyTombstoneOAuth('anthropic') } },
       childEnv: {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
-        OPENCODE_AUTH_CONTENT: JSON.stringify({ anthropic: { type: 'oauth', access: '', refresh: custodyTombstoneKey('anthropic'), expires: 0 } }),
       },
       beforeSpawn: async (env) => {
         await writeFile(join(env.configDir, 'anthropic-auth.json'), JSON.stringify({ version: 1, accounts: [], claustrum: { mode: 'claustrum' } }), { mode: 0o600 })
@@ -106,7 +150,22 @@ describe('zero-bind scoped custody', () => {
     const session = await harness.createSession()
     await harness.startPrompt(session, 'must fail before transport')
     try {
-      await harness.waitForSessionStatusType(session, 'retry', 15_000)
+      type SessionMessage = { info: { role?: string; error?: { name?: string; data?: { message?: unknown } } }; parts?: Array<{ type?: string; text?: string }> }
+      const statuses: Array<string | undefined> = []
+      const assistants = await harness.waitFor(async () => {
+        statuses.push((await harness!.client.session.status()).data?.[session]?.type)
+        const messages = ((await harness!.client.session.messages({ path: { id: session } })).data ?? []) as SessionMessage[]
+        const replies = messages.filter((message) => message.info.role === 'assistant')
+        return replies.length > 0 && replies.every((message) => message.info.error) ? replies : undefined
+      }, { timeoutMs: 15_000, label: 'terminal assistant error' })
+      const finalStatus = (await harness.client.session.status()).data?.[session]?.type
+      expect(
+        assistants.map((message) => message.info.error?.data?.message),
+        JSON.stringify({ errors: assistants.map((message) => message.info.error), statuses, finalStatus }),
+      ).toEqual(assistants.map(() => 'Anthropic account migration is required; run setup'))
+      expect(statuses).not.toContain('retry')
+      expect(finalStatus).not.toBe('retry')
+      expect(assistants.flatMap((message) => message.parts ?? []).filter((part) => part.type === 'text' && part.text)).toEqual([])
       expect(harness.anthropic.requests()).toHaveLength(0)
       expect(daemon.credentialGets).toHaveLength(0)
       expect(daemon.enrollmentProposals).toHaveLength(0)
@@ -114,6 +173,11 @@ describe('zero-bind scoped custody', () => {
         join(harness.opencode.env.configDir, 'claustrum-enrollment-state.json'),
         'utf8',
       )).rejects.toMatchObject({ code: 'ENOENT' })
+      const pool = await resolveNativePoolPaths(
+        join(harness.opencode.env.configDir, 'anthropic-auth.json'),
+        join(harness.opencode.env.configDir, 'anthropic-auth-state.json'),
+      )
+      expect(await readNativeMigrationJournal(pool)).toBeUndefined()
     } finally {
       await harness.abortSession(session)
     }
@@ -131,16 +195,9 @@ describe('scoped credential rotations in the OpenCode process', () => {
     })
     daemons.push(daemon)
     harness = await E2EHarness.create({
+      nativeAccounts: { kind: 'vault' },
       childEnv: {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: daemon.connectionFile,
-        OPENCODE_AUTH_CONTENT: JSON.stringify({
-          anthropic: {
-            type: 'oauth',
-            access: '',
-            refresh: custodyTombstoneKey('anthropic'),
-            expires: 0,
-          },
-        }),
       },
       beforeSpawn: async (env) => {
         await writeFile(join(env.configDir, 'anthropic-auth.json'), JSON.stringify({
@@ -224,6 +281,7 @@ it('late fixture cleanup cannot dispose the next test’s harness, daemon or dir
     await rm(previousRoot, { recursive: true, force: true })
     if (!roots.includes(nextRoot))
       await rm(nextRoot, { recursive: true, force: true })
-    // The registered afterEach owns the next fake fixture when installed.
+    // If nextRoot remains registered, afterEach stops its harness and daemon
+    // and removes that directory after this test.
   }
 })

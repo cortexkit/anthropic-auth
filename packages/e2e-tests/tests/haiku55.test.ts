@@ -81,7 +81,9 @@ test('Haiku 5.5 structured output preserves forced choice and reaches its tool',
 
 test('OpenCode real accounting changes the Haiku 5.5 rate only above 100K cache-inclusive input', async () => {
   harness = await E2EHarness.create({
-    childEnv: { OPENCODE_AUTH_CONTENT: JSON.stringify({ anthropic: { type: 'api', key: 'synthetic-api-key' } }) },
+    // OpenCode keeps its own stored Anthropic API key in auth.json. Migration
+    // creates no primary OAuth account in the shared credential store from it.
+    nativeAccounts: { kind: 'local', hostAuth: { anthropic: { type: 'api', key: 'synthetic-api-key' } } },
   })
   for (const total of [100_000, 100_001]) {
     harness.script([{ type: 'text', text: 'ok', usage: { input_tokens: total - 10_000, output_tokens: 20, cache_creation_input_tokens: 5000, cache_read_input_tokens: 5000 } }])
