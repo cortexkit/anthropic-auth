@@ -749,7 +749,10 @@ describe('scoped enrollment is explicit', () => {
       ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
       const notices = drainNotifications(0, sessionId)
       notificationId = notices.at(-1)?.id ?? 0
-      const accountDialog = notices.at(-1)?.payload
+      const notice = notices.at(-1)
+      if (notice?.type !== 'open-dialog')
+        throw new Error('Expected a legacy account dialog notification')
+      const accountDialog = notice.payload
       expect(accountDialog?.command).toBe('claude-account')
       expect(accountDialog?.knobs?.accounts).toContainEqual(
         expect.objectContaining({
@@ -7639,7 +7642,7 @@ describe('auth.loader', () => {
     expect(state.relay).toEqual({ enabled: true, transport: 'websocket' })
   })
 
-  test('registers and handles /claude-cache slash command with ignored status replies', async () => {
+  test('registers /claude and handles cache settings with ignored status replies', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient)
@@ -7647,30 +7650,13 @@ describe('auth.loader', () => {
 
     await plugin.config(config)
 
-    expect(config.command?.['claude-cache']).toMatchObject({
-      template: 'claude-cache',
-      description: expect.stringContaining('1-hour'),
+    expect(config.command?.claude).toMatchObject({
+      template: 'claude',
+      description: expect.stringContaining('Claude accounts'),
     })
-    expect(config.command?.['claude-quota']).toMatchObject({
-      template: 'claude-quota',
-      description: expect.stringContaining('Claude OAuth quota'),
-    })
-    expect(config.command?.['claude-dump']).toMatchObject({
-      template: 'claude-dump',
-      description: expect.stringContaining('dump'),
-    })
-    expect(config.command?.['claude-fast']).toMatchObject({
-      template: 'claude-fast',
-      description: expect.stringContaining('fast mode'),
-    })
-    expect(config.command?.['claude-cachekeep']).toMatchObject({
-      template: 'claude-cachekeep',
-      description: expect.stringContaining('cache warm'),
-    })
-    expect(config.command?.['claude-routing']).toMatchObject({
-      template: 'claude-routing',
-      description: expect.stringContaining('account routing'),
-    })
+    for (const command of COMMAND_MODAL_NAMES) {
+      expect(config.command?.[command]).toBeUndefined()
+    }
 
     await expectHandledCommandResponse(
       plugin['command.execute.before']({
@@ -7716,41 +7702,36 @@ describe('auth.loader', () => {
     expect(saved.claudeCache).toEqual({ enabled: true, mode: 'explicit' })
   })
 
-  test('config hook registers every modal command so they appear in the command palette', async () => {
+  test('config hook registers only /claude and retires owned aliases without clobbering foreign commands', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
     const plugin = await getPlugin()
-
-    // Seed a pre-existing command from another plugin / opencode itself — the
-    // config hook must MERGE into config.command, never clobber it.
     const preExisting = { template: 'other-plugin-cmd', description: 'foreign' }
     const result: { command?: Record<string, unknown> } = {
-      command: { 'other-plugin-cmd': preExisting },
+      command: {
+        'other-plugin-cmd': preExisting,
+        ...Object.fromEntries(
+          COMMAND_MODAL_NAMES.map((name) => [
+            name,
+            {
+              template: name,
+              description: 'previous plugin registration',
+            },
+          ]),
+        ),
+      },
     }
     await plugin.config(result)
 
-    const registered = Object.keys(result.command ?? {})
-
-    // Passthrough-survival: the foreign command must still be present (the hook
-    // spreads ...(config.command ?? {}) — dropping that spread would silently
-    // wipe every other plugin's commands).
     expect(result.command?.['other-plugin-cmd']).toEqual(preExisting)
-
-    // Every modal command must be registered — if one is missing it won't appear
-    // in the slash-command palette and users will get "No matching items".
+    expect(result.command?.claude).toMatchObject({ template: 'claude' })
     for (const name of COMMAND_MODAL_NAMES) {
-      expect(registered).toContain(name)
+      expect(result.command?.[name]).toBeUndefined()
     }
-
-    // The config hook must not register extra claude-* commands beyond the
-    // shared modal-command set (drift in either direction is a bug). The foreign
-    // 'other-plugin-cmd' is excluded from this count via the claude- prefix.
-    const claudeRegistered = registered.filter((name) =>
-      name.startsWith('claude-'),
-    )
-    expect(claudeRegistered).toHaveLength(COMMAND_MODAL_NAMES.length)
-    expect([...claudeRegistered].sort()).toEqual(
-      [...COMMAND_MODAL_NAMES].sort(),
-    )
+    expect(Object.keys(result.command ?? {}).sort()).toEqual([
+      'claude',
+      'other-plugin-cmd',
+    ])
+    await plugin.dispose?.()
   })
 
   test('handles /claude-start by injecting one visible synthetic prompt', async () => {
