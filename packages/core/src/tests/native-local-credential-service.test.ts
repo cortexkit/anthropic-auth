@@ -1,4 +1,5 @@
 import { expect } from 'bun:test'
+import { readFileSync, writeFileSync } from 'node:fs'
 import {
   chmod,
   mkdir,
@@ -8,7 +9,7 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { fingerprintOf, type PoolRow } from '@cortexkit/common-auth/store'
 
@@ -42,6 +43,7 @@ import {
 import { type NativePoolPaths, resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { tokenFingerprint } from '../token-fingerprint.ts'
+import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup, gate } = createTestLifetimeSuite()
@@ -74,6 +76,8 @@ interface FixtureOptions {
     | Partial<NativeRuntimeEntry>
     | ((binding: NativeLocalPoolBinding) => Partial<NativeRuntimeEntry>)
   authority?: Authority
+  /** Commit the empty pool through the real offline migration instead of writing a journal. */
+  migrated?: boolean
   expires?: number
 }
 
@@ -171,6 +175,7 @@ async function fixture(options: FixtureOptions = {}) {
     const read = await readNativeRuntime(paths.runtime, paths.storageId)
     return read.status === 'ready' ? read.state.accounts.row : undefined
   }
+  if (options.migrated) await initializeNativeTestAuthority(paths)
   await store.initialize()
   await store.add({
     id: 'row',
@@ -197,7 +202,8 @@ async function fixture(options: FixtureOptions = {}) {
       },
     }))
   }
-  await writeJournal(paths, options.authority ?? 'committed')
+  if (!options.migrated)
+    await writeJournal(paths, options.authority ?? 'committed')
   const f = {
     root,
     paths,
@@ -377,6 +383,150 @@ async function authorityScenario(module: ServiceModule) {
     expect([f.exchanges, f.lookups]).toEqual([0, 1])
   })
 }
+
+type AuthorityLoss = 'invalid' | 'incomplete'
+
+/**
+ * Take authority away from a pool that the real offline migration committed.
+ * 'invalid' truncates the migrated journal; 'incomplete' keeps its contents but
+ * moves it back to the pre-commit 'verified' phase. Neither variant writes a
+ * journal that grants authority. The write is synchronous so it finishes
+ * inside the callback that calls it, while the service request is in flight.
+ */
+function loseAuthority(paths: NativePoolPaths, loss: AuthorityLoss) {
+  const journal = readFileSync(paths.journal, 'utf8')
+  writeFileSync(
+    paths.journal,
+    loss === 'invalid'
+      ? journal.slice(0, Math.floor(journal.length / 2))
+      : JSON.stringify({ ...JSON.parse(journal), phase: 'verified' }),
+  )
+}
+
+async function lockFiles(f: Fixture) {
+  return (await readdir(f.root)).filter((name) => name.endsWith('.lock'))
+}
+
+/**
+ * The service checks authority before the coordinator starts, but the
+ * coordinator then awaits runtime reads and the host's admission policy. Lose
+ * authority from inside that policy, after the first check has passed, and
+ * require that the already-admitted access token is not returned.
+ */
+async function finalAuthorityScenario(
+  module: ServiceModule,
+  loss: AuthorityLoss = 'invalid',
+) {
+  const f = await fixture({ migrated: true })
+  let duringAdmission: (() => void) | undefined
+  const s = service(f, module, {
+    externalPolicy: () => {
+      const change = duringAdmission
+      duringAdmission = undefined
+      change?.()
+      return { status: 'allowed' }
+    },
+  })
+  const validated = await s.authorize(f.request())
+  const proof = await f.proof()
+  await named('healthy authorization serves validated access', () => {
+    expect(validated).toEqual({
+      status: 'usable',
+      source: 'validated',
+      binding: proof.binding,
+      access: original.access,
+      expires: original.expires,
+      subject: proof,
+      validation: proof,
+    })
+    expect([f.exchanges, f.lookups]).toEqual([0, 1])
+  })
+  const journal = relative(f.root, f.paths.journal)
+  const before = await snapshot(f.root)
+  duringAdmission = () => loseAuthority(f.paths, loss)
+  // The stored proof now matches, so this request is admitted as 'current'
+  // without an exchange or lookup; the policy callback is its only await window.
+  const result = await s.authorize(f.request())
+  await named('delayed authority loss blocks credential exit', () => {
+    expect(duringAdmission).toBeUndefined()
+    expect(result).toEqual({
+      status: 'refused',
+      reason: authorityCodes[loss],
+      persisted: false,
+    })
+  })
+  // Only the journal changed. The validation proof, pool row and runtime entry
+  // stay as they were, and no lease or staging file is left behind.
+  const after = await snapshot(f.root)
+  expect(after[journal]).not.toBe(before[journal])
+  expect(after).toEqual({ ...before, [journal]: expect.any(String) })
+  expect(await f.entry()).toEqual({
+    binding: proof.binding,
+    credentialValidation: proof,
+  })
+  expect([f.exchanges, f.lookups]).toEqual([0, 1])
+  expect(await lockFiles(f)).toEqual([])
+  leaksNoSecret(result)
+}
+
+for (const loss of ['invalid', 'incomplete'] as const)
+  test(`${loss} journal written during admission refuses the already admitted credential`, async () => {
+    await finalAuthorityScenario(production, loss)
+  })
+
+test('authority lost during a consumed refresh keeps the committed successor but serves nothing', async () => {
+  const f = await fixture({ migrated: true })
+  const entered = gate()
+  const release = gate()
+  f.exchange = async () => {
+    entered.open()
+    await release.wait
+    return successor
+  }
+  const s = service(f)
+  const pending = s.authorize(
+    f.request({ rejectedAccessToken: original.access }),
+  )
+  await entered.wait
+  // The paused exchange holds production refresh/provider leases, so the empty
+  // lease check at the end proves they were released.
+  expect((await lockFiles(f)).length).toBeGreaterThan(0)
+  loseAuthority(f.paths, 'invalid')
+  release.open()
+  const result = await pending
+  // The provider already consumed the old refresh token, so the result reports
+  // the saved successor (persisted: true) but carries no credential.
+  expect(result).toEqual({
+    status: 'refused',
+    reason: 'invalid-journal',
+    persisted: true,
+  })
+  leaksNoSecret(result)
+  expect(JSON.stringify(result)).not.toContain(successor.access)
+  // The successor commit and its account proof are durable, not rolled back.
+  const proof = await f.proof()
+  expect(proof.credentialFingerprint).toBe(
+    fingerprintOf({ type: 'oauth', refresh: successor.refresh }),
+  )
+  expect((await f.row()).credential).toMatchObject({
+    access: successor.access,
+    refresh: successor.refresh,
+  })
+  expect(await f.entry()).toEqual({
+    binding: proof.binding,
+    credentialValidation: proof,
+  })
+  expect([f.exchanges, f.lookups, f.failures.length]).toEqual([1, 1, 0])
+  expect(await stages(f)).toEqual([])
+  expect(await lockFiles(f)).toEqual([])
+  // Later requests are refused by the first check, before any provider work.
+  expect(await s.authorize(f.request())).toEqual({
+    status: 'refused',
+    reason: 'invalid-journal',
+    persisted: false,
+  })
+  expect([f.exchanges, f.lookups]).toEqual([1, 1])
+})
 
 test('exact positive proof is published before current access is served', async () => {
   const f = await fixture()
@@ -1149,6 +1299,13 @@ const guardBreaks: Array<{
     from: "      event.bootstrap === 'resolved'\n",
     to: '      true\n',
     assertion: 'unresolved lookup records validation retry, not proof',
+  },
+  {
+    guard: 'final authority admission',
+    scenario: finalAuthorityScenario,
+    from: 'return requireNativePoolAuthority(paths).then(',
+    to: 'return Promise.resolve().then(',
+    assertion: 'delayed authority loss blocks credential exit',
   },
 ]
 
