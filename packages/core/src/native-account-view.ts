@@ -491,6 +491,17 @@ export function projectNativeAccountViews(input: {
     const stored = input.runtime?.accounts[row.id]
     const entry = binding && sameLocal(stored, binding) ? stored : undefined
     const id = row.id === settings.mainAccountId ? 'main' : row.id
+    const observedQuota =
+      row.type === 'oauth' && row.quota !== undefined
+        ? fromNativeQuotaMap(row.quota)
+        : undefined
+    // Learning an account identity does not retag older quota observations.
+    // Only a reading explicitly owned by the current account can guide routing.
+    const quota =
+      row.identity !== undefined &&
+      observedQuota?.accountIdentity === row.identity
+        ? observedQuota
+        : undefined
     const localMetadata = metadata(entry)
     // A refresh-token rotation can keep the account and epoch unchanged.
     // An error from the previous token must not exclude the new credential.
@@ -511,9 +522,7 @@ export function projectNativeAccountViews(input: {
       accountIdentity: row.identity,
       binding,
       ...localMetadata,
-      ...(row.type === 'oauth' && row.quota !== undefined
-        ? { quota: fromNativeQuotaMap(row.quota) }
-        : {}),
+      ...(quota ? { quota } : {}),
       ...(row.credential?.type === 'api'
         ? {
             baseURL: row.credential.baseURL,

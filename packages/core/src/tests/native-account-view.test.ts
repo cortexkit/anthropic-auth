@@ -6,6 +6,7 @@ import {
   nativeQuotaFailure,
   projectNativeAccountViews,
 } from '../native-account-view.ts'
+import { toNativeQuotaMap } from '../native-quota-codec.ts'
 import type { NativeRuntimeState } from '../native-runtime.ts'
 import type { NativePoolPaths } from '../pool-paths.ts'
 
@@ -234,5 +235,36 @@ for (const lineage of ['current', 'previous', 'unbound'] as const) {
       expect(snapshot.accounts[0]?.lastRefreshError).toBeUndefined()
     else expect(snapshot.accounts[0]?.lastRefreshError?.permanent).toBe(true)
     expect(JSON.stringify(snapshot)).not.toContain(currentFingerprint)
+  })
+}
+
+for (const quotaIdentity of [
+  uuid,
+  undefined,
+  '99999999-2222-4333-8444-555555555555',
+]) {
+  test(`local quota projection rejects readings from another or unknown account (${quotaIdentity ?? 'unbound'})`, () => {
+    const quota = toNativeQuotaMap({
+      ...(quotaIdentity === undefined
+        ? {}
+        : { accountIdentity: quotaIdentity }),
+      checkedAt: 200,
+      five_hour: { usedPercent: 25, remainingPercent: 75, checkedAt: 200 },
+      seven_day: { usedPercent: 30, remainingPercent: 70, checkedAt: 200 },
+    })
+    const snapshot = projectNativeAccountViews({
+      paths,
+      rows: [{ ...row, quota }],
+      settings: { mainAccountId: row.id },
+    })
+    if (quotaIdentity === uuid) {
+      expect(snapshot.accounts[0]?.quota?.five_hour?.usedPercent).toBe(25)
+      expect(snapshot.policyStorage.quota?.mainQuota?.accountIdentity).toBe(
+        uuid,
+      )
+    } else {
+      expect(snapshot.accounts[0]?.quota).toBeUndefined()
+      expect(snapshot.policyStorage.quota?.mainQuota).toBeUndefined()
+    }
   })
 }
