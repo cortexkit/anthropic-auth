@@ -1,24 +1,25 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { afterEach, describe, expect, mock } from 'bun:test'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
   CACHE_KEEP_TICK_MS,
-  type ClaustrumScopedClient,
+  createNativeAccountRuntime,
   custodyTombstoneOAuth,
   getLogLevel,
   type LogTestRecord,
+  type NativeCustodyClient,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
-  saveAccountState,
-  saveAccounts,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
-
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
+import { drainSidebarWrites } from '../sidebar-state'
+import { migrateNativeOpencodeFixture } from './native-fixture'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
 type Site =
@@ -40,39 +41,94 @@ type OutboundRecord = {
 
 type IntervalRecord = { callback: () => unknown; ms: number }
 
-const originalFetch = globalThis.fetch
-const originalNow = Date.now
-const activePlugins = new Set<{ dispose?: () => Promise<void> | void }>()
-const tempDirs = new Set<string>()
+type PluginHooks = { dispose?: () => Promise<void> | void }
+
+// Every environment variable a test body or the migration fixture may set.
+// Each body saves and restores all of them, so no path leaks into the next
+// test.
 const fixtureEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
   'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
+  'CLAUDE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
-  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+  'OPENCODE_AUTH_CONTENT',
 ] as const
-const fixtureEnv = new Map(fixtureEnvKeys.map((key) => [key, process.env[key]]))
 
+const livePlugins = new Set<Set<PluginHooks>>()
+// Registered before the lifetime suite's own afterEach: dispose every plugin
+// (its timers and vault client) before that hook waits for a possibly
+// still-running body and removes the body's files.
 afterEach(async () => {
-  for (const plugin of activePlugins) await plugin.dispose?.()
-  activePlugins.clear()
-  await Promise.all(
-    [...tempDirs].map((directory) =>
-      rm(directory, { recursive: true, force: true }),
-    ),
-  )
-  tempDirs.clear()
-  globalThis.fetch = originalFetch
-  Date.now = originalNow
-  for (const key of fixtureEnvKeys) {
-    const value = fixtureEnv.get(key)
-    if (value === undefined) delete process.env[key]
-    else process.env[key] = value
-  }
-  resetCache1hState()
-  resetClaudeCodeIdentityCachesForTest()
+  const plugins = [...livePlugins].flatMap((owned) => {
+    const current = [...owned]
+    owned.clear()
+    return current
+  })
+  await disposeAll(plugins, 'Fallback census plugin cancellation failed')
 })
+const lifetimes = createTestLifetimeSuite()
+// The lifetime suite registers ordinary Bun tests, which run one at a time
+// within this file unless Bun is started with --concurrent; the `serial` name
+// keeps the original call sites unchanged.
+const test = { serial: lifetimes.test }
+
+async function disposeAll(plugins: PluginHooks[], message: string) {
+  const results = await Promise.allSettled(
+    plugins.map((plugin) => Promise.resolve().then(() => plugin.dispose?.())),
+  )
+  const failed = results.filter((result) => result.status === 'rejected')
+  if (failed.length)
+    throw new AggregateError(
+      failed.map((result) => result.reason),
+      message,
+    )
+}
+
+/**
+ * Claim a fresh owner-only directory for this body. Teardown first disposes
+ * the body's plugins and waits for sidebar writes, then restores fetch, the
+ * clock, the environment and the process-wide caches, and only then removes
+ * the directory.
+ */
+async function startBody(prefix: string) {
+  const savedFetch = globalThis.fetch
+  const savedNow = Date.now
+  const savedEnv = new Map(fixtureEnvKeys.map((key) => [key, process.env[key]]))
+  const plugins = new Set<PluginHooks>()
+  livePlugins.add(plugins)
+  lifetimes.deferCleanup(async () => {
+    const remaining = [...plugins]
+    plugins.clear()
+    livePlugins.delete(plugins)
+    try {
+      await disposeAll(remaining, 'Fallback census plugin cleanup failed')
+    } finally {
+      await drainSidebarWrites()
+      globalThis.fetch = savedFetch
+      Date.now = savedNow
+      for (const key of fixtureEnvKeys) {
+        const value = savedEnv.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      resetCache1hState()
+      resetClaudeCodeIdentityCachesForTest()
+    }
+  })
+  delete process.env.OPENCODE_AUTH_CONTENT
+  const root = await mkdtemp(join(tmpdir(), prefix))
+  // migrateNativeOpencodeFixture also removes the root once it accepts it;
+  // this covers a body that fails before handing the root to it.
+  lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
+  return { root, plugins }
+}
 
 function quota(now: number, fableRemaining = 90) {
   return {
@@ -168,16 +224,6 @@ async function createFixture(
   const credentialGets: Array<{ credentialId: string; isMain: boolean }> = []
   let refusalPending = options.recovery === true
 
-  if (options.now !== undefined) {
-    let clock = now
-    Date.now = mock(() => clock) as unknown as typeof Date.now
-    Object.defineProperty(intervals, 'clock', {
-      value: (next: number) => {
-        clock = next
-      },
-    })
-  }
-
   const storage: AccountStorage = {
     version: 1,
     mainAccountId: `main-slot-${site}`,
@@ -255,40 +301,19 @@ async function createFixture(
         claustrumScopedCredentialId: credentialId,
         claustrumScopedState: 'active',
         anthropicAccountUuid: accountId as never,
-        ...(options.quotaSnapshot ? { quota: options.quotaSnapshot } : {}),
+        // A legacy quota reading names the account it was read for in
+        // accountIdentity; the migration imports a reading only when that
+        // matches the account's anthropicAccountUuid.
+        ...(options.quotaSnapshot
+          ? { quota: { ...options.quotaSnapshot, accountIdentity: accountId } }
+          : {}),
       },
     ],
   }
 
-  const directory = await mkdtemp(join(tmpdir(), `fallback-census-${site}-`))
-  tempDirs.add(directory)
-  const accountFile = join(directory, 'anthropic-auth.json')
-  const tokenFile = join(directory, 'opencode-enrollment.json')
-  await writeFile(
-    tokenFile,
-    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
-    { mode: 0o600 },
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenFile
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountFile
-  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-    directory,
-    'sidebar.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
-    directory,
-    'cachekeep',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(directory, 'quota')
-  if (!options.profile) {
-    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-  }
-  await saveAccounts(storage, accountFile)
-  if (storage.main?.profile) {
-    await saveAccountState(storage, accountFile, { mainProfile: true })
-  }
+  const { root, plugins } = await startBody(`fallback-census-${site}-`)
 
-  const scopedClient: ClaustrumScopedClient = {
+  const scopedClient: NativeCustodyClient = {
     listScoped: async () => ({
       view: `census-${site}`,
       rows: [
@@ -333,6 +358,89 @@ async function createFixture(
     },
     reportAuthFailureScoped: async () => {},
     close() {},
+  }
+
+  // Import the legacy seat through the real offline migration. Discovery
+  // lists the same vault rows the plugin serves from but refuses credential
+  // reads, so every recorded credential read happened while serving.
+  const fixture = await migrateNativeOpencodeFixture({
+    root,
+    lifetime: lifetimes,
+    legacyConfig: storage as unknown as Record<string, unknown>,
+    hostAuth: { anthropic: custodyTombstoneOAuth('anthropic') },
+    custody: {
+      connect: async () => ({
+        listScoped: (token) => scopedClient.listScoped(token),
+        getScoped: async () => {
+          throw new Error('Migration discovery must not read credentials')
+        },
+        reportAuthFailureScoped: async () => {
+          throw new Error('Migration discovery must not report credentials')
+        },
+        close() {},
+      }),
+      enrollment: { token: 'ab'.repeat(32), token_generation: 1 },
+    },
+  })
+  for (const [key, value] of Object.entries(fixture.env))
+    process.env[key] = value
+  if (options.profile)
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+  else process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  // Both vault accounts are served from the migrated native pool, and the
+  // legacy quota readings the prime and recovery tests rely on were imported.
+  const migrated = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  try {
+    const snapshot = await migrated.read()
+    expect(
+      snapshot.accounts.map(
+        ({ id, source, credentialId, accountIdentity }) => ({
+          id,
+          source,
+          credentialId,
+          accountIdentity,
+        }),
+      ),
+    ).toEqual([
+      {
+        id: 'main',
+        source: 'vault',
+        credentialId: mainCredentialId,
+        accountIdentity: mainProviderAccountId,
+      },
+      {
+        id: accountId,
+        source: 'vault',
+        credentialId,
+        accountIdentity: accountId,
+      },
+    ])
+    const byId = new Map(snapshot.accounts.map((a) => [a.id, a]))
+    if (options.quotaSnapshot)
+      expect(byId.get(accountId)?.quota?.checkedAt).toBe(
+        options.quotaSnapshot.checkedAt,
+      )
+    if (storage.quota?.mainQuota)
+      expect(byId.get('main')?.quota?.accountIdentity).toBe(
+        mainProviderAccountId,
+      )
+  } finally {
+    migrated.close()
+  }
+
+  // Freeze the clock only after migration, so the migration journal and
+  // locks see real time and only the plugin observes the test clock.
+  if (options.now !== undefined) {
+    let clock = now
+    Date.now = mock(() => clock) as unknown as typeof Date.now
+    Object.defineProperty(intervals, 'clock', {
+      value: (next: number) => {
+        clock = next
+      },
+    })
   }
 
   const refusalSse = [
@@ -461,9 +569,11 @@ async function createFixture(
       clearInterval,
     },
   )) as any
-  activePlugins.add(plugin)
+  plugins.add(plugin)
   const result = await plugin.auth.loader(
-    () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
+    // The OpenCode auth entry exactly as the migration left it in host auth.
+    async () =>
+      JSON.parse(await readFile(fixture.hostAuthPath, 'utf8')).anthropic,
     { models: {} },
   )
   await plugin.__fallbackRefreshReady
@@ -589,7 +699,9 @@ describe('vault-served fallback outbound token census', () => {
     const bootstrap = fixture.records.filter((record) =>
       record.url.includes('/claude_cli/bootstrap'),
     )
-    expectOnlyVaultToken(bootstrap, 'cachekeep', fixture.credentialGets)
+    // Native signing uses the identity the vault already verified for this
+    // receipt, so a prewarm never sends a bootstrap lookup with any token.
+    expect(bootstrap, JSON.stringify(fixture.credentialGets)).toEqual([])
   })
 
   test.serial(

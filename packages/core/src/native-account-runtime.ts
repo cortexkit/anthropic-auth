@@ -89,6 +89,8 @@ export type {
 export interface NativeAccountRuntimeOptions {
   paths: NativePoolPaths
   host: 'opencode' | 'pi'
+  /** The setup CLI checks that OpenCode and Pi are still stopped before locked credential-file writes. */
+  beforePoolWrite?: () => Promise<void>
   local?: Partial<
     Pick<
       NativeLocalCredentialServiceOptions,
@@ -259,7 +261,17 @@ export function createNativeAccountRuntime(
   const paths = Object.freeze({ ...options.paths })
   const now = options.local?.now ?? options.vault?.now ?? Date.now
   const shutdown = new AbortController()
-  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec, now })
+  const store = createNativePoolStore({
+    paths,
+    quota: nativeQuotaCodec,
+    now,
+    onStep: options.beforePoolWrite
+      ? async (point) => {
+          if (point === 'before-config-write' || point === 'before-state-write')
+            await options.beforePoolWrite?.()
+        }
+      : undefined,
+  })
   const vault = acquireNativeVaultRuntime({
     ...options.vault,
     paths,

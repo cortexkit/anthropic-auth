@@ -11,6 +11,12 @@ import {
 import { defaultCommandRunner } from './command-runner.ts'
 import { detectAll } from './detect.ts'
 import { activateNativeVaultForHost } from './native-activation.ts'
+import { migrateNativeLocalForHost } from './native-local.ts'
+import { loginNativeOffline } from './native-login.ts'
+import {
+  requireDisjointNativeSetupPaths,
+  resolveNativeSetupPaths,
+} from './native-paths.ts'
 import {
   ensureOpenCodePluginConfig,
   ensureOpenCodeTuiConfig,
@@ -32,6 +38,8 @@ export interface SetupCommandOptions {
   /** Test seams for host detection and per-host vault activation. */
   detect?: typeof detectAll
   activate?: typeof activateNativeVaultForHost
+  migrateLocal?: typeof migrateNativeLocalForHost
+  localLogin?: typeof loginNativeOffline
 }
 
 export async function runSetupCommand(
@@ -42,12 +50,17 @@ export async function runSetupCommand(
   const runner = options.runner ?? defaultCommandRunner
   const fence = options.fence ?? defaultProcessFence
   const activate = options.activate ?? activateNativeVaultForHost
+  const migrateLocal = options.migrateLocal ?? migrateNativeLocalForHost
 
   const nonInteractive = argv.includes('--yes') || argv.includes('-y')
   const dryRun = argv.includes('--dry-run')
   const explicitNoClaustrum = argv.includes('--no-claustrum')
   const explicitClaustrum = argv.includes('--claustrum')
   const explicitRemovePiAuth = argv.includes('--remove-pi-auth')
+  const explicitLogin = argv.includes('--login')
+  const localLogin = explicitLogin
+    ? (options.localLogin ?? loginNativeOffline)
+    : undefined
 
   intro('CortexKit Anthropic Auth Setup')
 
@@ -153,18 +166,14 @@ export async function runSetupCommand(
     }
   }
 
-  // 4. If Pi selected and Claustrum chosen, handle local auth conflict
+  // Pi's stored OAuth takes precedence over the extension's account pool.
   let removePiLocalAuth = false
-  if (
-    selectedHosts.includes('pi') &&
-    useClaustrum &&
-    detection.pi.hasLocalAuth
-  ) {
+  if (selectedHosts.includes('pi') && detection.pi.hasLocalAuth) {
     if (nonInteractive) {
       // Deleting a stored login needs its own flag; --yes is not consent.
       if (!explicitRemovePiAuth) {
         log.error(
-          'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to remove it for vault custody.',
+          'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to move it into the native account pool.',
         )
         outro('Setup aborted.')
         return 1
@@ -172,17 +181,17 @@ export async function runSetupCommand(
       removePiLocalAuth = true
     } else {
       log.warn(
-        'Pi has a stored local Anthropic OAuth token. Claustrum custody replaces local credentials.',
+        'Pi has a stored Anthropic OAuth token. Native account-pool setup moves credentials out of the host auth store.',
       )
       const consent = await confirm({
         message:
-          'Remove local Pi Anthropic OAuth credential so Claustrum custody can serve requests?',
+          'Move the Pi Anthropic OAuth login into the native account pool and remove its stored copy?',
         initialValue: false,
       })
 
       if (isCancel(consent) || !consent) {
         log.error(
-          'Claustrum custody cannot be enabled for Pi while a local OAuth token takes precedence.',
+          'Native account-pool setup cannot finish while the stored Pi OAuth token takes precedence.',
         )
         outro('Setup aborted.')
         return 1
@@ -203,6 +212,11 @@ export async function runSetupCommand(
     }
     throw error
   }
+
+  const plans = []
+  for (const host of selectedHosts)
+    plans.push(await resolveNativeSetupPaths(host, env))
+  await requireDisjointNativeSetupPaths(plans)
 
   if (dryRun) {
     log.info('[dry-run] Planned actions:')
@@ -251,6 +265,13 @@ export async function runSetupCommand(
       log.error(error instanceof Error ? error.message : String(error))
       return 1
     }
+    if (localLogin || !useClaustrum)
+      await migrateLocal('opencode', {
+        env,
+        fence,
+        removePiAnthropicAuth: false,
+        login: localLogin,
+      })
     if (useClaustrum && !(await activateHost('opencode', 'OpenCode'))) return 1
   }
 
@@ -270,6 +291,13 @@ export async function runSetupCommand(
       log.error(error instanceof Error ? error.message : String(error))
       return 1
     }
+    if (localLogin || !useClaustrum)
+      await migrateLocal('pi', {
+        env,
+        fence,
+        removePiAnthropicAuth: removePiLocalAuth,
+        login: localLogin,
+      })
     if (useClaustrum && !(await activateHost('pi', 'Pi'))) return 1
   }
 

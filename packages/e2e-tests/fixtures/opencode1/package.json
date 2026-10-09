@@ -1,0 +1,8 @@
+{
+  "name": "anthropic-auth-e2e-opencode1-host",
+  "private": true,
+  "description": "Pinned OpenCode 1 host for the e2e process tests; matches the version CI installs.",
+  "dependencies": {
+    "opencode-ai": "1.18.18"
+  }
+}
