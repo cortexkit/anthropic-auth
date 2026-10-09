@@ -62,7 +62,6 @@ import {
   executeRoutingCommand,
   FALLBACK_BACKGROUND_TICK_MS,
   fallbackAccountUuidForLineage,
-  type fetchOAuthAccountProfile,
   formatEnrollmentStatus,
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
@@ -117,16 +116,20 @@ import {
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
   type NativeAccountRuntimeOptions,
+  type NativeAccountSnapshot,
   type NativeAccountView,
   type NativeCustodyClient,
   type NativeCustodyReceipt,
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativeMenuDispatch,
   type NativeUiOptions,
+  nativeMigrationAuthorityPhase,
   normalizeQuotaHeaders,
   type OAuthAccount,
+  type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
+  oauthProfileMatchesIdentity,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
   PrimeManager,
   type PrimeManagerOptions,
@@ -1238,15 +1241,51 @@ const anthropicAuthPlugin = async (
     })
     return loadAccounts()
   }
-  const setCache1hPersistentEnabled = (enabled: boolean) =>
-    updateNativeSection('claudeCache', { enabled })
+  function plainSettingsSection(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {}
+  }
+  // Turning the cache on or off also records the effective strategy, as the
+  // standalone cache command always did: a pool without a stored mode is
+  // saved as { enabled, mode: 'explicit' } instead of leaving mode implicit.
+  const setCache1hPersistentEnabled = async (enabled: boolean) => {
+    await nativeAccounts.updateSettings((settings) => ({
+      ...settings,
+      claudeCache: {
+        ...plainSettingsSection(settings.claudeCache),
+        enabled,
+        mode: getCache1hPersistentMode({
+          ...settings,
+          version: 1,
+          accounts: [],
+        }),
+      },
+    }))
+    return loadAccounts()
+  }
   const setCache1hPersistentMode = (
     mode: NonNullable<AccountStorage['claudeCache']>['mode'],
   ) => updateNativeSection('claudeCache', { mode })
   const setCacheKeepPersistentEnabled = (enabled: boolean) =>
     updateNativeSection('cacheKeep', { enabled })
-  const setCacheKeepPersistentAlways = () =>
-    updateNativeSection('cacheKeep', { enabled: true, always: true })
+  // An always-on schedule has no hour bounds. Leaving a previous window's
+  // startHour/endHour behind would revive that window as soon as anything
+  // reads the hours without first checking `always`.
+  const setCacheKeepPersistentAlways = async () => {
+    await nativeAccounts.updateSettings((settings) => {
+      const {
+        startHour: _startHour,
+        endHour: _endHour,
+        ...rest
+      } = plainSettingsSection(settings.cacheKeep)
+      return {
+        ...settings,
+        cacheKeep: { ...rest, enabled: true, always: true },
+      }
+    })
+    return loadAccounts()
+  }
   const setCacheKeepPersistentWindow = (startHour: number, endHour: number) =>
     updateNativeSection('cacheKeep', {
       enabled: true,
@@ -1681,56 +1720,220 @@ const anthropicAuthPlugin = async (
     initialStorage?.quotaHeaderFeed?.enabled === true
       ? new QuotaHeaderFeedRegistry()
       : null
-  const profileHydrationAttempts = new Map<
-    string,
-    Promise<Awaited<ReturnType<typeof fetchOAuthAccountProfile>> | undefined>
-  >()
+  // Profiles fetched by this plugin instance, keyed by route and account
+  // identity. A profile request that reached the network is not repeated in
+  // this boot: a failed request stays failed, and a fetched profile is reused
+  // until it goes stale, even if saving it is slow or fails. Attempts refused
+  // before any request (missing native authority, unavailable route) leave no
+  // entry, so a later display can try again.
+  interface ProfileHydration {
+    /** Settles when the profile response arrives or the attempt fails, never on the save. */
+    fetched: Promise<void>
+    /**
+     * The display bound the attempt started under. Once it has expired, a
+     * later display does not wait on the same attempt again.
+     */
+    deadline?: AbortSignal
+    profile?: OAuthAccountProfile
+    persistence?: 'pending' | 'saved' | 'failed'
+  }
+  const profileHydrations = new Map<string, ProfileHydration>()
+  // Saving a fetched profile continues after the display has used it. Dispose
+  // aborts unfinished profile requests and waits for these saves, so an
+  // instance never leaves a metadata write running after it is torn down.
+  const profilePublications = new Set<Promise<unknown>>()
+  const profileHydrationShutdown = new AbortController()
 
-  async function hydrateProfileOnce(
-    accountId: string,
-    accountIdentity: string | undefined,
-    _accessToken: string,
-    _providerAccountUuid?: ProviderAccountUuid,
-    signal?: AbortSignal,
+  function profileHydrationKey(id: string, accountIdentity?: string) {
+    return JSON.stringify([id, accountIdentity ?? null])
+  }
+
+  /** A fetched profile may be displayed while fresh unless its persistence failed. */
+  function displayableProfile(
+    hydration: ProfileHydration | undefined,
+    now: number,
   ) {
-    if (signal?.aborted) return undefined
+    return hydration?.profile &&
+      hydration.persistence !== 'failed' &&
+      oauthProfileIsFresh(hydration.profile, now)
+      ? hydration.profile
+      : undefined
+  }
+
+  function startProfileHydration(
+    account: NativeAccountView,
+    key: string,
+    signal?: AbortSignal,
+  ): ProfileHydration {
     assertNativeEnvironment()
-    const attemptKey = `${accountIdentity ?? accountId}`
-    let attempt = profileHydrationAttempts.get(attemptKey)
-    if (!attempt) {
-      const fetchAttempt: Promise<
-        Awaited<ReturnType<typeof fetchOAuthAccountProfile>> | undefined
-      > = nativeAccounts
-        .fetchProfile(accountId, profileFetch, signal)
-        .catch((error: unknown) => {
+    let requested = false
+    const transport: typeof fetch = Object.assign(
+      (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        requested = true
+        return profileFetch(input, init)
+      },
+      { preconnect: profileFetch.preconnect },
+    )
+    const hydration: ProfileHydration = {
+      fetched: Promise.resolve(),
+      ...(signal && { deadline: signal }),
+    }
+    hydration.fetched = nativeAccounts
+      .fetchProfileForDisplay(
+        account.id,
+        transport,
+        AbortSignal.any([
+          profileHydrationShutdown.signal,
+          ...(signal ? [signal] : []),
+        ]),
+      )
+      .then(
+        ({ profile, persisted }) => {
+          // Keep a profile only for the account it was read for. A route
+          // whose identity was not yet known accepts the identity this read
+          // reports; the display checks it against the route again later.
+          if (
+            account.accountIdentity === undefined ||
+            profile.accountIdentity === account.accountIdentity
+          ) {
+            hydration.profile = profile
+            hydration.persistence = 'pending'
+          }
+          const saving = persisted.then((outcome) => {
+            hydration.persistence = outcome
+            if (outcome === 'failed')
+              logger.debug('quota', 'failed to save account profile', {
+                account: account.id,
+              })
+          })
+          profilePublications.add(saving)
+          void saving.then(() => profilePublications.delete(saving))
+        },
+        (error: unknown) => {
           logger.debug('quota', 'failed to hydrate account profile', {
-            account: accountId,
+            account: account.id,
             error: error instanceof Error ? error.message : String(error),
           })
-          return undefined
-        })
-        .finally(() => {
-          if (profileHydrationAttempts.get(attemptKey) === fetchAttempt) {
-            profileHydrationAttempts.delete(attemptKey)
-          }
-        })
-      attempt = fetchAttempt
-      profileHydrationAttempts.set(attemptKey, attempt)
-    }
-    if (!signal) return attempt
-    return new Promise<Awaited<typeof attempt>>((resolve) => {
-      let settled = false
-      const finish = (profile: Awaited<typeof attempt>) => {
-        if (settled) return
-        settled = true
-        signal.removeEventListener('abort', onAbort)
-        resolve(profile)
+          if (!requested && profileHydrations.get(key) === hydration)
+            profileHydrations.delete(key)
+        },
+      )
+    profilePublications.add(hydration.fetched)
+    void hydration.fetched.then(() =>
+      profilePublications.delete(hydration.fetched),
+    )
+    return hydration
+  }
+
+  /**
+   * Wait for an attempt's profile response, but no longer than this display's
+   * `signal` or the bound the attempt itself started under.
+   */
+  function waitForProfile(
+    hydration: ProfileHydration,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const bounds = [signal, hydration.deadline].filter(
+      (bound): bound is AbortSignal => bound !== undefined,
+    )
+    if (!bounds.length) return hydration.fetched
+    const bound = AbortSignal.any(bounds)
+    if (bound.aborted) return Promise.resolve()
+    return new Promise((resolve) => {
+      const finish = () => {
+        bound.removeEventListener('abort', finish)
+        resolve()
       }
-      const onAbort = () => finish(undefined)
-      signal.addEventListener('abort', onAbort, { once: true })
-      if (signal.aborted) onAbort()
-      void attempt.then(finish)
+      bound.addEventListener('abort', finish, { once: true })
+      void hydration.fetched.then(finish)
     })
+  }
+
+  function storedProfileIsFresh(account: NativeAccountView, now: number) {
+    return (
+      oauthProfileIsFresh(account.profile, now) &&
+      oauthProfileMatchesIdentity(account.profile, account.accountIdentity)
+    )
+  }
+
+  /**
+   * Read native account metadata for the account and quota displays, first
+   * fetching missing or stale OAuth profiles. Waiting stops when `signal`
+   * aborts; a failed fetch or a refused save leaves the stored profile in
+   * place, and the display never waits for a fetched profile to be saved.
+   */
+  async function readNativeSnapshotForDisplay(
+    signal?: AbortSignal,
+  ): Promise<NativeAccountSnapshot> {
+    const snapshot = await nativeAccounts.read()
+    if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1')
+      return snapshot
+    const now = Date.now()
+    const waits: Promise<void>[] = []
+    // Attempts made for routes whose account identity was not yet known.
+    const unidentified = new Map<string, ProfileHydration>()
+    for (const account of snapshot.accounts) {
+      if (
+        account.type !== 'oauth' ||
+        !account.enabled ||
+        storedProfileIsFresh(account, now)
+      )
+        continue
+      const key = profileHydrationKey(account.id, account.accountIdentity)
+      let hydration = profileHydrations.get(key)
+      if (
+        !hydration ||
+        (hydration.profile && !oauthProfileIsFresh(hydration.profile, now))
+      ) {
+        if (signal?.aborted || profileHydrationShutdown.signal.aborted) continue
+        hydration = startProfileHydration(account, key, signal)
+        profileHydrations.set(key, hydration)
+      }
+      if (account.accountIdentity === undefined)
+        unidentified.set(account.id, hydration)
+      waits.push(waitForProfile(hydration, signal))
+    }
+    if (!waits.length) return snapshot
+    await Promise.all(waits)
+    // An account can be replaced or signed in again while profiles load.
+    // Reread the accounts and attach each fetched profile only to the route
+    // that still has the identity the profile was read for.
+    const current = await nativeAccounts.read()
+    const later = Date.now()
+    for (const account of current.accounts) {
+      if (account.type !== 'oauth') continue
+      const key = profileHydrationKey(account.id, account.accountIdentity)
+      // Authorizing a route records its account identity, so a route that
+      // was unidentified when its attempt began is usually identified now.
+      // File the attempt under the identified route as well; otherwise the
+      // next display would repeat the request or miss the profile.
+      const earlier = unidentified.get(account.id)
+      if (
+        earlier &&
+        account.accountIdentity !== undefined &&
+        !profileHydrations.has(key) &&
+        (!earlier.profile ||
+          earlier.profile.accountIdentity === account.accountIdentity)
+      )
+        profileHydrations.set(key, earlier)
+      if (storedProfileIsFresh(account, later)) continue
+      const profile = displayableProfile(profileHydrations.get(key), later)
+      if (!profile || profile.accountIdentity !== account.accountIdentity)
+        continue
+      account.profile = profile
+      if (account.id === 'main') {
+        if (current.policyStorage.main)
+          current.policyStorage.main.profile = profile
+      } else {
+        for (const stored of current.policyStorage.accounts)
+          if (stored.id === account.id && isOAuthAccount(stored))
+            stored.profile = profile
+      }
+    }
+    return current
   }
 
   async function ensureProfilesForQuotaDisplay(
@@ -1741,27 +1944,7 @@ const anthropicAuthPlugin = async (
   ): Promise<AccountStorage> {
     if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1')
       return storage
-    const snapshot = await nativeAccounts.read()
-    for (const account of snapshot.accounts) {
-      if (signal?.aborted) break
-      if (
-        account.type !== 'oauth' ||
-        !account.enabled ||
-        oauthProfileIsFresh(account.profile, Date.now())
-      )
-        continue
-      await hydrateProfileOnce(
-        account.id,
-        account.accountIdentity,
-        '',
-        asProviderAccountUuid(account.accountIdentity),
-        signal,
-      )
-    }
-    // Profile polling saved the tier and organization for the account it read.
-    // Reload current account metadata so replacing this route cannot display
-    // the profile fetched for its previous credentials.
-    return (await nativeAccounts.read()).policyStorage
+    return (await readNativeSnapshotForDisplay(signal)).policyStorage
   }
 
   const warnedQuotaNormalizeErrors = new Set<string>()
@@ -2991,6 +3174,8 @@ const anthropicAuthPlugin = async (
 
   let rpcServerAdoption: RpcServerAdoption | null = null
   const dispose: NonNullable<Hooks['dispose']> = async () => {
+    profileHydrationShutdown.abort()
+    while (profilePublications.size) await Promise.all([...profilePublications])
     try {
       closeOpenCodeScopedRuntime(accountStoragePath)
     } catch (error) {
@@ -3350,7 +3535,9 @@ const anthropicAuthPlugin = async (
       }
       await refreshFallbackQuotas(true)
     }
-    const snapshot = await nativeAccounts.read()
+    const snapshot = await readNativeSnapshotForDisplay(
+      AbortSignal.timeout(3_000),
+    )
     quotaManager.updateStorage(snapshot.policyStorage)
     quotaManager.seedMainFromStorage(snapshot.policyStorage, mainQuotaAccountId)
     quotaManager.seedFallbacksFromAccounts(
@@ -4601,7 +4788,9 @@ const anthropicAuthPlugin = async (
     invocation,
   ) => {
     if (command === 'account') {
-      const snapshot = await nativeAccounts.read()
+      const snapshot = await readNativeSnapshotForDisplay(
+        AbortSignal.timeout(3_000),
+      )
       const enrollment =
         snapshot.mode === 'claustrum'
           ? await readClaustrumEnrollmentStatus(
@@ -5184,10 +5373,7 @@ const anthropicAuthPlugin = async (
               main,
               fallbacks: fallbackDimensions.fallbacks,
               evidence: mainEvidence,
-              authority:
-                journal?.phase === 'committed' || journal?.phase === 'retired'
-                  ? journal.phase
-                  : undefined,
+              authority: nativeMigrationAuthorityPhase(journal),
             })
           } catch (error) {
             if (!(error instanceof CustodyStateMismatchError)) throw error

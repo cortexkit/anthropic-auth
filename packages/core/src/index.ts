@@ -55,6 +55,21 @@ export type {
 } from './native-custody.ts'
 export { createNativeCustody } from './native-custody.ts'
 export type {
+  NativeCustodyActivationErrorCode,
+  NativeCustodyActivationHooks,
+  NativeCustodyActivationOptions,
+  NativeCustodyActivationResult,
+} from './native-custody-activation.ts'
+export {
+  NativeCustodyActivationError,
+  runNativeCustodyActivation,
+} from './native-custody-activation.ts'
+export {
+  inspectNativeHostAuthEntry,
+  NativeHostAuthError,
+  requireNoSupervisedAuthContentSnapshot,
+} from './native-host-auth.ts'
+export type {
   NativeLocalAttributedFailure,
   NativeLocalCredentialService,
   NativeLocalCredentialServiceOptions,
@@ -167,7 +182,10 @@ export {
 export * from './oauth-profile.ts'
 export * from './pkce.ts'
 export type { NativeMigrationJournal } from './pool-authority.ts'
-export { readNativeMigrationJournal } from './pool-authority.ts'
+export {
+  nativeMigrationAuthorityPhase,
+  readNativeMigrationJournal,
+} from './pool-authority.ts'
 export type { NativeLocalPoolBinding } from './pool-binding.ts'
 export { captureNativeLocalPoolBinding } from './pool-binding.ts'
 export * from './pool-paths.ts'

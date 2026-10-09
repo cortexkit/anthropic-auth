@@ -298,7 +298,7 @@ test('offline controller imports synthetic Pi host OAuth with consent before nat
           fences++
         },
       })
-      expect(journal.version).toBe(3)
+      expect(journal.version).toBe(4)
       expect(journal.phase).toBe('retired')
       expect(fences).toBeGreaterThan(0)
       expect(JSON.parse(await readFile(hostAuthPath, 'utf8'))).toEqual({

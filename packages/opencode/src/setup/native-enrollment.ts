@@ -32,6 +32,7 @@ export class NativeVaultEnrollmentError extends Error {
   constructor(
     public readonly code:
       | 'enrollment-refused'
+      | 'enrollment-reset'
       | 'approval-refused'
       | 'permission-refused',
   ) {
@@ -108,6 +109,10 @@ export async function enrollNativeVaultForHost(
         await processFence()
         if ((await manager.resetTerminal()) !== 'reset')
           throw new NativeVaultEnrollmentError('enrollment-refused')
+        // Clearing a refused or superseded request is the whole effect of
+        // this run. A new request is proposed only when the user runs setup
+        // again, so a stale ceremony never turns into a fresh one unasked.
+        throw new NativeVaultEnrollmentError('enrollment-reset')
       }
       await processFence()
       status = await manager.reconcile()

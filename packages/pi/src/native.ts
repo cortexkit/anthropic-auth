@@ -12,6 +12,7 @@ import {
   type NativeLocalExternalPolicy,
   type NativePoolPaths,
   type NativeRefreshResult,
+  nativeMigrationAuthorityPhase,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -128,7 +129,7 @@ export class PiNativeRuntime {
     const journal = await readNativeMigrationJournal(await this.paths)
     if (
       !journal ||
-      (journal.phase !== 'committed' && journal.phase !== 'retired') ||
+      !nativeMigrationAuthorityPhase(journal) ||
       !journal.routingPaths.destination
     )
       throw new Error('Pi native routing requires committed offline migration')

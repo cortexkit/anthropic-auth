@@ -63,8 +63,10 @@ import {
 } from './native-runtime.ts'
 import {
   acquireNativeVaultRuntime,
+  type NativeDisplayProfile,
   type NativeVaultRuntime,
   type NativeVaultRuntimeOptions,
+  nativeDisplayProfile,
 } from './native-vault-runtime.ts'
 import { fetchOAuthAccountProfile } from './oauth-profile.ts'
 import { requireNativePoolAuthority } from './pool-authority.ts'
@@ -220,6 +222,12 @@ export interface NativeAccountRuntime {
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
   ): Promise<OAuthAccountProfile>
+  /** Like fetchProfile, but returns before the profile is saved; see NativeDisplayProfile. */
+  fetchProfileForDisplay(
+    routeId: string,
+    fetchImpl?: typeof fetch,
+    signal?: AbortSignal,
+  ): Promise<NativeDisplayProfile>
   close(): void
 }
 
@@ -1196,23 +1204,21 @@ export function createNativeAccountRuntime(
     async fetchProfile(routeId, fetchImpl = fetch, signal) {
       if ((await runtime.read()).mode === 'claustrum')
         return vault.fetchProfile(routeId, fetchImpl, signal)
-      const result = await fetchReading(
-        routeId,
-        fetchImpl,
-        signal,
-        (attempt, transport) =>
-          fetchOAuthAccountProfile({
-            accessToken: attempt.access,
-            accountIdentity: attempt.binding.identity,
-            fetchImpl: transport,
-            now,
-            signal,
-          }),
-      )
+      const result = await readLocalProfile(routeId, fetchImpl, signal)
       await runtime.publishLocal(result.attempt.subject, {
         profile: result.value,
       })
       return result.value
+    },
+    async fetchProfileForDisplay(routeId, fetchImpl = fetch, signal) {
+      if ((await runtime.read()).mode === 'claustrum')
+        return vault.fetchProfileForDisplay(routeId, fetchImpl, signal)
+      const result = await readLocalProfile(routeId, fetchImpl, signal)
+      return nativeDisplayProfile(result.value, () =>
+        runtime.publishLocal(result.attempt.subject, {
+          profile: result.value,
+        }),
+      )
     },
     close() {
       if (!shutdown.signal.aborted) {
@@ -1220,6 +1226,21 @@ export function createNativeAccountRuntime(
         vault.close()
       }
     },
+  }
+  function readLocalProfile(
+    id: string,
+    fetchImpl: typeof fetch,
+    signal: AbortSignal | undefined,
+  ) {
+    return fetchReading(id, fetchImpl, signal, (attempt, transport) =>
+      fetchOAuthAccountProfile({
+        accessToken: attempt.access,
+        accountIdentity: attempt.binding.identity,
+        fetchImpl: transport,
+        now,
+        signal,
+      }),
+    )
   }
   async function fetchReading<T>(
     id: string,

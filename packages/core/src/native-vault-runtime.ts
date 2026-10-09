@@ -74,6 +74,55 @@ export type NativeScoped401Site =
   | 'prime'
   | 'quota-profile'
 
+export type NativeProfilePersistence = 'saved' | 'failed'
+
+/** The profile fields a display may receive; never the legacy token fingerprint. */
+export type NativeDisplayProfileMetadata = Pick<
+  OAuthAccountProfile,
+  'tier' | 'orgType' | 'checkedAt' | 'accountIdentity' | 'providerAccountUuid'
+>
+
+/**
+ * A profile read for display, returned as soon as the validated profile
+ * response arrives. `profile` is a copy of the profile's metadata fields only;
+ * it carries no credential, receipt or subject. `persisted` follows the same
+ * fenced publication that fetchProfile awaits, resolves 'saved' or 'failed',
+ * and never rejects, so a caller may leave it unawaited.
+ */
+export interface NativeDisplayProfile {
+  profile: NativeDisplayProfileMetadata
+  persisted: Promise<NativeProfilePersistence>
+}
+
+/** Build a NativeDisplayProfile from a validated profile and its publication. */
+export function nativeDisplayProfile(
+  profile: OAuthAccountProfile,
+  publish: () => Promise<boolean>,
+): NativeDisplayProfile {
+  return {
+    // Copy named fields rather than spreading, so nothing else stored on a
+    // profile, such as a legacy token fingerprint, reaches a display.
+    profile: {
+      tier: profile.tier,
+      orgType: profile.orgType,
+      checkedAt: profile.checkedAt,
+      ...(profile.accountIdentity !== undefined && {
+        accountIdentity: profile.accountIdentity,
+      }),
+      ...(profile.providerAccountUuid !== undefined && {
+        providerAccountUuid: profile.providerAccountUuid,
+      }),
+    },
+    // A refused fence and a thrown write both mean the profile was not saved.
+    persisted: Promise.resolve()
+      .then(publish)
+      .then(
+        (saved): NativeProfilePersistence => (saved ? 'saved' : 'failed'),
+        (): NativeProfilePersistence => 'failed',
+      ),
+  }
+}
+
 export interface NativeVaultRuntime {
   read(): Promise<NativeVaultRosterDocument | undefined>
   refresh(signal?: AbortSignal): Promise<NativeVaultRosterDocument | undefined>
@@ -112,6 +161,12 @@ export interface NativeVaultRuntime {
     fetchImpl?: typeof fetch,
     signal?: AbortSignal,
   ): Promise<OAuthAccountProfile>
+  /** Like fetchProfile, but returns before the profile is saved; see NativeDisplayProfile. */
+  fetchProfileForDisplay(
+    routeId: string,
+    fetchImpl?: typeof fetch,
+    signal?: AbortSignal,
+  ): Promise<NativeDisplayProfile>
   /**
    * Accept or decline a vault route for the user. Resolves to whether the
    * route's enabled flag changed, judged on the roster under its write lock.
@@ -517,21 +572,15 @@ export function createNativeVaultRuntime(
       return quota
     },
     async fetchProfile(routeId, fetchImpl = fetch, signal) {
-      const result = await fetchReading(
-        routeId,
-        fetchImpl,
-        signal,
-        (receipt, transport) =>
-          fetchOAuthAccountProfile({
-            accessToken: receipt.accessToken,
-            accountIdentity: receipt.assertedAccountIdentity,
-            fetchImpl: transport,
-            now: options.now,
-            signal,
-          }),
-      )
+      const result = await readProfile(routeId, fetchImpl, signal)
       await runtime.publish(result.receipt, { profile: result.value })
       return result.value
+    },
+    async fetchProfileForDisplay(routeId, fetchImpl = fetch, signal) {
+      const result = await readProfile(routeId, fetchImpl, signal)
+      return nativeDisplayProfile(result.value, () =>
+        runtime.publish(result.receipt, { profile: result.value }),
+      )
     },
     async setEnabled(routeId, enabled) {
       await requireActive()
@@ -748,6 +797,21 @@ export function createNativeVaultRuntime(
     check(combined)
     return { value, receipt: served }
   }
+  function readProfile(
+    routeId: string,
+    fetchImpl: typeof fetch,
+    signal: AbortSignal | undefined,
+  ) {
+    return fetchReading(routeId, fetchImpl, signal, (receipt, transport) =>
+      fetchOAuthAccountProfile({
+        accessToken: receipt.accessToken,
+        accountIdentity: receipt.assertedAccountIdentity,
+        fetchImpl: transport,
+        now: options.now,
+        signal,
+      }),
+    )
+  }
   return runtime
 }
 
@@ -805,6 +869,8 @@ export function acquireNativeVaultRuntime(
       use().fetchQuota(id, transport, signal),
     fetchProfile: (id, transport, signal) =>
       use().fetchProfile(id, transport, signal),
+    fetchProfileForDisplay: (id, transport, signal) =>
+      use().fetchProfileForDisplay(id, transport, signal),
     setEnabled: (id, enabled) => use().setEnabled(id, enabled),
     resetBackoff: (receipt, kind) => use().resetBackoff(receipt, kind),
     getOrCreateAuthLineage: (receipt) => use().getOrCreateAuthLineage(receipt),

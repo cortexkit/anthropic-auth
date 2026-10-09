@@ -70,11 +70,16 @@ export class NativeMigrationError extends Error {
       | 'invalid-source'
       | 'unsafe-source'
       | 'consent-required'
+      | 'primary-unverified'
       | 'migration-busy'
       | 'ownership-lost'
       | 'retirement-refused',
   ) {
-    super(`Native migration: ${code}`)
+    super(
+      code === 'primary-unverified'
+        ? 'Sign in again with the Claude pool login, then run setup. Existing credentials have not been changed.'
+        : `Native migration: ${code}`,
+    )
     this.name = 'NativeMigrationError'
   }
 }
@@ -110,6 +115,12 @@ export interface NativeMigrationOptions {
   removePiAnthropicAuth: boolean
   custody?: NativeMigrationCustody
   preflight?: NativeMigrationPreflight
+  /**
+   * Offline setup sets requestVaultActivation when the user explicitly chose vault custody. It
+   * applies only when no journal exists yet; it keeps the pool unauthorized
+   * after this migration commits until runNativeCustodyActivation commits.
+   */
+  requestVaultActivation?: boolean
 }
 
 /** Result of read-only checks for the selected storage and host. Contains no account data or credential digests. */
@@ -332,6 +343,19 @@ async function capture(input: NativeMigrationOptions): Promise<Captured> {
       state: state.data,
       hostAuth: auth.data,
     })
+    const mainRouteId = projection.mainRouteId
+    const main = projection.accounts.find(
+      (account) => account.id === mainRouteId,
+    )
+    // A requested custody switch blocks local serving. Prove the imported
+    // main identity before creating that request or retiring working credentials.
+    if (
+      (input.requestVaultActivation ||
+        journal?.activation?.kind === 'requested') &&
+      main?.credential?.type === 'oauth' &&
+      !main.identity
+    )
+      refuse('primary-unverified')
     if (projection.custodyPrimary) {
       if (!input.custody) refuse()
       seedInput = {
@@ -398,7 +422,11 @@ async function runtimeState(
   return result.state
 }
 
-async function importedRuntimeProjection(
+/**
+ * The public, secret-free state recorded alongside account credential digests for recovery checks:
+ * runtime metadata, settings, account flags and quota, and the vault roster.
+ */
+export async function importedRuntimeProjection(
   paths: NativePoolPaths,
   store: ReturnType<typeof createNativePoolStore>,
   rows: PoolRow[],
@@ -656,13 +684,18 @@ export async function runNativeMigration(
             )
           },
         }
+        // Once a switch to vault custody is requested or prepared, the
+        // activation controller owns the host auth file. Restoring the ordinary host activation marker
+        // could delete a credential that controller must refuse to adopt.
         if (journal?.phase === 'retired') {
-          await repair(operation, assertMigration, hooks)
+          if (journal.activation === null)
+            await repair(operation, assertMigration, hooks)
           return journal
         }
         if (journal?.phase === 'committed') {
           journal = await retire(operation, journal, assertMigration, hooks)
-          await repair(operation, assertMigration, hooks)
+          if (journal.activation === null)
+            await repair(operation, assertMigration, hooks)
           return journal
         }
         if (!journal) {
@@ -685,6 +718,9 @@ export async function runNativeMigration(
                 source: captured.routingSourcePath,
                 destination: captured.routingDestinationPath,
               },
+              ...(operation.requestVaultActivation
+                ? { activation: 'requested' as const }
+                : {}),
             },
             journalHooks,
           )

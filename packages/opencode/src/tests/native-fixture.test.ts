@@ -263,7 +263,7 @@ test('local legacy accounts commit through the real migration and keep unrelated
   expect(requests).toEqual([])
   expect(calls).toEqual(['trackDetached', 'deferCleanup'])
 
-  expect(fixture.journal).toMatchObject({ phase: 'retired', version: 3 })
+  expect(fixture.journal).toMatchObject({ phase: 'retired', version: 4 })
   expect(await readNativeMigrationJournal(fixture.paths)).toEqual(
     fixture.journal,
   )
