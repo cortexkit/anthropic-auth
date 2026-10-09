@@ -27,7 +27,7 @@ import {
 } from './pool-authority.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 
-/** A failure that the runtime failure publisher can record for one credential. */
+/** A failure that can be recorded for a single credential. */
 export type NativeLocalAttributedFailure = Exclude<
   NativeLocalFailureAttribution,
   { kind: 'none' }
@@ -204,8 +204,10 @@ function capturePolicy(value: unknown): NativeLocalFailurePolicy {
 /**
  * Authorize local OAuth only after offline migration commits the pool as the
  * credential authority. Creating this service neither imports credentials nor
- * completes migration. The coordinator owns exchange, account lookup, bounded
- * retries and the final validation check; it refuses API-key rows.
+ * completes migration. Authority is checked before the coordinator starts and
+ * again before any access token is returned. The coordinator owns exchange,
+ * account lookup, bounded retries and the final validation check; it refuses
+ * API-key rows.
  *
  * Successful account checks record validation for the exact credential version.
  * An existing runtime entry with no account UUID loses its unproven metadata,
@@ -239,9 +241,10 @@ export function createNativeLocalCredentialService(
   >(descriptors, 'resolveIdentity')
 
   async function reconcile(observation: NativeRefreshObservation) {
-    // Select from the captured provider observation, never a later runtime read.
-    // Writers recheck its credential version, binding and error-clear timestamps
-    // under locks; changing the subject would misattribute the provider result.
+    // This result identifies the account and credential version to update.
+    // A later storage read may already refer to a replacement credential.
+    // Writers verify the captured version, account binding and error-clear
+    // timestamps while holding the account and runtime locks.
     const event = frozenCopy(observation)
     if (
       (event.status === 'persisted' ||
@@ -285,22 +288,38 @@ export function createNativeLocalCredentialService(
     reconcile,
   })
 
+  function authorityRefusal(
+    error: unknown,
+    persisted: boolean,
+  ): NativeRefreshResult {
+    return {
+      status: 'refused',
+      reason:
+        error instanceof NativeAuthorityError
+          ? error.code
+          : 'authority-unavailable',
+      persisted,
+    }
+  }
+
   async function authorize(
     request: NativeRefreshRequest,
   ): Promise<NativeRefreshResult> {
     try {
       await requireNativePoolAuthority(paths)
     } catch (error) {
-      return {
-        status: 'refused',
-        reason:
-          error instanceof NativeAuthorityError
-            ? error.code
-            : 'authority-unavailable',
-        persisted: false,
-      }
+      return authorityRefusal(error, false)
     }
-    return coordinator.authorize(request)
+    const result = await coordinator.authorize(request)
+    if (result.status !== 'usable') return result
+    // Authority can change while the coordinator awaits storage or admission
+    // policy. Recheck before returning an access token. A 'rotated' result
+    // means the successor is already durable; refusal must report that fact
+    // without returning the credential or undoing its saved state.
+    return requireNativePoolAuthority(paths).then(
+      () => result,
+      (error: unknown) => authorityRefusal(error, result.source === 'rotated'),
+    )
   }
 
   return Object.freeze({ authorize })
