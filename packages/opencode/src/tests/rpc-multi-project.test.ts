@@ -1,91 +1,165 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { describe, expect, mock } from 'bun:test'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   createEmptyStorage,
   QuotaHeaderFeedRegistry,
-  saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
-import type { Hooks } from '@opencode-ai/plugin'
+import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import { createOpencodeClient } from '@opencode-ai/sdk'
+import { $ } from 'bun'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index'
 import { resetNotificationsForTest } from '../rpc/notifications'
 import { discoverPortFile } from '../rpc/port-file'
 import { getRpcDir } from '../rpc/rpc-dir'
 import type { RpcServerHandle } from '../rpc/rpc-server'
+import { drainSidebarWrites } from '../sidebar-state.ts'
+import { migrateNativeOpencodeFixture } from './native-fixture.ts'
+import { createTimerTracking } from './timer-tracking'
 
 type RpcGlobal = typeof globalThis & {
   __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
 }
 
+const lifetimes = createTestLifetimeSuite()
+const test = lifetimes.test
+// getPlugin supplies timer mocks to each project's plugin instance. They
+// start no intervals, so background timers cannot outlive these RPC tests.
+const { disabledPluginTimerOverrides } = createTimerTracking()
+
+// Saved before each test and restored after it: every path variable that
+// migrateNativeOpencodeFixture returns in its env, plus the profile-hydration
+// switch and OPENCODE_AUTH_CONTENT, which this file sets or clears.
+const envKeys = [
+  'OPENCODE_ANTHROPIC_AUTH_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
+  'CLAUDE_CONFIG_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
+  'OPENCODE_AUTH_CONTENT',
+] as const
+
 let testRoot: string
-let previousRpcDir: string | undefined
-let previousAccountFile: string | undefined
-let previousSidebarStateFile: string | undefined
-let previousCacheKeepRegistryDir: string | undefined
-let previousQuotaFeedDir: string | undefined
 let startedRpcDirs: Set<string>
 let createdPlugins: Hooks[]
 
-const disabledPluginRuntimeOverrides = {
-  setInterval: mock(
-    () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-  ) as unknown as typeof setInterval,
-  clearInterval: mock(() => {}) as unknown as typeof clearInterval,
+/**
+ * Supply one project's plugin with the same input shape as OpenCode, using a
+ * real SDK client whose HTTP requests are answered inside the test process.
+ * Record each prompted session ID. A configured prompt failure appears in the
+ * command's RPC reply, identifying which project's client handled the action.
+ */
+function createHost(directory: string, rejectPromptsWith?: string) {
+  const prompts: string[] = []
+  const client = createOpencodeClient({
+    baseUrl: 'http://opencode.invalid',
+    fetch: async (request) => {
+      const path = new URL(request.url).pathname
+      if (request.method === 'GET' && /^\/session\/[^/]+\/message$/.test(path))
+        return Response.json([])
+      const prompt = /^\/session\/([^/]+)\/prompt_async$/.exec(path)
+      if (request.method === 'POST' && prompt) {
+        prompts.push(decodeURIComponent(prompt[1] ?? ''))
+        if (rejectPromptsWith) throw new Error(rejectPromptsWith)
+        return new Response(null, { status: 204 })
+      }
+      return Response.json({ name: 'NotFound' }, { status: 404 })
+    },
+  })
+  const context: PluginInput = {
+    client,
+    project: {
+      id: 'rpc-multi-project-fixture',
+      worktree: directory,
+      time: { created: Date.now() },
+    },
+    directory,
+    worktree: directory,
+    serverUrl: new URL('http://opencode.invalid'),
+    experimental_workspace: { register() {} },
+    $,
+  }
+  return { context, prompts }
 }
 
-function createMockClient(applyMarker?: string) {
-  return {
-    auth: { set: mock(() => Promise.resolve()) },
-    session: {
-      promptAsync: mock(() =>
-        applyMarker
-          ? Promise.reject(new Error(applyMarker))
-          : Promise.resolve(),
-      ),
-    },
-  }
+/** Plugin construction starts a fallback-account refresh and exposes its promise for tests. */
+function fallbackRefreshReady(hooks: Hooks): Promise<unknown> {
+  const ready =
+    '__fallbackRefreshReady' in hooks ? hooks.__fallbackRefreshReady : undefined
+  if (!(ready instanceof Promise))
+    throw new Error('Plugin did not expose its startup fallback refresh')
+  return ready
 }
 
 async function getPlugin(
   directory: string,
-  applyMarker?: string,
+  host = createHost(directory),
 ): Promise<Hooks> {
-  const plugin = AnthropicAuthPlugin as unknown as (
-    ctx: Parameters<typeof AnthropicAuthPlugin>[0],
-    runtimeOverrides: typeof disabledPluginRuntimeOverrides,
-  ) => ReturnType<typeof AnthropicAuthPlugin>
   startedRpcDirs.add(getRpcDir(directory))
-  const hooks = await plugin(
-    {
-      // @ts-expect-error: minimal mock for testing
-      client: createMockClient(applyMarker),
-      directory,
-    },
-    disabledPluginRuntimeOverrides,
+  const creation = AnthropicAuthPlugin(
+    host.context,
+    disabledPluginTimerOverrides(),
   )
+  lifetimes.trackDetached(creation)
+  const hooks = await creation
   createdPlugins.push(hooks)
+  // Plugin construction starts a background refresh of fallback accounts
+  // without awaiting it. Track that promise so teardown waits for it before
+  // deleting the files.
+  lifetimes.trackDetached(fallbackRefreshReady(hooks))
   return hooks
 }
 
-async function applyViaRpc(
+async function postRpc(
   entry: { port: number; token: string },
-  sessionId: string,
-) {
-  const response = await fetch(`http://127.0.0.1:${entry.port}/rpc/apply`, {
+  method: string,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  const response = await fetch(`http://127.0.0.1:${entry.port}/rpc/${method}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       authorization: `Bearer ${entry.token}`,
     },
-    body: JSON.stringify({
-      command: 'claude-start',
-      arguments: '',
-      sessionId,
-    }),
+    body: JSON.stringify(body),
   })
   expect(response.status).toBe(200)
-  return (await response.json()) as { text: string }
+  return response.json()
+}
+
+/**
+ * Ask one project's RPC server, through the /claude menu action the TUI sends,
+ * to fire a lane start: a single automated cache-warm message posted to the
+ * given session, to which no response is expected.
+ */
+async function fireLaneStartViaRpc(
+  entry: { port: number; token: string },
+  sessionId: string,
+): Promise<{ ok: boolean; text: string }> {
+  const result = await postRpc(entry, 'apply-menu', {
+    command: 'claude',
+    sectionId: 'Extras',
+    actionId: 'start-fire',
+    sessionId,
+  })
+  if (
+    typeof result !== 'object' ||
+    result === null ||
+    !('ok' in result) ||
+    typeof result.ok !== 'boolean' ||
+    !('text' in result) ||
+    typeof result.text !== 'string'
+  )
+    throw new Error('Menu RPC returned no apply result')
+  return { ok: result.ok, text: result.text }
 }
 
 async function stopRpcServers() {
@@ -99,88 +173,85 @@ async function stopRpcServers() {
   }
 }
 
-beforeEach(async () => {
-  testRoot = await mkdtemp(join(tmpdir(), 'aa-rpc-multi-project-'))
-  startedRpcDirs = new Set()
-  createdPlugins = []
-  previousRpcDir = process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
-  previousAccountFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  previousSidebarStateFile =
-    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
-  previousCacheKeepRegistryDir =
-    process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR
-  previousQuotaFeedDir = process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-  process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = '.rpc'
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(
-    testRoot,
-    'anthropic-auth.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-    testRoot,
-    'sidebar-state.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
-    testRoot,
-    'cachekeep-registry',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(
-    testRoot,
-    'quota-header-feed',
-  )
+/**
+ * Every project directory shares one set of native credential and
+ * configuration files, created by running the real offline migration on
+ * synthetic legacy fixtures, as separate OpenCode projects on one machine do.
+ *
+ * Lifetime cleanups run in registration order, and the migration fixture
+ * registers removal of its root only when it is called. The teardown below is
+ * registered first, so it stops every plugin and RPC server and waits for all
+ * queued sidebar writes before any fixture root or project directory is
+ * removed.
+ */
+async function migratedProjects(
+  legacyConfig: Record<string, unknown> = { ...createEmptyStorage() },
+) {
+  const savedEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
+  const projectsRoot = await mkdtemp(join(tmpdir(), 'aa-rpc-multi-project-'))
+  const plugins: Hooks[] = []
+  const rpcDirs = new Set<string>()
+  testRoot = projectsRoot
+  createdPlugins = plugins
+  startedRpcDirs = rpcDirs
+  lifetimes.deferCleanup(async () => {
+    try {
+      for (const plugin of plugins.reverse()) await plugin.dispose?.()
+      for (const rpcDir of rpcDirs) {
+        expect(
+          (globalThis as RpcGlobal).__anthropicAuthRpcServers?.get(rpcDir),
+        ).toBeUndefined()
+        expect(await discoverPortFile(rpcDir)).toBeNull()
+      }
+    } finally {
+      await stopRpcServers()
+      await drainSidebarWrites()
+      for (const key of envKeys) {
+        const value = savedEnv.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(projectsRoot, { recursive: true, force: true })
+      resetNotificationsForTest()
+    }
+  })
   await stopRpcServers()
-})
-
-afterEach(async () => {
-  try {
-    for (const plugin of createdPlugins.reverse()) await plugin.dispose?.()
-    for (const rpcDir of startedRpcDirs) {
-      expect(
-        (globalThis as RpcGlobal).__anthropicAuthRpcServers?.get(rpcDir),
-      ).toBeUndefined()
-      expect(await discoverPortFile(rpcDir)).toBeNull()
-    }
-  } finally {
-    await stopRpcServers()
-    if (previousRpcDir === undefined) {
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
-    } else {
-      process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = previousRpcDir
-    }
-    if (previousAccountFile === undefined) {
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-    } else {
-      process.env.OPENCODE_ANTHROPIC_AUTH_FILE = previousAccountFile
-    }
-    if (previousSidebarStateFile === undefined) {
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
-    } else {
-      process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE =
-        previousSidebarStateFile
-    }
-    if (previousCacheKeepRegistryDir === undefined) {
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR
-    } else {
-      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR =
-        previousCacheKeepRegistryDir
-    }
-    if (previousQuotaFeedDir === undefined) {
-      delete process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-    } else {
-      process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = previousQuotaFeedDir
-    }
-    await rm(testRoot, { recursive: true, force: true })
-    resetNotificationsForTest()
-  }
-})
+  const root = await mkdtemp(join(tmpdir(), 'aa-rpc-multi-project-pool-'))
+  // migrateNativeOpencodeFixture registers deletion of the directory only
+  // after it accepts it. This separate cleanup also removes the directory if
+  // the fixture fails before accepting it.
+  lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
+  const fixture = await migrateNativeOpencodeFixture({
+    root,
+    lifetime: lifetimes,
+    legacyConfig,
+  })
+  for (const [key, value] of Object.entries(fixture.env))
+    process.env[key] = value
+  // A relative RPC directory resolves inside each project directory. The
+  // fixture's absolute RPC path would put every project's server in one
+  // directory and hide the per-project separation these tests check.
+  process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = '.rpc'
+  // Startup otherwise fetches each OAuth account's profile in the background
+  // without awaiting it. That request is unrelated to these tests and could
+  // still be running when the temporary files are removed.
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  delete process.env.OPENCODE_AUTH_CONTENT
+  return fixture
+}
 
 describe('RPC server lifecycle', () => {
   test('dispose stops and removes its server when feed cleanup rejects', async () => {
-    await saveAccounts({
+    // The migrated settings enable the quota header feed, so the plugin builds
+    // the registry whose disposal is made to fail here.
+    await migratedProjects({
       ...createEmptyStorage(),
       quotaHeaderFeed: { enabled: true },
     })
     const originalDispose = QuotaHeaderFeedRegistry.prototype.dispose
+    let feedDisposals = 0
     QuotaHeaderFeedRegistry.prototype.dispose = async () => {
+      feedDisposals++
       throw new Error('feed disposal failed')
     }
     try {
@@ -192,6 +263,9 @@ describe('RPC server lifecycle', () => {
       expect(entry).not.toBeNull()
       await plugin.dispose?.()
 
+      // Quota-feed disposal threw as configured. The assertions below prove
+      // that this failure did not prevent RPC server cleanup.
+      expect(feedDisposals).toBe(1)
       expect(await discoverPortFile(rpcDir)).toBeNull()
       expect(
         (globalThis as RpcGlobal).__anthropicAuthRpcServers?.get(rpcDir),
@@ -205,6 +279,7 @@ describe('RPC server lifecycle', () => {
   })
 
   test('keeps RPC servers live for distinct project directories', async () => {
+    await migratedProjects()
     const directoryA = join(testRoot, 'project-a')
     const directoryB = join(testRoot, 'project-b')
 
@@ -220,10 +295,13 @@ describe('RPC server lifecycle', () => {
   })
 
   test('each project RPC server applies through its own plugin instance', async () => {
+    await migratedProjects()
     const directoryA = join(testRoot, 'project-a')
     const directoryB = join(testRoot, 'project-b')
-    await getPlugin(directoryA, 'applied by project-a')
-    await getPlugin(directoryB, 'applied by project-b')
+    const hostA = createHost(directoryA, 'applied by project-a')
+    const hostB = createHost(directoryB, 'applied by project-b')
+    await getPlugin(directoryA, hostA)
+    await getPlugin(directoryB, hostB)
 
     const entryA = await discoverPortFile(getRpcDir(directoryA))
     const entryB = await discoverPortFile(getRpcDir(directoryB))
@@ -248,15 +326,40 @@ describe('RPC server lifecycle', () => {
       ),
     ).toMatchObject({ port: entryB.port, token: entryB.token })
 
-    expect((await applyViaRpc(entryA, 'session-a')).text).toContain(
-      'applied by project-a',
-    )
-    expect((await applyViaRpc(entryB, 'session-b')).text).toContain(
-      'applied by project-b',
-    )
+    // The retired text apply endpoint only points at /claude; it must not
+    // reach either project's session client.
+    expect(
+      await postRpc(entryA, 'apply', {
+        command: 'claude-start',
+        arguments: '',
+        sessionId: 'session-a',
+      }),
+    ).toEqual({
+      text: 'Open /claude to manage native Claude settings.',
+      knobs: {},
+    })
+    expect(hostA.prompts).toHaveLength(0)
+    expect(hostB.prompts).toHaveLength(0)
+
+    // Lane start from the /claude menu prompts through the session client
+    // of the plugin that owns the RPC server, for the requesting session only.
+    const resultA = await fireLaneStartViaRpc(entryA, 'session-a')
+    expect(resultA.text).toContain('applied by project-a')
+    expect(resultA.text).not.toContain('applied by project-b')
+    expect(hostA.prompts).toHaveLength(1)
+    expect(hostA.prompts[0]).toBe('session-a')
+    expect(hostB.prompts).toHaveLength(0)
+
+    const resultB = await fireLaneStartViaRpc(entryB, 'session-b')
+    expect(resultB.text).toContain('applied by project-b')
+    expect(resultB.text).not.toContain('applied by project-a')
+    expect(hostB.prompts).toHaveLength(1)
+    expect(hostB.prompts[0]).toBe('session-b')
+    expect(hostA.prompts).toHaveLength(1)
   })
 
   test('dispose stops its directory while another project remains live', async () => {
+    await migratedProjects()
     const directoryA = join(testRoot, 'project-a')
     const directoryB = join(testRoot, 'project-b')
     const pluginA = await getPlugin(directoryA)
@@ -278,6 +381,7 @@ describe('RPC server lifecycle', () => {
   })
 
   test('late disposal cannot remove a same-directory successor port file', async () => {
+    await migratedProjects()
     const directory = join(testRoot, 'project')
     const first = await getPlugin(directory)
     const second = await getPlugin(directory)
@@ -302,6 +406,7 @@ describe('RPC server lifecycle', () => {
   })
 
   test('a dispose whose entry was replaced does not stop the successor server', async () => {
+    await migratedProjects()
     const directory = join(testRoot, 'project')
     const first = await getPlugin(directory)
     const rpcGlobal = globalThis as RpcGlobal
@@ -321,18 +426,21 @@ describe('RPC server lifecycle', () => {
 
     await first.dispose?.()
 
-    // D2's port-file check would otherwise mask loss of D1.
+    // Both registry entries use the same port. Port-file checks alone cannot
+    // detect an unintended call to stop the original server.
     expect(stopSpy).not.toHaveBeenCalled()
     expect(rpcGlobal.__anthropicAuthRpcServers?.get(rpcDir)).toBe(
       successorHandle,
     )
-    // Dispose refused to stop D1 by design; the spy wraps the real stop, so
-    // invoking it clears the dangling server and its port file before afterEach.
+    // The registry no longer names the original server, so its plugin must
+    // leave it running. Stop it explicitly for cleanup; the spy calls the real
+    // stop function, which also removes its port file.
     await stopSpy()
     rpcGlobal.__anthropicAuthRpcServers?.delete(rpcDir)
   })
 
   test('a disposed project can start a discoverable RPC server again', async () => {
+    await migratedProjects()
     const directory = join(testRoot, 'project')
     const first = await getPlugin(directory)
 
