@@ -17565,66 +17565,95 @@ describe('auth.loader', () => {
     test('fallback header push persists after access-token rotation for the same account', async () => {
       const fallbackTemplate = createFallbackStorage()
         .accounts[0] as OAuthAccount
-      const existingQuota = fallbackTemplate.quota
+      const oldAccess = 'sk-ant-oat01-old-fallback-access'
+      const newAccess = 'sk-ant-oat01-new-fallback-access'
       await useTempAccountFile(
-        createFallbackStorage({
-          accounts: [
-            {
-              ...fallbackTemplate,
-              access: 'sk-ant-oat01-old-fallback-access',
-              quota: existingQuota,
-            },
-          ],
-          quota: { enabled: false },
-        }),
+        bindPoolAccounts(
+          createFallbackStorage({
+            accounts: [
+              {
+                ...fallbackTemplate,
+                access: oldAccess,
+                quota: fallbackTemplate.quota,
+              },
+            ],
+            quota: { enabled: false },
+          }),
+        ),
       )
       let messageCalls = 0
-      let resolveFallbackResponse: ((response: Response) => void) | undefined
-      let fallbackRequestStarted: (() => void) | undefined
-      const fallbackStarted = new Promise<void>((resolve) => {
-        fallbackRequestStarted = resolve
-      })
+      const fallbackStarted = bodyLifetime().gate()
+      const releaseFallback = bodyLifetime().gate()
+      const authorizations: Array<string | null> = []
       globalThis.fetch = mock(
-        withNativeAdmission((input: string | URL | Request) => {
-          const url = extractUrl(input)
-          if (url.includes('/api/oauth/usage')) {
-            return Promise.resolve(
-              new Response('usage-unavailable', { status: 500 }),
-            )
-          }
-          messageCalls++
-          if (messageCalls === 1)
-            return Promise.resolve(new Response('limited', { status: 429 }))
-          return new Promise<Response>((resolve) => {
-            resolveFallbackResponse = resolve
-            fallbackRequestStarted?.()
-          })
-        }),
+        withNativeAdmission(
+          async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            const url = extractUrl(input)
+            if (url.includes('/api/oauth/usage'))
+              return new Response('usage-unavailable', { status: 500 })
+            if (!url.includes('/v1/messages')) return Response.json({})
+            authorizations.push(new Headers(init?.headers).get('authorization'))
+            if (++messageCalls === 1)
+              return new Response('limited', { status: 429 })
+            fallbackStarted.open()
+            await releaseFallback.wait
+            return new Response('fallback-ok', { headers: quotaHeaders })
+          },
+        ),
       ) as unknown as typeof fetch
       const result = await loadFetch()
       const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
-      await fallbackStarted
-
-      const rotated = await readAccountStorage()
-      if (!rotated) throw new Error('expected rotated fallback storage')
-      const fallback = rotated.accounts.find(
-        (account): account is OAuthAccount => account.id === 'fallback-1',
-      )
-      if (!fallback) throw new Error('expected fallback account')
-      fallback.access = 'new-fallback-access'
-      await saveAccounts(rotated)
-      resolveFallbackResponse?.(
-        new Response('fallback-ok', { headers: quotaHeaders }),
-      )
-      await responsePromise
-
-      const state = await waitForState(
-        (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
-      )
-      expect(state.accounts['fallback-1'].quota.accountIdentity).toBe(
-        'fallback-1',
-      )
-      expect(state.accounts['fallback-1'].quota.five_hour.usedPercent).toBe(78)
+      try {
+        await Promise.race([
+          fallbackStarted.wait,
+          responsePromise.then(() => {
+            throw new Error('Expected a held fallback request')
+          }),
+        ])
+        if (!migratedPool) throw new Error('Expected migrated pool')
+        const reader = createNativeAccountRuntime({
+          paths: migratedPool.paths,
+          host: 'opencode',
+        })
+        try {
+          const before = await reader.captureLocalSubject('fallback-1')
+          loginIssues(oldAccess, newAccess)
+          await refreshPoolLoginElsewhere('fallback-1', {
+            access: newAccess,
+            refresh: fallbackTemplate.refresh,
+            expires: Date.now() + 8 * 60 * 60_000,
+          })
+          const after = await reader.captureLocalSubject('fallback-1')
+          expect(after.binding.credentialEpoch).toBe(
+            before.binding.credentialEpoch,
+          )
+          expect(after.binding.identity).toBe(before.binding.identity)
+          expect(after.version?.accessFingerprint).not.toBe(
+            before.version?.accessFingerprint,
+          )
+        } finally {
+          reader.close()
+        }
+        releaseFallback.open()
+        await responsePromise
+        const state = await waitForState(
+          (value) =>
+            value.accounts?.['fallback-1']?.quota?.source === 'headers',
+        )
+        expect(state.accounts['fallback-1'].quota.accountIdentity).toBe(
+          syntheticFallbackAccountUuid(0),
+        )
+        expect(state.accounts['fallback-1'].quota.five_hour.usedPercent).toBe(
+          78,
+        )
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-main-access',
+          `Bearer ${oldAccess}`,
+        ])
+      } finally {
+        releaseFallback.open()
+        await Promise.allSettled([responsePromise])
+      }
     })
 
     test('fallback header push does not persist onto a different account identity', async () => {
