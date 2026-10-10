@@ -29,7 +29,6 @@ import * as Core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
   type AccountStorage,
-  acquireRefreshFileLock,
   buildPrimeRequestBody,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
@@ -67,6 +66,7 @@ import {
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
+import { withLock } from '@cortexkit/common-auth/fs'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
 import { EFFORT_MARKER_PREFIX } from '../effort-history'
@@ -9939,14 +9939,36 @@ describe('auth.loader', () => {
     )
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
 
-    const configLock = await acquireRefreshFileLock({
-      name: 'config-write',
-      path: process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-      ttlMs: 10_000,
-      renew: true,
+    const pool = migratedPool
+    if (!pool) throw new Error('Expected migrated pool')
+    const reader = createNativeAccountRuntime({
+      paths: pool.paths,
+      host: 'opencode',
     })
-    expect(configLock).not.toBeNull()
-    if (!configLock) throw new Error('expected account config lock')
+    try {
+      expect((await reader.authorizeLocal('main')).status).toBe('usable')
+    } finally {
+      reader.close()
+    }
+    const locked = bodyLifetime().gate()
+    const release = bodyLifetime().gate()
+    // Block the actual native profile destination, not the retired config
+    // file. Credential validation completed before acquiring this writer.
+    const writer = withLock(
+      pool.paths.runtime,
+      {
+        name: 'native-runtime',
+        ttlMs: 10_000,
+        timeoutMs: 15_000,
+        renew: true,
+      },
+      async () => {
+        locked.open()
+        await release.wait
+      },
+    )
+    bodyLifetime().trackDetached(writer)
+    await locked.wait
 
     const command = expectHandledCommandResponse(
       plugin['command.execute.before']({
@@ -9969,7 +9991,8 @@ describe('auth.loader', () => {
       expect(text).toContain('Max 20x')
       expect((await readAccountStorage())?.main?.profile).toBeUndefined()
     } finally {
-      await configLock.release()
+      release.open()
+      await writer
       await command
     }
 
