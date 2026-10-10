@@ -11718,11 +11718,14 @@ describe('auth.loader', () => {
 
   test('background refresh proactively rotates main oauth before expiry', async () => {
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: { enabled: false },
-        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
-      }),
+      bindMainAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false },
+          refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+        }),
+        'sk-ant-oat01-old-access',
+      ),
       {
         access: 'sk-ant-oat01-old-access',
         refresh: 'old-refresh',
@@ -11735,22 +11738,20 @@ describe('auth.loader', () => {
       return { unref() {} }
     }) as unknown as typeof setInterval
 
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'background-refresh-new',
-              access_token: 'sk-ant-oat01-background-access-new',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
+    mainAccountIssues('sk-ant-oat01-background-access-new')
+    globalThis.fetch = mock(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const admitted = await nativeBootstrapAnswer(input, init)
+        if (admitted) return admitted
+        if (extractUrl(input).includes('/v1/oauth/token'))
+          return Response.json({
+            refresh_token: 'background-refresh-new',
+            access_token: 'sk-ant-oat01-background-access-new',
+            expires_in: 3600,
+          })
+        return new Response(null, { status: 200 })
+      },
+    ) as unknown as typeof fetch
 
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient, undefined, {
@@ -11770,17 +11771,45 @@ describe('auth.loader', () => {
 
     expect(intervalHandlers.length).toBeGreaterThanOrEqual(2)
     for (const handler of intervalHandlers) handler()
-    await waitForMockCall(mockClient.auth.set)
-
-    expect(mockClient.auth.set).toHaveBeenCalledWith({
-      path: { id: 'anthropic' },
-      body: {
+    const pool = migratedPool
+    if (!pool) throw new Error('Expected migrated pool')
+    const reader = createNativeAccountRuntime({
+      paths: pool.paths,
+      host: 'opencode',
+    })
+    try {
+      let subject = await reader.captureLocalSubject('main')
+      for (
+        let attempt = 0;
+        attempt < 50 &&
+        subject.version?.accessFingerprint !==
+          tokenFingerprint('sk-ant-oat01-background-access-new');
+        attempt++
+      ) {
+        await Bun.sleep(10)
+        subject = await reader.captureLocalSubject('main')
+      }
+      const stored = await createNativePoolStore({
+        paths: pool.paths,
+        quota: nativeQuotaCodec,
+      }).read()
+      expect(stored.status).toBe('ready')
+      const credential =
+        stored.status === 'ready'
+          ? stored.rows.find((row) => row.id === subject.binding.rowId)
+              ?.credential
+          : undefined
+      expect(credential).toMatchObject({
         type: 'oauth',
         refresh: 'background-refresh-new',
         access: 'sk-ant-oat01-background-access-new',
         expires: expect.any(Number),
-      },
-    })
+      })
+      expect(subject.binding.identity).toBe(syntheticMainAccountUuid)
+      expect(mockClient.auth.set).not.toHaveBeenCalled()
+    } finally {
+      reader.close()
+    }
   })
 
   test('background refresh retries after a permanent main backoff belongs to an older refresh token', async () => {
