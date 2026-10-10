@@ -1177,6 +1177,9 @@ const anthropicAuthPlugin = async (
       ? { connect: runtimeOverrides.claustrumScopedConnect }
       : undefined,
   })
+  let mainQuotaCredentialEpoch:
+    | { rowId: string; credentialEpoch: number }
+    | undefined
   // The AccountStorage-shaped projection supplies quota, settings, and account
   // metadata to routing and display code. It contains no OAuth access/refresh
   // tokens or API keys; credential material comes only from native authorization.
@@ -1186,6 +1189,16 @@ const anthropicAuthPlugin = async (
     if (path !== accountStoragePath)
       throw new Error('Native account storage mismatch')
     const snapshot = await nativeAccounts.read()
+    if (!mainQuotaCredentialEpoch) {
+      const binding = snapshot.accounts.find(
+        (account) => account.id === 'main',
+      )?.binding
+      if (binding)
+        mainQuotaCredentialEpoch = {
+          rowId: binding.rowId,
+          credentialEpoch: binding.credentialEpoch,
+        }
+    }
     if (
       snapshot.mode !== 'claustrum' ||
       !snapshot.accounts.some((account) => account.source === 'vault')
@@ -5327,6 +5340,30 @@ const anthropicAuthPlugin = async (
             )
           }
           const primarySnapshot = await nativeAccounts.read()
+          const primaryAccount = primarySnapshot.accounts.find(
+            (account) => account.id === 'main',
+          )
+          const primaryBinding = primaryAccount?.binding
+          if (
+            primaryAccount &&
+            primaryBinding &&
+            (!mainQuotaCredentialEpoch ||
+              primaryBinding.rowId !== mainQuotaCredentialEpoch.rowId ||
+              primaryBinding.credentialEpoch >
+                mainQuotaCredentialEpoch.credentialEpoch)
+          ) {
+            // An explicit replacement clears persisted quota, even when the
+            // verified account UUID stays the same. Clear the matching cache
+            // and fence old polls too; ordinary token refresh keeps its epoch.
+            quotaManager.clearMain()
+            quotaManager.setMainQuotaAccountIdentity(
+              primaryAccount.accountIdentity,
+            )
+            mainQuotaCredentialEpoch = {
+              rowId: primaryBinding.rowId,
+              credentialEpoch: primaryBinding.credentialEpoch,
+            }
+          }
           if (
             deferCredential &&
             getRoutingMode(primarySnapshot.policyStorage) === 'fallback-first'

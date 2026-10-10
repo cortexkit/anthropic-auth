@@ -13859,62 +13859,96 @@ describe('auth.loader', () => {
       ],
     })
     await useTempAccountFile(
-      createFallbackStorage({
-        routing: { mode: 'sticky-balanced' },
-        refresh: {
-          enabled: true,
-          intervalMinutes: 10,
-          refreshBeforeExpiryMinutes: 240,
-          mainLastRefreshError: {
-            message:
-              'Claude OAuth refresh failed: 400 — {"error":"invalid_grant"}',
-            checkedAt,
-            nextRetryAt: checkedAt + 24 * 60 * 60_000,
-            retryCount: 1,
-            tokenHash: hashRefreshToken('main-refresh'),
-            status: 400,
-            permanent: true,
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'sticky-balanced' },
+          refresh: {
+            enabled: true,
+            intervalMinutes: 10,
+            refreshBeforeExpiryMinutes: 240,
+            mainLastRefreshError: {
+              message:
+                'Claude OAuth refresh failed: 400 — {"error":"invalid_grant"}',
+              checkedAt,
+              nextRetryAt: checkedAt + 24 * 60 * 60_000,
+              retryCount: 1,
+              tokenHash: hashRefreshToken('main-refresh'),
+              status: 400,
+              permanent: true,
+            },
           },
-        },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 1, seven_day: 1 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: quota(88),
-          mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
-        },
-        accounts: [
-          {
-            id: 'fallback-a',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-a-access',
-            refresh: 'fallback-a-refresh',
-            expires: checkedAt + 5 * 60 * 60_000,
-            quota: quota(0),
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 1, seven_day: 1 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: quota(88),
+            mainQuotaCheckedAt: checkedAt,
+            mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
           },
-          {
-            id: 'fallback-b',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-b-access',
-            refresh: 'fallback-b-refresh',
-            expires: checkedAt + 5 * 60 * 60_000,
-            quota: quota(0),
-          },
-        ],
-      }),
+          accounts: [
+            {
+              id: 'fallback-a',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fallback-a-access',
+              refresh: 'fallback-a-refresh',
+              expires: checkedAt + 5 * 60 * 60_000,
+              quota: quota(0),
+            },
+            {
+              id: 'fallback-b',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fallback-b-access',
+              refresh: 'fallback-b-refresh',
+              expires: checkedAt + 5 * 60 * 60_000,
+              quota: quota(0),
+            },
+          ],
+        }),
+      ),
+      {
+        access: 'sk-ant-oat01-main-access',
+        refresh: 'main-refresh',
+        expires: checkedAt - 1,
+      },
     )
     let messageRequests = 0
+    let reLoginQuotaPolls = 0
+    const servedAuthorizations: Array<string | null> = []
     globalThis.fetch = mock(
-      withNativeAdmission((input: string | URL | Request) => {
-        if (extractUrl(input).includes('/v1/messages')) messageRequests += 1
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }),
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage')) {
+            reLoginQuotaPolls += 1
+            return Promise.resolve(
+              Response.json({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+                limits: [
+                  {
+                    kind: 'weekly_scoped',
+                    group: 'weekly',
+                    percent: 12,
+                    scope: { model: { display_name: 'Fable' } },
+                  },
+                ],
+              }),
+            )
+          }
+          if (url.includes('/v1/messages')) {
+            messageRequests += 1
+            servedAuthorizations.push(
+              new Headers(init?.headers).get('authorization'),
+            )
+          }
+          return Promise.resolve(new Response('{}', { status: 200 }))
+        },
+      ),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
-    let currentAuth = {
+    const currentAuth = {
       type: 'oauth' as const,
       access: 'sk-ant-oat01-main-access',
       refresh: 'main-refresh',
@@ -13945,12 +13979,11 @@ describe('auth.loader', () => {
     })
     expect(messageRequests).toBe(0)
 
-    currentAuth = {
-      type: 'oauth',
+    await replacePoolMainLogin({
       access: 'sk-ant-oat01-main-access',
       refresh: 'relogged-main-refresh',
       expires: checkedAt + 5 * 60 * 60_000,
-    }
+    })
     const recovered = await result.fetch(MESSAGES_URL, {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses_sticky_no_fable_route' },
@@ -13961,10 +13994,14 @@ describe('auth.loader', () => {
       }),
     })
 
-    expect(recovered.status).toBe(401)
-    expect(messageRequests).toBe(0)
-    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
-    expect(savedState.main?.lastRefreshError).toBeDefined()
+    expect(recovered.status).toBe(200)
+    expect(messageRequests).toBe(1)
+    expect(servedAuthorizations).toEqual(['Bearer sk-ant-oat01-main-access'])
+    expect(reLoginQuotaPolls).toBe(1)
+    const saved = await readAccountStorage()
+    expect(saved?.refresh?.mainLastRefreshError).toBeUndefined()
+    expect(saved?.quota?.mainQuota?.scoped?.[0]?.remainingPercent).toBe(88)
+    expect(saved?.quota?.mainQuota?.accountIdentity).toBe(poolMainIdentity())
   })
 
   test('sticky-balanced uses API routes only after confirmed OAuth exhaustion', async () => {
