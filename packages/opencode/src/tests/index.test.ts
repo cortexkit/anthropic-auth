@@ -17540,6 +17540,13 @@ describe('auth.loader', () => {
           (value) => value.main?.quota?.source === 'headers',
         )
         const reloaded = await readAccountStorage()
+        await waitForLogRecord(
+          records,
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+          'published refreshed-main quota log',
+        )
         expect(
           records.some(
             (record) =>
