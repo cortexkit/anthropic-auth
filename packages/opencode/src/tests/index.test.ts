@@ -9782,9 +9782,34 @@ describe('auth.loader', () => {
   })
 
   test('/claude-quota bounds stalled profile hydration without hiding quota output', async () => {
-    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    const checkedAt = Date.now()
+    await useTempAccountFile(
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          main: {
+            type: 'opencode',
+            provider: 'anthropic',
+            profile: {
+              checkedAt: checkedAt - 8 * 24 * 60 * 60_000,
+              tier: 'default_claude_free',
+              orgType: 'claude_free',
+            },
+          },
+          quota: {
+            enabled: true,
+            mainQuota: {
+              five_hour: { usedPercent: 25, remainingPercent: 75, checkedAt },
+              seven_day: { usedPercent: 50, remainingPercent: 50, checkedAt },
+              checkedAt,
+            },
+          },
+        }),
+      ),
+    )
     const mockClient = createMockClient()
     let profileSignal: AbortSignal | undefined
+    let usageCalls = 0
     globalThis.fetch = mock(
       withNativeAdmission(
         (input: string | URL | Request, init?: RequestInit) => {
@@ -9800,6 +9825,7 @@ describe('auth.loader', () => {
             })
           }
           if (url.includes('/api/oauth/usage')) {
+            usageCalls++
             return Promise.resolve(
               Response.json({
                 five_hour: { utilization: 25 },
@@ -9835,6 +9861,7 @@ describe('auth.loader', () => {
 
     expect(performance.now() - startedAt).toBeLessThan(4_000)
     expect(profileSignal?.aborted).toBe(true)
+    expect(usageCalls).toBe(0)
     const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
       ?.body.parts[0]?.text as string
     expect(text).toContain('## Claude Quotas')
@@ -10309,6 +10336,8 @@ describe('auth.loader', () => {
           type: 'opencode',
           provider: 'anthropic',
           profile: {
+            accountIdentity: syntheticMainAccountUuid,
+            providerAccountUuid: syntheticMainAccountUuid,
             tier: 'default_claude_max_20x',
             orgType: 'claude_max',
             checkedAt: Date.now(),
@@ -10354,48 +10383,78 @@ describe('auth.loader', () => {
     await profileStarted.raised
     await drainSidebarWrites()
 
-    const rotated = await readAccountStorage()
-    const fallback = rotated?.accounts[0]
-    if (!rotated || fallback?.type !== 'oauth') {
-      throw new Error('expected fallback OAuth account')
-    }
-    fallback.access = 'sk-ant-oat01-new-access'
-    fallback.refresh = 'new-refresh'
-    fallback.lastRefreshedAt = 200
-    await saveAccounts(rotated)
-    await Bun.sleep(2)
-    profile.release(
-      Response.json({
-        organization: {
-          organization_type: 'claude_team',
-          rate_limit_tier: 'default_claude_max_5x',
-        },
-      }),
-    )
-    const reloaded = await waitForAccountStorage((storage) => {
-      const account = storage?.accounts.find(
-        (candidate) => candidate.id === 'fb',
+    const pool = migratedPool
+    if (!pool) throw new Error('Expected migrated pool')
+    const reader = createNativeAccountRuntime({
+      paths: pool.paths,
+      host: 'opencode',
+    })
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    setLogLevel('debug')
+    try {
+      const before = await reader.captureLocalSubject('fb')
+      loginIssues('sk-ant-oat01-old-access', 'sk-ant-oat01-new-access')
+      await refreshPoolLoginElsewhere('fb', {
+        access: 'sk-ant-oat01-new-access',
+        refresh: 'new-refresh',
+        expires: Date.now() + 8 * 60 * 60_000,
+      })
+      const rotated = await reader.captureLocalSubject('fb')
+      expect(rotated.binding.identity).toBe(before.binding.identity)
+      expect(rotated.binding.credentialEpoch).toBe(
+        before.binding.credentialEpoch,
       )
-      return (
-        account?.type === 'oauth' &&
-        account.profile?.tier === 'default_claude_max_5x'
+      expect(rotated.version?.accessFingerprint).not.toBe(
+        before.version?.accessFingerprint,
       )
-    })
-    await drainSidebarWrites()
-    const reloadedFallback = reloaded?.accounts[0]
-    expect(reloadedFallback).toMatchObject({
-      access: 'sk-ant-oat01-new-access',
-      refresh: 'new-refresh',
-      lastRefreshedAt: 200,
-    })
-    if (reloadedFallback?.type !== 'oauth') {
-      throw new Error('expected reloaded fallback OAuth account')
+      profile.release(
+        Response.json({
+          organization: {
+            organization_type: 'claude_team',
+            rate_limit_tier: 'default_claude_max_5x',
+          },
+        }),
+      )
+      // Profile metadata still requires its captured token version. The late
+      // response must not replace credentials or publish stale metadata.
+      await waitForLogRecord(
+        records,
+        (record) =>
+          record.channel === 'quota' &&
+          record.message === 'failed to save account profile' &&
+          record.payload?.account === 'fb',
+        'stale fallback profile publication refusal',
+      )
+      await drainSidebarWrites()
+      const after = await reader.captureLocalSubject('fb')
+      expect(after).toEqual(rotated)
+      const snapshot = await reader.read()
+      expect(
+        snapshot.accounts.find((account) => account.id === 'fb')?.profile,
+      ).toBeUndefined()
+      const stored = await createNativePoolStore({
+        paths: pool.paths,
+        quota: nativeQuotaCodec,
+      }).read()
+      expect(stored.status).toBe('ready')
+      const credential =
+        stored.status === 'ready'
+          ? stored.rows.find((row) => row.id === rotated.binding.rowId)
+              ?.credential
+          : undefined
+      expect(credential).toMatchObject({
+        type: 'oauth',
+        access: 'sk-ant-oat01-new-access',
+        refresh: 'new-refresh',
+      })
+      expect(profileCalls).toBe(1)
+    } finally {
+      profile.release(new Response('cancelled', { status: 499 }))
+      reader.close()
+      __setLogTestSink(null)
+      setLogLevel('info')
     }
-    expect(reloadedFallback.profile).toMatchObject({
-      tier: 'default_claude_max_5x',
-      accountIdentity: 'fb',
-    })
-    expect(profileCalls).toBe(1)
   })
 
   test('late main profile hydration cannot replace a rotated-token profile', async () => {
