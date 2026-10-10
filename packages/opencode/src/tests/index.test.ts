@@ -3093,52 +3093,79 @@ describe('quota header feed integration', () => {
 
   test('main-route sidebar writes use current fallback storage after re-login', async () => {
     const fallbackCheckedAt = Date.now()
-    let releaseMainResponse: ((response: Response) => void) | undefined
-    let mainStarted: (() => void) | undefined
-    const mainResponse = new Promise<Response>((resolve) => {
-      releaseMainResponse = resolve
-    })
-    const mainRequestStarted = new Promise<void>((resolve) => {
-      mainStarted = resolve
-    })
+    const fallbackAccess = 'sk-ant-oat01-sidebar-fallback-a'
+    const responseGate = bodyLifetime().gate()
+    const startedGate = bodyLifetime().gate()
+    let mainValue = new Response('{}', { status: 503 })
+    const mainResponse = responseGate.wait.then(() => mainValue)
+    const releaseMainResponse = (response: Response) => {
+      mainValue = response
+      responseGate.open()
+    }
+    const mainStarted = () => startedGate.open()
+    const mainRequestStarted = startedGate.wait
+    let responsePromise: Promise<Response> | undefined
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'fallback-1',
-            type: 'oauth',
-            refresh: 'fallback-lineage-a-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            authLineageId: 'lineage-a',
-            quota: {
+      bindPoolAccounts(
+        createFallbackStorage({
+          quota: {
+            ...createFallbackStorage().quota,
+            mainQuota: {
+              source: 'poll',
+              checkedAt: fallbackCheckedAt,
               five_hour: {
-                usedPercent: 25,
-                remainingPercent: 75,
+                usedPercent: 4,
+                remainingPercent: 96,
                 checkedAt: fallbackCheckedAt,
               },
               seven_day: {
-                usedPercent: 30,
-                remainingPercent: 70,
+                usedPercent: 12,
+                remainingPercent: 88,
                 checkedAt: fallbackCheckedAt,
               },
             },
+            mainQuotaCheckedAt: fallbackCheckedAt,
           },
-        ],
-      }),
+          accounts: [
+            {
+              id: 'fallback-1',
+              type: 'oauth',
+              access: fallbackAccess,
+              refresh: 'fallback-lineage-a-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              authLineageId: 'lineage-a',
+              quota: {
+                five_hour: {
+                  usedPercent: 25,
+                  remainingPercent: 75,
+                  checkedAt: fallbackCheckedAt,
+                },
+                seven_day: {
+                  usedPercent: 30,
+                  remainingPercent: 70,
+                  checkedAt: fallbackCheckedAt,
+                },
+              },
+            },
+          ],
+        }),
+      ),
     )
     globalThis.fetch = mock(
-      withNativeAdmission((input: any, init?: RequestInit) => {
-        const url = extractUrl(input)
-        if (url.includes('/v1/messages')) {
-          const token = new Headers(init?.headers).get('authorization')
-          if (token === 'Bearer sk-ant-oat01-main-access') {
-            mainStarted?.()
-            return mainResponse
+      withNativeAdmission(
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/v1/messages')) {
+            const token = new Headers(init?.headers).get('authorization')
+            if (token === 'Bearer sk-ant-oat01-main-access') {
+              mainStarted?.()
+              return mainResponse
+            }
+            return Promise.resolve(new Response(null, { status: 429 }))
           }
-          return Promise.resolve(new Response(null, { status: 429 }))
-        }
-        return Promise.resolve(Response.json({}))
-      }),
+          return Promise.resolve(Response.json({}))
+        },
+      ),
     ) as unknown as typeof fetch
 
     try {
@@ -3155,41 +3182,44 @@ describe('quota header feed integration', () => {
         { models: {} },
       )
       const quotaManager = plugin.__quotaManager
+      responsePromise = Promise.resolve(
+        result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+        }),
+      )
+      bodyLifetime().trackDetached(responsePromise)
+      await Promise.race([
+        mainRequestStarted,
+        responsePromise.then(() => {
+          throw new Error('Request completed without reaching main')
+        }),
+      ])
       expect(
         quotaManager.getAllFallbacks().get('fallback-1')?.quota.five_hour
           ?.usedPercent,
       ).toBe(25)
-
-      const responsePromise = result.fetch(MESSAGES_URL, {
-        method: 'POST',
-        body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
+      if (!migratedPool) throw new Error('Missing migrated pool')
+      const replacementRuntime = createNativeAccountRuntime({
+        paths: migratedPool.paths,
+        host: 'opencode',
       })
-      await mainRequestStarted
-
-      const replacement = await loadAccounts(
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-      )
-      if (!replacement) throw new Error('fallback storage unexpectedly missing')
-      const replacementAccount = replacement.accounts.find(
-        (account) => account.id === 'fallback-1',
-      )
-      if (!replacementAccount || !isOAuthAccount(replacementAccount)) {
-        throw new Error('fallback account unexpectedly missing')
+      try {
+        const replacementAccess = 'sk-ant-oat01-sidebar-fallback-b'
+        loginIssues(fallbackAccess, replacementAccess)
+        await replacementRuntime.loginOAuth({
+          routeId: 'fallback-1',
+          replace: true,
+          accountIdentity: syntheticFallbackAccountUuid(0),
+          credential: {
+            access: replacementAccess,
+            refresh: 'fallback-lineage-b-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+          },
+        })
+      } finally {
+        replacementRuntime.close()
       }
-      replacementAccount.authLineageId = 'lineage-b'
-      replacementAccount.quota = {
-        five_hour: {
-          usedPercent: 60,
-          remainingPercent: 40,
-          checkedAt: fallbackCheckedAt,
-        },
-        seven_day: {
-          usedPercent: 70,
-          remainingPercent: 30,
-          checkedAt: fallbackCheckedAt,
-        },
-      }
-      await saveAccounts(replacement)
       releaseMainResponse?.(new Response('{}', { status: 200 }))
 
       const response = await responsePromise
@@ -3202,6 +3232,9 @@ describe('quota header feed integration', () => {
       ).toBeUndefined()
       await drainSidebarWrites()
     } finally {
+      responseGate.open()
+      await Promise.allSettled([responsePromise, mainResponse])
+      await drainSidebarWrites()
       setLogLevel('info')
     }
   })

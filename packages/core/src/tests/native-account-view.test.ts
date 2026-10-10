@@ -91,6 +91,39 @@ test('secret-free native policy projection preserves primary and fallback order 
   expect(snapshot.policyStorage.prime?.main).toBeUndefined()
 })
 
+test('fallback quota lineage changes on replacement but survives ordinary token rotation without exposing secrets', () => {
+  const lineage = (candidate: PoolRow) => {
+    const account = projectNativeAccountViews({
+      paths,
+      rows: [row, candidate],
+      settings: { mainAccountId: row.id },
+    }).policyStorage.accounts[0]
+    return account?.type === 'oauth' ? account.authLineageId : undefined
+  }
+  const fallback = { ...row, id: 'fallback' }
+  const first = lineage(fallback)
+  expect(typeof first).toBe('string')
+  if (!first) throw new Error('Fallback has no credential lineage')
+  expect(first).not.toContain('synthetic-secret')
+  const rotated = lineage({
+    ...fallback,
+    credential: {
+      type: 'oauth',
+      access: 'rotated-access-secret',
+      refresh: 'rotated-refresh-secret',
+      expires: 2000,
+    },
+  })
+  expect(rotated).toBe(first)
+  expect(rotated).not.toContain('rotated-access-secret')
+  expect(rotated).not.toContain('rotated-refresh-secret')
+  expect(lineage({ ...fallback, credentialEpoch: 3 })).not.toBe(first)
+  expect(
+    lineage({ ...fallback, identity: '22222222-2222-4333-8444-555555555555' }),
+  ).not.toBe(first)
+  expect(lineage({ ...fallback, id: 'another-fallback' })).not.toBe(first)
+})
+
 test('vault primary alias maps to main while runtime scopes and windowless freshness survive', () => {
   const state: NativeRuntimeState = {
     version: 1,

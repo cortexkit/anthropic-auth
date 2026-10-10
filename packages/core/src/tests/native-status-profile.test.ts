@@ -51,7 +51,7 @@ async function localFixture() {
     identity: uuid,
     credential: {
       type: 'oauth',
-      access: 'synthetic-access',
+      access: 'sk-ant-oat01-synthetic-access',
       refresh: 'synthetic-refresh',
       expires: now + 3_600_000,
     },

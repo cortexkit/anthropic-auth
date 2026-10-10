@@ -588,6 +588,16 @@ export function projectNativeAccountViews(input: {
               | undefined,
             claustrumScopedCredentialId: row.credentialId,
             claustrumScopedState: row.state,
+            // Quota caches discard replaced logins when this identifier changes.
+            // Pool and row IDs, account UUID and credential epoch stay stable
+            // during token refresh; the epoch changes when login is replaced.
+            // Vault entries use credential ID and account UUID. No tokens enter
+            // this identifier.
+            authLineageId: row.binding
+              ? JSON.stringify(row.binding)
+              : row.credentialId
+                ? JSON.stringify([row.credentialId, row.accountIdentity])
+                : undefined,
             quota: row.quota,
             profile: row.profile,
             prime: row.prime,

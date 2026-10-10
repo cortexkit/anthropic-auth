@@ -50,7 +50,7 @@ async function fixture(
     identity: uuid,
     credential: {
       type: 'oauth',
-      access: 'synthetic-access',
+      access: 'sk-ant-oat01-synthetic-access',
       refresh: 'synthetic-refresh',
       expires: now + 3_600_000,
     },
@@ -75,7 +75,7 @@ async function fixture(
       refreshToken: async () => {
         counts.refresh++
         return {
-          access: 'synthetic-successor',
+          access: 'sk-ant-oat01-synthetic-successor',
           refresh: 'synthetic-new-refresh',
           expires: now + 4_000_000,
           expiresIn: 4000,
@@ -111,7 +111,7 @@ test('native facade reads no legacy authority and does not import legacy persist
   const read = await f.runtime.read()
   expect(read.accounts[0]?.id).toBe('main')
   expect(f.counts.lookups).toBe(0)
-  expect(JSON.stringify(read)).not.toContain('synthetic-access')
+  expect(JSON.stringify(read)).not.toContain('sk-ant-oat01-synthetic-access')
   const result = await f.runtime.authorizeLocal('main')
   expect(result.status).toBe('usable')
   expect(f.counts.lookups).toBe(1)
@@ -161,8 +161,8 @@ test('native background quota/profile authorize positively and refresh one rejec
   )
   const quota = await f.runtime.fetchQuota('main', transport)
   expect(headers).toEqual([
-    'Bearer synthetic-access',
-    'Bearer synthetic-successor',
+    'Bearer sk-ant-oat01-synthetic-access',
+    'Bearer sk-ant-oat01-synthetic-successor',
   ])
   expect(quota.scoped).toEqual([])
   expect(quota.checkedAt).toBe(now)
@@ -185,7 +185,7 @@ test('shared local recovery never captures request model policy', async () => {
       entered.open()
       await release.wait
       return {
-        access: 'synthetic-shared-successor',
+        access: 'sk-ant-oat01-synthetic-shared-successor',
         refresh: 'synthetic-shared-refresh',
         expires: now + 4_000_000,
         expiresIn: 4000,
@@ -194,7 +194,7 @@ test('shared local recovery never captures request model policy', async () => {
   })
   await f.store.rotate('imported-main', {
     type: 'oauth',
-    access: 'synthetic-expired',
+    access: 'sk-ant-oat01-synthetic-expired',
     refresh: 'synthetic-refresh',
     expires: now - 1,
   })
@@ -303,7 +303,7 @@ test('backoff reset fences exact refresh lineage and monotonically clears native
   ).toBe(1)
   await f.store.rotate('imported-main', {
     type: 'oauth',
-    access: 'synthetic-new-access',
+    access: 'sk-ant-oat01-synthetic-new-access',
     refresh: 'synthetic-new-lineage',
     expires: now + 4_000_000,
   })
@@ -336,7 +336,7 @@ test('native lineage and cumulative Prime updates are atomic and replacement fen
     accountIdentity: uuid,
     replace: true,
     credential: {
-      access: 'synthetic-relogin',
+      access: 'sk-ant-oat01-synthetic-relogin',
       refresh: 'synthetic-relogin-refresh',
       expires: now + 4_000_000,
     },
@@ -398,7 +398,7 @@ test('normal local refresh preserves Prime lineage and counters but relogin star
     replace: true,
     accountIdentity: uuid,
     credential: {
-      access: 'synthetic-relogin',
+      access: 'sk-ant-oat01-synthetic-relogin',
       refresh: 'synthetic-relogin-refresh',
       expires: now + 4_000_000,
     },
@@ -559,7 +559,7 @@ test('authorization recovers an interrupted replacement epoch without reusing ol
     'imported-main',
     {
       type: 'oauth',
-      access: 'synthetic-replaced-access',
+      access: 'sk-ant-oat01-synthetic-replaced-access',
       refresh: 'synthetic-replaced-refresh',
       expires: now + 4_000_000,
     },
@@ -653,7 +653,7 @@ test('cross-process remove and readd same native route and UUID creates new Prim
     routeId: 'main',
     accountIdentity: uuid,
     credential: {
-      access: 'synthetic-readded-access',
+      access: 'sk-ant-oat01-synthetic-readded-access',
       refresh: 'synthetic-readded-refresh',
       expires: now + 4_000_000,
     },
@@ -686,7 +686,7 @@ test('cross-process remove and readd same native route and UUID creates new Prim
     refreshToken: async () => {
       staleCalls++
       return {
-        access: 'synthetic-never-used',
+        access: 'sk-ant-oat01-synthetic-never-used',
         refresh: 'synthetic-never-used-refresh',
         expires: now + 4_000_000,
         expiresIn: 4000,
@@ -1053,7 +1053,7 @@ test('only an add that creates a new account row logs account added, without cre
   await f.runtime.loginOAuth({
     routeId: 'fallback-oauth',
     credential: {
-      access: 'synthetic-oauth-access',
+      access: 'sk-ant-oat01-synthetic-oauth-access',
       refresh: 'synthetic-oauth-refresh',
       expires: now + 3_600_000,
     },
@@ -1215,7 +1215,7 @@ test('local enable and disable log only a flag change made by their own write', 
     identity: uuid,
     credential: {
       type: 'oauth',
-      access: 'synthetic-dup-access',
+      access: 'sk-ant-oat01-synthetic-dup-access',
       refresh: 'synthetic-dup-refresh',
       expires: now + 3_600_000,
     },
