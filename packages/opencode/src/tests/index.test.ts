@@ -6969,35 +6969,37 @@ describe('auth.loader', () => {
 
   test('stale writer does not resurrect a deleted active account', async () => {
     await useTempAccountFile(
-      createFallbackStorage({
-        routing: { mode: 'fallback-first' },
-        quota: { enabled: false },
-        accounts: [
-          {
-            id: 'work-deleted',
-            type: 'oauth',
-            access: 'sk-ant-oat01-work-deleted-access',
-            refresh: 'work-deleted-refresh',
-            expires: Date.now() + 100000,
-          },
-          {
-            id: 'work-witness',
-            type: 'oauth',
-            access: 'sk-ant-oat01-work-witness-stale-access',
-            refresh: 'work-witness-stale-refresh',
-            expires: Date.now() + 100000,
-            lastRefreshedAt: 100,
-          },
-        ],
-      }),
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          quota: { enabled: false },
+          accounts: [
+            {
+              id: 'work-deleted',
+              type: 'oauth',
+              access: 'sk-ant-oat01-work-deleted-access',
+              refresh: 'work-deleted-refresh',
+              expires: Date.now() - 1000,
+            },
+            {
+              id: 'work-witness',
+              type: 'oauth',
+              access: 'sk-ant-oat01-work-witness-stale-access',
+              refresh: 'work-witness-stale-refresh',
+              expires: Date.now() - 1000,
+              lastRefreshedAt: 100,
+            },
+          ],
+        }),
+      ),
     )
-    const refreshStarted = deferred()
-    const releaseRefresh = deferred()
-    globalThis.fetch = mock((input: any) => {
+    const refreshStarted = bodyLifetime().gate()
+    const releaseRefresh = bodyLifetime().gate()
+    globalThis.fetch = mock((input: Parameters<typeof fetch>[0]) => {
       const url = extractUrl(input)
       if (url === TOKEN_URL) {
-        refreshStarted.resolve()
-        return releaseRefresh.promise.then(
+        refreshStarted.open()
+        return releaseRefresh.wait.then(
           () =>
             new Response(JSON.stringify({ error: 'invalid_grant' }), {
               status: 400,
@@ -7029,38 +7031,62 @@ describe('auth.loader', () => {
     expect(backgroundRefreshReady).toBeInstanceOf(Promise)
     try {
       await withDeadlockGuard(
-        refreshStarted.promise,
+        refreshStarted.wait,
         4_000,
         'fallback refresh never reached the token stub; the eager refresh did not start',
       )
-      // v1.16.0's mergeAccountsForSave unions existing+incoming accounts, so a
-      // deletion must be declared explicitly via removedAccountIds — a plain
-      // save without the account no longer removes it.
-      await saveAccounts(
-        createFallbackStorage({
-          routing: { mode: 'fallback-first' },
-          quota: { enabled: false },
-          accounts: [
-            {
-              id: 'work-current',
-              type: 'oauth',
-              access: 'sk-ant-oat01-work-current-access',
-              refresh: 'work-current-refresh',
-              expires: Date.now() + 100000,
-            },
-            {
-              id: 'work-witness',
-              type: 'oauth',
-              access: 'sk-ant-oat01-work-witness-current-access',
-              refresh: 'work-witness-current-refresh',
-              expires: Date.now() + 100000,
-              lastRefreshedAt: 200,
-            },
-          ],
-        }),
-        undefined,
-        { removedAccountIds: ['work-deleted'] },
-      )
+      const pool = migratedPool
+      if (!pool) throw new Error('Expected migrated pool')
+      const peer = createNativeAccountRuntime({
+        paths: pool.paths,
+        host: 'opencode',
+      })
+      try {
+        const witness = (await peer.read()).accounts.find(
+          (row) => row.id === 'work-witness',
+        )
+        if (!witness?.accountIdentity)
+          throw new Error('Expected known witness UUID')
+        const staleSubject = requireKnownPoolSubject(
+          await peer.captureLocalSubject('work-deleted'),
+        )
+        // Removal shares the refresh lock, so queue it before releasing the
+        // provider rather than waiting for removal while holding that lock.
+        const removing = peer.remove('work-deleted')
+        bodyLifetime().trackDetached(Promise.allSettled([removing]))
+        releaseRefresh.open()
+        await removing
+        expect(
+          await peer.publishLocal(staleSubject, { lastUsed: Date.now() }),
+        ).toBe(false)
+        await peer.loginOAuth({
+          routeId: 'work-current',
+          replace: false,
+          accountIdentity: '99999999-2222-4333-8444-555555555555',
+          credential: {
+            access: 'sk-ant-oat01-work-current-access',
+            refresh: 'work-current-refresh',
+            expires: Date.now() + 100000,
+          },
+        })
+        await peer.loginOAuth({
+          routeId: 'work-witness',
+          replace: true,
+          accountIdentity: witness.accountIdentity,
+          credential: {
+            access: 'sk-ant-oat01-work-witness-current-access',
+            refresh: 'work-witness-current-refresh',
+            expires: Date.now() - 1000,
+          },
+        })
+        await peer.reorder(['main', 'work-current', 'work-witness'])
+        const witnessFailure = await peer.authorizeLocal('work-witness', {
+          intent: 'refresh',
+        })
+        expect(witnessFailure.status).toBe('failed')
+      } finally {
+        peer.close()
+      }
       await seedSidebarRouting('work-deleted', 'fallback-first', Date.now())
 
       await plugin.auth.loader(
@@ -7073,7 +7099,7 @@ describe('auth.loader', () => {
           }),
         { models: {} },
       )
-      releaseRefresh.resolve()
+      releaseRefresh.open()
       await withDeadlockGuard(
         backgroundRefreshReady!,
         4_000,
@@ -7084,8 +7110,18 @@ describe('auth.loader', () => {
         'work-current',
         'work-witness',
       ])
+      const poolRead = await createNativePoolStore({
+        paths: pool.paths,
+        quota: nativeQuotaCodec,
+      }).read()
+      expect(poolRead.status).toBe('ready')
+      if (poolRead.status !== 'ready')
+        throw new Error('Expected ready native pool')
       expect(
-        disk?.accounts.find((account) => account.id === 'work-current'),
+        poolRead.rows.find((row) => row.id === 'work-deleted'),
+      ).toBeUndefined()
+      expect(
+        poolRead.rows.find((row) => row.id === 'work-current')?.credential,
       ).toMatchObject({
         access: 'sk-ant-oat01-work-current-access',
         refresh: 'work-current-refresh',
@@ -7104,7 +7140,7 @@ describe('auth.loader', () => {
         'work-witness',
       ])
     } finally {
-      releaseRefresh.resolve()
+      releaseRefresh.open()
     }
   })
 
