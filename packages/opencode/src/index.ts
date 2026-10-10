@@ -1615,6 +1615,78 @@ const anthropicAuthPlugin = async (
       return nativeAccounts.fetchQuota(routeId)
     },
   })
+  function quotaSnapshotIsExhausted(
+    quota: OAuthQuotaSnapshot | null | undefined,
+  ) {
+    return (['five_hour', 'seven_day'] as const).some(
+      (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
+    )
+  }
+  // Account-wide provider waits precede token acquisition in ordered routing.
+  // Model-scoped readings retain their separate last-main policy; permanent
+  // authentication failures and sticky allocation keep their own error paths.
+  function mainProviderQuotaRestriction(
+    storage: AccountStorage | null,
+    accountUuid: string | undefined,
+  ) {
+    if (
+      !storage ||
+      storage.quota?.enabled === false ||
+      !accountUuid ||
+      getRoutingMode(storage) === 'sticky-balanced' ||
+      isPermanentRefreshError(storage.refresh?.mainLastRefreshError)
+    )
+      return undefined
+    const now = Date.now()
+    const error = storage.quota?.mainLastQuotaApiError
+    if (
+      error &&
+      error.accountIdentity === accountUuid &&
+      error.nextRetryAt !== undefined &&
+      error.nextRetryAt > now
+    ) {
+      return {
+        message: formatQuotaBackoffMessage(error, now),
+        retryAfter: Math.max(1, Math.ceil((error.nextRetryAt - now) / 1000)),
+      }
+    }
+    const quota = storage.quota?.mainQuota
+    // Header percentages are rounded for display and cannot alone prove
+    // exhaustion. Leave them to normal request and routing policy.
+    const checkedAt = quotaSnapshotCheckedAt(quota)
+    if (
+      quota?.accountIdentity !== accountUuid ||
+      quota.source === 'headers' ||
+      !quotaSnapshotIsExhausted(quota) ||
+      checkedAt <= 0 ||
+      checkedAt > now ||
+      getQuotaNextRefreshAt(quota, storage, checkedAt) <= now
+    )
+      return undefined
+    const resetTimes = (['five_hour', 'seven_day'] as const).flatMap((key) => {
+      const window = quota[key]
+      const reset = window?.resetsAt ? Date.parse(window.resetsAt) : Number.NaN
+      return window &&
+        window.remainingPercent <= 0 &&
+        Number.isFinite(reset) &&
+        reset > now
+        ? [reset]
+        : []
+    })
+    return {
+      message: 'Claude OAuth quota is exhausted for this account.',
+      retryAfter: Math.max(
+        1,
+        Math.ceil(
+          ((resetTimes.length
+            ? Math.max(...resetTimes)
+            : now + getQuotaCheckIntervalMs(storage)) -
+            now) /
+            1000,
+        ),
+      ),
+    }
+  }
   async function reconcileMainQuotaAccountIdentity(
     accessToken: string,
     quotaKey: string | undefined,
@@ -5428,7 +5500,12 @@ const anthropicAuthPlugin = async (
           }
           if (
             deferCredential &&
-            getRoutingMode(primarySnapshot.policyStorage) === 'fallback-first'
+            (getRoutingMode(primarySnapshot.policyStorage) ===
+              'fallback-first' ||
+              mainProviderQuotaRestriction(
+                primarySnapshot.policyStorage,
+                primaryAccount?.accountIdentity,
+              ))
           ) {
             const primary = primarySnapshot.accounts.find(
               (account) => account.id === 'main',
@@ -6668,20 +6745,6 @@ const anthropicAuthPlugin = async (
             )
           }
 
-          // The fallbacks routing may actually send to: usable accounts that
-          // also pass the killswitch policy. Every fallback-selection path
-          // (fallback-first, soft-quota skip-main, the killswitch gate, reactive
-          // retries) must go through this so the killswitch is a hard block on
-          // ALL routes — a killswitch-killed account must never serve a request,
-          // even if it still passes the softer routing quota policy.
-          function quotaSnapshotIsExhausted(
-            quota: OAuthQuotaSnapshot | null | undefined,
-          ) {
-            return (['five_hour', 'seven_day'] as const).some(
-              (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
-            )
-          }
-
           function responseShowsMainQuotaExhausted(
             response: Response,
             streamingRateLimited: boolean,
@@ -6731,6 +6794,8 @@ const anthropicAuthPlugin = async (
             }
           }
 
+          // All fallback-selection paths apply killswitch policy after finding
+          // usable accounts; softer quota routing cannot bypass a killswitch.
           async function getRoutableFallbackAccounts(
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
             options: { includeApiRoutes?: boolean; modelId?: string } = {},
@@ -7683,6 +7748,55 @@ const anthropicAuthPlugin = async (
               const replayableRequest = isReplayableRequest(input, init?.body)
               const requestModelId =
                 parseRequestModel(init?.body) ?? credentialModelId
+              const providerRestriction = auth.deferred
+                ? mainProviderQuotaRestriction(storage, requestMainProviderUuid)
+                : undefined
+              if (providerRestriction) {
+                // A provider-issued wait applies before primary token acquisition.
+                // Available fallbacks may serve; a blocked primary must not refresh
+                // or obtain a bearer merely to discover the same restriction again.
+                const fallbackAccounts = replayableRequest
+                  ? await getRoutableFallbackAccounts(storage, {
+                      includeApiRoutes: mainQuotaEntryIsFreshExhausted(
+                        undefined,
+                        requestMainQuotaIdentity,
+                      ),
+                      modelId: requestModelId,
+                    })
+                  : []
+                const response = await tryUsableFallbackAccounts(
+                  input,
+                  init,
+                  fallbackAccounts,
+                  storage,
+                  undefined,
+                  trace,
+                  {
+                    onSuccess: (account) =>
+                      writeCurrentSidebarState(account.id, 'fallback'),
+                    mainQuotaIdentity: requestMainQuotaIdentity,
+                    fableRequest,
+                    laneStartRequest,
+                  },
+                )
+                if (response) return wrapResponse(response)
+                return new Response(
+                  JSON.stringify({
+                    type: 'error',
+                    error: {
+                      type: 'rate_limit_error',
+                      message: providerRestriction.message,
+                    },
+                  }),
+                  {
+                    status: 429,
+                    headers: {
+                      'content-type': 'application/json',
+                      'retry-after': String(providerRestriction.retryAfter),
+                    },
+                  },
+                )
+              }
               const modelDeniedResponse = () => {
                 const retryAfter = killswitchRetryAfterSeconds(
                   quotaManager.getMain(requestMainQuotaIdentity?.quotaKey)
