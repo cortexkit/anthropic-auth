@@ -755,7 +755,7 @@ for (const name of ['pool-config', 'pool-state', 'native-runtime']) {
     ).toEqual([])
     expect(error).toMatchObject({
       name: 'NativeRuntimeError',
-      code: name === 'native-runtime' ? 'runtime-io' : 'publication-refused',
+      code: 'publication-refused',
     })
     expect(controls.held.size).toBe(0)
   })

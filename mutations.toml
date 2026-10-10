@@ -166,3 +166,55 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
 broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "profile-publication-refusal-is-not-io"
+guards = "A stale credential publication must remain distinct from a storage failure."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "saved ? 'saved' : 'refused'"
+new = "saved ? 'saved' : 'failed'"
+test_file = "packages/core/src/tests/native-display-profile.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-display-profile.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["profile publication fence refusal is distinct from an I/O failure"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "profile-current-credential-display"
+guards = "A fetched tier after a failed write must not be displayed for changed credentials."
+file = "packages/opencode/src/index.ts"
+old = "!(await hydration.isCurrent?.())"
+new = "false"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > profile I/O failure hides a fetched tier after the credential changes"]
+expect_message = "error: expect(received).not.toContain(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-owner-loss-is-publication-refusal"
+guards = "Lost writer ownership must not license display through the I/O failure exception."
+file = "packages/core/src/native-runtime.ts"
+old = '''          try {
+            await lock.assertOwned()
+          } catch {
+            throw new NativeRuntimeError('publication-refused')
+          }'''
+new = '''          await lock.assertOwned()'''
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime writer ownership loss is a publication refusal, not an I/O display fallback"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

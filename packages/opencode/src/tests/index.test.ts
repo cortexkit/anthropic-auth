@@ -10,8 +10,8 @@ import {
 } from 'bun:test'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import * as filesystem from 'node:fs/promises'
 import {
-  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -10473,7 +10473,7 @@ describe('auth.loader', () => {
         records,
         (record) =>
           record.channel === 'quota' &&
-          record.message === 'failed to save account profile' &&
+          record.message === 'refused account profile publication' &&
           record.payload?.account === 'fb',
         'stale fallback profile publication refusal',
       )
@@ -11170,75 +11170,133 @@ describe('auth.loader', () => {
     ).toHaveLength(1)
   })
 
-  test('profile persistence failure does not block account display', async () => {
-    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
-    const mockClient = createMockClient()
-    globalThis.fetch = mock(
-      withNativeAdmission((input: string | URL | Request) =>
-        Promise.resolve(
-          extractUrl(input).includes('/api/oauth/profile')
-            ? Response.json({
-                organization: {
-                  organization_type: 'claude_max',
-                  rate_limit_tier: 'default_claude_max_20x',
-                },
-              })
-            : new Response('ok'),
-        ),
-      ),
-    ) as unknown as typeof fetch
-    const plugin = await getPlugin(mockClient)
-    await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
+  for (const rotate of [false, true]) {
+    test(
+      rotate
+        ? 'profile I/O failure hides a fetched tier after the credential changes'
+        : 'profile persistence failure does not block account display',
+      async () => {
+        await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+        const mockClient = createMockClient()
+        let profileCalls = 0
+        globalThis.fetch = mock(
+          withNativeAdmission((input: Parameters<typeof fetch>[0]) => {
+            if (extractUrl(input).includes('/api/oauth/profile')) {
+              profileCalls++
+              return Promise.resolve(
+                Response.json({
+                  organization: {
+                    organization_type: 'claude_max',
+                    rate_limit_tier: 'default_claude_max_20x',
+                  },
+                }),
+              )
+            }
+            return Promise.resolve(new Response('ok'))
+          }),
+        ) as unknown as typeof fetch
+        const plugin = await getPlugin(mockClient)
+        await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth',
+              access: 'sk-ant-oat01-main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 100000,
+            }),
+          { models: {} },
+        )
+        const pool = migratedPool
+        if (!pool) throw new Error('Expected migrated pool')
+        const reader = createNativeAccountRuntime({
+          paths: pool.paths,
+          host: 'opencode',
+        })
+        expect((await reader.authorizeLocal('main')).status).toBe('usable')
+        const before = await readFile(pool.paths.runtime)
+        const originalRename = filesystem.rename
+        let failedWrites = 0
+        // Fail only the actual metadata rename after credential admission and
+        // production publication guards. Leave credential files untouched.
+        const writer = spyOn(filesystem, 'rename').mockImplementation(
+          async (from, to) => {
+            if (to === pool.paths.runtime) {
+              failedWrites++
+              throw Object.assign(
+                new Error('Synthetic profile rename failure'),
+                { code: 'EIO' },
+              )
+            }
+            await originalRename(from, to)
+          },
+        )
+        const records: LogTestRecord[] = []
+        __setLogTestSink((record) => records.push(record))
+        setLogLevel('debug')
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+        const command = () =>
+          expectHandledCommandResponse(
+            plugin['command.execute.before']({
+              command: 'claude',
+              arguments: '',
+              sessionID: 'session-1',
+            }),
+          )
+        try {
+          await command()
+          await waitForLogRecord(
+            records,
+            (record) =>
+              record.level === 'warn' &&
+              record.channel === 'quota' &&
+              record.message === 'failed to persist account profile',
+            'profile I/O failure warning',
+          )
+          expect(failedWrites).toBe(1)
+          expect(await readFile(pool.paths.runtime)).toEqual(before)
+          writer.mockRestore()
+          if (rotate)
+            await refreshPoolMainElsewhere({
+              access: 'sk-ant-oat01-profile-io-successor',
+              refresh: 'profile-io-successor-refresh',
+              expires: Date.now() + 8 * 60 * 60_000,
+            })
+          // Reopen after the I/O outcome, so this assertion cannot pass merely
+          // because the first display raced the failing writer.
+          await command()
+          const calls = (
+            mockClient.session.promptAsync as unknown as {
+              mock: {
+                calls: Array<[{ body: { parts: Array<{ text: string }> } }]>
+              }
+            }
+          ).mock.calls
+          const text = calls.at(-1)?.[0].body.parts[0]?.text
+          if (rotate) expect(text).not.toContain('Max 20x')
+          else expect(text).toContain('Max 20x')
+          expect(profileCalls).toBe(1)
+          expect(
+            (await reader.read()).accounts.find(
+              (account) => account.id === 'main',
+            )?.profile,
+          ).toBeUndefined()
+          expect(
+            records.filter(
+              (record) =>
+                record.level === 'warn' &&
+                record.channel === 'quota' &&
+                record.message === 'failed to persist account profile',
+            ),
+          ).toHaveLength(1)
+        } finally {
+          writer.mockRestore()
+          reader.close()
+          __setLogTestSink(null)
+          setLogLevel('info')
+        }
+      },
     )
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
-    const statePath = getAccountStatePath(
-      process.env.OPENCODE_ANTHROPIC_AUTH_FILE,
-    )
-    const stateDir = dirname(statePath)
-    await chmod(stateDir, 0o555)
-    const records: LogTestRecord[] = []
-    __setLogTestSink((record) => records.push(record))
-    setLogLevel('debug')
-
-    let commandError: unknown
-    try {
-      await plugin['command.execute.before']({
-        command: 'claude',
-        arguments: '',
-        sessionID: 'session-1',
-      })
-    } catch (error) {
-      commandError = error
-    } finally {
-      await chmod(stateDir, 0o755)
-      __setLogTestSink(null)
-      setLogLevel('info')
-    }
-    const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
-      ?.body.parts[0]?.text as string
-
-    expect(commandError).toBeInstanceOf(Error)
-    expect((commandError as Error).message).toContain(
-      '__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__',
-    )
-    expect(text).toContain('Max 20x')
-    expect(
-      records.filter(
-        (record) =>
-          record.level === 'debug' &&
-          record.channel === 'quota' &&
-          record.message === 'failed to persist account profile',
-      ),
-    ).toHaveLength(1)
-  })
+  }
 
   test('ordinary model request never calls the profile endpoint', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))

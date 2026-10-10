@@ -828,7 +828,7 @@ for (const name of ['pool-config', 'pool-state', 'native-runtime']) {
     await refused(
       f,
       f.event,
-      name === 'native-runtime' ? 'runtime-io' : 'publication-refused',
+      'publication-refused',
       runtime.publishNativeLocalCredentialValidation,
     )
     expect(controls.renames).toBe(0)

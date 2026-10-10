@@ -436,7 +436,7 @@ for (const name of ['pool-config', 'pool-state', 'native-runtime']) {
     await refused(
       f,
       () => runtime.publishNativeLocalRefreshFailure(f.paths, f.event, policy),
-      name === 'native-runtime' ? 'runtime-io' : 'publication-refused',
+      'publication-refused',
     )
     expect(controls.renames).toBe(0)
     expect(controls.held.size).toBe(0)

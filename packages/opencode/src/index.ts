@@ -1987,7 +1987,8 @@ const anthropicAuthPlugin = async (
      */
     deadline?: AbortSignal
     profile?: OAuthAccountProfile
-    persistence?: 'pending' | 'saved' | 'failed'
+    persistence?: 'pending' | 'saved' | 'refused' | 'failed'
+    isCurrent?: () => Promise<boolean>
   }
   const profileHydrations = new Map<string, ProfileHydration>()
   // Saving a fetched profile continues after the display has used it. Dispose
@@ -2001,16 +2002,18 @@ const anthropicAuthPlugin = async (
     return JSON.stringify([id, accountIdentity ?? null])
   }
 
-  /** A fetched profile may be displayed while fresh unless its persistence failed. */
-  function displayableProfile(
+  /** A fetched tier requires current credentials; a storage failure alone does not hide it. */
+  async function displayableProfile(
     hydration: ProfileHydration | undefined,
     now: number,
   ) {
-    return hydration?.profile &&
-      hydration.persistence !== 'failed' &&
-      oauthProfileIsFresh(hydration.profile, now)
-      ? hydration.profile
-      : undefined
+    if (
+      !hydration?.profile ||
+      !oauthProfileIsFresh(hydration.profile, now) ||
+      !(await hydration.isCurrent?.())
+    )
+      return undefined
+    return hydration.persistence === 'refused' ? undefined : hydration.profile
   }
 
   function startProfileHydration(
@@ -2044,7 +2047,7 @@ const anthropicAuthPlugin = async (
         ]),
       )
       .then(
-        ({ profile, persisted }) => {
+        ({ profile, persisted, isCurrent }) => {
           // Keep a profile only for the account it was read for. A route
           // whose identity was not yet known accepts the identity this read
           // reports; the display checks it against the route again later.
@@ -2053,12 +2056,17 @@ const anthropicAuthPlugin = async (
             profile.accountIdentity === account.accountIdentity
           ) {
             hydration.profile = profile
+            hydration.isCurrent = isCurrent
             hydration.persistence = 'pending'
           }
           const saving = persisted.then(async (outcome) => {
             hydration.persistence = outcome
             if (outcome === 'failed')
-              logger.debug('quota', 'failed to save account profile', {
+              logger.warn('quota', 'failed to persist account profile', {
+                account: account.id,
+              })
+            else if (outcome === 'refused')
+              logger.debug('quota', 'refused account profile publication', {
                 account: account.id,
               })
             if (
@@ -2196,7 +2204,10 @@ const anthropicAuthPlugin = async (
       )
         profileHydrations.set(key, earlier)
       if (storedProfileIsFresh(account, later)) continue
-      const profile = displayableProfile(profileHydrations.get(key), later)
+      const profile = await displayableProfile(
+        profileHydrations.get(key),
+        later,
+      )
       if (!profile || profile.accountIdentity !== account.accountIdentity)
         continue
       account.profile = profile

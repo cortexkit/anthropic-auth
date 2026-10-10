@@ -53,7 +53,10 @@ import {
   updateNativeRuntime,
 } from './native-runtime.ts'
 import { fetchOAuthAccountProfile } from './oauth-profile.ts'
-import { requireNativePoolAuthority } from './pool-authority.ts'
+import {
+  NativeAuthorityError,
+  requireNativePoolAuthority,
+} from './pool-authority.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 import { createNativePoolStore } from './pool-store.ts'
 
@@ -74,7 +77,7 @@ export type NativeScoped401Site =
   | 'prime'
   | 'quota-profile'
 
-export type NativeProfilePersistence = 'saved' | 'failed'
+export type NativeProfilePersistence = 'saved' | 'refused' | 'failed'
 
 /** The profile fields a display may receive; never the legacy token fingerprint. */
 export type NativeDisplayProfileMetadata = Pick<
@@ -83,25 +86,28 @@ export type NativeDisplayProfileMetadata = Pick<
 >
 
 /**
- * A profile read for display, returned as soon as the validated profile
- * response arrives. `profile` is a copy of the profile's metadata fields only;
- * it carries no credential, receipt or subject. `persisted` follows the same
- * fenced publication that fetchProfile awaits, resolves 'saved' or 'failed',
- * and never rejects, so a caller may leave it unawaited.
+ * A fetched account tier for immediate display. `profile` contains metadata
+ * only, never tokens or authorization receipts. `persisted` reports whether
+ * the write succeeded, was refused because credentials or lock ownership
+ * changed, or failed because storage was unavailable. It never rejects.
+ * Call isCurrent before displaying the tier, including after a storage failure.
  */
 export interface NativeDisplayProfile {
   profile: NativeDisplayProfileMetadata
   persisted: Promise<NativeProfilePersistence>
+  /** Check the same account and token or vault record version, without fetching credentials. */
+  isCurrent(): Promise<boolean>
 }
 
 /** Build a NativeDisplayProfile from a validated profile and its publication. */
 export function nativeDisplayProfile(
   profile: OAuthAccountProfile,
   publish: () => Promise<boolean>,
+  isCurrent: () => Promise<boolean>,
 ): NativeDisplayProfile {
   return {
-    // Copy named fields rather than spreading, so nothing else stored on a
-    // profile, such as a legacy token fingerprint, reaches a display.
+    // Copy named fields rather than spreading, so legacy token fingerprints
+    // and any future credential fields never reach the display metadata.
     profile: {
       tier: profile.tier,
       orgType: profile.orgType,
@@ -113,13 +119,26 @@ export function nativeDisplayProfile(
         providerAccountUuid: profile.providerAccountUuid,
       }),
     },
-    // A refused fence and a thrown write both mean the profile was not saved.
+    // Changed credentials or lost write-lock ownership invalidate the tier.
+    // A storage error alone does not, but display still checks the credentials.
     persisted: Promise.resolve()
       .then(publish)
       .then(
-        (saved): NativeProfilePersistence => (saved ? 'saved' : 'failed'),
-        (): NativeProfilePersistence => 'failed',
+        (saved): NativeProfilePersistence => (saved ? 'saved' : 'refused'),
+        (error: unknown): NativeProfilePersistence =>
+          error instanceof NativeCustodyError ||
+          error instanceof NativeAuthorityError ||
+          (error instanceof NativeRuntimeError && error.code !== 'runtime-io')
+            ? 'refused'
+            : 'failed',
       ),
+    isCurrent: () =>
+      Promise.resolve()
+        .then(isCurrent)
+        .then(
+          (current) => current,
+          () => false,
+        ),
   }
 }
 
@@ -578,8 +597,10 @@ export function createNativeVaultRuntime(
     },
     async fetchProfileForDisplay(routeId, fetchImpl = fetch, signal) {
       const result = await readProfile(routeId, fetchImpl, signal)
-      return nativeDisplayProfile(result.value, () =>
-        runtime.publish(result.receipt, { profile: result.value }),
+      return nativeDisplayProfile(
+        result.value,
+        () => runtime.publish(result.receipt, { profile: result.value }),
+        currentDisplaySubject(result.receipt),
       )
     },
     async setEnabled(routeId, enabled) {
@@ -628,6 +649,52 @@ export function createNativeVaultRuntime(
       custody.close()
     },
   }
+  function currentDisplaySubject(receipt: NativeCustodyReceipt) {
+    const { routeId, logicalId } = requireIssued(receipt)
+    // Keep only route, account ID, credential ID and version for later checks.
+    // Checking a display must not acquire or retain an access token.
+    const subject = {
+      routeId,
+      logicalId,
+      credentialId: receipt.credentialId,
+      accountIdentity: receipt.assertedAccountIdentity,
+      recordVersion: receipt.recordVersion,
+    }
+    const key = JSON.stringify([
+      routeId,
+      subject.credentialId,
+      subject.accountIdentity,
+    ])
+    return async () => {
+      await requireActive()
+      const row = await rowFor(
+        await readVaultRoster(paths.roster),
+        subject.logicalId,
+      )
+      if (
+        !row?.enabled ||
+        row.state !== 'active' ||
+        row.routeId !== subject.routeId ||
+        row.accountIdentity !== subject.accountIdentity ||
+        (row.credentialId !== subject.credentialId &&
+          !row.aliases?.includes(subject.credentialId)) ||
+        (versions.get(key) ?? 0) > subject.recordVersion
+      )
+        return false
+      const read = await readNativeRuntime(paths.runtime, paths.storageId)
+      if (read.status === 'missing') return true
+      if (read.status !== 'ready') return false
+      const binding = read.state.accounts[subject.routeId]?.binding
+      return (
+        !binding ||
+        (binding.kind === 'custody' &&
+          binding.accountIdentity === subject.accountIdentity &&
+          binding.credentialId === subject.credentialId &&
+          binding.recordVersion <= subject.recordVersion)
+      )
+    }
+  }
+
   async function mutateReceipt(
     receipt: NativeCustodyReceipt,
     change: (old: NativeRuntimeEntry) => NativeRuntimeEntry,

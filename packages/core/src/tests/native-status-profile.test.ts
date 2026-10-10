@@ -15,11 +15,10 @@ import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
-// Account and quota displays may show a fetched profile before it is saved.
-// fetchProfileForDisplay returns a metadata-only copy as soon as the profile
-// response is validated; its `persisted` promise follows the same fenced save
-// that fetchProfile still waits for, and reports a failed save without
-// rejecting.
+// A fetched tier can display before its file is written. Saving requires the
+// account, credentials and write-lock ownership to remain unchanged. A change
+// refuses the save; a storage error fails it. Neither outcome rejects its
+// promise, and displaying unsaved metadata still requires current credentials.
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 const uuid = '11111111-2222-4333-8444-555555555555' as ProviderAccountUuid
@@ -229,12 +228,17 @@ test('local display profile returns while its save is held, then saves through t
   // Exactly the allowlisted metadata: no bearer, receipt, subject or token
   // fingerprint.
   expect(display.profile).toEqual(displayProfile)
-  expect(Object.keys(display).sort()).toEqual(['persisted', 'profile'])
+  expect(Object.keys(display).sort()).toEqual([
+    'isCurrent',
+    'persisted',
+    'profile',
+  ])
   expect(outcome).toBeUndefined()
   expect(savedRuntimeText(f.paths.runtime)).not.toContain(tier)
   release.open()
   await hold?.work
   expect(await persisted).toBe('saved')
+  expect(await display.isCurrent()).toBe(true)
   const read = await f.runtime.read()
   expect(read.accounts.find((row) => row.id === 'main')?.profile?.tier).toBe(
     tier,
@@ -255,7 +259,7 @@ test('vault display profile returns metadata only and saves through the fence', 
   expect(savedRuntimeText(f.paths.runtime)).toContain(tier)
 })
 
-test('a save refused by the credential fence resolves failed and stores nothing', async () => {
+test('a save refused by the credential fence resolves refused and stores nothing', async () => {
   const f = await localFixture()
   const display = await f.runtime.fetchProfileForDisplay(
     'main',
@@ -266,11 +270,12 @@ test('a save refused by the credential fence resolves failed and stores nothing'
     }),
   )
   expect(display.profile).toEqual(displayProfile)
-  expect(await display.persisted).toBe('failed')
+  expect(await display.persisted).toBe('refused')
+  expect(await display.isCurrent()).toBe(false)
   expect(savedRuntimeText(f.paths.runtime)).not.toContain(tier)
 })
 
-test('a save that throws resolves failed without an unhandled rejection in a fresh process', async () => {
+test('lost authority during a profile read resolves refused without an unhandled rejection in a fresh process', async () => {
   const f = await localFixture()
   const script = join(dirname(f.paths.journal), 'persist-failure.ts')
   const coreSource = new URL('../', import.meta.url).pathname
@@ -307,14 +312,36 @@ runtime.close()
     stdout: 'pipe',
     stderr: 'pipe',
   })
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ])
-  expect({ code, stdout, stderr }).toEqual({
+  const cancel = gate()
+  let finished = false
+  const exit = child.exited.finally(() => {
+    finished = true
+    cancel.open()
+  })
+  trackDetached(
+    cancel.wait.then(() => {
+      if (!finished) child.kill()
+    }),
+  )
+  const stdout = new Response(child.stdout).text()
+  const stderr = new Response(child.stderr).text()
+  for (const work of [exit, stdout, stderr]) work.catch(() => cancel.open())
+  const results = await Promise.allSettled([exit, stdout, stderr])
+  const [code, out, err] = results
+  if (
+    code.status !== 'fulfilled' ||
+    out.status !== 'fulfilled' ||
+    err.status !== 'fulfilled'
+  )
+    throw new AggregateError(
+      results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      ),
+      'Profile child failed',
+    )
+  expect({ code: code.value, stdout: out.value, stderr: err.value }).toEqual({
     code: 0,
-    stdout: `profile ${tier}\npersisted failed\n`,
+    stdout: `profile ${tier}\npersisted refused\n`,
     stderr: '',
   })
   expect(savedRuntimeText(f.paths.runtime)).not.toContain(tier)

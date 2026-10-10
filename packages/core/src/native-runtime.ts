@@ -754,7 +754,11 @@ async function writeNativeRuntime(
           } catch {
             throw new NativeRuntimeError('publication-refused')
           }
-          await lock.assertOwned()
+          try {
+            await lock.assertOwned()
+          } catch {
+            throw new NativeRuntimeError('publication-refused')
+          }
           await rename(stage, path)
           ownsStage = false
           try {

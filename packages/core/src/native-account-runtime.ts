@@ -1241,10 +1241,30 @@ export function createNativeAccountRuntime(
       if ((await runtime.read()).mode === 'claustrum')
         return vault.fetchProfileForDisplay(routeId, fetchImpl, signal)
       const result = await readLocalProfile(routeId, fetchImpl, signal)
-      return nativeDisplayProfile(result.value, () =>
-        runtime.publishLocal(result.attempt.subject, {
-          profile: result.value,
-        }),
+      const subject = structuredClone(result.attempt.subject)
+      const profile = result.value
+      return nativeDisplayProfile(
+        profile,
+        () => runtime.publishLocal(subject, { profile }),
+        async () => {
+          if (
+            (await runtime.read()).mode !== 'local' ||
+            (await physicalId(routeId)) !== subject.binding.rowId
+          )
+            return false
+          const row = await poolRow(subject.binding.rowId)
+          return (
+            row?.stamp === 'bound' &&
+            row.enabled !== false &&
+            row.credential?.type === 'oauth' &&
+            nativeLocalPoolBindingMatches(subject.binding, paths, row) &&
+            nativeLocalCredentialValidationMatches(
+              subject,
+              subject.binding,
+              row.credential,
+            )
+          )
+        },
       )
     },
     close() {

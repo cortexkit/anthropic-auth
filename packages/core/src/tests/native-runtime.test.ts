@@ -1470,3 +1470,27 @@ for (const seam of ['beforeRename', 'afterRename']) {
     }
   })
 }
+
+test('runtime writer ownership loss is a publication refusal, not an I/O display fallback', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, (state) => state)
+  const before = await readFile(path)
+  const directory = dirname(path)
+  const moved = `${directory}-moved`
+  let relocated = false
+  try {
+    await expect(
+      updateNativeRuntime(path, storageId, (state) => state, {
+        beforeRename: async () => {
+          // Move the fixture after its staged file is ready. The final writer
+          // check must see its lock file is missing, without waiting for expiry.
+          await fsPromises.rename(directory, moved)
+          relocated = true
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'publication-refused' })
+  } finally {
+    if (relocated) await fsPromises.rename(moved, directory)
+  }
+  expect(await readFile(path)).toEqual(before)
+})

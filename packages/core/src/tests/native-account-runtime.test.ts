@@ -1,4 +1,5 @@
 import { expect, spyOn } from 'bun:test'
+import * as filesystem from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { ProviderAccountUuid } from '../claude-code.ts'
@@ -1223,4 +1224,82 @@ test('local enable and disable log only a flag change made by their own write', 
   expect((await poolRow('fallback-dup')).enabled).toBe(false)
   await expect(f.runtime.setEnabled('fallback-dup', true)).rejects.toThrow()
   expect(logs.take()).toEqual([])
+})
+
+for (const rotate of [false, true]) {
+  test(`profile writer I/O failure rechecks the current credential (rotation=${rotate})`, async () => {
+    const f = await fixture()
+    expect((await f.runtime.authorizeLocal('main')).status).toBe('usable')
+    const before = await readFile(f.paths.runtime)
+    const original = filesystem.rename
+    let failedWrites = 0
+    // Fail the rename after the account, token and write locks are checked.
+    // Failing those checks would mean changed credentials or lost ownership,
+    // not a storage error.
+    const writer = spyOn(filesystem, 'rename').mockImplementation(
+      async (from, to) => {
+        if (to === f.paths.runtime) {
+          failedWrites++
+          throw Object.assign(new Error('Synthetic runtime rename failure'), {
+            code: 'EIO',
+          })
+        }
+        await original(from, to)
+      },
+    )
+    deferCleanup(() => writer.mockRestore())
+    const transport = Object.assign(
+      async () =>
+        Response.json({
+          organization: {
+            organization_type: 'claude_max',
+            rate_limit_tier: 'default_claude_max_20x',
+          },
+        }),
+      { preconnect() {} },
+    )
+    const result = await f.runtime.fetchProfileForDisplay('main', transport)
+    expect(await result.persisted).toBe('failed')
+    expect(failedWrites).toBe(1)
+    expect(await readFile(f.paths.runtime)).toEqual(before)
+    writer.mockRestore()
+    if (rotate)
+      await f.store.rotate('imported-main', {
+        type: 'oauth',
+        access: 'sk-ant-oat01-different-profile-version',
+        refresh: 'different-profile-refresh',
+        expires: now + 8_000_000,
+      })
+    expect(await result.isCurrent()).toBe(!rotate)
+    expect(result.profile.tier).toBe('default_claude_max_20x')
+  })
+}
+
+test('late profile publication refusal cannot authorize display for rotated credentials', async () => {
+  const f = await fixture()
+  expect((await f.runtime.authorizeLocal('main')).status).toBe('usable')
+  const transport = Object.assign(
+    async () => {
+      await f.store.rotate('imported-main', {
+        type: 'oauth',
+        access: 'sk-ant-oat01-profile-refusal-successor',
+        refresh: 'profile-refusal-refresh',
+        expires: now + 8_000_000,
+      })
+      return Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      })
+    },
+    { preconnect() {} },
+  )
+  const result = await f.runtime.fetchProfileForDisplay('main', transport)
+  expect(await result.persisted).toBe('refused')
+  expect(await result.isCurrent()).toBe(false)
+  expect(
+    (await f.runtime.read()).accounts.find((account) => account.id === 'main')
+      ?.profile,
+  ).toBeUndefined()
 })

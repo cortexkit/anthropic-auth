@@ -1,4 +1,5 @@
 import { expect, spyOn } from 'bun:test'
+import * as filesystem from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -917,4 +918,90 @@ test('vault account reorder logs once when the locked roster or stored order cha
       payload: expect.objectContaining({ id: second }),
     },
   ])
+})
+
+test('vault profile I/O failure rechecks non-secret provenance without another GET', async () => {
+  const f = await fixture()
+  const initial = await f.runtime.authorize('main')
+  expect(await f.runtime.publish(initial, { lastUsed: now })).toBe(true)
+  const before = await readFile(f.paths.runtime)
+  const originalRename = filesystem.rename
+  let failedWrites = 0
+  const writer = spyOn(filesystem, 'rename').mockImplementation(
+    async (from, to) => {
+      if (to === f.paths.runtime) {
+        failedWrites++
+        throw Object.assign(
+          new Error('Synthetic vault profile rename failure'),
+          { code: 'EIO' },
+        )
+      }
+      await originalRename(from, to)
+    },
+  )
+  deferCleanup(() => writer.mockRestore())
+  const transport = Object.assign(
+    async () =>
+      Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      }),
+    { preconnect() {} },
+  )
+  const result = await f.runtime.fetchProfileForDisplay('main', transport)
+  expect(await result.persisted).toBe('failed')
+  expect(failedWrites).toBe(1)
+  expect(await readFile(f.paths.runtime)).toEqual(before)
+  const gets = f.counts.gets
+  expect(await result.isCurrent()).toBe(true)
+  expect(f.counts.gets).toBe(gets)
+  writer.mockRestore()
+  f.version(8)
+  const peer = createNativeVaultRuntime(f.options)
+  deferCleanup(() => peer.close())
+  const successor = await peer.authorize('main')
+  expect(await peer.publish(successor, { lastUsed: now + 1 })).toBe(true)
+  const successorGets = f.counts.gets
+  expect(await result.isCurrent()).toBe(false)
+  expect(f.counts.gets).toBe(successorGets)
+})
+
+test('disabled vault route cannot validate a fetched profile for display', async () => {
+  const f = await fixture()
+  const transport = Object.assign(
+    async () => {
+      await f.runtime.setEnabled('main', false)
+      return Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      })
+    },
+    { preconnect() {} },
+  )
+  const result = await f.runtime.fetchProfileForDisplay('main', transport)
+  expect(await result.isCurrent()).toBe(false)
+})
+
+test('a newer vault receipt refuses stale profile publication and display', async () => {
+  const f = await fixture()
+  const transport = Object.assign(
+    async () => {
+      f.version(8)
+      await f.runtime.authorize('main')
+      return Response.json({
+        organization: {
+          organization_type: 'claude_max',
+          rate_limit_tier: 'default_claude_max_20x',
+        },
+      })
+    },
+    { preconnect() {} },
+  )
+  const result = await f.runtime.fetchProfileForDisplay('main', transport)
+  expect(await result.persisted).toBe('refused')
+  expect(await result.isCurrent()).toBe(false)
 })
