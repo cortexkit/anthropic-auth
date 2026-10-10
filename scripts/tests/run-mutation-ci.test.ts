@@ -192,7 +192,21 @@ process.exit(process.env.FAKE_FAILURE === '1' ? 1 : 0)
 `,
   )
   await chmod(binary, 0o700)
-  const env = { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined }
+  // This disposable repository must not depend on or change a real author's
+  // identity or Git configuration.
+  const env = {
+    ...process.env,
+    GIT_DIR: undefined,
+    GIT_WORK_TREE: undefined,
+    GIT_INDEX_FILE: undefined,
+    GIT_CONFIG_COUNT: undefined,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'Fixture',
+    GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+    GIT_COMMITTER_NAME: 'Fixture',
+    GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+  }
   for (const argv of [
     ['init', '-q'],
     ['add', '.'],
@@ -210,6 +224,10 @@ process.exit(process.env.FAKE_FAILURE === '1' ? 1 : 0)
       stdout: 'pipe',
       stderr: 'pipe',
     })
+    if (child.exitCode !== 0)
+      throw new Error(
+        `Synthetic Git ${argv.join(' ')} failed: ${child.stderr.toString()}`,
+      )
     expect(child.exitCode).toBe(0)
   }
   const base = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
@@ -221,6 +239,46 @@ process.exit(process.env.FAKE_FAILURE === '1' ? 1 : 0)
     .trim()
   return { root, base, env }
 }
+
+lifetimes.test(
+  'synthetic Git author stays in the disposable repository and leaves real config unchanged',
+  async () => {
+    const cwd = resolve(import.meta.dir, '../..')
+    const realEnv = { ...process.env }
+    // A remote snapshot can have a different owner. Permit only this checkout
+    // for the read-only path lookup, without changing any Git configuration.
+    const configPath = Bun.spawnSync(
+      [
+        'git',
+        '-c',
+        `safe.directory=${cwd}`,
+        'rev-parse',
+        '--git-path',
+        'config',
+      ],
+      { cwd, env: realEnv, stdout: 'pipe', stderr: 'pipe' },
+    )
+    if (configPath.exitCode !== 0)
+      throw new Error(
+        `Real Git config lookup failed: ${configPath.stderr.toString()}`,
+      )
+    expect(configPath.exitCode).toBe(0)
+    const realConfig = resolve(cwd, configPath.stdout.toString().trim())
+    const before = await readFile(realConfig)
+    const fixture = await ciFixture()
+    const author = Bun.spawnSync(
+      ['git', 'log', '-1', '--format=%an <%ae>%n%cn <%ce>'],
+      { cwd: fixture.root, env: fixture.env, stdout: 'pipe', stderr: 'pipe' },
+    )
+    expect(author.exitCode).toBe(0)
+    expect(author.stdout.toString().trim()).toBe(
+      'Fixture <fixture@example.invalid>\nFixture <fixture@example.invalid>',
+    )
+    expect(fixture.env.GIT_CONFIG_GLOBAL).toBe('/dev/null')
+    expect(fixture.env.GIT_CONFIG_NOSYSTEM).toBe('1')
+    expect(before.equals(await readFile(realConfig))).toBe(true)
+  },
+)
 
 function invokeCI(
   fixture: Awaited<ReturnType<typeof ciFixture>>,

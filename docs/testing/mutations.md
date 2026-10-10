@@ -1,6 +1,6 @@
 # Mutation proofs for request guards
 
-`mutations.toml` records three deliberately bounded runtime breaks against existing
+`mutations.toml` records nine deliberately bounded runtime breaks against named
 assertions. Run it only in an isolated checkout: `ckdev-mutate` edits its working
 checkout; it does **not** create a scratch worktree. Never reset/check out a target
 while replay is active, and never point builds at a live host installation.
@@ -39,6 +39,12 @@ sibling repositories.
 | `history-refuses-meaningful-assistant` | Treat meaningful assistant trailers as removable empty trailers. | `refuses unknown or meaningful content 0 without mutating history` in Core request-history tests. |
 | `fast-excludes-opus-46-47` | Widen `claude-opus-4-8` to `claude-opus-4-`, incorrectly enabling fast mode for Opus 4.6 and 4.7. | Core asserts that fast mode is not supported for Opus 4.6, 4.7 and `4.7[1m]`. |
 | `thinking-binding-excludes-api-key` | Call `applyThinkingBindingControls(body, 'drop_block')` even when Pi has no OAuth identity, bypassing the check that excludes API-key routes. | `buildAnthropicRequest — Fable/Mythos thinking > does not add Fable 5.1 binding controls to an API-key request`. |
+| `header-routing-current-credential-epoch` | Accept pending quota from a replaced login. | The next request must use the replacement OAuth token, not a paid API key. |
+| `header-routing-drops-refused-publication` | Retain pending quota after its publication is refused. | A real token rotation followed by refused publication must remove the paid-routing hint. |
+| `header-routing-raw-exhaustion-proof` | Treat raw utilization of 0.995 as exhausted. | Display rounding must not permit paid API fallback. |
+| `runtime-read-no-follow` | Follow a symlink installed between inspection and opening. | The runtime reader must reject the symlink. |
+| `runtime-read-opened-mode` | Ignore the opened file's permissions. | A replacement with mode 0644 must be rejected. |
+| `runtime-read-opened-owner` | Ignore the opened file's owner. | A foreign owner on the opened handle must be rejected. |
 
 The `thinking-binding-excludes-api-key` guard is owned by Pi's converter at its
 `applyThinkingBindingControls` call boundary. Pi imports the built Core helper,
@@ -65,7 +71,7 @@ bun scripts/run-mutation-bun.ts packages/core/src/tests/fast.test.ts \
   'fast mode eligibility for claude-opus-4-7[1m] is false'
 ```
 
-The wrapper accepts only the three reviewed owning test files. It rejects empty,
+The wrapper accepts only the five reviewed owning test files. It rejects empty,
 control-character and boundary-whitespace names and unsafe/unsupported paths.
 Bun prints nested scopes separated by ` > `, but its name filter joins those
 scopes with spaces. The wrapper applies that observed convention, escapes regex
@@ -120,17 +126,16 @@ Other healthy companions verify that fast mode remains supported for Opus
 requests:
 `buildAnthropicRequest — Fable/Mythos thinking > adds Fable 5.1 binding controls when compacted history replays signed thinking`.
 
-A named-only proof does **not** observe package breadth. Under `--broad`, the two
-Core rows additionally run the full Core unit directory (`packages/core/src/tests`)
-and the Pi row runs the full Pi unit directory (`packages/pi/src/tests`). Each
-uses its own package cwd/config, in a separate sequential Bun process. Measured
-clean baselines on the pinned toolchain contain **1,114 Core tests** and **155 Pi
-tests**, all green. These are unit-package domains, not workspace or E2E audits.
-Core history/fast guards also affect OpenCode and Pi; auditing Core alone does
-**not** prove absence of host/workspace collateral.
+A named-only proof does **not** observe package breadth. Under `--broad`, each
+row runs its full owning unit directory: Core, OpenCode or Pi. Each uses its own
+package cwd/config in a separate sequential Bun process and requires a clean
+current baseline. These are unit-package domains, not workspace or E2E audits.
+Core guards also affect OpenCode and Pi; auditing Core alone does **not** prove
+absence of host/workspace collateral.
 
 The supported fields are `broad_command`, `broad_report` and `broad_id = "{name}"`.
-Bun creates fresh JUnit XML at `tmp/mutations/core.xml` or `tmp/mutations/pi.xml`.
+Bun creates fresh JUnit XML at the owning package's `tmp/mutations/core.xml`,
+`tmp/mutations/opencode.xml` or `tmp/mutations/pi.xml`.
 The runner deletes the selected report before every invocation and validates the
 complete XML, expected identities and baseline failures. Missing, empty, garbage,
 ambiguous or mismatched reports are refused. Such reports are not evidence that

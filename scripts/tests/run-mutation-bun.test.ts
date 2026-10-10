@@ -69,6 +69,30 @@ test('accepts the real pinned baseline and assertion-failure summary shapes', ()
   expect(executedCount(name, red())).toBe(1)
 })
 
+test('package snapshot summaries still require a verified assertion count', () => {
+  const fixture = green()
+  fixture.stderr = fixture.stderr.replace(
+    ' 1 expect() calls',
+    ' 8 snapshots, 1 expect() calls',
+  )
+  expect(parseExecution(undefined, fixture).count).toBe(1)
+  for (const summary of [
+    ' 8 snapshots',
+    ' 8 snapshots, 0 expect() calls',
+    ' 8 snapshots, expect() calls',
+  ]) {
+    expect(() =>
+      parseExecution(undefined, {
+        ...fixture,
+        stderr: fixture.stderr.replace(
+          ' 8 snapshots, 1 expect() calls',
+          summary,
+        ),
+      }),
+    ).toThrow()
+  }
+})
+
 test('anchors literal punctuation and keeps Bun filter/display names distinct', () => {
   const regex = new RegExp(exactPattern(name))
   expect(regex.test(name)).toBe(true)
@@ -704,6 +728,42 @@ test('missing, empty, garbage and mismatched report identities refuse', () => {
   expect(() =>
     normalizeReport(junit([testcase('one')]), [event('one'), event('two')]),
   ).toThrow()
+})
+
+test('native guard selection uses the actual owning package and reviewed preload config', () => {
+  for (const [file, cwd, relative] of [
+    [
+      'packages/core/src/tests/native-runtime.test.ts',
+      'packages/core',
+      'src/tests/native-runtime.test.ts',
+    ],
+    [
+      'packages/opencode/src/tests/index.test.ts',
+      'packages/opencode',
+      'src/tests/index.test.ts',
+    ],
+  ]) {
+    if (!file || !cwd || !relative)
+      throw new Error('Expected complete test selection')
+    const name =
+      'auth.loader > quota header harvest > pending quota routes without waiting for header publication'
+    expect(selectionFor(file, name)).toEqual({
+      cwd,
+      file: relative,
+      name,
+      filterName: name.replaceAll(' > ', ' '),
+    })
+  }
+  expect(() =>
+    selectionFor('packages/opencode/src/tests/preload-sandbox.ts', 'unsafe'),
+  ).toThrow('Unsafe or unsupported test file')
+  expect(
+    packageSelection('packages/opencode', 'tmp/mutations/opencode.xml'),
+  ).toEqual({
+    cwd: 'packages/opencode',
+    file: 'src/tests',
+    report: 'tmp/mutations/opencode.xml',
+  })
 })
 
 test('package/report selection cannot escape reviewed unit configs or report paths', () => {

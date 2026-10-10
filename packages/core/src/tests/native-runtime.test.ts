@@ -191,7 +191,10 @@ for (const replacement of ['permissions', 'symlink'] as const) {
       },
     )
     try {
-      await expect(readNativeRuntime(path, storageId)).rejects.toMatchObject({
+      const outcome = await readNativeRuntime(path, storageId).catch(
+        (error: unknown) => error,
+      )
+      expect(outcome).toMatchObject({
         code: replacement === 'permissions' ? 'unsafe-runtime' : 'runtime-io',
       })
       expect(replacements).toBe(1)
@@ -228,9 +231,10 @@ test('runtime reader refuses a foreign owner on the opened handle', async () => 
     },
   )
   try {
-    await expect(readNativeRuntime(path, storageId)).rejects.toMatchObject({
-      code: 'unsafe-runtime',
-    })
+    const outcome = await readNativeRuntime(path, storageId).catch(
+      (error: unknown) => error,
+    )
+    expect(outcome).toMatchObject({ code: 'unsafe-runtime' })
     expect(changedOwner).toBe(true)
   } finally {
     openSpy.mockRestore()

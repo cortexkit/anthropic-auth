@@ -1,4 +1,4 @@
-# Commands select exact expect_red tests; --broad runs the Core or Pi package set below.
+# Commands select exact expect_red tests; --broad runs the full owning package.
 prebuild = [
   { name = "core-current-source", command = ["bun", "run", "--cwd", "packages/core", "build"] },
 ]
@@ -53,4 +53,101 @@ expect_red = ["buildAnthropicRequest — Fable/Mythos thinking > does not add Fa
 expect_message = "error: expect(received).toBeUndefined()"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
 broad_report = "tmp/mutations/pi.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "header-routing-current-credential-epoch"
+guards = "Pending response quota must not license paid fallback after the OAuth login is replaced."
+file = "packages/opencode/src/index.ts"
+old = "observation.lineage !== lineage"
+new = "false"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > pending quota from a superseded credential epoch cannot license API fallback"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "header-routing-drops-refused-publication"
+guards = "A refused quota publication must remove its routing hint without retaining permission for paid fallback."
+file = "packages/opencode/src/index.ts"
+old = '''            headerRoutingObservations.delete(served.accountId)
+            logger.debug('quota', 'discarded pending response quota', {'''
+new = '''            logger.debug('quota', 'discarded pending response quota', {'''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > refused header publication removes a same-epoch pending observation"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "header-routing-raw-exhaustion-proof"
+guards = "Display rounding from 99.5 percent must not license paid fallback before actual OAuth exhaustion."
+file = "packages/opencode/src/index.ts"
+old = "Number(raw) >= 1"
+new = "Number(raw) >= 0.995"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > pending rounded header usage cannot license API fallback"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-read-no-follow"
+guards = "A runtime file replaced by a symlink between inspection and opening must not be read."
+file = "packages/core/src/native-runtime.ts"
+old = "const file = await open(path, constants.O_RDONLY | noFollow)"
+new = "const file = await open(path, constants.O_RDONLY)"
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime reader refuses symlink replacement between stat and open"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-read-opened-mode"
+guards = "Runtime metadata with unsafe permissions must be rejected using the opened file's mode."
+file = "packages/core/src/native-runtime.ts"
+old = "(opened.mode & 0o777) !== 0o600"
+new = "false"
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime reader refuses permissions replacement between stat and open"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-read-opened-owner"
+guards = "Runtime metadata opened under a foreign owner must be rejected even if the path inspection saw the expected owner."
+file = "packages/core/src/native-runtime.ts"
+old = "opened.uid !== process.geteuid()"
+new = "false"
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime reader refuses a foreign owner on the opened handle"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"

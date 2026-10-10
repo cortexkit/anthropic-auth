@@ -85,13 +85,17 @@ export function selectionFor(file: string, name: string) {
     ![
       'packages/core/src/tests/request-history.test.ts',
       'packages/core/src/tests/fast.test.ts',
+      'packages/core/src/tests/native-runtime.test.ts',
+      'packages/opencode/src/tests/index.test.ts',
       'packages/pi/src/tests/convert.test.ts',
     ].includes(file)
   )
     throw new Error(`Unsafe or unsupported test file: ${file}`)
   const cwd = file.startsWith('packages/core/')
     ? 'packages/core'
-    : 'packages/pi'
+    : file.startsWith('packages/opencode/')
+      ? 'packages/opencode'
+      : 'packages/pi'
   return {
     cwd,
     file: file.slice(cwd.length + 1),
@@ -224,10 +228,10 @@ export function parseExecution(
     (name !== undefined && Number(summary[2]) !== 1)
   )
     throw new Error('Missing, zero or ambiguous executed total')
-  const expects = matches(/^ \d+ expect\(\) calls$/)
+  const expects = matches(/^ (?:\d+ snapshots?, )?\d+ expect\(\) calls$/)
   if (
     expects.length !== 1 ||
-    !/^ [1-9]\d* expect\(\) calls$/.test(expects[0] ?? '')
+    !/^ (?:\d+ snapshots?, )?[1-9]\d* expect\(\) calls$/.test(expects[0] ?? '')
   )
     throw new Error('No verified assertion executed')
   const errors = matches(/^error:/)
@@ -429,7 +433,7 @@ export function normalizeReport(
 
 export function packageSelection(pkg: string, report: string) {
   if (
-    !['packages/core', 'packages/pi'].includes(pkg) ||
+    !['packages/core', 'packages/opencode', 'packages/pi'].includes(pkg) ||
     report !== `tmp/mutations/${pkg.slice('packages/'.length)}.xml`
   )
     throw new Error('Unsafe package or broad report path')
