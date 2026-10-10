@@ -9762,7 +9762,33 @@ describe('auth.loader', () => {
     expect(result.text).toContain('Mode updated to `hybrid`.')
   })
 
-  test('handles /claude-quota before auth loader has run', async () => {
+  test('native quota status works before the host auth loader has run', async () => {
+    const checkedAt = Date.now()
+    await useTempAccountFile(
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: {
+            enabled: false,
+            mainQuota: {
+              accountIdentity: syntheticMainAccountUuid,
+              checkedAt,
+              five_hour: { usedPercent: 25, remainingPercent: 75, checkedAt },
+              seven_day: { usedPercent: 50, remainingPercent: 50, checkedAt },
+            },
+            mainQuotaCheckedAt: checkedAt,
+          },
+        }),
+      ),
+    )
+    let fetchCalls = 0
+    globalThis.fetch = Object.assign(
+      mock(async () => {
+        fetchCalls++
+        throw new Error('Unexpected network call during cached native status')
+      }),
+      { preconnect() {} },
+    )
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient)
 
@@ -9782,39 +9808,43 @@ describe('auth.loader', () => {
           {
             type: 'text',
             ignored: true,
-            text: expect.stringContaining('auth loader has not run yet'),
+            text: expect.stringContaining('5h: 75% remaining'),
           },
         ],
       },
     })
+    expect(fetchCalls).toBe(0)
   })
 
-  test('/claude-quota shows live main and fallback quotas', async () => {
+  test('native quota refresh shows live main and fallback quotas', async () => {
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [
-          {
-            id: 'fallback-1',
-            label: 'fallback personal',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-access',
-            refresh: 'fallback-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            quota: {
-              five_hour: {
-                usedPercent: 99,
-                remainingPercent: 1,
-                checkedAt: 1,
-              },
-              seven_day: {
-                usedPercent: 99,
-                remainingPercent: 1,
-                checkedAt: 1,
+      bindPoolAccounts(
+        createFallbackStorage({
+          quota: { enabled: false },
+          accounts: [
+            {
+              id: 'fallback-1',
+              label: 'fallback personal',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fallback-access',
+              refresh: 'fallback-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              quota: {
+                five_hour: {
+                  usedPercent: 99,
+                  remainingPercent: 1,
+                  checkedAt: 1,
+                },
+                seven_day: {
+                  usedPercent: 99,
+                  remainingPercent: 1,
+                  checkedAt: 1,
+                },
               },
             },
-          },
-        ],
-      }),
+          ],
+        }),
+      ),
     )
     const mockClient = createMockClient()
     const seenTokens: string[] = []
@@ -9834,7 +9864,12 @@ describe('auth.loader', () => {
               new Response(
                 JSON.stringify({
                   five_hour: { utilization },
-                  seven_day: { utilization: utilization + 10 },
+                  seven_day: {
+                    utilization:
+                      authorization === 'Bearer sk-ant-oat01-main-access'
+                        ? 50
+                        : 60,
+                  },
                 }),
                 { status: 200 },
               ),
@@ -9846,7 +9881,7 @@ describe('auth.loader', () => {
       ),
     ) as unknown as typeof fetch
 
-    const plugin = await getPlugin(mockClient)
+    const plugin = await getPlugin(mockClient, tempConfigDir)
     await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -9866,18 +9901,32 @@ describe('auth.loader', () => {
       }),
     ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
 
-    expect(seenTokens).toContain('Bearer sk-ant-oat01-main-access')
+    const refreshed = await applyMenuAction(plugin, 'session-1', {
+      sectionId: 'Quota',
+      actionId: 'quota-refresh',
+    })
+    expect(refreshed.ok).toBe(true)
+    const freshState = await readNativeRuntimeState()
+    expect(freshState.main?.quota?.five_hour?.usedPercent).toBe(25)
     expect(
-      seenTokens.filter(
-        (token) => token === 'Bearer sk-ant-oat01-fallback-access',
-      ).length,
-    ).toBeGreaterThanOrEqual(1)
-    const promptCalls = (
-      mockClient.session.promptAsync as unknown as {
-        mock: { calls: Array<[{ body: { parts: Array<{ text: string }> } }]> }
-      }
-    ).mock.calls
-    const text = promptCalls.at(-1)?.[0]?.body.parts[0]?.text
+      freshState.accounts['fallback-1']?.quota?.five_hour?.usedPercent,
+    ).toBe(40)
+    await expect(
+      plugin['command.execute.before']({
+        command: 'claude',
+        arguments: '',
+        sessionID: 'session-1',
+      }),
+    ).rejects.toThrow('__OPENCODE_ANTHROPIC_AUTH_COMMAND_HANDLED__')
+    expect(seenTokens.toSorted()).toEqual([
+      'Bearer sk-ant-oat01-fallback-access',
+      'Bearer sk-ant-oat01-main-access',
+    ])
+    // applyMenuAction opens a TUI-connected menu. Inspect its current
+    // payload, not the earlier headless notice sent before the refresh.
+    const currentMenu = await openClaudeMenu(plugin, 'session-1')
+    const text = JSON.stringify(currentMenu)
+    expect(refreshed.text).toContain('5h: 75% remaining')
     expect(text).toContain('## Claude Quotas')
     expect(text).toContain('### OpenCode anthropic (main)')
     expect(text).toContain('### fallback personal (fallback)')
