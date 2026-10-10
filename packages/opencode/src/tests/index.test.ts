@@ -22,6 +22,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { PrimeManager } from '@cortexkit/anthropic-auth-core'
+import * as Core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
   type AccountStorage,
@@ -16685,6 +16686,291 @@ describe('auth.loader', () => {
         ...overrides,
       })
 
+    function pauseHeaderPublication() {
+      const lifetime = bodyLifetime()
+      const entered = lifetime.gate()
+      const release = lifetime.gate()
+      const operations: Promise<boolean>[] = []
+      const factory = Core.createNativeAccountRuntime
+      const factorySpy = spyOn(
+        Core,
+        'createNativeAccountRuntime',
+      ).mockImplementation((options) => {
+        const runtime = factory(options)
+        const publish = runtime.publishLocal.bind(runtime)
+        runtime.publishLocal = (subject, patch) => {
+          if (patch.quota?.source !== 'headers') return publish(subject, patch)
+          // Pause before the real publisher runs; its ownership and version
+          // checks remain unchanged when the test releases it.
+          const operation = (async () => {
+            entered.open()
+            await release.wait
+            return publish(subject, patch)
+          })()
+          operations.push(operation)
+          lifetime.trackDetached(Promise.allSettled([operation]))
+          return operation
+        }
+        return runtime
+      })
+      return { entered, release, operations, factorySpy }
+    }
+    const apiFallbackForHeaderTests = {
+      id: 'header-api',
+      type: 'api' as const,
+      apiKey: 'header-key',
+      baseURL: 'https://example.test/claude',
+      authHeader: 'authorization-bearer' as const,
+    }
+
+    test('pending quota routes without waiting for header publication', async () => {
+      await useTempAccountFile(
+        harvestStorage([apiFallbackForHeaderTests], {
+          routing: { mode: 'fallback-first' },
+        }),
+      )
+      const pause = pauseHeaderPublication()
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            if (extractUrl(input).includes('/claude_cli/bootstrap'))
+              return Promise.resolve(
+                Response.json({
+                  oauth_account: { account_uuid: poolMainIdentity() },
+                }),
+              )
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            authorizations.push(authorization)
+            return Promise.resolve(
+              new Response('ok', {
+                headers:
+                  authorization === 'Bearer sk-ant-oat01-main-access'
+                    ? {
+                        ...quotaHeaders,
+                        'anthropic-ratelimit-unified-5h-utilization': '1',
+                      }
+                    : undefined,
+              }),
+            )
+          },
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth' as const,
+            access: 'sk-ant-oat01-main-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      )
+      try {
+        expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+        await pause.entered.wait
+        expect(plugin.__quotaManager.getMain(poolMainIdentity())).toBeNull()
+        expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-main-access',
+          'Bearer header-key',
+        ])
+        expect((await readAccountStorage())?.quota?.mainQuota).toBeUndefined()
+      } finally {
+        pause.release.open()
+        await Promise.allSettled(pause.operations)
+        pause.factorySpy.mockRestore()
+      }
+    })
+
+    test('pending rounded header usage cannot license API fallback', async () => {
+      await useTempAccountFile(
+        harvestStorage([apiFallbackForHeaderTests], {
+          routing: { mode: 'fallback-first' },
+        }),
+      )
+      const pause = pauseHeaderPublication()
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock(
+        withNativeAdmission((_input: unknown, init?: RequestInit) => {
+          authorizations.push(new Headers(init?.headers).get('authorization'))
+          return Promise.resolve(
+            new Response('ok', {
+              headers: {
+                ...quotaHeaders,
+                'anthropic-ratelimit-unified-5h-utilization': '0.995',
+              },
+            }),
+          )
+        }),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+      try {
+        await result.fetch(MESSAGES_URL, EMPTY_POST)
+        await pause.entered.wait
+        expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-main-access',
+          'Bearer sk-ant-oat01-main-access',
+        ])
+      } finally {
+        pause.release.open()
+        await Promise.allSettled(pause.operations)
+        pause.factorySpy.mockRestore()
+      }
+    })
+
+    test('pending quota from a superseded credential epoch cannot license API fallback', async () => {
+      await useTempAccountFile(
+        harvestStorage([apiFallbackForHeaderTests], {
+          routing: { mode: 'fallback-first' },
+        }),
+      )
+      const pause = pauseHeaderPublication()
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            if (extractUrl(input).includes('/claude_cli/bootstrap'))
+              return Promise.resolve(
+                Response.json({
+                  oauth_account: { account_uuid: poolMainIdentity() },
+                }),
+              )
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            authorizations.push(authorization)
+            return Promise.resolve(
+              new Response('ok', {
+                headers:
+                  authorization === 'Bearer sk-ant-oat01-main-access'
+                    ? {
+                        ...quotaHeaders,
+                        'anthropic-ratelimit-unified-5h-utilization': '1',
+                      }
+                    : undefined,
+              }),
+            )
+          },
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+      try {
+        await result.fetch(MESSAGES_URL, EMPTY_POST)
+        await pause.entered.wait
+        await replacePoolMainLogin(
+          {
+            access: 'sk-ant-oat01-new-epoch',
+            refresh: 'new-epoch-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+          },
+          { sameAccount: false, accountIdentity: poolMainIdentity() },
+        )
+        expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-main-access',
+          'Bearer sk-ant-oat01-new-epoch',
+        ])
+      } finally {
+        pause.release.open()
+        await Promise.allSettled(pause.operations)
+        pause.factorySpy.mockRestore()
+      }
+    })
+
+    test('refused header publication removes a same-epoch pending observation', async () => {
+      await useTempAccountFile(
+        harvestStorage([apiFallbackForHeaderTests], {
+          routing: { mode: 'fallback-first' },
+        }),
+      )
+      const pause = pauseHeaderPublication()
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      setLogLevel('debug')
+      const authorizations: Array<string | null> = []
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            if (extractUrl(input).includes('/claude_cli/bootstrap'))
+              return Promise.resolve(
+                Response.json({
+                  oauth_account: { account_uuid: poolMainIdentity() },
+                }),
+              )
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            authorizations.push(authorization)
+            return Promise.resolve(
+              new Response('ok', {
+                headers:
+                  authorization === 'Bearer sk-ant-oat01-main-access'
+                    ? {
+                        ...quotaHeaders,
+                        'anthropic-ratelimit-unified-5h-utilization': '1',
+                      }
+                    : undefined,
+              }),
+            )
+          },
+        ),
+      ) as unknown as typeof fetch
+      const result = await loadFetch()
+      setLogLevel('debug')
+      try {
+        await result.fetch(MESSAGES_URL, EMPTY_POST)
+        await pause.entered.wait
+        if (!migratedPool) throw new Error('This test has no migrated pool')
+        const reader = createNativeAccountRuntime({
+          paths: migratedPool.paths,
+          host: 'opencode',
+        })
+        try {
+          const before = await reader.captureLocalSubject('main')
+          await refreshPoolMainElsewhere({
+            access: 'sk-ant-oat01-same-epoch-new-access',
+            refresh: 'main-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+          })
+          const after = await reader.captureLocalSubject('main')
+          expect(after.binding.credentialEpoch).toBe(
+            before.binding.credentialEpoch,
+          )
+          expect(after.binding.identity).toBe(before.binding.identity)
+          expect(after.version?.accessFingerprint).not.toBe(
+            before.version?.accessFingerprint,
+          )
+        } finally {
+          reader.close()
+        }
+        pause.release.open()
+        expect(await pause.operations[0]).toBe(false)
+        await waitForLogRecord(
+          records,
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'discarded pending response quota',
+          'refused pending observation cleanup',
+        )
+        expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-main-access',
+          'Bearer sk-ant-oat01-same-epoch-new-access',
+        ])
+      } finally {
+        pause.release.open()
+        await Promise.allSettled(pause.operations)
+        pause.factorySpy.mockRestore()
+        __setLogTestSink(null)
+        setLogLevel('info')
+      }
+    })
+
     function installRelayWebSocket(responseHeaders: Record<string, string>) {
       const originalWebSocket = globalThis.WebSocket
 
@@ -16832,21 +17118,31 @@ describe('auth.loader', () => {
       )
       const authorizations: Array<string | null> = []
       globalThis.fetch = mock(
-        withNativeAdmission((_input: unknown, init?: RequestInit) => {
-          const authorization = new Headers(init?.headers).get('authorization')
-          authorizations.push(authorization)
-          return Promise.resolve(
-            new Response('ok', {
-              headers:
-                authorization === 'Bearer sk-ant-oat01-main-access'
-                  ? {
-                      ...quotaHeaders,
-                      'anthropic-ratelimit-unified-5h-utilization': '1',
-                    }
-                  : undefined,
-            }),
-          )
-        }),
+        withNativeAdmission(
+          (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            if (extractUrl(input).includes('/claude_cli/bootstrap'))
+              return Promise.resolve(
+                Response.json({
+                  oauth_account: { account_uuid: poolMainIdentity() },
+                }),
+              )
+            const authorization = new Headers(init?.headers).get(
+              'authorization',
+            )
+            authorizations.push(authorization)
+            return Promise.resolve(
+              new Response('ok', {
+                headers:
+                  authorization === 'Bearer sk-ant-oat01-main-access'
+                    ? {
+                        ...quotaHeaders,
+                        'anthropic-ratelimit-unified-5h-utilization': '1',
+                      }
+                    : undefined,
+              }),
+            )
+          },
+        ),
       ) as unknown as typeof fetch
       const result = await loadFetch()
 

@@ -769,12 +769,22 @@ type MainQuotaIdentityBinding = {
   quotaKey: string | undefined
   providerAccountUuid?: ProviderAccountUuid
   generation: number
+  routingLineage?: string
 }
 
 type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
   providerAccountUuid: ProviderAccountUuid | undefined
   stale: boolean
   state: CustodyStatusState
+}
+
+const HEADER_ROUTING_OBSERVATION_LIMIT = 1000
+
+type HeaderRoutingObservation = {
+  lineage: string
+  accountUuid: string
+  entry: QuotaEntry
+  generalExhausted: boolean
 }
 
 type ServedQuotaHeaders = {
@@ -1177,6 +1187,121 @@ const anthropicAuthPlugin = async (
       ? { connect: runtimeOverrides.claustrumScopedConnect }
       : undefined,
   })
+  // Routing may use received headers before disk publication, but only for
+  // the current account and credential epoch. Display and cache publication
+  // continue through the guarded writer below; this map contains no tokens.
+  const headerRoutingObservations = new Map<string, HeaderRoutingObservation>()
+  let headerRoutingPolicyStorage: AccountStorage | null = null
+  function localHeaderRoutingLineage(binding: NativeAccountView['binding']) {
+    return binding?.identity
+      ? JSON.stringify([
+          binding.storageId,
+          binding.rowId,
+          binding.credentialEpoch,
+          binding.identity,
+        ])
+      : undefined
+  }
+  function headerRoutingLineage(
+    subject: NativeKnownCredentialSubject | undefined,
+    receipt?: NativeCustodyReceipt,
+  ) {
+    return subject
+      ? localHeaderRoutingLineage(subject.binding)
+      : receipt
+        ? JSON.stringify([
+            receipt.credentialId,
+            receipt.accountIdentity,
+            receipt.recordVersion,
+          ])
+        : undefined
+  }
+  function currentHeaderRoutingObservation(
+    accountId: string,
+    lineage: string | undefined,
+    accountUuid: string | undefined,
+    storage: AccountStorage | null = headerRoutingPolicyStorage,
+  ) {
+    const observation = headerRoutingObservations.get(accountId)
+    if (
+      !observation ||
+      !lineage ||
+      observation.lineage !== lineage ||
+      observation.accountUuid !== accountUuid ||
+      getQuotaNextRefreshAt(
+        observation.entry.quota,
+        storage,
+        observation.entry.checkedAt,
+      ) <= Date.now()
+    )
+      return undefined
+    return observation
+  }
+  function routingQuotaEntry(
+    accountId: string,
+    lineage: string | undefined,
+    accountUuid: string | undefined,
+    committed: QuotaEntry | null | undefined,
+    storage: AccountStorage | null = headerRoutingPolicyStorage,
+  ) {
+    const observation = currentHeaderRoutingObservation(
+      accountId,
+      lineage,
+      accountUuid,
+      storage,
+    )
+    if (!observation) return committed
+    if (!committed)
+      return {
+        ...observation.entry,
+        refreshAfter: getQuotaNextRefreshAt(
+          observation.entry.quota,
+          storage,
+          observation.entry.checkedAt,
+        ),
+      }
+    const quota = mergeHeaderQuotaForPersistence(
+      committed.quota,
+      observation.entry.quota,
+    )
+    return {
+      ...observation.entry,
+      quota,
+      refreshAfter: getQuotaNextRefreshAt(
+        quota,
+        storage,
+        quotaSnapshotCheckedAt(quota),
+      ),
+    }
+  }
+  function routingAccountQuota(
+    account: NativeAccountView,
+    storage: AccountStorage,
+    receipt?: NativeCustodyReceipt,
+  ) {
+    if (!headerRoutingObservations.has(account.id)) return account.quota
+    const lineage = account.binding
+      ? localHeaderRoutingLineage(account.binding)
+      : headerRoutingLineage(undefined, receipt)
+    const checkedAt = quotaSnapshotCheckedAt(account.quota)
+    return routingQuotaEntry(
+      account.id,
+      lineage,
+      account.accountIdentity,
+      account.quota
+        ? {
+            quota: account.quota,
+            checkedAt,
+            refreshAfter: getQuotaNextRefreshAt(
+              account.quota,
+              storage,
+              checkedAt,
+            ),
+          }
+        : null,
+      storage,
+    )?.quota
+  }
   let mainQuotaCredentialEpoch:
     | { rowId: string; credentialEpoch: number }
     | undefined
@@ -1189,6 +1314,7 @@ const anthropicAuthPlugin = async (
     if (path !== accountStoragePath)
       throw new Error('Native account storage mismatch')
     const snapshot = await nativeAccounts.read()
+    headerRoutingPolicyStorage = snapshot.policyStorage
     if (!mainQuotaCredentialEpoch) {
       const binding = snapshot.accounts.find(
         (account) => account.id === 'main',
@@ -1448,7 +1574,9 @@ const anthropicAuthPlugin = async (
     const checkModelPolicy = (
       view: NativeAccountView,
       storage: AccountStorage,
+      receipt?: NativeCustodyReceipt,
     ) => {
+      const quota = routingAccountQuota(view, storage, receipt)
       // Ordered routing can try main after eligible fallbacks are exhausted.
       // A cached scoped limit must not remove that final provider attempt;
       // explicit killswitch limits still block it before dispatch.
@@ -1460,13 +1588,12 @@ const anthropicAuthPlugin = async (
         modelId &&
         ((isKillswitchEnabled(storage) &&
           !killswitchPassesPolicy(
-            view.quota,
+            quota,
             storage,
             routeId === 'main' ? undefined : routeId,
             modelId,
           )) ||
-          (!lastMainAttempt &&
-            !quotaSnapshotPassesModelScope(view.quota, modelId)))
+          (!lastMainAttempt && !quotaSnapshotPassesModelScope(quota, modelId)))
       )
         throw new NativeModelPolicyError(view, getQuotaCheckIntervalMs(storage))
     }
@@ -1534,7 +1661,7 @@ const anthropicAuthPlugin = async (
       selected.credentialId !== result.scopedAttempt.credentialId
     )
       throw new Error('Native vault credential binding changed before dispatch')
-    checkModelPolicy(selected, current.policyStorage)
+    checkModelPolicy(selected, current.policyStorage, result.scopedAttempt)
     return result
   }
 
@@ -1628,6 +1755,7 @@ const anthropicAuthPlugin = async (
   function mainProviderQuotaRestriction(
     storage: AccountStorage | null,
     accountUuid: string | undefined,
+    headerExhaustionProven = false,
   ) {
     if (
       !storage ||
@@ -1656,7 +1784,7 @@ const anthropicAuthPlugin = async (
     const checkedAt = quotaSnapshotCheckedAt(quota)
     if (
       quota?.accountIdentity !== accountUuid ||
-      quota.source === 'headers' ||
+      (quota.source === 'headers' && !headerExhaustionProven) ||
       !quotaSnapshotIsExhausted(quota) ||
       checkedAt <= 0 ||
       checkedAt > now ||
@@ -2306,43 +2434,108 @@ const anthropicAuthPlugin = async (
           ? quotaManager.getMain(mainQuotaIdentity?.quotaKey)
           : quotaManager.getAllFallbacks().get(served.accountId)
       const checkedAt = incoming.checkedAt ?? Date.now()
-      void (async () => {
-        let persistedEntry: QuotaEntry | null
-        try {
-          persistedEntry = await persistPushedQuota(
-            served,
-            { quota: incoming, checkedAt, refreshAfter: checkedAt },
-            previousEntry,
-          )
-        } catch (error) {
-          logPersistFailure(error)
-          return
-        }
-        if (persistedEntry === null) return
+      const lineage = headerRoutingLineage(
+        served.localSubject,
+        served.scopedAttempt,
+      )
+      const observation: HeaderRoutingObservation | undefined =
+        lineage && served.anthropicAccountUuid
+          ? {
+              lineage,
+              accountUuid: served.anthropicAccountUuid,
+              entry: {
+                quota: {
+                  ...incoming,
+                  accountIdentity: served.anthropicAccountUuid,
+                },
+                checkedAt,
+                refreshAfter: checkedAt,
+              },
+              generalExhausted: (['five_hour', 'seven_day'] as const).some(
+                (key) => {
+                  const raw = headers.get(
+                    key === 'five_hour'
+                      ? 'anthropic-ratelimit-unified-5h-utilization'
+                      : 'anthropic-ratelimit-unified-7d-utilization',
+                  )
+                  return (
+                    incoming[key] !== undefined &&
+                    raw !== null &&
+                    Number.isFinite(Number(raw)) &&
+                    Number(raw) >= 1
+                  )
+                },
+              ),
+            }
+          : undefined
+      if (observation) {
+        headerRoutingObservations.delete(served.accountId)
         if (
-          served.accountId === 'main' &&
-          quotaManager.getMainQuotaIdentityGeneration() !==
-            mainQuotaIdentity?.generation
-        )
-          return
-        // Publication checks the credential that supplied these headers before
-        // any cache or display can use them. A rejected old response must never
-        // become a transient quota reading for replacement credentials.
-        const entry = persistedEntry
-        if (served.accountId === 'main')
-          quotaManager.setMain(mainQuotaIdentity?.quotaKey, entry)
-        else
-          quotaManager.setFallback(served.accountId, entry, {
-            authLineageId: served.authLineageId,
+          headerRoutingObservations.size >= HEADER_ROUTING_OBSERVATION_LIMIT
+        ) {
+          const oldest = headerRoutingObservations.keys().next().value
+          if (oldest !== undefined) headerRoutingObservations.delete(oldest)
+        }
+        headerRoutingObservations.set(served.accountId, observation)
+      }
+      void (async () => {
+        let committed = false
+        try {
+          let persistedEntry: QuotaEntry | null
+          try {
+            persistedEntry = await persistPushedQuota(
+              served,
+              { quota: incoming, checkedAt, refreshAfter: checkedAt },
+              previousEntry,
+            )
+          } catch (error) {
+            logPersistFailure(error)
+            return
+          }
+          if (persistedEntry === null) return
+          if (
+            served.accountId === 'main' &&
+            quotaManager.getMainQuotaIdentityGeneration() !==
+              mainQuotaIdentity?.generation
+          )
+            return
+          // Publication checks the credential that supplied these headers before
+          // any cache or display can use them. A rejected old response must never
+          // become a transient quota reading for replacement credentials.
+          const entry = persistedEntry
+          if (
+            observation &&
+            headerRoutingObservations.get(served.accountId) === observation
+          ) {
+            observation.entry = entry
+            committed = true
+          }
+          if (served.accountId === 'main')
+            quotaManager.setMain(mainQuotaIdentity?.quotaKey, entry)
+          else
+            quotaManager.setFallback(served.accountId, entry, {
+              authLineageId: served.authLineageId,
+            })
+          void refreshSidebarQuota().catch(() => {})
+          await publishQuotaHeaderFeed(served, entry)
+          logger.debug('quota', 'harvested response quota', {
+            account: served.accountId,
+            fiveHourPercent: entry.quota.five_hour?.usedPercent,
+            sevenDayPercent: entry.quota.seven_day?.usedPercent,
+            source: 'headers',
           })
-        void refreshSidebarQuota().catch(() => {})
-        await publishQuotaHeaderFeed(served, entry)
-        logger.debug('quota', 'harvested response quota', {
-          account: served.accountId,
-          fiveHourPercent: entry.quota.five_hour?.usedPercent,
-          sevenDayPercent: entry.quota.seven_day?.usedPercent,
-          source: 'headers',
-        })
+        } finally {
+          if (
+            !committed &&
+            observation &&
+            headerRoutingObservations.get(served.accountId) === observation
+          ) {
+            headerRoutingObservations.delete(served.accountId)
+            logger.debug('quota', 'discarded pending response quota', {
+              accountId: served.accountId,
+            })
+          }
+        }
       })().catch(logQuotaHeaderFeedFailure)
       logger.trace('quota', 'response quota awaiting publication', {
         account: served.accountId,
@@ -2416,10 +2609,33 @@ const anthropicAuthPlugin = async (
     ) => {
       storage = storage ?? null
       const usable: OAuthAccount[] = []
+      const currentAccounts = storage?.accounts.some(
+        (account) =>
+          isOAuthAccount(account) && headerRoutingObservations.has(account.id),
+      )
+        ? (await nativeAccounts.read()).accounts
+        : []
       for (const account of storage?.accounts ?? []) {
         if (!isOAuthAccount(account) || account.enabled === false) continue
+        const currentAccount = currentAccounts.find(
+          (view) => view.id === account.id,
+        )
+        const committedQuota =
+          quotaManager.getFallback(
+            account.id,
+            currentAccount?.binding
+              ? { authLineageId: JSON.stringify(currentAccount.binding) }
+              : account,
+          )?.quota ??
+          currentAccount?.quota ??
+          account.quota
         const quota =
-          quotaManager.getAllFallbacks().get(account.id)?.quota ?? account.quota
+          currentAccount && storage
+            ? routingAccountQuota(
+                { ...currentAccount, quota: committedQuota },
+                storage,
+              )
+            : committedQuota
         if (
           !quotaSnapshotPassesPolicy(quota, storage) ||
           !quotaSnapshotPassesModelScope(quota, options?.modelId) ||
@@ -5462,6 +5678,7 @@ const anthropicAuthPlugin = async (
               expires: 0,
               refresh: undefined,
               nativeAccountIdentity: undefined,
+              nativeRoutingLineage: undefined,
               nativeLocalSource: undefined,
               nativeScopedAttempt: undefined,
               modelDenied: false,
@@ -5474,10 +5691,36 @@ const anthropicAuthPlugin = async (
             )
           }
           const primarySnapshot = await nativeAccounts.read()
+          headerRoutingPolicyStorage = primarySnapshot.policyStorage
           const primaryAccount = primarySnapshot.accounts.find(
             (account) => account.id === 'main',
           )
           const primaryBinding = primaryAccount?.binding
+          const primaryRoutingQuota = primaryAccount
+            ? routingAccountQuota(primaryAccount, primarySnapshot.policyStorage)
+            : undefined
+          const primaryRoutingStorage =
+            primaryRoutingQuota && primaryRoutingQuota !== primaryAccount?.quota
+              ? {
+                  ...primarySnapshot.policyStorage,
+                  quota: {
+                    ...primarySnapshot.policyStorage.quota,
+                    mainQuota: primaryRoutingQuota,
+                  },
+                }
+              : primarySnapshot.policyStorage
+          const primaryObservation = currentHeaderRoutingObservation(
+            'main',
+            localHeaderRoutingLineage(primaryBinding),
+            primaryAccount?.accountIdentity,
+            primarySnapshot.policyStorage,
+          )
+          const primaryHeaderExhaustionProven = Boolean(
+            primaryBinding &&
+              primaryObservation?.lineage ===
+                localHeaderRoutingLineage(primaryBinding) &&
+              primaryObservation?.generalExhausted === true,
+          )
           if (
             primaryAccount &&
             primaryBinding &&
@@ -5503,8 +5746,9 @@ const anthropicAuthPlugin = async (
             (getRoutingMode(primarySnapshot.policyStorage) ===
               'fallback-first' ||
               mainProviderQuotaRestriction(
-                primarySnapshot.policyStorage,
+                primaryRoutingStorage,
                 primaryAccount?.accountIdentity,
+                primaryHeaderExhaustionProven,
               ))
           ) {
             const primary = primarySnapshot.accounts.find(
@@ -5517,6 +5761,9 @@ const anthropicAuthPlugin = async (
               expires: 0,
               refresh: undefined,
               nativeAccountIdentity: primary?.accountIdentity,
+              nativeRoutingLineage: primary?.binding
+                ? localHeaderRoutingLineage(primary.binding)
+                : undefined,
               nativeLocalSource: undefined,
               nativeScopedAttempt: undefined,
               modelDenied: false,
@@ -5585,6 +5832,14 @@ const anthropicAuthPlugin = async (
             access: credential?.accessToken ?? '',
             expires: credential?.expires ?? 0,
             refresh: undefined,
+            nativeRoutingLineage:
+              headerRoutingLineage(
+                credential?.localSubject,
+                credential?.scopedAttempt,
+              ) ??
+              (primaryAccount?.binding
+                ? localHeaderRoutingLineage(primaryAccount.binding)
+                : undefined),
             nativeAccountIdentity:
               credential?.accountIdentity ??
               denied?.accountIdentity ??
@@ -5920,9 +6175,7 @@ const anthropicAuthPlugin = async (
           ) {
             assertNativeEnvironment()
             if (!accessToken) {
-              const general = identity?.quotaKey
-                ? quotaManager.getMain(identity.quotaKey)
-                : null
+              const general = routingMainQuotaEntry(identity)
               if (
                 !identity?.providerAccountUuid ||
                 !general ||
@@ -5936,7 +6189,14 @@ const anthropicAuthPlugin = async (
               // This primary authorization validates the existing general-quota
               // gate for an API route. It does not permit the denied Claude model.
               const primary = await authorizeOAuth('main', signal)
-              if (primary.accountIdentity !== identity.providerAccountUuid)
+              if (
+                primary.accountIdentity !== identity.providerAccountUuid ||
+                (identity.routingLineage &&
+                  headerRoutingLineage(
+                    primary.localSubject,
+                    primary.scopedAttempt,
+                  ) !== identity.routingLineage)
+              )
                 throw new Error('Primary identity changed before API fallback')
               accessToken = primary.accessToken
             }
@@ -5948,6 +6208,15 @@ const anthropicAuthPlugin = async (
             // API credential. Only account-wide OAuth exhaustion permits API
             // fallback; model-only limits, auth errors or an unknown account
             // do not justify using a paid API route.
+            const currentPrimary = (await nativeAccounts.read()).accounts.find(
+              (row) => row.id === 'main',
+            )
+            if (
+              currentPrimary?.binding &&
+              localHeaderRoutingLineage(currentPrimary.binding) !==
+                identity?.routingLineage
+            )
+              throw new Error('Primary identity changed before API fallback')
             if (!mainQuotaEntryIsFreshExhausted(accessToken, identity))
               throw new Error(
                 'API fallback requires fresh general primary OAuth exhaustion',
@@ -6752,15 +7021,25 @@ const anthropicAuthPlugin = async (
             return response.status === 429 || streamingRateLimited
           }
 
+          function routingMainQuotaEntry(
+            identity?: MainQuotaIdentityBinding,
+            storage: AccountStorage | null = headerRoutingPolicyStorage,
+          ) {
+            return routingQuotaEntry(
+              'main',
+              identity?.routingLineage,
+              identity?.providerAccountUuid,
+              quotaManager.getMain(identity?.quotaKey ?? mainQuotaAccountId),
+              storage,
+            )
+          }
           function mainQuotaEntryIsFreshExhausted(
             accessToken?: string,
             mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
             if (!accessToken && !mainQuotaIdentity?.providerAccountUuid)
               return false
-            const entry = quotaManager.getMain(
-              mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId,
-            )
+            const entry = routingMainQuotaEntry(mainQuotaIdentity)
             // Native metadata can establish account-owned exhaustion before
             // primary credential authorization. The API send still validates
             // that credential and rechecks this quota before dispatch.
@@ -6770,7 +7049,18 @@ const anthropicAuthPlugin = async (
                   entry.quota.accountIdentity ===
                     mainQuotaIdentity?.providerAccountUuid) &&
                 entry.refreshAfter > Date.now() &&
-                quotaSnapshotIsExhausted(entry.quota),
+                quotaSnapshotIsExhausted(entry.quota) &&
+                (entry.quota.source !== 'headers' ||
+                  currentHeaderRoutingObservation(
+                    'main',
+                    mainQuotaIdentity?.routingLineage,
+                    mainQuotaIdentity?.providerAccountUuid,
+                  )?.generalExhausted === true ||
+                  (['five_hour', 'seven_day'] as const).some(
+                    (key) =>
+                      entry.quota.fieldSources?.[key] === 'poll' &&
+                      (entry.quota[key]?.remainingPercent ?? 1) <= 0,
+                  )),
             )
           }
 
@@ -7696,7 +7986,10 @@ const anthropicAuthPlugin = async (
                     'Main OAuth identity changed while resolving request credentials',
                   )
                 }
-                requestMainQuotaIdentity = resolution
+                requestMainQuotaIdentity = {
+                  ...resolution,
+                  routingLineage: auth.nativeRoutingLineage,
+                }
                 if (requestMainProviderUuid) {
                   mainServedAccessToken = auth.access
                   mainProviderAccountUuid = resolution.providerAccountUuid
@@ -7721,6 +8014,7 @@ const anthropicAuthPlugin = async (
                   quotaKey: requestMainProviderUuid,
                   providerAccountUuid: requestMainProviderUuid,
                   generation: quotaManager.getMainQuotaIdentityGeneration(),
+                  routingLineage: auth.nativeRoutingLineage,
                   stale: false,
                   state: isScopedCustodyActive(storage) ? 'on-cold' : 'na',
                 }
@@ -7748,8 +8042,33 @@ const anthropicAuthPlugin = async (
               const replayableRequest = isReplayableRequest(input, init?.body)
               const requestModelId =
                 parseRequestModel(init?.body) ?? credentialModelId
+              const mainRoutingEntry = routingMainQuotaEntry(
+                requestMainQuotaIdentity,
+                storage,
+              )
+              const currentMainObservation = currentHeaderRoutingObservation(
+                'main',
+                requestMainQuotaIdentity?.routingLineage,
+                requestMainProviderUuid,
+                storage,
+              )
               const providerRestriction = auth.deferred
-                ? mainProviderQuotaRestriction(storage, requestMainProviderUuid)
+                ? mainProviderQuotaRestriction(
+                    mainRoutingEntry && storage
+                      ? {
+                          ...storage,
+                          accounts: storage?.accounts ?? [],
+                          quota: {
+                            ...storage?.quota,
+                            mainQuota: mainRoutingEntry.quota,
+                          },
+                        }
+                      : storage,
+                    requestMainProviderUuid,
+                    currentMainObservation?.lineage ===
+                      requestMainQuotaIdentity?.routingLineage &&
+                      currentMainObservation?.generalExhausted === true,
+                  )
                 : undefined
               if (providerRestriction) {
                 // A provider-issued wait applies before primary token acquisition.
@@ -8346,7 +8665,10 @@ const anthropicAuthPlugin = async (
                     throw new Error(
                       'Main OAuth identity changed while resolving request credentials',
                     )
-                  requestMainQuotaIdentity = resolution
+                  requestMainQuotaIdentity = {
+                    ...resolution,
+                    routingLineage: auth.nativeRoutingLineage,
+                  }
                   mainServedAccessToken = auth.access
                   mainProviderAccountUuid = resolution.providerAccountUuid
                 }
@@ -8507,8 +8829,9 @@ const anthropicAuthPlugin = async (
                   const quotaStart = nowMs()
                   // Identity-aware read prevents routing with a previous main
                   // account's quota after a slot switch.
-                  let routingQuotaEntry = quotaManager.getMain(
-                    requestMainQuotaIdentity?.quotaKey,
+                  let routingQuotaEntry = routingMainQuotaEntry(
+                    requestMainQuotaIdentity,
+                    storage,
                   )
                   let routingQuota = routingQuotaEntry?.quota
                   if (!routingQuota) {
@@ -8517,8 +8840,9 @@ const anthropicAuthPlugin = async (
                       auth.access,
                       requestMainQuotaIdentity?.generation,
                     )
-                    routingQuotaEntry = quotaManager.getMain(
-                      requestMainQuotaIdentity?.quotaKey,
+                    routingQuotaEntry = routingMainQuotaEntry(
+                      requestMainQuotaIdentity,
+                      storage,
                     )
                     showQuotaToastFromCache()
                   } else if (
@@ -8545,8 +8869,9 @@ const anthropicAuthPlugin = async (
                         auth.access,
                         requestMainQuotaIdentity?.generation,
                       )
-                      routingQuotaEntry = quotaManager.getMain(
-                        requestMainQuotaIdentity?.quotaKey,
+                      routingQuotaEntry = routingMainQuotaEntry(
+                        requestMainQuotaIdentity,
+                        storage,
                       )
                     } else {
                       // Stale OR every-N request boundary — background refresh,
@@ -8631,8 +8956,9 @@ const anthropicAuthPlugin = async (
                 }
               }
 
-              let mainQuota = quotaManager.getMain(
-                requestMainQuotaIdentity?.quotaKey,
+              let mainQuota = routingMainQuotaEntry(
+                requestMainQuotaIdentity,
+                storage,
               )?.quota
               if (
                 storage?.quota?.failClosedOnUnknownQuota &&
@@ -8712,8 +9038,9 @@ const anthropicAuthPlugin = async (
                 // Re-read after the eager refresh so the killswitch evaluates
                 // against fresh quota. The initial read above is null on the
                 // first request, before the refresh populates the cache.
-                mainQuota = quotaManager.getMain(
-                  requestMainQuotaIdentity?.quotaKey,
+                mainQuota = routingMainQuotaEntry(
+                  requestMainQuotaIdentity,
+                  storage,
                 )?.quota
               }
 

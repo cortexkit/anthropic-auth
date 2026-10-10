@@ -1,4 +1,5 @@
-import { expect } from 'bun:test'
+import { expect, spyOn } from 'bun:test'
+import * as fsPromises from 'node:fs/promises'
 import {
   chmod,
   lstat,
@@ -108,6 +109,228 @@ async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'anthropic-native-runtime-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   return join(root, 'private', 'native-state.json')
+}
+
+test('runtime reader accepts owner-only atomic replacement between stat and open', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => ({
+    version: 1,
+    storageId,
+    accounts: {
+      row: {
+        binding: { kind: 'local', storageId, rowId: 'row', credentialEpoch: 1 },
+        lastUsed: 1,
+      },
+    },
+  }))
+  const before = await lstat(path)
+  const realOpen = fsPromises.open
+  let armed = true
+  let replacements = 0
+  const openSpy = spyOn(fsPromises, 'open').mockImplementation(
+    async (openedPath, flags, mode) => {
+      if (armed && openedPath === path) {
+        armed = false
+        await updateNativeRuntime(path, storageId, (state) => {
+          const row = state.accounts.row
+          if (!row) throw new Error('Expected the seeded runtime row')
+          row.lastUsed = 2
+          return state
+        })
+        const after = await lstat(path)
+        expect(after.ino).not.toBe(before.ino)
+        expect(before.mode & 0o777).toBe(0o600)
+        expect(after.mode & 0o777).toBe(0o600)
+        expect(after.uid).toBe(before.uid)
+        replacements++
+      }
+      return realOpen(openedPath, flags, mode)
+    },
+  )
+  try {
+    await expect(readNativeRuntime(path, storageId)).resolves.toMatchObject({
+      status: 'ready',
+      state: { accounts: { row: { lastUsed: 2 } } },
+    })
+    expect(replacements).toBe(1)
+  } finally {
+    openSpy.mockRestore()
+  }
+})
+
+for (const replacement of ['permissions', 'symlink'] as const) {
+  test(`runtime reader refuses ${replacement} replacement between stat and open`, async () => {
+    const path = await fixture()
+    await updateNativeRuntime(path, storageId, () => ({
+      version: 1,
+      storageId,
+      accounts: {},
+    }))
+    const replacementPath = join(dirname(path), 'replacement.json')
+    await writeFile(
+      replacementPath,
+      JSON.stringify({ version: 1, storageId, accounts: {} }),
+      { mode: replacement === 'permissions' ? 0o644 : 0o600 },
+    )
+    const realOpen = fsPromises.open
+    let armed = true
+    let replacements = 0
+    const openSpy = spyOn(fsPromises, 'open').mockImplementation(
+      async (openedPath, flags, mode) => {
+        if (armed && openedPath === path) {
+          armed = false
+          if (replacement === 'permissions')
+            await fsPromises.rename(replacementPath, path)
+          else {
+            await rm(path)
+            await symlink(replacementPath, path)
+          }
+          replacements++
+        }
+        return realOpen(openedPath, flags, mode)
+      },
+    )
+    try {
+      await expect(readNativeRuntime(path, storageId)).rejects.toMatchObject({
+        code: replacement === 'permissions' ? 'unsafe-runtime' : 'runtime-io',
+      })
+      expect(replacements).toBe(1)
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+}
+
+test('runtime reader refuses a foreign owner on the opened handle', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => ({
+    version: 1,
+    storageId,
+    accounts: {},
+  }))
+  const realOpen = fsPromises.open
+  let changedOwner = false
+  const openSpy = spyOn(fsPromises, 'open').mockImplementation(
+    async (openedPath, flags, mode) => {
+      const file = await realOpen(openedPath, flags, mode)
+      if (openedPath === path) {
+        const realStat = file.stat.bind(file)
+        Object.defineProperty(file, 'stat', {
+          value: async () => {
+            const opened = await realStat()
+            Object.defineProperty(opened, 'uid', { value: opened.uid + 1 })
+            changedOwner = true
+            return opened
+          },
+        })
+      }
+      return file
+    },
+  )
+  try {
+    await expect(readNativeRuntime(path, storageId)).rejects.toMatchObject({
+      code: 'unsafe-runtime',
+    })
+    expect(changedOwner).toBe(true)
+  } finally {
+    openSpy.mockRestore()
+  }
+})
+
+async function runtimeReaderWithoutNoFollow(
+  path: string,
+): Promise<typeof readNativeRuntime> {
+  const sourceUrl = new URL('../native-runtime.ts', import.meta.url)
+  const source = await readFile(sourceUrl, 'utf8')
+  const flag = 'const noFollow = constants.O_NOFOLLOW ?? 0'
+  expect(source.split(flag)).toHaveLength(2)
+  // Simulate a platform without the flag in an isolated copy of the actual
+  // reader. All file checks and retry logic stay identical to production.
+  const isolated = source
+    .replace(flag, 'const noFollow = 0')
+    .replace(/from '([^']+)'/g, (_match, specifier: string) => {
+      const resolved = specifier.startsWith('.')
+        ? new URL(specifier, sourceUrl).href
+        : specifier.startsWith('node:')
+          ? specifier
+          : import.meta.resolve(specifier)
+      return `from '${resolved}'`
+    })
+  const modulePath = join(dirname(path), 'reader-without-no-follow.ts')
+  await writeFile(modulePath, isolated, { mode: 0o600 })
+  const module: typeof import('../native-runtime.ts') = await import(modulePath)
+  return module.readNativeRuntime
+}
+
+for (const replacements of [1, 2]) {
+  test(`runtime reader without no-follow bounds atomic replacement recovery at ${replacements} replacements`, async () => {
+    const path = await fixture()
+    await updateNativeRuntime(path, storageId, () => ({
+      version: 1,
+      storageId,
+      accounts: {
+        row: {
+          binding: {
+            kind: 'local',
+            storageId,
+            rowId: 'row',
+            credentialEpoch: 1,
+          },
+          lastUsed: 0,
+        },
+      },
+    }))
+    const reader = await runtimeReaderWithoutNoFollow(path)
+    const realOpen = fsPromises.open
+    let publishing = false
+    let changed = 0
+    let openedByReader = 0
+    let closedByReader = 0
+    const openSpy = spyOn(fsPromises, 'open').mockImplementation(
+      async (openedPath, flags, mode) => {
+        const outerRead = openedPath === path && !publishing
+        if (outerRead && changed < replacements) {
+          publishing = true
+          try {
+            await updateNativeRuntime(path, storageId, (state) => {
+              const row = state.accounts.row
+              if (!row) throw new Error('Expected seeded runtime row')
+              row.lastUsed = ++changed
+              return state
+            })
+          } finally {
+            publishing = false
+          }
+        }
+        const file = await realOpen(openedPath, flags, mode)
+        if (outerRead) {
+          openedByReader++
+          const realClose = file.close.bind(file)
+          file.close = async () => {
+            closedByReader++
+            return realClose()
+          }
+        }
+        return file
+      },
+    )
+    try {
+      if (replacements === 1)
+        await expect(reader(path, storageId)).resolves.toMatchObject({
+          status: 'ready',
+          state: { accounts: { row: { lastUsed: 1 } } },
+        })
+      else
+        await expect(reader(path, storageId)).rejects.toMatchObject({
+          code: 'unsafe-runtime',
+        })
+      expect(changed).toBe(replacements)
+      expect(openedByReader).toBe(2)
+      expect(closedByReader).toBe(2)
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
 }
 
 async function joinRuntimeUpdates(updates: Promise<NativeRuntimeState>[]) {

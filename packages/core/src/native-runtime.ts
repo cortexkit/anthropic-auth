@@ -502,43 +502,53 @@ export async function readNativeRuntime(
 ): Promise<NativeRuntimeRead> {
   checkPath(path)
   if (!digest(storageId)) throw new NativeRuntimeError('invalid-runtime')
+  const noFollow = constants.O_NOFOLLOW ?? 0
   try {
-    const info = await lstat(path)
-    if (
-      !info.isFile() ||
-      (info.mode & 0o777) !== 0o600 ||
-      (typeof process.geteuid === 'function' && info.uid !== process.geteuid())
-    )
-      throw new NativeRuntimeError('unsafe-runtime')
-    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-    try {
-      const opened = await file.stat()
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const info = await lstat(path)
       if (
-        opened.dev !== info.dev ||
-        opened.ino !== info.ino ||
-        !opened.isFile() ||
-        (opened.mode & 0o777) !== 0o600 ||
+        !info.isFile() ||
+        (info.mode & 0o777) !== 0o600 ||
         (typeof process.geteuid === 'function' &&
-          opened.uid !== process.geteuid())
+          info.uid !== process.geteuid())
       )
         throw new NativeRuntimeError('unsafe-runtime')
-      let contents: string
+      const file = await open(path, constants.O_RDONLY | noFollow)
       try {
-        contents = new TextDecoder('utf-8', { fatal: true }).decode(
-          await file.readFile(),
+        const opened = await file.stat()
+        if (
+          !opened.isFile() ||
+          (opened.mode & 0o777) !== 0o600 ||
+          (typeof process.geteuid === 'function' &&
+            opened.uid !== process.geteuid())
         )
-      } catch (error) {
-        if (error instanceof TypeError)
-          throw new NativeRuntimeError('invalid-runtime')
-        throw error
+          throw new NativeRuntimeError('unsafe-runtime')
+        // Atomic publication may replace the file between lstat and open.
+        // O_NOFOLLOW and the opened handle's permissions establish its safety.
+        // Without that flag, require matching file identity and retry once.
+        if (!noFollow && (opened.dev !== info.dev || opened.ino !== info.ino)) {
+          if (attempt === 0) continue
+          throw new NativeRuntimeError('unsafe-runtime')
+        }
+        let contents: string
+        try {
+          contents = new TextDecoder('utf-8', { fatal: true }).decode(
+            await file.readFile(),
+          )
+        } catch (error) {
+          if (error instanceof TypeError)
+            throw new NativeRuntimeError('invalid-runtime')
+          throw error
+        }
+        return {
+          status: 'ready',
+          state: decodeNativeRuntime(parseJsonRedacted(contents), storageId),
+        }
+      } finally {
+        await file.close()
       }
-      return {
-        status: 'ready',
-        state: decodeNativeRuntime(parseJsonRedacted(contents), storageId),
-      }
-    } finally {
-      await file.close()
     }
+    throw new NativeRuntimeError('unsafe-runtime')
   } catch (error) {
     if (missing(error)) return { status: 'missing' }
     if (error instanceof NativeRuntimeError) throw error
