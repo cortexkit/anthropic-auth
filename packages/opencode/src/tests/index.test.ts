@@ -9991,9 +9991,11 @@ describe('auth.loader', () => {
       }
     }
 
-    expect(profileCalls).toEqual([
-      'Bearer sk-ant-oat01-main-access',
+    // Independent account hydration may finish in either order. Require
+    // exactly one request per account, including after the second status read.
+    expect(profileCalls.toSorted()).toEqual([
       'Bearer sk-ant-oat01-fallback-access',
+      'Bearer sk-ant-oat01-main-access',
     ])
     const loaded = await readAccountStorage()
     expect(loaded?.main?.profile?.tier).toBe('default_claude_max_20x')
@@ -10056,7 +10058,7 @@ describe('auth.loader', () => {
     expect(profileCalls).toBe(0)
   })
 
-  test('legacy profile is adopted under the current main identity', async () => {
+  test('unbound legacy profile is not adopted by a different credential', async () => {
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -10115,14 +10117,11 @@ describe('auth.loader', () => {
     const text = (mockClient.session.promptAsync as any).mock.calls.at(-1)?.[0]
       ?.body.parts[0]?.text
 
-    expect(text).toContain('Max 20x')
-    expect(profileCalls).toBe(0)
-    const adoptedStorage = await waitForAccountStorage(
-      (storage) => storage?.main?.profile?.accountIdentity !== undefined,
-    )
-    expect(adoptedStorage?.main?.profile?.accountIdentity).toBe(
-      adoptedStorage?.mainAccountId,
-    )
+    // An old access-token fingerprint cannot prove the replacement account's
+    // tier. A failed fresh lookup must not restore that unclaimed profile.
+    expect(text).not.toContain('Max 20x')
+    expect(profileCalls).toBe(1)
+    expect((await readAccountStorage())?.main?.profile).toBeUndefined()
   })
 
   test('in-flight hydration is shared across access-token rotation', async () => {
@@ -10214,6 +10213,8 @@ describe('auth.loader', () => {
           type: 'opencode',
           provider: 'anthropic',
           profile: {
+            accountIdentity: syntheticMainAccountUuid,
+            providerAccountUuid: syntheticMainAccountUuid,
             tier: 'default_claude_max_20x',
             orgType: 'claude_max',
             checkedAt: Date.now(),
