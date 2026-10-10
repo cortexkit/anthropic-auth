@@ -12184,165 +12184,134 @@ describe('auth.loader', () => {
     )
   })
 
-  test('successful re-login clears a live stale main refresh backoff', async () => {
-    const now = Date.now()
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        mainAccountId: 'main-account-id',
-        quota: {
-          enabled: false,
-          mainLastQuotaApiError: {
-            message: 'stale quota failure',
-            checkedAt: now - 1_000,
-            nextRetryAt: now + 60_000,
-            retryCount: 1,
-          },
-        },
-        refresh: {
-          enabled: true,
-          mainLastRefreshError: {
-            message: 'stale refresh failure',
-            checkedAt: now - 1_000,
-            nextRetryAt: now + 60_000,
-            retryCount: 1,
-            accountIdentity: 'relogged-main-refresh',
-          },
-        },
-      }),
-      {
-        access: 'sk-ant-oat01-relogged-main-access',
-        refresh: 'relogged-main-refresh',
-        expires: now + 60 * 60_000,
-      },
-    )
-    let tokenRefreshCalls = 0
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'relogged-main-refresh-new',
-              access_token: 'sk-ant-oat01-relogged-main-access',
-              expires_in: 3600,
+  for (const sameAccount of [false, true]) {
+    test(
+      sameAccount
+        ? 'successful re-login preserves the current account main quota backoff'
+        : 'successful re-login clears a live stale main refresh backoff',
+      async () => {
+        const now = Date.now()
+        const prior = {
+          access: 'sk-ant-oat01-prior-login',
+          refresh: 'prior-login-refresh',
+          expires: now + 8 * 60 * 60_000,
+        }
+        const quotaRetryAt = now + 60_000
+        await useTempAccountFile(
+          bindMainAccount(
+            createFallbackStorage({
+              accounts: [],
+              mainAccountId: 'main-account-id',
+              quota: {
+                enabled: false,
+                mainLastQuotaApiError: {
+                  message: 'Prior quota failure',
+                  status: 429,
+                  checkedAt: now - 1000,
+                  nextRetryAt: quotaRetryAt,
+                  retryCount: 1,
+                  accountIdentity: syntheticMainAccountUuid,
+                },
+              },
+              refresh: {
+                enabled: true,
+                mainLastRefreshError: {
+                  message: 'Claude OAuth refresh failed: 400 — invalid_grant',
+                  status: 400,
+                  checkedAt: now - 1000,
+                  nextRetryAt: now + 24 * 60 * 60_000,
+                  retryCount: 1,
+                  permanent: true,
+                  accountIdentity: syntheticMainAccountUuid,
+                  tokenHash: hashRefreshToken(prior.refresh),
+                },
+              },
             }),
-            { status: 200 },
+            prior.access,
           ),
+          prior,
         )
-      }
-      if (url.includes('/v1/messages')) {
-        return Promise.resolve(new Response('{}', { status: 200 }))
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
-
-    const plugin = await getPlugin(createMockClient())
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
+        const successor = {
           access: 'sk-ant-oat01-relogged-main-access',
           refresh: 'relogged-main-refresh',
-          expires: now + 60 * 60_000,
-        }),
-      { models: {} },
-    )
-    const preflight = await readAccountStorage()
-    expect(preflight?.refresh?.mainLastRefreshError).toEqual(
-      expect.objectContaining({
-        accountIdentity: 'relogged-main-refresh',
-        nextRetryAt: expect.any(Number),
-      }),
-    )
-
-    const response = await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: '{}',
-    })
-
-    expect(response.status).toBe(200)
-    expect(tokenRefreshCalls).toBe(0)
-    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
-    expect(savedState.main.lastRefreshError).toBeUndefined()
-    const savedConfig = await readAccountStorage()
-    expect(savedConfig?.quota?.mainLastQuotaApiError).toBeUndefined()
-  })
-
-  test('successful re-login preserves the current account main quota backoff', async () => {
-    const now = Date.now()
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        mainAccountId: 'main-account-id',
-        quota: {
-          enabled: false,
-          mainLastQuotaApiError: {
-            message: 'current quota failure',
-            checkedAt: now - 1_000,
-            nextRetryAt: now + 60_000,
-            retryCount: 1,
-            accountIdentity: 'main-account-id',
+          expires: now + 8 * 60 * 60_000,
+        }
+        const identity = sameAccount
+          ? syntheticMainAccountUuid
+          : ('88888888-2222-4333-8444-555555555555' as ProviderAccountUuid)
+        successorAccess.set(successor.access, identity)
+        let tokenRefreshCalls = 0
+        const modelAuthorizations: Array<string | null> = []
+        globalThis.fetch = mock(
+          async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            const url = extractUrl(input)
+            if (
+              url.includes('/api/claude_cli/bootstrap') &&
+              new Headers(init?.headers).get('authorization') ===
+                `Bearer ${successor.access}`
+            )
+              return Response.json({
+                oauth_account: { account_uuid: identity },
+              })
+            const admitted = await nativeBootstrapAnswer(input, init)
+            if (admitted) return admitted
+            if (url.includes('/v1/oauth/token')) {
+              tokenRefreshCalls++
+              throw new Error(
+                'Unexpected token refresh during known-account re-login',
+              )
+            }
+            if (url.includes('/v1/messages'))
+              modelAuthorizations.push(
+                new Headers(init?.headers).get('authorization'),
+              )
+            return Response.json({})
           },
-        },
-        refresh: {
-          enabled: true,
-          mainLastRefreshError: {
-            message: 'stale refresh failure',
-            checkedAt: now - 1_000,
-            nextRetryAt: now + 60_000,
-            retryCount: 1,
-            accountIdentity: 'relogged-main-refresh',
-          },
-        },
-      }),
-      {
-        access: 'sk-ant-oat01-relogged-main-access',
-        refresh: 'relogged-main-refresh',
-        expires: now + 60 * 60_000,
+        ) as unknown as typeof fetch
+        const mockClient = createMockClient()
+        const plugin = await getPlugin(mockClient)
+        const result = await plugin.auth.loader(
+          () => Promise.resolve({ type: 'oauth', ...prior }),
+          { models: {} },
+        )
+        const before = await readNativeRuntimeState()
+        expect(before.main?.lastRefreshError?.permanent).toBe(true)
+        expect(before.main?.lastRefreshError?.nextRetryAt).toBeGreaterThan(now)
+        expect(before.main?.lastQuotaApiError?.nextRetryAt).toBe(quotaRetryAt)
+        await replacePoolMainLogin(successor, {
+          sameAccount,
+          accountIdentity: identity,
+        })
+        const response = await result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          body: '{}',
+        })
+        expect(response.status).toBe(200)
+        expect(modelAuthorizations).toEqual([`Bearer ${successor.access}`])
+        expect(tokenRefreshCalls).toBe(0)
+        const after = await readNativeRuntimeState()
+        expect(after.main?.accountIdentity).toBe(identity)
+        expect(after.main?.lastRefreshError).toBeUndefined()
+        if (sameAccount) {
+          // A refresh restriction belongs to the replaced credentials. Quota
+          // backoff belongs to the account UUID and must keep its live deadline.
+          expect(after.main?.lastQuotaApiError).toMatchObject({
+            accountIdentity: identity,
+            status: 429,
+            nextRetryAt: quotaRetryAt,
+          })
+          expect(after.main?.lastQuotaApiError?.nextRetryAt).toBeGreaterThan(
+            Date.now(),
+          )
+        } else expect(after.main?.lastQuotaApiError).toBeUndefined()
+        expect(
+          (await waitForPoolCredential('main', successor.access)).credential
+            .refresh,
+        ).toBe(successor.refresh)
+        expect(mockClient.auth.set).not.toHaveBeenCalled()
       },
     )
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any) => {
-        if (extractUrl(input).includes('/v1/messages'))
-          return Promise.resolve(new Response('{}', { status: 200 }))
-        return Promise.resolve(new Response(null, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
-
-    const plugin = await getPlugin(createMockClient())
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'sk-ant-oat01-relogged-main-access',
-          refresh: 'relogged-main-refresh',
-          expires: now + 60 * 60_000,
-        }),
-      { models: {} },
-    )
-
-    const response = await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: '{}',
-    })
-
-    expect(response.status).toBe(200)
-    const savedConfig = await readAccountStorage()
-    // The entry surviving is not the property under test — a backoff whose
-    // retry time has been zeroed is no longer restricting anything.
-    expect(savedConfig?.quota?.mainLastQuotaApiError).toEqual(
-      expect.objectContaining({
-        accountIdentity: 'main-account-id',
-        message: 'current quota failure',
-        nextRetryAt: now + 60_000,
-      }),
-    )
-    expect(
-      savedConfig?.quota?.mainLastQuotaApiError?.nextRetryAt,
-    ).toBeGreaterThan(Date.now())
-  })
+  }
 
   test('fallback-first uses stale passing fallback quota while quota refresh is in progress even when main refresh is backed off', async () => {
     const now = Date.now()
