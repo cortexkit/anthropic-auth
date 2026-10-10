@@ -1,4 +1,15 @@
 /** @jsxImportSource @opentui/solid */
+
+import type {
+  CommandApplyRequest,
+  CommandApplyResult,
+  CommandDialogPayload,
+  CommandMenuModel,
+  KnobValue,
+  MenuAction,
+  MenuItem,
+  MenuSection,
+} from '@cortexkit/anthropic-auth-core'
 import {
   custodyStatusLabel,
   type PrimeAccountStatus,
@@ -7,6 +18,259 @@ import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { AccountDialogAccount } from '../rpc/protocol'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import { formatPrimeCost, formatPrimeTime } from '../sidebar-state.js'
+
+/** Render menu sections, accounts and action inputs; send changes to the host instead of writing credentials here. */
+export function openNativeMenuDialog(
+  api: {
+    readonly ui: Pick<
+      TuiPluginApi['ui'],
+      'dialog' | 'DialogSelect' | 'DialogPrompt' | 'DialogConfirm' | 'toast'
+    >
+  },
+  payload: CommandDialogPayload,
+  apply: (request: CommandApplyRequest) => Promise<CommandApplyResult>,
+  isCurrentSession: () => boolean,
+): void {
+  let menu: CommandMenuModel = payload.menu
+  let inFlight = false
+  const DialogSelect = api.ui.DialogSelect<string>
+  const DialogPrompt = api.ui.DialogPrompt
+  const DialogConfirm = api.ui.DialogConfirm
+  const active = () => isCurrentSession() && !inFlight
+
+  const root = () => {
+    if (!active()) return
+    api.ui.dialog.setSize('xlarge')
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title={menu.title}
+        options={[
+          ...menu.sections.map((section) => ({
+            title: section.title,
+            value: section.id,
+          })),
+          { title: 'Close', value: '__close' },
+        ]}
+        onSelect={(option) => {
+          if (!active()) return
+          const section = menu.sections.find(
+            (entry) => entry.id === option.value,
+          )
+          if (section) showSection(section)
+          else if (option.value === '__close') api.ui.dialog.clear()
+        }}
+      />
+    ))
+  }
+
+  const showSection = (section: MenuSection) => {
+    if (!active()) return
+    api.ui.dialog.replace(() => (
+      <box flexDirection='column' padding={1}>
+        <text>{section.lines.join('\n')}</text>
+        <DialogSelect
+          title={section.title}
+          options={[
+            ...section.items.map((item) => ({
+              title: item.label,
+              value: `item:${item.id}`,
+              description: item.detail,
+            })),
+            ...section.actions.map((action) => ({
+              title: action.label,
+              value: `action:${action.id}`,
+              description: action.description,
+            })),
+            { title: 'Back', value: '__back' },
+          ]}
+          onSelect={(option) => {
+            if (!active()) return
+            if (option.value === '__back') return root()
+            const action = section.actions.find(
+              (entry) => `action:${entry.id}` === option.value,
+            )
+            if (action) return collect(section, action)
+            const item = section.items.find(
+              (entry) => `item:${entry.id}` === option.value,
+            )
+            if (item) showItem(section, item)
+          }}
+        />
+      </box>
+    ))
+  }
+
+  const showItem = (section: MenuSection, item: MenuItem) => {
+    if (!active()) return
+    api.ui.dialog.replace(() => (
+      <box flexDirection='column' padding={1}>
+        <text>{item.detail ?? ''}</text>
+        <DialogSelect
+          title={item.label}
+          options={[
+            ...item.actions.map((action) => ({
+              title: action.label,
+              value: action.id,
+              description: action.description,
+            })),
+            { title: 'Back', value: '__back' },
+          ]}
+          onSelect={(option) => {
+            if (!active()) return
+            const action = item.actions.find(
+              (entry) => entry.id === option.value,
+            )
+            if (action) collect(section, action, item)
+            else if (option.value === '__back') showSection(section)
+          }}
+        />
+      </box>
+    ))
+  }
+
+  const collect = (
+    section: MenuSection,
+    action: MenuAction,
+    item?: MenuItem,
+  ) => {
+    const values: Record<string, KnobValue> = {}
+    const back = () => {
+      for (const key of Object.keys(values)) delete values[key]
+      if (item) showItem(section, item)
+      else showSection(section)
+    }
+    const submit = async () => {
+      if (!active()) return
+      inFlight = true
+      try {
+        const result = await apply({
+          command: menu.command,
+          sectionId: section.id,
+          actionId: action.id,
+          ...(item ? { itemId: item.id } : {}),
+          values: { ...values },
+          ...(action.confirm ? { confirmed: true } : {}),
+        })
+        if (!isCurrentSession()) return
+        menu = result.menu
+        api.ui.toast({ message: result.text })
+      } catch {
+        if (isCurrentSession())
+          api.ui.toast({ message: 'Menu apply unavailable; outcome unknown.' })
+      } finally {
+        for (const key of Object.keys(values)) delete values[key]
+        inFlight = false
+        if (isCurrentSession()) {
+          const refreshed = menu.sections.find(
+            (entry) => entry.id === section.id,
+          )
+          if (refreshed) showSection(refreshed)
+          else root()
+        }
+      }
+    }
+    const next = (index: number) => {
+      if (!active()) return
+      const knob = action.knobs[index]
+      if (!knob) {
+        if (!action.confirm) return void submit()
+        api.ui.dialog.replace(() => (
+          <DialogConfirm
+            title={action.label}
+            message={action.confirm?.message ?? ''}
+            onConfirm={() => void submit()}
+            onCancel={back}
+          />
+        ))
+        return
+      }
+      if (knob.kind === 'choice' || knob.kind === 'toggle') {
+        const choices =
+          knob.kind === 'choice'
+            ? knob.choices
+            : [
+                { value: 'on', label: 'On' },
+                { value: 'off', label: 'Off' },
+              ]
+        api.ui.dialog.replace(() => (
+          <DialogSelect
+            title={knob.label}
+            options={[
+              ...choices.map((choice) => ({
+                title: choice.label,
+                value: choice.value,
+              })),
+              { title: 'Cancel', value: '__cancel' },
+            ]}
+            onSelect={(option) => {
+              if (!active()) return
+              if (option.value === '__cancel') return back()
+              values[knob.id] =
+                knob.kind === 'toggle' ? option.value === 'on' : option.value
+              next(index + 1)
+            }}
+          />
+        ))
+        return
+      }
+      // DialogPrompt has no masking capability in the host API. Never seed a
+      // protected input or claim it is hidden; warn before collecting it.
+      api.ui.dialog.replace(() => (
+        <DialogPrompt
+          title={knob.label}
+          description={() => (
+            <text>
+              {knob.kind === 'text' && knob.masked
+                ? 'This host prompt displays input. Avoid screen sharing; the value is not echoed in menu results.'
+                : knob.required
+                  ? 'Required input'
+                  : 'Optional; leave empty for the default'}
+            </text>
+          )}
+          value={
+            knob.kind === 'text' && knob.masked
+              ? ''
+              : knob.value === undefined
+                ? ''
+                : String(knob.value)
+          }
+          placeholder={
+            knob.kind === 'text'
+              ? knob.placeholder
+              : `${knob.min ?? ''}-${knob.max ?? ''}`
+          }
+          onCancel={back}
+          onConfirm={(typed) => {
+            if (!active()) return
+            const text = typed.trim()
+            if (!text && knob.required) {
+              api.ui.toast({ message: `${knob.label} is required.` })
+              return
+            }
+            const value =
+              text === '' ? null : knob.kind === 'number' ? Number(text) : text
+            if (
+              knob.kind === 'number' &&
+              typeof value === 'number' &&
+              (!Number.isFinite(value) ||
+                (knob.min !== undefined && value < knob.min) ||
+                (knob.max !== undefined && value > knob.max))
+            ) {
+              api.ui.toast({
+                message: `${knob.label} needs a number in range.`,
+              })
+              return
+            }
+            values[knob.id] = value
+            next(index + 1)
+          }}
+        />
+      ))
+    }
+    next(0)
+  }
+  root()
+}
 
 type ApplyFn = (
   command: OpenDialogPayload['command'],

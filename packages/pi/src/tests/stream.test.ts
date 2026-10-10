@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { loadAccounts, saveAccounts } from '@cortexkit/anthropic-auth-core'
 import {
   buildExplicitBaseMessagesUrl,
   configureApiRouteHeaders,
@@ -11,6 +10,7 @@ import {
   streamCortexKitAnthropic,
 } from '../stream.ts'
 import { normalizeContext } from '../transcript.ts'
+import { readNativePiFixture, saveNativePiFixture } from './native-fixture.ts'
 
 let tempDir: string | undefined
 const originalFetch = globalThis.fetch
@@ -41,11 +41,11 @@ afterEach(async () => {
 })
 
 describe('Pi API fallback routing helpers', () => {
-  test('mints the main account identity when Pi storage omits it', async () => {
+  test('keeps the admitted native main identity without recreating legacy storage', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-main-identity-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         main: { type: 'opencode', provider: 'anthropic' },
@@ -53,7 +53,8 @@ describe('Pi API fallback routing helpers', () => {
       },
       storagePath,
     )
-    expect((await loadAccounts(storagePath))?.mainAccountId).toBeUndefined()
+    const before = (await readNativePiFixture(storagePath)).mainAccountId
+    expect(before).toEqual(expect.any(String))
 
     globalThis.fetch = mock(async (input: string | URL | Request) => {
       const url = input.toString()
@@ -82,16 +83,18 @@ describe('Pi API fallback routing helpers', () => {
       // Drain the provider stream.
     }
 
-    expect((await loadAccounts(storagePath))?.mainAccountId).toEqual(
-      expect.any(String),
-    )
+    expect((await stream.result()).stopReason).toBe('stop')
+    expect((await readNativePiFixture(storagePath)).mainAccountId).toBe(before)
+    await expect(readFile(storagePath, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
   })
 
   test('sends Fable 5.1 thinking binding controls after compacted signed history', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-fable-51-binding-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         main: { type: 'opencode', provider: 'anthropic' },
@@ -271,7 +274,7 @@ describe('Pi API fallback routing helpers', () => {
       tempDir,
       'sticky-routes.json',
     )
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -326,7 +329,7 @@ describe('Pi API fallback routing helpers', () => {
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
     const expires = Date.now() + 5 * 60 * 60_000
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -388,7 +391,7 @@ describe('Pi API fallback routing helpers', () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-killswitch-unknown-quota-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -534,7 +537,7 @@ describe('Pi API fallback routing helpers', () => {
         },
       ],
     })
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -596,6 +599,13 @@ describe('Pi API fallback routing helpers', () => {
             ),
           )
         }
+        if (url.includes('/oauth/token')) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ error: 'invalid_grant' }), {
+              status: 400,
+            }),
+          )
+        }
         if (!url.includes('/v1/messages')) {
           return Promise.resolve(new Response('{}', { status: 200 }))
         }
@@ -655,13 +665,16 @@ describe('Pi API fallback routing helpers', () => {
     for await (const _event of directOpus) {
       // Drain the provider stream.
     }
+    expect((await directOpus.result()).errorMessage).toBeUndefined()
 
+    // The main account’s invalid_grant prevents its reuse. The next Opus
+    // session must select the usable fallback instead of sending the rejected
+    // main credential again.
     expect(authorizations).toEqual([
       'Bearer abundant-access',
       'Bearer abundant-access',
       'Bearer main-access',
       'Bearer abundant-access',
-      'Bearer main-access',
       'Bearer abundant-access',
     ])
   })
@@ -700,7 +713,7 @@ describe('Pi API fallback routing helpers', () => {
         },
       ],
     })
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -807,7 +820,7 @@ describe('Pi API fallback routing helpers', () => {
         },
       ],
     })
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         mainAccountId: 'main-account',
@@ -931,6 +944,10 @@ describe('Pi Anthropic stream content blocks', () => {
   test('preserves redacted thinking for same-model replay', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-redacted-thinking-'))
     process.env.PI_ANTHROPIC_AUTH_FILE = join(tempDir, 'anthropic-auth.json')
+    await saveNativePiFixture(
+      { version: 1, accounts: [] },
+      process.env.PI_ANTHROPIC_AUTH_FILE,
+    )
 
     globalThis.fetch = mock((input: string | URL | Request) => {
       const url =
@@ -985,7 +1002,7 @@ test('Pi 0.86 normalized transcript maps a returned Claude Code tool name back t
   tempDir = await mkdtemp(join(tmpdir(), 'pi-transcript-tool-roundtrip-'))
   const storagePath = join(tempDir, 'anthropic-auth.json')
   process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-  await saveAccounts(
+  await saveNativePiFixture(
     { version: 1, accounts: [], quota: { enabled: false } },
     storagePath,
   )

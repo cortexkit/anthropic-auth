@@ -1,3 +1,4 @@
+import type { CommandDialogPayload } from '@cortexkit/anthropic-auth-core'
 import type { OpenDialogPayload, RpcNotification } from './protocol'
 
 const QUEUE_CAP = 100
@@ -18,11 +19,17 @@ function assertSessionId(sessionId: string): void {
 }
 
 export function pushNotification(
-  payload: OpenDialogPayload,
+  payload: OpenDialogPayload | CommandDialogPayload,
   sessionId: string,
 ): void {
   assertSessionId(sessionId)
-  queue.push({ id: nextId++, type: 'open-dialog', payload, sessionId })
+  if ('menu' in payload) {
+    if (payload.command !== 'claude' || payload.menu.command !== 'claude')
+      throw new TypeError('Only the claude menu is supported')
+    queue.push({ id: nextId++, type: 'open-menu', payload, sessionId })
+  } else {
+    queue.push({ id: nextId++, type: 'open-dialog', payload, sessionId })
+  }
   if (queue.length > QUEUE_CAP) queue = queue.slice(queue.length - QUEUE_CAP)
 }
 

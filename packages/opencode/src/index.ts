@@ -1,10 +1,9 @@
 import { randomUUID } from 'node:crypto'
+import type { NativeRefreshFailure } from '@cortexkit/anthropic-auth-core'
 import {
   type AccountCommandStatusProjection,
   type AccountStorage,
   type ApiKeyAccount,
-  acquireRefreshFileLock,
-  addAccountPersistent,
   applyCustomHeaders,
   assertNotCustodyTombstone,
   authorize,
@@ -12,50 +11,41 @@ import {
   buildClaudeQuotaSummary,
   buildFallbackQuotaSummaries,
   buildPrimeRequestBody,
-  buildRefreshOperationError,
-  CACHE_1H_COMMAND_NAME,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
-  CLAUDE_ACCOUNT_COMMAND_NAME,
-  CLAUDE_CACHE_KEEP_COMMAND_NAME,
-  CLAUDE_DUMP_COMMAND_NAME,
   CLAUDE_FABLE_MYTHOS_5_1_PRICING,
   CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW,
   CLAUDE_FABLE_MYTHOS_5_MAX_OUTPUT_TOKENS,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
   CLAUDE_FABLE_MYTHOS_5_PRICING,
-  CLAUDE_FAST_COMMAND_NAME,
   CLAUDE_HAIKU_4_5_MODEL_ID,
-  CLAUDE_LOGGING_COMMAND_NAME,
+  CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
+  CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING,
+  CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
+  CLAUDE_HAIKU_5_5_MAX_OUTPUT_TOKENS,
+  CLAUDE_HAIKU_5_5_MODEL_ID,
+  CLAUDE_HAIKU_5_5_PRICING,
+  CLAUDE_HAIKU_5_5_RELEASE_DATE,
   CLAUDE_OPUS_5_5_CONTEXT_WINDOW,
   CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS,
   CLAUDE_OPUS_5_5_MODEL_ID,
   CLAUDE_OPUS_5_5_PRICING,
   CLAUDE_OPUS_5_5_RELEASE_DATE,
-  CLAUDE_PRIME_COMMAND_NAME,
-  CLAUDE_QUOTAS_COMMAND_NAME,
-  CLAUDE_ROUTING_COMMAND_NAME,
   CLAUDE_SONNET_5_5_CONTEXT_WINDOW,
   CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
   CLAUDE_SONNET_5_5_MODEL_ID,
   CLAUDE_SONNET_5_5_PRICING,
   CLAUDE_SONNET_5_5_RELEASE_DATE,
-  CLAUDE_START_COMMAND_NAME,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
-  type ClaustrumScopedAttempt,
-  type ClaustrumScopedClient,
-  ClaustrumScopedRuntime,
-  type ClaustrumScopedRuntimeOptions,
   type CustodyStatusState,
-  CustodyTombstoneLoginError,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
-  connectClaustrumScopedClient,
   createEmptyStorage,
+  createNativeAccountRuntime,
   createStickyNoRouteResponse,
+  custodyTombstoneOAuth,
   type DumpHandle,
-  decideScopedRetryAfter401,
   decideStickyQuotaFailure,
   detectClaustrumConnection,
   dumpDirectRequest,
@@ -71,10 +61,8 @@ import {
   executeLoggingCommand,
   executePrimeCommand,
   executeRoutingCommand,
-  FallbackAccountManager,
+  FALLBACK_BACKGROUND_TICK_MS,
   fallbackAccountUuidForLineage,
-  fetchOAuthAccountProfile,
-  fetchOAuthQuotaSnapshot,
   formatEnrollmentStatus,
   formatOAuthAccountTier,
   formatQuotaBackoffMessage,
@@ -83,24 +71,21 @@ import {
   getCache1hMode,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getClaudeCodeIdentityForVerifiedAccount,
   getClaudeFableMythos5ReleaseDate,
   getClaustrumMode,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getHostClaustrumEnrollmentPaths,
   getKillswitchConfig,
-  getOrCreateMainAccountId,
-  getOrCreatePrimeAuthLineageId,
   getPersistedLogLevel,
-  getPersistedMainQuota,
+  getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
-  getRelayConfig,
   getRoutingMode,
+  getScopedQuotaWindowForModel,
   getStickyRoutingStatePath,
   getThinkingPrefixMismatchBehavior,
-  hashRefreshToken,
   type IdentityState,
-  incrementPrimeUsagePersistent,
   isApiKeyAccount,
   isCache1hEnabled,
   isCache1hPersistentlyEnabled,
@@ -110,6 +95,7 @@ import {
   isCacheKeepSubagentsEnabled,
   isClaudeFable51Model,
   isClaudeFableOrMythos51Model,
+  isClaudeHaiku55Model,
   isClaudeOpus5FamilyModel,
   isClaudeOpus5Model,
   isClaudeOpus55Model,
@@ -126,18 +112,24 @@ import {
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
-  KILLSWITCH_COMMAND_NAME,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
-  loadAccounts,
   log,
   logger,
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
-  mergeMainQuotaErrorClearedAt,
-  mergeMainRefreshErrorClearedAt,
+  type NativeAccountRuntimeOptions,
+  type NativeAccountSnapshot,
+  type NativeAccountView,
+  type NativeCustodyClient,
+  type NativeCustodyReceipt,
+  type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
+  type NativeMenuDispatch,
+  type NativeUiOptions,
+  nativeMigrationAuthorityPhase,
   normalizeQuotaHeaders,
   type OAuthAccount,
+  type OAuthAccountProfile,
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   oauthProfileMatchesIdentity,
@@ -156,8 +148,6 @@ import {
   parseLoggingCommandAction,
   parsePrimeCommandAction,
   parseRoutingCommandAction,
-  persistFallbackQuotaHeaderPersistent,
-  primeStorageFingerprint,
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
   type QuotaEntry,
@@ -171,36 +161,19 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   readClaustrumEnrollmentStatus,
+  readNativeMigrationJournal,
   refreshBackoffActive,
-  refreshClaudeOAuthToken,
   remapRequestBodyModel,
-  removeAccountPersistent,
-  reorderAccountsPersistent,
   resetClaustrumEnrollmentState,
-  resolveClaudeCodeIdentity,
+  resolveNativePoolPaths,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
   StickySessionRouter,
-  saveAccountState,
-  saveOAuthProfileState,
   sendViaRelay,
-  setAccountEnabledPersistent,
-  setCache1hPersistentEnabled,
-  setCache1hPersistentMode,
   setCache1hState,
-  setCacheKeepPersistentAlways,
-  setCacheKeepPersistentEnabled,
-  setCacheKeepPersistentWindow,
-  setCacheKeepSubagentsEnabled,
   setDumpEnabled,
-  setDumpPersistentEnabled,
   setFastModeEnabled,
-  setFastModePersistentEnabled,
-  setKillswitchPersistent,
   setLogLevel,
-  setLogLevelPersistent,
-  setPrimePersistentEnabled,
-  setRoutingMode,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
   stickyRouteFamilyForModel,
@@ -208,6 +181,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
+import type { Model as ProviderModelV2 } from '@opencode-ai/sdk/v2'
 import {
   BILLING_LINEAGE_REQUEST_HEADER,
   BillingLineageTracker,
@@ -234,7 +208,6 @@ import {
 } from './custody-dimensions.ts'
 import {
   CustodyStateMismatchError,
-  OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
   reconcileCustodyStartup,
 } from './custody-mode.ts'
 import {
@@ -255,6 +228,7 @@ import {
   LANE_START_REQUEST_HEADER,
   LaneStartTracker,
 } from './lane-start.ts'
+import { createNativeCommand } from './native-command.js'
 import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
@@ -366,15 +340,10 @@ function trailingAssistantHistoryFailureResponse(
 }
 const MAIN_AUTH_REFRESH_TICK_MS = 60_000
 const MAIN_AUTH_REFRESH_TICK_JITTER_MS = 60_000
-const CONCURRENT_MAIN_REFRESH_WAIT_MS = 5_000
-const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 200
 const MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES = 240
 const DEFAULT_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES =
   MIN_MAIN_REFRESH_BEFORE_EXPIRY_MINUTES
 const SIDEBAR_ROUTING_FRESH_MS = 10 * 60 * 1000
-// OpenCode creates one plugin instance per project, but those instances share
-// the same host OAuth credential and account sidecar within a server process.
-const mainAccessRefreshesByStoragePath = new Map<string, Promise<string>>()
 
 function hasEnabledOAuthAccount(
   storage: AccountStorage | null,
@@ -460,7 +429,7 @@ async function resolveFreshSidebarRouting(
 }
 
 async function resolveInitialSidebarRouting(
-  accountStoragePath: string,
+  loadStorage: () => Promise<AccountStorage | null>,
 ): Promise<{
   activeId: string | undefined
   route: string
@@ -469,7 +438,7 @@ async function resolveInitialSidebarRouting(
   await getInitialSidebarRoutingTestHooks()?.beforeStorageLoad?.()
   let freshStorage: AccountStorage | null
   try {
-    freshStorage = await loadAccounts(accountStoragePath)
+    freshStorage = await loadStorage()
   } catch {
     return { activeId: 'main', route: 'main', freshStorage: null }
   } finally {
@@ -722,23 +691,27 @@ async function sendIgnoredMessage(
 }
 
 function cleanAbort(): never {
-  // OpenCode currently has no handled/cancel return contract for
-  // command.execute.before. Throw an Error for legacy hosts, but duck-type an
-  // Effect HttpServerResponse.empty({ status: 204 }) so OpenCode 1.17+ treats
-  // handled slash commands as a clean no-content response instead of logging a
-  // plugin error.
-  const sentinel = new Error(HANDLED_SENTINEL) as Error &
-    Record<string, unknown>
-  sentinel[HTTP_SERVER_RESPONSE_TYPE_ID] = HTTP_SERVER_RESPONSE_TYPE_ID
-  sentinel[ERROR_REPORTER_IGNORE] = true
-  sentinel.status = 204
-  sentinel.statusText = undefined
-  sentinel.headers = {}
-  sentinel.cookies = {
-    [HTTP_COOKIES_TYPE_ID]: HTTP_COOKIES_TYPE_ID,
-    cookies: {},
-  }
-  sentinel.body = { [HTTP_BODY_TYPE_ID]: HTTP_BODY_TYPE_ID, _tag: 'Empty' }
+  // OpenCode has no return value that says "this slash command was handled"
+  // in command.execute.before, so the plugin throws. Older hosts only see an
+  // Error. OpenCode 1.17+ recognises the fields below as Effect's empty HTTP
+  // response (status 204, body tag `Empty`) and answers the command with no
+  // content; the reporter-ignore marker keeps Effect's error reporter from
+  // logging the handled command as a plugin failure.
+  // The fields are set while the error is built rather than assigned
+  // afterwards, because Effect's typing of the global Error makes the
+  // reporter-ignore marker read-only.
+  const sentinel = Object.assign(new Error(HANDLED_SENTINEL), {
+    [HTTP_SERVER_RESPONSE_TYPE_ID]: HTTP_SERVER_RESPONSE_TYPE_ID,
+    [ERROR_REPORTER_IGNORE]: true,
+    status: 204,
+    statusText: undefined,
+    headers: {},
+    cookies: {
+      [HTTP_COOKIES_TYPE_ID]: HTTP_COOKIES_TYPE_ID,
+      cookies: {},
+    },
+    body: { [HTTP_BODY_TYPE_ID]: HTTP_BODY_TYPE_ID, _tag: 'Empty' },
+  })
   throw sentinel
 }
 
@@ -797,6 +770,7 @@ type MainQuotaIdentityBinding = {
   quotaKey: string | undefined
   providerAccountUuid?: ProviderAccountUuid
   generation: number
+  routingLineage?: string
 }
 
 type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
@@ -805,12 +779,23 @@ type MainQuotaIdentityResolution = MainQuotaIdentityBinding & {
   state: CustodyStatusState
 }
 
+const HEADER_ROUTING_OBSERVATION_LIMIT = 1000
+
+type HeaderRoutingObservation = {
+  lineage: string
+  accountUuid: string
+  entry: QuotaEntry
+  generalExhausted: boolean
+}
+
 type ServedQuotaHeaders = {
   accountId: 'main' | string
   accessToken: string
   authLineageId?: string
   anthropicAccountUuid?: ProviderAccountUuid | null
   mainQuotaIdentity?: MainQuotaIdentityBinding
+  localSubject?: NativeKnownCredentialSubject
+  scopedAttempt?: NativeCustodyReceipt
 }
 
 function asProviderAccountUuid(
@@ -888,6 +873,31 @@ type AnthropicProviderModel = {
   [key: string]: unknown
 }
 
+function haiku55ModelCost(): ProviderModelV2['cost'] {
+  return {
+    input: CLAUDE_HAIKU_5_5_PRICING.input,
+    output: CLAUDE_HAIKU_5_5_PRICING.output,
+    cache: {
+      read: CLAUDE_HAIKU_5_5_PRICING.cacheRead,
+      write: CLAUDE_HAIKU_5_5_PRICING.cacheWrite5m,
+    },
+    tiers: [
+      {
+        tier: {
+          type: 'context',
+          size: CLAUDE_HAIKU_5_5_LONG_CONTEXT_THRESHOLD,
+        },
+        input: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.input,
+        output: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.output,
+        cache: {
+          read: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.cacheRead,
+          write: CLAUDE_HAIKU_5_5_LONG_CONTEXT_PRICING.cacheWrite5m,
+        },
+      },
+    ],
+  }
+}
+
 function addNativeClaudeModels<
   T extends Record<string, AnthropicProviderModel>,
 >(models: T) {
@@ -935,6 +945,32 @@ function addNativeClaudeModels<
         ]
       }),
     ),
+    ...(models[CLAUDE_HAIKU_5_5_MODEL_ID]
+      ? {}
+      : {
+          [CLAUDE_HAIKU_5_5_MODEL_ID]: {
+            ...base,
+            id: CLAUDE_HAIKU_5_5_MODEL_ID,
+            name: 'Claude Haiku 5.5',
+            api: base.api
+              ? { ...base.api, id: CLAUDE_HAIKU_5_5_MODEL_ID }
+              : undefined,
+            cost: haiku55ModelCost(),
+            limit: {
+              ...(base.limit ?? {}),
+              context: CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
+              output: CLAUDE_HAIKU_5_5_MAX_OUTPUT_TOKENS,
+            },
+            capabilities: {
+              ...(base.capabilities ?? {}),
+              reasoning: true,
+              attachment: true,
+              toolcall: true,
+            },
+            release_date: CLAUDE_HAIKU_5_5_RELEASE_DATE,
+            variants: createNativeAdaptiveEffortVariants(),
+          },
+        }),
     ...(models[CLAUDE_SONNET_5_5_MODEL_ID]
       ? {}
       : {
@@ -1034,7 +1070,8 @@ function applyNativeAdaptiveEffortVariants<
         id,
         isClaudeOpus5FamilyModel(modelId) ||
         isClaudeFable51Model(modelId) ||
-        isClaudeSonnet55Model(modelId)
+        isClaudeSonnet55Model(modelId) ||
+        isClaudeHaiku55Model(modelId)
           ? { ...model, variants: createNativeAdaptiveEffortVariants() }
           : model,
       ]
@@ -1060,7 +1097,8 @@ type PluginRuntimeOverrides = Partial<{
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
   scopedRosterPollIntervalMs: number
-  claustrumScopedConnect: () => Promise<ClaustrumScopedClient>
+  claustrumScopedConnect: () => Promise<NativeCustodyClient>
+  nativeLocal: NativeAccountRuntimeOptions['local']
   cacheKeepAggregateRefreshIntervalMs: number
 }>
 
@@ -1141,14 +1179,307 @@ const anthropicAuthPlugin = async (
     return entry
   }
 
-  let initialStorage: AccountStorage | null
-  try {
-    initialStorage = await loadAccounts(accountStoragePath)
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`Failed to load account store: ${message}`, {
-      cause: error instanceof Error ? error : undefined,
+  const nativePaths = await resolveNativePoolPaths(accountStoragePath)
+  const nativeAccounts = createNativeAccountRuntime({
+    paths: nativePaths,
+    host: 'opencode',
+    local: runtimeOverrides.nativeLocal,
+    vault: runtimeOverrides.claustrumScopedConnect
+      ? { connect: runtimeOverrides.claustrumScopedConnect }
+      : undefined,
+  })
+  // Routing may use received headers before disk publication, but only for
+  // the current account and credential epoch. Display and cache publication
+  // continue through the guarded writer below; this map contains no tokens.
+  const headerRoutingObservations = new Map<string, HeaderRoutingObservation>()
+  let headerRoutingPolicyStorage: AccountStorage | null = null
+  function localHeaderRoutingLineage(binding: NativeAccountView['binding']) {
+    return binding?.identity
+      ? JSON.stringify([
+          binding.storageId,
+          binding.rowId,
+          binding.credentialEpoch,
+          binding.identity,
+        ])
+      : undefined
+  }
+  function headerRoutingLineage(
+    subject: NativeKnownCredentialSubject | undefined,
+    receipt?: NativeCustodyReceipt,
+  ) {
+    return subject
+      ? localHeaderRoutingLineage(subject.binding)
+      : receipt
+        ? JSON.stringify([
+            receipt.credentialId,
+            receipt.accountIdentity,
+            receipt.recordVersion,
+          ])
+        : undefined
+  }
+  function currentHeaderRoutingObservation(
+    accountId: string,
+    lineage: string | undefined,
+    accountUuid: string | undefined,
+    storage: AccountStorage | null = headerRoutingPolicyStorage,
+  ) {
+    const observation = headerRoutingObservations.get(accountId)
+    if (
+      !observation ||
+      !lineage ||
+      observation.lineage !== lineage ||
+      observation.accountUuid !== accountUuid ||
+      getQuotaNextRefreshAt(
+        observation.entry.quota,
+        storage,
+        observation.entry.checkedAt,
+      ) <= Date.now()
+    )
+      return undefined
+    return observation
+  }
+  function routingQuotaEntry(
+    accountId: string,
+    lineage: string | undefined,
+    accountUuid: string | undefined,
+    committed: QuotaEntry | null | undefined,
+    storage: AccountStorage | null = headerRoutingPolicyStorage,
+  ) {
+    const observation = currentHeaderRoutingObservation(
+      accountId,
+      lineage,
+      accountUuid,
+      storage,
+    )
+    if (!observation) return committed
+    if (!committed)
+      return {
+        ...observation.entry,
+        refreshAfter: getQuotaNextRefreshAt(
+          observation.entry.quota,
+          storage,
+          observation.entry.checkedAt,
+        ),
+      }
+    const quota = mergeHeaderQuotaForPersistence(
+      committed.quota,
+      observation.entry.quota,
+    )
+    return {
+      ...observation.entry,
+      quota,
+      refreshAfter: getQuotaNextRefreshAt(
+        quota,
+        storage,
+        quotaSnapshotCheckedAt(quota),
+      ),
+    }
+  }
+  function routingAccountQuota(
+    account: NativeAccountView,
+    storage: AccountStorage,
+    receipt?: NativeCustodyReceipt,
+  ) {
+    if (!headerRoutingObservations.has(account.id)) return account.quota
+    const lineage = account.binding
+      ? localHeaderRoutingLineage(account.binding)
+      : headerRoutingLineage(undefined, receipt)
+    const checkedAt = quotaSnapshotCheckedAt(account.quota)
+    return routingQuotaEntry(
+      account.id,
+      lineage,
+      account.accountIdentity,
+      account.quota
+        ? {
+            quota: account.quota,
+            checkedAt,
+            refreshAfter: getQuotaNextRefreshAt(
+              account.quota,
+              storage,
+              checkedAt,
+            ),
+          }
+        : null,
+      storage,
+    )?.quota
+  }
+  let mainQuotaCredentialEpoch:
+    | { rowId: string; credentialEpoch: number }
+    | undefined
+  // The AccountStorage-shaped projection supplies quota, settings, and account
+  // metadata to routing and display code. It contains no OAuth access/refresh
+  // tokens or API keys; credential material comes only from native authorization.
+  async function loadAccounts(
+    path = accountStoragePath,
+  ): Promise<AccountStorage | null> {
+    if (path !== accountStoragePath)
+      throw new Error('Native account storage mismatch')
+    const snapshot = await nativeAccounts.read()
+    headerRoutingPolicyStorage = snapshot.policyStorage
+    if (!mainQuotaCredentialEpoch) {
+      const binding = snapshot.accounts.find(
+        (account) => account.id === 'main',
+      )?.binding
+      if (binding)
+        mainQuotaCredentialEpoch = {
+          rowId: binding.rowId,
+          credentialEpoch: binding.credentialEpoch,
+        }
+    }
+    if (
+      snapshot.mode !== 'claustrum' ||
+      !snapshot.accounts.some((account) => account.source === 'vault')
+    )
+      return snapshot.policyStorage
+    const primary = snapshot.accounts.find(
+      (account) => account.id === 'main' && account.source === 'vault',
+    )
+    const primaryUuid = asProviderAccountUuid(primary?.accountIdentity)
+    // Routing uses scopedRoster to identify a discovered vault account pool.
+    // Derive it from native account rows, not legacy config. This is routing
+    // metadata only; each physical send obtains a fresh vault credential.
+    return {
+      ...snapshot.policyStorage,
+      claustrum: {
+        ...snapshot.policyStorage.claustrum,
+        mode: 'claustrum',
+        scopedRoster: true,
+        primaryAccount:
+          primary?.credentialId && primaryUuid
+            ? {
+                credentialId: primary.credentialId,
+                accountId: primaryUuid,
+                state: primary.state ?? 'cold',
+              }
+            : undefined,
+      },
+    }
+  }
+  async function updateNativeSection(
+    section:
+      | 'claudeCache'
+      | 'cacheKeep'
+      | 'dump'
+      | 'claudeFast'
+      | 'logging'
+      | 'prime'
+      | 'routing'
+      | 'killswitch',
+    patch: Record<string, unknown>,
+  ) {
+    await nativeAccounts.updateSettings((settings) => {
+      const previous = settings[section]
+      return {
+        ...settings,
+        [section]: {
+          ...(previous &&
+          typeof previous === 'object' &&
+          !Array.isArray(previous)
+            ? previous
+            : {}),
+          ...patch,
+        },
+      }
     })
+    return loadAccounts()
+  }
+  function plainSettingsSection(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {}
+  }
+  // Turning the cache on or off also records the effective strategy, as the
+  // standalone cache command always did: a pool without a stored mode is
+  // saved as { enabled, mode: 'explicit' } instead of leaving mode implicit.
+  const setCache1hPersistentEnabled = async (enabled: boolean) => {
+    await nativeAccounts.updateSettings((settings) => ({
+      ...settings,
+      claudeCache: {
+        ...plainSettingsSection(settings.claudeCache),
+        enabled,
+        mode: getCache1hPersistentMode({
+          ...settings,
+          version: 1,
+          accounts: [],
+        }),
+      },
+    }))
+    return loadAccounts()
+  }
+  const setCache1hPersistentMode = (
+    mode: NonNullable<AccountStorage['claudeCache']>['mode'],
+  ) => updateNativeSection('claudeCache', { mode })
+  const setCacheKeepPersistentEnabled = (enabled: boolean) =>
+    updateNativeSection('cacheKeep', { enabled })
+  // An always-on schedule has no hour bounds. Leaving a previous window's
+  // startHour/endHour behind would revive that window as soon as anything
+  // reads the hours without first checking `always`.
+  const setCacheKeepPersistentAlways = async () => {
+    await nativeAccounts.updateSettings((settings) => {
+      const {
+        startHour: _startHour,
+        endHour: _endHour,
+        ...rest
+      } = plainSettingsSection(settings.cacheKeep)
+      return {
+        ...settings,
+        cacheKeep: { ...rest, enabled: true, always: true },
+      }
+    })
+    return loadAccounts()
+  }
+  const setCacheKeepPersistentWindow = (startHour: number, endHour: number) =>
+    updateNativeSection('cacheKeep', {
+      enabled: true,
+      always: false,
+      startHour,
+      endHour,
+    })
+  const setCacheKeepSubagentsEnabled = (subagents: boolean) =>
+    updateNativeSection('cacheKeep', { subagents })
+  const setDumpPersistentEnabled = (enabled: boolean) =>
+    updateNativeSection('dump', { enabled })
+  const setFastModePersistentEnabled = (enabled: boolean) =>
+    updateNativeSection('claudeFast', { enabled })
+  // Stores the level, then aligns this process's live logger level with it.
+  const setLogLevelPersistent = async (
+    level: NonNullable<NonNullable<AccountStorage['logging']>['level']>,
+  ) => {
+    await nativeAccounts.setLoggingLevel(level)
+    return loadAccounts()
+  }
+  const setPrimePersistentEnabled = (
+    enabled: boolean,
+    _path = accountStoragePath,
+  ) => updateNativeSection('prime', { enabled })
+  const setRoutingMode = (
+    mode: NonNullable<AccountStorage['routing']>['mode'],
+    _path = accountStoragePath,
+  ) => updateNativeSection('routing', { mode })
+  const setKillswitchPersistent = (
+    killswitch: NonNullable<AccountStorage['killswitch']>,
+  ) => updateNativeSection('killswitch', killswitch)
+  const setAccountEnabledPersistent = (
+    routeId: string,
+    enabled: boolean,
+    _path = accountStoragePath,
+  ) => nativeAccounts.setEnabled(routeId, enabled)
+  const removeAccountPersistent = (
+    routeId: string,
+    _path = accountStoragePath,
+  ) => nativeAccounts.remove(routeId)
+  const reorderAccountsPersistent = (
+    routeIds: string[],
+    _path = accountStoragePath,
+    movedRouteId?: string,
+  ) => nativeAccounts.reorder(routeIds, movedRouteId)
+
+  let initialStorage: AccountStorage | null = null
+  let nativeStartupError: unknown
+  try {
+    initialStorage = await loadAccounts()
+  } catch (error) {
+    nativeStartupError = error
   }
   function isScopedCustodyActive(
     storage: AccountStorage | null | undefined,
@@ -1159,53 +1490,229 @@ const anthropicAuthPlugin = async (
         storage.claustrum?.scopedRoster === true,
     )
   }
-
-  const openCodeScopedRuntimes = new Map<string, ClaustrumScopedRuntime>()
-
   function getOpenCodeScopedRuntime(
     storagePath = accountStoragePath,
-    ctxDirectory = ctx.directory,
-    overrides: Partial<ClaustrumScopedRuntimeOptions> = {},
-  ): ClaustrumScopedRuntime {
-    let runtime = openCodeScopedRuntimes.get(storagePath)
-    if (!runtime) {
-      const identity = {
-        project_root: ctxDirectory ?? process.cwd(),
-        harness: 'opencode',
-        session: `store-${primeStorageFingerprint(storagePath)}`,
-      }
-      runtime = new ClaustrumScopedRuntime({
-        storagePath,
-        tokenPath: getHostClaustrumEnrollmentPaths('opencode').tokenPath,
-        connect: () =>
-          runtimeOverrides.claustrumScopedConnect
-            ? runtimeOverrides.claustrumScopedConnect()
-            : connectClaustrumScopedClient({
-                storagePath,
-                identity,
-                ...(getConfiguredClaustrumConnectionFile() && {
-                  connectionFile: getConfiguredClaustrumConnectionFile(),
-                }),
-              }),
-        pollIntervalMs: runtimeOverrides.scopedRosterPollIntervalMs ?? 2000,
-        onRoster: async () => {
-          await fallbackManager.refreshQuotaForDueAccounts().catch(() => {})
-          await refreshSidebarQuota().catch(() => {})
-        },
-        ...overrides,
-      })
-      openCodeScopedRuntimes.set(storagePath, runtime)
+    _ctxDirectory = ctx.directory,
+  ) {
+    if (storagePath !== accountStoragePath)
+      throw new Error('Native vault storage mismatch')
+    return nativeAccounts.vault
+  }
+  function closeOpenCodeScopedRuntime(_storagePath = accountStoragePath): void {
+    nativeAccounts.close()
+  }
+
+  function assertNativeEnvironment() {
+    if (process.env.OPENCODE_AUTH_CONTENT !== undefined)
+      throw new Error(
+        'Native OAuth cannot serve while OPENCODE_AUTH_CONTENT is set',
+      )
+  }
+  type NativeOAuthAuthorization = {
+    accessToken: string
+    expires?: number
+    accountIdentity?: string
+    localSubject?: NativeKnownCredentialSubject
+    localSource?: 'current' | 'validated' | 'rotated' | 'adopted'
+    scopedAttempt?: NativeCustodyReceipt
+  }
+  function nativeWireIdentity(accountIdentity: string | undefined) {
+    const accountUuid = asProviderAccountUuid(accountIdentity)
+    if (!accountUuid)
+      throw new Error(
+        'Native wire identity requires an admitted provider account',
+      )
+    // Credential checks already verified the Anthropic account UUID. Use it
+    // for both the device identity cache key and the request's account metadata,
+    // without another bootstrap request carrying an earlier access token.
+    return getClaudeCodeIdentityForVerifiedAccount(accountUuid, accountUuid)
+  }
+  class NativeModelPolicyError extends Error {
+    constructor(
+      readonly account: NativeAccountView,
+      readonly checkIntervalMs: number,
+    ) {
+      super(
+        'OAuth account cannot serve the requested model under current quota policy',
+      )
     }
-    return runtime
+  }
+  class NativeUnsupportedCredentialError extends Error {
+    constructor() {
+      super(
+        'Native OAuth requires a Claude Pro/Max credential. An API key belongs in OpenCode stock Anthropic authentication.',
+      )
+    }
+  }
+  class NativeCredentialUnavailableError extends Error {
+    constructor(
+      readonly account: NativeAccountView,
+      status: string,
+      readonly tokenRefreshFailed = false,
+      readonly failure?: NativeRefreshFailure,
+    ) {
+      super(
+        failure?.kind === 'provider' && failure.status !== undefined
+          ? `Claude OAuth refresh failed: ${failure.status} — ${failure.classification === 'invalid-grant' ? 'invalid_grant' : 'OAuth operation failed'}`
+          : `Native OAuth authorization refused: ${status}`,
+      )
+    }
+  }
+  async function authorizeOAuth(
+    routeId: string,
+    signal?: AbortSignal,
+    rejectedAccessToken?: string,
+    modelId?: string,
+    intent: 'serve' | 'refresh' | 'last-main' = 'serve',
+    accountSnapshot?: NativeAccountSnapshot,
+  ): Promise<NativeOAuthAuthorization> {
+    assertNativeEnvironment()
+    signal?.throwIfAborted()
+    const snapshot = accountSnapshot ?? (await nativeAccounts.read())
+    const account = snapshot.accounts.find(
+      (candidate) => candidate.id === routeId,
+    )
+    if (account?.state === 'unsupported-access')
+      throw new NativeUnsupportedCredentialError()
+    if (account?.type !== 'oauth' || !account.enabled) {
+      throw new Error('Native OAuth account is unavailable')
+    }
+    const checkModelPolicy = (
+      view: NativeAccountView,
+      storage: AccountStorage,
+      receipt?: NativeCustodyReceipt,
+    ) => {
+      const quota = routingAccountQuota(view, storage, receipt)
+      // Ordered routing can try main after eligible fallbacks are exhausted.
+      // A cached scoped limit must not remove that final provider attempt;
+      // explicit killswitch limits still block it before dispatch.
+      const lastMainAttempt =
+        intent === 'last-main' &&
+        routeId === 'main' &&
+        getRoutingMode(storage) !== 'sticky-balanced'
+      if (
+        modelId &&
+        ((isKillswitchEnabled(storage) &&
+          !killswitchPassesPolicy(
+            quota,
+            storage,
+            routeId === 'main' ? undefined : routeId,
+            modelId,
+          )) ||
+          (!lastMainAttempt && !quotaSnapshotPassesModelScope(quota, modelId)))
+      )
+        throw new NativeModelPolicyError(view, getQuotaCheckIntervalMs(storage))
+    }
+    checkModelPolicy(account, snapshot.policyStorage)
+    let result: NativeOAuthAuthorization
+    if (account.source === 'vault') {
+      const receipt = await nativeAccounts.authorizeVault(routeId, signal)
+      result = {
+        accessToken: receipt.accessToken,
+        expires: receipt.expiresAtMs ?? undefined,
+        accountIdentity: receipt.accountIdentity,
+        scopedAttempt: receipt,
+      }
+    } else {
+      const authorization = await nativeAccounts.authorizeLocal(routeId, {
+        signal,
+        rejectedAccessToken,
+        intent: rejectedAccessToken
+          ? 'refresh'
+          : intent === 'last-main'
+            ? 'serve'
+            : intent,
+      })
+      if (authorization.status !== 'usable')
+        throw new NativeCredentialUnavailableError(
+          account,
+          authorization.status,
+          authorization.status === 'failed' &&
+            authorization.failure.kind === 'provider',
+          authorization.status === 'failed' ? authorization.failure : undefined,
+        )
+      result = {
+        accessToken: authorization.access,
+        expires: authorization.expires,
+        accountIdentity: authorization.binding.identity,
+        localSubject: authorization.subject,
+        localSource: authorization.source,
+      }
+    }
+    // Concurrent requests can share token refresh while using different models.
+    // After authorization waits, recheck that the account is still enabled and
+    // that this request's model quota and killswitch rules still permit sending.
+    const current = await nativeAccounts.read()
+    const selected = current.accounts.find(
+      (candidate) => candidate.id === routeId,
+    )
+    if (signal?.aborted) throw signal.reason ?? new Error('Request aborted')
+    if (
+      !selected?.enabled ||
+      selected.source !== account.source ||
+      selected.accountIdentity !== result.accountIdentity
+    )
+      throw new Error('Native OAuth account changed before dispatch')
+    if (
+      result.localSubject &&
+      (!selected.binding ||
+        selected.binding.storageId !== result.localSubject.binding.storageId ||
+        selected.binding.rowId !== result.localSubject.binding.rowId ||
+        selected.binding.credentialEpoch !==
+          result.localSubject.binding.credentialEpoch ||
+        selected.binding.identity !== result.localSubject.binding.identity)
+    )
+      throw new Error('Native local account binding changed before dispatch')
+    if (
+      result.scopedAttempt &&
+      selected.credentialId !== result.scopedAttempt.credentialId
+    )
+      throw new Error('Native vault credential binding changed before dispatch')
+    checkModelPolicy(selected, current.policyStorage, result.scopedAttempt)
+    return result
   }
 
-  function closeOpenCodeScopedRuntime(storagePath = accountStoragePath): void {
-    openCodeScopedRuntimes.get(storagePath)?.close()
-    openCodeScopedRuntimes.delete(storagePath)
+  async function resetNativeBackoff(routeId: string, signal?: AbortSignal) {
+    const snapshot = await nativeAccounts.read()
+    const account = snapshot.accounts.find(
+      (candidate) => candidate.id === routeId,
+    )
+    if (account?.type !== 'oauth')
+      throw new Error('Native OAuth account is unavailable')
+    const fence =
+      account.source === 'vault'
+        ? await nativeAccounts.authorizeVault(routeId, signal)
+        : await nativeAccounts.captureLocalSubject(routeId)
+    if (!(await nativeAccounts.resetBackoff(routeId, fence)))
+      throw new Error('Native reset fence changed')
   }
-
-  if (isScopedCustodyActive(initialStorage)) {
-    getOpenCodeScopedRuntime(accountStoragePath, ctx.directory).start()
+  const nativeLocalRefreshFailures = new WeakMap<Response, unknown>()
+  const reportedVault401 = new WeakSet<NativeCustodyReceipt>()
+  async function reportVault401(
+    receipt: NativeCustodyReceipt,
+    source: 'direct' | 'relay_status_field',
+  ) {
+    if (reportedVault401.has(receipt)) return
+    reportedVault401.add(receipt)
+    await nativeAccounts.vault.reportFailure(receipt, 401, source).catch(() => {
+      logger.warn('claustrum', 'native auth-failure report unavailable')
+    })
+  }
+  // Re-authorize after a 401 before anything is reported. When the vault admits
+  // a strictly newer version of the same credential and account, the served
+  // version is obsolete: the caller replays once and reports only the receipt
+  // whose response is final. A refusal leaves the served receipt final.
+  async function prepareVaultRetry(
+    receipt: NativeCustodyReceipt,
+    site: 'model' | 'model-relay' | 'cachekeep' | 'prime',
+    signal?: AbortSignal,
+  ) {
+    const result = await nativeAccounts.vault.prepareRetry(
+      receipt,
+      signal,
+      site,
+    )
+    return result.retry ? result.receipt : undefined
   }
 
   const fallbackMode = resolveContentFilterFallbackMode(
@@ -1229,152 +1736,92 @@ const anthropicAuthPlugin = async (
       process.env.OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE ||
       getStickyRoutingStatePath(accountStoragePath),
   })
-  const persistFallbackQuotaError = async (
-    accountId: string,
-    error: NonNullable<OAuthAccount['lastQuotaRefreshError']>,
-  ) => {
-    try {
-      const storage = await loadAccounts(accountStoragePath)
-      const account = storage?.accounts.find(
-        (candidate): candidate is OAuthAccount =>
-          candidate.id === accountId && isOAuthAccount(candidate),
-      )
-      if (!storage || !account) return
-      if (
-        account.lastQuotaRefreshError?.checkedAt !== undefined &&
-        account.lastQuotaRefreshError.checkedAt > error.checkedAt
-      ) {
-        return
-      }
-      if (quotaSnapshotCheckedAt(account.quota) > error.checkedAt) return
-      account.lastQuotaRefreshError = error
-      await saveAccountState(storage, accountStoragePath, {
-        accounts: [accountId],
-      })
-    } catch (caught) {
-      logger.warn('quota', 'failed to persist fallback backoff state', {
-        accountId,
-        error: caught instanceof Error ? caught.message : String(caught),
-      })
-    }
-  }
+  // The runtime stores quota readings for the account and tokens used to fetch
+  // them. QuotaManager caches those readings and when they were checked.
+  // A failed poll supplies no exhaustion evidence and cannot prove that a
+  // rejected refresh token became usable, so it must not clear refresh errors.
   const quotaManager = new QuotaManager({
     storage: initialStorage,
-    fetchQuotaSnapshot: async (request) => {
-      const storage = await loadAccounts(accountStoragePath)
-      if (getClaustrumMode(storage) === 'claustrum') {
-        if (!isScopedCustodyActive(storage))
-          throw new Error('Claustrum scoped custody setup is incomplete')
-        const runtime = getOpenCodeScopedRuntime(
-          accountStoragePath,
-          ctx.directory,
-        )
-        const routeId = request.kind === 'main' ? 'main' : request.accountId
-        if (!routeId)
-          throw new Error('Claustrum quota request has no account identity')
-        return runtime.fetchQuota(routeId)
-      }
-      return fetchOAuthQuotaSnapshot({
-        accessToken: request.accessToken,
-      })
+    fetchQuotaSnapshot: (request) => {
+      assertNativeEnvironment()
+      const routeId = request.kind === 'main' ? 'main' : request.accountId
+      if (!routeId) throw new Error('Quota request has no account identity')
+      return nativeAccounts.fetchQuota(routeId)
     },
-    onMainQuotaFetched: async (
-      quota,
-      checkedAt,
-      tokenFingerprint,
-      fetchStartedAt,
-      quotaErrorGeneration,
-      quotaErrorClearedAt,
-    ) => {
-      try {
-        const storage =
-          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
-        const persisted = getPersistedMainQuota(storage)
-        if (
-          persisted &&
-          persisted.checkedAt >= fetchStartedAt &&
-          getQuotaNextRefreshAt(persisted.quota, storage, persisted.checkedAt) >
-            Date.now()
-        ) {
-          quotaManager.seedMainFromStorage(storage, mainQuotaAccountId)
-          return
-        }
-        storage.quota = storage.quota ?? {}
-        storage.quota.mainQuota = quota
-        storage.quota.mainQuotaCheckedAt = checkedAt
-        storage.quota.mainQuotaToken = tokenFingerprint
-        storage.quota.mainLastQuotaApiError = undefined
-        storage.quota.mainQuotaErrorGeneration = quotaErrorGeneration
-        storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
-          storage.quota.mainQuotaErrorClearedAt,
-          quotaErrorClearedAt,
-        )
-        await saveAccountState(storage, accountStoragePath, { mainQuota: true })
-      } catch (error) {
-        logger.warn('quota', 'failed to persist main quota', {
-          error: error instanceof Error ? error.message : String(error),
-        })
-      }
-    },
-    onApiError: async (error, quotaErrorGeneration) => {
-      try {
-        const storage =
-          (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
-        storage.quota = storage.quota ?? {}
-        storage.quota.mainLastQuotaApiError = error
-        storage.quota.mainQuotaErrorGeneration = quotaErrorGeneration
-        await saveAccountState(storage, accountStoragePath, { mainQuota: true })
-      } catch (e) {
-        logger.warn('quota', 'failed to persist backoff state', {
-          error: e instanceof Error ? e.message : String(e),
-        })
-      }
-    },
-    onFallbackQuotaFetched: async (
-      accountId,
-      quota,
-      _checkedAt,
-      fetchStartedAt,
-    ) => {
-      try {
-        const storage = await loadAccounts(accountStoragePath)
-        const account = storage?.accounts.find(
-          (candidate): candidate is OAuthAccount =>
-            candidate.id === accountId && isOAuthAccount(candidate),
-        )
-        if (!storage || !account) return
-        const persistedCheckedAt = quotaSnapshotCheckedAt(account.quota)
-        if (
-          persistedCheckedAt >= fetchStartedAt &&
-          getQuotaNextRefreshAt(account.quota, storage, persistedCheckedAt) >
-            Date.now()
-        ) {
-          quotaManager.seedFallbacksFromAccounts(
-            storage.accounts.filter(isOAuthAccount),
-          )
-          return
-        }
-        if (
-          account.lastQuotaRefreshError?.checkedAt !== undefined &&
-          account.lastQuotaRefreshError.checkedAt > fetchStartedAt
-        ) {
-          return
-        }
-        account.quota = quota
-        account.lastQuotaRefreshError = undefined
-        await saveAccountState(storage, accountStoragePath, {
-          accounts: [accountId],
-        })
-      } catch (error) {
-        logger.warn('quota', 'failed to persist fallback quota', {
-          accountId,
-          error: error instanceof Error ? error.message : String(error),
-        })
-      }
-    },
-    onFallbackApiError: persistFallbackQuotaError,
   })
-
+  function quotaSnapshotIsExhausted(
+    quota: OAuthQuotaSnapshot | null | undefined,
+  ) {
+    return (['five_hour', 'seven_day'] as const).some(
+      (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
+    )
+  }
+  // Account-wide provider waits precede token acquisition in ordered routing.
+  // Model-scoped readings retain their separate last-main policy; permanent
+  // authentication failures and sticky allocation keep their own error paths.
+  function mainProviderQuotaRestriction(
+    storage: AccountStorage | null,
+    accountUuid: string | undefined,
+    headerExhaustionProven = false,
+  ) {
+    if (
+      !storage ||
+      storage.quota?.enabled === false ||
+      !accountUuid ||
+      getRoutingMode(storage) === 'sticky-balanced' ||
+      isPermanentRefreshError(storage.refresh?.mainLastRefreshError)
+    )
+      return undefined
+    const now = Date.now()
+    const error = storage.quota?.mainLastQuotaApiError
+    if (
+      error &&
+      error.accountIdentity === accountUuid &&
+      error.nextRetryAt !== undefined &&
+      error.nextRetryAt > now
+    ) {
+      return {
+        message: formatQuotaBackoffMessage(error, now),
+        retryAfter: Math.max(1, Math.ceil((error.nextRetryAt - now) / 1000)),
+      }
+    }
+    const quota = storage.quota?.mainQuota
+    // Header percentages are rounded for display and cannot alone prove
+    // exhaustion. Leave them to normal request and routing policy.
+    const checkedAt = quotaSnapshotCheckedAt(quota)
+    if (
+      quota?.accountIdentity !== accountUuid ||
+      (quota.source === 'headers' && !headerExhaustionProven) ||
+      !quotaSnapshotIsExhausted(quota) ||
+      checkedAt <= 0 ||
+      checkedAt > now ||
+      getQuotaNextRefreshAt(quota, storage, checkedAt) <= now
+    )
+      return undefined
+    const resetTimes = (['five_hour', 'seven_day'] as const).flatMap((key) => {
+      const window = quota[key]
+      const reset = window?.resetsAt ? Date.parse(window.resetsAt) : Number.NaN
+      return window &&
+        window.remainingPercent <= 0 &&
+        Number.isFinite(reset) &&
+        reset > now
+        ? [reset]
+        : []
+    })
+    return {
+      message: 'Claude OAuth quota is exhausted for this account.',
+      retryAfter: Math.max(
+        1,
+        Math.ceil(
+          ((resetTimes.length
+            ? Math.max(...resetTimes)
+            : now + getQuotaCheckIntervalMs(storage)) -
+            now) /
+            1000,
+        ),
+      ),
+    }
+  }
   async function reconcileMainQuotaAccountIdentity(
     accessToken: string,
     quotaKey: string | undefined,
@@ -1383,72 +1830,24 @@ const anthropicAuthPlugin = async (
     if (
       mainQuotaIdentityAccessToken === accessToken &&
       mainQuotaAccountId === quotaKey
-    ) {
+    )
       return
-    }
-
     const providerIdentityChanged =
       mainProviderAccountUuid !== undefined &&
       providerAccountUuid !== undefined &&
       mainProviderAccountUuid !== providerAccountUuid
     mainQuotaIdentityAccessToken = accessToken
     mainQuotaAccountId = quotaKey
-    const clearedGeneration = quotaManager.setMainQuotaAccountIdentity(
+    quotaManager.setMainQuotaAccountIdentity(
       quotaKey,
-      accessToken.startsWith('sk-ant-oat'),
+      true,
       providerIdentityChanged,
     )
-    if (quotaKey === undefined) return
-
-    const storage = await loadAccounts(accountStoragePath)
-    const persistedError = storage?.quota?.mainLastQuotaApiError
-    if (
-      !storage ||
-      !persistedError ||
-      persistedError.accountIdentity === quotaKey ||
-      (!accessToken.startsWith('sk-ant-oat') &&
-        persistedError.accountIdentity === undefined)
-    ) {
-      return
-    }
-
-    storage.quota = storage.quota ?? {}
-    storage.quota.mainLastQuotaApiError = undefined
-    storage.quota.mainQuotaErrorGeneration = Math.max(
-      storage.quota.mainQuotaErrorGeneration ?? 0,
-      clearedGeneration ?? quotaManager.getMainQuotaErrorGeneration(),
-    )
-    storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
-      storage.quota.mainQuotaErrorClearedAt,
-      quotaManager.getMainQuotaErrorClearedAt() ?? Date.now(),
-    )
-    await saveAccountState(storage, accountStoragePath, { mainQuota: true })
-  }
-
-  async function persistFallbackAnthropicAccountUuid(
-    accountId: string,
-    anthropicAccountUuid: ProviderAccountUuid,
-  ): Promise<void> {
-    const storage = await loadAccounts(accountStoragePath)
-    const account = storage?.accounts.find(
-      (candidate): candidate is OAuthAccount =>
-        candidate.id === accountId && isOAuthAccount(candidate),
-    )
-    if (
-      !storage ||
-      !account ||
-      account.anthropicAccountUuid === anthropicAccountUuid
-    )
-      return
-    account.anthropicAccountUuid = anthropicAccountUuid
-    await saveAccountState(storage, accountStoragePath, {
-      accounts: [accountId],
-    })
   }
 
   async function resolveMainQuotaAccountIdentity(
     accessToken: string,
-    model?: string,
+    _model?: string,
     credentialAccountUuid?: string,
     credentialRecordVersion?: number,
   ): Promise<MainQuotaIdentityResolution> {
@@ -1464,12 +1863,15 @@ const anthropicAuthPlugin = async (
     const resolution = (async () => {
       const resolutionGeneration = ++mainQuotaIdentityResolutionGeneration
       const mainSlotQuotaKey = mainAccountId
-      const identity = await resolveClaudeCodeIdentity(
-        accessToken,
-        model,
-        credentialAccountUuid ?? mainSlotQuotaKey,
+
+      const currentSnapshot = await nativeAccounts.read()
+      const currentStorage = currentSnapshot.policyStorage
+      const nativePrimaryIdentity = currentSnapshot.accounts.find(
+        (account) => account.id === 'main',
+      )?.accountIdentity
+      const identity = nativeWireIdentity(
+        credentialAccountUuid ?? nativePrimaryIdentity,
       )
-      const currentStorage = await loadAccounts(accountStoragePath)
       const scopedCustodyActive = isScopedCustodyActive(currentStorage)
       const rosterPrimaryAccountId = scopedCustodyActive
         ? currentStorage?.claustrum?.primaryAccount?.accountId
@@ -1479,10 +1881,9 @@ const anthropicAuthPlugin = async (
       // receipt was issued, the receipt's quota must not land on the new
       // account: fail closed without touching the global main identity.
       if (
-        (scopedCustodyActive &&
-          (credentialAccountUuid === undefined ||
-            credentialAccountUuid !== rosterPrimaryAccountId)) ||
-        (!scopedCustodyActive && credentialAccountUuid !== undefined)
+        (credentialAccountUuid !== undefined &&
+          credentialAccountUuid !== nativePrimaryIdentity) ||
+        (scopedCustodyActive && credentialAccountUuid === undefined)
       ) {
         return {
           quotaKey: undefined,
@@ -1497,7 +1898,8 @@ const anthropicAuthPlugin = async (
       // so a slot-keyed quota would never persist. Outside scoped custody,
       // non-oat adapters keep their local slot for quota fencing; it is not a
       // provider identity and must never reach a provider-facing field.
-      const quotaKey = rosterPrimaryAccountId ?? mainSlotQuotaKey
+      const quotaKey =
+        nativePrimaryIdentity ?? rosterPrimaryAccountId ?? mainSlotQuotaKey
       const persistedProviderAccountUuid =
         currentStorage?.main?.profile?.providerAccountUuid ??
         (currentStorage?.main?.profile?.accountIdentity as
@@ -1577,280 +1979,344 @@ const anthropicAuthPlugin = async (
     initialStorage?.quotaHeaderFeed?.enabled === true
       ? new QuotaHeaderFeedRegistry()
       : null
-  const profileHydrationAttempts = new Map<
-    string,
-    Promise<Awaited<ReturnType<typeof fetchOAuthAccountProfile>> | undefined>
-  >()
+  // Profiles fetched by this plugin instance, keyed by route and account
+  // identity. A profile request that reached the network is not repeated in
+  // this boot: a failed request stays failed, and a fetched profile is reused
+  // until it goes stale, even if saving it is slow or fails. Attempts refused
+  // before any request (missing native authority, unavailable route) leave no
+  // entry, so a later display can try again.
+  interface ProfileHydration {
+    /** Settles when the profile response arrives or the attempt fails, never on the save. */
+    fetched: Promise<void>
+    /**
+     * The display bound the attempt started under. Once it has expired, a
+     * later display does not wait on the same attempt again.
+     */
+    deadline?: AbortSignal
+    profile?: OAuthAccountProfile
+    persistence?: 'pending' | 'saved' | 'refused' | 'failed'
+    isCurrent?: () => Promise<boolean>
+  }
+  const profileHydrations = new Map<string, ProfileHydration>()
+  // Saving a fetched profile continues after the display has used it. Dispose
+  // aborts unfinished profile requests and waits for these saves, so an
+  // instance never leaves a metadata write running after it is torn down.
+  const profilePublications = new Set<Promise<unknown>>()
+  const profileHydrationShutdown = new AbortController()
+  let bootProfileHydrationStarted = false
 
-  async function hydrateProfileOnce(
-    accountId: string,
-    accountIdentity: string | undefined,
-    accessToken: string,
-    providerAccountUuid?: ProviderAccountUuid,
-    signal?: AbortSignal,
+  function profileHydrationKey(id: string, accountIdentity?: string) {
+    return JSON.stringify([id, accountIdentity ?? null])
+  }
+
+  /** A fetched tier requires current credentials; a storage failure alone does not hide it. */
+  async function displayableProfile(
+    hydration: ProfileHydration | undefined,
+    now: number,
   ) {
-    if (signal?.aborted) return undefined
-    const attemptKey = `${accountIdentity ?? accountId}`
-    let attempt = profileHydrationAttempts.get(attemptKey)
-    if (!attempt) {
-      const fetchAttempt = fetchOAuthAccountProfile({
-        accessToken,
-        accountIdentity,
-        providerAccountUuid,
-        fetchImpl: profileFetch,
-        signal,
-      })
-        .catch((error) => {
+    if (
+      !hydration?.profile ||
+      !oauthProfileIsFresh(hydration.profile, now) ||
+      !(await hydration.isCurrent?.())
+    )
+      return undefined
+    return hydration.persistence === 'refused' ? undefined : hydration.profile
+  }
+
+  function startProfileHydration(
+    account: NativeAccountView,
+    key: string,
+    signal?: AbortSignal,
+  ): ProfileHydration {
+    assertNativeEnvironment()
+    let requested = false
+    const transport: typeof fetch = Object.assign(
+      (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1],
+      ) => {
+        requested = true
+        return profileFetch(input, init)
+      },
+      { preconnect: profileFetch.preconnect },
+    )
+    const hydration: ProfileHydration = {
+      fetched: Promise.resolve(),
+      ...(signal && { deadline: signal }),
+    }
+    hydration.fetched = nativeAccounts
+      .fetchProfileForDisplay(
+        account.id,
+        transport,
+        AbortSignal.any([
+          profileHydrationShutdown.signal,
+          ...(signal ? [signal] : []),
+        ]),
+      )
+      .then(
+        ({ profile, persisted, isCurrent }) => {
+          // Keep a profile only for the account it was read for. A route
+          // whose identity was not yet known accepts the identity this read
+          // reports; the display checks it against the route again later.
+          if (
+            account.accountIdentity === undefined ||
+            profile.accountIdentity === account.accountIdentity
+          ) {
+            hydration.profile = profile
+            hydration.isCurrent = isCurrent
+            hydration.persistence = 'pending'
+          }
+          const saving = persisted.then(async (outcome) => {
+            hydration.persistence = outcome
+            if (outcome === 'failed')
+              logger.warn('quota', 'failed to persist account profile', {
+                account: account.id,
+              })
+            else if (outcome === 'refused')
+              logger.debug('quota', 'refused account profile publication', {
+                account: account.id,
+              })
+            if (
+              outcome === 'saved' &&
+              !profileHydrationShutdown.signal.aborted
+            ) {
+              // Display-only writes reread native state. Refresh after the
+              // profile commits so that reread can include the new tier.
+              try {
+                const current = await nativeAccounts.read()
+                if (!profileHydrationShutdown.signal.aborted)
+                  await writeSidebarState(current.policyStorage, {
+                    ...lastSidebarRouting,
+                    routingAuthoritative: false,
+                  })
+              } catch {
+                logger.debug(
+                  'quota',
+                  'failed to publish account profile to sidebar',
+                  {
+                    account: account.id,
+                  },
+                )
+              }
+            }
+          })
+          profilePublications.add(saving)
+          void saving.then(() => profilePublications.delete(saving))
+        },
+        (error: unknown) => {
           logger.debug('quota', 'failed to hydrate account profile', {
-            account: accountId,
+            account: account.id,
             error: error instanceof Error ? error.message : String(error),
           })
-          return undefined
-        })
-        .finally(() => {
-          if (profileHydrationAttempts.get(attemptKey) === fetchAttempt) {
-            profileHydrationAttempts.delete(attemptKey)
-          }
-        })
-      attempt = fetchAttempt
-      profileHydrationAttempts.set(attemptKey, attempt)
-    }
-    if (!signal) return attempt
-    return new Promise<Awaited<typeof attempt>>((resolve) => {
-      let settled = false
-      const finish = (profile: Awaited<typeof attempt>) => {
-        if (settled) return
-        settled = true
-        signal.removeEventListener('abort', onAbort)
-        resolve(profile)
+          if (!requested && profileHydrations.get(key) === hydration)
+            profileHydrations.delete(key)
+        },
+      )
+    profilePublications.add(hydration.fetched)
+    void hydration.fetched.then(() =>
+      profilePublications.delete(hydration.fetched),
+    )
+    return hydration
+  }
+
+  /**
+   * Wait for an attempt's profile response, but no longer than this display's
+   * `signal` or the bound the attempt itself started under.
+   */
+  function waitForProfile(
+    hydration: ProfileHydration,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const bounds = [signal, hydration.deadline].filter(
+      (bound): bound is AbortSignal => bound !== undefined,
+    )
+    if (!bounds.length) return hydration.fetched
+    const bound = AbortSignal.any(bounds)
+    if (bound.aborted) return Promise.resolve()
+    return new Promise((resolve) => {
+      const finish = () => {
+        bound.removeEventListener('abort', finish)
+        resolve()
       }
-      const onAbort = () => finish(undefined)
-      signal.addEventListener('abort', onAbort, { once: true })
-      if (signal.aborted) onAbort()
-      void attempt.then(finish)
+      bound.addEventListener('abort', finish, { once: true })
+      void hydration.fetched.then(finish)
     })
   }
 
-  async function persistProfileStateBestEffort(input: {
-    accountId: 'main' | string
-    accountIdentity?: string
-    providerAccountUuid?: ProviderAccountUuid
-    accessToken: string
-    profile: OAuthAccount['profile']
-  }): Promise<boolean | undefined> {
-    try {
-      return await saveOAuthProfileState(
-        {
-          accountId: input.accountId,
-          profile: input.profile,
-          accountIdentity: input.accountIdentity,
-        },
-        accountStoragePath,
+  function storedProfileIsFresh(account: NativeAccountView, now: number) {
+    return (
+      oauthProfileIsFresh(account.profile, now) &&
+      oauthProfileMatchesIdentity(account.profile, account.accountIdentity)
+    )
+  }
+
+  /**
+   * Read native account metadata for the account and quota displays, first
+   * fetching missing or stale OAuth profiles. Waiting stops when `signal`
+   * aborts; a failed fetch or a refused save leaves the stored profile in
+   * place, and the display never waits for a fetched profile to be saved.
+   */
+  async function readNativeSnapshotForDisplay(
+    signal?: AbortSignal,
+  ): Promise<NativeAccountSnapshot> {
+    const snapshot = await nativeAccounts.read()
+    if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1')
+      return snapshot
+    const now = Date.now()
+    const waits: Promise<void>[] = []
+    // Attempts made for routes whose account identity was not yet known.
+    const unidentified = new Map<string, ProfileHydration>()
+    for (const account of snapshot.accounts) {
+      if (
+        account.type !== 'oauth' ||
+        !account.enabled ||
+        storedProfileIsFresh(account, now)
       )
-    } catch (error) {
-      logger.debug('quota', 'failed to persist account profile', {
-        account: input.accountId,
-        error: error instanceof Error ? error.message : String(error),
-      })
-      return undefined
+        continue
+      const key = profileHydrationKey(account.id, account.accountIdentity)
+      let hydration = profileHydrations.get(key)
+      if (
+        !hydration ||
+        (hydration.profile && !oauthProfileIsFresh(hydration.profile, now))
+      ) {
+        if (signal?.aborted || profileHydrationShutdown.signal.aborted) continue
+        hydration = startProfileHydration(account, key, signal)
+        profileHydrations.set(key, hydration)
+      }
+      if (account.accountIdentity === undefined)
+        unidentified.set(account.id, hydration)
+      waits.push(waitForProfile(hydration, signal))
     }
+    if (!waits.length) return snapshot
+    await Promise.all(waits)
+    // An account can be replaced or signed in again while profiles load.
+    // Reread the accounts and attach each fetched profile only to the route
+    // that still has the identity the profile was read for.
+    const current = await nativeAccounts.read()
+    const later = Date.now()
+    for (const account of current.accounts) {
+      if (account.type !== 'oauth') continue
+      const key = profileHydrationKey(account.id, account.accountIdentity)
+      // Authorizing a route records its account identity, so a route that
+      // was unidentified when its attempt began is usually identified now.
+      // File the attempt under the identified route as well; otherwise the
+      // next display would repeat the request or miss the profile.
+      const earlier = unidentified.get(account.id)
+      if (
+        earlier &&
+        account.accountIdentity !== undefined &&
+        !profileHydrations.has(key) &&
+        (!earlier.profile ||
+          earlier.profile.accountIdentity === account.accountIdentity)
+      )
+        profileHydrations.set(key, earlier)
+      if (storedProfileIsFresh(account, later)) continue
+      const profile = await displayableProfile(
+        profileHydrations.get(key),
+        later,
+      )
+      if (!profile || profile.accountIdentity !== account.accountIdentity)
+        continue
+      account.profile = profile
+      if (account.id === 'main') {
+        if (current.policyStorage.main)
+          current.policyStorage.main.profile = profile
+      } else {
+        for (const stored of current.policyStorage.accounts)
+          if (stored.id === account.id && isOAuthAccount(stored))
+            stored.profile = profile
+      }
+    }
+    return current
   }
 
   async function ensureProfilesForQuotaDisplay(
     storage: AccountStorage,
-    mainAccessToken?: string,
+    _mainAccessToken?: string,
     signal?: AbortSignal,
-    mainProviderAccountUuid?: ProviderAccountUuid,
+    _mainProviderAccountUuid?: ProviderAccountUuid,
   ): Promise<AccountStorage> {
-    if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1') {
+    if (process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION === '1')
       return storage
-    }
-    const now = Date.now()
-    const mainIdentity = mainQuotaAccountId
-    if (
-      mainAccessToken &&
-      storage.main?.profile &&
-      mainProviderAccountUuid &&
-      storage.main.profile.providerAccountUuid !== mainProviderAccountUuid
-    ) {
-      storage.main.profile = undefined
-      void persistProfileStateBestEffort({
-        accountId: 'main',
-        accountIdentity: mainIdentity,
-        providerAccountUuid: mainProviderAccountUuid,
-        accessToken: mainAccessToken,
-        profile: undefined,
-      }).catch(() => {})
-    }
-    if (
-      mainAccessToken &&
-      storage.main?.profile &&
-      mainIdentity !== undefined &&
-      storage.main.profile.accountIdentity === undefined
-    ) {
-      storage.main.profile = {
-        ...storage.main.profile,
-        accountIdentity: mainIdentity,
-      }
-      void persistProfileStateBestEffort({
-        accountId: 'main',
-        accountIdentity: mainIdentity,
-        providerAccountUuid: mainProviderAccountUuid,
-        accessToken: mainAccessToken,
-        profile: storage.main.profile,
-      }).catch(() => {})
-    }
-    if (mainAccessToken && !oauthProfileIsFresh(storage.main?.profile, now)) {
-      const profile = await hydrateProfileOnce(
-        'main',
-        undefined,
-        mainAccessToken,
-        mainProviderAccountUuid,
-        signal,
-      )
-      if (profile) {
-        storage.main = {
-          type: 'opencode',
-          provider: 'anthropic',
-          profile,
-        }
-        void persistProfileStateBestEffort({
-          accountId: 'main',
-          accountIdentity: mainIdentity,
-          providerAccountUuid: mainProviderAccountUuid,
-          accessToken: mainAccessToken,
-          profile,
-        }).catch(() => {})
-      }
-    }
-
-    for (const account of storage.accounts) {
-      if (signal?.aborted) break
-      if (!isOAuthAccount(account)) continue
-      const vaultEnabled = isScopedCustodyActive(storage)
-      if (vaultEnabled && !isFallbackAccountVaultServed(account.id, storage))
-        continue
-      const accessToken = vaultEnabled
-        ? (
-            await getOpenCodeScopedRuntime()
-              .authorize(account.id, signal)
-              .catch(() => undefined)
-          )?.accessToken
-        : account.access
-      if (!accessToken) continue
-      if (
-        account.profile &&
-        !oauthProfileMatchesIdentity(account.profile, account.id)
-      ) {
-        account.profile = undefined
-        void persistProfileStateBestEffort({
-          accountId: account.id,
-          accountIdentity: account.id,
-          accessToken,
-          profile: undefined,
-        }).catch(() => {})
-      }
-      if (account.profile && account.profile.accountIdentity === undefined) {
-        account.profile = { ...account.profile, accountIdentity: account.id }
-        void persistProfileStateBestEffort({
-          accountId: account.id,
-          accountIdentity: account.id,
-          accessToken,
-          profile: account.profile,
-        }).catch(() => {})
-      }
-      if (oauthProfileIsFresh(account.profile, now)) continue
-      const profile = await hydrateProfileOnce(
-        account.id,
-        account.id,
-        accessToken,
-        undefined,
-        signal,
-      )
-      if (profile) {
-        account.profile = profile
-        void persistProfileStateBestEffort({
-          accountId: account.id,
-          accountIdentity: account.id,
-          accessToken,
-          profile,
-        }).catch(() => {})
-      }
-    }
-    return storage
+    return (await readNativeSnapshotForDisplay(signal)).policyStorage
   }
 
   const warnedQuotaNormalizeErrors = new Set<string>()
-  const warnedStaleFallbackQuotaPersists = new Set<string>()
 
   async function persistPushedQuota(
     served: ServedQuotaHeaders,
     entry: QuotaEntry,
+    previousEntry: QuotaEntry | null | undefined,
   ): Promise<QuotaEntry | null> {
-    const storage =
-      (await loadAccounts(accountStoragePath)) ?? createEmptyStorage()
-    if (served.accountId === 'main') {
-      const quotaKey = served.mainQuotaIdentity?.quotaKey
-      if (!quotaKey || entry.quota.accountIdentity !== quotaKey) {
-        logger.trace(
-          'quota',
-          'skipped quota persistence without verified main account identity',
-        )
-        return null
-      }
-      storage.quota = storage.quota ?? {}
-      storage.quota.mainQuota = {
-        ...entry.quota,
-        accountIdentity: quotaKey,
-      }
-      storage.quota.mainQuotaCheckedAt = entry.checkedAt
-      await saveAccountState(storage, accountStoragePath, { mainQuota: true })
-      const reloaded = await loadAccounts(accountStoragePath)
-      const persistedQuota = reloaded?.quota?.mainQuota
-      const persistedQuotaBelongsToRequest = Boolean(
-        persistedQuota && persistedQuota.accountIdentity === quotaKey,
-      )
-      const mergedQuota = persistedQuotaBelongsToRequest
-        ? mergeHeaderQuotaForPersistence(persistedQuota, entry.quota)
-        : entry.quota
-      return persistedQuota
-        ? {
-            ...entry,
-            quota: mergedQuota,
-            checkedAt: entry.checkedAt,
-          }
-        : entry
-    }
-    const persisted = await persistFallbackQuotaHeaderPersistent(
-      {
-        accountId: served.accountId,
-        authLineageId: served.authLineageId,
-        quota: entry.quota,
-        anthropicAccountUuid: served.anthropicAccountUuid ?? undefined,
-      },
-      accountStoragePath,
+    const snapshot = await nativeAccounts.read()
+    const account = snapshot.accounts.find(
+      (candidate) => candidate.id === served.accountId,
     )
+    if (
+      !account ||
+      !served.anthropicAccountUuid ||
+      account.accountIdentity !== served.anthropicAccountUuid
+    )
+      return null
+    const quota = {
+      ...mergeHeaderQuotaForPersistence(account.quota, entry.quota),
+      accountIdentity: account.accountIdentity,
+    }
+    const persisted = served.scopedAttempt
+      ? await nativeAccounts.vault.publish(served.scopedAttempt, { quota })
+      : served.localSubject
+        ? await nativeAccounts.publishLocal(served.localSubject, { quota })
+        : false
     if (!persisted) {
-      const key = `${served.accountId}:${served.authLineageId ?? ''}`
-      if (!warnedStaleFallbackQuotaPersists.has(key)) {
-        warnedStaleFallbackQuotaPersists.add(key)
-        logger.debug(
-          'quota',
-          'skipped stale fallback quota persistence after lineage change',
-          {
-            accountId: served.accountId,
-            servedLineage: served.authLineageId,
-          },
+      if (served.accountId === 'main') {
+        if (
+          quotaManager.getMain(served.mainQuotaIdentity?.quotaKey) ===
+          previousEntry
         )
-      }
-      // The persistence fence is authoritative; discard the optimistic cache
-      // write unless a newer replacement observation already won the race.
-      if (quotaManager.getAllFallbacks().get(served.accountId) === entry) {
+          quotaManager.clearMain()
+      } else if (
+        quotaManager.getAllFallbacks().get(served.accountId) === previousEntry
+      ) {
         quotaManager.clearFallback(served.accountId)
       }
+      logger.debug('quota', 'native quota publication refused', {
+        accountId: served.accountId,
+      })
       return null
     }
-    return entry
+    // The pool merges quota under its locks. A poll can finish while this
+    // publication waits, so read the committed result instead of replaying
+    // the pre-write merge into cache and dropping that poll's fields.
+    const currentSnapshot = await nativeAccounts.read()
+    const current = currentSnapshot.accounts.find(
+      (candidate) => candidate.id === served.accountId,
+    )
+    if (
+      !current?.quota ||
+      current.accountIdentity !== served.anthropicAccountUuid ||
+      current.source !== account.source
+    )
+      return null
+    if (
+      served.localSubject &&
+      current.binding?.credentialEpoch !==
+        served.localSubject.binding.credentialEpoch
+    )
+      return null
+    if (
+      served.scopedAttempt &&
+      current.credentialId !== served.scopedAttempt.credentialId
+    )
+      return null
+    return {
+      ...entry,
+      quota: current.quota,
+      refreshAfter: getQuotaNextRefreshAt(
+        current.quota,
+        currentSnapshot.policyStorage,
+        entry.checkedAt,
+      ),
+    }
   }
 
   function logPersistFailure(error: unknown) {
@@ -2005,57 +2471,325 @@ const anthropicAuthPlugin = async (
           return
         }
       }
-      const entry =
+      const previousEntry =
         served.accountId === 'main'
-          ? quotaManager.pushMainFromHeaders(
-              mainQuotaIdentity?.quotaKey,
-              incoming,
+          ? quotaManager.getMain(mainQuotaIdentity?.quotaKey)
+          : quotaManager.getAllFallbacks().get(served.accountId)
+      const checkedAt = incoming.checkedAt ?? Date.now()
+      const lineage = headerRoutingLineage(
+        served.localSubject,
+        served.scopedAttempt,
+      )
+      const observation: HeaderRoutingObservation | undefined =
+        lineage && served.anthropicAccountUuid
+          ? {
+              lineage,
+              accountUuid: served.anthropicAccountUuid,
+              entry: {
+                quota: {
+                  ...incoming,
+                  accountIdentity: served.anthropicAccountUuid,
+                },
+                checkedAt,
+                refreshAfter: checkedAt,
+              },
+              generalExhausted: (['five_hour', 'seven_day'] as const).some(
+                (key) => {
+                  const raw = headers.get(
+                    key === 'five_hour'
+                      ? 'anthropic-ratelimit-unified-5h-utilization'
+                      : 'anthropic-ratelimit-unified-7d-utilization',
+                  )
+                  return (
+                    incoming[key] !== undefined &&
+                    raw !== null &&
+                    Number.isFinite(Number(raw)) &&
+                    Number(raw) >= 1
+                  )
+                },
+              ),
+            }
+          : undefined
+      if (observation) {
+        headerRoutingObservations.delete(served.accountId)
+        if (
+          headerRoutingObservations.size >= HEADER_ROUTING_OBSERVATION_LIMIT
+        ) {
+          const oldest = headerRoutingObservations.keys().next().value
+          if (oldest !== undefined) headerRoutingObservations.delete(oldest)
+        }
+        headerRoutingObservations.set(served.accountId, observation)
+      }
+      void (async () => {
+        let committed = false
+        try {
+          let persistedEntry: QuotaEntry | null
+          try {
+            persistedEntry = await persistPushedQuota(
+              served,
+              { quota: incoming, checkedAt, refreshAfter: checkedAt },
+              previousEntry,
             )
-          : quotaManager.pushFallbackFromHeaders(served.accountId, incoming, {
+          } catch (error) {
+            logPersistFailure(error)
+            return
+          }
+          if (persistedEntry === null) return
+          if (
+            served.accountId === 'main' &&
+            quotaManager.getMainQuotaIdentityGeneration() !==
+              mainQuotaIdentity?.generation
+          )
+            return
+          // Publication checks the credential that supplied these headers before
+          // any cache or display can use them. A rejected old response must never
+          // become a transient quota reading for replacement credentials.
+          const entry = persistedEntry
+          if (
+            observation &&
+            headerRoutingObservations.get(served.accountId) === observation
+          ) {
+            observation.entry = entry
+            committed = true
+          }
+          if (served.accountId === 'main')
+            quotaManager.setMain(mainQuotaIdentity?.quotaKey, entry)
+          else
+            quotaManager.setFallback(served.accountId, entry, {
               authLineageId: served.authLineageId,
             })
-      if (!entry) return
-      void (async () => {
-        let feedEntry = entry
-        try {
-          const persistedEntry = await persistPushedQuota(served, entry)
-          if (persistedEntry === null) return
-          feedEntry = persistedEntry
-        } catch (error) {
-          logPersistFailure(error)
+          void refreshSidebarQuota().catch(() => {})
+          await publishQuotaHeaderFeed(served, entry)
+          logger.debug('quota', 'harvested response quota', {
+            account: served.accountId,
+            fiveHourPercent: entry.quota.five_hour?.usedPercent,
+            sevenDayPercent: entry.quota.seven_day?.usedPercent,
+            source: 'headers',
+          })
+        } finally {
+          if (
+            !committed &&
+            observation &&
+            headerRoutingObservations.get(served.accountId) === observation
+          ) {
+            headerRoutingObservations.delete(served.accountId)
+            logger.debug('quota', 'discarded pending response quota', {
+              accountId: served.accountId,
+            })
+          }
         }
-        void refreshSidebarQuota().catch(() => {})
-        await publishQuotaHeaderFeed(served, feedEntry)
       })().catch(logQuotaHeaderFeedFailure)
-      logger.debug('quota', 'harvested response quota', {
+      logger.trace('quota', 'response quota awaiting publication', {
         account: served.accountId,
-        fiveHourPercent: entry.quota.five_hour?.usedPercent,
-        sevenDayPercent: entry.quota.seven_day?.usedPercent,
-        source: 'headers',
       })
     } catch (error) {
       warnQuotaNormalizeOnce(error)
     }
   }
 
-  // Local OAuth and scoped custody share quota/routing machinery. The latter
-  // never exposes a bearer from sidecar storage or a capability-handle cache.
-  const fallbackManager = new FallbackAccountManager({
-    quotaManager,
-    isFallbackAccountVaultServed,
-    isFallbackAccountVaultEnabled: (_accountId, storage) =>
-      isScopedCustodyActive(storage),
-    resolveFallbackAccessToken: (account, storage) =>
-      getClaustrumMode(storage) === 'local' && account.access
-        ? { token: account.access, source: 'sidecar' as const }
-        : undefined,
-    setIntervalImpl: runtimeTimers.setInterval,
-    clearIntervalImpl: runtimeTimers.clearInterval,
-    onFallbackStorageChanged: () => {
-      void refreshSidebarQuota().catch(() => {})
+  async function refreshFallbackQuotas(force = false) {
+    const snapshot = await nativeAccounts.read()
+    if (!force && snapshot.policyStorage.quota?.enabled === false) return
+    for (const account of snapshot.accounts) {
+      if (account.id === 'main' || account.type !== 'oauth' || !account.enabled)
+        continue
+      if (
+        !force &&
+        getQuotaNextRefreshAt(
+          account.quota,
+          snapshot.policyStorage,
+          quotaSnapshotCheckedAt(account.quota),
+        ) > Date.now()
+      )
+        continue
+      try {
+        await quotaManager.refreshFallback(
+          account.id,
+          '',
+          snapshot.policyStorage.accounts.find(
+            (candidate) =>
+              candidate.id === account.id && isOAuthAccount(candidate),
+          ) as OAuthAccount | undefined,
+        )
+      } catch {
+        // The runtime already recorded the quota-fetch failure for its account.
+        // Keep any separate refresh-token rejection; a usage poll cannot fix it.
+      }
+    }
+  }
+  const fallbackManager = {
+    refreshQuotaForDueAccounts: () => refreshFallbackQuotas(),
+    refreshQuotaForAllAccounts: (_options?: { force?: boolean }) =>
+      refreshFallbackQuotas(true),
+    refreshAccount: async (
+      account: OAuthAccount,
+      _storage: AccountStorage,
+      options?: { force?: boolean },
+    ) => {
+      const credential = await authorizeOAuth(
+        account.id,
+        undefined,
+        options?.force ? account.access : undefined,
+      )
+      return {
+        ...account,
+        access: credential.accessToken,
+        expires: credential.expires,
+      }
     },
-  })
-  const fallbackRefreshReady = fallbackManager.startBackgroundRefresh()
+    refreshAccountQuota: async (
+      account: OAuthAccount,
+      _storage: AccountStorage,
+    ) => {
+      assertNativeEnvironment()
+      const quota = await nativeAccounts.fetchQuota(account.id)
+      return { account: { ...account, quota }, fetched: true }
+    },
+    getUsableFallbackAccounts: async (
+      storage: AccountStorage | null | undefined,
+      options?: { modelId?: string },
+    ) => {
+      storage = storage ?? null
+      const usable: OAuthAccount[] = []
+      const currentAccounts = storage?.accounts.some(
+        (account) =>
+          isOAuthAccount(account) && headerRoutingObservations.has(account.id),
+      )
+        ? (await nativeAccounts.read()).accounts
+        : []
+      for (const account of storage?.accounts ?? []) {
+        if (!isOAuthAccount(account) || account.enabled === false) continue
+        const currentAccount = currentAccounts.find(
+          (view) => view.id === account.id,
+        )
+        const committedQuota =
+          quotaManager.getFallback(
+            account.id,
+            currentAccount?.binding
+              ? { authLineageId: JSON.stringify(currentAccount.binding) }
+              : account,
+          )?.quota ??
+          currentAccount?.quota ??
+          account.quota
+        const quota =
+          currentAccount && storage
+            ? routingAccountQuota(
+                { ...currentAccount, quota: committedQuota },
+                storage,
+              )
+            : committedQuota
+        if (
+          !quotaSnapshotPassesPolicy(quota, storage) ||
+          !quotaSnapshotPassesModelScope(quota, options?.modelId) ||
+          (isKillswitchEnabled(storage) &&
+            !killswitchPassesPolicy(
+              quota,
+              storage,
+              account.id,
+              options?.modelId,
+            ))
+        )
+          continue
+        try {
+          const credential = await authorizeOAuth(
+            account.id,
+            undefined,
+            undefined,
+            options?.modelId,
+          )
+          usable.push({
+            ...account,
+            access: credential.accessToken,
+            expires: credential.expires,
+          })
+        } catch {
+          // Do not use credentials that failed authorization. A failed or
+          // missing quota reading also cannot prove the account's general
+          // limits are exhausted and therefore cannot permit paid fallback.
+        }
+      }
+      return usable
+    },
+  }
+  async function refreshNativeFallbacks() {
+    assertNativeEnvironment()
+    const snapshot = await nativeAccounts.read()
+    if (
+      snapshot.mode === 'local' &&
+      snapshot.policyStorage.refresh?.enabled !== false
+    ) {
+      for (const account of snapshot.accounts) {
+        if (
+          account.id === 'main' ||
+          account.type !== 'oauth' ||
+          !account.enabled
+        )
+          continue
+        try {
+          const credential = await authorizeOAuth(account.id)
+          // Proactive refresh must honor an existing account backoff even when
+          // the still-valid access token enters the refresh-before-expiry window.
+          if (
+            refreshBackoffActive(
+              account.lastRefreshError,
+              account.accountIdentity,
+              Date.now(),
+              undefined,
+            )
+          )
+            continue
+          if (
+            credential.localSource !== 'rotated' &&
+            credential.localSource !== 'adopted' &&
+            (!credential.expires ||
+              credential.expires - Date.now() <=
+                mainRefreshBeforeExpiryMs(snapshot.policyStorage))
+          ) {
+            await authorizeOAuth(
+              account.id,
+              undefined,
+              undefined,
+              undefined,
+              'refresh',
+            )
+          }
+        } catch {
+          // The runtime records whether refresh failed temporarily or the
+          // provider rejected the refresh token with invalid_grant. A subsequent
+          // quota poll cannot repair that rejected token or clear its error.
+        }
+      }
+    }
+    await refreshFallbackQuotas()
+  }
+  const canStartNativeServices =
+    initialStorage !== null && process.env.OPENCODE_AUTH_CONTENT === undefined
+  const fallbackRefreshReady = canStartNativeServices
+    ? (isScopedCustodyActive(initialStorage)
+        ? nativeAccounts.vault.refresh().then(() => refreshNativeFallbacks())
+        : refreshNativeFallbacks()
+      ).catch(() => {})
+    : Promise.resolve()
+  const fallbackRefreshTimer = canStartNativeServices
+    ? runtimeTimers.setInterval(() => {
+        void refreshNativeFallbacks().catch(() => {})
+      }, FALLBACK_BACKGROUND_TICK_MS +
+        jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
+    : null
+  fallbackRefreshTimer?.unref?.()
+  const rosterRefreshTimer =
+    canStartNativeServices &&
+    isScopedCustodyActive(initialStorage) &&
+    runtimeOverrides.scopedRosterPollIntervalMs !== 0
+      ? runtimeTimers.setInterval(() => {
+          if (process.env.OPENCODE_AUTH_CONTENT !== undefined) return
+          void nativeAccounts.vault
+            .refresh()
+            .then(() => refreshSidebarQuota())
+            .catch(() => {})
+        }, runtimeOverrides.scopedRosterPollIntervalMs ?? 2000)
+      : null
+  rosterRefreshTimer?.unref?.()
   const fallbackCustodyStateFor = (
     accountId: string,
     storage: AccountStorage | null,
@@ -2249,7 +2983,9 @@ const anthropicAuthPlugin = async (
     cacheDiagnosticsResponses.set(response, { ...input, dumpWrite })
   }
 
-  let latestRefreshMainAccessToken: (() => Promise<string>) | null = null
+  let latestGetActivation:
+    | (() => Promise<{ type: string; active: boolean }>)
+    | null = null
   const cacheKeepRegistry = new CacheKeepSessionRegistry({
     directory:
       process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
@@ -2258,7 +2994,7 @@ const anthropicAuthPlugin = async (
   let aggregateCacheKeepSessions: ReturnType<
     CacheKeepManager['trackedSessions']
   > = []
-  const cacheKeepScopedAttempts = new Map<number, ClaustrumScopedAttempt>()
+  const cacheKeepScopedAttempts = new Map<number, NativeOAuthAuthorization>()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     setIntervalImpl: runtimeTimers.setInterval,
@@ -2308,13 +3044,9 @@ const anthropicAuthPlugin = async (
       receivedAt,
       attempt,
     }) => {
-      const receipt = cacheKeepScopedAttempts.get(attempt.id)
-      if (status === 401 && receipt) {
-        await getOpenCodeScopedRuntime().reportFailure(
-          receipt,
-          status,
-          'direct',
-        )
+      const authorization = cacheKeepScopedAttempts.get(attempt.id)
+      if (status === 401 && authorization?.scopedAttempt) {
+        await reportVault401(authorization.scopedAttempt, 'direct')
       }
       const prepared = cacheKeepDiagnosticsRequests.get(target.id)
       if (!prepared?.betasHash || !prepared.betas) {
@@ -2364,94 +3096,68 @@ const anthropicAuthPlugin = async (
     retryOnUnauthorized: async ({ target, headers, attempt }) => {
       const served = cacheKeepScopedAttempts.get(attempt.id)
       if (!served) return undefined
-      let current: ClaustrumScopedAttempt | undefined
+      let modelId: string | undefined
       try {
-        current = await getOpenCodeScopedRuntime(
-          accountStoragePath,
-          ctx.directory,
-        ).authorize(target.oauthAccountId ?? 'main', attempt.signal)
-      } catch {
-        // No verified replacement: fall through so the decision records
-        // reauthorize-failed, then keep the original 401.
-      }
-      if (!decideScopedRetryAfter401('cachekeep', served, current))
-        return undefined
-      logger.info(
-        'claustrum',
-        'retrying CacheKeep after scoped credential rotation',
-        {
-          accountId: target.oauthAccountId ?? 'main',
-          previousVersion: served.recordVersion,
-          newVersion: current.recordVersion,
-        },
+        const body = JSON.parse(target.bodyText)
+        if (typeof body.model === 'string') modelId = body.model
+      } catch {}
+      if (
+        served.scopedAttempt &&
+        !(await prepareVaultRetry(
+          served.scopedAttempt,
+          'cachekeep',
+          attempt.signal,
+        ))
       )
+        return undefined
+      const current = await authorizeOAuth(
+        target.oauthAccountId ?? 'main',
+        attempt.signal,
+        served.scopedAttempt ? undefined : served.accessToken,
+        modelId,
+      )
+      if (
+        current.accountIdentity !== served.accountIdentity ||
+        Boolean(current.scopedAttempt) !== Boolean(served.scopedAttempt)
+      )
+        return undefined
+      if (
+        served.scopedAttempt &&
+        (!current.scopedAttempt ||
+          current.scopedAttempt.credentialId !==
+            served.scopedAttempt.credentialId ||
+          current.scopedAttempt.recordVersion <=
+            served.scopedAttempt.recordVersion)
+      )
+        return undefined
+      if (!served.scopedAttempt && current.accessToken === served.accessToken)
+        return undefined
       const rotatedHeaders = new Headers(headers)
       rotatedHeaders.set('authorization', `Bearer ${current.accessToken}`)
       cacheKeepScopedAttempts.set(attempt.id, current)
       return rotatedHeaders
     },
     prepareHeaders: async (headers, target, attempt) => {
-      let accessToken: string | undefined
-      let scopedAttempt: ClaustrumScopedAttempt | undefined
-      const accountId = target.oauthAccountId
-      if (accountId && accountId !== 'main') {
-        const storage = await loadAccounts(accountStoragePath)
-        const account = storage?.accounts.find(
-          (candidate): candidate is OAuthAccount =>
-            candidate.id === accountId &&
-            candidate.enabled !== false &&
-            isOAuthAccount(candidate),
-        )
-        if (!account || !storage) {
-          throw new Error(
-            `OAuth account ${accountId} is unavailable for cache prewarm`,
-          )
-        }
-        if (
-          isScopedCustodyActive(storage) &&
-          account.claustrumScopedCredentialId
-        ) {
-          const runtime = getOpenCodeScopedRuntime(
-            accountStoragePath,
-            ctx.directory,
-          )
-          scopedAttempt = await runtime.authorize(accountId, attempt.signal)
-          accessToken = scopedAttempt.accessToken
-        } else if (getClaustrumMode(storage) === 'local') {
-          let current = account
-          try {
-            current = await fallbackManager.refreshAccount(account, storage)
-          } catch (error) {
-            logger.warn('cachekeep', 'fallback token refresh failed', {
-              accountId,
-              error: error instanceof Error ? error.message : String(error),
-            })
-          }
-          accessToken = current.access
-        } else {
-          throw new Error('CacheKeep requires a scoped Claustrum account')
-        }
-        if (!accessToken) {
-          throw new Error(
-            `OAuth account ${accountId} has no access token for cache prewarm`,
-          )
-        }
-      } else {
-        const credential = await getCurrentMainCredential(attempt.signal)
-        accessToken = credential.accessToken
-        scopedAttempt = credential.scopedAttempt
-      }
-      if (!accessToken) return headers
+      const accountId = target.oauthAccountId ?? 'main'
+      let modelId: string | undefined
+      try {
+        const body = JSON.parse(target.bodyText)
+        if (typeof body.model === 'string') modelId = body.model
+      } catch {}
+      const credential = await authorizeOAuth(
+        accountId,
+        attempt.signal,
+        undefined,
+        modelId,
+      )
+      const accessToken = credential.accessToken
+      cacheKeepScopedAttempts.set(attempt.id, credential)
       try {
         const parsedBody = JSON.parse(target.bodyText) as Record<
           string,
           unknown
         >
-        const identity = await resolveClaudeCodeIdentity(
-          accessToken,
-          typeof parsedBody.model === 'string' ? parsedBody.model : undefined,
-          accountId === 'main' ? mainAccountId : accountId,
-        )
+        const identity = nativeWireIdentity(credential.accountIdentity)
         headers.delete('anthropic-beta')
         setOAuthHeaders(headers, accessToken, {
           body: parsedBody,
@@ -2473,59 +3179,48 @@ const anthropicAuthPlugin = async (
       } catch {
         setOAuthHeaders(headers, accessToken)
       }
-      if (scopedAttempt) cacheKeepScopedAttempts.set(attempt.id, scopedAttempt)
+
+      const finalCredential = await authorizeOAuth(
+        accountId,
+        attempt.signal,
+        undefined,
+        modelId,
+      )
+      if (
+        finalCredential.accountIdentity !== credential.accountIdentity ||
+        Boolean(finalCredential.scopedAttempt) !==
+          Boolean(credential.scopedAttempt)
+      )
+        throw new Error(
+          'CacheKeep credential authority changed before dispatch',
+        )
+      headers.set('authorization', `Bearer ${finalCredential.accessToken}`)
+      cacheKeepScopedAttempts.set(attempt.id, finalCredential)
       return headers
     },
   })
 
   const recoveryWarmChains = new Map<string, Promise<void>>()
 
-  // -- /claude-prime manager: direct OAuth request to start each account's
-  // five-hour quota window ~60s after reset, exactly once across concurrent
-  // OpenCode processes via atomic marker claim. In-process manager mirrors the
-  // cacheKeep singleton shape; cross-process exclusivity is the marker's job.
+  // Prime sends a minimal Haiku request after the account's quota reset to
+  // start its next five-hour usage window. One shared manager and an atomic
+  // claim file prevent different projects or processes firing for the same reset.
 
-  // Resolve one current main credential for Prime. In Claustrum mode the
-  // OpenCode slot is an inert tombstone, so both quota checks and fires must
-  // use the resident vault credential and must never enter local refresh.
+  // OpenCode stores an empty OAuth marker to enable this provider, not a token
+  // that can authenticate requests. Prime and CacheKeep must still validate
+  // the current local credentials or freshly authorize them through the vault.
   async function getCurrentMainCredential(signal?: AbortSignal): Promise<{
     accessToken: string
     credentialAccountId?: ProviderAccountUuid
-    scopedAttempt?: ClaustrumScopedAttempt
+    scopedAttempt?: NativeCustodyReceipt
+    localSubject?: NativeKnownCredentialSubject
   }> {
-    if (!latestGetAuth) {
-      throw new Error('prime: main auth loader is not available')
-    }
-    const auth = await latestGetAuth()
-    if (auth.type !== 'oauth') {
-      throw new Error('prime: main account is not an OAuth account')
-    }
-    const storage = await loadAccounts(accountStoragePath)
-    if (getClaustrumMode(storage) === 'claustrum') {
-      if (!isScopedCustodyActive(storage))
-        throw new Error('Scoped Claustrum custody is not configured')
-      const attempt = await getOpenCodeScopedRuntime().authorize('main', signal)
-      return {
-        accessToken: attempt.accessToken,
-        credentialAccountId: asProviderAccountUuid(attempt.accountId),
-        scopedAttempt: attempt,
-      }
-    }
-    if (auth.access && (!auth.expires || auth.expires > Date.now())) {
-      return { accessToken: auth.access }
-    }
-    if (!latestRefreshMainAccessToken) {
-      throw new Error('prime: main token refresh unavailable')
-    }
-    try {
-      return { accessToken: await latestRefreshMainAccessToken() }
-    } catch (error) {
-      if (error instanceof Error) {
-        ;(
-          error as Error & { isPrimeTokenRefresh?: boolean }
-        ).isPrimeTokenRefresh = true
-      }
-      throw error
+    if (!latestGetActivation || !(await latestGetActivation()).active)
+      throw new Error('Native main OAuth activation is not available')
+    const credential = await authorizeOAuth('main', signal)
+    return {
+      ...credential,
+      credentialAccountId: asProviderAccountUuid(credential.accountIdentity),
     }
   }
 
@@ -2539,9 +3234,9 @@ const anthropicAuthPlugin = async (
     if (resolution.stale && credential.credentialAccountId !== undefined) {
       throw new Error('Main account identity changed before the prime refresh')
     }
-    // The quota transport obtains its own per-dispatch scoped receipt and
-    // owns any 401 report. Reporting the earlier identity-preflight receipt
-    // here would misattribute a rotation and potentially invalidate it.
+    // The usage poll independently validates local credentials or obtains vault
+    // authorization. Report a 401 against the tokens used for that actual poll,
+    // not the tokens obtained above to resolve the main account's identity.
     const result = await quotaManager.refreshMainWithMetadata(
       mainQuotaAccountId,
       credential.accessToken,
@@ -2552,6 +3247,7 @@ const anthropicAuthPlugin = async (
   async function refreshPrimeFallbackQuota(
     accountId: string,
   ): Promise<PrimeRefreshResult> {
+    assertNativeEnvironment()
     const storage = await loadAccounts(accountStoragePath)
     const account = storage?.accounts.find(
       (candidate): candidate is OAuthAccount =>
@@ -2562,101 +3258,53 @@ const anthropicAuthPlugin = async (
     if (!account || !storage) {
       throw new Error(`prime: OAuth account ${accountId} is unavailable`)
     }
-    // Reuse the same fallback-manager refresh path used by the
-    // background quota refresh — it persists the refreshed quota to the
-    // state file (M1 persist requirement) and is the SINGLE usage-API
-    // call per tick for fallback fresh-checks. The redundant
-    // `quotaManager.refreshFallback` call was collapsed (R2).
+    // This poll stores current quota for the account and tokens used to fetch it.
+    // Prime uses that reading to decide whether to start the next window;
+    // sendPrime sends the minimal Haiku request without repeating this poll.
     const refreshed = await fallbackManager.refreshAccountQuota(
       account,
       storage,
     )
-    await fallbackManager.save(storage, [accountId])
+
     return {
       quota: refreshed.account.quota ?? {},
       fresh: refreshed.fetched,
     }
   }
 
+  const primePhysicalAttempts = new Map<string, NativeOAuthAuthorization>()
   async function sendPrime(
     accountId: 'main' | string,
   ): Promise<PrimeSendResult> {
     const start = performance.now()
     let accessToken: string | undefined
     let resolvedModel: string | undefined
-    let scopedAttempt: ClaustrumScopedAttempt | undefined
+    let scopedAttempt: NativeCustodyReceipt | undefined
     try {
-      if (accountId === 'main') {
-        // Use the same refresh path the fresh-check uses, so a missing or
-        // expired access token is refreshed BEFORE the request — not used
-        // as-is. The previous early-return-on-!auth.access made the
-        // refresh arm unreachable (M2).
-        try {
-          const credential = await getCurrentMainCredential()
-          accessToken = credential.accessToken
-          scopedAttempt = credential.scopedAttempt
-        } catch (error) {
-          const isTokenRefresh =
-            error instanceof Error &&
-            (error as Error & { isPrimeTokenRefresh?: boolean })
-              .isPrimeTokenRefresh === true
-          return {
-            ok: false,
-            ...(isTokenRefresh && { reason: 'token-refresh' as const }),
-            error: error instanceof Error ? error.message : String(error),
-          }
-        }
-        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
-      } else {
-        const storage = await loadAccounts(accountStoragePath)
-        const account = storage?.accounts.find(
-          (candidate): candidate is OAuthAccount =>
-            candidate.id === accountId &&
-            candidate.enabled !== false &&
-            isOAuthAccount(candidate),
-        )
-        if (!account || !storage) {
-          return {
-            ok: false,
-            error: `prime: OAuth account ${accountId} is unavailable`,
-          }
-        }
-        if (isScopedCustodyActive(storage)) {
-          scopedAttempt = await getOpenCodeScopedRuntime().authorize(account.id)
-          accessToken = scopedAttempt.accessToken
-        } else if (getClaustrumMode(storage) === 'local') {
-          let current = account
-          try {
-            // R2: the fire path refreshes ONLY the token, not the quota.
-            // The fresh-check already performed the single usage-API
-            // call and persisted the result; the fire path reuses the
-            // in-memory quota via the headers / URL contract. This keeps
-            // the cycle at exactly one quota API call per account.
-            current = await fallbackManager.refreshAccount(account, storage)
-          } catch (error) {
-            return {
-              ok: false,
-              reason: 'token-refresh',
-              error: error instanceof Error ? error.message : String(error),
-            }
-          }
-          accessToken = current.access
-        } else {
-          throw new Error('Scoped Claustrum custody is not configured')
-        }
-        resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
-      }
+      // The manager already checked current quota. Validate the account and
+      // tokens for this Haiku send without another quota poll. An upstream 401
+      // may retry once with newer credentials for the same account.
+      if (
+        accountId === 'main' &&
+        (!latestGetActivation || !(await latestGetActivation()).active)
+      )
+        throw new Error('Native main OAuth activation is not available')
+      const initialAuthorization = await authorizeOAuth(
+        accountId,
+        undefined,
+        undefined,
+        CLAUDE_HAIKU_4_5_MODEL_ID,
+      )
+      accessToken = initialAuthorization.accessToken
+      scopedAttempt = initialAuthorization.scopedAttempt
+      resolvedModel = CLAUDE_HAIKU_4_5_MODEL_ID
 
       if (!accessToken) {
         return { ok: false, error: 'prime: no access token available' }
       }
 
       const primeBody = buildPrimeRequestBody()
-      const identity = await resolveClaudeCodeIdentity(
-        accessToken,
-        resolvedModel,
-        accountId === 'main' ? mainAccountId : accountId,
-      )
+      const identity = nativeWireIdentity(initialAuthorization.accountIdentity)
       const body = await rewriteRequestBody(JSON.stringify(primeBody), {
         identity,
       })
@@ -2679,19 +3327,34 @@ const anthropicAuthPlugin = async (
         primeRequest.url?.toString() ?? primeRequest.input.toString()
       const signal = AbortSignal.timeout(30_000)
       const primeInit = { method: 'POST', headers, body, signal }
+      let physicalAuthorization = await authorizeOAuth(
+        accountId,
+        signal,
+        undefined,
+        resolvedModel,
+      )
+      if (
+        physicalAuthorization.accountIdentity !==
+          initialAuthorization.accountIdentity ||
+        Boolean(physicalAuthorization.scopedAttempt) !==
+          Boolean(initialAuthorization.scopedAttempt)
+      )
+        throw new Error('Prime credential authority changed before dispatch')
+      scopedAttempt = physicalAuthorization.scopedAttempt
+      headers.set(
+        'authorization',
+        `Bearer ${physicalAuthorization.accessToken}`,
+      )
       let response = await fetch(primeUrl, primeInit)
       if (response.status === 401 && scopedAttempt && !signal.aborted) {
-        let current: ClaustrumScopedAttempt | undefined
+        let current: NativeCustodyReceipt | undefined
         try {
-          current = await getOpenCodeScopedRuntime().authorize(
-            accountId,
-            signal,
-          )
+          current = await prepareVaultRetry(scopedAttempt, 'prime', signal)
         } catch {
           // The first 401 belongs to the original physical attempt unless
           // the vault confirms a newer version of this same account.
         }
-        if (decideScopedRetryAfter401('prime', scopedAttempt, current)) {
+        if (current) {
           await response.body?.cancel().catch(() => {})
           logger.info(
             'claustrum',
@@ -2702,8 +3365,61 @@ const anthropicAuthPlugin = async (
               newVersion: current.recordVersion,
             },
           )
-          scopedAttempt = current
-          headers.set('authorization', `Bearer ${current.accessToken}`)
+          physicalAuthorization = await authorizeOAuth(
+            accountId,
+            signal,
+            undefined,
+            resolvedModel,
+          )
+          const successor = physicalAuthorization.scopedAttempt
+          if (
+            !successor ||
+            successor.credentialId !== scopedAttempt.credentialId ||
+            successor.accountIdentity !== scopedAttempt.accountIdentity ||
+            successor.recordVersion <= scopedAttempt.recordVersion
+          )
+            throw new Error('Prime vault retry lost its strict newer receipt')
+          scopedAttempt = successor
+          headers.set('authorization', `Bearer ${successor.accessToken}`)
+          response = await fetch(primeUrl, primeInit)
+        }
+      }
+      if (
+        response.status === 401 &&
+        !physicalAuthorization.scopedAttempt &&
+        !signal.aborted
+      ) {
+        const rejectedAccess = physicalAuthorization.accessToken
+        const replacement = await authorizeOAuth(
+          accountId,
+          signal,
+          rejectedAccess,
+          resolvedModel,
+        ).catch(() => undefined)
+        if (
+          replacement &&
+          replacement.accessToken !== rejectedAccess &&
+          replacement.accountIdentity ===
+            initialAuthorization.accountIdentity &&
+          !replacement.scopedAttempt
+        ) {
+          await response.body?.cancel().catch(() => {})
+          physicalAuthorization = await authorizeOAuth(
+            accountId,
+            signal,
+            undefined,
+            resolvedModel,
+          )
+          if (
+            physicalAuthorization.scopedAttempt ||
+            physicalAuthorization.accountIdentity !==
+              initialAuthorization.accountIdentity
+          )
+            throw new Error('Prime local authority changed before retry')
+          headers.set(
+            'authorization',
+            `Bearer ${physicalAuthorization.accessToken}`,
+          )
           response = await fetch(primeUrl, primeInit)
         }
       }
@@ -2712,11 +3428,7 @@ const anthropicAuthPlugin = async (
         const reason =
           (await response.text().catch(() => '')) || `HTTP ${response.status}`
         if (response.status === 401 && scopedAttempt) {
-          await getOpenCodeScopedRuntime().reportFailure(
-            scopedAttempt,
-            401,
-            'direct',
-          )
+          await reportVault401(scopedAttempt, 'direct')
         }
         return { ok: false, status: response.status, ms, error: reason }
       }
@@ -2740,10 +3452,13 @@ const anthropicAuthPlugin = async (
                 : undefined,
             }
           : undefined
+      primePhysicalAttempts.set(accountId, physicalAuthorization)
       return { ok: true, status: response.status, ms, ...(usage && { usage }) }
     } catch (error) {
       return {
         ok: false,
+        ...(error instanceof NativeCredentialUnavailableError &&
+          error.tokenRefreshFailed && { reason: 'token-refresh' as const }),
         ms: Math.round(performance.now() - start),
         error: error instanceof Error ? error.message : String(error),
       }
@@ -2754,9 +3469,17 @@ const anthropicAuthPlugin = async (
     storagePath: accountStoragePath,
     loadStorage: () => loadAccounts(accountStoragePath),
     getAccountFingerprint: async (accountId) => {
-      const authLineageId = await getOrCreatePrimeAuthLineageId(
+      if (
+        accountId === 'main' &&
+        (!latestGetActivation || !(await latestGetActivation()).active)
+      )
+        return undefined
+      const credential = await authorizeOAuth(accountId)
+      const fence = credential.scopedAttempt ?? credential.localSubject
+      if (!fence) return undefined
+      const authLineageId = await nativeAccounts.getOrCreateAuthLineage(
         accountId,
-        accountStoragePath,
+        fence,
       )
       return authLineageId ? tokenFingerprint(authLineageId) : undefined
     },
@@ -2765,8 +3488,27 @@ const anthropicAuthPlugin = async (
       return refreshPrimeFallbackQuota(accountId)
     },
     sendPrime,
-    recordSuccess: (accountId, usage) =>
-      incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
+    recordSuccess: async (accountId, usage) => {
+      const credential = primePhysicalAttempts.get(accountId)
+      primePhysicalAttempts.delete(accountId)
+      const fence = credential?.scopedAttempt ?? credential?.localSubject
+      if (
+        !fence ||
+        !(await nativeAccounts.incrementPrimeUsage(accountId, fence, usage))
+      ) {
+        throw new Error(
+          'Prime usage publication lost its native credential fence',
+        )
+      }
+      const current = (await nativeAccounts.read()).accounts.find(
+        (account) => account.id === accountId,
+      )?.prime
+      if (!current)
+        throw new Error(
+          'Prime usage counters are unavailable after publication',
+        )
+      return current
+    },
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     setTimeoutImpl: runtimeTimers.setTimeout,
@@ -2887,23 +3629,9 @@ const anthropicAuthPlugin = async (
   }
 
   let rpcServerAdoption: RpcServerAdoption | null = null
-  if (ctx.directory) {
-    const rpcDir = getRpcDir(ctx.directory)
-    try {
-      rpcServerAdoption = await adoptRpcServer(rpcDir, () =>
-        startRpcServer({
-          dir: rpcDir,
-          drain: drainNotifications,
-          apply: applyCommand,
-        }),
-      )
-    } catch (error) {
-      logger.warn('rpc', 'failed to start', {
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
-  }
   const dispose: NonNullable<Hooks['dispose']> = async () => {
+    profileHydrationShutdown.abort()
+    while (profilePublications.size) await Promise.all([...profilePublications])
     try {
       closeOpenCodeScopedRuntime(accountStoragePath)
     } catch (error) {
@@ -2936,7 +3664,9 @@ const anthropicAuthPlugin = async (
       })
     }
     try {
-      fallbackManager.stopBackgroundRefresh()
+      if (fallbackRefreshTimer)
+        runtimeTimers.clearInterval(fallbackRefreshTimer)
+      if (rosterRefreshTimer) runtimeTimers.clearInterval(rosterRefreshTimer)
     } catch (error) {
       logger.warn('fallback-background', 'failed to stop', {
         error: error instanceof Error ? error.message : String(error),
@@ -2993,48 +3723,7 @@ const anthropicAuthPlugin = async (
     mainAccessToken?: string
     mainRefreshToken?: string
     routingAuthoritative?: boolean
-    useHydratedProfiles?: boolean
     skipFallbackQuotaSeed?: boolean
-  }
-
-  function mergeHydratedProfilesForSidebar(
-    latest: Awaited<ReturnType<typeof loadAccounts>>,
-    hydrated: Awaited<ReturnType<typeof loadAccounts>>,
-    mainAccessToken?: string,
-  ) {
-    if (!latest || !hydrated) return latest
-    const merged: AccountStorage = {
-      ...latest,
-      accounts: latest.accounts.map((account) => {
-        const hydratedAccount = hydrated.accounts.find(
-          (candidate) => candidate.id === account.id,
-        )
-        if (
-          !isOAuthAccount(account) ||
-          !hydratedAccount ||
-          !isOAuthAccount(hydratedAccount) ||
-          !account.access ||
-          hydratedAccount.access !== account.access
-        ) {
-          return account
-        }
-        return { ...account, profile: hydratedAccount.profile }
-      }),
-    }
-    const latestMainProfile = latest.main?.profile
-    const mainState = latest.main ?? hydrated.main
-    if (
-      mainAccessToken &&
-      mainState &&
-      (!latestMainProfile ||
-        oauthProfileMatchesIdentity(latestMainProfile, mainAccountId))
-    ) {
-      merged.main = {
-        ...mainState,
-        profile: hydrated.main?.profile,
-      }
-    }
-    return merged
   }
 
   function buildSidebarState(
@@ -3081,17 +3770,14 @@ const anthropicAuthPlugin = async (
             id: account.id,
             label: account.label,
             tierLabel: formatOAuthAccountTier(account.profile),
-            // Token-aware read: local access or a live vault-served tombstone
-            // qualifies the lineage-bound cache read. If a fallback account was
-            // re-logged with the same id/label, an old in-memory quota snapshot
-            // must not be shown as the new account's quota; vault-served
-            // tombstones have no local access by design, but their live binding
-            // proves the snapshot belongs to the currently served account.
+            // Native account reads verify the quota's current account binding.
+            // Local and vault projections both omit bearer material, so an
+            // empty access field must not hide their verified quota readings.
             quota: options.skipFallbackQuotaSeed
               ? null
-              : account.access || vaultServed
-                ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
-                : null,
+              : (quotaManager.getFallback(account.id, account)?.quota ??
+                account.quota ??
+                null),
             // A fallback with a permanently-dead refresh token (400 invalid_grant)
             // is dropped by getUsableFallbackAccounts and silently degrades to
             // main — surface it as "needs re-login". Only flag truly-dead tokens
@@ -3113,15 +3799,10 @@ const anthropicAuthPlugin = async (
         }),
       activeId: options.activeId,
       route: options.route,
-      relay: (() => {
-        const currentRelayConfig = getRelayConfig(storage)
-        return currentRelayConfig
-          ? {
-              enabled: true,
-              transport: currentRelayConfig.transport ?? 'http',
-            }
-          : null
-      })(),
+      relay:
+        storage?.relay?.enabled && storage.relay.url
+          ? { enabled: true, transport: storage.relay.transport ?? 'http' }
+          : null,
       fastMode: isFastModeEnabled(),
       cacheKeep: {
         enabled: isCacheKeepHybridActive(storage),
@@ -3170,13 +3851,10 @@ const anthropicAuthPlugin = async (
               () => loadAccounts(accountStoragePath),
               { activeId: state.activeId, route: state.route },
             )
-            const displayStorage = options.useHydratedProfiles
-              ? mergeHydratedProfilesForSidebar(
-                  preservedRouting.freshStorage,
-                  storage,
-                  options.mainAccessToken,
-                )
-              : preservedRouting.freshStorage
+            // Display the profile from current storage. A route may have been
+            // replaced while polling, so the earlier fetched profile could
+            // describe a different account.
+            const displayStorage = preservedRouting.freshStorage
             return {
               activeId: preservedRouting.activeId,
               route: preservedRouting.route,
@@ -3296,151 +3974,53 @@ const anthropicAuthPlugin = async (
     return storage?.refresh?.enabled !== false
   }
 
-  async function clearStaleMainRefreshError(
-    accountIdentity?: string,
-    currentRefreshTokenFingerprint?: string,
-  ) {
-    if (!accountIdentity) return
-    const storage = await loadAccounts(accountStoragePath)
-    const error = storage?.refresh?.mainLastRefreshError
-    if (!storage?.refresh || !error) return
-    const identityChanged =
-      Boolean(error.accountIdentity) &&
-      error.accountIdentity !== accountIdentity
-    const refreshTokenChanged =
-      Boolean(error.refreshTokenFingerprint) &&
-      Boolean(currentRefreshTokenFingerprint) &&
-      error.refreshTokenFingerprint !== currentRefreshTokenFingerprint
-    if (!identityChanged && !refreshTokenChanged) return
-    storage.refresh.mainLastRefreshError = undefined
-    storage.refresh.mainRefreshErrorClearedAt = mergeMainRefreshErrorClearedAt(
-      storage.refresh.mainRefreshErrorClearedAt,
-      Date.now(),
-    )
-    if (!mainQuotaIdentityAccessToken?.startsWith('sk-ant-oat')) {
-      const quotaError = storage.quota?.mainLastQuotaApiError
-      if (quotaError && quotaError.accountIdentity !== mainQuotaAccountId) {
-        const clearedGeneration = quotaManager.clearMainBackoff()
-        storage.quota = storage.quota ?? {}
-        storage.quota.mainLastQuotaApiError = undefined
-        storage.quota.mainQuotaErrorGeneration = Math.max(
-          storage.quota.mainQuotaErrorGeneration ?? 0,
-          clearedGeneration ?? quotaManager.getMainQuotaErrorGeneration(),
-        )
-        storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
-          storage.quota.mainQuotaErrorClearedAt,
-          quotaManager.getMainQuotaErrorClearedAt() ?? Date.now(),
-        )
-      }
-    }
-    await saveAccountState(storage, accountStoragePath, {
-      mainRefresh: true,
-      ...(!mainQuotaIdentityAccessToken?.startsWith('sk-ant-oat') && {
-        mainQuota: true,
-      }),
-    })
-    log(
-      '[refresh] opencode main oauth cleared stale backoff after token rotation',
-      {
-        previousCheckedAt: error.checkedAt,
-        previousNextRetryAt: error.nextRetryAt,
-        previousRetryCount: error.retryCount,
-      },
-    )
-  }
-
-  async function buildQuotaCommandSummary() {
-    const accounts: QuotaAccountSummary[] = []
-    let mainAccessToken: string | undefined
-    if (latestGetAuth) {
-      try {
-        const auth = await latestGetAuth()
-        // Under scoped custody the host slot is a tombstone with empty access;
-        // main's credential comes from the vault per attempt instead.
-        const scopedMainCredential =
-          auth.type === 'oauth' &&
-          isScopedCustodyActive(await loadAccounts(accountStoragePath))
-            ? await getCurrentMainCredential()
-            : undefined
-        const commandAccessToken = scopedMainCredential
-          ? scopedMainCredential.accessToken
-          : auth.access
-            ? (mainServedAccessToken ?? auth.access)
-            : undefined
-        if (auth.type === 'oauth' && commandAccessToken) {
-          mainAccessToken = commandAccessToken
-          const resolution = await resolveMainQuotaAccountIdentity(
-            commandAccessToken,
-            undefined,
-            scopedMainCredential?.credentialAccountId,
-          )
-          if (resolution.stale && scopedMainCredential) {
-            throw new Error(
-              'Main account identity changed while checking quota; try again',
-            )
-          }
-          // /claude-quota is a manual action: force a real fetch instead of
-          // returning the cache. refreshMain still respects 429 backoff — it
-          // returns the last cached snapshot when the API is backed off.
-          const quota = await quotaManager.refreshMain(
-            mainQuotaAccountId,
-            commandAccessToken,
-          )
-          accounts.push({
-            name: 'OpenCode anthropic',
-            role: 'main',
-            quota,
-          })
-        } else if (auth.type === 'oauth') {
-          accounts.push({
-            name: 'OpenCode anthropic',
-            role: 'main',
-            error:
-              'missing access token; send a request first or reconnect auth',
-          })
+  async function buildQuotaCommandSummary(refresh = false) {
+    const errors = new Map<string, string>()
+    if (refresh) {
+      // Only the explicit refresh action polls usage. Opening the menu reads
+      // saved account metadata and cannot start credential recovery or a poll.
+      if (latestGetActivation && (await latestGetActivation()).active) {
+        try {
+          await nativeAccounts.fetchQuota('main')
+        } catch {
+          errors.set('main', 'Native primary usage refresh unavailable')
         }
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error)
-        accounts.push({
-          name: 'OpenCode anthropic',
-          role: 'main',
-          error: msg.includes('429')
-            ? 'Usage API rate limited — try again in a moment'
-            : msg,
-        })
       }
+      await refreshFallbackQuotas(true)
     }
-
-    // Force a real fallback refresh and PERSIST it to anthropic-auth.json.
-    // refreshQuotaForAllAccounts({ force: true }) bypasses the staleness skip,
-    // routes through the unified QuotaManager path (429 backoff respected
-    // per-account), saves refreshed snapshots, and clears stale errors.
-    const { storage, errors } =
-      await fallbackManager.refreshQuotaForAllAccounts({ force: true })
-    const displayStorage = await ensureProfilesForQuotaDisplay(
-      storage ?? createEmptyStorage(),
-      mainAccessToken,
+    const snapshot = await readNativeSnapshotForDisplay(
       AbortSignal.timeout(3_000),
-      mainProviderAccountUuid,
     )
-    const mainSummary = accounts.find((account) => account.role === 'main')
-    if (mainSummary) {
-      mainSummary.tierLabel = formatOAuthAccountTier(
-        displayStorage.main?.profile,
-      )
-    }
-    const errorMap = new Map(errors.map((e) => [e.accountId, e.message]))
-    accounts.push(...buildFallbackQuotaSummaries(displayStorage, errorMap))
-
-    if (!latestGetAuth) {
-      accounts.unshift({
-        name: 'OpenCode anthropic',
+    quotaManager.updateStorage(snapshot.policyStorage)
+    quotaManager.seedMainFromStorage(snapshot.policyStorage, mainQuotaAccountId)
+    quotaManager.seedFallbacksFromAccounts(
+      snapshot.policyStorage.accounts.filter(isOAuthAccount),
+    )
+    const accounts: QuotaAccountSummary[] = []
+    const main = snapshot.accounts.find(
+      (account) => account.id === 'main' && account.type === 'oauth',
+    )
+    if (main)
+      accounts.push({
+        name: main.label ?? 'OpenCode anthropic',
         role: 'main',
-        error: 'auth loader has not run yet; send a request first',
+        quota: main.quota,
+        tierLabel: formatOAuthAccountTier(main.profile),
+        error: errors.get('main') ?? main.lastQuotaRefreshError?.message,
       })
-    }
-
-    return buildClaudeQuotaSummary({ accounts, refreshedAt: Date.now() })
+    accounts.push(
+      ...buildFallbackQuotaSummaries(snapshot.policyStorage, errors),
+    )
+    const checkedAt = Math.max(
+      0,
+      ...snapshot.accounts.map((account) =>
+        quotaSnapshotCheckedAt(account.quota),
+      ),
+    )
+    return buildClaudeQuotaSummary({
+      accounts,
+      refreshedAt: checkedAt || undefined,
+    })
   }
 
   async function refreshSidebarAfterMutation(
@@ -3915,8 +4495,9 @@ const anthropicAuthPlugin = async (
   async function executePersistentLoggingCommand(argumentsText: string) {
     const action = parseLoggingCommandAction(argumentsText)
     if (action.type === 'level') {
+      // The native runtime stores the level, applies it to this process's
+      // logger and logs a live level change.
       await setLogLevelPersistent(action.level)
-      logger.info('commands', 'log level changed', { level: action.level })
       return executeLoggingCommand({ argumentsText, level: action.level })
     }
 
@@ -3982,8 +4563,9 @@ const anthropicAuthPlugin = async (
   async function executePersistentAccountCommand(
     argumentsText: string,
     sessionId?: string,
+    checkedAction?: ReturnType<typeof parseAccountCommandAction>,
   ) {
-    const action = parseAccountCommandAction(argumentsText)
+    const action = checkedAction ?? parseAccountCommandAction(argumentsText)
 
     // -- add-apikey --------------------------------------------------------
     if (action.type === 'add-apikey') {
@@ -4019,12 +4601,15 @@ const anthropicAuthPlugin = async (
         addedAt: now,
         lastUsed: now,
       }
-      await addAccountPersistent(account, accountStoragePath)
-      logger.info('commands', 'account added', {
-        id: account.id,
+      await nativeAccounts.addApi({
+        routeId: account.id,
+        apiKey: action.apiKey,
         label: account.label,
-        type: 'apikey',
+        baseURL: resolvedBaseURL,
+        authHeader: resolvedAuthHeader,
       })
+      // addApi logs only a newly saved account. Do not emit a second
+      // account-added event from this command adapter.
 
       const updatedStorage = await loadAccounts(accountStoragePath)
       await refreshSidebarAfterMutation(updatedStorage)
@@ -4111,12 +4696,18 @@ const anthropicAuthPlugin = async (
           lastUsed: now,
           lastRefreshedAt: now,
         }
-        await addAccountPersistent(account, accountStoragePath)
-        logger.info('commands', 'account added', {
-          id: account.id,
+        assertNativeEnvironment()
+        await nativeAccounts.loginOAuth({
+          routeId: account.id,
           label: account.label,
-          type: 'oauth',
+          credential: {
+            access: result.access,
+            refresh: result.refresh,
+            expires: result.expires,
+          },
         })
+        // loginOAuth logs the saved account addition. This command adapter
+        // must not emit a duplicate event.
 
         const updatedStorage = await loadAccounts(accountStoragePath)
         await refreshSidebarAfterMutation(updatedStorage)
@@ -4208,82 +4799,30 @@ const anthropicAuthPlugin = async (
       },
     })
 
+    // These persistence helpers call the native account runtime, which logs
+    // committed changes. Command parsing must not log attempted mutations.
     if (result.updated) {
       if (
         result.updated.action === 'enable' ||
         result.updated.action === 'disable'
       ) {
-        const enabled = result.updated.action === 'enable'
         await setAccountEnabledPersistent(
           result.updated.id,
-          enabled,
+          result.updated.action === 'enable',
           accountStoragePath,
         )
-        const updatedId = result.updated.id
-        const account = storage?.accounts.find((a) => a.id === updatedId)
-        logger.info('commands', `account ${result.updated.action}d`, {
-          id: updatedId,
-          label: account?.label,
-          enabled,
-        })
       } else if (result.updated.action === 'remove') {
         await removeAccountPersistent(result.updated.id, accountStoragePath)
-        const updatedId = result.updated.id
-        const account = storage?.accounts.find((a) => a.id === updatedId)
-        logger.info('commands', 'account removed', {
-          id: updatedId,
-          label: account?.label,
-        })
       } else if (result.updated.action === 'reorder') {
         await reorderAccountsPersistent(
           result.updated.newOrder ?? result.updated.previousOrder ?? [],
           accountStoragePath,
+          result.updated.id,
         )
-        const updatedId = result.updated.id
-        const account = storage?.accounts.find((a) => a.id === updatedId)
-        logger.info('commands', 'account reordered', {
-          id: updatedId,
-          label: account?.label,
-        })
       } else if (result.updated.action === 'reset-backoff') {
-        const mainIdentity = mainAccountId ?? storage?.mainAccountId
-        storage = storage ?? createEmptyStorage()
-        storage.refresh = storage.refresh ?? {}
-        storage.refresh.mainLastRefreshError = undefined
-        storage.refresh.mainRefreshErrorClearedAt =
-          mergeMainRefreshErrorClearedAt(
-            storage.refresh.mainRefreshErrorClearedAt,
-            Date.now(),
-          )
-        const quotaError = storage.quota?.mainLastQuotaApiError
-        if (
-          !quotaError?.accountIdentity ||
-          !mainIdentity ||
-          quotaError.accountIdentity === mainIdentity
-        ) {
-          const clearedGeneration = quotaManager.clearMainBackoff()
-          storage.quota = storage.quota ?? {}
-          storage.quota.mainLastQuotaApiError = undefined
-          storage.quota.mainQuotaErrorGeneration = Math.max(
-            storage.quota.mainQuotaErrorGeneration ?? 0,
-            clearedGeneration ?? quotaManager.getMainQuotaErrorGeneration(),
-          )
-          storage.quota.mainQuotaErrorClearedAt = mergeMainQuotaErrorClearedAt(
-            storage.quota.mainQuotaErrorClearedAt,
-            quotaManager.getMainQuotaErrorClearedAt() ?? Date.now(),
-          )
-        }
-        await saveAccountState(storage, accountStoragePath, {
-          mainRefresh: true,
-          mainQuota: true,
-        })
-        logger.info(
-          'commands',
-          'main OAuth refresh and quota backoff cleared',
-          {
-            mainIdentity,
-          },
-        )
+        await resetNativeBackoff('main')
+        quotaManager.clearMainBackoff()
+        logger.info('commands', 'native main refresh and quota backoff cleared')
       }
 
       const updatedStorage = await loadAccounts(accountStoragePath)
@@ -4482,23 +5021,9 @@ const anthropicAuthPlugin = async (
       accountIds,
     })
     if (result.updatedConfig) {
+      // This persistence call logs only committed setting changes. Keep
+      // logging out of the parser so a failed write produces no change event.
       await setKillswitchPersistent(result.updatedConfig)
-      if (config.enabled !== result.updatedConfig.enabled) {
-        logger.info('commands', 'killswitch changed', {
-          enabled: result.updatedConfig.enabled === true,
-        })
-      }
-      if (
-        JSON.stringify(config.main) !==
-          JSON.stringify(result.updatedConfig.main) ||
-        JSON.stringify(config.accounts) !==
-          JSON.stringify(result.updatedConfig.accounts)
-      ) {
-        logger.info('commands', 'killswitch thresholds changed', {
-          thresholds:
-            result.updatedConfig.main ?? result.updatedConfig.accounts,
-        })
-      }
     }
     return {
       command,
@@ -4507,13 +5032,289 @@ const anthropicAuthPlugin = async (
     }
   }
 
-  async function applyCommand(request: ApplyRequest): Promise<ApplyResult> {
+  async function applyCommand(_request: ApplyRequest): Promise<ApplyResult> {
+    // Old dialog requests return guidance instead of changing accounts or
+    // settings. The /claude menu requires confirmation and checks which
+    // actions are allowed without an interactive UI before dispatching them.
+    return { text: 'Open /claude to manage native Claude settings.', knobs: {} }
+  }
+
+  const dispatchNative: NativeMenuDispatch = async (request, options) => {
+    if (options.signal?.aborted)
+      throw options.signal.reason ?? new Error('Menu action aborted')
+    let text: string
+    switch (request.action) {
+      case 'enable':
+      case 'disable':
+        await nativeAccounts.setEnabled(
+          request.values.id,
+          request.action === 'enable',
+        )
+        text = `Account ${request.values.id} ${request.action}d.`
+        break
+      case 'remove':
+        await nativeAccounts.remove(request.values.id)
+        text = `Account ${request.values.id} removed.`
+        break
+      case 'move-up':
+      case 'move-down': {
+        const order = (await nativeAccounts.read()).accounts
+          .filter((account) => account.id !== 'main')
+          .map((account) => account.id)
+        const index = order.indexOf(request.values.id)
+        if (index < 0) throw new Error('Native account not found')
+        const target = index + (request.action === 'move-up' ? -1 : 1)
+        if (target >= 0 && target < order.length) {
+          const neighbor = order[target]
+          if (neighbor === undefined)
+            throw new Error('Native account order changed')
+          order[target] = request.values.id
+          order[index] = neighbor
+          await nativeAccounts.reorder(order, request.values.id)
+        }
+        text = 'Native account order updated.'
+        break
+      }
+      case 'add-apikey':
+        // Use this plugin's established API-route defaults when values are
+        // omitted: route id = the label, or a random UUID without one; base URL
+        // = https://api.kie.ai/claude; auth header = authorization-bearer.
+        // The generic native addApi would instead use a random UUID and
+        // https://api.anthropic.com with no auth header set.
+        text = (
+          await executePersistentAccountCommand('', request.sessionId, {
+            type: 'add-apikey',
+            apiKey: request.values.apiKey,
+            label: request.values.label ?? undefined,
+            baseURL: request.values.baseURL ?? undefined,
+            authHeader: request.values.authHeader ?? undefined,
+          })
+        ).text
+        break
+      case 'add-oauth-start':
+        text = (
+          await executePersistentAccountCommand('', request.sessionId, {
+            type: 'add-oauth-start',
+          })
+        ).text
+        break
+      case 'add-oauth-finish':
+        text = (
+          await executePersistentAccountCommand('', request.sessionId, {
+            type: 'add-oauth-finish',
+            ...request.values,
+          })
+        ).text
+        break
+      case 'reset-backoff': {
+        await resetNativeBackoff('main', options.signal)
+        quotaManager.clearMainBackoff()
+        text =
+          'Native main refresh and quota backoff cleared; credential validation and quarantine are unchanged.'
+        break
+      }
+      case 'enrollment-reset':
+        text = (await executePersistentAccountCommand('enrollment-reset')).text
+        break
+      case 'quota-refresh':
+        text = await buildQuotaCommandSummary(true)
+        break
+      case 'routing-mode':
+        text = await executePersistentRoutingCommand(request.values.mode)
+        break
+      case 'routing-reset':
+        text = await executePersistentRoutingCommand('reset', request.sessionId)
+        break
+      case 'cache-on':
+      case 'cache-off':
+        text = await executePersistentCache1hCommand(
+          request.action === 'cache-on' ? 'on' : 'off',
+        )
+        break
+      case 'cache-mode':
+        text = await executePersistentCache1hCommand(
+          `mode ${request.values.mode}`,
+        )
+        break
+      case 'cachekeep-always':
+        text = await executePersistentCacheKeepCommand('always')
+        break
+      case 'cachekeep-off':
+        text = await executePersistentCacheKeepCommand('off')
+        break
+      case 'cachekeep-window':
+        text = await executePersistentCacheKeepCommand(
+          `${request.values.startHour}-${request.values.endHour}`,
+        )
+        break
+      case 'cachekeep-subagents':
+        text = await executePersistentCacheKeepCommand(
+          `subagents ${request.values.enabled}`,
+        )
+        break
+      case 'dump-on':
+      case 'dump-off':
+        text = await executePersistentDumpCommand(
+          request.action === 'dump-on' ? 'on' : 'off',
+        )
+        break
+      case 'fast-on':
+      case 'fast-off':
+        text = await executePersistentFastModeCommand(
+          request.action === 'fast-on' ? 'on' : 'off',
+        )
+        break
+      case 'prime-on':
+      case 'prime-off':
+        text = await executePersistentPrimeCommand(
+          request.action === 'prime-on' ? 'on' : 'off',
+        )
+        break
+      case 'logging-level':
+        text = await executePersistentLoggingCommand(request.values.level)
+        break
+      case 'killswitch-on':
+      case 'killswitch-off':
+      case 'killswitch-set': {
+        const snapshot = await nativeAccounts.read()
+        const accountIds = snapshot.accounts
+          .filter((account) => account.id !== 'main')
+          .map((account) => account.id)
+        await nativeAccounts.updateSettings((settings) => {
+          const config = getKillswitchConfig({
+            ...settings,
+            version: 1,
+            accounts: [],
+          })
+          if (request.action !== 'killswitch-set') {
+            const result = executeKillswitchCommand({
+              argumentsText: request.action === 'killswitch-on' ? 'on' : 'off',
+              config,
+              accountIds,
+            })
+            return { ...settings, killswitch: result.updatedConfig ?? config }
+          }
+          const accounts = { ...config.accounts }
+          const updated: NonNullable<AccountStorage['killswitch']> = {
+            ...config,
+            enabled: true,
+            accounts,
+          }
+          for (const entry of request.values.entries) {
+            const thresholds = {
+              five_hour: entry.fh,
+              seven_day: entry.sd,
+              ...(entry.scoped === undefined ? {} : { scoped: entry.scoped }),
+            }
+            if (entry.account === 'main' || entry.account === 'all')
+              updated.main = thresholds
+            if (entry.account === 'all') {
+              for (const id of accountIds) accounts[id] = thresholds
+            } else if (entry.account !== 'main')
+              accounts[entry.account] = thresholds
+          }
+          return { ...settings, killswitch: updated }
+        })
+        text = 'Native killswitch policy updated.'
+        break
+      }
+      case 'start-fire':
+        text = await executePersistentStartCommand('', request.sessionId)
+        break
+      default: {
+        const unsupported: never = request
+        throw new Error(`Unsupported native menu action: ${unsupported}`)
+      }
+    }
+    await refreshSidebarAfterMutation(await loadAccounts())
+    return {
+      ok: true,
+      text: text
+        .split('\n')
+        .filter((line) => !line.includes('/claude-'))
+        .join('\n'),
+    }
+  }
+
+  const readNativeStatus: NativeUiOptions['readStatus'] = async (
+    command,
+    invocation,
+  ) => {
+    if (command === 'account') {
+      const snapshot = await readNativeSnapshotForDisplay(
+        AbortSignal.timeout(3_000),
+      )
+      const enrollment =
+        snapshot.mode === 'claustrum'
+          ? await readClaustrumEnrollmentStatus(
+              getHostClaustrumEnrollmentPaths('opencode'),
+              CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+            )
+          : undefined
+      return [
+        `Custody mode: ${snapshot.mode}`,
+        ...(enrollment
+          ? formatEnrollmentStatus(
+              enrollment,
+              snapshot.accounts.some(
+                (account) =>
+                  account.id === 'main' &&
+                  account.source === 'vault' &&
+                  account.enabled,
+              ),
+            )
+          : []),
+        ...snapshot.accounts.map(
+          (account) =>
+            `${account.label ?? account.id} [${account.id === 'main' ? 'main' : 'fallback'}] ${account.enabled ? 'enabled' : 'disabled'} — ${account.source}${account.state ? ` (${account.state})` : ''}${formatOAuthAccountTier(account.profile) ? ` — ${formatOAuthAccountTier(account.profile)}` : ''}`,
+        ),
+      ].join('\n')
+    }
+    const modalNames = {
+      account: 'claude-account',
+      quota: 'claude-quota',
+      routing: 'claude-routing',
+      killswitch: 'claude-killswitch',
+      cache: 'claude-cache',
+      cachekeep: 'claude-cachekeep',
+      dump: 'claude-dump',
+      logging: 'claude-logging',
+      fast: 'claude-fast',
+      prime: 'claude-prime',
+    } satisfies Record<
+      Parameters<NativeUiOptions['readStatus']>[0],
+      CommandModalName
+    >
     const payload = await buildDialogPayload(
-      request.command,
-      request.arguments,
-      request.sessionId,
+      modalNames[command],
+      '',
+      invocation.sessionId,
     )
-    return { text: payload.text, knobs: payload.knobs }
+    return payload.text
+      .split('\n')
+      .filter((line) => !line.includes('/claude-'))
+      .join('\n')
+  }
+  const nativeCommands = new Map<
+    string,
+    { interactive: boolean; command: ReturnType<typeof createNativeCommand> }
+  >()
+  function getNativeCommand(sessionId: string) {
+    const interactive = isTuiConnected(sessionId)
+    let entry = nativeCommands.get(sessionId)
+    if (!entry || entry.interactive !== interactive) {
+      entry = {
+        interactive,
+        command: createNativeCommand({
+          host: 'opencode',
+          dispatch: dispatchNative,
+          readStatus: readNativeStatus,
+          interactive,
+        }),
+      }
+      nativeCommands.set(sessionId, entry)
+    }
+    return entry.command
   }
 
   function quotaBar(pct: number, width = 10): string {
@@ -4617,6 +5418,23 @@ const anthropicAuthPlugin = async (
         },
       })
       ?.catch?.(() => {})
+  }
+
+  if (ctx.directory) {
+    const rpcDir = getRpcDir(ctx.directory)
+    try {
+      rpcServerAdoption = await adoptRpcServer(rpcDir, () =>
+        startRpcServer({
+          dir: rpcDir,
+          drain: drainNotifications,
+          apply: applyCommand,
+          applyMenu: (request) =>
+            getNativeCommand(request.sessionId ?? '').apply(request),
+        }),
+      )
+    } catch {
+      logger.warn('rpc', 'native menu server unavailable')
+    }
   }
 
   return {
@@ -4760,6 +5578,8 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.deleted') {
+        nativeCommands.delete(sessionId)
+        oauthPending.delete(sessionId)
         laneStartTracker.clearSession(sessionId)
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
@@ -4776,63 +5596,15 @@ const anthropicAuthPlugin = async (
       }
     },
     config: async (config: { command?: Record<string, unknown> }) => {
+      const commands = { ...(config.command ?? {}) }
+      // Retire only commands owned by this plugin; unrelated user commands stay.
+      for (const command of COMMAND_MODAL_NAMES) delete commands[command]
       config.command = {
-        ...(config.command ?? {}),
-        [CACHE_1H_COMMAND_NAME]: {
-          template: CACHE_1H_COMMAND_NAME,
+        ...commands,
+        claude: {
+          template: 'claude',
           description:
-            'Show or toggle 1-hour Anthropic ephemeral prompt cache TTL.',
-        },
-        [CLAUDE_ACCOUNT_COMMAND_NAME]: {
-          template: CLAUDE_ACCOUNT_COMMAND_NAME,
-          description:
-            'Manage fallback accounts — list, enable/disable, reorder, remove, or add (API key or OAuth).',
-        },
-        [CLAUDE_CACHE_KEEP_COMMAND_NAME]: {
-          template: CLAUDE_CACHE_KEEP_COMMAND_NAME,
-          description:
-            'Keep hybrid Claude cache warm always or during a local time window.',
-        },
-        [CLAUDE_PRIME_COMMAND_NAME]: {
-          template: CLAUDE_PRIME_COMMAND_NAME,
-          description:
-            "Start each OAuth account's five-hour quota window after reset.",
-        },
-        [CLAUDE_START_COMMAND_NAME]: {
-          template: CLAUDE_START_COMMAND_NAME,
-          description:
-            'Send a billed one-token synthetic turn to warm and renew the current Claude session cache.',
-        },
-
-        [CLAUDE_QUOTAS_COMMAND_NAME]: {
-          template: CLAUDE_QUOTAS_COMMAND_NAME,
-          description:
-            'Show current Claude OAuth quota usage for all accounts.',
-        },
-        [CLAUDE_DUMP_COMMAND_NAME]: {
-          template: CLAUDE_DUMP_COMMAND_NAME,
-          description:
-            'Show or toggle Anthropic request dump capture for debugging.',
-        },
-        [CLAUDE_FAST_COMMAND_NAME]: {
-          template: CLAUDE_FAST_COMMAND_NAME,
-          description:
-            'Show or toggle Anthropic fast mode for supported Opus models.',
-        },
-        [CLAUDE_LOGGING_COMMAND_NAME]: {
-          template: CLAUDE_LOGGING_COMMAND_NAME,
-          description:
-            'Show or set the plugin log level (error, warn, info, debug, trace).',
-        },
-        [CLAUDE_ROUTING_COMMAND_NAME]: {
-          template: CLAUDE_ROUTING_COMMAND_NAME,
-          description:
-            'Show or change Claude account routing: main-first, fallback-first, or sticky-balanced.',
-        },
-        [KILLSWITCH_COMMAND_NAME]: {
-          template: KILLSWITCH_COMMAND_NAME,
-          description:
-            'Manage killswitch — hard-block requests when quota drops below per-account thresholds.',
+            'Manage Claude accounts, quotas, routing, and cache settings.',
         },
       }
     },
@@ -4871,37 +5643,32 @@ const anthropicAuthPlugin = async (
       arguments: string
       sessionID: string
     }) => {
-      if (!COMMAND_MODAL_NAMES.includes(input.command as CommandModalName))
-        return
-      const command = input.command as CommandModalName
-      const payload = await buildDialogPayload(
-        command,
-        input.arguments,
+      if (input.command !== 'claude') return
+      const payload = await getNativeCommand(input.sessionID).open(
         input.sessionID,
       )
-      if (command === 'claude-quota') {
-        const cmdStorage = await loadAccounts()
-        const cmdAuth = latestGetAuth
-          ? await latestGetAuth().catch(() => undefined)
-          : undefined
-        writeSidebarState(cmdStorage, {
-          activeId: lastSidebarRouting.activeId,
-          route: lastSidebarRouting.route,
-          mainAccessToken: cmdAuth?.access,
-          routingAuthoritative: false,
-        })
-      }
       if (isTuiConnected(input.sessionID)) {
         pushNotification(payload, input.sessionID)
       } else {
-        await sendIgnoredMessage(ctx, input.sessionID, payload.text)
+        const text = [
+          payload.menu.title,
+          ...payload.menu.sections.flatMap((section) => [
+            `\n## ${section.title}`,
+            ...section.lines,
+            ...section.items.map(
+              (item) =>
+                `${item.label}${item.detail ? ` — ${item.detail}` : ''}`,
+            ),
+          ]),
+        ].join('\n')
+        await sendIgnoredMessage(ctx, input.sessionID, text)
       }
       cleanAbort()
     },
     auth: {
       provider: 'anthropic',
       async loader(
-        getAuth: () => Promise<{
+        hostGetAuth: () => Promise<{
           type: string
           access?: string
           refresh?: string
@@ -4909,8 +5676,267 @@ const anthropicAuthPlugin = async (
         }>,
         _provider: { models: Record<string, { cost: unknown }> },
       ) {
+        latestGetActivation = async () => {
+          const current = await hostGetAuth()
+          return {
+            type: current.type,
+            active: isCustodyTombstoneOAuth(current, 'anthropic'),
+          }
+        }
+        const activation = await hostGetAuth()
+        // Ordinary OpenCode API-key authentication remains unchanged. After
+        // migration, the OAuth marker only enables our provider. Each send must
+        // validate current local credentials or obtain new vault authorization.
+        if (activation.type !== 'oauth') return {}
+        if (process.env.OPENCODE_AUTH_CONTENT !== undefined) {
+          return {
+            apiKey: '',
+            fetch: async () => {
+              throw new Error(
+                'Native OAuth cannot serve while OPENCODE_AUTH_CONTENT is set',
+              )
+            },
+          }
+        }
+        if (nativeStartupError) {
+          return {
+            apiKey: '',
+            fetch: async () => {
+              throw nativeStartupError
+            },
+          }
+        }
+        const journal = await readNativeMigrationJournal(nativePaths)
+        if (
+          !bootProfileHydrationStarted &&
+          isCustodyTombstoneOAuth(activation, 'anthropic') &&
+          process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION !== '1'
+        ) {
+          // Show native account tiers before the first model request, without
+          // making provider initialization wait for profile network or storage.
+          bootProfileHydrationStarted = true
+          const hydration = readNativeSnapshotForDisplay(
+            profileHydrationShutdown.signal,
+          )
+            .then((snapshot) => {
+              if (!profileHydrationShutdown.signal.aborted)
+                return writeSidebarState(snapshot.policyStorage, {
+                  ...lastSidebarRouting,
+                  routingAuthoritative: false,
+                })
+            })
+            .catch(() => {
+              if (!profileHydrationShutdown.signal.aborted)
+                logger.debug(
+                  'quota',
+                  'startup account profile hydration failed',
+                )
+            })
+          profilePublications.add(hydration)
+          void hydration.then(() => profilePublications.delete(hydration))
+        }
+        function requireNativeActivation(currentActivation: unknown) {
+          if (!isCustodyTombstoneOAuth(currentActivation, 'anthropic'))
+            throw new Error(
+              'Native OAuth requires inert OpenCode activation; run offline setup',
+            )
+        }
+        const getAuth = async (
+          modelId?: string,
+          signal?: AbortSignal,
+          deferCredential = false,
+        ) => {
+          const currentActivation = await hostGetAuth()
+          if (currentActivation.type !== 'oauth')
+            return {
+              type: currentActivation.type,
+              access: '',
+              expires: 0,
+              refresh: undefined,
+              nativeAccountIdentity: undefined,
+              nativeRoutingLineage: undefined,
+              nativeLocalSource: undefined,
+              nativeScopedAttempt: undefined,
+              modelDenied: false,
+              credentialUnavailable: false,
+              credentialFailure: undefined,
+              deferred: false,
+            }
+          requireNativeActivation(currentActivation)
+          const primarySnapshot = await nativeAccounts.read()
+          headerRoutingPolicyStorage = primarySnapshot.policyStorage
+          const primaryAccount = primarySnapshot.accounts.find(
+            (account) => account.id === 'main',
+          )
+          const primaryBinding = primaryAccount?.binding
+          const primaryRoutingQuota = primaryAccount
+            ? routingAccountQuota(primaryAccount, primarySnapshot.policyStorage)
+            : undefined
+          const primaryRoutingStorage =
+            primaryRoutingQuota && primaryRoutingQuota !== primaryAccount?.quota
+              ? {
+                  ...primarySnapshot.policyStorage,
+                  quota: {
+                    ...primarySnapshot.policyStorage.quota,
+                    mainQuota: primaryRoutingQuota,
+                  },
+                }
+              : primarySnapshot.policyStorage
+          const primaryObservation = currentHeaderRoutingObservation(
+            'main',
+            localHeaderRoutingLineage(primaryBinding),
+            primaryAccount?.accountIdentity,
+            primarySnapshot.policyStorage,
+          )
+          const primaryHeaderExhaustionProven = Boolean(
+            primaryBinding &&
+              primaryObservation?.lineage ===
+                localHeaderRoutingLineage(primaryBinding) &&
+              primaryObservation?.generalExhausted === true,
+          )
+          if (
+            primaryAccount &&
+            primaryBinding &&
+            (!mainQuotaCredentialEpoch ||
+              primaryBinding.rowId !== mainQuotaCredentialEpoch.rowId ||
+              primaryBinding.credentialEpoch >
+                mainQuotaCredentialEpoch.credentialEpoch)
+          ) {
+            // An explicit replacement clears persisted quota, even when the
+            // verified account UUID stays the same. Clear the matching cache
+            // and fence old polls too; ordinary token refresh keeps its epoch.
+            quotaManager.clearMain()
+            quotaManager.setMainQuotaAccountIdentity(
+              primaryAccount.accountIdentity,
+            )
+            mainQuotaCredentialEpoch = {
+              rowId: primaryBinding.rowId,
+              credentialEpoch: primaryBinding.credentialEpoch,
+            }
+          }
+          if (
+            deferCredential &&
+            (getRoutingMode(primarySnapshot.policyStorage) ===
+              'fallback-first' ||
+              mainProviderQuotaRestriction(
+                primaryRoutingStorage,
+                primaryAccount?.accountIdentity,
+                primaryHeaderExhaustionProven,
+              ))
+          ) {
+            const primary = primarySnapshot.accounts.find(
+              (account) => account.id === 'main',
+            )
+            signal?.throwIfAborted()
+            return {
+              type: 'oauth',
+              access: '',
+              expires: 0,
+              refresh: undefined,
+              nativeAccountIdentity: primary?.accountIdentity,
+              nativeRoutingLineage: primary?.binding
+                ? localHeaderRoutingLineage(primary.binding)
+                : undefined,
+              nativeLocalSource: undefined,
+              nativeScopedAttempt: undefined,
+              modelDenied: false,
+              credentialUnavailable: false,
+              credentialFailure: undefined,
+              deferred: true,
+            }
+          }
+          let credential: NativeOAuthAuthorization | undefined
+          let denied: NativeAccountView | undefined
+          let unavailable: NativeAccountView | undefined
+          let credentialFailure: NativeCredentialUnavailableError | undefined
+          try {
+            credential = await authorizeOAuth(
+              'main',
+              signal,
+              undefined,
+              modelId,
+              'serve',
+              primarySnapshot,
+            )
+          } catch (error) {
+            if (error instanceof NativeUnsupportedCredentialError) throw error
+            if (error instanceof NativeModelPolicyError) {
+              denied = error.account
+              // Recheck a stale limit for this model before moving the request
+              // to another account. A neutral usage poll grants no permission
+              // to send the model; authorization checks the new reading again.
+              const scopedWindow = getScopedQuotaWindowForModel(
+                denied.quota,
+                modelId,
+              )
+              const scopedStale =
+                scopedWindow !== undefined &&
+                (!Number.isFinite(scopedWindow.checkedAt) ||
+                  (scopedWindow.checkedAt ?? 0) + error.checkIntervalMs <=
+                    Date.now())
+              if (
+                scopedStale ||
+                (!quotaSnapshotHasStandardWindows(denied.quota) &&
+                  !quotaSnapshotModelScopeIsExhausted(denied.quota, modelId))
+              ) {
+                try {
+                  await nativeAccounts.fetchQuota('main', undefined, signal)
+                  credential = await authorizeOAuth(
+                    'main',
+                    signal,
+                    undefined,
+                    modelId,
+                  )
+                  denied = undefined
+                } catch (retryError) {
+                  if (retryError instanceof NativeModelPolicyError)
+                    denied = retryError.account
+                  else if (
+                    retryError instanceof NativeCredentialUnavailableError
+                  ) {
+                    unavailable = retryError.account
+                    credentialFailure = retryError
+                  }
+                }
+              }
+            } else if (error instanceof NativeCredentialUnavailableError) {
+              unavailable = error.account
+              credentialFailure = error
+            }
+          }
+          signal?.throwIfAborted()
+          return {
+            type: 'oauth',
+            access: credential?.accessToken ?? '',
+            expires: credential?.expires ?? 0,
+            refresh: undefined,
+            nativeRoutingLineage:
+              headerRoutingLineage(
+                credential?.localSubject,
+                credential?.scopedAttempt,
+              ) ??
+              (primaryAccount?.binding
+                ? localHeaderRoutingLineage(primaryAccount.binding)
+                : undefined),
+            nativeAccountIdentity:
+              credential?.accountIdentity ??
+              denied?.accountIdentity ??
+              unavailable?.accountIdentity,
+            modelDenied: Boolean(denied),
+            credentialUnavailable: Boolean(unavailable),
+            credentialFailure,
+            deferred: false,
+            nativeLocalSource: credential?.localSource,
+            nativeScopedAttempt: credential?.scopedAttempt,
+          }
+        }
         latestGetAuth = getAuth
-        const auth = await getAuth()
+        const auth: {
+          type: string
+          access: string
+          refresh?: string
+          expires: number
+        } = { type: 'oauth', access: '', expires: 0 }
         const custodyStorage = await loadAccounts(accountStoragePath)
         if (
           getClaustrumMode(custodyStorage) === 'claustrum' &&
@@ -4935,11 +5961,11 @@ const anthropicAuthPlugin = async (
               ),
           }
         }
-        // Provider initialization also runs for sessions using other models.
-        // Never make that shared path wait on account discovery: dispatch-time
-        // scoped authorization verifies the chosen route before Anthropic I/O.
+        // Other providers share initialization, so do not block them while
+        // the vault lists Claude accounts. Each Anthropic send separately
+        // checks that its selected vault account can supply credentials.
         const custodyMode = getClaustrumMode(custodyStorage)
-        const main = mainCustodyDimension(auth)
+        const main = mainCustodyDimension(activation)
         const fallbackDimensions = fallbackCustodyDimensions(custodyStorage)
         const mainEvidence =
           custodyMode !== 'claustrum' ||
@@ -4958,6 +5984,7 @@ const anthropicAuthPlugin = async (
               main,
               fallbacks: fallbackDimensions.fallbacks,
               evidence: mainEvidence,
+              authority: nativeMigrationAuthorityPhase(journal),
             })
           } catch (error) {
             if (!(error instanceof CustodyStateMismatchError)) throw error
@@ -4971,456 +5998,80 @@ const anthropicAuthPlugin = async (
           }
         }
         if (auth.type === 'oauth') {
-          if (
-            isCustodyTombstoneOAuth(auth, 'anthropic') &&
-            custodyMode !== 'claustrum'
-          ) {
-            throw new CustodyTombstoneLoginError('anthropic')
-          }
-          mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
-          mainQuotaAccountId ??=
-            custodyMode === 'claustrum'
-              ? custodyStorage?.claustrum?.primaryAccount?.accountId
-              : mainAccountId
+          const initialSnapshot = await nativeAccounts.read()
+          const initialMain = initialSnapshot.accounts.find(
+            (account) => account.id === 'main',
+          )
+          mainAccountId =
+            initialMain?.binding?.rowId ?? initialMain?.accountIdentity
+          mainQuotaAccountId ??= initialMain?.accountIdentity ?? mainAccountId
           if (auth.access) {
             await resolveMainQuotaAccountIdentity(auth.access)
           }
-          async function refreshMainAccessToken(rejectedAccess?: string) {
-            if (rejectedAccess) {
-              const currentAuth = await getAuth()
-              if (
-                currentAuth.type === 'oauth' &&
-                currentAuth.access &&
-                currentAuth.access !== rejectedAccess &&
-                (!currentAuth.expires || currentAuth.expires > Date.now())
-              ) {
-                log(
-                  '[refresh] opencode main oauth reused concurrently rotated access token',
-                  {
-                    expiresInMs: currentAuth.expires
-                      ? currentAuth.expires - Date.now()
-                      : undefined,
-                  },
-                )
-                return currentAuth.access
-              }
-            }
-
-            let refreshPromise =
-              mainAccessRefreshesByStoragePath.get(accountStoragePath)
-            if (!refreshPromise) {
-              refreshPromise = (async () => {
-                const maxRetries = 2
-                const baseDelayMs = 500
-                let leaseId: string | null = null
-                let leaseTokenHash: string | null = null
-                let releaseFileLock: (() => Promise<void>) | null = null
-
-                async function updateMainRefreshState(
-                  update: (storage: AccountStorage) => void,
-                ) {
-                  const storage: AccountStorage =
-                    (await loadAccounts(accountStoragePath)) ??
-                    createEmptyStorage()
-                  storage.refresh = storage.refresh ?? {}
-                  update(storage)
-                  await saveAccountState(storage, accountStoragePath, {
-                    mainRefresh: true,
-                  })
-                }
-
-                async function waitForConcurrentMainRefresh(previous: {
-                  access?: string
-                  refresh?: string
-                  expires?: number
-                }) {
-                  const deadline = Date.now() + CONCURRENT_MAIN_REFRESH_WAIT_MS
-                  while (Date.now() < deadline) {
-                    await new Promise((resolve) =>
-                      runtimeTimers.setTimeout(
-                        resolve,
-                        CONCURRENT_MAIN_REFRESH_POLL_BASE_MS +
-                          jitterMs(CONCURRENT_MAIN_REFRESH_POLL_BASE_MS),
-                      ),
-                    )
-                    const latest = await getAuth()
-                    if (latest.type !== 'oauth' || !latest.access) continue
-                    const changed =
-                      latest.access !== previous.access ||
-                      latest.refresh !== previous.refresh ||
-                      (latest.expires ?? 0) > (previous.expires ?? 0) + 60_000
-                    if (
-                      changed &&
-                      (!latest.expires || latest.expires > Date.now())
-                    ) {
-                      log(
-                        '[refresh] opencode main oauth joined concurrent refresh',
-                        {
-                          expiresInMs: latest.expires
-                            ? latest.expires - Date.now()
-                            : undefined,
-                        },
-                      )
-                      return latest.access
-                    }
-                  }
-                  return null
-                }
-
-                for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                  let freshAuth: Awaited<ReturnType<typeof getAuth>> | null =
-                    null
-                  try {
-                    if (attempt > 0) {
-                      const delay = baseDelayMs * 2 ** (attempt - 1)
-                      await new Promise((resolve) =>
-                        runtimeTimers.setTimeout(resolve, delay),
-                      )
-                    }
-
-                    // Re-read auth to get the latest refresh token.
-                    // The outer `auth` snapshot may be stale if tokens
-                    // were rotated since the fetch() call was made.
-                    freshAuth = await getAuth()
-
-                    if (!freshAuth.refresh) {
-                      throw new Error(
-                        'Token refresh failed: missing refresh token',
-                      )
-                    }
-
-                    const storage = await loadAccounts(accountStoragePath)
-                    const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
-                    const mainError = storage?.refresh?.mainLastRefreshError
-                    log('[refresh] opencode main oauth refresh check', {
-                      attempt,
-                      expiresInMs: freshAuth.expires
-                        ? freshAuth.expires - Date.now()
-                        : undefined,
-                      hasBackoff: Boolean(mainError),
-                      backoffActive: mainError
-                        ? refreshBackoffActive(
-                            mainError,
-                            mainAccountId ?? storage?.mainAccountId,
-                            Date.now(),
-                            tokenFingerprint(freshAuth.refresh),
-                          )
-                        : false,
-                      retryCount: mainError?.retryCount,
-                      nextRetryAt: mainError?.nextRetryAt,
-                    })
-                    if (
-                      mainError &&
-                      refreshBackoffActive(
-                        mainError,
-                        mainAccountId ?? storage?.mainAccountId,
-                        Date.now(),
-                        tokenFingerprint(freshAuth.refresh),
-                      )
-                    ) {
-                      log(
-                        '[refresh] opencode main oauth refresh skipped backoff',
-                        {
-                          nextRetryAt: mainError.nextRetryAt,
-                          retryCount: mainError.retryCount,
-                        },
-                      )
-                      throw new Error(
-                        formatRefreshBackoffMessage(mainError, Date.now()),
-                      )
-                    }
-                    if (
-                      storage?.refresh?.mainRefreshLeaseUntil &&
-                      storage.refresh.mainRefreshLeaseUntil > Date.now() &&
-                      storage.refresh.mainRefreshLeaseTokenHash ===
-                        refreshTokenHash
-                    ) {
-                      log(
-                        '[refresh] opencode main oauth refresh skipped lease',
-                        {
-                          leaseUntil: storage.refresh.mainRefreshLeaseUntil,
-                        },
-                      )
-                      const concurrentAccess =
-                        await waitForConcurrentMainRefresh(freshAuth)
-                      if (concurrentAccess) return concurrentAccess
-                      throw new Error(
-                        'Claude OAuth refresh is already in progress',
-                      )
-                    }
-
-                    const fileLock = await acquireRefreshFileLock({
-                      name: OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
-                      ttlMs: 2 * 60_000,
-                      renew: true,
-                    })
-                    if (!fileLock) {
-                      log(
-                        '[refresh] opencode main oauth refresh skipped file lock',
-                      )
-                      const concurrentAccess =
-                        await waitForConcurrentMainRefresh(freshAuth)
-                      if (concurrentAccess) return concurrentAccess
-                      throw new Error(
-                        'Claude OAuth refresh is already in progress',
-                      )
-                    }
-                    releaseFileLock = fileLock.release
-
-                    leaseId = randomUUID()
-                    leaseTokenHash = refreshTokenHash
-                    await updateMainRefreshState((nextStorage) => {
-                      nextStorage.refresh = nextStorage.refresh ?? {}
-                      nextStorage.refresh.mainRefreshLeaseId =
-                        leaseId ?? undefined
-                      nextStorage.refresh.mainRefreshLeaseUntil =
-                        Date.now() + 2 * 60_000
-                      nextStorage.refresh.mainRefreshLeaseTokenHash =
-                        refreshTokenHash
-                    })
-                    const latestLease = await loadAccounts(accountStoragePath)
-                    log(
-                      '[refresh] opencode main oauth refresh lease acquired',
-                      {
-                        attempt,
-                        leaseUntil: Date.now() + 2 * 60_000,
-                      },
-                    )
-                    if (
-                      latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
-                      latestLease.refresh.mainRefreshLeaseTokenHash !==
-                        refreshTokenHash
-                    ) {
-                      throw new Error(
-                        'Claude OAuth refresh is already in progress',
-                      )
-                    }
-
-                    log('[refresh] opencode main oauth refresh request start', {
-                      attempt,
-                    })
-                    const refreshed = await refreshClaudeOAuthToken({
-                      refreshToken: freshAuth.refresh,
-                      // Main OpenCode OAuth already has request-path retry,
-                      // persisted backoff, and cross-process serialization here.
-                      // Keep the shared helper single-shot in this path so the
-                      // two retry layers cannot multiply endpoint pressure.
-                      maxRetries: 0,
-                    })
-
-                    // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                    await (client as any).auth.set({
-                      path: {
-                        id: 'anthropic',
-                      },
-                      body: {
-                        type: 'oauth',
-                        refresh: refreshed.refresh,
-                        access: refreshed.access,
-                        expires: refreshed.expires,
-                      },
-                    })
-
-                    await updateMainRefreshState((storage) => {
-                      if (!storage?.refresh) return
-                      storage.refresh.mainLastRefreshError = undefined
-                      if (storage.refresh.mainRefreshLeaseId === leaseId) {
-                        storage.refresh.mainRefreshLeaseId = undefined
-                        storage.refresh.mainRefreshLeaseUntil = undefined
-                        storage.refresh.mainRefreshLeaseTokenHash = undefined
-                      }
-                    })
-
-                    log('[refresh] opencode main oauth refresh succeeded', {
-                      attempt,
-                      expiresInMs: refreshed.expires - Date.now(),
-                    })
-                    return refreshed.access
-                  } catch (error) {
-                    const isNetworkError =
-                      error instanceof Error &&
-                      (error.message.includes('fetch failed') ||
-                        ('code' in error &&
-                          (error.code === 'ECONNRESET' ||
-                            error.code === 'ECONNREFUSED' ||
-                            error.code === 'ETIMEDOUT' ||
-                            error.code === 'UND_ERR_CONNECT_TIMEOUT')))
-
-                    if (
-                      attempt < maxRetries &&
-                      (isNetworkError ||
-                        (() => {
-                          const s = (error as { status?: number }).status
-                          return typeof s === 'number' && s >= 500
-                        })())
-                    ) {
-                      continue
-                    }
-
-                    log(
-                      '[refresh] opencode main oauth refresh attempt failed',
-                      {
-                        attempt,
-                        error:
-                          error instanceof Error
-                            ? error.message
-                            : String(error),
-                        transient: isNetworkError,
-                      },
-                    )
-
-                    const failedRefreshToken = freshAuth?.refresh
-                    if (
-                      failedRefreshToken &&
-                      (error as { isRefreshError?: boolean }).isRefreshError
-                    ) {
-                      await updateMainRefreshState((storage) => {
-                        storage.refresh = storage.refresh ?? {}
-                        storage.refresh.mainLastRefreshError =
-                          buildRefreshOperationError({
-                            error,
-                            now: Date.now(),
-                            accountIdentity:
-                              mainAccountId ?? storage.mainAccountId,
-                            refreshTokenFingerprint:
-                              tokenFingerprint(failedRefreshToken),
-                            previous: storage.refresh.mainLastRefreshError,
-                          })
-                      })
-                    }
-
-                    throw error
-                  } finally {
-                    if (leaseId) {
-                      await updateMainRefreshState((storage) => {
-                        if (!storage?.refresh) return
-                        if (
-                          storage.refresh.mainRefreshLeaseId === leaseId &&
-                          storage.refresh.mainRefreshLeaseTokenHash ===
-                            leaseTokenHash
-                        ) {
-                          storage.refresh.mainRefreshLeaseId = undefined
-                          storage.refresh.mainRefreshLeaseUntil = undefined
-                          storage.refresh.mainRefreshLeaseTokenHash = undefined
-                        }
-                      }).catch(() => {})
-                    }
-                    await releaseFileLock?.().catch(() => {})
-                  }
-                }
-                // Unreachable — each iteration either returns or throws.
-                // Kept as a TypeScript exhaustiveness guard.
-                throw new Error('Token refresh exhausted all retries')
-              })()
-              mainAccessRefreshesByStoragePath.set(
-                accountStoragePath,
-                refreshPromise,
-              )
-            }
-            try {
-              return await refreshPromise
-            } finally {
-              if (
-                mainAccessRefreshesByStoragePath.get(accountStoragePath) ===
-                refreshPromise
-              ) {
-                mainAccessRefreshesByStoragePath.delete(accountStoragePath)
-              }
-            }
+          async function refreshMainAccessToken(
+            rejectedAccess?: string,
+            modelId?: string,
+            signal?: AbortSignal,
+          ) {
+            // A provider's 401 cannot authorize refresh after OpenCode's
+            // native activation marker is removed or changed. Recheck the
+            // host auth slot before and after awaiting the credentials.
+            requireNativeActivation(await hostGetAuth())
+            signal?.throwIfAborted()
+            const credential = await authorizeOAuth(
+              'main',
+              signal,
+              rejectedAccess,
+              modelId,
+              'refresh',
+            )
+            requireNativeActivation(await hostGetAuth())
+            signal?.throwIfAborted()
+            return credential.accessToken
           }
 
-          latestRefreshMainAccessToken = refreshMainAccessToken
-
           function startMainBackgroundRefresh() {
-            if (mainBackgroundRefreshTimer) {
+            if (mainBackgroundRefreshTimer)
               runtimeTimers.clearInterval(mainBackgroundRefreshTimer)
-              mainBackgroundRefreshTimer = null
-            }
-
             const run = async () => {
               try {
                 const storage = await loadAccounts(accountStoragePath)
                 if (!mainRefreshEnabled(storage)) return
                 const latestAuth = await getAuth()
                 if (latestAuth.type !== 'oauth') return
-                await clearStaleMainRefreshError(
-                  mainAccountId ?? storage?.mainAccountId,
-                  latestAuth.refresh
-                    ? tokenFingerprint(latestAuth.refresh)
-                    : undefined,
+                if (
+                  latestAuth.nativeLocalSource === 'rotated' ||
+                  latestAuth.nativeLocalSource === 'adopted'
                 )
-                if (!latestAuth.expires) return
-                const expiresInMs = latestAuth.expires - Date.now()
-                const refreshBeforeMs = mainRefreshBeforeExpiryMs(storage)
-                if (expiresInMs > refreshBeforeMs) {
                   return
-                }
-                log('[refresh] opencode main oauth background due', {
-                  expiresInMs,
-                  refreshBeforeMs,
-                })
                 if (
-                  refreshBackoffActive(
-                    storage?.refresh?.mainLastRefreshError,
-                    mainAccountId ?? storage?.mainAccountId,
-                    Date.now(),
-                    latestAuth.refresh
-                      ? tokenFingerprint(latestAuth.refresh)
-                      : undefined,
-                  )
-                ) {
-                  log(
-                    '[refresh] opencode main oauth background skipped backoff',
-                    {
-                      nextRetryAt:
-                        storage?.refresh?.mainLastRefreshError?.nextRetryAt,
-                      retryCount:
-                        storage?.refresh?.mainLastRefreshError?.retryCount,
-                      expiresInMs,
-                    },
-                  )
+                  latestAuth.expires &&
+                  latestAuth.expires - Date.now() >
+                    mainRefreshBeforeExpiryMs(storage)
+                )
                   return
-                }
-                if (
-                  latestAuth.refresh &&
-                  storage?.refresh?.mainRefreshLeaseUntil &&
-                  storage.refresh.mainRefreshLeaseUntil > Date.now() &&
-                  storage.refresh.mainRefreshLeaseTokenHash ===
-                    hashRefreshToken(latestAuth.refresh)
-                ) {
-                  return
-                }
-
                 await refreshMainAccessToken()
-                const refreshedAuth = await getAuth()
-                log('[refresh] opencode main oauth refreshed in background', {
-                  newExpiresInMs: refreshedAuth.expires
-                    ? refreshedAuth.expires - Date.now()
-                    : undefined,
-                })
-              } catch (error) {
-                logger.warn('refresh', 'opencode main oauth refresh failed', {
-                  message:
-                    error instanceof Error ? error.message : String(error),
-                })
+              } catch {
+                logger.warn(
+                  'refresh',
+                  'native main OAuth background refresh unavailable',
+                )
               }
             }
-
             mainBackgroundRefreshTimer = runtimeTimers.setInterval(() => {
               void run()
             }, MAIN_AUTH_REFRESH_TICK_MS +
               jitterMs(MAIN_AUTH_REFRESH_TICK_JITTER_MS))
-            if ('unref' in mainBackgroundRefreshTimer) {
-              mainBackgroundRefreshTimer.unref()
-            }
+            mainBackgroundRefreshTimer.unref?.()
           }
 
           if (!scopedMainRoute) startMainBackgroundRefresh()
           quotaManager.seedFallbacksFromAccounts(
             (initialStorage?.accounts ?? []).filter(isOAuthAccount),
           )
-          const initialSidebarRouting =
-            await resolveInitialSidebarRouting(accountStoragePath)
+          const initialSidebarRouting = await resolveInitialSidebarRouting(() =>
+            loadAccounts(accountStoragePath),
+          )
           await writeSidebarState(initialSidebarRouting.freshStorage, {
             activeId: initialSidebarRouting.activeId,
             route: initialSidebarRouting.route,
@@ -5441,7 +6092,6 @@ const anthropicAuthPlugin = async (
                   route: 'main',
                   mainAccessToken: auth.access,
                   routingAuthoritative: false,
-                  useHydratedProfiles: true,
                 })
               })
               .catch(() => {})
@@ -5603,6 +6253,62 @@ const anthropicAuthPlugin = async (
             applyCustomHeaders(headers)
           }
 
+          async function authorizePaidFallback(
+            routeId: string,
+            accessToken: string | undefined,
+            identity: MainQuotaIdentityBinding | undefined,
+            signal?: AbortSignal,
+          ) {
+            assertNativeEnvironment()
+            if (!accessToken) {
+              const general = routingMainQuotaEntry(identity)
+              if (
+                !identity?.providerAccountUuid ||
+                !general ||
+                general.refreshAfter <= Date.now() ||
+                !quotaSnapshotIsExhausted(general.quota)
+              ) {
+                throw new Error(
+                  'API fallback requires fresh general primary OAuth exhaustion',
+                )
+              }
+              // This primary authorization validates the existing general-quota
+              // gate for an API route. It does not permit the denied Claude model.
+              const primary = await authorizeOAuth('main', signal)
+              if (
+                primary.accountIdentity !== identity.providerAccountUuid ||
+                (identity.routingLineage &&
+                  headerRoutingLineage(
+                    primary.localSubject,
+                    primary.scopedAttempt,
+                  ) !== identity.routingLineage)
+              )
+                throw new Error('Primary identity changed before API fallback')
+              accessToken = primary.accessToken
+            }
+            const credential = await nativeAccounts.authorizeApi(
+              routeId,
+              signal,
+            )
+            // Recheck the primary account's fresh quota after obtaining the
+            // API credential. Only account-wide OAuth exhaustion permits API
+            // fallback; model-only limits, auth errors or an unknown account
+            // do not justify using a paid API route.
+            const currentPrimary = (await nativeAccounts.read()).accounts.find(
+              (row) => row.id === 'main',
+            )
+            if (
+              currentPrimary?.binding &&
+              localHeaderRoutingLineage(currentPrimary.binding) !==
+                identity?.routingLineage
+            )
+              throw new Error('Primary identity changed before API fallback')
+            if (!mainQuotaEntryIsFreshExhausted(accessToken, identity))
+              throw new Error(
+                'API fallback requires fresh general primary OAuth exhaustion',
+              )
+            return credential
+          }
           async function sendWithApiAccount(
             input: string | URL | Request,
             init: RequestInit | undefined,
@@ -5611,6 +6317,8 @@ const anthropicAuthPlugin = async (
             route = 'api_fallback',
             currentStorage?: Awaited<ReturnType<typeof loadAccounts>>,
             fableRequest?: FableRequestContext,
+            mainAccessToken?: string,
+            mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
             void currentStorage
             if (fableRequest?.plan.downgraded) {
@@ -5695,6 +6403,14 @@ const anthropicAuthPlugin = async (
 
             const cacheDiagnosticsBetas =
               await getCacheDiagnosticsBetas(requestHeaders)
+            const apiCredential = await authorizePaidFallback(
+              account.id,
+              mainAccessToken,
+              mainQuotaIdentity,
+              init?.signal ?? undefined,
+            )
+            account = { ...account, ...apiCredential }
+            configureApiRouteHeaders(requestHeaders, account)
             const rewritten = rewriteUrl(input, { baseURL: account.baseURL })
             const sendStart = nowMs()
             let response: Response
@@ -5750,6 +6466,10 @@ const anthropicAuthPlugin = async (
               totalSendWithAccessMs: roundMs(nowMs() - start),
               baseURL: account.baseURL,
             })
+            if (response.ok)
+              await nativeAccounts.publishApi(apiCredential.subject, {
+                lastUsed: Date.now(),
+              })
             return response
           }
 
@@ -5765,7 +6485,7 @@ const anthropicAuthPlugin = async (
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
             mainQuotaIdentity?: MainQuotaIdentityResolution,
-            scopedAttempt?: ClaustrumScopedAttempt,
+            scopedAttempt?: NativeCustodyReceipt,
           ) {
             assertNotCustodyTombstone(accessToken, 'anthropic')
             const start = nowMs()
@@ -5823,34 +6543,29 @@ const anthropicAuthPlugin = async (
                 bodyBytes: body.length,
               })
             }
-            const identityStart = nowMs()
-            const identity = await resolveClaudeCodeIdentity(
-              accessToken,
+            let nativeAuthorization = await authorizeOAuth(
+              oauthAccountId,
+              init?.signal ?? undefined,
+              undefined,
               modelForIdentity,
-              oauthAccountId === 'main'
-                ? (mainQuotaIdentity?.quotaKey ??
-                    asProviderAccountUuid(scopedAttempt?.accountId) ??
-                    (!accessToken.startsWith('sk-ant-oat')
-                      ? mainAccountId
-                      : undefined))
-                : oauthAccountId,
+              oauthAccountId === 'main' ? 'last-main' : 'serve',
             )
-            if (oauthAccountId !== 'main' && identity.accountUuid) {
-              void persistFallbackAnthropicAccountUuid(
-                oauthAccountId,
-                identity.accountUuid,
-              ).catch((error) => {
-                logger.warn(
-                  'claustrum',
-                  'failed to persist fallback identity',
-                  {
-                    accountId: oauthAccountId,
-                    error:
-                      error instanceof Error ? error.message : String(error),
-                  },
-                )
-              })
+            accessToken = nativeAuthorization.accessToken
+            if (
+              oauthAccountId === 'main' &&
+              mainQuotaIdentity?.providerAccountUuid &&
+              nativeAuthorization.accountIdentity !==
+                mainQuotaIdentity.providerAccountUuid
+            ) {
+              throw new Error(
+                'Main account identity changed after request routing',
+              )
             }
+            scopedAttempt = nativeAuthorization.scopedAttempt
+            const identityStart = nowMs()
+            const identity = nativeWireIdentity(
+              nativeAuthorization.accountIdentity,
+            )
             trace?.mark('resolve_claude_code_identity', {
               route,
               ms: roundMs(nowMs() - identityStart),
@@ -6040,39 +6755,69 @@ const anthropicAuthPlugin = async (
               }
             }
 
+            const requestAuthority = nativeAuthorization
+            let retryFromVault: NativeCustodyReceipt | undefined
+            const authorizePhysical = async (rejectedAccessToken?: string) => {
+              // Every direct or relay attempt still needs the native host
+              // activation, including retries after an upstream 401.
+              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()
+              const current = await authorizeOAuth(
+                oauthAccountId,
+                init?.signal ?? undefined,
+                rejectedAccessToken,
+                modelForIdentity,
+                oauthAccountId === 'main' ? 'last-main' : 'serve',
+              )
+              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()
+              if (
+                current.accountIdentity !== requestAuthority.accountIdentity ||
+                Boolean(current.scopedAttempt) !==
+                  Boolean(requestAuthority.scopedAttempt)
+              ) {
+                throw new Error(
+                  'Native credential authority changed during the request',
+                )
+              }
+              if (
+                retryFromVault &&
+                (!current.scopedAttempt ||
+                  current.scopedAttempt.credentialId !==
+                    retryFromVault.credentialId ||
+                  current.scopedAttempt.accountIdentity !==
+                    retryFromVault.accountIdentity ||
+                  current.scopedAttempt.recordVersion <=
+                    retryFromVault.recordVersion)
+              ) {
+                throw new Error(
+                  'Native vault retry has no strict newer same-account receipt',
+                )
+              }
+              return current
+            }
             let usedDirectFetch = false
             let directAttempt = scopedAttempt
-            let retryDirectAttempt: ClaustrumScopedAttempt | undefined
+
             const directFetch = async () => {
               usedDirectFetch = true
-              if (scopedAttempt) {
-                // A relay-to-direct fallback is another physical attempt. Its
-                // original receipt may have rotated while the relay was failing.
-                directAttempt =
-                  retryDirectAttempt ??
-                  (relayConfig?.enabled
-                    ? await getOpenCodeScopedRuntime(
-                        accountStoragePath,
-                        ctx.directory,
-                      ).authorize(
-                        oauthAccountId,
-                        init?.signal instanceof AbortSignal
-                          ? init.signal
-                          : undefined,
-                      )
-                    : scopedAttempt)
-                retryDirectAttempt = undefined
-                requestHeaders.set(
-                  'authorization',
-                  `Bearer ${directAttempt.accessToken}`,
-                )
-                served = {
-                  ...served,
-                  accessToken: directAttempt.accessToken,
-                  anthropicAccountUuid: asProviderAccountUuid(
-                    directAttempt.accountId,
-                  ),
-                }
+              // Validate current local credentials or obtain new vault
+              // authorization before every direct send, including relay rescue.
+              // Tokens checked earlier may have expired or been revoked.
+              nativeAuthorization = await authorizePhysical()
+              directAttempt = nativeAuthorization.scopedAttempt
+              requestHeaders.set(
+                'authorization',
+                `Bearer ${nativeAuthorization.accessToken}`,
+              )
+              served = {
+                ...served,
+                accessToken: nativeAuthorization.accessToken,
+                anthropicAccountUuid: asProviderAccountUuid(
+                  nativeAuthorization.accountIdentity,
+                ),
+                localSubject: nativeAuthorization.localSubject,
+                scopedAttempt: nativeAuthorization.scopedAttempt,
               }
               try {
                 const response = await fetch(rewritten.input, {
@@ -6116,7 +6861,7 @@ const anthropicAuthPlugin = async (
             }
 
             const requestStorageForIdentity = await getRequestStorage()
-            const relayConfig = getRelayConfig(requestStorageForIdentity)
+            const relayConfig = await nativeAccounts.getRelayConfig()
             const persistedFallbackAccount =
               oauthAccountId === 'main'
                 ? undefined
@@ -6133,30 +6878,24 @@ const anthropicAuthPlugin = async (
               accessToken,
               authLineageId: fallbackAuthLineageId,
               anthropicAccountUuid:
-                asProviderAccountUuid(scopedAttempt?.accountId) ??
+                asProviderAccountUuid(scopedAttempt?.accountIdentity) ??
                 (oauthAccountId === 'main'
                   ? mainQuotaIdentity?.providerAccountUuid
                   : (asProviderAccountUuid(identity.accountUuid) ??
                     asProviderAccountUuid(persistedFallbackAccountUuid))),
+              localSubject: nativeAuthorization.localSubject,
+              scopedAttempt: nativeAuthorization.scopedAttempt,
               ...(oauthAccountId === 'main' && mainQuotaIdentity
                 ? { mainQuotaIdentity }
                 : {}),
             }
             const sendStart = nowMs()
-            let relay401Attempt: ClaustrumScopedAttempt | undefined
+            let relay401Attempt: NativeCustodyReceipt | undefined
+            // Set once this dispatch has made its final retry decision. Before
+            // that, a relayed upstream 401 is only recorded: the dispatch may
+            // still replay on a newer version, which makes this one obsolete.
             let relayReturned = false
-            const reportScoped401 = (
-              attempt: ClaustrumScopedAttempt,
-              source: 'direct' | 'relay_status_field',
-            ) =>
-              getOpenCodeScopedRuntime(accountStoragePath, ctx.directory)
-                .reportFailure(attempt, 401, source)
-                .catch(() => {
-                  logger.warn(
-                    'claustrum',
-                    'OpenCode scoped auth-failure report unavailable',
-                  )
-                })
+            const reportScoped401 = reportVault401
             const sendOnce = () =>
               sendViaRelay({
                 config: relayConfig,
@@ -6167,46 +6906,38 @@ const anthropicAuthPlugin = async (
                 fallback: directFetch,
                 affinity: relayAffinity,
                 optimisticResponse: relayConfig?.transport === 'websocket',
-                authorizeAttempt: scopedAttempt
-                  ? async () => {
-                      const runtime = getOpenCodeScopedRuntime(
-                        accountStoragePath,
-                        ctx.directory,
-                      )
-                      const nextAttempt = await runtime.authorize(
-                        oauthAccountId,
-                        init?.signal instanceof AbortSignal
-                          ? init.signal
-                          : undefined,
-                      )
-                      served = {
-                        ...served,
-                        accessToken: nextAttempt.accessToken,
-                        anthropicAccountUuid: asProviderAccountUuid(
-                          nextAttempt.accountId,
-                        ),
-                      }
-                      const relayHeaders = new Headers(requestHeaders)
-                      relayHeaders.set(
-                        'authorization',
-                        `Bearer ${nextAttempt.accessToken}`,
-                      )
-                      return {
-                        headers: relayHeaders,
-                        onUpstreamStatus: (status: number) => {
-                          if (status !== 401) return
-                          relay401Attempt = nextAttempt
-                          // A WebSocket can deliver a real upstream 401 after
-                          // its optimistic response has been handed to the host.
-                          if (relayReturned)
-                            void reportScoped401(
-                              nextAttempt,
-                              'relay_status_field',
-                            )
-                        },
-                      }
-                    }
-                  : undefined,
+                authorizeAttempt: async () => {
+                  const nextAuthorization = await authorizePhysical()
+                  const nextAttempt = nextAuthorization.scopedAttempt
+                  nativeAuthorization = nextAuthorization
+                  served = {
+                    ...served,
+                    accessToken: nextAuthorization.accessToken,
+                    anthropicAccountUuid: asProviderAccountUuid(
+                      nextAuthorization.accountIdentity,
+                    ),
+                    localSubject: nextAuthorization.localSubject,
+                    scopedAttempt: nextAttempt,
+                  }
+                  const relayHeaders = new Headers(requestHeaders)
+                  relayHeaders.set(
+                    'authorization',
+                    `Bearer ${nextAuthorization.accessToken}`,
+                  )
+                  return {
+                    headers: relayHeaders,
+                    onUpstreamStatus: (status: number) => {
+                      if (status !== 401 || !nextAttempt) return
+                      relay401Attempt = nextAttempt
+                      // A WebSocket can deliver a real upstream 401 after its
+                      // optimistic response was handed to the host. Report
+                      // then the exact version used for this send, never a
+                      // newer version obtained after the rejection.
+                      if (relayReturned)
+                        void reportScoped401(nextAttempt, 'relay_status_field')
+                    },
+                  }
+                },
                 onResponseHeaders: (headers) => {
                   harvestQuotaHeaders(headers, served)
                   billingLineageTracker.commit(
@@ -6228,25 +6959,17 @@ const anthropicAuthPlugin = async (
               (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
               !init?.signal?.aborted
             ) {
-              let rotated: ClaustrumScopedAttempt | undefined
+              let rotated: NativeCustodyReceipt | undefined
               try {
-                rotated = await getOpenCodeScopedRuntime(
-                  accountStoragePath,
-                  ctx.directory,
-                ).authorize(
-                  oauthAccountId,
-                  init?.signal instanceof AbortSignal ? init.signal : undefined,
+                rotated = await prepareVaultRetry(
+                  relay401Attempt,
+                  'model-relay',
+                  init?.signal ?? undefined,
                 )
               } catch {
                 // Keep the 401 and report the exact relay-served record below.
               }
-              if (
-                decideScopedRetryAfter401(
-                  'model-relay',
-                  relay401Attempt,
-                  rotated,
-                )
-              ) {
+              if (rotated) {
                 await response.body?.cancel().catch(() => {})
                 logger.info(
                   'claustrum',
@@ -6258,6 +6981,7 @@ const anthropicAuthPlugin = async (
                     transport: 'relay',
                   },
                 )
+                retryFromVault = relay401Attempt
                 relay401Attempt = undefined
                 // sendOnce obtains its own fresh receipt for this HTTP retry.
                 response = await sendOnce()
@@ -6271,19 +6995,17 @@ const anthropicAuthPlugin = async (
               (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
               !init?.signal?.aborted
             ) {
-              let rotated: ClaustrumScopedAttempt | undefined
+              let rotated: NativeCustodyReceipt | undefined
               try {
-                rotated = await getOpenCodeScopedRuntime(
-                  accountStoragePath,
-                  ctx.directory,
-                ).authorize(
-                  oauthAccountId,
-                  init?.signal instanceof AbortSignal ? init.signal : undefined,
+                rotated = await prepareVaultRetry(
+                  directAttempt,
+                  'model',
+                  init?.signal ?? undefined,
                 )
               } catch {
                 // Preserve the genuine 401 if no replacement can be verified.
               }
-              if (decideScopedRetryAfter401('model', directAttempt, rotated)) {
+              if (rotated) {
                 await response.body?.cancel().catch(() => {})
                 logger.info(
                   'claustrum',
@@ -6295,10 +7017,32 @@ const anthropicAuthPlugin = async (
                     transport: 'direct',
                   },
                 )
-                retryDirectAttempt = rotated
+
+                retryFromVault = directAttempt
                 // Transport failures on the new attempt must propagate. They
                 // are not evidence that the new record's token was rejected.
                 response = await directFetch()
+              }
+            }
+            if (
+              response.status === 401 &&
+              !nativeAuthorization.scopedAttempt &&
+              typeof body === 'string' &&
+              (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
+              !init?.signal?.aborted
+            ) {
+              const rejectedAccess = nativeAuthorization.accessToken
+              let replacement: NativeOAuthAuthorization | undefined
+              try {
+                replacement = await authorizePhysical(rejectedAccess)
+              } catch (error) {
+                nativeLocalRefreshFailures.set(response, error)
+              }
+              if (replacement && replacement.accessToken !== rejectedAccess) {
+                await response.body?.cancel().catch(() => {})
+                response = usedDirectFetch
+                  ? await directFetch()
+                  : await sendOnce()
               }
             }
             trace?.mark('send_headers_received', {
@@ -6335,6 +7079,16 @@ const anthropicAuthPlugin = async (
             if (!usedDirectFetch && relay401Attempt) {
               await reportScoped401(relay401Attempt, 'relay_status_field')
             }
+            if (response.ok) {
+              if (served.scopedAttempt)
+                await nativeAccounts.vault.publish(served.scopedAttempt, {
+                  lastUsed: Date.now(),
+                })
+              else if (served.localSubject)
+                await nativeAccounts.publishLocal(served.localSubject, {
+                  lastUsed: Date.now(),
+                })
+            }
             return response
           }
 
@@ -6352,20 +7106,6 @@ const anthropicAuthPlugin = async (
             )
           }
 
-          // The fallbacks routing may actually send to: usable accounts that
-          // also pass the killswitch policy. Every fallback-selection path
-          // (fallback-first, soft-quota skip-main, the killswitch gate, reactive
-          // retries) must go through this so the killswitch is a hard block on
-          // ALL routes — a killswitch-killed account must never serve a request,
-          // even if it still passes the softer routing quota policy.
-          function quotaSnapshotIsExhausted(
-            quota: OAuthQuotaSnapshot | null | undefined,
-          ) {
-            return (['five_hour', 'seven_day'] as const).some(
-              (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
-            )
-          }
-
           function responseShowsMainQuotaExhausted(
             response: Response,
             streamingRateLimited: boolean,
@@ -6373,20 +7113,46 @@ const anthropicAuthPlugin = async (
             return response.status === 429 || streamingRateLimited
           }
 
+          function routingMainQuotaEntry(
+            identity?: MainQuotaIdentityBinding,
+            storage: AccountStorage | null = headerRoutingPolicyStorage,
+          ) {
+            return routingQuotaEntry(
+              'main',
+              identity?.routingLineage,
+              identity?.providerAccountUuid,
+              quotaManager.getMain(identity?.quotaKey ?? mainQuotaAccountId),
+              storage,
+            )
+          }
           function mainQuotaEntryIsFreshExhausted(
             accessToken?: string,
             mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
-            if (!accessToken) return false
-            const entry = quotaManager.getMain(
-              mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId,
-            )
-            // A genuine response header is live routing evidence like a 429, but
-            // it gets no exemption from the shared freshness and token gates.
+            if (!accessToken && !mainQuotaIdentity?.providerAccountUuid)
+              return false
+            const entry = routingMainQuotaEntry(mainQuotaIdentity)
+            // Native metadata can establish account-owned exhaustion before
+            // primary credential authorization. The API send still validates
+            // that credential and rechecks this quota before dispatch.
             return Boolean(
               entry &&
+                (accessToken ||
+                  entry.quota.accountIdentity ===
+                    mainQuotaIdentity?.providerAccountUuid) &&
                 entry.refreshAfter > Date.now() &&
-                quotaSnapshotIsExhausted(entry.quota),
+                quotaSnapshotIsExhausted(entry.quota) &&
+                (entry.quota.source !== 'headers' ||
+                  currentHeaderRoutingObservation(
+                    'main',
+                    mainQuotaIdentity?.routingLineage,
+                    mainQuotaIdentity?.providerAccountUuid,
+                  )?.generalExhausted === true ||
+                  (['five_hour', 'seven_day'] as const).some(
+                    (key) =>
+                      entry.quota.fieldSources?.[key] === 'poll' &&
+                      (entry.quota[key]?.remainingPercent ?? 1) <= 0,
+                  )),
             )
           }
 
@@ -6410,6 +7176,8 @@ const anthropicAuthPlugin = async (
             }
           }
 
+          // All fallback-selection paths apply killswitch policy after finding
+          // usable accounts; softer quota routing cannot bypass a killswitch.
           async function getRoutableFallbackAccounts(
             storageArg: Awaited<ReturnType<typeof loadAccounts>>,
             options: { includeApiRoutes?: boolean; modelId?: string } = {},
@@ -6454,7 +7222,6 @@ const anthropicAuthPlugin = async (
                 options.includeApiRoutes === true &&
                 isApiKeyAccount(account) &&
                 account.enabled !== false &&
-                account.apiKey &&
                 isValidApiBaseURL(account.baseURL)
               ) {
                 usable.push(account)
@@ -6477,6 +7244,7 @@ const anthropicAuthPlugin = async (
             storage: AccountStorage | null
             mainAccessToken: string
             mainRefreshToken?: string
+            mainPolicyDenied?: boolean
             requestedModelId?: string
             mainQuotaIdentity?: MainQuotaIdentityBinding
           }) {
@@ -6527,6 +7295,7 @@ const anthropicAuthPlugin = async (
                 })
               }
             } else if (
+              (input.mainAccessToken || input.mainPolicyDenied) &&
               !isPermanentRefreshError(
                 latestStorage?.refresh?.mainLastRefreshError,
               )
@@ -6589,11 +7358,11 @@ const anthropicAuthPlugin = async (
                 if (stored.enabled === false || !isOAuthAccount(stored))
                   continue
                 const account = usableFallbacksById.get(stored.id) ?? stored
-                if (
-                  !account.access ||
-                  isPermanentRefreshError(account.lastRefreshError)
-                )
-                  continue
+                // Retain temporarily unavailable account metadata so sticky
+                // sessions can keep their account assignment. Only IDs with
+                // separately authorized credentials can serve requests;
+                // these empty access fields cannot supply a bearer token.
+                if (isPermanentRefreshError(account.lastRefreshError)) continue
                 let accountQuota = getFallbackQuota(account)
                 if (
                   !stickyQuotaSnapshotIsFresh(
@@ -6606,14 +7375,14 @@ const anthropicAuthPlugin = async (
                   try {
                     accountQuota = await quotaManager.refreshFallback(
                       account.id,
-                      account.access,
+                      account.access ?? '',
                       account,
                     )
                   } catch {}
                 }
                 allRoutes.push({
                   id: account.id,
-                  access: account.access,
+                  access: account.access ?? '',
                   quota: accountQuota,
                   identity: { kind: 'known', accountId: account.id },
                   order: index + 1,
@@ -6782,6 +7551,8 @@ const anthropicAuthPlugin = async (
             trace?: PerfTrace,
             options?: {
               returnLastOnExhausted?: boolean
+              mainAccessToken?: string
+              mainQuotaIdentity?: MainQuotaIdentityBinding
               onSuccess?: (account: {
                 id: string
                 access?: string
@@ -6804,7 +7575,6 @@ const anthropicAuthPlugin = async (
             for (const [index, account] of accounts.entries()) {
               let response: Response
               if (isApiKeyAccount(account)) {
-                if (!account.apiKey) continue
                 await cancelCurrentResponse()
                 response = await sendWithApiAccount(
                   input,
@@ -6814,19 +7584,24 @@ const anthropicAuthPlugin = async (
                   `api_fallback_${index}`,
                   storage,
                   options?.fableRequest,
+                  options?.mainAccessToken,
+                  options?.mainQuotaIdentity,
                 )
               } else if (
                 isScopedCustodyActive(storage) &&
                 account.claustrumScopedCredentialId
               ) {
-                const runtime = getOpenCodeScopedRuntime(
-                  accountStoragePath,
-                  ctx.directory,
-                )
-                const scopedAttempt = await runtime.authorize(
+                const credential = await authorizeOAuth(
                   account.id,
-                  init?.signal instanceof AbortSignal ? init.signal : undefined,
+                  init?.signal ?? undefined,
+                  undefined,
+                  parseRequestModel(await fetchBody(input, init)),
                 )
+                const scopedAttempt = credential.scopedAttempt
+                if (!scopedAttempt)
+                  throw new Error(
+                    'Native vault fallback credential is unavailable',
+                  )
                 await cancelCurrentResponse()
                 response = await sendWithAccessToken(
                   input,
@@ -6876,7 +7651,7 @@ const anthropicAuthPlugin = async (
                   response,
                   isApiKeyAccount(account) ? 'api' : 'oauth',
                 )
-                await fallbackManager.markUsed(account)
+
                 await options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
                 // request, so keep its quota fresh on the same cadence as main.
@@ -6940,7 +7715,6 @@ const anthropicAuthPlugin = async (
                 account.enabled !== false &&
                 (isOAuthAccount(account) ||
                   (isApiKeyAccount(account) &&
-                    Boolean(account.apiKey) &&
                     isValidApiBaseURL(account.baseURL))),
             )
             if (!hasPotentialFallbackRoute) return mainResponse
@@ -7023,6 +7797,8 @@ const anthropicAuthPlugin = async (
                 trace,
                 {
                   onSuccess: onFallbackSuccess,
+                  mainAccessToken,
+                  mainQuotaIdentity,
                   fableRequest,
                   laneStartRequest,
                 },
@@ -7033,6 +7809,8 @@ const anthropicAuthPlugin = async (
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
+              if (input instanceof Request && init?.signal === undefined)
+                init = { ...init, signal: input.signal }
               const incomingHeaders = mergeHeaders(input, init)
               const laneStartRequest =
                 incomingHeaders.get(LANE_START_REQUEST_HEADER) === '1'
@@ -7247,7 +8025,14 @@ const anthropicAuthPlugin = async (
                 })
               }
               const authStart = nowMs()
-              const auth = await getAuth()
+              const credentialModelId =
+                fablePlan?.effectiveModel ??
+                parseRequestModel(await fetchBody(input, init))
+              const auth = await getAuth(
+                credentialModelId,
+                init?.signal ?? undefined,
+                true,
+              )
               trace.mark('get_auth', {
                 ms: roundMs(nowMs() - authStart),
                 authType: auth.type,
@@ -7275,32 +8060,9 @@ const anthropicAuthPlugin = async (
                 return response
               }
               const storage = await loadAccounts()
-              let requestMainProviderUuid: ProviderAccountUuid | undefined
-              let requestMainScopedAttempt: ClaustrumScopedAttempt | undefined
-              if (isScopedCustodyActive(storage)) {
-                const runtime = getOpenCodeScopedRuntime(
-                  accountStoragePath,
-                  ctx.directory,
-                )
-                try {
-                  const attempt = await runtime.authorize(
-                    'main',
-                    init?.signal instanceof AbortSignal
-                      ? init.signal
-                      : undefined,
-                  )
-                  auth.access = attempt.accessToken
-                  auth.expires = attempt.expiresAtMs
-                  mainServedAccessToken = attempt.accessToken
-                  requestMainScopedAttempt = attempt
-                  requestMainProviderUuid = asProviderAccountUuid(
-                    attempt.accountId,
-                  )
-                } catch {
-                  auth.access = ''
-                  auth.expires = 0
-                }
-              }
+              const requestMainProviderUuid: ProviderAccountUuid | undefined =
+                asProviderAccountUuid(auth.nativeAccountIdentity)
+              const requestMainScopedAttempt = auth.nativeScopedAttempt
               let requestMainQuotaIdentity:
                 | MainQuotaIdentityResolution
                 | undefined
@@ -7316,16 +8078,40 @@ const anthropicAuthPlugin = async (
                     'Main OAuth identity changed while resolving request credentials',
                   )
                 }
-                requestMainQuotaIdentity = resolution
+                requestMainQuotaIdentity = {
+                  ...resolution,
+                  routingLineage: auth.nativeRoutingLineage,
+                }
                 if (requestMainProviderUuid) {
                   mainServedAccessToken = auth.access
                   mainProviderAccountUuid = resolution.providerAccountUuid
                 }
+              } else if (
+                (auth.modelDenied ||
+                  auth.credentialUnavailable ||
+                  auth.deferred) &&
+                requestMainProviderUuid
+              ) {
+                // A known account keeps its quota in the routing inventory
+                // even when model policy or credential backoff blocks serving.
+                // This metadata does not authorize a model request.
+                // An API fallback still requires its separate primary-account
+                // credential check and fresh account-wide exhaustion proof.
+                await reconcileMainQuotaAccountIdentity(
+                  '',
+                  requestMainProviderUuid,
+                  requestMainProviderUuid,
+                )
+                requestMainQuotaIdentity = {
+                  quotaKey: requestMainProviderUuid,
+                  providerAccountUuid: requestMainProviderUuid,
+                  generation: quotaManager.getMainQuotaIdentityGeneration(),
+                  routingLineage: auth.nativeRoutingLineage,
+                  stale: false,
+                  state: isScopedCustodyActive(storage) ? 'on-cold' : 'na',
+                }
               }
-              await clearStaleMainRefreshError(
-                mainAccountId,
-                auth.refresh ? tokenFingerprint(auth.refresh) : undefined,
-              )
+
               const loadStart = nowMs()
               trace.mark('load_storage', { ms: roundMs(nowMs() - loadStart) })
               quotaManager.updateStorage(storage)
@@ -7346,7 +8132,108 @@ const anthropicAuthPlugin = async (
                 clearFableRecoveryNotice(sessionId, storage, auth)
               }
               const replayableRequest = isReplayableRequest(input, init?.body)
-              const requestModelId = parseRequestModel(init?.body)
+              const requestModelId =
+                parseRequestModel(init?.body) ?? credentialModelId
+              const mainRoutingEntry = routingMainQuotaEntry(
+                requestMainQuotaIdentity,
+                storage,
+              )
+              const currentMainObservation = currentHeaderRoutingObservation(
+                'main',
+                requestMainQuotaIdentity?.routingLineage,
+                requestMainProviderUuid,
+                storage,
+              )
+              const providerRestriction = auth.deferred
+                ? mainProviderQuotaRestriction(
+                    mainRoutingEntry && storage
+                      ? {
+                          ...storage,
+                          accounts: storage?.accounts ?? [],
+                          quota: {
+                            ...storage?.quota,
+                            mainQuota: mainRoutingEntry.quota,
+                          },
+                        }
+                      : storage,
+                    requestMainProviderUuid,
+                    currentMainObservation?.lineage ===
+                      requestMainQuotaIdentity?.routingLineage &&
+                      currentMainObservation?.generalExhausted === true,
+                  )
+                : undefined
+              if (providerRestriction) {
+                // A provider-issued wait applies before primary token acquisition.
+                // Available fallbacks may serve; a blocked primary must not refresh
+                // or obtain a bearer merely to discover the same restriction again.
+                const fallbackAccounts = replayableRequest
+                  ? await getRoutableFallbackAccounts(storage, {
+                      includeApiRoutes: mainQuotaEntryIsFreshExhausted(
+                        undefined,
+                        requestMainQuotaIdentity,
+                      ),
+                      modelId: requestModelId,
+                    })
+                  : []
+                const response = await tryUsableFallbackAccounts(
+                  input,
+                  init,
+                  fallbackAccounts,
+                  storage,
+                  undefined,
+                  trace,
+                  {
+                    onSuccess: (account) =>
+                      writeCurrentSidebarState(account.id, 'fallback'),
+                    mainQuotaIdentity: requestMainQuotaIdentity,
+                    fableRequest,
+                    laneStartRequest,
+                  },
+                )
+                if (response) return wrapResponse(response)
+                return new Response(
+                  JSON.stringify({
+                    type: 'error',
+                    error: {
+                      type: 'rate_limit_error',
+                      message: providerRestriction.message,
+                    },
+                  }),
+                  {
+                    status: 429,
+                    headers: {
+                      'content-type': 'application/json',
+                      'retry-after': String(providerRestriction.retryAfter),
+                    },
+                  },
+                )
+              }
+              const modelDeniedResponse = () => {
+                const retryAfter = killswitchRetryAfterSeconds(
+                  quotaManager.getMain(requestMainQuotaIdentity?.quotaKey)
+                    ?.quota,
+                  (storage?.accounts ?? []).filter(isOAuthAccount),
+                  Date.now(),
+                  credentialModelId,
+                )
+                return new Response(
+                  JSON.stringify({
+                    type: 'error',
+                    error: {
+                      type: 'rate_limit_error',
+                      message:
+                        'No enabled OAuth route can serve the requested model under current quota policy.',
+                    },
+                  }),
+                  {
+                    status: 429,
+                    headers: {
+                      'content-type': 'application/json',
+                      'retry-after': String(retryAfter),
+                    },
+                  },
+                )
+              }
               // Count every replayable request up front — before the
               // fallback-first early return — so the every-N refresh cadence
               // (quota.refreshEveryNRequests) advances for main and the active
@@ -7363,10 +8250,10 @@ const anthropicAuthPlugin = async (
                   requestMainQuotaIdentity,
                 )
               }
-              const writeCurrentSidebarState = async (
+              async function writeCurrentSidebarState(
                 activeId: string | undefined,
                 route: string,
-              ) => {
+              ) {
                 let sidebarStorage = storage
                 let skipFallbackQuotaSeed = false
                 if (
@@ -7400,8 +8287,7 @@ const anthropicAuthPlugin = async (
               if (
                 replayableRequest &&
                 sessionId &&
-                getRoutingMode(storage) === 'sticky-balanced' &&
-                auth.access
+                getRoutingMode(storage) === 'sticky-balanced'
               ) {
                 const routingModelId =
                   fablePlan?.effectiveModel ?? requestModelId
@@ -7420,6 +8306,8 @@ const anthropicAuthPlugin = async (
                     storage,
                     mainAccessToken: auth.access,
                     mainRefreshToken: auth.refresh,
+                    mainPolicyDenied:
+                      auth.modelDenied || auth.credentialUnavailable,
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
@@ -7457,11 +8345,13 @@ const anthropicAuthPlugin = async (
                     )
                   let resolution = await resolveRoute()
                   if (!resolution && incompleteQuotaPool) {
+                    if (auth.modelDenied) return modelDeniedResponse()
                     throw new Error(
                       'Sticky-balanced routing is waiting for current OAuth quota snapshots',
                     )
                   }
                   if (!resolution) {
+                    if (auth.modelDenied) return modelDeniedResponse()
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
                         stickyRoutes.storage?.refresh?.mainLastRefreshError,
@@ -7498,16 +8388,17 @@ const anthropicAuthPlugin = async (
                     }
                     const sendRoute = async (selected: StickyOAuthRoute) => {
                       if (selected.scoped) {
-                        const runtime = getOpenCodeScopedRuntime(
-                          accountStoragePath,
-                          ctx.directory,
-                        )
-                        const scopedAttempt = await runtime.authorize(
+                        const credential = await authorizeOAuth(
                           selected.id,
-                          init?.signal instanceof AbortSignal
-                            ? init.signal
-                            : undefined,
+                          init?.signal ?? undefined,
+                          undefined,
+                          routingModelId,
                         )
+                        const scopedAttempt = credential.scopedAttempt
+                        if (!scopedAttempt)
+                          throw new Error(
+                            'Native vault sticky credential is unavailable',
+                          )
                         return sendWithAccessToken(
                           input,
                           init,
@@ -7544,11 +8435,8 @@ const anthropicAuthPlugin = async (
                     const completeRoute = async (
                       selected: StickyOAuthRoute,
                       response: Response,
-                      markUsed = true,
+                      _markUsed = true,
                     ) => {
-                      if (markUsed && selected.account) {
-                        await fallbackManager.markUsed(selected.account)
-                      }
                       await writeCurrentSidebarState(
                         selected.id,
                         'sticky-balanced',
@@ -7622,7 +8510,7 @@ const anthropicAuthPlugin = async (
                       )
                     }
 
-                    let inspected = await inspectResponse(
+                    const inspected = await inspectResponse(
                       await sendRoute(route),
                     )
                     let permanentAuthFailure = false
@@ -7631,58 +8519,28 @@ const anthropicAuthPlugin = async (
                     }
 
                     if (inspected.response.status === 401) {
-                      const authRouteId = route.id
-                      try {
-                        if (route.scoped) {
-                          permanentAuthFailure = true
-                        } else if (
-                          authRouteId === STICKY_ROUTING_MAIN_ACCOUNT_ID
-                        ) {
-                          auth.access = await refreshMainAccessToken(
-                            route.access ?? '',
-                          )
-                          route = { ...route, access: auth.access }
-                        } else if (route.account && stickyRoutes.storage) {
-                          const refreshed =
-                            await fallbackManager.refreshAccount(
-                              route.account,
-                              stickyRoutes.storage,
-                              { force: true },
-                            )
-                          if (refreshed.access) {
-                            route = {
-                              ...route,
-                              access: refreshed.access,
-                              account: refreshed,
-                            }
-                          }
-                        }
-                        if (!permanentAuthFailure) {
-                          await inspected.response.body
-                            ?.cancel()
-                            .catch(() => {})
-                          inspected = await inspectResponse(
-                            await sendRoute(route),
-                          )
-                          if (!inspected.routeFailure) {
-                            return completeRoute(route, inspected.response)
-                          }
-                          permanentAuthFailure =
-                            inspected.response.status === 401
-                        }
-                      } catch (error) {
+                      const failure = nativeLocalRefreshFailures.get(
+                        inspected.response,
+                      )
+                      if (failure) {
                         const latest = await loadAccounts(accountStoragePath)
+                        const failedRouteId = route.id
                         const refreshError =
-                          authRouteId === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                          route.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
                             ? latest?.refresh?.mainLastRefreshError
                             : latest?.accounts.find(
                                 (account): account is OAuthAccount =>
-                                  account.id === authRouteId &&
+                                  account.id === failedRouteId &&
                                   isOAuthAccount(account),
                               )?.lastRefreshError
-                        if (!isPermanentRefreshError(refreshError)) throw error
-                        permanentAuthFailure = true
+                        // This request already retried after token rejection;
+                        // do not rotate again. Temporary refresh or network
+                        // failure keeps the current account. Switch only after
+                        // the runtime confirms its credentials are permanently invalid.
+                        if (!isPermanentRefreshError(refreshError))
+                          throw failure
                       }
+                      permanentAuthFailure = true
                     }
 
                     let migrate =
@@ -7740,6 +8598,8 @@ const anthropicAuthPlugin = async (
                         storage: stickyRoutes.storage,
                         mainAccessToken: auth.access,
                         mainRefreshToken: auth.refresh,
+                        mainPolicyDenied:
+                          auth.modelDenied || auth.credentialUnavailable,
                         requestedModelId: routingModelId,
                         mainQuotaIdentity: requestMainQuotaIdentity,
                       })
@@ -7795,6 +8655,8 @@ const anthropicAuthPlugin = async (
                                   account.id,
                                   'sticky-balanced',
                                 ),
+                              mainAccessToken: auth.access,
+                              mainQuotaIdentity: requestMainQuotaIdentity,
                               fableRequest,
                               laneStartRequest,
                             },
@@ -7853,6 +8715,8 @@ const anthropicAuthPlugin = async (
                     trace,
                     {
                       returnLastOnExhausted: false,
+                      mainAccessToken: auth.access,
+                      mainQuotaIdentity: requestMainQuotaIdentity,
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback-first'),
                       fableRequest,
@@ -7874,19 +8738,50 @@ const anthropicAuthPlugin = async (
                 }
               }
 
-              if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-                if (isScopedCustodyActive(storage)) {
-                  const runtime = getOpenCodeScopedRuntime(
-                    accountStoragePath,
-                    ctx.directory,
+              // Fallback-first reached main only after its fallback attempts.
+              // Resolve current access now; absence from the earlier metadata
+              // view is not evidence that the stored token needs refreshing.
+              if (auth.deferred) {
+                Object.assign(
+                  auth,
+                  await getAuth(credentialModelId, init?.signal ?? undefined),
+                )
+                if (auth.access) {
+                  const resolution = await resolveMainQuotaAccountIdentity(
+                    auth.access,
+                    credentialModelId,
+                    auth.nativeAccountIdentity,
+                    auth.nativeScopedAttempt?.recordVersion,
                   )
-                  try {
-                    const scopedAttempt = await runtime.authorize(
-                      'main',
-                      init?.signal instanceof AbortSignal
-                        ? init.signal
-                        : undefined,
+                  if (resolution.stale)
+                    throw new Error(
+                      'Main OAuth identity changed while resolving request credentials',
                     )
+                  requestMainQuotaIdentity = {
+                    ...resolution,
+                    routingLineage: auth.nativeRoutingLineage,
+                  }
+                  mainServedAccessToken = auth.access
+                  mainProviderAccountUuid = resolution.providerAccountUuid
+                }
+              }
+              if (
+                !auth.modelDenied &&
+                (!auth.access || !auth.expires || auth.expires < Date.now())
+              ) {
+                if (isScopedCustodyActive(storage)) {
+                  try {
+                    const credential = await authorizeOAuth(
+                      'main',
+                      init?.signal ?? undefined,
+                      undefined,
+                      credentialModelId,
+                    )
+                    const scopedAttempt = credential.scopedAttempt
+                    if (!scopedAttempt)
+                      throw new Error(
+                        'Native vault main credential is unavailable',
+                      )
                     mainServedAccessToken = scopedAttempt.accessToken
                     const response = await sendWithAccessToken(
                       input,
@@ -7919,6 +8814,8 @@ const anthropicAuthPlugin = async (
                       {
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
+                        mainAccessToken: auth.access,
+                        mainQuotaIdentity: requestMainQuotaIdentity,
                         fableRequest,
                         laneStartRequest,
                       },
@@ -7927,6 +8824,11 @@ const anthropicAuthPlugin = async (
                     throw error
                   }
                 }
+                // Report the refresh failure that happened in this request,
+                // rather than replacing it with its newly recorded backoff.
+                // Later requests still check the persisted retry deadline.
+                if (auth.credentialFailure?.tokenRefreshFailed)
+                  throw auth.credentialFailure
                 // Check backoff before attempting refresh — avoids noisy
                 // per-request retries during prolonged rate limits
                 const refreshStorage = await loadAccounts()
@@ -7936,7 +8838,9 @@ const anthropicAuthPlugin = async (
                   mainRefreshError &&
                   refreshBackoffActive(
                     mainRefreshError,
-                    mainAccountId ?? refreshStorage?.mainAccountId,
+                    auth.nativeAccountIdentity ??
+                      mainAccountId ??
+                      refreshStorage?.mainAccountId,
                     Date.now(),
                     auth.refresh ? tokenFingerprint(auth.refresh) : undefined,
                   )
@@ -7966,13 +8870,17 @@ const anthropicAuthPlugin = async (
                   },
                 )
                 const refreshStart = nowMs()
-                auth.access = await refreshMainAccessToken()
+                auth.access = await refreshMainAccessToken(
+                  undefined,
+                  credentialModelId,
+                  init?.signal ?? undefined,
+                )
                 trace.mark('refresh_main_access', {
                   ms: roundMs(nowMs() - refreshStart),
                 })
               }
 
-              if (!auth.access) {
+              if (!auth.access && !auth.modelDenied) {
                 trace.done('missing_access_error')
                 throw new Error('OAuth access token is missing after refresh')
               }
@@ -8020,8 +8928,9 @@ const anthropicAuthPlugin = async (
                   const quotaStart = nowMs()
                   // Identity-aware read prevents routing with a previous main
                   // account's quota after a slot switch.
-                  let routingQuotaEntry = quotaManager.getMain(
-                    requestMainQuotaIdentity?.quotaKey,
+                  let routingQuotaEntry = routingMainQuotaEntry(
+                    requestMainQuotaIdentity,
+                    storage,
                   )
                   let routingQuota = routingQuotaEntry?.quota
                   if (!routingQuota) {
@@ -8030,8 +8939,9 @@ const anthropicAuthPlugin = async (
                       auth.access,
                       requestMainQuotaIdentity?.generation,
                     )
-                    routingQuotaEntry = quotaManager.getMain(
-                      requestMainQuotaIdentity?.quotaKey,
+                    routingQuotaEntry = routingMainQuotaEntry(
+                      requestMainQuotaIdentity,
+                      storage,
                     )
                     showQuotaToastFromCache()
                   } else if (
@@ -8058,8 +8968,9 @@ const anthropicAuthPlugin = async (
                         auth.access,
                         requestMainQuotaIdentity?.generation,
                       )
-                      routingQuotaEntry = quotaManager.getMain(
-                        requestMainQuotaIdentity?.quotaKey,
+                      routingQuotaEntry = routingMainQuotaEntry(
+                        requestMainQuotaIdentity,
+                        storage,
                       )
                     } else {
                       // Stale OR every-N request boundary — background refresh,
@@ -8122,6 +9033,8 @@ const anthropicAuthPlugin = async (
                       {
                         onSuccess: (account) =>
                           writeCurrentSidebarState(account.id, 'fallback'),
+                        mainAccessToken: auth.access,
+                        mainQuotaIdentity: requestMainQuotaIdentity,
                         fableRequest,
                         laneStartRequest,
                       },
@@ -8142,8 +9055,9 @@ const anthropicAuthPlugin = async (
                 }
               }
 
-              let mainQuota = quotaManager.getMain(
-                requestMainQuotaIdentity?.quotaKey,
+              let mainQuota = routingMainQuotaEntry(
+                requestMainQuotaIdentity,
+                storage,
               )?.quota
               if (
                 storage?.quota?.failClosedOnUnknownQuota &&
@@ -8223,8 +9137,9 @@ const anthropicAuthPlugin = async (
                 // Re-read after the eager refresh so the killswitch evaluates
                 // against fresh quota. The initial read above is null on the
                 // first request, before the refresh populates the cache.
-                mainQuota = quotaManager.getMain(
-                  requestMainQuotaIdentity?.quotaKey,
+                mainQuota = routingMainQuotaEntry(
+                  requestMainQuotaIdentity,
+                  storage,
                 )?.quota
               }
 
@@ -8280,6 +9195,8 @@ const anthropicAuthPlugin = async (
                       // is wrong once the killswitch hands off to a fallback.
                       onSuccess: (account) =>
                         writeCurrentSidebarState(account.id, 'fallback'),
+                      mainAccessToken: auth.access,
+                      mainQuotaIdentity: requestMainQuotaIdentity,
                       laneStartRequest,
                     },
                   )
@@ -8341,6 +9258,60 @@ const anthropicAuthPlugin = async (
                 )
               }
 
+              if (auth.modelDenied) {
+                const deniedResponse = modelDeniedResponse()
+                const fallbackAccounts = replayableRequest
+                  ? await getRoutableFallbackAccounts(storage, {
+                      modelId: credentialModelId,
+                    })
+                  : []
+                const response = await tryUsableFallbackAccounts(
+                  input,
+                  init,
+                  fallbackAccounts,
+                  storage,
+                  undefined,
+                  trace,
+                  {
+                    onSuccess: (account) =>
+                      writeCurrentSidebarState(account.id, 'fallback'),
+                    fableRequest,
+                    laneStartRequest,
+                    mainAccessToken: auth.access,
+                    mainQuotaIdentity: requestMainQuotaIdentity,
+                  },
+                )
+                if (response) return wrapResponse(response)
+                const lastMainAttempt =
+                  getRoutingMode(storage) !== 'sticky-balanced' &&
+                  quotaSnapshotModelScopeIsExhausted(
+                    mainQuota,
+                    credentialModelId,
+                  ) &&
+                  quotaSnapshotPassesPolicy(mainQuota, storage) &&
+                  killswitchPassesPolicy(
+                    mainQuota,
+                    storage,
+                    undefined,
+                    credentialModelId,
+                  )
+                if (!lastMainAttempt) return wrapResponse(deniedResponse)
+                return wrapResponse(
+                  await sendWithAccessToken(
+                    input,
+                    init,
+                    '',
+                    trace,
+                    'main',
+                    storage,
+                    'main',
+                    undefined,
+                    fableRequest,
+                    laneStartRequest,
+                    requestMainQuotaIdentity,
+                  ),
+                )
+              }
               const mainResponse = await sendWithAccessToken(
                 input,
                 init,
@@ -8414,7 +9385,24 @@ const anthropicAuthPlugin = async (
                   result.redirectUri,
                   result.state,
                 )
-                return exchanged
+                if (exchanged.type === 'failed') return exchanged
+                assertNativeEnvironment()
+                await nativeAccounts.loginOAuth({
+                  routeId: 'main',
+                  replace: true,
+                  credential: {
+                    access: exchanged.access,
+                    refresh: exchanged.refresh,
+                    expires: exchanged.expires,
+                  },
+                })
+                const activation = custodyTombstoneOAuth('anthropic')
+                return {
+                  type: 'success' as const,
+                  access: activation.access,
+                  refresh: activation.refresh,
+                  expires: activation.expires,
+                }
               },
             }
           },
@@ -8465,7 +9453,6 @@ const anthropicAuthPlugin = async (
     __resolveMainQuotaIdentityForTest: resolveMainQuotaAccountIdentity,
     __resolveSidebarQuotaAccessForTest: resolveSidebarQuotaAccess,
     __mainProviderAccountUuidForTest: () => mainProviderAccountUuid,
-    __persistFallbackQuotaErrorForTest: persistFallbackQuotaError,
     __fallbackRefreshReady: fallbackRefreshReady,
     get __scopedRuntime() {
       return getOpenCodeScopedRuntime(accountStoragePath, ctx.directory)

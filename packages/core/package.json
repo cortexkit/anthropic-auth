@@ -21,14 +21,20 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --emitDeclarationOnly && bun scripts/build.ts",
     "test": "bun run build && bun test src/tests",
+    "test:scripts": "bun test scripts",
+    "check:native-type-closure": "bun scripts/check-native-type-closure.ts",
     "typecheck": "tsc",
     "types": "tsc",
     "prepublishOnly": "bun run build"
   },
+  "devDependencies": {
+    "@cortexkit/common-auth": "0.11.7"
+  },
   "dependencies": {
-    "@cortexkit/claustrum-client": "0.4.0",
+    "@cortexkit/claustrum-client": "0.6.2",
+    "jsonc-parser": "^3.3.1",
     "xxhash-wasm": "^1.1.0"
   }
 }

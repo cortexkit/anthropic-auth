@@ -165,3 +165,56 @@ test('Opus 5.5 uses the same explicit adaptive-thinking prefix control', () => {
     prefix_mismatch_behavior: 'error',
   })
 })
+
+describe('Haiku 5.5 thinking binding controls', () => {
+  test.each(['error', 'drop_block'] as const)(
+    'adds %s only for replayed signed or redacted thinking',
+    (behavior) => {
+      for (const block of [
+        { type: 'thinking', thinking: 'reason', signature: 'signed' },
+        { type: 'redacted_thinking', data: 'redacted' },
+      ]) {
+        const body = bodyWith('claude-haiku-5-5[1m]', block)
+        expect(applyThinkingBindingControls(body, behavior)).toBe(true)
+        expect(body.thinking.block_binding).toEqual({
+          prefix_mismatch_behavior: behavior,
+        })
+        expect(hasThinkingBindingControls(body)).toBe(true)
+      }
+    },
+  )
+  test('account-default leaves Haiku replay bytes unchanged', () => {
+    const body = bodyWith('claude-haiku-5-5', {
+      type: 'thinking',
+      signature: 'signed',
+      thinking: 'reason',
+    })
+    const before = JSON.stringify(body)
+    expect(applyThinkingBindingControls(body)).toBe(false)
+    expect(JSON.stringify(body)).toBe(before)
+  })
+  test('first Haiku turns receive no prefix control', () => {
+    const body = bodyWith('claude-haiku-5-5')
+    expect(applyThinkingBindingControls(body, 'drop_block')).toBe(false)
+    expect(hasThinkingBindingControls(body)).toBe(false)
+  })
+  test('disabled Haiku thinking receives no unsupported block_binding field', () => {
+    const body = bodyWith('claude-haiku-5-5', {
+      type: 'thinking',
+      signature: 'signed',
+      thinking: 'reason',
+    })
+    body.thinking.type = 'disabled'
+    expect(applyThinkingBindingControls(body, 'drop_block')).toBe(false)
+    expect(hasThinkingBindingControls(body)).toBe(false)
+  })
+  test('Haiku 4.5 remains outside the prefix-control family', () => {
+    const body = bodyWith('claude-haiku-4-5', {
+      type: 'thinking',
+      signature: 'signed',
+      thinking: 'reason',
+    })
+    expect(applyThinkingBindingControls(body, 'drop_block')).toBe(false)
+    expect(hasThinkingBindingControls(body)).toBe(false)
+  })
+})

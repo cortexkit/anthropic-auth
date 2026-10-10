@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   type ClaustrumEnrollmentClient,
   ClaustrumScopedCredentialError,
+  createNativeAccountRuntime,
+  type ProviderAccountUuid,
+  readNativeMigrationJournal,
+  runNativeMigration,
 } from '@cortexkit/anthropic-auth-core'
 import { runSetupCommand } from '../setup/command.ts'
+import { resolveNativeSetupPaths } from '../setup/native-paths.ts'
 import type { CommandRunner, ProcessFence } from '../setup/types.ts'
 
 const testDirs: string[] = []
@@ -163,6 +168,9 @@ describe('setup wizard command', () => {
 
     const tuiConfig = await readFile(join(configDir, 'tui.jsonc'), 'utf8')
     expect(tuiConfig).toContain('@cortexkit/opencode-anthropic-auth@')
+    const plan = await resolveNativeSetupPaths('opencode', env)
+    const journal = await readNativeMigrationJournal(plan.paths)
+    expect(journal?.phase).toBe('retired')
   })
 })
 
@@ -677,3 +685,104 @@ test.each(['pending', 'blocked'] as const)(
     expect(JSON.stringify(state)).not.toContain(expiredSecret)
   },
 )
+
+test('explicit offline recovery login is performed before setup reports completion', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'setup-offline-login-'))
+  testDirs.push(root)
+  const env: NodeJS.ProcessEnv = {
+    HOME: root,
+    XDG_CONFIG_HOME: join(root, '.config'),
+    XDG_DATA_HOME: join(root, '.local', 'share'),
+    PI_CODING_AGENT_DIR: join(root, 'absent-pi'),
+    OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
+      root,
+      'absent-connection',
+    ),
+  }
+  const plan = await resolveNativeSetupPaths('opencode', env)
+  await mkdir(dirname(plan.hostAuthPath), { recursive: true, mode: 0o700 })
+  const oldAuth = JSON.stringify({
+    anthropic: {
+      type: 'oauth',
+      access: 'sk-ant-oat01-old-unidentified',
+      refresh: 'old-refresh',
+      expires: Date.now() + 24 * 60 * 60_000,
+    },
+  })
+  await writeFile(plan.hostAuthPath, oldAuth, { mode: 0o600 })
+  await expect(
+    runNativeMigration({
+      ...plan,
+      env,
+      processFence: async () => {},
+      requestVaultActivation: true,
+      removePiAnthropicAuth: false,
+    }),
+  ).rejects.toThrow('setup --login --no-claustrum')
+  expect(await readFile(plan.hostAuthPath, 'utf8')).toBe(oldAuth)
+  expect(await readNativeMigrationJournal(plan.paths)).toBeUndefined()
+  let logins = 0
+  const options = {
+    env,
+    fence: createTestFence(),
+    runner: createMockRunner({
+      opencode: () => ({ exitCode: 0, stdout: '1.18.30\n', stderr: '' }),
+      pi: () => ({ exitCode: 1, stdout: '', stderr: '' }),
+      ck: () => ({ exitCode: 1, stdout: '', stderr: '' }),
+    }),
+    localLogin: async () => {
+      logins++
+      return {
+        accountIdentity: 'aabbccdd-1122-3344-5566-778899001122',
+        credential: {
+          type: 'oauth' as const,
+          access: 'sk-ant-oat01-fresh-main',
+          refresh: 'fresh-refresh',
+          expires: Date.now() + 24 * 60 * 60_000,
+        },
+      }
+    },
+  }
+  expect(
+    await runSetupCommand(['--yes', '--no-claustrum', '--login'], options),
+  ).toBe(0)
+  expect(logins).toBe(1)
+  const runtime = createNativeAccountRuntime({
+    paths: plan.paths,
+    host: 'opencode',
+    local: {
+      refreshToken: async () => {
+        throw new Error('Unexpected token refresh after fresh sign-in')
+      },
+      resolveIdentity: async (access) => {
+        expect(access).toBe('sk-ant-oat01-fresh-main')
+        return {
+          deviceId: 'synthetic-device',
+          sessionId: 'synthetic-session',
+          accountUuid:
+            'aabbccdd-1122-3344-5566-778899001122' as ProviderAccountUuid,
+        }
+      },
+    },
+  })
+  try {
+    const snapshot = await runtime.read()
+    expect(
+      snapshot.accounts.find((account) => account.id === 'main')
+        ?.accountIdentity,
+    ).toBe('aabbccdd-1122-3344-5566-778899001122')
+    expect((await readNativeMigrationJournal(plan.paths))?.phase).toBe(
+      'retired',
+    )
+    const authorized = await runtime.authorizeLocal('main')
+    expect(authorized).toMatchObject({ status: 'usable' })
+    if (authorized.status !== 'usable')
+      throw new Error('Fresh login did not authorize')
+    expect(authorized.access).toBe('sk-ant-oat01-fresh-main')
+    expect(authorized.subject.binding.identity).toBe(
+      'aabbccdd-1122-3344-5566-778899001122',
+    )
+  } finally {
+    runtime.close()
+  }
+})

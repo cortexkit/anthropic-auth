@@ -225,6 +225,91 @@ function normalizeState(value: unknown): StickyRouteState | undefined {
   }
 }
 
+/**
+ * Produce deterministic journal bytes from captured, parsed legacy routing JSON.
+ * The offline caller must prove each old-to-concrete row binding, including main;
+ * a map entry is not credential or identity proof. Unmapped assignments and their
+ * implicit prompt-byte deficits are dropped. Quota observations must separately
+ * retain their proven checkedAt values for those deficits to remain attributable.
+ *
+ * The caller owns source/path revalidation, the digest, journal authority and the
+ * locked temp-plus-rename write with an ownership check before rename. An absent
+ * source is handled by the caller, not by substituting an empty state here. This
+ * helper neither authorizes migration nor reads clocks, prunes or writes state.
+ * Invalid source data or unusable map values throw Error('invalid-source') without
+ * including any captured data. Input must be parsed JSON, not executable objects.
+ */
+export function migrateStickyRoutingState(
+  source: unknown,
+  rowIdMap: ReadonlyMap<string, string>,
+): string {
+  try {
+    if (!isRecord(source) || !isRecord(source.assignments)) throw new Error()
+    const entries = Object.entries(source.assignments)
+    // The runtime normalizer writes into an ordinary dictionary. Neutral keys
+    // let it validate every record without invoking the __proto__ setter; the
+    // original session keys are restored only into a null-prototype dictionary.
+    const state = normalizeState({
+      ...source,
+      assignments: Object.fromEntries(
+        entries.map(([, assignment], index) => [String(index), assignment]),
+      ),
+    })
+    if (
+      !state ||
+      Object.keys(source).length !== 3 ||
+      !Object.hasOwn(source, 'version') ||
+      !Object.hasOwn(source, 'updatedAt') ||
+      !Object.hasOwn(source, 'assignments') ||
+      !Object.is(source.updatedAt, state.updatedAt)
+    ) {
+      throw new Error()
+    }
+
+    // Validate even unused mappings. These are concrete pool row IDs, whose
+    // binding contract requires nonempty strings without surrounding whitespace.
+    for (const accountId of rowIdMap.values()) {
+      if (
+        typeof accountId !== 'string' ||
+        accountId.length === 0 ||
+        accountId.trim() !== accountId
+      ) {
+        throw new Error()
+      }
+    }
+
+    const assignments: Record<string, StickyRouteAssignment> =
+      Object.create(null)
+    for (const [index, [key, original]] of entries.entries()) {
+      const assignment = state.assignments[String(index)]
+      if (!isRecord(original) || !assignment) throw new Error()
+      // An absent legacy affinity is valid, but no other missing, extra or
+      // changed field is safe to import. Compare fields, not JSON key order.
+      const fields = Object.keys(assignment).filter(
+        (field) =>
+          field !== 'affinityModelId' ||
+          Object.hasOwn(original, 'affinityModelId'),
+      )
+      if (
+        Object.keys(original).length !== fields.length ||
+        fields.some(
+          (field) =>
+            !Object.hasOwn(original, field) ||
+            !Object.is(original[field], Reflect.get(assignment, field)),
+        )
+      ) {
+        throw new Error()
+      }
+      const accountId = rowIdMap.get(assignment.accountId)
+      if (accountId === undefined) continue
+      assignments[key] = { ...assignment, accountId }
+    }
+    return `${JSON.stringify({ ...state, assignments }, null, 2)}\n`
+  } catch {
+    throw new Error('invalid-source')
+  }
+}
+
 function emptyState(now: number): StickyRouteState {
   return { version: 1, updatedAt: now, assignments: {} }
 }

@@ -65,3 +65,12 @@ export async function hasPiLocalAnthropicOAuth(): Promise<boolean> {
     throw new Error('Cannot safely inspect Pi authentication metadata')
   }
 }
+
+/** The user must approve removing the host’s Anthropic OAuth credential before the shared account store can serve requests. */
+export async function requirePiNativeHostAuth(): Promise<void> {
+  if (await hasPiLocalAnthropicOAuth()) {
+    throw new Error(
+      'Pi still has a host Anthropic OAuth credential. Run offline setup to migrate it and approve its removal before using the native pool.',
+    )
+  }
+}

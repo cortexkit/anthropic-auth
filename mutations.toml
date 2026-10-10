@@ -1,0 +1,278 @@
+# Commands select exact expect_red tests; --broad runs the full owning package.
+prebuild = [
+  { name = "core-current-source", command = ["bun", "run", "--cwd", "packages/core", "build"] },
+]
+
+[[control]]
+id = "history-refuses-meaningful-assistant"
+guards = "Meaningful assistant trailers must be refused without deleting history or replaying the preceding question."
+file = "packages/core/src/request-history.ts"
+old = "if (!isProvablyEmptyContent(last.content)) {"
+new = "if (!isProvablyEmptyContent(last.content) && end < 0) { // NON-VACUITY BREAK: accept and remove meaningful trailers"
+test_file = "packages/core/src/tests/request-history.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/request-history.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["refuses unknown or meaningful content 0 without mutating history"]
+expect_message = "error: expect(received).toThrow(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "fast-excludes-opus-46-47"
+guards = "Fast mode excludes Opus 4.6 and 4.7 while retaining Opus 4.8, 5 and 5.5."
+file = "packages/core/src/constants.ts"
+old = "model.startsWith('claude-opus-4-8') || model.startsWith('claude-opus-5')"
+new = "model.startsWith('claude-opus-4-') || model.startsWith('claude-opus-5') /* NON-VACUITY BREAK: widen unsupported models */"
+test_file = "packages/core/src/tests/fast.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/fast.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["fast mode eligibility for claude-opus-4-6 is false", "fast mode eligibility for claude-opus-4-7 is false", "fast mode eligibility for claude-opus-4-7[1m] is false"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "thinking-binding-excludes-api-key"
+guards = "Pi must not apply Core thinking-binding controls without an OAuth identity, including signed history on API-key routes."
+file = "packages/pi/src/convert.ts"
+old = '''  if (identity) {
+    applyThinkingBindingControls('''
+new = '''  // NON-VACUITY BREAK: decorate API-key routes with an explicit override
+  if (!identity) applyThinkingBindingControls(body, 'drop_block')
+  if (identity) {
+    applyThinkingBindingControls('''
+test_file = "packages/pi/src/tests/convert.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/pi/src/tests/convert.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["buildAnthropicRequest — Fable/Mythos thinking > does not add Fable 5.1 binding controls to an API-key request"]
+expect_message = "error: expect(received).toBeUndefined()"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/pi", "tmp/mutations/pi.xml"]
+broad_report = "tmp/mutations/pi.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "header-routing-current-credential-epoch"
+guards = "Pending response quota must not license paid fallback after the OAuth login is replaced."
+file = "packages/opencode/src/index.ts"
+old = "observation.lineage !== lineage"
+new = "false"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > pending quota from a superseded credential epoch cannot license API fallback"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "header-routing-raw-exhaustion-proof"
+guards = "Display rounding from 99.5 percent must not license paid fallback before actual OAuth exhaustion."
+file = "packages/opencode/src/index.ts"
+old = "Number(raw) >= 1"
+new = "Number(raw) >= 0.995"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > pending rounded header usage cannot license API fallback"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-read-no-follow"
+guards = "A runtime file replaced by a symlink between inspection and opening must not be read."
+file = "packages/core/src/native-runtime.ts"
+old = "const file = await open(path, constants.O_RDONLY | noFollow)"
+new = "const file = await open(path, constants.O_RDONLY)"
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime reader refuses symlink replacement between stat and open"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-read-opened-mode"
+guards = "Runtime metadata with unsafe permissions must be rejected using the opened file's mode."
+file = "packages/core/src/native-runtime.ts"
+old = "(opened.mode & 0o777) !== 0o600"
+new = "false"
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime reader refuses permissions replacement between stat and open"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-read-opened-owner"
+guards = "Runtime metadata opened under a foreign owner must be rejected even if the path inspection saw the expected owner."
+file = "packages/core/src/native-runtime.ts"
+old = "opened.uid !== process.geteuid()"
+new = "false"
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime reader refuses a foreign owner on the opened handle"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "local-quota-survives-token-refresh"
+guards = "Account-owned quota must survive same-account token refresh while stale metadata and mixed writes remain refused."
+file = "packages/core/src/native-account-runtime.ts"
+old = "quota !== undefined && Object.keys(metadata).length === 0"
+new = "false"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > quota-only publication survives native token refresh without admitting stale metadata"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "local-metadata-requires-token-version"
+guards = "The account-only quota exception must not permit stale metadata or mixed patches after token refresh."
+file = "packages/core/src/native-account-runtime.ts"
+old = "quota !== undefined && Object.keys(metadata).length === 0"
+new = "true"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > quota-only publication survives native token refresh without admitting stale metadata"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "profile-publication-refusal-is-not-io"
+guards = "A stale credential publication must remain distinct from a storage failure."
+file = "packages/core/src/native-vault-runtime.ts"
+old = "saved ? 'saved' : 'refused'"
+new = "saved ? 'saved' : 'failed'"
+test_file = "packages/core/src/tests/native-display-profile.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-display-profile.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["profile publication fence refusal is distinct from an I/O failure"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "profile-current-credential-display"
+guards = "A fetched tier after a failed write must not be displayed for changed credentials."
+file = "packages/opencode/src/index.ts"
+old = "!(await hydration.isCurrent?.())"
+new = "false"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > profile I/O failure hides a fetched tier after the credential changes"]
+expect_message = "error: expect(received).not.toContain(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "runtime-owner-loss-is-publication-refusal"
+guards = "Lost writer ownership must not license display through the I/O failure exception."
+file = "packages/core/src/native-runtime.ts"
+old = '''          try {
+            await lock.assertOwned()
+          } catch {
+            throw new NativeRuntimeError('publication-refused')
+          }'''
+new = '''          await lock.assertOwned()'''
+test_file = "packages/core/src/tests/native-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["runtime writer ownership loss is a publication refusal, not an I/O display fallback"]
+expect_message = "error: expect(received).toMatchObject(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "refresh-backoff-preserves-attempt-budget"
+guards = "Failure bookkeeping must not block the coordinator's own remaining transient retries."
+file = "packages/core/src/native-account-runtime.ts"
+old = "nextRetryAt: retrying ? policy.checkedAt : policy.nextRetryAt,"
+new = "nextRetryAt: retrying ? policy.nextRetryAt : policy.nextRetryAt,"
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["native refresh keeps bounded provider attempts before backoff (status=500, failures=1)"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "native-activation-before-401-refresh"
+guards = "A revoked host activation must not trigger a credential refresh."
+file = "packages/opencode/src/index.ts"
+old = '''              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()
+              const current = await authorizeOAuth('''
+new = '''              init?.signal?.throwIfAborted()
+              const current = await authorizeOAuth('''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+prebuild = ["bun", "run", "--cwd", "packages/core", "build"]
+expect_red = ["auth.loader > sticky 401 retry refuses a foreign-provider tombstone before the token endpoint"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "native-activation-after-authorization"
+guards = "Activation revocation during physical credential authorization must prevent model dispatch."
+file = "packages/opencode/src/index.ts"
+old = '''                oauthAccountId === 'main' ? 'last-main' : 'serve',
+              )
+              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()'''
+new = '''                oauthAccountId === 'main' ? 'last-main' : 'serve',
+              )
+              init?.signal?.throwIfAborted()'''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+prebuild = ["bun", "run", "--cwd", "packages/core", "build"]
+expect_red = ["auth.loader > physical OAuth authorization refuses host revocation during fresh token validation"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"

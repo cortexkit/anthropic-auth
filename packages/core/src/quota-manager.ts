@@ -57,7 +57,11 @@ export type QuotaRefreshResult = {
 export type QuotaManagerOptions = {
   storage: AccountStorage | null
   fetchImpl?: typeof fetch
-  /** Resolve custody credentials at the actual HTTP boundary, after quota gates. */
+  /**
+   * This callback checks or obtains credentials before its own HTTP request.
+   * accessToken may be empty when the host uses a native pool or vault instead
+   * of keeping a token in its quota settings snapshot.
+   */
   fetchQuotaSnapshot?: (request: {
     kind: 'main' | 'fallback'
     accountId: string | undefined
@@ -214,13 +218,9 @@ export class QuotaManager {
     return this.fallbacks.get(accountId) ?? null
   }
 
-  /** A host transport resolves scoped credentials at dispatch time. */
+  /** A configured transport obtains its own credentials; policy snapshots need no tokens. */
   canFetchWithoutAccessToken(): boolean {
-    return Boolean(
-      this.fetchQuotaSnapshot &&
-        (this.storage === null ||
-          this.storage?.claustrum?.scopedRoster === true),
-    )
+    return Boolean(this.fetchQuotaSnapshot)
   }
 
   getAllFallbacks(): Map<string, QuotaEntry> {

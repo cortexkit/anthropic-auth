@@ -3,7 +3,6 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  type ClaustrumScopedClient,
   getClaustrumMode,
   getHostClaustrumEnrollmentPaths,
   loadAccounts,
@@ -30,68 +29,26 @@ async function fixture() {
     JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
     { mode: 0o600 },
   )
-  let connections = 0,
-    gets = 0,
-    reconfigurations = 0
-  const client: ClaustrumScopedClient = {
-    listScoped: async () => ({
-      view: 'v',
-      rows: [
-        {
-          id: 'oauth:anthropic',
-          accountId: 'provider-account',
-          credentialType: 'oauth',
-          categories: ['anthropic-native'],
-          serves: ['anthropic'],
-          refreshAdapter: 'anthropic',
-          state: 'active',
-          operations: ['read'],
-          recordVersion: 1,
-          createdAtMs: null,
-        },
-      ],
-    }),
-    getScoped: async () => {
-      gets++
-      return {
-        material: 'vault-test-access',
-        credentialId: 'oauth:anthropic',
-        accountId: 'provider-account',
-        recordVersion: 1,
-        expiresAtMs: Date.now() + 600_000,
-      }
-    },
-    reportAuthFailureScoped: async () => {},
-    close: () => {},
-  }
-  const commands = createPiCustodyCommands({
-    storagePath,
-    connect: async () => {
-      connections++
-      return client
-    },
-    reconfigure: async () => {
-      reconfigurations++
-    },
-  })
   return {
     storagePath,
     tokenPath,
     authPath: join(dir, 'auth.json'),
-    commands,
-    client,
-    counts: () => ({ connections, gets, reconfigurations }),
+    commands: createPiCustodyCommands(),
   }
 }
 
-test('a custody command verifies existing grants and credentials before changing mode', async () => {
+test('custody mode commands give offline guidance without granting or changing authority', async () => {
   const f = await fixture()
-  await f.commands.transition('claustrum')
-  expect(getClaustrumMode(await loadAccounts(f.storagePath))).toBe('claustrum')
-  expect(f.counts()).toEqual({ connections: 1, gets: 1, reconfigurations: 1 })
-  await f.commands.transition('local')
+  const before = await readFile(f.storagePath, 'utf8')
+  const tokenBefore = await readFile(f.tokenPath, 'utf8')
+  expect((await f.commands.transition('claustrum')).text).toContain(
+    'offline setup',
+  )
   expect(getClaustrumMode(await loadAccounts(f.storagePath))).toBe('local')
-  expect(f.counts()).toEqual({ connections: 1, gets: 1, reconfigurations: 2 })
+  expect((await f.commands.transition('local')).text).toContain('offline setup')
+  expect(getClaustrumMode(await loadAccounts(f.storagePath))).toBe('local')
+  expect(await readFile(f.storagePath, 'utf8')).toBe(before)
+  expect(await readFile(f.tokenPath, 'utf8')).toBe(tokenBefore)
 })
 
 test('local OAuth requires explicit setup consent; a slash command never deletes it', async () => {
@@ -109,21 +66,20 @@ test('local OAuth requires explicit setup consent; a slash command never deletes
   expect((await f.commands.transition('claustrum')).text).toContain('Refused:')
   expect(await readFile(f.authPath, 'utf8')).toBe(auth)
   expect(await readFile(f.storagePath, 'utf8')).toBe(before)
-  expect(f.counts()).toEqual({ connections: 0, gets: 0, reconfigurations: 0 })
 })
 
-test('failed preflight does not commit mode or reconfigure the provider', async () => {
+test('offline custody guidance does not need a live vault preflight or reconfigure the provider', async () => {
   const f = await fixture()
-  f.client.getScoped = async () => ({
-    material: 'vault-test-access',
-    credentialId: 'oauth:anthropic',
-    accountId: 'wrong-account',
-    recordVersion: 1,
-    expiresAtMs: Date.now() + 600_000,
-  })
-  await expect(f.commands.transition('claustrum')).rejects.toThrow('identity')
+  await rm(f.tokenPath)
+  const before = await readFile(f.storagePath, 'utf8')
+  expect((await f.commands.transition('claustrum')).text).toContain(
+    'offline setup',
+  )
   expect(getClaustrumMode(await loadAccounts(f.storagePath))).toBe('local')
-  expect(f.counts().reconfigurations).toBe(0)
+  expect(await readFile(f.storagePath, 'utf8')).toBe(before)
+  await expect(readFile(f.tokenPath, 'utf8')).rejects.toMatchObject({
+    code: 'ENOENT',
+  })
 })
 
 test('terminal enrollment reset is local, locked and independent of daemon availability', async () => {
@@ -142,5 +98,4 @@ test('terminal enrollment reset is local, locked and independent of daemon avail
   )
   expect((await f.commands.reset()).text).toContain('cleared')
   expect(await f.commands.status()).toEqual({ state: 'idle' })
-  expect(f.counts()).toEqual({ connections: 0, gets: 0, reconfigurations: 0 })
 })

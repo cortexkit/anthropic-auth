@@ -3,6 +3,7 @@ import { MockAnthropicServer, type MockResponse } from './mock-anthropic.ts'
 import { MockRelayServer } from './mock-relay.ts'
 import {
   type IsolatedEnv,
+  type NativeAccountFixture,
   type SpawnedOpencode,
   spawnOpencode,
 } from './opencode-runner.ts'
@@ -49,6 +50,8 @@ export type E2EHarnessOptions = {
   childTmpDir?: string
   childEnv?: Record<string, string | undefined>
   beforeSpawn?: (env: IsolatedEnv) => void | Promise<void>
+  /** Defaults to `{ kind: 'local' }`; see NativeAccountFixture. */
+  nativeAccounts?: NativeAccountFixture
 }
 
 export class E2EHarness {
@@ -98,6 +101,7 @@ export class E2EHarness {
       quotaFeed: options.quotaFeed,
       childEnv: options.childEnv,
       beforeSpawn: options.beforeSpawn,
+      nativeAccounts: options.nativeAccounts,
     })
     const sdk = await import('@opencode-ai/sdk')
     const client = sdk.createOpencodeClient({

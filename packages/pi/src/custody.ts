@@ -3,19 +3,10 @@ import {
   CLAUSTRUM_PI_ENROLLMENT_NAME,
   type ClaustrumEnrollmentStatus,
   type ClaustrumMode,
-  type ClaustrumScopedClient,
-  ClaustrumScopedCustody,
-  connectClaustrumScopedClient,
   getHostClaustrumEnrollmentPaths,
   readClaustrumEnrollmentStatus,
   resetClaustrumEnrollmentState,
-  setClaustrumModePersistent,
 } from '@cortexkit/anthropic-auth-core'
-import {
-  getPiAccountStoragePath,
-  getPiClaustrumConnectionOptions,
-  hasPiLocalAnthropicOAuth,
-} from './paths.ts'
 
 export async function requirePiEnrollment() {
   const status = await readClaustrumEnrollmentStatus(
@@ -39,12 +30,7 @@ export interface PiCustodyCommands {
   reset(): Promise<AccountCommandResult>
 }
 
-export function createPiCustodyCommands(options: {
-  reconfigure: () => Promise<void>
-  storagePath?: string
-  connect?: () => Promise<ClaustrumScopedClient>
-}): PiCustodyCommands {
-  const storagePath = options.storagePath ?? getPiAccountStoragePath()
+export function createPiCustodyCommands(): PiCustodyCommands {
   const paths = () => getHostClaustrumEnrollmentPaths('pi')
   return {
     status: () =>
@@ -66,44 +52,10 @@ export function createPiCustodyCommands(options: {
       return { text: messages[result] }
     },
     async transition(mode) {
-      if (mode === 'claustrum') {
-        if (await hasPiLocalAnthropicOAuth()) {
-          return {
-            text: 'Refused: Pi still has a local Anthropic OAuth credential. Run `bunx @cortexkit/opencode-anthropic-auth setup` to approve its removal and enable Claustrum.',
-          }
-        }
-        // A slash command never invokes the administrative CLI or approves itself.
-        // Existing enrollment and grants must be verified before committing mode.
-        await requirePiEnrollment()
-        const client = await (options.connect?.() ??
-          connectClaustrumScopedClient(
-            getPiClaustrumConnectionOptions(storagePath),
-          ))
-        const custody = new ClaustrumScopedCustody({
-          client,
-          tokenPath: paths().tokenPath,
-        })
-        try {
-          const inventory = await custody.discover()
-          const active = inventory.accounts.filter(
-            (account) => account.state === 'active',
-          )
-          if (!active.length)
-            return {
-              text: 'Refused: Claustrum has no accessible active Anthropic accounts.',
-            }
-          for (const account of active) await custody.authorize(account)
-        } finally {
-          custody.close()
-        }
-      }
-      await setClaustrumModePersistent(mode, storagePath)
-      await options.reconfigure()
+      // Mode changes can remove host credentials and require offline consent.
+      // A menu never enrolls, grants custody or writes the authority journal.
       return {
-        text:
-          mode === 'claustrum'
-            ? 'Pi now uses Claustrum for Anthropic authentication.'
-            : 'Pi now uses local Anthropic authentication. Use /login anthropic if needed.',
+        text: `Refused: Changing Pi authentication to ${mode} requires offline setup. Run \`bunx @cortexkit/opencode-anthropic-auth setup\` and review the migration and host OAuth removal consent.`,
       }
     },
   }

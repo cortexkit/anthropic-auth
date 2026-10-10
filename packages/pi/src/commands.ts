@@ -1,407 +1,55 @@
 import {
-  buildClaudeQuotaSummary,
-  buildFallbackQuotaSummaries,
-  buildPrimeAccountStatuses,
-  CLAUDE_ACCOUNT_COMMAND_NAME,
-  CLAUDE_CACHE_KEEP_COMMAND_NAME,
-  CLAUDE_PRIME_COMMAND_NAME,
-  CLAUDE_ROUTING_COMMAND_NAME,
-  createEmptyStorage,
-  detectClaustrumConnection,
-  executeAccountCommand,
-  executeCache1hCommand,
-  executeCacheKeepCommand,
-  executeDumpCommand,
-  executeFastModeCommand,
-  executeLoggingCommand,
-  executePrimeCommand,
-  executeRoutingCommand,
-  formatEnrollmentStatus,
-  getCache1hPersistentMode,
-  getCacheKeepWindow,
-  getClaustrumMode,
-  getPersistedLogLevel,
-  getRoutingMode,
-  isCache1hPersistentlyEnabled,
-  isCacheKeepAlways,
-  isCacheKeepHybridActive,
-  isCacheKeepPersistentlyEnabled,
-  isDumpPersistentlyEnabled,
-  isFastModePersistentlyEnabled,
-  isPrimePersistentlyEnabled,
-  loadAccounts,
-  mergeMainQuotaErrorClearedAt,
-  mergeMainRefreshErrorClearedAt,
-  parseAccountCommandAction,
-  parseCache1hCommandAction,
-  parseCacheKeepCommandAction,
-  parseDumpCommandAction,
-  parseFastModeCommandAction,
-  parseLoggingCommandAction,
-  parseRoutingCommandAction,
-  removeAccountPersistent,
-  reorderAccountsPersistent,
-  saveAccountState,
-  setAccountEnabledPersistent,
-  setCache1hPersistentEnabled,
-  setCache1hPersistentMode,
-  setCacheKeepPersistentAlways,
-  setCacheKeepPersistentEnabled,
-  setCacheKeepPersistentWindow,
-  setCacheKeepSubagentsEnabled,
-  setDumpEnabled,
-  setDumpPersistentEnabled,
-  setFastModePersistentEnabled,
-  setLogLevelPersistent,
-  setRoutingMode,
+  createNativeUi,
+  type NativeMenuCommandId,
+  type NativeMenuDispatch,
+  runPiCommandMenu,
 } from '@cortexkit/anthropic-auth-core'
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-} from '@earendil-works/pi-coding-agent'
-import type { PiCustodyCommands } from './custody.ts'
-import { getPiAccountStoragePath } from './paths.ts'
-import {
-  clearPiStickyRoutingSession,
-  getPiTrackedCacheKeepSessions,
-} from './stream.ts'
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
-type NotifyKind = 'info' | 'warning' | 'error'
-
-function notify(
-  ctx: ExtensionCommandContext,
-  message: string,
-  kind: NotifyKind = 'info',
-) {
-  ctx.ui.notify(message, kind)
+/** Backend callbacks use native authority; the renderer never receives credentials. */
+export interface PiNativeCommands {
+  dispatch: NativeMenuDispatch
+  readStatus: (
+    command: Exclude<NativeMenuCommandId, 'start'>,
+    invocation: { sessionId?: string },
+  ) => Promise<string>
 }
 
-export function registerCommands(
-  pi: ExtensionAPI,
-  custody?: PiCustodyCommands,
-) {
-  pi.registerCommand('claude-cache', {
-    description: 'Show or configure Claude 1-hour prompt cache mode',
-    handler: async (args, ctx) => {
-      const path = getPiAccountStoragePath()
-      const storage = await loadAccounts(path)
-      const action = parseCache1hCommandAction(args ?? '')
-      const enabled = isCache1hPersistentlyEnabled(storage)
-      const mode = getCache1hPersistentMode(storage)
-
-      const nextEnabled =
-        action.type === 'enable'
-          ? true
-          : action.type === 'disable'
-            ? false
-            : enabled
-      const nextMode = action.type === 'mode' ? action.mode : mode
-
-      if (action.type === 'enable') {
-        await setCache1hPersistentEnabled(true, undefined, path)
-      } else if (action.type === 'disable') {
-        await setCache1hPersistentEnabled(false, undefined, path)
-      } else if (action.type === 'mode') {
-        await setCache1hPersistentMode(action.mode, path)
-      }
-
-      notify(
-        ctx,
-        executeCache1hCommand({
-          argumentsText: args ?? '',
-          enabled: nextEnabled,
-          mode: nextMode,
-        }),
-        action.type === 'usage' ? 'warning' : 'info',
-      )
-    },
-  })
-
-  pi.registerCommand(CLAUDE_CACHE_KEEP_COMMAND_NAME, {
+export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
+  pi.registerCommand('claude', {
     description:
-      'Keep hybrid Claude cache warm always or during a local time window',
+      'Claude accounts, quota, routing, limits, cache and diagnostics',
     handler: async (args, ctx) => {
-      const path = getPiAccountStoragePath()
-      let storage = await loadAccounts(path)
-      const action = parseCacheKeepCommandAction(args ?? '')
-
-      if (action.type === 'window') {
-        storage = await setCacheKeepPersistentWindow(
-          action.startHour,
-          action.endHour,
-          path,
-        )
-      } else if (action.type === 'always') {
-        storage = await setCacheKeepPersistentAlways(path)
-      } else if (action.type === 'disable') {
-        storage = await setCacheKeepPersistentEnabled(false, path)
-      } else if (action.type === 'subagents') {
-        storage = await setCacheKeepSubagentsEnabled(action.enabled, path)
-      }
-
-      const trackedSessionDetails = await getPiTrackedCacheKeepSessions()
-      const nextPrewarmAt = trackedSessionDetails.length
-        ? Math.min(
-            ...trackedSessionDetails.map((session) => session.nextPrewarmAt),
-          )
-        : undefined
-      notify(
-        ctx,
-        executeCacheKeepCommand({
-          argumentsText: args ?? '',
-          enabled: isCacheKeepPersistentlyEnabled(storage),
-          always: isCacheKeepAlways(storage),
-          window: getCacheKeepWindow(storage),
-          hybridActive: isCacheKeepHybridActive(storage),
-          trackedSessions: trackedSessionDetails.length,
-          trackedSessionDetails,
-          nextPrewarmAt,
-        }),
-        action.type === 'usage' ? 'warning' : 'info',
-      )
-    },
-  })
-
-  pi.registerCommand('claude-dump', {
-    description: 'Show or configure Anthropic request/relay dumping',
-    handler: async (args, ctx) => {
-      const path = getPiAccountStoragePath()
-      const storage = await loadAccounts(path)
-      const action = parseDumpCommandAction(args ?? '')
-      const enabled = isDumpPersistentlyEnabled(storage)
-
-      const nextEnabled =
-        action.type === 'enable'
-          ? true
-          : action.type === 'disable'
-            ? false
-            : enabled
-
-      if (action.type === 'enable') {
-        await setDumpPersistentEnabled(true, path)
-        setDumpEnabled(true)
-      } else if (action.type === 'disable') {
-        await setDumpPersistentEnabled(false, path)
-        setDumpEnabled(false)
-      } else {
-        setDumpEnabled(enabled)
-      }
-
-      notify(
-        ctx,
-        executeDumpCommand({ argumentsText: args ?? '', enabled: nextEnabled }),
-        action.type === 'usage' ? 'warning' : 'info',
-      )
-    },
-  })
-
-  pi.registerCommand('claude-fast', {
-    description:
-      'Show or configure Anthropic fast mode for supported Opus models',
-    handler: async (args, ctx) => {
-      const path = getPiAccountStoragePath()
-      const storage = await loadAccounts(path)
-      const action = parseFastModeCommandAction(args ?? '')
-      const enabled = isFastModePersistentlyEnabled(storage)
-
-      const nextEnabled =
-        action.type === 'enable'
-          ? true
-          : action.type === 'disable'
-            ? false
-            : enabled
-
-      if (action.type === 'enable') {
-        await setFastModePersistentEnabled(true, path)
-      } else if (action.type === 'disable') {
-        await setFastModePersistentEnabled(false, path)
-      }
-
-      notify(
-        ctx,
-        executeFastModeCommand({
-          argumentsText: args ?? '',
-          enabled: nextEnabled,
-        }),
-        action.type === 'usage' ? 'warning' : 'info',
-      )
-    },
-  })
-
-  pi.registerCommand(CLAUDE_ROUTING_COMMAND_NAME, {
-    description: 'Show or change Claude account routing mode',
-    handler: async (args, ctx) => {
-      const path = getPiAccountStoragePath()
-      let storage = await loadAccounts(path)
-      const action = parseRoutingCommandAction(args ?? '')
-
-      if (action.type === 'mode') {
-        storage = await setRoutingMode(action.mode, path)
-      } else if (action.type === 'reset') {
-        await clearPiStickyRoutingSession(
-          path,
-          ctx.sessionManager.getSessionId(),
-        )
-      }
-
-      notify(
-        ctx,
-        executeRoutingCommand({
-          argumentsText: args ?? '',
-          mode: getRoutingMode(storage),
-        }),
-        action.type === 'usage' ? 'warning' : 'info',
-      )
-    },
-  })
-
-  pi.registerCommand('claude-quota', {
-    description: 'Show Claude quota state for fallback accounts',
-    handler: async (_args, ctx) => {
-      const storage = await loadAccounts(getPiAccountStoragePath())
-      notify(
-        ctx,
-        buildClaudeQuotaSummary({
-          accounts: buildFallbackQuotaSummaries(storage),
-          now: Date.now(),
-        }),
-      )
-    },
-  })
-
-  pi.registerCommand(CLAUDE_ACCOUNT_COMMAND_NAME, {
-    description: 'List, enable/disable, reorder, or remove fallback accounts',
-    handler: async (args, ctx) => {
-      const path = getPiAccountStoragePath()
-      const storage = await loadAccounts(path)
-      const action = parseAccountCommandAction(args ?? '')
-      const result = await executeAccountCommand({
-        argumentsText: args ?? '',
-        storage: storage ?? createEmptyStorage(),
-        path,
-        transition:
-          custody?.transition ??
-          (async () => ({
-            text: 'Refused: Pi custody controller is unavailable.',
-          })),
-        resetEnrollment: custody?.reset,
-        claustrum:
-          action.type === 'status'
-            ? await detectClaustrumConnection()
-            : undefined,
-      })
-
-      if (action.type === 'status' && custody) {
-        try {
-          result.text += `\n${formatEnrollmentStatus(await custody.status(), getClaustrumMode(storage) === 'claustrum').join('\n')}`
-        } catch {
-          result.text += '\n- Enrollment: unavailable'
-        }
-      }
-      if (!result.updated) {
-        notify(
-          ctx,
-          result.text,
-          result.text.startsWith('Refused:') ? 'error' : 'info',
+      if (args?.trim()) {
+        ctx.ui.notify(
+          'Use /claude to open the menu. Action parameters are collected in the selected action; custody changes require offline setup.',
+          'warning',
         )
         return
       }
-
-      // Wire persistent mutations via core helpers
-      const { id, action: mutationAction } = result.updated
-
-      if (mutationAction === 'enable') {
-        await setAccountEnabledPersistent(id, true, path)
-      } else if (mutationAction === 'disable') {
-        await setAccountEnabledPersistent(id, false, path)
-      } else if (mutationAction === 'remove') {
-        const existed = await removeAccountPersistent(id, path)
-        if (!existed) {
-          notify(ctx, `Account "${id}" not found.`, 'warning')
-          return
-        }
-      } else if (mutationAction === 'reorder') {
-        const newOrder = result.updated.newOrder
-        if (newOrder) {
-          await reorderAccountsPersistent(newOrder, path)
-        }
-      } else if (mutationAction === 'reset-backoff') {
-        const nextStorage = storage ?? createEmptyStorage()
-        nextStorage.refresh = nextStorage.refresh ?? {}
-        nextStorage.refresh.mainLastRefreshError = undefined
-        nextStorage.refresh.mainRefreshErrorClearedAt =
-          mergeMainRefreshErrorClearedAt(
-            nextStorage.refresh.mainRefreshErrorClearedAt,
-            Date.now(),
-          )
-        const mainIdentity = nextStorage.mainAccountId
-        const quotaError = nextStorage.quota?.mainLastQuotaApiError
-        if (
-          !quotaError?.accountIdentity ||
-          !mainIdentity ||
-          quotaError.accountIdentity === mainIdentity
-        ) {
-          nextStorage.quota = nextStorage.quota ?? {}
-          nextStorage.quota.mainLastQuotaApiError = undefined
-          const nextQuotaErrorGeneration =
-            (nextStorage.quota.mainQuotaErrorGeneration ?? 0) + 1
-          nextStorage.quota.mainQuotaErrorGeneration = Math.max(
-            nextStorage.quota.mainQuotaErrorGeneration ?? 0,
-            nextQuotaErrorGeneration,
-          )
-          nextStorage.quota.mainQuotaErrorClearedAt =
-            mergeMainQuotaErrorClearedAt(
-              nextStorage.quota.mainQuotaErrorClearedAt,
-              Date.now(),
-            )
-        }
-        await saveAccountState(nextStorage, path, {
-          mainRefresh: true,
-          mainQuota: true,
+      const menu = createNativeUi({
+        host: 'pi',
+        dispatch: backend.dispatch,
+        readStatus: backend.readStatus,
+        interactive: ctx.hasUI,
+      })
+      const sessionId = ctx.sessionManager.getSessionId()
+      if (ctx.hasUI) {
+        await runPiCommandMenu(menu, ctx.ui, { sessionId })
+      } else {
+        // A scripted invocation can inspect status, but cannot answer prompts or
+        // silently confirm a destructive action.
+        const payload = await menu.open({
+          sessionId,
+          notify: (message, kind) => ctx.ui.notify(message, kind),
         })
+        ctx.ui.notify(
+          payload.menu.sections
+            .map((section) => `${section.title}\n${section.lines.join('\n')}`)
+            .join('\n\n'),
+          'info',
+        )
       }
-
-      notify(ctx, result.text)
-    },
-  })
-
-  pi.registerCommand('claude-logging', {
-    description: 'Show or set the plugin log level',
-    handler: async (args, ctx) => {
-      const path = getPiAccountStoragePath()
-      const storage = await loadAccounts(path)
-      const action = parseLoggingCommandAction(args ?? '')
-      const currentLevel = getPersistedLogLevel(storage) ?? 'info'
-
-      // Wire persistent log-level mutation
-      let level = currentLevel
-      if (action.type === 'level') {
-        await setLogLevelPersistent(action.level, path)
-        level = action.level
-      }
-
-      notify(ctx, executeLoggingCommand({ argumentsText: args ?? '', level }))
-    },
-  })
-
-  pi.registerCommand(CLAUDE_PRIME_COMMAND_NAME, {
-    description: "Show each OAuth account's five-hour quota window state",
-    handler: async (_args, ctx) => {
-      // Pi has no live PrimeManager; render persisted counters and the
-      // next-due timestamp from stored quota snapshots. Always pass
-      // `argumentsText: 'status'` to the pure executor so on/off args
-      // are display-only — Pi cannot toggle the setting.
-      const path = getPiAccountStoragePath()
-      const storage = await loadAccounts(path)
-      const accounts = buildPrimeAccountStatuses(storage, { now: Date.now() })
-      notify(
-        ctx,
-        executePrimeCommand({
-          argumentsText: 'status',
-          enabled: isPrimePersistentlyEnabled(storage),
-          accounts,
-        }).text,
-      )
     },
   })
 }

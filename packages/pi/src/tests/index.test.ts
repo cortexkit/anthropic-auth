@@ -1,11 +1,13 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { saveAccounts } from '@cortexkit/anthropic-auth-core'
+import type { Provider } from '@earendil-works/pi-ai'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
-
 import cortexKitPiAnthropicAuth from '../index'
+import { closePiNativeRuntime } from '../native.ts'
+import { getPiAccountStoragePath } from '../paths.ts'
+import { saveNativePiFixture } from './native-fixture.ts'
 
 let tempDir: string | undefined
 const originalFetch = globalThis.fetch
@@ -26,7 +28,15 @@ const fableModel = {
 }
 const messagesUrl = `${fableModel.baseUrl}/v1/messages`
 
+beforeEach(async () => {
+  tempDir = await mkdtemp(join(tmpdir(), 'pi-native-index-'))
+  const storagePath = join(tempDir, 'anthropic-auth.json')
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
+})
+
 afterEach(async () => {
+  closePiNativeRuntime(getPiAccountStoragePath())
   globalThis.fetch = originalFetch
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   if (tempDir) await rm(tempDir, { recursive: true, force: true })
@@ -46,13 +56,20 @@ function mockPi() {
   const pi = {
     registerCommand: () => {},
     registerProvider: (
-      name: string,
-      config: {
+      name: string | Provider,
+      config?: {
         models?: Array<Record<string, unknown>>
         streamSimple?: (...args: any[]) => unknown
       },
     ) => {
-      providers.set(name, config)
+      if (typeof name === 'string') {
+        if (config) providers.set(name, config)
+      } else {
+        providers.set(name.id, {
+          models: name.getModels().map((model) => ({ ...model })),
+          streamSimple: name.streamSimple,
+        })
+      }
     },
     on: (name: string, handler: (...args: any[]) => unknown) => {
       events.set(name, handler)
@@ -82,6 +99,43 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
       cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
       contextWindow: 1_000_000,
       maxTokens: 128_000,
+    })
+  })
+
+  test('exposes Claude Haiku 5.5 with adaptive efforts and the exact 100K price tier', async () => {
+    const { pi, providers } = mockPi()
+    await cortexKitPiAnthropicAuth(pi)
+    const haiku55 = providers
+      .get('anthropic')
+      ?.models?.find((model) => model.id === 'claude-haiku-5-5')
+    expect(haiku55).toMatchObject({
+      id: 'claude-haiku-5-5',
+      name: 'Claude Haiku 5.5',
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        xhigh: 'xhigh',
+        max: 'max',
+      },
+      input: ['text', 'image'],
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+      cost: {
+        input: 0.1,
+        output: 0.5,
+        cacheRead: 0.01,
+        cacheWrite: 0.125,
+        tiers: [
+          {
+            inputTokensAbove: 100_000,
+            input: 0.5,
+            output: 2.5,
+            cacheRead: 0.05,
+            cacheWrite: 0.625,
+          },
+        ],
+      },
     })
   })
 
@@ -181,10 +235,10 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
 // getSessionId/getBranch are assumed here — the accessors both hosts expose.
 describe('cortexKitPiAnthropicAuth turn_start effort history', () => {
   test('carries transitions from a getBranch-only host into the request', async () => {
-    tempDir = await mkdtemp(join(tmpdir(), 'pi-turn-start-effort-'))
+    if (!tempDir) throw new Error('Native index fixture is missing')
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-    await saveAccounts(
+    await saveNativePiFixture(
       {
         version: 1,
         main: { type: 'opencode', provider: 'anthropic' },

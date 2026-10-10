@@ -6,6 +6,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Features
 
+- Add Claude Haiku 5.5 (`claude-haiku-5-5`) to Core, OpenCode, and Pi with a 1M context, 128K output and native `low` through `max` adaptive effort. Preserve supported forced tool choice, remove rejected manual thinking budgets and sampling parameters, and honor OpenCode thinking opt-outs at high effort or below. Standard input/output pricing is $0.10/$0.50 per million tokens; all rates increase fivefold above 100K total input tokens, including cached input. OpenCode and Pi apply the selected pricing tier to all input, output and cached tokens in the request, not just the tokens above the threshold. `thinkingBinding.prefixMismatchBehavior` set to `error` or `drop_block` also covers replayed Haiku 5.5 thinking after earlier conversation content changes. Subscription OAuth requests continue to show zero API cost in the host. Haiku 5.5 does not enable fast mode or automatic safety fallback, and quota priming continues to use Haiku 4.5.
+
 - Add Claude Sonnet 5.5 (`claude-sonnet-5-5`) to Core, OpenCode, and Pi with its 1M context, 128K output, and official pricing. OpenCode and Pi request readable adaptive thinking. OpenCode maps explicit thinking opt-outs to Sonnet 5.5's `between_tools` mode, removes unsupported forced tool choice, and offers native `low` through `max` effort variants. Apply configured `error` or `drop_block` behavior to replayed Sonnet 5.5 and Opus 5.5 thinking when earlier messages, instructions, or tools have changed; the default account behavior stays unchanged. Pi exposes the model's supported `low`–`max` effort levels while refusing unsupported `minimal` and unavailable `off`.
 
 ### Fixes

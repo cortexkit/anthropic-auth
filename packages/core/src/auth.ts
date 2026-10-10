@@ -88,6 +88,7 @@ export async function refreshClaudeOAuthToken(input: {
 
       const response = await fetchImpl(TOKEN_URL, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json, text/plain, */*',
@@ -185,6 +186,7 @@ async function exchangeCode(
 ): Promise<ExchangeResult> {
   const result = await fetch(TOKEN_URL, {
     method: 'POST',
+    redirect: 'error',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/plain, */*',

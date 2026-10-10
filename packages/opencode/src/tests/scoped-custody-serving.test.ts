@@ -1,33 +1,202 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  type AccountStorage,
-  acquireRefreshFileLock,
-  type ClaustrumScopedClient,
-  getAccountStatePath,
-  isOAuthAccount,
-  type OAuthAccount,
+  createNativeAccountRuntime,
+  custodyTombstoneOAuth,
+  type NativeCustodyClient,
 } from '@cortexkit/anthropic-auth-core'
 import type { ScopedInventoryRow } from '@cortexkit/claustrum-client'
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { drainSidebarWrites, getSidebarStateFile } from '../sidebar-state.ts'
+import {
+  migrateNativeOpencodeFixture,
+  type NativeOpencodeFixture,
+} from './native-fixture.ts'
 
-const testDirs: string[] = []
-const originalFetch = globalThis.fetch
+type PluginHooks = Awaited<ReturnType<typeof AnthropicAuthPlugin>>
 
+// Every environment variable a test body or the migration fixture may set.
+// Each body saves and restores all of them, so no path leaks into the next
+// test.
+const bodyEnvKeys = [
+  'OPENCODE_ANTHROPIC_AUTH_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
+  'CLAUDE_CONFIG_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION',
+  'OPENCODE_ANTHROPIC_AUTH_DUMP_DIR',
+  'OPENCODE_AUTH_CONTENT',
+] as const
+
+const livePlugins = new Set<Set<PluginHooks>>()
+// Registered before the lifetime suite's own afterEach: dispose every plugin
+// (its timers, vault client and RPC server) before that hook waits for a
+// possibly still-running body and removes the body's files.
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  for (const d of testDirs.splice(0)) {
-    await rm(d, { recursive: true, force: true })
-  }
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
-  delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+  const plugins = [...livePlugins].flatMap((owned) => {
+    const current = [...owned]
+    owned.clear()
+    return current
+  })
+  await disposeAll(plugins, 'Scoped custody plugin cancellation failed')
 })
+const lifetimes = createTestLifetimeSuite()
+const test = lifetimes.test
+
+async function disposeAll(plugins: PluginHooks[], message: string) {
+  const results = await Promise.allSettled(
+    plugins.map((plugin) => Promise.resolve().then(() => plugin.dispose?.())),
+  )
+  const failed = results.filter((result) => result.status === 'rejected')
+  if (failed.length)
+    throw new AggregateError(
+      failed.map((result) => result.reason),
+      message,
+    )
+}
+
+/**
+ * Claim a fresh owner-only directory for this body. Teardown first disposes
+ * the body's plugins and waits for sidebar writes, then restores fetch and
+ * the environment, and only then removes the directory.
+ */
+async function startBody(prefix: string) {
+  const savedFetch = globalThis.fetch
+  const savedEnv = new Map(bodyEnvKeys.map((key) => [key, process.env[key]]))
+  const plugins = new Set<PluginHooks>()
+  livePlugins.add(plugins)
+  lifetimes.deferCleanup(async () => {
+    const remaining = [...plugins]
+    plugins.clear()
+    livePlugins.delete(plugins)
+    try {
+      await disposeAll(remaining, 'Scoped custody plugin cleanup failed')
+    } finally {
+      await drainSidebarWrites()
+      globalThis.fetch = savedFetch
+      for (const key of bodyEnvKeys) {
+        const value = savedEnv.get(key)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+  delete process.env.OPENCODE_AUTH_CONTENT
+  const root = await mkdtemp(join(tmpdir(), prefix))
+  // migrateNativeOpencodeFixture also removes the root once it accepts it;
+  // this covers a body that fails before handing the root to it.
+  lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
+  return { root, plugins }
+}
+
+/**
+ * Import a legacy scoped-custody seat through the real offline migration. The
+ * discovery client lists the same synthetic vault rows the test later serves
+ * from, and refuses any credential read, so every receipt a test observes was
+ * issued while serving. The returned env is applied for the plugin.
+ */
+async function migrateScopedSeat(
+  root: string,
+  options: {
+    rows: () => ScopedInventoryRow[]
+    legacyConfig: Record<string, unknown>
+    token: string
+    expectedCredentials: string[]
+  },
+) {
+  let listed = 0
+  const discovery: NativeCustodyClient = {
+    async listScoped() {
+      listed++
+      return { view: 'migration-discovery', rows: options.rows() }
+    },
+    async getScoped() {
+      throw new Error('Migration discovery must not read credential material')
+    },
+    async reportAuthFailureScoped() {
+      throw new Error('Migration discovery must not report credentials')
+    },
+    close() {},
+  }
+  const fixture = await migrateNativeOpencodeFixture({
+    root,
+    lifetime: lifetimes,
+    legacyConfig: options.legacyConfig,
+    hostAuth: { anthropic: custodyTombstoneOAuth('anthropic') },
+    custody: {
+      connect: async () => discovery,
+      enrollment: { token: options.token, token_generation: 1 },
+    },
+  })
+  expect(listed).toBeGreaterThan(0)
+  for (const [key, value] of Object.entries(fixture.env))
+    process.env[key] = value
+  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
+  // The migrated pool really serves the expected vault rows; a test cannot
+  // pass against an empty roster.
+  const snapshot = await readNativeAccounts(fixture)
+  expect(snapshot.mode).toBe('claustrum')
+  expect(
+    snapshot.accounts
+      .filter((account) => account.source === 'vault')
+      .map((account) => account.credentialId)
+      .sort(),
+  ).toEqual([...options.expectedCredentials].sort())
+  return fixture
+}
+
+async function readNativeAccounts(fixture: NativeOpencodeFixture) {
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+  })
+  try {
+    return await runtime.read()
+  } finally {
+    runtime.close()
+  }
+}
+
+/** The OpenCode auth entry exactly as the migration left it in host auth. */
+function migratedActivation(fixture: NativeOpencodeFixture) {
+  return async () =>
+    JSON.parse(await readFile(fixture.hostAuthPath, 'utf8')).anthropic
+}
+
+async function createPlugin(
+  plugins: Set<PluginHooks>,
+  fixture: { root: string },
+  runtime: Record<string, unknown>,
+) {
+  const creation = AnthropicAuthPlugin(
+    { directory: fixture.root } as never,
+    runtime as never,
+  )
+  lifetimes.trackDetached(creation)
+  const plugin = await creation
+  plugins.add(plugin)
+  return plugin
+}
+
+async function filesUnder(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, {
+    recursive: true,
+    withFileTypes: true,
+  })
+  return entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => join(entry.parentPath, entry.name))
+}
 
 const MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
 const EMPTY_POST = {
@@ -45,6 +214,7 @@ const mainRow: ScopedInventoryRow = {
   accountId: 'provider-main-uuid',
   categories: ['anthropic-native'],
   serves: ['anthropic'],
+  providerIds: [],
   credentialType: 'oauth',
   refreshAdapter: 'anthropic',
   operations: ['read'],
@@ -58,6 +228,7 @@ const workRow: ScopedInventoryRow = {
   accountId: 'provider-work-uuid',
   categories: ['anthropic-native'],
   serves: ['anthropic'],
+  providerIds: [],
   credentialType: 'oauth',
   refreshAdapter: 'anthropic',
   operations: ['read'],
@@ -66,58 +237,65 @@ const workRow: ScopedInventoryRow = {
   createdAtMs: null,
 }
 
+/**
+ * Legacy scoped-custody config for the vault inventory above, with mainRow as
+ * the designated primary account, plus any extra legacy fields.
+ */
+function scopedLegacyConfig(extra: Record<string, unknown> = {}) {
+  return {
+    version: 1,
+    accounts: [],
+    quota: { enabled: false },
+    claustrum: {
+      mode: 'claustrum',
+      scopedRoster: true,
+      primaryAccount: {
+        credentialId: mainRow.id,
+        accountId: mainRow.accountId,
+        state: 'active',
+      },
+    },
+    ...extra,
+  }
+}
+
 describe('OpenCode scoped custody serving', () => {
   test('serves requests using scoped receipts and dynamically adopts newly logged-in accounts without restart', async () => {
-    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-serving-'))
-    testDirs.push(root)
-
-    const storagePath = join(root, 'anthropic-auth.json')
-    const tokenPath = join(root, 'opencode-enrollment.json')
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
-    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = join(root, 'dumps')
-    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-      root,
-      'sidebar.json',
-    )
-
-    await writeFile(
-      tokenPath,
-      JSON.stringify({ token: 'aa'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
-
-    const initialStorage: AccountStorage = {
-      version: 1,
-      claustrum: {
-        mode: 'claustrum',
-        scopedRoster: true,
-        primaryAccount: {
-          credentialId: mainRow.id,
-          accountId: mainRow.accountId as any,
-          state: 'active',
-        },
-      },
-      dump: { enabled: true },
-      accounts: [
-        {
-          id: 'work',
-          label: 'work',
-          type: 'oauth',
-          enabled: true,
-          refresh: '',
-          claustrumScopedCredentialId: workRow.id,
-          anthropicAccountUuid: workRow.accountId as any,
-          claustrumScopedState: 'active',
-        },
-      ],
-    }
-    await writeFile(storagePath, JSON.stringify(initialStorage, null, 2), {
-      mode: 0o600,
-    })
-
+    const { root, plugins } = await startBody('opencode-scoped-serving-')
     const rows = [mainRow, workRow]
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [...rows],
+      token: 'aa'.repeat(32),
+      expectedCredentials: [mainRow.id, workRow.id],
+      legacyConfig: {
+        version: 1,
+        claustrum: {
+          mode: 'claustrum',
+          scopedRoster: true,
+          primaryAccount: {
+            credentialId: mainRow.id,
+            accountId: mainRow.accountId,
+            state: 'active',
+          },
+        },
+        dump: { enabled: true },
+        accounts: [
+          {
+            id: 'work',
+            label: 'work',
+            type: 'oauth',
+            enabled: true,
+            refresh: '',
+            claustrumScopedCredentialId: workRow.id,
+            anthropicAccountUuid: workRow.accountId,
+            claustrumScopedState: 'active',
+          },
+        ],
+      },
+    })
+    const dumpDir = join(fixture.root, 'dumps')
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+
     const gets: Array<{ credentialId: string }> = []
     const reports: Array<{
       credentialId: string
@@ -125,7 +303,7 @@ describe('OpenCode scoped custody serving', () => {
       providerStatus: number
     }> = []
 
-    const scopedClient: ClaustrumScopedClient = {
+    const scopedClient: NativeCustodyClient = {
       listScoped: async () => ({
         view: `view-${rows.length}`,
         rows: [...rows],
@@ -171,120 +349,103 @@ describe('OpenCode scoped custody serving', () => {
       return new Response('not found', { status: 404 })
     }) as typeof fetch
 
-    const plugin = await AnthropicAuthPlugin(
-      {
-        directory: root,
-      } as any,
-      { claustrumScopedConnect: async () => scopedClient } as any,
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => scopedClient,
+    })
+
+    const result = await (plugin as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} } as any,
     )
 
-    try {
-      const result = await (plugin as any).auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth',
-            access: '',
-            refresh: 'claustrum-tombstone:v1:anthropic',
-            expires: 0,
-          }),
-        { models: {} } as any,
-      )
+    // 1. Initial request uses the main account's vault credential
+    const firstResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(firstResponse.status).toBe(200)
+    expect(authorizations).toHaveLength(1)
+    expect(authorizations[0]).toBe('Bearer scoped-access-oauth:anthropic')
+    expect(gets.some((g) => g.credentialId === 'oauth:anthropic')).toBe(true)
+    await firstResponse.text()
+    await drainSidebarWrites()
+    // Neither the served access token nor the enrollment token may reach any
+    // file the plugin or the migration wrote: pool config, state, runtime,
+    // roster, journal, host auth, sidebar or request dumps. Only the
+    // enrollment file itself holds the enrollment token.
+    const dumps = await readdir(dumpDir)
+    expect(dumps.length).toBeGreaterThan(0)
+    const written = (await filesUnder(fixture.root)).filter(
+      (path) => path !== fixture.enrollmentPath,
+    )
+    for (const path of [
+      fixture.paths.config,
+      fixture.paths.runtime,
+      fixture.paths.roster,
+      fixture.paths.journal,
+      fixture.hostAuthPath,
+      getSidebarStateFile(),
+      ...dumps.map((name) => join(dumpDir, name)),
+    ])
+      expect(written).toContain(path)
+    const serialized = (
+      await Promise.all(written.map((path) => readFile(path, 'utf8')))
+    ).join('\n')
+    expect(serialized).not.toContain('scoped-access-oauth:anthropic')
+    expect(serialized).not.toContain('aa'.repeat(32))
 
-      // 1. Initial request dispatches with main scoped credential
-      const firstResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
-      expect(firstResponse.status).toBe(200)
-      expect(authorizations).toHaveLength(1)
-      expect(authorizations[0]).toBe('Bearer scoped-access-oauth:anthropic')
-      expect(gets.some((g) => g.credentialId === 'oauth:anthropic')).toBe(true)
-      await firstResponse.text()
-      await drainSidebarWrites()
-      const serialized = [
-        await readFile(storagePath, 'utf8'),
-        await readFile(getAccountStatePath(storagePath), 'utf8'),
-        await readFile(getSidebarStateFile(), 'utf8'),
-        ...(await Promise.all(
-          (
-            await readdir(process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR!)
-          ).map((name) =>
-            readFile(
-              join(process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR!, name),
-              'utf8',
-            ),
-          ),
-        )),
-      ].join('\n')
-      expect(serialized).not.toContain('scoped-access-oauth:anthropic')
-      expect(serialized).not.toContain('aa'.repeat(32))
-
-      // 2. Simulate user adding a 3rd account via `ck auth login`
-      const personalRow: ScopedInventoryRow = {
-        id: 'oauth:anthropic:personal',
-        accountId: 'provider-personal-uuid',
-        categories: ['anthropic-native'],
-        serves: ['anthropic'],
-        credentialType: 'oauth',
-        refreshAdapter: 'anthropic',
-        operations: ['read'],
-        state: 'active',
-        recordVersion: 1,
-        createdAtMs: null,
-      }
-      rows.push(personalRow)
-
-      // Trigger discovery refresh (simulating background poll)
-      const runtime = (plugin as any).__scopedRuntime
-      expect(runtime).toBeDefined()
-      await runtime.refresh()
-
-      // 3. Verify storage was updated with the new account
-      const { loadAccounts } = await import('@cortexkit/anthropic-auth-core')
-      const updatedStorage = await loadAccounts(storagePath)
-      const personalAccount = updatedStorage?.accounts.find(
-        (a): a is OAuthAccount =>
-          isOAuthAccount(a) &&
-          a.anthropicAccountUuid === 'provider-personal-uuid',
-      )
-      expect(personalAccount).toBeDefined()
-      expect(personalAccount?.claustrumScopedCredentialId).toBe(
-        'oauth:anthropic:personal',
-      )
-      expect(personalAccount?.claustrumScopedState).toBe('active')
-    } finally {
-      await plugin.dispose?.()
+    // 2. Simulate user adding a 3rd account via `ck auth login`
+    const personalRow: ScopedInventoryRow = {
+      id: 'oauth:anthropic:personal',
+      accountId: 'provider-personal-uuid',
+      categories: ['anthropic-native'],
+      serves: ['anthropic'],
+      providerIds: [],
+      credentialType: 'oauth',
+      refreshAdapter: 'anthropic',
+      operations: ['read'],
+      state: 'active',
+      recordVersion: 1,
+      createdAtMs: null,
     }
+    // Wait for startup discovery before adding the row; otherwise a refresh
+    // could reuse the earlier results and miss the added account.
+    await (plugin as any).__fallbackRefreshReady
+    rows.push(personalRow)
+
+    // Trigger discovery refresh (simulating background poll)
+    const runtime = (plugin as any).__scopedRuntime
+    expect(runtime).toBeDefined()
+    await runtime.refresh()
+
+    // 3. The native account view now serves the new vault account.
+    const updated = await readNativeAccounts(fixture)
+    const personalAccount = updated.accounts.find(
+      (account) => account.accountIdentity === 'provider-personal-uuid',
+    )
+    expect(personalAccount).toBeDefined()
+    expect(personalAccount?.source).toBe('vault')
+    expect(personalAccount?.credentialId).toBe('oauth:anthropic:personal')
+    expect(personalAccount?.state).toBe('active')
+    expect(reports).toEqual([])
   })
 
   test('reports upstream 401 auth failure to Claustrum with exact served record version', async () => {
-    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-401-'))
-    testDirs.push(root)
-
-    const storagePath = join(root, 'anthropic-auth.json')
-    const tokenPath = join(root, 'opencode-enrollment.json')
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
-
-    await writeFile(
-      tokenPath,
-      JSON.stringify({ token: 'bb'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
-
-    const initialStorage: AccountStorage = {
-      version: 1,
-      claustrum: {
-        mode: 'claustrum',
-        scopedRoster: true,
-        primaryAccount: {
-          credentialId: mainRow.id,
-          accountId: mainRow.accountId as any,
-          state: 'active',
+    const { root, plugins } = await startBody('opencode-scoped-401-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'bb'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: {
+        version: 1,
+        claustrum: {
+          mode: 'claustrum',
+          scopedRoster: true,
+          primaryAccount: {
+            credentialId: mainRow.id,
+            accountId: mainRow.accountId,
+            state: 'active',
+          },
         },
+        accounts: [],
       },
-      accounts: [],
-    }
-    await writeFile(storagePath, JSON.stringify(initialStorage, null, 2), {
-      mode: 0o600,
     })
 
     const reports: Array<{
@@ -292,7 +453,7 @@ describe('OpenCode scoped custody serving', () => {
       recordVersion: number
       providerStatus: number
     }> = []
-    const scopedClient: ClaustrumScopedClient = {
+    const scopedClient: NativeCustodyClient = {
       listScoped: async () => ({ view: 'v1', rows: [mainRow] }),
       getScoped: async (input) => ({
         credentialId: input.credentialId,
@@ -326,141 +487,117 @@ describe('OpenCode scoped custody serving', () => {
       )
     }) as typeof fetch
 
-    const plugin = await AnthropicAuthPlugin(
-      { directory: root } as any,
-      { claustrumScopedConnect: async () => scopedClient } as any,
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => scopedClient,
+    })
+
+    const result = await (plugin as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} } as any,
     )
 
-    try {
-      const result = await (plugin as any).auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth',
-            access: '',
-            refresh: 'claustrum-tombstone:v1:anthropic',
-            expires: 0,
-          }),
-        { models: {} } as any,
-      )
+    await result.fetch(MESSAGES_URL, EMPTY_POST).catch(() => {})
 
-      await result.fetch(MESSAGES_URL, EMPTY_POST).catch(() => {})
-
-      expect(modelSends).toBe(1)
-      expect(reports).toHaveLength(1)
-      expect(reports[0]).toMatchObject({
-        credentialId: 'oauth:anthropic',
-        recordVersion: 10,
-        providerStatus: 401,
-      })
-    } finally {
-      await plugin.dispose?.()
-    }
+    expect(modelSends).toBe(1)
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      credentialId: 'oauth:anthropic',
+      recordVersion: 10,
+      providerStatus: 401,
+    })
   })
 })
 
 test('Claustrum mode without a scoped roster refuses to serve even with legacy local fallback material', async () => {
+  // Deliberately not migrated: legacy handle bindings have no native
+  // authority, so serving must refuse before any upstream request and must
+  // leave the legacy material untouched.
+  const { root, plugins } = await startBody('opencode-legacy-refusal-')
   process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-  const root = await mkdtemp(join(tmpdir(), 'opencode-legacy-refusal-'))
-  testDirs.push(root)
   const storagePath = join(root, 'anthropic-auth.json')
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
+  process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE = join(
+    root,
+    'anthropic-auth-state.json',
+  )
   process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
     root,
     'enrollment.json',
   )
-  await writeFile(
-    storagePath,
-    JSON.stringify({
-      version: 1,
-      claustrum: { mode: 'claustrum' },
-      accounts: [
-        {
-          id: 'old',
-          label: 'old',
-          type: 'oauth',
-          enabled: true,
-          access: 'stale-local-access',
-          refresh: 'stale-local-refresh',
-          expires: Date.now() + 3600000,
-        },
-      ],
-    }),
-    { mode: 0o600 },
-  )
+  const legacyBytes = JSON.stringify({
+    version: 1,
+    claustrum: { mode: 'claustrum' },
+    accounts: [
+      {
+        id: 'old',
+        label: 'old',
+        type: 'oauth',
+        enabled: true,
+        access: 'stale-local-access',
+        refresh: 'stale-local-refresh',
+        expires: Date.now() + 3600000,
+      },
+    ],
+  })
+  await writeFile(storagePath, legacyBytes, { mode: 0o600 })
   let sends = 0
   globalThis.fetch = (async () => {
     sends++
     throw new Error('request must not reach upstream')
   }) as unknown as typeof fetch
-  const plugin = await AnthropicAuthPlugin(
-    { directory: root } as any,
+  const plugin = await createPlugin(
+    plugins,
+    { root },
     {
       scopedRosterPollIntervalMs: 0,
-    } as any,
+    },
   )
-  try {
-    const loader = await (plugin as any).auth.loader(
-      async () => ({
-        type: 'oauth',
-        access: '',
-        refresh: 'claustrum-tombstone:v1:anthropic',
-        expires: 0,
-      }),
-      { models: {} },
-    )
-    const response = await loader.fetch(MESSAGES_URL, EMPTY_POST)
-    expect(response.status).toBe(503)
-    expect(await response.text()).toContain(
-      'Run setup to enable scoped Claustrum custody',
-    )
-    expect(sends).toBe(0)
-  } finally {
-    await plugin.dispose?.()
-  }
+  const loader = await (plugin as any).auth.loader(
+    async () => custodyTombstoneOAuth('anthropic'),
+    { models: {} },
+  )
+  // Legacy storage used to answer this with a 503 asking for scoped-custody
+  // setup. Natively, a pool without a migration journal has no authority to
+  // serve at all, so the request is refused before any upstream call.
+  await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
+    'Anthropic account migration is required',
+  )
+  expect(sends).toBe(0)
+  expect(await readFile(storagePath, 'utf8')).toBe(legacyBytes)
 })
 
 test('loader and model request remain usable when a peer holds the scoped roster lease', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-lease-'))
-  testDirs.push(root)
-  const storagePath = join(root, 'anthropic-auth.json')
-  const tokenPath = join(root, 'opencode-enrollment.json')
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
-  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-  await writeFile(
-    tokenPath,
-    JSON.stringify({ token: 'cc'.repeat(32), token_generation: 1 }),
-    { mode: 0o600 },
-  )
-  await writeFile(
-    storagePath,
-    JSON.stringify({
-      version: 1,
-      accounts: [],
-      quota: { enabled: false },
-      claustrum: {
-        mode: 'claustrum',
-        scopedRoster: true,
-        primaryAccount: {
-          credentialId: mainRow.id,
-          accountId: mainRow.accountId,
-          state: 'active',
-        },
-      },
-    }),
-    { mode: 0o600 },
-  )
+  const { root, plugins } = await startBody('opencode-scoped-lease-')
+  const fixture = await migrateScopedSeat(root, {
+    rows: () => [mainRow],
+    token: 'cc'.repeat(32),
+    expectedCredentials: [mainRow.id],
+    legacyConfig: scopedLegacyConfig(),
+  })
+  // A peer process holds the vault roster's discovery lease, the lease every
+  // native roster refresh must take before listing the vault.
   const lease = await acquireRefreshFileLock({
-    name: 'scoped-roster',
-    path: storagePath,
+    name: 'claustrum-roster',
+    path: fixture.paths.roster,
     ttlMs: 30_000,
     renew: true,
   })
   if (!lease) throw new Error('test could not acquire roster lease')
+  try {
+    await serveWhileLeaseHeld(fixture, plugins)
+  } finally {
+    await lease.release()
+  }
+})
+
+async function serveWhileLeaseHeld(
+  fixture: NativeOpencodeFixture,
+  plugins: Set<PluginHooks>,
+) {
   let lists = 0,
     gets = 0,
     sends = 0
-  const scopedClient: ClaustrumScopedClient = {
+  const scopedClient: NativeCustodyClient = {
     listScoped: async () => {
       lists++
       throw new Error('peer owns discovery')
@@ -487,78 +624,43 @@ test('loader and model request remain usable when a peer holds the scoped roster
     sends++
     return new Response('{}', { status: 200 })
   }) as typeof fetch
-  let plugin: Awaited<ReturnType<typeof AnthropicAuthPlugin>> | undefined
-  try {
-    plugin = await AnthropicAuthPlugin(
-      { directory: root } as never,
-      {
-        claustrumScopedConnect: async () => scopedClient,
-        scopedRosterPollIntervalMs: 0,
-      } as never,
-    )
-    // OpenCode initializes plugins for all providers. A contested roster
-    // must not make an unrelated model's provider initialization fail.
-    const loader = await (plugin as any).auth.loader(
-      async () => ({
-        type: 'oauth',
-        access: '',
-        refresh: 'claustrum-tombstone:v1:anthropic',
-        expires: 0,
-      }),
-      { models: {} },
-    )
-    expect(lists).toBe(0)
-    expect(gets).toBe(0)
-    expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
-    expect(gets).toBeGreaterThan(0)
-    expect(sends).toBe(1)
-    expect(lists).toBe(0)
-  } finally {
-    await plugin?.dispose?.()
-    await lease.release()
-  }
-})
+  const plugin = await createPlugin(plugins, fixture, {
+    claustrumScopedConnect: async () => scopedClient,
+    scopedRosterPollIntervalMs: 0,
+  })
+  // OpenCode initializes plugins for all providers. A contested roster
+  // must not make an unrelated model's provider initialization fail.
+  const loader = await (plugin as any).auth.loader(
+    migratedActivation(fixture),
+    { models: {} },
+  )
+  // The startup discovery found the lease held and kept the committed roster.
+  await (plugin as any).__fallbackRefreshReady
+  expect(lists).toBe(0)
+  expect(gets).toBe(0)
+  expect((await loader.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
+  expect(gets).toBeGreaterThan(0)
+  expect(sends).toBe(1)
+  expect(lists).toBe(0)
+}
 
 test('provider initialization does not wait for a stalled scoped discovery connection', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-loader-'))
-  testDirs.push(root)
-  const storagePath = join(root, 'anthropic-auth.json')
-  const tokenPath = join(root, 'opencode-enrollment.json')
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
-  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-  await writeFile(
-    tokenPath,
-    JSON.stringify({ token: 'dd'.repeat(32), token_generation: 1 }),
-    { mode: 0o600 },
-  )
-  await writeFile(
-    storagePath,
-    JSON.stringify({
-      version: 1,
-      accounts: [],
-      quota: { enabled: false },
-      claustrum: {
-        mode: 'claustrum',
-        scopedRoster: true,
-        primaryAccount: {
-          credentialId: mainRow.id,
-          accountId: mainRow.accountId,
-          state: 'active',
-        },
-      },
-    }),
-    { mode: 0o600 },
-  )
+  const { root, plugins } = await startBody('opencode-scoped-loader-')
+  const fixture = await migrateScopedSeat(root, {
+    rows: () => [mainRow],
+    token: 'dd'.repeat(32),
+    expectedCredentials: [mainRow.id],
+    legacyConfig: scopedLegacyConfig(),
+  })
   let connectStarted!: () => void
-  let releaseConnect!: (value: ClaustrumScopedClient) => void
+  let releaseConnect!: (value: NativeCustodyClient) => void
   const entered = new Promise<void>((resolve) => {
     connectStarted = resolve
   })
-  const blocked = new Promise<ClaustrumScopedClient>((resolve) => {
+  const blocked = new Promise<NativeCustodyClient>((resolve) => {
     releaseConnect = resolve
   })
-  const client: ClaustrumScopedClient = {
+  const client: NativeCustodyClient = {
     listScoped: async () => ({ rows: [mainRow], view: 'v' }),
     getScoped: async () => {
       throw new Error('no dispatch expected')
@@ -566,29 +668,20 @@ test('provider initialization does not wait for a stalled scoped discovery conne
     reportAuthFailureScoped: async () => {},
     close: () => {},
   }
-  const plugin = await AnthropicAuthPlugin(
-    { directory: root } as never,
-    {
-      claustrumScopedConnect: () => {
-        connectStarted()
-        return blocked
-      },
-      scopedRosterPollIntervalMs: 0,
-    } as never,
-  )
+  const plugin = await createPlugin(plugins, fixture, {
+    claustrumScopedConnect: () => {
+      connectStarted()
+      return blocked
+    },
+    scopedRosterPollIntervalMs: 0,
+  })
   let deadline: ReturnType<typeof setTimeout> | undefined
   try {
     await entered
     const loader = await Promise.race([
-      (plugin as any).auth.loader(
-        async () => ({
-          type: 'oauth',
-          access: '',
-          refresh: 'claustrum-tombstone:v1:anthropic',
-          expires: 0,
-        }),
-        { models: {} },
-      ),
+      (plugin as any).auth.loader(migratedActivation(fixture), {
+        models: {},
+      }),
       new Promise<never>((_, reject) => {
         deadline = setTimeout(
           () =>
@@ -604,53 +697,26 @@ test('provider initialization does not wait for a stalled scoped discovery conne
   } finally {
     if (deadline) clearTimeout(deadline)
     releaseConnect(client)
-    await plugin.dispose?.()
   }
 })
 
-test.each([
+for (const { outcome, finalStatus } of [
   { outcome: '200', finalStatus: 200 },
   { outcome: '401', finalStatus: 401 },
   { outcome: 'network-error', finalStatus: 'network-error' },
-] as const)(
-  'a scoped main rotated during HTTP dispatch retries once, final outcome $outcome',
-  async ({ finalStatus }) => {
-    const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-rotation-'))
-    testDirs.push(root)
-    const storagePath = join(root, 'anthropic-auth.json')
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-      root,
-      'enrollment.json',
-    )
-    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    await writeFile(
-      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
-      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
-    await writeFile(
-      storagePath,
-      JSON.stringify({
-        version: 1,
-        accounts: [],
-        quota: { enabled: false },
-        claustrum: {
-          mode: 'claustrum',
-          scopedRoster: true,
-          primaryAccount: {
-            credentialId: mainRow.id,
-            accountId: mainRow.accountId,
-            state: 'active',
-          },
-        },
-      }),
-      { mode: 0o600 },
-    )
+] as const) {
+  test(`a scoped main rotated during HTTP dispatch retries once, final outcome ${outcome}`, async () => {
+    const { root, plugins } = await startBody('opencode-scoped-rotation-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'ab'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig(),
+    })
     let version = 1
     const reports: number[] = []
     const wireTokens: string[] = []
-    const scopedClient: ClaustrumScopedClient = {
+    const scopedClient: NativeCustodyClient = {
       listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
       getScoped: async ({ credentialId }) => ({
         credentialId,
@@ -677,93 +743,59 @@ test.each([
         throw new Error('new record transport failed')
       return new Response('rotated token response', { status: finalStatus })
     }) as typeof fetch
-    const plugin = await AnthropicAuthPlugin(
-      { directory: root } as never,
-      {
-        claustrumScopedConnect: async () => scopedClient,
-        scopedRosterPollIntervalMs: 0,
-      } as never,
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => scopedClient,
+      scopedRosterPollIntervalMs: 0,
+    })
+    const loader = await (plugin as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} },
     )
-    try {
-      const loader = await (plugin as any).auth.loader(
-        async () => ({
-          type: 'oauth',
-          access: '',
-          refresh: 'claustrum-tombstone:v1:anthropic',
-          expires: 0,
-        }),
-        { models: {} },
+    if (finalStatus === 'network-error') {
+      await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
+        'new record transport failed',
       )
-      if (finalStatus === 'network-error') {
-        await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
-          'new record transport failed',
-        )
-      } else {
-        const response = await loader.fetch(MESSAGES_URL, EMPTY_POST)
-        expect(response.status).toBe(finalStatus)
-        expect(await response.text()).toBe('rotated token response')
-      }
-      expect(wireTokens).toEqual([
-        'Bearer scoped-version-1',
-        'Bearer scoped-version-2',
-      ])
-      expect(reports).toEqual(finalStatus === 401 ? [2] : [])
-    } finally {
-      await plugin.dispose?.()
+    } else {
+      const response = await loader.fetch(MESSAGES_URL, EMPTY_POST)
+      expect(response.status).toBe(finalStatus)
+      expect(await response.text()).toBe('rotated token response')
     }
-  },
-)
+    expect(wireTokens).toEqual([
+      'Bearer scoped-version-1',
+      'Bearer scoped-version-2',
+    ])
+    expect(reports).toEqual(finalStatus === 401 ? [2] : [])
+  })
+}
 
-test.each(['transport-error', 'relay-auth-401'] as const)(
-  'relay-to-direct after %s reauthorizes and reports only the direct credential',
-  async (mode) => {
-    const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-relay-direct-'))
-    testDirs.push(root)
-    const storagePath = join(root, 'anthropic-auth.json')
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-      root,
-      'enrollment.json',
-    )
-    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    await writeFile(
-      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
-      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
-    await writeFile(
-      storagePath,
-      JSON.stringify({
-        version: 1,
-        accounts: [],
-        quota: { enabled: false },
-        relay: {
-          enabled: true,
-          transport: 'http',
-          url: 'https://relay.example.test/forward',
-          token: 'relay-test',
-          fallbackToDirect: true,
-        },
-        claustrum: {
-          mode: 'claustrum',
-          scopedRoster: true,
-          primaryAccount: {
-            credentialId: mainRow.id,
-            accountId: mainRow.accountId,
-            state: 'active',
-          },
-        },
-      }),
-      { mode: 0o600 },
-    )
+/** Legacy HTTP relay settings; the migration moves the token into private runtime state. */
+const legacyHttpRelay = {
+  enabled: true,
+  transport: 'http',
+  url: 'https://relay.example.test/forward',
+  token: 'relay-test',
+  fallbackToDirect: true,
+}
+
+for (const mode of ['transport-error', 'relay-auth-401'] as const) {
+  test(`relay-to-direct after ${mode} reauthorizes and reports only the direct credential`, async () => {
+    const { root, plugins } = await startBody('opencode-scoped-relay-direct-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'ab'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig({ relay: legacyHttpRelay }),
+    })
     let version = 1
-    const gets: number[] = [],
-      reports: number[] = [],
+    // Vault reads and wire sends in the order they happen, so each receipt
+    // can be matched to the send (if any) that used it.
+    const events: string[] = []
+    const reports: number[] = [],
       direct: string[] = []
-    const scopedClient: ClaustrumScopedClient = {
+    const scopedClient: NativeCustodyClient = {
       listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
       getScoped: async ({ credentialId }) => {
-        gets.push(version)
+        events.push(`vault read v${version}`)
         return {
           credentialId,
           accountId: mainRow.accountId,
@@ -779,6 +811,10 @@ test.each(['transport-error', 'relay-auth-401'] as const)(
     }
     globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
       if (String(input).includes('relay.example.test')) {
+        const payload = JSON.parse(String(init?.body)) as {
+          upstream: { headers: Record<string, string> }
+        }
+        events.push(`relay send ${payload.upstream.headers.authorization}`)
         version = 2
         if (mode === 'relay-auth-401')
           return new Response('relay secret rejected', { status: 401 })
@@ -787,87 +823,63 @@ test.each(['transport-error', 'relay-auth-401'] as const)(
       if (!String(input).includes('/v1/messages'))
         throw new Error('unexpected upstream call')
       direct.push(new Headers(init?.headers).get('authorization') ?? '')
+      events.push(`direct send ${direct.at(-1)}`)
       return new Response('rejected latest record', { status: 401 })
     }) as typeof fetch
-    const plugin = await AnthropicAuthPlugin(
-      { directory: root } as never,
-      {
-        claustrumScopedConnect: async () => scopedClient,
-        scopedRosterPollIntervalMs: 0,
-      } as never,
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => scopedClient,
+      scopedRosterPollIntervalMs: 0,
+    })
+    const loader = await (plugin as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} },
     )
-    try {
-      const loader = await (plugin as any).auth.loader(
-        async () => ({
-          type: 'oauth',
-          access: '',
-          refresh: 'claustrum-tombstone:v1:anthropic',
-          expires: 0,
-        }),
-        { models: {} },
-      )
-      const response = await loader.fetch(MESSAGES_URL, {
-        ...EMPTY_POST,
-        headers: { 'x-session-affinity': 'relay-direct-rotation' },
-      })
-      expect(response.status).toBe(401)
-      expect(direct).toEqual(['Bearer scoped-version-2'])
-      expect(gets).toEqual([1, 1, 2, 2])
-      expect(reports).toEqual([2])
-    } finally {
-      await plugin.dispose?.()
-    }
-  },
-)
+    const response = await loader.fetch(MESSAGES_URL, {
+      ...EMPTY_POST,
+      headers: { 'x-session-affinity': 'relay-direct-rotation' },
+    })
+    expect(response.status).toBe(401)
+    expect(direct).toEqual(['Bearer scoped-version-2'])
+    // Every vault credential read, in order and by purpose, interleaved with
+    // the physical sends. A read is not a send: only the relay and direct
+    // sends carry a credential, and each uses the read just before it.
+    expect(events).toEqual([
+      // Routing picks main and checks its model policy for this request.
+      'vault read v1',
+      // After routing, the selected route is authorized again to verify it
+      // (enabled state, source, identity, binding, model policy) and to supply
+      // the request-signing identity. Its access token is not dispatched: the
+      // next transport attempt authorizes again.
+      'vault read v1',
+      // Fresh access token and record version for the relay attempt.
+      'vault read v1',
+      'relay send Bearer scoped-version-1',
+      // Fresh access token and record version for the direct fallback,
+      // issued after the vault rotated.
+      'vault read v2',
+      'direct send Bearer scoped-version-2',
+      // After the direct 401 the vault is asked for a newer record; v2 is
+      // still current, so there is no retry, and reportAuthFailure records
+      // exactly version 2 as the final rejected record.
+      'vault read v2',
+    ])
+    expect(reports).toEqual([2])
+  })
+}
 
-test.each([200, 401])(
-  'HTTP relay retries once after scoped rotation; final upstream status %i',
-  async (finalStatus) => {
-    const root = await mkdtemp(
-      join(tmpdir(), 'opencode-scoped-relay-rotation-'),
-    )
-    testDirs.push(root)
-    const storagePath = join(root, 'anthropic-auth.json')
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-      root,
-      'enrollment.json',
-    )
-    process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-    await writeFile(
-      process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
-      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
-    await writeFile(
-      storagePath,
-      JSON.stringify({
-        version: 1,
-        accounts: [],
-        quota: { enabled: false },
-        relay: {
-          enabled: true,
-          transport: 'http',
-          url: 'https://relay.example.test/forward',
-          token: 'relay-test',
-          fallbackToDirect: true,
-        },
-        claustrum: {
-          mode: 'claustrum',
-          scopedRoster: true,
-          primaryAccount: {
-            credentialId: mainRow.id,
-            accountId: mainRow.accountId,
-            state: 'active',
-          },
-        },
-      }),
-      { mode: 0o600 },
-    )
+for (const finalStatus of [200, 401]) {
+  test(`HTTP relay retries once after scoped rotation; final upstream status ${finalStatus}`, async () => {
+    const { root, plugins } = await startBody('opencode-scoped-relay-rotation-')
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'ab'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig({ relay: legacyHttpRelay }),
+    })
     let version = 1
     const reports: number[] = [],
       relayTokens: string[] = []
-    const scopedClient: ClaustrumScopedClient = {
+    const scopedClient: NativeCustodyClient = {
       listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
       getScoped: async ({ credentialId }) => ({
         credentialId,
@@ -902,43 +914,31 @@ test.each([200, 401])(
         headers: { 'request-id': 'req_upstream_success' },
       })
     }) as typeof fetch
-    const plugin = await AnthropicAuthPlugin(
-      { directory: root } as never,
-      {
-        claustrumScopedConnect: async () => scopedClient,
-        scopedRosterPollIntervalMs: 0,
-      } as never,
+    const plugin = await createPlugin(plugins, fixture, {
+      claustrumScopedConnect: async () => scopedClient,
+      scopedRosterPollIntervalMs: 0,
+    })
+    const loader = await (plugin as any).auth.loader(
+      migratedActivation(fixture),
+      { models: {} },
     )
-    try {
-      const loader = await (plugin as any).auth.loader(
-        async () => ({
-          type: 'oauth',
-          access: '',
-          refresh: 'claustrum-tombstone:v1:anthropic',
-          expires: 0,
-        }),
-        { models: {} },
-      )
-      const response = await loader.fetch(MESSAGES_URL, {
-        ...EMPTY_POST,
-        headers: { 'x-session-affinity': 'relay-rotation' },
-      })
-      expect(response.status).toBe(finalStatus)
-      expect(await response.text()).toBe('new relay token response')
-      expect(relayTokens).toEqual([
-        'Bearer scoped-version-1',
-        'Bearer scoped-version-2',
-      ])
-      expect(reports).toEqual(finalStatus === 401 ? [2] : [])
-    } finally {
-      await plugin.dispose?.()
-    }
-  },
-)
+    const response = await loader.fetch(MESSAGES_URL, {
+      ...EMPTY_POST,
+      headers: { 'x-session-affinity': 'relay-rotation' },
+    })
+    expect(response.status).toBe(finalStatus)
+    expect(await response.text()).toBe('new relay token response')
+    expect(relayTokens).toEqual([
+      'Bearer scoped-version-1',
+      'Bearer scoped-version-2',
+    ])
+    expect(reports).toEqual(finalStatus === 401 ? [2] : [])
+  })
+}
 
 test('optimistic WebSocket reports only the scoped version used by its real upstream 401', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'opencode-scoped-ws-401-'))
-  testDirs.push(root)
+  const { root, plugins } = await startBody('opencode-scoped-ws-401-')
+  const relayTokens: string[] = []
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
@@ -982,81 +982,51 @@ test('optimistic WebSocket reports only the scoped version used by its real upst
       },
     },
   })
-  const relayTokens: string[] = []
-  const storagePath = join(root, 'anthropic-auth.json')
-  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = storagePath
-  process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
-    root,
-    'enrollment.json',
-  )
-  process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-  await writeFile(
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
-    JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
-    { mode: 0o600 },
-  )
-  await writeFile(
-    storagePath,
-    JSON.stringify({
-      version: 1,
-      accounts: [],
-      quota: { enabled: false },
-      relay: {
-        enabled: true,
-        transport: 'websocket',
-        url: server.url.href,
-        token: 'relay-test',
-        fallbackToDirect: false,
-      },
-      claustrum: {
-        mode: 'claustrum',
-        scopedRoster: true,
-        primaryAccount: {
-          credentialId: mainRow.id,
-          accountId: mainRow.accountId,
-          state: 'active',
+  try {
+    const fixture = await migrateScopedSeat(root, {
+      rows: () => [mainRow],
+      token: 'ab'.repeat(32),
+      expectedCredentials: [mainRow.id],
+      legacyConfig: scopedLegacyConfig({
+        relay: {
+          enabled: true,
+          transport: 'websocket',
+          url: server.url.href,
+          token: 'relay-test',
+          fallbackToDirect: false,
         },
+      }),
+    })
+    let gets = 0
+    const reports: number[] = []
+    const reported = lifetimes.gate()
+    const scopedClient: NativeCustodyClient = {
+      listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
+      getScoped: async ({ credentialId }) => {
+        const version = Math.min(++gets, 2)
+        return {
+          credentialId,
+          accountId: mainRow.accountId,
+          material: `scoped-version-${version}`,
+          recordVersion: version,
+          expiresAtMs: Date.now() + 3_600_000,
+        }
       },
-    }),
-    { mode: 0o600 },
-  )
-  let gets = 0
-  const reports: number[] = []
-  const scopedClient: ClaustrumScopedClient = {
-    listScoped: async () => ({ view: 'main-only', rows: [mainRow] }),
-    getScoped: async ({ credentialId }) => {
-      const version = Math.min(++gets, 2)
-      return {
-        credentialId,
-        accountId: mainRow.accountId,
-        material: `scoped-version-${version}`,
-        recordVersion: version,
-        expiresAtMs: Date.now() + 3_600_000,
-      }
-    },
-    reportAuthFailureScoped: async ({ recordVersion }) => {
-      reports.push(recordVersion)
-    },
-    close: () => {},
-  }
-  globalThis.fetch = (async () => {
-    throw new Error('unexpected direct send')
-  }) as unknown as typeof fetch
-  const plugin = await AnthropicAuthPlugin(
-    { directory: root } as never,
-    {
+      reportAuthFailureScoped: async ({ recordVersion }) => {
+        reports.push(recordVersion)
+        reported.open()
+      },
+      close: () => {},
+    }
+    globalThis.fetch = (async () => {
+      throw new Error('unexpected direct send')
+    }) as unknown as typeof fetch
+    const plugin = await createPlugin(plugins, fixture, {
       claustrumScopedConnect: async () => scopedClient,
       scopedRosterPollIntervalMs: 0,
-    } as never,
-  )
-  try {
+    })
     const loader = await (plugin as any).auth.loader(
-      async () => ({
-        type: 'oauth',
-        access: '',
-        refresh: 'claustrum-tombstone:v1:anthropic',
-        expires: 0,
-      }),
+      migratedActivation(fixture),
       { models: {} },
     )
     const response = await loader.fetch(MESSAGES_URL, {
@@ -1065,12 +1035,15 @@ test('optimistic WebSocket reports only the scoped version used by its real upst
     })
     expect(response.status).toBe(200) // local optimistic status, not Anthropic's 401
     await response.text().catch(() => {})
-    for (let attempt = 0; attempt < 50 && reports.length === 0; attempt++)
-      await Bun.sleep(10)
+    // Anthropic's late 401 is reported asynchronously, after the optimistic
+    // response. Wait for that report; if it never arrives, teardown resolves
+    // this wait so the test fails instead of hanging.
+    await reported.wait
     expect(relayTokens).toEqual(['Bearer scoped-version-2'])
     expect(reports).toEqual([2])
   } finally {
-    await plugin.dispose?.()
+    await disposeAll([...plugins], 'Scoped custody plugin cleanup failed')
+    plugins.clear()
     await server.stop(true)
   }
 })
