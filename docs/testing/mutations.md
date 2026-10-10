@@ -1,6 +1,6 @@
 # Mutation proofs for request guards
 
-`mutations.toml` records thirteen deliberately bounded runtime breaks against named
+`mutations.toml` records fourteen deliberately bounded runtime breaks against named
 assertions. Run it only in an isolated checkout: `ckdev-mutate` edits its working
 checkout; it does **not** create a scratch worktree. Never reset/check out a target
 while replay is active, and never point builds at a live host installation.
@@ -46,6 +46,7 @@ sibling repositories.
 | `profile-publication-refusal-is-not-io` | Label a rejected profile write as an I/O failure. | Stale-subject refusal must remain distinct from storage failure. |
 | `profile-current-credential-display` | Omit the current-credential display check. | A fetched tier must not cross a token rotation after its write failed. |
 | `runtime-owner-loss-is-publication-refusal` | Label runtime lease loss as storage I/O. | A failed ownership fence must never use the fresh-tier I/O exception. |
+| `refresh-backoff-preserves-attempt-budget` | Start transient backoff after the first attempt. | A transient failure must leave the coordinator's remaining attempts available; 429 and permanent failures still back off immediately. |
 | `runtime-read-no-follow` | Follow a symlink installed between inspection and opening. | The runtime reader must reject the symlink. |
 | `runtime-read-opened-mode` | Ignore the opened file's permissions. | A replacement with mode 0644 must be rejected. |
 | `runtime-read-opened-owner` | Ignore the opened file's owner. | A foreign owner on the opened handle must be rejected. |
@@ -75,7 +76,7 @@ bun scripts/run-mutation-bun.ts packages/core/src/tests/fast.test.ts \
   'fast mode eligibility for claude-opus-4-7[1m] is false'
 ```
 
-The wrapper accepts only the six reviewed owning test files. It rejects empty,
+The wrapper accepts only the seven reviewed owning test files. It rejects empty,
 control-character and boundary-whitespace names and unsafe/unsupported paths.
 Bun prints nested scopes separated by ` > `, but its name filter joins those
 scopes with spaces. The wrapper applies that observed convention, escapes regex

@@ -38,6 +38,8 @@ import {
 } from './pool-store.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
+export const NATIVE_REFRESH_MAX_ATTEMPTS = 3
+
 /**
  * Jobs distinguish credential replacements. This lock must still serialize
  * all refreshes for the same account.
@@ -735,7 +737,7 @@ export function createNativeRefreshCoordinator(
     }
 
     try {
-      for (attempt = 1; attempt <= 3; attempt++) {
+      for (attempt = 1; attempt <= NATIVE_REFRESH_MAX_ATTEMPTS; attempt++) {
         // Clear the previous attempt's UUID, refresh lineage, access version and
         // runtime context before awaiting another row read. If the next policy
         // read fails, its failed observation must not reuse earlier reset values.
@@ -1148,7 +1150,7 @@ export function createNativeRefreshCoordinator(
             failure.kind === 'provider' &&
             failure.classification === 'transient' &&
             failure.status !== 429 &&
-            attempt < 3
+            attempt < NATIVE_REFRESH_MAX_ATTEMPTS
           ) {
             await releaseHandoff()
             if (aliasKey) unregister(job, aliasKey)

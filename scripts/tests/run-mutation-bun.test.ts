@@ -743,6 +743,11 @@ test('native guard selection uses the actual owning package and reviewed preload
       'src/tests/native-display-profile.test.ts',
     ],
     [
+      'packages/core/src/tests/native-account-runtime.test.ts',
+      'packages/core',
+      'src/tests/native-account-runtime.test.ts',
+    ],
+    [
       'packages/opencode/src/tests/index.test.ts',
       'packages/opencode',
       'src/tests/index.test.ts',

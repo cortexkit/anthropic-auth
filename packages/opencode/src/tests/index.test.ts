@@ -12104,11 +12104,14 @@ describe('auth.loader', () => {
 
   test('fetch wrapper backs off main oauth refresh after rate limits', async () => {
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: { enabled: false },
-        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
-      }),
+      bindMainAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false },
+          refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+        }),
+        'sk-ant-oat01-expired',
+      ),
       {
         access: 'sk-ant-oat01-expired',
         refresh: 'refresh-token',
@@ -12158,13 +12161,26 @@ describe('auth.loader', () => {
     ).rejects.toThrow('Claude OAuth refresh is backed off')
 
     expect(tokenRefreshCalls).toBe(1)
-    const savedConfig = JSON.parse(
-      await readFile(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!, 'utf8'),
+    const pool = migratedPool
+    if (!pool) throw new Error('Expected migrated pool')
+    const savedConfig = await createNativePoolStore({
+      paths: pool.paths,
+      quota: nativeQuotaCodec,
+    }).readSettings()
+    expect(savedConfig.status).toBe('ready')
+    if (savedConfig.status !== 'ready')
+      throw new Error('Expected ready native pool')
+    expect(JSON.stringify(savedConfig.settings)).not.toContain(
+      'lastRefreshError',
     )
-    expect(savedConfig.refresh?.mainLastRefreshError).toBeUndefined()
-    const savedState = JSON.parse(await readFile(getAccountStatePath(), 'utf8'))
-    expect(savedState.main.lastRefreshError.nextRetryAt).toBeGreaterThan(
+    const savedState = await readNativeRuntimeState()
+    expect(savedState.main?.lastRefreshError?.nextRetryAt).toBeGreaterThan(
       Date.now(),
+    )
+    expect(savedState.main?.lastRefreshError?.status).toBe(429)
+    expect(savedState.main?.accountIdentity).toBe(syntheticMainAccountUuid)
+    await expect(readFile(getAccountStatePath(), 'utf8')).rejects.toMatchObject(
+      { code: 'ENOENT' },
     )
   })
 
@@ -12480,43 +12496,58 @@ describe('auth.loader', () => {
   })
 
   test('fetch wrapper retries transient token refresh failures', async () => {
-    await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
-      access: 'sk-ant-oat01-expired',
-      refresh: 'refresh',
-      expires: Date.now() - 1000,
-    })
+    await useTempAccountFile(
+      bindMainAccount(
+        createFallbackStorage({ accounts: [], quota: { enabled: false } }),
+        'sk-ant-oat01-expired',
+      ),
+      {
+        access: 'sk-ant-oat01-expired',
+        refresh: 'refresh',
+        expires: Date.now() - 1000,
+      },
+    )
     let tokenRefreshCalls = 0
     const setTimeoutMock = mock((handler: () => unknown) => {
       handler()
       return 0 as unknown as ReturnType<typeof setTimeout>
     }) as unknown as typeof setTimeout
 
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
+    mainAccountIssues('sk-ant-oat01-new-access')
+    const modelAuthorizations: Array<string | null> = []
+    globalThis.fetch = mock(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const admitted = await nativeBootstrapAnswer(input, init)
+        if (admitted) return admitted
+        const url = extractUrl(input)
+        if (url.includes('/v1/messages'))
+          modelAuthorizations.push(
+            new Headers(init?.headers).get('authorization'),
+          )
+        if (url.includes('/v1/oauth/token')) {
+          tokenRefreshCalls += 1
 
-      if (url.includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
+          if (tokenRefreshCalls === 1) {
+            return Promise.resolve(
+              new Response('Temporary failure', { status: 500 }),
+            )
+          }
 
-        if (tokenRefreshCalls === 1) {
           return Promise.resolve(
-            new Response('Temporary failure', { status: 500 }),
+            new Response(
+              JSON.stringify({
+                refresh_token: 'new-refresh',
+                access_token: 'sk-ant-oat01-new-access',
+                expires_in: 3600,
+              }),
+              { status: 200 },
+            ),
           )
         }
 
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'new-refresh',
-              access_token: 'sk-ant-oat01-new-access',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
+        return Promise.resolve(new Response(null, { status: 200 }))
+      },
+    ) as unknown as typeof fetch
 
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient, undefined, {
@@ -12539,9 +12570,15 @@ describe('auth.loader', () => {
     })
 
     expect(tokenRefreshCalls).toBe(2)
-    expect(setTimeoutMock).toHaveBeenCalledTimes(1)
-    expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 500)
-    expect(mockClient.auth.set).toHaveBeenCalledTimes(1)
+    expect(modelAuthorizations).toEqual(['Bearer sk-ant-oat01-new-access'])
+    expect(
+      (await waitForPoolCredential('main', 'sk-ant-oat01-new-access'))
+        .credential.refresh,
+    ).toBe('new-refresh')
+    // Retry belongs to the shared coordinator. The host must not add another
+    // retry loop or write the resulting secret into its activation slot.
+    expect(setTimeoutMock).not.toHaveBeenCalled()
+    expect(mockClient.auth.set).not.toHaveBeenCalled()
   })
 
   test('fetch wrapper keeps main oauth retry count bounded when helper also supports retries', async () => {
@@ -12620,7 +12657,7 @@ describe('auth.loader', () => {
       { models: {} },
     )
 
-    expect(
+    await expect(
       result.fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         body: '{}',

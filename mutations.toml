@@ -218,3 +218,19 @@ expect_message = "error: expect(received).toMatchObject(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "refresh-backoff-preserves-attempt-budget"
+guards = "Failure bookkeeping must not block the coordinator's own remaining transient retries."
+file = "packages/core/src/native-account-runtime.ts"
+old = "nextRetryAt: retrying ? policy.checkedAt : policy.nextRetryAt,"
+new = "nextRetryAt: retrying ? policy.nextRetryAt : policy.nextRetryAt,"
+test_file = "packages/core/src/tests/native-account-runtime.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/core/src/tests/native-account-runtime.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["native refresh keeps bounded provider attempts before backoff (status=500, failures=1)"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
+broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"

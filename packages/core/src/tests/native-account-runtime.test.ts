@@ -2,6 +2,7 @@ import { expect, spyOn } from 'bun:test'
 import * as filesystem from 'node:fs/promises'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { ClaudeOAuthRefreshError } from '../auth.ts'
 import type { ProviderAccountUuid } from '../claude-code.ts'
 import {
   __setLogTestSink,
@@ -1301,5 +1302,77 @@ test('late profile publication refusal cannot authorize display for rotated cred
   expect(
     (await f.runtime.read()).accounts.find((account) => account.id === 'main')
       ?.profile,
+  ).toBeUndefined()
+})
+
+for (const [status, failCount, expectedAttempts, expectedStatus] of [
+  [500, 1, 2, 'usable'],
+  [500, 3, 3, 'failed'],
+  [429, 3, 1, 'failed'],
+  [403, 3, 1, 'failed'],
+] as const) {
+  test(`native refresh keeps bounded provider attempts before backoff (status=${status}, failures=${failCount})`, async () => {
+    let attempts = 0
+    const f = await fixture({
+      refreshToken: async (input) => {
+        expect(input.maxRetries).toBe(0)
+        attempts++
+        if (attempts <= failCount)
+          throw new ClaudeOAuthRefreshError(
+            status,
+            'Synthetic provider failure',
+          )
+        return {
+          access: 'sk-ant-oat01-retry-successor',
+          refresh: 'retry-successor-refresh',
+          expires: now + 8_000_000,
+          expiresIn: 8000,
+        }
+      },
+    })
+    const result = await f.runtime.authorizeLocal('main', { intent: 'refresh' })
+    expect(attempts).toBe(expectedAttempts)
+    expect(result.status).toBe(expectedStatus)
+    const state = await f.runtime.read()
+    const error = state.accounts.find(
+      (row) => row.id === 'main',
+    )?.lastRefreshError
+    if (expectedStatus === 'usable') {
+      if (result.status !== 'usable')
+        throw new Error('Expected usable successor')
+      expect(result.access).toBe('sk-ant-oat01-retry-successor')
+      expect(error).toBeUndefined()
+    } else {
+      expect(error?.nextRetryAt).toBeGreaterThan(now)
+      expect(error?.retryCount).toBe(expectedAttempts)
+      await f.runtime.authorizeLocal('main', { intent: 'refresh' })
+      expect(attempts).toBe(expectedAttempts)
+    }
+  })
+}
+
+test('native network refresh failure permits one retry and clears its transient error on success', async () => {
+  let attempts = 0
+  const f = await fixture({
+    refreshToken: async (input) => {
+      expect(input.maxRetries).toBe(0)
+      if (++attempts === 1)
+        throw Object.assign(new Error('Synthetic socket reset'), {
+          code: 'ECONNRESET',
+        })
+      return {
+        access: 'sk-ant-oat01-network-successor',
+        refresh: 'network-successor-refresh',
+        expires: now + 8_000_000,
+        expiresIn: 8000,
+      }
+    },
+  })
+  const result = await f.runtime.authorizeLocal('main', { intent: 'refresh' })
+  expect(attempts).toBe(2)
+  expect(result.status).toBe('usable')
+  expect(
+    (await f.runtime.read()).accounts.find((row) => row.id === 'main')
+      ?.lastRefreshError,
   ).toBeUndefined()
 })

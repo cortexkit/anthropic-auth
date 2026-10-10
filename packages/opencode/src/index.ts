@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import type { NativeRefreshFailure } from '@cortexkit/anthropic-auth-core'
 import {
   type AccountCommandStatusProjection,
   type AccountStorage,
@@ -1548,8 +1549,13 @@ const anthropicAuthPlugin = async (
       readonly account: NativeAccountView,
       status: string,
       readonly tokenRefreshFailed = false,
+      readonly failure?: NativeRefreshFailure,
     ) {
-      super(`Native OAuth authorization refused: ${status}`)
+      super(
+        failure?.kind === 'provider' && failure.status !== undefined
+          ? `Claude OAuth refresh failed: ${failure.status} — ${failure.classification === 'invalid-grant' ? 'invalid_grant' : 'OAuth operation failed'}`
+          : `Native OAuth authorization refused: ${status}`,
+      )
     }
   }
   async function authorizeOAuth(
@@ -1623,6 +1629,7 @@ const anthropicAuthPlugin = async (
           authorization.status,
           authorization.status === 'failed' &&
             authorization.failure.kind === 'provider',
+          authorization.status === 'failed' ? authorization.failure : undefined,
         )
       result = {
         accessToken: authorization.access,
@@ -5746,6 +5753,7 @@ const anthropicAuthPlugin = async (
               nativeScopedAttempt: undefined,
               modelDenied: false,
               credentialUnavailable: false,
+              credentialFailure: undefined,
               deferred: false,
             }
           if (!isCustodyTombstoneOAuth(currentActivation, 'anthropic')) {
@@ -5831,12 +5839,14 @@ const anthropicAuthPlugin = async (
               nativeScopedAttempt: undefined,
               modelDenied: false,
               credentialUnavailable: false,
+              credentialFailure: undefined,
               deferred: true,
             }
           }
           let credential: NativeOAuthAuthorization | undefined
           let denied: NativeAccountView | undefined
           let unavailable: NativeAccountView | undefined
+          let credentialFailure: NativeCredentialUnavailableError | undefined
           try {
             credential = await authorizeOAuth(
               'main',
@@ -5881,12 +5891,15 @@ const anthropicAuthPlugin = async (
                     denied = retryError.account
                   else if (
                     retryError instanceof NativeCredentialUnavailableError
-                  )
+                  ) {
                     unavailable = retryError.account
+                    credentialFailure = retryError
+                  }
                 }
               }
             } else if (error instanceof NativeCredentialUnavailableError) {
               unavailable = error.account
+              credentialFailure = error
             }
           }
           signal?.throwIfAborted()
@@ -5909,6 +5922,7 @@ const anthropicAuthPlugin = async (
               unavailable?.accountIdentity,
             modelDenied: Boolean(denied),
             credentialUnavailable: Boolean(unavailable),
+            credentialFailure,
             deferred: false,
             nativeLocalSource: credential?.localSource,
             nativeScopedAttempt: credential?.scopedAttempt,
@@ -8795,6 +8809,11 @@ const anthropicAuthPlugin = async (
                     throw error
                   }
                 }
+                // Report the refresh failure that happened in this request,
+                // rather than replacing it with its newly recorded backoff.
+                // Later requests still check the persisted retry deadline.
+                if (auth.credentialFailure?.tokenRefreshFailed)
+                  throw auth.credentialFailure
                 // Check backoff before attempting refresh — avoids noisy
                 // per-request retries during prolonged rate limits
                 const refreshStorage = await loadAccounts()
@@ -8804,7 +8823,9 @@ const anthropicAuthPlugin = async (
                   mainRefreshError &&
                   refreshBackoffActive(
                     mainRefreshError,
-                    mainAccountId ?? refreshStorage?.mainAccountId,
+                    auth.nativeAccountIdentity ??
+                      mainAccountId ??
+                      refreshStorage?.mainAccountId,
                     Date.now(),
                     auth.refresh ? tokenFingerprint(auth.refresh) : undefined,
                   )

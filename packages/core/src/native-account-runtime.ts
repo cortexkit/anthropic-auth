@@ -55,6 +55,7 @@ import type {
   NativeRefreshResult,
   NativeRefreshSubject,
 } from './native-refresh-coordinator.ts'
+import { NATIVE_REFRESH_MAX_ATTEMPTS } from './native-refresh-coordinator.ts'
 import {
   type NativeRuntimeEntry,
   NativeRuntimeError,
@@ -707,9 +708,20 @@ export function createNativeAccountRuntime(
                 retryCount: Math.max(0, input.observation.attempt - 1),
               },
             })
+            // The coordinator owns up to three physical attempts. Recording
+            // a deadline after its first transient failure would block its own
+            // next attempt. A 429 or permanent error starts backoff immediately.
+            const retrying =
+              input.observation.status === 'failed' &&
+              failure?.kind === 'provider' &&
+              failure.classification === 'transient' &&
+              failure.status !== 429 &&
+              !input.observation.persisted &&
+              !input.observation.committed &&
+              input.observation.attempt < NATIVE_REFRESH_MAX_ATTEMPTS
             return {
               checkedAt: policy.checkedAt,
-              nextRetryAt: policy.nextRetryAt,
+              nextRetryAt: retrying ? policy.checkedAt : policy.nextRetryAt,
               retryCount: policy.retryCount,
             }
           }),

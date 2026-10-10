@@ -87,6 +87,7 @@ export function selectionFor(file: string, name: string) {
       'packages/core/src/tests/fast.test.ts',
       'packages/core/src/tests/native-runtime.test.ts',
       'packages/core/src/tests/native-display-profile.test.ts',
+      'packages/core/src/tests/native-account-runtime.test.ts',
       'packages/opencode/src/tests/index.test.ts',
       'packages/pi/src/tests/convert.test.ts',
     ].includes(file)
