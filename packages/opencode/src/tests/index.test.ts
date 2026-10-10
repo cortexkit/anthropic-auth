@@ -43,8 +43,10 @@ import {
   FallbackAccountManager,
   getAccountStatePath,
   getClaudeCodeIdentityForVerifiedAccount,
+  getDumpDirectory,
   hashRefreshToken,
   isCustodyTombstoneOAuth,
+  isDumpEnabled,
   isNativeLocalCredentialValidation,
   isOAuthAccount,
   type LogTestRecord,
@@ -8661,67 +8663,71 @@ describe('auth.loader', () => {
 
   test('does not use API-key route in fallback-first before main quota is exhausted', async () => {
     await useTempAccountFile(
-      createFallbackStorage({
-        routing: { mode: 'fallback-first' },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-        } as AccountStorage['quota'],
-        accounts: [
-          {
-            id: 'kie-opus',
-            label: 'Kie Opus',
-            type: 'api',
-            apiKey: 'kie-key',
-            baseURL: 'https://api.kie.ai/claude',
-            authHeader: 'authorization-bearer',
-          },
-          {
-            id: 'fallback-1',
-            type: 'oauth',
-            access: 'sk-ant-oat01-fallback-access',
-            refresh: 'fallback-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            quota: {
-              five_hour: {
-                usedPercent: 25,
-                remainingPercent: 75,
-                checkedAt: Date.now(),
-              },
-              seven_day: {
-                usedPercent: 30,
-                remainingPercent: 70,
-                checkedAt: Date.now(),
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+          } as AccountStorage['quota'],
+          accounts: [
+            {
+              id: 'kie-opus',
+              label: 'Kie Opus',
+              type: 'api',
+              apiKey: 'kie-key',
+              baseURL: 'https://api.kie.ai/claude',
+              authHeader: 'authorization-bearer',
+            },
+            {
+              id: 'fallback-1',
+              type: 'oauth',
+              access: 'sk-ant-oat01-fallback-access',
+              refresh: 'fallback-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              quota: {
+                five_hour: {
+                  usedPercent: 25,
+                  remainingPercent: 75,
+                  checkedAt: Date.now(),
+                },
+                seven_day: {
+                  usedPercent: 30,
+                  remainingPercent: 70,
+                  checkedAt: Date.now(),
+                },
               },
             },
-          },
-        ],
-      }),
+          ],
+        }),
+      ),
     )
 
     const requests: Array<{ url: string; authorization: string | null }> = []
     globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 10 },
-                seven_day: { utilization: 10 },
-              }),
-              { status: 200 },
-            ),
-          )
-        }
-        requests.push({
-          url,
-          authorization: new Headers(init?.headers).get('authorization'),
-        })
-        return Promise.resolve(new Response(null, { status: 200 }))
-      }),
+      withNativeAdmission(
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage')) {
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  five_hour: { utilization: 10 },
+                  seven_day: { utilization: 10 },
+                }),
+                { status: 200 },
+              ),
+            )
+          }
+          requests.push({
+            url,
+            authorization: new Headers(init?.headers).get('authorization'),
+          })
+          return Promise.resolve(new Response(null, { status: 200 }))
+        },
+      ),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
@@ -19244,56 +19250,81 @@ describe('cache diagnostics', () => {
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
     try {
       await useTempAccountFile(
-        createFallbackStorage({
-          dump: { enabled: true },
-          quota: {
-            enabled: true,
-            checkIntervalMinutes: 5,
-            minimumRemaining: { five_hour: 10, seven_day: 20 },
-            failClosedOnUnknownQuota: true,
-            mainQuota: {
-              checkedAt: Date.now(),
-              five_hour: { usedPercent: 100, remainingPercent: 0 },
-              seven_day: { usedPercent: 50, remainingPercent: 50 },
-            },
-            mainQuotaCheckedAt: Date.now(),
-            mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
-          } as AccountStorage['quota'],
-          accounts: [
-            {
-              id: 'kie-opus',
-              type: 'api',
-              apiKey: 'kie-key',
-              baseURL: 'https://api.kie.ai/claude',
-              authHeader: 'authorization-bearer',
-            },
-          ],
-        }),
+        bindPoolAccounts(
+          createFallbackStorage({
+            dump: { enabled: true },
+            quota: {
+              enabled: true,
+              checkIntervalMinutes: 5,
+              minimumRemaining: { five_hour: 10, seven_day: 20 },
+              failClosedOnUnknownQuota: true,
+              mainQuota: {
+                checkedAt: Date.now(),
+                five_hour: {
+                  usedPercent: 100,
+                  remainingPercent: 0,
+                  checkedAt: Date.now(),
+                },
+                seven_day: {
+                  usedPercent: 50,
+                  remainingPercent: 50,
+                  checkedAt: Date.now(),
+                },
+              },
+              mainQuotaCheckedAt: Date.now(),
+              mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
+            } as AccountStorage['quota'],
+            accounts: [
+              {
+                id: 'kie-opus',
+                type: 'api',
+                apiKey: 'kie-key',
+                baseURL: 'https://api.kie.ai/claude',
+                authHeader: 'authorization-bearer',
+              },
+            ],
+          }),
+        ),
       )
       const records: LogTestRecord[] = []
       let sentBody: Record<string, unknown> | undefined
       let sentBeta = ''
-      globalThis.fetch = mock((_input: any, init: RequestInit) => {
-        sentBody = JSON.parse(String(init.body))
-        sentBeta = new Headers(init.headers).get('anthropic-beta') ?? ''
-        return Promise.resolve(sseResponse(message('provider-api')))
-      }) as unknown as typeof fetch
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            expect(extractUrl(input)).toBe(
+              'https://api.kie.ai/claude/v1/messages?beta=true',
+            )
+            expect(new Headers(init?.headers).get('authorization')).toBe(
+              'Bearer kie-key',
+            )
+            sentBody = JSON.parse(String(init?.body))
+            sentBeta = new Headers(init?.headers).get('anthropic-beta') ?? ''
+            return Promise.resolve(sseResponse(message('provider-api')))
+          },
+        ),
+      ) as unknown as typeof fetch
       __setLogTestSink((record) => records.push(record))
 
+      expect((await readAccountStorage())?.dump?.enabled).toBe(true)
       const plugin = await getPlugin()
+      expect(isDumpEnabled()).toBe(true)
       const result = await plugin.auth.loader(oauthLoader, { models: {} })
-      await (
-        await result.fetch(MESSAGES_URL, {
-          method: 'POST',
-          headers: { 'x-session-affinity': 'ses-api' },
-          body: JSON.stringify({
-            model: 'claude-opus-4-8',
-            stream: true,
-            messages: [{ role: 'user', content: 'hello' }],
-          }),
-        })
-      ).text()
+      const response = await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-api' },
+        body: JSON.stringify({
+          model: 'claude-opus-4-8',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      expect(response.status).toBe(200)
+      await response.text()
 
+      expect(sentBody).toBeDefined()
+      expect(isDumpEnabled()).toBe(true)
+      expect(getDumpDirectory()).toBe(dumpDir)
       expect(sentBody?.diagnostics).toBeUndefined()
       expect(sentBeta).not.toContain('cache-diagnosis-2026-04-07')
       expect(

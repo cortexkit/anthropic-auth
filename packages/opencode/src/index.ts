@@ -8158,10 +8158,10 @@ const anthropicAuthPlugin = async (
                   requestMainQuotaIdentity,
                 )
               }
-              const writeCurrentSidebarState = async (
+              async function writeCurrentSidebarState(
                 activeId: string | undefined,
                 route: string,
-              ) => {
+              ) {
                 let sidebarStorage = storage
                 let skipFallbackQuotaSeed = false
                 if (
