@@ -8,7 +8,7 @@ import {
   mock,
   spyOn,
 } from 'bun:test'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import {
   chmod,
@@ -17318,6 +17318,13 @@ describe('auth.loader', () => {
         expect(relay503Calls).toBe(1)
         expect(directCalls).toBe(1)
         await waitForState((value) => value.main?.quota?.source === 'headers')
+        await waitForLogRecord(
+          records,
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'harvested response quota',
+          'published direct-fallback quota log',
+        )
         expect(
           records.filter(
             (record) =>
@@ -17657,79 +17664,96 @@ describe('auth.loader', () => {
     })
 
     test('fallback header push does not persist onto a different account identity', async () => {
-      const accountXQuota = {
-        five_hour: {
-          usedPercent: 11,
-          remainingPercent: 89,
-          checkedAt: 1,
-        },
+      const accountXQuota: OAuthQuotaSnapshot = {
+        accountIdentity: syntheticFallbackAccountUuid(0),
+        five_hour: { usedPercent: 11, remainingPercent: 89, checkedAt: 1 },
       }
-      const servedAccount = {
-        ...(createFallbackStorage().accounts[0] as OAuthAccount),
-        access: 'sk-ant-oat01-served-account-access',
-        quota: accountXQuota,
-      }
+      const template = createFallbackStorage().accounts[0] as OAuthAccount
       await useTempAccountFile(
-        createFallbackStorage({
-          accounts: [
-            {
-              ...(createFallbackStorage().accounts[0] as OAuthAccount),
-              id: 'account-x',
-              lastRefreshError: {
-                message: 'dead fallback',
-                checkedAt: Date.now(),
-                permanent: true,
-                accountIdentity: 'account-x',
+        bindPoolAccounts(
+          createFallbackStorage({
+            accounts: [
+              {
+                ...template,
+                id: 'account-x',
+                lastRefreshError: {
+                  message: 'dead fallback',
+                  checkedAt: Date.now(),
+                  permanent: true,
+                  // Import a failure bound to the exact stored refresh token.
+                  tokenHash: createHash('sha256')
+                    .update(template.refresh)
+                    .digest('hex'),
+                  accountIdentity: syntheticFallbackAccountUuid(0),
+                },
+                quota: accountXQuota,
               },
-              quota: accountXQuota,
-            },
-            servedAccount,
-          ],
-          quota: { enabled: false },
-        }),
+              {
+                ...template,
+                access: 'sk-ant-oat01-served-account-access',
+                refresh: 'served-account-refresh',
+                quota: {
+                  ...accountXQuota,
+                  accountIdentity: syntheticFallbackAccountUuid(1),
+                },
+              },
+            ],
+            quota: { enabled: false },
+          }),
+        ),
       )
       let messageCalls = 0
-      globalThis.fetch = mock((input: string | URL | Request) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
+      globalThis.fetch = mock(
+        withNativeAdmission((input: Parameters<typeof fetch>[0]) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage'))
+            return Promise.resolve(
+              new Response('usage-unavailable', { status: 500 }),
+            )
+          if (!url.includes('/v1/messages'))
+            return Promise.resolve(Response.json({}))
           return Promise.resolve(
-            new Response('usage-unavailable', { status: 500 }),
+            ++messageCalls === 1
+              ? new Response('limited', { status: 429 })
+              : new Response('fallback-ok', { headers: quotaHeaders }),
           )
-        }
-        messageCalls++
-        return Promise.resolve(
-          messageCalls === 1
-            ? new Response('limited', { status: 429 })
-            : new Response('fallback-ok', { headers: quotaHeaders }),
-        )
-      }) as unknown as typeof fetch
+        }),
+      ) as unknown as typeof fetch
+      const before = await readNativeRuntimeState()
+      expect(before.accounts['account-x']?.lastRefreshError?.permanent).toBe(
+        true,
+      )
       const result = await loadFetch()
-
       await result.fetch(MESSAGES_URL, EMPTY_POST)
       const state = await waitForState(
         (value) => value.accounts?.['fallback-1']?.quota?.source === 'headers',
       )
       expect(state.accounts['account-x'].quota).toEqual(accountXQuota)
       expect(state.accounts['fallback-1'].quota.accountIdentity).toBe(
-        'fallback-1',
+        syntheticFallbackAccountUuid(1),
       )
+      expect(state.accounts['fallback-1'].quota.five_hour.usedPercent).toBe(78)
     })
 
     test('main header push preserves persisted poll backoff across reload', async () => {
       const pollBackoff = {
+        status: 429,
+        accountIdentity: syntheticMainAccountUuid,
         message: 'Claude quota check failed: 429 — rate limited',
         checkedAt: Date.now(),
         nextRetryAt: Date.now() + 60_000,
         retryCount: 1,
       }
       await useTempAccountFile(
-        createFallbackStorage({
-          accounts: [],
-          quota: {
-            enabled: false,
-            mainLastQuotaApiError: pollBackoff,
-          },
-        }),
+        bindMainAccount(
+          createFallbackStorage({
+            accounts: [],
+            quota: {
+              enabled: false,
+              mainLastQuotaApiError: pollBackoff,
+            },
+          }),
+        ),
       )
       globalThis.fetch = mock(
         withNativeAdmission(() =>
@@ -17746,9 +17770,16 @@ describe('auth.loader', () => {
       )
       const reloaded = await readAccountStorage()
 
-      expect(state.main.lastQuotaApiError).toEqual(pollBackoff)
+      // Public native views retain backoff fields but hide stored error text.
+      expect(state.main.lastQuotaApiError).toEqual({
+        ...pollBackoff,
+        message: 'OAuth operation failed',
+      })
       expect(state.main.quota.five_hour.usedPercent).toBe(78)
-      expect(reloaded?.quota?.mainLastQuotaApiError).toEqual(pollBackoff)
+      expect(reloaded?.quota?.mainLastQuotaApiError).toEqual({
+        ...pollBackoff,
+        message: 'OAuth operation failed',
+      })
       expect(reloaded?.quota?.mainQuota?.source).toBe('headers')
     })
 
@@ -17776,6 +17807,13 @@ describe('auth.loader', () => {
 
       expect(messageCalls).toBe(1)
       expect(usageCalls).toBe(0)
+      await waitForLogRecord(
+        records,
+        (record) =>
+          record.channel === 'quota' &&
+          record.message === 'harvested response quota',
+        'published primary quota log',
+      )
       expect(
         records.filter(
           (record) =>
@@ -17822,6 +17860,8 @@ describe('auth.loader', () => {
 
     test('fallback header push preserves persisted poll backoff across reload', async () => {
       const pollBackoff = {
+        status: 429,
+        accountIdentity: syntheticFallbackAccountUuid(0),
         message: 'Claude quota check failed: 429 — rate limited',
         checkedAt: Date.now(),
         nextRetryAt: Date.now() + 60_000,
@@ -17832,7 +17872,9 @@ describe('auth.loader', () => {
         throw new Error('expected OAuth fallback fixture')
       }
       await useTempAccountFile(
-        harvestStorage([{ ...fallback, lastQuotaRefreshError: pollBackoff }]),
+        bindPoolAccounts(
+          harvestStorage([{ ...fallback, lastQuotaRefreshError: pollBackoff }]),
+        ),
       )
       let messages = 0
       globalThis.fetch = mock(
@@ -17867,11 +17909,15 @@ describe('auth.loader', () => {
           account.id === 'fallback-1' && account.type === 'oauth',
       )
 
-      expect(state.accounts['fallback-1'].lastQuotaRefreshError).toEqual(
-        pollBackoff,
-      )
+      expect(state.accounts['fallback-1'].lastQuotaRefreshError).toEqual({
+        ...pollBackoff,
+        message: 'OAuth operation failed',
+      })
       expect(state.accounts['fallback-1'].quota.five_hour.usedPercent).toBe(78)
-      expect(reloadedFallback?.lastQuotaRefreshError).toEqual(pollBackoff)
+      expect(reloadedFallback?.lastQuotaRefreshError).toEqual({
+        ...pollBackoff,
+        message: 'OAuth operation failed',
+      })
       expect(reloadedFallback?.quota?.source).toBe('headers')
     })
 
@@ -17927,6 +17973,7 @@ describe('auth.loader', () => {
 
     test('non-finite utilization headers leave stored quota untouched', async () => {
       const existingQuota = {
+        accountIdentity: syntheticMainAccountUuid,
         five_hour: {
           usedPercent: 11,
           remainingPercent: 89,
@@ -17937,15 +17984,17 @@ describe('auth.loader', () => {
         checkedAt: 1,
       }
       await useTempAccountFile(
-        createFallbackStorage({
-          accounts: [],
-          quota: {
-            enabled: false,
-            mainQuota: existingQuota,
-            mainQuotaCheckedAt: 1,
-            mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
-          },
-        }),
+        bindMainQuotaToAccount(
+          createFallbackStorage({
+            accounts: [],
+            quota: {
+              enabled: false,
+              mainQuota: existingQuota,
+              mainQuotaCheckedAt: 1,
+              mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
+            },
+          }),
+        ),
       )
       globalThis.fetch = mock(
         withNativeAdmission(() =>
@@ -18027,6 +18076,13 @@ describe('auth.loader', () => {
 
       await result.fetch(MESSAGES_URL, EMPTY_POST)
 
+      await waitForLogRecord(
+        records,
+        (record) =>
+          record.channel === 'quota' &&
+          record.message === 'harvested response quota',
+        'published quota log',
+      )
       const harvested = records.filter(
         (record) =>
           record.channel === 'quota' &&
