@@ -1152,6 +1152,46 @@ async function refreshPoolMainElsewhere(successor: {
   await refreshPoolLoginElsewhere('main', successor)
 }
 
+/** Wait for an account-bound credential write without changing test deadlines. */
+async function waitForPoolCredential(routeId: string, access: string) {
+  const pool = migratedPool
+  if (!pool) throw new Error('Expected migrated pool')
+  const reader = createNativeAccountRuntime({
+    paths: pool.paths,
+    host: 'opencode',
+  })
+  const store = createNativePoolStore({
+    paths: pool.paths,
+    quota: nativeQuotaCodec,
+  })
+  try {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const subject = await reader.captureLocalSubject(routeId)
+      const read = await store.read()
+      const row =
+        read.status === 'ready'
+          ? read.rows.find((row) => row.id === subject.binding.rowId)
+          : undefined
+      const credential = row?.credential
+      if (
+        row?.stamp === 'bound' &&
+        row.identity === subject.binding.identity &&
+        row.credentialEpoch === subject.binding.credentialEpoch &&
+        credential?.type === 'oauth' &&
+        credential.access === access &&
+        subject.version?.accessFingerprint === tokenFingerprint(access)
+      )
+        return { subject, credential }
+      await Bun.sleep(10)
+    }
+    throw new Error(
+      `Expected a persisted native OAuth successor for ${routeId}`,
+    )
+  } finally {
+    reader.close()
+  }
+}
+
 /**
  * Rotate the chosen account's tokens using a separate account runtime.
  * Register the returned access token with loginIssues or mainAccountIssues
@@ -11815,25 +11855,28 @@ describe('auth.loader', () => {
   test('background refresh retries after a permanent main backoff belongs to an older refresh token', async () => {
     const now = Date.now()
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        mainAccountId: 'main-account-id',
-        quota: { enabled: false },
-        refresh: {
-          enabled: true,
-          refreshBeforeExpiryMinutes: 30,
-          mainLastRefreshError: {
-            message: 'Claude OAuth refresh failed: 400 — invalid_grant',
-            checkedAt: now - 1_000,
-            nextRetryAt: now + 24 * 60 * 60_000,
-            retryCount: 1,
-            accountIdentity: 'main-account-id',
-            refreshTokenFingerprint: tokenFingerprint('failed-refresh'),
-            status: 400,
-            permanent: true,
+      bindMainAccount(
+        createFallbackStorage({
+          accounts: [],
+          mainAccountId: 'main-account-id',
+          quota: { enabled: false },
+          refresh: {
+            enabled: true,
+            refreshBeforeExpiryMinutes: 30,
+            mainLastRefreshError: {
+              message: 'Claude OAuth refresh failed: 400 — invalid_grant',
+              checkedAt: now - 1_000,
+              nextRetryAt: now + 24 * 60 * 60_000,
+              retryCount: 1,
+              accountIdentity: 'main-account-id',
+              refreshTokenFingerprint: tokenFingerprint('failed-refresh'),
+              status: 400,
+              permanent: true,
+            },
           },
-        },
-      }),
+        }),
+        'sk-ant-oat01-current-access',
+      ),
       {
         access: 'sk-ant-oat01-current-access',
         refresh: 'current-refresh',
@@ -11846,19 +11889,22 @@ describe('auth.loader', () => {
       return { unref() {} }
     }) as unknown as typeof setInterval
     let tokenRefreshCalls = 0
-    globalThis.fetch = mock((input: any) => {
-      if (extractUrl(input).includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
-        return Promise.resolve(
-          Response.json({
+    mainAccountIssues('sk-ant-oat01-refreshed-access')
+    globalThis.fetch = mock(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const admitted = await nativeBootstrapAnswer(input, init)
+        if (admitted) return admitted
+        if (extractUrl(input).includes('/v1/oauth/token')) {
+          tokenRefreshCalls += 1
+          return Response.json({
             refresh_token: 'refreshed-refresh',
             access_token: 'sk-ant-oat01-refreshed-access',
             expires_in: 8 * 60 * 60,
-          }),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
+          })
+        }
+        return new Response(null, { status: 200 })
+      },
+    ) as unknown as typeof fetch
 
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient, undefined, {
@@ -11877,36 +11923,44 @@ describe('auth.loader', () => {
     )
 
     for (const handler of intervalHandlers) handler()
-    await waitForMockCall(mockClient.auth.set)
-
+    const refreshed = await waitForPoolCredential(
+      'main',
+      'sk-ant-oat01-refreshed-access',
+    )
+    expect(refreshed.credential.refresh).toBe('refreshed-refresh')
+    expect(refreshed.subject.binding.identity).toBe(syntheticMainAccountUuid)
     expect(tokenRefreshCalls).toBe(1)
-    expect(mockClient.auth.set).toHaveBeenCalledTimes(1)
+    expect(mockClient.auth.set).not.toHaveBeenCalled()
     expect(
       (await readAccountStorage())?.refresh?.mainLastRefreshError,
     ).toBeUndefined()
   })
 
-  test('reset-backoff clears a legacy main latch before the next background refresh', async () => {
+  test('reset-backoff clears an imported main latch before the next background refresh', async () => {
     const now = Date.now()
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        mainAccountId: 'main-account-id',
-        quota: { enabled: false },
-        refresh: {
-          enabled: true,
-          refreshBeforeExpiryMinutes: 30,
-          mainLastRefreshError: {
-            message: 'Claude OAuth refresh failed: 400 — invalid_grant',
-            checkedAt: now - 1_000,
-            nextRetryAt: now + 24 * 60 * 60_000,
-            retryCount: 1,
-            accountIdentity: 'main-account-id',
-            status: 400,
-            permanent: true,
+      bindMainAccount(
+        createFallbackStorage({
+          accounts: [],
+          mainAccountId: 'main-account-id',
+          quota: { enabled: false },
+          refresh: {
+            enabled: true,
+            refreshBeforeExpiryMinutes: 30,
+            mainLastRefreshError: {
+              message: 'Claude OAuth refresh failed: 400 — invalid_grant',
+              checkedAt: now - 1_000,
+              nextRetryAt: now + 24 * 60 * 60_000,
+              retryCount: 1,
+              accountIdentity: syntheticMainAccountUuid,
+              tokenHash: hashRefreshToken('current-refresh'),
+              status: 400,
+              permanent: true,
+            },
           },
-        },
-      }),
+        }),
+        'sk-ant-oat01-current-access',
+      ),
       {
         access: 'sk-ant-oat01-current-access',
         refresh: 'current-refresh',
@@ -11919,19 +11973,22 @@ describe('auth.loader', () => {
       return { unref() {} }
     }) as unknown as typeof setInterval
     let tokenRefreshCalls = 0
-    globalThis.fetch = mock((input: any) => {
-      if (extractUrl(input).includes('/v1/oauth/token')) {
-        tokenRefreshCalls += 1
-        return Promise.resolve(
-          Response.json({
+    mainAccountIssues('sk-ant-oat01-refreshed-access')
+    globalThis.fetch = mock(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const admitted = await nativeBootstrapAnswer(input, init)
+        if (admitted) return admitted
+        if (extractUrl(input).includes('/v1/oauth/token')) {
+          tokenRefreshCalls += 1
+          return Response.json({
             refresh_token: 'refreshed-refresh',
             access_token: 'sk-ant-oat01-refreshed-access',
             expires_in: 8 * 60 * 60,
-          }),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
+          })
+        }
+        return new Response(null, { status: 200 })
+      },
+    ) as unknown as typeof fetch
 
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient, tempConfigDir, {
@@ -11950,6 +12007,10 @@ describe('auth.loader', () => {
     )
 
     expect(
+      (await readNativeRuntimeState()).main?.lastRefreshError?.permanent,
+    ).toBe(true)
+    expect(tokenRefreshCalls).toBe(0)
+    expect(
       (
         await applyMenuAction(plugin, 'session-1', {
           sectionId: 'Accounts',
@@ -11957,9 +12018,16 @@ describe('auth.loader', () => {
         })
       ).ok,
     ).toBe(true)
+    expect(
+      (await readNativeRuntimeState()).main?.lastRefreshError,
+    ).toBeUndefined()
     for (const handler of intervalHandlers) handler()
-    await waitForMockCall(mockClient.auth.set)
-
+    const refreshed = await waitForPoolCredential(
+      'main',
+      'sk-ant-oat01-refreshed-access',
+    )
+    expect(refreshed.credential.refresh).toBe('refreshed-refresh')
+    expect(mockClient.auth.set).not.toHaveBeenCalled()
     expect(tokenRefreshCalls).toBe(1)
     expect(
       (await readAccountStorage())?.refresh?.mainLastRefreshError,
@@ -11968,11 +12036,14 @@ describe('auth.loader', () => {
 
   test('background refresh uses a four-hour minimum window for main oauth', async () => {
     await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        quota: { enabled: false },
-        refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
-      }),
+      bindMainAccount(
+        createFallbackStorage({
+          accounts: [],
+          quota: { enabled: false },
+          refresh: { enabled: true, refreshBeforeExpiryMinutes: 30 },
+        }),
+        'sk-ant-oat01-old-access',
+      ),
       {
         access: 'sk-ant-oat01-old-access',
         refresh: 'old-refresh',
@@ -11985,22 +12056,20 @@ describe('auth.loader', () => {
       return { unref() {} }
     }) as unknown as typeof setInterval
 
-    globalThis.fetch = mock((input: any) => {
-      const url = extractUrl(input)
-      if (url.includes('/v1/oauth/token')) {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              refresh_token: 'early-refresh-new',
-              access_token: 'sk-ant-oat01-early-access-new',
-              expires_in: 3600,
-            }),
-            { status: 200 },
-          ),
-        )
-      }
-      return Promise.resolve(new Response(null, { status: 200 }))
-    }) as unknown as typeof fetch
+    mainAccountIssues('sk-ant-oat01-early-access-new')
+    globalThis.fetch = mock(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const admitted = await nativeBootstrapAnswer(input, init)
+        if (admitted) return admitted
+        if (extractUrl(input).includes('/v1/oauth/token'))
+          return Response.json({
+            refresh_token: 'early-refresh-new',
+            access_token: 'sk-ant-oat01-early-access-new',
+            expires_in: 3600,
+          })
+        return new Response(null, { status: 200 })
+      },
+    ) as unknown as typeof fetch
 
     const mockClient = createMockClient()
     const plugin = await getPlugin(mockClient, undefined, {
@@ -12019,17 +12088,18 @@ describe('auth.loader', () => {
     )
 
     for (const handler of intervalHandlers) handler()
-    await waitForMockCall(mockClient.auth.set)
-
-    expect(mockClient.auth.set).toHaveBeenCalledWith({
-      path: { id: 'anthropic' },
-      body: {
-        type: 'oauth',
-        refresh: 'early-refresh-new',
-        access: 'sk-ant-oat01-early-access-new',
-        expires: expect.any(Number),
-      },
+    const refreshed = await waitForPoolCredential(
+      'main',
+      'sk-ant-oat01-early-access-new',
+    )
+    expect(refreshed.credential).toMatchObject({
+      type: 'oauth',
+      refresh: 'early-refresh-new',
+      access: 'sk-ant-oat01-early-access-new',
+      expires: expect.any(Number),
     })
+    expect(refreshed.subject.binding.identity).toBe(syntheticMainAccountUuid)
+    expect(mockClient.auth.set).not.toHaveBeenCalled()
   })
 
   test('fetch wrapper backs off main oauth refresh after rate limits', async () => {
