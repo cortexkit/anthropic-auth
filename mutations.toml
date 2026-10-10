@@ -72,23 +72,6 @@ broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"
 
 [[control]]
-id = "header-routing-drops-refused-publication"
-guards = "A refused quota publication must remove its routing hint without retaining permission for paid fallback."
-file = "packages/opencode/src/index.ts"
-old = '''            headerRoutingObservations.delete(served.accountId)
-            logger.debug('quota', 'discarded pending response quota', {'''
-new = '''            logger.debug('quota', 'discarded pending response quota', {'''
-test_file = "packages/opencode/src/tests/index.test.ts"
-runner = "command"
-command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
-test_count_pattern = "CKDEV executed {count} tests"
-expect_red = ["auth.loader > quota header harvest > refused header publication removes a same-epoch pending observation"]
-expect_message = "error: expect(received).toEqual(expected)"
-broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
-broad_report = "tmp/mutations/opencode.xml"
-broad_id = "{name}"
-
-[[control]]
 id = "header-routing-raw-exhaustion-proof"
 guards = "Display rounding from 99.5 percent must not license paid fallback before actual OAuth exhaustion."
 file = "packages/opencode/src/index.ts"
@@ -150,4 +133,36 @@ expect_red = ["runtime reader refuses a foreign owner on the opened handle"]
 expect_message = "error: expect(received).toMatchObject(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "local-quota-survives-token-refresh"
+guards = "Account-owned quota must survive same-account token refresh while stale metadata and mixed writes remain refused."
+file = "packages/core/src/native-account-runtime.ts"
+old = "quota !== undefined && Object.keys(metadata).length === 0"
+new = "false"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > quota-only publication survives native token refresh without admitting stale metadata"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "local-metadata-requires-token-version"
+guards = "The account-only quota exception must not permit stale metadata or mixed patches after token refresh."
+file = "packages/core/src/native-account-runtime.ts"
+old = "quota !== undefined && Object.keys(metadata).length === 0"
+new = "true"
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+expect_red = ["auth.loader > quota header harvest > quota-only publication survives native token refresh without admitting stale metadata"]
+expect_message = "error: expect(received).toBe(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
 broad_id = "{name}"

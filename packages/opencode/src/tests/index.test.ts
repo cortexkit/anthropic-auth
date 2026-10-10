@@ -21,7 +21,10 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import type { PrimeManager } from '@cortexkit/anthropic-auth-core'
+import type {
+  NativeRefreshSubject,
+  PrimeManager,
+} from '@cortexkit/anthropic-auth-core'
 import * as Core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
@@ -1096,6 +1099,31 @@ async function replacePoolMainLogin(
     })
   } finally {
     runtime.close()
+  }
+}
+
+/** Require all stored fields that a known-account publication must carry. */
+function requireKnownPoolSubject(
+  subject: NativeRefreshSubject,
+): Parameters<
+  ReturnType<typeof createNativeAccountRuntime>['publishLocal']
+>[0] {
+  const { binding, credentialFingerprint, version } = subject
+  if (
+    !binding.identity ||
+    !credentialFingerprint ||
+    !version?.accessFingerprint ||
+    version.expires === undefined
+  )
+    throw new Error('Expected a complete known pool credential subject')
+  return {
+    binding: { ...binding, identity: binding.identity },
+    credentialFingerprint,
+    version: {
+      ...version,
+      accessFingerprint: version.accessFingerprint,
+      expires: version.expires,
+    },
   }
 }
 
@@ -16882,7 +16910,7 @@ describe('auth.loader', () => {
       }
     })
 
-    test('refused header publication removes a same-epoch pending observation', async () => {
+    test('refused header publication cannot persist superseded-epoch quota', async () => {
       await useTempAccountFile(
         harvestStorage([apiFallbackForHeaderTests], {
           routing: { mode: 'fallback-first' },
@@ -16932,13 +16960,16 @@ describe('auth.loader', () => {
         })
         try {
           const before = await reader.captureLocalSubject('main')
-          await refreshPoolMainElsewhere({
-            access: 'sk-ant-oat01-same-epoch-new-access',
-            refresh: 'main-refresh',
-            expires: Date.now() + 8 * 60 * 60_000,
-          })
+          await replacePoolMainLogin(
+            {
+              access: 'sk-ant-oat01-new-epoch-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 8 * 60 * 60_000,
+            },
+            { sameAccount: false, accountIdentity: poolMainIdentity() },
+          )
           const after = await reader.captureLocalSubject('main')
-          expect(after.binding.credentialEpoch).toBe(
+          expect(after.binding.credentialEpoch).toBeGreaterThan(
             before.binding.credentialEpoch,
           )
           expect(after.binding.identity).toBe(before.binding.identity)
@@ -16950,6 +16981,9 @@ describe('auth.loader', () => {
         }
         pause.release.open()
         expect(await pause.operations[0]).toBe(false)
+        expect((await readNativeRuntimeState()).main?.quota?.source).not.toBe(
+          'headers',
+        )
         await waitForLogRecord(
           records,
           (record) =>
@@ -16960,7 +16994,7 @@ describe('auth.loader', () => {
         expect((await result.fetch(MESSAGES_URL, EMPTY_POST)).status).toBe(200)
         expect(authorizations).toEqual([
           'Bearer sk-ant-oat01-main-access',
-          'Bearer sk-ant-oat01-same-epoch-new-access',
+          'Bearer sk-ant-oat01-new-epoch-access',
         ])
       } finally {
         pause.release.open()
@@ -17339,81 +17373,193 @@ describe('auth.loader', () => {
       ).toBeUndefined()
     })
 
+    test('quota-only publication survives native token refresh without admitting stale metadata', async () => {
+      await useTempAccountFile(harvestStorage())
+      globalThis.fetch = mock(
+        withNativeAdmission(async () => Response.json({})),
+      ) as unknown as typeof fetch
+      if (!migratedPool) throw new Error('Expected migrated pool')
+      const reader = createNativeAccountRuntime({
+        paths: migratedPool.paths,
+        host: 'opencode',
+      })
+      try {
+        expect((await reader.authorizeLocal('main')).status).toBe('usable')
+        const before = requireKnownPoolSubject(
+          await reader.captureLocalSubject('main'),
+        )
+        await refreshPoolMainElsewhere({
+          ...syntheticMainHostAuth(),
+          access: 'sk-ant-oat01-refreshed-quota-access',
+        })
+        const after = await reader.captureLocalSubject('main')
+        expect(after.binding.credentialEpoch).toBe(
+          before.binding.credentialEpoch,
+        )
+        expect(after.binding.identity).toBe(before.binding.identity)
+        expect(after.version?.accessFingerprint).not.toBe(
+          before.version?.accessFingerprint,
+        )
+        const quota: OAuthQuotaSnapshot = {
+          accountIdentity: before.binding.identity,
+          source: 'headers',
+          checkedAt: Date.now(),
+          five_hour: {
+            usedPercent: 78,
+            remainingPercent: 22,
+            checkedAt: Date.now(),
+          },
+        }
+        expect(
+          await reader.publishLocal(before, { quota, lastUsed: Date.now() }),
+        ).toBe(false)
+        expect(await reader.publishLocal(before, { quota })).toBe(true)
+        expect(
+          (await reader.read()).accounts.find(
+            (account) => account.id === 'main',
+          )?.quota?.five_hour?.usedPercent,
+        ).toBe(78)
+        expect(
+          await reader.publishLocal(before, { lastUsed: Date.now() }),
+        ).toBe(false)
+      } finally {
+        reader.close()
+      }
+    })
+
     test('main header push persists after access-token rotation for the same account', async () => {
-      let liveAccessToken = 'old-main-access'
+      const initialAuth = {
+        ...syntheticMainHostAuth(),
+        access: 'sk-ant-oat01-old-main-access',
+      }
+      let liveAccessToken = initialAuth.access
       const existingQuota = {
-        five_hour: {
-          usedPercent: 11,
-          remainingPercent: 89,
-          checkedAt: 1,
-        },
+        five_hour: { usedPercent: 11, remainingPercent: 89, checkedAt: 1 },
         source: 'poll' as const,
         checkedAt: 1,
       }
       await useTempAccountFile(
-        createFallbackStorage({
-          mainAccountId: 'account-x',
-          accounts: [],
-          quota: {
-            enabled: false,
-            mainQuota: existingQuota,
-            mainQuotaCheckedAt: 1,
-          },
-        }),
+        bindMainQuotaToAccount(
+          createFallbackStorage({
+            mainAccountId: 'account-x',
+            accounts: [],
+            quota: {
+              enabled: false,
+              mainQuota: existingQuota,
+              mainQuotaCheckedAt: 1,
+            },
+          }),
+          initialAuth.access,
+        ),
+        initialAuth,
       )
-      let resolveResponse: ((response: Response) => void) | undefined
-      let markRequestStarted: (() => void) | undefined
-      const requestStarted = new Promise<void>((resolve) => {
-        markRequestStarted = resolve
-      })
+      const requestStarted = bodyLifetime().gate()
+      const releaseResponse = bodyLifetime().gate()
       const requestAuthorizations: Array<string | null> = []
       globalThis.fetch = mock(
         withNativeAdmission(
-          (_input: string | URL | Request, init?: RequestInit) =>
-            new Promise<Response>((resolve) => {
-              requestAuthorizations.push(
-                new Headers(init?.headers).get('authorization'),
-              )
-              resolveResponse = resolve
-              markRequestStarted?.()
-            }),
+          async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            if (!extractUrl(input).includes('/v1/messages'))
+              return Response.json({})
+            requestAuthorizations.push(
+              new Headers(init?.headers).get('authorization'),
+            )
+            requestStarted.open()
+            await releaseResponse.wait
+            return new Response('main-ok', { headers: quotaHeaders })
+          },
         ),
       ) as unknown as typeof fetch
       const result = await loadFetch(() => liveAccessToken)
       const records: LogTestRecord[] = []
       __setLogTestSink((record) => records.push(record))
       setLogLevel('debug')
-
       const responsePromise = result.fetch(MESSAGES_URL, EMPTY_POST)
-      await requestStarted
-      liveAccessToken = 'new-main-access'
-      resolveResponse?.(new Response('main-ok', { headers: quotaHeaders }))
-      await responsePromise
-      await Bun.sleep(100)
-      const rawState = JSON.parse(
-        await readFile(
-          getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE),
-          'utf8',
-        ),
-      )
-      const reloaded = await readAccountStorage()
-
-      expect(
-        records.some(
-          (record) =>
-            record.channel === 'quota' &&
-            record.message === 'harvested response quota',
-        ),
-      ).toBe(true)
-      expect(requestAuthorizations[0]).toBe('Bearer old-main-access')
-      expect(rawState.main.quota.five_hour.usedPercent).toBe(78)
-      expect(rawState.main.quota.accountIdentity).toBe('account-x')
-      expect(rawState.main.quotaToken).toBeUndefined()
-      expect(reloaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(78)
-      expect(reloaded?.quota?.mainQuota?.accountIdentity).toBe('account-x')
-      expect(reloaded?.quota?.mainQuotaToken).toBeUndefined()
-      __setLogTestSink(null)
-      setLogLevel('info')
+      try {
+        await Promise.race([
+          requestStarted.wait,
+          responsePromise.then(() => {
+            throw new Error('Expected a held main model request')
+          }),
+        ])
+        if (!migratedPool) throw new Error('Expected migrated pool')
+        const reader = createNativeAccountRuntime({
+          paths: migratedPool.paths,
+          host: 'opencode',
+        })
+        try {
+          const before = requireKnownPoolSubject(
+            await reader.captureLocalSubject('main'),
+          )
+          liveAccessToken = 'sk-ant-oat01-new-main-access'
+          await refreshPoolMainElsewhere({
+            ...initialAuth,
+            access: liveAccessToken,
+          })
+          const after = await reader.captureLocalSubject('main')
+          expect(after.binding.credentialEpoch).toBe(
+            before.binding.credentialEpoch,
+          )
+          expect(after.binding.identity).toBe(before.binding.identity)
+          expect(after.version?.accessFingerprint).not.toBe(
+            before.version?.accessFingerprint,
+          )
+          expect(
+            await reader.publishLocal(before, {
+              quota: {
+                ...existingQuota,
+                accountIdentity: syntheticMainAccountUuid,
+                five_hour: {
+                  usedPercent: 99,
+                  remainingPercent: 1,
+                  checkedAt: Date.now(),
+                },
+                checkedAt: Date.now(),
+              },
+              lastUsed: Date.now(),
+            }),
+          ).toBe(false)
+          expect(
+            (await reader.read()).accounts.find(
+              (account) => account.id === 'main',
+            )?.quota?.five_hour?.usedPercent,
+          ).toBe(11)
+        } finally {
+          reader.close()
+        }
+        releaseResponse.open()
+        await responsePromise
+        const state = await waitForState(
+          (value) => value.main?.quota?.source === 'headers',
+        )
+        const reloaded = await readAccountStorage()
+        expect(
+          records.some(
+            (record) =>
+              record.channel === 'quota' &&
+              record.message === 'harvested response quota',
+          ),
+        ).toBe(true)
+        expect(requestAuthorizations[0]).toBe(
+          'Bearer sk-ant-oat01-old-main-access',
+        )
+        expect(state.main.quota.five_hour.usedPercent).toBe(78)
+        expect(state.main.quota.accountIdentity).toBe(syntheticMainAccountUuid)
+        expect(state.main.quotaToken).toBeUndefined()
+        expect(reloaded?.quota?.mainQuota?.five_hour?.usedPercent).toBe(78)
+        expect(reloaded?.quota?.mainQuota?.accountIdentity).toBe(
+          syntheticMainAccountUuid,
+        )
+        // In the policy view, mainQuotaToken is an account UUID, not a token.
+        expect(reloaded?.quota?.mainQuotaToken).toBe(syntheticMainAccountUuid)
+        expect(JSON.stringify(reloaded)).not.toContain(initialAuth.access)
+        expect(JSON.stringify(reloaded)).not.toContain(liveAccessToken)
+      } finally {
+        releaseResponse.open()
+        await Promise.allSettled([responsePromise])
+        __setLogTestSink(null)
+        setLogLevel('info')
+      }
     })
 
     test('fallback header push persists after access-token rotation for the same account', async () => {

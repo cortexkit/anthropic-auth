@@ -1069,17 +1069,22 @@ export function createNativeAccountRuntime(
     async publishLocal(subject, rawPatch) {
       const patch = captureNativeMetadataPatch(rawPatch)
       await authority()
+      const { quota, ...metadata } = patch
+      const quotaOnly =
+        quota !== undefined && Object.keys(metadata).length === 0
       const row = await poolRow(subject.binding.rowId)
       if (
-        !row ||
-        !nativeLocalCredentialValidationMatches(
-          subject,
-          subject.binding,
-          row.credential,
-        )
+        row?.stamp !== 'bound' ||
+        row.credential?.type !== 'oauth' ||
+        !nativeLocalPoolBindingMatches(subject.binding, paths, row) ||
+        (!quotaOnly &&
+          !nativeLocalCredentialValidationMatches(
+            subject,
+            subject.binding,
+            row.credential,
+          ))
       )
         return false
-      const { quota, ...metadata } = patch
       if (quota) {
         if (quota.accountIdentity !== subject.binding.identity)
           throw new NativeRuntimeError('publication-refused')
@@ -1094,8 +1099,12 @@ export function createNativeAccountRuntime(
           toNativeQuotaMap(quota),
         )
       }
-      return localWrite(subject, (old) =>
-        applyNativeMetadataPatch(old, metadata),
+      // Quota remains valid across a same-account refresh. Other metadata
+      // still requires the exact credential version that produced it.
+      return localWrite(
+        subject,
+        (old) => applyNativeMetadataPatch(old, metadata),
+        quotaOnly ? 'binding' : true,
       )
     },
     publishApi: (subject, patch) =>

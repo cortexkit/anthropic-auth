@@ -1,6 +1,6 @@
 # Mutation proofs for request guards
 
-`mutations.toml` records nine deliberately bounded runtime breaks against named
+`mutations.toml` records ten deliberately bounded runtime breaks against named
 assertions. Run it only in an isolated checkout: `ckdev-mutate` edits its working
 checkout; it does **not** create a scratch worktree. Never reset/check out a target
 while replay is active, and never point builds at a live host installation.
@@ -40,8 +40,9 @@ sibling repositories.
 | `fast-excludes-opus-46-47` | Widen `claude-opus-4-8` to `claude-opus-4-`, incorrectly enabling fast mode for Opus 4.6 and 4.7. | Core asserts that fast mode is not supported for Opus 4.6, 4.7 and `4.7[1m]`. |
 | `thinking-binding-excludes-api-key` | Call `applyThinkingBindingControls(body, 'drop_block')` even when Pi has no OAuth identity, bypassing the check that excludes API-key routes. | `buildAnthropicRequest — Fable/Mythos thinking > does not add Fable 5.1 binding controls to an API-key request`. |
 | `header-routing-current-credential-epoch` | Accept pending quota from a replaced login. | The next request must use the replacement OAuth token, not a paid API key. |
-| `header-routing-drops-refused-publication` | Retain pending quota after its publication is refused. | A real token rotation followed by refused publication must remove the paid-routing hint. |
 | `header-routing-raw-exhaustion-proof` | Treat raw utilization of 0.995 as exhausted. | Display rounding must not permit paid API fallback. |
+| `local-quota-survives-token-refresh` | Reject writes containing only quota when the token rotates, although the account UUID and credential epoch are unchanged. | The account's quota must survive refresh; writes containing other metadata must still require the original token version. |
+| `local-metadata-requires-token-version` | Apply the account-only quota exception to writes that also contain other metadata. | Writes containing metadata from the old token must still be refused after refresh, even when they also contain quota. |
 | `runtime-read-no-follow` | Follow a symlink installed between inspection and opening. | The runtime reader must reject the symlink. |
 | `runtime-read-opened-mode` | Ignore the opened file's permissions. | A replacement with mode 0644 must be rejected. |
 | `runtime-read-opened-owner` | Ignore the opened file's owner. | A foreign owner on the opened handle must be rejected. |
