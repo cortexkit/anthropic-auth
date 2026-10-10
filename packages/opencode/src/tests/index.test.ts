@@ -10654,6 +10654,14 @@ describe('auth.loader', () => {
           const authorization = new Headers(
             input instanceof Request ? input.headers : init?.headers,
           ).get('authorization')
+          if (extractUrl(input).includes('/api/oauth/usage')) {
+            return Promise.resolve(
+              Response.json({
+                five_hour: { utilization: 25 },
+                seven_day: { utilization: 30 },
+              }),
+            )
+          }
           firstFetchCalls.push(authorization ?? '')
           if (authorization === 'Bearer sk-ant-oat01-main-access') {
             mainProfileStarted.raise()
@@ -10697,9 +10705,9 @@ describe('auth.loader', () => {
       (state) => state.fallbacks[0]?.tierLabel === 'Team · Max 5x',
     )
 
-    expect(firstFetchCalls).toEqual([
-      'Bearer sk-ant-oat01-main-access',
+    expect(firstFetchCalls.toSorted()).toEqual([
       'Bearer sk-ant-oat01-fallback-access',
+      'Bearer sk-ant-oat01-main-access',
     ])
     expect(nextTestFetch).not.toHaveBeenCalled()
   })
