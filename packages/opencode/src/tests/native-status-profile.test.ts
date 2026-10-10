@@ -42,22 +42,23 @@ const fallbackIdentity = '22222222-2222-4222-8222-222222222222'
 const otherIdentity = '33333333-3333-4333-8333-333333333333'
 /** Which account each synthetic bearer belongs to. */
 const bearerIdentity: Record<string, string> = {
-  'synthetic-main-access': mainIdentity,
-  'synthetic-main-rotated': mainIdentity,
-  'synthetic-fallback-access': fallbackIdentity,
-  'synthetic-fallback-rotated': fallbackIdentity,
-  'synthetic-fallback-rotated-again': fallbackIdentity,
-  'synthetic-other-access': otherIdentity,
-  'synthetic-other-rotated': otherIdentity,
+  'sk-ant-oat01-synthetic-main-access': mainIdentity,
+  'sk-ant-oat01-synthetic-main-rotated': mainIdentity,
+  'sk-ant-oat01-synthetic-fallback-access': fallbackIdentity,
+  'sk-ant-oat01-synthetic-fallback-rotated': fallbackIdentity,
+  'sk-ant-oat01-synthetic-fallback-rotated-again': fallbackIdentity,
+  'sk-ant-oat01-synthetic-other-access': otherIdentity,
+  'sk-ant-oat01-synthetic-other-rotated': otherIdentity,
   'synthetic-vault-main-bearer': mainIdentity,
   'synthetic-vault-fallback-bearer': fallbackIdentity,
 }
 /** The access token a synthetic refresh credential is exchanged for. */
 const rotatedAccess: Record<string, string> = {
-  'synthetic-main-refresh': 'synthetic-main-rotated',
-  'synthetic-fallback-refresh': 'synthetic-fallback-rotated',
-  'synthetic-fallback-refresh-again': 'synthetic-fallback-rotated-again',
-  'synthetic-other-refresh': 'synthetic-other-rotated',
+  'synthetic-main-refresh': 'sk-ant-oat01-synthetic-main-rotated',
+  'synthetic-fallback-refresh': 'sk-ant-oat01-synthetic-fallback-rotated',
+  'synthetic-fallback-refresh-again':
+    'sk-ant-oat01-synthetic-fallback-rotated-again',
+  'synthetic-other-refresh': 'sk-ant-oat01-synthetic-other-rotated',
 }
 /** The tier the profile endpoint reports for each account. */
 const accountTier: Record<string, string> = {
@@ -124,7 +125,7 @@ function localLegacyConfig() {
         id: 'fallback-route',
         type: 'oauth',
         enabled: true,
-        access: 'synthetic-fallback-access',
+        access: 'sk-ant-oat01-synthetic-fallback-access',
         refresh: 'synthetic-fallback-refresh',
         expires: Date.now() + 8 * 60 * 60_000,
       },
@@ -142,7 +143,7 @@ function localHostAuth() {
   return {
     anthropic: {
       type: 'oauth',
-      access: 'synthetic-main-access',
+      access: 'sk-ant-oat01-synthetic-main-access',
       refresh: 'synthetic-main-refresh',
       expires: Date.now() + 8 * 60 * 60_000,
     },
@@ -560,7 +561,7 @@ test('a fresh saved profile survives access rotation without a new profile reque
           runtime.close()
         }
         expect(await readFile(paths.state, 'utf8')).toContain(
-          'synthetic-fallback-rotated',
+          'sk-ant-oat01-synthetic-fallback-rotated',
         )
       },
     },
@@ -597,7 +598,7 @@ test('a profile read for a replaced account is not shown or saved for its succes
         await runtime.loginOAuth({
           routeId: 'fallback-route',
           credential: {
-            access: 'synthetic-other-access',
+            access: 'sk-ant-oat01-synthetic-other-access',
             refresh: 'synthetic-other-refresh',
             expires: Date.now() + 8 * 60 * 60_000,
           },
@@ -780,7 +781,7 @@ test('a profile whose save was refused is not shown once the refusal is known', 
       await runtime.loginOAuth({
         routeId: 'fallback-route',
         credential: {
-          access: 'synthetic-fallback-rotated',
+          access: 'sk-ant-oat01-synthetic-fallback-rotated',
           refresh: 'synthetic-fallback-refresh-again',
           expires: Date.now() + 8 * 60 * 60_000,
         },
