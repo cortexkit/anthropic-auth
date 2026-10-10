@@ -181,6 +181,16 @@ function bodyLifetime(): TestLifetime {
 
 type TestBody = () => unknown
 
+async function drainBeforeReset(
+  lifetime: TestLifetime | undefined,
+  reset: () => void | Promise<void>,
+) {
+  // Bun can time out the test before its async body finishes. Keep its
+  // transport and environment intact until that body and its work drain.
+  await lifetime?.finish()
+  await reset()
+}
+
 /** Bun's test, with the body run inside this test's fixture lifetime. */
 function test(name: string, body: TestBody, timeout?: number) {
   bunTest(name, () => bodyLifetime().runBody(body), timeout)
@@ -6529,20 +6539,38 @@ describe('auth.loader', () => {
   })
 
   afterEach(async () => {
-    globalThis.fetch = originalFetch
-    pluginRuntimeOverrides = {}
-    Math.random = originalRandom
-    Date.now = originalDateNow
-    resetNotificationsForTest()
-    __setInitialSidebarRoutingTestHooks(null)
-    __setSidebarStateWriteTestHooks(null)
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
-    await drainSidebarWrites()
-    restoreProcessTestFiles()
-    // Clear tempConfigDir without deleting the account files used by plugins.
-    // TestLifetime disposes those plugins and joins their work before removal.
-    tempConfigDir = undefined
+    await drainBeforeReset(testLifetime, async () => {
+      globalThis.fetch = originalFetch
+      pluginRuntimeOverrides = {}
+      Math.random = originalRandom
+      Date.now = originalDateNow
+      resetNotificationsForTest()
+      __setInitialSidebarRoutingTestHooks(null)
+      __setSidebarStateWriteTestHooks(null)
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
+      await drainSidebarWrites()
+      restoreProcessTestFiles()
+      tempConfigDir = undefined
+    })
+  })
+
+  test('teardown drains an interrupted body before resetting its request transport', async () => {
+    const scope = new TestLifetime()
+    const resume = scope.gate()
+    const events: string[] = []
+    let transport = () => events.push('owned-request')
+    const body = scope.runBody(async () => {
+      await resume.wait
+      events.push('body-resumed')
+      transport()
+    })
+    await drainBeforeReset(scope, () => {
+      events.push('transport-reset')
+      transport = () => events.push('network-guard')
+    })
+    await body
+    expect(events).toEqual(['body-resumed', 'owned-request', 'transport-reset'])
   })
 
   test('returns empty object for non-oauth auth', async () => {
