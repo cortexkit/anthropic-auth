@@ -2004,6 +2004,7 @@ const anthropicAuthPlugin = async (
   async function persistPushedQuota(
     served: ServedQuotaHeaders,
     entry: QuotaEntry,
+    previousEntry: QuotaEntry | null | undefined,
   ): Promise<QuotaEntry | null> {
     const snapshot = await nativeAccounts.read()
     const account = snapshot.accounts.find(
@@ -2025,12 +2026,55 @@ const anthropicAuthPlugin = async (
         ? await nativeAccounts.publishLocal(served.localSubject, { quota })
         : false
     if (!persisted) {
-      if (served.accountId === 'main') quotaManager.clearMain()
-      else if (quotaManager.getAllFallbacks().get(served.accountId) === entry)
+      if (served.accountId === 'main') {
+        if (
+          quotaManager.getMain(served.mainQuotaIdentity?.quotaKey) ===
+          previousEntry
+        )
+          quotaManager.clearMain()
+      } else if (
+        quotaManager.getAllFallbacks().get(served.accountId) === previousEntry
+      ) {
         quotaManager.clearFallback(served.accountId)
+      }
+      logger.debug('quota', 'native quota publication refused', {
+        accountId: served.accountId,
+      })
       return null
     }
-    return { ...entry, quota }
+    // The pool merges quota under its locks. A poll can finish while this
+    // publication waits, so read the committed result instead of replaying
+    // the pre-write merge into cache and dropping that poll's fields.
+    const currentSnapshot = await nativeAccounts.read()
+    const current = currentSnapshot.accounts.find(
+      (candidate) => candidate.id === served.accountId,
+    )
+    if (
+      !current?.quota ||
+      current.accountIdentity !== served.anthropicAccountUuid ||
+      current.source !== account.source
+    )
+      return null
+    if (
+      served.localSubject &&
+      current.binding?.credentialEpoch !==
+        served.localSubject.binding.credentialEpoch
+    )
+      return null
+    if (
+      served.scopedAttempt &&
+      current.credentialId !== served.scopedAttempt.credentialId
+    )
+      return null
+    return {
+      ...entry,
+      quota: current.quota,
+      refreshAfter: getQuotaNextRefreshAt(
+        current.quota,
+        currentSnapshot.policyStorage,
+        entry.checkedAt,
+      ),
+    }
   }
 
   function logPersistFailure(error: unknown) {
@@ -2185,33 +2229,51 @@ const anthropicAuthPlugin = async (
           return
         }
       }
-      const entry =
+      const previousEntry =
         served.accountId === 'main'
-          ? quotaManager.pushMainFromHeaders(
-              mainQuotaIdentity?.quotaKey,
-              incoming,
-            )
-          : quotaManager.pushFallbackFromHeaders(served.accountId, incoming, {
-              authLineageId: served.authLineageId,
-            })
-      if (!entry) return
+          ? quotaManager.getMain(mainQuotaIdentity?.quotaKey)
+          : quotaManager.getAllFallbacks().get(served.accountId)
+      const checkedAt = incoming.checkedAt ?? Date.now()
       void (async () => {
-        let feedEntry = entry
+        let persistedEntry: QuotaEntry | null
         try {
-          const persistedEntry = await persistPushedQuota(served, entry)
-          if (persistedEntry === null) return
-          feedEntry = persistedEntry
+          persistedEntry = await persistPushedQuota(
+            served,
+            { quota: incoming, checkedAt, refreshAfter: checkedAt },
+            previousEntry,
+          )
         } catch (error) {
           logPersistFailure(error)
+          return
         }
+        if (persistedEntry === null) return
+        if (
+          served.accountId === 'main' &&
+          quotaManager.getMainQuotaIdentityGeneration() !==
+            mainQuotaIdentity?.generation
+        )
+          return
+        // Publication checks the credential that supplied these headers before
+        // any cache or display can use them. A rejected old response must never
+        // become a transient quota reading for replacement credentials.
+        const entry = persistedEntry
+        if (served.accountId === 'main')
+          quotaManager.setMain(mainQuotaIdentity?.quotaKey, entry)
+        else
+          quotaManager.setFallback(served.accountId, entry, {
+            authLineageId: served.authLineageId,
+          })
         void refreshSidebarQuota().catch(() => {})
-        await publishQuotaHeaderFeed(served, feedEntry)
+        await publishQuotaHeaderFeed(served, entry)
+        logger.debug('quota', 'harvested response quota', {
+          account: served.accountId,
+          fiveHourPercent: entry.quota.five_hour?.usedPercent,
+          sevenDayPercent: entry.quota.seven_day?.usedPercent,
+          source: 'headers',
+        })
       })().catch(logQuotaHeaderFeedFailure)
-      logger.debug('quota', 'harvested response quota', {
+      logger.trace('quota', 'response quota awaiting publication', {
         account: served.accountId,
-        fiveHourPercent: entry.quota.five_hour?.usedPercent,
-        sevenDayPercent: entry.quota.seven_day?.usedPercent,
-        source: 'headers',
       })
     } catch (error) {
       warnQuotaNormalizeOnce(error)

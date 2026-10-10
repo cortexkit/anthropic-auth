@@ -41,6 +41,7 @@ import {
   getClaudeCodeIdentityForVerifiedAccount,
   hashRefreshToken,
   isCustodyTombstoneOAuth,
+  isNativeLocalCredentialValidation,
   isOAuthAccount,
   type LogTestRecord,
   loadAccounts,
@@ -2637,6 +2638,8 @@ describe('quota header feed integration', () => {
         ])
       }
       let firstRequest: Promise<Response> | undefined
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
       try {
         const plugin = await getPlugin()
         const result = await plugin.auth.loader(
@@ -2649,8 +2652,9 @@ describe('quota header feed integration', () => {
             }),
           { models: {} },
         )
+        setLogLevel('trace')
         // Response completion also records account use under the pool locks.
-        // Release the poll when headers reach the cache, not after that write.
+        // Release the poll after header arrival, not after that write.
         firstRequest = Promise.resolve(result.fetch(MESSAGES_URL, EMPTY_POST))
         bodyLifetime().trackDetached(firstRequest)
         await entered.wait
@@ -2661,25 +2665,34 @@ describe('quota header feed integration', () => {
             }
           }
         ).__quotaManager
-        for (
-          let attempt = 0;
-          attempt < 100 &&
-          cache.getMain(mainAccountId)?.quota.checkedAt !== clock;
-          attempt++
+        await waitForLogRecord(
+          records,
+          (record) =>
+            record.channel === 'quota' &&
+            record.message === 'response quota awaiting publication' &&
+            record.payload?.account === 'main',
+          'header observation awaiting the held poll write',
         )
-          await Bun.sleep(10)
-        expect(cache.getMain(mainAccountId)?.quota.checkedAt).toBe(clock)
+        expect(cache.getMain(mainAccountId)?.quota.checkedAt).toBe(
+          pollCheckedAt,
+        )
         release.open()
         if (!pollWriter)
           throw new Error(
             'First model request did not start the native poll writer',
           )
         expect(await pollWriter).toBe(true)
+        expect((await readAccountStorage())?.quota?.mainQuota?.scoped).toEqual(
+          scoped,
+        )
         const firstResponse = await firstRequest
         expect(firstResponse.status).toBe(200)
         await firstResponse.text()
         await waitForAccountStorage(
           (loaded) => loaded?.quota?.mainQuota?.checkedAt === clock,
+        )
+        expect((await readAccountStorage())?.quota?.mainQuota?.scoped).toEqual(
+          scoped,
         )
         clock += 1_000
         const secondResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
@@ -2716,6 +2729,8 @@ describe('quota header feed integration', () => {
         release.open()
         await Promise.allSettled([pollWriter, firstRequest])
         writer.close()
+        __setLogTestSink(null)
+        setLogLevel('info')
       }
     } finally {
       Date.now = originalNow
@@ -2844,46 +2859,50 @@ describe('quota header feed integration', () => {
   })
 
   test('stale fallback headers do not persist or publish after re-login', async () => {
-    const fallbackAccess = 'fallback-lineage-a-access'
+    const fallbackAccess = 'sk-ant-oat01-fallback-lineage-a-access'
     const fallbackCheckedAt = Date.now()
-    let releaseFallbackResponse: ((response: Response) => void) | undefined
-    let fallbackStarted: (() => void) | undefined
-    const fallbackResponse = new Promise<Response>((resolve) => {
-      releaseFallbackResponse = resolve
-    })
-    const fallbackRequestStarted = new Promise<void>((resolve) => {
-      fallbackStarted = resolve
-    })
+    const responseGate = bodyLifetime().gate()
+    const startedGate = bodyLifetime().gate()
+    let fallbackValue = new Response('{}', { status: 503 })
+    const fallbackResponse = responseGate.wait.then(() => fallbackValue)
+    const releaseFallbackResponse = (response: Response) => {
+      fallbackValue = response
+      responseGate.open()
+    }
+    const fallbackStarted = () => startedGate.open()
+    const fallbackRequestStarted = startedGate.wait
     await useTempAccountFile(
-      createFallbackStorage({
-        quotaHeaderFeed: { enabled: true },
-        quota: {
-          ...createFallbackStorage().quota,
-          checkIntervalMinutes: 60,
-        },
-        accounts: [
-          {
-            id: 'fallback-1',
-            type: 'oauth',
-            access: fallbackAccess,
-            refresh: 'fallback-lineage-a-refresh',
-            expires: Date.now() + 5 * 60 * 60 * 1000,
-            authLineageId: 'lineage-a',
-            quota: {
-              five_hour: {
-                usedPercent: 25,
-                remainingPercent: 75,
-                checkedAt: fallbackCheckedAt,
-              },
-              seven_day: {
-                usedPercent: 30,
-                remainingPercent: 70,
-                checkedAt: fallbackCheckedAt,
+      bindPoolAccounts(
+        createFallbackStorage({
+          quotaHeaderFeed: { enabled: true },
+          quota: {
+            ...createFallbackStorage().quota,
+            checkIntervalMinutes: 60,
+          },
+          accounts: [
+            {
+              id: 'fallback-1',
+              type: 'oauth',
+              access: fallbackAccess,
+              refresh: 'fallback-lineage-a-refresh',
+              expires: Date.now() + 5 * 60 * 60 * 1000,
+              authLineageId: 'lineage-a',
+              quota: {
+                five_hour: {
+                  usedPercent: 25,
+                  remainingPercent: 75,
+                  checkedAt: fallbackCheckedAt,
+                },
+                seven_day: {
+                  usedPercent: 30,
+                  remainingPercent: 70,
+                  checkedAt: fallbackCheckedAt,
+                },
               },
             },
-          },
-        ],
-      }),
+          ],
+        }),
+      ),
     )
     globalThis.fetch = mock(
       withNativeAdmission((input: any, init?: RequestInit) => {
@@ -2901,6 +2920,7 @@ describe('quota header feed integration', () => {
     ) as unknown as typeof fetch
 
     const records: LogTestRecord[] = []
+    let responsePromise: Promise<Response> | undefined
     let fallbackAtPersistenceReject: unknown
     const sidebarStates: unknown[] = []
     try {
@@ -2921,8 +2941,7 @@ describe('quota header feed integration', () => {
         records.push(record)
         if (
           record.channel === 'quota' &&
-          record.message ===
-            'skipped stale fallback quota persistence after lineage change'
+          record.message === 'native quota publication refused'
         ) {
           queueMicrotask(() => {
             fallbackAtPersistenceReject = quotaManager
@@ -2931,16 +2950,25 @@ describe('quota header feed integration', () => {
           })
         }
       })
-      expect(
-        quotaManager.getFallback('fallback-1', {
-          authLineageId: 'lineage-a',
+      responsePromise = Promise.resolve(
+        result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
         }),
-      ).not.toBeNull()
-      const responsePromise = result.fetch(MESSAGES_URL, {
-        method: 'POST',
-        body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [] }),
-      })
-      await fallbackRequestStarted
+      )
+      bodyLifetime().trackDetached(responsePromise)
+      await Promise.race([
+        fallbackRequestStarted,
+        responsePromise.then(() => {
+          throw new Error(
+            'Request completed without reaching the expected fallback',
+          )
+        }),
+      ])
+      expect(
+        quotaManager.getAllFallbacks().get('fallback-1')?.quota.five_hour
+          ?.usedPercent,
+      ).toBe(25)
       await drainSidebarWrites()
       __setSidebarStateWriteTestHooks({
         beforeRename: async (_stateFile, tempFile) => {
@@ -2948,30 +2976,57 @@ describe('quota header feed integration', () => {
         },
       })
 
-      const replacement = await loadAccounts(
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-      )
-      if (!replacement) throw new Error('fallback storage unexpectedly missing')
-      const replacementAccount = replacement.accounts.find(
+      if (!migratedPool) throw new Error('Missing migrated pool')
+      const replacementRuntime = createNativeAccountRuntime({
+        paths: migratedPool.paths,
+        host: 'opencode',
+      })
+      const newAccess = 'sk-ant-oat01-fallback-lineage-b-access'
+      loginIssues(fallbackAccess, newAccess)
+      try {
+        await replacementRuntime.loginOAuth({
+          routeId: 'fallback-1',
+          accountIdentity: syntheticFallbackAccountUuid(0),
+          replace: true,
+          credential: {
+            access: newAccess,
+            refresh: 'fallback-lineage-b-refresh',
+            expires: Date.now() + 8 * 60 * 60_000,
+          },
+        })
+        const subject =
+          await replacementRuntime.captureLocalSubject('fallback-1')
+        if (!isNativeLocalCredentialValidation(subject))
+          throw new Error(
+            'Replacement subject has no exact account and credential version',
+          )
+        expect(
+          await replacementRuntime.publishLocal(subject, {
+            quota: {
+              accountIdentity: subject.binding.identity,
+              checkedAt: fallbackCheckedAt,
+              five_hour: {
+                usedPercent: 60,
+                remainingPercent: 40,
+                checkedAt: fallbackCheckedAt,
+              },
+              seven_day: {
+                usedPercent: 70,
+                remainingPercent: 30,
+                checkedAt: fallbackCheckedAt,
+              },
+            },
+          }),
+        ).toBe(true)
+      } finally {
+        replacementRuntime.close()
+      }
+      const replacedAccount = (await readAccountStorage())?.accounts.find(
         (account) => account.id === 'fallback-1',
       )
-      if (!replacementAccount || !isOAuthAccount(replacementAccount)) {
-        throw new Error('fallback account unexpectedly missing')
-      }
-      replacementAccount.authLineageId = 'lineage-b'
-      replacementAccount.quota = {
-        five_hour: {
-          usedPercent: 60,
-          remainingPercent: 40,
-          checkedAt: fallbackCheckedAt,
-        },
-        seven_day: {
-          usedPercent: 70,
-          remainingPercent: 30,
-          checkedAt: fallbackCheckedAt,
-        },
-      }
-      await saveAccounts(replacement)
+      if (!replacedAccount || !isOAuthAccount(replacedAccount))
+        throw new Error('Replacement OAuth account is missing')
+      expect(replacedAccount.quota?.five_hour?.usedPercent).toBe(60)
       setLogLevel('trace')
 
       releaseFallbackResponse?.(
@@ -2992,10 +3047,8 @@ describe('quota header feed integration', () => {
         (record) =>
           record.level === 'debug' &&
           record.channel === 'quota' &&
-          record.message ===
-            'skipped stale fallback quota persistence after lineage change' &&
-          record.payload?.accountId === 'fallback-1' &&
-          record.payload?.servedLineage === 'lineage-a',
+          record.message === 'native quota publication refused' &&
+          record.payload?.accountId === 'fallback-1',
         'stale fallback quota persistence discard',
       )
       await drainSidebarWrites()
@@ -3009,16 +3062,29 @@ describe('quota header feed integration', () => {
           : undefined,
       ).toBe(fallbackCheckedAt)
       expect(fallbackAtPersistenceReject).toBeUndefined()
-      // A rejected harvest must not add a quota-only refresh that re-reads the
-      // replacement account's newer persisted numbers.
-      expect(
-        sidebarStates.some(
-          (state: any) =>
-            state.fallbacks?.[0]?.quota?.five_hour?.usedPercent === 60,
-        ),
-      ).toBe(false)
+      if (!settledAccount || !isOAuthAccount(settledAccount))
+        throw new Error('Settled OAuth account is missing')
+      // Route completion may display the replacement's verified quota. The
+      // refused old response must not supply its quota to that display.
+      expect(sidebarStates).not.toContainEqual(
+        expect.objectContaining({
+          fallbacks: expect.arrayContaining([
+            expect.objectContaining({
+              id: 'fallback-1',
+              quota: expect.objectContaining({
+                five_hour: expect.objectContaining({ usedPercent: 4 }),
+              }),
+            }),
+          ]),
+        }),
+      )
+      expect(settledAccount?.quota?.five_hour?.usedPercent).toBe(60)
+      expect(settledAccount?.quota?.seven_day?.usedPercent).toBe(70)
       expect(await readFeedEntries()).toEqual([])
     } finally {
+      responseGate.open()
+      await Promise.allSettled([responsePromise, fallbackResponse])
+      await drainSidebarWrites()
       __setLogTestSink(null)
       __setSidebarStateWriteTestHooks(null)
       setLogLevel('info')
