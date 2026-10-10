@@ -10260,6 +10260,9 @@ describe('auth.loader', () => {
   test('boot profile hydration publishes tier labels to the sidebar', async () => {
     delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    expect(
+      process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION,
+    ).toBeUndefined()
     let profileCalls = 0
     globalThis.fetch = mock(
       withNativeAdmission((input: string | URL | Request) => {

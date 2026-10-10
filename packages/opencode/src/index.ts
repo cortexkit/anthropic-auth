@@ -1995,6 +1995,7 @@ const anthropicAuthPlugin = async (
   // instance never leaves a metadata write running after it is torn down.
   const profilePublications = new Set<Promise<unknown>>()
   const profileHydrationShutdown = new AbortController()
+  let bootProfileHydrationStarted = false
 
   function profileHydrationKey(id: string, accountIdentity?: string) {
     return JSON.stringify([id, accountIdentity ?? null])
@@ -2054,12 +2055,35 @@ const anthropicAuthPlugin = async (
             hydration.profile = profile
             hydration.persistence = 'pending'
           }
-          const saving = persisted.then((outcome) => {
+          const saving = persisted.then(async (outcome) => {
             hydration.persistence = outcome
             if (outcome === 'failed')
               logger.debug('quota', 'failed to save account profile', {
                 account: account.id,
               })
+            if (
+              outcome === 'saved' &&
+              !profileHydrationShutdown.signal.aborted
+            ) {
+              // Display-only writes reread native state. Refresh after the
+              // profile commits so that reread can include the new tier.
+              try {
+                const current = await nativeAccounts.read()
+                if (!profileHydrationShutdown.signal.aborted)
+                  await writeSidebarState(current.policyStorage, {
+                    ...lastSidebarRouting,
+                    routingAuthoritative: false,
+                  })
+              } catch {
+                logger.debug(
+                  'quota',
+                  'failed to publish account profile to sidebar',
+                  {
+                    account: account.id,
+                  },
+                )
+              }
+            }
           })
           profilePublications.add(saving)
           void saving.then(() => profilePublications.delete(saving))
@@ -5665,6 +5689,34 @@ const anthropicAuthPlugin = async (
           }
         }
         const journal = await readNativeMigrationJournal(nativePaths)
+        if (
+          !bootProfileHydrationStarted &&
+          isCustodyTombstoneOAuth(activation, 'anthropic') &&
+          process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION !== '1'
+        ) {
+          // Show native account tiers before the first model request, without
+          // making provider initialization wait for profile network or storage.
+          bootProfileHydrationStarted = true
+          const hydration = readNativeSnapshotForDisplay(
+            profileHydrationShutdown.signal,
+          )
+            .then((snapshot) => {
+              if (!profileHydrationShutdown.signal.aborted)
+                return writeSidebarState(snapshot.policyStorage, {
+                  ...lastSidebarRouting,
+                  routingAuthoritative: false,
+                })
+            })
+            .catch(() => {
+              if (!profileHydrationShutdown.signal.aborted)
+                logger.debug(
+                  'quota',
+                  'startup account profile hydration failed',
+                )
+            })
+          profilePublications.add(hydration)
+          void hydration.then(() => profilePublications.delete(hydration))
+        }
         const getAuth = async (
           modelId?: string,
           signal?: AbortSignal,
