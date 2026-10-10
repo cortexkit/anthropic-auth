@@ -34,7 +34,6 @@ import {
   ClaudeOAuthRefreshError,
   type CommandApplyRequest,
   type CommandApplyResult,
-  CustodyTombstoneRefreshError,
   createNativeAccountRuntime,
   createNativePoolStore,
   custodyTombstoneOAuth,
@@ -9099,83 +9098,118 @@ describe('auth.loader', () => {
     })
   })
 
-  test('fallback-first adopts legacy persisted main quota for sidebar without refetching', async () => {
-    await useTempAccountFile(
-      createFallbackStorage({
-        routing: { mode: 'fallback-first' },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 10, seven_day: 20 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            five_hour: { usedPercent: 6, remainingPercent: 94 },
-            seven_day: { usedPercent: 75, remainingPercent: 25 },
+  for (const bound of [true, false]) {
+    test(
+      bound
+        ? 'fallback-first reuses migrated account-bound main quota for sidebar without refetching'
+        : 'fallback-first refuses legacy main quota attributed only to an old access token',
+      async () => {
+        const checkedAt = Date.now()
+        const storage = createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 10, seven_day: 20 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              five_hour: { usedPercent: 6, remainingPercent: 94, checkedAt },
+              seven_day: { usedPercent: 75, remainingPercent: 25, checkedAt },
+              checkedAt,
+            },
+            mainQuotaCheckedAt: checkedAt,
           },
-          mainQuotaCheckedAt: Date.now(),
-          mainQuotaToken: tokenFingerprint('old-main-access'),
-        } as AccountStorage['quota'],
-      }),
-    )
-
-    const authorizations: string[] = []
-    let mainQuotaCalls = 0
-    globalThis.fetch = mock(
-      withNativeAdmission((input: any, init: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/api/oauth/usage')) {
-          mainQuotaCalls++
-          expect(new Headers(init?.headers).get('authorization')).toBe(
-            'Bearer sk-ant-oat01-main-access',
-          )
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({
-                five_hour: { utilization: 12 },
-                seven_day: { utilization: 34 },
-              }),
-              { status: 200 },
-            ),
-          )
+        })
+        for (const account of storage.accounts) {
+          if (account.type !== 'oauth') continue
+          account.expires = checkedAt + 8 * 60 * 60_000
+          account.quota = {
+            checkedAt,
+            five_hour: { usedPercent: 30, remainingPercent: 70, checkedAt },
+            seven_day: { usedPercent: 40, remainingPercent: 60, checkedAt },
+          }
         }
+        bindPoolAccounts(storage)
+        if (!bound && storage.quota?.mainQuota) {
+          storage.quota.mainQuota.accountIdentity = undefined
+          storage.quota.mainQuotaToken = tokenFingerprint('old-main-access')
+        }
+        await useTempAccountFile(storage)
+        const imported = await readNativeRuntimeState()
+        expect(imported.main?.accountIdentity).toBe(syntheticMainAccountUuid)
+        if (bound)
+          expect(imported.main?.quota).toMatchObject({
+            accountIdentity: syntheticMainAccountUuid,
+            five_hour: { usedPercent: 6 },
+            seven_day: { usedPercent: 75 },
+          })
+        else expect(imported.main?.quota).toBeUndefined()
 
-        authorizations.push(
-          new Headers(init?.headers).get('authorization') ?? '',
+        const authorizations: string[] = []
+        let mainQuotaCalls = 0
+        globalThis.fetch = mock(
+          withNativeAdmission(
+            (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+              const url = extractUrl(input)
+              if (url.includes('/api/oauth/usage')) {
+                mainQuotaCalls++
+                expect(new Headers(init?.headers).get('authorization')).toBe(
+                  'Bearer sk-ant-oat01-main-access',
+                )
+                return Promise.resolve(
+                  new Response(
+                    JSON.stringify({
+                      five_hour: { utilization: 12 },
+                      seven_day: { utilization: 34 },
+                    }),
+                    { status: 200 },
+                  ),
+                )
+              }
+
+              authorizations.push(
+                new Headers(init?.headers).get('authorization') ?? '',
+              )
+              return Promise.resolve(new Response(null, { status: 200 }))
+            },
+          ),
+        ) as unknown as typeof fetch
+
+        const plugin = await getPlugin()
+        const result = await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth',
+              access: 'sk-ant-oat01-main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 100000,
+            }),
+          { models: {} },
         )
-        return Promise.resolve(new Response(null, { status: 200 }))
-      }),
-    ) as unknown as typeof fetch
 
-    const plugin = await getPlugin()
-    const result = await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'sk-ant-oat01-main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100000,
-        }),
-      { models: {} },
+        await result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        })
+
+        const state = await waitForSidebarState(
+          (candidate) =>
+            candidate.activeId === 'fallback-1' &&
+            (bound
+              ? candidate.main.quota?.five_hour?.usedPercent === 6
+              : candidate.main.quota === null),
+        )
+        expect(state.route).toBe('fallback-first')
+        if (bound) expect(state.main.quota?.seven_day?.usedPercent).toBe(75)
+        else expect(state.main.quota).toBeNull()
+        expect(mainQuotaCalls).toBe(0)
+        expect(authorizations[0]).toBe('Bearer sk-ant-oat01-fallback-access')
+      },
     )
-
-    await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: JSON.stringify({
-        model: 'claude-opus-4-8',
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    })
-
-    const state = await waitForSidebarState(
-      (candidate) =>
-        candidate.activeId === 'fallback-1' &&
-        candidate.main.quota?.five_hour?.usedPercent === 6,
-    )
-    expect(state.route).toBe('fallback-first')
-    expect(state.main.quota?.seven_day?.usedPercent).toBe(75)
-    expect(mainQuotaCalls).toBe(0)
-    expect(authorizations[0]).toBe('Bearer sk-ant-oat01-fallback-access')
-  })
+  }
 
   test('fetch wrapper sets OAuth headers and prefixes tools', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
@@ -12890,77 +12924,270 @@ describe('auth.loader', () => {
     )
   })
 
-  test('sticky 401 retry refuses a foreign-provider tombstone before the token endpoint', async () => {
-    const checkedAt = Date.now()
-    await useTempAccountFile(
-      createFallbackStorage({
-        accounts: [],
-        routing: { mode: 'sticky-balanced' },
-        quota: {
-          enabled: true,
-          checkIntervalMinutes: 5,
-          minimumRemaining: { five_hour: 1, seven_day: 1 },
-          failClosedOnUnknownQuota: true,
-          mainQuota: {
-            checkedAt,
-            five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
-            seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
-          },
-          mainQuotaCheckedAt: checkedAt,
-          mainQuotaToken: tokenFingerprint('sk-ant-oat01-live-main-access'),
-        },
-      }),
+  for (const duringRefresh of [false, true]) {
+    test(
+      duringRefresh
+        ? 'sticky 401 retry persists consumed successor but refuses it after host activation changes'
+        : 'sticky 401 retry refuses a foreign-provider tombstone before the token endpoint',
+      async () => {
+        const checkedAt = Date.now()
+        const login = {
+          access: 'sk-ant-oat01-live-main-access',
+          refresh: 'live-main-refresh',
+          expires: checkedAt + 8 * 60 * 60_000,
+        }
+        await useTempAccountFile(
+          bindMainQuotaToAccount(
+            createFallbackStorage({
+              accounts: [],
+              routing: { mode: 'sticky-balanced' },
+              quota: {
+                enabled: true,
+                checkIntervalMinutes: 5,
+                minimumRemaining: { five_hour: 1, seven_day: 1 },
+                failClosedOnUnknownQuota: true,
+                mainQuota: {
+                  checkedAt,
+                  five_hour: {
+                    usedPercent: 10,
+                    remainingPercent: 90,
+                    checkedAt,
+                  },
+                  seven_day: {
+                    usedPercent: 10,
+                    remainingPercent: 90,
+                    checkedAt,
+                  },
+                },
+                mainQuotaCheckedAt: checkedAt,
+              },
+            }),
+            login.access,
+          ),
+          login,
+        )
+        const pool = migratedPool
+        if (!pool) throw new Error('Expected migrated pool')
+        const hostAuthPath = pool.hostAuthPath
+        const messageAuthorizations: string[] = []
+        const tokenEndpointCalls: string[] = []
+        const successor = {
+          access: 'sk-ant-oat01-consumed-revoked',
+          refresh: 'consumed-revoked-refresh',
+        }
+        mainAccountIssues(successor.access)
+        async function revokeActivation() {
+          const authFile = JSON.parse(await readFile(hostAuthPath, 'utf8'))
+          authFile.anthropic = {
+            ...custodyTombstoneOAuth('openai'),
+            access: 'claustrum-tombstone:v1:openai',
+            expires: 0,
+          }
+          await writeFile(hostAuthPath, JSON.stringify(authFile), {
+            mode: 0o600,
+          })
+        }
+        globalThis.fetch = mock(
+          withNativeBootstrap(
+            async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+              const url = extractUrl(input)
+              if (url === TOKEN_URL) {
+                tokenEndpointCalls.push(url)
+                if (duringRefresh) {
+                  await revokeActivation()
+                  return Response.json({
+                    access_token: successor.access,
+                    refresh_token: successor.refresh,
+                    expires_in: 8 * 60 * 60,
+                  })
+                }
+                return Promise.resolve(
+                  new Response('unexpected', { status: 200 }),
+                )
+              }
+              if (url.includes('/v1/messages')) {
+                messageAuthorizations.push(
+                  new Headers(init?.headers).get('authorization') ?? '',
+                )
+                if (!duringRefresh) await revokeActivation()
+                return new Response('unauthorized', { status: 401 })
+              }
+              return Promise.resolve(new Response('{}', { status: 200 }))
+            },
+          ),
+        ) as unknown as typeof fetch
+
+        const plugin = await getPlugin()
+        const result = await plugin.auth.loader(
+          () => Promise.resolve({ type: 'oauth', ...login }),
+          { models: {} },
+        )
+
+        let refusal: unknown
+        try {
+          await result.fetch(MESSAGES_URL, {
+            method: 'POST',
+            headers: { 'x-session-affinity': 'tombstone-sticky-401' },
+            body: JSON.stringify({
+              model: 'claude-opus-5',
+              max_tokens: 1,
+              messages: [{ role: 'user', content: 'hello' }],
+            }),
+          })
+        } catch (error) {
+          refusal = error
+        }
+        expect(messageAuthorizations).toEqual([
+          'Bearer sk-ant-oat01-live-main-access',
+        ])
+        expect(tokenEndpointCalls).toEqual(duringRefresh ? [TOKEN_URL] : [])
+        if (duringRefresh) {
+          // The provider already issued replacement credentials, so losing
+          // them could leave only an invalid old refresh token. Removing
+          // OpenCode's activation blocks model sends, not credential storage.
+          expect(
+            (await waitForPoolCredential('main', successor.access)).credential
+              .refresh,
+          ).toBe(successor.refresh)
+        }
+        expect(
+          (await readNativeRuntimeState()).main?.lastRefreshError,
+        ).toBeUndefined()
+        expect(refusal).toBeInstanceOf(Error)
+        expect(
+          refusal instanceof Error ? refusal.message : undefined,
+        ).toContain('Native OAuth requires inert OpenCode activation')
+        await plugin.dispose?.()
+      },
     )
-    let currentAuth: Record<string, unknown> = {
-      type: 'oauth',
-      access: 'sk-ant-oat01-live-main-access',
-      refresh: 'live-main-refresh',
+  }
+
+  test('physical OAuth authorization refuses host revocation during fresh token validation', async () => {
+    const checkedAt = Date.now()
+    const login = {
+      access: 'sk-ant-oat01-validation-initial',
+      refresh: 'validation-refresh',
       expires: checkedAt + 8 * 60 * 60_000,
     }
-    const messageAuthorizations: string[] = []
-    const tokenEndpointCalls: string[] = []
-    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
-      const url = extractUrl(input as string | URL | Request)
-      if (url === TOKEN_URL) {
-        tokenEndpointCalls.push(url)
-        return Promise.resolve(new Response('unexpected', { status: 200 }))
-      }
-      if (url.includes('/v1/messages')) {
-        messageAuthorizations.push(
-          new Headers(init?.headers).get('authorization') ?? '',
-        )
-        currentAuth = {
-          ...custodyTombstoneOAuth('openai'),
-          access: 'claustrum-tombstone:v1:openai',
-          expires: 0,
+    const successorAccess = 'sk-ant-oat01-validation-rotated'
+    await useTempAccountFile(
+      bindMainQuotaToAccount(
+        createFallbackStorage({
+          accounts: [],
+          routing: { mode: 'sticky-balanced' },
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 1, seven_day: 1 },
+            failClosedOnUnknownQuota: true,
+            mainQuota: {
+              checkedAt,
+              five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt },
+              seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt },
+            },
+            mainQuotaCheckedAt: checkedAt,
+          },
+        }),
+        login.access,
+      ),
+      login,
+    )
+    const pool = migratedPool
+    if (!pool) throw new Error('Expected migrated pool')
+    const store = createNativePoolStore({
+      paths: pool.paths,
+      quota: nativeQuotaCodec,
+    })
+    let initialBootstrapDone = false
+    let rotated = false
+    const bootstraps: Array<string | null> = []
+    const modelAuthorizations: Array<string | null> = []
+    let tokenCalls = 0
+    globalThis.fetch = Object.assign(
+      mock(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        const url = extractUrl(input)
+        const bearer = new Headers(init?.headers).get('authorization')
+        if (url.includes('/api/claude_cli/bootstrap')) {
+          bootstraps.push(bearer)
+          if (bearer === `Bearer ${login.access}`) initialBootstrapDone = true
+          else if (bearer === `Bearer ${successorAccess}`) {
+            const authFile = JSON.parse(
+              await readFile(pool.hostAuthPath, 'utf8'),
+            )
+            authFile.anthropic = {
+              ...custodyTombstoneOAuth('openai'),
+              access: 'claustrum-tombstone:v1:openai',
+              expires: 0,
+            }
+            await writeFile(pool.hostAuthPath, JSON.stringify(authFile), {
+              mode: 0o600,
+            })
+          } else throw new Error('Unexpected bootstrap credential')
+          return Response.json({
+            oauth_account: { account_uuid: syntheticMainAccountUuid },
+          })
         }
-        return Promise.resolve(new Response('unauthorized', { status: 401 }))
-      }
-      return Promise.resolve(new Response('{}', { status: 200 }))
-    }) as unknown as typeof fetch
-
+        if (url === TOKEN_URL) tokenCalls++
+        if (url.includes('/v1/messages')) modelAuthorizations.push(bearer)
+        return Response.json({})
+      }),
+      { preconnect() {} },
+    )
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
-      () => Promise.resolve(currentAuth as never),
+      async () => {
+        if (initialBootstrapDone && !rotated) {
+          rotated = true
+          const settings = await store.readSettings()
+          if (
+            settings.status !== 'ready' ||
+            typeof settings.settings.mainAccountId !== 'string'
+          )
+            throw new Error('Expected primary row')
+          // Simulate another process rotating the pool token after initial
+          // validation. The new token's bootstrap mock then replaces OpenCode's
+          // activation slot before that authorization returns.
+          await store.rotate(settings.settings.mainAccountId, {
+            type: 'oauth',
+            access: successorAccess,
+            refresh: login.refresh,
+            expires: login.expires + 1000,
+          })
+        }
+        return { type: 'oauth', ...login }
+      },
       { models: {} },
     )
-
-    await expect(
-      result.fetch(MESSAGES_URL, {
+    let refusal: unknown
+    try {
+      await result.fetch(MESSAGES_URL, {
         method: 'POST',
-        headers: { 'x-session-affinity': 'tombstone-sticky-401' },
+        headers: { 'x-session-affinity': 'revoked-token-validation' },
         body: JSON.stringify({
           model: 'claude-opus-5',
           max_tokens: 1,
           messages: [{ role: 'user', content: 'hello' }],
         }),
-      }),
-    ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
-    expect(messageAuthorizations).toEqual([
-      'Bearer sk-ant-oat01-live-main-access',
+      })
+    } catch (error) {
+      refusal = error
+    }
+    expect(rotated).toBe(true)
+    expect(bootstraps).toEqual([
+      `Bearer ${login.access}`,
+      `Bearer ${successorAccess}`,
     ])
-    expect(tokenEndpointCalls).toEqual([])
-    await plugin.dispose?.()
+    expect(modelAuthorizations).toEqual([])
+    expect(tokenCalls).toBe(0)
+    expect(refusal instanceof Error ? refusal.message : undefined).toContain(
+      'Native OAuth requires inert OpenCode activation',
+    )
+    expect(
+      (await waitForPoolCredential('main', successorAccess)).credential.refresh,
+    ).toBe(login.refresh)
+    expect(
+      (await readNativeRuntimeState()).main?.lastRefreshError,
+    ).toBeUndefined()
   })
 
   test('sticky 401 retries with a concurrently rotated main access token', async () => {

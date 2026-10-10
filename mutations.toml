@@ -234,3 +234,45 @@ expect_message = "error: expect(received).toBe(expected)"
 broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/core", "tmp/mutations/core.xml"]
 broad_report = "tmp/mutations/core.xml"
 broad_id = "{name}"
+
+[[control]]
+id = "native-activation-before-401-refresh"
+guards = "A revoked host activation must not trigger a credential refresh."
+file = "packages/opencode/src/index.ts"
+old = '''              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()
+              const current = await authorizeOAuth('''
+new = '''              init?.signal?.throwIfAborted()
+              const current = await authorizeOAuth('''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+prebuild = ["bun", "run", "--cwd", "packages/core", "build"]
+expect_red = ["auth.loader > sticky 401 retry refuses a foreign-provider tombstone before the token endpoint"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"
+
+[[control]]
+id = "native-activation-after-authorization"
+guards = "Activation revocation during physical credential authorization must prevent model dispatch."
+file = "packages/opencode/src/index.ts"
+old = '''                oauthAccountId === 'main' ? 'last-main' : 'serve',
+              )
+              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()'''
+new = '''                oauthAccountId === 'main' ? 'last-main' : 'serve',
+              )
+              init?.signal?.throwIfAborted()'''
+test_file = "packages/opencode/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "scripts/run-mutation-bun.ts", "packages/opencode/src/tests/index.test.ts", "{test}"]
+test_count_pattern = "CKDEV executed {count} tests"
+prebuild = ["bun", "run", "--cwd", "packages/core", "build"]
+expect_red = ["auth.loader > physical OAuth authorization refuses host revocation during fresh token validation"]
+expect_message = "error: expect(received).toEqual(expected)"
+broad_command = ["bun", "scripts/run-mutation-bun.ts", "--broad", "packages/opencode", "tmp/mutations/opencode.xml"]
+broad_report = "tmp/mutations/opencode.xml"
+broad_id = "{name}"

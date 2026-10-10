@@ -5735,6 +5735,12 @@ const anthropicAuthPlugin = async (
           profilePublications.add(hydration)
           void hydration.then(() => profilePublications.delete(hydration))
         }
+        function requireNativeActivation(currentActivation: unknown) {
+          if (!isCustodyTombstoneOAuth(currentActivation, 'anthropic'))
+            throw new Error(
+              'Native OAuth requires inert OpenCode activation; run offline setup',
+            )
+        }
         const getAuth = async (
           modelId?: string,
           signal?: AbortSignal,
@@ -5756,11 +5762,7 @@ const anthropicAuthPlugin = async (
               credentialFailure: undefined,
               deferred: false,
             }
-          if (!isCustodyTombstoneOAuth(currentActivation, 'anthropic')) {
-            throw new Error(
-              'Native OAuth requires inert OpenCode activation; run offline setup',
-            )
-          }
+          requireNativeActivation(currentActivation)
           const primarySnapshot = await nativeAccounts.read()
           headerRoutingPolicyStorage = primarySnapshot.policyStorage
           const primaryAccount = primarySnapshot.accounts.find(
@@ -6011,6 +6013,11 @@ const anthropicAuthPlugin = async (
             modelId?: string,
             signal?: AbortSignal,
           ) {
+            // A provider's 401 cannot authorize refresh after OpenCode's
+            // native activation marker is removed or changed. Recheck the
+            // host auth slot before and after awaiting the credentials.
+            requireNativeActivation(await hostGetAuth())
+            signal?.throwIfAborted()
             const credential = await authorizeOAuth(
               'main',
               signal,
@@ -6018,6 +6025,8 @@ const anthropicAuthPlugin = async (
               modelId,
               'refresh',
             )
+            requireNativeActivation(await hostGetAuth())
+            signal?.throwIfAborted()
             return credential.accessToken
           }
 
@@ -6749,6 +6758,10 @@ const anthropicAuthPlugin = async (
             const requestAuthority = nativeAuthorization
             let retryFromVault: NativeCustodyReceipt | undefined
             const authorizePhysical = async (rejectedAccessToken?: string) => {
+              // Every direct or relay attempt still needs the native host
+              // activation, including retries after an upstream 401.
+              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()
               const current = await authorizeOAuth(
                 oauthAccountId,
                 init?.signal ?? undefined,
@@ -6756,6 +6769,8 @@ const anthropicAuthPlugin = async (
                 modelForIdentity,
                 oauthAccountId === 'main' ? 'last-main' : 'serve',
               )
+              requireNativeActivation(await hostGetAuth())
+              init?.signal?.throwIfAborted()
               if (
                 current.accountIdentity !== requestAuthority.accountIdentity ||
                 Boolean(current.scopedAttempt) !==
