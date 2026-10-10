@@ -1517,6 +1517,33 @@ async function readNativeSettings(): Promise<Record<string, unknown>> {
   }
 }
 
+/** Publish a poll through the current native credential's guarded writer. */
+async function publishNativeMainQuota(quota: OAuthQuotaSnapshot) {
+  if (!migratedPool) throw new Error('This test has no migrated pool')
+  const runtime = createNativeAccountRuntime({
+    paths: migratedPool.paths,
+    host: 'opencode',
+  })
+  try {
+    const authorization = await runtime.authorizeLocal('main')
+    if (authorization.status !== 'usable')
+      throw new Error(
+        `Main quota publication cannot authorize: ${authorization.status}`,
+      )
+    if (!authorization.binding.identity)
+      throw new Error('Main quota publication requires an account UUID')
+    if (
+      !(await runtime.publishLocal(authorization.subject, {
+        quota: { ...quota, accountIdentity: authorization.binding.identity },
+      }))
+    )
+      throw new Error('Main quota publication refused the current credential')
+    return authorization.subject
+  } finally {
+    runtime.close()
+  }
+}
+
 /**
  * Per-account runtime state as the native pool records it, in the shape of
  * the retired legacy state file: `main` and `accounts[routeId]`, each with
@@ -2505,8 +2532,8 @@ describe('quota header feed integration', () => {
     let clock = 1_000_000
     Date.now = () => clock
     try {
-      const mainAccountId = 'cache-seeded-main'
-      const accessToken = 'sk-ant-oat-cache-seeded'
+      const mainAccountId = syntheticMainAccountUuid
+      const accessToken = 'sk-ant-oat01-cache-seeded'
       const pollCheckedAt = 900_000
       const initialPollQuota: OAuthQuotaSnapshot = {
         source: 'poll',
@@ -2535,110 +2562,161 @@ describe('quota header feed integration', () => {
           checkedAt: pollCheckedAt,
         },
       ]
-      const extraUsage = {
+      const extraUsage: NonNullable<OAuthQuotaSnapshot['extraUsage']> = {
         used: { amountMinor: 1261, currency: 'USD', exponent: 2 },
         limit: { amountMinor: 10000, currency: 'USD', exponent: 2 },
         utilizationPercent: 12.61,
         severity: 'normal',
         exhausted: false,
       }
-      const storage = createFallbackStorage({
+      const storage = bindMainQuotaToAccount(
+        createFallbackStorage({
+          mainAccountId,
+          quotaHeaderFeed: { enabled: true },
+          accounts: [],
+          quota: {
+            ...createFallbackStorage().quota,
+            mainQuota: initialPollQuota,
+            mainQuotaCheckedAt: pollCheckedAt,
+            mainQuotaToken: tokenFingerprint(accessToken),
+          },
+        }),
+        accessToken,
         mainAccountId,
-        quotaHeaderFeed: { enabled: true },
-        accounts: [],
-        quota: {
-          ...createFallbackStorage().quota,
-          mainQuota: initialPollQuota,
-          mainQuotaCheckedAt: pollCheckedAt,
-          mainQuotaToken: tokenFingerprint(accessToken),
-        },
-      })
-      await useTempAccountFile(storage)
-      await saveAccountState(
-        storage,
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-        {
-          mainQuota: true,
-        },
       )
+      await useTempAccountFile(storage, {
+        access: accessToken,
+        refresh: 'main-refresh',
+        expires: Date.now() + 8 * 60 * 60_000,
+      })
       process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-      globalThis.fetch = mock((input: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/claude_cli/bootstrap')) {
-          return Promise.resolve(
-            Response.json({ oauth_account: { account_uuid: mainAccountId } }),
-          )
-        }
-        if (url.includes('/v1/messages')) {
-          return Promise.resolve(
-            new Response('{}', {
+      let startPollWriter: () => Promise<void> = async () => {
+        throw new Error('Poll writer is not ready')
+      }
+      let modelRequests = 0
+      globalThis.fetch = mock(
+        withNativeAdmission(async (input: Parameters<typeof fetch>[0]) => {
+          if (extractUrl(input).includes('/v1/messages')) {
+            if (modelRequests++ === 0) await startPollWriter()
+            return new Response('{}', {
               status: 200,
               headers: {
                 'anthropic-ratelimit-unified-5h-utilization': '0.04',
                 'anthropic-ratelimit-unified-7d-utilization': '0.52',
               },
-            }),
-          )
-        }
-        return Promise.resolve(Response.json({}))
-      }) as unknown as typeof fetch
-      // Keep the first header persistence pending to model a slower writer on the same host.
-      const stateWriteLock = await acquireRefreshFileLock({
-        name: 'state-write',
-        ttlMs: 10_000,
-        path: process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-        renew: true,
-      })
-      if (!stateWriteLock) throw new Error('failed to hold account state lock')
-
-      const plugin = await getPlugin()
-      const result = await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth' as const,
-            access: accessToken,
-            refresh: 'main-refresh',
-            expires: Date.now() + 100000,
-          }),
-        { models: {} },
-      )
-      const firstResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
-      await firstResponse.text()
-
-      const statePath = getAccountStatePath(
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-      )
-      const state = JSON.parse(await readFile(statePath, 'utf8')) as {
-        main?: Record<string, unknown>
-      }
-      state.main = {
-        ...(state.main ?? {}),
-        quota: {
-          ...initialPollQuota,
-          scoped,
-          extraUsage,
+            })
+          }
+          throw new Error(`Unexpected test endpoint: ${extractUrl(input)}`)
+        }),
+      ) as unknown as typeof fetch
+      const pollSubject = await publishNativeMainQuota(initialPollQuota)
+      if (!migratedPool) throw new Error('Missing migrated fixture')
+      const entered = bodyLifetime().gate()
+      const release = bodyLifetime().gate()
+      // Pause a real pool quota write after credential admission. The header
+      // harvest must reconcile the poll's fields when that write completes.
+      const writer = createNativeAccountRuntime({
+        paths: migratedPool.paths,
+        host: 'opencode',
+        beforePoolWrite: async () => {
+          entered.open()
+          await release.wait
         },
-        quotaCheckedAt: pollCheckedAt + 50_000,
-        quotaToken: tokenFingerprint(accessToken),
+      })
+      let pollWriter: ReturnType<typeof writer.publishLocal> | undefined
+      startPollWriter = async () => {
+        pollWriter = writer.publishLocal(pollSubject, {
+          quota: { ...initialPollQuota, scoped, extraUsage },
+        })
+        bodyLifetime().trackDetached(pollWriter)
+        await Promise.race([
+          entered.wait,
+          pollWriter.then(() => {
+            throw new Error('Poll writer did not reach its pause')
+          }),
+        ])
       }
-      await writeFile(statePath, `${JSON.stringify(state)}\n`)
-      await stateWriteLock.release()
-      await waitForAccountStorage(
-        (loaded) => loaded?.quota?.mainQuotaCheckedAt === clock,
-      )
-
-      clock += 1_000
-      const secondResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
-      await secondResponse.text()
-      const secondEntry = (
-        await waitForFeedEntries(
-          (entries) => entries.length === 1,
-          'one published entry',
+      let firstRequest: Promise<Response> | undefined
+      try {
+        const plugin = await getPlugin()
+        const result = await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth',
+              access: accessToken,
+              refresh: 'main-refresh',
+              expires: Date.now() + 100000,
+            }),
+          { models: {} },
         )
-      )[0] as any
-      expect(secondEntry.quota.scoped).toEqual(scoped)
-      expect(secondEntry.quota.extraUsage).toEqual(extraUsage)
-      expect(secondEntry.quota.bindingWindow).toBe('claude-weekly-scoped-fable')
+        // Response completion also records account use under the pool locks.
+        // Release the poll when headers reach the cache, not after that write.
+        firstRequest = Promise.resolve(result.fetch(MESSAGES_URL, EMPTY_POST))
+        bodyLifetime().trackDetached(firstRequest)
+        await entered.wait
+        const cache = (
+          plugin as unknown as {
+            __quotaManager: {
+              getMain(identity: string): { quota: OAuthQuotaSnapshot } | null
+            }
+          }
+        ).__quotaManager
+        for (
+          let attempt = 0;
+          attempt < 100 &&
+          cache.getMain(mainAccountId)?.quota.checkedAt !== clock;
+          attempt++
+        )
+          await Bun.sleep(10)
+        expect(cache.getMain(mainAccountId)?.quota.checkedAt).toBe(clock)
+        release.open()
+        if (!pollWriter)
+          throw new Error(
+            'First model request did not start the native poll writer',
+          )
+        expect(await pollWriter).toBe(true)
+        const firstResponse = await firstRequest
+        expect(firstResponse.status).toBe(200)
+        await firstResponse.text()
+        await waitForAccountStorage(
+          (loaded) => loaded?.quota?.mainQuota?.checkedAt === clock,
+        )
+        clock += 1_000
+        const secondResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
+        expect(secondResponse.status).toBe(200)
+        await secondResponse.text()
+        const secondEntry = (
+          await waitForFeedEntries(
+            (entries) =>
+              entries.length === 1 &&
+              entries[0] !== null &&
+              typeof entries[0] === 'object' &&
+              'observed_at_ms' in entries[0] &&
+              entries[0].observed_at_ms === clock,
+            'second header observation',
+          )
+        )[0]
+        if (
+          secondEntry === null ||
+          typeof secondEntry !== 'object' ||
+          !('quota' in secondEntry)
+        )
+          throw new Error('Published feed entry has no quota')
+        const quota = secondEntry.quota
+        if (quota === null || typeof quota !== 'object')
+          throw new Error('Published quota is not an object')
+        expect('scoped' in quota ? quota.scoped : undefined).toEqual(scoped)
+        expect('extraUsage' in quota ? quota.extraUsage : undefined).toEqual(
+          extraUsage,
+        )
+        expect('bindingWindow' in quota ? quota.bindingWindow : undefined).toBe(
+          'claude-weekly-scoped-fable',
+        )
+      } finally {
+        release.open()
+        await Promise.allSettled([pollWriter, firstRequest])
+        writer.close()
+      }
     } finally {
       Date.now = originalNow
       delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
@@ -2650,9 +2728,9 @@ describe('quota header feed integration', () => {
     const clock = 1_000_000
     Date.now = () => clock
     try {
-      const mainAccountId = 'rotated-token-main'
-      const pollAccessToken = 'sk-ant-oat-poll-token'
-      const rotatedAccessToken = 'sk-ant-oat-rotated-token'
+      const mainAccountId = syntheticMainAccountUuid
+      const pollAccessToken = 'sk-ant-oat01-poll-token'
+      const rotatedAccessToken = 'sk-ant-oat01-rotated-token'
       const pollCheckedAt = 900_000
       const scoped = [
         {
@@ -2700,42 +2778,47 @@ describe('quota header feed integration', () => {
           mainQuotaToken: tokenFingerprint(pollAccessToken),
         },
       })
-      await useTempAccountFile(storage)
-      await saveAccountState(
-        storage,
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
-        { mainQuota: true },
+      await useTempAccountFile(
+        bindMainQuotaToAccount(storage, pollAccessToken, mainAccountId),
+        {
+          access: pollAccessToken,
+          refresh: 'poll-refresh-token',
+          expires: clock + 8 * 60 * 60_000,
+        },
       )
       process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
-      globalThis.fetch = mock((input: any) => {
-        const url = extractUrl(input)
-        if (url.includes('/claude_cli/bootstrap')) {
-          return Promise.resolve(
-            Response.json({ oauth_account: { account_uuid: mainAccountId } }),
-          )
-        }
-        if (url.includes('/v1/messages')) {
-          return Promise.resolve(
-            new Response('{}', {
+      const served: Array<string | null> = []
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+            if (!extractUrl(input).includes('/v1/messages'))
+              throw new Error(`Unexpected test endpoint: ${extractUrl(input)}`)
+            served.push(new Headers(init?.headers).get('authorization'))
+            return new Response('{}', {
               status: 200,
               headers: {
                 'anthropic-ratelimit-unified-5h-utilization': '0.11',
                 'anthropic-ratelimit-unified-7d-utilization': '0.22',
               },
-            }),
-          )
-        }
-        return Promise.resolve(Response.json({}))
-      }) as unknown as typeof fetch
+            })
+          },
+        ),
+      ) as unknown as typeof fetch
+      mainAccountIssues(rotatedAccessToken)
+      await refreshPoolLoginElsewhere('main', {
+        access: rotatedAccessToken,
+        refresh: 'rotated-refresh-token',
+        expires: clock + 5 * 60 * 60_000,
+      })
 
       const plugin = await getPlugin()
       const result = await plugin.auth.loader(
         () =>
           Promise.resolve({
             type: 'oauth' as const,
-            access: rotatedAccessToken,
-            refresh: 'rotated-refresh-token',
-            expires: clock + 5 * 60 * 60 * 1000,
+            access: pollAccessToken,
+            refresh: 'poll-refresh-token',
+            expires: clock + 8 * 60 * 60_000,
           }),
         { models: {} },
       )
@@ -2752,9 +2835,8 @@ describe('quota header feed integration', () => {
       expect(persisted?.quota?.mainQuota?.bindingWindow).toBe(
         'claude-weekly-scoped-fable',
       )
-      expect(persisted?.quota?.mainQuotaToken).toBe(
-        tokenFingerprint(pollAccessToken),
-      )
+      expect(persisted?.quota?.mainQuotaToken).toBe(mainAccountId)
+      expect(served).toEqual([`Bearer ${rotatedAccessToken}`])
     } finally {
       Date.now = originalNow
       delete process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION
