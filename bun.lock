@@ -53,7 +53,7 @@
         "@clack/prompts": "^1.6.0",
         "@cortexkit/anthropic-auth-core": "2.0.3",
         "@opentui/core": "0.6.0",
-        "@opentui/solid": "0.6.0",
+        "@opentui/solid": "0.6.5",
         "jsonc-parser": "^3.3.1",
         "solid-js": "1.9.12",
       },
@@ -507,7 +507,7 @@
 
     "@opentui/core-win32-x64": ["@opentui/core-win32-x64@0.6.0", "", { "os": "win32", "cpu": "x64" }, "sha512-J9KwN5kr8npZWYzmqPtILUBnYyprs/T5PHcDUabJmReVS/VSScG7NtjB+ezylWMQlz8EaKFpBXa/9PKIag1Hew=="],
 
-    "@opentui/solid": ["@opentui/solid@0.6.0", "", { "dependencies": { "@babel/core": "7.29.7", "@babel/preset-typescript": "7.27.1", "@opentui/core": "0.6.0", "babel-plugin-module-resolver": "5.0.2", "babel-preset-solid": "1.9.12", "entities": "7.0.1", "s-js": "^0.4.9" }, "peerDependencies": { "solid-js": "1.9.12" } }, "sha512-yEFcZbVTuexvHCDjuxxL/05FDnW2FhnnO+57xvx9fasaznq3SWIMcYBA0pb+bDUxFaoPwW3Cb5IPcENDvHAVQg=="],
+    "@opentui/solid": ["@opentui/solid@0.6.5", "", { "dependencies": { "@babel/core": "7.29.7", "@babel/preset-typescript": "7.27.1", "@opentui/core": "0.6.5", "babel-plugin-module-resolver": "5.0.2", "babel-preset-solid": "1.9.12", "entities": "7.0.1", "s-js": "^0.4.9" }, "peerDependencies": { "solid-js": "1.9.12" } }, "sha512-EVhvH9+lq6j/+vJ0twpLtjdi/9r9YIH0pqn2WrP1NWFmY55zD3zRfJSL+kpeXAIHjYNKUuMy3W08Ba1Macm9Cw=="],
 
     "@poppinss/colors": ["@poppinss/colors@4.1.6", "", { "dependencies": { "kleur": "^4.1.5" } }, "sha512-H9xkIdFswbS8n1d6vmRd8+c10t2Qe+rZITbbDHHkQixH5+2x1FDGmi/0K+WgWiqQFKPSlIYB7jlH6Kpfn6Fleg=="],
 
@@ -1277,6 +1277,8 @@
 
     "@opentui/core/marked": ["marked@17.0.1", "", { "bin": { "marked": "bin/marked.js" } }, "sha512-boeBdiS0ghpWcSwoNm/jJBwdpFaMnZWRzjA6SkUMYb40SVaN1x7mmfGKp0jvexGcx+7y2La5zRZsYFZI6Qpypg=="],
 
+    "@opentui/solid/@opentui/core": ["@opentui/core@0.6.5", "", { "dependencies": { "bun-ffi-structs": "0.3.1", "diff": "9.0.0", "marked": "17.0.1", "string-width": "7.2.0" }, "optionalDependencies": { "@opentui/core-darwin-arm64": "0.6.5", "@opentui/core-darwin-x64": "0.6.5", "@opentui/core-linux-arm64": "0.6.5", "@opentui/core-linux-arm64-musl": "0.6.5", "@opentui/core-linux-x64": "0.6.5", "@opentui/core-linux-x64-musl": "0.6.5", "@opentui/core-win32-arm64": "0.6.5", "@opentui/core-win32-x64": "0.6.5" }, "peerDependencies": { "web-tree-sitter": "0.25.10" } }, "sha512-OAonnjtLIIgg1rW7uwJ8IA8Weft9St7eG3LCq4rppkNqIYbCQlUR03Pv9a10ooc2SXM9bqkHH/47/S1Og39I1w=="],
+
     "@smithy/util-buffer-from/@smithy/core": ["@smithy/core@3.35.1", "", { "dependencies": { "@smithy/types": "^4.19.0", "tslib": "^2.6.2" } }, "sha512-i4YPS4B6ts7bjn7UwLnGjiZdprOvHvgGobFZsYK3GIY3E5hIqtj0rReU69BcTpGp+fvtraSNXeG1l+jtJvF55w=="],
 
     "@smithy/util-hex-encoding/@smithy/core": ["@smithy/core@3.35.1", "", { "dependencies": { "@smithy/types": "^4.19.0", "tslib": "^2.6.2" } }, "sha512-i4YPS4B6ts7bjn7UwLnGjiZdprOvHvgGobFZsYK3GIY3E5hIqtj0rReU69BcTpGp+fvtraSNXeG1l+jtJvF55w=="],
@@ -1394,6 +1396,26 @@
     "@opencode/util/effect/fast-check": ["fast-check@4.10.2", "", { "dependencies": { "pure-rand": "^8.0.0" } }, "sha512-iK2f+YrcmoeGqk6fA0ea2bptcu/itMIm4NfEozq6N25+aG6h7s5HZbB/k1aV7b5w5sFLMCbbtRUsTVR+BgC3xw=="],
 
     "@opencode/util/effect/msgpackr": ["msgpackr@2.1.0", "", { "optionalDependencies": { "msgpackr-extract": "^3.0.4" } }, "sha512-p/pBCVO63CsvvpkomUnNNag6+n38rULuDA6HHe70o2gtC8ODI52foF/4ko2qQcp6OiErJXTmrZeXmsGGHsIQNQ=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-darwin-arm64": ["@opentui/core-darwin-arm64@0.6.5", "", { "os": "darwin", "cpu": "arm64" }, "sha512-jg/GUWi0Z2hvprY317M43LI/pu6yvmp26vRutcCFUlSTuE3dwGir4cg0v22iY+6lu9h6w/GPRGbYIkVp0VXqIw=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-darwin-x64": ["@opentui/core-darwin-x64@0.6.5", "", { "os": "darwin", "cpu": "x64" }, "sha512-ZT3P3jcg3cxVYRN9dHCq/G8Gn99RzPRMsCMUtOEMggpAC0x0jE40MlrE6VbOEgK4cZYTDDVJeKGIwMH1arnxyg=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-linux-arm64": ["@opentui/core-linux-arm64@0.6.5", "", { "os": "linux", "cpu": "arm64" }, "sha512-B4t4pLmGyJ8925dKkztPK6Yx/W5XRNvCr0Hy5JbSDYqu+m/aSMWuQcmoVC6sHXNLMjoBbcaY+EGdwMavIAjf+Q=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-linux-arm64-musl": ["@opentui/core-linux-arm64-musl@0.6.5", "", { "os": "linux", "cpu": "arm64" }, "sha512-Rf9DbmkEyNjb/sgH6l+7S3MqQm+OBi3ibi4pEkljLUiS3wQhWMb5xpCAbY7KrK39t1F2s3A9xqh+ZFHRcn+bLQ=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-linux-x64": ["@opentui/core-linux-x64@0.6.5", "", { "os": "linux", "cpu": "x64" }, "sha512-SBV/ehX7DX4YnfCTF4Xu5sVvv0cGXX+TUxYrOAxjFmgSQToTOL819DmbaPDP20TL5QmVkK+G3HPr+MLFF2ztXQ=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-linux-x64-musl": ["@opentui/core-linux-x64-musl@0.6.5", "", { "os": "linux", "cpu": "x64" }, "sha512-Mvq6DHcJMIKxMkrcgCp91sGENt8AW01ZgXPyQpcYsKh0B02XCJA0mrYn12EI0I+JltvefJygrg9hzUhfrAm3MA=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-win32-arm64": ["@opentui/core-win32-arm64@0.6.5", "", { "os": "win32", "cpu": "arm64" }, "sha512-uQdUN/TNv2FJgeKzCdjetkBI1XF9MyU4ndFMjjh5SHWVMPNLvrNET1Hmeqc12Wy4ycwEhV5f0zL0XLsOcbk7pA=="],
+
+    "@opentui/solid/@opentui/core/@opentui/core-win32-x64": ["@opentui/core-win32-x64@0.6.5", "", { "os": "win32", "cpu": "x64" }, "sha512-3l6NtgQUZxmS+RtywqeLTe41MTg0cClT7pDJOYRMLjrVfJ2mjZB3KtFt8Kz9mP8v8QKeA35peZRNoYIgINJkkA=="],
+
+    "@opentui/solid/@opentui/core/diff": ["diff@9.0.0", "", {}, "sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw=="],
+
+    "@opentui/solid/@opentui/core/marked": ["marked@17.0.1", "", { "bin": { "marked": "bin/marked.js" } }, "sha512-boeBdiS0ghpWcSwoNm/jJBwdpFaMnZWRzjA6SkUMYb40SVaN1x7mmfGKp0jvexGcx+7y2La5zRZsYFZI6Qpypg=="],
 
     "@smithy/util-buffer-from/@smithy/core/@smithy/types": ["@smithy/types@4.19.0", "", { "dependencies": { "tslib": "^2.6.2" } }, "sha512-r7jh49VJxGerfAcTQA6gXcKc+98zOp/tqRwzYjgOE+iSQsP6cEU1hq2QzbuipmP68QtYdY9wKEhiCQZIzHgZ4Q=="],
 
