@@ -31,7 +31,7 @@
     "@babel/parser": "8.0.7",
     "@biomejs/biome": "2.5.14",
     "@earendil-works/pi-ai": "1.1.0",
-    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
     "@earendil-works/pi-tui": "1.1.0",
     "@opencode-ai/plugin": "1.18.35",
     "@tsconfig/bun": "1.0.11",
