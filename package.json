@@ -33,7 +33,7 @@
     "@earendil-works/pi-ai": "1.1.0",
     "@earendil-works/pi-coding-agent": "1.1.0",
     "@earendil-works/pi-tui": "1.1.0",
-    "@opencode-ai/plugin": "1.18.35",
+    "@opencode-ai/plugin": "1.19.0",
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.2",
     "dedent": "^1.7.2",
