@@ -35,7 +35,7 @@
   "dependencies": {
     "@cortexkit/claustrum-client": "0.10.0",
     "@cortexkit/private-files": "0.2.1",
-    "@cortexkit/subc-client": "^0.16.0",
+    "@cortexkit/subc-client": "^0.22.0",
     "jsonc-parser": "^3.3.1",
     "xxhash-wasm": "^1.1.0"
   }
