@@ -89,6 +89,6 @@
   },
   "devDependencies": {
     "@ai-sdk/anthropic": "4.0.77",
-    "@opencode/plugin": "2.0.22"
+    "@opencode/plugin": "2.0.32"
   }
 }
