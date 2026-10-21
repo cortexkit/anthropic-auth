@@ -143,7 +143,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Download verified package tarballs
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: anthropic-release-packages
           path: ${{ runner.temp }}/anthropic-packed
