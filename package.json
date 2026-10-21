@@ -39,7 +39,7 @@
     "@types/bun": "1.4.3",
     "dedent": "^1.7.2",
     "jsonc-parser": "^3.3.1",
-    "lefthook": "2.1.14",
+    "lefthook": "2.2.2",
     "miniflare": "^4.20260730.0",
     "opencode-ai": "1.19.3",
     "pi-coding-agent-1": "npm:@earendil-works/pi-coding-agent@1.0.4",
