@@ -88,7 +88,7 @@
     "xxhash-wasm": "^1.1.0"
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "4.0.82",
+    "@ai-sdk/anthropic": "4.0.88",
     "@opencode/plugin": "2.2.0"
   }
 }
