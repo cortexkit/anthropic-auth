@@ -11,7 +11,7 @@
         "@earendil-works/pi-ai": "1.3.0",
         "@earendil-works/pi-coding-agent": "1.3.0",
         "@earendil-works/pi-tui": "1.3.0",
-        "@opencode-ai/plugin": "1.19.3",
+        "@opencode-ai/plugin": "1.19.4",
         "@tsconfig/bun": "1.0.11",
         "@types/bun": "1.4.3",
         "dedent": "^1.7.2",
@@ -41,7 +41,7 @@
       "name": "@cortexkit/anthropic-auth-e2e",
       "dependencies": {
         "@cortexkit/subc-client": "^0.22.0",
-        "@opencode-ai/sdk": "1.19.3",
+        "@opencode-ai/sdk": "1.19.4",
       },
     },
     "packages/opencode": {
@@ -452,9 +452,9 @@
 
     "@npmcli/run-script": ["@npmcli/run-script@10.0.4", "", { "dependencies": { "@npmcli/node-gyp": "^5.0.0", "@npmcli/package-json": "^7.0.0", "@npmcli/promise-spawn": "^9.0.0", "node-gyp": "^12.1.0", "proc-log": "^6.0.0" } }, "sha512-mGUWr1uMnf0le2TwfOZY4SFxZGXGfm4Jtay/nwAa2FLNAKXUoUwaGwBMNH36UHPtinWfTSJ3nqFQr0091CxVGg=="],
 
-    "@opencode-ai/plugin": ["@opencode-ai/plugin@1.19.3", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode-ai/sdk": "1.19.3", "effect": "4.0.0-beta.83", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/keymap": ">=0.4.5", "@opentui/solid": ">=0.4.5" }, "optionalPeers": ["@opentui/core", "@opentui/keymap", "@opentui/solid"] }, "sha512-FBN2OREfg9xiIvrxrxjZt6CCg6kn8WzKdwsD/6+a10R/M4hrdRTounUgg0LUR4cOXcI/XMKPeIWdfdaXBdmZEw=="],
+    "@opencode-ai/plugin": ["@opencode-ai/plugin@1.19.4", "", { "dependencies": { "@ai-sdk/provider": "3.0.8", "@opencode-ai/sdk": "1.19.4", "effect": "4.0.0-beta.83", "zod": "4.1.8" }, "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/keymap": ">=0.4.5", "@opentui/solid": ">=0.4.5" }, "optionalPeers": ["@opentui/core", "@opentui/keymap", "@opentui/solid"] }, "sha512-VN71q/OmfggxIhiDbuzYDYmZcQMsNyVSw1o91e7LD6WUn/9jx4usI9ZpoPbC5p/Prpo/Umzpd+38+EuLoKRr+A=="],
 
-    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.19.3", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-G63bZD2r6plqgjFdenWVj3HBFWmLQSVuG9CXMQuTjakzA5aL6wFLmI23Biz5ESE4lQQ08UTHcY2N4NOShJFb2w=="],
+    "@opencode-ai/sdk": ["@opencode-ai/sdk@1.19.4", "", { "dependencies": { "cross-spawn": "7.0.6" } }, "sha512-3Wuc4t8gEuWKHbX1Na9oDK6PgOveid70l4Ks5RCjRIo2RcP8FQN3NS6Mg3XWc2+WiUfpfrmvBWlh5u1zeQfDQw=="],
 
     "@opencode/ai": ["@opencode/ai@2.2.0", "", { "dependencies": { "@aws-sdk/credential-providers": "3.1057.0", "@opencode/schema": "2.2.0", "@smithy/eventstream-codec": "4.2.14", "@smithy/util-utf8": "4.2.2", "aws4fetch": "1.0.20", "effect": "4.0.1", "google-auth-library": "10.5.0" } }, "sha512-Jn8gKsJfC/BGhStq07uWqgk3D7ue77GE8bFDdTLPQSkdtVBbbJB2/HVmxHDCLjbmE53MqSynu4aDEBeX5PHfHQ=="],
 
