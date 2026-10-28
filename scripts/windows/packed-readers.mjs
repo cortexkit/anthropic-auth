@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { join, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { assertFreshOpenCode1Journal, sha256, snapshot } from './harness.mjs'
 
@@ -81,5 +81,103 @@ export async function verifySetupReaders({
     enrollment: 'synthetic token, never used for a connection',
     ownershipBackend:
       process.platform === 'win32' ? 'native-dacl' : 'posix-mode-and-owner',
+  }
+}
+
+/** Exercise long state-home publication through installed Core, including lock release and reuse. */
+export async function verifyLongStateHomeRuntimePublication({
+  core,
+  api,
+  env,
+  root,
+  result,
+}) {
+  const configDir = join(root, 'long-state-home-config')
+  const stateBase = join(
+    root,
+    'long-state-base',
+    ...Array.from({ length: 8 }, (_, i) => `segment-${i}-${'x'.repeat(28)}`),
+  )
+  await mkdir(configDir, { recursive: true })
+  await mkdir(stateBase, { recursive: true })
+  await writeFile(join(configDir, 'opencode.json'), '{}\n')
+  const fixtureEnv = {
+    ...env,
+    OPENCODE_CONFIG_DIR: configDir,
+    XDG_STATE_HOME: stateBase,
+  }
+  const decision = await core.decideOpenCodeStateLayout({
+    role: 'opencode1',
+    env: fixtureEnv,
+    home: fixtureEnv.HOME,
+    // Force the state-home layout for this fixture even while moving is opt-in.
+    moveEnabled: true,
+  })
+  assert.equal(decision.kind, 'state-home')
+  const paths = await core.resolveNativePoolPaths(
+    decision.dataset.newPaths.legacyConfig,
+    decision.dataset.newPaths.legacyState,
+    decision.layout,
+  )
+  assert.equal(paths.runtime, decision.dataset.newPaths.runtime)
+  assert(paths.runtime.startsWith(`${decision.layout.dir}${sep}`))
+  assert(
+    paths.runtime.length > 260,
+    `Runtime path is only ${paths.runtime.length} characters`,
+  )
+  await core.publishNativeEmptyInit({
+    paths,
+    routingDestinationPath: core.resolveLocalRoutingDestination(
+      'opencode',
+      paths,
+      fixtureEnv,
+    ),
+    processFence: async () => {},
+    env: fixtureEnv,
+  })
+  const events = []
+  const runtime = core.createNativeAccountRuntime({
+    paths,
+    host: 'opencode',
+    vault: { env: fixtureEnv },
+    local: { onLockEvent: (event) => events.push(event) },
+  })
+  try {
+    const row = await runtime.addApi({
+      routeId: 'long-state-home-probe',
+      apiKey: 'synthetic-long-state-home-key',
+      baseURL: 'https://example.test',
+    })
+    const authorized = await runtime.authorizeApi(row.id)
+    const lockPath = `${paths.runtime}.native-runtime.lock`
+    const runtimeLocks = () =>
+      events.filter((event) => event.name === 'native-runtime')
+    // A second publication must acquire the same lock after the first release.
+    for (const lastUsed of [1_700_000_000_000, 1_700_000_000_001]) {
+      await assert.rejects(lstat(lockPath), { code: 'ENOENT' })
+      const before = runtimeLocks().length
+      assert.equal(
+        await runtime.publishApi(authorized.subject, { lastUsed }),
+        true,
+      )
+      const cycle = runtimeLocks().slice(before)
+      assert.deepEqual(
+        cycle.map((event) => event.type),
+        ['acquiring', 'acquired', 'released'],
+      )
+      assert(cycle.every((event) => event.path === paths.runtime))
+      await assert.rejects(lstat(lockPath), { code: 'ENOENT' })
+    }
+    const bytes = await api.readPrivateFile(paths.runtime)
+    const state = JSON.parse(bytes.toString('utf8'))
+    assert.equal(state.storageId, paths.storageId)
+    assert.equal(state.accounts[row.id].lastUsed, 1_700_000_000_001)
+    const verdict = await api.verifyOwnerOnly(paths.runtime)
+    assert.equal(verdict.ok, true)
+    result.dacls['long-state-home-runtime'] = verdict
+    result.files['long-state-home-runtime'] = sha256(bytes)
+    return { runtimePathLength: paths.runtime.length, runtimeLockCycles: 2 }
+  } finally {
+    await runtime.close()
   }
 }

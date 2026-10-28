@@ -11,7 +11,11 @@ import {
   snapshot,
   withReceipt,
 } from './harness.mjs'
-import { loadPackedRuntime, verifySetupReaders } from './packed-readers.mjs'
+import {
+  loadPackedRuntime,
+  verifyLongStateHomeRuntimePublication,
+  verifySetupReaders,
+} from './packed-readers.mjs'
 import { cleanupFixture } from './setup-evidence.mjs'
 
 const exec = promisify(execFile)
@@ -195,6 +199,9 @@ const ok = await withReceipt(
       })
       return { command: 'tasklist.exe /fo csv /nh' }
     })
+    await step('packed-long-state-home-runtime-publish-lock', () =>
+      verifyLongStateHomeRuntimePublication({ core, api, env, root, result }),
+    )
     const args = [cli, 'setup', '--yes', '--no-claustrum', '--opencode=1']
     await step(
       'setup-dry-run-no-writes',
