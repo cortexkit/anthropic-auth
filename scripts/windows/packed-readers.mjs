@@ -84,6 +84,75 @@ export async function verifySetupReaders({
   }
 }
 
+/** Strict relocation move proof: the real state-layout move must reach state-home. */
+export async function verifyRelocationMoveStrict({
+  core,
+  env,
+  root,
+  result,
+  label,
+  stateBaseParts,
+  expectLong,
+}) {
+  const configDir = join(root, `${label}-config`)
+  const stateBase = join(root, `${label}-state-base`, ...stateBaseParts)
+  await mkdir(configDir, { recursive: true })
+  await mkdir(stateBase, { recursive: true })
+  await writeFile(join(configDir, 'opencode.json'), '{}\n')
+  const fixtureEnv = {
+    ...env,
+    OPENCODE_CONFIG_DIR: configDir,
+    XDG_STATE_HOME: stateBase,
+  }
+  let lastStep
+  const decision = await core.decideOpenCodeStateLayout({
+    role: 'opencode1',
+    env: fixtureEnv,
+    home: fixtureEnv.HOME,
+    moveEnabled: true,
+    onStep: (step) => {
+      lastStep = step
+    },
+  })
+  try {
+    assert.equal(
+      decision.kind,
+      'state-home',
+      `Expected state-home for ${label} at step ${lastStep}, got ${decision.kind}: ${(decision.reasons ?? []).join('; ')}`,
+    )
+    const runtimePath = decision.dataset.newPaths.runtime
+    const subDir = decision.layout.dir
+    if (expectLong) {
+      assert(
+        runtimePath.length > 260,
+        `Long ${label} runtime is only ${runtimePath.length} characters`,
+      )
+      assert(
+        subDir.length > 260,
+        `Long ${label} state-home is only ${subDir.length} characters`,
+      )
+    } else {
+      assert(
+        runtimePath.length < 260,
+        `Ordinary ${label} runtime should stay under 260 characters, got ${runtimePath.length}`,
+      )
+      assert(
+        runtimePath.length > 100,
+        `Ordinary ${label} runtime should still be a realistic path, got ${runtimePath.length}`,
+      )
+    }
+    return {
+      label,
+      lastStep,
+      kind: decision.kind,
+      runtimePathLength: runtimePath.length,
+      stateHomeLength: subDir.length,
+    }
+  } finally {
+    await decision.registration?.close()
+  }
+}
+
 /** Exercise long state-home publication through installed Core, including lock release and reuse. */
 export async function verifyLongStateHomeRuntimePublication({
   core,

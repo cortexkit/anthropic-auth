@@ -14,6 +14,7 @@ import {
 import {
   loadPackedRuntime,
   verifyLongStateHomeRuntimePublication,
+  verifyRelocationMoveStrict,
   verifySetupReaders,
 } from './packed-readers.mjs'
 import { cleanupFixture } from './setup-evidence.mjs'
@@ -201,6 +202,28 @@ const ok = await withReceipt(
     })
     await step('packed-long-state-home-runtime-publish-lock', () =>
       verifyLongStateHomeRuntimePublication({ core, api, env, root, result }),
+    )
+    await step('relocation-move-long-state-home', () =>
+      verifyRelocationMoveStrict({
+        core,
+        env,
+        root,
+        result,
+        label: 'relocation-long',
+        stateBaseParts: Array.from({ length: 8 }, (_, i) => `segment-${i}-${'x'.repeat(28)}`),
+        expectLong: true,
+      }),
+    )
+    await step('relocation-move-ordinary-state-home', () =>
+      verifyRelocationMoveStrict({
+        core,
+        env,
+        root,
+        result,
+        label: 'relocation-ordinary',
+        stateBaseParts: [],
+        expectLong: false,
+      }),
     )
     const args = [cli, 'setup', '--yes', '--no-claustrum', '--opencode=1']
     await step(
