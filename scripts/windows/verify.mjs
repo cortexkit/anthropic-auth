@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import {
   assertHealthySetupPublication,
@@ -195,6 +196,28 @@ const ok = await withReceipt(
       })
       return { command: 'tasklist.exe /fo csv /nh' }
     })
+    for (const pathKind of ['ordinary', 'long']) {
+      await step(`state-relocation-${pathKind}-path-strict`, async () => {
+        const home = join(root, `relocation-${pathKind}`)
+        const output = await exec(
+          process.execPath,
+          [
+            '--experimental-import-meta-resolve',
+            fileURLToPath(new URL('./relocation-move.mjs', import.meta.url)),
+            consumer,
+            home,
+            pathKind,
+          ],
+          { cwd: consumer, env: isolatedEnvironment(home), timeout: 120_000 },
+        )
+        const evidence = JSON.parse(output.stdout.trim().split('\n').at(-1))
+        console.log(
+          JSON.stringify({ name: `state-relocation-${pathKind}`, evidence }),
+        )
+        assert.equal(evidence.passed, true, JSON.stringify(evidence))
+        return evidence
+      })
+    }
     const args = [cli, 'setup', '--yes', '--no-claustrum', '--opencode=1']
     await step(
       'setup-dry-run-no-writes',
