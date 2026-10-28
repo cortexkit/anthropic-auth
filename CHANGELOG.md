@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- **Update every OpenCode and Pi installation on the machine first.** Once no process is using the old files, OpenCode moves its machine-written account, vault, usage and session state out of the config folder into `~/.local/state/cortexkit/anthropic-auth/opencode/` (`%USERPROFILE%\.local\state\cortexkit\anthropic-auth\opencode\` on Windows); `XDG_STATE_HOME` replaces `~/.local/state` when set, and a custom config folder (including `OPENCODE_CONFIG_DIR`) uses `opencode-<16 hex sha256 of the config folder's real path>/`. Pi's files do not move. Before downgrading, quit every OpenCode and Pi and run `npx @cortexkit/opencode-anthropic-auth setup --restore-legacy` to put OpenCode's files back. User-edited settings stay in the config folder: `anthropic-auth.json`, `anthropic-auth-state.json`, `anthropic-auth-pool.json`, `anthropic-auth-vault-settings.json`, `anthropic-auth-pool-routing-state.json` (local routing), and `tui-preferences.jsonc`. The CacheKeep session registry and restart records stay in the CortexKit data folder. Addresses #477.
 - After a plugin reload, the OpenCode TUI's `/claude` menu no longer briefly gets an "unauthorized" error or a dropped connection from the previous plugin instance.
 ## 2.8.0
 

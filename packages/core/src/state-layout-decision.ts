@@ -112,7 +112,7 @@ const ACCOUNT_STATE_FILE = 'anthropic-auth-state.json'
  * checks, and the mandatory state-home registration. The release that ships
  * the move turns it on.
  */
-export const RELOCATION_MOVE_ENABLED = false
+export const RELOCATION_MOVE_ENABLED = true
 
 let moveEnabledOverride: boolean | undefined
 

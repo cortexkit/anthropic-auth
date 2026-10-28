@@ -52,6 +52,7 @@ import {
   type DecideStateLayoutOptions,
   decideOpenCodeStateLayout,
   type StateLayoutDecision,
+  unmovedRegistrationPolicy,
 } from '../state-layout-decision.ts'
 import { StateLayoutRefusalError } from '../state-layout-errors.ts'
 import {
@@ -227,9 +228,6 @@ async function decide(
     // that have since "exited": earlier decisions in the same test.
     liveness: liveness([process.pid]),
     timeouts: { layoutMs: 3_000, holderMs: 3_000, dataMs: 3_000 },
-    // These tests exercise the move itself, which is off by default until
-    // the release that ships it; the gate has its own tests.
-    moveEnabled: true,
     ...options,
   })
 }
@@ -315,7 +313,8 @@ async function subDataFiles(m: Machine) {
   )
 }
 
-test('a first start moves an idle dataset, keeps the storage ids, and serves only the new copy', async () => {
+test('by default a first start moves an idle dataset, keeps the storage ids, and serves only the new copy', async () => {
+  expect(unmovedRegistrationPolicy()).toBe('mandatory')
   const m = await machine()
   const decision = await decide(m)
   expect(decision.kind).toBe('state-home')

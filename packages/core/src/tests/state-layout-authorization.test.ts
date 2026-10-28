@@ -168,8 +168,6 @@ async function moved() {
     role: 'opencode2',
     env,
     home,
-    // Moving is off by default until the release that ships it.
-    moveEnabled: true,
     artifacts: {
       rpcRoots: [join(dir, 'rpc')],
       rpcDirs: [],
