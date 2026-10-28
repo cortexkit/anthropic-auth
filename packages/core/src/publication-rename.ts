@@ -1,5 +1,6 @@
 import { rename } from 'node:fs/promises'
 import { types as utilTypes } from 'node:util'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /** Per-publication seams keep platform and sharing-failure tests out of process globals. */
 export interface PublicationOptions {
@@ -43,7 +44,13 @@ export async function renameWithWindowsSharingRetry(
   options: PublicationOptions = {},
   beforeRetry?: () => Promise<'publish' | 'skip'>,
 ): Promise<'published' | 'skipped'> {
-  const move = options.rename ?? rename
+  const move =
+    options.rename ??
+    ((from, to) =>
+      rename(
+        windowsLongPath(from, options.platform ?? process.platform),
+        windowsLongPath(to, options.platform ?? process.platform),
+      ))
   if ((options.platform ?? process.platform) !== 'win32') {
     await move(from, to)
     return 'published'

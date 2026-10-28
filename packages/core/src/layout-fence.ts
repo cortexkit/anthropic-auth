@@ -12,6 +12,7 @@ import {
   readHolderFile,
 } from './holder-registry.ts'
 import { anthropicAuthStateRoot } from './state-layout-paths.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /**
  * Environment variables that name anthropic-auth files. A process with any of
@@ -184,7 +185,7 @@ async function listDir(
   blockers: FenceBlocker[],
 ): Promise<string[]> {
   try {
-    return await readdir(dir)
+    return await readdir(windowsLongPath(dir))
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return []
     blockers.push({ kind: 'artifact-scan', path: dir, reason: reasonOf(error) })
@@ -209,7 +210,7 @@ async function readArtifact(
 ): Promise<unknown | undefined> {
   let text: string
   try {
-    text = await readFile(path, 'utf8')
+    text = await readFile(windowsLongPath(path), 'utf8')
   } catch (error) {
     // Removed between the listing and the read: its writer released it.
     if (errorCode(error) === 'ENOENT') return undefined

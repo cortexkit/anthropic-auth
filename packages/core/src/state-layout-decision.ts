@@ -98,6 +98,7 @@ import {
   finishRestoreRetirement,
   syncObservedRestoreRecord,
 } from './state-layout-restore.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 const ACCOUNT_FILE = 'anthropic-auth.json'
 const ACCOUNT_STATE_FILE = 'anthropic-auth-state.json'
@@ -604,7 +605,7 @@ async function oldFolderTransition(
   }
   let names: string[]
   try {
-    names = await readdir(dirname(journal))
+    names = await readdir(windowsLongPath(dirname(journal)))
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return false
     const moving = await recordedMovingJournal()
@@ -1043,7 +1044,10 @@ async function ensureSubfolder(sub: string, fs: StateLayoutFs): Promise<void> {
       await ensureWindowsOwnerOnlyDirectory(sub)
       return
     }
-    const created = await mkdir(sub, { recursive: true, mode: 0o700 })
+    const created = await mkdir(windowsLongPath(sub), {
+      recursive: true,
+      mode: 0o700,
+    })
     if (created === undefined) return
     // Each new folder's entry must be durable in its parent before anything
     // inside it is: flush every parent from the new subfolder's up to the

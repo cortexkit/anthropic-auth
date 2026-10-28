@@ -16,6 +16,7 @@ import {
   readStateLayoutRecord,
   type StateLayoutRecord,
 } from './state-layout-record.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /** The files a state-home process watches for a conflict with its own copies. */
 export interface StateHomeServingFiles {
@@ -111,7 +112,7 @@ type Identity = string | 'absent'
 
 async function identityOf(path: string): Promise<Identity> {
   try {
-    const info = await lstat(path, { bigint: true })
+    const info = await lstat(windowsLongPath(path), { bigint: true })
     return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return 'absent'

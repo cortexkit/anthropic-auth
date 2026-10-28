@@ -6,6 +6,7 @@ import * as nodePath from 'node:path'
 
 import { getOpenCodeConfigDir } from './accounts.ts'
 import { parseJsonRedacted } from './json.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /**
  * Where a dataset's machine-written files live.
@@ -307,9 +308,12 @@ async function readSmallFile(
   path: string,
   maxBytes: number,
 ): Promise<SmallFile> {
+  // On Windows a long state-home marker needs the extended-length form or
+  // the open below fails with EINVAL; POSIX is unchanged.
+  const longPath = windowsLongPath(path)
   let handle: Awaited<ReturnType<typeof open>>
   try {
-    handle = await open(path, 'r')
+    handle = await open(longPath, 'r')
   } catch (error) {
     const code = errorCode(error)
     if (code === 'ENOENT') return { status: 'absent' }

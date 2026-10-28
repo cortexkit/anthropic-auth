@@ -31,6 +31,7 @@ import {
   configFolderIdentity,
   STATE_HOME_FILE_NAMES,
 } from './state-layout-paths.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /** The file, beside a dataset's files, that lists the processes using them. */
 export const HOLDER_FILE_NAME = 'anthropic-auth-holders.json'
@@ -385,12 +386,13 @@ function sameRegistration(value: unknown, entry: HolderEntry): boolean {
 export async function readHolderFile(
   path: string,
 ): Promise<HolderFileContents | undefined> {
+  const longPath = windowsLongPath(path)
   let text: string
   try {
-    const info = await lstat(path)
+    const info = await lstat(longPath)
     if (!info.isFile() || info.size > HOLDER_FILE_MAX_BYTES)
       throw new HolderRegistrationError('malformed', dirname(path))
-    text = await readFile(path, 'utf8')
+    text = await readFile(longPath, 'utf8')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw error
@@ -408,7 +410,7 @@ export async function readHolderFile(
 
 async function exists(path: string): Promise<boolean> {
   try {
-    await lstat(path)
+    await lstat(windowsLongPath(path))
     return true
   } catch {
     return false
@@ -542,11 +544,11 @@ export async function ensureHolderDirectory(
   ownerOnly: OwnerOnlyOptions = {},
 ): Promise<void> {
   if ((ownerOnly.platform ?? process.platform) !== 'win32') {
-    await mkdir(dir, { recursive: true, mode: 0o700 })
+    await mkdir(windowsLongPath(dir), { recursive: true, mode: 0o700 })
     return
   }
   try {
-    await lstat(dir)
+    await lstat(windowsLongPath(dir, ownerOnly.platform ?? process.platform))
     return
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error

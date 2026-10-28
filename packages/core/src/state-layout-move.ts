@@ -61,6 +61,7 @@ import {
   readStateLayoutRecord,
   type StateLayoutRecord,
 } from './state-layout-record.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 const ACCOUNT_FILE = 'anthropic-auth.json'
 const ACCOUNT_STATE_FILE = 'anthropic-auth-state.json'
@@ -625,9 +626,12 @@ function restoringPath(path: string, attempt: string): string {
   return `${path}.restoring-${attempt}`
 }
 
-export async function exists(path: string): Promise<boolean> {
+export async function exists(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean> {
   try {
-    await lstat(path)
+    await lstat(windowsLongPath(path, platform))
     return true
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return false
@@ -635,10 +639,13 @@ export async function exists(path: string): Promise<boolean> {
   }
 }
 
-export async function removeOwnStaging(path: string): Promise<void> {
+export async function removeOwnStaging(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
   try {
-    const info = await lstat(path)
-    if (info.isFile()) await unlink(path)
+    const info = await lstat(windowsLongPath(path, platform))
+    if (info.isFile()) await unlink(windowsLongPath(path, platform))
   } catch (error) {
     if (errorCode(error) !== 'ENOENT') throw error
   }
@@ -678,10 +685,10 @@ export async function movePreconditionFailure(
   platform: NodeJS.Platform,
 ): Promise<string | undefined> {
   // Same directory, or one inside the other: copying would overwrite sources.
-  const oldInfo = await stat(dataset.oldDir)
+  const oldInfo = await stat(windowsLongPath(dataset.oldDir, platform))
   let subInfo: Awaited<ReturnType<typeof stat>> | undefined
   try {
-    subInfo = await stat(dataset.sub)
+    subInfo = await stat(windowsLongPath(dataset.sub, platform))
   } catch (error) {
     if (errorCode(error) !== 'ENOENT') throw error
   }
@@ -700,7 +707,7 @@ export async function movePreconditionFailure(
     for (const path of new Set([slot.configured, slot.from])) {
       let info: Awaited<ReturnType<typeof lstat>>
       try {
-        info = await lstat(path)
+        info = await lstat(windowsLongPath(path, platform))
       } catch (error) {
         if (errorCode(error) === 'ENOENT') continue
         throw error
@@ -718,11 +725,14 @@ export async function movePreconditionFailure(
       basename(slot.from) !== basename(slot.configured)
     )
       return `${slot.configured} resolves to ${slot.from}, not to a file of its own in the config folder`
-    const fromExists = await exists(slot.from)
+    const fromExists = await exists(slot.from, platform)
     anyOld ||= fromExists
-    if (await exists(slot.to)) {
+    if (await exists(slot.to, platform)) {
       if (fromExists) {
-        const [a, b] = await Promise.all([lstat(slot.from), lstat(slot.to)])
+        const [a, b] = await Promise.all([
+          lstat(windowsLongPath(slot.from, platform)),
+          lstat(windowsLongPath(slot.to, platform)),
+        ])
         if (a.dev === b.dev && a.ino === b.ino)
           return `${slot.from} and ${slot.to} are the same file`
       }
@@ -734,7 +744,7 @@ export async function movePreconditionFailure(
     if (slot && (await tombstoneAttempt(slot.from)) !== undefined)
       return `${slot.from} is already a relocation tombstone`
   }
-  if (await exists(dataset.oldPaths.journal)) {
+  if (await exists(dataset.oldPaths.journal, platform)) {
     let phase: string | undefined
     try {
       phase = nativeMigrationAuthorityPhase(
@@ -750,10 +760,13 @@ export async function movePreconditionFailure(
   // gets its barriers) or when something authorizes its files: a runtime or
   // a journal. Pool settings with neither mean state was deleted by hand.
   const authorized =
-    (await exists(dataset.oldPaths.runtime)) ||
-    (await exists(dataset.oldVault.runtime)) ||
-    (await exists(dataset.oldPaths.journal))
-  if (!authorized && (anyOld || (await exists(dataset.oldPaths.config))))
+    (await exists(dataset.oldPaths.runtime, platform)) ||
+    (await exists(dataset.oldVault.runtime, platform)) ||
+    (await exists(dataset.oldPaths.journal, platform))
+  if (
+    !authorized &&
+    (anyOld || (await exists(dataset.oldPaths.config, platform)))
+  )
     return `${dataset.oldPaths.config} exists with no runtime and no journal`
   return undefined
 }
@@ -905,7 +918,7 @@ export async function rollbackPreparing(
       } else {
         let copy: Buffer
         try {
-          copy = await readFile(file.to)
+          copy = await readFile(windowsLongPath(file.to, ctx.fs.platform))
         } catch {
           throw new StateLayoutRollbackRefused(
             file.to,
@@ -920,7 +933,7 @@ export async function rollbackPreparing(
         const stage = restoringPath(file.from, attempt)
         await removeOwnStaging(stage)
         await createOwnerOnlyFile(ctx.fs, stage, copy)
-        if ((await fileSha256(stage)) !== original)
+        if ((await fileSha256(stage, ctx.fs.platform)) !== original)
           throw new StateLayoutRollbackRefused(
             stage,
             'the restored bytes differ',
@@ -939,9 +952,9 @@ export async function rollbackPreparing(
   await stateLayoutStep(ctx, 'rollback:old-dir-flushed')
   // 4. Destination cleanup over a closed allowlist.
   for (const file of record.files) {
-    await removeOwnStaging(relocatingPath(file.to, attempt))
+    await removeOwnStaging(relocatingPath(file.to, attempt), ctx.fs.platform)
     if (file.sha256 === null) continue
-    const digest = await digestFile(file.to)
+    const digest = await digestFile(file.to, ctx.fs.platform)
     if (digest.status !== 'file' || digest.sha256 !== file.sha256) continue
     // A copy whose source is gone may be the only copy left: keep it.
     if (!(await exists(file.from))) continue
@@ -951,9 +964,11 @@ export async function rollbackPreparing(
       expectDigest(file.to, file.sha256),
     )
   }
-  for (const name of await readdir(dataset.sub))
+  for (const name of await readdir(
+    windowsLongPath(dataset.sub, ctx.fs.platform),
+  ))
     if (isLayoutRecordStage(name, attempt))
-      await removeOwnStaging(join(dataset.sub, name))
+      await removeOwnStaging(join(dataset.sub, name), ctx.fs.platform)
   await stateLayoutStep(ctx, 'rollback:destination-removed')
   await ctx.fs.syncDirectory(dataset.sub)
   await stateLayoutStep(ctx, 'rollback:sub-flushed')
@@ -1045,7 +1060,7 @@ export async function cleanupOldCopies(
       const credential = CREDENTIAL_AUTHORITY_ROLES.includes(role)
       let digest: FileDigest | undefined
       try {
-        digest = await digestFile(path)
+        digest = await digestFile(path, ctx.fs.platform)
       } catch (error) {
         // A credential file that is no longer a plain file can't be proven
         // to be the verified copy, so it is a second copy.
@@ -1142,14 +1157,14 @@ export async function moveDataset(
       role: slot.role,
       from: slot.from,
       to: slot.to,
-      sha256: await fileSha256(slot.from),
+      sha256: await fileSha256(slot.from, ctx.fs.platform),
     })
   const sha = (role: RelocationRole) =>
     files.find((file) => file.role === role)?.sha256 ?? null
   await ctx.stack.assertAll()
   // Step 2: the subfolder's identity and holder files.
   const configDirPath = join(dataset.sub, STATE_HOME_FILE_NAMES.configDirMarker)
-  if (!(await exists(configDirPath))) {
+  if (!(await exists(configDirPath, ctx.fs.platform))) {
     const stage = `${configDirPath}.${attempt}.tmp`
     await createOwnerOnlyFile(
       ctx.fs,
@@ -1165,11 +1180,11 @@ export async function moveDataset(
         expectAbsent(configDirPath),
       )
     } finally {
-      await removeOwnStaging(stage)
+      await removeOwnStaging(stage, ctx.fs.platform)
     }
   }
   const holderFile = join(dataset.sub, HOLDER_FILE_NAME)
-  if (!(await exists(holderFile)))
+  if (!(await exists(holderFile, ctx.fs.platform)))
     await writeJsonAtomic(
       holderFile,
       { version: 1, entries: [] },
@@ -1212,12 +1227,12 @@ export async function moveDataset(
     // Step 4: copy and verify each present file.
     for (const file of files) {
       if (file.sha256 === null) continue
-      const bytes = await readFile(file.from)
+      const bytes = await readFile(windowsLongPath(file.from, ctx.fs.platform))
       if (sha256Hex(bytes) !== file.sha256)
         throw new MoveRefused(`${file.from} changed while it was copied`)
       const stage = relocatingPath(file.to, attempt)
       await createOwnerOnlyFile(ctx.fs, stage, bytes)
-      const back = await readFile(stage)
+      const back = await readFile(windowsLongPath(stage, ctx.fs.platform))
       if (!back.equals(bytes))
         throw new MoveRefused(`the copy of ${file.from} reads back differently`)
       await owned(
@@ -1360,7 +1375,9 @@ export async function syncLayoutRecord(
   dataset: Pick<RelocationDataset, 'sub'>,
   ctx: Pick<StateLayoutTransitionContext, 'fs'>,
 ): Promise<void> {
-  await (ctx.fs.syncFile ?? syncFile)(layoutRecordPath(dataset.sub))
+  await (
+    ctx.fs.syncFile ?? ((path: string) => syncFile(path, ctx.fs.platform))
+  )(layoutRecordPath(dataset.sub))
   await ctx.fs.syncDirectory(dataset.sub)
 }
 

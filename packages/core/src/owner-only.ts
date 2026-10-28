@@ -2,6 +2,7 @@ import { lstat } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { types as utilTypes } from 'node:util'
 import type * as PrivateFiles from '@cortexkit/private-files'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /** Per-operation injection keeps simulated Windows policy out of process globals. */
 export interface OwnerOnlyOptions {
@@ -107,7 +108,9 @@ export async function ensureWindowsOwnerOnlyDirectory(
   }
   async function exists(directory: string) {
     try {
-      const metadata = await lstat(directory)
+      const metadata = await lstat(
+        windowsLongPath(directory, options.platform ?? process.platform),
+      )
       if (metadata.isSymbolicLink()) throw refused('verify', 'reparse-point')
       if (!metadata.isDirectory()) throw refused('verify', 'wrong-kind')
       return true

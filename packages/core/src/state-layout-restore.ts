@@ -145,6 +145,7 @@ import {
   restoreStagingPath,
   type StateLayoutRecord,
 } from './state-layout-record.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /** Old files a move removed and restore renames back before any barrier. */
 const DATA_ROLES: readonly RelocationRole[] = [
@@ -334,7 +335,7 @@ export async function finishRestoreRetirement(
   const kept: string[] = [...(record.restore?.kept ?? [])]
   for (const file of restore.files) {
     try {
-      const digest = await digestFile(file.to)
+      const digest = await digestFile(file.to, ctx.fs.platform)
       if (digest.status === 'file') {
         if (digest.sha256 === file.sha256)
           await owned(
@@ -714,7 +715,7 @@ async function startRestore(
   for (const slot of dataset.slots) {
     let digest: Awaited<ReturnType<typeof digestFile>>
     try {
-      digest = await digestFile(slot.to)
+      digest = await digestFile(slot.to, ctx.fs.platform)
     } catch (error) {
       throw refused(
         `${slot.to} is not a regular file, so anthropic-auth won't restore it; move it aside, then run ${RESTORE_LEGACY_COMMAND} again.`,
@@ -765,7 +766,7 @@ async function startRestore(
   await stateLayoutStep(ctx, 'restore:restoring-written')
   // R2: stage every file under a name only this attempt uses.
   for (const file of files) {
-    const bytes = await readFile(file.to)
+    const bytes = await readFile(windowsLongPath(file.to, ctx.fs.platform))
     if (sha256Hex(bytes) !== file.sha256)
       throw refused(
         `${file.to} changed while it was being restored; run ${RESTORE_LEGACY_COMMAND} again.`,
@@ -773,7 +774,7 @@ async function startRestore(
       )
     await ctx.stack.assertAll()
     await createOwnerOnlyFile(ctx.fs, file.staging, bytes)
-    const back = await readFile(file.staging)
+    const back = await readFile(windowsLongPath(file.staging, ctx.fs.platform))
     if (!back.equals(bytes))
       throw refused(
         `the restored copy of ${file.to} reads back differently; run ${RESTORE_LEGACY_COMMAND} again.`,

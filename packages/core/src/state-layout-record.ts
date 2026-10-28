@@ -13,6 +13,7 @@ import {
   StateLayoutFileError,
   type StateLayoutPhase,
 } from './state-layout-paths.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /**
  * The data files a move copies, in the order cleanup removes the old copies:
@@ -396,12 +397,13 @@ export async function readStateLayoutRecord(
   sub: string,
 ): Promise<StateLayoutRecord | undefined> {
   const path = layoutRecordPath(sub)
+  const longPath = windowsLongPath(path)
   let bytes: string
   try {
-    const info = await lstat(path)
+    const info = await lstat(longPath)
     if (!info.isFile() || info.size > 4 * 1024 * 1024)
       throw new StateLayoutFileError('invalid', path)
-    bytes = await readFile(path, 'utf8')
+    bytes = await readFile(longPath, 'utf8')
   } catch (error) {
     if (error instanceof StateLayoutFileError) throw error
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined
@@ -445,7 +447,7 @@ export async function publishStateLayoutRecord(
     if (outcome === 'skipped')
       throw new Error(`anthropic-auth could not publish ${path}`)
   } catch (error) {
-    await unlink(stage).catch(() => {})
+    await unlink(windowsLongPath(stage)).catch(() => {})
     throw error
   }
   await fs.syncDirectory(record.sub)

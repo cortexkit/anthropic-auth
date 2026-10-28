@@ -10,6 +10,7 @@ import {
   stateHomeDatasetFiles,
 } from './state-layout-paths.ts'
 import { getStickyRoutingStatePath } from './sticky-routing.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 export interface NativePoolPaths {
   legacyConfig: string
@@ -58,7 +59,7 @@ export function resolveLocalRoutingDestination(
 export async function canonicalPath(path: string): Promise<string> {
   const absolute = resolve(path)
   try {
-    return await realpath(absolute)
+    return await realpath(windowsLongPath(absolute))
   } catch (error) {
     if (
       !(error instanceof Error) ||

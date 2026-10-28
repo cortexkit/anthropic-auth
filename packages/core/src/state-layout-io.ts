@@ -20,6 +20,7 @@ import {
 } from './native-lock-observer.ts'
 import { createWindowsOwnerOnly } from './owner-only.ts'
 import { renameWithWindowsSharingRetry } from './publication-rename.ts'
+import { windowsLongPath } from './windows-long-path.ts'
 
 /**
  * The filesystem calls a layout transition makes, so tests can fail one, drop
@@ -59,8 +60,11 @@ export function createOwnerOnlyFile(
 }
 
 /** Flush a file's bytes to disk. */
-export async function syncFile(path: string): Promise<void> {
-  const handle = await open(path, 'r')
+export async function syncFile(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  const handle = await open(windowsLongPath(path, platform), 'r')
   try {
     await handle.sync()
   } finally {
@@ -68,8 +72,11 @@ export async function syncFile(path: string): Promise<void> {
   }
 }
 
-async function syncDirectoryPosix(dir: string): Promise<void> {
-  const handle = await open(dir, 'r')
+async function syncDirectoryPosix(
+  dir: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  const handle = await open(windowsLongPath(dir, platform), 'r')
   try {
     await handle.sync()
   } finally {
@@ -82,11 +89,17 @@ export function defaultStateLayoutFs(
 ): StateLayoutFs {
   return {
     platform,
-    rename: renameFile,
-    unlink: unlinkFile,
+    rename: (from, to) =>
+      renameFile(
+        windowsLongPath(from, platform),
+        windowsLongPath(to, platform),
+      ),
+    unlink: (path) => unlinkFile(windowsLongPath(path, platform)),
     syncDirectory: (dir) =>
-      platform === 'win32' ? Promise.resolve() : syncDirectoryPosix(dir),
-    syncFile,
+      platform === 'win32'
+        ? Promise.resolve()
+        : syncDirectoryPosix(dir, platform),
+    syncFile: (path) => syncFile(windowsLongPath(path, platform), platform),
   }
 }
 
@@ -108,12 +121,16 @@ export function sha256Hex(bytes: Uint8Array | string): string {
  * than an absent path or a regular file is refused: the mover only ever
  * handles files it can prove are plain data files.
  */
-export async function digestFile(path: string): Promise<FileDigest> {
+export async function digestFile(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<FileDigest> {
+  const longPath = windowsLongPath(path, platform)
   try {
-    const info = await lstat(path)
+    const info = await lstat(longPath)
     if (!info.isFile())
       throw new Error(`anthropic-auth state file ${path} is not a regular file`)
-    return { status: 'file', sha256: sha256Hex(await readFile(path)) }
+    return { status: 'file', sha256: sha256Hex(await readFile(longPath)) }
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return { status: 'absent' }
     throw error
@@ -121,8 +138,11 @@ export async function digestFile(path: string): Promise<FileDigest> {
 }
 
 /** The sha256 of a regular file, or null when the path is absent. */
-export async function fileSha256(path: string): Promise<string | null> {
-  const digest = await digestFile(path)
+export async function fileSha256(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<string | null> {
+  const digest = await digestFile(path, platform)
   return digest.status === 'file' ? digest.sha256 : null
 }
 
@@ -137,10 +157,11 @@ export async function writeOwnerOnlyExclusive(
   bytes: Uint8Array,
   platform: NodeJS.Platform,
 ): Promise<void> {
+  const longPath = windowsLongPath(path, platform)
   const nativeCreated =
-    platform === 'win32' ? await createWindowsOwnerOnly(path, '') : false
+    platform === 'win32' ? await createWindowsOwnerOnly(longPath, '') : false
   const handle = await open(
-    path,
+    longPath,
     nativeCreated ? constants.O_RDWR | constants.O_TRUNC : 'wx',
     0o600,
   )
