@@ -53,7 +53,11 @@ import {
   type StateLayoutDecision,
 } from '../state-layout-decision.ts'
 import { StateLayoutRefusalError } from '../state-layout-errors.ts'
-import { defaultStateLayoutFs, type StateLayoutFs } from '../state-layout-io.ts'
+import {
+  defaultStateLayoutFs,
+  type StateLayoutFs,
+  writeOwnerOnlyExclusive,
+} from '../state-layout-io.ts'
 import { StateLayoutCrash, type StateLayoutStep } from '../state-layout-move.ts'
 import {
   LEGACY_STATE_LAYOUT,
@@ -1233,6 +1237,51 @@ test('Windows: no directory flush, and a transient sharing violation is retried 
   expect(win.attempts()).toBe(3)
   expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
   expect(await exists(m.oldPaths.state)).toBe(false)
+})
+
+test('Windows move stages use the complete native write without a Node reopen', async () => {
+  const m = await machine()
+  const binaryRoster = Buffer.from([0, 0xff, 0xc3, 0x28, 13, 10])
+  await writeFile(m.oldPaths.roster, binaryRoster)
+  const writes: { path: string; bytes: Buffer }[] = []
+  let opens = 0
+  const fs: StateLayoutFs = {
+    ...defaultStateLayoutFs('win32'),
+    createOwnerOnly: (path, bytes) =>
+      writeOwnerOnlyExclusive(path, bytes, 'win32', {
+        ownership: {
+          privateFiles: {
+            verifyOwnerOnly: async () => ({ ok: true }),
+            readPrivateFile: readFile,
+            createPrivateFile: async (path, bytes) => {
+              writes.push({ path, bytes: Buffer.from(bytes!) })
+              await writeFile(path, bytes!, { flag: 'wx', mode: 0o600 })
+            },
+          },
+        },
+        open: async () => {
+          opens++
+          throw new Error('A native-written move stage must not be reopened')
+        },
+      }),
+  }
+  const decision = await decide(m, { fs })
+  expect(decision.kind).toBe('state-home')
+  if (decision.kind !== 'state-home') throw new Error('move did not commit')
+  expect(decision.record.phase).toBe('committed')
+  expect(decision.record.cleanup).toBe('done')
+  expect(opens).toBe(0)
+  const markers = writes.filter((file) =>
+    file.path.startsWith(join(m.sub, 'config-dir.json.')),
+  )
+  expect(markers).toHaveLength(1)
+  expect(JSON.parse(markers[0]!.bytes.toString('utf8'))).toEqual({
+    version: 1,
+    identity: decision.dataset.identity,
+  })
+  expect(writes.every((file) => file.bytes.length > 0)).toBe(true)
+  expect(new Set(writes.map((file) => file.path)).size).toBe(writes.length)
+  expect(await readFile(m.newPaths.roster)).toEqual(binaryRoster)
 })
 
 test('Windows: a retry checks the file again first, so a file changed between attempts is kept and refused', async () => {

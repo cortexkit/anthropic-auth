@@ -68,7 +68,7 @@ export async function isSafeWindowsParent(
 /** Native creation establishes a protected DACL before any bytes are written. */
 export async function createWindowsOwnerOnly(
   path: string,
-  bytes: string,
+  bytes: string | Uint8Array,
   options: OwnerOnlyOptions = {},
 ): Promise<boolean> {
   const api = await windowsBackend(options)

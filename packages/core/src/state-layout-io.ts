@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto'
-import { constants } from 'node:fs'
 import {
   lstat,
   open,
@@ -18,7 +17,7 @@ import {
   type NativeLockEvent,
   nativeLockObserver,
 } from './native-lock-observer.ts'
-import { createWindowsOwnerOnly } from './owner-only.ts'
+import { createWindowsOwnerOnly, type OwnerOnlyOptions } from './owner-only.ts'
 import { renameWithWindowsSharingRetry } from './publication-rename.ts'
 
 /**
@@ -136,14 +135,18 @@ export async function writeOwnerOnlyExclusive(
   path: string,
   bytes: Uint8Array,
   platform: NodeJS.Platform,
+  options: { ownership?: OwnerOnlyOptions; open?: typeof open } = {},
 ): Promise<void> {
-  const nativeCreated =
-    platform === 'win32' ? await createWindowsOwnerOnly(path, '') : false
-  const handle = await open(
-    path,
-    nativeCreated ? constants.O_RDWR | constants.O_TRUNC : 'wx',
-    0o600,
-  )
+  if (platform === 'win32') {
+    // Native creation verifies, writes and flushes the same owner-only handle.
+    // Reopening that file to truncate it is unnecessary and can fail with EINVAL.
+    await createWindowsOwnerOnly(path, bytes, {
+      ...options.ownership,
+      platform,
+    })
+    return
+  }
+  const handle = await (options.open ?? open)(path, 'wx', 0o600)
   try {
     await handle.writeFile(bytes)
     await handle.sync()
