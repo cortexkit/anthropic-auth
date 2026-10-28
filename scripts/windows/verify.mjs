@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { captureStateHomeLayoutDiagnostic } from './layout-diagnostic.mjs'
 import {
   assertHealthySetupPublication,
   isolatedEnvironment,
@@ -11,7 +12,11 @@ import {
   snapshot,
   withReceipt,
 } from './harness.mjs'
-import { loadPackedRuntime, verifySetupReaders } from './packed-readers.mjs'
+import {
+  loadPackedRuntime,
+  verifyLongStateHomeRuntimePublication,
+  verifySetupReaders,
+} from './packed-readers.mjs'
 import { cleanupFixture } from './setup-evidence.mjs'
 
 const exec = promisify(execFile)
@@ -195,6 +200,9 @@ const ok = await withReceipt(
       })
       return { command: 'tasklist.exe /fo csv /nh' }
     })
+    await step('packed-long-state-home-runtime-publish-lock', () =>
+      verifyLongStateHomeRuntimePublication({ core, api, env, root, result }),
+    )
     const args = [cli, 'setup', '--yes', '--no-claustrum', '--opencode=1']
     await step(
       'setup-dry-run-no-writes',
@@ -250,6 +258,9 @@ const ok = await withReceipt(
         fixtureToken,
       })
     })
+    await step('packed-long-state-home-layout-diagnostic', () =>
+      captureStateHomeLayoutDiagnostic({ core, env, root }),
+    )
   },
   async () => {
     const evidence = await cleanupFixture(root, { secrets: [fixtureToken] })

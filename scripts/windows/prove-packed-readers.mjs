@@ -11,8 +11,13 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { captureStateHomeLayoutDiagnostic } from './layout-diagnostic.mjs'
 import { isolatedEnvironment, sha256, withReceipt } from './harness.mjs'
-import { loadPackedRuntime, verifySetupReaders } from './packed-readers.mjs'
+import {
+  loadPackedRuntime,
+  verifyLongStateHomeRuntimePublication,
+  verifySetupReaders,
+} from './packed-readers.mjs'
 
 if (process.platform === 'win32') {
   console.error(
@@ -103,6 +108,9 @@ const ok = await withReceipt(
     assert(installed, 'Packed install failed; no workspace/source fallback')
     const { cli, core, api } = await loadPackedRuntime(consumer)
     result.packedCoreExports = Object.keys(core).sort()
+    await step('packed-long-state-home-runtime-publish-lock', () =>
+      verifyLongStateHomeRuntimePublication({ core, api, env, root, result }),
+    )
     const setup = await step(
       'setup-local-noninteractive',
       async () => ({
@@ -129,6 +137,9 @@ const ok = await withReceipt(
         fixtureToken: token,
       })
     })
+    await step('packed-long-state-home-layout-diagnostic', () =>
+      captureStateHomeLayoutDiagnostic({ core, env, root }),
+    )
   },
   () => rm(root, { recursive: true, force: true }),
   {
