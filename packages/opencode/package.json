@@ -79,7 +79,7 @@
     "@clack/prompts": "^1.6.0",
     "@cortexkit/anthropic-auth-core": "2.4.2",
     "@cortexkit/claustrum-client": "0.13.0",
-    "@cortexkit/private-files": "0.2.1",
+    "@cortexkit/private-files": "0.2.2",
     "@cortexkit/subc-client": "^0.22.10",
     "@opentui/core": "0.7.0",
     "@opentui/solid": "0.7.0",
