@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { captureStateHomeLayoutDiagnostic } from './layout-diagnostic.mjs'
 import { isolatedEnvironment, sha256, withReceipt } from './harness.mjs'
 import {
   loadPackedRuntime,
@@ -136,6 +137,9 @@ const ok = await withReceipt(
         fixtureToken: token,
       })
     })
+    await step('packed-long-state-home-layout-diagnostic', () =>
+      captureStateHomeLayoutDiagnostic({ core, env, root }),
+    )
   },
   () => rm(root, { recursive: true, force: true }),
   {

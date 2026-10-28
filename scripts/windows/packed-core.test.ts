@@ -99,3 +99,62 @@ test('packed Core exports every function referenced by the Windows verifier and 
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('long state-home publication reuses its runtime lock without depending on relocation admission', async () => {
+  const scratch = join(repo, 'target', 'scratch')
+  await mkdir(scratch, { recursive: true })
+  const root = await mkdtemp(join(scratch, 'long-state-home-'))
+  try {
+    const output = await run(
+      'node',
+      [
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict';
+      import { join } from 'node:path';
+      import * as core from './packages/core/dist/index.js';
+      import * as api from '@cortexkit/private-files';
+      import { isolatedEnvironment } from './scripts/windows/harness.mjs';
+      import { verifyLongStateHomeRuntimePublication } from './scripts/windows/packed-readers.mjs';
+      const result = { files: {}, dacls: {} };
+      const evidence = await verifyLongStateHomeRuntimePublication({
+        core: {
+          ...core,
+          decideOpenCodeStateLayout() {
+            throw new Error('Publication must not depend on relocation admission');
+          },
+        },
+        api,
+        env: isolatedEnvironment(process.argv[1]),
+        root: process.argv[1],
+        result,
+      });
+      assert(evidence.runtimePathLength > 260);
+      assert.equal(evidence.runtimeLockCycles, 2);
+      assert.equal(result.dacls['long-state-home-runtime'].ok, true);
+      assert.match(result.files['long-state-home-runtime'], /^[a-f0-9]{64}$/);
+      const admitted = await core.decideOpenCodeStateLayout({
+        role: 'opencode1',
+        home: process.argv[1],
+        moveEnabled: false,
+        env: {
+          ...isolatedEnvironment(process.argv[1]),
+          OPENCODE_CONFIG_DIR: join(process.argv[1], 'long-state-home-config'),
+          XDG_STATE_HOME: join(process.argv[1], 'long-state-base', ...Array.from({ length: 8 }, (_, i) => 'segment-' + i + '-' + 'x'.repeat(28))),
+        },
+      });
+      assert.equal(admitted.kind, 'state-home', 'The fixture must pass real committed-layout admission');
+      console.log(JSON.stringify(evidence));
+      `,
+        root,
+      ],
+      { cwd: repo },
+    )
+    const evidence = JSON.parse(output.stdout)
+    expect(evidence.runtimePathLength).toBeGreaterThan(260)
+    expect(evidence.runtimeLockCycles).toBe(2)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

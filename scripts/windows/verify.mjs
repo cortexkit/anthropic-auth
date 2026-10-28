@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { captureStateHomeLayoutDiagnostic } from './layout-diagnostic.mjs'
 import {
   assertHealthySetupPublication,
   isolatedEnvironment,
@@ -257,6 +258,9 @@ const ok = await withReceipt(
         fixtureToken,
       })
     })
+    await step('packed-long-state-home-layout-diagnostic', () =>
+      captureStateHomeLayoutDiagnostic({ core, env, root }),
+    )
   },
   async () => {
     const evidence = await cleanupFixture(root, { secrets: [fixtureToken] })

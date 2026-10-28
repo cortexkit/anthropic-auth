@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join, sep } from 'node:path'
+import { dirname, join, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { assertFreshOpenCode1Journal, sha256, snapshot } from './harness.mjs'
+import { installEmptyStateHomeFixture } from './state-home-fixture.mjs'
 
 /** Resolve from the installed CLI, including import-only package export maps. */
 export async function loadPackedRuntime(consumer) {
@@ -106,25 +107,27 @@ export async function verifyLongStateHomeRuntimePublication({
     OPENCODE_CONFIG_DIR: configDir,
     XDG_STATE_HOME: stateBase,
   }
-  const decision = await core.decideOpenCodeStateLayout({
-    role: 'opencode1',
+  // Probe publication, not relocation: move admission can stay legacy when
+  // an older-version artifact is present or a migration precondition fails.
+  const target = core.resolveStateHomeTarget({
     env: fixtureEnv,
     home: fixtureEnv.HOME,
-    // Force the state-home layout for this fixture even while moving is opt-in.
-    moveEnabled: true,
   })
-  assert.equal(decision.kind, 'state-home')
+  assert(target, 'The existing config folder must name a state-home target')
+  const layout = { kind: 'state-home', dir: target.dir }
   const paths = await core.resolveNativePoolPaths(
-    decision.dataset.newPaths.legacyConfig,
-    decision.dataset.newPaths.legacyState,
-    decision.layout,
+    join(configDir, 'anthropic-auth.json'),
+    join(configDir, 'anthropic-auth-state.json'),
+    layout,
   )
-  assert.equal(paths.runtime, decision.dataset.newPaths.runtime)
-  assert(paths.runtime.startsWith(`${decision.layout.dir}${sep}`))
+  layout.dir = dirname(paths.runtime)
+  assert.equal(paths.runtime, core.stateHomeFilePaths(layout.dir).localRuntime)
+  assert(paths.runtime.startsWith(`${layout.dir}${sep}`))
   assert(
     paths.runtime.length > 260,
     `Runtime path is only ${paths.runtime.length} characters`,
   )
+  await installEmptyStateHomeFixture({ core, api, target, layout, paths })
   await core.publishNativeEmptyInit({
     paths,
     routingDestinationPath: core.resolveLocalRoutingDestination(
