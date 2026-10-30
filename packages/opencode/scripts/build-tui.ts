@@ -6,6 +6,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const sourceRoot = join(pluginRoot, 'src')
 const outputRoot = join(sourceRoot, 'tui-compiled')
+const sharedSidebarSpecifier = '@cortexkit/common-auth/quota-sidebar'
+const sharedSidebarOutput = join(outputRoot, 'quota-sidebar.js')
+const rawSharedSidebarOutput = join(sourceRoot, 'tui/quota-sidebar.js')
 const shippedSourceFiles = [
   'tui.tsx',
   'tui/command-dialogs.tsx',
@@ -124,8 +127,12 @@ async function compileTsx(
   const compiled = await transformSolidSource(code, {
     filename: sourceFile,
     moduleName: runtimeModuleId('@opentui/solid'),
-    resolvePath: (specifier) =>
-      runtimeSpecifiers.has(specifier) ? runtimeModuleId(specifier) : null,
+    resolvePath: (specifier) => {
+      if (runtimeSpecifiers.has(specifier)) return runtimeModuleId(specifier)
+      if (specifier === './quota-sidebar.js')
+        return `./${relative(dirname(outputFile), sharedSidebarOutput).replaceAll('\\', '/')}`
+      return null
+    },
   })
 
   await mkdir(dirname(outputFile), { recursive: true })
@@ -134,6 +141,56 @@ async function compileTsx(
 
 const transformSolidSource = await loadTransformSolidSource()
 await rm(outputRoot, { recursive: true, force: true })
+
+// Both entry paths ship the frame and quota helpers, not dependency JSX. Only
+// the older raw-source fallback binds normal package imports instead of the
+// host's virtual registry; neither bundle includes Solid or OpenTUI itself.
+async function bundleSharedSidebar(outputFile: string, hostRuntime: boolean) {
+  const sharedSidebarBuild = await Bun.build({
+    entrypoints: [fileURLToPath(import.meta.resolve(sharedSidebarSpecifier))],
+    target: 'bun',
+    format: 'esm',
+    external: [...runtimeSpecifiers],
+    plugins: [
+      {
+        name: 'shared-sidebar-host-runtime',
+        setup(build) {
+          build.onResolve({ filter: /^opentui:runtime-module:/ }, (args) => ({
+            path: args.path,
+            external: true,
+          }))
+          build.onLoad({ filter: /\.tsx$/ }, async (args) => ({
+            contents: await transformSolidSource(
+              await readFile(args.path, 'utf8'),
+              {
+                filename: args.path,
+                moduleName: hostRuntime
+                  ? runtimeModuleId('@opentui/solid')
+                  : '@opentui/solid',
+                resolvePath: (specifier) =>
+                  hostRuntime && runtimeSpecifiers.has(specifier)
+                    ? runtimeModuleId(specifier)
+                    : null,
+              },
+            ),
+            loader: 'ts',
+          }))
+        },
+      },
+    ],
+  })
+  if (!sharedSidebarBuild.success)
+    throw new AggregateError(
+      sharedSidebarBuild.logs,
+      'Shared sidebar build failed',
+    )
+  if (sharedSidebarBuild.outputs.length !== 1)
+    throw new Error('Expected one bundled shared sidebar module')
+  await mkdir(dirname(outputFile), { recursive: true })
+  await writeFile(outputFile, await sharedSidebarBuild.outputs[0]!.text())
+}
+await bundleSharedSidebar(sharedSidebarOutput, true)
+await bundleSharedSidebar(rawSharedSidebarOutput, false)
 
 for (const relativePath of shippedSourceFiles) {
   const sourceFile = join(sourceRoot, relativePath)
@@ -151,5 +208,5 @@ for (const relativePath of shippedSourceFiles) {
 }
 
 console.log(
-  `build-tui: wrote ${shippedSourceFiles.length} file(s) to ${relative(pluginRoot, outputRoot)}`,
+  `build-tui: wrote ${shippedSourceFiles.length + 1} file(s) to ${relative(pluginRoot, outputRoot)} and the raw sidebar bundle`,
 )

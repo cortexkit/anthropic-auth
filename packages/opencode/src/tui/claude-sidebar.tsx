@@ -13,7 +13,7 @@ import {
   quotaDisplayProjection,
   quotaWindowParts,
 } from '@cortexkit/anthropic-auth-core'
-import { type BoxRenderable, type RGBA, TextAttributes } from '@opentui/core'
+import type { BoxRenderable, RGBA } from '@opentui/core'
 import {
   createEffect,
   createMemo,
@@ -24,6 +24,7 @@ import {
   onCleanup,
   Show,
 } from 'solid-js'
+import { createStore, reconcile } from 'solid-js/store'
 import {
   type AccountQuota,
   computeQuotaPacing,
@@ -32,7 +33,6 @@ import {
   fitPaceLine,
   fitQuotaRow,
   formatPrimeAccountValue,
-  formatQuotaRowLabel,
   getCollapsedAccounts,
   getCollapsedQuotaSummary,
   getFableRecoverySummary,
@@ -52,6 +52,13 @@ import {
   resolveAnthropicAuthPrefs,
   watchTuiPreferences,
 } from '../tui-preferences.js'
+import {
+  type AccountView,
+  type PaceView,
+  type Tone as SharedTone,
+  SidebarFrame,
+  SidebarTextRow,
+} from './quota-sidebar.js'
 
 // Read package metadata from either the raw src/ entry or its generated
 // src/tui-compiled/tui/ counterpart. Avoid a JSON import because package.json sits
@@ -112,6 +119,18 @@ function usageTone(usedPct: number, appearance: AppearancePrefs): Tone {
   if (usedPct < appearance.warnThreshold) return 'ok'
   if (usedPct < appearance.errorThreshold) return 'warn'
   return 'err'
+}
+
+function sharedTone(tone: Tone): SharedTone {
+  return tone === 'ok'
+    ? 'success'
+    : tone === 'warn'
+      ? 'warning'
+      : tone === 'err'
+        ? 'error'
+        : tone === 'muted'
+          ? 'textMuted'
+          : tone
 }
 
 interface BarSegment {
@@ -238,77 +257,6 @@ function CollapsedRow(props: {
     <box width='100%' flexDirection='row' justifyContent='space-between'>
       <text fg={props.theme.textMuted}>{props.label}</text>
       {props.children}
-    </box>
-  )
-}
-
-function CollapsedAccountRow(props: {
-  theme: SidebarTheme
-  account: ReturnType<typeof getCollapsedAccounts>[number]
-  tone: Tone
-  now: number
-}) {
-  const [width, setWidth] = createSignal(40)
-  let row: BoxRenderable | undefined
-  const summary = () => getCollapsedQuotaSummary(props.account.quota, props.now)
-  const value = () => summary().text ?? '—'
-  // Keep the quota and its two-cell status suffix intact; only the label shrinks.
-  const labelWidth = () =>
-    Math.max(0, width() - 1 - Bun.stringWidth(value()) - 2)
-  const dim = () =>
-    !props.account.active || props.account.quotaDated || summary().stale
-  const attributes = () => (dim() ? TextAttributes.DIM : TextAttributes.BOLD)
-  const color = () =>
-    dim() ? props.theme.textMuted : toneColor(props.theme, props.tone)
-  return (
-    <box
-      width='100%'
-      height={1}
-      flexDirection='row'
-      ref={(element: BoxRenderable) => {
-        row = element
-        setWidth(element.width || 40)
-      }}
-      onSizeChange={() => setWidth(row?.width || 40)}
-    >
-      <Show when={labelWidth() > 0}>
-        <text
-          width={labelWidth()}
-          flexShrink={0}
-          wrapMode='none'
-          fg={color()}
-          attributes={attributes()}
-        >
-          {formatQuotaRowLabel(props.account.name, labelWidth())}
-        </text>
-        <text width={1} flexShrink={0}>
-          {' '}
-        </text>
-      </Show>
-      <text
-        width={Bun.stringWidth(value())}
-        flexShrink={0}
-        wrapMode='none'
-        fg={color()}
-        attributes={attributes()}
-      >
-        {value()}
-      </text>
-      <text
-        width={2}
-        flexShrink={0}
-        fg={toneColor(
-          props.theme,
-          props.account.blocked
-            ? 'warn'
-            : props.account.active
-              ? 'ok'
-              : 'muted',
-        )}
-        attributes={attributes()}
-      >
-        {props.account.blocked ? ' ⊘' : ' ●'}
-      </text>
     </box>
   )
 }
@@ -614,6 +562,54 @@ export function AccountBlock(props: {
   )
 }
 
+function AccountExtras(props: {
+  quota: AccountQuota | null
+  now: number
+  theme: SidebarTheme
+}) {
+  const [width, setWidth] = createSignal<number>()
+  let block: BoxRenderable | undefined
+  const budget = () =>
+    quotaWindowParts(quotaDisplayProjection(props.quota, props.now), {
+      now: props.now,
+    }).windows.find((part) => part.kind === 'budget')
+  return (
+    <box
+      width='100%'
+      flexDirection='column'
+      ref={(element: BoxRenderable) => {
+        block = element
+        setWidth(element.width || undefined)
+      }}
+      onSizeChange={() => setWidth(block?.width || undefined)}
+    >
+      <Show when={budget()}>
+        {(part: () => QuotaWindowPart) => (
+          <box width='100%' height={1} flexDirection='row'>
+            <text
+              wrapMode='none'
+              fg={toneColor(
+                props.theme,
+                props.quota?.extraUsage?.severity === 'critical'
+                  ? 'err'
+                  : props.quota?.extraUsage?.severity === 'warning' ||
+                      props.quota?.extraUsage?.exhausted
+                    ? 'warn'
+                    : 'muted',
+              )}
+            >
+              {creditLine(part().figure, props.quota?.extraUsage, width())}
+            </text>
+          </box>
+        )}
+      </Show>
+      <Show when={props.quota?.fallbackAdvised === true}>
+        <SidebarTextRow text='→ fallback advised' />
+      </Show>
+    </box>
+  )
+}
+
 export interface SidebarController {
   prefs: () => AnthropicAuthTuiPrefs
   collapsed: () => boolean
@@ -717,22 +713,6 @@ export function ClaudeSidebar(props: {
     state().main?.quota != null ||
     state().main?.stateLine != null ||
     enabledFallbacks().length > 0
-  // One label column for every expanded account, so all their bars line up.
-  const quotaLabelWidth = () =>
-    quotaLabelColumnWidth(
-      [
-        state().main?.quota,
-        ...(prefs().sections.fallbackAccounts
-          ? enabledFallbacks().map((fallback) => fallback.quota)
-          : []),
-      ],
-      now(),
-    )
-
-  const headerLabel = () => {
-    const name = prefs().header.label
-    return !hasData() ? name : collapsed() ? `\u25b6 ${name}` : `\u25bc ${name}`
-  }
   const activeAccount = () => resolveActiveAccount(state())
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota, now())
@@ -808,217 +788,284 @@ export function ClaudeSidebar(props: {
     return `${r.transport} \u00b7 ${r.enabled ? 'on' : 'off'}`
   }
 
-  return (
-    <box width='100%' flexDirection='column'>
-      {/* The collapse control stays on the left; the version stays on the right. */}
-      {/* biome-ignore lint/a11y/noStaticElementInteractions: opentui renders to a terminal, not the DOM — ARIA roles do not apply */}
-      <box
-        width='100%'
-        flexDirection='row'
-        justifyContent='space-between'
-        alignItems='center'
-        onMouseDown={() => {
-          if (hasData()) props.controller.toggleCollapsed()
-        }}
-      >
-        <box paddingLeft={1} paddingRight={1} backgroundColor={theme().accent}>
-          <text fg={theme().background}>
-            <b>{headerLabel()}</b>
-          </text>
-        </box>
-        <Show when={prefs().header.showVersion && PLUGIN_VERSION !== ''}>
-          <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
-        </Show>
-      </box>
+  const accountDetail = (id: string) =>
+    id === 'main'
+      ? state().main
+      : state().fallbacks?.find((account) => account.id === id)
+  const accountViews = createMemo((): AccountView[] => {
+    if (!hasData()) return []
+    return getCollapsedAccounts(state(), prefs().sections.fallbackAccounts).map(
+      (account): AccountView => {
+        const detail = accountDetail(account.id)
+        const quota = quotaDisplayProjection(account.quota, now())
+        const needsReauth =
+          detail && 'needsReauth' in detail && detail.needsReauth
+        const vaultReauth =
+          detail && 'vaultReauth' in detail && detail.vaultReauth
+        const active = state().activeId === account.id
+        const status =
+          account.quotaDated && account.quota
+            ? 'dated'
+            : needsReauth
+              ? 're-login'
+              : vaultReauth
+                ? 'needs sign-in in the vault'
+                : active
+                  ? 'active'
+                  : 'idle'
+        const groups = [
+          {
+            rows: quotaWindowParts(quota, { now: now() })
+              .windows.filter((part) => part.kind === 'window')
+              .map((part) => {
+                const scoped = account.quota?.scoped?.find(
+                  (window) => window.title === part.name,
+                )
+                const window =
+                  part.name === '5h'
+                    ? account.quota?.five_hour
+                    : part.name === '7d'
+                      ? account.quota?.seven_day
+                      : scoped
+                const pacing =
+                  prefs().sections.pacing && !account.quotaDated && window
+                    ? computeQuotaPacing(
+                        window,
+                        part.name === '5h' ? FIVE_HOUR_MS : SEVEN_DAY_MS,
+                        now(),
+                      )
+                    : null
+                const text = fitPaceLine(
+                  pacing,
+                  undefined,
+                  pacing?.runsOutAt
+                    ? formatResetIn(pacing.runsOutAt, now())
+                    : undefined,
+                  part.resetIn,
+                  part.remainingPercent,
+                )
+                const pace: PaceView | undefined = pacing
+                  ? {
+                      text: text ?? '',
+                      tone:
+                        pacing.state === 'deficit' ? 'warning' : 'textMuted',
+                      overlay: {
+                        kind: pacing.deltaPercent > 0 ? 'deficit' : 'reserve',
+                        percent: pacing.pacePercent,
+                      },
+                    }
+                  : undefined
+                const binding =
+                  account.quota?.bindingWindow ===
+                  (part.name === '5h'
+                    ? 'five_hour'
+                    : part.name === '7d'
+                      ? 'seven_day'
+                      : scoped?.id)
+                return {
+                  part: {
+                    ...part,
+                    name: part.short,
+                    figure: `${part.figure}${binding ? ' •' : ''}`,
+                  },
+                  pace,
+                }
+              }),
+          },
+        ]
+        return {
+          id: account.id,
+          label: account.name,
+          titleSuffix: detail?.tierLabel,
+          quota,
+          groups,
+          status: {
+            text: status,
+            tone:
+              needsReauth || vaultReauth || detail?.stateLine
+                ? 'warning'
+                : active
+                  ? 'success'
+                  : 'textMuted',
+          },
+          blocked: Boolean(account.blocked),
+          indicatorTone: account.blocked
+            ? 'warning'
+            : account.active
+              ? 'success'
+              : 'textMuted',
+          collapsed: {
+            muted: Boolean(
+              !account.active ||
+                account.quotaDated ||
+                getCollapsedQuotaSummary(account.quota, now()).stale,
+            ),
+            quotaTone: sharedTone(activeQuotaTone()),
+          },
+          emptyQuotaText: { expanded: 'checking…', collapsed: '—' },
+        }
+      },
+    )
+  })
+  // Polls rebuild snapshots, but account ids keep the shared frame's rows mounted.
+  const [accounts, setAccounts] = createStore<AccountView[]>([])
+  createEffect(() => setAccounts(reconcile(accountViews(), { key: 'id' })))
 
-      {/* Collapsed accounts keep placement order; only a fresh active row is emphasized. */}
-      <Show when={collapsed() && hasData()}>
-        {/* Index keys rows by position: each state update builds new account
-            objects, so For would rebuild every row and its measured width.
-            Passing the accessor's value as a prop keeps the row reactive. */}
-        <Index
-          each={getCollapsedAccounts(
-            state(),
-            prefs().sections.fallbackAccounts,
-          )}
-        >
-          {(account) => (
-            <CollapsedAccountRow
-              theme={theme()}
-              account={account()}
-              tone={activeQuotaTone()}
-              now={now()}
-            />
-          )}
-        </Index>
-        <Show when={state().fastMode}>
-          <CollapsedRow theme={theme()} label='Mode'>
-            <text fg={toneColor(theme(), 'accent')}>
-              <b>{'fast'}</b>
-            </text>
-          </CollapsedRow>
+  return (
+    <SidebarFrame
+      header={{
+        badge: prefs().header.label,
+        version:
+          prefs().header.showVersion && PLUGIN_VERSION !== ''
+            ? `v${PLUGIN_VERSION}`
+            : undefined,
+      }}
+      accounts={accounts}
+      theme={theme()}
+      appearance={prefs().appearance}
+      showQuota={prefs().sections.quota}
+      now={now()}
+      collapsed={collapsed()}
+      onToggle={props.controller.toggleCollapsed}
+      beforeQuota={(account) => (
+        <Show when={accountDetail(account.id)?.stateLine}>
+          {(text: () => string) => <SidebarTextRow text={text()} />}
         </Show>
-        <Show when={fableRecoverySummary()}>
-          {(summary: () => string) => (
-            <CollapsedRow theme={theme()} label='Recovery'>
-              <text fg={toneColor(theme(), fableRecoveryTone())}>
-                <b>{summary()}</b>
+      )}
+      afterQuota={(account) => (
+        <AccountExtras
+          quota={accountDetail(account.id)?.quota ?? null}
+          now={now()}
+          theme={theme()}
+        />
+      )}
+      collapsedSections={() => (
+        <>
+          <Show when={state().fastMode}>
+            <CollapsedRow theme={theme()} label='Mode'>
+              <text fg={toneColor(theme(), 'accent')}>
+                <b>{'fast'}</b>
               </text>
             </CollapsedRow>
-          )}
-        </Show>
-      </Show>
-
-      {/* Expanded: full sections. Also render when there's no data so the
-          sidebar can never go blank if data clears while collapsed. */}
-      <Show when={!collapsed() || !hasData()}>
-        <Show
-          when={hasData()}
-          fallback={
+          </Show>
+          <Show when={fableRecoverySummary()}>
+            {(summary: () => string) => (
+              <CollapsedRow theme={theme()} label='Recovery'>
+                <text fg={toneColor(theme(), fableRecoveryTone())}>
+                  <b>{summary()}</b>
+                </text>
+              </CollapsedRow>
+            )}
+          </Show>
+        </>
+      )}
+      sections={() => (
+        <>
+          <Show when={!hasData()}>
             <box marginTop={1} width='100%'>
               <text fg={theme().textMuted}>{'Waiting for quota\u2026'}</text>
             </box>
-          }
-        >
-          {/* Quota */}
-          <Show when={prefs().sections.quota}>
-            <SectionHeader theme={theme()} title='Quota' />
-            <AccountBlock
+          </Show>
+
+          {/* Routing */}
+          <Show when={prefs().sections.routing}>
+            <SectionHeader theme={theme()} title='Routing' />
+            <StatRow
               theme={theme()}
-              appearance={prefs().appearance}
-              name='main'
-              quota={state().main?.quota}
-              active={state().activeId === 'main'}
-              pacingEnabled={prefs().sections.pacing}
-              tierLabel={state().main?.tierLabel}
-              labelWidth={quotaLabelWidth()}
-              stateLine={state().main?.stateLine}
-              quotaDated={state().main?.quotaDated}
-              now={now()}
+              label='Route'
+              value={state().route}
+              tone='accent'
             />
-            <Show when={prefs().sections.fallbackAccounts}>
-              <For each={enabledFallbacks()}>
-                {(fb) => (
-                  <AccountBlock
-                    theme={theme()}
-                    appearance={prefs().appearance}
-                    name={fb.label ?? fb.id}
-                    quota={fb.quota}
-                    active={state().activeId === fb.id}
-                    pacingEnabled={prefs().sections.pacing}
-                    tierLabel={fb.tierLabel}
-                    labelWidth={quotaLabelWidth()}
-                    needsReauth={fb.needsReauth}
-                    vaultReauth={fb.vaultReauth}
-                    stateLine={fb.stateLine}
-                    quotaDated={fb.quotaDated}
-                    marginTop={1}
-                    now={now()}
-                  />
-                )}
-              </For>
+            <StatRow
+              theme={theme()}
+              label='Mode'
+              value={state().fastMode ? 'fast' : 'std'}
+              tone={state().fastMode ? 'accent' : 'muted'}
+            />
+            <StatRow
+              theme={theme()}
+              label='Relay'
+              value={relayValue()}
+              tone={state().relay?.enabled ? 'ok' : 'muted'}
+            />
+          </Show>
+
+          <Show when={fableRecoverySummary()}>
+            {(summary: () => string) => (
+              <StatRow
+                theme={theme()}
+                label='Recovery'
+                value={summary()}
+                tone={fableRecoveryTone()}
+              />
+            )}
+          </Show>
+
+          {/* Cache */}
+          <Show when={showCache()}>
+            <SectionHeader theme={theme()} title='Cache' />
+            <StatRow
+              theme={theme()}
+              label='1h cache'
+              value={`${cacheKeep()?.window} \u00b7 ${cacheKeep()?.enabled ? 'on' : 'off'}`}
+              tone={cacheKeep()?.enabled ? 'ok' : 'muted'}
+            />
+            <Show when={(cacheKeep()?.trackedSessions ?? 0) > 0}>
+              <StatRow
+                theme={theme()}
+                label='Tracked'
+                value={String(cacheKeep()?.trackedSessions)}
+                tone='text'
+              />
             </Show>
           </Show>
-        </Show>
 
-        {/* Routing */}
-        <Show when={prefs().sections.routing}>
-          <SectionHeader theme={theme()} title='Routing' />
-          <StatRow
-            theme={theme()}
-            label='Route'
-            value={state().route}
-            tone='accent'
-          />
-          <StatRow
-            theme={theme()}
-            label='Mode'
-            value={state().fastMode ? 'fast' : 'std'}
-            tone={state().fastMode ? 'accent' : 'muted'}
-          />
-          <StatRow
-            theme={theme()}
-            label='Relay'
-            value={relayValue()}
-            tone={state().relay?.enabled ? 'ok' : 'muted'}
-          />
-        </Show>
-
-        <Show when={fableRecoverySummary()}>
-          {(summary: () => string) => (
+          {/* Prime — only when enabled. Expanded view only (no collapsed surface). */}
+          <Show when={showPrime()}>
             <StatRow
               theme={theme()}
-              label='Recovery'
-              value={summary()}
-              tone={fableRecoveryTone()}
+              label='Prime'
+              value={primeHasError() ? 'err' : 'on'}
+              tone={primeHasError() ? 'warn' : 'ok'}
             />
-          )}
-        </Show>
-
-        {/* Cache */}
-        <Show when={showCache()}>
-          <SectionHeader theme={theme()} title='Cache' />
-          <StatRow
-            theme={theme()}
-            label='1h cache'
-            value={`${cacheKeep()?.window} \u00b7 ${cacheKeep()?.enabled ? 'on' : 'off'}`}
-            tone={cacheKeep()?.enabled ? 'ok' : 'muted'}
-          />
-          <Show when={(cacheKeep()?.trackedSessions ?? 0) > 0}>
-            <StatRow
-              theme={theme()}
-              label='Tracked'
-              value={String(cacheKeep()?.trackedSessions)}
-              tone='text'
-            />
+            <For each={prime()?.accounts ?? []}>
+              {(account) => {
+                const value = () => formatPrimeAccountValue(account, now())
+                return (
+                  <StatRow
+                    theme={theme()}
+                    label={account.label}
+                    value={value().text}
+                    tone={value().hasError ? 'warn' : 'text'}
+                  />
+                )
+              }}
+            </For>
           </Show>
-        </Show>
 
-        {/* Prime — only when enabled. Expanded view only (no collapsed surface). */}
-        <Show when={showPrime()}>
-          <StatRow
-            theme={theme()}
-            label='Prime'
-            value={primeHasError() ? 'err' : 'on'}
-            tone={primeHasError() ? 'warn' : 'ok'}
-          />
-          <For each={prime()?.accounts ?? []}>
-            {(account) => {
-              const value = () => formatPrimeAccountValue(account, now())
-              return (
-                <StatRow
-                  theme={theme()}
-                  label={account.label}
-                  value={value().text}
-                  tone={value().hasError ? 'warn' : 'text'}
-                />
-              )
-            }}
-          </For>
-        </Show>
-
-        {/* Health — only when something is wrong */}
-        <Show when={degraded() && prefs().sections.health}>
-          <SectionHeader theme={theme()} title='Health' />
-          <Show when={quotaBackedOff()}>
-            <StatRow
-              theme={theme()}
-              label='Quota API'
-              value={`backoff ${formatUntil(state().main?.quotaBackoffUntil, now())}`}
-              tone='warn'
-            />
+          {/* Health — only when something is wrong */}
+          <Show when={degraded() && prefs().sections.health}>
+            <SectionHeader theme={theme()} title='Health' />
+            <Show when={quotaBackedOff()}>
+              <StatRow
+                theme={theme()}
+                label='Quota API'
+                value={`backoff ${formatUntil(state().main?.quotaBackoffUntil, now())}`}
+                tone='warn'
+              />
+            </Show>
+            <Show when={refreshBackedOff()}>
+              <StatRow
+                theme={theme()}
+                label='Token refresh'
+                value={`backoff ${formatUntil(state().main?.refreshBackoffUntil, now())}`}
+                tone='warn'
+              />
+            </Show>
           </Show>
-          <Show when={refreshBackedOff()}>
-            <StatRow
-              theme={theme()}
-              label='Token refresh'
-              value={`backoff ${formatUntil(state().main?.refreshBackoffUntil, now())}`}
-              tone='warn'
-            />
-          </Show>
-        </Show>
-      </Show>
-    </box>
+        </>
+      )}
+    />
   )
 }
 

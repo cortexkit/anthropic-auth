@@ -72,6 +72,7 @@ process.once('SIGTERM', () => {
   process.exit(143);
 });
 import { createTestRenderer } from '@opentui/core/testing';
+import { TextAttributes } from '@opentui/core';
 import { render } from '@opentui/solid';
 import { ensureRuntimePluginSupport } from '@opentui/solid/runtime-plugin-support/configure';
 ensureRuntimePluginSupport();
@@ -127,7 +128,12 @@ try {
       await setupRenderer.renderOnce();
       const text = setupRenderer.captureCharFrame();
       if (asked.length >= (step.calls ?? 0) && step.wanted.every((part) => text.includes(part))) {
-        frames.push(text);
+        // The shared frame measures gutters and bars after its first layout.
+        for (let i = 0; i < 10; i++) {
+          await setupRenderer.renderOnce();
+          await Bun.sleep(40);
+        }
+        frames.push(setupRenderer.captureCharFrame());
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -137,7 +143,7 @@ try {
   const colors = {};
   const lines = setupRenderer.captureSpans().lines.map((line) => ({
     text: line.spans.map((span) => span.text).join(''),
-    spans: line.spans.map((span) => ({ text: span.text, fg: String(span.fg) })),
+    spans: line.spans.map((span) => ({ text: span.text, fg: String(span.fg), dim: (span.attributes & TextAttributes.DIM) !== 0, bold: (span.attributes & TextAttributes.BOLD) !== 0 })),
   }));
   for (const line of setupRenderer.captureSpans().lines)
     for (const span of line.spans)
@@ -235,8 +241,14 @@ for (const width of [37, 42]) {
       `OpenCode 2 shared sidebar shape at ${width} columns ${collapsed ? 'collapsed with trailing status glyphs' : 'expanded'}`,
       async () => {
         const result = await renderOpenCode2Sidebar(
-          [sharedShapeSidebarState()],
-          [{ wanted: collapsed ? ['5h 70% left', '…'] : ['Health', 'Prime'] }],
+          [sharedShapeSidebarState(Date.now(), 'ses_oc2')],
+          [
+            {
+              wanted: collapsed
+                ? ['5h 70% left', '…', 'Opus 4.8 · 2 left']
+                : ['Health', 'Prime', 'Opus 4.8 · 2 left'],
+            },
+          ],
           { width, height: 50, collapsed },
         )
         const [frame] = result.frames
@@ -246,6 +258,22 @@ for (const width of [37, 42]) {
       SUBPROCESS_TIMEOUT_MS,
     )
   }
+}
+
+for (const collapsed of [false, true]) {
+  test(
+    `OpenCode 2 respects the hidden version preference ${collapsed ? 'collapsed' : 'expanded'}`,
+    async () => {
+      const result = await renderOpenCode2Sidebar(
+        [quotaState()],
+        [{ wanted: ['40%'] }],
+        { width: 42, height: 32, collapsed, showVersion: false },
+      )
+      expect(result.frames[0]?.split('\n')[0]).not.toMatch(/v\d+\.\d+\.\d+/)
+      expect(result.frames[0]).toContain('CLAUDE')
+    },
+    SUBPROCESS_TIMEOUT_MS,
+  )
 }
 
 test(

@@ -10,7 +10,9 @@ import {
 } from './fixtures/sidebar-five-accounts'
 import {
   captureSharedSidebarFrame,
+  expectCollapsedStyle,
   expectSharedSidebarShape,
+  type SidebarFrameLine,
   sharedShapeSidebarState,
 } from './fixtures/sidebar-shared-shape'
 
@@ -102,6 +104,14 @@ const nextFrame = (wanted) => new Promise((resolve) => {
   pending = { wanted, resolve };
   setup.renderer.requestRender();
 });
+const settledFrame = async () => {
+  // Shared rows measure their gutters and bars after layout, across frames.
+  for (let i = 0; i < 10; i++) {
+    await setup.renderOnce();
+    await Bun.sleep(40);
+  }
+  return setup.captureCharFrame();
+};
 const rewrite = ${JSON.stringify(rewrite ?? null)};
 const rowIds = () => {
   const ids = [];
@@ -120,11 +130,13 @@ try {
   const first = nextFrame(${JSON.stringify(wanted)});
   await render(() => sidebar({}, { session_id: 'quota-render-test' }), setup.renderer);
   setup.renderer.requestRender();
-  let text = await first;
+   await first;
+   let text = await settledFrame();
   if (rewrite) {
     const before = rowIds();
     await Bun.write(process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE, JSON.stringify(rewrite.state));
-    text = await nextFrame(rewrite.wanted);
+    await nextFrame(rewrite.wanted);
+    text = await settledFrame();
     console.log('ROWS:' + JSON.stringify({ before, after: rowIds() }));
   }
   console.log(text);
@@ -132,7 +144,9 @@ try {
     console.log('STYLES:' + JSON.stringify(setup.captureSpans().lines.map((line) => {
       const spans = line.spans.filter((span) => span.text.trim());
       return { text: line.spans.map((span) => span.text).join(''),
-        spans: spans.map((span) => ({ text: span.text, fg: String(span.fg) })),
+        spans: spans.map((span) => ({ text: span.text, fg: String(span.fg),
+          dim: (span.attributes & TextAttributes.DIM) !== 0,
+          bold: (span.attributes & TextAttributes.BOLD) !== 0 })),
         dim: spans.length > 0 && spans.every((span) => (span.attributes & TextAttributes.DIM) !== 0),
         bold: spans.length > 0 && spans.every((span) => (span.attributes & TextAttributes.BOLD) !== 0) };
     })));
@@ -201,8 +215,8 @@ for (const width of [36, 42]) {
       const stdout = await renderSidebar(
         sharedShapeSidebarState(),
         collapsed
-          ? ['5h 40% · 7d 80% left', '5h 70% left', '…']
-          : ['Health', 'Prime'],
+          ? ['5h 40% · 7d 80% left', '5h 70% left', '…', 'Opus 4.8 · 2 left']
+          : ['Health', 'Prime', 'Opus 4.8 · 2 left'],
         collapsed,
         { width, height: 50 },
       )
@@ -246,7 +260,87 @@ test('compiled sidebar renders the shared quota figure reset and stale reading a
   expect(stdout).not.toContain('Fable')
 })
 
-test('collapsed sidebar keeps every account on one line with intact narrow quotas and dim stale rows', async () => {
+test('shared sidebar replaces a pre-reset reading with reset since last check', async () => {
+  const now = Date.now()
+  const stdout = await renderSidebar(
+    {
+      main: {
+        quota: {
+          five_hour: {
+            usedPercent: 60,
+            remainingPercent: 40,
+            checkedAt: now - 3 * 3_600_000,
+            resetsAt: new Date(now - 3_600_000).toISOString(),
+          },
+        },
+      },
+      fallbacks: [],
+      activeId: 'main',
+      route: 'main',
+      lastUpdated: now,
+    },
+    ['reset since last check', 'checked 3h ago'],
+  )
+  expect(stdout).not.toContain('40% left')
+  expect(stdout).not.toMatch(/[█░▓▒]/)
+  expect(stdout).not.toContain('out in')
+})
+
+for (const collapsed of [false, true]) {
+  test(`OpenCode 1 respects the hidden version preference ${collapsed ? 'collapsed' : 'expanded'}`, async () => {
+    const stdout = await renderSidebar(
+      sharedShapeSidebarState(),
+      ['80% left'],
+      collapsed,
+      { showVersion: false },
+    )
+    expect(stdout.split('\n')[0]).not.toMatch(/v\d+\.\d+\.\d+/)
+    expect(stdout).toContain('CLAUDE')
+  })
+}
+
+test('shared sidebar puts the credit below reading age and fallback advice below the credit', async () => {
+  const now = Date.now()
+  const stdout = await renderSidebar(
+    {
+      main: {
+        quota: {
+          five_hour: {
+            usedPercent: 10,
+            remainingPercent: 90,
+            checkedAt: now - 30 * 3_600_000,
+          },
+          extraUsage: {
+            used: { amountMinor: 1250, currency: 'USD', exponent: 2 },
+            limit: { amountMinor: 5000, currency: 'USD', exponent: 2 },
+            exhausted: false,
+          },
+          fallbackAdvised: true,
+        },
+      },
+      fallbacks: [],
+      activeId: 'main',
+      route: 'main',
+      lastUpdated: now,
+    },
+    [
+      'checked 1d6h ago',
+      'credits 75% left · $12.50/$50.00',
+      '→ fallback advised',
+    ],
+  )
+  const lines = stdout.split('\n').map((line) => line.trimEnd())
+  const age = lines.indexOf('checked 1d6h ago')
+  expect(age).toBeGreaterThan(0)
+  expect(lines.slice(age, age + 3)).toEqual([
+    'checked 1d6h ago',
+    'credits 75% left · $12.50/$50.00',
+    '→ fallback advised',
+  ])
+  expect(stdout).not.toContain('7d —')
+})
+
+test('collapsed sidebar keeps every account on one line with intact narrow quotas and muted stale rows', async () => {
   const now = Date.now()
   const window = (used: number, checkedAt = now) => ({
     usedPercent: used,
@@ -304,22 +398,18 @@ test('collapsed sidebar keeps every account on one line with intact narrow quota
   expect(rows).toHaveLength(2)
   expect(rows[0]).toContain('38%')
   expect(rows[1]).toContain('92%')
-  const styles = JSON.parse(styleText!) as {
-    text: string
-    dim: boolean
-    bold: boolean
-  }[]
-  expect(styles.find((line) => line.text.includes('5h 38%'))).toMatchObject({
-    dim: false,
-    bold: true,
-  })
-  expect(styles.find((line) => line.text.includes('5h 92%'))).toMatchObject({
-    dim: true,
-    bold: false,
-  })
+  const styles = JSON.parse(styleText!) as SidebarFrameLine[]
+  expectCollapsedStyle(
+    styles,
+    'main',
+    '5h 38%',
+    true,
+    'rgba(1.00, 1.00, 0.00, 1.00)',
+  )
+  expectCollapsedStyle(styles, 'work', '5h 92%', false)
 })
 
-test('collapsed sidebar dims a stale active row and a fresh inactive row without reordering accounts', async () => {
+test('collapsed sidebar mutes a stale active row and a fresh inactive row without reordering accounts', async () => {
   const now = Date.now()
   const window = (used: number, checkedAt: number) => ({
     usedPercent: used,
@@ -352,19 +442,9 @@ test('collapsed sidebar dims a stale active row and a fresh inactive row without
   )
   const [frame, styleText] = stdout.split('STYLES:')
   expect(frame!.indexOf('main')).toBeLessThan(frame!.indexOf('work'))
-  const styles = JSON.parse(styleText!) as {
-    text: string
-    dim: boolean
-    bold: boolean
-  }[]
-  expect(styles.find((line) => line.text.includes('5h 90%'))).toMatchObject({
-    dim: true,
-    bold: false,
-  })
-  expect(styles.find((line) => line.text.includes('5h 92%'))).toMatchObject({
-    dim: true,
-    bold: false,
-  })
+  const styles = JSON.parse(styleText!) as SidebarFrameLine[]
+  expectCollapsedStyle(styles, 'main', '5h 90%', false)
+  expectCollapsedStyle(styles, 'work', '5h 92%', false)
 })
 
 test('collapsed sidebar leaves out a window without a reading and keeps the muted dash for an account with none', async () => {
@@ -394,17 +474,13 @@ test('collapsed sidebar leaves out a window without a reading and keeps the mute
   )
   const [frame, styleText] = stdout.split('STYLES:')
   expect(frame).not.toContain('7d')
-  const styles = JSON.parse(styleText!) as {
-    text: string
-    dim: boolean
-    bold: boolean
-  }[]
+  const styles = JSON.parse(styleText!) as SidebarFrameLine[]
   const main = styles.find((line) => line.text.includes('main'))
   expect(main?.text.trimEnd().endsWith('5h 87% left ●')).toBe(true)
-  expect(main).toMatchObject({ dim: false, bold: true })
+  expectCollapsedStyle(styles, 'main', '5h 87%', true)
   const work = styles.find((line) => line.text.includes('work'))
   expect(work?.text.trimEnd().endsWith('— ●')).toBe(true)
-  expect(work).toMatchObject({ dim: true, bold: false })
+  expectCollapsedStyle(styles, 'work', '—', false)
 })
 
 test('collapsed account rows keep their renderables across same-value state updates', async () => {
@@ -600,7 +676,7 @@ for (const width of [36, 42]) {
   })
 }
 
-test('a 28-column sidebar drops resets that do not fit instead of wrapping rows or running text together', async () => {
+test('a 28-column shared sidebar shrinks bars before dropping resets without wrapping rows', async () => {
   const stdout = await renderSidebar(
     fiveAccountSidebarState(),
     // The cents drop once the block has a measured width, so this waits for it.
@@ -610,12 +686,11 @@ test('a 28-column sidebar drops resets that do not fit instead of wrapping rows 
   )
   const rows = expectOneLineQuotaRows(stdout, FIVE_ACCOUNTS)
   expect(rows).toHaveLength(15)
-  for (const row of rows) expect(row).toMatch(/^\S+ +[█░▓▒]{10} \d+% left/)
-  // `100% left •` leaves no room for ` 4h39m`, so that row has no reset; a
-  // row that fits exactly keeps its one-cell gap.
-  expect(rows).toContain('5h ▒░░░░░░░░░ 100% left •')
-  expect(rows.some((row) => / 97% left \d+h\d+m$/.test(row))).toBe(true)
-  expect(stdout).toMatch(/reserve \d+% · lasts to re…/)
+  for (const row of rows)
+    expect(row).toMatch(/^\S+ +[█░▓▒]{4,10} \d+% left( •)? +\d+[a-z]/)
+  expect(rows.some((row) => /[█░▓▒]{4,9} \d+% left/.test(row))).toBe(true)
+  expect(rows.some((row) => / 100% left • +\d+h\d+m$/.test(row))).toBe(true)
+  expect(stdout).toMatch(/reserve \d+% · lasts to re.*…/)
 })
 
 test('a 36-column sidebar keeps an exhausted window used-up line on one row', async () => {
@@ -720,8 +795,8 @@ test('scoped rows whose models share a short name extend it as the collapsed lin
     '5h',
     '7d',
   ])
-  // The column fits the longest label in the sidebar, across accounts.
-  expect(new Set(rows.map((row) => row.search(/[█░▓▒]/)))).toEqual(new Set([5]))
+  // Each account's gutter fits its own longest window name.
+  expect(rows.map((row) => row.search(/[█░▓▒]/))).toEqual([5, 5, 5, 5, 3, 3])
   const collapsed = await renderSidebar(state, ['Fabr 10% left'], true, {
     width: 36,
   })

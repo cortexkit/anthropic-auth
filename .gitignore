@@ -3,6 +3,7 @@ node_modules/
 dist/
 packages/*/dist/
 packages/opencode/src/tui-compiled/
+packages/opencode/src/tui/quota-sidebar.js
 *.tsbuildinfo
 
 # Local agent/dev state

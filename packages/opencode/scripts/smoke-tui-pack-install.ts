@@ -685,6 +685,23 @@ try {
   const compiledTui = join(installedPackageRoot, 'src/tui-compiled/tui.tsx')
   check('compiled TUI ships in the packed package', existsSync(compiledTui))
 
+  const compiledSidebar = join(
+    installedPackageRoot,
+    'src/tui-compiled/quota-sidebar.js',
+  )
+  check(
+    'compiled shared sidebar ships in the packed package',
+    existsSync(compiledSidebar),
+  )
+  const sidebarText = await readFile(compiledSidebar, 'utf8')
+  check(
+    'shared sidebar uses host runtime modules, not dependency JSX',
+    sidebarText.includes('opentui:runtime-module:') &&
+      !/(?:from\s*|import\s*\()['"](?:solid-js|@cortexkit\/common-auth)(?:\/[^'"]*)?['"]/.test(
+        sidebarText,
+      ),
+  )
+
   const compiledText = existsSync(compiledTui)
     ? await readFile(compiledTui, 'utf8')
     : ''

@@ -24,6 +24,7 @@
       "!packages/core/src/tests/fixtures/legacy-1x/*/config.json",
       "!packages/core/src/tests/fixtures/legacy-1x/*/state.json",
       "!packages/opencode/src/tui-compiled",
+      "!packages/opencode/src/tui/quota-sidebar.js",
       "packages/*/*.json",
       "packages/*/scripts/**",
       "scripts/**",
