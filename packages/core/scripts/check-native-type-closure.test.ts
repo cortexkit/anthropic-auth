@@ -102,7 +102,7 @@ test('recognizes runtime dynamic import edges and exact ranges without matching 
   ).toEqual([['./chunk.js', "'./chunk.js'"]])
 })
 
-test.each(['0.24.0', '0.29.0', '0.30.1'])(
+test.each(['0.24.0', '0.29.0', '0.30.1', '0.31.0'])(
   'rejects unsupported published producer version %s before copying declarations',
   async (version) => {
     const root = await fixture()
@@ -126,7 +126,7 @@ test.each(['0.24.0', '0.29.0', '0.30.1'])(
     )
 
     await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-      `Expected published common-auth 0.31.0, got ${version}`,
+      `Expected published common-auth 0.32.0, got ${version}`,
     )
     expect(await readdir(dist)).not.toContain('internal-types')
   },
@@ -140,7 +140,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.31.0',
+      version: '0.32.0',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
@@ -276,7 +276,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
   const manifest = JSON.parse(
     await readFile(join(core, 'package.json'), 'utf8'),
   )
-  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.31.0')
+  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.32.0')
   expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.13.0')
   expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.22.10')
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')

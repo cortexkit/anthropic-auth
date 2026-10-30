@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- `@cortexkit/common-auth` 0.32.0. A vault account whose quota reading insula could not refresh because Anthropic refused it is no longer polled again by the plugin, which only extended the refusal.
 - In vault mode, a request refused because your own quota floors or killswitch limits exclude every account now says which limit blocked it and where to change it, instead of asking you to sign in again. Addresses #567.
 ## 2.4.6
 

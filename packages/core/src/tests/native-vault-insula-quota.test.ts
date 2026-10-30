@@ -424,8 +424,38 @@ for (const [miss, entries] of [
   })
 }
 
+test('background ten-minute upstream_failed stale entry defers without a usage GET', async () => {
+  const f = await fixture(() => [
+    entry(uuid),
+    entry(uuid2, {
+      stale: { class: 'upstream_failed' },
+      fetchedAt: new Date(now - 10 * 60_000).toISOString(),
+    }),
+  ])
+  await f.runtime.fetchQuota(
+    f.routeOf(uuid),
+    f.usage,
+    undefined,
+    undefined,
+    'background',
+  )
+  await expect(
+    f.runtime.fetchQuota(
+      f.routeOf(uuid2),
+      f.usage,
+      undefined,
+      undefined,
+      'background',
+    ),
+  ).rejects.toThrow(QuotaRefreshDeferred)
+  expect(f.counts.usage).toEqual([])
+})
+
 for (const [miss, entries] of [
-  ['stale', () => [entry(uuid2, { stale: true })]],
+  [
+    'stale',
+    () => [entry(uuid2, { stale: { class: 'local_source_unavailable' } })],
+  ],
   ['credential', () => [entry(uuid2, { errorClass: 'credential_rejected' })]],
   ['absent', () => [entry(uuid)]],
   [
