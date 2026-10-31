@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-anthropic-auth",
-  "version": "2.4.9",
+  "version": "2.4.10",
   "type": "module",
   "repository": {
     "type": "git",
@@ -77,7 +77,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.6.0",
-    "@cortexkit/anthropic-auth-core": "2.4.9",
+    "@cortexkit/anthropic-auth-core": "2.4.10",
     "@cortexkit/claustrum-client": "0.13.0",
     "@cortexkit/private-files": "0.2.2",
     "@cortexkit/subc-client": "^0.22.10",
