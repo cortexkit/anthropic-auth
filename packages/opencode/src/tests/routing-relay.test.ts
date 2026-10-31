@@ -226,7 +226,7 @@ describe('shared routing relay', () => {
           account_id: 'account',
           outcome: 'exhausted',
           window: '7d',
-          pool: modelId ?? 'Fable',
+          pool: (modelId ?? 'Fable').toLowerCase(),
           resets_at: 2_000_000_000_000,
         },
       ])
@@ -327,7 +327,7 @@ describe('shared routing relay', () => {
         account_id: 'account',
         outcome: 'exhausted',
         window: '7d',
-        pool: 'Fable',
+        pool: 'fable',
       },
     ])
   })

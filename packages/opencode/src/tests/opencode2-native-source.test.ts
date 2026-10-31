@@ -498,7 +498,7 @@ describe('OC2 shared routing relay', () => {
           credential_id: 'oauth:anthropic',
           outcome: 'exhausted',
           window: '7d',
-          pool: modelId ?? 'Fable',
+          pool: (modelId ?? 'Fable').toLowerCase(),
         },
       ])
     },

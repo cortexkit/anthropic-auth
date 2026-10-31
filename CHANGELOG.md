@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.4.9
 
+- Under the CortexKit agent runner, a used-up model limit is reported to shared routing with its pool name in routing's lowercase form (for example `fable`), and a model limit whose name routing cannot accept is not reported at all, so it is never mistaken for the whole account's weekly limit.
 - `@cortexkit/common-auth` 0.33.0.
 - Under the CortexKit agent runner, a used-up limit is now reported to shared routing as the five-hour or weekly window, with the model's own limit named as a pool (for example Fable), matching the other auth plugins.
 

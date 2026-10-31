@@ -312,11 +312,13 @@ describe('OC1 shared routing relay', () => {
   }
 
   for (const { mode, modelId, pool } of [
-    { mode: 'fable', modelId: undefined, pool: 'Fable' },
-    { mode: 'fable', modelId: 'Claude-Fable-Pool', pool: 'Claude-Fable-Pool' },
+    { mode: 'fable', modelId: undefined, pool: 'fable' },
+    { mode: 'fable', modelId: 'Claude-Fable-Pool', pool: 'claude-fable-pool' },
+    // Outside routing's pool alphabet even after lowercasing: no report at all.
+    { mode: 'fable', modelId: 'Fable Pool', pool: undefined },
     { mode: 'fable-without-poll', modelId: undefined, pool: undefined },
   ]) {
-    test(`Fable 429 uses only the stored poll pool ${pool} on OpenCode 1`, async () => {
+    test(`Fable 429 (${mode}, model id ${modelId}) reports pool ${pool} on OpenCode 1`, async () => {
       let calls = 0
       const f = await fixture(
         mode,

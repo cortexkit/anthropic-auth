@@ -44,6 +44,9 @@ export function routingReserveAllows(
   return !depleted.length || depleted.some((row) => row.accountId === accountId)
 }
 
+// Shared routing's pool-name alphabet; it drops a report whose pool falls outside it.
+const ROUTING_POOL_NAME = /^[a-z0-9._-]{1,64}$/
+
 export function createRoutingRelay(
   quotaFor?: (
     subject: RoutingSubject,
@@ -157,8 +160,11 @@ export function createRoutingRelay(
           for (const report of reports) reportRouting(report)
           if (quota?.scoped?.length) {
             const stored = await quotaFor?.(subject)
-            // Stored usage-poll rows use this id prefix and retain the provider's
-            // case-sensitive model identity. Header-only rows cannot name a pool.
+            // Stored usage-poll rows use this id prefix and keep the provider's
+            // model identity; header-only rows cannot name a pool. Routing names
+            // the pool by that identity in lowercase and ignores any other
+            // spelling, so a name outside its alphabet sends no report: a report
+            // without a valid pool would block the whole account for the week.
             const scoped = getScopedQuotaWindowForModel(
               {
                 scoped: stored?.scoped?.filter((row) =>
@@ -167,8 +173,10 @@ export function createRoutingRelay(
               },
               modelId,
             )
-            const pool = scoped?.modelId ?? scoped?.modelName.trim()
-            if (!pool) return
+            const pool = (scoped?.modelId ?? scoped?.modelName)
+              ?.trim()
+              .toLowerCase()
+            if (!pool || !ROUTING_POOL_NAME.test(pool)) return
             for (const reading of quota.scoped) {
               reportRouting({
                 ...identity,
