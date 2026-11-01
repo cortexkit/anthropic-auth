@@ -739,6 +739,7 @@ test('Pi cancel during vault re-authorization after a 401 ends aborted and keeps
   controller.abort()
   const cancelled = await pending
   release.open()
+  await f.native.drainDispatchWork()
   expect(cancelled.stopReason).toBe('aborted')
   expect(cancelled.errorMessage).not.toContain('401')
   const assigned = served[0]
@@ -770,6 +771,7 @@ test('Pi cancel after a 401 arrives and before re-authorization ends aborted and
     signal: controller.signal,
   }).result()
   expect(cancelled.stopReason).toBe('aborted')
+  await f.native.drainDispatchWork()
   const assigned = served[0]
   if (!assigned) throw new Error('No model send reached the provider')
   expect(served).toEqual([assigned])
@@ -782,6 +784,46 @@ test('Pi cancel after a 401 arrives and before re-authorization ends aborted and
   const next = await streamCortexKitAnthropic(model, context, options).result()
   expect(next.stopReason).toBe('stop')
   expect(served).toEqual([assigned, assigned])
+  expect(f.reports).toHaveLength(1)
+})
+
+test('Pi shutdown after caller abort drains a pending 401 report', async () => {
+  const controller = new AbortController()
+  const { f, served } = await stickyRejectedFirstSend((response) => {
+    if (response.status === 401) controller.abort()
+  })
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  const report = f.client.reportAuthFailureScoped.bind(f.client)
+  f.client.reportAuthFailureScoped = async (input) => {
+    entered.open()
+    await release.wait
+    return report(input)
+  }
+  const cancelled = await streamCortexKitAnthropic(model, context, {
+    sessionId: 'pi-shutdown-after-401',
+    signal: controller.signal,
+  }).result()
+  expect(cancelled.stopReason).toBe('aborted')
+  let closed = false
+  const closing = closePiNativeRuntime(path).then(() => {
+    closed = true
+  })
+  lifetimes.trackDetached(closing)
+  try {
+    await entered.wait
+    expect(closed).toBe(false)
+    expect(f.reports).toEqual([])
+  } finally {
+    release.open()
+    await closing
+  }
+  const assigned = served[0]
+  if (!assigned) throw new Error('No model send reached the provider')
+  expect(served).toEqual([assigned])
+  expect(
+    f.reports.map((report) => [report.credentialId, report.providerStatus]),
+  ).toEqual([[assigned, 401]])
   expect(f.reports).toHaveLength(1)
 })
 

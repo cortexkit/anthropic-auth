@@ -752,11 +752,12 @@ test('an expired unidentified profile attempt cannot replace its successor accou
   expect(
     s.network.profileAccounts.filter((id) => id === otherIdentity),
   ).toHaveLength(1)
-  // The /claude menu renders Accounts before Quota. The first readMenu call's
-  // Quota display retries the expired request while its transport is held.
+  // The profile helper rejects on the display deadline even when the transport
+  // ignores cancellation. The menu's quota section does not retry that failed
+  // profile request during this boot; a new login still fetches its own profile.
   expect(
     s.network.profileAccounts.filter((id) => id === fallbackIdentity),
-  ).toHaveLength(2)
+  ).toHaveLength(1)
   release.open()
   await s.dispose()
   expect((await storedTiers(s.paths))['fallback-route']).toBe(

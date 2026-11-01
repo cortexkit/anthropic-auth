@@ -166,6 +166,23 @@ export interface PiVaultPollOptions {
 }
 
 export class PiNativeRuntime {
+  private readonly dispatchWork = new Set<Promise<unknown>>()
+
+  async trackDispatch<T>(work: () => Promise<T>): Promise<T> {
+    const pending = Promise.resolve().then(work)
+    this.dispatchWork.add(pending)
+    try {
+      return await pending
+    } finally {
+      this.dispatchWork.delete(pending)
+    }
+  }
+
+  async drainDispatchWork(): Promise<void> {
+    while (this.dispatchWork.size)
+      await Promise.allSettled([...this.dispatchWork])
+  }
+
   private readonly paths: Promise<NativePoolPaths>
   private readonly holderRegistration: Promise<NativeHolderRegistration>
   private readonly initialization: Promise<NativeAccountRuntime>
@@ -478,11 +495,12 @@ export class PiNativeRuntime {
     source: NativeCustodyReporterSource,
   ): Promise<void> {
     if (served.source === 'vault' && status === 401)
-      await (await this.service()).vault.reportFailure(
-        served.receipt,
-        status,
-        source,
-      )
+      await this.trackDispatch(async () => {
+        // An already-served receipt can be reported while shutdown drains it.
+        // Do not re-enter service admission after close has blocked new sends.
+        const runtime = await this.initialization
+        await runtime.vault.reportFailure(served.receipt, status, source)
+      })
   }
 
   async markUsed(
@@ -504,6 +522,7 @@ export class PiNativeRuntime {
       () => {},
     )
     this.closing ??= (async () => {
+      await this.drainDispatchWork()
       await this.usagePublications.drain()
       await this.drainRoutingPublications()
       this.routingPublications.clear()
