@@ -166,21 +166,12 @@ export interface PiVaultPollOptions {
 }
 
 export class PiNativeRuntime {
-  private readonly dispatchWork = new Set<Promise<unknown>>()
+  private readonly pendingReports = new Set<Promise<void>>()
 
-  async trackDispatch<T>(work: () => Promise<T>): Promise<T> {
-    const pending = Promise.resolve().then(work)
-    this.dispatchWork.add(pending)
-    try {
-      return await pending
-    } finally {
-      this.dispatchWork.delete(pending)
-    }
-  }
-
-  async drainDispatchWork(): Promise<void> {
-    while (this.dispatchWork.size)
-      await Promise.allSettled([...this.dispatchWork])
+  /** Join started failure reports, never model sends waiting for headers. */
+  async drainReports(): Promise<void> {
+    while (this.pendingReports.size)
+      await Promise.allSettled([...this.pendingReports])
   }
 
   private readonly paths: Promise<NativePoolPaths>
@@ -494,13 +485,19 @@ export class PiNativeRuntime {
     status: number,
     source: NativeCustodyReporterSource,
   ): Promise<void> {
-    if (served.source === 'vault' && status === 401)
-      await this.trackDispatch(async () => {
-        // An already-served receipt can be reported while shutdown drains it.
-        // Do not re-enter service admission after close has blocked new sends.
-        const runtime = await this.initialization
-        await runtime.vault.reportFailure(served.receipt, status, source)
-      })
+    if (served.source === 'vault' && status === 401) {
+      // An already-served receipt can be reported while shutdown drains it.
+      // Do not re-enter service admission after close has blocked new sends.
+      const pending = this.initialization.then((runtime) =>
+        runtime.vault.reportFailure(served.receipt, status, source),
+      )
+      this.pendingReports.add(pending)
+      try {
+        await pending
+      } finally {
+        this.pendingReports.delete(pending)
+      }
+    }
   }
 
   async markUsed(
@@ -522,7 +519,6 @@ export class PiNativeRuntime {
       () => {},
     )
     this.closing ??= (async () => {
-      await this.drainDispatchWork()
       await this.usagePublications.drain()
       await this.drainRoutingPublications()
       this.routingPublications.clear()
@@ -530,6 +526,7 @@ export class PiNativeRuntime {
         async (runtime) => {
           await runtime.drainQuotaPublications()
           await runtime.drainRoutingPublications()
+          await this.drainReports()
           await runtime.close()
         },
         () => {},

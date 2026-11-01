@@ -186,6 +186,7 @@ async function fixture(
   const reports: Array<
     Parameters<ClaustrumScopedClient['reportAuthFailureScoped']>[0]
   > = []
+  const firstReport = lifetimes.gate()
   const client: ClaustrumScopedClient = {
     listScoped: async () => ({
       rows,
@@ -206,6 +207,7 @@ async function fixture(
     },
     reportAuthFailureScoped: async (input) => {
       reports.push(input)
+      firstReport.open()
     },
     close: () => {},
   }
@@ -239,6 +241,7 @@ async function fixture(
     rows,
     gets,
     reports,
+    firstReport: firstReport.wait,
     client,
     connect,
     path,
@@ -739,7 +742,8 @@ test('Pi cancel during vault re-authorization after a 401 ends aborted and keeps
   controller.abort()
   const cancelled = await pending
   release.open()
-  await f.native.drainDispatchWork()
+  await f.firstReport
+  await f.native.drainReports()
   expect(cancelled.stopReason).toBe('aborted')
   expect(cancelled.errorMessage).not.toContain('401')
   const assigned = served[0]
@@ -771,7 +775,8 @@ test('Pi cancel after a 401 arrives and before re-authorization ends aborted and
     signal: controller.signal,
   }).result()
   expect(cancelled.stopReason).toBe('aborted')
-  await f.native.drainDispatchWork()
+  await f.firstReport
+  await f.native.drainReports()
   const assigned = served[0]
   if (!assigned) throw new Error('No model send reached the provider')
   expect(served).toEqual([assigned])
@@ -805,13 +810,13 @@ test('Pi shutdown after caller abort drains a pending 401 report', async () => {
     signal: controller.signal,
   }).result()
   expect(cancelled.stopReason).toBe('aborted')
+  await entered.wait
   let closed = false
   const closing = closePiNativeRuntime(path).then(() => {
     closed = true
   })
   lifetimes.trackDetached(closing)
   try {
-    await entered.wait
     expect(closed).toBe(false)
     expect(f.reports).toEqual([])
   } finally {
@@ -826,6 +831,65 @@ test('Pi shutdown after caller abort drains a pending 401 report', async () => {
   ).toEqual([[assigned, 401]])
   expect(f.reports).toHaveLength(1)
 })
+
+for (const relay of [false, true]) {
+  test(`Pi ${relay ? 'HTTP relay' : 'direct'} shutdown does not wait for model response headers`, async () => {
+    const f = await fixture()
+    if (relay)
+      await (await f.native.service()).updateRelay({
+        enabled: true,
+        url: 'https://relay.invalid/request',
+        token: 'synthetic-held-relay-token',
+        transport: 'http',
+        fallbackToDirect: false,
+      })
+    const entered = lifetimes.gate()
+    const release = lifetimes.gate()
+    globalThis.fetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0]) => {
+        const url = String(input)
+        if (url.includes('/api/oauth/usage'))
+          return Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 0 },
+          })
+        if (
+          !url.includes('/v1/messages') &&
+          !url.startsWith('https://relay.invalid/')
+        )
+          throw new Error('Unexpected held-send fixture request')
+        entered.open()
+        // The transport ignores abort and never returns response headers. Only
+        // fixture teardown can reject it, after the shutdown assertion below.
+        await release.wait
+        throw new Error('Held model transport stopped by fixture teardown')
+      },
+      { preconnect: originalFetch.preconnect },
+    )
+    const controller = new AbortController()
+    const pending = streamCortexKitAnthropic(model, context, {
+      sessionId: `pi-held-${relay ? 'relay' : 'direct'}`,
+      signal: controller.signal,
+    }).result()
+    await entered.wait
+    const closing = closePiNativeRuntime(f.path)
+    try {
+      expect(
+        await Promise.race([
+          closing.then(() => 'closed'),
+          Bun.sleep(500).then(() => 'still waiting for headers'),
+        ]),
+      ).toBe('closed')
+      expect(controller.signal.aborted).toBe(false)
+      expect(f.reports).toEqual([])
+    } finally {
+      controller.abort()
+      release.open()
+      await pending
+      await closing
+    }
+  })
+}
 
 test('Pi failed vault re-authorization after a 401 still reports and moves the sticky account', async () => {
   const { f, served } = await stickyRejectedFirstSend()

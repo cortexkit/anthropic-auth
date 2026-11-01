@@ -673,142 +673,141 @@ async function sendAnthropicRequest(options: {
       throw new Error('Pi native OAuth route identity changed')
     return attempt
   }
-  const directFetch = () =>
-    native.trackDispatch(async () => {
-      let attempt: PiNativeAttempt | undefined
-      let apiSubject: NativeApiSubject | undefined
-      // The secret this physical send goes out with; a provider error may repeat it.
-      let secret = ''
-      if (options.apiAccount) {
-        const credential = await (await native.service()).authorizeApi(
-          options.apiAccount.id,
-          init.signal ?? undefined,
-        )
-        apiSubject = credential.subject
-        secret = credential.apiKey ?? ''
-        input = buildExplicitBaseMessagesUrl(credential.baseURL)
-        const authorized = configureApiRouteHeaders(
-          {
-            ...credential,
-            id: options.apiAccount.id,
-          },
-          fastMode,
-        )
-        init.headers = authorized
-      } else {
-        attempt = await takeAttempt()
-        secret = piAttemptAccessToken(attempt)
-        headers.set('authorization', `Bearer ${secret}`)
-      }
-      lastTransport = 'direct'
-      // The response scope of the latest physical send. Each send gets its own
-      // before the request leaves, so a rejected 401 is already scrubbed when
-      // it is reported, dumped or cancelled.
-      const physical: { scope?: ProviderErrorResponseScope } = {}
-      const send = async () => {
-        const scope = createProviderErrorResponseScope([secret], 'event-stream')
-        physical.scope = scope
-        // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
-        // the signed identity text for dumps and CacheKeep.
-        if (options.apiAccount || typeof init.body !== 'string')
-          return scope.redactResponse(await fetch(input, init))
-        return scope.redactResponse(
-          await sendWithRequestGzip({
-            url: input,
-            body: init.body,
+  const directFetch = async () => {
+    let attempt: PiNativeAttempt | undefined
+    let apiSubject: NativeApiSubject | undefined
+    // The secret this physical send goes out with; a provider error may repeat it.
+    let secret = ''
+    if (options.apiAccount) {
+      const credential = await (await native.service()).authorizeApi(
+        options.apiAccount.id,
+        init.signal ?? undefined,
+      )
+      apiSubject = credential.subject
+      secret = credential.apiKey ?? ''
+      input = buildExplicitBaseMessagesUrl(credential.baseURL)
+      const authorized = configureApiRouteHeaders(
+        {
+          ...credential,
+          id: options.apiAccount.id,
+        },
+        fastMode,
+      )
+      init.headers = authorized
+    } else {
+      attempt = await takeAttempt()
+      secret = piAttemptAccessToken(attempt)
+      headers.set('authorization', `Bearer ${secret}`)
+    }
+    lastTransport = 'direct'
+    // The response scope of the latest physical send. Each send gets its own
+    // before the request leaves, so a rejected 401 is already scrubbed when
+    // it is reported, dumped or cancelled.
+    const physical: { scope?: ProviderErrorResponseScope } = {}
+    const send = async () => {
+      const scope = createProviderErrorResponseScope([secret], 'event-stream')
+      physical.scope = scope
+      // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
+      // the signed identity text for dumps and CacheKeep.
+      if (options.apiAccount || typeof init.body !== 'string')
+        return scope.redactResponse(await fetch(input, init))
+      return scope.redactResponse(
+        await sendWithRequestGzip({
+          url: input,
+          body: init.body,
+          headers,
+          latch: getRequestGzipLatch(
+            getRequestGzipLatchPath(options.storagePath),
+          ),
+          send: (wireBody, wireHeaders) =>
+            fetch(input, { ...init, body: wireBody, headers: wireHeaders }),
+        }),
+      )
+    }
+    let response: Response
+    try {
+      response = await send()
+      if (attempt && response.status === 401) {
+        // Report the rejected credential version before retrying, even if its replacement later succeeds.
+        await report(attempt, response.status, 'direct')
+        const rotated =
+          !retried401 && !init.signal?.aborted
+            ? await native
+                .retry(
+                  routeId,
+                  attempt,
+                  init.signal ?? undefined,
+                  options.model.id,
+                )
+                .catch(() => undefined)
+            : undefined
+        if (rotated) {
+          retried401 = true
+          await dumpDirectRequest({
+            affinity: relayAffinity,
+            route: options.route ?? 'oauth',
+            status: response.status,
+            bodyText,
+            url: input.toString(),
+            method: init.method,
             headers,
-            latch: getRequestGzipLatch(
-              getRequestGzipLatchPath(options.storagePath),
-            ),
-            send: (wireBody, wireHeaders) =>
-              fetch(input, { ...init, body: wireBody, headers: wireHeaders }),
-          }),
-        )
-      }
-      let response: Response
-      try {
-        response = await send()
-        if (attempt && response.status === 401) {
-          // Report the rejected credential version before retrying, even if its replacement later succeeds.
-          await report(attempt, response.status, 'direct')
-          const rotated =
-            !retried401 && !init.signal?.aborted
-              ? await native
-                  .retry(
-                    routeId,
-                    attempt,
-                    init.signal ?? undefined,
-                    options.model.id,
-                  )
-                  .catch(() => undefined)
-              : undefined
-          if (rotated) {
-            retried401 = true
-            await dumpDirectRequest({
-              affinity: relayAffinity,
-              route: options.route ?? 'oauth',
-              status: response.status,
-              bodyText,
-              url: input.toString(),
-              method: init.method,
-              headers,
-            })
-            // Retire the rejected send's credentials before cancelling its
-            // body, since that cancellation may never settle.
-            physical.scope?.dispose()
-            await response.body?.cancel().catch(() => {})
-            attempt = rotated
-            secret = piAttemptAccessToken(rotated)
-            headers.set('authorization', `Bearer ${secret}`)
-            response = await send()
-          }
+          })
+          // Retire the rejected send's credentials before cancelling its
+          // body, since that cancellation may never settle.
+          physical.scope?.dispose()
+          await response.body?.cancel().catch(() => {})
+          attempt = rotated
+          secret = piAttemptAccessToken(rotated)
+          headers.set('authorization', `Bearer ${secret}`)
+          response = await send()
         }
-        if (attempt) await report(attempt, response.status, 'direct')
-        // The vault has been told about the 401 above. If the request was
-        // cancelled after the 401 arrived (before or while the vault was asked
-        // for a newer credential), end it as cancelled here.
-        if (attempt && response.status === 401)
-          await endIfCancelled(response, init.signal)
-        await dumpDirectRequest({
-          affinity: relayAffinity,
-          route:
-            options.route ??
-            (options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth'),
-          status: response.status,
-          bodyText,
-          url: input.toString(),
-          method: init.method,
-          headers: init.headers,
-        })
-      } catch (caught) {
-        // No response leaves this send, so its credentials retire here.
-        physical.scope?.dispose()
-        const scope = createProviderErrorResponseScope([secret], 'event-stream')
-        const error = scope.redactError(caught)
-        scope.dispose()
-        await dumpDirectRequest({
-          affinity: relayAffinity,
-          route:
-            options.route ??
-            (options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth'),
-          // A fixed label: the error text can repeat provider output or a credential.
-          error: PHYSICAL_SEND_FAILED,
-          bodyText,
-          url: input.toString(),
-          method: init.method,
-          headers: init.headers,
-        })
-        throw error
       }
-      if (apiSubject && response.ok) {
-        const subject = apiSubject
-        native.usagePublications.publish(() =>
-          servingRuntime.publishApi(subject, { lastUsed: Date.now() }),
-        )
-      }
-      if (attempt && response.ok) markServed(attempt)
-      return response
-    })
+      if (attempt) await report(attempt, response.status, 'direct')
+      // The vault has been told about the 401 above. If the request was
+      // cancelled after the 401 arrived (before or while the vault was asked
+      // for a newer credential), end it as cancelled here.
+      if (attempt && response.status === 401)
+        await endIfCancelled(response, init.signal)
+      await dumpDirectRequest({
+        affinity: relayAffinity,
+        route:
+          options.route ??
+          (options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth'),
+        status: response.status,
+        bodyText,
+        url: input.toString(),
+        method: init.method,
+        headers: init.headers,
+      })
+    } catch (caught) {
+      // No response leaves this send, so its credentials retire here.
+      physical.scope?.dispose()
+      const scope = createProviderErrorResponseScope([secret], 'event-stream')
+      const error = scope.redactError(caught)
+      scope.dispose()
+      await dumpDirectRequest({
+        affinity: relayAffinity,
+        route:
+          options.route ??
+          (options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth'),
+        // A fixed label: the error text can repeat provider output or a credential.
+        error: PHYSICAL_SEND_FAILED,
+        bodyText,
+        url: input.toString(),
+        method: init.method,
+        headers: init.headers,
+      })
+      throw error
+    }
+    if (apiSubject && response.ok) {
+      const subject = apiSubject
+      native.usagePublications.publish(() =>
+        servingRuntime.publishApi(subject, { lastUsed: Date.now() }),
+      )
+    }
+    if (attempt && response.ok) markServed(attempt)
+    return response
+  }
   if (options.apiAccount) return directFetch()
 
   let relay401Attempt: PiNativeAttempt | undefined
@@ -846,42 +845,40 @@ async function sendAnthropicRequest(options: {
         }
       },
     })
-  return native.trackDispatch(async () => {
-    let response = await sendRelayAttempt()
-    await Promise.all(relayReports)
-    if (
-      relay401Attempt &&
-      response.status === 401 &&
-      !retried401 &&
-      !init.signal?.aborted
-    ) {
-      const rotated = await native
-        .retry(
-          routeId,
-          relay401Attempt,
-          init.signal ?? undefined,
-          options.model.id,
-        )
-        .catch(() => undefined)
-      if (rotated) {
-        retried401 = true
-        await response.body?.cancel().catch(() => {})
-        // Use the replacement credential only for the retried relay request.
-        // A direct request after relay failure obtains its own authorization.
-        nextAttempt = rotated
-        relay401Attempt = undefined
-        response = await sendRelayAttempt()
-        await Promise.all(relayReports)
-      }
+  let response = await sendRelayAttempt()
+  await Promise.all(relayReports)
+  if (
+    relay401Attempt &&
+    response.status === 401 &&
+    !retried401 &&
+    !init.signal?.aborted
+  ) {
+    const rotated = await native
+      .retry(
+        routeId,
+        relay401Attempt,
+        init.signal ?? undefined,
+        options.model.id,
+      )
+      .catch(() => undefined)
+    if (rotated) {
+      retried401 = true
+      await response.body?.cancel().catch(() => {})
+      // Use the replacement credential only for the retried relay request.
+      // A direct request after relay failure obtains its own authorization.
+      nextAttempt = rotated
+      relay401Attempt = undefined
+      response = await sendRelayAttempt()
+      await Promise.all(relayReports)
     }
-    // A relayed 401 is reported to the vault as soon as the relay returns it.
-    // If the request was cancelled since, end it as cancelled here.
-    if (relay401Attempt && response.status === 401)
-      await endIfCancelled(response, init.signal)
-    if (response.ok && lastTransport === 'relay' && relayAttempt)
-      markServed(relayAttempt)
-    return response
-  })
+  }
+  // A relayed 401 is reported to the vault as soon as the relay returns it.
+  // If the request was cancelled since, end it as cancelled here.
+  if (relay401Attempt && response.status === 401)
+    await endIfCancelled(response, init.signal)
+  if (response.ok && lastTransport === 'relay' && relayAttempt)
+    markServed(relayAttempt)
+  return response
 }
 
 /**
