@@ -2,9 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## 2.4.10
+## Unreleased
 
 - Records left by OpenCode or Pi processes from before the last restart of the computer no longer delay moving the plugin's state files, even when their process number has been reused.
+## 2.4.10
+
 - Under the CortexKit agent runner, a used-up model limit is reported to shared routing with its pool name in routing's lowercase form (for example `fable`), and a model limit whose name routing cannot accept is not reported at all, so it is never mistaken for the whole account's weekly limit.
 
 ## 2.4.9
