@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { lstat, mkdir, readFile } from 'node:fs/promises'
+import { uptime } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { LockContentionError, writeJsonAtomic } from '@cortexkit/common-auth/fs'
 
@@ -262,6 +263,9 @@ export interface HolderLiveness {
   pidAlive(pid: number): boolean
   /** Undefined or null when it can't be read. */
   incarnation(pid: number): Promise<string | null>
+  /** Wall clock and OS uptime; tests replace both. */
+  now?(): number
+  uptime?(): number
 }
 
 function pidAlive(pid: number): boolean {
@@ -323,15 +327,41 @@ const defaultLiveness: HolderLiveness = {
 }
 
 /**
- * Whether an entry's process may still be running. A dead pid is stale. A
- * live pid is stale only when the entry recorded an incarnation and the OS
- * now reports a different one; an unreadable incarnation counts as alive.
- * So pid reuse can keep a stale entry, but never clears a live one.
+ * A process recorded before this boot cannot still be running, even if its
+ * pid is alive again. Keep a five-minute margin for clock imprecision, and
+ * keep blocking when the timestamp is missing, invalid or in the future.
+ */
+export function recordPredatesBoot(
+  startedAt: unknown,
+  clock: Pick<HolderLiveness, 'now' | 'uptime'> = {},
+): boolean {
+  if (
+    typeof startedAt !== 'number' ||
+    !Number.isFinite(startedAt) ||
+    startedAt < 0
+  )
+    return false
+  const now = (clock.now ?? Date.now)()
+  const uptimeSeconds = (clock.uptime ?? uptime)()
+  return (
+    Number.isFinite(now) &&
+    Number.isFinite(uptimeSeconds) &&
+    uptimeSeconds >= 0 &&
+    startedAt <= now &&
+    startedAt < now - uptimeSeconds * 1000 - 5 * 60_000
+  )
+}
+
+/**
+ * Whether an entry's process may still be running. An entry from before
+ * this boot or a dead pid is stale. Otherwise an unreadable incarnation
+ * counts as alive; only a different incarnation clears a live pid.
  */
 export async function holderEntryIsLive(
-  entry: Pick<HolderEntry, 'pid' | 'incarnation'>,
+  entry: Pick<HolderEntry, 'pid' | 'incarnation'> & { registeredAt?: unknown },
   liveness: HolderLiveness = defaultLiveness,
 ): Promise<boolean> {
+  if (recordPredatesBoot(entry.registeredAt, liveness)) return false
   if (!liveness.pidAlive(entry.pid)) return false
   if (entry.incarnation === null) return true
   let current: string | null
@@ -352,16 +382,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** An entry's pid and incarnation when it has a usable shape. */
+/** An entry's liveness fields when its pid and incarnation have a usable shape. */
 export function holderEntryLiveness(
   value: unknown,
-): Pick<HolderEntry, 'pid' | 'incarnation'> | undefined {
+):
+  | (Pick<HolderEntry, 'pid' | 'incarnation'> & { registeredAt?: unknown })
+  | undefined {
   if (!isRecord(value)) return undefined
   const { pid, incarnation } = value
   if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0)
     return undefined
   if (incarnation !== null && typeof incarnation !== 'string') return undefined
-  return { pid, incarnation }
+  return { pid, incarnation, registeredAt: value.registeredAt }
 }
 
 function sameRegistration(value: unknown, entry: HolderEntry): boolean {
@@ -587,10 +619,10 @@ async function publishEntry(
 }
 
 /**
- * Add `entry` to `holderFile`, pruning entries of dead processes, while the
- * caller holds that file's `holders` lock. Writes nothing when a live entry
- * for this process, kind and files is already there. A holder file that
- * doesn't parse throws and is never overwritten.
+ * Add `entry` to `holderFile`, pruning stale entries, while the caller holds
+ * that file's `holders` lock. Writes nothing when nothing was pruned and a
+ * live entry for this process, kind and files is already there. A holder
+ * file that doesn't parse throws and is never overwritten.
  */
 export async function publishHolderEntryLocked(
   holderFile: string,
@@ -605,8 +637,12 @@ export async function publishHolderEntryLocked(
     // An entry this version can't read is kept: it may be a live process.
     if (!life || (await holderEntryIsLive(life, liveness))) kept.push(value)
   }
+  let changed = kept.length !== (current?.entries.length ?? 0)
   if (!kept.some((value) => sameRegistration(value, entry))) {
     kept.push(entry)
+    changed = true
+  }
+  if (changed) {
     await writeJsonAtomic(
       holderFile,
       { version: 1, entries: kept },

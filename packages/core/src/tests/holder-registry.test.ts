@@ -204,7 +204,7 @@ test('the next write prunes dead and reused pids but never a live entry', async 
     kind: 'legacy',
     identity: dir,
     files: nativeHolderDatasetFiles(paths),
-    registeredAt: 1,
+    registeredAt: Date.now(),
   })
   await writeFile(
     join(dir, HOLDER_FILE_NAME),
@@ -232,6 +232,34 @@ test('the next write prunes dead and reused pids but never a live entry', async 
   expect(pids).toEqual([910003, 910004, 910005, undefined, process.pid])
 })
 
+test('the next locked write removes pre-boot own entries even when a current registration already exists', async () => {
+  const dir = await folder('opencode')
+  const paths = await dataset(dir)
+  const now = Date.UTC(2026, 0, 2, 12)
+  const boot = Date.UTC(2026, 0, 2, 11)
+  const live: HolderLiveness = {
+    ...liveness({ incarnations: { [process.pid]: null } }),
+    now: () => now,
+    uptime: () => 3_600,
+  }
+  await register(paths, { liveness: live, now: () => now })
+  const current = await holders(dir)
+  const stale = {
+    ...current.entries[0],
+    instance: 'from-previous-boot',
+    registeredAt: boot - 5 * 60_000 - 1,
+  }
+  await writeFile(
+    join(dir, HOLDER_FILE_NAME),
+    JSON.stringify({ version: 1, entries: [stale, ...current.entries] }),
+  )
+
+  resetNativeHolderRegistryForTests()
+  await register(paths, { liveness: live, now: () => now })
+
+  expect(await holders(dir)).toEqual(current)
+})
+
 test('an unreadable incarnation counts as alive and a matching one is never cleared', async () => {
   const own = await processIncarnation(process.pid)
   expect(await holderEntryIsLive({ pid: process.pid, incarnation: own })).toBe(
@@ -252,7 +280,7 @@ test('an unreadable incarnation counts as alive and a matching one is never clea
       liveness({ incarnations: { [process.pid]: 'recorded' } }),
     ),
   ).toBe(true)
-  // Only a different incarnation, or a dead pid, makes an entry stale.
+  // Without a pre-boot time, only a different incarnation or a dead pid clears it.
   expect(
     await holderEntryIsLive(
       { pid: process.pid, incarnation: 'recorded' },

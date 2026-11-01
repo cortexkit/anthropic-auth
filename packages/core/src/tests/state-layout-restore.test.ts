@@ -665,7 +665,7 @@ test('restore refuses while a live process is registered beside either copy, or 
           kind: 'pi',
           identity: null,
           files: [m.oldPaths.state],
-          registeredAt: 1,
+          registeredAt: Date.now(),
         },
       ],
     }),

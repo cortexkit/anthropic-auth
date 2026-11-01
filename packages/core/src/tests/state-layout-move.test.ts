@@ -14,6 +14,7 @@ import {
   rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -480,7 +481,12 @@ test('the fence: a live holder, a malformed holder file, or a live older-version
         await mkdir(dir, { recursive: true })
         await writeFile(
           join(dir, `port-${OLDER_PID}.json`),
-          JSON.stringify({ port: 1, token: 't', pid: OLDER_PID, startedAt: 0 }),
+          JSON.stringify({
+            port: 1,
+            token: 't',
+            pid: OLDER_PID,
+            startedAt: Date.now(),
+          }),
         )
       },
     ],
@@ -501,6 +507,45 @@ test('the fence: a live holder, a malformed holder file, or a live older-version
     expect(await exists(join(m.sub, 'layout.json'))).toBe(false)
     expect(await subDataFiles(m)).toEqual([])
   }
+})
+
+test('the fence moves past pre-boot holders and artifacts despite live reused pids', async () => {
+  const m = await machine()
+  const now = Date.UTC(2026, 0, 2, 12)
+  const boot = Date.UTC(2026, 0, 2, 11)
+  const startedAt = boot - 5 * 60_000 - 1
+  await writeFile(
+    join(m.configDir, HOLDER_FILE_NAME),
+    JSON.stringify({
+      version: 1,
+      entries: [
+        {
+          pid: process.pid,
+          incarnation: null,
+          files: [m.oldPaths.state],
+          registeredAt: startedAt,
+        },
+      ],
+    }),
+  )
+  const cacheKeepDir = m.artifacts.cacheKeepDirs[0] as string
+  const rpcDir = join(m.root, 'rpc', 'project')
+  for (const [dir, name] of [
+    [cacheKeepDir, `${process.pid}-old.json`],
+    [rpcDir, `port-${process.pid}.json`],
+  ] as const) {
+    await mkdir(dir, { recursive: true })
+    const path = join(dir, name)
+    await writeFile(path, JSON.stringify({ pid: process.pid, sessions: [] }))
+    await utimes(path, new Date(startedAt), new Date(startedAt))
+  }
+
+  const decision = await decide(m, {
+    now: () => now,
+    liveness: { ...liveness(), now: () => now, uptime: () => 3_600 },
+  })
+  expect(decision.kind).toBe('state-home')
+  expect(await exists(join(m.sub, 'layout.json'))).toBe(true)
 })
 
 test('a malformed holder file keeps the dataset in place and, since registration is mandatory, refuses', async () => {

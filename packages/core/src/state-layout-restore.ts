@@ -674,6 +674,7 @@ async function newRestoreProblems(
   for (const blocker of await preNArtifactBlockers(
     artifacts,
     options.liveness?.pidAlive,
+    options.liveness,
   ))
     problems.push(`${describeFenceBlocker(blocker)} is still running`)
   for (const slot of dataset.slots) {

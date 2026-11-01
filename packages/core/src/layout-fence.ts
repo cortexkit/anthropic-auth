@@ -1,4 +1,4 @@
-import { readdir, readFile } from 'node:fs/promises'
+import { open, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 
@@ -10,6 +10,7 @@ import {
   holderEntryLiveness,
   processIncarnation,
   readHolderFile,
+  recordPredatesBoot,
 } from './holder-registry.ts'
 import { anthropicAuthStateRoot } from './state-layout-paths.ts'
 
@@ -206,10 +207,18 @@ function stamped(value: unknown): boolean {
 async function readArtifact(
   path: string,
   blockers: FenceBlocker[],
-): Promise<unknown | undefined> {
+): Promise<{ value: unknown; startedAt: unknown } | undefined> {
   let text: string
+  let mtimeMs: number
   try {
-    text = await readFile(path, 'utf8')
+    // Keep the bytes and mtime from the same file if its writer replaces the path.
+    const file = await open(path, 'r')
+    try {
+      text = await file.readFile('utf8')
+      mtimeMs = (await file.stat()).mtimeMs
+    } finally {
+      await file.close()
+    }
   } catch (error) {
     // Removed between the listing and the read: its writer released it.
     if (errorCode(error) === 'ENOENT') return undefined
@@ -217,7 +226,17 @@ async function readArtifact(
     return undefined
   }
   try {
-    return JSON.parse(text) as unknown
+    const value: unknown = JSON.parse(text)
+    // A recorded but unusable time must not fall back to an older mtime.
+    const startedAt =
+      typeof value === 'object' && value !== null
+        ? 'startedAt' in value
+          ? value.startedAt
+          : 'registeredAt' in value
+            ? value.registeredAt
+            : mtimeMs
+        : mtimeMs
+    return { value, startedAt }
   } catch {
     blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
     return undefined
@@ -228,11 +247,13 @@ async function readArtifact(
  * The fence's check for older versions: an RPC port file or CacheKeep record without the
  * `writer` stamp, whose pid is alive, belongs to a version that registers
  * nothing and blocks. Every entry is read; a folder or file that can't be
- * read or parsed blocks too. No timestamp ever clears a live pid.
+ * read or parsed blocks too. A record from before this boot is stale even
+ * if its pid has been reused; missing or untrustworthy times keep blocking.
  */
 export async function preNArtifactBlockers(
   locations: PreNArtifactLocations,
   pidAlive: (pid: number) => boolean = defaultLiveness.pidAlive,
+  clock: Pick<HolderLiveness, 'now' | 'uptime'> = {},
 ): Promise<FenceBlocker[]> {
   const blockers: FenceBlocker[] = []
   const portDirs = [...locations.rpcDirs]
@@ -243,14 +264,15 @@ export async function preNArtifactBlockers(
     for (const name of await listDir(dir, blockers)) {
       if (!/^port-\d+\.json$/.test(name)) continue
       const path = join(dir, name)
-      const value = await readArtifact(path, blockers)
-      if (value === undefined || stamped(value)) continue
+      const record = await readArtifact(path, blockers)
+      if (record === undefined || stamped(record.value)) continue
+      const { value, startedAt } = record
       const pid = (value as { pid?: unknown }).pid
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
         blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
         continue
       }
-      if (pidAlive(pid))
+      if (!recordPredatesBoot(startedAt, clock) && pidAlive(pid))
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })
     }
   }
@@ -259,10 +281,10 @@ export async function preNArtifactBlockers(
       const match = /^(\d+)-.+\.json$/.exec(name)
       if (!match) continue
       const path = join(dir, name)
-      const value = await readArtifact(path, blockers)
-      if (value === undefined || stamped(value)) continue
+      const record = await readArtifact(path, blockers)
+      if (record === undefined || stamped(record.value)) continue
       const pid = Number(match[1])
-      if (pidAlive(pid))
+      if (!recordPredatesBoot(record.startedAt, clock) && pidAlive(pid))
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })
     }
   }

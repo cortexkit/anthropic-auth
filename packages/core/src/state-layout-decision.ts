@@ -1190,6 +1190,7 @@ async function underLayoutLock(
     const found = await preNArtifactBlockers(
       artifacts,
       options.liveness?.pidAlive,
+      options.liveness,
     )
     return found.length ? found.map(describeFenceBlocker).join('; ') : undefined
   }
@@ -1199,7 +1200,11 @@ async function underLayoutLock(
       files,
       liveness: options.liveness,
     })),
-    ...(await preNArtifactBlockers(artifacts, options.liveness?.pidAlive)),
+    ...(await preNArtifactBlockers(
+      artifacts,
+      options.liveness?.pidAlive,
+      options.liveness,
+    )),
   ].map(describeFenceBlocker)
   if (!blockers.length) {
     const failure = await movePreconditionFailure(dataset, ctx.fs.platform)
