@@ -305,35 +305,105 @@ describe('auth.loader', () => {
   // A loopback server stands in for api.anthropic.com: the plugin's fetch
   // still sees the production URL (so the gzip host rule applies) and the
   // stand-in network forwards the exact bytes to the server.
+  type GzipWireTrace = {
+    serverPort: number
+    stopped: boolean
+    sends: Array<{
+      send: number
+      encoding: string | null
+      requestId: string | null
+      bodyBytes: number | null
+      clientLocalPort: number | null
+      requestBodyBytes?: number
+      contentLength?: string | null
+      replyStatus?: number
+      status?: number
+      error?: ReturnType<typeof gzipWireError>
+      serverError?: ReturnType<typeof gzipWireError>
+    }>
+  }
+  // Keep earlier fixtures' ports too: a later server can get a stopped
+  // server's port while Bun still has a pooled connection to that address.
+  const gzipWireTraces: GzipWireTrace[] = []
+
+  function gzipWireError(error: unknown) {
+    return error instanceof Error
+      ? {
+          name: error.name,
+          message: error.message,
+          code: 'code' in error ? error.code : undefined,
+        }
+      : { message: String(error) }
+  }
+
   async function gzipWireScenario(replies: Response[]) {
     await useTempAccountFile(
       createFallbackStorage({ quota: { enabled: false }, accounts: [] }),
     )
     const received: Array<{ headers: Headers; body: Uint8Array }> = []
+    const trace: GzipWireTrace = { serverPort: 0, stopped: false, sends: [] }
     const upstream = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
-      async fetch(request) {
-        received.push({
-          headers: new Headers(request.headers),
-          body: new Uint8Array(await request.arrayBuffer()),
-        })
-        return (
-          replies.shift() ??
-          new Response('event: message_stop\ndata: {}\n\n', {
-            status: 200,
-            headers: { 'request-id': 'req_011CGzipOk00000000000001' },
+      async fetch(request, server) {
+        // The fixture sends sequentially, so the current send owns this
+        // request. The peer port is the fetch client's local loopback port.
+        const attempt = trace.sends.at(-1)!
+        attempt.clientLocalPort = server.requestIP(request)?.port ?? null
+        attempt.contentLength = request.headers.get('content-length')
+        try {
+          const body = new Uint8Array(await request.arrayBuffer())
+          attempt.requestBodyBytes = body.byteLength
+          received.push({
+            headers: new Headers(request.headers),
+            body,
           })
-        )
+          const reply =
+            replies.shift() ??
+            new Response('event: message_stop\ndata: {}\n\n', {
+              status: 200,
+              headers: { 'request-id': 'req_011CGzipOk00000000000001' },
+            })
+          attempt.replyStatus = reply.status
+          return reply
+        } catch (error) {
+          attempt.serverError = gzipWireError(error)
+          throw error
+        }
       },
     })
+    trace.serverPort = upstream.port!
+    gzipWireTraces.push(trace)
     globalThis.fetch = mock(
       withNativeAdmission(async (input: any, init: any) => {
         const target = new URL(input instanceof Request ? input.url : input)
-        return Bun.fetch(
-          `http://127.0.0.1:${upstream.port}${target.pathname}${target.search}`,
-          init,
-        )
+        const headers = new Headers(init?.headers)
+        const attempt: GzipWireTrace['sends'][number] = {
+          send: trace.sends.length + 1,
+          encoding: headers.get('content-encoding'),
+          requestId: headers.get('x-client-request-id'),
+          bodyBytes:
+            typeof init?.body === 'string'
+              ? Buffer.byteLength(init.body)
+              : init?.body instanceof Uint8Array
+                ? init.body.byteLength
+                : null,
+          // Bun fetch exposes no client socket. Null means the request
+          // never reached the handler (or requestIP could not resolve it).
+          clientLocalPort: null,
+        }
+        trace.sends.push(attempt)
+        try {
+          const response = await Bun.fetch(
+            `http://127.0.0.1:${upstream.port}${target.pathname}${target.search}`,
+            init,
+          )
+          attempt.status = response.status
+          return response
+        } catch (error) {
+          attempt.error = gzipWireError(error)
+          throw error
+        }
       }),
     ) as unknown as typeof fetch
     const plugin = await getPlugin()
@@ -358,11 +428,26 @@ describe('auth.loader', () => {
           messages: [{ role: 'user', content: `Review: ${'x'.repeat(9000)}` }],
         }),
       }) as Promise<Response>
-    return { received, send, stop: () => upstream.stop(true) }
+    return {
+      received,
+      send,
+      traceFailure: (error: unknown) =>
+        console.error(
+          '[gzip-wire failure]',
+          JSON.stringify({
+            error: gzipWireError(error),
+            fixtures: gzipWireTraces,
+          }),
+        ),
+      stop: () => {
+        trace.stopped = true
+        return upstream.stop(true)
+      },
+    }
   }
 
   test('sends a large OAuth body gzipped with cch=00000 and padding', async () => {
-    const { received, send, stop } = await gzipWireScenario([])
+    const { received, send, stop, traceFailure } = await gzipWireScenario([])
     try {
       const response = await send()
       await response.text()
@@ -378,13 +463,16 @@ describe('auth.loader', () => {
       // The same body signed is what an uncompressed send would carry.
       const signed = await Core.signRequestBody(trimmed)
       expect(signed).not.toBe(trimmed)
+    } catch (error) {
+      traceFailure(error)
+      throw error
     } finally {
       stop()
     }
   })
 
   test('resends a rejected gzipped body uncompressed once with the same request id', async () => {
-    const { received, send, stop } = await gzipWireScenario([
+    const { received, send, stop, traceFailure } = await gzipWireScenario([
       new Response('Bad Request', { status: 400 }),
     ])
     try {
@@ -411,6 +499,9 @@ describe('auth.loader', () => {
       await next.text()
       expect(received).toHaveLength(3)
       expect(received[2]?.headers.get('content-encoding')).toBeNull()
+    } catch (error) {
+      traceFailure(error)
+      throw error
     } finally {
       stop()
     }
