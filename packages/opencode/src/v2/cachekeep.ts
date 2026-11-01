@@ -46,6 +46,36 @@ function accountKey(account: NativeAccountView) {
   ])
 }
 
+function missingAccountReason(
+  identity: string | undefined,
+  accounts: readonly NativeAccountView[],
+): 'foreign-identity' | 'account-gone' {
+  if (!identity) return 'foreign-identity'
+  try {
+    const key = JSON.parse(identity)
+    if (!Array.isArray(key)) return 'foreign-identity'
+    const [source, , credentialId, storageId, rowId] = key
+    if (
+      source === 'local' &&
+      typeof storageId === 'string' &&
+      typeof rowId === 'string'
+    )
+      return accounts.some(
+        (row) =>
+          row.binding?.storageId === storageId && row.binding.rowId === rowId,
+      )
+        ? 'foreign-identity'
+        : 'account-gone'
+    if (source === 'vault' && typeof credentialId === 'string')
+      return accounts.some((row) => row.credentialId === credentialId)
+        ? 'foreign-identity'
+        : 'account-gone'
+  } catch {
+    // A malformed identity must not be matched to a different login.
+  }
+  return 'foreign-identity'
+}
+
 type CacheKeepPolicyStorage = Awaited<
   ReturnType<NativeAccountRuntime['read']>
 >['policyStorage']
@@ -78,7 +108,9 @@ interface CacheKeepLease {
 interface SharedCacheKeep {
   readonly manager: CacheKeepManager
   readonly registry: CacheKeepSessionRegistry
-  readonly persistence: CacheKeepStore
+  persistence: CacheKeepStore
+  readonly persistenceFollowsOwner?: true
+  legacyPersistence?: CacheKeepStore
   loading?: Promise<void>
   readonly prepared: Map<
     number,
@@ -117,10 +149,10 @@ function sharedCacheKeeps(): Map<string, SharedCacheKeep> {
 function createSharedCacheKeep(
   storageId: string,
   options: NativeCacheKeepOptions,
+  persistence: CacheKeepStore,
 ): SharedCacheKeep {
   const prepared: SharedCacheKeep['prepared'] = new Map()
   const leases: SharedCacheKeep['leases'] = new Map()
-  const persistence = new CacheKeepStore({ storageId, ...options.persistence })
   const restored = new Set<string>()
   let lastRestoredSend = 0
   const registry = new CacheKeepSessionRegistry({
@@ -143,7 +175,7 @@ function createSharedCacheKeep(
       if (lease && !isCacheKeepHybridActive(storage)) {
         for (const session of manager.trackedSessions())
           manager.untrack(session.id)
-        persistence.clear()
+        shared.persistence.clear()
       }
       return storage
     },
@@ -159,10 +191,10 @@ function createSharedCacheKeep(
         return shared.ticking
       }, ms)) as typeof globalThis.setInterval,
     clearIntervalImpl: options.clearIntervalImpl,
-    onTargetChanged: (target) => persistence.changed(target),
+    onTargetChanged: (target) => shared.persistence.changed(target),
     onTargetRemoved: (id) => {
       restored.delete(id)
-      persistence.removed(id)
+      shared.persistence.removed(id)
     },
     // While no instance is live the sessions are only retained, not warmed,
     // so the shared session list for the status menu shows none of them.
@@ -240,6 +272,7 @@ function createSharedCacheKeep(
     manager,
     registry,
     persistence,
+    persistenceFollowsOwner: true,
     prepared,
     leases,
     nextGeneration: 0,
@@ -255,24 +288,29 @@ function createSharedCacheKeep(
         if (!lease) return
         const snapshot = await lease.read()
         if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
-          persistence.clear()
+          shared.persistence.clear()
           return
         }
         const now = options.now?.() ?? Date.now()
         let overdue = 0
-        await persistence.load(now, (entry) => {
+        await shared.persistence.load(now, (entry) => {
           // Disposal may race startup. Leave the file for the next live lease.
-          if (!leases.size || manager.trackedRequest(entry.id)) return true
+          if (!leases.size || manager.trackedRequest(entry.id)) return undefined
           const account = snapshot.accounts.find(
             (row) => accountKey(row) === entry.oauthAccountIdentity,
           )
+          if (!account)
+            return missingAccountReason(
+              entry.oauthAccountIdentity,
+              snapshot.accounts,
+            )
+          if (account.type !== 'oauth' || !nativeAccountCanServe(account))
+            return 'account-gone'
           if (
-            account?.type !== 'oauth' ||
-            !nativeAccountCanServe(account) ||
-            (entry.isSubagent &&
-              !isCacheKeepSubagentsEnabled(snapshot.policyStorage))
+            entry.isSubagent &&
+            !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
           )
-            return false
+            return 'invalid'
           const nextPrewarmAt =
             entry.nextPrewarmAt <= now
               ? now + overdue++ * 3000
@@ -290,7 +328,7 @@ function createSharedCacheKeep(
             retained: { cacheExpiresAt: entry.cacheExpiresAt, nextPrewarmAt },
           })
           if (result.tracked) restored.add(entry.id)
-          return result.tracked
+          return result.tracked ? true : 'invalid'
         })
       })().catch(() => {
         logger.warn('cachekeep', 'failed to restore tracked sessions')
@@ -330,9 +368,24 @@ export function createNativeCacheKeep(
   const { runtime, source } = options
   const abort = new AbortController()
   const shareds = sharedCacheKeeps()
+  const previous = shareds.get(options.storageId)
+  const persistence = new CacheKeepStore(
+    { storageId: options.storageId, ...options.persistence },
+    previous?.persistence,
+  )
   const owner =
-    shareds.get(options.storageId) ??
-    createSharedCacheKeep(options.storageId, options)
+    previous ?? createSharedCacheKeep(options.storageId, options, persistence)
+  if (previous && !previous.persistenceFollowsOwner) {
+    // Older copies captured their first store in the manager callbacks. Keep
+    // those callbacks following the current writer across subsequent reloads.
+    owner.legacyPersistence ??= owner.persistence
+    const legacy = owner.legacyPersistence
+    legacy.changed = (target) => persistence.changed(target)
+    legacy.removed = (id) => persistence.removed(id)
+    legacy.clear = () => persistence.clear()
+    legacy.load = (now, accept) => persistence.load(now, accept)
+  }
+  owner.persistence = persistence
   shareds.set(options.storageId, owner)
   const { manager, registry } = owner
   const send = async (

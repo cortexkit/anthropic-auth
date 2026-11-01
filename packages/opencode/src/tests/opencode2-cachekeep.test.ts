@@ -1,9 +1,11 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   writeFile,
 } from 'node:fs/promises'
@@ -37,7 +39,10 @@ import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
 } from '../v2/adapter'
-import { cacheKeepStoreDirectory } from '../v2/cachekeep-store'
+import {
+  type CacheKeepStore,
+  cacheKeepStoreDirectory,
+} from '../v2/cachekeep-store'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
 import type { NativeSource } from '../v2/source'
@@ -862,6 +867,104 @@ function forgetCacheKeepProcess(storageId: string) {
   ;(globalThis as any)[key]?.delete(storageId)
 }
 
+test('OpenCode 2 restores and prewarms a live format-1 record from another plugin version', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture(false, false, 'debug')
+  const live = (await (await f.live()).json()) as Record<string, any>
+  await f.dispose()
+  const [name] = await readdir(f.disk)
+  const path = join(f.disk, name!)
+  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+  expect(saved.v).toBe(1)
+  saved.pluginVersion = '0.0.0'
+  await writeFile(path, gzipSync(JSON.stringify(saved)))
+  forgetCacheKeepProcess(f.paths.storageId)
+  lines.length = 0
+  const next = await f.start()
+  expect(await readdir(f.disk)).toEqual([name!])
+  const summaries = lines.filter((line) =>
+    line.includes('restart records loaded'),
+  )
+  expect(summaries).toHaveLength(1)
+  expect(summaries[0]).toContain('INFO  [cachekeep]')
+  expect(summaries[0]).toContain('"restored":1,"dropped":0')
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  const warm = (await next.sent[0]!.json()) as Record<string, any>
+  expect(warm.messages).toEqual(live.messages)
+  expect(warm.system.slice(1)).toEqual(live.system.slice(1))
+  expect(warm.max_tokens).toBe(0)
+})
+
+test.each([false, true])(
+  'an OpenCode 2 adopted entry writes through the newer store (legacy callbacks: %s)',
+  async (legacy) => {
+    const f = await fixture()
+    const first = (await (await f.live()).json()) as Record<string, any>
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    const oldStore: CacheKeepStore = owner.persistence
+    if (legacy) delete owner.persistenceFollowsOwner
+    const next = await f.start()
+    const newStore: CacheKeepStore = owner.persistence
+    expect(newStore).not.toBe(oldStore)
+    await newStore.drain()
+    const [name] = await readdir(f.disk)
+    const saved = () =>
+      readFile(join(f.disk, name!)).then((bytes) =>
+        JSON.parse(gunzipSync(bytes).toString()),
+      )
+    expect(JSON.parse((await saved()).bodyText).messages).toEqual(
+      first.messages,
+    )
+    const changed = spyOn(newStore, 'changed')
+    cleanups.push(() => changed.mockRestore())
+    const latest = (await (
+      await next.live(undefined, {
+        messages: [{ role: 'user', content: 'A request after plugin reload' }],
+      })
+    ).json()) as Record<string, any>
+    expect(changed).toHaveBeenCalledTimes(1)
+    if (legacy) {
+      // Emulate an older manager's callback, which captured the first store.
+      oldStore.changed(changed.mock.calls[0]![0])
+      expect(changed).toHaveBeenCalledTimes(2)
+    }
+    await newStore.drain()
+    expect(JSON.parse((await saved()).bodyText).messages).toEqual(
+      latest.messages,
+    )
+  },
+)
+
+test('OpenCode 2 startup reports restored and dropped counts, but not an empty store', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture()
+  expect(
+    lines.filter((line) => line.includes('restart records loaded')),
+  ).toEqual([])
+  await f.live(undefined, {}, 'ses_live')
+  await f.live(undefined, {}, 'ses_expired')
+  await f.dispose()
+  for (const name of await readdir(f.disk)) {
+    const path = join(f.disk, name)
+    const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+    if (saved.id !== 'ses_expired') continue
+    saved.cacheExpiresAt = 0
+    await writeFile(path, gzipSync(JSON.stringify(saved)))
+  }
+  forgetCacheKeepProcess(f.paths.storageId)
+  lines.length = 0
+  await f.start()
+  const summaries = lines.filter((line) =>
+    line.includes('restart records loaded'),
+  )
+  expect(summaries).toHaveLength(1)
+  expect(summaries[0]).toContain('INFO  [cachekeep]')
+  expect(summaries[0]).toContain('"restored":1,"dropped":1')
+})
+
 test('OpenCode 2 restores the latest body from two steps in the same turn more than five seconds apart', async () => {
   const f = await fixture()
   const first = (await (await f.live()).json()) as Record<string, any>
@@ -932,13 +1035,16 @@ test('OpenCode 2 throttles later tool steps for five seconds but disposal drains
 test.each([
   'expired',
   'foreign-identity',
-  'schema-version',
-  'plugin-version',
+  'format',
   'unreadable',
+  'unfinished-write',
+  'invalid',
+  ...(process.platform === 'win32' ? [] : ['unsafe-file']),
 ])(
   'OpenCode 2 deletes a %s restart record without sending it',
   async (change) => {
-    const f = await fixture()
+    const lines = captureStartupLogs()
+    const f = await fixture(false, false, 'debug')
     await f.live()
     await f.dispose()
     const [name] = await readdir(f.disk)
@@ -947,14 +1053,35 @@ test.each([
     if (change === 'expired') saved.cacheExpiresAt = 0
     if (change === 'foreign-identity')
       saved.oauthAccountIdentity = 'someone-else'
-    if (change === 'schema-version') saved.v = 99
-    if (change === 'plugin-version') saved.pluginVersion = '0.0.0'
+    if (change === 'format') saved.v = 99
+    if (change === 'invalid') saved.bodyText = '{not JSON'
     await writeFile(
       path,
       change === 'unreadable' ? 'not gzip' : gzipSync(JSON.stringify(saved)),
     )
+    const droppedName =
+      change === 'unfinished-write' ? `${name!}.1234.tmp` : name!
+    if (change === 'unfinished-write')
+      await rename(path, join(f.disk, droppedName))
+    if (change === 'unsafe-file') await chmod(path, 0o644)
     forgetCacheKeepProcess(f.paths.storageId)
+    lines.length = 0
     const next = await f.start()
+    const drops = lines.filter((line) =>
+      line.includes('restart record dropped'),
+    )
+    expect(drops).toHaveLength(1)
+    expect(drops[0]).toContain('DEBUG [cachekeep]')
+    expect(drops[0]).toContain(`"reason":"${change}"`)
+    expect(drops[0]).toContain(`"file":"${droppedName}"`)
+    expect(drops[0]).not.toContain(saved.id)
+    expect(drops[0]).not.toContain(saved.bodyText)
+    const summaries = lines.filter((line) =>
+      line.includes('restart records loaded'),
+    )
+    expect(summaries).toHaveLength(1)
+    expect(summaries[0]).toContain('INFO  [cachekeep]')
+    expect(summaries[0]).toContain('"restored":0,"dropped":1')
     f.due()
     await f.timers.fire()
     expect(next.sent).toHaveLength(0)
@@ -965,13 +1092,20 @@ test.each([
 test.each(['removed', 'disabled'])(
   'OpenCode 2 drops a restored session whose account was %s',
   async (change) => {
-    const f = await fixture()
+    const lines = captureStartupLogs()
+    const f = await fixture(false, false, 'debug')
     await f.live()
     await f.dispose()
     if (change === 'removed') await f.store.remove('first')
     else await f.store.disable('first', 'user')
     forgetCacheKeepProcess(f.paths.storageId)
+    lines.length = 0
     const next = await f.start()
+    const drops = lines.filter((line) =>
+      line.includes('restart record dropped'),
+    )
+    expect(drops).toHaveLength(1)
+    expect(drops[0]).toContain('"reason":"account-gone"')
     f.due()
     await f.timers.fire()
     expect(next.sent).toHaveLength(0)

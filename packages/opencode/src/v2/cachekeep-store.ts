@@ -24,6 +24,10 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const FILE = /^[a-f0-9]{64}\.json\.gz$/
 const TEMP = /^[a-f0-9]{64}\.json\.gz\.[a-f0-9-]+\.tmp$/
 const MAX_RECORD_BYTES = 2 * CACHE_KEEP_MAX_BODY_BYTES + 64 * 1024
+// Replay compatibility depends only on the record format, not the plugin
+// version. Bump this for format changes; the loader must accept or migrate the
+// previous format so updates do not discard still-live caches.
+const RECORD_FORMAT_VERSION = 1
 
 export function cacheKeepStoreDirectory(storageId: string, root = tmpdir()) {
   return join(
@@ -41,13 +45,30 @@ export type SavedCacheKeepTarget = Pick<
   | 'nextPrewarmAt'
   | 'oauthAccountIdentity'
   | 'isSubagent'
-> & { v: 1; pluginVersion: string }
+> & { v: typeof RECORD_FORMAT_VERSION; pluginVersion: string }
+
+type DropReason =
+  | 'format'
+  | 'expired'
+  | 'foreign-identity'
+  | 'account-gone'
+  | 'unsafe-file'
+  | 'unreadable'
+  | 'unfinished-write'
+  | 'invalid'
+
+type Acceptance =
+  | boolean
+  | 'foreign-identity'
+  | 'account-gone'
+  | 'invalid'
+  | undefined
 
 function record(target: Readonly<CacheKeepTarget>): SavedCacheKeepTarget {
   // Deliberately whitelist fields: transport headers and account credentials
   // must never become part of the restart record, even if tracking gains them.
   return {
-    v: 1,
+    v: RECORD_FORMAT_VERSION,
     pluginVersion,
     id: target.id,
     bodyText: target.bodyText,
@@ -80,15 +101,15 @@ function sanitizedBody(text: string): string {
   return stripped ? JSON.stringify(body) : text
 }
 
-function valid(
+function invalidReason(
   value: SavedCacheKeepTarget,
   name: string,
   now: number,
-): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+): DropReason | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    return 'invalid'
+  if (value.v !== RECORD_FORMAT_VERSION) return 'format'
   if (
-    value.v !== 1 ||
-    value.pluginVersion !== pluginVersion ||
     typeof value.id !== 'string' ||
     !value.id ||
     `${hash(value.id)}.json.gz` !== name ||
@@ -99,12 +120,12 @@ function valid(
     !value.oauthAccountIdentity ||
     typeof value.isSubagent !== 'boolean' ||
     !Number.isFinite(value.cacheExpiresAt) ||
-    value.cacheExpiresAt <= now ||
     !Number.isFinite(value.nextPrewarmAt)
   )
-    return false
+    return 'invalid'
+  if (value.cacheExpiresAt <= now) return 'expired'
   // Malformed bodies and credential-bearing records are not replayable.
-  return sanitizedBody(value.bodyText) === value.bodyText
+  if (sanitizedBody(value.bodyText) !== value.bodyText) return 'invalid'
 }
 
 export interface CacheKeepStoreOptions {
@@ -127,8 +148,14 @@ export class CacheKeepStore {
   private readonly lastWrite = new Map<string, number>()
   private readonly latest = new Map<string, SavedCacheKeepTarget>()
 
-  constructor(private readonly options: CacheKeepStoreOptions) {
+  constructor(
+    private readonly options: CacheKeepStoreOptions,
+    previous?: CacheKeepStore,
+  ) {
     this.directory = cacheKeepStoreDirectory(options.storageId, options.root)
+    // Capture pending writes before the shared entry switches writers. New
+    // writes and loads wait for them, so an old write cannot land last.
+    this.chain = previous?.drain() ?? Promise.resolve()
   }
 
   private refuse() {
@@ -188,14 +215,23 @@ export class CacheKeepStore {
       .catch(() => this.refuse())
   }
 
-  async load(now: number, accept: (entry: SavedCacheKeepTarget) => boolean) {
+  // An undefined acceptance leaves the record untouched without counting a
+  // restore, for example when its session is already tracked in this process.
+  async load(now: number, accept: (entry: SavedCacheKeepTarget) => Acceptance) {
+    await this.chain
     if (!(await this.directoryReady())) return
+    let restored = 0
+    let dropped = 0
     try {
       for (const name of (await readdir(this.directory)).sort()) {
         if (!FILE.test(name) && !TEMP.test(name)) continue
         const path = join(this.directory, name)
+        let reason: DropReason = 'unreadable'
         try {
-          if (TEMP.test(name)) throw new Error('Unfinished write')
+          if (TEMP.test(name)) {
+            reason = 'unfinished-write'
+            throw new Error('Unfinished write')
+          }
           const stat = await lstat(path)
           if (
             !stat.isFile() ||
@@ -208,8 +244,10 @@ export class CacheKeepStore {
                 (stat.mode & 0o777) === 0o600,
               this.options.ownerOnly,
             ))
-          )
+          ) {
+            reason = 'unsafe-file'
             throw new Error('Unsafe restart file')
+          }
           let bytes = await readWindowsOwnerOnly(path, this.options.ownerOnly)
           if (!bytes) {
             const file = await open(
@@ -225,15 +263,32 @@ export class CacheKeepStore {
           const raw = await decompress(bytes, {
             maxOutputLength: MAX_RECORD_BYTES,
           })
+          reason = 'invalid'
           const entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
-          if (!valid(entry, name, now) || !accept(entry))
+          const invalid = invalidReason(entry, name, now)
+          const accepted = invalid ?? accept(entry)
+          if (accepted !== true && accepted !== undefined) {
+            reason = accepted || 'invalid'
             throw new Error('Stale restart file')
+          }
+          if (accepted === true) restored++
         } catch {
+          logger.debug('cachekeep', 'restart record dropped', {
+            file: name,
+            reason,
+          })
+          dropped++
           await rm(path, { force: true })
         }
       }
     } catch {
       this.refuse()
+    } finally {
+      if (restored || dropped)
+        logger.info('cachekeep', 'restart records loaded', {
+          restored,
+          dropped,
+        })
     }
   }
 

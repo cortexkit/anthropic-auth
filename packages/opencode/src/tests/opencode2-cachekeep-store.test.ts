@@ -120,6 +120,22 @@ test('restart writes coalesce the latest body and drain includes later tool step
   expect((await f.saved()).bodyText).toContain('later tool step')
 })
 
+test('a replacement restart store drains the old pending body before loading or writing', async () => {
+  const f = await fixture()
+  f.store.changed(f.target)
+  const next = new CacheKeepStore({ storageId: 'store', root: f.root }, f.store)
+  const restored: string[] = []
+  await next.load(Date.now(), (entry) => {
+    restored.push(entry.bodyText)
+    return true
+  })
+  expect(restored).toEqual([f.target.bodyText])
+  const newest = '{"system":"Written by the newer store"}'
+  next.changed({ ...f.target, bodyText: newest })
+  await next.drain()
+  expect((await f.saved()).bodyText).toBe(newest)
+})
+
 test('removal and policy-off cancel queued writes without resurrecting a file', async () => {
   const f = await fixture()
   f.store.changed(f.target)

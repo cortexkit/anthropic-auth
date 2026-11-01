@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- On OpenCode 2, keep-warm sessions saved before a plugin update are now restored at the next restart instead of being deleted, and each saved session the plugin drops at startup is logged with the reason. Addresses #585.
 - Records left by OpenCode or Pi processes from before the last restart of the computer no longer delay moving the plugin's state files, even when their process number has been reused.
 ## 2.4.10
 
