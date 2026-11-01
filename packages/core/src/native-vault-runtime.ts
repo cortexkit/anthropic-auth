@@ -1442,7 +1442,13 @@ export function createNativeVaultRuntime(
       input: Parameters<typeof fetch>[0],
       init?: Parameters<typeof fetch>[1],
     ) => {
-      const physical = () => fetchImpl(input, { ...init, signal: combined })
+      const physical = () =>
+        fetchImpl(input, {
+          ...init,
+          signal: init?.signal
+            ? AbortSignal.any([combined, init.signal])
+            : combined,
+        })
       if (!dispatch) return physical()
       return dispatch(physical, async () => {
         await requireActive(combined)

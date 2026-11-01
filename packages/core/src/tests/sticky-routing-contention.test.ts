@@ -11,6 +11,7 @@ import {
   setLogLevel,
 } from '../logger.ts'
 import type { NativeLockEvent } from '../native-lock-observer.ts'
+import { runWithRequestSignal } from '../request-abort.ts'
 import { StickySessionRouter } from '../sticky-routing.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
@@ -56,6 +57,50 @@ async function fixture() {
   }
   return { directory, path, router, hold }
 }
+
+lifetimes.test(
+  'an aborted request cannot publish a prepared sticky pin migration',
+  async () => {
+    const f = await fixture()
+    const router = f.router()
+    await router.resolve(input('aborted-migration'))
+    await router.drain()
+    const before = await readFile(f.path, 'utf8')
+    const entered = lifetimes.gate()
+    const release = lifetimes.gate()
+    const finished = lifetimes.gate()
+    const controller = new AbortController()
+    const migration = {
+      ...input('aborted-migration', 'other'),
+      excludeAccountIds: new Set(['main']),
+    }
+    const pending = runWithRequestSignal(controller.signal, async () => {
+      expect((await router.resolve(migration))?.accountId).toBe('other')
+      entered.open()
+      await release.wait
+      finished.open()
+    })
+    await entered.wait
+    controller.abort(new Error('request ended before send'))
+    await expect(pending).rejects.toBe(controller.signal.reason)
+    release.open()
+    await finished.wait
+    await router.drain()
+    expect(await readFile(f.path, 'utf8')).toBe(before)
+    expect(
+      (await router.resolve(input('aborted-migration', 'other')))?.accountId,
+    ).toBe('main')
+    await runWithRequestSignal(new AbortController().signal, async () => {
+      expect((await router.resolve(migration))?.accountId).toBe('other')
+    })
+    await router.drain()
+    expect(
+      JSON.parse(await readFile(f.path, 'utf8')).assignments[
+        key('aborted-migration')
+      ].accountId,
+    ).toBe('other')
+  },
+)
 
 lifetimes.test(
   'sticky routing decisions read published pins without waiting and publish after the writer releases',

@@ -31,6 +31,7 @@ import {
   type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
+  requestSignal,
   setDumpEnabled as setDumpEnabledCore,
   stateRefusalCause,
   stateRefusalPublicMessage,
@@ -946,6 +947,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     }
     operations.add(operation)
     const ensureLive = () => {
+      requestSignal()?.throwIfAborted()
       if (disposed || operation.revoked) {
         throw new NativeAnthropicRevokedError(scope.sessionID, scope.kind)
       }

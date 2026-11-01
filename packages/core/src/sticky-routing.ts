@@ -32,6 +32,7 @@ import {
   readNativeVaultLegacyJson,
 } from './native-vault-seed.ts'
 import { quotaExhaustionFromHeaders } from './quota-headers.ts'
+import { commitRequestChange, requestSignal } from './request-abort.ts'
 
 export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
 export const STICKY_ROUTING_SHORT_RESET_GRACE_MS = 15 * 60_000
@@ -1123,10 +1124,12 @@ export class StickySessionRouter {
     /** Leave the current pin intact when selection cannot offer an account. */
     preserveOnNoCandidate?: boolean
   }): Promise<StickyRouteResolution | null> {
+    requestSignal()?.throwIfAborted()
     if (!input.sessionId) return null
     this.recoverLocalPins()
     await this.prepareLegacySeed()
     await this.refreshStateIfChanged().catch(() => {})
+    requestSignal()?.throwIfAborted()
     const key = sessionKey(input.sessionId)
     const affinityModelId = input.affinityModelId ?? input.modelId
     const matchesAffinity = (assignment: StickyRouteAssignment) =>
@@ -1156,10 +1159,12 @@ export class StickySessionRouter {
       !input.excludeAccountIds?.has(this.logicalAccountId(cached))
     ) {
       if (this.now() - cached.lastSeenAt >= STICKY_ROUTING_TOUCH_INTERVAL_MS) {
-        cached.lastSeenAt = this.now()
-        this.scheduleTouch(key)
+        commitRequestChange(() => {
+          cached.lastSeenAt = this.now()
+          this.scheduleTouch(key)
+        })
       }
-      this.retryChange(key)
+      commitRequestChange(() => this.retryChange(key))
       return {
         accountId: this.logicalAccountId(cached),
         assignment: { ...cached },
@@ -1171,7 +1176,9 @@ export class StickySessionRouter {
     // Route decisions use the atomically published state, never a writer lease.
     const state = structuredClone(this.state)
     const save = (operation: 'touch' | 'delete' | 'assign') => {
-      this.scheduleChange(key, state.assignments[key], operation)
+      commitRequestChange(() =>
+        this.scheduleChange(key, state.assignments[key], operation),
+      )
     }
     this.prune(state)
     const current = state.assignments[key]

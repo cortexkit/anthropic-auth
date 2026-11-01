@@ -938,6 +938,55 @@ async function sendNative(
   })
 }
 
+test('OC1 abort ends a stalled quota preflight without sending a model request', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => fixture.scopedClient },
+  })
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    routing: { mode: 'sticky-balanced' },
+  }))
+  runtime.close()
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  network.mockImplementation(async (input, init) => {
+    if (String(input).includes('/api/oauth/usage')) {
+      entered.open()
+      await release.wait
+    }
+    return fixture.fetchProvider(input, init)
+  })
+  const controller = new AbortController()
+  const reason = new Error('synthetic header timeout')
+  const pending = sendNative(
+    plugin,
+    undefined,
+    undefined,
+    false,
+    controller.signal,
+  ).catch((error: unknown) => error)
+  try {
+    await entered.wait
+    controller.abort(reason)
+    expect(
+      await Promise.race([pending, Bun.sleep(500).then(() => 'still waiting')]),
+    ).toBe(reason)
+  } finally {
+    release.open()
+  }
+  await pending
+  await plugin.dispose?.()
+  expect(
+    fixture.records.filter((record) => record.url.includes('/v1/messages')),
+  ).toEqual([])
+})
+
 for (const concurrency of [4, 8]) {
   test(`OC1 concurrent local sends retain quota and lastUsed N=${concurrency}`, async () => {
     const fixture = await migrateServingFixture('local')
@@ -3677,6 +3726,7 @@ for (const relay of [false, true]) {
     controller.abort()
     const outcome = await pending
     release.open()
+    await getPluginTestHandles(plugin).drainDispatchWork()
     expect(outcome).toBe(controller.signal.reason)
     const assigned = served[0]
     if (!assigned) throw new Error('No model send reached the provider')
@@ -3742,11 +3792,68 @@ test('vault direct cancel after a 401 arrives and before re-authorization ends a
   // Nothing was read from the vault after the cancel: no re-authorization
   // and no authorization of another account.
   expect(fixture.authorizedGets).toHaveLength(readsAtRejection ?? -1)
+  await getPluginTestHandles(plugin).drainDispatchWork()
   expect(reportedRecords(fixture)).toEqual([[assigned, 1, 401]])
   expect((await sendNative(plugin, undefined, sessionId)).status).toBe(200)
   expect(served).toEqual([assigned, assigned])
   expect(fixture.scopedReports).toHaveLength(1)
 })
+
+for (const relay of [false, true]) {
+  test(`vault ${relay ? 'HTTP relay' : 'direct'} dispose drains a pending 401 report after caller abort`, async () => {
+    const controller = new AbortController()
+    const { fixture, plugin, served } =
+      await stickyVaultRejectedFirstSend(relay)
+    const authorizing = lifetimes.gate()
+    const releaseAuthorization = lifetimes.gate()
+    const get = fixture.scopedClient.getScoped.bind(fixture.scopedClient)
+    fixture.scopedClient.getScoped = async (input) => {
+      if (served.length === 1) {
+        authorizing.open()
+        await releaseAuthorization.wait
+      }
+      return get(input)
+    }
+    const entered = lifetimes.gate()
+    const release = lifetimes.gate()
+    const report = fixture.scopedClient.reportAuthFailureScoped.bind(
+      fixture.scopedClient,
+    )
+    fixture.scopedClient.reportAuthFailureScoped = async (input) => {
+      entered.open()
+      await release.wait
+      return report(input)
+    }
+    const pending = sendNative(
+      plugin,
+      undefined,
+      undefined,
+      false,
+      controller.signal,
+    ).catch((error: unknown) => error)
+    await authorizing.wait
+    controller.abort(new Error('synthetic caller timeout'))
+    expect(await pending).toBe(controller.signal.reason)
+    let closed = false
+    const closing = Promise.resolve(plugin.dispose?.()).then(() => {
+      closed = true
+    })
+    try {
+      await entered.wait
+      expect(closed).toBe(false)
+      expect(fixture.scopedReports).toEqual([])
+    } finally {
+      releaseAuthorization.open()
+      release.open()
+      await closing
+    }
+    const assigned = served[0]
+    if (!assigned) throw new Error('No model send reached the provider')
+    expect(served).toEqual([assigned])
+    expect(reportedRecords(fixture)).toEqual([[assigned, 1, 401]])
+    expect(fixture.scopedReports).toHaveLength(1)
+  })
+}
 
 test('OpenCode 1 serves through a vault outage without local token rescue', async () => {
   const f = await migrateServingFixture('claustrum')
