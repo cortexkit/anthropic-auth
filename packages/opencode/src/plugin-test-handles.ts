@@ -10,6 +10,7 @@ import type {
 import type { FableFallbackManager } from './fable-fallback.ts'
 
 export interface PluginTestHandles {
+  drainDispatchWork: () => Promise<void>
   primeManager: PrimeManager
   quotaManager: QuotaManager
   cacheKeepManager: CacheKeepManager

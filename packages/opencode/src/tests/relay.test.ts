@@ -1543,6 +1543,106 @@ describe('relay client', () => {
     ])
   })
 
+  for (const optimistic of [false, true]) {
+    test(`websocket caller abort ends keepalive-only ${optimistic ? 'optimistic stream' : 'header wait'}`, async () => {
+      const originalWebSocket = globalThis.WebSocket
+      let sent!: () => void
+      const started = new Promise<void>((resolve) => {
+        sent = resolve
+      })
+      let sends = 0
+      let closes = 0
+      let fallbacks = 0
+      let socket: KeepaliveWebSocket | undefined
+      let requestId: string | undefined
+      class KeepaliveWebSocket extends EventTarget {
+        static OPEN = 1
+        readyState = 1
+        constructor() {
+          super()
+          socket = this
+          queueMicrotask(() =>
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({
+                  protocol: 2,
+                  type: 'ready',
+                  state: null,
+                }),
+              }),
+            ),
+          )
+        }
+        send(data: string) {
+          requestId = JSON.parse(data).id
+          sends++
+          for (let i = 0; i < 3; i++)
+            this.dispatchEvent(
+              new MessageEvent('message', {
+                data: JSON.stringify({ protocol: 2, type: 'keepalive' }),
+              }),
+            )
+          sent()
+        }
+        close() {
+          closes++
+          this.readyState = 3
+          this.dispatchEvent(new Event('close'))
+        }
+      }
+      globalThis.WebSocket = KeepaliveWebSocket as unknown as typeof WebSocket
+      const controller = new AbortController()
+      const reason = new Error('synthetic caller timeout')
+      let received!: () => void
+      const responseReady = new Promise<void>((resolve) => {
+        received = resolve
+      })
+      try {
+        const pending = sendViaRelay({
+          config: websocketConfig,
+          input: 'https://api.anthropic.com/v1/messages',
+          init: { method: 'POST', signal: controller.signal },
+          headers: headers(`session-abort-keepalive-${optimistic}`),
+          body: streamingRequest('hello'),
+          optimisticResponse: optimistic,
+          fallback: async () => {
+            fallbacks++
+            return new Response('direct')
+          },
+        })
+          .then((response) => {
+            received()
+            return response.text()
+          })
+          .catch((error: unknown) => error)
+        await started
+        if (optimistic) await responseReady
+        controller.abort(reason)
+        expect(
+          await Promise.race([
+            pending,
+            Bun.sleep(500).then(() => 'still waiting'),
+          ]),
+        ).toBe(reason)
+        expect(sends).toBe(1)
+        expect(closes).toBe(1)
+        expect(fallbacks).toBe(0)
+      } finally {
+        controller.abort()
+        for (const message of [
+          { type: 'response_start', status: 200 },
+          { type: 'done' },
+        ])
+          socket?.dispatchEvent(
+            new MessageEvent('message', {
+              data: JSON.stringify({ protocol: 2, id: requestId, ...message }),
+            }),
+          )
+        globalThis.WebSocket = originalWebSocket
+      }
+    })
+  }
+
   test('websocket keepalive resets pre-response timeout', async () => {
     const originalWebSocket = globalThis.WebSocket
     const timeouts: Array<{ id: number; ms?: number }> = []

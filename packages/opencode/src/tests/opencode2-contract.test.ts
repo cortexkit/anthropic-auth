@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   custodyTombstoneOAuth,
+  fetchOAuthQuotaSnapshot,
   THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import type { OpenCode2HookContext } from '@cortexkit/common-auth/opencode2'
@@ -118,6 +119,76 @@ function request() {
 }
 
 describe('OpenCode 2 published installation contract', () => {
+  test('OC2 abort ends a stalled quota preflight without sending a model request', async () => {
+    const hooks = new Hooks()
+    let entered!: () => void
+    const started = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    let release!: (response: Response) => void
+    const quota = new Promise<Response>((resolve) => {
+      release = resolve
+    })
+    let authorized = 0
+    let sends = 0
+    const native = await installNativeAnthropic(
+      { session: hooks },
+      {
+        source: source({
+          chooseAccount: async () => {
+            await fetchOAuthQuotaSnapshot({
+              accessToken: 'sk-ant-oat01-synthetic',
+              fetchImpl: Object.assign(
+                async () => {
+                  entered()
+                  return quota
+                },
+                { preconnect: fetch.preconnect },
+              ),
+            })
+            return 'main'
+          },
+          authorizeAccount: () => {
+            authorized++
+            return undefined
+          },
+        }),
+      },
+      { credential: preparedAnthropicCredential },
+    )
+    const controller = new AbortController()
+    const reason = new Error('synthetic header timeout')
+    const draft = {
+      ...scope,
+      request: new Request(request(), { signal: controller.signal }),
+    }
+    const pending = hooks
+      .run('http.request', draft)
+      .then(() => {
+        sends++
+      })
+      .catch((error: unknown) => error)
+    try {
+      await started
+      controller.abort(reason)
+      expect(
+        await Promise.race([
+          pending,
+          Bun.sleep(500).then(() => 'still waiting'),
+        ]),
+      ).toBe(reason)
+    } finally {
+      release(Response.json({ five_hour: { utilization: 0 } }))
+      await pending
+      await native.dispose()
+    }
+    expect(authorized).toBe(0)
+    expect(sends).toBe(0)
+    expect(draft.request.headers.get('authorization')).toBe(
+      `Bearer ${placeholderSecret('anthropic')}`,
+    )
+  })
+
   test('generic WebSocket transport leaves stock untouched but refuses an exact pool placeholder before dispatch', async () => {
     const hooks = new Hooks()
     const native = await installNativeAnthropic(

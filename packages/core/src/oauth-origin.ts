@@ -101,6 +101,13 @@ export function createAnthropicOAuthFetch(
       input: Parameters<typeof fetch>[0],
       init?: Parameters<typeof fetch>[1],
     ) => {
+      const signal =
+        init?.signal !== undefined
+          ? init.signal
+          : input instanceof Request
+            ? input.signal
+            : undefined
+      signal?.throwIfAborted()
       requireAnthropicOAuthOrigin(fetchInputUrl(input), current())
       return fetch(input, { ...init, redirect: 'error' })
     },

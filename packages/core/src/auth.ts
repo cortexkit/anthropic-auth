@@ -10,6 +10,7 @@ import {
 } from './constants.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import { generatePKCE } from './pkce.ts'
+import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
 
 type CallbackParams = {
   code: string
@@ -86,28 +87,36 @@ export async function refreshClaudeOAuthToken(input: {
         await new Promise((resolve) => setTimeoutImpl(resolve, delay))
       }
 
-      const response = await fetchImpl(TOKEN_URL, {
-        method: 'POST',
-        redirect: 'error',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json, text/plain, */*',
-          'User-Agent': AXIOS_USER_AGENT,
-        },
-        body: JSON.stringify({
-          grant_type: 'refresh_token',
-          refresh_token: input.refreshToken,
-          client_id: CLIENT_ID,
-          scope: REFRESH_SCOPE,
+      const signal = auxiliaryRequestSignal()
+      const response = await raceWithSignal(signal, () =>
+        fetchImpl(TOKEN_URL, {
+          signal,
+          method: 'POST',
+          redirect: 'error',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json, text/plain, */*',
+            'User-Agent': AXIOS_USER_AGENT,
+          },
+          body: JSON.stringify({
+            grant_type: 'refresh_token',
+            refresh_token: input.refreshToken,
+            client_id: CLIENT_ID,
+            scope: REFRESH_SCOPE,
+          }),
         }),
-      })
+      )
 
       if (!response.ok) {
         if (response.status >= 500 && attempt < maxRetries) {
-          await response.body?.cancel().catch(() => {})
+          await raceWithSignal(signal, async () =>
+            response.body?.cancel(),
+          ).catch(() => {})
           continue
         }
-        const body = await response.text().catch(() => '')
+        const body = await raceWithSignal(signal, () => response.text()).catch(
+          () => '',
+        )
         throw new ClaudeOAuthRefreshError(
           response.status,
           body,
@@ -115,7 +124,7 @@ export async function refreshClaudeOAuthToken(input: {
         )
       }
 
-      const json = (await response.json()) as {
+      const json = (await raceWithSignal(signal, () => response.json())) as {
         access_token: string
         refresh_token?: string
         expires_in: number

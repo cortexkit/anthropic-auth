@@ -80,6 +80,81 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true })
 })
 
+test('Pi abort ends a stalled quota preflight without sending a model request', async () => {
+  await saveNativePiFixture(
+    {
+      version: 1,
+      routing: { mode: 'sticky-balanced' },
+      accounts: [],
+    },
+    storagePath,
+    { mainAccess: 'sk-ant-oat01-synthetic-native-main-access' },
+  )
+  getPiNativeRuntime(storagePath, {
+    local: {
+      resolveIdentity: async () =>
+        getClaudeCodeIdentityForVerifiedAccount(
+          'main',
+          fixtureAccountIdentity('main'),
+        ),
+    },
+  })
+  let entered!: () => void
+  const started = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  let release!: (response: Response) => void
+  const quota = new Promise<Response>((resolve) => {
+    release = resolve
+  })
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).includes('/api/oauth/usage')) {
+        entered()
+        return quota
+      }
+      sends++
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const controller = new AbortController()
+  const pending = streamCortexKitAnthropic(model, context, {
+    signal: controller.signal,
+    sessionId: 'synthetic-quota-abort',
+  }).result()
+  try {
+    await Promise.race([
+      started,
+      pending.then((result) => {
+        throw new Error(
+          `Quota preflight was not reached: ${result.errorMessage ?? result.stopReason}`,
+        )
+      }),
+    ])
+    controller.abort(new Error('synthetic caller timeout'))
+    const result = await Promise.race([
+      pending,
+      Bun.sleep(500).then(() => undefined),
+    ])
+    expect(result?.stopReason).toBe('aborted')
+    expect(result?.errorMessage).toBe('synthetic caller timeout')
+  } finally {
+    release(
+      Response.json({
+        seven_day: {
+          utilization: 0,
+          resets_at: new Date(Date.now() + 60_000).toISOString(),
+        },
+      }),
+    )
+    await pending
+    await closePiNativeRuntime(storagePath)
+  }
+  expect(sends).toBe(0)
+})
+
 test('Pi empty-init routing uses the construction-time override or native derived path; missing authority refuses', () =>
   trackPiTestBody(
     (async () => {

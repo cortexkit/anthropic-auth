@@ -33,6 +33,7 @@ import {
   quotaSnapshotHasStandardWindows,
   readNativeAccountsForRequest,
   remapModelId,
+  requestSignal,
   StickySessionRouter,
   setDumpEnabled,
   shouldFallbackStatus,
@@ -311,7 +312,13 @@ export function createNativeAnthropicSource(
         if (!first.done) source.forgetSession?.(first.value)
       }
     }
-    return current
+    const signal = requestSignal()
+    return signal
+      ? {
+          signal: AbortSignal.any([current.signal, signal]),
+          abort: current.abort.bind(current),
+        }
+      : current
   }
   const eligible = (
     account: NativeAccountView,

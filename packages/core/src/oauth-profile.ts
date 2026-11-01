@@ -1,5 +1,6 @@
 import type { OAuthAccountProfile, ProviderAccountUuid } from './accounts.ts'
 import { assertNotCustodyTombstone } from './claustrum.ts'
+import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 
@@ -15,21 +16,24 @@ export async function fetchOAuthAccountProfile(input: {
 }): Promise<OAuthAccountProfile> {
   // The bearer value is guarded where it becomes a header, like every other builder.
   assertNotCustodyTombstone(input.accessToken, 'anthropic')
-  const response = await (input.fetchImpl ?? fetch)(PROFILE_URL, {
-    method: 'GET',
-    // The bearer is an OAuth token; never let a redirect carry it elsewhere.
-    redirect: 'error',
-    signal: input.signal,
-    headers: {
-      Authorization: `Bearer ${input.accessToken}`,
-      Accept: 'application/json',
-      'anthropic-beta': 'oauth-2025-04-20',
-    },
-  })
+  const signal = auxiliaryRequestSignal(input.signal)
+  const response = await raceWithSignal(signal, () =>
+    (input.fetchImpl ?? fetch)(PROFILE_URL, {
+      method: 'GET',
+      // The bearer is an OAuth token; never let a redirect carry it elsewhere.
+      redirect: 'error',
+      signal,
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        Accept: 'application/json',
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+    }),
+  )
   if (!response.ok) {
     throw new Error(`Claude profile check failed: ${response.status}`)
   }
-  const value = (await response.json()) as {
+  const value = (await raceWithSignal(signal, () => response.json())) as {
     organization?: {
       organization_type?: unknown
       rate_limit_tier?: unknown

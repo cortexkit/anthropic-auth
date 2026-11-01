@@ -14,6 +14,7 @@ import {
 } from './constants.ts'
 import type { LogLevel } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
+import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
 
 export type { ProviderAccountUuid } from './claude-code.ts'
 
@@ -1709,21 +1710,27 @@ export async function fetchOAuthQuotaSnapshot(input: {
 }): Promise<OAuthQuotaSnapshot> {
   assertNotCustodyTombstone(input.accessToken, 'anthropic')
   const fetchImpl = input.fetchImpl ?? fetch
-  const response = await fetchImpl(QUOTA_URL, {
-    method: 'GET',
-    // The bearer is an OAuth token; never let a redirect carry it elsewhere.
-    redirect: 'error',
-    headers: {
-      Authorization: `Bearer ${input.accessToken}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'anthropic-beta': 'oauth-2025-04-20',
-      'User-Agent': `claude-code/${CLAUDE_CODE_VERSION}`,
-    },
-  })
+  const signal = auxiliaryRequestSignal()
+  const response = await raceWithSignal(signal, () =>
+    fetchImpl(QUOTA_URL, {
+      method: 'GET',
+      signal,
+      // The bearer is an OAuth token; never let a redirect carry it elsewhere.
+      redirect: 'error',
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': `claude-code/${CLAUDE_CODE_VERSION}`,
+      },
+    }),
+  )
 
   if (!response.ok) {
-    const body = await response.text().catch(() => '')
+    const body = await raceWithSignal(signal, () => response.text()).catch(
+      () => '',
+    )
     const error = Object.assign(
       new Error(`Claude quota check failed: ${response.status} — ${body}`),
       {
@@ -1735,7 +1742,9 @@ export async function fetchOAuthQuotaSnapshot(input: {
   }
 
   const checkedAt = input.now?.() ?? Date.now()
-  const usage = (await response.json()) as OAuthUsageResponse
+  const usage = (await raceWithSignal(signal, () =>
+    response.json(),
+  )) as OAuthUsageResponse
   const bindingWindow = mapBindingWindow(usage.limits)
   const snapshot = {
     five_hour: mapUsageWindow(usage.five_hour, checkedAt),

@@ -13,6 +13,7 @@ import {
   type ProviderErrorStreamScope,
   type ProviderResponseMode,
 } from './provider-error.ts'
+import { raceWithSignal } from './request-abort.ts'
 import { SseFrameTooLargeError } from './sse.ts'
 
 export type RelayConfig = {
@@ -447,6 +448,7 @@ async function postRelay(
   payload: RelayPayload,
   signal?: AbortSignal | null,
 ): Promise<Response> {
+  signal?.throwIfAborted()
   const stringifyStart = perfNowMs()
   const body = JSON.stringify(payload)
   relayPerfLog('http_payload_stringify', {
@@ -801,6 +803,7 @@ function disposeWebSocketAttemptScopes(scopes: WebSocketAttemptScopes) {
 }
 
 type PendingWebSocketRequest = {
+  abortCleanup?: () => void
   payload: RelayPayload
   bodyText: string
   resolve: (response: Response) => void
@@ -889,20 +892,25 @@ class PersistentRelaySession {
     onResponseHeaders: ((headers: Headers) => void) | undefined,
     authorizeAttempt: AuthorizeRelayAttempt | undefined,
     responseMode: ProviderResponseMode,
+    signal?: AbortSignal | null,
   ): Promise<RelaySendResult> {
+    signal?.throwIfAborted()
     this.touch()
     const enqueuedAt = perfNowMs()
     const start = this.queue
       .catch(() => {})
       .then(() =>
-        this.startQueued(
-          payload,
-          bodyText,
-          enqueuedAt,
-          optimisticResponse,
-          onResponseHeaders,
-          authorizeAttempt,
-          responseMode,
+        raceWithSignal(signal, () =>
+          this.startQueued(
+            payload,
+            bodyText,
+            enqueuedAt,
+            optimisticResponse,
+            onResponseHeaders,
+            authorizeAttempt,
+            responseMode,
+            signal,
+          ),
         ),
       )
     const result = start.then(async ({ response, getPayload }) => ({
@@ -916,7 +924,7 @@ class PersistentRelaySession {
       ({ done }) => done.catch(() => {}),
       () => {},
     )
-    return result
+    return raceWithSignal(signal, () => result)
   }
 
   private async startQueued(
@@ -927,11 +935,14 @@ class PersistentRelaySession {
     onResponseHeaders: ((headers: Headers) => void) | undefined,
     authorizeAttempt: AuthorizeRelayAttempt | undefined,
     responseMode: ProviderResponseMode,
+    signal?: AbortSignal | null,
   ) {
+    signal?.throwIfAborted()
     const createScopes = (secrets: readonly string[]) =>
       createWebSocketAttemptScopes(secrets, responseMode)
     const connectStart = perfNowMs()
     await this.ensureConnected()
+    signal?.throwIfAborted()
     const connectedAt = perfNowMs()
     const localState = sessionState.get(this.affinity)
     const serverHash = this.serverState?.hash
@@ -965,6 +976,10 @@ class PersistentRelaySession {
       authorizeAttempt,
       createScopes,
     )
+    if (signal?.aborted) {
+      disposeWebSocketAttemptScopes(firstAttempt.scope)
+      signal.throwIfAborted()
+    }
     let activePayload = requestPayload
     const first = this.sendPayload(
       requestPayload,
@@ -974,6 +989,7 @@ class PersistentRelaySession {
       authorizeAttempt,
       firstAttempt,
       responseMode,
+      signal,
     )
     void first.done.catch(() => {})
     let activeDone = first.done
@@ -994,6 +1010,10 @@ class PersistentRelaySession {
         authorizeAttempt,
         createScopes,
       )
+      if (signal?.aborted) {
+        disposeWebSocketAttemptScopes(retryAttempt.scope)
+        signal.throwIfAborted()
+      }
       activePayload = fullSync
       const retry = this.sendPayload(
         fullSync,
@@ -1003,6 +1023,7 @@ class PersistentRelaySession {
         authorizeAttempt,
         retryAttempt,
         responseMode,
+        signal,
       )
       void retry.done.catch(() => {})
       activeDone = retry.done
@@ -1012,6 +1033,8 @@ class PersistentRelaySession {
       () => activeDone,
       () => activeDone.catch(() => {}),
     )
+    // Cancellation can happen before the queued caller receives the request handle.
+    void done.catch(() => {})
     return { response, done, getPayload: () => activePayload }
   }
 
@@ -1118,6 +1141,7 @@ class PersistentRelaySession {
     authorizeAttempt: AuthorizeRelayAttempt | undefined,
     attempt: PhysicalAttempt<WebSocketAttemptScopes>,
     responseMode: ProviderResponseMode,
+    signal?: AbortSignal | null,
   ) {
     const socket = this.socket
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -1161,6 +1185,24 @@ class PersistentRelaySession {
         responseHeadersDelivered: false,
       }
       this.pending = pending
+      if (signal) {
+        const abort = () => {
+          if (this.pending !== pending) return
+          // Keep the caller's timeout reason unchanged when failing the request.
+          this.failPending(signal.reason, false)
+          const socket = this.socket
+          this.socket = undefined
+          this.serverState = undefined
+          this.connecting = undefined
+          socket?.close()
+        }
+        pending.abortCleanup = () => signal.removeEventListener('abort', abort)
+        signal.addEventListener('abort', abort, { once: true })
+        if (signal.aborted) {
+          abort()
+          return
+        }
+      }
       this.resetPendingTimeout(pending)
       socket.send(JSON.stringify(payload))
       if (optimisticResponse) {
@@ -1307,6 +1349,8 @@ class PersistentRelaySession {
    */
   private retireAttempt(pending: PendingWebSocketRequest) {
     pending.retired = true
+    pending.abortCleanup?.()
+    pending.abortCleanup = undefined
     pending.scope?.dispose()
     pending.scope = undefined
     pending.responseScope?.dispose()
@@ -1904,8 +1948,10 @@ export async function sendViaRelay(options: {
           onResponseHeaders,
           authorizeAttempt,
           requestMode(),
+          init?.signal,
         )
       } catch (error) {
+        init?.signal?.throwIfAborted()
         if (
           error instanceof RelayAuthorizationError ||
           error instanceof RelayResponseMetadataError
@@ -1996,6 +2042,7 @@ export async function sendViaRelay(options: {
     })
     return result.response
   } catch (error) {
+    init?.signal?.throwIfAborted()
     if (error instanceof RelayAuthorizationError) throw error.failure
     // The upstream already answered this request; a direct fallback would
     // send it a second time.

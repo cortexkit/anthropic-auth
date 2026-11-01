@@ -210,6 +210,7 @@ import {
   stickyRouteFamilyForModel,
   TrailingAssistantHistoryError,
   tokenFingerprint,
+  withAbortableFetch,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
 import type { Model as ProviderModelV2 } from '@opencode-ai/sdk/v2'
@@ -1610,10 +1611,26 @@ const anthropicAuthPlugin = async (
     return nativeAccounts.vault
   }
   const usagePublications = createNativeUsagePublisher('native-auth')
+  const dispatchWork = new Set<Promise<unknown>>()
+  async function trackDispatch<T>(work: () => Promise<T>): Promise<T> {
+    const pending = Promise.resolve().then(work)
+    dispatchWork.add(pending)
+    try {
+      return await pending
+    } finally {
+      dispatchWork.delete(pending)
+    }
+  }
+  async function drainDispatchWork() {
+    while (dispatchWork.size) await Promise.allSettled([...dispatchWork])
+  }
   async function closeOpenCodeScopedRuntime(
     _storagePath = accountStoragePath,
   ): Promise<void> {
     vaultWatch?.close()
+    // Aborting the caller does not cancel a version-fenced 401 report.
+    // Finish dispatch cleanup before closing the custody client it uses.
+    await drainDispatchWork()
     await usagePublications.drain()
     await nativeAccounts.drainQuotaPublications()
     await Promise.all(
@@ -1852,7 +1869,9 @@ const anthropicAuthPlugin = async (
   ) {
     if (reportedVault401.has(receipt)) return
     reportedVault401.add(receipt)
-    await nativeAccounts.vault.reportFailure(receipt, 401, source).catch(() => {
+    await trackDispatch(() =>
+      nativeAccounts.vault.reportFailure(receipt, 401, source),
+    ).catch(() => {
       logger.warn('claustrum', 'native auth-failure report unavailable')
     })
   }
@@ -8001,190 +8020,192 @@ const anthropicAuthPlugin = async (
                 },
                 dumpTag: laneStartRequest ? 'start' : undefined,
               })
-            let response = await sendOnce()
-            if (
-              !usedDirectFetch &&
-              relay401Attempt &&
-              response.status === 401 &&
-              typeof body === 'string' &&
-              (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
-              !init?.signal?.aborted
-            ) {
-              let rotated: NativeCustodyReceipt | undefined
-              try {
-                rotated = await prepareVaultRetry(
-                  relay401Attempt,
-                  'model-relay',
-                  init?.signal ?? undefined,
-                )
-              } catch {
-                // Keep the 401 and report the exact relay-served record below.
+            return trackDispatch(async () => {
+              let response = await sendOnce()
+              if (
+                !usedDirectFetch &&
+                relay401Attempt &&
+                response.status === 401 &&
+                typeof body === 'string' &&
+                (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
+                !init?.signal?.aborted
+              ) {
+                let rotated: NativeCustodyReceipt | undefined
+                try {
+                  rotated = await prepareVaultRetry(
+                    relay401Attempt,
+                    'model-relay',
+                    init?.signal ?? undefined,
+                  )
+                } catch {
+                  // Keep the 401 and report the exact relay-served record below.
+                }
+                if (rotated) {
+                  await response.body?.cancel().catch(() => {})
+                  logger.info(
+                    'claustrum',
+                    'retrying after scoped credential rotation',
+                    {
+                      accountId: oauthAccountId,
+                      previousVersion: relay401Attempt.recordVersion,
+                      newVersion: rotated.recordVersion,
+                      transport: 'relay',
+                    },
+                  )
+                  retryFromVault = relay401Attempt
+                  relay401Attempt = undefined
+                  // sendOnce obtains its own fresh receipt for this HTTP retry.
+                  response = await sendOnce()
+                }
               }
-              if (rotated) {
-                await response.body?.cancel().catch(() => {})
-                logger.info(
-                  'claustrum',
-                  'retrying after scoped credential rotation',
-                  {
-                    accountId: oauthAccountId,
-                    previousVersion: relay401Attempt.recordVersion,
-                    newVersion: rotated.recordVersion,
-                    transport: 'relay',
-                  },
-                )
-                retryFromVault = relay401Attempt
-                relay401Attempt = undefined
-                // sendOnce obtains its own fresh receipt for this HTTP retry.
-                response = await sendOnce()
-              }
-            }
-            if (
-              usedDirectFetch &&
-              directAttempt &&
-              response.status === 401 &&
-              typeof body === 'string' &&
-              (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
-              !init?.signal?.aborted
-            ) {
-              let rotated: NativeCustodyReceipt | undefined
-              try {
-                rotated = await prepareVaultRetry(
-                  directAttempt,
-                  'model',
-                  init?.signal ?? undefined,
-                )
-              } catch {
-                // Preserve the genuine 401 if no replacement can be verified.
-              }
-              if (rotated) {
-                await response.body?.cancel().catch(() => {})
-                logger.info(
-                  'claustrum',
-                  'retrying after scoped credential rotation',
-                  {
-                    accountId: oauthAccountId,
-                    previousVersion: directAttempt.recordVersion,
-                    newVersion: rotated.recordVersion,
-                    transport: 'direct',
-                  },
-                )
+              if (
+                usedDirectFetch &&
+                directAttempt &&
+                response.status === 401 &&
+                typeof body === 'string' &&
+                (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
+                !init?.signal?.aborted
+              ) {
+                let rotated: NativeCustodyReceipt | undefined
+                try {
+                  rotated = await prepareVaultRetry(
+                    directAttempt,
+                    'model',
+                    init?.signal ?? undefined,
+                  )
+                } catch {
+                  // Preserve the genuine 401 if no replacement can be verified.
+                }
+                if (rotated) {
+                  await response.body?.cancel().catch(() => {})
+                  logger.info(
+                    'claustrum',
+                    'retrying after scoped credential rotation',
+                    {
+                      accountId: oauthAccountId,
+                      previousVersion: directAttempt.recordVersion,
+                      newVersion: rotated.recordVersion,
+                      transport: 'direct',
+                    },
+                  )
 
-                retryFromVault = directAttempt
-                // Transport failures on the new attempt must propagate. They
-                // are not evidence that the new record's token was rejected.
-                response = await directFetch()
+                  retryFromVault = directAttempt
+                  // Transport failures on the new attempt must propagate. They
+                  // are not evidence that the new record's token was rejected.
+                  response = await directFetch()
+                }
               }
-            }
-            if (
-              response.status === 401 &&
-              !nativeAuthorization.scopedAttempt &&
-              typeof body === 'string' &&
-              (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
-              !init?.signal?.aborted
-            ) {
-              const rejectedAccess = nativeAuthorization.accessToken
-              let replacement: NativeOAuthAuthorization | undefined
-              try {
-                replacement = await authorizePhysical(rejectedAccess)
-              } catch (error) {
-                nativeLocalRefreshFailures.set(response, error)
+              if (
+                response.status === 401 &&
+                !nativeAuthorization.scopedAttempt &&
+                typeof body === 'string' &&
+                (fetchMethod(input, init) ?? '').toUpperCase() === 'POST' &&
+                !init?.signal?.aborted
+              ) {
+                const rejectedAccess = nativeAuthorization.accessToken
+                let replacement: NativeOAuthAuthorization | undefined
+                try {
+                  replacement = await authorizePhysical(rejectedAccess)
+                } catch (error) {
+                  nativeLocalRefreshFailures.set(response, error)
+                }
+                if (replacement && replacement.accessToken !== rejectedAccess) {
+                  await response.body?.cancel().catch(() => {})
+                  response = usedDirectFetch
+                    ? await directFetch()
+                    : await sendOnce()
+                }
               }
-              if (replacement && replacement.accessToken !== rejectedAccess) {
-                await response.body?.cancel().catch(() => {})
-                response = usedDirectFetch
-                  ? await directFetch()
-                  : await sendOnce()
-              }
-            }
-            trace?.mark('send_headers_received', {
-              route,
-              ms: roundMs(nowMs() - sendStart),
-              status: response.status,
-              relayConfigured: relayConfig != null,
-              totalSendWithAccessMs: roundMs(nowMs() - start),
-            })
-
-            if (usedDirectFetch) {
-              harvestQuotaHeaders(response.headers, served)
-              billingLineageTracker.commit(
-                activeBillingLineage,
-                extractAnthropicRequestId(response.headers),
-              )
-            }
-            if (relayAffinity && !laneStartRequest) {
-              const headers = usedDirectFetch
-                ? response.headers
-                : (routingHeaders ?? response.headers)
-              // All retries for one client request reuse its trace, so report served only once.
-              const servedTurn =
-                response.status < 400 &&
-                (!trace || !routingServedTurns.has(trace))
-              if (servedTurn && trace) routingServedTurns.add(trace)
-              const subject = {
-                accountIdentity: nativeAuthorization.accountIdentity,
-                credentialId: nativeAuthorization.scopedAttempt?.credentialId,
-              }
-              routingRelay.report(
-                relayAffinity,
-                subject,
-                headers,
-                response.status,
-                modelForIdentity,
-                servedTurn,
-              )
-              if (response.status === 200) {
-                // Keep the upstream headers before sticky retries replace the
-                // response's status or Retry-After for the host.
-                routingStreamLimits.set(response, () =>
-                  routingRelay.report(
-                    relayAffinity,
-                    subject,
-                    headers,
-                    429,
-                    modelForIdentity,
-                    false,
-                  ),
-                )
-              }
-            }
-            attachCacheDiagnosticsResponse(response, {
-              source: laneStartRequest ? 'start' : 'turn',
-              toolNameMap,
-              accountId: oauthAccountId,
-              synthetic: laneStartRequest,
-              ...cacheDiagnosticsBetas,
-              requestedModel: parseRequestModel(body),
-              request: cacheDiagnosticsRequest,
-              trackSessionId: relayAffinity ?? undefined,
-              dump: usedDirectFetch ? directDump : relayDump,
-              status: response.status,
-              streaming,
-            })
-            if (usedDirectFetch && directAttempt && response.status === 401) {
-              await reportScoped401(directAttempt, 'direct')
-            }
-            relayReturned = true
-            if (!usedDirectFetch && relay401Attempt) {
-              await reportScoped401(relay401Attempt, 'relay_status_field')
-            }
-            // The vault has been told about the 401 above. If the request was
-            // cancelled after the 401 arrived (before or while the vault was
-            // asked for a newer credential), end it as cancelled here.
-            if (response.status === 401)
-              await endIfCancelled(response, init?.signal)
-            if (response.ok) {
-              usagePublications.publish(async () => {
-                if (served.scopedAttempt)
-                  await nativeAccounts.vault.publish(served.scopedAttempt, {
-                    lastUsed: Date.now(),
-                  })
-                else if (served.localSubject)
-                  await nativeAccounts.publishLocal(served.localSubject, {
-                    lastUsed: Date.now(),
-                  })
+              trace?.mark('send_headers_received', {
+                route,
+                ms: roundMs(nowMs() - sendStart),
+                status: response.status,
+                relayConfigured: relayConfig != null,
+                totalSendWithAccessMs: roundMs(nowMs() - start),
               })
-            }
-            return response
+
+              if (usedDirectFetch) {
+                harvestQuotaHeaders(response.headers, served)
+                billingLineageTracker.commit(
+                  activeBillingLineage,
+                  extractAnthropicRequestId(response.headers),
+                )
+              }
+              if (relayAffinity && !laneStartRequest) {
+                const headers = usedDirectFetch
+                  ? response.headers
+                  : (routingHeaders ?? response.headers)
+                // All retries for one client request reuse its trace, so report served only once.
+                const servedTurn =
+                  response.status < 400 &&
+                  (!trace || !routingServedTurns.has(trace))
+                if (servedTurn && trace) routingServedTurns.add(trace)
+                const subject = {
+                  accountIdentity: nativeAuthorization.accountIdentity,
+                  credentialId: nativeAuthorization.scopedAttempt?.credentialId,
+                }
+                routingRelay.report(
+                  relayAffinity,
+                  subject,
+                  headers,
+                  response.status,
+                  modelForIdentity,
+                  servedTurn,
+                )
+                if (response.status === 200) {
+                  // Keep the upstream headers before sticky retries replace the
+                  // response's status or Retry-After for the host.
+                  routingStreamLimits.set(response, () =>
+                    routingRelay.report(
+                      relayAffinity,
+                      subject,
+                      headers,
+                      429,
+                      modelForIdentity,
+                      false,
+                    ),
+                  )
+                }
+              }
+              attachCacheDiagnosticsResponse(response, {
+                source: laneStartRequest ? 'start' : 'turn',
+                toolNameMap,
+                accountId: oauthAccountId,
+                synthetic: laneStartRequest,
+                ...cacheDiagnosticsBetas,
+                requestedModel: parseRequestModel(body),
+                request: cacheDiagnosticsRequest,
+                trackSessionId: relayAffinity ?? undefined,
+                dump: usedDirectFetch ? directDump : relayDump,
+                status: response.status,
+                streaming,
+              })
+              if (usedDirectFetch && directAttempt && response.status === 401) {
+                await reportScoped401(directAttempt, 'direct')
+              }
+              relayReturned = true
+              if (!usedDirectFetch && relay401Attempt) {
+                await reportScoped401(relay401Attempt, 'relay_status_field')
+              }
+              // The vault has been told about the 401 above. If the request was
+              // cancelled after the 401 arrived (before or while the vault was
+              // asked for a newer credential), end it as cancelled here.
+              if (response.status === 401)
+                await endIfCancelled(response, init?.signal)
+              if (response.ok) {
+                usagePublications.publish(async () => {
+                  if (served.scopedAttempt)
+                    await nativeAccounts.vault.publish(served.scopedAttempt, {
+                      lastUsed: Date.now(),
+                    })
+                  else if (served.localSubject)
+                    await nativeAccounts.publishLocal(served.localSubject, {
+                      lastUsed: Date.now(),
+                    })
+                })
+              }
+              return response
+            })
           }
 
           function getFallbackQuota(account: {
@@ -8935,7 +8956,7 @@ const anthropicAuthPlugin = async (
             )
           }
 
-          return {
+          return withAbortableFetch({
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
               if (input instanceof Request && init?.signal === undefined)
@@ -9283,6 +9304,7 @@ const anthropicAuthPlugin = async (
                     }
                   } catch {}
                 }
+                init?.signal?.throwIfAborted()
                 const response = await fetch(rewritten.input, {
                   ...init,
                   body: passthroughBody,
@@ -10737,7 +10759,7 @@ const anthropicAuthPlugin = async (
               trace.done('return_response', { status: response.status })
               return wrapResponse(response)
             },
-          }
+          })
         }
 
         return {}
@@ -10850,6 +10872,7 @@ const anthropicAuthPlugin = async (
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
   pluginTestHandles?.set(plugin, {
+    drainDispatchWork,
     primeManager,
     quotaManager,
     cacheKeepManager,

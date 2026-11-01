@@ -57,6 +57,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  runWithRequestSignal,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   type StickyRouteCandidate,
   StickySessionRouter,
@@ -1727,16 +1728,18 @@ export function streamCortexKitAnthropic(
       buildPiOAuthMessagesUrl(model.baseUrl)
       const storagePath = getPiAccountStoragePath()
       let hostTools: Tool[] = []
-      const response = await executeWithFallback({
-        model,
-        context,
-        streamOptions: options,
-        storagePath,
-        effortTransitions,
-        onResolvedTools: (tools) => {
-          hostTools = tools
-        },
-      })
+      const response = await runWithRequestSignal(options?.signal, () =>
+        executeWithFallback({
+          model,
+          context,
+          streamOptions: options,
+          storagePath,
+          effortTransitions,
+          onResolvedTools: (tools) => {
+            hostTools = tools
+          },
+        }),
+      )
 
       if (!response.ok) {
         throw new Error(
