@@ -75,7 +75,7 @@ All local sign-in paths refuse while the host is enrolled in the vault (`Disconn
 `setup --claustrum`, or answering yes to the vault question, enrolls each selected host while it is stopped. The Claustrum daemon (v0.2.0 or newer) must be running and `ck` installed. For each host, setup:
 
 1. proposes or resumes the `anthropic-auth-<host>` enrollment and approves it with `ck auth enroll approve`;
-2. grants read access to the `anthropic-native` category: `ck auth grant --principal enrolled:anthropic-auth-<host> --selector-kind category --selector anthropic-native --operation read`;
+2. grants read access to the `anthropic-native` category for the approved name: `ck auth grant --principal enrolled:<approved name> --selector-kind category --selector anthropic-native --operation read`. The approved name is `anthropic-auth-<host>` unless the operator chose another `--name` at approval, as a second host of the same kind must;
 3. refreshes the vault inventory and requires its default Anthropic credential (`oauth:anthropic`) to have a vault-reported account identity. Otherwise it stops with `The vault has no verified default Claude account. Sign in through the vault and rerun setup.`
 
 Vault setup writes only the selected host's enrollment files and, for Pi with consent, Pi's auth file (below). It does not read, import, change or delete the local pool, the migration journal, local runtime metadata or routing assignments. It never imports local OAuth into the vault, and never writes OpenCode's auth file.

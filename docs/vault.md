@@ -20,6 +20,8 @@ Setup grants the principal named by the enrollment's `approvedName`, using the p
 ck auth grant --principal enrolled:anthropic-auth-opencode-v2 --selector-kind category --selector anthropic-native --operation read
 ```
 
+A second host of the same kind, such as another OpenCode installation, is approved with its own `--name` (for example `ck auth enroll approve --request-id <id> --name anthropic-auth-opencode-2`), and its grant names that same name.
+
 Do not substitute `anthropic-auth-opencode` or `anthropic-auth-pi` unless that is this installation's approved name (or its default when no approved name was recorded). If a read grant reaches no Claude login, run `ck auth reclassify --from-registry` and check the logins with `ck auth status` before rerunning setup.
 
 If setup fails after enrollment is approved, the host stays connected to the vault. Run setup again to finish connecting. Or, in that host, run `/claude` → **Accounts** → **Disconnect from the vault** to undo it. Local settings do not undo enrollment.
