@@ -336,7 +336,10 @@ export async function setupAnthropicAuth(
     requestOptions: wire.requestOptions,
     responseOptions: wire.responseOptions,
     onRequestId: wire.onRequestId,
-    onForgetSession: wire.forgetSession,
+    onForgetSession: (sessionID) => {
+      wire.forgetSession(sessionID)
+      cacheKeep?.forgetSession(sessionID)
+    },
     onRequestPrepared: async (input) => {
       try {
         await cacheKeep?.track(input)
@@ -344,6 +347,14 @@ export async function setupAnthropicAuth(
         logger.warn('cachekeep', 'live request tracking failed')
       }
     },
+    onResponseHeaders: (input) => {
+      try {
+        cacheKeep?.onResponseHeaders(input)
+      } catch {
+        logger.warn('cachekeep', 'live request tracking failed')
+      }
+    },
+    onAttemptEnd: (input) => cacheKeep?.discardAttempt(input.attemptId),
     resolveModelId: async (scope) => models.modelId(scope.modelID),
     onOwnedRequest: () => {
       lifecycle ??= startNativeAnthropicLifecycle(runtime, options.fetch)

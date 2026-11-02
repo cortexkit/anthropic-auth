@@ -388,6 +388,23 @@ export function createNativeCacheKeep(
   owner.persistence = persistence
   shareds.set(options.storageId, owner)
   const { manager, registry } = owner
+  // Unanswered attempts are not warm targets: replacing a target or reserving
+  // budget before Anthropic accepts the request would evict useful prefixes.
+  const pending = new Map<
+    string,
+    {
+      sessionID: string
+      signal?: AbortSignal
+      onAbort: () => void
+      target?: Parameters<CacheKeepManager['track']>[0]
+    }
+  >()
+  const discardAttempt = (attemptId: string) => {
+    const entry = pending.get(attemptId)
+    pending.delete(attemptId)
+    entry?.signal?.removeEventListener('abort', entry.onAbort)
+    return entry?.target
+  }
   const send = async (
     target: CacheKeepTarget,
     warm: Request,
@@ -606,6 +623,7 @@ export function createNativeCacheKeep(
       // off) and keep any existing target, so they stay at debug and do no
       // per-request work beyond the log call.
       const skipped = (reason: string) => {
+        discardAttempt(input.attemptId)
         logger.debug('cachekeep', 'tracking skipped', {
           session: input.sessionID,
           reason,
@@ -616,6 +634,15 @@ export function createNativeCacheKeep(
       if (input.agent === 'cachekeep' || input.agent === 'prime')
         return skipped('background-agent')
       if (input.kind !== 'primary') return skipped('not-primary')
+      if (input.signal?.aborted) return skipped('attempt-ended')
+      discardAttempt(input.attemptId)
+      const entry: NonNullable<ReturnType<typeof pending.get>> = {
+        sessionID: input.sessionID,
+        signal: input.signal,
+        onAbort: () => discardAttempt(input.attemptId),
+      }
+      pending.set(input.attemptId, entry)
+      input.signal?.addEventListener('abort', entry.onAbort, { once: true })
       const snapshot = await runtime.read()
       if (lease.stopped) return skipped('lease-stopped')
       if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
@@ -649,7 +676,9 @@ export function createNativeCacheKeep(
         account.credentialId !== input.provenance.credentialId
       )
         return skipped('vault-credential-changed')
-      const result = manager.track({
+      if (pending.get(input.attemptId) !== entry)
+        return skipped('attempt-ended')
+      entry.target = {
         sessionId: input.sessionID,
         url: input.url,
         headers: new Headers(),
@@ -659,15 +688,25 @@ export function createNativeCacheKeep(
         oauthAccountId: input.accountId,
         oauthAccountIdentity: accountKey(account),
         isSubagent,
-      })
-      await registry.publish(manager.trackedSessions())
-      // Core records each refusal or eviction, including its reason and sizes.
-      return result
+      }
+    },
+    onResponseHeaders(input: { attemptId: string; status: number }) {
+      const target = discardAttempt(input.attemptId)
+      if (!lease.stopped && input.status >= 200 && input.status < 300 && target)
+        return manager.track(target)
+    },
+    discardAttempt(attemptId: string) {
+      discardAttempt(attemptId)
+    },
+    forgetSession(sessionID: string) {
+      for (const [attemptId, entry] of pending)
+        if (entry.sessionID === sessionID) discardAttempt(attemptId)
     },
     registry,
     dispose() {
       if (cleanup) return cleanup
       lease.stopped = true
+      for (const attemptId of pending.keys()) discardAttempt(attemptId)
       abort.abort()
       for (const [id, entry] of owner.prepared)
         if (entry.lease === lease) owner.prepared.delete(id)

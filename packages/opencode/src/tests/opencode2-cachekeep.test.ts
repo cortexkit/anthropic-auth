@@ -257,10 +257,11 @@ async function fixture(
       },
     })
     cleanups.push(dispose)
-    const live = async (
+    const prepare = async (
       url = 'https://api.anthropic.com/v1/messages',
       extra: Record<string, unknown> = {},
       sessionID = 'ses_oc2_keep',
+      signal?: AbortSignal,
     ) => {
       const draft = {
         sessionID: sessionID as SessionHooks['http.request']['sessionID'],
@@ -269,6 +270,7 @@ async function fixture(
         kind: 'primary',
         request: new Request(url, {
           method: 'POST',
+          signal,
           headers: {
             'content-type': 'application/json',
             authorization: `Bearer ${placeholderSecret('anthropic')}`,
@@ -301,10 +303,30 @@ async function fixture(
         draft.request.headers.set(name, value)
       for (const callback of hooks.get('http.request') ?? [])
         await callback(draft)
+      return draft
+    }
+    const respond = async (
+      draft: Awaited<ReturnType<typeof prepare>>,
+      response = Response.json({ usage: { cache_read_input_tokens: 1 } }),
+      consume = true,
+    ) => {
+      const answered = { ...draft, response }
+      for (const callback of hooks.get('http.response') ?? [])
+        await callback(answered)
+      if (consume) await answered.response.text()
+      const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+      await (globalThis as any)[key]?.get(paths.storageId)?.registry.list()
+      return answered.response
+    }
+    const live = async (...args: Parameters<typeof prepare>) => {
+      const draft = await prepare(...args)
+      await respond(draft)
       return draft.request
     }
     return {
       live,
+      prepare,
+      respond,
       sent,
       dispose,
       setSend: (callback: typeof send) => {
@@ -422,6 +444,86 @@ test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes i
   await f.dispose()
   expect(f.timers.callbacks.size).toBe(0)
   expect(await f.registry.list()).toEqual([])
+})
+
+test('OpenCode 2 rejected oversized request keeps the old target without evicting warm sessions', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture()
+  await f.live(undefined, { system: 'a'.repeat(1024 * 1024) })
+  for (let i = 0; i < 10; i++)
+    await f.live(
+      undefined,
+      { system: 'b'.repeat(3 * 1024 * 1024) },
+      `ses_healthy_${i}`,
+    )
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+  const before = manager.trackedRequest('ses_oc2_keep')
+  const sessions = await f.registry.list()
+  expect(sessions).toHaveLength(11)
+  const draft = await f.prepare(undefined, {
+    system: 'c'.repeat(40 * 1024 * 1024),
+  })
+  await f.respond(
+    draft,
+    Response.json(
+      {
+        error: { type: 'invalid_request_error', message: 'prompt is too long' },
+      },
+      { status: 400 },
+    ),
+  )
+  expect(manager.trackedRequest('ses_oc2_keep')?.bodyText.length).toBe(
+    before.bodyText.length,
+  )
+  expect(manager.trackedRequest('ses_oc2_keep')).toEqual(before)
+  expect(await f.registry.list()).toEqual(sessions)
+  expect(
+    lines.filter((line) => line.includes('stopped warming session')),
+  ).toEqual([])
+})
+
+test('OpenCode 2 accepts the oversized body at 2xx headers before streaming starts', async () => {
+  const f = await fixture()
+  await f.live()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+  const before = manager.trackedRequest('ses_oc2_keep')
+  const draft = await f.prepare(undefined, {
+    system: 'c'.repeat(40 * 1024 * 1024),
+    stream: true,
+  })
+  expect(manager.trackedRequest('ses_oc2_keep')).toEqual(before)
+  const response = await f.respond(
+    draft,
+    new Response(new ReadableStream(), { status: 201 }),
+    false,
+  )
+  expect(
+    manager.trackedRequest('ses_oc2_keep').bodyText.length,
+  ).toBeGreaterThan(40 * 1024 * 1024)
+  expect((await f.registry.list()).map((session) => session.id)).toEqual([
+    'ses_oc2_keep',
+  ])
+  await response.body?.cancel()
+})
+
+test('OpenCode 2 aborted attempt leaves its old target even if late 2xx headers arrive', async () => {
+  const f = await fixture()
+  await f.live()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+  const before = manager.trackedRequest('ses_oc2_keep')
+  const abort = new AbortController()
+  const draft = await f.prepare(
+    undefined,
+    { system: 'aborted request' },
+    undefined,
+    abort.signal,
+  )
+  abort.abort()
+  await f.respond(draft)
+  expect(manager.trackedRequest('ses_oc2_keep')).toEqual(before)
 })
 
 test('OpenCode 2 records its use of the pool at setup and serves a request as before', async () => {

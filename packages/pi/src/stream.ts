@@ -548,17 +548,22 @@ export async function* parseSse(
   }
 }
 
-async function sendAnthropicRequest(options: {
-  model: Model<Api>
-  context: Context
-  streamOptions?: SimpleStreamOptions
-  apiAccount?: NativeAccountView
-  storagePath: string
-  oauthAccountId?: string
-  route?: string
-  effortTransitions?: readonly MidConversationEffortTransition[]
-  onResolvedTools?: (tools: Tool[]) => void
-}): Promise<Response> {
+async function sendAnthropicRequest(
+  options: {
+    model: Model<Api>
+    context: Context
+    streamOptions?: SimpleStreamOptions
+    apiAccount?: NativeAccountView
+    storagePath: string
+    oauthAccountId?: string
+    route?: string
+    effortTransitions?: readonly MidConversationEffortTransition[]
+    onResolvedTools?: (tools: Tool[]) => void
+  },
+  deps: { fetch?: typeof fetch; cacheKeep?: CacheKeepManager } = {},
+): Promise<Response> {
+  const fetchImpl = deps.fetch ?? globalThis.fetch
+  const keep = deps.cacheKeep ?? cacheKeepManager
   const native = getPiNativeRuntime(options.storagePath)
   // Capture the serving service while authorization is open. Shutdown rejects
   // new serving work immediately but drains writes for already-served attempts.
@@ -625,8 +630,9 @@ async function sendAnthropicRequest(options: {
     signal: options.streamOptions?.signal,
     ...(!options.apiAccount && { redirect: 'error' as const }),
   }
-  if (!options.apiAccount)
-    await cacheKeepManager.track({
+  const trackAcceptedRequest = () => {
+    if (options.apiAccount || init.signal?.aborted) return
+    keep.track({
       sessionId: relayAffinity,
       url: input.toString(),
       headers,
@@ -637,6 +643,7 @@ async function sendAnthropicRequest(options: {
       oauthAccountIdentity: verifiedUuid,
       accountStoragePath: options.storagePath,
     })
+  }
 
   const reported = new Set<PiNativeAttempt>()
   let retried401 = false
@@ -710,7 +717,7 @@ async function sendAnthropicRequest(options: {
       // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
       // the signed identity text for dumps and CacheKeep.
       if (options.apiAccount || typeof init.body !== 'string')
-        return scope.redactResponse(await fetch(input, init))
+        return scope.redactResponse(await fetchImpl(input, init))
       return scope.redactResponse(
         await sendWithRequestGzip({
           url: input,
@@ -720,7 +727,7 @@ async function sendAnthropicRequest(options: {
             getRequestGzipLatchPath(options.storagePath),
           ),
           send: (wireBody, wireHeaders) =>
-            fetch(input, { ...init, body: wireBody, headers: wireHeaders }),
+            fetchImpl(input, { ...init, body: wireBody, headers: wireHeaders }),
         }),
       )
     }
@@ -805,7 +812,10 @@ async function sendAnthropicRequest(options: {
         servingRuntime.publishApi(subject, { lastUsed: Date.now() }),
       )
     }
-    if (attempt && response.ok) markServed(attempt)
+    if (attempt && response.ok) {
+      trackAcceptedRequest()
+      markServed(attempt)
+    }
     return response
   }
   if (options.apiAccount) return directFetch()
@@ -876,10 +886,15 @@ async function sendAnthropicRequest(options: {
   // If the request was cancelled since, end it as cancelled here.
   if (relay401Attempt && response.status === 401)
     await endIfCancelled(response, init.signal)
-  if (response.ok && lastTransport === 'relay' && relayAttempt)
+  if (response.ok && lastTransport === 'relay' && relayAttempt) {
+    trackAcceptedRequest()
     markServed(relayAttempt)
+  }
   return response
 }
+
+/** Exercise one native send with isolated transport and scheduling in tests. */
+export const __sendPiAnthropicRequestForTest = sendAnthropicRequest
 
 /**
  * If the request's signal is aborted, cancels the response body and throws the

@@ -7626,6 +7626,7 @@ const anthropicAuthPlugin = async (
               await getCacheDiagnosticsBetas(requestHeaders)
             if (fableRequest) fableRequest.oauthAccountId = oauthAccountId
             if (fableRequest) fableRequest.subagent = subagentRequest
+            let trackAcceptedRequest: (() => void) | undefined
             if (typeof body === 'string') {
               const storage = await getRequestStorage()
               if (
@@ -7633,45 +7634,49 @@ const anthropicAuthPlugin = async (
                 getCache1hMode() === 'hybrid' &&
                 (!subagentRequest || isCacheKeepSubagentsEnabled(storage))
               ) {
-                const cacheKeepStart = nowMs()
-                const tracked = cacheKeepManager.track({
-                  sessionId: relayAffinity,
-                  url: rewritten.url?.toString() ?? rewritten.input.toString(),
-                  headers: requestHeaders,
-                  bodyText: body,
-                  storage,
-                  cacheMode: 'hybrid',
-                  oauthAccountId,
-                  oauthAccountIdentity: nativeAuthorization?.accountIdentity,
-                  isSubagent: subagentRequest,
-                })
-                trace?.mark('cachekeep_track', {
-                  session: relayAffinity,
-                  ms: roundMs(nowMs() - cacheKeepStart),
-                  tracked: tracked.tracked,
-                  reason: tracked.tracked ? undefined : tracked.reason,
-                  bodyBytes: body.length,
-                })
-                // Remember a refusal-prone source send's account identity
-                // and time. The keep itself takes the exact signed bytes
-                // from CacheKeep's live target for the session, so only
-                // this small metadata is stored per round.
-                if (
-                  relayAffinity &&
-                  fableRequest &&
-                  !fableRequest.plan.downgraded &&
-                  tracked.tracked
-                ) {
-                  pendingSourceMeta.set(fableRequest.plan.recoveryKey, {
-                    ...(nativeAuthorization.accountIdentity !== undefined && {
-                      accountIdentity: nativeAuthorization.accountIdentity,
-                    }),
-                    sentAt: Date.now(),
+                const bodyText = body
+                trackAcceptedRequest = () => {
+                  const cacheKeepStart = nowMs()
+                  const tracked = cacheKeepManager.track({
+                    sessionId: relayAffinity,
+                    url:
+                      rewritten.url?.toString() ?? rewritten.input.toString(),
+                    headers: requestHeaders,
+                    bodyText,
+                    storage,
+                    cacheMode: 'hybrid',
+                    oauthAccountId,
+                    oauthAccountIdentity: nativeAuthorization?.accountIdentity,
+                    isSubagent: subagentRequest,
                   })
-                  while (pendingSourceMeta.size > 128) {
-                    const oldest = pendingSourceMeta.keys().next().value
-                    if (oldest === undefined) break
-                    pendingSourceMeta.delete(oldest)
+                  trace?.mark('cachekeep_track', {
+                    session: relayAffinity,
+                    ms: roundMs(nowMs() - cacheKeepStart),
+                    tracked: tracked.tracked,
+                    reason: tracked.tracked ? undefined : tracked.reason,
+                    bodyBytes: bodyText.length,
+                  })
+                  // Remember the source-model send's account identity and
+                  // time for content-filter recovery. The keep takes the exact
+                  // signed bytes from CacheKeep's live target, so only
+                  // this small metadata is stored per round.
+                  if (
+                    relayAffinity &&
+                    fableRequest &&
+                    !fableRequest.plan.downgraded &&
+                    tracked.tracked
+                  ) {
+                    pendingSourceMeta.set(fableRequest.plan.recoveryKey, {
+                      ...(nativeAuthorization.accountIdentity !== undefined && {
+                        accountIdentity: nativeAuthorization.accountIdentity,
+                      }),
+                      sentAt: Date.now(),
+                    })
+                    while (pendingSourceMeta.size > 128) {
+                      const oldest = pendingSourceMeta.keys().next().value
+                      if (oldest === undefined) break
+                      pendingSourceMeta.delete(oldest)
+                    }
                   }
                 }
               }
@@ -7873,6 +7878,8 @@ const anthropicAuthPlugin = async (
                       })
                     : await physicalSend(body, requestHeaders),
                 )
+                if (response.ok && !init?.signal?.aborted)
+                  trackAcceptedRequest?.()
                 if (typeof body === 'string') {
                   directDump = await dumpDirectRequest({
                     affinity: relayAffinity,
@@ -7996,6 +8003,12 @@ const anthropicAuthPlugin = async (
                     headers: relayHeaders,
                     errorSecrets: [nextAuthorization.accessToken],
                     onUpstreamStatus: (status: number) => {
+                      if (
+                        status >= 200 &&
+                        status < 300 &&
+                        !init?.signal?.aborted
+                      )
+                        trackAcceptedRequest?.()
                       if (status !== 401 || !nextAttempt) return
                       relay401Attempt = nextAttempt
                       // A WebSocket can deliver a real upstream 401 after its

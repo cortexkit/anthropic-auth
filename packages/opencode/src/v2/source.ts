@@ -180,6 +180,10 @@ export interface NativeSourceOptions {
   readonly onForgetSession?: (sessionID: string) => void
   readonly onOwnedRequest?: () => void
   readonly onRequestPrepared?: NativeSource['onRequestPrepared']
+  readonly onResponseHeaders?: (
+    input: NativeAnthropicResponseContext<NativeSourceProvenance>,
+  ) => void
+  readonly onAttemptEnd?: NativeSource['onAttemptEnd']
   readonly fetch?: typeof fetch
   /** Resolve a host model alias to the upstream ID before request-local policy. */
   readonly resolveModelId?: (scope: RequestScope) => Promise<string>
@@ -990,6 +994,7 @@ export function createNativeAnthropicSource(
       })
     },
     quotaFromHeaders(headers, input) {
+      options.onResponseHeaders?.(input)
       const state = states.get(input.provenance)
       if (state) {
         state.responseHeaders = headers
@@ -1201,6 +1206,7 @@ export function createNativeAnthropicSource(
       return undefined
     },
     async onAttemptEnd(input, outcome) {
+      await options.onAttemptEnd?.(input, outcome)
       const state = states.get(input.provenance)
       if (!state) return
       try {

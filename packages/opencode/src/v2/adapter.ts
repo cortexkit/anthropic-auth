@@ -355,6 +355,7 @@ export interface NativeAnthropicSource<Q, P> {
     input: NativeAnthropicAttemptContext<P> & {
       readonly url: string
       readonly bodyText: string
+      readonly signal?: AbortSignal
     },
   ) => Promise<void> | void
   /** Response observers for an OAuth response. */
@@ -1245,6 +1246,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         ...contextOf(attempt, data),
         url,
         bodyText: body,
+        signal: request.signal,
       })
       ensureLive()
     }

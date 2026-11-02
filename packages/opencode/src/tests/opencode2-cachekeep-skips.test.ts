@@ -6,13 +6,16 @@ import { join } from 'node:path'
 import {
   __setLogTestSink,
   CACHE_KEEP_MAX_BODY_BYTES,
+  type CacheKeepManager,
   getLogLevel,
   type LogTestRecord,
   type NativeAccountRuntime,
+  resolveNativePoolPaths,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
+import { createNativeAnthropicAdapter } from '../v2/adapter'
 import { createNativeCacheKeep } from '../v2/cachekeep'
-import type { NativeSource } from '../v2/source'
+import { createNativeAnthropicSource, type NativeSource } from '../v2/source'
 
 const cleanups: Array<() => unknown | Promise<unknown>> = []
 afterEach(async () => {
@@ -61,6 +64,7 @@ async function fixture() {
   let stopDuringRead = false
   let stopDuringLookup = false
   const runtime = {
+    drainRoutingPublications: async () => {},
     read: async () => {
       if (stopDuringRead) await keep.dispose()
       return { accounts: [account], policyStorage: policy }
@@ -72,6 +76,8 @@ async function fixture() {
     storageId: binding.storageId,
     registryDirectory: directory,
     now: () => now,
+    setIntervalImpl: (() => ({ unref() {} })) as unknown as typeof setInterval,
+    clearIntervalImpl: (() => {}) as typeof clearInterval,
     isSubagent: async () => {
       if (stopDuringLookup) await keep.dispose()
       if (lookupFails) throw new Error('PRIVATE host error')
@@ -94,6 +100,7 @@ async function fixture() {
   })
   const input = {
     sessionID: 'ses_skipped',
+    attemptId: 'attempt-first',
     route: 'oauth',
     agent: 'build',
     kind: 'primary',
@@ -103,11 +110,20 @@ async function fixture() {
     provenance: { kind: 'local', subject: { binding } },
   } as Prepared
   return {
+    runtime,
+    directory,
     keep,
     input,
     logs,
     policy,
     account,
+    manager: (globalThis as any)[
+      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    ].get(binding.storageId).manager as CacheKeepManager,
+    accept: async () => {
+      keep.onResponseHeaders({ attemptId: input.attemptId, status: 200 })
+      await keep.registry.list()
+    },
     child: () => {
       child = true
     },
@@ -141,6 +157,7 @@ test.each([
   async (path) => {
     const f = await fixture()
     await f.keep.track(f.input)
+    await f.accept()
     const tracked = await f.keep.registry.list()
     expect(tracked).toHaveLength(1)
     f.logs.length = 0
@@ -209,10 +226,12 @@ test.each([
 test('OpenCode 2 manager refusal reports its returned reason once, not just debug', async () => {
   const f = await fixture()
   await f.keep.track(f.input)
+  await f.accept()
   const tracked = await f.keep.registry.list()
   f.logs.length = 0
   f.input.bodyText = 'é'.repeat(CACHE_KEEP_MAX_BODY_BYTES / 2 + 1)
   await f.keep.track(f.input)
+  await f.accept()
   expect(f.logs).toHaveLength(1)
   expect(f.logs[0]).toMatchObject({
     level: 'warn',
@@ -227,4 +246,104 @@ test('OpenCode 2 manager refusal reports its returned reason once, not just debu
     },
   })
   expect(await f.keep.registry.list()).toEqual(tracked)
+})
+
+test.each([400, 413, 429, 500, 503])(
+  'OpenCode 2 HTTP %i discards only its own held body',
+  async (status) => {
+    const f = await fixture()
+    await f.keep.track(f.input)
+    await f.accept()
+    const before = f.manager.trackedRequest(f.input.sessionID)
+    const failed = { ...f.input, attemptId: 'failed', bodyText: 'rejected' }
+    const next = {
+      ...f.input,
+      attemptId: 'next',
+      bodyText: 'accepted next step',
+    }
+    await f.keep.track(failed)
+    await f.keep.track(next)
+    expect(f.manager.trackedRequest(f.input.sessionID)).toEqual(before)
+    f.keep.onResponseHeaders({ ...failed, status })
+    expect(f.manager.trackedRequest(f.input.sessionID)).toEqual(before)
+    f.keep.onResponseHeaders({ ...next, status: 200 })
+    expect(f.manager.trackedRequest(f.input.sessionID)?.bodyText).toBe(
+      next.bodyText,
+    )
+    f.keep.onResponseHeaders({ ...failed, status: 200 })
+    expect(f.manager.trackedRequest(f.input.sessionID)?.bodyText).toBe(
+      next.bodyText,
+    )
+  },
+)
+
+test('OpenCode 2 thrown transport error ends the held attempt without replacing its target', async () => {
+  const f = await fixture()
+  await f.keep.track(f.input)
+  await f.accept()
+  const before = f.manager.trackedRequest(f.input.sessionID)
+  const source = createNativeAnthropicSource({
+    runtime: f.runtime,
+    paths: await resolveNativePoolPaths(join(f.directory, 'accounts.json')),
+    requestOptions: () => ({}),
+    onRequestPrepared: (input) => f.keep.track(input),
+    onResponseHeaders: (input) => {
+      f.keep.onResponseHeaders(input)
+    },
+    onAttemptEnd: (input) => f.keep.discardAttempt(input.attemptId),
+  })
+  const native = createNativeAnthropicAdapter({ source })
+  cleanups.push(async () => {
+    native.dispose()
+    await source.close()
+  })
+  const failed = { ...f.input, attemptId: 'transport', bodyText: 'not sent' }
+  await source.onRequestPrepared?.(failed)
+  const transport = async () => {
+    throw new TypeError('connection reset')
+  }
+  try {
+    await transport()
+    throw new Error('transport unexpectedly succeeded')
+  } catch (error) {
+    expect(error).toBeInstanceOf(TypeError)
+    await native.adapter.onAttemptEnd?.(
+      {
+        ...failed,
+        data: {
+          route: 'oauth',
+          provenance: failed.provenance,
+          dispatch: 'direct',
+        },
+      },
+      {
+        outputStarted: false,
+        error: { reason: 'failed', message: 'connection reset' },
+      },
+    )
+  }
+  source.quotaFromHeaders?.(new Headers(), { ...failed, status: 200 })
+  expect(f.manager.trackedRequest(f.input.sessionID)).toEqual(before)
+})
+
+test('OpenCode 2 disposal releases held bodies and their abort listeners', async () => {
+  const f = await fixture()
+  await f.keep.track(f.input)
+  await f.accept()
+  const before = f.manager.trackedRequest(f.input.sessionID)
+  const listeners = new Set<unknown>()
+  const signal = {
+    aborted: false,
+    addEventListener: (_name: string, listener: unknown) =>
+      listeners.add(listener),
+    removeEventListener: (_name: string, listener: unknown) =>
+      listeners.delete(listener),
+  } as unknown as AbortSignal
+  const held = { ...f.input, attemptId: 'dispose', bodyText: 'held', signal }
+  await f.keep.track(held)
+  expect(listeners.size).toBe(1)
+  await f.keep.dispose()
+  expect(listeners.size).toBe(0)
+  f.keep.onResponseHeaders({ ...held, status: 200 })
+  expect(f.manager.trackedRequest(f.input.sessionID)).toEqual(before)
 })
