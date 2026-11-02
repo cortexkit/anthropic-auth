@@ -2,11 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.4.11
 
 - A Claude request now always ends when OpenCode gives up on it (for example its five-minute wait for a response), instead of waiting indefinitely when the plugin was still waiting on an account check or a relay.
 - On OpenCode 2, keep-warm sessions saved before a plugin update are now restored at the next restart instead of being deleted, and each saved session the plugin drops at startup is logged with the reason. Addresses #585.
 - Records left by OpenCode or Pi processes from before the last restart of the computer no longer delay moving the plugin's state files, even when their process number has been reused.
+
 ## 2.4.10
 
 - Under the CortexKit agent runner, a used-up model limit is reported to shared routing with its pool name in routing's lowercase form (for example `fable`), and a model limit whose name routing cannot accept is not reported at all, so it is never mistaken for the whole account's weekly limit.
