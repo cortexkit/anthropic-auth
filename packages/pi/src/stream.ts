@@ -631,7 +631,12 @@ async function sendAnthropicRequest(
     options.context,
     options.streamOptions,
     {
-      enabled: isCache1hPersistentlyEnabled(storage),
+      // Pi's per-request `cacheRetention: 'long'` asks for the provider's
+      // longest retention (Anthropic's one-hour TTL), as Pi's own Anthropic
+      // provider honours it; the account setting still enables it for all.
+      enabled:
+        isCache1hPersistentlyEnabled(storage) ||
+        options.streamOptions?.cacheRetention === 'long',
       mode: getCache1hPersistentMode(storage),
     },
     isFastModePersistentlyEnabled(storage),

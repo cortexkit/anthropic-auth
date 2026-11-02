@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Pi now honors a request's `cacheRetention: 'long'` option with Anthropic's one-hour cache TTL, as Pi's own Anthropic provider does, even when one-hour caching is not turned on for every request. The account-wide one-hour setting is unchanged.
 - Pi now stops immediately with a non-retryable refusal when no fresh reset time is known, instead of waiting on a five-minute fallback retry hint. Known reset times still use the bounded, cancelable wait.
 - Quota refusals now show the capped retry delay separately from the actual time an account can serve again, after all of its blocking limits reset. Successful keep-warm requests also refresh the session's cache lifetime for sticky routing.
 - Pi now waits inside the plugin when an account can reset within the selected wait budget, showing the reset time in its working message. Escape cancels immediately. After one bounded wait it checks the accounts again; if they still cannot serve, it stops instead of triggering Pi's automatic retries.
