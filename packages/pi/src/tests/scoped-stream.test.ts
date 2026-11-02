@@ -13,6 +13,7 @@ import {
   NativeCustodyError,
   PER_TURN_CONTROL_BETA,
   resolveNativePoolPaths,
+  sessionCacheActivity,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -1464,63 +1465,90 @@ registerTest.each([200, 401])(
   }),
 )
 
-test('Pi CacheKeep retains the accepted target across rejected and failed sends', async () => {
-  const f = await fixture()
-  const runtime = await f.native.service()
-  await runtime.updateSettings((settings) => ({
-    ...settings,
-    quota: { enabled: false },
-    claudeCache: { enabled: true, mode: 'hybrid' },
-    cacheKeep: { enabled: true, always: true },
-  }))
-  const keep = new CacheKeepManager({
-    loadStorage: async () => (await runtime.read()).policyStorage,
-    setIntervalImpl: (() => ({ unref() {} })) as unknown as typeof setInterval,
-    clearIntervalImpl: (() => {}) as typeof clearInterval,
-  })
-  deferCleanup(() => keep.stop())
-  const sessionId = 'pi-accepted-only'
-  let status = 200
-  let failure: 'throw' | 'abort' | undefined
-  const abort = new AbortController()
-  const fetchImpl = (async () => {
-    if (failure === 'abort') abort.abort()
-    if (failure) throw new TypeError('synthetic transport failure')
-    return new Response('{}', { status })
-  }) as unknown as typeof fetch
-  const send = (systemPrompt: string) =>
-    __sendPiAnthropicRequestForTest(
-      {
-        model,
-        context: { ...context, systemPrompt },
-        storagePath: f.path,
-        streamOptions: { sessionId, signal: abort.signal },
-      },
-      { fetch: fetchImpl, cacheKeep: keep },
+for (const cacheKeepEnabled of [true, false]) {
+  test(`Pi records only accepted cache activity with CacheKeep ${cacheKeepEnabled ? 'on' : 'off'}`, async () => {
+    const f = await fixture()
+    const runtime = await f.native.service()
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: false },
+      claudeCache: { enabled: true, mode: 'hybrid' },
+      cacheKeep: { enabled: cacheKeepEnabled, always: true },
+    }))
+    const keep = new CacheKeepManager({
+      loadStorage: async () => (await runtime.read()).policyStorage,
+      setIntervalImpl: (() => ({
+        unref() {},
+      })) as unknown as typeof setInterval,
+      clearIntervalImpl: (() => {}) as typeof clearInterval,
+    })
+    deferCleanup(() => keep.stop())
+    const sessionId = 'pi-accepted-only'
+    sessionCacheActivity.forget(sessionId)
+    deferCleanup(() => sessionCacheActivity.forget(sessionId))
+    let status = 200
+    let failure: 'throw' | 'abort' | undefined
+    const abort = new AbortController()
+    const fetchImpl = (async () => {
+      if (failure === 'abort') abort.abort()
+      if (failure) throw new TypeError('synthetic transport failure')
+      return new Response('{}', { status })
+    }) as unknown as typeof fetch
+    const send = (systemPrompt: string) =>
+      __sendPiAnthropicRequestForTest(
+        {
+          model,
+          context: { ...context, systemPrompt },
+          storagePath: f.path,
+          streamOptions: { sessionId, signal: abort.signal },
+        },
+        { fetch: fetchImpl, cacheKeep: keep },
+      )
+    await (await send('accepted')).text()
+    const before = keep.trackedRequest(sessionId)
+    if (cacheKeepEnabled) expect(before).toBeDefined()
+    else expect(before).toBeUndefined()
+    const cacheExpiry = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      Date.now(),
+      'max',
     )
-  await (await send('accepted')).text()
-  const before = keep.trackedRequest(sessionId)
-  expect(before).toBeDefined()
-  for (status of [400, 413, 429, 500]) {
-    await (await send('rejected')).text()
+    expect(cacheExpiry).toBeGreaterThan(Date.now() + 55 * 60_000)
+    for (status of [400, 413, 429, 500]) {
+      await (await send('rejected')).text()
+      expect(keep.trackedRequest(sessionId)).toEqual(before)
+      expect(
+        sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
+      ).toBe(cacheExpiry)
+    }
+    failure = 'throw'
+    await expect(send('transport error')).rejects.toThrow(
+      'synthetic transport failure',
+    )
     expect(keep.trackedRequest(sessionId)).toEqual(before)
-  }
-  failure = 'throw'
-  await expect(send('transport error')).rejects.toThrow(
-    'synthetic transport failure',
-  )
-  expect(keep.trackedRequest(sessionId)).toEqual(before)
-  failure = undefined
-  status = 201
-  await (await send('accepted next step')).text()
-  expect(keep.trackedRequest(sessionId)?.bodyText).toContain(
-    'accepted next step',
-  )
-  const next = keep.trackedRequest(sessionId)
-  failure = 'abort'
-  await expect(send('aborted')).rejects.toThrow()
-  expect(keep.trackedRequest(sessionId)).toEqual(next)
-})
+    failure = undefined
+    status = 201
+    await (await send('accepted next step')).text()
+    if (cacheKeepEnabled)
+      expect(keep.trackedRequest(sessionId)?.bodyText).toContain(
+        'accepted next step',
+      )
+    const next = keep.trackedRequest(sessionId)
+    const nextExpiry = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      Date.now(),
+      'max',
+    )
+    failure = 'abort'
+    await expect(send('aborted')).rejects.toThrow()
+    expect(keep.trackedRequest(sessionId)).toEqual(next)
+    expect(
+      sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
+    ).toBe(nextExpiry)
+  })
+}
 
 // Sends one model request through Pi's real stream path, then replays its
 // captured URL, headers and body through Pi's CacheKeep prewarm, recording

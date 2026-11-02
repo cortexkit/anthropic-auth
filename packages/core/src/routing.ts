@@ -7,6 +7,18 @@ export const ROUTING_MODES = [
   'sticky-balanced',
 ] as const
 export const DEFAULT_ROUTING_MODE: RoutingMode = 'main-first'
+export const MAX_SAME_ACCOUNT_WAITS = ['0', '15', 'max'] as const
+export type MaxSameAccountWait = (typeof MAX_SAME_ACCOUNT_WAITS)[number]
+export const DEFAULT_MAX_SAME_ACCOUNT_WAIT: MaxSameAccountWait = '15'
+
+export function getMaxSameAccountWait(
+  storage: AccountStorage | null,
+): MaxSameAccountWait {
+  const value = storage?.routing?.maxSameAccountWait
+  return MAX_SAME_ACCOUNT_WAITS.includes(value as MaxSameAccountWait)
+    ? (value as MaxSameAccountWait)
+    : DEFAULT_MAX_SAME_ACCOUNT_WAIT
+}
 
 const ROUTING_USAGE =
   'Usage: `/claude-routing`, `/claude-routing main-first`, `/claude-routing fallback-first`, `/claude-routing sticky-balanced`, or `/claude-routing reset`.'
@@ -57,12 +69,16 @@ function routingDescription(mode: RoutingMode) {
   return 'Try the main account first. Use fallback accounts only when quota policy or fallback errors require it.'
 }
 
-export function buildRoutingStatusSummary(input?: { mode?: RoutingMode }) {
+export function buildRoutingStatusSummary(input?: {
+  mode?: RoutingMode
+  maxSameAccountWait?: MaxSameAccountWait
+}) {
   const mode = input?.mode ?? DEFAULT_ROUTING_MODE
   return [
     '## Claude Routing Status',
     '',
     `- Mode: \`${mode}\``,
+    `- Longest wait on the same account: \`${input?.maxSameAccountWait ?? DEFAULT_MAX_SAME_ACCOUNT_WAIT}\``,
     `- Behavior: ${routingDescription(mode)}`,
     '',
     ROUTING_USAGE,
@@ -72,17 +88,22 @@ export function buildRoutingStatusSummary(input?: { mode?: RoutingMode }) {
 export function executeRoutingCommand(input: {
   argumentsText: string
   mode?: RoutingMode
+  maxSameAccountWait?: MaxSameAccountWait
 }) {
   const action = parseRoutingCommandAction(input.argumentsText)
   const mode = input.mode ?? DEFAULT_ROUTING_MODE
-  if (action.type === 'status') return buildRoutingStatusSummary({ mode })
+  const maxSameAccountWait = input.maxSameAccountWait
+  if (action.type === 'status')
+    return buildRoutingStatusSummary({ mode, maxSameAccountWait })
   if (action.type === 'mode') {
     return [
       '## Claude Routing Updated',
       '',
       `Mode updated to \`${action.mode}\`.`,
       '',
-      ...buildRoutingStatusSummary({ mode: action.mode }).split('\n').slice(2),
+      ...buildRoutingStatusSummary({ mode: action.mode, maxSameAccountWait })
+        .split('\n')
+        .slice(2),
     ].join('\n')
   }
   if (action.type === 'reset') {
@@ -91,7 +112,9 @@ export function executeRoutingCommand(input: {
       '',
       'The current session will be assigned again on its next request.',
       '',
-      ...buildRoutingStatusSummary({ mode }).split('\n').slice(2),
+      ...buildRoutingStatusSummary({ mode, maxSameAccountWait })
+        .split('\n')
+        .slice(2),
     ].join('\n')
   }
   return [
@@ -99,6 +122,8 @@ export function executeRoutingCommand(input: {
     '',
     ROUTING_USAGE,
     '',
-    ...buildRoutingStatusSummary({ mode }).split('\n').slice(2),
+    ...buildRoutingStatusSummary({ mode, maxSameAccountWait })
+      .split('\n')
+      .slice(2),
   ].join('\n')
 }

@@ -58,6 +58,7 @@ const fixtures = {
   'quota-refresh': ['Quota', {}],
   'routing-mode': ['Routing', { mode: 'sticky-balanced' }],
   'routing-reset': ['Routing', {}],
+  'routing-max-same-account-wait': ['Routing', { maxSameAccountWait: 'max' }],
   'killswitch-on': ['Limits', {}],
   'killswitch-off': ['Limits', {}],
   'killswitch-set': ['Limits', { entries: JSON.stringify(entries) }],
@@ -380,6 +381,23 @@ describe('native UI contract', () => {
         (section) => section.actions,
       )
       const api = actions.find((action) => action.id === 'add-apikey')
+      expect(
+        actions.find((action) => action.id === 'routing-max-same-account-wait'),
+      ).toMatchObject({
+        label: 'Longest wait on the same account',
+        knobs: [
+          {
+            id: 'maxSameAccountWait',
+            kind: 'choice',
+            label: 'Longest wait on the same account',
+            choices: [
+              { value: '0', label: "Don't wait" },
+              { value: '15', label: '15 minutes' },
+              { value: 'max', label: 'Until the cache expires' },
+            ],
+          },
+        ],
+      })
       expect(api?.knobs.map((knob) => knob.id)).toEqual([
         'apiKey',
         'label',

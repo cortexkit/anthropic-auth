@@ -256,6 +256,15 @@ const fixture: Record<
         'packages/core/src/routing.ts:RoutingCommandAction:21-25; packages/opencode/src/index.ts:claude-routing:4416-4420',
       ],
       [
+        'routing-max-same-account-wait',
+        'routing',
+        'Routing',
+        ['maxSameAccountWait:choice!=0|15|max'],
+        false,
+        false,
+        'packages/core/src/routing.ts:MaxSameAccountWait',
+      ],
+      [
         'killswitch-on',
         'killswitch',
         'Limits',
@@ -656,6 +665,15 @@ const fixture: Record<
         'packages/core/src/routing.ts:RoutingCommandAction:21-25; packages/pi/src/commands.ts:claude-routing:231-256',
       ],
       [
+        'routing-max-same-account-wait',
+        'routing',
+        'Routing',
+        ['maxSameAccountWait:choice!=0|15|max'],
+        false,
+        false,
+        'packages/core/src/routing.ts:MaxSameAccountWait',
+      ],
+      [
         'cache-on',
         'cache',
         'Cache',
@@ -935,7 +953,7 @@ for (const host of ['opencode', 'pi'] as const) {
     expect(actualStatuses).toEqual(
       fixture[host].statuses.map((row) => row.slice(0, 6)),
     )
-    expect(actual).toHaveLength(host === 'opencode' ? 32 : 25)
+    expect(actual).toHaveLength(host === 'opencode' ? 33 : 26)
     const families: string[] = [
       ...new Set(
         [...allActions(host), ...statuses].map(

@@ -9,6 +9,7 @@ import {
   type NativeMenuCustodyMode,
   type NativeMenuHost,
   type NativeMenuLogLevel,
+  type NativeMenuMaxSameAccountWait,
   type NativeMenuParameter,
   type NativeMenuParameterId,
   type NativeMenuRefusalCode,
@@ -77,6 +78,9 @@ export type NativeMenuActionValues = {
   readonly 'vault-disconnect': NativeMenuNoValues
   readonly 'quota-refresh': NativeMenuNoValues
   readonly 'routing-mode': { readonly mode: NativeMenuRoutingMode }
+  readonly 'routing-max-same-account-wait': {
+    readonly maxSameAccountWait: NativeMenuMaxSameAccountWait
+  }
   readonly 'routing-reset': NativeMenuNoValues
   readonly 'killswitch-on': NativeMenuNoValues
   readonly 'killswitch-off': NativeMenuNoValues

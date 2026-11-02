@@ -12,6 +12,7 @@ import {
   formatOAuthAccountTier,
   getCache1hPersistentMode,
   getCacheKeepWindow,
+  getMaxSameAccountWait,
   getPersistedLogLevel,
   getRoutingMode,
   isCache1hPersistentlyEnabled,
@@ -228,6 +229,11 @@ export function createPiNativeCommands(
       case 'routing-mode':
         await setSection('routing', { mode: request.values.mode })
         return { ok: true, text: 'Native routing mode updated.' }
+      case 'routing-max-same-account-wait':
+        await setSection('routing', {
+          maxSameAccountWait: request.values.maxSameAccountWait,
+        })
+        return { ok: true, text: 'Longest wait on the same account updated.' }
       case 'routing-reset':
         await clearPiStickyRoutingSession(storagePath, request.sessionId)
         return {
@@ -346,7 +352,7 @@ export function createPiNativeCommands(
               })),
           })
         case 'routing':
-          return `Routing: ${getRoutingMode(storage)}`
+          return `Routing: ${getRoutingMode(storage)}\nLongest wait on the same account: ${getMaxSameAccountWait(storage)}`
         case 'killswitch':
           return `Killswitch: ${isKillswitchEnabled(storage) ? 'enabled' : 'disabled'}\n${JSON.stringify(storage.killswitch ?? {})}`
         case 'cache':

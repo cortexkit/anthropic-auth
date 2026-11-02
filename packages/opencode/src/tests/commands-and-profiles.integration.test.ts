@@ -589,6 +589,23 @@ describe('auth.loader', () => {
     expect((await readNativeSettings()).routing).toEqual({
       mode: 'sticky-balanced',
     })
+    for (const maxSameAccountWait of ['0', '15', 'max']) {
+      const changed = await applyMenuAction(plugin, 'session-menu', {
+        sectionId: 'Routing',
+        actionId: 'routing-max-same-account-wait',
+        values: { maxSameAccountWait },
+      })
+      expect(changed.ok).toBe(true)
+      expect((await readNativeSettings()).routing).toEqual({
+        mode: 'sticky-balanced',
+        maxSameAccountWait,
+      })
+      expect(
+        changed.menu.sections
+          .find((section) => section.id === 'Routing')
+          ?.lines.join('\n'),
+      ).toContain(maxSameAccountWait)
+    }
   })
 
   test('hidden slash-command replies preserve previous assistant model and variant', async () => {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { OAuthQuotaSnapshot } from '../accounts.ts'
+import { SessionCacheActivity } from '../session-cache-activity.ts'
 import {
   decideStickyQuotaFailure,
   stickyRetainRetryHeaders,
@@ -33,7 +34,13 @@ function exhausted(kind: Kind, reset: string | undefined): OAuthQuotaSnapshot {
 }
 
 function decide(quota: OAuthQuotaSnapshot, modelId = MODEL) {
-  return decideStickyQuotaFailure({ quota, modelId, now: NOW })
+  return decideStickyQuotaFailure({
+    quota,
+    modelId,
+    now: NOW,
+    sessionId: 'session-a',
+    holdUntil: NOW + 40 * 60_000,
+  })
 }
 
 const resetIn = (ms: number) => new Date(NOW + ms).toISOString()
@@ -96,6 +103,7 @@ describe('sticky quota hold', () => {
     expect(
       decideStickyQuotaFailure({
         quota: exhausted('five-hour', resetIn(12 * 60_000)),
+        holdUntil: NOW + 40 * 60_000,
         responseHeaders: new Headers({
           'anthropic-ratelimit-unified-7d-status': 'rejected',
           'anthropic-ratelimit-unified-7d-reset': String(
@@ -159,8 +167,8 @@ describe('sticky quota hold', () => {
   })
 
   for (const kind of kinds) {
-    test(`${kind} holds within fifteen minutes including the boundary`, () => {
-      for (const ms of [1, 10 * 60_000, 15 * 60_000]) {
+    test(`${kind} holds while the reset and jitter fit the cache lifetime`, () => {
+      for (const ms of [1, 10 * 60_000, 40 * 60_000 - 16_000]) {
         expect(decide(exhausted(kind, resetIn(ms)))).toEqual({
           action: 'hold',
           reason: `${kind}-short-reset`,
@@ -169,8 +177,8 @@ describe('sticky quota hold', () => {
       }
     })
 
-    test(`${kind} moves beyond fifteen minutes`, () => {
-      expect(decide(exhausted(kind, resetIn(15 * 60_000 + 1)))).toEqual({
+    test(`${kind} moves when jitter pushes past the cache lifetime`, () => {
+      expect(decide(exhausted(kind, resetIn(40 * 60_000 - 15_999)))).toEqual({
         action: 'migrate',
         reason: kind,
       })
@@ -202,7 +210,7 @@ describe('sticky quota hold', () => {
           retryAfterSeconds: 12 * 60,
         })
         expect(
-          decide({ ...quota, ...exhausted(second, resetIn(16 * 60_000)) }),
+          decide({ ...quota, ...exhausted(second, resetIn(40 * 60_000)) }),
         ).toEqual({ action: 'migrate', reason: second })
       }
     }
@@ -258,5 +266,62 @@ describe('sticky quota hold', () => {
     expect(stickyRetryAfterWithJitter('session-a', 840)).toBe(856)
     expect(stickyRetryAfterWithJitter('session-a', 0)).toBe(17)
     expect(stickyRetryAfterWithJitter('session-a', 1.1)).toBe(18)
+  })
+
+  test('holds a thirty-minute reset with a warm one-hour cache only under max, not the default fifteen minutes', () => {
+    const activity = new SessionCacheActivity()
+    activity.record('session-a', 'account-a', 3_600_000, NOW - 5 * 60_000)
+    for (const maxWait of [undefined, '15', 'max'] as const) {
+      expect(
+        decideStickyQuotaFailure({
+          quota: exhausted('five-hour', resetIn(30 * 60_000)),
+          now: NOW,
+          sessionId: 'session-a',
+          holdUntil: activity.holdUntil('session-a', 'account-a', NOW, maxWait),
+        }).action,
+      ).toBe(maxWait === 'max' ? 'hold' : 'migrate')
+    }
+  })
+
+  test('zero wait migrates even with a live cache and a two-minute reset', () => {
+    const activity = new SessionCacheActivity()
+    activity.record('session-a', 'account-a', 3_600_000, NOW)
+    expect(
+      decideStickyQuotaFailure({
+        quota: exhausted('five-hour', resetIn(2 * 60_000)),
+        now: NOW,
+        sessionId: 'session-a',
+        holdUntil: activity.holdUntil('session-a', 'account-a', NOW, '0'),
+      }).action,
+    ).toBe('migrate')
+  })
+
+  test('migrates a ten-minute reset when the five-minute cache expires in three minutes', () => {
+    const activity = new SessionCacheActivity()
+    activity.record('session-a', 'account-a', 300_000, NOW - 2 * 60_000)
+    expect(
+      decideStickyQuotaFailure({
+        quota: exhausted('five-hour', resetIn(10 * 60_000)),
+        now: NOW,
+        sessionId: 'session-a',
+        holdUntil: activity.holdUntil('session-a', 'account-a', NOW),
+      }).action,
+    ).toBe('migrate')
+  })
+
+  test('migrates without activity on the same account', () => {
+    const activity = new SessionCacheActivity()
+    activity.record('other-session', 'account-a', 3_600_000, NOW)
+    activity.record('different-account', 'account-b', 3_600_000, NOW)
+    for (const sessionId of ['missing', 'different-account']) {
+      expect(
+        decideStickyQuotaFailure({
+          quota: exhausted('five-hour', resetIn(10 * 60_000)),
+          now: NOW,
+          sessionId,
+          holdUntil: activity.holdUntil(sessionId, 'account-a', NOW),
+        }).action,
+      ).toBe('migrate')
+    }
   })
 })

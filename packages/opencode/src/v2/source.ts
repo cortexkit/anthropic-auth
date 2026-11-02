@@ -4,6 +4,7 @@ import {
   decideStickyQuotaFailure,
   effectiveRelayTransport,
   getClaudeCodeIdentityForVerifiedAccount,
+  getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRoutingMode,
   isDumpPersistentlyEnabled,
@@ -28,6 +29,8 @@ import {
   nativePollQuotaGenerallyExhausted,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
+  PROMPT_CACHE_1H_TTL_MS,
+  PROMPT_CACHE_DEFAULT_TTL_MS,
   type ProviderAccountUuid,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
@@ -35,6 +38,7 @@ import {
   remapModelId,
   requestSignal,
   StickySessionRouter,
+  sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
@@ -92,6 +96,7 @@ type State = {
   quota?: OAuthQuotaSnapshot
   responseHeaders?: Headers
   exhaustionReported?: boolean
+  cacheTtlMs?: number
 }
 type Retry = {
   readonly scope: RequestScope
@@ -113,8 +118,8 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
 /**
  * Sticky-balanced sessions wait on their own account, as OpenCode 1 and Pi
  * do, when a 429 refused it and every exhausted quota window blocking the
- * model has a known reset within 15 minutes. The wait is that reset plus the
- * session's deterministic jitter. The installer then keeps the refused account
+ * model resets before the session's same-account cache and wait budget expire,
+ * including deterministic jitter. The common-auth retry hook keeps the refused account
  * and its routing pin and replaces the host's retry wait with this delay.
  *
  * `servable` holds the accounts that can serve this model right now. A
@@ -127,6 +132,7 @@ function stickyHold(
   snapshot: NativeAccountSnapshot,
   servable: readonly NativeAccountView[],
   modelID: string,
+  responseHeaders?: Headers,
 ): RetryHold | undefined {
   const refused = input.rerouteFrom
   if (
@@ -139,26 +145,38 @@ function stickyHold(
   // Only a current reading can show when the blocking windows reset.
   if (
     !account ||
-    !stickyQuotaSnapshotIsFresh(
-      account.quota,
-      snapshot.policyStorage,
-      Date.now(),
-      modelID,
-    )
+    (!responseHeaders &&
+      !stickyQuotaSnapshotIsFresh(
+        account.quota,
+        snapshot.policyStorage,
+        Date.now(),
+        modelID,
+      ))
   )
     return undefined
   const decision = decideStickyQuotaFailure({
     quota: account.quota,
     modelId: modelID,
+    responseHeaders,
+    sessionId: input.sessionID,
+    holdUntil: sessionCacheActivity.holdUntil(
+      input.sessionID,
+      account.id,
+      Date.now(),
+      getMaxSameAccountWait(snapshot.policyStorage),
+    ),
   })
   if (decision.action !== 'hold') return undefined
   return {
     hold: {
-      delayMs:
+      // OpenCode 2 caps each wait; under "max", retries recheck the original cache expiry.
+      delayMs: Math.min(
+        15 * 60_000,
         stickyRetryAfterWithJitter(
           input.sessionID,
           decision.retryAfterSeconds,
         ) * 1000,
+      ),
     },
   }
 }
@@ -255,6 +273,10 @@ export function createNativeAnthropicSource(
   }
   const states = new WeakMap<NativeSourceProvenance, State>()
   const retries = new Map<string, Retry>()
+  const refusalHeaders = new Map<
+    string,
+    { sessionID: string; headers: Headers }
+  >()
   const recoveries = new Map<string, Retry[]>()
   const sessions = new Map<string, AbortController>()
   // The account behind each session's latest authorization, for the sidebar.
@@ -632,7 +654,17 @@ export function createNativeAnthropicSource(
             : 'unknown account, credential, account policy or Fable reserve',
         )
       }
-      const hold = stickyHold(input, snapshot, oauth, modelID)
+      const hold = stickyHold(
+        input,
+        snapshot,
+        oauth,
+        modelID,
+        input.rerouteFrom
+          ? refusalHeaders.get(
+              key({ ...input, modelID }, input.rerouteFrom.accountId),
+            )?.headers
+          : undefined,
+      )
       if (hold) return hold
       const withoutRejected = oauth.filter(
         (account) => account.id !== input.rerouteFrom?.accountId,
@@ -957,13 +989,17 @@ export function createNativeAnthropicSource(
           'request refused: native account is ineligible for this model',
         )
       }
+      const bodyOptions = options.requestOptions(input, snapshot)
       const state = states.get(input.provenance)
       if (state)
         states.set(input.provenance, {
           ...state,
           scope: { ...state.scope, modelID: input.modelID },
+          cacheTtlMs: bodyOptions.cache1hEnabled
+            ? PROMPT_CACHE_1H_TTL_MS
+            : PROMPT_CACHE_DEFAULT_TTL_MS,
         })
-      return options.requestOptions(input, snapshot)
+      return bodyOptions
     },
     async admitRequest(input, onRefusal) {
       const state = states.get(input.provenance)
@@ -997,6 +1033,32 @@ export function createNativeAnthropicSource(
       options.onResponseHeaders?.(input)
       const state = states.get(input.provenance)
       if (state) {
+        if (
+          input.route === 'oauth' &&
+          input.status >= 200 &&
+          input.status < 300 &&
+          !state.active.signal.aborted
+        )
+          sessionCacheActivity.record(
+            input.sessionID,
+            input.accountId,
+            state.cacheTtlMs,
+          )
+        const refusalKey = key(
+          { ...input, modelID: state.scope.modelID },
+          input.accountId,
+        )
+        if (input.status === 429) {
+          refusalHeaders.delete(refusalKey)
+          refusalHeaders.set(refusalKey, {
+            sessionID: input.sessionID,
+            headers,
+          })
+          if (refusalHeaders.size > 512) {
+            const oldest = refusalHeaders.keys().next().value
+            if (oldest !== undefined) refusalHeaders.delete(oldest)
+          }
+        } else refusalHeaders.delete(refusalKey)
         state.responseHeaders = headers
         const served = input.status < 400 && !servedTurns.has(input.sessionID)
         if (served) servedTurns.add(input.sessionID)
@@ -1231,6 +1293,9 @@ export function createNativeAnthropicSource(
       }
     },
     forgetSession(sessionID) {
+      sessionCacheActivity.forget(sessionID)
+      for (const [key, value] of refusalHeaders)
+        if (value.sessionID === sessionID) refusalHeaders.delete(key)
       servedTurns.delete(sessionID)
       sessions.get(sessionID)?.abort()
       sessions.delete(sessionID)

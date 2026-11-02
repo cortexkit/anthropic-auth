@@ -1010,136 +1010,173 @@ describe('Pi API fallback routing helpers', () => {
     await checkStickyQuotaReread(false)
   })
 
-  for (const window of ['5h', '7d', 'model-scoped'] as const) {
-    test(`sticky-balanced holds the assigned Pi account for a 10-minute ${window} reset and moves for a far reset`, async () => {
-      tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-hold-'))
-      const storagePath = join(tempDir, 'anthropic-auth.json')
-      const routingPath = join(tempDir, 'sticky-routes.json')
-      process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-      process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = routingPath
-      const checkedAt = Date.now()
-      const quota = (remaining: number) => ({
-        checkedAt,
-        five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt },
-        seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
-        scoped: [
-          {
-            id: 'claude-weekly-scoped-fable',
-            title: 'Fable only',
-            modelName: 'Fable',
-            usedPercent: 100 - remaining,
-            remainingPercent: remaining,
-            resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
-            checkedAt,
-          },
-        ],
-      })
-      await saveNativePiFixture(
-        {
-          version: 1,
-          mainAccountId: 'main-account',
-          main: { type: 'opencode', provider: 'anthropic' },
-          fallbackOn: [401, 403, 429],
-          quota: {
-            enabled: true,
-            checkIntervalMinutes: 5,
-            minimumRemaining: { five_hour: 1, seven_day: 1 },
-            failClosedOnUnknownQuota: true,
-            mainQuota: { ...quota(0), accountIdentity: 'main-account' },
-            mainQuotaCheckedAt: checkedAt,
-          },
-          routing: { mode: 'sticky-balanced' },
-          accounts: [
+  for (const maxSameAccountWait of ['15', 'max'] as const) {
+    for (const window of ['5h', '7d', 'model-scoped'] as const) {
+      test(`sticky-balanced holds the assigned Pi account for a cache-bound ${window} reset with ${maxSameAccountWait} wait and moves for a far reset`, async () => {
+        tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-hold-'))
+        const storagePath = join(tempDir, 'anthropic-auth.json')
+        const routingPath = join(tempDir, 'sticky-routes.json')
+        process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+        process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = routingPath
+        const checkedAt = Date.now()
+        const quota = (remaining: number) => ({
+          checkedAt,
+          five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt },
+          seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
+          scoped: [
             {
-              id: 'yiyi',
-              type: 'oauth',
-              access: 'sk-ant-oat01-scarce-access',
-              refresh: 'scarce-refresh',
-              expires: checkedAt + 5 * 60 * 60_000,
-              quota: quota(13),
-            },
-            {
-              id: 'ufuk2',
-              type: 'oauth',
-              access: 'sk-ant-oat01-abundant-access',
-              refresh: 'abundant-refresh',
-              expires: checkedAt + 5 * 60 * 60_000,
-              quota: quota(98),
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 100 - remaining,
+              remainingPercent: remaining,
+              resetsAt: new Date(
+                checkedAt + 4 * 24 * 60 * 60_000,
+              ).toISOString(),
+              checkedAt,
             },
           ],
-        },
-        storagePath,
-      )
+        })
+        await saveNativePiFixture(
+          {
+            version: 1,
+            mainAccountId: 'main-account',
+            main: { type: 'opencode', provider: 'anthropic' },
+            fallbackOn: [401, 403, 429],
+            quota: {
+              enabled: true,
+              checkIntervalMinutes: 5,
+              minimumRemaining: { five_hour: 1, seven_day: 1 },
+              failClosedOnUnknownQuota: true,
+              mainQuota: { ...quota(0), accountIdentity: 'main-account' },
+              mainQuotaCheckedAt: checkedAt,
+            },
+            routing: { mode: 'sticky-balanced', maxSameAccountWait },
+            claudeCache: { enabled: true, mode: 'explicit' },
+            accounts: [
+              {
+                id: 'yiyi',
+                type: 'oauth',
+                access: 'sk-ant-oat01-scarce-access',
+                refresh: 'scarce-refresh',
+                expires: checkedAt + 5 * 60 * 60_000,
+                quota: quota(13),
+              },
+              {
+                id: 'ufuk2',
+                type: 'oauth',
+                access: 'sk-ant-oat01-abundant-access',
+                refresh: 'abundant-refresh',
+                expires: checkedAt + 5 * 60 * 60_000,
+                quota: quota(98),
+              },
+            ],
+          },
+          storagePath,
+        )
 
-      let now = checkedAt
-      let useLongReset = false
-      const authorizations: string[] = []
-      globalThis.fetch = mock(
-        (input: string | URL | Request, init?: RequestInit) => {
-          const url = input instanceof Request ? input.url : input.toString()
-          const authorization =
-            new Headers(init?.headers).get('authorization') ?? ''
-          const abundant =
-            authorization === 'Bearer sk-ant-oat01-abundant-access'
-          if (url.includes('/api/oauth/usage')) {
-            const reset = new Date(
-              checkedAt + (useLongReset ? 120 : 10) * 60_000,
-            ).toISOString()
+        let now = checkedAt
+        let useLongReset = false
+        const authorizations: string[] = []
+        globalThis.fetch = mock(
+          (input: string | URL | Request, init?: RequestInit) => {
+            const url = input instanceof Request ? input.url : input.toString()
+            const authorization =
+              new Headers(init?.headers).get('authorization') ?? ''
+            const abundant =
+              authorization === 'Bearer sk-ant-oat01-abundant-access'
+            if (url.includes('/api/oauth/usage')) {
+              const reset = new Date(
+                checkedAt +
+                  (useLongReset
+                    ? 120
+                    : maxSameAccountWait === 'max'
+                      ? 30
+                      : 10) *
+                    60_000,
+              ).toISOString()
+              return Promise.resolve(
+                new Response(
+                  JSON.stringify({
+                    five_hour: {
+                      utilization: abundant && window === '5h' ? 100 : 0,
+                      resets_at: reset,
+                    },
+                    seven_day: {
+                      utilization: abundant && window === '7d' ? 100 : 0,
+                      resets_at: reset,
+                    },
+                    limits: [
+                      {
+                        kind: 'weekly_scoped',
+                        group: 'weekly',
+                        percent:
+                          authorization === 'Bearer sk-ant-oat01-main-access' ||
+                          (abundant && window === 'model-scoped')
+                            ? 100
+                            : abundant
+                              ? 2
+                              : 87,
+                        resets_at: reset,
+                        scope: { model: { display_name: 'Fable' } },
+                      },
+                    ],
+                  }),
+                  { status: 200 },
+                ),
+              )
+            }
+            if (!url.includes('/v1/messages'))
+              return Promise.resolve(new Response('{}'))
+            authorizations.push(authorization)
             return Promise.resolve(
               new Response(
-                JSON.stringify({
-                  five_hour: {
-                    utilization: abundant && window === '5h' ? 100 : 0,
-                    resets_at: reset,
-                  },
-                  seven_day: {
-                    utilization: abundant && window === '7d' ? 100 : 0,
-                    resets_at: reset,
-                  },
-                  limits: [
-                    {
-                      kind: 'weekly_scoped',
-                      group: 'weekly',
-                      percent:
-                        authorization === 'Bearer sk-ant-oat01-main-access' ||
-                        (abundant && window === 'model-scoped')
-                          ? 100
-                          : abundant
-                            ? 2
-                            : 87,
-                      resets_at: reset,
-                      scope: { model: { display_name: 'Fable' } },
-                    },
-                  ],
-                }),
+                abundant
+                  ? 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"quota"}}\n\n'
+                  : [
+                      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+                      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+                      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+                    ].join(''),
                 { status: 200 },
               ),
             )
-          }
-          if (!url.includes('/v1/messages'))
-            return Promise.resolve(new Response('{}'))
-          authorizations.push(authorization)
-          return Promise.resolve(
-            new Response(
-              abundant
-                ? 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"quota"}}\n\n'
-                : [
-                    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
-                    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
-                    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-                  ].join(''),
-              { status: 200 },
-            ),
-          )
-        },
-      ) as unknown as typeof fetch
+          },
+        ) as unknown as typeof fetch
 
-      const originalNow = Date.now
-      Date.now = () => now
-      try {
-        for (let request = 0; request < 2; request++) {
-          const events = []
-          const stream = streamCortexKitAnthropic(
+        const originalNow = Date.now
+        Date.now = () => now
+        try {
+          for (let request = 0; request < 2; request++) {
+            const events = []
+            const stream = streamCortexKitAnthropic(
+              anthropicModel,
+              anthropicContext,
+              {
+                apiKey: 'sk-ant-oat01-main-access',
+                sessionId: 'ses_pi_sticky_hold',
+              },
+            )
+            for await (const event of stream) events.push(event)
+            const error = events.find((event) => event.type === 'error')
+            expect(error?.error.errorMessage).toContain('HTTP 429')
+            expect(error?.error.errorMessage).toContain(
+              'Sticky OAuth account quota resets shortly; retaining session affinity.',
+            )
+            await getPiNativeRuntime(storagePath).drainRoutingPublications()
+            expect(
+              Object.values(
+                JSON.parse(await readFile(routingPath, 'utf8')).assignments,
+              ),
+            ).toMatchObject([{ accountId: 'ufuk2' }])
+          }
+          expect(authorizations).toEqual([
+            'Bearer sk-ant-oat01-abundant-access',
+          ])
+
+          useLongReset = true
+          now += 6 * 60_000
+          const moved = streamCortexKitAnthropic(
             anthropicModel,
             anthropicContext,
             {
@@ -1147,49 +1184,25 @@ describe('Pi API fallback routing helpers', () => {
               sessionId: 'ses_pi_sticky_hold',
             },
           )
-          for await (const event of stream) events.push(event)
-          const error = events.find((event) => event.type === 'error')
-          expect(error?.error.errorMessage).toContain('HTTP 429')
-          expect(error?.error.errorMessage).toContain(
-            'Sticky OAuth account quota resets shortly; retaining session affinity.',
-          )
+          for await (const _event of moved) {
+            // Drain the successful retry so its final result is available.
+          }
+          expect((await moved.result()).errorMessage).toBeUndefined()
+          expect(authorizations).toEqual([
+            'Bearer sk-ant-oat01-abundant-access',
+            'Bearer sk-ant-oat01-scarce-access',
+          ])
           await getPiNativeRuntime(storagePath).drainRoutingPublications()
           expect(
             Object.values(
               JSON.parse(await readFile(routingPath, 'utf8')).assignments,
             ),
-          ).toMatchObject([{ accountId: 'ufuk2' }])
+          ).toMatchObject([{ accountId: 'yiyi' }])
+        } finally {
+          Date.now = originalNow
         }
-        expect(authorizations).toEqual(['Bearer sk-ant-oat01-abundant-access'])
-
-        useLongReset = true
-        now += 6 * 60_000
-        const moved = streamCortexKitAnthropic(
-          anthropicModel,
-          anthropicContext,
-          {
-            apiKey: 'sk-ant-oat01-main-access',
-            sessionId: 'ses_pi_sticky_hold',
-          },
-        )
-        for await (const _event of moved) {
-          // Drain the successful retry so its final result is available.
-        }
-        expect((await moved.result()).errorMessage).toBeUndefined()
-        expect(authorizations).toEqual([
-          'Bearer sk-ant-oat01-abundant-access',
-          'Bearer sk-ant-oat01-scarce-access',
-        ])
-        await getPiNativeRuntime(storagePath).drainRoutingPublications()
-        expect(
-          Object.values(
-            JSON.parse(await readFile(routingPath, 'utf8')).assignments,
-          ),
-        ).toMatchObject([{ accountId: 'yiyi' }])
-      } finally {
-        Date.now = originalNow
-      }
-    })
+      })
+    }
   }
 
   test('sticky-balanced keeps repeated Pi session requests on the quota-selected account', async () => {

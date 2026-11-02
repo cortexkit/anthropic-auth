@@ -107,7 +107,7 @@ function pick(
 }
 
 const settingFields: Record<string, readonly string[]> = {
-  routing: ['mode'],
+  routing: ['mode', 'maxSameAccountWait'],
   refresh: ['enabled', 'intervalMinutes', 'refreshBeforeExpiryMinutes'],
   quota: [
     'enabled',
@@ -146,6 +146,7 @@ export function validateNativeMigrationSettings(
     )
   const enums: Record<string, readonly string[]> = {
     'routing.mode': ['main-first', 'fallback-first', 'sticky-balanced'],
+    'routing.maxSameAccountWait': ['0', '15', 'max'],
     'claudeCache.mode': CACHE_1H_MODES,
     'logging.level': ['debug', 'info', 'warn', 'error', 'trace'],
     'thinkingBinding.prefixMismatchBehavior': [

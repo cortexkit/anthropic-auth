@@ -256,6 +256,11 @@ export function createNativeMenuCapabilities(options: {
       case 'routing-mode':
         await write('routing', { mode: request.values.mode })
         return done()
+      case 'routing-max-same-account-wait':
+        await write('routing', {
+          maxSameAccountWait: request.values.maxSameAccountWait,
+        })
+        return done()
       case 'killswitch-on':
       case 'killswitch-off':
         await write('killswitch', {

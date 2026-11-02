@@ -1858,200 +1858,206 @@ describe('auth.loader', () => {
     ])
   })
 
-  for (const window of ['5h', '7d', 'model-scoped'] as const) {
-    test(`sticky-balanced retains the assigned account across transient errors and a short ${window} reset`, async () => {
-      const checkedAt = Date.now()
-      const holdMinutes = window === '5h' ? 14 : 10
-      const shortResetAt = new Date(
-        checkedAt + holdMinutes * 60_000,
-      ).toISOString()
-      const longResetAt = new Date(checkedAt + 2 * 60 * 60_000).toISOString()
-      let useLongReset = false
-      let now = checkedAt
-      const quota = (fableRemaining: number) => ({
-        checkedAt,
-        five_hour: {
-          usedPercent: 0,
-          remainingPercent: 100,
-          resetsAt: new Date(checkedAt + 5 * 60 * 60_000).toISOString(),
+  for (const maxSameAccountWait of ['15', 'max'] as const) {
+    for (const window of ['5h', '7d', 'model-scoped'] as const) {
+      test(`sticky-balanced retains the assigned account across transient errors and a cache-bound ${window} reset with ${maxSameAccountWait} wait`, async () => {
+        const checkedAt = Date.now()
+        const holdMinutes =
+          maxSameAccountWait === 'max' ? 30 : window === '5h' ? 14 : 10
+        const shortResetAt = new Date(
+          checkedAt + holdMinutes * 60_000,
+        ).toISOString()
+        const longResetAt = new Date(checkedAt + 2 * 60 * 60_000).toISOString()
+        let useLongReset = false
+        let now = checkedAt
+        const quota = (fableRemaining: number) => ({
           checkedAt,
-        },
-        seven_day: {
-          usedPercent: 0,
-          remainingPercent: 100,
-          resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
-          checkedAt,
-        },
-        scoped: [
-          {
-            id: 'claude-weekly-scoped-fable',
-            title: 'Fable only',
-            modelName: 'Fable',
-            usedPercent: 100 - fableRemaining,
-            remainingPercent: fableRemaining,
+          five_hour: {
+            usedPercent: 0,
+            remainingPercent: 100,
+            resetsAt: new Date(checkedAt + 5 * 60 * 60_000).toISOString(),
+            checkedAt,
+          },
+          seven_day: {
+            usedPercent: 0,
+            remainingPercent: 100,
             resetsAt: new Date(checkedAt + 4 * 24 * 60 * 60_000).toISOString(),
             checkedAt,
           },
-        ],
-      })
-      await useTempAccountFile(
-        bindPoolAccounts(
-          createFallbackStorage({
-            routing: { mode: 'sticky-balanced' },
-            quota: {
-              enabled: true,
-              checkIntervalMinutes: 5,
-              minimumRemaining: { five_hour: 1, seven_day: 1 },
-              failClosedOnUnknownQuota: true,
-              mainQuota: quota(0),
-              mainQuotaCheckedAt: checkedAt,
-              mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
+          scoped: [
+            {
+              id: 'claude-weekly-scoped-fable',
+              title: 'Fable only',
+              modelName: 'Fable',
+              usedPercent: 100 - fableRemaining,
+              remainingPercent: fableRemaining,
+              resetsAt: new Date(
+                checkedAt + 4 * 24 * 60 * 60_000,
+              ).toISOString(),
+              checkedAt,
             },
-            accounts: [
-              {
-                id: 'yiyi',
-                type: 'oauth',
-                access: 'sk-ant-oat01-scarce-access',
-                refresh: 'scarce-refresh',
-                expires: checkedAt + 5 * 60 * 60_000,
-                quota: quota(13),
+          ],
+        })
+        await useTempAccountFile(
+          bindPoolAccounts(
+            createFallbackStorage({
+              routing: { mode: 'sticky-balanced', maxSameAccountWait },
+              claudeCache: { enabled: true, mode: 'explicit' },
+              quota: {
+                enabled: true,
+                checkIntervalMinutes: 5,
+                minimumRemaining: { five_hour: 1, seven_day: 1 },
+                failClosedOnUnknownQuota: true,
+                mainQuota: quota(0),
+                mainQuotaCheckedAt: checkedAt,
+                mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
               },
-              {
-                id: 'ufuk2',
-                type: 'oauth',
-                access: 'sk-ant-oat01-abundant-access',
-                refresh: 'abundant-refresh',
-                expires: checkedAt + 5 * 60 * 60_000,
-                quota: quota(98),
-              },
-            ],
-          }),
-        ),
-      )
-      const authorizations: string[] = []
-      let modelRequest = 0
-      globalThis.fetch = mock(
-        withNativeAdmission((input: any, init: any) => {
-          const url = extractUrl(input)
-          if (url.includes('/api/oauth/usage')) {
-            const authorization = new Headers(init?.headers).get(
-              'authorization',
-            )
-            const abundant =
-              authorization === 'Bearer sk-ant-oat01-abundant-access'
-            const main = authorization === 'Bearer sk-ant-oat01-main-access'
-            return Promise.resolve(
-              new Response(
-                JSON.stringify({
-                  five_hour: {
-                    utilization: abundant && window === '5h' ? 100 : 0,
-                    resets_at: useLongReset ? longResetAt : shortResetAt,
-                  },
-                  seven_day: {
-                    utilization: abundant && window === '7d' ? 100 : 0,
-                    resets_at: useLongReset ? longResetAt : shortResetAt,
-                  },
-                  limits: [
-                    {
-                      kind: 'weekly_scoped',
-                      group: 'weekly',
-                      percent:
-                        main || (abundant && window === 'model-scoped')
-                          ? 100
-                          : abundant
-                            ? 2
-                            : 87,
-                      resets_at:
-                        abundant && window === 'model-scoped'
-                          ? useLongReset
-                            ? longResetAt
-                            : shortResetAt
-                          : new Date(
-                              checkedAt + 4 * 24 * 60 * 60_000,
-                            ).toISOString(),
-                      scope: { model: { display_name: 'Fable' } },
+              accounts: [
+                {
+                  id: 'yiyi',
+                  type: 'oauth',
+                  access: 'sk-ant-oat01-scarce-access',
+                  refresh: 'scarce-refresh',
+                  expires: checkedAt + 5 * 60 * 60_000,
+                  quota: quota(13),
+                },
+                {
+                  id: 'ufuk2',
+                  type: 'oauth',
+                  access: 'sk-ant-oat01-abundant-access',
+                  refresh: 'abundant-refresh',
+                  expires: checkedAt + 5 * 60 * 60_000,
+                  quota: quota(98),
+                },
+              ],
+            }),
+          ),
+        )
+        const authorizations: string[] = []
+        let modelRequest = 0
+        globalThis.fetch = mock(
+          withNativeAdmission((input: any, init: any) => {
+            const url = extractUrl(input)
+            if (url.includes('/api/oauth/usage')) {
+              const authorization = new Headers(init?.headers).get(
+                'authorization',
+              )
+              const abundant =
+                authorization === 'Bearer sk-ant-oat01-abundant-access'
+              const main = authorization === 'Bearer sk-ant-oat01-main-access'
+              return Promise.resolve(
+                new Response(
+                  JSON.stringify({
+                    five_hour: {
+                      utilization: abundant && window === '5h' ? 100 : 0,
+                      resets_at: useLongReset ? longResetAt : shortResetAt,
                     },
-                  ],
-                }),
-                { status: 200 },
-              ),
+                    seven_day: {
+                      utilization: abundant && window === '7d' ? 100 : 0,
+                      resets_at: useLongReset ? longResetAt : shortResetAt,
+                    },
+                    limits: [
+                      {
+                        kind: 'weekly_scoped',
+                        group: 'weekly',
+                        percent:
+                          main || (abundant && window === 'model-scoped')
+                            ? 100
+                            : abundant
+                              ? 2
+                              : 87,
+                        resets_at:
+                          abundant && window === 'model-scoped'
+                            ? useLongReset
+                              ? longResetAt
+                              : shortResetAt
+                            : new Date(
+                                checkedAt + 4 * 24 * 60 * 60_000,
+                              ).toISOString(),
+                        scope: { model: { display_name: 'Fable' } },
+                      },
+                    ],
+                  }),
+                  { status: 200 },
+                ),
+              )
+            }
+            if (!url.includes('/v1/messages')) {
+              return Promise.resolve(new Response('{}', { status: 200 }))
+            }
+            authorizations.push(
+              new Headers(init?.headers).get('authorization') ?? '',
             )
-          }
-          if (!url.includes('/v1/messages')) {
-            return Promise.resolve(new Response('{}', { status: 200 }))
-          }
-          authorizations.push(
-            new Headers(init?.headers).get('authorization') ?? '',
-          )
-          modelRequest += 1
-          if (modelRequest === 1) {
-            return Promise.resolve(new Response('temporary', { status: 500 }))
-          }
-          if (modelRequest === 2) {
-            return Promise.resolve(
-              new Response(
-                'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"quota"}}\n\n',
-                { status: 200 },
-              ),
-            )
-          }
-          return Promise.resolve(new Response('ok', { status: 200 }))
-        }),
-      ) as unknown as typeof fetch
-
-      Date.now = mock(() => now) as unknown as typeof Date.now
-      const plugin = await getPlugin()
-      const result = await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth',
-            access: 'sk-ant-oat01-main-access',
-            refresh: 'main-refresh',
-            expires: checkedAt + 10 * 60 * 60_000,
+            modelRequest += 1
+            if (modelRequest === 1) {
+              return Promise.resolve(new Response('temporary', { status: 500 }))
+            }
+            if (modelRequest === 2) {
+              return Promise.resolve(
+                new Response(
+                  'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"quota"}}\n\n',
+                  { status: 200 },
+                ),
+              )
+            }
+            return Promise.resolve(new Response('ok', { status: 200 }))
           }),
-        { models: {} },
-      )
-      const request = {
-        method: 'POST',
-        headers: { 'x-session-affinity': 'ses_sticky_hold' },
-        body: JSON.stringify({
-          model: 'claude-fable-5',
-          stream: true,
-          messages: [{ role: 'user', content: 'hello' }],
-        }),
-      }
+        ) as unknown as typeof fetch
 
-      expect((await result.fetch(MESSAGES_URL, request)).status).toBe(500)
-      const held = await result.fetch(MESSAGES_URL, request)
-      expect(held.status).toBe(429)
-      expect(Number(held.headers.get('retry-after'))).toBeGreaterThanOrEqual(
-        holdMinutes * 60,
-      )
-      expect(Number(held.headers.get('retry-after'))).toBeLessThanOrEqual(
-        holdMinutes * 60 + 20,
-      )
-      expect(await held.text()).toContain(
-        'Sticky OAuth account quota resets shortly; retaining session affinity.',
-      )
-      const proactive = await result.fetch(MESSAGES_URL, request)
-      expect(proactive.status).toBe(429)
-      expect(await proactive.text()).toContain(
-        'Sticky OAuth account quota resets shortly; retaining session affinity.',
-      )
-      expect(authorizations).toEqual([
-        'Bearer sk-ant-oat01-abundant-access',
-        'Bearer sk-ant-oat01-abundant-access',
-      ])
+        Date.now = mock(() => now) as unknown as typeof Date.now
+        const plugin = await getPlugin()
+        const result = await plugin.auth.loader(
+          () =>
+            Promise.resolve({
+              type: 'oauth',
+              access: 'sk-ant-oat01-main-access',
+              refresh: 'main-refresh',
+              expires: checkedAt + 10 * 60 * 60_000,
+            }),
+          { models: {} },
+        )
+        const request = {
+          method: 'POST',
+          headers: { 'x-session-affinity': 'ses_sticky_hold' },
+          body: JSON.stringify({
+            model: 'claude-fable-5',
+            stream: true,
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        }
 
-      useLongReset = true
-      now += 6 * 60_000
-      const migrated = await result.fetch(MESSAGES_URL, request)
-      expect(migrated.status).toBe(200)
-      expect(authorizations).toEqual([
-        'Bearer sk-ant-oat01-abundant-access',
-        'Bearer sk-ant-oat01-abundant-access',
-        'Bearer sk-ant-oat01-scarce-access',
-      ])
-    })
+        expect((await result.fetch(MESSAGES_URL, request)).status).toBe(500)
+        const held = await result.fetch(MESSAGES_URL, request)
+        expect(held.status).toBe(429)
+        expect(Number(held.headers.get('retry-after'))).toBeGreaterThanOrEqual(
+          holdMinutes * 60,
+        )
+        expect(Number(held.headers.get('retry-after'))).toBeLessThanOrEqual(
+          holdMinutes * 60 + 20,
+        )
+        expect(await held.text()).toContain(
+          'Sticky OAuth account quota resets shortly; retaining session affinity.',
+        )
+        const proactive = await result.fetch(MESSAGES_URL, request)
+        expect(proactive.status).toBe(429)
+        expect(await proactive.text()).toContain(
+          'Sticky OAuth account quota resets shortly; retaining session affinity.',
+        )
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-abundant-access',
+          'Bearer sk-ant-oat01-abundant-access',
+        ])
+
+        useLongReset = true
+        now += 6 * 60_000
+        const migrated = await result.fetch(MESSAGES_URL, request)
+        expect(migrated.status).toBe(200)
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-abundant-access',
+          'Bearer sk-ant-oat01-abundant-access',
+          'Bearer sk-ant-oat01-scarce-access',
+        ])
+      })
+    }
   }
 })

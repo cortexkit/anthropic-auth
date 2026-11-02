@@ -19,6 +19,7 @@ import {
   getClaudeCodeIdentityForVerifiedAccount,
   getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
+  getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRequestGzipLatch,
   getRequestGzipLatchPath,
@@ -45,6 +46,8 @@ import {
   nativeAccountCanServe,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  PROMPT_CACHE_1H_TTL_MS,
+  PROMPT_CACHE_DEFAULT_TTL_MS,
   type ProviderAccountUuid,
   type ProviderErrorResponseScope,
   parseSseFrame,
@@ -63,6 +66,7 @@ import {
   StickySessionRouter,
   sendViaRelay,
   sendWithRequestGzip,
+  sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
@@ -258,6 +262,7 @@ export async function clearPiStickyRoutingSession(
   storagePath: string,
   sessionId: string,
 ) {
+  sessionCacheActivity.forget(sessionId)
   await (await getPiStickyRouter(storagePath)).clear(sessionId)
 }
 
@@ -632,6 +637,14 @@ async function sendAnthropicRequest(
   }
   const trackAcceptedRequest = () => {
     if (options.apiAccount || init.signal?.aborted) return
+    if (relayAffinity)
+      sessionCacheActivity.record(
+        relayAffinity,
+        routeId,
+        isCache1hPersistentlyEnabled(storage)
+          ? PROMPT_CACHE_1H_TTL_MS
+          : PROMPT_CACHE_DEFAULT_TTL_MS,
+      )
     keep.track({
       sessionId: relayAffinity,
       url: input.toString(),
@@ -1203,8 +1216,17 @@ async function executeWithFallback(options: {
             Date.now(),
             modelId,
           ) &&
-          decideStickyQuotaFailure({ quota: route.quota, modelId }).action ===
-            'migrate'
+          decideStickyQuotaFailure({
+            quota: route.quota,
+            modelId,
+            sessionId: options.streamOptions?.sessionId,
+            holdUntil: sessionCacheActivity.holdUntil(
+              options.streamOptions?.sessionId,
+              route.id,
+              Date.now(),
+              getMaxSameAccountWait(storage),
+            ),
+          }).action === 'migrate'
         ) {
           return []
         }
@@ -1448,6 +1470,13 @@ async function executeWithFallback(options: {
         ? decideStickyQuotaFailure({
             quota: route.quota,
             modelId: options.model.id,
+            sessionId,
+            holdUntil: sessionCacheActivity.holdUntil(
+              sessionId,
+              route.id,
+              Date.now(),
+              getMaxSameAccountWait(storage),
+            ),
           })
         : undefined
       if (proactiveQuotaDecision?.action === 'hold') {
@@ -1520,6 +1549,13 @@ async function executeWithFallback(options: {
           quota,
           modelId: options.model.id,
           responseHeaders,
+          sessionId,
+          holdUntil: sessionCacheActivity.holdUntil(
+            sessionId,
+            route.id,
+            Date.now(),
+            getMaxSameAccountWait(storage),
+          ),
         })
         if (decision.action === 'hold') {
           const headers = new Headers(

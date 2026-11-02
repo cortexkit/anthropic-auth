@@ -39,6 +39,7 @@ import {
   resolveNativePoolPaths,
   runNativeMigration,
   StickySessionRouter,
+  sessionCacheActivity,
   setLogLevel,
   setRelocationMoveEnabledForTests,
   stickyRouteFamilyForModel,
@@ -2832,69 +2833,99 @@ const cacheKeepPrewarmBody = JSON.stringify({
   ],
 })
 
-test('OpenCode 1 CacheKeep retains the accepted target across rejected and failed sends', async () => {
-  const fixture = await migrateServingFixture('claustrum')
-  const runtime = createNativeAccountRuntime({
-    paths: fixture.paths,
-    host: 'opencode',
-  })
-  try {
-    await runtime.updateSettings((settings) => ({
-      ...settings,
-      claudeCache: { enabled: true, mode: 'hybrid' },
-      cacheKeep: { enabled: true, always: true },
-    }))
-  } finally {
-    runtime.close()
-  }
-  let status = 200
-  let failure = false
-  network.mockImplementation(async (input, init) => {
-    const url = input instanceof Request ? input.url : input.toString()
-    if (!url.includes('/v1/messages')) return fixture.fetchProvider(input, init)
-    if (failure) throw new TypeError('synthetic transport failure')
-    return Response.json({ content: [], usage: {} }, { status })
-  })
-  const plugin = await createPlugin({
-    claustrumScopedConnect: async () => fixture.scopedClient,
-    setInterval: (() => ({ unref() {} })) as unknown as typeof setInterval,
-    clearInterval: (() => {}) as typeof clearInterval,
-  })
-  const sendRequest = requestFetch(
-    await load(plugin, async () => custodyTombstoneOAuth('anthropic')),
-  )
-  const keep = getPluginTestHandles(plugin).cacheKeepManager
-  if (!(keep instanceof CacheKeepManager))
-    throw new Error('missing CacheKeep manager')
-  const sessionId = 'oc1-accepted-only'
-  const send = (text: string) =>
-    sendRequest('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-session-affinity': sessionId },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 8,
-        messages: [{ role: 'user', content: text }],
-      }),
+for (const cacheKeepEnabled of [true, false]) {
+  test(`OpenCode 1 records only accepted cache activity with CacheKeep ${cacheKeepEnabled ? 'on' : 'off'}`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
     })
-  await (await send('accepted')).text()
-  const before = keep.trackedRequest(sessionId)
-  expect(before).toBeDefined()
-  status = 400
-  await (await send('rejected')).text()
-  expect(keep.trackedRequest(sessionId)).toEqual(before)
-  failure = true
-  await expect(send('transport error')).rejects.toThrow(
-    'synthetic transport failure',
-  )
-  expect(keep.trackedRequest(sessionId)).toEqual(before)
-  failure = false
-  status = 201
-  await (await send('accepted next step')).text()
-  expect(keep.trackedRequest(sessionId)?.bodyText).toContain(
-    'accepted next step',
-  )
-})
+    try {
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: cacheKeepEnabled, always: true },
+      }))
+    } finally {
+      runtime.close()
+    }
+    let status = 200
+    let failure = false
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (!url.includes('/v1/messages'))
+        return fixture.fetchProvider(input, init)
+      if (failure) throw new TypeError('synthetic transport failure')
+      return Response.json({ content: [], usage: {} }, { status })
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+      setInterval: (() => ({ unref() {} })) as unknown as typeof setInterval,
+      clearInterval: (() => {}) as typeof clearInterval,
+    })
+    const sendRequest = requestFetch(
+      await load(plugin, async () => custodyTombstoneOAuth('anthropic')),
+    )
+    const keep = getPluginTestHandles(plugin).cacheKeepManager
+    if (!(keep instanceof CacheKeepManager))
+      throw new Error('missing CacheKeep manager')
+    const sessionId = 'oc1-accepted-only'
+    sessionCacheActivity.forget(sessionId)
+    const send = (text: string, signal?: AbortSignal) =>
+      sendRequest('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        signal,
+        headers: { 'x-session-affinity': sessionId },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 8,
+          messages: [{ role: 'user', content: text }],
+        }),
+      })
+    await (await send('accepted')).text()
+    const before = keep.trackedRequest(sessionId)
+    if (cacheKeepEnabled) expect(before).toBeDefined()
+    else expect(before).toBeUndefined()
+    const cacheExpiry = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      Date.now(),
+      'max',
+    )
+    expect(cacheExpiry).toBeGreaterThan(Date.now() + 55 * 60_000)
+    status = 400
+    await (await send('rejected')).text()
+    expect(keep.trackedRequest(sessionId)).toEqual(before)
+    expect(
+      sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
+    ).toBe(cacheExpiry)
+    failure = true
+    await expect(send('transport error')).rejects.toThrow(
+      'synthetic transport failure',
+    )
+    expect(keep.trackedRequest(sessionId)).toEqual(before)
+    failure = false
+    status = 201
+    await (await send('accepted next step')).text()
+    if (cacheKeepEnabled)
+      expect(keep.trackedRequest(sessionId)?.bodyText).toContain(
+        'accepted next step',
+      )
+    const nextExpiry = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      Date.now(),
+      'max',
+    )
+    const abort = new AbortController()
+    abort.abort()
+    await send('aborted', abort.signal).catch(() => undefined)
+    expect(
+      sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
+    ).toBe(nextExpiry)
+    sessionCacheActivity.forget(sessionId)
+  })
+}
 
 async function enablePrime(fixture: ServingFixture) {
   const runtime = createNativeAccountRuntime({
