@@ -1832,3 +1832,26 @@ describe('buildAnthropicRequest — Opus 5.5 thinking', () => {
     expect(body.output_config).toEqual({ effort: 'medium' })
   })
 })
+
+describe('Anthropic tool-name snapshots', () => {
+  test('rejects wire-name collisions instead of dispatching ambiguously', async () => {
+    const context = normalizeContext({
+      messages: [userMsg('inspect')],
+      tools: [
+        {
+          name: 'bash',
+          description: 'lower',
+          parameters: { type: 'object', properties: {} },
+        },
+        {
+          name: 'Bash',
+          description: 'upper',
+          parameters: { type: 'object', properties: {} },
+        },
+      ],
+    })
+    await expect(
+      buildAnthropicRequest(TEST_MODEL_ID, context, undefined, defaultCache),
+    ).rejects.toThrow(/tool name collision/u)
+  })
+})
