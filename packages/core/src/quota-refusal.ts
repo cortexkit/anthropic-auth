@@ -1,5 +1,12 @@
 import type { quotaRefusalTiming } from './accounts.ts'
 
+const details = new WeakMap<
+  Response,
+  { reason: string; timing: ReturnType<typeof quotaRefusalTiming> }
+>()
+
+export const quotaRefusalDetails = (response: Response) => details.get(response)
+
 export function createQuotaRefusalResponse(
   reason: string,
   timing: ReturnType<typeof quotaRefusalTiming>,
@@ -23,7 +30,7 @@ export function createQuotaRefusalResponse(
     timing.retryAfterSeconds === undefined
       ? ''
       : ` Retry in ${Math.floor(seconds / 60)}m ${seconds % 60}s.`
-  return new Response(
+  const response = new Response(
     JSON.stringify({
       type: 'error',
       error: {
@@ -44,4 +51,6 @@ export function createQuotaRefusalResponse(
       },
     },
   )
+  details.set(response, { reason, timing })
+  return response
 }

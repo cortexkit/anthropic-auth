@@ -9,6 +9,7 @@ import {
   type ClaudeCodeIdentity,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
+  createQuotaRefusalResponse,
   createSseFramer,
   createStickyNoRouteResponse,
   decideStickyQuotaFailure,
@@ -56,6 +57,7 @@ import {
   type QuotaState,
   quotaBackoffActive,
   quotaExhaustionFromHeaders,
+  quotaRefusalTiming,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
@@ -95,6 +97,11 @@ import {
   piAttemptAccessToken,
 } from './native.ts'
 import { getPiAccountStoragePath } from './paths.ts'
+import {
+  markPiAccountHold,
+  type PiQuotaWaitOptions,
+  withPiQuotaWait,
+} from './quota-wait.ts'
 import {
   buildPiOAuthMessagesUrl,
   fetchPiOAuth,
@@ -561,6 +568,7 @@ async function sendAnthropicRequest(
     apiAccount?: NativeAccountView
     storagePath: string
     oauthAccountId?: string
+    expectedAccountIdentity?: string
     route?: string
     effortTransitions?: readonly MidConversationEffortTransition[]
     onResolvedTools?: (tools: Tool[]) => void
@@ -579,6 +587,11 @@ async function sendAnthropicRequest(
   const routeId = options.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
   const selected = snapshot.accounts.find((account) => account.id === routeId)
   let verifiedUuid = options.apiAccount ? undefined : selected?.accountIdentity
+  if (
+    options.expectedAccountIdentity &&
+    verifiedUuid !== options.expectedAccountIdentity
+  )
+    throw new Error('The selected OAuth account changed while waiting.')
   if (!options.apiAccount && !verifiedUuid) {
     if (selected?.source === 'vault')
       throw new Error('Pi vault route identity is unasserted')
@@ -1467,6 +1480,34 @@ async function executeWithFallback(options: {
         response: Response,
         _markUsed = true,
       ) => response
+      const heldAccountId = route.id
+      const heldAccountIdentity = accountView(route.id)?.accountIdentity
+      const holdResponse = (retryAfterSeconds: number, upstream?: Headers) => {
+        const headers = new Headers(upstream)
+        headers.set('content-type', 'application/json')
+        headers.set(
+          'retry-after',
+          String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
+        )
+        return markPiAccountHold(
+          new Response(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'rate_limit_error',
+                message:
+                  'Sticky OAuth account quota resets shortly; retaining session affinity.',
+              },
+            }),
+            { status: 429, headers },
+          ),
+          {
+            accountId: heldAccountId,
+            accountIdentity: heldAccountIdentity,
+            resetAt: Date.now() + retryAfterSeconds * 1000,
+          },
+        )
+      }
       const proactiveQuotaDecision = stickyQuotaSnapshotIsFresh(
         route.quota,
         storage,
@@ -1485,34 +1526,8 @@ async function executeWithFallback(options: {
             ),
           })
         : undefined
-      if (proactiveQuotaDecision?.action === 'hold') {
-        return completeRoute(
-          route,
-          new Response(
-            JSON.stringify({
-              type: 'error',
-              error: {
-                type: 'rate_limit_error',
-                message:
-                  'Sticky OAuth account quota resets shortly; retaining session affinity.',
-              },
-            }),
-            {
-              status: 429,
-              headers: {
-                'content-type': 'application/json',
-                'retry-after': String(
-                  stickyRetryAfterWithJitter(
-                    sessionId,
-                    proactiveQuotaDecision.retryAfterSeconds,
-                  ),
-                ),
-              },
-            },
-          ),
-          false,
-        )
-      }
+      if (proactiveQuotaDecision?.action === 'hold')
+        return holdResponse(proactiveQuotaDecision.retryAfterSeconds)
 
       const { response, preflight } = await firstStreamingError(
         await sendRoute(route),
@@ -1564,43 +1579,8 @@ async function executeWithFallback(options: {
           ),
         })
         if (decision.action === 'hold') {
-          const headers = new Headers(
-            preflight instanceof Response
-              ? preflight.headers
-              : response.headers,
-          )
-          headers.set(
-            'retry-after',
-            String(
-              stickyRetryAfterWithJitter(sessionId, decision.retryAfterSeconds),
-            ),
-          )
-          if (preflight instanceof Response) {
-            return completeRoute(
-              route,
-              new Response(preflight.body, {
-                status: preflight.status,
-                statusText: preflight.statusText,
-                headers,
-              }),
-            )
-          }
-          await response.body?.cancel().catch(() => {})
-          headers.set('content-type', 'application/json')
-          return completeRoute(
-            route,
-            new Response(
-              JSON.stringify({
-                type: 'error',
-                error: {
-                  type: 'rate_limit_error',
-                  message:
-                    'Sticky OAuth account quota resets shortly; retaining session affinity.',
-                },
-              }),
-              { status: 429, headers },
-            ),
-          )
+          void response.body?.cancel().catch(() => {})
+          return holdResponse(decision.retryAfterSeconds, responseHeaders)
         }
         migrate = decision.action === 'migrate'
       }
@@ -1722,21 +1702,24 @@ async function executeWithFallback(options: {
         const fallback = await tryFallbackAccounts()
         if (fallback) return fallback
       }
-      return new Response(
-        JSON.stringify({
-          type: 'error',
-          error: {
-            type: 'rate_limit_error',
-            message: 'Killswitch blocked all OAuth routes',
-          },
+      const current = await native.view()
+      return createQuotaRefusalResponse(
+        'Killswitch blocked all OAuth routes',
+        quotaRefusalTiming({
+          readings: current.accounts
+            .filter(
+              (account) =>
+                account.type === 'oauth' && nativeAccountCanServe(account),
+            )
+            .map((account) => ({
+              quota: account.quota,
+              accountIdentity: account.accountIdentity,
+            })),
+          storage: current.policyStorage,
+          sessionTtlMs: sessionCacheActivity.ttlMs(
+            options.streamOptions?.sessionId,
+          ),
         }),
-        {
-          status: 429,
-          headers: {
-            'content-type': 'application/json',
-            'retry-after': '60',
-          },
-        },
       )
     }
   }
@@ -1781,6 +1764,7 @@ export function streamCortexKitAnthropic(
   context: Context,
   options?: SimpleStreamOptions,
   effortTransitions?: readonly MidConversationEffortTransition[],
+  wait?: PiQuotaWaitOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream()
 
@@ -1792,15 +1776,78 @@ export function streamCortexKitAnthropic(
       buildPiOAuthMessagesUrl(model.baseUrl)
       const storagePath = getPiAccountStoragePath()
       let hostTools: Tool[] = []
+      const request = {
+        model,
+        context,
+        streamOptions: options,
+        storagePath,
+        effortTransitions,
+        onResolvedTools: (tools: Tool[]) => {
+          hostTools = tools
+        },
+      }
       const response = await runWithRequestSignal(options?.signal, () =>
-        executeWithFallback({
-          model,
-          context,
-          streamOptions: options,
-          storagePath,
-          effortTransitions,
-          onResolvedTools: (tools) => {
-            hostTools = tools
+        withPiQuotaWait({
+          signal: options?.signal,
+          wait,
+          run: () => executeWithFallback(request),
+          resume: async (hold) => {
+            const native = getPiNativeRuntime(storagePath)
+            const before = await native.requestView(options?.signal)
+            if (
+              hold &&
+              (!hold.accountIdentity ||
+                before.accounts.find((account) => account.id === hold.accountId)
+                  ?.accountIdentity !== hold.accountIdentity)
+            )
+              throw new Error(
+                'The selected OAuth account changed while waiting.',
+              )
+            const runtime = await native.service()
+            let heldStillBlocked = false
+            for (const account of before.accounts) {
+              if (
+                account.type !== 'oauth' ||
+                !nativeAccountCanServe(account) ||
+                (hold && account.id !== hold.accountId)
+              )
+                continue
+              options?.signal?.throwIfAborted()
+              try {
+                const quota = await runtime.fetchQuota(
+                  account.id,
+                  fetchPiOAuth,
+                  options?.signal,
+                  undefined,
+                  'admission',
+                )
+                if (
+                  hold &&
+                  decideStickyQuotaFailure({ quota, modelId: model.id })
+                    .action === 'migrate'
+                )
+                  heldStillBlocked = true
+              } catch (error) {
+                if (options?.signal?.aborted) throw error
+              }
+            }
+            options?.signal?.throwIfAborted()
+            if (heldStillBlocked)
+              throw new Error(
+                'The selected OAuth account cannot serve this request.',
+              )
+            if (!hold) return executeWithFallback(request)
+            const inspected = await firstStreamingError(
+              await sendAnthropicRequest({
+                ...request,
+                oauthAccountId: hold.accountId,
+                expectedAccountIdentity: hold.accountIdentity,
+              }),
+            )
+            if (inspected.preflight instanceof Response)
+              return inspected.preflight
+            void inspected.response.body?.cancel().catch(() => {})
+            return new Response(null, { status: 429 })
           },
         }),
       )

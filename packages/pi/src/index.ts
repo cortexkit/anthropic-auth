@@ -37,6 +37,7 @@ import {
 } from './native.ts'
 import { createPiNativeCommands } from './native-commands.ts'
 import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
+import type { PiQuotaWaitOptions } from './quota-wait.ts'
 import { streamCortexKitAnthropic } from './stream.ts'
 
 function textImageInput(): Array<'text' | 'image'> {
@@ -68,9 +69,11 @@ export default async function cortexKitPiAnthropicAuth(
   pi: ExtensionAPI,
   options: {
     connectScoped?: () => Promise<NativeCustodyClient>
+    quotaWait?: PiQuotaWaitOptions
   } = {},
 ) {
   const storagePath = getPiAccountStoragePath()
+  const quotaWait = options.quotaWait
   getPiNativeRuntime(storagePath, {
     ...(options.connectScoped && { connect: options.connectScoped }),
   })
@@ -79,9 +82,20 @@ export default async function cortexKitPiAnthropicAuth(
     string,
     MidConversationEffortTransition[]
   >()
+  const workingMessageBySession = new Map<string, (message?: string) => void>()
   pi.on('turn_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     if (!sessionId) return
+    if (ctx.hasUI) {
+      workingMessageBySession.set(sessionId, (message) => {
+        if (ctx.sessionManager.getSessionId() === sessionId)
+          ctx.ui.setWorkingMessage(message)
+      })
+      if (workingMessageBySession.size > 128) {
+        const oldest = workingMessageBySession.keys().next().value
+        if (oldest !== undefined) workingMessageBySession.delete(oldest)
+      }
+    }
     // This hook collects effort history for the per-message effort markers
     // that core adds to Fable 5.1, Opus 5.5 and Sonnet 5.5 requests. A host
     // whose session entries do not match what this reads must cost the
@@ -116,6 +130,7 @@ export default async function cortexKitPiAnthropicAuth(
     const sessionId = ctx.sessionManager.getSessionId()
     if (sessionId) {
       effortHistoryBySession.delete(sessionId)
+      workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)
     }
     await closePiNativeRuntime(storagePath)
@@ -257,6 +272,13 @@ export default async function cortexKitPiAnthropicAuth(
         options?.sessionId
           ? effortHistoryBySession.get(options.sessionId)
           : undefined,
+        {
+          ...quotaWait,
+          setWorkingMessage:
+            (options?.sessionId
+              ? workingMessageBySession.get(options.sessionId)
+              : undefined) ?? quotaWait?.setWorkingMessage,
+        },
       ),
   } satisfies ProviderConfig
 

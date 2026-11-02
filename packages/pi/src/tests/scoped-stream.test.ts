@@ -29,6 +29,10 @@ import type {
   Provider,
 } from '@earendil-works/pi-ai'
 import {
+  isRetryableAssistantError,
+  normalizeContext,
+} from '@earendil-works/pi-ai'
+import {
   type ExtensionAPI,
   type ExtensionCommandContext,
   ModelRuntime,
@@ -252,6 +256,167 @@ async function fixture(
     beforeLocal,
     native,
   }
+}
+
+for (const outcome of [
+  'resume',
+  'abort',
+  'identity-change',
+  'still-blocked',
+  'pool-resume',
+  'pool-abort',
+] as const) {
+  test(`Pi plugin wait ${outcome} rechecks admission, identity and working UI without host retry`, async () => {
+    const f = await fixture('sticky-balanced')
+    const runtime = await f.native.service()
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      routing: { mode: 'sticky-balanced', maxSameAccountWait: '15' },
+      quota: {
+        enabled: true,
+        minimumRemaining: { five_hour: 1, seven_day: 1 },
+      },
+      claudeCache: { enabled: true, mode: 'explicit' },
+    }))
+    const sessionId = `pi-wait-${outcome}`
+    sessionCacheActivity.record(sessionId, 'main', 3_600_000)
+    deferCleanup(() => sessionCacheActivity.forget(sessionId))
+    const pool = outcome.startsWith('pool-')
+    if (pool) {
+      const receipt = await runtime.authorizeVault('main')
+      const checkedAt = Date.now()
+      await runtime.vault.publish(receipt, {
+        quota: {
+          accountIdentity: fixtureAccountIdentity('main'),
+          checkedAt,
+          five_hour: {
+            remainingPercent: 0,
+            usedPercent: 100,
+            checkedAt,
+            resetsAt: new Date(checkedAt + 120_000).toISOString(),
+          },
+          seven_day: {
+            remainingPercent: 90,
+            usedPercent: 10,
+            checkedAt,
+            resetsAt: new Date(checkedAt + 3_600_000).toISOString(),
+          },
+        },
+      })
+    }
+    let healthy = !pool
+    let sends = 0
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (url.includes('/api/oauth/usage'))
+        return Response.json({
+          five_hour: {
+            utilization: healthy ? 0 : 100,
+            resets_at: new Date(Date.now() + 120_000).toISOString(),
+          },
+          seven_day: {
+            utilization: 0,
+            resets_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+        })
+      if (url.includes('/v1/messages')) {
+        sends++
+        if (sends === 1 && !pool) {
+          healthy = false
+          return new Response('{}', {
+            status: 429,
+            headers: {
+              'anthropic-ratelimit-unified-5h-status': 'rejected',
+              'anthropic-ratelimit-unified-5h-reset': String(
+                Math.floor(Date.now() / 1000) + 120,
+              ),
+            },
+          })
+        }
+        return success()
+      }
+      throw new Error('Unexpected network request')
+    }) as typeof fetch
+    const scheduled = Promise.withResolvers<void>()
+    let timer: (() => void) | undefined
+    const messages: (string | undefined)[] = []
+    const hooks = new Map<
+      string,
+      (event: unknown, ctx: unknown) => Promise<void>
+    >()
+    let provider: Provider | undefined
+    const pi = {
+      registerCommand() {},
+      on: (
+        event: string,
+        handler: (event: unknown, ctx: unknown) => Promise<void>,
+      ) => hooks.set(event, handler),
+      registerProvider: (value: Provider) => {
+        provider = value
+      },
+    } as unknown as ExtensionAPI
+    await cortexKitPiAnthropicAuth(pi, {
+      connectScoped: f.connect,
+      quotaWait: {
+        setTimeout: ((callback: () => void) => {
+          timer = callback
+          scheduled.resolve()
+          return 1
+        }) as unknown as typeof setTimeout,
+        clearTimeout: (() => {
+          timer = undefined
+        }) as unknown as typeof clearTimeout,
+      },
+    })
+    await hooks.get('turn_start')?.(
+      {},
+      {
+        hasUI: true,
+        model,
+        sessionManager: { getSessionId: () => sessionId, getBranch: () => [] },
+        ui: { setWorkingMessage: (message?: string) => messages.push(message) },
+      },
+    )
+    if (!provider?.streamSimple) throw new Error('Missing provider stream')
+    const abort = new AbortController()
+    const stream = provider.streamSimple(model, normalizeContext(context), {
+      sessionId,
+      signal: abort.signal,
+    })
+    const drained = (async () => {
+      for await (const _event of stream) {
+        /* Consume the provider stream. */
+      }
+    })()
+    await scheduled.promise
+    expect(sends).toBe(pool ? 0 : 1)
+    expect(messages[0]).toMatch(
+      /^Waiting for the account to reset at \d\d:\d\d · Esc to cancel$/,
+    )
+    if (outcome.endsWith('abort')) abort.abort()
+    else {
+      healthy = outcome !== 'still-blocked'
+      if (outcome === 'identity-change') {
+        f.rows[0] = row('oauth:anthropic', 'changed-account')
+        await runtime.vault.refresh()
+      }
+      timer?.()
+    }
+    await drained
+    const result = await stream.result()
+    expect(result.stopReason).toBe(
+      outcome.endsWith('resume')
+        ? 'stop'
+        : outcome.endsWith('abort')
+          ? 'aborted'
+          : 'error',
+    )
+    expect(sends).toBe(
+      outcome.endsWith('resume') ? (pool ? 1 : 2) : pool ? 0 : 1,
+    )
+    expect(messages.at(-1)).toBeUndefined()
+    expect(isRetryableAssistantError(result)).toBe(false)
+  })
 }
 
 test('Pi background vault poll adopts a main re-login while a fallback serves, with no request-time discovery', async () => {
@@ -665,11 +830,12 @@ async function stickyRejectedFirstSend(
 }
 
 for (const limit of ['quota floor', 'killswitch'] as const) {
-  test(`Pi vault quota policy identifies ${limit} without sending a request`, async () => {
+  test(`Pi vault quota policy identifies ${limit} without sending a request when waiting is disabled`, async () => {
     const f = await fixture('sticky-balanced')
     const service = await f.native.service()
     await service.updateSettings((settings) => ({
       ...settings,
+      routing: { mode: 'sticky-balanced', maxSameAccountWait: '0' },
       quota: {
         enabled: true,
         minimumRemaining: {
@@ -710,9 +876,9 @@ for (const limit of ['quota floor', 'killswitch'] as const) {
       sessionId: 'pi-vault-quota-policy',
     }).result()
     expect(result.stopReason).toBe('error')
-    expect(result.errorMessage).toContain('429')
+    expect(result.errorMessage).toContain('412')
     expect(result.errorMessage).toContain(limit)
-    expect(result.errorMessage).toContain('Retry in ')
+    expect(result.errorMessage).not.toContain('Retry in ')
     expect(result.errorMessage).toContain('/claude → Killswitch / Quota')
     expect(result.errorMessage).not.toContain('signing in')
     expect(networkCalls).toBe(0)
