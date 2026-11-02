@@ -20,11 +20,13 @@ import {
   CacheKeepSessionRegistry,
   createNativeAccountRuntime,
   createNativePoolStore,
+  decideStickyQuotaFailure,
   formatLogLine,
   getLogLevel,
   logger,
   resolveNativePoolPaths,
   runNativeMigration,
+  sessionCacheActivity,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -445,6 +447,56 @@ test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes i
   expect(f.timers.callbacks.size).toBe(0)
   expect(await f.registry.list()).toEqual([])
 })
+
+for (const status of [200, 400]) {
+  test(`OC2 prewarm status ${status} refreshes cache activity only on success`, async () => {
+    const f = await fixture()
+    const sessionId = 'ses_oc2_keep'
+    cleanups.push(() => sessionCacheActivity.forget(sessionId))
+    await f.live()
+    sessionCacheActivity.record(
+      sessionId,
+      'main',
+      3_600_000,
+      Date.now() - 5 * 60_000,
+    )
+    const before = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      Date.now(),
+      'max',
+    )
+    f.setSend(async () => Response.json({ usage: {} }, { status }))
+    f.due()
+    await f.timers.fire()
+    const after = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      Date.now(),
+      'max',
+    )
+    if (status !== 200) expect(after).toBe(before)
+    else {
+      expect(after).toBeGreaterThan(before!)
+      const now = after! - 50 * 60_000
+      expect(
+        decideStickyQuotaFailure({
+          quota: {
+            five_hour: {
+              remainingPercent: 0,
+              usedPercent: 100,
+              checkedAt: now,
+              resetsAt: new Date(now + 10 * 60_000).toISOString(),
+            },
+          },
+          sessionId,
+          now,
+          holdUntil: sessionCacheActivity.holdUntil(sessionId, 'main', now),
+        }).action,
+      ).toBe('hold')
+    }
+  })
+}
 
 test('OpenCode 2 rejected oversized request keeps the old target without evicting warm sessions', async () => {
   const lines = captureStartupLogs()

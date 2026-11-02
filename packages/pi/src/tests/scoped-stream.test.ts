@@ -1603,8 +1603,12 @@ registerTest.each([200, 401])(
       },
       { preconnect: originalFetch.preconnect },
     )
+    const sessionId = `pi-cachekeep-${finalStatus}`
+    const acceptedAt = Date.now() - 70 * 60_000
+    sessionCacheActivity.record(sessionId, 'main', 3_600_000, acceptedAt)
+    deferCleanup(() => sessionCacheActivity.forget(sessionId))
     const result = await __prewarmPiCacheKeepForTest({
-      sessionId: `pi-cachekeep-${finalStatus}`,
+      sessionId,
       url: 'https://api.anthropic.com/v1/messages',
       headers: new Headers(),
       bodyText: JSON.stringify({
@@ -1624,6 +1628,15 @@ registerTest.each([200, 401])(
       accountStoragePath: f.path,
     })
     expect(result.ok).toBe(finalStatus === 200)
+    const expiry = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      Date.now(),
+      'max',
+    )
+    if (finalStatus === 200)
+      expect(expiry).toBeGreaterThan(Date.now() + 55 * 60_000)
+    else expect(expiry).toBe(acceptedAt + 3_600_000)
     expect(sent).toEqual(['Bearer pi-cachekeep-v1', 'Bearer pi-cachekeep-v2'])
     expect(f.reports.map((report) => report.recordVersion)).toEqual(
       finalStatus === 401 ? [1, 2] : [1],

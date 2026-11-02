@@ -3087,9 +3087,21 @@ for (const scenario of final401Cases) {
       oauthAccountId: 'main',
     }
     cacheKeep.track({ ...target, storage, cacheMode: 'hybrid' })
+    const acceptedAt = Date.now() - 70 * 60_000
+    sessionCacheActivity.record(target.sessionId, 'main', 3_600_000, acceptedAt)
     const decisions = await scoped401Decisions(() =>
       cacheKeep.prewarmNow({ ...target, isSubagent: false }),
     )
+    const expiry = sessionCacheActivity.holdUntil(
+      target.sessionId,
+      'main',
+      Date.now(),
+      'max',
+    )
+    if (scenario.outcome === 'replay succeeds')
+      expect(expiry).toBeGreaterThan(Date.now() + 55 * 60_000)
+    else expect(expiry).toBe(acceptedAt + 3_600_000)
+    sessionCacheActivity.forget(target.sessionId)
     expectFinal401Record(
       fixture,
       scenario,

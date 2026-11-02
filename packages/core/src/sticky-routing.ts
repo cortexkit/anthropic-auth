@@ -113,6 +113,7 @@ export function createStickyNoRouteResponse(input: {
   fallbackReauthLabels?: readonly string[]
   routeQuotas: readonly OAuthQuotaSnapshot[]
   routeIdentities?: readonly (string | undefined)[]
+  routeAccountIds?: readonly string[]
   storage?: AccountStorage | null
   sessionId?: string | null
   vaultPolicyLimits?: readonly NativeQuotaPolicyLimit[]
@@ -163,9 +164,10 @@ export function createStickyNoRouteResponse(input: {
     readings: input.routeQuotas.map((quota, index) => ({
       quota,
       accountIdentity: input.routeIdentities?.[index],
+      accountId: input.routeAccountIds?.[index],
     })),
     storage: input.storage,
-    scopedModelId: scopedBlocked ? modelId : undefined,
+    modelId,
     now,
     sessionTtlMs: sessionCacheActivity.ttlMs(input.sessionId),
   })

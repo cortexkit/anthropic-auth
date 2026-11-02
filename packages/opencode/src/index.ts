@@ -3683,6 +3683,18 @@ const anthropicAuthPlugin = async (
       attempt,
     }) => {
       const authorization = cacheKeepScopedAttempts.get(attempt.id)
+      // A recovery source warm protects another model, not the active fallback's cache.
+      if (
+        !target.sourceWarm &&
+        status >= 200 &&
+        status < 300 &&
+        !attempt.signal?.aborted
+      )
+        sessionCacheActivity.recordPrewarm(
+          target.id,
+          target.oauthAccountId ?? 'main',
+          receivedAt,
+        )
       if (status === 401 && authorization?.scopedAttempt) {
         await reportVault401(authorization.scopedAttempt, 'direct')
       }
@@ -9528,9 +9540,10 @@ const anthropicAuthPlugin = async (
                       .map((account) => ({
                         quota: account.quota,
                         accountIdentity: account.accountIdentity,
+                        accountId: account.id,
                       })),
                     storage: current.policyStorage,
-                    scopedModelId,
+                    modelId: scopedModelId ?? credentialModelId,
                     sessionTtlMs: sessionCacheActivity.ttlMs(sessionId),
                   }),
                 )
@@ -9783,6 +9796,9 @@ const anthropicAuthPlugin = async (
                             snapshot.accounts.find((row) => row.id === route.id)
                               ?.accountIdentity,
                         ),
+                      routeAccountIds: stickyRoutes.allRoutes
+                        .filter((route) => route.quota)
+                        .map((route) => route.id),
                       storage: stickyRoutes.storage,
                       sessionId,
                       modelId: routingModelId,

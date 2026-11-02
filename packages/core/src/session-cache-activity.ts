@@ -51,6 +51,13 @@ export class SessionCacheActivity {
     )
   }
 
+  /** A late keep-warm send must not replace a newer turn on a different account. */
+  recordPrewarm(sessionId: string, accountId: string, acceptedAt = Date.now()) {
+    const activity = this.entries.get(sessionId)
+    if (activity && activity.accountId !== accountId) return
+    this.record(sessionId, accountId, PROMPT_CACHE_1H_TTL_MS, acceptedAt)
+  }
+
   forget(sessionId: string) {
     this.entries.delete(sessionId)
   }

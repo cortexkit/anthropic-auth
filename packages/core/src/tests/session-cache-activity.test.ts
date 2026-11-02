@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
 import { SessionCacheActivity } from '../session-cache-activity.ts'
+import { decideStickyQuotaFailure } from '../sticky-routing.ts'
 
 test('cache activity is bounded by the last accepted response, account and wait setting', () => {
   const activity = new SessionCacheActivity()
@@ -32,4 +33,38 @@ test('unknown TTL uses the five-minute default', () => {
   const activity = new SessionCacheActivity()
   activity.record('session', 'account', undefined, 1000)
   expect(activity.holdUntil('session', 'account', 2000, 'max')).toBe(301_000)
+})
+
+test('a successful prewarm ten minutes ago protects a turn accepted seventy minutes ago', () => {
+  const now = Date.parse('2026-11-02T10:00:00Z')
+  const activity = new SessionCacheActivity()
+  activity.record('warm-session', 'account', 3_600_000, now - 70 * 60_000)
+  activity.recordPrewarm('warm-session', 'account', now - 10 * 60_000)
+  expect(
+    decideStickyQuotaFailure({
+      quota: {
+        five_hour: {
+          remainingPercent: 0,
+          usedPercent: 100,
+          checkedAt: now,
+          resetsAt: new Date(now + 10 * 60_000).toISOString(),
+        },
+      },
+      sessionId: 'warm-session',
+      now,
+      holdUntil: activity.holdUntil('warm-session', 'account', now),
+    }).action,
+  ).toBe('hold')
+})
+
+test('a restored prewarm can establish activity but cannot replace a different-account turn', () => {
+  const activity = new SessionCacheActivity()
+  activity.recordPrewarm('restored', 'account', 1000)
+  expect(activity.holdUntil('restored', 'account', 2000, 'max')).toBe(3_601_000)
+  activity.record('restored', 'new-account', 300_000, 3000)
+  activity.recordPrewarm('restored', 'account', 4000)
+  expect(activity.holdUntil('restored', 'account', 5000, 'max')).toBeUndefined()
+  expect(activity.holdUntil('restored', 'new-account', 5000, 'max')).toBe(
+    303_000,
+  )
 })

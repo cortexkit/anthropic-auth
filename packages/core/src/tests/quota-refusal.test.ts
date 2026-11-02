@@ -24,7 +24,7 @@ const quota = (
     remainingPercent: 0,
     usedPercent: 100,
     checkedAt,
-    resetsAt: new Date(resetAt + 3_600_000).toISOString(),
+    resetsAt: new Date(resetAt).toISOString(),
   },
 })
 const storage = (maxSameAccountWait: '0' | '15' | 'max'): AccountStorage => ({
@@ -53,6 +53,7 @@ test('only fresh current-identity scope-covered resets feed the terminal scan', 
   ).toEqual({ resetAt, retryAfterSeconds: 900 })
   const earlier = quota()
   earlier.five_hour!.resetsAt = new Date(now + 600_000).toISOString()
+  earlier.seven_day!.resetsAt = new Date(now + 600_000).toISOString()
   expect(
     quotaRefusalTiming({
       readings: [
@@ -105,11 +106,37 @@ test('refusal caps follow zero, fifteen and max without hiding the true reset', 
       expect(body.error.message).not.toMatch(
         /429|500|502|503|504|524|retry|rate.?limit|overloaded|timeout/i,
       )
-    } else expect(body.error.message).toContain('Retry in 120m 0s.')
+    } else
+      expect(body.error.message).toContain(`Retry in ${expected / 60}m 0s.`)
   }
 })
 
-test('scoped refusal scans only the fresh matching model window', () => {
+test('capped retry text agrees with the header while retaining the actual later reset', async () => {
+  const actualReset = now + 3 * 24 * 3_600_000
+  const response = createQuotaRefusalResponse(
+    'No account can serve this request.',
+    {
+      resetAt: actualReset,
+      retryAfterSeconds: 900,
+    },
+    now,
+  )
+  expect(response.headers.get('retry-after')).toBe('900')
+  const body = (await response.json()) as { error: { message: string } }
+  expect(body.error.message).toContain('Retry in 15m 0s.')
+  expect(body.error.message).not.toContain('4320m')
+  expect(body.error.message).toContain(
+    new Intl.DateTimeFormat('en-US', {
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    }).format(actualReset),
+  )
+})
+
+test('scoped refusal includes the matching scope and standard blockers', () => {
   const q = quota()
   q.scoped = [
     {
@@ -135,7 +162,108 @@ test('scoped refusal scans only the fresh matching model window', () => {
       scopedModelId: 'claude-opus-5',
       now,
     }).resetAt,
+  ).toBe(resetAt)
+})
+
+test('an exhausted weekly window determines usable time despite an earlier five-hour reset', () => {
+  const q = quota()
+  q.seven_day!.resetsAt = new Date(now + 4 * 24 * 3_600_000).toISOString()
+  expect(
+    quotaRefusalTiming({
+      readings: [{ quota: q, accountIdentity: 'current' }],
+      now,
+    }),
+  ).toEqual({
+    resetAt: now + 4 * 24 * 3_600_000,
+    retryAfterSeconds: 900,
+  })
+})
+
+test('the earlier usable account wins only after all its blockers reset', () => {
+  const slow = quota()
+  slow.seven_day!.resetsAt = new Date(now + 4 * 24 * 3_600_000).toISOString()
+  const fast = quota(now, 'second')
+  fast.five_hour!.resetsAt = new Date(now + 120_000).toISOString()
+  fast.seven_day!.resetsAt = new Date(now + 600_000).toISOString()
+  expect(
+    quotaRefusalTiming({
+      readings: [
+        { quota: slow, accountIdentity: 'current' },
+        { quota: fast, accountIdentity: 'second' },
+      ],
+      now,
+    }),
+  ).toEqual({ resetAt: now + 600_000, retryAfterSeconds: 600 })
+  fast.seven_day!.resetsAt = undefined
+  expect(
+    quotaRefusalTiming({
+      readings: [
+        { quota: slow, accountIdentity: 'current' },
+        { quota: fast, accountIdentity: 'second' },
+      ],
+      now,
+    }).resetAt,
+  ).toBe(now + 4 * 24 * 3_600_000)
+})
+
+test('healthy resets do not shorten per-account floors or requested model blockers', () => {
+  const q = quota()
+  q.five_hour!.remainingPercent = 10
+  q.seven_day!.remainingPercent = 90
+  q.seven_day!.resetsAt = new Date(now + 60_000).toISOString()
+  q.scoped = [
+    {
+      id: 'fable',
+      title: 'Fable',
+      modelName: 'Fable',
+      remainingPercent: 3,
+      usedPercent: 97,
+      checkedAt: now,
+      resetsAt: new Date(now + 4 * 3_600_000).toISOString(),
+    },
+  ]
+  const policy = storage('15')
+  policy.killswitch = {
+    enabled: true,
+    main: { five_hour: 0, seven_day: 0, scoped: 0 },
+    accounts: { work: { five_hour: 20, scoped: 5 } },
+  }
+  expect(
+    quotaRefusalTiming({
+      readings: [{ quota: q, accountIdentity: 'current', accountId: 'work' }],
+      storage: policy,
+      modelId: 'claude-fable-5',
+      now,
+    }).resetAt,
+  ).toBe(now + 4 * 3_600_000)
+  expect(
+    quotaRefusalTiming({
+      readings: [{ quota: q, accountIdentity: 'current', accountId: 'work' }],
+      storage: policy,
+      modelId: 'claude-opus-5',
+      now,
+    }).resetAt,
+  ).toBe(resetAt)
+  expect(
+    quotaRefusalTiming({
+      readings: [{ quota: q, accountIdentity: 'current', accountId: 'other' }],
+      storage: policy,
+      modelId: 'claude-opus-5',
+      now,
+    }).resetAt,
   ).toBeUndefined()
+  policy.quota = {
+    enabled: true,
+    minimumRemaining: { five_hour: 15, seven_day: 0 },
+  }
+  expect(
+    quotaRefusalTiming({
+      readings: [{ quota: q, accountIdentity: 'current', accountId: 'other' }],
+      storage: policy,
+      modelId: 'claude-opus-5',
+      now,
+    }).resetAt,
+  ).toBe(resetAt)
 })
 
 test('zero wait does not change re-login precedence', () => {

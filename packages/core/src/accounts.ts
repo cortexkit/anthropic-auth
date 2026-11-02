@@ -1492,6 +1492,7 @@ export function killswitchPassesPolicy(
 export type QuotaResetEvidence = {
   quota?: OAuthQuotaSnapshot
   accountIdentity?: string
+  accountId?: string
 }
 
 /** Only current, identity-bound readings can justify waiting for a stored reset. */
@@ -1499,6 +1500,7 @@ export function quotaRefusalTiming(input: {
   readings: readonly QuotaResetEvidence[]
   storage?: AccountStorage | null
   scopedModelId?: string
+  modelId?: string
   sessionTtlMs?: number
   now?: number
 }) {
@@ -1512,22 +1514,59 @@ export function quotaRefusalTiming(input: {
         now - window.checkedAt < maxAge,
     )
   const resetTimes: number[] = []
-  for (const { quota, accountIdentity } of input.readings) {
+  const storage = input.storage ?? null
+  const modelId = input.modelId ?? input.scopedModelId
+  const floors = quotaEnabled(storage)
+    ? getQuotaMinimumRemainingThresholds(storage)
+    : { five_hour: 0, seven_day: 0 }
+  for (const { quota, accountIdentity, accountId } of input.readings) {
     if (!accountIdentity || quota?.accountIdentity !== accountIdentity) continue
-    const scoped = getScopedQuotaWindowForModel(quota, input.scopedModelId)
-    const windows = input.scopedModelId
-      ? scoped && fresh(scoped)
-        ? [scoped]
-        : []
-      : quotaSnapshotHasStandardWindows(quota) &&
-          fresh(quota.seven_day) &&
-          (quotaSnapshotOmitsFiveHour(quota) || fresh(quota.five_hour))
-        ? [quota.five_hour, quota.seven_day]
-        : []
-    for (const window of windows) {
-      const resetAt = Date.parse(window?.resetsAt ?? '')
-      if (Number.isFinite(resetAt) && resetAt > now) resetTimes.push(resetAt)
+    const killswitch = isKillswitchEnabled(storage)
+      ? getKillswitchThresholdsForAccount(
+          storage,
+          accountId === 'main' ? undefined : accountId,
+        )
+      : { five_hour: 0, seven_day: 0, scoped: 0 }
+    const scoped = getScopedQuotaWindowForModel(quota, modelId)
+    if (
+      !quotaSnapshotHasStandardWindows(quota) ||
+      !fresh(quota.seven_day) ||
+      (!quotaSnapshotOmitsFiveHour(quota) && !fresh(quota.five_hour)) ||
+      (scoped && !fresh(scoped)) ||
+      (modelId && killswitch.scoped > 0 && quota.scoped === undefined)
+    )
+      continue
+    const blockers: AccountQuotaWindow[] = []
+    let unknown = false
+    for (const key of ['five_hour', 'seven_day'] as const) {
+      if (key === 'five_hour' && quotaSnapshotOmitsFiveHour(quota)) continue
+      const window = quota[key]
+      if (!window || !Number.isFinite(window.remainingPercent)) {
+        unknown = true
+        break
+      }
+      if (
+        window.remainingPercent <= 0 ||
+        window.remainingPercent < Math.max(floors[key], killswitch[key])
+      )
+        blockers.push(window)
     }
+    if (scoped) {
+      if (!Number.isFinite(scoped.remainingPercent)) unknown = true
+      else if (scoped.remainingPercent <= killswitch.scoped)
+        blockers.push(scoped)
+    }
+    // An account can serve again only after every window blocking this request resets.
+    let usableAt: number | undefined
+    for (const window of blockers) {
+      const resetAt = Date.parse(window?.resetsAt ?? '')
+      if (!Number.isFinite(resetAt) || resetAt <= now) {
+        unknown = true
+        break
+      }
+      usableAt = Math.max(usableAt ?? resetAt, resetAt)
+    }
+    if (!unknown && usableAt !== undefined) resetTimes.push(usableAt)
   }
   const resetAt = resetTimes.length ? Math.min(...resetTimes) : undefined
   const wait = getMaxSameAccountWait(input.storage ?? null)
@@ -1571,7 +1610,11 @@ export function killswitchRetryAfterSeconds(
       now,
       scopedModelId,
       readings: [
-        { quota: mainQuota, accountIdentity: options?.mainAccountIdentity },
+        {
+          quota: mainQuota,
+          accountIdentity: options?.mainAccountIdentity,
+          accountId: 'main',
+        },
         ...fallbackAccounts,
       ],
     }).retryAfterSeconds ?? 0
