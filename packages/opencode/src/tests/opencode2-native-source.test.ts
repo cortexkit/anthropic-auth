@@ -2170,9 +2170,17 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     const auth = await native.authorizeAccount(scope, 'main')
     if (!auth) throw new Error('Missing OAuth authorization')
     const input = context(auth.provenance)
+    const prepare = (signal?: AbortSignal) =>
+      native.onRequestPrepared?.({
+        ...input,
+        url: 'https://api.anthropic.com/v1/messages',
+        bodyText: '{}',
+        signal,
+      })
     sessionCacheActivity.forget(scope.sessionID)
     cleanups.push(() => sessionCacheActivity.forget(scope.sessionID))
     await native.requestOptions?.({ ...input, route: 'oauth', correlation: {} })
+    await prepare()
     native.quotaFromHeaders?.(new Headers(), {
       ...input,
       status: 429,
@@ -2182,6 +2190,7 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     ).toBeUndefined()
     const now = Date.now()
     await atTime(now, async () => {
+      await prepare()
       native.quotaFromHeaders?.(new Headers(), {
         ...input,
         status: 201,
@@ -2189,6 +2198,7 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
       expect(
         sessionCacheActivity.holdUntil(scope.sessionID, 'main', now, 'max'),
       ).toBe(now + 300_000)
+      await prepare()
       native.quotaFromHeaders?.(new Headers(), {
         ...input,
         status: 400,
@@ -2196,6 +2206,15 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
       expect(
         sessionCacheActivity.holdUntil(scope.sessionID, 'main', now, 'max'),
       ).toBe(now + 300_000)
+      sessionCacheActivity.forget(scope.sessionID)
+      const abort = new AbortController()
+      await prepare(abort.signal)
+      abort.abort()
+      native.quotaFromHeaders?.(new Headers(), { ...input, status: 200 })
+      expect(
+        sessionCacheActivity.holdUntil(scope.sessionID, 'main'),
+      ).toBeUndefined()
+      await prepare()
       native.forgetSession?.(scope.sessionID)
       native.quotaFromHeaders?.(new Headers(), {
         ...input,

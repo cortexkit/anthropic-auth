@@ -272,6 +272,10 @@ export function createNativeAnthropicSource(
     return router
   }
   const states = new WeakMap<NativeSourceProvenance, State>()
+  const cacheAttempts = new Map<
+    string,
+    { sessionID: string; accountId: string; signal?: AbortSignal }
+  >()
   const retries = new Map<string, Retry>()
   const refusalHeaders = new Map<
     string,
@@ -1023,7 +1027,20 @@ export function createNativeAnthropicSource(
       })
     },
     isDumpEnabled: () => readDumpEnabled(),
-    onRequestPrepared: (input) => options.onRequestPrepared?.(input),
+    onRequestPrepared: (input) => {
+      if (input.route === 'oauth' && !input.signal?.aborted) {
+        cacheAttempts.set(input.attemptId, {
+          sessionID: input.sessionID,
+          accountId: input.accountId,
+          signal: input.signal,
+        })
+        if (cacheAttempts.size > 4096) {
+          const oldest = cacheAttempts.keys().next().value
+          if (oldest !== undefined) cacheAttempts.delete(oldest)
+        }
+      }
+      return options.onRequestPrepared?.(input)
+    },
     responseOptions(input) {
       return options.responseOptions?.({
         ...input,
@@ -1033,12 +1050,17 @@ export function createNativeAnthropicSource(
     quotaFromHeaders(headers, input) {
       options.onResponseHeaders?.(input)
       const state = states.get(input.provenance)
+      const cacheAttempt = cacheAttempts.get(input.attemptId)
+      cacheAttempts.delete(input.attemptId)
       if (state) {
         if (
           input.route === 'oauth' &&
           input.status >= 200 &&
           input.status < 300 &&
-          !state.active.signal.aborted
+          !state.active.signal.aborted &&
+          cacheAttempt?.sessionID === input.sessionID &&
+          cacheAttempt.accountId === input.accountId &&
+          !cacheAttempt.signal?.aborted
         )
           sessionCacheActivity.record(
             input.sessionID,
@@ -1269,6 +1291,7 @@ export function createNativeAnthropicSource(
       return undefined
     },
     async onAttemptEnd(input, outcome) {
+      cacheAttempts.delete(input.attemptId)
       await options.onAttemptEnd?.(input, outcome)
       const state = states.get(input.provenance)
       if (!state) return
@@ -1294,6 +1317,8 @@ export function createNativeAnthropicSource(
       }
     },
     forgetSession(sessionID) {
+      for (const [attemptId, attempt] of cacheAttempts)
+        if (attempt.sessionID === sessionID) cacheAttempts.delete(attemptId)
       sessionCacheActivity.forget(sessionID)
       for (const [key, value] of refusalHeaders)
         if (value.sessionID === sessionID) refusalHeaders.delete(key)
