@@ -1075,7 +1075,6 @@ describe('Pi API fallback routing helpers', () => {
           storagePath,
         )
 
-        let now = checkedAt
         let useLongReset = false
         const authorizations: string[] = []
         globalThis.fetch = mock(
@@ -1144,63 +1143,62 @@ describe('Pi API fallback routing helpers', () => {
           },
         ) as unknown as typeof fetch
 
-        const originalNow = Date.now
-        Date.now = () => now
-        try {
-          for (let request = 0; request < 2; request++) {
-            const events = []
-            const stream = streamCortexKitAnthropic(
-              anthropicModel,
-              anthropicContext,
-              {
-                apiKey: 'sk-ant-oat01-main-access',
-                sessionId: 'ses_pi_sticky_hold',
-              },
-            )
-            for await (const event of stream) events.push(event)
-            const error = events.find((event) => event.type === 'error')
-            expect(error?.error.errorMessage).toContain('HTTP 429')
-            expect(error?.error.errorMessage).toContain(
-              'Sticky OAuth account quota resets shortly; retaining session affinity.',
-            )
-            await getPiNativeRuntime(storagePath).drainRoutingPublications()
-            expect(
-              Object.values(
-                JSON.parse(await readFile(routingPath, 'utf8')).assignments,
-              ),
-            ).toMatchObject([{ accountId: 'ufuk2' }])
-          }
-          expect(authorizations).toEqual([
-            'Bearer sk-ant-oat01-abundant-access',
-          ])
-
-          useLongReset = true
-          now += 6 * 60_000
-          const moved = streamCortexKitAnthropic(
+        const wait = {
+          setTimeout: ((callback: () => void) => {
+            queueMicrotask(callback)
+            return 1
+          }) as unknown as typeof setTimeout,
+          clearTimeout: (() => {}) as unknown as typeof clearTimeout,
+        }
+        const send = () =>
+          streamCortexKitAnthropic(
             anthropicModel,
             anthropicContext,
             {
               apiKey: 'sk-ant-oat01-main-access',
               sessionId: 'ses_pi_sticky_hold',
             },
+            undefined,
+            wait,
           )
-          for await (const _event of moved) {
-            // Drain the successful retry so its final result is available.
-          }
-          expect((await moved.result()).errorMessage).toBeUndefined()
-          expect(authorizations).toEqual([
-            'Bearer sk-ant-oat01-abundant-access',
-            'Bearer sk-ant-oat01-scarce-access',
-          ])
+        for (let request = 0; request < 2; request++) {
+          const events = []
+          const stream = send()
+          for await (const event of stream) events.push(event)
+          const error = events.find((event) => event.type === 'error')
+          expect(error?.error.errorMessage).toContain('HTTP 412')
+          expect(error?.error.errorMessage).toContain(
+            'The selected OAuth account cannot serve this request.',
+          )
           await getPiNativeRuntime(storagePath).drainRoutingPublications()
           expect(
             Object.values(
               JSON.parse(await readFile(routingPath, 'utf8')).assignments,
             ),
-          ).toMatchObject([{ accountId: 'yiyi' }])
-        } finally {
-          Date.now = originalNow
+          ).toMatchObject([{ accountId: 'ufuk2' }])
         }
+        expect(authorizations).toEqual(['Bearer sk-ant-oat01-abundant-access'])
+
+        useLongReset = true
+        const recheck = send()
+        for await (const _event of recheck) {
+          /* Refresh the quota after the bounded wait. */
+        }
+        const moved = send()
+        for await (const _event of moved) {
+          // Drain the successful retry so its final result is available.
+        }
+        expect((await moved.result()).errorMessage).toBeUndefined()
+        expect(authorizations).toEqual([
+          'Bearer sk-ant-oat01-abundant-access',
+          'Bearer sk-ant-oat01-scarce-access',
+        ])
+        await getPiNativeRuntime(storagePath).drainRoutingPublications()
+        expect(
+          Object.values(
+            JSON.parse(await readFile(routingPath, 'utf8')).assignments,
+          ),
+        ).toMatchObject([{ accountId: 'yiyi' }])
       })
     }
   }
