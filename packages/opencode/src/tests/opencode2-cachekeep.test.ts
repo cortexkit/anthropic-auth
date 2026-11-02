@@ -489,10 +489,11 @@ test('OpenCode 2 accepts the oversized body at 2xx headers before streaming star
   const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
   const manager = (globalThis as any)[key].get(f.paths.storageId).manager
   const before = manager.trackedRequest('ses_oc2_keep')
-  const draft = await f.prepare(undefined, {
-    system: 'c'.repeat(40 * 1024 * 1024),
-    stream: true,
-  })
+  const draft = await f.prepare(
+    undefined,
+    { system: 'c'.repeat(40 * 1024 * 1024), stream: true },
+    'ses_oc2_accepted',
+  )
   expect(manager.trackedRequest('ses_oc2_keep')).toEqual(before)
   const response = await f.respond(
     draft,
@@ -500,11 +501,11 @@ test('OpenCode 2 accepts the oversized body at 2xx headers before streaming star
     false,
   )
   expect(
-    manager.trackedRequest('ses_oc2_keep').bodyText.length,
+    manager.trackedRequest('ses_oc2_accepted').bodyText.length,
   ).toBeGreaterThan(40 * 1024 * 1024)
-  expect((await f.registry.list()).map((session) => session.id)).toEqual([
-    'ses_oc2_keep',
-  ])
+  expect((await f.registry.list()).map((session) => session.id).sort()).toEqual(
+    ['ses_oc2_accepted', 'ses_oc2_keep'],
+  )
   await response.body?.cancel()
 })
 

@@ -692,8 +692,19 @@ export function createNativeCacheKeep(
     },
     onResponseHeaders(input: { attemptId: string; status: number }) {
       const target = discardAttempt(input.attemptId)
-      if (!lease.stopped && input.status >= 200 && input.status < 300 && target)
-        return manager.track(target)
+      if (
+        !lease.stopped &&
+        input.status >= 200 &&
+        input.status < 300 &&
+        target
+      ) {
+        const result = manager.track(target)
+        if (result.tracked)
+          registry.publish(manager.trackedSessions()).catch(() => {
+            logger.warn('cachekeep', 'failed to publish tracked sessions')
+          })
+        return result
+      }
     },
     discardAttempt(attemptId: string) {
       discardAttempt(attemptId)
