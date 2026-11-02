@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { Provider } from '@earendil-works/pi-ai'
+import {
+  getSupportedThinkingLevels,
+  type Provider,
+} from '@earendil-works/pi-ai'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import { buildAnthropicRequest } from '../convert.ts'
 import cortexKitPiAnthropicAuth from '../index'
 import { closePiNativeRuntime } from '../native.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
@@ -203,11 +207,33 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
       id: 'claude-opus-5-5',
       name: 'Claude Opus 5.5',
       reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        xhigh: 'xhigh',
+        max: 'max',
+      },
       input: ['text', 'image'],
       cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 8 },
       contextWindow: 1_000_000,
       maxTokens: 128_000,
     })
+    // Opus 5.5 is adaptive-only: every offered level is an API effort.
+    expect(
+      getSupportedThinkingLevels(
+        opus55 as unknown as Parameters<typeof getSupportedThinkingLevels>[0],
+      ),
+    ).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    for (const effort of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      const { body } = await buildAnthropicRequest(
+        'claude-opus-5-5',
+        { messages: [], systemPrompt: '', tools: [] } as any,
+        { reasoning: effort } as any,
+        { enabled: false, mode: 'explicit' },
+      )
+      expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+      expect(body.output_config).toEqual({ effort })
+    }
   })
 
   test('exposes Claude Opus 5 in the Pi Anthropic catalog', async () => {
