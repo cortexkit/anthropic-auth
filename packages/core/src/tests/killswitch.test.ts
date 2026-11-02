@@ -522,6 +522,28 @@ describe('parseKillswitchCommandAction — scoped three-number form', () => {
 // killswitchRetryAfterSeconds — scoped window resetsAt
 // ---------------------------------------------------------------------------
 describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
+  function identifiedRetry(
+    main: OAuthQuotaSnapshot,
+    fallbacks: { quota: OAuthQuotaSnapshot }[],
+    now: number,
+    modelId?: string,
+  ) {
+    const identify = (quota: OAuthQuotaSnapshot): OAuthQuotaSnapshot => ({
+      ...quota,
+      accountIdentity: 'current',
+      scoped: quota.scoped?.map((window) => ({ ...window, checkedAt: now })),
+    })
+    return killswitchRetryAfterSeconds(
+      identify(main),
+      fallbacks.map(({ quota }) => ({
+        quota: identify(quota),
+        accountIdentity: 'current',
+      })),
+      now,
+      modelId,
+      { mainAccountIdentity: 'current' },
+    )
+  }
   test('considers the matched scoped window resetsAt when present', () => {
     const now = Date.now()
     const mainQuota: OAuthQuotaSnapshot = {
@@ -553,18 +575,11 @@ describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
         },
       },
     ]
-    const seconds = killswitchRetryAfterSeconds(
-      mainQuota,
-      fallbacks,
-      now,
-      'claude-fable-5',
-    )
-    // 180s until reset + 60s buffer
-    expect(seconds).toBeGreaterThanOrEqual(239)
-    expect(seconds).toBeLessThanOrEqual(241)
+    const seconds = identifiedRetry(mainQuota, fallbacks, now, 'claude-fable-5')
+    expect(seconds).toBe(180)
   })
 
-  test('omitting scoped resetsAt is backward-compatible', () => {
+  test('missing standard-window coverage uses the conservative fallback', () => {
     const now = Date.now()
     const mainQuota: OAuthQuotaSnapshot = {
       five_hour: {
@@ -585,9 +600,8 @@ describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
         },
       },
     ]
-    const seconds = killswitchRetryAfterSeconds(mainQuota, fallbacks, now)
-    expect(seconds).toBeGreaterThanOrEqual(359)
-    expect(seconds).toBeLessThanOrEqual(361)
+    const seconds = identifiedRetry(mainQuota, fallbacks, now)
+    expect(seconds).toBe(300)
   })
 
   // Regression for FINDING 1: when a scopedModelId is provided, the 5h/7d
@@ -619,17 +633,9 @@ describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
         ),
       ],
     }
-    const seconds = killswitchRetryAfterSeconds(
-      mainQuota,
-      [],
-      now,
-      'claude-fable-5',
-    )
-    // Expected: ~2 days + 60s buffer. The 5h/7d reset (~2h) must be ignored
-    // because the block is scoped-driven.
-    const expected = Math.ceil(twoDays / 1000) + 60
-    expect(seconds).toBeGreaterThanOrEqual(expected - 2)
-    expect(seconds).toBeLessThanOrEqual(expected + 2)
+    const seconds = identifiedRetry(mainQuota, [], now, 'claude-fable-5')
+    // The reset remains model-scoped, but the default wait is capped.
+    expect(seconds).toBe(900)
   })
 
   test('scoped branch: matched scoped window in FALLBACK is the only source (FINDING 1 fallback case)', () => {
@@ -659,15 +665,8 @@ describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
         },
       },
     ]
-    const seconds = killswitchRetryAfterSeconds(
-      mainQuota,
-      fallbacks,
-      now,
-      'claude-fable-5',
-    )
-    const expected = Math.ceil(twoDays / 1000) + 60
-    expect(seconds).toBeGreaterThanOrEqual(expected - 2)
-    expect(seconds).toBeLessThanOrEqual(expected + 2)
+    const seconds = identifiedRetry(mainQuota, fallbacks, now, 'claude-fable-5')
+    expect(seconds).toBe(900)
   })
 
   test('scoped branch: no matched scoped window in any quota → 300 fallback (FINDING 1 empty)', () => {
@@ -681,12 +680,7 @@ describe('killswitchRetryAfterSeconds — scoped resetsAt', () => {
         checkedAt: now,
       },
     }
-    const seconds = killswitchRetryAfterSeconds(
-      mainQuota,
-      [],
-      now,
-      'claude-fable-5',
-    )
+    const seconds = identifiedRetry(mainQuota, [], now, 'claude-fable-5')
     expect(seconds).toBe(300)
   })
 })

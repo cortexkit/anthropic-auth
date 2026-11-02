@@ -726,6 +726,7 @@ export function createNativeAnthropicSource(
         throw await NativeVaultQuotaPolicyError.fromResponse(
           createNativeVaultNoRouteResponse({
             snapshot,
+            sessionId: input.sessionID,
             modelId: modelID,
             policies,
             sticky:

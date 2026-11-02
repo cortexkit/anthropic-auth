@@ -48,6 +48,7 @@ import {
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
+  createQuotaRefusalResponse,
   createSseFramer,
   createStickyNoRouteResponse,
   custodyTombstoneOAuth,
@@ -123,7 +124,6 @@ import {
   isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
   killswitchPassesPolicy,
-  killswitchRetryAfterSeconds,
   log,
   logger,
   mergeAnthropicBetas,
@@ -182,6 +182,7 @@ import {
   type QuotaReadingPurpose,
   type QuotaState,
   quotaExhaustionFromHeaders,
+  quotaRefusalTiming,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
@@ -9510,36 +9511,41 @@ const anthropicAuthPlugin = async (
                   },
                 )
               }
+              const quotaRefusal = async (
+                reason: string,
+                scopedModelId?: string,
+              ) => {
+                const current = await nativeAccounts.read()
+                return createQuotaRefusalResponse(
+                  reason,
+                  quotaRefusalTiming({
+                    readings: current.accounts
+                      .filter(
+                        (account) =>
+                          account.type === 'oauth' &&
+                          nativeAccountCanServe(account),
+                      )
+                      .map((account) => ({
+                        quota: account.quota,
+                        accountIdentity: account.accountIdentity,
+                      })),
+                    storage: current.policyStorage,
+                    scopedModelId,
+                    sessionTtlMs: sessionCacheActivity.ttlMs(sessionId),
+                  }),
+                )
+              }
               const modelDeniedResponse = async () => {
                 if (isScopedCustodyActive(storage))
                   return createNativeVaultNoRouteResponse({
                     snapshot: await nativeAccounts.read(),
                     modelId: credentialModelId,
                     sticky: getRoutingMode(storage) === 'sticky-balanced',
+                    sessionId,
                   })
-                const retryAfter = killswitchRetryAfterSeconds(
-                  quotaManager.getMain(requestMainQuotaIdentity?.quotaKey)
-                    ?.quota,
-                  (storage?.accounts ?? []).filter(isOAuthAccount),
-                  Date.now(),
+                return quotaRefusal(
+                  'No enabled OAuth route can serve the requested model under current quota policy.',
                   credentialModelId,
-                )
-                return new Response(
-                  JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'rate_limit_error',
-                      message:
-                        'No enabled OAuth route can serve the requested model under current quota policy.',
-                    },
-                  }),
-                  {
-                    status: 429,
-                    headers: {
-                      'content-type': 'application/json',
-                      'retry-after': String(retryAfter),
-                    },
-                  },
                 )
               }
               // Count every replayable request up front — before the
@@ -9759,6 +9765,7 @@ const anthropicAuthPlugin = async (
                         snapshot: await nativeAccounts.read(),
                         modelId: routingModelId,
                         sticky: true,
+                        sessionId,
                       })
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
@@ -9769,6 +9776,15 @@ const anthropicAuthPlugin = async (
                       routeQuotas: stickyRoutes.allRoutes.flatMap((route) =>
                         route.quota ? [route.quota] : [],
                       ),
+                      routeIdentities: stickyRoutes.allRoutes
+                        .filter((route) => route.quota)
+                        .map(
+                          (route) =>
+                            snapshot.accounts.find((row) => row.id === route.id)
+                              ?.accountIdentity,
+                        ),
+                      storage: stickyRoutes.storage,
+                      sessionId,
                       modelId: routingModelId,
                     })
                     trace.done('return_sticky_no_route', {
@@ -10686,13 +10702,6 @@ const anthropicAuthPlugin = async (
                 }
                 // Nowhere to route (no surviving fallback, or none produced a
                 // response): hard-block instead of using the killed main.
-                const now = Date.now()
-                const fallbackAccounts = (storage?.accounts ?? [])
-                  .filter(
-                    (a): a is OAuthAccount =>
-                      nativeAccountCanServe(a) && isOAuthAccount(a),
-                  )
-                  .map((a) => ({ ...a, quota: getFallbackQuota(a) }))
                 // Decide whether the block is scoped-driven (request's
                 // model matches a scoped window that is at/below the scoped
                 // threshold) vs a whole-account 5h/7d-driven block. A
@@ -10702,31 +10711,12 @@ const anthropicAuthPlugin = async (
                   requestModelId,
                   storage,
                 })
-                const retryAfter = killswitchRetryAfterSeconds(
-                  mainQuota,
-                  fallbackAccounts,
-                  now,
-                  scoped.isScopedDriven ? scoped.modelId : undefined,
-                )
                 const message = formatKillswitchBlockMessage({
-                  retryAfterSeconds: retryAfter,
                   ...(scoped.isScopedDriven && { modelName: scoped.modelName }),
                 })
-                return new Response(
-                  JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'rate_limit_error',
-                      message,
-                    },
-                  }),
-                  {
-                    status: 429,
-                    headers: {
-                      'content-type': 'application/json',
-                      'retry-after': String(retryAfter),
-                    },
-                  },
+                return quotaRefusal(
+                  message,
+                  scoped.isScopedDriven ? scoped.modelId : undefined,
                 )
               }
 

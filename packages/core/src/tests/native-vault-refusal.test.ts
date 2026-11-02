@@ -18,7 +18,9 @@ function account(id = 'main', state = 'active'): NativeAccountView {
     source: 'vault',
     enabled: true,
     state,
+    accountIdentity: id,
     quota: {
+      accountIdentity: id,
       checkedAt,
       five_hour: { remainingPercent: 100, usedPercent: 0, checkedAt },
       seven_day: { remainingPercent: 19, usedPercent: 81, checkedAt },
@@ -117,7 +119,7 @@ test('vault model-scoped refusal names the model limit and uses its reset retry 
   expect(response.status).toBe(429)
   expect(Number(response.headers.get('retry-after'))).toBeGreaterThan(0)
   expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(180)
-  expect(Number(response.headers.get('retry-after'))).toBeGreaterThan(120)
+  expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(120)
   const body = (await response.json()) as { error: { message: string } }
   expect(body.error.message).toContain('Opus scoped limit')
   expect(body.error.message).toContain('/claude → Killswitch / Quota')

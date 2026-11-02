@@ -54,6 +54,13 @@ export class SessionCacheActivity {
   forget(sessionId: string) {
     this.entries.delete(sessionId)
   }
+
+  ttlMs(sessionId: string | null | undefined): number {
+    return (
+      (sessionId && this.entries.get(sessionId)?.ttlMs) ||
+      PROMPT_CACHE_DEFAULT_TTL_MS
+    )
+  }
 }
 
 export const sessionCacheActivity = new SessionCacheActivity()

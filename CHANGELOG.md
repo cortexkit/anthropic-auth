@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.4.12
 
+- When no account can serve a request, retry waits now use only fresh readings from the current accounts and respect **Longest wait on the same account**. The message still shows the actual reset time; **Don't wait** stops automatic retries instead of leaving the host waiting on a used-up pool.
 - In sticky-balanced routing, a session now waits on its used-up account only when that account resets before the session's prompt cache would expire (1 hour with 1-hour caching, otherwise 5 minutes). Otherwise it moves to an account with room at once. The new **Longest wait on the same account** setting in `/claude` → Routing defaults to **15 minutes**; choose **Don't wait** to move at once or **Until the cache expires** for longer waits. OpenCode 2 limits each wait to 15 minutes and can wait again on later retries with the cache-expiry option.
 - On OpenCode 2, keep-warm now saves a session's request only after Anthropic accepts it. A rejected request, such as one that is too long, no longer replaces the saved session or pushes other sessions out of keep-warm. Addresses #591.
 

@@ -166,21 +166,18 @@ describe('sticky-balanced session routing', () => {
       fable: 0,
     })
     const response = createStickyNoRouteResponse({
-      routeQuotas: [exhausted.quota],
+      routeQuotas: [{ ...exhausted.quota, accountIdentity: 'main' }],
+      routeIdentities: ['main'],
       modelId: 'claude-fable-5',
       now: NOW,
     })
 
     expect(response.status).toBe(429)
-    expect(Number(response.headers.get('retry-after'))).toBe(96 * 60 * 60 + 60)
-    expect(await response.json()).toEqual({
-      type: 'error',
-      error: {
-        type: 'rate_limit_error',
-        message:
-          'Fable weekly limit reached, no routable OAuth accounts. Retry in 5761m 0s.',
-      },
-    })
+    expect(Number(response.headers.get('retry-after'))).toBe(900)
+    const body = (await response.json()) as { error: { message: string } }
+    expect(body.error.message).toContain(
+      'Fable weekly limit reached, no routable OAuth accounts. Retry in 5760m 0s. Reset at ',
+    )
   })
 
   test('weights Fable accounts by spendable quota and time to reset', () => {
