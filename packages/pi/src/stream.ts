@@ -642,6 +642,10 @@ async function sendAnthropicRequest(
       thinkingPrefixMismatchBehavior: options.apiAccount
         ? 'account-default'
         : getThinkingPrefixMismatchBehavior(storage),
+      ...(options.streamOptions?.onPayload && {
+        onPayload: (payload: unknown) =>
+          options.streamOptions?.onPayload?.(payload, options.model),
+      }),
     },
   )
   options.onResolvedTools?.(hostTools)

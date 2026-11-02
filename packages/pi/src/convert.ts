@@ -219,11 +219,19 @@ function convertMessages(
           result.push({ role: 'user', content: sanitize(message.content) })
         }
       } else {
+        const parts = message.content as Array<TextContent | ImageContent>
+        // A text-only user message with several parts keeps them as separate
+        // blocks, as Pi's own Anthropic provider sends them, so a host's block
+        // boundaries (and the cache breakpoints it places between them) survive.
+        const blocks = parts.some((item) => item.type === 'image')
+          ? []
+          : parts
+              .filter((item): item is TextContent => item.type === 'text')
+              .map((item) => ({ type: 'text', text: sanitize(item.text) }))
+              .filter((block) => block.text.trim())
         result.push({
           role: 'user',
-          content: convertTextAndImages(
-            message.content as Array<TextContent | ImageContent>,
-          ),
+          content: blocks.length > 1 ? blocks : convertTextAndImages(parts),
         })
       }
       continue
@@ -593,6 +601,13 @@ export async function buildAnthropicRequest(
     effortTransitions?: readonly MidConversationEffortTransition[]
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     turnEndNote?: { tools: string[] }
+    /**
+     * Pi's `options.onPayload`, bound to the dispatched model. Pi's provider
+     * contract: call it before sending and send any replacement it returns. It
+     * sees the body with this provider's cache breakpoints placed and runs
+     * before signing, so the billing signature covers what is sent.
+     */
+    onPayload?: (body: AnthropicRequestBody) => unknown | Promise<unknown>
   } = {},
 ): Promise<{
   body: AnthropicRequestBody
@@ -668,7 +683,7 @@ export async function buildAnthropicRequest(
     prependCachedPromptBlock(messages, prompt.messageText)
   }
 
-  const body: AnthropicRequestBody = {
+  let body: AnthropicRequestBody = {
     model: modelId,
     max_tokens: options?.maxTokens ?? 16_384,
     stream: true,
@@ -762,6 +777,10 @@ export async function buildAnthropicRequest(
     applyClaudeCodeMetadata(body, identity)
   }
 
+  const replaced = controls.onPayload
+    ? await controls.onPayload(body)
+    : undefined
+  if (replaced !== undefined) body = replaced as AnthropicRequestBody
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
   // The stream decoder must use the exact tool set that produced this body.

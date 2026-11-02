@@ -1770,3 +1770,114 @@ test('Pi 0.86 normalized transcript maps a returned Claude Code tool name back t
     }),
   )
 })
+
+// Pi's provider contract: a provider calls `options.onPayload` before sending
+// and uses any replacement it returns. Hosts rely on it to place their own
+// cache breakpoints; without the call a host's request layout silently never
+// reaches the provider.
+describe('Pi onPayload hook', () => {
+  async function capture(
+    onPayload?: (payload: unknown, model: unknown) => unknown,
+  ): Promise<string> {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-on-payload-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      { version: 1, accounts: [], quota: { enabled: false } },
+      storagePath,
+    )
+    let sent = ''
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).includes('/api/claude_cli/bootstrap')) {
+          return Response.json({
+            oauth_account: { account_uuid: 'pi-on-payload-account' },
+          })
+        }
+        sent = String(init?.body)
+        return new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        )
+      },
+    ) as unknown as typeof fetch
+    const context = normalizeContext({
+      systemPrompt: 'test',
+      tools: [],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'host view' },
+            { type: 'text', text: 'host input' },
+          ],
+          timestamp: 0,
+        },
+      ],
+    } as any)
+    const result = await streamCortexKitAnthropic(
+      anthropicModel,
+      context as any,
+      {
+        apiKey: 'sk-ant-oat-pi-on-payload',
+        sessionId: 'ses_pi_on_payload',
+        ...(onPayload ? { onPayload } : {}),
+      } as any,
+    ).result()
+    expect(result.stopReason).not.toBe('error')
+    return sent
+  }
+
+  test('sends the payload the hook returns, signed after the hook', async () => {
+    const seen: Array<{ payload: Record<string, any>; model: unknown }> = []
+    const sent = await capture((payload, model) => {
+      const body = payload as Record<string, any>
+      seen.push({ payload: structuredClone(body), model })
+      // A host breakpoint on its own block, copying the provider's control.
+      const user = body.messages.find((message: any) => message.role === 'user')
+      const view = user.content.find((block: any) => block.text === 'host view')
+      view.cache_control = { type: 'ephemeral', ttl: '1h' }
+      return body
+    })
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.model).toBe(anthropicModel)
+    // The hook sees the provider's own breakpoints already placed.
+    expect(JSON.stringify(seen[0]?.payload)).toContain('cache_control')
+    const body = JSON.parse(sent)
+    const user = body.messages.find((message: any) => message.role === 'user')
+    expect(
+      user.content.find((block: any) => block.text === 'host view')
+        ?.cache_control,
+    ).toEqual({ type: 'ephemeral', ttl: '1h' })
+    // Signed over the replaced body: re-signing the sent body reproduces it.
+    expect(await signRequestBody(resetBillingHeaderCCH(sent))).toBe(sent)
+  })
+
+  test('keeps the provider payload when the hook returns nothing', async () => {
+    // Each request carries its own session metadata and signature, so compare
+    // the bodies without them.
+    const stable = (sent: string) =>
+      JSON.stringify({
+        ...JSON.parse(resetBillingHeaderCCH(sent)),
+        metadata: undefined,
+      })
+    const withoutHook = await capture()
+    const withVoidHook = await capture(() => undefined)
+    expect(stable(withVoidHook)).toBe(stable(withoutHook))
+  })
+
+  test("keeps a user message's text parts as separate blocks", async () => {
+    const body = JSON.parse(await capture())
+    const user = body.messages.find((message: any) => message.role === 'user')
+    const texts = user.content
+      .filter((block: any) => block.type === 'text')
+      .map((block: any) => block.text)
+    expect(texts).toContain('host view')
+    expect(texts).toContain('host input')
+    expect(texts.join('')).not.toContain('host view\nhost input')
+  })
+})
