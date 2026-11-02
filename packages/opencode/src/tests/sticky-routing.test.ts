@@ -176,7 +176,7 @@ describe('sticky-balanced session routing', () => {
     expect(Number(response.headers.get('retry-after'))).toBe(900)
     const body = (await response.json()) as { error: { message: string } }
     expect(body.error.message).toContain(
-      'Fable weekly limit reached, no routable OAuth accounts. Retry in 5760m 0s. Reset at ',
+      'Fable weekly limit reached, no routable OAuth accounts. Retry in 15m 0s. Reset at ',
     )
   })
 

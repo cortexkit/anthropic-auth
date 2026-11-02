@@ -391,8 +391,20 @@ const cacheKeepManager = new CacheKeepManager({
     })
     return rotatedHeaders
   },
-  onResponse: async ({ attempt, status }) => {
+  onResponse: async ({ target, attempt, status, receivedAt }) => {
     const entry = nativePrewarmAttempts.get(attempt.id)
+    if (
+      entry &&
+      status >= 200 &&
+      status < 300 &&
+      !attempt.signal?.aborted &&
+      !target.sourceWarm
+    )
+      sessionCacheActivity.recordPrewarm(
+        target.id,
+        target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+        receivedAt,
+      )
     if (entry && status === 401 && !entry.reported)
       await entry.runtime.report(entry.served, status, 'direct').catch(() => {
         logger.warn(
@@ -1460,6 +1472,9 @@ async function executeWithFallback(options: {
         routeIdentities: routes.allRoutes
           .filter((route) => route.quota)
           .map((route) => accountView(route.id)?.accountIdentity),
+        routeAccountIds: routes.allRoutes
+          .filter((route) => route.quota)
+          .map((route) => route.id),
         storage,
         sessionId,
         modelId: options.model.id,
@@ -1677,6 +1692,10 @@ async function executeWithFallback(options: {
         .filter(isOAuthAccount)
         .filter((account) => account.quota)
         .map((account) => accountView(account.id)?.accountIdentity),
+      routeAccountIds: (storage?.accounts ?? [])
+        .filter(isOAuthAccount)
+        .filter((account) => account.quota)
+        .map((account) => account.id),
       storage,
       sessionId: options.streamOptions?.sessionId,
       modelId: options.model.id,
@@ -1714,8 +1733,10 @@ async function executeWithFallback(options: {
             .map((account) => ({
               quota: account.quota,
               accountIdentity: account.accountIdentity,
+              accountId: account.id,
             })),
           storage: current.policyStorage,
+          modelId: options.model.id,
           sessionTtlMs: sessionCacheActivity.ttlMs(
             options.streamOptions?.sessionId,
           ),

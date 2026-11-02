@@ -65,6 +65,9 @@ export function createNativeVaultNoRouteResponse(input: {
     routeIdentities: active
       .filter((account) => account.quota)
       .map((account) => account.accountIdentity),
+    routeAccountIds: active
+      .filter((account) => account.quota)
+      .map((account) => account.id),
     storage: snapshot.policyStorage,
     sessionId: input.sessionId,
     vaultPolicyLimits: [...limits],

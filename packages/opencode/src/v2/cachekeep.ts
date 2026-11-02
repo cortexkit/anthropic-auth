@@ -15,6 +15,7 @@ import {
   type NativeAccountView,
   nativeAccountCanServe,
   nativeAccountRefusal,
+  sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
 import {
@@ -429,7 +430,8 @@ export function createNativeCacheKeep(
       source: {
         ...source,
         // Background sends must not extend a user turn's billing or diagnostics
-        // chain, nor register themselves as fresh live-session activity.
+        // chain or replace its live CacheKeep target. Successful prewarms only
+        // update the target session's last cache refresh time below.
         onRequestPrepared: undefined,
         responseOptions: undefined,
         async requestOptions(input) {
@@ -579,6 +581,12 @@ export function createNativeCacheKeep(
           attempt,
         })
       const bytes = await response.arrayBuffer()
+      if (response.ok && !signal.aborted && !target.sourceWarm)
+        sessionCacheActivity.recordPrewarm(
+          target.id,
+          accountId,
+          options.now?.() ?? Date.now(),
+        )
       complete = true
       return new Response(bytes, { status, headers: response.headers })
     } catch (error) {

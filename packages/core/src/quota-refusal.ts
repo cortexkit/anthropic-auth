@@ -10,7 +10,7 @@ export const quotaRefusalDetails = (response: Response) => details.get(response)
 export function createQuotaRefusalResponse(
   reason: string,
   timing: ReturnType<typeof quotaRefusalTiming>,
-  now = Date.now(),
+  _now?: number,
 ): Response {
   const reset =
     timing.resetAt === undefined
@@ -22,12 +22,9 @@ export function createQuotaRefusalResponse(
           minute: '2-digit',
           timeZoneName: 'short',
         }).format(timing.resetAt)}.`
-  const seconds =
-    timing.resetAt === undefined
-      ? 300
-      : Math.max(1, Math.ceil((timing.resetAt - now) / 1000))
+  const seconds = timing.retryAfterSeconds
   const retry =
-    timing.retryAfterSeconds === undefined
+    seconds === undefined
       ? ''
       : ` Retry in ${Math.floor(seconds / 60)}m ${seconds % 60}s.`
   const response = new Response(

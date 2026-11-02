@@ -3,6 +3,7 @@ import {
   __setLogTestSink,
   type AccountStorage,
   CACHE_KEEP_EXTENDED_TTL_BETA,
+  sessionCacheActivity,
   setCache1hState,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -271,6 +272,9 @@ describe('source-warm', () => {
       Date.now = () => baseNow + 56 * 60_000
       await getPluginTestHandles(round.plugin).cacheKeepManager.tick()
       expect(sourceWarms(round)).toHaveLength(1)
+      expect(
+        sessionCacheActivity.holdUntil(targetId(sessionId), 'main'),
+      ).toBeUndefined()
       const warm = sourceWarms(round)[0]!
       expect(warm.maxTokens).toBe(0)
       expect(warm.fallbacks).toBeUndefined()
