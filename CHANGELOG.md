@@ -2,13 +2,15 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## 2.4.12
+## Unreleased
 
 - Pi now stops immediately with a non-retryable refusal when no fresh reset time is known, instead of waiting on a five-minute fallback retry hint. Known reset times still use the bounded, cancelable wait.
 - Quota refusals now show the capped retry delay separately from the actual time an account can serve again, after all of its blocking limits reset. Successful keep-warm requests also refresh the session's cache lifetime for sticky routing.
 - Pi now waits inside the plugin when an account can reset within the selected wait budget, showing the reset time in its working message. Escape cancels immediately. After one bounded wait it checks the accounts again; if they still cannot serve, it stops instead of triggering Pi's automatic retries.
 - When no account can serve a request, retry waits now use only fresh readings from the current accounts and respect **Longest wait on the same account**. The message still shows the actual reset time; **Don't wait** stops automatic retries instead of leaving the host waiting on a used-up pool.
 - In sticky-balanced routing, a session now waits on its used-up account only when that account resets before the session's prompt cache would expire (1 hour with 1-hour caching, otherwise 5 minutes). Otherwise it moves to an account with room at once. The new **Longest wait on the same account** setting in `/claude` → Routing defaults to **15 minutes**; choose **Don't wait** to move at once or **Until the cache expires** for longer waits. OpenCode 2 limits each wait to 15 minutes and can wait again on later retries with the cache-expiry option.
+## 2.4.12
+
 - On OpenCode 2, keep-warm now saves a session's request only after Anthropic accepts it. A rejected request, such as one that is too long, no longer replaces the saved session or pushes other sessions out of keep-warm. Addresses #591.
 
 ## 2.4.11
