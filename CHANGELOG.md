@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - On OpenCode 2, keep-warm now saves a session's request only after Anthropic accepts it. A rejected request, such as one that is too long, no longer replaces the saved session or pushes other sessions out of keep-warm. Addresses #591.
-
 ## 2.4.11
 
 - A Claude request now always ends when OpenCode gives up on it (for example its five-minute wait for a response), instead of waiting indefinitely when the plugin was still waiting on an account check or a relay.
