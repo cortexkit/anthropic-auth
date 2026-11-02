@@ -1779,6 +1779,7 @@ describe('Pi onPayload hook', () => {
   async function capture(
     onPayload?: (payload: unknown, model: unknown) => unknown,
   ): Promise<string> {
+    if (tempDir) await rm(tempDir, { recursive: true, force: true })
     tempDir = await mkdtemp(join(tmpdir(), 'pi-on-payload-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
@@ -1828,16 +1829,16 @@ describe('Pi onPayload hook', () => {
         ...(onPayload ? { onPayload } : {}),
       } as any,
     ).result()
-    expect(result.stopReason).not.toBe('error')
+    if (result.stopReason === 'error') throw new Error(result.errorMessage)
     return sent
   }
 
   test('sends the payload the hook returns, signed after the hook', async () => {
     const seen: Array<{ payload: Record<string, any>; model: unknown }> = []
     const sent = await capture((payload, model) => {
-      const body = payload as Record<string, any>
-      seen.push({ payload: structuredClone(body), model })
-      // A host breakpoint on its own block, copying the provider's control.
+      seen.push({ payload: structuredClone(payload as object), model })
+      // A host breakpoint on its own block, only on the returned replacement.
+      const body = structuredClone(payload) as Record<string, any>
       const user = body.messages.find((message: any) => message.role === 'user')
       const view = user.content.find((block: any) => block.text === 'host view')
       view.cache_control = { type: 'ephemeral', ttl: '1h' }
@@ -1855,6 +1856,26 @@ describe('Pi onPayload hook', () => {
     ).toEqual({ type: 'ephemeral', ttl: '1h' })
     // Signed over the replaced body: re-signing the sent body reproduces it.
     expect(await signRequestBody(resetBillingHeaderCCH(sent))).toBe(sent)
+  })
+
+  test('refuses a hook replacement with more than four breakpoints before sending', async () => {
+    let sentAny = false
+    await expect(
+      capture((payload) => {
+        const body = structuredClone(payload) as Record<string, any>
+        for (const message of body.messages)
+          for (const block of message.content)
+            block.cache_control = { type: 'ephemeral' }
+        body.cache_control = { type: 'ephemeral' }
+        body.system = [
+          ...(body.system ?? []),
+          { type: 'text', text: 'host', cache_control: { type: 'ephemeral' } },
+        ]
+        sentAny = true
+        return body
+      }),
+    ).rejects.toThrow(/at most 4 cache breakpoints/u)
+    expect(sentAny).toBe(true)
   })
 
   test('keeps the provider payload when the hook returns nothing', async () => {

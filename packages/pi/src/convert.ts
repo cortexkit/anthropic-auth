@@ -781,6 +781,16 @@ export async function buildAnthropicRequest(
     ? await controls.onPayload(body)
     : undefined
   if (replaced !== undefined) body = replaced as AnthropicRequestBody
+  // A host hook may add breakpoints; Anthropic rejects a fifth before the
+  // model runs, so refuse the request here with the reason instead.
+  let breakpoints = 0
+  walkCacheControlHolders(body, () => {
+    breakpoints += 1
+  })
+  if (breakpoints > 4)
+    throw new Error(
+      `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
+    )
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
   // The stream decoder must use the exact tool set that produced this body.
