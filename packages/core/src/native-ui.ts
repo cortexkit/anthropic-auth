@@ -150,10 +150,23 @@ function knob(parameter: NativeMenuParameter): MenuKnob {
       return {
         kind: 'choice',
         id: parameter.id,
-        label: parameter.id,
+        label:
+          parameter.id === 'maxSameAccountWait'
+            ? 'Longest wait on the same account'
+            : parameter.id,
         choices: [
           ...(!parameter.required ? [{ value: '', label: 'Default' }] : []),
-          ...parameter.choices.map((value) => ({ value, label: value })),
+          ...parameter.choices.map((value) => ({
+            value,
+            label:
+              parameter.id === 'maxSameAccountWait'
+                ? {
+                    '0': "Don't wait",
+                    '15': '15 minutes',
+                    max: 'Until the cache expires',
+                  }[value as '0' | '15' | 'max']
+                : value,
+          })),
         ],
       }
     case 'number':

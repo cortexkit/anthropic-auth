@@ -321,6 +321,29 @@ describe('native diagnostics persistence', () => {
 })
 
 describe('native CacheKeep and routing commands', () => {
+  test('Routing menu round-trips every longest same-account wait value', async () => {
+    await controller().execute({
+      action: 'routing-mode',
+      values: { mode: 'sticky-balanced' },
+    })
+    for (const maxSameAccountWait of ['0', '15', 'max'] as const) {
+      expect(
+        (
+          await controller().execute({
+            action: 'routing-max-same-account-wait',
+            values: { maxSameAccountWait },
+          })
+        ).status,
+      ).toBe('executed')
+      expect((await readNativePiFixture(storagePath)).routing).toEqual({
+        mode: 'sticky-balanced',
+        maxSameAccountWait,
+      })
+      expect(await controller().backend.readStatus('routing', {})).toContain(
+        `Longest wait on the same account: ${maxSameAccountWait}`,
+      )
+    }
+  })
   test('lists tracked sessions from all live Pi instances', async () => {
     const registry = new CacheKeepSessionRegistry({
       directory: join(directory, 'cachekeep'),

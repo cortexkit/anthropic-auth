@@ -35,7 +35,6 @@ import { quotaExhaustionFromHeaders } from './quota-headers.ts'
 import { commitRequestChange, requestSignal } from './request-abort.ts'
 
 export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
-export const STICKY_ROUTING_SHORT_RESET_GRACE_MS = 15 * 60_000
 export const STICKY_ROUTING_ASSIGNMENT_TTL_MS = 7 * 24 * 60 * 60_000
 
 const STICKY_ROUTING_TOUCH_INTERVAL_MS = 60 * 60_000
@@ -519,6 +518,8 @@ export function decideStickyQuotaFailure(input: {
   responseHeaders?: Headers
   modelId?: string
   now?: number
+  sessionId?: string
+  holdUntil?: number
 }): StickyQuotaFailureDecision {
   const now = input.now ?? Date.now()
   let reading = knownQuota(input.quota)
@@ -560,7 +561,13 @@ export function decideStickyQuotaFailure(input: {
     if (!blocking || resetAt > blocking.resetAt) blocking = { resetAt, reason }
   }
   if (!blocking) return { action: 'retain', reason: 'not-exhausted' }
-  if (blocking.resetAt - now <= STICKY_ROUTING_SHORT_RESET_GRACE_MS) {
+  const jitterMs = input.sessionId
+    ? (stickyRetryAfterWithJitter(input.sessionId, 1) - 1) * 1000
+    : 0
+  if (
+    input.holdUntil !== undefined &&
+    blocking.resetAt + jitterMs <= input.holdUntil
+  ) {
     return {
       action: 'hold',
       reason: `${blocking.reason}-short-reset`,

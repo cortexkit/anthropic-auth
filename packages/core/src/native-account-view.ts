@@ -403,7 +403,7 @@ export function nativeVaultPrimaryRow(
 // Select public settings explicitly. Exclude stored tokens, relay authorization
 // and arbitrary extra fields so UI and routing snapshots cannot retain credentials.
 const settingFields: Readonly<Record<string, readonly string[]>> = {
-  routing: ['mode'],
+  routing: ['mode', 'maxSameAccountWait'],
   refresh: ['enabled', 'intervalMinutes', 'refreshBeforeExpiryMinutes'],
   quota: [
     'enabled',

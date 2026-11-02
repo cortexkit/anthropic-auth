@@ -88,6 +88,7 @@ import {
   getFallbackReauthLabels,
   getHostClaustrumEnrollmentPaths,
   getKillswitchConfig,
+  getMaxSameAccountWait,
   getPersistedLogLevel,
   getQuotaCheckIntervalMs,
   getQuotaNextRefreshAt,
@@ -153,6 +154,8 @@ import {
   oauthProfileIsFresh,
   oauthProfileMatchesIdentity,
   PARALLEL_TOOL_CALLS_SYSTEM_PROMPT,
+  PROMPT_CACHE_1H_TTL_MS,
+  PROMPT_CACHE_DEFAULT_TTL_MS,
   PrimeManager,
   type PrimeManagerOptions,
   type PrimeRefreshResult,
@@ -199,6 +202,7 @@ import {
   StickySessionRouter,
   sendViaRelay,
   sendWithRequestGzip,
+  sessionCacheActivity,
   setCache1hState,
   setDumpEnabled,
   setFastModeEnabled,
@@ -5234,6 +5238,7 @@ const anthropicAuthPlugin = async (
     return executeRoutingCommand({
       argumentsText,
       mode: getRoutingMode(storage),
+      maxSameAccountWait: getMaxSameAccountWait(storage),
     })
   }
 
@@ -5875,6 +5880,12 @@ const anthropicAuthPlugin = async (
       case 'routing-mode':
         text = await executePersistentRoutingCommand(request.values.mode)
         break
+      case 'routing-max-same-account-wait':
+        await updateNativeSection('routing', {
+          maxSameAccountWait: request.values.maxSameAccountWait,
+        })
+        text = 'Longest wait on the same account updated.'
+        break
       case 'routing-reset':
         text = await executePersistentRoutingCommand('reset', request.sessionId)
         break
@@ -6352,6 +6363,7 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.deleted') {
+        sessionCacheActivity.forget(sessionId)
         fableFallbackManager.clearSession(sessionId)
         dropSessionSourceWarms(sessionId)
         nativeCommands.delete(sessionId)
@@ -7468,6 +7480,7 @@ const anthropicAuthPlugin = async (
               hasAccountUuid: Boolean(identity.accountUuid),
             })
 
+            let acceptedCacheTtlMs = PROMPT_CACHE_DEFAULT_TTL_MS
             const originalBytes =
               typeof body === 'string' ? body.length : undefined
             if (body && typeof body === 'string') {
@@ -7481,6 +7494,9 @@ const anthropicAuthPlugin = async (
                 }
               })()
               const cacheEnabled = !subagentRequest && isCache1hEnabled()
+              acceptedCacheTtlMs = cacheEnabled
+                ? PROMPT_CACHE_1H_TTL_MS
+                : PROMPT_CACHE_DEFAULT_TTL_MS
               const cacheMode = getCache1hMode()
               const standbyCacheAnchor =
                 fableRequest?.plan.downgraded &&
@@ -7626,7 +7642,17 @@ const anthropicAuthPlugin = async (
               await getCacheDiagnosticsBetas(requestHeaders)
             if (fableRequest) fableRequest.oauthAccountId = oauthAccountId
             if (fableRequest) fableRequest.subagent = subagentRequest
-            let trackAcceptedRequest: (() => void) | undefined
+            let trackCacheKeepRequest: (() => void) | undefined
+            const trackAcceptedRequest = () => {
+              if (init?.signal?.aborted) return
+              if (relayAffinity)
+                sessionCacheActivity.record(
+                  relayAffinity,
+                  oauthAccountId,
+                  acceptedCacheTtlMs,
+                )
+              trackCacheKeepRequest?.()
+            }
             if (typeof body === 'string') {
               const storage = await getRequestStorage()
               if (
@@ -7635,7 +7661,7 @@ const anthropicAuthPlugin = async (
                 (!subagentRequest || isCacheKeepSubagentsEnabled(storage))
               ) {
                 const bodyText = body
-                trackAcceptedRequest = () => {
+                trackCacheKeepRequest = () => {
                   const cacheKeepStart = nowMs()
                   const tracked = cacheKeepManager.track({
                     sessionId: relayAffinity,
@@ -8399,6 +8425,7 @@ const anthropicAuthPlugin = async (
           }
 
           async function buildStickyOAuthRoutes(input: {
+            sessionId: string
             storage: AccountStorage | null
             mainAccessToken: string
             mainRefreshToken?: string
@@ -8595,6 +8622,13 @@ const anthropicAuthPlugin = async (
                   decideStickyQuotaFailure({
                     quota: route.quota,
                     modelId: input.requestedModelId,
+                    sessionId: input.sessionId,
+                    holdUntil: sessionCacheActivity.holdUntil(
+                      input.sessionId,
+                      route.id,
+                      Date.now(),
+                      getMaxSameAccountWait(latestStorage),
+                    ),
                   }).action === 'migrate'
                 ) {
                   return []
@@ -9577,6 +9611,7 @@ const anthropicAuthPlugin = async (
                 let stickyRouteSelected = false
                 try {
                   let stickyRoutes = await buildStickyOAuthRoutes({
+                    sessionId,
                     storage,
                     mainAccessToken: auth.access,
                     mainRefreshToken: auth.refresh,
@@ -9863,6 +9898,13 @@ const anthropicAuthPlugin = async (
                       ? decideStickyQuotaFailure({
                           quota: route.quota,
                           modelId: routingModelId,
+                          sessionId,
+                          holdUntil: sessionCacheActivity.holdUntil(
+                            sessionId,
+                            route.id,
+                            Date.now(),
+                            getMaxSameAccountWait(stickyRoutes.storage),
+                          ),
                         })
                       : undefined
                     if (proactiveQuotaDecision?.action === 'hold') {
@@ -9961,6 +10003,13 @@ const anthropicAuthPlugin = async (
                         quota,
                         modelId: routingModelId,
                         responseHeaders: inspected.response.headers,
+                        sessionId,
+                        holdUntil: sessionCacheActivity.holdUntil(
+                          sessionId,
+                          route.id,
+                          Date.now(),
+                          getMaxSameAccountWait(stickyRoutes.storage),
+                        ),
                       })
                       trace.mark('sticky_quota_failure', {
                         accountId: route.id,
@@ -10000,6 +10049,7 @@ const anthropicAuthPlugin = async (
                       await endIfCancelled(inspected.response, init?.signal)
                       const failedRouteId = route.id
                       stickyRoutes = await buildStickyOAuthRoutes({
+                        sessionId,
                         storage: stickyRoutes.storage,
                         mainAccessToken: auth.access,
                         mainRefreshToken: auth.refresh,

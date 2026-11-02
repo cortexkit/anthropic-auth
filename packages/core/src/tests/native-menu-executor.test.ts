@@ -290,6 +290,10 @@ const samples: { [Id in NativeMenuActionId]: RequestFor<Id> } = {
     values: { mode: 'fallback-first' },
   },
   'routing-reset': { action: 'routing-reset' },
+  'routing-max-same-account-wait': {
+    action: 'routing-max-same-account-wait',
+    values: { maxSameAccountWait: 'max' },
+  },
   'killswitch-on': { action: 'killswitch-on' },
   'killswitch-off': { action: 'killswitch-off' },
   'killswitch-set': {
@@ -345,6 +349,7 @@ const expectedValues: {
   'quota-refresh': {},
   'routing-mode': { mode: 'fallback-first' },
   'routing-reset': {},
+  'routing-max-same-account-wait': { maxSameAccountWait: 'max' },
   'killswitch-on': {},
   'killswitch-off': {},
   'killswitch-set': {

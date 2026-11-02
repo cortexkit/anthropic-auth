@@ -20,9 +20,11 @@ import {
   __setLogTestSink,
   captureNativeLocalPoolBinding,
   createNativeAccountRuntime,
+  createNativeMenuExecutor,
   createNativePoolStore,
   fetchOAuthQuotaSnapshot,
   getLogLevel,
+  getMaxSameAccountWait,
   getStickyRoutingStatePath,
   type LogTestRecord,
   type NativeAccountRuntime,
@@ -35,6 +37,7 @@ import {
   readNativeEnrollmentMode,
   resolveNativePoolPaths,
   runNativeMigration,
+  sessionCacheActivity,
   setLogLevel,
   stickyRetryAfterWithJitter,
 } from '@cortexkit/anthropic-auth-core'
@@ -76,6 +79,7 @@ import {
   NativeAnthropicTransportRefusal,
 } from '../v2/adapter'
 import { installNativeAnthropic } from '../v2/install'
+import { createNativeMenuCapabilities } from '../v2/menu'
 import { preparedAnthropicCredential } from '../v2/ownership'
 import {
   claudeLoginMethods,
@@ -1684,11 +1688,16 @@ async function retryHost(native: ReturnType<typeof source>) {
       await run('http.request', draft)
       return draft.request
     },
-    async response(request: Request, status: number, input = scope) {
+    async response(
+      request: Request,
+      status: number,
+      input = scope,
+      headers?: Record<string, string>,
+    ) {
       const draft = {
         ...hostScope(input),
         request,
-        response: new Response('{}', { status }),
+        response: new Response('{}', { status, headers }),
       }
       await run('http.response', draft)
       await draft.response.text()
@@ -2119,6 +2128,85 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
   const mainBearer = 'Bearer sk-ant-oat01-oauth:anthropic'
   const fallbackBearer = 'Bearer sk-ant-oat01-oauth:anthropic:work'
 
+  test('OC2 Routing menu round-trips every longest same-account wait value', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const capabilities = createNativeMenuCapabilities({
+      runtime: f.runtime,
+      source: native,
+      start: async () => {},
+    })
+    cleanups.push(() => capabilities.close())
+    const menu = createNativeMenuExecutor({
+      host: 'opencode',
+      dispatch: capabilities.dispatch,
+    })
+    for (const maxSameAccountWait of ['0', '15', 'max'] as const) {
+      expect(
+        (
+          await menu.execute(
+            {
+              action: 'routing-max-same-account-wait',
+              values: { maxSameAccountWait },
+            },
+            { interactive: true, custodyMode: 'claustrum' },
+          )
+        ).status,
+      ).toBe('executed')
+      const snapshot = await f.runtime.read()
+      expect(snapshot.settings.routing).toMatchObject({
+        mode: 'sticky-balanced',
+        maxSameAccountWait,
+      })
+      expect(getMaxSameAccountWait(snapshot.policyStorage)).toBe(
+        maxSameAccountWait,
+      )
+    }
+  })
+
+  test('accepted OAuth responses record cache activity with CacheKeep off; rejected and aborted responses do not', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('Missing OAuth authorization')
+    const input = context(auth.provenance)
+    sessionCacheActivity.forget(scope.sessionID)
+    cleanups.push(() => sessionCacheActivity.forget(scope.sessionID))
+    await native.requestOptions?.({ ...input, route: 'oauth', correlation: {} })
+    native.quotaFromHeaders?.(new Headers(), {
+      ...input,
+      status: 429,
+    })
+    expect(
+      sessionCacheActivity.holdUntil(scope.sessionID, 'main'),
+    ).toBeUndefined()
+    const now = Date.now()
+    await atTime(now, async () => {
+      native.quotaFromHeaders?.(new Headers(), {
+        ...input,
+        status: 201,
+      })
+      expect(
+        sessionCacheActivity.holdUntil(scope.sessionID, 'main', now, 'max'),
+      ).toBe(now + 300_000)
+      native.quotaFromHeaders?.(new Headers(), {
+        ...input,
+        status: 400,
+      })
+      expect(
+        sessionCacheActivity.holdUntil(scope.sessionID, 'main', now, 'max'),
+      ).toBe(now + 300_000)
+      native.forgetSession?.(scope.sessionID)
+      native.quotaFromHeaders?.(new Headers(), {
+        ...input,
+        status: 200,
+      })
+      expect(
+        sessionCacheActivity.holdUntil(scope.sessionID, 'main'),
+      ).toBeUndefined()
+    })
+  })
+
   async function heldSession(sessionID = scope.sessionID) {
     const fixture = await vaultWithFallback()
     const native = source(fixture.runtime, fixture.paths)
@@ -2127,6 +2215,8 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     const host = await retryHost(native)
     const session = { ...scope, sessionID }
     const first = await host.send(session)
+    sessionCacheActivity.record(sessionID, 'main', 3_600_000, Date.now())
+    cleanups.push(() => sessionCacheActivity.forget(sessionID))
     const accountFor = () =>
       host.installation.installation.accountFor(sessionID, 'primary')
     expect(accountFor()).toBe('main')
@@ -2179,10 +2269,23 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     ).toMatchObject({ accountId: 'main' })
   })
 
-  test('a 429 whose reset is beyond fifteen minutes moves the session to another account', async () => {
+  test('raw refused headers confirm a short reset even when the stored quota is not exhausted', async () => {
+    const f = await heldSession('ses_raw_header_hold')
+    const now = Date.now()
+    await f.host.response(f.first, 429, f.session, {
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+      'anthropic-ratelimit-unified-5h-reset': String((now + 120_000) / 1000),
+    })
+    expect(await atTime(now, () => f.host.retry(false, f.session))).toEqual({
+      retry: true,
+      delay: stickyRetryAfterWithJitter(f.session.sessionID, 120) * 1000,
+    })
+  })
+
+  test('the default wait moves a session whose reset is thirty minutes away despite a one-hour cache', async () => {
     const f = await heldSession()
     const now = Date.now()
-    await exhaustDefault(f.fixture, now + 60 * 60_000, now)
+    await exhaustDefault(f.fixture, now + 30 * 60_000, now)
     await f.host.response(f.first, 429, f.session)
     expect(await atTime(now, () => f.host.retry(true, f.session))).toEqual({
       retry: true,
@@ -2193,7 +2296,7 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     expect(f.accountFor()).not.toBe('main')
   })
 
-  test('a reset exactly fifteen minutes away holds for 920 seconds with the largest jitter, below the installer cap', async () => {
+  test('a reset exactly fifteen minutes away migrates when jitter exceeds the wait budget', async () => {
     let sessionID = ''
     for (let index = 0; !sessionID; index++) {
       const candidate = `ses_hold_boundary_${index}`
@@ -2206,11 +2309,50 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     await f.host.response(f.first, 429, f.session)
     expect(await atTime(now, () => f.host.retry(true, f.session))).toEqual({
       retry: true,
-      delay: 920_000,
+      delay: 0,
     })
     expect((await f.host.send(f.session)).headers.get('authorization')).toBe(
-      mainBearer,
+      fallbackBearer,
     )
+  })
+
+  test('max chains fifteen-minute host holds without extending the original cache expiry', async () => {
+    const f = await heldSession('ses_max_chained')
+    await f.fixture.runtime.updateSettings((settings) => ({
+      ...settings,
+      routing: { mode: 'sticky-balanced', maxSameAccountWait: 'max' },
+    }))
+    const now = Date.now()
+    const expiry = sessionCacheActivity.holdUntil(
+      f.session.sessionID,
+      'main',
+      now,
+      'max',
+    )
+    await exhaustDefault(f.fixture, now + 30 * 60_000, now)
+    await f.host.response(f.first, 429, f.session)
+    expect(await atTime(now, () => f.host.retry(false, f.session))).toEqual({
+      retry: true,
+      delay: 900_000,
+    })
+    await atTime(now + 15 * 60_000, async () => {
+      const next = await f.host.send(f.session)
+      expect(next.headers.get('authorization')).toBe(mainBearer)
+      await exhaustDefault(f.fixture, now + 30 * 60_000, Date.now())
+      await f.host.response(next, 429, f.session)
+      expect(await f.host.retry(false, f.session)).toEqual({
+        retry: true,
+        delay: 900_000,
+      })
+      expect(
+        sessionCacheActivity.holdUntil(
+          f.session.sessionID,
+          'main',
+          Date.now(),
+          'max',
+        ),
+      ).toBe(expiry)
+    })
   })
 
   test('a rate limit after output has started never holds or retries', async () => {

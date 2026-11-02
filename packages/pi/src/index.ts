@@ -17,6 +17,7 @@ import {
   type NativeCustodyClient,
   nativeAccountCanServe,
   readNativeEnrollmentMode,
+  sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import type { Provider, SimpleStreamOptions } from '@earendil-works/pi-ai'
 import type {
@@ -113,7 +114,10 @@ export default async function cortexKitPiAnthropicAuth(
   })
   pi.on('session_shutdown', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
-    if (sessionId) effortHistoryBySession.delete(sessionId)
+    if (sessionId) {
+      effortHistoryBySession.delete(sessionId)
+      sessionCacheActivity.forget(sessionId)
+    }
     await closePiNativeRuntime(storagePath)
   })
 

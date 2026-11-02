@@ -35,7 +35,7 @@ export async function nativeVaultFileAbsent(path: string): Promise<boolean> {
 }
 
 const preferenceFields: Record<string, readonly string[]> = {
-  routing: ['mode'],
+  routing: ['mode', 'maxSameAccountWait'],
   claudeCache: ['enabled', 'mode'],
   cacheKeep: ['enabled', 'always', 'startHour', 'endHour', 'subagents'],
   quota: [

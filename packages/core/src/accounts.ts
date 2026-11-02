@@ -271,6 +271,7 @@ export type AccountStorage = {
   }
   routing?: {
     mode?: RoutingMode
+    maxSameAccountWait?: import('./routing.ts').MaxSameAccountWait
   }
   fallbackOn?: number[]
   refresh?: {

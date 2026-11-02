@@ -860,7 +860,7 @@ describe('sticky-balanced session routing', () => {
     expect(first).toBeLessThanOrEqual(860)
   })
 
-  test('holds a five-hour exhausted route when reset is within fifteen minutes', () => {
+  test('holds a five-hour exhausted route when reset and jitter fit its cache bound', () => {
     const decision = decideStickyQuotaFailure({
       quota: {
         five_hour: {
@@ -877,6 +877,8 @@ describe('sticky-balanced session routing', () => {
       },
       modelId: 'claude-fable-5',
       now: NOW,
+      sessionId: 'session-a',
+      holdUntil: NOW + 15 * 60_000,
     })
     expect(decision).toEqual({
       action: 'hold',

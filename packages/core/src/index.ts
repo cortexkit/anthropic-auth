@@ -342,6 +342,7 @@ export * from './request-abort.ts'
 export * from './request-gzip.ts'
 export * from './request-history.ts'
 export * from './routing.ts'
+export * from './session-cache-activity.ts'
 export type { SseEvent, SseFramer, SseFramerOptions } from './sse.ts'
 export {
   createSseFramer,

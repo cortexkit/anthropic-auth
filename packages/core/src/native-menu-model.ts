@@ -31,6 +31,7 @@ export type NativeMenuRoutingMode =
   | 'fallback-first'
   | 'sticky-balanced'
 export type NativeMenuCacheMode = 'explicit' | 'automatic' | 'hybrid'
+export type NativeMenuMaxSameAccountWait = '0' | '15' | 'max'
 export type NativeMenuLogLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace'
 export type NativeMenuParameterId =
   | 'id'
@@ -40,6 +41,7 @@ export type NativeMenuParameterId =
   | 'authHeader'
   | 'code'
   | 'mode'
+  | 'maxSameAccountWait'
   | 'entries'
   | 'startHour'
   | 'endHour'
@@ -71,6 +73,10 @@ export type NativeMenuParameter =
     }
   | NativeMenuChoiceParameter<'mode', NativeMenuCustodyMode>
   | NativeMenuChoiceParameter<'mode', NativeMenuRoutingMode>
+  | NativeMenuChoiceParameter<
+      'maxSameAccountWait',
+      NativeMenuMaxSameAccountWait
+    >
   | NativeMenuChoiceParameter<'mode', NativeMenuCacheMode>
   | NativeMenuChoiceParameter<
       'authHeader',
@@ -105,6 +111,7 @@ export type NativeMenuActionId =
   | 'vault-disconnect'
   | 'quota-refresh'
   | 'routing-mode'
+  | 'routing-max-same-account-wait'
   | 'routing-reset'
   | 'killswitch-on'
   | 'killswitch-off'
@@ -398,6 +405,21 @@ const actions: readonly NativeMenuAction[] = Object.freeze(
         group: 'Routing',
         label: 'Reset routing session',
         parameters: [],
+      },
+      {
+        ...ordinary,
+        id: 'routing-max-same-account-wait',
+        command: 'routing',
+        group: 'Routing',
+        label: 'Longest wait on the same account',
+        parameters: [
+          {
+            id: 'maxSameAccountWait',
+            kind: 'choice',
+            required: true,
+            choices: ['0', '15', 'max'],
+          },
+        ],
       },
       {
         ...ordinary,
