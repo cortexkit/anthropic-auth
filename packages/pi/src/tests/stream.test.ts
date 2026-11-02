@@ -7,6 +7,7 @@ import {
   createNativePoolStore,
   resetBillingHeaderCCH,
   resolveNativePoolPaths,
+  sessionCacheActivity,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
@@ -1822,8 +1823,28 @@ describe("Pi cacheRetention 'long'", () => {
       })
       return [...ttls]
     }
-    expect(await send()).toEqual([undefined])
-    expect(await send('short')).toEqual([undefined])
-    expect(await send('long')).toEqual(['1h'])
+    // Sticky routing keeps the session on its account for the cache lifetime
+    // the request actually asked for.
+    const heldFor = () => {
+      const now = Date.now()
+      return (
+        (sessionCacheActivity.holdUntil(
+          'ses_cache_retention',
+          'main',
+          now,
+          'max',
+        ) ?? now) - now
+      )
+    }
+    try {
+      expect(await send()).toEqual([undefined])
+      expect(heldFor()).toBeLessThanOrEqual(5 * 60_000)
+      expect(await send('short')).toEqual([undefined])
+      expect(heldFor()).toBeLessThanOrEqual(5 * 60_000)
+      expect(await send('long')).toEqual(['1h'])
+      expect(heldFor()).toBeGreaterThan(55 * 60_000)
+    } finally {
+      sessionCacheActivity.forget('ses_cache_retention')
+    }
   })
 })
