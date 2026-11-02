@@ -15,6 +15,7 @@ import {
 import type { LogLevel } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
+import { getMaxSameAccountWait } from './routing.ts'
 
 export type { ProviderAccountUuid } from './claude-code.ts'
 
@@ -1488,46 +1489,93 @@ export function killswitchPassesPolicy(
   return true
 }
 
-/**
- * Find the earliest reset time across all accounts' quota windows.
- * Returns seconds from `now` until that reset, or 300 as a fallback.
- *
- * When `scopedModelId` is provided, ONLY the matched scoped window's
- * `resetsAt` is considered — the 5h/7d resets are intentionally ignored
- * so the retry hint reflects the weekly reset, not the sooner 5h reset
- * (which would cause a retry-storm against a block that won't clear for
- * days). With `scopedModelId` undefined, the 5h/7d behavior is unchanged.
- */
-export function killswitchRetryAfterSeconds(
-  mainQuota: OAuthQuotaSnapshot | undefined,
-  fallbackAccounts: Array<{ quota?: OAuthQuotaSnapshot }>,
-  now: number,
-  scopedModelId?: string,
-): number {
+export type QuotaResetEvidence = {
+  quota?: OAuthQuotaSnapshot
+  accountIdentity?: string
+}
+
+/** Only current, identity-bound readings can justify waiting for a stored reset. */
+export function quotaRefusalTiming(input: {
+  readings: readonly QuotaResetEvidence[]
+  storage?: AccountStorage | null
+  scopedModelId?: string
+  sessionTtlMs?: number
+  now?: number
+}) {
+  const now = input.now ?? Date.now()
+  const maxAge = getQuotaCheckIntervalMs(input.storage ?? null)
+  const fresh = (window: AccountQuotaWindow | undefined) =>
+    Boolean(
+      window &&
+        Number.isFinite(window.checkedAt) &&
+        window.checkedAt <= now &&
+        now - window.checkedAt < maxAge,
+    )
   const resetTimes: number[] = []
-  const allQuotas = [mainQuota, ...fallbackAccounts.map((a) => a.quota)]
-  for (const quota of allQuotas) {
-    if (scopedModelId) {
-      const scopedWindow = getScopedQuotaWindowForModel(quota, scopedModelId)
-      const resetStr = scopedWindow?.resetsAt
-      if (!resetStr) continue
-      const resetTime = Date.parse(resetStr)
-      if (Number.isFinite(resetTime) && resetTime > now) {
-        resetTimes.push(resetTime)
-      }
-    } else {
-      for (const key of ['five_hour', 'seven_day'] as const) {
-        const resetStr = quota?.[key]?.resetsAt
-        if (!resetStr) continue
-        const resetTime = Date.parse(resetStr)
-        if (Number.isFinite(resetTime) && resetTime > now) {
-          resetTimes.push(resetTime)
-        }
-      }
+  for (const { quota, accountIdentity } of input.readings) {
+    if (!accountIdentity || quota?.accountIdentity !== accountIdentity) continue
+    const scoped = getScopedQuotaWindowForModel(quota, input.scopedModelId)
+    const windows = input.scopedModelId
+      ? scoped && fresh(scoped)
+        ? [scoped]
+        : []
+      : quotaSnapshotHasStandardWindows(quota) &&
+          fresh(quota.seven_day) &&
+          (quotaSnapshotOmitsFiveHour(quota) || fresh(quota.five_hour))
+        ? [quota.five_hour, quota.seven_day]
+        : []
+    for (const window of windows) {
+      const resetAt = Date.parse(window?.resetsAt ?? '')
+      if (Number.isFinite(resetAt) && resetAt > now) resetTimes.push(resetAt)
     }
   }
-  if (!resetTimes.length) return 300
-  return Math.max(1, Math.ceil((Math.min(...resetTimes) - now) / 1000)) + 60
+  const resetAt = resetTimes.length ? Math.min(...resetTimes) : undefined
+  const wait = getMaxSameAccountWait(input.storage ?? null)
+  const ttlMs =
+    input.sessionTtlMs &&
+    input.sessionTtlMs > 0 &&
+    Number.isFinite(input.sessionTtlMs)
+      ? input.sessionTtlMs
+      : 300_000
+  const capMs = wait === 'max' ? ttlMs : Number(wait) * 60_000
+  return {
+    resetAt,
+    retryAfterSeconds:
+      wait === '0'
+        ? undefined
+        : Math.max(
+            1,
+            Math.ceil(
+              Math.min(resetAt === undefined ? 300_000 : resetAt - now, capMs) /
+                1000,
+            ),
+          ),
+  }
+}
+
+/** Compatibility accessor for callers that need only the capped retry delay. */
+export function killswitchRetryAfterSeconds(
+  mainQuota: OAuthQuotaSnapshot | undefined,
+  fallbackAccounts: Array<QuotaResetEvidence>,
+  now: number,
+  scopedModelId?: string,
+  options?: {
+    storage?: AccountStorage | null
+    mainAccountIdentity?: string
+    sessionTtlMs?: number
+  },
+): number {
+  return (
+    quotaRefusalTiming({
+      ...options,
+      now,
+      scopedModelId,
+      readings: [
+        { quota: mainQuota, accountIdentity: options?.mainAccountIdentity },
+        ...fallbackAccounts,
+      ],
+    }).retryAfterSeconds ?? 0
+  )
 }
 
 export function getKillswitchConfig(

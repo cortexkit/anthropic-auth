@@ -12,9 +12,9 @@ import {
   getScopedQuotaWindowForModel,
   isKillswitchEnabled,
   isPermanentRefreshError,
-  killswitchRetryAfterSeconds,
   type OAuthQuotaSnapshot,
   quotaFieldSource,
+  quotaRefusalTiming,
   quotaSnapshotOmitsFiveHour,
   quotaSnapshotPassesModelScope,
 } from './accounts.ts'
@@ -32,7 +32,9 @@ import {
   readNativeVaultLegacyJson,
 } from './native-vault-seed.ts'
 import { quotaExhaustionFromHeaders } from './quota-headers.ts'
+import { createQuotaRefusalResponse } from './quota-refusal.ts'
 import { commitRequestChange, requestSignal } from './request-abort.ts'
+import { sessionCacheActivity } from './session-cache-activity.ts'
 
 export const STICKY_ROUTING_MAIN_ACCOUNT_ID = 'main'
 export const STICKY_ROUTING_ASSIGNMENT_TTL_MS = 7 * 24 * 60 * 60_000
@@ -110,6 +112,9 @@ export function createStickyNoRouteResponse(input: {
   mainRefreshError?: AccountOperationError
   fallbackReauthLabels?: readonly string[]
   routeQuotas: readonly OAuthQuotaSnapshot[]
+  routeIdentities?: readonly (string | undefined)[]
+  storage?: AccountStorage | null
+  sessionId?: string | null
   vaultPolicyLimits?: readonly NativeQuotaPolicyLimit[]
   modelId?: string
   now?: number
@@ -153,15 +158,17 @@ export function createStickyNoRouteResponse(input: {
         (quota) => !quotaSnapshotPassesModelScope(quota, modelId),
       ),
   )
-  const [firstQuota, ...remainingQuotas] = input.routeQuotas
-  const retryAfter = killswitchRetryAfterSeconds(
-    firstQuota,
-    remainingQuotas.map((quota) => ({ quota })),
-    input.now ?? Date.now(),
-    scopedBlocked ? modelId : undefined,
-  )
-  const minutes = Math.floor(retryAfter / 60)
-  const seconds = retryAfter % 60
+  const now = input.now ?? Date.now()
+  const timing = quotaRefusalTiming({
+    readings: input.routeQuotas.map((quota, index) => ({
+      quota,
+      accountIdentity: input.routeIdentities?.[index],
+    })),
+    storage: input.storage,
+    scopedModelId: scopedBlocked ? modelId : undefined,
+    now,
+    sessionTtlMs: sessionCacheActivity.ttlMs(input.sessionId),
+  })
   const limitNames = input.vaultPolicyLimits?.map((limit) =>
     limit === 'model-scoped'
       ? `${modelName ?? 'Model'} scoped limit`
@@ -174,20 +181,7 @@ export function createStickyNoRouteResponse(input: {
     : scopedBlocked && modelName
       ? `${modelName} weekly limit reached, no routable OAuth accounts.`
       : 'No OAuth account currently satisfies sticky-balanced quota policy.'
-  const message = `${reason} Retry in ${minutes}m ${seconds}s.`
-  return new Response(
-    JSON.stringify({
-      type: 'error',
-      error: { type: 'rate_limit_error', message },
-    }),
-    {
-      status: 429,
-      headers: {
-        'content-type': 'application/json',
-        'retry-after': String(retryAfter),
-      },
-    },
-  )
+  return createQuotaRefusalResponse(reason, timing, now)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

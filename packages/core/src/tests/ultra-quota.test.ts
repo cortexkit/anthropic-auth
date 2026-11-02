@@ -235,7 +235,7 @@ test('Ultra weekly killswitch floor and retry hint still apply without a session
   const low = await poll(90)
   expect(killswitchPassesPolicy(low, policy)).toBe(false)
   const now = Date.now()
-  expect(killswitchRetryAfterSeconds(low, [], now)).toBeGreaterThan(86000)
+  expect(killswitchRetryAfterSeconds(low, [], now)).toBe(300)
   expect(killswitchPassesPolicy(undefined, policy)).toBe(false)
 })
 
@@ -243,7 +243,14 @@ test('Ultra weekly short reset holds; a long weekly or Fable reset migrates', as
   const now = Date.now()
   const exhausted = await poll(100, now)
   exhausted.seven_day!.resetsAt = new Date(now + 60_000).toISOString()
-  expect(decideStickyQuotaFailure({ quota: exhausted, now })).toEqual({
+  expect(
+    decideStickyQuotaFailure({
+      quota: exhausted,
+      now,
+      sessionId: 'ultra',
+      holdUntil: now + 300_000,
+    }),
+  ).toEqual({
     action: 'hold',
     reason: 'seven-day-short-reset',
     retryAfterSeconds: 60,

@@ -20,6 +20,7 @@ export function createNativeVaultNoRouteResponse(input: {
   modelId?: string
   policies?: ReadonlyMap<string, NativeAccountPolicy>
   sticky?: boolean
+  sessionId?: string | null
 }): Response {
   const { snapshot, modelId } = input
   const accounts = snapshot.accounts.filter(
@@ -61,19 +62,24 @@ export function createNativeVaultNoRouteResponse(input: {
       account.quota ? [account.quota] : [],
     ),
     modelId,
+    routeIdentities: active
+      .filter((account) => account.quota)
+      .map((account) => account.accountIdentity),
+    storage: snapshot.policyStorage,
+    sessionId: input.sessionId,
     vaultPolicyLimits: [...limits],
   })
 }
 
 type QuotaPolicyBody = {
   type: 'error'
-  error: { type: 'rate_limit_error'; message: string }
+  error: { type: 'rate_limit_error' | 'FAILED_PRECONDITION'; message: string }
 }
 
 /** OpenCode 2 selection refuses before sending; its chooser cannot return a Response. */
 export class NativeVaultQuotaPolicyError extends Error {
   readonly kind = 'quota-policy'
-  readonly status = 429
+  readonly status: number
   readonly headers: Headers
   readonly retryAfter: number
 
@@ -83,6 +89,7 @@ export class NativeVaultQuotaPolicyError extends Error {
   ) {
     super(body.error.message)
     this.name = 'NativeVaultQuotaPolicyError'
+    this.status = response.status
     this.headers = new Headers(response.headers)
     this.retryAfter = Number(this.headers.get('retry-after'))
   }

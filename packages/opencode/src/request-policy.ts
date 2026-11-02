@@ -12,15 +12,17 @@ import {
  * per-model weekly block from a whole-account kill.
  */
 export function formatKillswitchBlockMessage(input: {
-  retryAfterSeconds: number
+  retryAfterSeconds?: number
   modelName?: string
 }): string {
-  const minutes = Math.floor(input.retryAfterSeconds / 60)
-  const seconds = input.retryAfterSeconds % 60
-  const retryHint = `Retry in ${minutes}m ${seconds}s.`
+  const seconds = input.retryAfterSeconds
+  const retryHint =
+    seconds === undefined
+      ? ''
+      : ` Retry in ${Math.floor(seconds / 60)}m ${seconds % 60}s.`
   return input.modelName
-    ? `${input.modelName} weekly limit reached, no routable accounts. ${retryHint}`
-    : `Killswitch: no routable accounts. ${retryHint}`
+    ? `${input.modelName} weekly limit reached, no routable accounts.${retryHint}`
+    : `Killswitch: no routable accounts.${retryHint}`
 }
 
 /**

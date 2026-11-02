@@ -293,7 +293,7 @@ describe('killswitchPassesPolicy', () => {
 // killswitchRetryAfterSeconds
 // ---------------------------------------------------------------------------
 describe('killswitchRetryAfterSeconds', () => {
-  test('returns earliest reset across all accounts', () => {
+  test('unidentified stored resets use the conservative fallback', () => {
     const now = Date.now()
     const mainQuota = {
       five_hour: {
@@ -316,9 +316,7 @@ describe('killswitchRetryAfterSeconds', () => {
       },
     ]
     const seconds = killswitchRetryAfterSeconds(mainQuota, fallbacks, now)
-    // 300s until reset + 60s buffer
-    expect(seconds).toBeGreaterThanOrEqual(359)
-    expect(seconds).toBeLessThanOrEqual(361)
+    expect(seconds).toBe(300)
   })
 
   test('returns 300 fallback when no reset times available', () => {

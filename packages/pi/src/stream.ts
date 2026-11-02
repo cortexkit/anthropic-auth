@@ -1436,6 +1436,7 @@ async function executeWithFallback(options: {
           snapshot: await native.view(),
           modelId: options.model.id,
           sticky: true,
+          sessionId,
         })
       return createStickyNoRouteResponse({
         mainRefreshError: storage?.refresh?.mainLastRefreshError,
@@ -1443,6 +1444,11 @@ async function executeWithFallback(options: {
         routeQuotas: routes.allRoutes.flatMap((route) =>
           route.quota ? [route.quota] : [],
         ),
+        routeIdentities: routes.allRoutes
+          .filter((route) => route.quota)
+          .map((route) => accountView(route.id)?.accountIdentity),
+        storage,
+        sessionId,
         modelId: options.model.id,
       })
     }
@@ -1681,11 +1687,18 @@ async function executeWithFallback(options: {
       return createNativeVaultNoRouteResponse({
         snapshot: await native.view(),
         modelId: options.model.id,
+        sessionId: options.streamOptions?.sessionId,
       })
     return createStickyNoRouteResponse({
       routeQuotas: (storage?.accounts ?? [])
         .filter(isOAuthAccount)
         .flatMap((account) => (account.quota ? [account.quota] : [])),
+      routeIdentities: (storage?.accounts ?? [])
+        .filter(isOAuthAccount)
+        .filter((account) => account.quota)
+        .map((account) => accountView(account.id)?.accountIdentity),
+      storage,
+      sessionId: options.streamOptions?.sessionId,
       modelId: options.model.id,
     })
   }

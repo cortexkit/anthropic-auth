@@ -214,6 +214,19 @@ test('vault quota floors refuse new OpenCode 2 sessions without asking for sign-
     status: 429,
     message: expect.stringContaining('killswitch'),
   })
+  await store.updateSettings((s) => ({
+    ...s,
+    routing: { mode: 'sticky-balanced', maxSameAccountWait: '0' },
+  }))
+  const stopped = (await choose('no-auto-retry').catch(
+    (error: unknown) => error,
+  )) as NativeVaultQuotaPolicyError
+  expect(stopped.status).toBe(412)
+  expect(stopped.headers.has('retry-after')).toBe(false)
+  expect(stopped.body.error.type).toBe('FAILED_PRECONDITION')
+  expect(stopped.message).not.toMatch(
+    /429|500|502|503|504|524|retry|rate.?limit/i,
+  )
   expect(networkCalls()).toBe(0)
 })
 
