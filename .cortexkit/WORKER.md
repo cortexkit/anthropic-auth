@@ -19,6 +19,6 @@
 
 - Run the filtered tests for the code you touched on the remote runner. Use `bun test <files>` in the package, after building Core in the same job.
 - Before you deliver, run `bash scripts/gate.sh fast` on `runon: linux,4c,net`. It runs CI's fast checks (lockfile, layout, format, lint, types, wire vectors, build) in about 20 s and ends with `GATE_OK <commit> fast`. Put that line in your report. A formatting or type error there would fail CI's first job.
-- For a bug fix, show once that the new test fails without the fix.
+- For a bug fix, show once that the new test fails without the fix. Remote Linux jobs cannot change tracked files, so a revert made inside the job fails and the test quietly runs against the fix. Instead, in the same job, copy the checkout to `$TMPDIR` (`cp -R . "$TMPDIR/red"`), undo the fix in that copy, and run the test there; or do it locally.
 - Don't write mutation proofs or lists of deliberate code breaks, don't run the full suites, and don't repeat a run. GitHub CI runs the full Core, OpenCode and Pi suites on every PR, and its result decides the merge.
 - In your report, list what you ran and what you left to CI.
