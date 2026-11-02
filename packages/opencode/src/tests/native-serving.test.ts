@@ -3484,6 +3484,7 @@ async function stickyVaultRejectedFirstSend(
   options: {
     firstRefusal?: (headers: Record<string, string>) => Response
     fallback?: boolean
+    acceptFirst?: boolean
   } = {},
 ) {
   const fixture = await migrateServingFixture(
@@ -3505,6 +3506,9 @@ async function stickyVaultRejectedFirstSend(
       ...settings,
       quota: { enabled: true },
       routing: { mode: 'sticky-balanced' },
+      ...(options.acceptFirst && {
+        claudeCache: { enabled: true, mode: 'explicit' },
+      }),
     }))
     // Sticky routing chooses only between accounts with current quota.
     const window = () => ({
@@ -3549,9 +3553,10 @@ async function stickyVaultRejectedFirstSend(
       )
       // An Anthropic request id is what lets a relayed status count as upstream.
       const headers = { 'request-id': `req_synthetic_sticky_${served.length}` }
-      if (served.length === 1 && options.firstRefusal)
+      const refusalNumber = options.acceptFirst ? 2 : 1
+      if (served.length === refusalNumber && options.firstRefusal)
         return options.firstRefusal(headers)
-      if (served.length === 1)
+      if (served.length === refusalNumber)
         return Response.json(
           {
             type: 'error',
@@ -3602,6 +3607,7 @@ async function weeklyStickyRefusal(
     resetSeconds?: number
     headers?: Record<string, string>
     fallback?: boolean
+    acceptFirst?: boolean
   } = {},
 ) {
   const resetSeconds = options.resetSeconds ?? 5 * 24 * 60 * 60
@@ -3615,6 +3621,7 @@ async function weeklyStickyRefusal(
     },
     {
       fallback: options.fallback,
+      acceptFirst: options.acceptFirst,
       firstRefusal: (headers) =>
         Response.json(
           {
@@ -3764,17 +3771,43 @@ for (const shortWait of [false, true]) {
   })
 }
 
-test('vault sticky weekly 429 holds main for a ten minute reset', async () => {
+test('vault sticky ten minute weekly reset migrates without an accepted main response', async () => {
   const { plugin, served, sessionId, routingPath } = await weeklyStickyRefusal({
     resetSeconds: 600,
   })
+  sessionCacheActivity.forget(sessionId)
+  lifetimes.deferCleanup(() => sessionCacheActivity.forget(sessionId))
+  const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+  expect(response.status).toBe(200)
+  expect(await response.text()).toContain('native-serving-ok')
+  expect(served).toEqual(['oauth:anthropic', 'oauth:secondary'])
+  await plugin.dispose?.()
+  expect((await stickyPin(routingPath, sessionId))?.accountIdentity).toBe(
+    fallbackIdentity,
+  )
+})
+
+test('vault sticky weekly 429 holds main for a ten minute reset', async () => {
+  const { plugin, served, sessionId, routingPath } = await weeklyStickyRefusal({
+    resetSeconds: 600,
+    acceptFirst: true,
+  })
+  sessionCacheActivity.forget(sessionId)
+  lifetimes.deferCleanup(() => sessionCacheActivity.forget(sessionId))
+  const accepted = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+  expect(accepted.status).toBe(200)
+  expect(await accepted.text()).toContain('native-serving-ok')
+  expect(sessionCacheActivity.holdUntil(sessionId, 'main')).toBeGreaterThan(
+    Date.now(),
+  )
+  expect(sessionCacheActivity.ttlMs(sessionId)).toBe(3_600_000)
   const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
   expect(response.status).toBe(429)
   expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(
     599,
   )
   expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(630)
-  expect(served).toEqual(['oauth:anthropic'])
+  expect(served).toEqual(['oauth:anthropic', 'oauth:anthropic'])
   await plugin.dispose?.()
   expect((await stickyPin(routingPath, sessionId))?.accountId).toBe('main')
 })

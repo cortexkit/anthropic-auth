@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test'
-import { createQuotaRefusalResponse } from '@cortexkit/anthropic-auth-core'
+import {
+  createQuotaRefusalResponse,
+  quotaRefusalTiming,
+} from '@cortexkit/anthropic-auth-core'
 import {
   type AssistantMessage,
   isRetryableAssistantError,
@@ -146,3 +149,74 @@ test('zero wait never schedules a timer or rechecks', async () => {
   expect(clock.delay).toBeUndefined()
   expect(clock.messages).toEqual([])
 })
+
+for (const evidence of ['unknown', 'stale'] as const) {
+  test(`Pi immediately refuses ${evidence} reset evidence without a timer or working message`, async () => {
+    const now = Date.parse('2026-11-02T10:00:00Z')
+    const checkedAt = now - 3_600_000
+    const timing = quotaRefusalTiming({
+      now,
+      readings:
+        evidence === 'unknown'
+          ? []
+          : [
+              {
+                accountIdentity: 'current',
+                quota: {
+                  accountIdentity: 'current',
+                  five_hour: {
+                    usedPercent: 100,
+                    remainingPercent: 0,
+                    checkedAt,
+                    resetsAt: new Date(now + 3_600_000).toISOString(),
+                  },
+                  seven_day: {
+                    usedPercent: 100,
+                    remainingPercent: 0,
+                    checkedAt,
+                    resetsAt: new Date(now + 4 * 24 * 3_600_000).toISOString(),
+                  },
+                },
+              },
+            ],
+    })
+    expect(timing).toEqual({ resetAt: undefined, retryAfterSeconds: 300 })
+    const response = createQuotaRefusalResponse(
+      'Killswitch blocked all OAuth routes',
+      timing,
+      now,
+    )
+    expect(response.headers.get('retry-after')).toBe('300')
+    let timers = 0
+    let rechecks = 0
+    const messages: (string | undefined)[] = []
+    const final = await withPiQuotaWait({
+      run: async () => response,
+      resume: async () => {
+        rechecks++
+        return new Response()
+      },
+      wait: {
+        now: () => now,
+        setWorkingMessage: (message) => messages.push(message),
+        setTimeout: (() => {
+          timers++
+          throw new Error('unexpected blind wait')
+        }) as unknown as typeof setTimeout,
+      },
+    })
+    expect(timers).toBe(0)
+    expect(rechecks).toBe(0)
+    expect(messages).toEqual([])
+    expect(final.status).toBe(412)
+    expect(final.headers.has('retry-after')).toBe(false)
+    const message = `Anthropic request failed: HTTP ${final.status} ${await final.text()}`
+    expect(message).toContain('Reset time is unknown.')
+    expect(
+      isRetryableAssistantError({
+        stopReason: 'error',
+        errorMessage: message,
+      } as AssistantMessage),
+    ).toBe(false)
+  })
+}

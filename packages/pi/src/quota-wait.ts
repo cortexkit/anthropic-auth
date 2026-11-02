@@ -79,6 +79,13 @@ export async function withPiQuotaWait(input: {
     return response
   const options = input.wait ?? {}
   void response.body?.cancel().catch(() => {})
+  input.signal?.throwIfAborted()
+  // An unknown reset's retry hint is not evidence that waiting can help this request.
+  if (!hold && refusal && refusal.timing.resetAt === undefined)
+    return createQuotaRefusalResponse(refusal.reason, {
+      resetAt: undefined,
+      retryAfterSeconds: undefined,
+    })
   await waitForReset(
     delay,
     hold?.resetAt ?? refusal?.timing.resetAt,
