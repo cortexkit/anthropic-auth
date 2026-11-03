@@ -193,14 +193,16 @@ export class MessageThreadTracker {
     if (decision.type === 'continue') {
       Object.assign(body, { messages: decision.deltaMessages })
       placeContinueCache(body, input.body)
-      if (body.diagnostics && typeof body.diagnostics === 'object') {
-        Object.assign(body, {
-          diagnostics: {
-            ...body.diagnostics,
-            previous_message_id: decision.previousMessageId,
-          },
-        })
-      }
+      Object.assign(body, {
+        diagnostics: {
+          ...(body.diagnostics &&
+          typeof body.diagnostics === 'object' &&
+          !Array.isArray(body.diagnostics)
+            ? body.diagnostics
+            : {}),
+          previous_message_id: decision.previousMessageId,
+        },
+      })
     }
     return {
       decision,

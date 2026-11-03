@@ -532,3 +532,21 @@ test.each([0, 1, 2, 3, 4])(
     ).toBe(true)
   },
 )
+
+test.each([undefined, {}, { custom: 'retained' }])(
+  'audit diagnostics: continue always supplies response lineage (%j)',
+  (diagnostics) => {
+    const tracker = new MessageThreadTracker()
+    const request = advance(anchor(tracker))
+    if (diagnostics !== undefined) request.body.diagnostics = diagnostics
+    const continued = tracker.prepare(request).body
+    expect(continued.thread).toMatchObject({
+      type: 'continue',
+      previous_message_id: 'msg_1',
+    })
+    expect(continued.diagnostics).toEqual({
+      ...(diagnostics ?? {}),
+      previous_message_id: 'msg_1',
+    })
+  },
+)
