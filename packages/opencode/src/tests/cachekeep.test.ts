@@ -956,9 +956,17 @@ describe('CacheKeepManager', () => {
     expect(publishCount).toBeGreaterThan(publishedBeforeTick)
 
     attempts.length = 0
-    now += 60_000
+    // The first transient retry is due at twenty seconds; successful targets
+    // keep their normal cache lifetime and must not be sent again with it.
+    now += 19_999
     await manager.tick()
     expect(attempts).toEqual([])
+    now += 1
+    await manager.tick()
+    expect(attempts).toEqual(['https://api.anthropic.com/v1/messages/A'])
+    expect(
+      manager.trackedSessions().some((session) => session.id === 'ses_A'),
+    ).toBe(true)
     manager.stop()
   })
 
