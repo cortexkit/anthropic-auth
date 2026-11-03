@@ -36,6 +36,7 @@ import {
   remapModelId,
   remapRequestBodyModel,
   requestSignal,
+  runWithRequestSignal,
   sendWithRequestGzip,
   setDumpEnabled as setDumpEnabledCore,
   stateRefusalCause,
@@ -822,7 +823,9 @@ export function createNativeAnthropicAdapter<Q, P>(
       redactor: createProviderErrorRedactor(secrets),
       scope,
     })
-    void scope.settled.then(() => release(data))
+    void scope.settled.then(() => {
+      if (owned.get(data)?.scope === scope) release(data)
+    })
     while (owned.size > maxPending) {
       const oldest = owned.keys().next().value
       if (oldest === undefined) break
@@ -1104,10 +1107,14 @@ export function createNativeAnthropicAdapter<Q, P>(
     Data,
     {
       thread: MessageThreadRequest
+      beforeResend: (
+        response: Response,
+      ) => Promise<false | { credential: string }>
       resend: (body: string) => Promise<Response>
     }
   >()
   const resendProvenance = new WeakMap<Data, P>()
+  const classifiedForRetry = new WeakSet<Data>()
   const rewriteRequest = (
     input: AccountRequest & {
       readonly request: Request
@@ -1277,6 +1284,8 @@ export function createNativeAnthropicAdapter<Q, P>(
       attempt.agent !== 'compaction' &&
       correlation[LANE_START_REQUEST_HEADER] !== '1'
     ) {
+      const expectedAccountUuid = send.oauth.identity?.accountUuid
+      let resendAuthorization: NativeAnthropicAuthorization<P> | undefined
       const thread = await prepareMessageThreadRequest(messageThreads, {
         session: input.sessionID,
         account: send.oauth.identity?.accountUuid ?? input.accountId,
@@ -1288,20 +1297,50 @@ export function createNativeAnthropicAdapter<Q, P>(
       body = thread.bodyText
       threadRequests.set(data, {
         thread,
-        resend: async (createBody) => {
+        beforeResend: async () => {
+          // common-auth's OpenCode 2 HTTP installer classifies errors before this rewrite.
+          if (classifiedForRetry.has(data) || !owned.has(data)) return false
           ensureLive()
-          const authorized = await source.authorizeAccount(
-            input,
-            input.accountId,
+          request.signal.throwIfAborted()
+          const authorized = await runWithRequestSignal(
+            request.signal,
+            async () => source.authorizeAccount(input, input.accountId),
           )
           ensureLive()
+          request.signal.throwIfAborted()
+          if (
+            !owned.has(data) ||
+            authorized?.route !== 'oauth' ||
+            !authorized.accessToken ||
+            !expectedAccountUuid ||
+            authorized.identity?.accountUuid !== expectedAccountUuid
+          )
+            return false
+          if (
+            (authorized.dispatch?.kind ?? 'direct') !==
+            (send.dispatch?.kind ?? 'direct')
+          )
+            return false
+          await runWithRequestSignal(request.signal, async () =>
+            source.admitRequest?.({
+              ...contextOf(attempt, data),
+              provenance: authorized.provenance,
+            }),
+          )
+          ensureLive()
+          if (!owned.has(data)) return false
+          resendAuthorization = authorized
+          return { credential: authorized.accessToken }
+        },
+        resend: async (createBody) => {
+          ensureLive()
+          request.signal.throwIfAborted()
+          const authorized = resendAuthorization
+          resendAuthorization = undefined
+          if (!owned.has(data))
+            throw new NativeAnthropicRevokedError(input.sessionID, input.kind)
           if (authorized?.route !== 'oauth' || !authorized.accessToken)
             throw refuse(input)
-          await source.admitRequest?.({
-            ...contextOf(attempt, data),
-            provenance: authorized.provenance,
-          })
-          ensureLive()
           resendProvenance.set(data, authorized.provenance)
           const retryHeaders = new Headers(headers)
           retryHeaders.set('authorization', `Bearer ${authorized.accessToken}`)
@@ -1530,7 +1569,11 @@ export function createNativeAnthropicAdapter<Q, P>(
       const threaded = data ? threadRequests.get(data) : undefined
       if (data) threadRequests.delete(data)
       if (threaded && data && fromUpstream(response.headers, data)) {
-        response = await threaded.thread.recover(response, threaded.resend)
+        response = await threaded.thread.recover(
+          response,
+          threaded.resend,
+          threaded.beforeResend,
+        )
         response = threaded.thread.observe(response)
       } else threaded?.thread.fail()
       if (data && !fromUpstream(response.headers, data)) {
@@ -1793,13 +1836,15 @@ export function createNativeAnthropicAdapter<Q, P>(
       // is passed on as it is. Anything else is scrubbed here.
       const rewritten = rewrittenFailures.get(headers) === data
       const scrubber = scrubberFor(data)
-      return source.limitFromResponse({
+      const limit = await source.limitFromResponse({
         ...contextOf(attempt, data),
         status,
         headers,
         body: async () =>
           rewritten ? await body() : scrubber.redactText(await body()),
       })
+      if (limit) classifiedForRetry.add(data)
+      return limit
     },
     inspectEvent({ data: payload, event, attempt }) {
       if (

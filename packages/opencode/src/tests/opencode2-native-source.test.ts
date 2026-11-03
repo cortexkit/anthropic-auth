@@ -3689,3 +3689,26 @@ test('OpenCode 2 serves through a vault outage with the original receipt', async
   expect(f.gets).toHaveLength(1)
   await expect(native.authorizeAccount(scope, 'main')).rejects.toThrow()
 })
+
+test('audit OC2 configured 400 policy reaches the installed retry hook and can move accounts', async () => {
+  const fixture = await vaultWithFallback()
+  await fixture.runtime.updateSettings((settings) => ({
+    ...settings,
+    fallbackOn: [400],
+  }))
+  const native = source(fixture.runtime, fixture.paths)
+  const host = await retryHost(native)
+  const first = await host.send()
+  expect(
+    host.installation.installation.accountFor(scope.sessionID, 'primary'),
+  ).toBe('main')
+  await host.response(first, 400)
+  expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+  const next = await host.send()
+  expect(
+    host.installation.installation.accountFor(scope.sessionID, 'primary'),
+  ).not.toBe('main')
+  expect(next.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-oauth:anthropic:work',
+  )
+})

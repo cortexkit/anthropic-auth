@@ -700,11 +700,29 @@ export async function prepareMessageThreadRequest(
   if (!threading) delete prepared.body.thread
   let bodyText = await signRequestBody(JSON.stringify(prepared.body))
   let recovered = false
-  const prepareStateless = async () => {
-    prepared.fail()
+  let credential = input.credential
+  const mayResend = async (
+    rejected: Response,
+    authorize?: (
+      rejected: Response,
+    ) =>
+      | Promise<boolean | { credential: string }>
+      | boolean
+      | { credential: string },
+  ) => {
+    const result = await authorize?.(rejected)
+    if (result === false) return false
+    if (result && typeof result === 'object') credential = result.credential
+    return true
+  }
+  const latchStateless = () => {
     disableThreadsForAccount(accountKey)
     threading = false
     removeThreadBeta(input.headers)
+  }
+  const prepareStateless = async () => {
+    prepared.fail()
+    latchStateless()
     const stateless = { ...full }
     delete stateless.thread
     bodyText = await signRequestBody(JSON.stringify(stateless))
@@ -730,6 +748,12 @@ export async function prepareMessageThreadRequest(
     async recover(
       response: Response,
       send: (body: string) => Promise<Response>,
+      beforeResend?: (
+        rejected: Response,
+      ) =>
+        | Promise<boolean | { credential: string }>
+        | boolean
+        | { credential: string },
     ): Promise<Response> {
       if (!threading || recovered) return response
       const rejectedCreate =
@@ -740,6 +764,11 @@ export async function prepareMessageThreadRequest(
         (await isMessageThreadRejection(response))
       if (!rejectedCreate && !rejectedContinue) return response
       recovered = true
+      if (!(await mayResend(response, beforeResend))) {
+        prepared.fail()
+        if (rejectedCreate) latchStateless()
+        return response
+      }
       prepared.fail()
       void response.body?.cancel().catch(() => {})
       if (rejectedCreate || disabledThreadAccounts.has(accountKey)) {
@@ -750,6 +779,7 @@ export async function prepareMessageThreadRequest(
         tracker.forget(input.session)
         prepared = tracker.prepare({
           ...input,
+          credential,
           session: input.session,
           body: full,
           betas,
@@ -761,6 +791,11 @@ export async function prepareMessageThreadRequest(
       const created = await send(bodyText)
       // Only a rejected recovery create may add the final stateless attempt.
       if (await isThreadCreateRejection(created)) {
+        if (!(await mayResend(created, beforeResend))) {
+          prepared.fail()
+          latchStateless()
+          return created
+        }
         void created.body?.cancel().catch(() => {})
         await prepareStateless()
         return send(bodyText)

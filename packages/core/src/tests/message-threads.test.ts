@@ -1351,3 +1351,100 @@ test.each([200, 400])(
     expect(JSON.parse(later.bodyText).thread).toBeUndefined()
   },
 )
+
+test('audit resend authorization: refreshed credentials label the recovered anchor', async () => {
+  const tracker = new MessageThreadTracker()
+  const original = anchor(tracker, {
+    ...input(),
+    account: 'audit-credential-refresh',
+    credential: 'old-credential',
+    betas: ['base', MESSAGE_THREADS_BETA],
+  })
+  const full = advance(original)
+  const headers = new Headers({ 'anthropic-beta': 'base' })
+  const request = await prepareMessageThreadRequest(tracker, {
+    ...full,
+    bodyText: JSON.stringify(full.body),
+    headers,
+  })
+  const response = await request.recover(
+    Response.json(
+      {
+        error: {
+          type: 'not_found_error',
+          details: { error_code: 'thread_not_found' },
+        },
+      },
+      { status: 404 },
+    ),
+    async () =>
+      sse([
+        {
+          type: 'message_start',
+          message: {
+            id: 'msg_new_credential',
+            content: [{ type: 'text', text: 'new reply' }],
+          },
+        },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+        { type: 'message_stop' },
+      ]),
+    () => ({ credential: 'new-credential' }),
+  )
+  await request.observe(response).text()
+  const nextRequest = await prepareMessageThreadRequest(tracker, {
+    ...full,
+    credential: 'new-credential',
+    bodyText: JSON.stringify({
+      ...full.body,
+      messages: [
+        ...(full.body.messages as unknown[]),
+        { role: 'assistant', content: 'new reply' },
+        next,
+      ],
+    }),
+    headers,
+  })
+  expect(JSON.parse(nextRequest.bodyText).thread).toEqual({
+    type: 'continue',
+    previous_message_id: 'msg_new_credential',
+  })
+})
+
+test('audit resend authorization: a declined create retry preserves the original response body', async () => {
+  const headers = new Headers({ 'anthropic-beta': 'base' })
+  const original = { ...input(), account: 'audit-declined-create' }
+  const request = await prepareMessageThreadRequest(
+    new MessageThreadTracker(),
+    { ...original, bodyText: JSON.stringify(original.body), headers },
+  )
+  const rejected = Response.json(
+    {
+      error: {
+        type: 'invalid_request_error',
+        message: 'thread: unsupported request',
+        details: { error_code: 'thread_unsupported_request' },
+      },
+    },
+    { status: 400 },
+  )
+  const expected = await rejected.clone().text()
+  let sent = false
+  const response = await request.recover(
+    rejected,
+    async () => {
+      sent = true
+      return new Response('unexpected')
+    },
+    () => false,
+  )
+  expect(sent).toBe(false)
+  expect(response).toBe(rejected)
+  expect(await response.text()).toBe(expected)
+  const later = await prepareMessageThreadRequest(new MessageThreadTracker(), {
+    ...original,
+    bodyText: JSON.stringify(original.body),
+    headers,
+  })
+  expect(JSON.parse(later.bodyText).thread).toBeUndefined()
+})

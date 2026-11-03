@@ -2646,3 +2646,143 @@ test('OpenCode 2 auxiliary, prewarm, lane-start and API-key requests stay statel
   )
   api.dispose()
 })
+
+test.each(['changed identity', 'replacement scope', 'configured 400'])(
+  'audit OC2 resend: %s is fenced',
+  async (scenario) => {
+    let authorizations = 0
+    let physicalSends = 0
+    let heldDuringResend = -1
+    const { source } = makeSource({
+      authorize: () => {
+        authorizations++
+        return oauth(
+          authorizations >= 3 ? 'audit-new-secret' : 'audit-old-secret',
+          { custody: 'local', receipt: `audit-${authorizations}` },
+          {
+            identity:
+              scenario === 'changed identity' && authorizations >= 3
+                ? {
+                    ...IDENTITY,
+                    accountUuid:
+                      '6f1d1c2e-0000-4000-8000-00000000b22d' as ProviderAccountUuid,
+                  }
+                : IDENTITY,
+          },
+        )
+      },
+      limitFromResponse: ({ status }) =>
+        scenario === 'configured 400' && status === 400
+          ? { status: 400, reason: 'provider-400' }
+          : undefined,
+    })
+    const native = createNativeAnthropicAdapter({
+      source,
+      fetch: Object.assign(
+        async () => {
+          physicalSends++
+          await Promise.resolve()
+          heldDuringResend = native.heldRedactorCount
+          return Response.json(
+            {
+              type: 'error',
+              error: {
+                type: 'invalid_request_error',
+                message: 'retained diagnostic detail audit-new-secret',
+              },
+            },
+            { status: 400 },
+          )
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      ) as typeof fetch,
+    })
+    try {
+      const host = new Host(native.adapter)
+      const payload = {
+        model: 'claude-sonnet-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'first' }],
+      }
+      const first = await host.run(scopeOf(), hostRequest(payload))
+      const seed = new Response(
+        sse('message_start', {
+          type: 'message_start',
+          message: {
+            id: 'msg_fence',
+            content: [{ type: 'text', text: 'answer' }],
+          },
+        }) +
+          sse('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+          }) +
+          sse('message_stop', { type: 'message_stop' }),
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+      await (
+        await native.adapter.rewriteResponse?.({
+          ...first.attempt,
+          attempt: first.attempt,
+          request: first.final,
+          response: seed,
+        } as never)
+      )?.text()
+      const second = await host.run(
+        scopeOf(),
+        hostRequest({
+          ...payload,
+          messages: [
+            ...payload.messages,
+            { role: 'assistant', content: 'answer' },
+            { role: 'user', content: 'next' },
+          ],
+        }),
+      )
+      expect(JSON.parse(await second.final.clone().text()).thread.type).toBe(
+        'continue',
+      )
+      const original = Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'original rejection',
+            details: { error_code: 'thread_fingerprint_mismatch' },
+          },
+        },
+        { status: 400 },
+      )
+      if (scenario === 'configured 400') {
+        const limit = await native.adapter.limitFromResponse?.({
+          status: original.status,
+          headers: original.headers,
+          body: () => original.clone().text(),
+          attempt: second.attempt,
+        })
+        expect(limit).toMatchObject({ status: 400, reason: 'provider-400' })
+      }
+      const response = await native.adapter.rewriteResponse?.({
+        ...second.attempt,
+        attempt: second.attempt,
+        request: second.final,
+        response: original,
+      } as never)
+      if (!response) throw new Error('Missing rewritten response')
+      const text = await response.text()
+      if (scenario === 'replacement scope') {
+        expect(physicalSends).toBe(1)
+        expect(heldDuringResend).toBe(1)
+        expect(text).toContain('retained diagnostic detail')
+        expect(text).not.toContain('audit-new-secret')
+      } else {
+        expect(physicalSends).toBe(0)
+        expect(response.status).toBe(400)
+        expect(text).toContain('original rejection')
+        expect(text).toContain('thread_fingerprint_mismatch')
+      }
+    } finally {
+      native.dispose()
+    }
+  },
+)
