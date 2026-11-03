@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.5.0
 
 - Updated `@cortexkit/common-auth` to 0.34.0 (Windows lock-release retry, quota sidebar fixes).
 - On OpenCode 2, a plugin reload no longer fails the next step of a Claude turn that was already running with "Native custody refused: closed"; the step is served by the reloaded plugin. Addresses #605.
