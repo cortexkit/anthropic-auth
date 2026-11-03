@@ -8,6 +8,7 @@ import {
   OPENCODE_IDENTITY_PREFIX,
   PER_TURN_CONTROL_BETA,
   REQUIRED_BETAS,
+  signRequestBody,
   THINKING_BINDING_CONTROLS_BETA,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   TrailingAssistantHistoryError,
@@ -5160,4 +5161,16 @@ describe('Claude Opus 5.5 request transform', () => {
     })
     expect(rewrittenOpus55.output_config.effort).toBe('high')
   })
+})
+
+test('audit hot path: OpenCode defers signing until the final thread shape', async () => {
+  const input = JSON.stringify({
+    model: 'claude-sonnet-5',
+    max_tokens: 32,
+    messages: [{ role: 'user', content: 'Prepare one signed request' }],
+  })
+  const unsigned = await rewriteRequestBody(input, { deferSigning: true })
+  expect(unsigned).toContain('cch=00000;')
+  const signed = await rewriteRequestBody(input)
+  expect(signed).toBe(await signRequestBody(unsigned))
 })

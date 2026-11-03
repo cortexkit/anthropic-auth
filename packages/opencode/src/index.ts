@@ -213,6 +213,7 @@ import {
   setFastModeEnabled,
   setLogLevel,
   shouldFallbackStatus,
+  signRequestBody,
   snapshotHasServableLocalOAuth,
   stateRefusalPublicMessage,
   stickyQuotaSnapshotIsFresh,
@@ -1908,10 +1909,9 @@ const anthropicAuthPlugin = async (
   const fableFallbackManager = new FableFallbackManager()
   // Send-time metadata per recovery round, keyed by recovery key. The kept
   // source body itself is never copied here: when a refusal starts the
-  // round, the keep takes the exact signed bytes from CacheKeep's live
-  // target for the session, which already holds the last body actually
-  // sent. If that target is absent (CacheKeep off, not hybrid), there is
-  // nothing to warm.
+  // round, the keep takes the full request template from CacheKeep's live
+  // target for the session and signs it when warming. If that target is absent
+  // (CacheKeep off, not hybrid), there is nothing to warm.
   const pendingSourceMeta = new Map<
     string,
     { accountIdentity?: string; sentAt: number }
@@ -7526,6 +7526,7 @@ const anthropicAuthPlugin = async (
                   : undefined
               try {
                 body = await rewriteRequestBody(body, {
+                  deferSigning: true,
                   onToolNameMap: (map) => {
                     toolNameMap = map
                   },
@@ -7703,9 +7704,9 @@ const anthropicAuthPlugin = async (
                     bodyBytes: bodyText.length,
                   })
                   // Remember the source-model send's account identity and
-                  // time for content-filter recovery. The keep takes the exact
-                  // signed bytes from CacheKeep's live target, so only
-                  // this small metadata is stored per round.
+                  // time for content-filter recovery. CacheKeep already owns
+                  // the full request template, so only this small metadata is
+                  // stored per round; warming applies its own signature.
                   if (
                     relayAffinity &&
                     fableRequest &&
@@ -7909,8 +7910,8 @@ const anthropicAuthPlugin = async (
                     ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
                   })
                 // Claude Code gzips large bodies on the wire. `body` stays the
-                // signed uncompressed text: request dumps, CacheKeep prewarm
-                // replays and the relay's direct fallback all reuse it.
+                // signed uncompressed wire text for dumps and relay fallback.
+                // CacheKeep retains the separate full stateless template.
                 const response = scope.redactResponse(
                   typeof body === 'string'
                     ? await sendWithRequestGzip({
@@ -8004,6 +8005,8 @@ const anthropicAuthPlugin = async (
                 },
               )
               body = threadRequest.bodyText
+            } else if (typeof body === 'string') {
+              body = await signRequestBody(body)
             }
             const persistedFallbackAccount =
               oauthAccountId === 'main'
@@ -9162,9 +9165,10 @@ const anthropicAuthPlugin = async (
                             return false
                           }
                           // Keep the source prefix from CacheKeep's live
-                          // target for the session: the exact signed bytes
-                          // just sent (normally the refused request itself),
-                          // never rebuilt from a 4.8 request. The live target
+                          // target for the session: the original full request
+                          // template (normally the refused request itself),
+                          // never rebuilt from a 4.8 request. Warming signs it.
+                          // The live target
                           // is required to be this round's source-model send
                           // for this session and account; anything else (a
                           // 4.8 request, another round's probe) cannot become

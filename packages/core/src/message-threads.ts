@@ -239,9 +239,7 @@ function fixedCacheHolders(body: Body): Body[] {
   )
 }
 
-export function messageThreadSnapshot(
-  input: MessageThreadInput,
-): MessageThreadSnapshot {
+function fixedThreadFingerprint(input: MessageThreadInput): string {
   const { body } = input
   const system = Array.isArray(body.system)
     ? body.system.filter(
@@ -259,28 +257,54 @@ export function messageThreadSnapshot(
       'output_config',
       'tool_choice',
       'context_management',
-      'tools',
     ].map((key) => [key, body[key]]),
   )
-  const messages = (Array.isArray(body.messages) ? body.messages : []).map(
-    (message) => hash(canonicalValue(withoutMessageCache(message))),
+  return hash(
+    canonicalValue({
+      ...fixed,
+      // Preserve fixed-field wire order and cache annotations in the digest.
+      tools: JSON.stringify(body.tools),
+      system: JSON.stringify(system),
+      cache_control: JSON.stringify(body.cache_control),
+      fallbacks: Object.hasOwn(body, 'fallbacks'),
+      betas: input.betas,
+    }),
   )
-  return {
-    identity: hash([input.account, input.credential]),
-    fingerprint: hash(
-      canonicalValue({
-        ...fixed,
-        // Preserve fixed-field wire order and cache annotations in the digest.
-        tools: JSON.stringify(body.tools),
-        system: JSON.stringify(system),
-        cache_control: JSON.stringify(body.cache_control),
-        fallbacks: Object.hasOwn(body, 'fallbacks'),
-        betas: input.betas,
-      }),
-    ),
-    messages,
-    prefix: hash(messages),
-  }
+}
+
+export function messageThreadSnapshot(
+  input: MessageThreadInput,
+  identity = hash([input.account, input.credential]),
+  fingerprint = fixedThreadFingerprint(input),
+): MessageThreadSnapshot {
+  const messages = (
+    Array.isArray(input.body.messages) ? input.body.messages : []
+  ).map((message) => hash(canonicalValue(withoutMessageCache(message))))
+  return { identity, fingerprint, messages, prefix: hash(messages) }
+}
+
+function canContinueFrom(
+  anchor: MessageThreadAnchor | undefined,
+  input: MessageThreadInput,
+  identity: string | undefined,
+  now: number,
+): anchor is MessageThreadAnchor {
+  if (
+    !anchor ||
+    !identity ||
+    anchor.identity !== identity ||
+    now < anchor.completedAt ||
+    now - anchor.completedAt >= MAX_AGE_MS
+  )
+    return false
+  const messages = Array.isArray(input.body.messages) ? input.body.messages : []
+  return (
+    messages.length >= anchor.messages.length + 2 &&
+    messages[anchor.messages.length]?.role === 'assistant' &&
+    messages[anchor.messages.length + 1]?.role !== 'assistant' &&
+    assistantReplyFingerprint(messages[anchor.messages.length]) ===
+      anchor.replyFingerprint
+  )
 }
 
 /** Decide from immutable request facts; no session state or clock is read here. */
@@ -290,21 +314,13 @@ export function decideMessageThread(
   snapshot: MessageThreadSnapshot,
   now: number,
 ): MessageThreadDecision {
-  const messages = Array.isArray(input.body.messages) ? input.body.messages : []
   if (
-    !anchor ||
-    anchor.identity !== snapshot.identity ||
+    !canContinueFrom(anchor, input, snapshot.identity, now) ||
     anchor.fingerprint !== snapshot.fingerprint ||
-    now < anchor.completedAt ||
-    now - anchor.completedAt >= MAX_AGE_MS ||
-    messages.length < anchor.messages.length + 2 ||
-    messages[anchor.messages.length]?.role !== 'assistant' ||
-    messages[anchor.messages.length + 1]?.role === 'assistant' ||
-    assistantReplyFingerprint(messages[anchor.messages.length]) !==
-      anchor.replyFingerprint ||
     hash(snapshot.messages.slice(0, anchor.messages.length)) !== anchor.prefix
   )
     return { type: 'create' }
+  const messages = Array.isArray(input.body.messages) ? input.body.messages : []
   return {
     type: 'continue',
     previousMessageId: anchor.messageId,
@@ -367,46 +383,61 @@ export class MessageThreadTracker {
     complete: (facts: MessageThreadCompletion) => void
     fail: () => void
   } {
-    const snapshot = messageThreadSnapshot(input)
     const previous = this.sessions.get(input.session)
-    const decision = decideMessageThread(
-      previous?.anchor,
-      input,
-      snapshot,
-      this.now(),
-    )
+    const anchor = previous?.anchor
+    const now = this.now()
+    // Check session metadata and history shape before hashing request content.
+    const identity =
+      anchor &&
+      now >= anchor.completedAt &&
+      now - anchor.completedAt < MAX_AGE_MS
+        ? hash([input.account, input.credential])
+        : undefined
+    let snapshot: MessageThreadSnapshot | undefined
+    if (canContinueFrom(anchor, input, identity, now)) {
+      const fingerprint = fixedThreadFingerprint(input)
+      if (fingerprint === anchor.fingerprint)
+        snapshot = messageThreadSnapshot(input, identity, fingerprint)
+    }
+    const decision: MessageThreadDecision = snapshot
+      ? decideMessageThread(anchor, input, snapshot, now)
+      : { type: 'create' }
     const token = {}
     this.forget(input.session)
     this.sessions.set(input.session, { token })
     this.prune()
     const fail = this.failureFor(input.session, token)
-    const body: Body = {
-      ...input.body,
-      thread:
-        decision.type === 'create'
-          ? { type: 'create' }
-          : {
-              type: 'continue',
-              previous_message_id: decision.previousMessageId,
-            },
-    }
-    if (decision.type === 'continue') {
-      Object.assign(body, { messages: decision.deltaMessages })
-      placeContinueCache(body, input.body)
-      Object.assign(body, {
-        diagnostics: {
-          ...(body.diagnostics &&
-          typeof body.diagnostics === 'object' &&
-          !Array.isArray(body.diagnostics)
-            ? body.diagnostics
-            : {}),
-          previous_message_id: decision.previousMessageId,
-        },
-      })
+    let body: Body | undefined
+    const outgoingBody = (): Body => {
+      if (body) return body
+      const full = input.body
+      body = {
+        ...full,
+        thread:
+          decision.type === 'create'
+            ? { type: 'create' }
+            : {
+                type: 'continue',
+                previous_message_id: decision.previousMessageId,
+              },
+      }
+      if (decision.type === 'continue') {
+        Object.assign(body, { messages: decision.deltaMessages })
+        placeContinueCache(body, full)
+        Object.assign(body, {
+          diagnostics: {
+            ...(isBody(body.diagnostics) ? body.diagnostics : {}),
+            previous_message_id: decision.previousMessageId,
+          },
+        })
+      }
+      return body
     }
     return {
       decision,
-      body,
+      get body() {
+        return outgoingBody()
+      },
       fail,
       complete: (facts) => {
         const current = this.sessions.get(input.session)
@@ -419,7 +450,8 @@ export class MessageThreadTracker {
           facts.refusal ||
           facts.fallback ||
           facts.rewritten ||
-          snapshot.messages.length > this.hashBudget
+          (Array.isArray(input.body.messages) &&
+            input.body.messages.length > this.hashBudget)
         ) {
           fail()
           return
@@ -430,13 +462,17 @@ export class MessageThreadTracker {
           fail()
           return
         }
-        this.messageHashes += snapshot.messages.length
+        const completedAt = this.now()
+        // Compute a create request's history fingerprint after response completion.
+        const completedSnapshot =
+          snapshot ?? messageThreadSnapshot(input, identity)
+        this.messageHashes += completedSnapshot.messages.length
         this.sessions.set(input.session, {
           token,
           anchor: {
-            ...snapshot,
+            ...completedSnapshot,
             messageId: facts.messageId,
-            completedAt: this.now(),
+            completedAt,
             replyFingerprint,
           },
         })
@@ -449,7 +485,10 @@ export class MessageThreadTracker {
 /** Observe without teeing or buffering the response; cancellation cannot publish an anchor. */
 export function observeMessageThreadResponse(
   response: Response,
-  prepared: ReturnType<MessageThreadTracker['prepare']>,
+  prepared: Pick<
+    ReturnType<MessageThreadTracker['prepare']>,
+    'complete' | 'fail'
+  >,
 ): Response {
   if (!response.ok || !response.body) {
     prepared.fail()
@@ -668,7 +707,7 @@ function disableThreadsForAccount(key: string): void {
   logger.warn(
     'message-threads',
     'Anthropic rejected message threads; using full stateless requests for this account until restart',
-    { account: key.slice(0, 12) },
+    { account: hash(key).slice(0, 12) },
   )
 }
 
@@ -685,6 +724,28 @@ function threadFailureState(initial: () => void) {
   }
 }
 
+// Append to the existing template; only replacing a root field needs re-serialization.
+function serializedCreate(text: string, full: () => Body): string {
+  if (/"thread"\s*:/.test(text) && Object.hasOwn(full(), 'thread'))
+    return JSON.stringify({ ...full(), thread: { type: 'create' } })
+  const compactEnd = text.trimEnd()
+  if (
+    (!compactEnd.startsWith('{') && !compactEnd.trimStart().startsWith('{')) ||
+    !compactEnd.endsWith('}')
+  )
+    throw new SyntaxError('Message request must be a JSON object')
+  const prefix = compactEnd.slice(0, -1)
+  return `${prefix}${prefix.trimEnd().endsWith('{') ? '' : ','}"thread":{"type":"create"}}${text.slice(compactEnd.length)}`
+}
+
+function serializedStateless(text: string, full: () => Body): string {
+  if (!/"thread"\s*:/.test(text) || !Object.hasOwn(full(), 'thread'))
+    return text
+  const body = { ...full() }
+  delete body.thread
+  return JSON.stringify(body)
+}
+
 export async function prepareMessageThreadRequest(
   tracker: MessageThreadTracker,
   input: Omit<MessageThreadInput, 'body' | 'betas' | 'session'> & {
@@ -694,10 +755,22 @@ export async function prepareMessageThreadRequest(
     signal?: AbortSignal
   },
 ) {
-  const full = JSON.parse(input.bodyText) as Body
-  const accountKey = hash(input.account)
+  const fullText = input.bodyText
+  let full: Body | undefined
+  const fullBody = () => (full ??= JSON.parse(fullText) as Body)
+  const accountKey = input.account
   let threading = !disabledThreadAccounts.has(accountKey)
   const betas = threading ? messageThreadBetas(input.headers) : []
+  const prepareForSession = (credential: string) =>
+    tracker.prepare({
+      account: input.account,
+      credential,
+      session: input.session ?? '',
+      betas,
+      get body() {
+        return fullBody()
+      },
+    })
   if (!threading) {
     removeThreadBeta(input.headers)
     if (input.session) tracker.forget(input.session)
@@ -705,18 +778,24 @@ export async function prepareMessageThreadRequest(
   // Without a host session, create a thread but retain no continuation state.
   let prepared: ReturnType<MessageThreadTracker['prepare']> =
     threading && input.session
-      ? tracker.prepare({ ...input, session: input.session, body: full, betas })
+      ? prepareForSession(input.credential)
       : {
           decision: { type: 'create' },
-          body: threading
-            ? { ...full, thread: { type: 'create' } }
-            : { ...full },
+          get body() {
+            return threading
+              ? { ...fullBody(), thread: { type: 'create' } }
+              : fullBody()
+          },
           complete: () => {},
           fail: ignoreThreadFailure,
         }
-  if (!threading) delete prepared.body.thread
   const failure = threadFailureState(prepared.fail)
-  let bodyText = await signRequestBody(JSON.stringify(prepared.body))
+  const outgoing = threading
+    ? prepared.decision.type === 'continue'
+      ? JSON.stringify(prepared.body)
+      : serializedCreate(fullText, fullBody)
+    : serializedStateless(fullText, fullBody)
+  let bodyText = await signRequestBody(outgoing)
   let recovered = false
   let credential = input.credential
   const mayResend = async (
@@ -741,9 +820,7 @@ export async function prepareMessageThreadRequest(
   const prepareStateless = async () => {
     prepared.fail()
     latchStateless()
-    const stateless = { ...full }
-    delete stateless.thread
-    bodyText = await signRequestBody(JSON.stringify(stateless))
+    bodyText = await signRequestBody(serializedStateless(fullText, fullBody))
   }
   return {
     get bodyText() {
@@ -751,12 +828,16 @@ export async function prepareMessageThreadRequest(
     },
     fail: failure.fail,
     observe: (response: Response) => {
-      if (!threading || disabledThreadAccounts.has(accountKey)) {
+      if (
+        !threading ||
+        !input.session ||
+        disabledThreadAccounts.has(accountKey)
+      ) {
         prepared.fail()
         return response
       }
       return observeMessageThreadResponse(response, {
-        ...prepared,
+        fail: failure.fail,
         complete: (facts) => {
           if (input.signal?.aborted) prepared.fail()
           else prepared.complete(facts)
@@ -773,6 +854,9 @@ export async function prepareMessageThreadRequest(
         | boolean
         | { credential: string },
     ): Promise<Response> {
+      // At most one create and one stateless resend for thread errors.
+      // A separate gzip rejection may replay a request uncompressed once,
+      // then turns gzip off until process restart.
       if (!threading || recovered) return response
       const rejectedCreate =
         prepared.decision.type === 'create' &&
@@ -795,18 +879,10 @@ export async function prepareMessageThreadRequest(
       }
       if (input.session) {
         tracker.forget(input.session)
-        prepared = tracker.prepare({
-          ...input,
-          credential,
-          session: input.session,
-          body: full,
-          betas,
-        })
+        prepared = prepareForSession(credential)
         failure.replace(prepared.fail)
       }
-      bodyText = await signRequestBody(
-        JSON.stringify({ ...full, thread: { type: 'create' } }),
-      )
+      bodyText = await signRequestBody(serializedCreate(fullText, fullBody))
       const created = await send(bodyText)
       // Only a rejected recovery create may add the final stateless attempt.
       if (await isThreadCreateRejection(created)) {

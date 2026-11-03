@@ -1548,6 +1548,8 @@ export async function rewriteRequestBody(
     cache1hEnabled?: boolean
     cache1hMode?: Cache1hMode
     fastModeEnabled?: boolean
+    /** Leave the billing signature placeholder for the transport to finalize. */
+    deferSigning?: boolean
     identity?: ClaudeCodeIdentity
     sessionId?: string
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
@@ -1742,10 +1744,13 @@ export async function rewriteRequestBody(
     })
 
     const signStart = rewriteNowMs()
-    const signed = await signRequestBody(prefixed)
+    const signed = options.deferSigning
+      ? prefixed
+      : await signRequestBody(prefixed)
     options.perf?.('cch_sign', {
       ms: rewriteRoundMs(rewriteNowMs() - signStart),
       outputBytes: signed.length,
+      deferred: options.deferSigning === true,
     })
 
     options.onToolNameMap?.(toolNameMap)

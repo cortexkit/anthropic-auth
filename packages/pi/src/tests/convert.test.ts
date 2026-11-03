@@ -5,6 +5,7 @@ import {
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   type ProviderAccountUuid,
+  signRequestBody,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
 import { type Context, type Message, Type } from '@earendil-works/pi-ai'
@@ -2020,3 +2021,28 @@ test.each([
     expect(compacted.system?.[0]?.text).toBe(first.system?.[0]?.text)
   },
 )
+
+test('audit hot path: Pi defers signing until the final thread shape', async () => {
+  const context = {
+    messages: [userMsg('Prepare one signed request')],
+    tools: [],
+  }
+  const cache = { enabled: false, mode: 'explicit' as const }
+  const unsigned = await buildAnthropicRequest(
+    TEST_MODEL_ID,
+    context,
+    undefined,
+    cache,
+    false,
+    undefined,
+    { deferSigning: true },
+  )
+  expect(unsigned.bodyText).toContain('cch=00000;')
+  const signed = await buildAnthropicRequest(
+    TEST_MODEL_ID,
+    context,
+    undefined,
+    cache,
+  )
+  expect(signed.bodyText).toBe(await signRequestBody(unsigned.bodyText))
+})

@@ -2937,3 +2937,30 @@ test('audit downstream refusal: OC2 revokes an anchor after raw EOF validation f
     native.dispose()
   }
 })
+
+test('audit hot path: OC2 retains an unsigned full template and signs only the sent shape', async () => {
+  let template = ''
+  const { source } = makeSource({
+    onRequestPrepared: ({ bodyText }) => {
+      template = bodyText
+    },
+  })
+  const native = createNativeAnthropicAdapter({ source })
+  try {
+    const run = await new Host(native.adapter).run(
+      scopeOf(),
+      hostRequest({
+        model: 'claude-sonnet-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Prepare one signed request' }],
+      }),
+    )
+    expect(template).toContain('cch=00000;')
+    expect(JSON.parse(template).thread).toBeUndefined()
+    const wire = await run.final.text()
+    expect(JSON.parse(wire).thread).toEqual({ type: 'create' })
+    expect(await signRequestBody(wire)).toBe(wire)
+  } finally {
+    native.dispose()
+  }
+})

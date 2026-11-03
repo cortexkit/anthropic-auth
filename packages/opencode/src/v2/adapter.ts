@@ -39,6 +39,7 @@ import {
   runWithRequestSignal,
   sendWithRequestGzip,
   setDumpEnabled as setDumpEnabledCore,
+  signRequestBody,
   stateRefusalCause,
   stateRefusalPublicMessage,
   stripEmptyTrailingAssistantMessages,
@@ -234,16 +235,13 @@ export interface NativeAnthropicAttemptContext<P> extends AccountRequest {
 type RewriteBodyOptions = NonNullable<Parameters<typeof rewriteRequestBody>[1]>
 
 /**
- * The body rewrite options a source supplies for an OAuth send: billing
- * lineage, effort plan, cache, fast mode, safety and diagnostics inputs. Two
- * options are left out because the adapter sets them: the Claude Code
- * identity, which the source returns with the credential, and the session id,
- * which is the host's own session id for the request. The tool-name callback
- * is private to the adapter so response names stay bound to that send.
+ * The source supplies billing, effort, cache, fast-mode, safety and diagnostic
+ * inputs. The adapter owns identity/session correlation, final signing and
+ * the tool-name callback that binds response names to this send.
  */
 export type NativeAnthropicBodyOptions = Omit<
   RewriteBodyOptions,
-  'identity' | 'sessionId' | 'onToolNameMap'
+  'identity' | 'sessionId' | 'onToolNameMap' | 'deferSigning'
 >
 
 type StrippedStreamOptions = NonNullable<
@@ -356,7 +354,7 @@ export interface NativeAnthropicSource<Q, P> {
   readonly admitRequest?: (
     input: NativeAnthropicAttemptContext<P>,
   ) => Promise<void> | void
-  /** Observe the admitted OAuth wire body before any relay envelope is added. */
+  /** Observe the full stateless template; the cache warmer signs its replay. */
   readonly onRequestPrepared?: (
     input: NativeAnthropicAttemptContext<P> & {
       readonly url: string
@@ -1199,6 +1197,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           if (attempt.agent !== 'cachekeep')
             body = await rewriteRequestBody(body, {
               ...options,
+              deferSigning: true,
               ...(identity ? { identity } : {}),
               sessionId: input.sessionID,
               onToolNameMap: (map) => responseToolNameMaps.set(data, map),
@@ -1430,6 +1429,14 @@ export function createNativeAnthropicAdapter<Q, P>(
           return response
         },
       })
+      ensureLive()
+    } else if (
+      data.route === 'oauth' &&
+      messages &&
+      body !== undefined &&
+      attempt.agent !== 'cachekeep'
+    ) {
+      body = await signRequestBody(body)
       ensureLive()
     }
     if (send.dispatch?.kind === 'http-relay') {

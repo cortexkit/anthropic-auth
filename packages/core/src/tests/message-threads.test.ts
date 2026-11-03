@@ -1448,3 +1448,109 @@ test('audit resend authorization: a declined create retry preserves the original
   })
   expect(JSON.parse(later.bodyText).thread).toBeUndefined()
 })
+
+test.each([
+  'no anchor',
+  'wrong account',
+  'expired',
+  'short history',
+  'changed model',
+])('audit hot path: %s creates before reading message content', (gate) => {
+  let now = 0
+  const tracker = new MessageThreadTracker(8, () => now)
+  const original = input()
+  if (gate !== 'no anchor') anchor(tracker, original)
+  if (gate === 'expired') now = 300_000
+  const candidate = gate === 'short history' ? original : advance(original)
+  if (gate === 'wrong account') candidate.account = 'different-account'
+  if (gate === 'changed model') candidate.body.model = 'different-model'
+  let reads = 0
+  candidate.body.messages = [
+    {
+      role: 'user',
+      get content() {
+        reads++
+        throw new Error('message content read before create gate')
+      },
+    },
+    ...(candidate.body.messages as unknown[]).slice(1),
+  ]
+  expect(tracker.prepare(candidate).decision.type).toBe('create')
+  expect(reads).toBe(0)
+})
+
+test('audit hot path: create hashes its snapshot only after accepted completion', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  let reads = 0
+  request.body.messages = [
+    {
+      role: 'user',
+      get content() {
+        reads++
+        return 'one'
+      },
+    },
+  ]
+  const prepared = tracker.prepare(request)
+  expect(prepared.decision.type).toBe('create')
+  expect(reads).toBe(0)
+  prepared.complete({
+    messageId: 'msg_deferred',
+    stopped: true,
+    stopReason: 'end_turn',
+    reply: assistant,
+  })
+  expect(reads).toBeGreaterThan(0)
+  const candidate = {
+    ...request,
+    body: {
+      ...request.body,
+      messages: [{ role: 'user', content: 'one' }, assistant, next],
+    },
+  }
+  expect(tracker.prepare(candidate).decision.type).toBe('continue')
+})
+
+test('audit hot path: serialized create preserves ordinary thread-named data and replaces only a root thread', async () => {
+  for (const rootThread of [
+    undefined,
+    { type: 'continue', previous_message_id: 'caller-value' },
+  ]) {
+    const original = input()
+    original.body.tools = [
+      {
+        name: 'read',
+        input_schema: {
+          type: 'object',
+          properties: { thread: { type: 'string' } },
+        },
+      },
+    ]
+    original.body.messages = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'id',
+            content: '{"thread":"ordinary text"}',
+          },
+        ],
+      },
+    ]
+    if (rootThread) original.body.thread = rootThread
+    const request = await prepareMessageThreadRequest(
+      new MessageThreadTracker(),
+      {
+        ...original,
+        bodyText: ` \n${JSON.stringify(original.body)}\n`,
+        headers: new Headers(),
+      },
+    )
+    const sent = JSON.parse(request.bodyText)
+    expect(sent.thread).toEqual({ type: 'create' })
+    expect(sent.tools).toEqual(original.body.tools)
+    expect(sent.messages).toEqual(original.body.messages)
+  }
+})

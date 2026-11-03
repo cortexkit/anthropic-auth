@@ -1635,3 +1635,65 @@ describe('audit OC1 downstream refusal', () => {
     expect(sent[1]?.thread).toEqual({ type: 'create' })
   })
 })
+
+describe('audit OC1 signing hot path', () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+  test('audit hot path: OC1 retains an unsigned full template and signs only the sent shape', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+      }),
+    )
+    const track = spyOn(Core.CacheKeepManager.prototype, 'track')
+    try {
+      let wire = ''
+      globalThis.fetch = mock(
+        withNativeAdmission((_input: unknown, init?: RequestInit) => {
+          if (typeof init?.body === 'string') wire = init.body
+          return Promise.resolve(
+            new Response(
+              'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_hot","content":[]}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            ),
+          )
+        }),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const auth = await plugin.auth.loader(
+        () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+        { models: {} },
+      )
+      await (
+        await auth.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': 'oc1-hot-path' },
+          body: JSON.stringify({
+            model: 'claude-sonnet-5',
+            stream: true,
+            messages: [{ role: 'user', content: 'Prepare one signed request' }],
+          }),
+        })
+      ).text()
+      const template =
+        track.mock.calls.findLast(
+          ([request]) => request.sessionId === 'oc1-hot-path',
+        )?.[0].bodyText ?? ''
+      expect(template).toContain('cch=00000;')
+      expect(JSON.parse(template).thread).toBeUndefined()
+      expect(JSON.parse(wire).thread).toEqual({ type: 'create' })
+      expect(await Core.signRequestBody(wire)).toBe(wire)
+    } finally {
+      track.mockRestore()
+    }
+  })
+})

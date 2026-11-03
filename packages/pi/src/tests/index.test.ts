@@ -11,7 +11,11 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
-import { MessageThreadTracker } from '@cortexkit/anthropic-auth-core'
+import {
+  CacheKeepManager,
+  MessageThreadTracker,
+  signRequestBody,
+} from '@cortexkit/anthropic-auth-core'
 import {
   type AssistantMessage,
   type Context,
@@ -681,5 +685,25 @@ test('audit downstream refusal: Pi revokes a response aborted after raw EOF', as
     expect(h.sent.at(-1)?.body.thread).toEqual({ type: 'create' })
   } finally {
     spy.mockRestore()
+  }
+})
+
+test('audit hot path: Pi retains an unsigned full template and signs only the sent shape', async () => {
+  const track = spyOn(CacheKeepManager.prototype, 'track')
+  try {
+    const h = await auditPiPrimaryHarness('sign-once')
+    await h.start()
+    await h.send(h.context)
+    const template =
+      track.mock.calls.findLast(
+        ([request]) => request.sessionId === h.options.sessionId,
+      )?.[0].bodyText ?? ''
+    expect(template).toContain('cch=00000;')
+    expect(JSON.parse(template).thread).toBeUndefined()
+    const wire = JSON.stringify(h.sent[0]?.body ?? {})
+    expect(JSON.parse(wire).thread).toEqual({ type: 'create' })
+    expect(await signRequestBody(wire)).toBe(wire)
+  } finally {
+    track.mockRestore()
   }
 })

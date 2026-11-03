@@ -633,6 +633,8 @@ export async function buildAnthropicRequest(
   identity?: ClaudeCodeIdentity,
   controls: {
     effortTransitions?: readonly MidConversationEffortTransition[]
+    /** Leave the billing signature placeholder for the transport to finalize. */
+    deferSigning?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     turnEndNote?: { tools: string[] }
     /**
@@ -830,7 +832,9 @@ export async function buildAnthropicRequest(
       `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
     )
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
-  const bodyText = await signRequestBody(unsigned)
+  const bodyText = controls.deferSigning
+    ? unsigned
+    : await signRequestBody(unsigned)
   // Translate only known host/wire pairs that survived the hook and JSON
   // serialization. Hook-added or renamed tools must not acquire an alias, and
   // response decoding must never change outgoing names or signed history.

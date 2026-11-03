@@ -73,6 +73,7 @@ import {
   sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
+  signRequestBody,
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
@@ -693,6 +694,7 @@ async function sendAnthropicRequest(
     isFastModePersistentlyEnabled(storage),
     identity,
     {
+      deferSigning: true,
       effortTransitions: options.apiAccount ? [] : options.effortTransitions,
       turnEndNote: storage.turnEndNote,
       thinkingPrefixMismatchBehavior: options.apiAccount
@@ -799,6 +801,9 @@ async function sendAnthropicRequest(
     })
     options.onThreadPrepared?.(threadRequest.fail)
     wireBodyText = threadRequest.bodyText
+    init.body = wireBodyText
+  } else {
+    wireBodyText = await signRequestBody(bodyText)
     init.body = wireBodyText
   }
   const directFetch = async () => {
