@@ -301,7 +301,9 @@ function canContinueFrom(
   return (
     messages.length >= anchor.messages.length + 2 &&
     messages[anchor.messages.length]?.role === 'assistant' &&
-    messages[anchor.messages.length + 1]?.role !== 'assistant' &&
+    !messages
+      .slice(anchor.messages.length + 1)
+      .some((message) => message?.role === 'assistant') &&
     assistantReplyFingerprint(messages[anchor.messages.length]) ===
       anchor.replyFingerprint
   )

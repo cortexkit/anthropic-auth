@@ -1569,3 +1569,41 @@ test.each(['default', 'different-policy', null])(
     )
   },
 )
+
+test.each([
+  'adjacent assistant',
+  'later assistant',
+  'assistant after controls',
+  'user-only delta',
+])('recheck rule four: %s', (kind) => {
+  const tracker = new MessageThreadTracker()
+  const request = anchor(tracker)
+  const other = { role: 'assistant', content: 'intervening reply' }
+  const delta =
+    kind === 'adjacent assistant'
+      ? [other, next]
+      : kind === 'later assistant'
+        ? [next, other, { role: 'user', content: 'third' }]
+        : kind === 'assistant after controls'
+          ? [
+              {
+                role: 'system',
+                content: [],
+                output_config: { effort: 'high' },
+              },
+              next,
+              other,
+              { role: 'user', content: 'third' },
+            ]
+          : [next]
+  const prepared = tracker.prepare({
+    ...request,
+    body: {
+      ...request.body,
+      messages: [...(request.body.messages as unknown[]), assistant, ...delta],
+    },
+  })
+  expect(prepared.decision.type).toBe(
+    kind === 'user-only delta' ? 'continue' : 'create',
+  )
+})
