@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Keep-warm now retries a failed keep-warm request several times before the session's cache expires, instead of at most twice, and its warning names which step failed and why (without credentials). Addresses #610.
-
 ## 2.5.0
 
 - Updated `@cortexkit/common-auth` to 0.34.0 (Windows lock-release retry, quota sidebar fixes).
