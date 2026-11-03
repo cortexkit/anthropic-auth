@@ -31,6 +31,7 @@ function anchor(tracker: MessageThreadTracker, request = input()) {
     messageId: 'msg_1',
     stopped: true,
     stopReason: 'end_turn',
+    reply: assistant,
   })
   return request
 }
@@ -185,7 +186,13 @@ test.each(['complete', 'cut', 'refusal', 'fallback', 'error'])(
     const tracker = new MessageThreadTracker()
     const request = input()
     const events: unknown[] = [
-      { type: 'message_start', message: { id: 'msg_stream' } },
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_stream',
+          content: [{ type: 'text', text: 'answer' }],
+        },
+      },
       {
         type: 'message_delta',
         delta: { stop_reason: kind === 'refusal' ? 'refusal' : 'end_turn' },
@@ -246,7 +253,13 @@ test.each([
     await first
       .observe(
         sse([
-          { type: 'message_start', message: { id: 'msg_1' } },
+          {
+            type: 'message_start',
+            message: {
+              id: 'msg_1',
+              content: [{ type: 'text', text: 'answer' }],
+            },
+          },
           { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
           { type: 'message_stop' },
         ]),
@@ -881,4 +894,209 @@ test('audit delta cache: only the last non-system message carries delta breakpoi
     latest,
     note,
   ])
+})
+
+async function observeAuditReply(
+  prepared: ReturnType<MessageThreadTracker['prepare']>,
+  id: string,
+  content: unknown[],
+) {
+  const events: unknown[] = [
+    { type: 'message_start', message: { id, content: [] } },
+  ]
+  for (const [index, block] of content.entries()) {
+    events.push(
+      { type: 'content_block_start', index, content_block: block },
+      { type: 'content_block_stop', index },
+    )
+  }
+  events.push(
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+    { type: 'message_stop' },
+  )
+  await observeMessageThreadResponse(sse(events), prepared).text()
+}
+
+test.each([
+  'retry keeps A',
+  'parallel keeps A',
+  'another process keeps A',
+  'kept B',
+])('audit ancestry: %s', async (scenario) => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  if (scenario === 'retry keeps A')
+    await observeAuditReply(tracker.prepare(request), 'msg_A', [
+      { type: 'text', text: 'response A' },
+    ])
+  const pendingA =
+    scenario === 'parallel keeps A' ? tracker.prepare(request) : undefined
+  await observeAuditReply(tracker.prepare(request), 'msg_B', [
+    { type: 'text', text: 'response B' },
+  ])
+  if (pendingA)
+    await observeAuditReply(pendingA, 'msg_A', [
+      { type: 'text', text: 'response A' },
+    ])
+  const kept = {
+    role: 'assistant',
+    content: scenario === 'kept B' ? 'response B' : 'response A',
+  }
+  const body = tracker.prepare({
+    ...request,
+    body: {
+      ...request.body,
+      messages: [...(request.body.messages as unknown[]), kept, next],
+    },
+  }).body
+  expect(body.thread).toMatchObject({
+    type: scenario === 'kept B' ? 'continue' : 'create',
+  })
+})
+
+test.each([
+  'lowered reply',
+  'tool id',
+  'tool order',
+  'thinking signature',
+  'redacted signature',
+])(
+  'audit ancestry: fingerprint survives lowering but rejects changed %s',
+  async (change) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    await observeAuditReply(tracker.prepare(request), 'msg_reply', [
+      {
+        type: 'thinking',
+        thinking: 'private reasoning',
+        signature: 'signed-thinking',
+      },
+      { type: 'text', text: '  an' },
+      { type: 'tool_use', id: 'call_1', name: 'mcp_Read', input: {} },
+      { type: 'redacted_thinking', data: 'redacted-signature' },
+      { type: 'tool_use', id: 'call_2', name: 'mcp_Read', input: {} },
+      { type: 'text', text: 'swer  \n' },
+    ])
+    const lowered: Array<Record<string, unknown>> = [
+      {
+        type: 'thinking',
+        thinking: 'lowered display',
+        signature: 'signed-thinking',
+      },
+      { type: 'text', text: 'answer' },
+      { type: 'tool_use', id: 'call_1', name: 'Read', input: {} },
+      { type: 'redacted_thinking', data: 'redacted-signature' },
+      { type: 'tool_use', id: 'call_2', name: 'Read', input: {} },
+    ]
+    if (change === 'tool id' && lowered[2]) lowered[2].id = 'different-call'
+    if (change === 'tool order')
+      [lowered[2], lowered[4]] = [
+        lowered[4] as Record<string, unknown>,
+        lowered[2] as Record<string, unknown>,
+      ]
+    if (change === 'thinking signature' && lowered[0])
+      lowered[0].signature = 'different-thinking'
+    if (change === 'redacted signature' && lowered[3])
+      lowered[3].data = 'different-redacted'
+    const body = tracker.prepare({
+      ...request,
+      body: {
+        ...request.body,
+        messages: [
+          ...(request.body.messages as unknown[]),
+          { role: 'assistant', content: lowered },
+          next,
+        ],
+      },
+    }).body
+    expect(body.thread).toMatchObject({
+      type: change === 'lowered reply' ? 'continue' : 'create',
+    })
+  },
+)
+
+test('audit ancestry: fragmented signatures and trimmed text match the kept reply', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const events = [
+    { type: 'message_start', message: { id: 'msg_fragments', content: [] } },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'thinking', thinking: '', signature: '' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'signature_delta', signature: 'signed-' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'signature_delta', signature: 'thinking' },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'text', text: '' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'text_delta', text: '  an' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'text_delta', text: 'swer' },
+    },
+    {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'text_delta', text: ' \n' },
+    },
+    { type: 'content_block_stop', index: 1 },
+    {
+      type: 'content_block_start',
+      index: 2,
+      content_block: { type: 'redacted_thinking', data: 'opaque' },
+    },
+    { type: 'content_block_stop', index: 2 },
+    {
+      type: 'content_block_start',
+      index: 3,
+      content_block: {
+        type: 'tool_use',
+        id: 'call',
+        name: 'mcp_Read',
+        input: {},
+      },
+    },
+    { type: 'content_block_stop', index: 3 },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+    { type: 'message_stop' },
+  ]
+  await observeMessageThreadResponse(
+    sse(events),
+    tracker.prepare(request),
+  ).text()
+  const kept = {
+    role: 'assistant',
+    content: [
+      { type: 'thinking', thinking: 'display', signature: 'signed-thinking' },
+      { type: 'redacted_thinking', data: 'opaque' },
+      { type: 'text', text: 'answer' },
+      { type: 'tool_use', id: 'call', name: 'Read', input: {} },
+    ],
+  }
+  expect(
+    tracker.prepare({
+      ...request,
+      body: {
+        ...request.body,
+        messages: [...(request.body.messages as unknown[]), kept, next],
+      },
+    }).decision.type,
+  ).toBe('continue')
 })

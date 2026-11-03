@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, type Hash } from 'node:crypto'
 import { signRequestBody } from './cch.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
 
@@ -25,6 +25,7 @@ export interface MessageThreadSnapshot {
 export interface MessageThreadAnchor extends MessageThreadSnapshot {
   messageId: string
   completedAt: number
+  replyFingerprint: string
 }
 export type MessageThreadDecision =
   | { type: 'create' }
@@ -32,6 +33,140 @@ export type MessageThreadDecision =
 
 function hash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+}
+
+// Hosts may rename tools or trim text. Match replies by tool IDs, thinking
+// signatures and the combined trimmed text digest; retain only hashes and IDs.
+class ReplyFingerprint {
+  private readonly open = new Map<
+    number,
+    { type: string; signature?: Hash; signatureLength: number }
+  >()
+  private readonly seen = new Set<number>()
+  private readonly tools = new Map<number, string>()
+  private readonly signatures = new Map<number, [string, string]>()
+  private readonly text = createHash('sha256')
+  private committedText = this.text.copy()
+  private hasText = false
+  private activeText: number | undefined
+  private lastText = -1
+  private invalid = false
+
+  private appendText(value: string): void {
+    const part = this.hasText ? value : value.trimStart()
+    const visible = part.trimEnd()
+    if (visible) {
+      this.text.update(visible)
+      this.committedText = this.text.copy()
+      this.hasText = true
+    }
+    if (this.hasText) this.text.update(part.slice(visible.length))
+  }
+
+  start(index: unknown, block: unknown): void {
+    if (
+      typeof index !== 'number' ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      !isBody(block) ||
+      typeof block.type !== 'string' ||
+      this.seen.has(index)
+    ) {
+      this.invalid = true
+      return
+    }
+    this.seen.add(index)
+    const state: { type: string; signature?: Hash; signatureLength: number } = {
+      type: block.type,
+      signatureLength: 0,
+    }
+    if (block.type === 'text') {
+      if (this.activeText !== undefined || index < this.lastText)
+        this.invalid = true
+      this.activeText = index
+      this.lastText = index
+      this.appendText(typeof block.text === 'string' ? block.text : '')
+    }
+    if (block.type === 'tool_use') {
+      if (typeof block.id !== 'string') this.invalid = true
+      else this.tools.set(index, block.id)
+    }
+    if (block.type === 'thinking' || block.type === 'redacted_thinking') {
+      state.signature = createHash('sha256')
+      const signature =
+        block.type === 'redacted_thinking' ? block.data : block.signature
+      if (typeof signature === 'string') {
+        state.signature.update(signature)
+        state.signatureLength += signature.length
+      }
+    }
+    this.open.set(index, state)
+  }
+
+  delta(index: unknown, delta: unknown): void {
+    const state = typeof index === 'number' ? this.open.get(index) : undefined
+    if (!state || !isBody(delta)) {
+      this.invalid = true
+      return
+    }
+    if (delta.type === 'text_delta') {
+      if (
+        state.type !== 'text' ||
+        this.activeText !== index ||
+        typeof delta.text !== 'string'
+      )
+        this.invalid = true
+      else this.appendText(delta.text)
+    }
+    if (delta.type === 'signature_delta') {
+      if (!state.signature || typeof delta.signature !== 'string')
+        this.invalid = true
+      else {
+        state.signature.update(delta.signature)
+        state.signatureLength += delta.signature.length
+      }
+    }
+  }
+
+  stop(index: unknown): void {
+    const state = typeof index === 'number' ? this.open.get(index) : undefined
+    if (!state || typeof index !== 'number') {
+      this.invalid = true
+      return
+    }
+    this.open.delete(index)
+    if (state.type === 'text') this.activeText = undefined
+    if (state.signature) {
+      if (!state.signatureLength) this.invalid = true
+      this.signatures.set(index, [state.type, state.signature.digest('hex')])
+    }
+  }
+
+  digest(): string | undefined {
+    if (this.invalid || this.open.size) return undefined
+    return hash({
+      tools: [...this.tools].sort(([a], [b]) => a - b).map(([, id]) => id),
+      signatures: [...this.signatures]
+        .sort(([a], [b]) => a - b)
+        .map(([, signature]) => signature),
+      text: this.committedText.copy().digest('hex'),
+    })
+  }
+}
+
+function assistantReplyFingerprint(message: unknown): string | undefined {
+  if (!isBody(message) || message.role !== 'assistant') return undefined
+  const content =
+    typeof message.content === 'string'
+      ? [{ type: 'text', text: message.content }]
+      : message.content
+  if (!Array.isArray(content)) return undefined
+  const reply = new ReplyFingerprint()
+  for (const [index, block] of content.entries()) {
+    reply.start(index, block)
+    reply.stop(index)
+  }
+  return reply.digest()
 }
 
 // Cache placement is transport-local and may move as the history grows.
@@ -164,6 +299,8 @@ export function decideMessageThread(
     messages.length < anchor.messages.length + 2 ||
     messages[anchor.messages.length]?.role !== 'assistant' ||
     messages[anchor.messages.length + 1]?.role === 'assistant' ||
+    assistantReplyFingerprint(messages[anchor.messages.length]) !==
+      anchor.replyFingerprint ||
     hash(snapshot.messages.slice(0, anchor.messages.length)) !== anchor.prefix
   )
     return { type: 'create' }
@@ -181,6 +318,8 @@ export interface MessageThreadCompletion {
   refusal?: boolean
   fallback?: boolean
   rewritten?: boolean
+  replyFingerprint?: string
+  reply?: unknown
 }
 
 export class MessageThreadTracker {
@@ -280,6 +419,12 @@ export class MessageThreadTracker {
           fail()
           return
         }
+        const replyFingerprint =
+          facts.replyFingerprint ?? assistantReplyFingerprint(facts.reply)
+        if (!replyFingerprint) {
+          fail()
+          return
+        }
         this.messageHashes += snapshot.messages.length
         this.sessions.set(input.session, {
           token,
@@ -287,6 +432,7 @@ export class MessageThreadTracker {
             ...snapshot,
             messageId: facts.messageId,
             completedAt: this.now(),
+            replyFingerprint,
           },
         })
         this.prune()
@@ -307,6 +453,7 @@ export function observeMessageThreadResponse(
   const reader = response.body.getReader()
   const framer = createSseFramer()
   const facts: MessageThreadCompletion = { stopped: false }
+  const reply = new ReplyFingerprint()
   let inspecting = true
   let streamStart = true
   const parse = (frame: Uint8Array) => {
@@ -315,7 +462,21 @@ export function observeMessageThreadResponse(
     if (!data || data === '[DONE]') return
     try {
       const event = JSON.parse(data)
-      if (event.type === 'message_start') facts.messageId = event.message?.id
+      if (event.type === 'message_start') {
+        if (typeof event.message?.id === 'string')
+          facts.messageId = event.message.id
+        if (Array.isArray(event.message?.content)) {
+          for (const [index, block] of event.message.content.entries()) {
+            reply.start(index, block)
+            reply.stop(index)
+          }
+        }
+      }
+      if (event.type === 'content_block_start')
+        reply.start(event.index, event.content_block)
+      if (event.type === 'content_block_delta')
+        reply.delta(event.index, event.delta)
+      if (event.type === 'content_block_stop') reply.stop(event.index)
       const stop = event.delta?.stop_reason ?? event.message?.stop_reason
       if (typeof stop === 'string') facts.stopReason = stop
       if (stop === 'refusal' || event.content_block?.type === 'refusal')
@@ -345,7 +506,10 @@ export function observeMessageThreadResponse(
             if (chunk.done) {
               // An unterminated EOF tail is not a completed SSE event.
               if (inspecting && framer.finish()) facts.rewritten = true
-              if (inspecting) prepared.complete(facts)
+              if (inspecting) {
+                facts.replyFingerprint = reply.digest()
+                prepared.complete(facts)
+              }
               controller.close()
               return
             }

@@ -2557,7 +2557,7 @@ for (const transport of ['direct', 'http'] as const) {
         )
       }
       return new Response(
-        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_pi_thread"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
+        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_pi_thread","content":[{"type":"text","text":"Answer"}]}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
         { headers: { 'content-type': 'text/event-stream' } },
       )
     }) as typeof fetch

@@ -1257,7 +1257,7 @@ describe('message threads wire', () => {
           return Promise.resolve(
             new Response(
               [
-                `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_thread_${sent.length}"}}\n\n`,
+                `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_thread_${sent.length}","content":[{"type":"text","text":"Answer"}]}}\n\n`,
                 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
                 'event: message_stop\ndata: {"type":"message_stop"}\n\n',
               ].join(''),
@@ -1280,6 +1280,7 @@ describe('message threads wire', () => {
         messages: unknown[],
         session = 'ses_message_thread',
         auxiliary = false,
+        subagent = false,
       ) => {
         const response = await auth.fetch(MESSAGES_URL, {
           method: 'POST',
@@ -1287,6 +1288,7 @@ describe('message threads wire', () => {
             'x-session-affinity': session,
             'x-cortexkit-request-class': auxiliary ? 'auxiliary' : 'main',
             'x-client-request-id': 'thread-client',
+            ...(subagent ? { 'x-parent-session-id': 'parent-session' } : {}),
           },
           body: JSON.stringify({
             model: 'claude-sonnet-5',
@@ -1390,6 +1392,26 @@ describe('message threads wire', () => {
       }
       await send([first], 'auxiliary-thread-exclusion', true)
       expect(sent.at(-1)?.body.thread).toBeUndefined()
+      const sharedSession = 'subagent-shared-affinity'
+      await send([first], sharedSession)
+      const parentMessageId = `msg_thread_${sent.length}`
+      await send([first], sharedSession, false, true)
+      expect(sent.at(-1)?.body.thread).toBeUndefined()
+      expect(sent.at(-1)?.headers.get('anthropic-beta')).not.toContain(
+        Core.MESSAGE_THREADS_BETA,
+      )
+      await send(
+        [
+          first,
+          { role: 'assistant', content: 'Answer' },
+          { role: 'user', content: 'After subagent' },
+        ],
+        sharedSession,
+      )
+      expect(sent.at(-1)?.body.thread).toEqual({
+        type: 'continue',
+        previous_message_id: parentMessageId,
+      })
     },
   )
 })

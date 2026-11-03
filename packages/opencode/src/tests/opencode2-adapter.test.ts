@@ -2408,7 +2408,10 @@ describe.each(['direct', 'http'] as const)(
           request: run.final,
           attempt: run.attempt,
           response: new Response(
-            sse('message_start', { type: 'message_start', message: { id } }) +
+            sse('message_start', {
+              type: 'message_start',
+              message: { id, content: [{ type: 'text', text: 'Answer' }] },
+            }) +
               sse('message_delta', {
                 type: 'message_delta',
                 delta: { stop_reason: 'end_turn' },
@@ -2508,7 +2511,10 @@ describe.each(['direct', 'http'] as const)(
         const success = new Response(
           sse('message_start', {
             type: 'message_start',
-            message: { id: 'msg_recover' },
+            message: {
+              id: 'msg_recover',
+              content: [{ type: 'text', text: 'answer' }],
+            },
           }) +
             sse('message_delta', {
               type: 'message_delta',

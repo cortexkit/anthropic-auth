@@ -7980,6 +7980,7 @@ const anthropicAuthPlugin = async (
             if (
               typeof body === 'string' &&
               requestClass === 'main' &&
+              !subagentRequest &&
               !laneStartRequest &&
               (!relayConfig ||
                 effectiveRelayTransport(
