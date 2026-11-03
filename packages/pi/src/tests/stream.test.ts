@@ -7,6 +7,7 @@ import {
   createNativePoolStore,
   resetBillingHeaderCCH,
   resolveNativePoolPaths,
+  sessionCacheActivity,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
@@ -1986,5 +1987,82 @@ describe('Pi onPayload hook', () => {
     expect(texts).toContain('host view')
     expect(texts).toContain('host input')
     expect(texts.join('')).not.toContain('host view\nhost input')
+  })
+})
+
+describe("Pi cacheRetention 'long'", () => {
+  test('requests the one-hour TTL even when the account setting is off', async () => {
+    const send = async (cacheRetention?: string) => {
+      tempDir = await mkdtemp(join(tmpdir(), 'pi-cache-retention-'))
+      const storagePath = join(tempDir, 'anthropic-auth.json')
+      process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+      await saveNativePiFixture(
+        { version: 1, accounts: [], quota: { enabled: false } },
+        storagePath,
+      )
+      let sent: any
+      globalThis.fetch = mock(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          if (String(input).includes('/api/claude_cli/bootstrap')) {
+            return Response.json({
+              oauth_account: { account_uuid: 'pi-cache-retention' },
+            })
+          }
+          sent = JSON.parse(String(init?.body))
+          return new Response(
+            [
+              'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+              'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+              'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            ].join(''),
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        },
+      ) as unknown as typeof fetch
+      await streamCortexKitAnthropic(
+        anthropicModel,
+        normalizeContext({
+          systemPrompt: 'test',
+          tools: [],
+          messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
+        } as any) as any,
+        {
+          apiKey: 'sk-ant-oat-cache-retention',
+          sessionId: 'ses_cache_retention',
+          ...(cacheRetention ? { cacheRetention } : {}),
+        } as any,
+      ).result()
+      await rm(tempDir, { recursive: true, force: true })
+      tempDir = undefined
+      const ttls = new Set<unknown>()
+      JSON.stringify(sent, (key, value) => {
+        if (key === 'cache_control') ttls.add(value.ttl)
+        return value
+      })
+      return [...ttls]
+    }
+    // Sticky routing keeps the session on its account for the cache lifetime
+    // the request actually asked for.
+    const heldFor = () => {
+      const now = Date.now()
+      return (
+        (sessionCacheActivity.holdUntil(
+          'ses_cache_retention',
+          'main',
+          now,
+          'max',
+        ) ?? now) - now
+      )
+    }
+    try {
+      expect(await send()).toEqual([undefined])
+      expect(heldFor()).toBeLessThanOrEqual(5 * 60_000)
+      expect(await send('short')).toEqual([undefined])
+      expect(heldFor()).toBeLessThanOrEqual(5 * 60_000)
+      expect(await send('long')).toEqual(['1h'])
+      expect(heldFor()).toBeGreaterThan(55 * 60_000)
+    } finally {
+      sessionCacheActivity.forget('ses_cache_retention')
+    }
   })
 })

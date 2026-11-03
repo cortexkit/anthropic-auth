@@ -625,12 +625,20 @@ async function sendAnthropicRequest(
         verifiedUuid as ProviderAccountUuid,
       )
     : undefined
+  // Pi's per-request `cacheRetention: 'long'` asks for the provider's longest
+  // retention (Anthropic's one-hour TTL), as Pi's own Anthropic provider
+  // honours it; the account setting still enables it for all requests. The
+  // request and the session's cache lifetime for sticky routing use the same
+  // decision.
+  const oneHourCache =
+    isCache1hPersistentlyEnabled(storage) ||
+    options.streamOptions?.cacheRetention === 'long'
   const { body, bodyText, toolNames } = await buildAnthropicRequest(
     options.model.id,
     options.context,
     options.streamOptions,
     {
-      enabled: isCache1hPersistentlyEnabled(storage),
+      enabled: oneHourCache,
       mode: getCache1hPersistentMode(storage),
     },
     isFastModePersistentlyEnabled(storage),
@@ -669,9 +677,7 @@ async function sendAnthropicRequest(
       sessionCacheActivity.record(
         relayAffinity,
         routeId,
-        isCache1hPersistentlyEnabled(storage)
-          ? PROMPT_CACHE_1H_TTL_MS
-          : PROMPT_CACHE_DEFAULT_TTL_MS,
+        oneHourCache ? PROMPT_CACHE_1H_TTL_MS : PROMPT_CACHE_DEFAULT_TTL_MS,
       )
     keep.track({
       sessionId: relayAffinity,
