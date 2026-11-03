@@ -1,5 +1,5 @@
-import { afterEach, expect, test } from 'bun:test'
-import { NativeCustodyError } from '@cortexkit/anthropic-auth-core'
+import { afterEach, expect, spyOn, test } from 'bun:test'
+import { logger, NativeCustodyError } from '@cortexkit/anthropic-auth-core'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
@@ -17,6 +17,11 @@ async function instance(
   key: string,
   label: string,
   end: () => Promise<void> = async () => {},
+  compatibility: {
+    version?: string
+    before?: ReadonlyArray<keyof SessionHooks>
+    after?: ReadonlyArray<keyof SessionHooks>
+  } = {},
 ) {
   const callbacks = new Map<keyof SessionHooks, (draft: unknown) => unknown>()
   const hook: Plugin.Context['session']['hook'] = async (name, callback) => {
@@ -27,6 +32,7 @@ async function instance(
   const bridge = createReloadableRequestHooks(
     { session: { hook } } as unknown as Plugin.Context,
     key,
+    compatibility.version,
   )
   let closed = false
   const events: string[] = []
@@ -63,11 +69,19 @@ async function instance(
       await end()
     },
   }
+  const extraHooks = async (names: ReadonlyArray<keyof SessionHooks> = []) => {
+    for (const name of names)
+      await bridge.context.session.hook(name, () => {
+        events.push(`extra:${name}`)
+      })
+  }
+  await extraHooks(compatibility.before)
   const installation = await installNativeAnthropic(
     bridge.context,
     { source },
     { credential: preparedAnthropicCredential },
   )
+  await extraHooks(compatibility.after)
   bridge.activate()
   const dispose = async () => {
     bridge.retire()
@@ -228,4 +242,40 @@ test('a retired hook never forwards to a different storage key', async () => {
   await a.dispose()
   await expect(a.prepare()).rejects.toThrow('Native custody refused: closed')
   expect(b.events).toEqual([])
+})
+
+test.each([
+  {
+    mismatch: 'different plugin versions',
+    a: { version: '1.0.0' },
+    b: { version: '2.0.0' },
+  },
+  {
+    mismatch: 'different registration counts in the same version',
+    a: { version: '1.0.0' },
+    b: { version: '1.0.0', after: ['http.request' as const] },
+  },
+  {
+    mismatch: 'different registration order in the same version',
+    a: { version: '1.0.0', before: ['context' as const] },
+    b: { version: '1.0.0', after: ['context' as const] },
+  },
+])('retired hooks refuse $mismatch and log once', async (compatibility) => {
+  const key = crypto.randomUUID()
+  const a = await instance(key, 'A', undefined, compatibility.a)
+  const b = await instance(key, 'B', undefined, compatibility.b)
+  const debug = spyOn(logger, 'debug').mockImplementation(() => {})
+  cleanups.push(async () => {
+    debug.mockRestore()
+  })
+  await a.dispose()
+  await expect(a.prepare()).rejects.toThrow('Native custody refused: closed')
+  await expect(a.prepare()).rejects.toThrow('Native custody refused: closed')
+  expect(a.events).toEqual([])
+  expect(b.events).toEqual([])
+  expect(
+    debug.mock.calls.filter(([, message]) =>
+      message.includes('different plugin version'),
+    ),
+  ).toHaveLength(1)
 })

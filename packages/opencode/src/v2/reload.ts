@@ -1,12 +1,15 @@
-import { NativeCustodyError } from '@cortexkit/anthropic-auth-core'
+import { logger, NativeCustodyError } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
+import { version as pluginVersion } from '../../package.json'
 
 type Hook = keyof SessionHooks
 type Callback = (draft: SessionHooks[Hook]) => unknown
 
 interface Owner {
   readonly hooks: Map<Hook, Callback[]>
+  readonly version: string
+  readonly registrations: Array<readonly [Hook, number]>
 }
 
 interface ReloadableRequestHooks {
@@ -15,7 +18,9 @@ interface ReloadableRequestHooks {
   retire(): void
 }
 
-const SHARED = Symbol.for('cortexkit.anthropic-auth.opencode2.requests.v1')
+// Keep live setups out of the registry used by older plugin code that does
+// not check the plugin version and hook registration shape before forwarding.
+const SHARED = Symbol.for('cortexkit.anthropic-auth.opencode2.requests.v2')
 
 function shared() {
   const scope = globalThis as typeof globalThis & {
@@ -41,17 +46,36 @@ function shared() {
 export function createReloadableRequestHooks(
   ctx: Plugin.Context,
   key: string,
+  version = pluginVersion,
 ): ReloadableRequestHooks {
   const registry = shared()
-  const owner: Owner = { hooks: new Map() }
+  const owner: Owner = { hooks: new Map(), version, registrations: [] }
   const transports = new Map<string, Owner | undefined>()
   let retired = false
+  let mismatchLogged = false
 
   const newest = () => {
     if (!retired) return owner
     const live = registry.live.get(key)
     const next = live && [...live].at(-1)
     if (!next) throw new NativeCustodyError('closed')
+    // Callback positions are interchangeable only within the same plugin
+    // version and the same ordered registration shape. An update may change
+    // either, even when the callback at a particular index still exists.
+    if (
+      next.version !== owner.version ||
+      JSON.stringify(next.registrations) !== JSON.stringify(owner.registrations)
+    ) {
+      if (!mismatchLogged) {
+        mismatchLogged = true
+        logger.debug(
+          'opencode2',
+          'reload handoff refused: different plugin version or hook registration shape',
+          { version: owner.version, successorVersion: next.version },
+        )
+      }
+      throw new NativeCustodyError('closed')
+    }
     return next
   }
 
@@ -64,6 +88,7 @@ export function createReloadableRequestHooks(
     const index = callbacks.length
     callbacks.push(callback as Callback)
     owner.hooks.set(name, callbacks)
+    owner.registrations.push([name, index])
     return ctx.session.hook(
       name,
       async (draft) => {
