@@ -1772,91 +1772,103 @@ test('Pi 0.86 normalized transcript maps a returned Claude Code tool name back t
   )
 })
 
-test('maps response tool names only through the exact request snapshot', async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'pi-tool-name-snapshot-'))
-  const storagePath = join(tempDir, 'anthropic-auth.json')
-  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
-  await saveNativePiFixture(
-    { version: 1, accounts: [], quota: { enabled: false } },
-    storagePath,
-  )
-  const tool = (name: string) => ({
-    name,
-    description: name,
-    parameters: { type: 'object', properties: {} },
-  })
-  // `write` is removed by a later system entry, so the request snapshot holds
-  // read, bash and the mixed-case custom tool only.
-  const context = normalizeContext({
-    messages: [
-      { role: 'user', content: 'inspect', timestamp: 0 },
-      {
-        role: 'system',
-        content: '',
-        toolsRemoved: [tool('write')],
-        toolsAdded: [tool('myCustomHTTPTool')],
-        timestamp: 1,
-      },
-    ],
-    tools: [tool('read'), tool('bash'), tool('write')],
-  } as any)
-  let requestBody: any
-  const wireCalls = [
-    ['Read', 'call_read'],
-    ['Bash', 'call_bash'],
-    ['myCustomHTTPTool', 'call_custom'],
-    // Not in the snapshot: neither may be case-folded onto a host tool.
-    ['Write', 'call_removed'],
-    ['MYCUSTOMHTTPTOOL', 'call_casefold'],
-  ] as const
-  const frames = [
-    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
-    ...wireCalls.flatMap(([name, id], index) => [
-      `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'tool_use', id, name } })}\n\n`,
-      `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: '{}' } })}\n\n`,
-      `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index })}\n\n`,
-    ]),
-    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}\n\n',
-    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-  ].join('')
-  globalThis.fetch = mock(
-    async (input: string | URL | Request, init?: RequestInit) => {
-      if (String(input).includes('/api/claude_cli/bootstrap')) {
-        return Response.json({
-          oauth_account: { account_uuid: 'tool-name-test' },
+test.each([false, true])(
+  'maps response tool names only through the exact request snapshot (hook removes Bash: %s)',
+  async (removeBash) => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-tool-name-snapshot-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      { version: 1, accounts: [], quota: { enabled: false } },
+      storagePath,
+    )
+    const tool = (name: string) => ({
+      name,
+      description: name,
+      parameters: { type: 'object', properties: {} },
+    })
+    // `write` is removed by a later system entry, so the request snapshot holds
+    // read, bash and the mixed-case custom tool only.
+    const context = normalizeContext({
+      messages: [
+        { role: 'user', content: 'inspect', timestamp: 0 },
+        {
+          role: 'system',
+          content: '',
+          toolsRemoved: [tool('write')],
+          toolsAdded: [tool('myCustomHTTPTool')],
+          timestamp: 1,
+        },
+      ],
+      tools: [tool('read'), tool('bash'), tool('write')],
+    } as any)
+    let requestBody: any
+    const wireCalls = [
+      ['Read', 'call_read'],
+      ['Bash', 'call_bash'],
+      ['myCustomHTTPTool', 'call_custom'],
+      // Not in the snapshot: neither may be case-folded onto a host tool.
+      ['Write', 'call_removed'],
+      ['MYCUSTOMHTTPTOOL', 'call_casefold'],
+    ] as const
+    const frames = [
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+      ...wireCalls.flatMap(([name, id], index) => [
+        `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'tool_use', id, name } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: '{}' } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index })}\n\n`,
+      ]),
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).includes('/api/claude_cli/bootstrap')) {
+          return Response.json({
+            oauth_account: { account_uuid: 'tool-name-test' },
+          })
+        }
+        requestBody = JSON.parse(String(init?.body))
+        return new Response(frames, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
         })
-      }
-      requestBody = JSON.parse(String(init?.body))
-      return new Response(frames, {
-        status: 200,
-        headers: { 'content-type': 'text/event-stream' },
-      })
-    },
-  ) as unknown as typeof fetch
+      },
+    ) as unknown as typeof fetch
 
-  const result = await streamCortexKitAnthropic(
-    anthropicModel,
-    context as any,
-    { apiKey: 'sk-ant-oat-tool-name', sessionId: 'ses_tool_name_snapshot' },
-  ).result()
+    const result = await streamCortexKitAnthropic(
+      anthropicModel,
+      context as any,
+      {
+        apiKey: 'sk-ant-oat-tool-name',
+        sessionId: 'ses_tool_name_snapshot',
+        ...(removeBash && {
+          onPayload: (payload: unknown) => {
+            const body = payload as { tools: Array<{ name: string }> }
+            body.tools = body.tools.filter((tool) => tool.name !== 'Bash')
+          },
+        }),
+      },
+    ).result()
 
-  expect(requestBody.tools.map((tool: any) => tool.name)).toEqual([
-    'Read',
-    'Bash',
-    'myCustomHTTPTool',
-  ])
-  expect(
-    result.content
-      .filter((part: any) => part.type === 'toolCall')
-      .map((call: any) => [call.name, call.id]),
-  ).toEqual([
-    ['read', 'call_read'],
-    ['bash', 'call_bash'],
-    ['myCustomHTTPTool', 'call_custom'],
-    ['Write', 'call_removed'],
-    ['MYCUSTOMHTTPTOOL', 'call_casefold'],
-  ])
-})
+    expect(requestBody.tools.map((tool: any) => tool.name)).toEqual([
+      'Read',
+      ...(!removeBash ? ['Bash'] : []),
+      'myCustomHTTPTool',
+    ])
+    expect(
+      result.content
+        .filter((part: any) => part.type === 'toolCall')
+        .map((call: any) => [call.name, call.id]),
+    ).toEqual([
+      ['read', 'call_read'],
+      [removeBash ? 'Bash' : 'bash', 'call_bash'],
+      ['myCustomHTTPTool', 'call_custom'],
+      ['Write', 'call_removed'],
+      ['MYCUSTOMHTTPTOOL', 'call_casefold'],
+    ])
+  },
+)
 
 // Pi's provider contract: a provider calls `options.onPayload` before sending
 // and uses any replacement it returns. Hosts rely on it to place their own

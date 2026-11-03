@@ -723,7 +723,7 @@ export async function buildAnthropicRequest(
     messages,
   }
 
-  const toolNames = createClaudeCodeToolNameMap(context.tools ?? [])
+  const declaredToolNames = createClaudeCodeToolNameMap(context.tools ?? [])
   const tools = convertTools(context.tools)
   if (tools?.length) body.tools = tools
 
@@ -826,8 +826,13 @@ export async function buildAnthropicRequest(
     )
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
-  // The stream decoder must use the exact wire-name snapshot that produced this
-  // body. Pi 0.86's transcript has no top-level context.tools, and normalizing
-  // it again after dispatch would duplicate work and risk a different mapping.
+  // Translate only known host/wire pairs that survived the hook and JSON
+  // serialization. Hook-added or renamed tools must not acquire an alias, and
+  // response decoding must never change outgoing names or signed history.
+  const sentBody = JSON.parse(bodyText) as AnthropicRequestBody
+  const sentNames = new Set(sentBody.tools?.map((tool) => tool.name))
+  const toolNames = new Map(
+    [...declaredToolNames].filter(([wireName]) => sentNames.has(wireName)),
+  )
   return { body, bodyText, toolNames }
 }

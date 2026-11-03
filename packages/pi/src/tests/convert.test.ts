@@ -1855,3 +1855,119 @@ describe('Anthropic tool-name snapshots', () => {
     ).rejects.toThrow(/tool name collision/u)
   })
 })
+
+test('response aliases leave main serialized messages, wire names and signed history unchanged', async () => {
+  const context = {
+    messages: [
+      userMsg('inspect'),
+      {
+        ...thinkingToolMsg('signed reasoning', 'opaque-signature', 'call_1'),
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'signed reasoning',
+            thinkingSignature: 'opaque-signature',
+          },
+          {
+            type: 'toolCall',
+            id: 'call_1',
+            name: 'bash',
+            arguments: { command: 'pwd' },
+          },
+        ],
+      },
+      toolResultMsg('call_1', '/work'),
+      userMsg('continue'),
+    ],
+    tools: ['bash', 'myCustomHTTPTool'].map((name) => ({
+      name,
+      description: name,
+      parameters: { type: 'object', properties: {} },
+    })),
+  } as Context
+  const { bodyText } = await buildAnthropicRequest(
+    TEST_MODEL_ID,
+    context,
+    undefined,
+    defaultCache,
+  )
+  const sent = JSON.parse(bodyText)
+  // Literal wire fixtures: alias decoding must not rewrite history
+  // or the signed thinking bytes while tightening response-name translation.
+  expect(JSON.stringify(sent.messages)).toBe(
+    JSON.stringify([
+      { role: 'user', content: 'inspect' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'signed reasoning',
+            signature: 'opaque-signature',
+          },
+          {
+            type: 'tool_use',
+            id: 'call_1',
+            name: 'Bash',
+            input: { command: 'pwd' },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call_1', content: '/work' },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'continue',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+    ]),
+  )
+  expect(JSON.stringify(sent.tools)).toBe(
+    JSON.stringify([
+      {
+        name: 'Bash',
+        description: 'bash',
+        input_schema: { type: 'object', properties: {}, required: [] },
+      },
+      {
+        name: 'myCustomHTTPTool',
+        description: 'myCustomHTTPTool',
+        input_schema: { type: 'object', properties: {}, required: [] },
+        cache_control: { type: 'ephemeral' },
+      },
+    ]),
+  )
+})
+
+test('snapshots response aliases from serialized declarations after the hook', async () => {
+  const { bodyText, toolNames } = await buildAnthropicRequest(
+    TEST_MODEL_ID,
+    {
+      messages: [userMsg('inspect')],
+      tools: [
+        { name: 'bash', description: 'bash', parameters: Type.Object({}) },
+      ],
+    } as Context,
+    undefined,
+    defaultCache,
+    false,
+    undefined,
+    {
+      onPayload: (body) => {
+        const tool = body.tools![0]!
+        tool.toJSON = () => ({ ...tool, name: 'hookTool' })
+      },
+    },
+  )
+  expect(JSON.parse(bodyText).tools[0].name).toBe('hookTool')
+  expect([...toolNames]).toEqual([])
+})
