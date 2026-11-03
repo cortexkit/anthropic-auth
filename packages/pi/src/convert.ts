@@ -813,9 +813,11 @@ export async function buildAnthropicRequest(
   const replaced = controls.onPayload
     ? await controls.onPayload(body)
     : undefined
-  if (replaced !== undefined) body = replaced as AnthropicRequestBody
-  // A host hook may add breakpoints; Anthropic rejects a fifth before the
-  // model runs, so refuse the request here with the reason instead.
+  if (replaced !== undefined)
+    body = { ...(replaced as AnthropicRequestBody), stream: true }
+  // As in Pi's native adapter, replacements must still request SSE. Hooks own
+  // the validity of their other edits and must not add a fifth cache breakpoint:
+  // the provider's existing layout may already use Anthropic's four slots.
   let breakpoints = 0
   walkCacheControlHolders(body, () => {
     breakpoints += 1

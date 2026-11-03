@@ -1938,6 +1938,7 @@ describe('Pi onPayload hook', () => {
       seen.push({ payload: structuredClone(payload as object), model })
       // A host breakpoint on its own block, only on the returned replacement.
       const body = structuredClone(payload) as Record<string, any>
+      body.stream = false
       const user = body.messages.find((message: any) => message.role === 'user')
       const view = user.content.find((block: any) => block.text === 'host view')
       view.cache_control = { type: 'ephemeral', ttl: '1h' }
@@ -1948,12 +1949,39 @@ describe('Pi onPayload hook', () => {
     // The hook sees the provider's own breakpoints already placed.
     expect(JSON.stringify(seen[0]?.payload)).toContain('cache_control')
     const body = JSON.parse(sent)
+    expect(body.stream).toBe(true)
     const user = body.messages.find((message: any) => message.role === 'user')
     expect(
       user.content.find((block: any) => block.text === 'host view')
         ?.cache_control,
     ).toEqual({ type: 'ephemeral', ttl: '1h' })
     // Signed over the replaced body: re-signing the sent body reproduces it.
+    expect(await signRequestBody(resetBillingHeaderCCH(sent))).toBe(sent)
+  })
+
+  test('adopts an async replacement and forces SSE before signing', async () => {
+    const sent = await capture(async (payload) => {
+      await Promise.resolve()
+      const body = structuredClone(payload) as Record<string, any>
+      body.stream = false
+      body.messages[0].content.push({ type: 'text', text: 'async replacement' })
+      return body
+    })
+    const body = JSON.parse(sent)
+    expect(body.stream).toBe(true)
+    expect(body.messages[0].content.at(-1).text).toBe('async replacement')
+    expect(await signRequestBody(resetBillingHeaderCCH(sent))).toBe(sent)
+  })
+
+  test('signs in-place edits when the hook returns undefined', async () => {
+    const sent = await capture((payload) => {
+      const body = payload as Record<string, any>
+      body.messages[0].content.push({ type: 'text', text: 'in-place edit' })
+      return undefined
+    })
+    expect(JSON.parse(sent).messages[0].content.at(-1).text).toBe(
+      'in-place edit',
+    )
     expect(await signRequestBody(resetBillingHeaderCCH(sent))).toBe(sent)
   })
 

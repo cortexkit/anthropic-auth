@@ -1971,3 +1971,52 @@ test('snapshots response aliases from serialized declarations after the hook', a
   expect(JSON.parse(bodyText).tools[0].name).toBe('hookTool')
   expect([...toolNames]).toEqual([])
 })
+
+test.each([
+  {
+    parts: ['host view', 'host input', ''],
+    selected: 'host input',
+    sessionId: 'pi-multipart-visible',
+  },
+  {
+    parts: [
+      'reminder\n<command-name>/audit</command-name> payload',
+      'later visible text',
+    ],
+    selected: '<command-name>/audit</command-name> payload',
+    sessionId: 'pi-multipart-command',
+  },
+])(
+  'pins the selected multi-part first-user suffix across later turns: $sessionId',
+  async ({ parts, selected, sessionId }) => {
+    const firstUser: Message = {
+      role: 'user',
+      content: parts.map((text) => ({ type: 'text' as const, text })),
+      timestamp: 0,
+    }
+    const build = async (messages: Message[]) =>
+      (
+        await buildAnthropicRequest(
+          TEST_MODEL_ID,
+          { messages, tools: [] } as Context,
+          { sessionId },
+          defaultCache,
+        )
+      ).body
+    const first = await build([firstUser])
+    // The extractor prefers the command block, otherwise the last nonempty text
+    // block, not a newline-joined view of every part of the first user message.
+    const expectedSuffix = `cc_version=${CLAUDE_CODE_VERSION}.${computeCcVersionSuffix(selected, CLAUDE_CODE_VERSION)};`
+    expect(String(first.system?.[0]?.text)).toContain(expectedSuffix)
+    const later = await build([
+      firstUser,
+      assistantMsg('reply'),
+      userMsg('new turn'),
+    ])
+    const compacted = await build([
+      userMsg('compacted summary with different text'),
+    ])
+    expect(later.system?.[0]?.text).toBe(first.system?.[0]?.text)
+    expect(compacted.system?.[0]?.text).toBe(first.system?.[0]?.text)
+  },
+)
