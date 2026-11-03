@@ -35,19 +35,72 @@ function hash(value: unknown): string {
 }
 
 // Cache placement is transport-local and may move as the history grows.
-function stripped(value: unknown, canonical = true): unknown {
-  if (Array.isArray(value))
-    return value.map((item) => stripped(item, canonical))
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue)
   if (value && typeof value === 'object') {
-    const entries = Object.entries(value).filter(
-      ([key]) => key !== 'cache_control',
-    )
-    if (canonical) entries.sort(([a], [b]) => a.localeCompare(b))
     return Object.fromEntries(
-      entries.map(([key, item]) => [key, stripped(item, canonical)]),
+      Object.entries(value)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, canonicalValue(item)]),
     )
   }
   return value
+}
+
+function isBody(value: unknown): value is Body {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function withoutOwnCache(value: unknown): unknown {
+  if (!isBody(value)) return value
+  const copy = { ...value }
+  delete copy.cache_control
+  return copy
+}
+
+function withoutContentCache(content: unknown): unknown {
+  if (!Array.isArray(content)) return content
+  return content.map((block) => {
+    const copy = withoutOwnCache(block)
+    if (isBody(copy) && copy.type === 'tool_result')
+      copy.content = withoutContentCache(copy.content)
+    return copy
+  })
+}
+
+function withoutMessageCache(message: unknown): unknown {
+  if (!isBody(message)) return message
+  return { ...message, content: withoutContentCache(message.content) }
+}
+
+// Only protocol annotation holders count; tool arguments and schemas are data.
+function contentCacheHolders(content: unknown): Body[] {
+  if (!Array.isArray(content)) return []
+  const holders: Body[] = []
+  for (const block of content) {
+    if (!isBody(block)) continue
+    if (block.cache_control) holders.push(block)
+    if (block.type === 'tool_result')
+      holders.push(...contentCacheHolders(block.content))
+  }
+  return holders
+}
+
+function messageCacheHolders(messages: unknown): Body[] {
+  if (!Array.isArray(messages)) return []
+  return messages.flatMap((message) =>
+    isBody(message) ? contentCacheHolders(message.content) : [],
+  )
+}
+
+function fixedCacheHolders(body: Body): Body[] {
+  return [body.system, body.tools].flatMap((items) =>
+    Array.isArray(items)
+      ? items.filter(
+          (item): item is Body => isBody(item) && Boolean(item.cache_control),
+        )
+      : [],
+  )
 }
 
 export function messageThreadSnapshot(
@@ -74,14 +127,17 @@ export function messageThreadSnapshot(
     ].map((key) => [key, body[key]]),
   )
   const messages = (Array.isArray(body.messages) ? body.messages : []).map(
-    (message) => hash(stripped(message)),
+    (message) => hash(canonicalValue(withoutMessageCache(message))),
   )
   return {
     identity: hash([input.account, input.credential]),
     fingerprint: hash(
-      stripped({
+      canonicalValue({
         ...fixed,
-        system,
+        tools: Array.isArray(body.tools)
+          ? body.tools.map(withoutOwnCache)
+          : body.tools,
+        system: Array.isArray(system) ? system.map(withoutOwnCache) : system,
         fallbacks: Object.hasOwn(body, 'fallbacks'),
         betas: input.betas,
       }),
@@ -323,26 +379,8 @@ export function observeMessageThreadResponse(
 }
 
 function placeContinueCache(body: Body, full: Body): void {
-  const holders = (value: unknown): Body[] => {
-    const result: Body[] = []
-    const visit = (item: unknown) => {
-      if (!item || typeof item !== 'object') return
-      if (Array.isArray(item)) {
-        for (const child of item) visit(child)
-        return
-      }
-      const record = item as Body
-      if (record.cache_control) result.push(record)
-      for (const [key, child] of Object.entries(record)) {
-        if (key !== 'cache_control') visit(child)
-      }
-    }
-    visit(value)
-    return result
-  }
-
   // Fixed fields keep their exact wire shape, including existing breakpoints.
-  const fixed = [...holders(body.system), ...holders(body.tools)]
+  const fixed = fixedCacheHolders(body)
   let remaining = Math.max(0, 4 - fixed.length)
   const messages = structuredClone(body.messages) as Array<{
     content?: unknown
@@ -351,7 +389,7 @@ function placeContinueCache(body: Body, full: Body): void {
   delete body.cache_control
   const template =
     full.cache_control ??
-    [...holders(full.messages), ...fixed][0]?.cache_control
+    [...messageCacheHolders(full.messages), ...fixed][0]?.cache_control
   const last = messages.at(-1)
   if (last && remaining > 0 && template && typeof last.content === 'string') {
     last.content = [{ type: 'text', text: last.content }]
@@ -370,7 +408,7 @@ function placeContinueCache(body: Body, full: Body): void {
     reserved = cacheableLastBlock
     remaining--
   }
-  for (const holder of holders(messages)) {
+  for (const holder of messageCacheHolders(messages)) {
     if (holder === reserved) continue
     if (remaining > 0) remaining--
     else delete holder.cache_control

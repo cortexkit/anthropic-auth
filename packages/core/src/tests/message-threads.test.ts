@@ -126,6 +126,9 @@ describe('message threads', () => {
         cache_control: { type: 'ephemeral' },
       },
     ]
+    request.body.messages = [
+      { role: 'user', content: [{ type: 'text', text: 'one' }] },
+    ]
     anchor(tracker, request)
     const continued = advance(request)
     continued.body.system = [
@@ -133,7 +136,12 @@ describe('message threads', () => {
       { type: 'text', text: 'instructions' },
     ]
     continued.body.messages = [
-      { role: 'user', content: 'one', cache_control: { type: 'ephemeral' } },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'one', cache_control: { type: 'ephemeral' } },
+        ],
+      },
       assistant,
       next,
     ]
@@ -550,3 +558,126 @@ test.each([undefined, {}, { custom: 'retained' }])(
     })
   },
 )
+
+test('audit protocol cache: historical tool arguments named cache_control are semantic data', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const call = {
+    role: 'assistant',
+    content: [
+      {
+        type: 'tool_use',
+        id: 'old_call',
+        name: 'read',
+        input: { cache_control: 'original', path: 'file' },
+      },
+    ],
+  }
+  const result = {
+    role: 'user',
+    content: [
+      { type: 'tool_result', tool_use_id: 'old_call', content: 'result' },
+    ],
+  }
+  const first = (request.body.messages as unknown[])[0]
+  request.body.messages = [first, call, result]
+  anchor(tracker, request)
+  const edited = {
+    ...call,
+    content: [
+      { ...call.content[0], input: { cache_control: 'edited', path: 'file' } },
+    ],
+  }
+  expect(
+    tracker.prepare({
+      ...request,
+      body: {
+        ...request.body,
+        messages: [first, edited, result, assistant, next],
+      },
+    }).decision.type,
+  ).toBe('create')
+})
+
+test('audit protocol cache: schema properties named cache_control affect the fingerprint', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const schema = (description: string) => [
+    {
+      name: 'read',
+      input_schema: {
+        type: 'object',
+        properties: { cache_control: { type: 'string', description } },
+      },
+    },
+  ]
+  request.body.tools = schema('original')
+  anchor(tracker, request)
+  const continued = advance(request)
+  continued.body.tools = schema('edited')
+  expect(tracker.prepare(continued).decision.type).toBe('create')
+})
+
+test('audit protocol cache: schema data neither consumes nor loses a breakpoint', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const cc = { type: 'ephemeral', ttl: '1h' }
+  request.body.system = [0, 1].map((i) => ({
+    type: 'text',
+    text: `system ${i}`,
+    cache_control: cc,
+  }))
+  request.body.tools = [
+    {
+      name: 'read',
+      input_schema: {
+        type: 'object',
+        properties: { cache_control: { type: 'string' } },
+      },
+      cache_control: cc,
+    },
+  ]
+  anchor(tracker, request)
+  const delta = {
+    role: 'user',
+    content: [{ type: 'text', text: 'next', cache_control: cc }],
+  }
+  const body = tracker.prepare({
+    ...request,
+    body: {
+      ...request.body,
+      messages: [...(request.body.messages as unknown[]), assistant, delta],
+    },
+  }).body
+  expect(JSON.stringify(body.tools)).toBe(JSON.stringify(request.body.tools))
+  expect(body.messages).toEqual([delta])
+})
+
+test('audit protocol cache: only nested tool-result block annotations are ignored', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const message = (ttl: string) => ({
+    role: 'user',
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: 'old',
+        content: [
+          {
+            type: 'text',
+            text: '{"cache_control":"ordinary JSON text"}',
+            cache_control: { type: 'ephemeral', ttl },
+          },
+        ],
+      },
+    ],
+  })
+  request.body.messages = [message('5m')]
+  anchor(tracker, request)
+  const body = tracker.prepare({
+    ...request,
+    body: { ...request.body, messages: [message('1h'), assistant, next] },
+  }).body
+  expect(body.thread).toMatchObject({ type: 'continue' })
+  expect((request.body.messages as unknown[])[0]).toEqual(message('5m'))
+})
