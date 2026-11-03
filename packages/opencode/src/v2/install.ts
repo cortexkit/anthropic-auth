@@ -19,6 +19,7 @@ export interface NativeAnthropicInstallation<Q, P> {
     NativeAnthropicAttemptData<P>
   >
   readonly forgetSession: (sessionID: string) => void
+  readonly drain: () => Promise<void>
   readonly dispose: () => Promise<void>
 }
 
@@ -33,6 +34,24 @@ export async function installNativeAnthropic<Q, P>(
   ownership: NonNullable<InstallOpenCode2AuthOptions['gateOnPlaceholder']>,
 ): Promise<NativeAnthropicInstallation<Q, P>> {
   const native = createNativeAnthropicAdapter(deps)
+  const endings = new Set<Promise<void>>()
+  const adapter: typeof native.adapter = {
+    ...native.adapter,
+    onAttemptEnd(attempt, outcome) {
+      const pending = Promise.resolve(
+        native.adapter.onAttemptEnd?.(attempt, outcome),
+      )
+      endings.add(pending)
+      void pending.finally(() => endings.delete(pending)).catch(() => {})
+      return pending
+    },
+  }
+  // common-auth starts abandonment callbacks during dispose without awaiting
+  // them. Keep the runtime lease until those callbacks finish recording usage
+  // and credential failures.
+  const drain = async () => {
+    await Promise.allSettled([...endings])
+  }
   const registrations: Registration[] = []
   const hook: Plugin.Context['session']['hook'] = async (
     name,
@@ -61,7 +80,7 @@ export async function installNativeAnthropic<Q, P>(
   try {
     installation = await installOpenCode2Auth(
       { session: { hook }, event: ctx.event },
-      native.adapter,
+      adapter,
       {
         logger: deps.log,
         gateOnPlaceholder: ownership,
@@ -110,6 +129,7 @@ export async function installNativeAnthropic<Q, P>(
   return {
     installation,
     forgetSession,
+    drain,
     dispose() {
       if (cleanup) return cleanup
       // Cancel credential callbacks before awaiting hook removal, so a
@@ -119,6 +139,7 @@ export async function installNativeAnthropic<Q, P>(
       cleanup = (async () => {
         await installation.dispose()
         await listener
+        await drain()
       })()
       return cleanup
     },

@@ -290,6 +290,7 @@ export {
   acquireNativeVaultRuntime,
   createNativeVaultRuntime,
   discoverNativeVaultInventory,
+  nativeVaultRuntimeKey,
   publishNativeVaultRosterSeed,
   publishNativeVaultRuntimeSeed,
 } from './native-vault-runtime.ts'

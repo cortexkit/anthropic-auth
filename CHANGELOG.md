@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- On OpenCode 2, a plugin reload no longer fails the next step of a Claude turn that was already running with "Native custody refused: closed"; the step is served by the reloaded plugin. Addresses #605.
 - In sticky-balanced routing, after a rate limit Anthropic doesn't confirm as a used-up limit, a session now retries its own account at most twice per turn (up to a minute each), then moves to another account. OpenCode 2 used to move at once, and OpenCode 1 retried until OpenCode gave up.
 ## 2.4.13
 

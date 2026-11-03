@@ -14,6 +14,7 @@ import {
   type NativeHolderRegistration,
   type NativePoolPaths,
   type NativeUiOptions,
+  nativeVaultRuntimeKey,
   openCodeHolderKind,
   readNativeEnrollmentMode,
   registerNativePoolHolder,
@@ -43,6 +44,7 @@ import { createNativeMenuCapabilities } from './menu'
 import { createNativeClaudeModelRules } from './models'
 import { preparedAnthropicCredential } from './ownership'
 import { createNativePrime } from './prime'
+import { createReloadableRequestHooks } from './reload'
 import { registerNativeMenu } from './rpc'
 import { createNativeAnthropicSource, type NativeSource } from './source'
 import { createNativeWirePolicy } from './wire'
@@ -304,6 +306,11 @@ export async function setupAnthropicAuth(
   options: AnthropicAuthV2Options = {},
 ): Promise<Plugin.Cleanup> {
   const { paths, holderRegistration } = await decideNativePaths(options)
+  const requests = createReloadableRequestHooks(
+    ctx,
+    nativeVaultRuntimeKey({ ...options.vault, paths, host: 'opencode' }),
+  )
+  ctx = requests.context
   const runtime = acquireNativeAccountRuntime({
     paths,
     host: 'opencode',
@@ -418,6 +425,7 @@ export async function setupAnthropicAuth(
   const dispose = () => {
     if (cleanup) return cleanup
     active = false
+    requests.retire()
     holderRegistration?.close()
     capabilities.close()
     source.close()
@@ -431,6 +439,7 @@ export async function setupAnthropicAuth(
       ])
       // Prime and transport teardown can finish attempts after source shutdown
       // begins. Join their advisory usage writes before closing the runtime.
+      await installation.drain()
       await source.close()
       // A quota reading taken by a request or poll is written after the
       // reading returns. Closing the runtime first would refuse that write and
@@ -468,6 +477,7 @@ export async function setupAnthropicAuth(
     registrations.push(await registerNativeMenu(ctx, command, capabilities))
     // Only a completed, explicit Claude-pool login selects the plugin's inert
     // OAuth connection. Startup never creates or replaces a host connection.
+    requests.activate()
     return dispose
   } catch (error) {
     await dispose()
