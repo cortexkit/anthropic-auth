@@ -283,7 +283,7 @@ test.each([
   },
 )
 
-test('continue cache budget keeps system and delta markers, not old-history or tool markers', () => {
+test('continue preserves fixed tool and system bytes and maps automatic caching onto the delta', () => {
   const tracker = new MessageThreadTracker()
   const request = input()
   const cc = { type: 'ephemeral', ttl: '1h' }
@@ -302,7 +302,12 @@ test('continue cache budget keeps system and delta markers, not old-history or t
   const continued = tracker.prepare(advance(request)).body
   expect(continued.thread).toMatchObject({ type: 'continue' })
   expect(continued.cache_control).toBeUndefined()
-  expect(continued.tools).toEqual([{ name: 'read' }])
+  expect(JSON.stringify(continued.tools)).toBe(
+    JSON.stringify(request.body.tools),
+  )
+  expect(JSON.stringify(continued.system)).toBe(
+    JSON.stringify(request.body.system),
+  )
   expect(
     JSON.stringify(continued).match(/"cache_control"/g)?.length,
   ).toBeLessThanOrEqual(4)
@@ -465,3 +470,65 @@ test('uncorrelated main requests create without sharing an anchor', async () => 
   expect(JSON.parse(nextRequest.bodyText).thread).toEqual({ type: 'create' })
   expect(JSON.parse(nextRequest.bodyText).messages).toHaveLength(3)
 })
+
+test.each([0, 1, 2, 3, 4])(
+  'continue budgets fixed tool and system markers first (%s fixed markers)',
+  (fixedCount) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    const cc = { type: 'ephemeral', ttl: '1h' }
+    const systemCount = Math.min(2, fixedCount)
+    request.body.system = Array.from({ length: systemCount }, (_, i) => ({
+      type: 'text',
+      text: `system ${i}`,
+      cache_control: cc,
+    }))
+    request.body.tools = Array.from(
+      { length: fixedCount - systemCount },
+      (_, i) => ({
+        name: `tool_${i}`,
+        input_schema: { type: 'object' },
+        cache_control: cc,
+      }),
+    )
+    request.body.cache_control = cc
+    anchor(tracker, request)
+    const delta = ['early delta', 'last delta'].map((text) => ({
+      role: 'user',
+      content: [{ type: 'text', text, cache_control: cc }],
+    }))
+    const continued = tracker.prepare({
+      ...request,
+      body: {
+        ...request.body,
+        messages: [
+          ...(request.body.messages as unknown[]),
+          assistant,
+          ...delta,
+        ],
+      },
+    }).body
+    expect(continued.thread).toMatchObject({ type: 'continue' })
+    expect(JSON.stringify(continued.system)).toBe(
+      JSON.stringify(request.body.system),
+    )
+    expect(JSON.stringify(continued.tools)).toBe(
+      JSON.stringify(request.body.tools),
+    )
+    expect(continued.cache_control).toBeUndefined()
+    const count = (value: unknown) =>
+      (JSON.stringify(value).match(/"cache_control"/g) ?? []).length
+    expect(count(continued)).toBeLessThanOrEqual(4)
+    expect(count({ tools: continued.tools, system: continued.system })).toBe(
+      fixedCount,
+    )
+    expect(count(continued.messages)).toBeLessThanOrEqual(4 - fixedCount)
+    const messages = continued.messages as typeof delta
+    expect(messages.at(-1)?.content.at(-1)?.cache_control).toEqual(
+      fixedCount === 4 ? undefined : cc,
+    )
+    expect(
+      delta.every((message) => message.content[0]?.cache_control === cc),
+    ).toBe(true)
+  },
+)

@@ -2572,11 +2572,21 @@ for (const transport of ['direct', 'http'] as const) {
         },
         { fetch: fetchImpl, cacheKeep: keep },
       )
-    await (await send(context)).text()
-    const history: Context = {
+    const threadContext: Context = {
       ...context,
+      tools: [
+        {
+          name: 'read',
+          description: 'Read a file',
+          parameters: { properties: {}, required: [] },
+        },
+      ],
+    }
+    await (await send(threadContext)).text()
+    const history: Context = {
+      ...threadContext,
       messages: [
-        ...context.messages,
+        ...threadContext.messages,
         {
           role: 'assistant',
           api: 'anthropic-messages',
@@ -2615,8 +2625,15 @@ for (const transport of ['direct', 'http'] as const) {
     expect(second.messages).toHaveLength(1)
     expect(JSON.stringify(second.messages)).toContain('Next prompt')
     expect(JSON.stringify(second.messages)).not.toContain('Hello')
-    expect(second.tools).toEqual(first.tools)
-    expect(second.system.slice(1)).toEqual(first.system.slice(1))
+    const oneHourControl = { type: 'ephemeral', ttl: '1h' }
+    expect(first.tools.at(-1)?.cache_control).toEqual(oneHourControl)
+    expect(first.system.at(-1)?.cache_control).toEqual(oneHourControl)
+    expect(JSON.stringify(second.tools)).toBe(JSON.stringify(first.tools))
+    // The body signature (cch) changes when history is sliced. All other system
+    // bytes, including cache controls, must remain identical.
+    const systemBytes = (system: unknown) =>
+      JSON.stringify(system).replace(/cch=[a-f0-9]{5}/g, 'cch=00000')
+    expect(systemBytes(second.system)).toBe(systemBytes(first.system))
     expect(second.system[0].text.match(/cc_version=[^;]+/)?.[0]).toBe(
       first.system[0].text.match(/cc_version=[^;]+/)?.[0],
     )
@@ -2650,11 +2667,11 @@ for (const transport of ['direct', 'http'] as const) {
       'unrelated',
     ]) {
       const sessionId = `pi-thread-error-${code}`
-      await (await send(context, sessionId)).text()
+      await (await send(threadContext, sessionId)).text()
       const current: Context = {
-        ...context,
+        ...threadContext,
         messages: [
-          ...context.messages,
+          ...threadContext.messages,
           replay,
           { role: 'user', content: `Following ${code}`, timestamp: 3 },
         ],

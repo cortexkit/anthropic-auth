@@ -321,45 +321,57 @@ export function observeMessageThreadResponse(
 }
 
 function placeContinueCache(body: Body, full: Body): void {
-  const system = structuredClone(body.system)
+  const holders = (value: unknown): Body[] => {
+    const result: Body[] = []
+    const visit = (item: unknown) => {
+      if (!item || typeof item !== 'object') return
+      if (Array.isArray(item)) {
+        for (const child of item) visit(child)
+        return
+      }
+      const record = item as Body
+      if (record.cache_control) result.push(record)
+      for (const [key, child] of Object.entries(record)) {
+        if (key !== 'cache_control') visit(child)
+      }
+    }
+    visit(value)
+    return result
+  }
+
+  // Fixed fields keep their exact wire shape, including existing breakpoints.
+  const fixed = [...holders(body.system), ...holders(body.tools)]
+  let remaining = Math.max(0, 4 - fixed.length)
   const messages = structuredClone(body.messages) as Array<{
     content?: unknown
   }>
-  body.system = system
   body.messages = messages
-  body.tools = stripped(body.tools, false)
   delete body.cache_control
-  let remaining = 4
-  let template: unknown = full.cache_control
-  const visit = (value: unknown, keep?: boolean) => {
-    if (!value || typeof value !== 'object') return
-    if (Array.isArray(value)) {
-      for (const child of value) visit(child, keep)
-      return
-    }
-    const record = value as Body
-    if (record.cache_control) {
-      template ??= record.cache_control
-      if (keep === false || (keep === true && remaining === 0))
-        delete record.cache_control
-      else if (keep === true) remaining--
-    }
-    for (const [key, child] of Object.entries(record))
-      if (key !== 'cache_control') visit(child, keep)
-  }
-  // Read cache-control settings from full history before placing delta breakpoints.
-  visit(full.messages)
-  visit(system, true)
-  visit(messages, true)
+  const template =
+    full.cache_control ??
+    [...holders(full.messages), ...fixed][0]?.cache_control
   const last = messages.at(-1)
-  if (last && remaining > 0 && template) {
-    if (typeof last.content === 'string')
-      last.content = [{ type: 'text', text: last.content }]
-    if (Array.isArray(last.content)) {
-      const block = last.content.at(-1)
-      if (block && typeof block === 'object' && !block.cache_control)
-        block.cache_control = template
-    }
+  if (last && remaining > 0 && template && typeof last.content === 'string') {
+    last.content = [{ type: 'text', text: last.content }]
+  }
+  const lastBlock = Array.isArray(last?.content)
+    ? last.content.at(-1)
+    : undefined
+  const cacheableLastBlock =
+    lastBlock && typeof lastBlock === 'object' ? (lastBlock as Body) : undefined
+  const lastControl =
+    full.cache_control ?? cacheableLastBlock?.cache_control ?? template
+  let reserved: Body | undefined
+  // Automatic caching belongs on the last delta block, within the remaining budget.
+  if (cacheableLastBlock && lastControl && remaining > 0) {
+    cacheableLastBlock.cache_control = lastControl
+    reserved = cacheableLastBlock
+    remaining--
+  }
+  for (const holder of holders(messages)) {
+    if (holder === reserved) continue
+    if (remaining > 0) remaining--
+    else delete holder.cache_control
   }
 }
 
