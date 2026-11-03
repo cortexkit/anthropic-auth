@@ -188,6 +188,10 @@ export class BillingLineageTracker {
     return true
   }
 
+  promptIdForHeader(value: string | null | undefined): string | undefined {
+    return value ? this.#requests.get(value)?.promptId : undefined
+  }
+
   resolveHeader(
     value: string | null | undefined,
   ): BillingLineageContext | undefined {

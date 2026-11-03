@@ -4,6 +4,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Updated `@cortexkit/common-auth` to 0.34.0 (Windows lock-release retry, quota sidebar fixes).
+- On OpenCode 2, a plugin reload no longer fails the next step of a Claude turn that was already running with "Native custody refused: closed"; the step is served by the reloaded plugin. Addresses #605.
+- In sticky-balanced routing, after a rate limit Anthropic doesn't confirm as a used-up limit, a session now retries its own account at most twice per turn (up to a minute each), then moves to another account. OpenCode 2 used to move at once, and OpenCode 1 retried until OpenCode gave up.
 - Claude requests now use Anthropic's message threads, as Claude Code does: after the first request in a conversation, each request sends only the new messages instead of the whole history, so requests are much smaller and faster to start. Anything that changes the earlier conversation or the request's settings sends a full request again.
 - Fixed relay requests failing after edits to earlier messages or effort controls caused overlapping upload patches.
 

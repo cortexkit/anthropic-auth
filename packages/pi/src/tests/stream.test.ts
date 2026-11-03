@@ -14,6 +14,7 @@ import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { getPiNativeRuntime } from '../native.ts'
 import {
   buildExplicitBaseMessagesUrl,
+  clearPiStickyQuotaRetries,
   configureApiRouteHeaders,
   parseSse,
   primaryResponseAllowsApiFallback,
@@ -24,6 +25,7 @@ import { readNativePiFixture, saveNativePiFixture } from './native-fixture.ts'
 
 let tempDir: string | undefined
 const originalFetch = globalThis.fetch
+const originalNow = Date.now
 const anthropicModel = {
   id: 'claude-fable-5',
   name: 'Claude Fable 5',
@@ -44,6 +46,7 @@ const anthropicContext = {
 
 afterEach(async () => {
   globalThis.fetch = originalFetch
+  Date.now = originalNow
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   delete process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE
   if (tempDir) await rm(tempDir, { recursive: true, force: true })
@@ -888,7 +891,10 @@ describe('Pi API fallback routing helpers', () => {
     }
   })
 
-  const checkStickyQuotaReread = async (confirmed: boolean) => {
+  const checkStickyQuotaReread = async (
+    confirmed: boolean,
+    retryBudget = false,
+  ) => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-weekly-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
@@ -958,7 +964,7 @@ describe('Pi API fallback routing helpers', () => {
         const authorization =
           new Headers(init?.headers).get('authorization') ?? ''
         authorizations.push(authorization)
-        if (authorization.includes('full-access'))
+        if (retryBudget || authorization.includes('full-access'))
           return Response.json(
             { error: { type: 'rate_limit_error' } },
             {
@@ -983,6 +989,59 @@ describe('Pi API fallback routing helpers', () => {
         )
       },
     ) as unknown as typeof fetch
+    if (retryBudget) {
+      let now = checkedAt
+      Date.now = mock(() => now)
+      let pluginWaits = 0
+      const send = async (sessionId: string, timestamp: number) => {
+        now += 10_000
+        const start = authorizations.length
+        const stream = streamCortexKitAnthropic(
+          anthropicModel,
+          {
+            ...anthropicContext,
+            messages: [{ role: 'user', content: 'hello', timestamp }],
+          },
+          { apiKey: 'sk-ant-oat01-main-access', sessionId },
+          undefined,
+          {
+            setTimeout: (() => {
+              pluginWaits++
+              throw new Error('Unconfirmed 429 must use the host retry')
+            }) as unknown as typeof setTimeout,
+          },
+        )
+        for await (const _event of stream) {
+          /* Drain the failed host attempt. */
+        }
+        expect((await stream.result()).stopReason).toBe('error')
+        return authorizations.slice(start)
+      }
+      const initial = (await send('pi-budget', 1))[0]
+      if (!initial) throw new Error('Initial request did not reach an account')
+      expect(await send('pi-budget', 1)).toEqual([initial])
+      const other = (await send('pi-other-budget', 1))[0]
+      if (!other)
+        throw new Error('Independent session did not reach an account')
+      expect(await send('pi-budget', 2)).toEqual([initial])
+      expect(await send('pi-budget', 2)).toEqual([initial])
+      const moved = await send('pi-budget', 2)
+      expect(moved).toHaveLength(2)
+      expect(moved[0]).toBe(initial)
+      expect(moved[1]).not.toBe(initial)
+      const replacement = moved[1]
+      if (!replacement)
+        throw new Error('Third refusal did not move to an account')
+      expect(await send('pi-budget', 2)).toEqual([replacement])
+      expect(await send('pi-budget', 2)).toEqual([replacement])
+      expect(await send('pi-budget', 2)).toEqual([replacement, initial])
+      expect(await send('pi-other-budget', 1)).toEqual([other])
+      expect(await send('pi-other-budget', 1)).toHaveLength(2)
+      clearPiStickyQuotaRetries(storagePath, 'pi-budget')
+      expect(await send('pi-budget', 2)).toEqual([initial])
+      expect(pluginWaits).toBe(0)
+      return
+    }
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
       apiKey: 'sk-ant-oat01-main-access',
       sessionId: 'pi-weekly-headers',
@@ -1009,6 +1068,10 @@ describe('Pi API fallback routing helpers', () => {
 
   test('sticky-balanced Pi 429 without confirming headers re-reads the usage endpoint exactly once', async () => {
     await checkStickyQuotaReread(false)
+  })
+
+  test('sticky-balanced Pi retries unconfirmed 429s twice per turn and account without a plugin wait', async () => {
+    await checkStickyQuotaReread(false, true)
   })
 
   for (const maxSameAccountWait of ['15', 'max'] as const) {

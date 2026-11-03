@@ -418,6 +418,8 @@ export interface NativeAnthropicSource<Q, P> {
    * for the session.
    */
   readonly forgetSession?: (sessionID: string) => void
+  /** Drop the retry budget when the host finishes the user turn, not an HTTP attempt. */
+  readonly forgetTurn?: (sessionID: string) => void
 }
 
 export interface NativeAnthropicAdapterLogger {

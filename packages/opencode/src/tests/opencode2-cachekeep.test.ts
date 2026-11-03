@@ -273,7 +273,7 @@ async function fixture(
     await mkdir(cacheKeepStoreDirectory(paths.storageId, directory), {
       mode: 0o755,
     })
-  const start = async () => {
+  const start = async (enrollmentFile = 'enrollment.json') => {
     const hooks = new Map<string, Array<(draft: any) => unknown>>()
     const registration = { dispose: async () => {} }
     const ctx = {
@@ -309,7 +309,7 @@ async function fixture(
         env: {
           OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
             directory,
-            'enrollment.json',
+            enrollmentFile,
           ),
         },
       },
@@ -428,6 +428,7 @@ async function fixture(
     start,
     paths,
     store,
+    routingPath: join(directory, 'routing.json'),
     registry,
     disk: cacheKeepStoreDirectory(paths.storageId, directory),
     timers,
@@ -981,6 +982,72 @@ test('a later OpenCode 2 instance for the same storage keeps warming a session t
   expect(next.sent[0]!.headers.get('authorization')).toBe(
     'Bearer sk-ant-oat01-reloaded-first',
   )
+})
+
+test('retired OpenCode 2 hooks serve the next step through the successor with the session pin', async () => {
+  const f = await fixture()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    routing: { mode: 'sticky-balanced' },
+  }))
+  await f.store.disable('first', 'user')
+  const first = await f.live()
+  expect(first.headers.get('authorization')).toBe('Bearer sk-ant-oat01-second')
+  const next = await f.start()
+  await f.dispose()
+  const pins = JSON.parse(await readFile(f.routingPath, 'utf8')).assignments
+  expect(Object.values(pins)).toMatchObject([{ accountId: 'second' }])
+  await f.store.enable('first')
+  await f.store.rotate('second', {
+    type: 'oauth',
+    access: 'sk-ant-oat01-reloaded-second',
+    refresh: 'refresh-second',
+    expires: Date.now() + 12 * 3600_000,
+  })
+  const request = await f.live()
+  expect(request.headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-reloaded-second',
+  )
+  expect(
+    Object.values(
+      JSON.parse(await readFile(f.routingPath, 'utf8')).assignments,
+    ),
+  ).toMatchObject([{ accountId: 'second' }])
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(next.sent).toHaveLength(1)
+  expect(f.timers.callbacks.size).toBe(1)
+  await next.dispose()
+  expect(f.timers.callbacks.size).toBe(0)
+})
+
+test('retired OpenCode 2 hooks still refuse closed without a live successor', async () => {
+  const f = await fixture()
+  await f.dispose()
+  await expect(f.prepare()).rejects.toThrow('Native custody refused: closed')
+})
+
+test('retired OpenCode 2 hooks skip a disposed middle generation', async () => {
+  const f = await fixture()
+  const middle = await f.start()
+  const newest = await f.start()
+  await f.dispose()
+  await middle.dispose()
+  await f.live()
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  expect(middle.sent).toHaveLength(0)
+  expect(newest.sent).toHaveLength(1)
+  expect(f.timers.callbacks.size).toBe(1)
+})
+
+test('retired OpenCode 2 hooks do not adopt a setup with different vault options', async () => {
+  const f = await fixture()
+  await f.start('different-enrollment.json')
+  await f.dispose()
+  await expect(f.prepare()).rejects.toThrow('Native custody refused: closed')
 })
 
 test('a late OpenCode 2 dispose of the predecessor leaves its successor warming', async () => {

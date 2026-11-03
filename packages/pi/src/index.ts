@@ -40,6 +40,7 @@ import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
 import type { PiQuotaWaitOptions } from './quota-wait.ts'
 import {
   beginPiPrimaryTurn,
+  clearPiStickyQuotaRetries,
   endPiPrimaryTurn,
   forgetPiMessageThread,
   streamCortexKitAnthropic,
@@ -132,13 +133,16 @@ export default async function cortexKitPiAnthropicAuth(
       else break
     }
   })
-  pi.on('agent_settled', (_event, ctx) =>
-    endPiPrimaryTurn(storagePath, ctx.sessionManager.getSessionId()),
-  )
+  pi.on('agent_settled', async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    endPiPrimaryTurn(storagePath, sessionId)
+    if (sessionId) clearPiStickyQuotaRetries(storagePath, sessionId)
+  })
   pi.on('session_shutdown', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     endPiPrimaryTurn(storagePath, sessionId)
     if (sessionId) {
+      clearPiStickyQuotaRetries(storagePath, sessionId)
       effortHistoryBySession.delete(sessionId)
       workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)

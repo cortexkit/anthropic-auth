@@ -3,6 +3,8 @@ import type { OAuthQuotaSnapshot } from '../accounts.ts'
 import { SessionCacheActivity } from '../session-cache-activity.ts'
 import {
   decideStickyQuotaFailure,
+  MAX_UNCONFIRMED_SAME_ACCOUNT_RETRIES,
+  StickyQuotaRetryCounter,
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
 } from '../sticky-routing.ts'
@@ -44,6 +46,78 @@ function decide(quota: OAuthQuotaSnapshot, modelId = MODEL) {
 }
 
 const resetIn = (ms: number) => new Date(NOW + ms).toISOString()
+
+describe('unconfirmed sticky retry budget', () => {
+  test('retains twice then migrates per session, turn and account', () => {
+    expect(MAX_UNCONFIRMED_SAME_ACCOUNT_RETRIES).toBe(2)
+    const counter = new StickyQuotaRetryCounter()
+    const fail = (
+      sessionId = 'session',
+      turnId = 'turn',
+      accountId = 'account',
+    ) =>
+      decideStickyQuotaFailure({
+        quota: undefined,
+        unconfirmedRetry: { counter, sessionId, turnId, accountId },
+      }).action
+    expect(fail()).toBe('retain')
+    expect(fail('other-session')).toBe('retain')
+    expect(fail()).toBe('retain')
+    expect(fail()).toBe('migrate')
+    expect(fail('other-session')).toBe('retain')
+    expect(fail('session', 'new-turn')).toBe('retain')
+    expect(fail('session', 'new-turn')).toBe('retain')
+    expect(fail('session', 'new-turn')).toBe('migrate')
+    expect(fail('session', 'new-turn', 'moved-account')).toBe('retain')
+    counter.clear('session')
+    expect(fail('session', 'new-turn', 'moved-account')).toBe('retain')
+  })
+
+  test('confirmed holds and migration do not consume unconfirmed retains', () => {
+    const counter = new StickyQuotaRetryCounter()
+    const scope = {
+      counter,
+      sessionId: 'session',
+      turnId: 'turn',
+      accountId: 'account',
+    }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(
+        decideStickyQuotaFailure({
+          quota: exhausted('five-hour', resetIn(60_000)),
+          now: NOW,
+          holdUntil: NOW + 120_000,
+          unconfirmedRetry: scope,
+        }).action,
+      ).toBe('hold')
+      expect(
+        decideStickyQuotaFailure({
+          quota: exhausted('seven-day', resetIn(86_400_000)),
+          now: NOW,
+          unconfirmedRetry: scope,
+        }).action,
+      ).toBe('migrate')
+    }
+    expect(
+      decideStickyQuotaFailure({ quota: {}, unconfirmedRetry: scope }).action,
+    ).toBe('retain')
+    expect(
+      decideStickyQuotaFailure({ quota: {}, unconfirmedRetry: scope }).action,
+    ).toBe('retain')
+    expect(
+      decideStickyQuotaFailure({ quota: {}, unconfirmedRetry: scope }).action,
+    ).toBe('migrate')
+  })
+
+  test('evicts old sessions instead of growing without a bound', () => {
+    const counter = new StickyQuotaRetryCounter(2)
+    expect(counter.retain('first', 'turn', 'account')).toBe(true)
+    expect(counter.retain('first', 'turn', 'account')).toBe(true)
+    expect(counter.retain('second', 'turn', 'account')).toBe(true)
+    expect(counter.retain('third', 'turn', 'account')).toBe(true)
+    expect(counter.retain('first', 'turn', 'account')).toBe(true)
+  })
+})
 
 describe('sticky quota hold', () => {
   test('429 headers confirm raw exhaustion, including rejected windows without utilization', () => {

@@ -37,11 +37,13 @@ import {
   readNativeAccountsForRequest,
   remapModelId,
   requestSignal,
+  StickyQuotaRetryCounter,
   StickySessionRouter,
   sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
   stickyQuotaSnapshotIsFresh,
+  stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
 } from '@cortexkit/anthropic-auth-core'
@@ -116,11 +118,10 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
   )
 
 /**
- * Sticky-balanced sessions wait on their own account, as OpenCode 1 and Pi
- * do, when a 429 refused it and every exhausted quota window blocking the
- * model resets before the session's same-account cache and wait budget expire,
- * including deterministic jitter. The common-auth retry hook keeps the refused account
- * and its routing pin and replaces the host's retry wait with this delay.
+ * An unconfirmed 429 gets at most two short same-account retries per turn.
+ * Confirmed exhaustion holds only when every blocking reset, including jitter,
+ * fits within the session's cache and wait budget. The common-auth retry installer
+ * keeps the refused account and routing pin and replaces the host wait with the hold.
  *
  * `servable` holds the accounts that can serve this model right now. A
  * refused account outside it would be refused again by `authorizeAccount`
@@ -132,6 +133,8 @@ function stickyHold(
   snapshot: NativeAccountSnapshot,
   servable: readonly NativeAccountView[],
   modelID: string,
+  counter: StickyQuotaRetryCounter,
+  turnId: string,
   responseHeaders?: Headers,
 ): RetryHold | undefined {
   const refused = input.rerouteFrom
@@ -143,22 +146,27 @@ function stickyHold(
     return undefined
   const account = servable.find((row) => row.id === refused.accountId)
   // Only a current reading can show when the blocking windows reset.
-  if (
-    !account ||
-    (!responseHeaders &&
-      !stickyQuotaSnapshotIsFresh(
+  if (!account) return undefined
+  const decision = decideStickyQuotaFailure({
+    quota:
+      responseHeaders ||
+      stickyQuotaSnapshotIsFresh(
         account.quota,
         snapshot.policyStorage,
         Date.now(),
         modelID,
-      ))
-  )
-    return undefined
-  const decision = decideStickyQuotaFailure({
-    quota: account.quota,
+      )
+        ? account.quota
+        : undefined,
     modelId: modelID,
     responseHeaders,
     sessionId: input.sessionID,
+    unconfirmedRetry: {
+      counter,
+      sessionId: input.sessionID,
+      turnId,
+      accountId: account.id,
+    },
     holdUntil: sessionCacheActivity.holdUntil(
       input.sessionID,
       account.id,
@@ -166,6 +174,16 @@ function stickyHold(
       getMaxSameAccountWait(snapshot.policyStorage),
     ),
   })
+  if (decision.action === 'retain')
+    return {
+      hold: {
+        delayMs: Number(
+          stickyRetainRetryHeaders(responseHeaders ?? new Headers()).get(
+            'retry-after-ms',
+          ),
+        ),
+      },
+    }
   if (decision.action !== 'hold') return undefined
   return {
     hold: {
@@ -249,6 +267,8 @@ export function createNativeAnthropicSource(
     )?.quota
   })
   const servedTurns = new Set<string>()
+  const stickyQuotaRetries = new StickyQuotaRetryCounter()
+  const turnIds = new Map<string, string>()
   // Vault mode keeps session affinity in its own file, named by the snapshot,
   // so vault sessions never read or write the local account's routing state.
   // Local mode uses the destination from the runtime's existing authority read.
@@ -645,6 +665,7 @@ export function createNativeAnthropicSource(
             preserveOnNoCandidate: true,
           })
           active.signal.throwIfAborted()
+          if (selected?.migrated) stickyQuotaRetries.clear(input.sessionID)
           if (selected)
             return advice.hold
               ? { hold: { delayMs: advice.hold.retry_after_ms } }
@@ -663,6 +684,8 @@ export function createNativeAnthropicSource(
         snapshot,
         oauth,
         modelID,
+        stickyQuotaRetries,
+        turnIds.get(input.sessionID) ?? input.kind,
         input.rerouteFrom
           ? refusalHeaders.get(
               key({ ...input, modelID }, input.rerouteFrom.accountId),
@@ -711,7 +734,15 @@ export function createNativeAnthropicSource(
           preserveOnNoCandidate: true,
         })
         active.signal.throwIfAborted()
-        if (selected) return selected.accountId
+        if (selected) {
+          if (
+            selected.migrated ||
+            (input.rerouteFrom &&
+              selected.accountId !== input.rerouteFrom.accountId)
+          )
+            stickyQuotaRetries.clear(input.sessionID)
+          return selected.accountId
+        }
       } else {
         const mode = getRoutingMode(snapshot.policyStorage)
         const ordered =
@@ -995,6 +1026,11 @@ export function createNativeAnthropicSource(
         )
       }
       const bodyOptions = options.requestOptions(input, snapshot)
+      const turnId = bodyOptions.billingLineage?.promptId
+      if (turnId && turnIds.get(input.sessionID) !== turnId) {
+        stickyQuotaRetries.clear(input.sessionID)
+        turnIds.set(input.sessionID, turnId)
+      }
       const state = states.get(input.provenance)
       if (state)
         states.set(input.provenance, {
@@ -1316,7 +1352,12 @@ export function createNativeAnthropicSource(
         states.delete(input.provenance)
       }
     },
+    forgetTurn(sessionID) {
+      stickyQuotaRetries.clear(sessionID)
+      turnIds.delete(sessionID)
+    },
     forgetSession(sessionID) {
+      source.forgetTurn?.(sessionID)
       for (const [attemptId, attempt] of cacheAttempts)
         if (attempt.sessionID === sessionID) cacheAttempts.delete(attemptId)
       sessionCacheActivity.forget(sessionID)
@@ -1333,8 +1374,10 @@ export function createNativeAnthropicSource(
       options.onForgetSession?.(sessionID)
     },
     servedAccount: (sessionID) => servedBy.get(sessionID),
-    resetRouting: async (sessionID) =>
-      routerFor(await runtime.read()).clear(sessionID),
+    resetRouting: async (sessionID) => {
+      source.forgetTurn?.(sessionID)
+      await routerFor(await runtime.read()).clear(sessionID)
+    },
     async recordPrime(provenance, usage) {
       const state = states.get(provenance)
       if (!state || state.active.signal.aborted) return false

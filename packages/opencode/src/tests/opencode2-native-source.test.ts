@@ -1729,6 +1729,58 @@ async function retryHost(native: ReturnType<typeof source>) {
 }
 
 describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
+  test('installed unconfirmed 429 holds twice per turn and account before moving', async () => {
+    const fixture = await vaultWithFallback()
+    let turnId = '11111111-2222-4333-8444-555555555555'
+    const native = createNativeAnthropicSource({
+      runtime: fixture.runtime,
+      paths: fixture.paths,
+      requestOptions: () => ({ billingLineage: { promptId: turnId } }),
+    })
+    cleanups.push(() => native.close())
+    const choose = spyOn(native, 'chooseAccount')
+    const host = await retryHost(native)
+    const fail = async (input = scope) => {
+      const request = await host.send(input)
+      const account = host.installation.installation.accountFor(
+        input.sessionID,
+        input.kind,
+      )
+      await host.response(request, 429, input, { 'retry-after': '432000' })
+      const decision = await host.retry(false, input)
+      return { account, decision }
+    }
+    const held = { retry: true, delay: 60_000 }
+    const first = await fail()
+    expect(first.decision).toEqual(held)
+    expect(await choose.mock.results.at(-1)?.value).toEqual({
+      hold: { delayMs: 60_000 },
+    })
+    expect(await fail()).toEqual({ account: first.account, decision: held })
+    const otherScope = { ...scope, sessionID: 'other-budget-session' }
+    const other = await fail(otherScope)
+    expect(other.decision).toEqual(held)
+    turnId = '99999999-2222-4333-8444-555555555555'
+    expect(await fail()).toEqual({ account: first.account, decision: held })
+    expect(await fail()).toEqual({ account: first.account, decision: held })
+    expect((await fail()).decision).toEqual({ retry: true, delay: 0 })
+    const moved = await fail()
+    expect(moved.account).not.toBe(first.account)
+    expect(moved.decision).toEqual(held)
+    expect(await fail()).toEqual({ account: moved.account, decision: held })
+    expect((await fail()).decision).toEqual({ retry: true, delay: 0 })
+    // The other session still has its own original two-retry allowance.
+    turnId = '11111111-2222-4333-8444-555555555555'
+    expect(await fail(otherScope)).toEqual({
+      account: other.account,
+      decision: held,
+    })
+    expect((await fail(otherScope)).decision).toEqual({ retry: true, delay: 0 })
+    host.idle()
+    await new Promise((resolve) => setImmediate(resolve))
+    expect((await fail()).decision).toEqual(held)
+  })
+
   test('mixed session retries vault-newer on the same account without choosing again', async () => {
     const fixture = await vault([7, 8, 9])
     const native = source(fixture.runtime, fixture.paths)
@@ -1927,7 +1979,7 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     expect(drop).toHaveBeenCalledTimes(0)
   })
 
-  test('installed 429 reroutes once and pins the next attempt to the new account', async () => {
+  test('installed confirmed 429 reroutes once and pins the next attempt to the new account', async () => {
     const fixture = await vaultWithFallback()
     const native = source(fixture.runtime, fixture.paths)
     const choose = spyOn(native, 'chooseAccount')
@@ -1936,7 +1988,9 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     expect(
       host.installation.installation.accountFor(scope.sessionID, 'primary'),
     ).toBe('main')
-    await host.response(first, 429)
+    await host.response(first, 429, scope, {
+      'anthropic-ratelimit-unified-7d-status': 'rejected',
+    })
     expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
     const next = await host.send()
     const selected = host.installation.installation.accountFor(
@@ -1982,7 +2036,9 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     const { routingPath } = await fixture.runtime.read()
     if (!routingPath) throw new Error('Missing routing path')
     const pin = await readFile(routingPath, 'utf8')
-    await host.response(first, 429)
+    await host.response(first, 429, scope, {
+      'anthropic-ratelimit-unified-7d-status': 'rejected',
+    })
     expect(await host.retry()).toEqual({ retry: true, delay: 1234 })
     await expect(choose.mock.results[1]?.value).resolves.toBeUndefined()
     await native.drainRoutingPublications()
