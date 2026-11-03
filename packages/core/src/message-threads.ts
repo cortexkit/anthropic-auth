@@ -1,5 +1,6 @@
 import { createHash, type Hash } from 'node:crypto'
 import { signRequestBody } from './cch.ts'
+import { logger } from './logger.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
 
 export const MESSAGE_THREADS_BETA = 'message-threads-2026-08-12'
@@ -590,13 +591,10 @@ export function messageThreadBetas(headers: Headers): string[] {
   return betas
 }
 
-/** The HTTP protocol uses error.details.error_code, not the SDK's error.code. */
-export async function isMessageThreadRejection(
-  response: Response,
-): Promise<boolean> {
-  if (response.status !== 400 && response.status !== 404) return false
+async function readThreadError(response: Response): Promise<Body | undefined> {
+  if (response.status !== 400 && response.status !== 404) return undefined
   const reader = response.clone().body?.getReader()
-  if (!reader) return false
+  if (!reader) return undefined
   let text = ''
   let remaining = 16_384
   const decoder = new TextDecoder()
@@ -605,25 +603,69 @@ export async function isMessageThreadRejection(
       const chunk = await reader.read()
       if (chunk.done) break
       remaining -= chunk.value.byteLength
-      if (remaining < 0) return false
+      if (remaining < 0) return undefined
       text += decoder.decode(chunk.value, { stream: true })
     }
-    const error = JSON.parse(text).error
-    const code = error?.details?.error_code
-    return response.status === 404
-      ? error?.type === 'not_found_error' && code === 'thread_not_found'
-      : error?.type === 'invalid_request_error' &&
-          [
-            'thread_fingerprint_mismatch',
-            'thread_already_continued',
-            'thread_continue_in_flight',
-            'thread_unsupported_request',
-          ].includes(code)
+    const body = JSON.parse(text)
+    return isBody(body?.error) ? body.error : undefined
   } catch {
-    return false
+    return undefined
   } finally {
     void reader.cancel().catch(() => {})
   }
+}
+
+/** The HTTP protocol uses error.details.error_code, not the SDK's error.code. */
+export async function isMessageThreadRejection(
+  response: Response,
+): Promise<boolean> {
+  const error = await readThreadError(response)
+  const code = isBody(error?.details) ? error.details.error_code : undefined
+  return response.status === 404
+    ? error?.type === 'not_found_error' && code === 'thread_not_found'
+    : response.status === 400 &&
+        error?.type === 'invalid_request_error' &&
+        [
+          'thread_fingerprint_mismatch',
+          'thread_already_continued',
+          'thread_continue_in_flight',
+          'thread_unsupported_request',
+        ].includes(code as string)
+}
+
+async function isThreadCreateRejection(response: Response): Promise<boolean> {
+  if (response.status !== 400) return false
+  const error = await readThreadError(response)
+  const code = isBody(error?.details) ? error.details.error_code : undefined
+  if (typeof code === 'string' && code.startsWith('thread_')) return true
+  const message = typeof error?.message === 'string' ? error.message : ''
+  return (
+    message.includes(MESSAGE_THREADS_BETA) ||
+    /(?:^|\W)thread\s*[:.]|["'`]thread["'`]|(?:field|parameter|property|argument|input)s?\s*[:=]?\s+thread\b|^\s*thread\s+(?:is|was)\b/i.test(
+      message,
+    )
+  )
+}
+
+const disabledThreadAccounts = new Set<string>()
+
+function removeThreadBeta(headers: Headers): void {
+  const kept = (headers.get('anthropic-beta') ?? '')
+    .split(',')
+    .map((beta) => beta.trim())
+    .filter((beta) => beta && beta !== MESSAGE_THREADS_BETA)
+  if (kept.length) headers.set('anthropic-beta', kept.join(','))
+  else headers.delete('anthropic-beta')
+}
+
+function disableThreadsForAccount(key: string): void {
+  if (disabledThreadAccounts.has(key)) return
+  disabledThreadAccounts.add(key)
+  logger.warn(
+    'message-threads',
+    'Anthropic rejected message threads; using full stateless requests for this account until restart',
+    { account: key.slice(0, 12) },
+  )
 }
 
 export async function prepareMessageThreadRequest(
@@ -636,16 +678,26 @@ export async function prepareMessageThreadRequest(
   },
 ) {
   const full = JSON.parse(input.bodyText) as Body
-  const betas = messageThreadBetas(input.headers)
+  const accountKey = hash(input.account)
+  let threading = !disabledThreadAccounts.has(accountKey)
+  const betas = threading ? messageThreadBetas(input.headers) : []
+  if (!threading) {
+    removeThreadBeta(input.headers)
+    if (input.session) tracker.forget(input.session)
+  }
   // Without a host session, create a thread but retain no continuation state.
-  const prepared: ReturnType<MessageThreadTracker['prepare']> = input.session
-    ? tracker.prepare({ ...input, session: input.session, body: full, betas })
-    : {
-        decision: { type: 'create' },
-        body: { ...full, thread: { type: 'create' } },
-        complete: () => {},
-        fail: () => {},
-      }
+  const prepared: ReturnType<MessageThreadTracker['prepare']> =
+    threading && input.session
+      ? tracker.prepare({ ...input, session: input.session, body: full, betas })
+      : {
+          decision: { type: 'create' },
+          body: threading
+            ? { ...full, thread: { type: 'create' } }
+            : { ...full },
+          complete: () => {},
+          fail: () => {},
+        }
+  if (!threading) delete prepared.body.thread
   let bodyText = await signRequestBody(JSON.stringify(prepared.body))
   let recovered = false
   return {
@@ -653,30 +705,46 @@ export async function prepareMessageThreadRequest(
       return bodyText
     },
     fail: prepared.fail,
-    observe: (response: Response) =>
-      observeMessageThreadResponse(response, {
+    observe: (response: Response) => {
+      if (!threading || disabledThreadAccounts.has(accountKey)) {
+        prepared.fail()
+        return response
+      }
+      return observeMessageThreadResponse(response, {
         ...prepared,
         complete: (facts) => {
           if (input.signal?.aborted) prepared.fail()
           else prepared.complete(facts)
         },
-      }),
+      })
+    },
     async recover(
       response: Response,
       send: (body: string) => Promise<Response>,
     ): Promise<Response> {
-      if (
-        recovered ||
-        prepared.decision.type !== 'continue' ||
-        !(await isMessageThreadRejection(response))
-      )
-        return response
+      if (!threading || recovered) return response
+      const rejectedCreate =
+        prepared.decision.type === 'create' &&
+        (await isThreadCreateRejection(response))
+      const rejectedContinue =
+        prepared.decision.type === 'continue' &&
+        (await isMessageThreadRejection(response))
+      if (!rejectedCreate && !rejectedContinue) return response
       recovered = true
       prepared.fail()
       void response.body?.cancel().catch(() => {})
-      bodyText = await signRequestBody(
-        JSON.stringify({ ...full, thread: { type: 'create' } }),
-      )
+      if (rejectedCreate || disabledThreadAccounts.has(accountKey)) {
+        disableThreadsForAccount(accountKey)
+        threading = false
+        removeThreadBeta(input.headers)
+        const stateless = { ...full }
+        delete stateless.thread
+        bodyText = await signRequestBody(JSON.stringify(stateless))
+      } else {
+        bodyText = await signRequestBody(
+          JSON.stringify({ ...full, thread: { type: 'create' } }),
+        )
+      }
       return send(bodyText)
     },
   }

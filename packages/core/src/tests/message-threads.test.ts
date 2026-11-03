@@ -1,5 +1,7 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { buildCacheKeepPrewarmBody, CacheKeepManager } from '../cachekeep.ts'
+import { signRequestBody } from '../cch.ts'
+import { logger } from '../logger.ts'
 import {
   MESSAGE_THREADS_BETA,
   type MessageThreadInput,
@@ -1099,4 +1101,125 @@ test('audit ancestry: fragmented signatures and trimmed text match the kept repl
       },
     }).decision.type,
   ).toBe('continue')
+})
+
+test.each([
+  {
+    name: 'thread code',
+    code: 'thread_unsupported_request',
+    message: 'unsupported request',
+    rejected: true,
+  },
+  {
+    name: 'future thread code',
+    code: 'thread_future_rejection',
+    message: 'unsupported request',
+    rejected: true,
+  },
+  {
+    name: 'thread field',
+    message: 'thread: unsupported request',
+    rejected: true,
+  },
+  {
+    name: 'quoted thread field',
+    message: 'Unknown field: `thread`',
+    rejected: true,
+  },
+  {
+    name: 'thread beta',
+    message: 'Unsupported beta message-threads-2026-08-12',
+    rejected: true,
+  },
+  { name: 'unrelated field', message: 'model: not found', rejected: false },
+  {
+    name: 'unrelated thread word',
+    message: 'worker thread pool is exhausted',
+    rejected: false,
+  },
+])('audit create fallback: %j', async (fault) => {
+  const warn = spyOn(logger, 'warn').mockImplementation(() => {})
+  try {
+    const original = input()
+    original.body.system = [
+      {
+        type: 'text',
+        text: 'x-anthropic-billing-header: cc_version=2.1.302.abc; cc_entrypoint=cli; cch=00000;',
+      },
+    ]
+    const account = `audit-create-${fault.name}`
+    const make = async (tracker: MessageThreadTracker, target = account) => {
+      const laterHeaders = new Headers({
+        'anthropic-beta': `base,${MESSAGE_THREADS_BETA}`,
+        'x-client-request-id': 'create-fallback-id',
+      })
+      const later = await prepareMessageThreadRequest(tracker, {
+        ...original,
+        account: target,
+        credential: 'rotated-credential',
+        bodyText: JSON.stringify(original.body),
+        headers: laterHeaders,
+      })
+      return { request: later, headers: laterHeaders }
+    }
+    const headers = new Headers({
+      'anthropic-beta': 'base',
+      'x-client-request-id': 'create-fallback-id',
+    })
+    const request = await prepareMessageThreadRequest(
+      new MessageThreadTracker(),
+      {
+        ...original,
+        account,
+        bodyText: JSON.stringify(original.body),
+        headers,
+      },
+    )
+    const rejected = () =>
+      Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: fault.message,
+            details: { error_code: fault.code },
+          },
+        },
+        { status: 400 },
+      )
+    let resends = 0
+    const resend = async (text: string) => {
+      resends++
+      expect(JSON.parse(text).thread).toBeUndefined()
+      expect(JSON.parse(text).messages).toEqual(original.body.messages)
+      expect(headers.get('anthropic-beta')).toBe('base')
+      expect(headers.get('x-client-request-id')).toBe('create-fallback-id')
+      expect(await signRequestBody(text)).toBe(text)
+      expect(JSON.parse(text).system[0].text).not.toContain('cch=00000')
+      return new Response('stateless accepted')
+    }
+    const response = await request.recover(rejected(), resend)
+    await request.recover(rejected(), resend)
+    expect(resends).toBe(fault.rejected ? 1 : 0)
+    expect(response.status).toBe(fault.rejected ? 200 : 400)
+    const subsequent = await make(new MessageThreadTracker())
+    expect(JSON.parse(subsequent.request.bodyText).thread).toEqual(
+      fault.rejected ? undefined : { type: 'create' },
+    )
+    expect(subsequent.headers.get('anthropic-beta')).toBe(
+      fault.rejected ? 'base' : `base,${MESSAGE_THREADS_BETA}`,
+    )
+    const otherAccount = await make(
+      new MessageThreadTracker(),
+      `${account}-other`,
+    )
+    expect(JSON.parse(otherAccount.request.bodyText).thread).toEqual({
+      type: 'create',
+    })
+    expect(
+      warn.mock.calls.filter((call) => call[0] === 'message-threads'),
+    ).toHaveLength(fault.rejected ? 1 : 0)
+  } finally {
+    warn.mockRestore()
+  }
 })
