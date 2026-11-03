@@ -47,8 +47,6 @@ import {
   nativeAccountCanServe,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
-  PROMPT_CACHE_1H_TTL_MS,
-  PROMPT_CACHE_DEFAULT_TTL_MS,
   type ProviderAccountUuid,
   type ProviderErrorResponseScope,
   parseSseFrame,
@@ -627,13 +625,12 @@ async function sendAnthropicRequest(
     : undefined
   // Pi's per-request `cacheRetention: 'long'` asks for the provider's longest
   // retention (Anthropic's one-hour TTL), as Pi's own Anthropic provider
-  // honours it; the account setting still enables it for all requests. The
-  // request and the session's cache lifetime for sticky routing use the same
-  // decision.
+  // honours it; the account setting still enables it for all requests. Cache
+  // activity below follows the final serialized body, since hooks can edit TTLs.
   const oneHourCache =
     isCache1hPersistentlyEnabled(storage) ||
     options.streamOptions?.cacheRetention === 'long'
-  const { body, bodyText, toolNames } = await buildAnthropicRequest(
+  const { body, bodyText, toolNames, cacheTtlMs } = await buildAnthropicRequest(
     options.model.id,
     options.context,
     options.streamOptions,
@@ -674,11 +671,7 @@ async function sendAnthropicRequest(
   const trackAcceptedRequest = () => {
     if (options.apiAccount || init.signal?.aborted) return
     if (relayAffinity)
-      sessionCacheActivity.record(
-        relayAffinity,
-        routeId,
-        oneHourCache ? PROMPT_CACHE_1H_TTL_MS : PROMPT_CACHE_DEFAULT_TTL_MS,
-      )
+      sessionCacheActivity.record(relayAffinity, routeId, cacheTtlMs)
     keep.track({
       sessionId: relayAffinity,
       url: input.toString(),

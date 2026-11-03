@@ -2106,3 +2106,236 @@ describe("Pi cacheRetention 'long'", () => {
     }
   })
 })
+
+describe('Pi final-payload cache activity', () => {
+  const sessionId = 'ses_final_payload_activity'
+  afterEach(() => sessionCacheActivity.forget(sessionId))
+
+  async function send(options: {
+    long?: boolean
+    persistent?: boolean
+    mode?: 'explicit' | 'hybrid' | 'automatic'
+    edit?: (body: any) => unknown
+    outcome?: 'failed' | 'cancelled'
+  }) {
+    if (tempDir) await rm(tempDir, { recursive: true, force: true })
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-final-cache-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        accounts: [],
+        quota: { enabled: false },
+        claudeCache: {
+          enabled: options.persistent ?? false,
+          mode: options.mode ?? 'explicit',
+        },
+      },
+      storagePath,
+    )
+    const controller = new AbortController()
+    let sent: any
+    let requests = 0
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).includes('/api/claude_cli/bootstrap'))
+          return Response.json({
+            oauth_account: { account_uuid: 'pi-final-cache-account' },
+          })
+        requests += 1
+        sent = JSON.parse(String(init?.body))
+        if (options.outcome === 'failed')
+          return Response.json(
+            { error: { type: 'invalid_request_error', message: 'rejected' } },
+            { status: 400 },
+          )
+        if (options.outcome === 'cancelled') controller.abort()
+        return new Response(
+          [
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join(''),
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        )
+      },
+    ) as unknown as typeof fetch
+    const started = Date.now()
+    const result = await streamCortexKitAnthropic(
+      anthropicModel,
+      normalizeContext({
+        ...anthropicContext,
+        tools: [
+          {
+            name: 'bash',
+            description: 'shell',
+            parameters: {
+              type: 'object',
+              properties: {
+                data: {
+                  type: 'object',
+                  default: { cache_control: { type: 'ephemeral', ttl: '1h' } },
+                },
+              },
+            },
+          },
+        ],
+      } as any) as any,
+      {
+        apiKey: 'sk-ant-oat-final-cache',
+        sessionId,
+        signal: controller.signal,
+        cacheRetention: options.long ? 'long' : 'short',
+        ...(options.edit ? { onPayload: options.edit } : {}),
+      },
+    ).result()
+    return { result, sent, requests, started, finished: Date.now() }
+  }
+
+  test.each([
+    {
+      name: 'long without persistent caching',
+      long: true,
+      ttl: 3_600_000,
+      writtenTtls: ['1h', '1h', '1h', '1h'],
+    },
+    {
+      name: 'persistent explicit',
+      persistent: true,
+      mode: 'explicit' as const,
+      ttl: 3_600_000,
+      writtenTtls: ['1h', '1h', '1h', '1h'],
+    },
+    {
+      name: 'persistent hybrid',
+      persistent: true,
+      mode: 'hybrid' as const,
+      ttl: 3_600_000,
+      writtenTtls: ['1h', '1h', '1h', '1h'],
+    },
+    {
+      name: 'persistent automatic',
+      persistent: true,
+      mode: 'automatic' as const,
+      ttl: 3_600_000,
+      writtenTtls: ['1h'],
+    },
+    {
+      name: 'hook upgrades a breakpoint',
+      edit: (body: any) => {
+        body.tools[0].cache_control.ttl = '1h'
+      },
+      ttl: 3_600_000,
+      writtenTtls: [undefined, '1h', undefined, undefined],
+    },
+    {
+      name: 'hook removes persistent automatic retention',
+      persistent: true,
+      mode: 'automatic' as const,
+      edit: (body: any) => {
+        delete body.cache_control
+      },
+      ttl: 300_000,
+      writtenTtls: [],
+    },
+    {
+      name: 'mixed TTLs keep the longest written TTL',
+      long: true,
+      edit: (body: any) => {
+        delete body.tools[0].cache_control.ttl
+      },
+      ttl: 3_600_000,
+      writtenTtls: ['1h', undefined, '1h', '1h'],
+    },
+    {
+      name: 'nested tool data is not a breakpoint',
+      ttl: 300_000,
+      writtenTtls: [undefined, undefined, undefined, undefined],
+    },
+    {
+      name: 'hook serializes a different TTL',
+      edit: (body: any) => {
+        const tool = body.tools[0]
+        tool.toJSON = () => ({
+          ...tool,
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        })
+      },
+      ttl: 3_600_000,
+      writtenTtls: [undefined, '1h', undefined, undefined],
+    },
+  ])(
+    'records the final serialized TTL and hold bound: $name',
+    async (options) => {
+      const { result, sent, requests, started, finished } = await send(options)
+      expect(result.stopReason).toBe('stop')
+      expect(requests).toBe(1)
+      expect(
+        sent.tools[0].input_schema.properties.data.default.cache_control.ttl,
+      ).toBe('1h')
+      const controls = [
+        sent.cache_control,
+        ...sent.system.map((block: any) => block.cache_control),
+        ...sent.tools.map((tool: any) => tool.cache_control),
+        ...sent.messages.flatMap((message: any) => [
+          message.cache_control,
+          ...(Array.isArray(message.content)
+            ? message.content.map((block: any) => block.cache_control)
+            : []),
+        ]),
+      ]
+      expect(controls.filter(Boolean).map((control) => control.ttl)).toEqual([
+        ...options.writtenTtls,
+      ])
+      expect(sessionCacheActivity.ttlMs(sessionId)).toBe(options.ttl)
+      const hold = sessionCacheActivity.holdUntil(
+        sessionId,
+        'main',
+        finished,
+        'max',
+      )!
+      expect(hold).toBeGreaterThanOrEqual(started + options.ttl)
+      expect(hold).toBeLessThanOrEqual(finished + options.ttl)
+      expect(
+        sessionCacheActivity.holdUntil(
+          sessionId,
+          'another-account',
+          finished,
+          'max',
+        ),
+      ).toBeUndefined()
+    },
+  )
+
+  test('a later accepted short request replaces the earlier one-hour lifetime', async () => {
+    expect((await send({ long: true })).result.stopReason).toBe('stop')
+    expect(sessionCacheActivity.ttlMs(sessionId)).toBe(3_600_000)
+    const { result, started, finished } = await send({})
+    expect(result.stopReason).toBe('stop')
+    expect(sessionCacheActivity.ttlMs(sessionId)).toBe(300_000)
+    const hold = sessionCacheActivity.holdUntil(
+      sessionId,
+      'main',
+      finished,
+      'max',
+    )!
+    expect(hold).toBeGreaterThanOrEqual(started + 300_000)
+    expect(hold).toBeLessThanOrEqual(finished + 300_000)
+  })
+
+  test.each(['failed', 'cancelled'] as const)(
+    'does not refresh cache activity for a %s request',
+    async (outcome) => {
+      const acceptedAt = Date.now() - 60_000
+      sessionCacheActivity.record(sessionId, 'main', 300_000, acceptedAt)
+      const { result, requests } = await send({ long: true, outcome })
+      expect(requests).toBe(1)
+      expect(result.stopReason).toBe(outcome === 'failed' ? 'error' : 'aborted')
+      expect(sessionCacheActivity.ttlMs(sessionId)).toBe(300_000)
+      expect(
+        sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
+      ).toBe(acceptedAt + 300_000)
+    },
+  )
+})

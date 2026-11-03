@@ -26,6 +26,8 @@ import {
   isOpenAIReasoningSignature,
   type MidConversationEffortTransition,
   orderClaudeCodeBody,
+  PROMPT_CACHE_1H_TTL_MS,
+  PROMPT_CACHE_DEFAULT_TTL_MS,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
   type ThinkingPrefixMismatchBehavior,
@@ -645,6 +647,7 @@ export async function buildAnthropicRequest(
   body: AnthropicRequestBody
   bodyText: string
   toolNames: ReadonlyMap<string, string>
+  cacheTtlMs: number
 }> {
   // Pi 0.86 passes a normalized transcript to providers, and later system
   // messages can change the prompt, its named sections and the tool set. Resolve
@@ -836,5 +839,13 @@ export async function buildAnthropicRequest(
   const toolNames = new Map(
     [...declaredToolNames].filter(([wireName]) => sentNames.has(wireName)),
   )
-  return { body, bodyText, toolNames }
+  // Sticky routing uses the longest TTL actually sent to bound how long a
+  // session waits on its account. Include hook edits, not the account setting;
+  // a cache_control key inside tool data is not a cache breakpoint.
+  let cacheTtlMs = PROMPT_CACHE_DEFAULT_TTL_MS
+  walkCacheControlHolders(sentBody, (holder) => {
+    if ((holder.cache_control as Record<string, unknown>).ttl === '1h')
+      cacheTtlMs = PROMPT_CACHE_1H_TTL_MS
+  })
+  return { body, bodyText, toolNames, cacheTtlMs }
 }
