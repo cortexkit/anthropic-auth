@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - In sticky-balanced routing, after a rate limit Anthropic doesn't confirm as a used-up limit, a session now retries its own account at most twice per turn (up to a minute each), then moves to another account. OpenCode 2 used to move at once, and OpenCode 1 retried until OpenCode gave up.
-
 ## 2.4.13
 
 - Pi now offers Claude Opus 5.5's supported adaptive effort levels, `low` through `max`, including `xhigh`, instead of offering unsupported `off` and `minimal`. Thanks @mhismail3.
