@@ -90,6 +90,12 @@ export async function installNativeAnthropic<Q, P>(
           })) {
             if (event.type === 'session.deleted')
               forgetSession(event.data.sessionID)
+            if (
+              event.type === 'session.idle' ||
+              (event.type === 'session.status' &&
+                event.data.status.type === 'idle')
+            )
+              deps.source.forgetTurn?.(event.data.sessionID)
           }
         } catch (error) {
           if (!abort.signal.aborted)

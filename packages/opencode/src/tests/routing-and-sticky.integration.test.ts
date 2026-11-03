@@ -97,6 +97,165 @@ function expectUnknownQuotaAdmissionBlocked(storage: AccountStorage) {
 describe('auth.loader', () => {
   installLoaderSetup(testContext)
 
+  test('sticky-balanced OpenCode 1 retries unconfirmed 429s twice per turn and account', async () => {
+    const checkedAt = Date.now()
+    let now = checkedAt
+    Date.now = mock(() => now)
+    const quota = (remaining: number) => ({
+      checkedAt,
+      five_hour: {
+        usedPercent: 100 - remaining,
+        remainingPercent: remaining,
+        checkedAt,
+      },
+      seven_day: {
+        usedPercent: 100 - remaining,
+        remainingPercent: remaining,
+        checkedAt,
+      },
+    })
+    await useTempAccountFile(
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'sticky-balanced' },
+          quota: {
+            enabled: true,
+            mainQuota: quota(0),
+            mainQuotaCheckedAt: checkedAt,
+            mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
+          },
+          accounts: ['first', 'second'].map((id, index) => ({
+            id,
+            type: 'oauth' as const,
+            access: `sk-ant-oat01-${id}-access`,
+            refresh: `${id}-refresh`,
+            expires: checkedAt + 8 * 60 * 60_000,
+            quota: quota(index ? 10 : 100),
+          })),
+        }),
+      ),
+    )
+    const sent: string[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        (input: string | URL | Request, init?: RequestInit) => {
+          const url = extractUrl(input)
+          if (url.includes('/api/oauth/usage'))
+            return Promise.resolve(
+              Response.json({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+              }),
+            )
+          if (!url.includes('/v1/messages'))
+            return Promise.resolve(Response.json({}))
+          sent.push(new Headers(init?.headers).get('authorization') ?? '')
+          return Promise.resolve(
+            Response.json(
+              { error: { type: 'rate_limit_error' } },
+              { status: 429, headers: { 'retry-after': '432000' } },
+            ),
+          )
+        },
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const auth = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'sk-ant-oat01-main-access',
+          refresh: 'main-refresh',
+          expires: checkedAt + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const send = async (sessionId: string, messageId: string) => {
+      now += 10_000
+      await plugin['experimental.chat.messages.transform'](
+        {},
+        {
+          messages: [
+            {
+              info: {
+                id: messageId,
+                role: 'user',
+                sessionID: sessionId,
+                model: { providerID: 'anthropic', modelID: 'claude-fable-5' },
+              },
+              parts: [{ type: 'text', text: 'hello' }],
+            },
+          ],
+        },
+      )
+      const headers: Record<string, string> = {
+        'x-session-affinity': sessionId,
+      }
+      await plugin['chat.headers'](
+        { sessionID: sessionId, message: { id: messageId } },
+        { headers },
+      )
+      expect(headers['x-cortexkit-billing-lineage']).toBeDefined()
+      const start = sent.length
+      const response = await auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      await response.text()
+      return { accounts: sent.slice(start), response }
+    }
+    const initial = (await send('budget-session', 'turn-one')).accounts[0]
+    if (!initial) throw new Error('Initial request did not reach an account')
+    expect((await send('budget-session', 'turn-one')).accounts).toEqual([
+      initial,
+    ])
+    const other = (await send('other-budget-session', 'other-turn')).accounts[0]
+    if (!other) throw new Error('Independent session did not reach an account')
+    // A new user message resets a spent two-retry budget without an idle event.
+    for (let i = 0; i < 2; i++) {
+      const retained = await send('budget-session', 'turn-two')
+      expect(retained.accounts).toEqual([initial])
+      expect(
+        Number(retained.response.headers.get('retry-after')),
+      ).toBeLessThanOrEqual(60)
+    }
+    const moved = (await send('budget-session', 'turn-two')).accounts
+    expect(moved).toHaveLength(2)
+    expect(moved[0]).toBe(initial)
+    expect(moved[1]).not.toBe(initial)
+    const replacement = moved[1]
+    if (!replacement)
+      throw new Error('Third refusal did not move to an account')
+    expect((await send('budget-session', 'turn-two')).accounts).toEqual([
+      replacement,
+    ])
+    expect((await send('budget-session', 'turn-two')).accounts).toEqual([
+      replacement,
+    ])
+    const movedAgain = (await send('budget-session', 'turn-two')).accounts
+    expect(movedAgain).toEqual([replacement, initial])
+    expect((await send('other-budget-session', 'other-turn')).accounts).toEqual(
+      [other],
+    )
+    expect(
+      (await send('other-budget-session', 'other-turn')).accounts,
+    ).toHaveLength(2)
+    await plugin.event({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'budget-session' },
+      },
+    })
+    expect((await send('budget-session', 'turn-two')).accounts).toEqual([
+      initial,
+    ])
+  })
+
   test('fetch wrapper adds beta=true to /v1/messages URL', async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }), {
       access: 'sk-ant-oat01-token',

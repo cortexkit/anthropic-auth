@@ -62,6 +62,7 @@ import {
   quotaSnapshotPassesPolicy,
   runWithRequestSignal,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  StickyQuotaRetryCounter,
   type StickyRouteCandidate,
   StickySessionRouter,
   sendViaRelay,
@@ -111,6 +112,14 @@ const PHYSICAL_SEND_FAILED = 'physical send failed before a response'
 let cacheKeepRegistry: CacheKeepSessionRegistry | undefined
 let cacheKeepRegistryDirectory: string | undefined
 const stickyRouters = new Map<string, StickySessionRouter>()
+const stickyQuotaRetries = new StickyQuotaRetryCounter()
+
+export function clearPiStickyQuotaRetries(
+  storagePath: string,
+  sessionId: string,
+) {
+  stickyQuotaRetries.clear(JSON.stringify([storagePath, sessionId]))
+}
 const quotaManagers = new Map<
   string,
   { identityKey: string; manager: QuotaManager }
@@ -267,6 +276,7 @@ export async function clearPiStickyRoutingSession(
   sessionId: string,
 ) {
   sessionCacheActivity.forget(sessionId)
+  clearPiStickyQuotaRetries(storagePath, sessionId)
   await (await getPiStickyRouter(storagePath)).clear(sessionId)
 }
 
@@ -1447,6 +1457,8 @@ async function executeWithFallback(options: {
       storage,
       inputBytes: initialInputBytes,
     })
+    if (resolution?.migrated)
+      clearPiStickyQuotaRetries(options.storagePath, sessionId)
     if (!resolution && incompleteQuotaPool) {
       const error = new Error(
         'Sticky-balanced routing is waiting for current OAuth quota snapshots',
@@ -1588,6 +1600,16 @@ async function executeWithFallback(options: {
           modelId: options.model.id,
           responseHeaders,
           sessionId,
+          unconfirmedRetry: {
+            counter: stickyQuotaRetries,
+            sessionId: JSON.stringify([options.storagePath, sessionId]),
+            turnId: String(
+              options.context.messages.findLast(
+                (message) => message.role === 'user',
+              )?.timestamp ?? sessionId,
+            ),
+            accountId: route.id,
+          },
           holdUntil: sessionCacheActivity.holdUntil(
             sessionId,
             route.id,
@@ -1635,6 +1657,7 @@ async function executeWithFallback(options: {
             (candidate) => candidate.id === resolution?.accountId,
           )
           if (resolution && migrated) {
+            clearPiStickyQuotaRetries(options.storagePath, sessionId)
             route = migrated
             return completeRoute(route, await sendRoute(route))
           }
@@ -1652,7 +1675,10 @@ async function executeWithFallback(options: {
             includeApiRoutes: true,
             apiOnly: true,
           })
-          if (apiFallback) return apiFallback
+          if (apiFallback) {
+            clearPiStickyQuotaRetries(options.storagePath, sessionId)
+            return apiFallback
+          }
         }
       }
       return completeRoute(

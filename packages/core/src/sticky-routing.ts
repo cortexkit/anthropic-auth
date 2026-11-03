@@ -100,8 +100,44 @@ export type StickyQuotaFailureDecision =
     }
   | {
       action: 'migrate'
-      reason: 'five-hour' | 'seven-day' | 'model-scoped'
+      reason:
+        | 'five-hour'
+        | 'seven-day'
+        | 'model-scoped'
+        | 'unconfirmed-retry-limit'
     }
+
+export const MAX_UNCONFIRMED_SAME_ACCOUNT_RETRIES = 2
+
+/** Process-local retry budgets; only the current turn and account survive per session. */
+export class StickyQuotaRetryCounter {
+  private readonly sessions = new Map<
+    string,
+    { turnId: string; accountId: string; retains: number }
+  >()
+
+  constructor(private readonly maxSessions = STICKY_ROUTING_MAX_ASSIGNMENTS) {}
+
+  retain(sessionId: string, turnId: string, accountId: string): boolean {
+    let entry = this.sessions.get(sessionId)
+    if (entry?.turnId !== turnId || entry.accountId !== accountId) {
+      this.sessions.delete(sessionId)
+      if (this.sessions.size >= this.maxSessions) {
+        const oldest = this.sessions.keys().next().value
+        if (oldest !== undefined) this.sessions.delete(oldest)
+      }
+      entry = { turnId, accountId, retains: 0 }
+      this.sessions.set(sessionId, entry)
+    }
+    if (entry.retains >= MAX_UNCONFIRMED_SAME_ACCOUNT_RETRIES) return false
+    entry.retains++
+    return true
+  }
+
+  clear(sessionId: string): void {
+    this.sessions.delete(sessionId)
+  }
+}
 
 /**
  * Build the terminal response for a complete sticky quota pool that has no
@@ -516,8 +552,23 @@ export function decideStickyQuotaFailure(input: {
   now?: number
   sessionId?: string
   holdUntil?: number
+  unconfirmedRetry?: {
+    counter: StickyQuotaRetryCounter
+    sessionId: string
+    turnId: string
+    accountId: string
+  }
 }): StickyQuotaFailureDecision {
   const now = input.now ?? Date.now()
+  const retain = (
+    reason: 'unknown' | 'not-exhausted',
+  ): StickyQuotaFailureDecision => {
+    const scope = input.unconfirmedRetry
+    return scope &&
+      !scope.counter.retain(scope.sessionId, scope.turnId, scope.accountId)
+      ? { action: 'migrate', reason: 'unconfirmed-retry-limit' }
+      : { action: 'retain', reason }
+  }
   let reading = knownQuota(input.quota)
   // The refused request can confirm exhaustion even when a quota probe fails
   // or serves an older cached reading. Never use rounded header percentages here.
@@ -535,7 +586,7 @@ export function decideStickyQuotaFailure(input: {
     reading || (confirmed && Object.keys(confirmed).length)
       ? { ...reading, ...confirmed }
       : undefined
-  if (!quota) return { action: 'retain', reason: 'unknown' }
+  if (!quota) return retain('unknown')
   let blocking:
     | { resetAt: number; reason: 'five-hour' | 'seven-day' | 'model-scoped' }
     | undefined
@@ -556,7 +607,7 @@ export function decideStickyQuotaFailure(input: {
     // A request can resume only after every exhausted window blocking its model resets.
     if (!blocking || resetAt > blocking.resetAt) blocking = { resetAt, reason }
   }
-  if (!blocking) return { action: 'retain', reason: 'not-exhausted' }
+  if (!blocking) return retain('not-exhausted')
   const jitterMs = input.sessionId
     ? (stickyRetryAfterWithJitter(input.sessionId, 1) - 1) * 1000
     : 0

@@ -38,7 +38,10 @@ import {
 import { createPiNativeCommands } from './native-commands.ts'
 import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
 import type { PiQuotaWaitOptions } from './quota-wait.ts'
-import { streamCortexKitAnthropic } from './stream.ts'
+import {
+  clearPiStickyQuotaRetries,
+  streamCortexKitAnthropic,
+} from './stream.ts'
 
 function textImageInput(): Array<'text' | 'image'> {
   return ['text', 'image']
@@ -126,9 +129,14 @@ export default async function cortexKitPiAnthropicAuth(
       else break
     }
   })
+  pi.on('agent_settled', async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (sessionId) clearPiStickyQuotaRetries(storagePath, sessionId)
+  })
   pi.on('session_shutdown', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     if (sessionId) {
+      clearPiStickyQuotaRetries(storagePath, sessionId)
       effortHistoryBySession.delete(sessionId)
       workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)

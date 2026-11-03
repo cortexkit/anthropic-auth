@@ -40,6 +40,11 @@ describe('BillingLineageTracker', () => {
         headers: firstHeaders,
       }),
     ).toBe(true)
+    for (let lookup = 0; lookup < 2; lookup++)
+      expect(
+        tracker.promptIdForHeader(firstHeaders[BILLING_LINEAGE_REQUEST_HEADER]),
+      ).toBe('00000000-0000-4000-8000-000000000001')
+    expect(tracker.promptIdForHeader('missing')).toBeUndefined()
     const first = tracker.resolveHeader(
       firstHeaders[BILLING_LINEAGE_REQUEST_HEADER],
     )

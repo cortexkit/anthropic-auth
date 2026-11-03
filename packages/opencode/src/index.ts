@@ -199,6 +199,7 @@ import {
   resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
+  StickyQuotaRetryCounter,
   type StickyRouteCandidate,
   StickySessionRouter,
   sendViaRelay,
@@ -1932,6 +1933,7 @@ const anthropicAuthPlugin = async (
   const laneStartTracker = new LaneStartTracker()
   const effortPlanTracker = new OpenCodeEffortPlanTracker()
   const billingLineageTracker = new BillingLineageTracker()
+  const stickyQuotaRetries = new StickyQuotaRetryCounter()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const pendingRecoveryDesktopNotices = new Map<string, string>()
@@ -6348,6 +6350,7 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.idle') {
+        stickyQuotaRetries.clear(sessionId)
         const latestUserMessageId =
           desktopNoticeLatestUserMessages.get(sessionId)
         if (latestUserMessageId) {
@@ -6376,6 +6379,7 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.deleted') {
+        stickyQuotaRetries.clear(sessionId)
         sessionCacheActivity.forget(sessionId)
         fableFallbackManager.clearSession(sessionId)
         dropSessionSourceWarms(sessionId)
@@ -9029,6 +9033,9 @@ const anthropicAuthPlugin = async (
               const sessionId =
                 incomingHeaders.get('x-session-affinity') ||
                 incomingHeaders.get('x-opencode-session')
+              const turnId = billingLineageTracker.promptIdForHeader(
+                incomingHeaders.get(BILLING_LINEAGE_REQUEST_HEADER),
+              )
               const requestModel = parseRequestModel(init?.body)
               // Match sticky routing's original requested-model affinity, not
               // the effective model chosen by recovery or a subagent's model.
@@ -9732,6 +9739,7 @@ const anthropicAuthPlugin = async (
                         ),
                     )
                   let resolution = await resolveRoute()
+                  if (resolution?.migrated) stickyQuotaRetries.clear(sessionId)
                   if (advisedAccountId && !resolution) {
                     routingRelay.override(
                       sessionId,
@@ -10036,6 +10044,12 @@ const anthropicAuthPlugin = async (
                         modelId: routingModelId,
                         responseHeaders: inspected.response.headers,
                         sessionId,
+                        unconfirmedRetry: {
+                          counter: stickyQuotaRetries,
+                          sessionId,
+                          turnId: turnId ?? sessionId,
+                          accountId: route.id,
+                        },
                         holdUntil: sessionCacheActivity.holdUntil(
                           sessionId,
                           route.id,
@@ -10102,6 +10116,7 @@ const anthropicAuthPlugin = async (
                           (candidate) => candidate.id === resolution?.accountId,
                         )
                         if (resolution && migratedRoute) {
+                          stickyQuotaRetries.clear(sessionId)
                           route = migratedRoute
                           if (
                             fablePlan?.downgraded &&
@@ -10158,6 +10173,7 @@ const anthropicAuthPlugin = async (
                             },
                           )
                           if (apiResponse) {
+                            stickyQuotaRetries.clear(sessionId)
                             trace.done('return_sticky_api_fallback', {
                               status: apiResponse.status,
                             })
