@@ -349,6 +349,8 @@ suite.test(
     expect(result).toEqual({
       ok: false,
       reason: 'Provider prewarm transport failed',
+      stage: 'send',
+      class: 'ECONNREFUSED',
       provider_error: {
         type: 'unknown',
         reason: 'transport',
@@ -594,6 +596,8 @@ suite.test(
     })
     expect(await fixture.run()).toEqual({
       ok: false,
+      stage: 'authorization',
+      class: 'unknown',
       transient: true,
       reason: 'OAuth cache prewarm credential is unavailable',
       provider_error: {

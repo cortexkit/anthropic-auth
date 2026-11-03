@@ -1431,11 +1431,85 @@ registerTest(
       ok: false,
       reason: 'account-policy',
       refusal: 'account-policy',
+      stage: 'authorization',
+      class: 'account-policy',
     })
     expect(gets).toBe(0)
     expect(sends).toBe(0)
   }),
 )
+
+test('Pi CacheKeep retains only closed authorization, send and response diagnostics', async () => {
+  const f = await fixture()
+  const prewarm = () =>
+    __prewarmPiCacheKeepForTest({
+      sessionId: 'pi-cachekeep-diagnostics',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: model.id,
+        system: [
+          {
+            type: 'text',
+            text: 'stable',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      }),
+      oauthAccountId: 'main',
+      oauthAccountIdentity: fixtureAccountIdentity('main'),
+      accountStoragePath: f.path,
+    })
+  for (const [failureClass, fail] of [
+    [
+      'AbortError',
+      async () => {
+        throw new DOMException('SECRET credential', 'AbortError')
+      },
+    ],
+    [
+      'TimeoutError',
+      async () => {
+        throw new DOMException('SECRET credential', 'TimeoutError')
+      },
+    ],
+    [
+      'ECONNRESET',
+      async () => {
+        throw Object.assign(new Error('SECRET credential'), {
+          code: 'ECONNRESET',
+        })
+      },
+    ],
+    [
+      500,
+      async () =>
+        Response.json(
+          { error: { type: 'api_error', message: 'SECRET provider body' } },
+          { status: 500 },
+        ),
+    ],
+  ] as const) {
+    globalThis.fetch = Object.assign(fail, {
+      preconnect: originalFetch.preconnect,
+    })
+    const result = await prewarm()
+    expect(result).toMatchObject({
+      ok: false,
+      stage: failureClass === 500 ? 'response' : 'send',
+      class: failureClass,
+    })
+    expect(JSON.stringify(result)).not.toContain('SECRET')
+  }
+  f.client.getScoped = async () => {
+    throw new NativeCustodyError('unavailable')
+  }
+  expect(await prewarm()).toMatchObject({
+    ok: false,
+    stage: 'authorization',
+    class: 'unavailable',
+  })
+})
 
 registerTest.each([200, 401])(
   'Pi retries in-flight scoped 401 once and fences final status %i',

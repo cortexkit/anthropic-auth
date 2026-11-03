@@ -254,6 +254,8 @@ test('CacheKeep provider-body and transport failures log status and flags, never
     {
       session: 'ck-http',
       status: 500,
+      stage: 'response',
+      class: 500,
       provider_error: {
         type: 'api_error',
         reason: 'http_error',
@@ -262,6 +264,8 @@ test('CacheKeep provider-body and transport failures log status and flags, never
     },
     {
       session: 'ck-transport',
+      stage: 'send',
+      class: 'unknown',
       transient: true,
       provider_error: {
         type: 'unknown',
@@ -271,6 +275,8 @@ test('CacheKeep provider-body and transport failures log status and flags, never
     },
     {
       session: 'ck-credential',
+      stage: 'authorization',
+      class: 'unknown',
       transient: true,
       provider_error: {
         type: 'unknown',
@@ -293,6 +299,8 @@ test('CacheKeep provider-body and transport failures log status and flags, never
     ok: false,
     reason: 'Provider prewarm request failed',
     status: 500,
+    stage: 'response',
+    class: 500,
     provider_error: {
       type: 'api_error',
       reason: 'http_error',
@@ -344,6 +352,9 @@ test('CacheKeep callback and stage exceptions log fixed stages and safe summarie
   ).toEqual([
     {
       session: 'ck-thrown',
+      stage: 'authorization',
+      class: 'unknown',
+      transient: true,
       provider_error: {
         type: 'unknown',
         reason: 'transport',

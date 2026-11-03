@@ -27,6 +27,7 @@ import {
   HOLDER_FILE_NAME,
   type LogTestRecord,
   type NativeCustodyClient,
+  NativeCustodyError,
   type NativeLockEvent,
   PrimeManager,
   type ProviderAccountUuid,
@@ -1861,11 +1862,87 @@ test('native CacheKeep returns a terminal killswitch refusal without authorizing
       bodyText: cacheKeepPrewarmBody,
       oauthAccountId: 'main',
     }),
-  ).toEqual({ ok: false, reason: 'account-policy', refusal: 'account-policy' })
+  ).toEqual({
+    ok: false,
+    reason: 'account-policy',
+    refusal: 'account-policy',
+    stage: 'authorization',
+    class: 'account-policy',
+  })
   expect(fixture.authorizedGets).toHaveLength(reads)
   expect(
     fixture.records.filter((record) => record.url.includes('/v1/messages')),
   ).toEqual([])
+})
+
+test('native OpenCode 1 CacheKeep retains only closed authorization, send and response diagnostics', async () => {
+  const fixture = await migrateServingFixture('claustrum')
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  await load(plugin, async () => custodyTombstoneOAuth('anthropic'))
+  const cacheKeep = getPluginTestHandles(plugin).cacheKeepManager
+  if (!(cacheKeep instanceof CacheKeepManager))
+    throw new Error('No CacheKeep manager')
+  const prewarm = () =>
+    cacheKeep.prewarmNow({
+      sessionId: 'synthetic-diagnostic-session',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: cacheKeepPrewarmBody,
+      oauthAccountId: 'main',
+    })
+  for (const [failureClass, fail] of [
+    [
+      'AbortError',
+      async () => {
+        throw new DOMException('SECRET credential', 'AbortError')
+      },
+    ],
+    [
+      'TimeoutError',
+      async () => {
+        throw new DOMException('SECRET credential', 'TimeoutError')
+      },
+    ],
+    [
+      'ECONNRESET',
+      async () => {
+        throw Object.assign(new Error('SECRET credential'), {
+          code: 'ECONNRESET',
+        })
+      },
+    ],
+    [
+      500,
+      async () =>
+        Response.json(
+          { error: { type: 'api_error', message: 'SECRET provider body' } },
+          { status: 500 },
+        ),
+    ],
+  ] as const) {
+    network.mockImplementation(async (input, init) =>
+      String(input).includes('/v1/messages')
+        ? fail()
+        : fixture.fetchProvider(input, init),
+    )
+    const result = await prewarm()
+    expect(result).toMatchObject({
+      ok: false,
+      stage: failureClass === 500 ? 'response' : 'send',
+      class: failureClass,
+    })
+    expect(JSON.stringify(result)).not.toContain('SECRET')
+  }
+  fixture.scopedClient.getScoped = async () => {
+    throw new NativeCustodyError('unavailable')
+  }
+  expect(await prewarm()).toMatchObject({
+    ok: false,
+    stage: 'authorization',
+    class: 'unavailable',
+  })
 })
 
 test('vault relay transport failure reauthorizes direct fallback without false credential rejection', async () => {

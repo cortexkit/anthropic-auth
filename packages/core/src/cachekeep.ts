@@ -1,5 +1,11 @@
 import { createHash } from 'node:crypto'
 import type { AccountStorage } from './accounts.ts'
+import {
+  type CacheKeepFailure,
+  type CacheKeepFailureStage,
+  CacheKeepPrewarmError,
+  classifyCacheKeepFailure,
+} from './cachekeep-failure.ts'
 import type { CacheKeepTrackedSession } from './cachekeep-registry.ts'
 import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
@@ -10,6 +16,7 @@ import { CLAUDE_OPUS_5_5_PRICING } from './models.ts'
 import {
   NativeAccountRefusal,
   type NativeAccountRefusalReason,
+  nativeAccountRefusal,
 } from './native-account-refusal.ts'
 import {
   createProviderErrorResponseScope,
@@ -28,6 +35,12 @@ export const CACHE_KEEP_PREWARM_TIMEOUT_MS = 30_000
 export const CACHE_KEEP_RETRY_BASE_MS = 60_000
 export const CACHE_KEEP_RETRY_MAX_MS = 15 * 60_000
 export const CACHE_KEEP_RETRY_JITTER_MAX_MS = 30_000
+// Cap transient backoff at 20, 40, then 60 seconds so several minute-tick
+// attempts fit in the unchanged five-minute lead; reserve the request timeout
+// plus five seconds before expiry, and never send after that last-start deadline.
+export const CACHE_KEEP_TRANSIENT_RETRY_STEP_MS = 20_000
+export const CACHE_KEEP_TRANSIENT_RETRY_MAX_MS = 60_000
+export const CACHE_KEEP_EXPIRY_SAFETY_MS = 5_000
 const STATUS_TITLE = '## Claude Cache Keep Status'
 const ENABLED_TITLE = '## Claude Cache Keep Enabled'
 const DISABLED_TITLE = '## Claude Cache Keep Disabled'
@@ -517,6 +530,8 @@ export type CacheKeepPrewarmResult =
       status?: number
       transient?: true
       provider_error?: ProviderErrorSummary['provider_error']
+      stage?: CacheKeepFailure['stage']
+      class?: CacheKeepFailure['class']
     }
   | {
       /** The warm was refused before any send; the target is removed. */
@@ -982,23 +997,55 @@ export class CacheKeepManager {
 
     logger.debug('cachekeep', 'fired', { targets: this.targets.size })
     for (const target of this.targets.values()) {
-      if (target.nextPrewarmAt > now) continue
+      const attemptAt = this.options.now?.() ?? Date.now()
+      if (target.nextPrewarmAt > attemptAt) continue
+      if (attemptAt > this.lastPrewarmStart(target)) {
+        this.removeTarget(target, 'retry-window-ended', attemptAt)
+        continue
+      }
       try {
-        await this.prewarm(target, now)
-      } catch {
+        await this.prewarm(target, attemptAt)
+      } catch (error) {
         logger.warn('cachekeep', 'prewarm failed', {
           session: target.id,
+          ...classifyCacheKeepFailure(error, 'send'),
+          transient: true,
           ...summarizePrewarmProviderError({ failure: 'transport' }),
         })
-        target.consecutiveFailures += 1
-        target.nextPrewarmAt =
-          now + cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
+        this.scheduleRetry(target, true)
       } finally {
         if (this.targets.get(target.id) === target)
           this.options.onTargetChanged?.(target)
       }
     }
     this.publishTrackedSessions()
+  }
+
+  private lastPrewarmStart(target: CacheKeepTarget) {
+    return (
+      target.cacheExpiresAt -
+      (this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS) -
+      CACHE_KEEP_EXPIRY_SAFETY_MS
+    )
+  }
+
+  private scheduleRetry(target: CacheKeepTarget, transient: boolean) {
+    const now = this.options.now?.() ?? Date.now()
+    const deadline = this.lastPrewarmStart(target)
+    if (now >= deadline) {
+      this.removeTarget(target, 'retry-window-ended', now)
+      return
+    }
+    target.consecutiveFailures += 1
+    const backoff = cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
+    const delay = transient
+      ? Math.min(
+          backoff,
+          CACHE_KEEP_TRANSIENT_RETRY_STEP_MS * target.consecutiveFailures,
+          CACHE_KEEP_TRANSIENT_RETRY_MAX_MS,
+        )
+      : backoff
+    target.nextPrewarmAt = Math.min(now + delay, deadline)
   }
 
   private async sendPrewarm(
@@ -1010,6 +1057,8 @@ export class CacheKeepManager {
         this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
       ),
     }
+    let stage: CacheKeepFailureStage = 'authorization'
+    let responseStatus: number | undefined
     try {
       let bodyText = target.bodyText
       if (this.options.prepareBody) {
@@ -1070,17 +1119,18 @@ export class CacheKeepManager {
           ...summary,
           reason: summary.provider_error.message,
           transient: true,
+          ...classifyCacheKeepFailure(undefined, 'authorization'),
         }
       }
       headers.delete('content-length')
       headers.delete('transfer-encoding')
+      stage = 'send'
       let response: Response
       // Every physical send gets its own response scope holding exactly the
-      // credentials that send carried, so a provider error or transport
-      // exception echoing them is scrubbed before anything reads it: the
-      // status check, onResponse data, dumps and the returned reason. The
-      // scope retires itself when the error body is read or cancelled; a
-      // successful body is passed through untouched.
+      // credentials that send carried. Provider bodies are scrubbed before
+      // callbacks or dumps read them; transport exceptions retain only closed
+      // diagnostics. The scope retires when the error body is read or cancelled;
+      // a successful body is passed through untouched.
       const send = async (attemptHeaders: Headers): Promise<Response> => {
         const scope = createProviderErrorResponseScope(
           cacheKeepSentCredentials(attemptHeaders),
@@ -1095,58 +1145,48 @@ export class CacheKeepManager {
           })
           return scope.redactResponse(sent)
         } catch (error) {
-          if (error instanceof NativeAccountRefusal) {
+          if (nativeAccountRefusal(error)) {
             scope.dispose()
             throw error
           }
-          const redacted = scope.redactError(error)
           scope.dispose()
-          throw redacted
+          throw new CacheKeepPrewarmError('send', error)
         }
       }
-      try {
-        response = await send(headers)
-        if (
-          response.status === 401 &&
-          !attempt.signal?.aborted &&
-          this.options.retryOnUnauthorized
-        ) {
-          let rotatedHeaders: Headers | undefined
-          try {
-            rotatedHeaders = await this.options.retryOnUnauthorized({
-              target: prewarmTarget,
-              headers,
-              bodyText: prewarm.bodyText,
-              attempt,
-            })
-          } catch (error) {
-            if (error instanceof NativeAccountRefusal) {
-              await response.body?.cancel().catch(() => {})
-              throw error
-            }
-            // A failed credential lookup cannot justify replay. Observe and
-            // report the original 401 against its actual send-time receipt.
-          }
-          if (rotatedHeaders && !attempt.signal?.aborted) {
-            rotatedHeaders.delete('content-length')
-            rotatedHeaders.delete('transfer-encoding')
+      response = await send(headers)
+      if (
+        response.status === 401 &&
+        !attempt.signal?.aborted &&
+        this.options.retryOnUnauthorized
+      ) {
+        let rotatedHeaders: Headers | undefined
+        try {
+          rotatedHeaders = await this.options.retryOnUnauthorized({
+            target: prewarmTarget,
+            headers,
+            bodyText: prewarm.bodyText,
+            attempt,
+          })
+        } catch (error) {
+          if (error instanceof NativeAccountRefusal) {
             await response.body?.cancel().catch(() => {})
-            headers = rotatedHeaders
-            response = await send(headers)
+            throw error
           }
+          // A failed credential lookup cannot justify replay. Observe and
+          // report the original 401 against its actual send-time receipt.
         }
-      } catch (error) {
-        if (error instanceof NativeAccountRefusal) throw error
-        const summary = summarizePrewarmProviderError({ failure: 'transport' })
-        return {
-          ok: false,
-          ...summary,
-          reason: summary.provider_error.message,
-          transient: true,
+        if (rotatedHeaders && !attempt.signal?.aborted) {
+          rotatedHeaders.delete('content-length')
+          rotatedHeaders.delete('transfer-encoding')
+          await response.body?.cancel().catch(() => {})
+          headers = rotatedHeaders
+          response = await send(headers)
         }
       }
+      stage = 'response'
+      responseStatus = response.status
       const receivedAt = this.options.now?.() ?? Date.now()
-      const raw = await response.text().catch(() => '')
+      const raw = await response.text()
       let data: unknown = null
       try {
         data = raw ? JSON.parse(raw) : null
@@ -1188,6 +1228,7 @@ export class CacheKeepManager {
           ok: false,
           ...summary,
           reason: summary.provider_error.message,
+          ...classifyCacheKeepFailure(undefined, 'response', response.status),
         }
       }
       const objectData =
@@ -1203,9 +1244,23 @@ export class CacheKeepManager {
         | undefined
       return { ok: true, ...(usage && { usage }) }
     } catch (error) {
-      if (error instanceof NativeAccountRefusal)
-        return { ok: false, reason: error.reason, refusal: error.reason }
-      throw error
+      const failure = classifyCacheKeepFailure(error, stage, responseStatus)
+      const refusal = nativeAccountRefusal(error)
+      if (refusal)
+        return {
+          ok: false,
+          reason: refusal.reason,
+          refusal: refusal.reason,
+          ...failure,
+        }
+      const summary = summarizePrewarmProviderError({ failure: 'transport' })
+      return {
+        ok: false,
+        ...summary,
+        ...failure,
+        reason: summary.provider_error.message,
+        transient: true,
+      }
     } finally {
       try {
         await this.options.onComplete?.({ target, attempt })
@@ -1223,7 +1278,10 @@ export class CacheKeepManager {
         return
       }
       if (result.refusal) {
-        this.removeTarget(target, result.refusal, now)
+        this.removeTarget(target, result.refusal, now, {
+          stage: result.stage,
+          class: result.class,
+        })
       } else if (result.status == null && !result.transient) {
         this.removeTarget(
           target,
@@ -1237,14 +1295,20 @@ export class CacheKeepManager {
         logger.warn('cachekeep', 'prewarm failed', {
           session: target.id,
           status: result.status,
+          stage: result.stage,
+          class: result.class,
           ...(result.transient && { transient: true }),
           ...(result.provider_error && {
             provider_error: result.provider_error,
           }),
         })
-        target.consecutiveFailures += 1
-        target.nextPrewarmAt =
-          now + cacheKeepRetryDelayMs(target.id, target.consecutiveFailures)
+        this.scheduleRetry(
+          target,
+          result.transient === true ||
+            result.status === 408 ||
+            result.status === 429 ||
+            (result.status !== undefined && result.status >= 500),
+        )
       }
       return
     }

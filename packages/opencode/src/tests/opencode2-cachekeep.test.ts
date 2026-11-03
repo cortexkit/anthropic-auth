@@ -24,6 +24,7 @@ import {
   formatLogLine,
   getLogLevel,
   logger,
+  NativeCustodyError,
   type NativeLockEvent,
   resolveNativePoolPaths,
   runNativeMigration,
@@ -42,6 +43,7 @@ import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
 } from '../v2/adapter'
+import { createNativeCacheKeep } from '../v2/cachekeep'
 import {
   type CacheKeepStore,
   cacheKeepStoreDirectory,
@@ -743,6 +745,8 @@ test('a killswitch-refused OpenCode 2 target warns once, stops, and tracks the n
   expect(warnings()[0]).toContain('stopped warming session')
   expect(warnings()[0]).toContain('"session":"ses_oc2_keep"')
   expect(warnings()[0]).toContain('"reason":"account-policy"')
+  expect(warnings()[0]).toContain('"stage":"authorization"')
+  expect(warnings()[0]).toContain('"class":"account-policy"')
   expect(await f.registry.list()).toEqual([])
   f.advance(2 * 60_000)
   await f.timers.fire()
@@ -831,6 +835,112 @@ test('an OpenCode 2 API-key request and a prewarm send produce no WARN', async (
     'ses_oc2_keep',
   ])
   expect(lines.filter((line) => line.includes(' WARN '))).toEqual([])
+})
+
+test.each([
+  [
+    'AbortError',
+    'send',
+    async () => {
+      throw new DOMException('SECRET native credential', 'AbortError')
+    },
+  ],
+  [
+    'TimeoutError',
+    'send',
+    async () => {
+      throw new DOMException('SECRET native credential', 'TimeoutError')
+    },
+  ],
+  [
+    'ECONNRESET',
+    'send',
+    async () => {
+      throw Object.assign(new Error('SECRET native credential'), {
+        code: 'ECONNRESET',
+      })
+    },
+  ],
+  [
+    500,
+    'response',
+    async () =>
+      Response.json(
+        { error: { type: 'api_error', message: 'SECRET provider body' } },
+        { status: 500 },
+      ),
+  ],
+  [
+    'TypeError',
+    'response',
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new TypeError('SECRET native response'))
+          },
+        }),
+      ),
+  ],
+] as const)(
+  'OpenCode 2 prewarm preserves the closed failure class %s at %s',
+  async (failureClass, stage, fail) => {
+    const lines = captureStartupLogs()
+    const f = await fixture()
+    await f.live()
+    f.setSend(fail)
+    f.due()
+    await f.timers.fire()
+    const warnings = lines.filter((line) => line.includes(' WARN '))
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('prewarm failed')
+    expect(warnings[0]).toContain(`"stage":"${stage}"`)
+    expect(warnings[0]).toContain(`"class":${JSON.stringify(failureClass)}`)
+    expect(lines.join('\n')).not.toContain('SECRET')
+    expect(lines.join('\n')).not.toContain('sk-ant-oat01-first')
+  },
+)
+
+test('OpenCode 2 prewarm classifies a vault authorization refusal without credentials', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture()
+  await f.live()
+  const runtime = createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+  })
+  const keeper = createNativeCacheKeep({
+    runtime,
+    storageId: f.paths.storageId,
+    persistence: { root: dirname(f.paths.legacyConfig) },
+    source: {
+      chooseAccount: () => 'first',
+      close: async () => {},
+      drainRoutingPublications: async () => {},
+      resetRouting: async () => {},
+      servedAccount: () => undefined,
+      recordPrime: async () => false,
+      authorizeAccount: () => {
+        const error = new NativeCustodyError('unavailable')
+        error.message = 'SECRET vault credential'
+        throw error
+      },
+    },
+  })
+  cleanups.push(async () => {
+    await keeper.dispose()
+    runtime.close()
+  })
+  await keeper.ready
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  const warnings = lines.filter((line) => line.includes(' WARN '))
+  expect(warnings).toHaveLength(1)
+  expect(warnings[0]).toContain('prewarm failed')
+  expect(warnings[0]).toContain('"stage":"authorization"')
+  expect(warnings[0]).toContain('"class":"unavailable"')
+  expect(lines.join('\n')).not.toContain('SECRET')
 })
 
 test('an OpenCode 2 prewarm sends the live request prefix as it was sent, without rewriting it again', async () => {

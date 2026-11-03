@@ -1,7 +1,9 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  type CacheKeepFailureStage,
   CacheKeepManager,
   type CacheKeepPrewarmAttempt,
+  CacheKeepPrewarmError,
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
   getDefaultCacheKeepRegistryDirectory,
@@ -414,7 +416,8 @@ export function createNativeCacheKeep(
     const signal = deadline
       ? AbortSignal.any([abort.signal, deadline])
       : abort.signal
-    signal.throwIfAborted()
+    if (signal.aborted)
+      throw new CacheKeepPrewarmError('authorization', signal.reason)
     const body = JSON.parse(await warm.text()) as { model: string }
     const scope: RequestScope = {
       providerID: 'anthropic',
@@ -509,6 +512,7 @@ export function createNativeCacheKeep(
       | Attempt<NativeAnthropicAttemptData<NativeSourceProvenance>>
       | undefined
     let status: number | undefined
+    let stage: CacheKeepFailureStage = 'authorization'
     let complete = false
     const cancel = () => native.forgetSession(scope.sessionID)
     signal.addEventListener('abort', cancel, { once: true })
@@ -558,7 +562,10 @@ export function createNativeCacheKeep(
       })
       if (!request) throw new Error('CacheKeep rewrite refused')
       signal.throwIfAborted()
+      stage = 'send'
       const physical = await (options.fetch ?? fetch)(request)
+      stage = 'response'
+      status = physical.status
       const response = await native.adapter.rewriteResponse?.({
         ...scope,
         accountId,
@@ -592,9 +599,9 @@ export function createNativeCacheKeep(
     } catch (error) {
       const refusal = nativeAccountRefusal(error)
       if (refusal) throw refusal
-      // The manager's transport headers contain only a correlation ID, so its
-      // generic error scrubber cannot know the native send's credentials.
-      throw new Error('Native CacheKeep was not completed')
+      // The native credentials are unavailable to the manager's error scrubber;
+      // retain closed diagnostics, never the native error or its message.
+      throw new CacheKeepPrewarmError(stage, error, status)
     } finally {
       signal.removeEventListener('abort', cancel)
       try {

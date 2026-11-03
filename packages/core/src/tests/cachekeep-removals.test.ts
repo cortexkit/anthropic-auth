@@ -94,6 +94,188 @@ test.each(['prepareHeaders', 'fetchImpl'] as const)(
   },
 )
 
+test('transient prewarm retries get a third attempt before expiry and a later success keeps the target warm', async () => {
+  let calls = 0
+  const { manager, track } = fixture({
+    fetchImpl: Object.assign(
+      async () => {
+        if (++calls < 3)
+          throw new TypeError('synthetic temporary network failure')
+        return Response.json({})
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  track('ses_retry')
+  const expiry = now + CACHE_KEEP_TTL_MS
+  expect(manager.trackedSessions()[0]?.nextPrewarmAt).toBe(expiry - 5 * 60_000)
+  now = expiry - 5 * 60_000
+  await manager.tick()
+  for (let minute = 1; minute <= 4; minute++) {
+    now = expiry - (5 - minute) * 60_000
+    await manager.tick()
+  }
+  expect(calls).toBe(3)
+  expect(manager.trackedSessions()[0]?.cacheExpiresAt).toBe(
+    expiry - 3 * 60_000 + CACHE_KEEP_TTL_MS,
+  )
+  now = expiry + 60_000
+  await manager.tick()
+  expect(manager.trackedCount()).toBe(1)
+  expect(calls).toBe(3)
+})
+
+test('a retry is bounded by the last safe start and is not scheduled once its request cannot fit', async () => {
+  let calls = 0
+  const { manager, track } = fixture({
+    fetchImpl: Object.assign(
+      async () => {
+        calls++
+        throw new TypeError('synthetic temporary network failure')
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  track('ses_deadline')
+  const expiry = now + CACHE_KEEP_TTL_MS
+  now = expiry - 45_000
+  await manager.tick()
+  // Thirty seconds for the request and five seconds of safety leave ten
+  // seconds for a final retry, rather than the usual twenty-second delay.
+  expect(manager.trackedSessions()[0]?.nextPrewarmAt).toBe(expiry - 35_000)
+  now = expiry - 35_000
+  await manager.tick()
+  expect(calls).toBe(2)
+  expect(manager.trackedCount()).toBe(0)
+  now = expiry - 1
+  await manager.tick()
+  expect(calls).toBe(2)
+})
+
+test('a due attempt cannot start when less than its timeout and safety margin remain', async () => {
+  let calls = 0
+  const { manager, track } = fixture({
+    prewarmTimeoutMs: 45_000,
+    fetchImpl: Object.assign(
+      async () => {
+        calls++
+        return Response.json({})
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  track('ses_late_tick')
+  now += CACHE_KEEP_TTL_MS - 49_000
+  await manager.tick()
+  expect(calls).toBe(0)
+  expect(manager.trackedCount()).toBe(0)
+})
+
+test('retry scheduling uses completion time rather than the tick start', async () => {
+  const { manager, track } = fixture({
+    fetchImpl: Object.assign(
+      async () => {
+        now += 30_000
+        throw new TypeError('synthetic slow failure')
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  track('ses_slow_failure')
+  now += CACHE_KEEP_TTL_MS - 60_000
+  await manager.tick()
+  expect(manager.trackedCount()).toBe(0)
+})
+
+test.each([
+  [
+    'abort',
+    'send',
+    'AbortError',
+    () => {
+      throw new DOMException('SECRET credential in abort', 'AbortError')
+    },
+  ],
+  [
+    'timeout',
+    'send',
+    'TimeoutError',
+    () => {
+      throw new DOMException('SECRET credential in timeout', 'TimeoutError')
+    },
+  ],
+  [
+    'socket reset',
+    'send',
+    'ECONNRESET',
+    () => {
+      throw Object.assign(new Error('SECRET socket credential'), {
+        code: 'ECONNRESET',
+      })
+    },
+  ],
+  [
+    'vault outage',
+    'authorization',
+    'unavailable',
+    () => {
+      const error = new NativeCustodyError('unavailable')
+      error.message = 'SECRET vault credential'
+      throw error
+    },
+  ],
+  [
+    'HTTP 500',
+    'response',
+    500,
+    () =>
+      Response.json(
+        { error: { type: 'api_error', message: 'SECRET provider body' } },
+        { status: 500 },
+      ),
+  ],
+  [
+    'response read',
+    'response',
+    'TypeError',
+    () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new TypeError('SECRET response credential'))
+          },
+        }),
+      ),
+  ],
+] as const)(
+  'prewarm warning classifies %s without copying messages or provider text',
+  async (_name, stage, failureClass, fail) => {
+    const fetchImpl = Object.assign(async () => fail() as Response, {
+      preconnect: fetch.preconnect,
+    })
+    const { manager, track } = fixture(
+      stage === 'authorization'
+        ? {
+            prepareHeaders: () => {
+              fail()
+              return new Headers()
+            },
+          }
+        : { fetchImpl },
+    )
+    track('ses_diagnostic')
+    now += CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
+    await manager.tick()
+    expect(logs).toHaveLength(1)
+    expect(logs[0]).toMatchObject({
+      level: 'warn',
+      message: 'prewarm failed',
+      payload: { stage, class: failureClass },
+    })
+    expect(JSON.stringify(logs)).not.toContain('SECRET')
+  },
+)
+
 test.each(['prepareHeaders', 'fetchImpl'] as const)(
   'an unreachable vault in %s is retried without dropping the target',
   async (stage) => {
