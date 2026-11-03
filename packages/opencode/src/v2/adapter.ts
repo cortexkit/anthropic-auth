@@ -2,7 +2,8 @@
 // Claude Code request transforms and response classification to common-auth's
 // transport hooks. The injected source uses Core's account and policy services.
 // Each response keeps the credential version and account of its own request,
-// including HTTP relay responses. This adapter never sends a retry itself.
+// including HTTP relay responses. Only a rejected message-thread continuation
+// is resent here, once as a full create, before the host reads any bytes.
 
 import { createHash } from 'node:crypto'
 import {
@@ -24,14 +25,18 @@ import {
   getRequestGzipLatch,
   getRequestGzipLatchPath,
   isDumpEnabled as isDumpEnabledCore,
+  type MessageThreadRequest,
+  MessageThreadTracker,
   mergeAnthropicBetas,
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
+  prepareMessageThreadRequest,
   type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
   requestSignal,
+  sendWithRequestGzip,
   setDumpEnabled as setDumpEnabledCore,
   stateRefusalCause,
   stateRefusalPublicMessage,
@@ -435,6 +440,7 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
    * OpenCode account storage file.
    */
   readonly requestGzipLatch?: RequestGzipLatch
+  readonly fetch?: typeof fetch
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
@@ -794,6 +800,8 @@ export function createNativeAnthropicAdapter<Q, P>(
   const scrubberFor = (data: Data | undefined) =>
     (data && owned.get(data)?.redactor) ?? withheld
   const release = (data: Data) => {
+    threadRequests.get(data)?.thread.fail()
+    threadRequests.delete(data)
     const entry = owned.get(data)
     if (!entry) return
     owned.delete(data)
@@ -992,7 +1000,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     attemptId: attempt.attemptId,
     transport: attempt.transport,
     route: data.route,
-    provenance: data.provenance,
+    provenance: resendProvenance.get(data) ?? data.provenance,
     dispatch: data.dispatch,
   })
 
@@ -1091,6 +1099,15 @@ export function createNativeAnthropicAdapter<Q, P>(
     return { headers: relayHeaders ?? headers, attempt: data }
   }
 
+  const messageThreads = new MessageThreadTracker()
+  const threadRequests = new WeakMap<
+    Data,
+    {
+      thread: MessageThreadRequest
+      resend: (body: string) => Promise<Response>
+    }
+  >()
+  const resendProvenance = new WeakMap<Data, P>()
   const rewriteRequest = (
     input: AccountRequest & {
       readonly request: Request
@@ -1250,6 +1267,128 @@ export function createNativeAnthropicAdapter<Q, P>(
       })
       ensureLive()
     }
+    if (
+      data.route === 'oauth' &&
+      send.oauth &&
+      messages &&
+      body !== undefined &&
+      !isAuxiliaryAgent(attempt.agent) &&
+      attempt.agent !== 'cachekeep' &&
+      attempt.agent !== 'compaction' &&
+      correlation[LANE_START_REQUEST_HEADER] !== '1'
+    ) {
+      const thread = await prepareMessageThreadRequest(messageThreads, {
+        session: input.sessionID,
+        account: send.oauth.identity?.accountUuid ?? input.accountId,
+        credential: send.oauth.accessToken,
+        bodyText: body,
+        headers,
+        signal: request.signal,
+      })
+      body = thread.bodyText
+      threadRequests.set(data, {
+        thread,
+        resend: async (createBody) => {
+          ensureLive()
+          const authorized = await source.authorizeAccount(
+            input,
+            input.accountId,
+          )
+          ensureLive()
+          if (authorized?.route !== 'oauth' || !authorized.accessToken)
+            throw refuse(input)
+          await source.admitRequest?.({
+            ...contextOf(attempt, data),
+            provenance: authorized.provenance,
+          })
+          ensureLive()
+          resendProvenance.set(data, authorized.provenance)
+          const retryHeaders = new Headers(headers)
+          retryHeaders.set('authorization', `Bearer ${authorized.accessToken}`)
+          release(data)
+          holdRedactor(
+            data,
+            {
+              ...send,
+              oauth: {
+                accessToken: authorized.accessToken,
+                identity: authorized.identity,
+              },
+            },
+            'event-stream',
+            retryHeaders,
+          )
+          const dispatch = authorized.dispatch
+          let response: Response
+          if (dispatch?.kind === 'http-relay') {
+            const envelope = {
+              protocol: 1,
+              type: 'request',
+              affinity: input.sessionID,
+              upstream: {
+                url,
+                method: request.method,
+                headers: Object.fromEntries(retryHeaders),
+              },
+              mode: 'full_sync',
+              revision: 1,
+              body: createBody,
+              next_hash: `sha256:${createHash('sha256').update(createBody).digest('hex')}`,
+            }
+            dumpContexts.set(data, {
+              affinity: input.sessionID,
+              route: input.accountId,
+              bodyText: createBody,
+              url,
+              method: request.method,
+              headers: retryHeaders,
+              dispatch: 'http-relay',
+              relayUrl: dispatch.url,
+              envelope,
+              relayBytes: JSON.stringify(envelope).length,
+            })
+            response = await (deps.fetch ?? globalThis.fetch)(dispatch.url, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-relay-token': dispatch.token,
+              },
+              body: JSON.stringify(envelope),
+              signal: request.signal,
+              redirect: 'error',
+            })
+          } else {
+            if (dispatch?.kind === 'websocket-relay')
+              throw new NativeAnthropicTransportRefusal()
+            dumpContexts.set(data, {
+              affinity: input.sessionID,
+              route: input.accountId,
+              bodyText: createBody,
+              url,
+              method: request.method,
+              headers: retryHeaders,
+              dispatch: 'direct',
+            })
+            response = await sendWithRequestGzip({
+              url,
+              body: createBody,
+              headers: retryHeaders,
+              latch: requestGzipLatch,
+              send: (wireBody, wireHeaders) =>
+                (deps.fetch ?? globalThis.fetch)(url, {
+                  method: request.method,
+                  body: wireBody,
+                  headers: wireHeaders,
+                  signal: request.signal,
+                  redirect: 'error',
+                }),
+            })
+          }
+          return response
+        },
+      })
+      ensureLive()
+    }
     if (send.dispatch?.kind === 'http-relay') {
       // Each HTTP relay attempt sends the complete upstream body, not a patch.
       // A host retry authorizes credentials again and builds a new envelope;
@@ -1388,6 +1527,12 @@ export function createNativeAnthropicAdapter<Q, P>(
     },
     async rewriteResponse({ response, attempt }) {
       const data = attempt.data
+      const threaded = data ? threadRequests.get(data) : undefined
+      if (data) threadRequests.delete(data)
+      if (threaded && data && fromUpstream(response.headers, data)) {
+        response = await threaded.thread.recover(response, threaded.resend)
+        response = threaded.thread.observe(response)
+      } else threaded?.thread.fail()
       if (data && !fromUpstream(response.headers, data)) {
         if (data) dropDumpContext(data)
         // Relay authentication errors must not appear as an OAuth 401 to the
@@ -1827,6 +1972,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       for (const data of [...owned.keys()]) release(data)
     },
     forgetSession(sessionID) {
+      messageThreads.forget(sessionID)
       for (const operation of inProgress.get(sessionID) ?? []) {
         operation.revoked = true
       }

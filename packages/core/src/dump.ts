@@ -579,6 +579,7 @@ function bodyStructureSummary(bodyText: string) {
     parseable: true as const,
     model: typeof parsed.model === 'string' ? parsed.model : undefined,
     stream: parsed.stream,
+    thread: parsed.thread,
     systemCount: system.length,
     messagesCount: messages.length,
     systemHash: hashJson(system),
@@ -656,7 +657,9 @@ async function dumpRequest(input: {
     await mkdir(dumpDir, { recursive: true })
     const previousBodyText =
       input.previousBodyText ?? (await loadLatestDumpBody(input))
+    const bodySummary = bodyStructureSummary(input.bodyText)
     const metadata = {
+      thread: 'thread' in bodySummary ? bodySummary.thread : undefined,
       id,
       createdAt: new Date().toISOString(),
       session: shortAffinity(affinity),
@@ -671,7 +674,7 @@ async function dumpRequest(input: {
       relayBytes: input.relayBytes,
       bodyHash: hashText(input.bodyText),
       diff: diffSummary(previousBodyText, input.bodyText),
-      body: bodyStructureSummary(input.bodyText),
+      body: bodySummary,
       files,
     }
 

@@ -3,8 +3,10 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
+  buildCacheKeepPrewarmBody,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   type NativeCustodyClient as ClaustrumScopedClient,
@@ -15,6 +17,8 @@ import {
   resolveNativePoolPaths,
   sessionCacheActivity,
   setLogLevel,
+  signRequestBody,
+  WORKER_SCRIPT,
 } from '@cortexkit/anthropic-auth-core'
 import {
   ClaustrumCredentialError,
@@ -1807,6 +1811,7 @@ async function sendAndPrewarm(
   expect(prewarm.ok).toBe(true)
   expect(sent).toHaveLength(2)
   const warm = sent[1]!
+  expect(JSON.parse(warm.body).thread).toBeUndefined()
   const betas = (headers: Headers) =>
     (headers.get('anthropic-beta') ?? '').split(',')
   return {
@@ -1829,7 +1834,10 @@ function expectPrewarmHeadersMatchModelRequest(
   warm: { headers: Headers; betas: string[] },
 ) {
   expect(main.betas).toContain(CACHE_KEEP_EXTENDED_TTL_BETA)
-  expect(warm.betas).toEqual(main.betas)
+  expect(warm.betas).toEqual(
+    main.betas.filter((beta) => beta !== 'message-threads-2026-08-12'),
+  )
+  expect(warm.betas).not.toContain('message-threads-2026-08-12')
   const others = (headers: Headers) =>
     [...headers.entries()].filter(
       ([name]) =>
@@ -1999,8 +2007,11 @@ test('Pi WebSocket reconnect authorizes the replacement physical attempt without
           message: (socket, data) => {
             const payload = JSON.parse(String(data)) as {
               id: string
+              body?: string
               upstream: { headers: Record<string, string> }
             }
+            if (payload.body)
+              expect(JSON.parse(payload.body).thread).toBeUndefined()
             sent.push(payload.upstream.headers.authorization ?? '')
             if (sent.length === 1) {
               socket.close(1011, 'interrupted before upstream')
@@ -2474,3 +2485,199 @@ test('Pi serves through a vault outage without local token rescue', async () => 
     f.beforeLocal,
   )
 })
+
+for (const transport of ['direct', 'http'] as const) {
+  test(`Pi create then continue sends only new messages and keep-warm retains full history over ${transport}`, async () => {
+    const f = await fixture('main-first', transport === 'http')
+    const get = f.client.getScoped.bind(f.client)
+    const credentials = spyOn(f.client, 'getScoped').mockImplementation(
+      async (input) => ({
+        ...(await get(input)),
+        material: 'stable-thread-access',
+        recordVersion: 1,
+      }),
+    )
+    deferCleanup(() => credentials.mockRestore())
+    const runtime = await f.native.service()
+    await runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: false },
+      claudeCache: { enabled: true, mode: 'hybrid' },
+      cacheKeep: { enabled: true, always: true },
+    }))
+    const keep = new CacheKeepManager({
+      loadStorage: async () => (await runtime.read()).policyStorage,
+      setIntervalImpl: (() => ({
+        unref() {},
+      })) as unknown as typeof setInterval,
+      clearIntervalImpl: (() => {}) as typeof clearInterval,
+    })
+    deferCleanup(() => keep.stop())
+    const sent: Array<{ text: string; headers: Headers }> = []
+    let rejection: string | undefined
+    let relayBody = ''
+    const applyPatch = new Function(
+      WORKER_SCRIPT.replace(/export default[\s\S]*$/, 'return applyPatchSet'),
+    )() as (base: string, patch: unknown) => string
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const wireText =
+        init?.body instanceof Uint8Array
+          ? gunzipSync(init.body).toString().trim()
+          : String(init?.body)
+      const envelope = JSON.parse(wireText)
+      const text =
+        envelope.mode === 'patch'
+          ? applyPatch(relayBody, envelope.patch)
+          : typeof envelope.body === 'string'
+            ? envelope.body
+            : wireText
+      if (envelope.mode) relayBody = text
+      sent.push({
+        text,
+        headers: new Headers(envelope.upstream?.headers ?? init?.headers),
+      })
+      if (rejection) {
+        const code = rejection
+        rejection = undefined
+        return Response.json(
+          {
+            type: 'error',
+            error: {
+              type:
+                code === 'thread_not_found'
+                  ? 'not_found_error'
+                  : 'invalid_request_error',
+              details: { error_code: code },
+            },
+          },
+          {
+            status: code === 'thread_not_found' ? 404 : 400,
+            headers: { 'request-id': 'req_thread_error' },
+          },
+        )
+      }
+      return new Response(
+        `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_pi_thread"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    }) as typeof fetch
+    globalThis.fetch = fetchImpl
+    const send = (requestContext: Context, sessionId = 'pi-message-thread') =>
+      __sendPiAnthropicRequestForTest(
+        {
+          model,
+          context: requestContext,
+          storagePath: f.path,
+          streamOptions: { sessionId },
+        },
+        { fetch: fetchImpl, cacheKeep: keep },
+      )
+    await (await send(context)).text()
+    const history: Context = {
+      ...context,
+      messages: [
+        ...context.messages,
+        {
+          role: 'assistant',
+          api: 'anthropic-messages',
+          provider: 'anthropic',
+          model: model.id,
+          content: [{ type: 'text', text: 'Answer' }],
+          stopReason: 'stop',
+          timestamp: 1,
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+        },
+        { role: 'user', content: 'Next prompt', timestamp: 2 },
+      ],
+    }
+    await (await send(history)).text()
+    const first = JSON.parse(sent[0]?.text ?? '{}')
+    const second = JSON.parse(sent[1]?.text ?? '{}')
+    expect(second.messages).toHaveLength(1)
+    expect(first.thread).toEqual({ type: 'create' })
+    expect(second.thread).toEqual({
+      type: 'continue',
+      previous_message_id: 'msg_pi_thread',
+    })
+    expect(second.messages).toHaveLength(1)
+    expect(JSON.stringify(second.messages)).toContain('Next prompt')
+    expect(JSON.stringify(second.messages)).not.toContain('Hello')
+    expect(second.tools).toEqual(first.tools)
+    expect(second.system.slice(1)).toEqual(first.system.slice(1))
+    expect(second.system[0].text.match(/cc_version=[^;]+/)?.[0]).toBe(
+      first.system[0].text.match(/cc_version=[^;]+/)?.[0],
+    )
+    expect(sent[1]?.headers.get('anthropic-beta')).toBe(
+      sent[0]?.headers.get('anthropic-beta'),
+    )
+    expect(sent[1]?.headers.get('anthropic-beta')?.split(',').at(-1)).toBe(
+      'message-threads-2026-08-12',
+    )
+    expect(await signRequestBody(sent[1]?.text ?? '')).toBe(sent[1]?.text ?? '')
+    expect(
+      (sent[1]?.text.match(/"cache_control"/g) ?? []).length,
+    ).toBeLessThanOrEqual(4)
+    const stored = keep.trackedRequest('pi-message-thread')
+    expect(stored).toBeDefined()
+    const warm = await buildCacheKeepPrewarmBody(stored?.bodyText ?? '{}')
+    expect(warm.ok).toBe(true)
+    const prewarm = JSON.parse(warm.ok ? warm.bodyText : '{}')
+    expect(prewarm.thread).toBeUndefined()
+    expect(prewarm.messages).toHaveLength(3)
+    const replay = history.messages.find(
+      (message) => message.role === 'assistant',
+    )
+    if (!replay) throw new Error('Missing assistant fixture')
+    for (const code of [
+      'thread_not_found',
+      'thread_fingerprint_mismatch',
+      'thread_already_continued',
+      'thread_continue_in_flight',
+      'thread_unsupported_request',
+      'unrelated',
+    ]) {
+      const sessionId = `pi-thread-error-${code}`
+      await (await send(context, sessionId)).text()
+      const current: Context = {
+        ...context,
+        messages: [
+          ...context.messages,
+          replay,
+          { role: 'user', content: `Following ${code}`, timestamp: 3 },
+        ],
+      }
+      const before = sent.length
+      rejection = code
+      await (await send(current, sessionId)).text()
+      expect(JSON.parse(sent[before]?.text ?? '{}').thread.type).toBe(
+        'continue',
+      )
+      expect(sent.length - before).toBe(code === 'unrelated' ? 1 : 2)
+      if (code !== 'unrelated') {
+        const retried = JSON.parse(sent[before + 1]?.text ?? '{}')
+        expect(retried.thread).toEqual({ type: 'create' })
+        expect(retried.messages).toHaveLength(current.messages.length)
+        expect(sent[before + 1]?.headers.get('x-client-request-id')).toBe(
+          sent[before]?.headers.get('x-client-request-id'),
+        )
+      }
+      await (await send(current, sessionId)).text()
+      expect(JSON.parse(sent.at(-1)?.text ?? '{}').thread).toEqual({
+        type: 'create',
+      })
+    }
+  })
+}

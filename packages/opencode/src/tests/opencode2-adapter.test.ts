@@ -2357,3 +2357,286 @@ describe('OpenCode 2 native Anthropic adapter: OAuth destination', () => {
     }
   })
 })
+
+describe.each(['direct', 'http'] as const)(
+  'OpenCode 2 message threads over %s',
+  (transport) => {
+    const authorize = () =>
+      oauth(
+        'stable-thread-token',
+        { custody: 'local', receipt: 'thread-receipt' },
+        {
+          dispatch:
+            transport === 'http'
+              ? {
+                  kind: 'http-relay',
+                  url: 'https://relay.example.test',
+                  token: 'relay-token',
+                }
+              : { kind: 'direct' },
+        },
+      )
+    const upstreamText = (text: string): string =>
+      transport === 'http' ? JSON.parse(text).body : text
+    const upstreamHeaders = (text: string, headers: Headers): Headers =>
+      transport === 'http'
+        ? new Headers(JSON.parse(text).upstream.headers)
+        : headers
+    test('create then continue sends only new messages and keeps the full keep-warm body', async () => {
+      const warmBodies: string[] = []
+      const { source } = makeSource({
+        authorize,
+        onRequestPrepared: ({ bodyText }) => {
+          warmBodies.push(bodyText)
+        },
+      })
+      const native = createNativeAnthropicAdapter({ source })
+      const host = new Host(native.adapter)
+      const payload = {
+        ...sonnetPayload(),
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'First thread prompt' }],
+          },
+        ],
+      }
+      const first = await host.run(scopeOf(), hostRequest(payload))
+      const complete = async (run: typeof first, id: string) => {
+        const response = await native.adapter.rewriteResponse?.({
+          ...run.attempt,
+          request: run.final,
+          attempt: run.attempt,
+          response: new Response(
+            sse('message_start', { type: 'message_start', message: { id } }) +
+              sse('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: 'end_turn' },
+              }) +
+              sse('message_stop', { type: 'message_stop' }),
+            {
+              headers: {
+                'content-type': 'text/event-stream',
+                'request-id': 'req_thread_success',
+              },
+            },
+          ),
+        } as never)
+        await response?.text()
+      }
+      await complete(first, 'msg_thread_2')
+      const second = await host.run(
+        scopeOf(),
+        hostRequest({
+          ...payload,
+          messages: [
+            ...payload.messages,
+            { role: 'assistant', content: [{ type: 'text', text: 'Answer' }] },
+            { role: 'user', content: [{ type: 'text', text: 'Next prompt' }] },
+          ],
+        }),
+      )
+      const firstText = await first.final.text()
+      const secondText = await second.final.text()
+      const a = JSON.parse(upstreamText(firstText))
+      const b = JSON.parse(upstreamText(secondText))
+      expect(b.messages).toEqual([
+        { role: 'user', content: [{ type: 'text', text: 'Next prompt' }] },
+      ])
+      expect(a.thread).toEqual({ type: 'create' })
+      expect(b.thread).toEqual({
+        type: 'continue',
+        previous_message_id: 'msg_thread_2',
+      })
+      expect(b.messages).toEqual([
+        { role: 'user', content: [{ type: 'text', text: 'Next prompt' }] },
+      ])
+      expect(b.system.slice(1)).toEqual(a.system.slice(1))
+      expect(b.system[0].text.match(/cc_version=[^;]+/)?.[0]).toBe(
+        a.system[0].text.match(/cc_version=[^;]+/)?.[0],
+      )
+      expect(b.tools).toEqual(a.tools)
+      const firstHeaders = upstreamHeaders(firstText, first.final.headers)
+      const secondHeaders = upstreamHeaders(secondText, second.final.headers)
+      expect(secondHeaders.get('anthropic-beta')).toBe(
+        firstHeaders.get('anthropic-beta'),
+      )
+      expect(secondHeaders.get('anthropic-beta')?.split(',').at(-1)).toBe(
+        'message-threads-2026-08-12',
+      )
+      expect(await signRequestBody(upstreamText(secondText))).toBe(
+        upstreamText(secondText),
+      )
+      expect(JSON.parse(warmBodies[1] ?? '{}').messages).toHaveLength(3)
+      expect(JSON.parse(warmBodies[1] ?? '{}').thread).toBeUndefined()
+      native.dispose()
+    })
+
+    test.each([
+      'thread_not_found',
+      'thread_fingerprint_mismatch',
+      'thread_already_continued',
+      'thread_continue_in_flight',
+      'thread_unsupported_request',
+      'unrelated',
+    ])(
+      '%s recovery sends at most one full create with the same request id',
+      async (code) => {
+        const { source } = makeSource({ authorize })
+        const resent: Request[] = []
+        const native = createNativeAnthropicAdapter({
+          source,
+          fetch: Object.assign(
+            async (url: string | URL | Request, init?: RequestInit) => {
+              resent.push(
+                url instanceof Request
+                  ? new Request(url, init)
+                  : new Request(url.toString(), init),
+              )
+              return new Response('still rejected', { status: 400 })
+            },
+            { preconnect: globalThis.fetch.preconnect },
+          ) as typeof fetch,
+        })
+        const host = new Host(native.adapter)
+        const payload = {
+          model: 'claude-sonnet-5',
+          stream: true,
+          messages: [{ role: 'user', content: 'first' }],
+        }
+        const first = await host.run(scopeOf(), hostRequest(payload))
+        const success = new Response(
+          sse('message_start', {
+            type: 'message_start',
+            message: { id: 'msg_recover' },
+          }) +
+            sse('message_delta', {
+              type: 'message_delta',
+              delta: { stop_reason: 'end_turn' },
+            }) +
+            sse('message_stop', { type: 'message_stop' }),
+          {
+            headers: {
+              'content-type': 'text/event-stream',
+              'request-id': 'req_thread_anchor',
+            },
+          },
+        )
+        await (
+          await native.adapter.rewriteResponse?.({
+            ...first.attempt,
+            attempt: first.attempt,
+            request: first.final,
+            response: success,
+          } as never)
+        )?.text()
+        const messages = [
+          ...payload.messages,
+          { role: 'assistant', content: 'answer' },
+          { role: 'user', content: 'next' },
+        ]
+        const second = await host.run(
+          scopeOf(),
+          hostRequest(
+            { ...payload, messages },
+            { headers: { 'x-client-request-id': 'same-thread-request' } },
+          ),
+        )
+        const response = await native.adapter.rewriteResponse?.({
+          ...second.attempt,
+          attempt: second.attempt,
+          request: second.final,
+          response: Response.json(
+            {
+              type: 'error',
+              error: {
+                type:
+                  code === 'thread_not_found'
+                    ? 'not_found_error'
+                    : 'invalid_request_error',
+                details: { error_code: code },
+              },
+            },
+            {
+              status: code === 'thread_not_found' ? 404 : 400,
+              headers: { 'request-id': 'req_thread_rejected' },
+            },
+          ),
+        } as never)
+        await response?.text()
+        expect(resent).toHaveLength(code === 'unrelated' ? 0 : 1)
+        if (resent[0]) {
+          const text = await resent[0].text()
+          const secondText = await second.final.clone().text()
+          expect(
+            upstreamHeaders(text, resent[0].headers).get('x-client-request-id'),
+          ).toBe(
+            upstreamHeaders(secondText, second.final.headers).get(
+              'x-client-request-id',
+            ),
+          )
+          const body = JSON.parse(upstreamText(text))
+          expect(body.thread).toEqual({ type: 'create' })
+          expect(body.messages).toEqual(messages)
+          expect(await signRequestBody(upstreamText(text))).toBe(
+            upstreamText(text),
+          )
+        }
+        const third = await host.run(
+          scopeOf(),
+          hostRequest({ ...payload, messages }),
+        )
+        expect(
+          JSON.parse(upstreamText(await third.final.text())).thread,
+        ).toEqual({
+          type: 'create',
+        })
+        native.dispose()
+      },
+    )
+  },
+)
+
+test('OpenCode 2 auxiliary, prewarm, lane-start and API-key requests stay stateless', async () => {
+  const { source } = makeSource()
+  const native = createNativeAnthropicAdapter({ source })
+  const host = new Host(native.adapter)
+  for (const agent of [
+    'title',
+    'summary',
+    'prime',
+    'cachekeep',
+    'compaction',
+  ]) {
+    const run = await host.run(
+      scopeOf({ agent }),
+      hostRequest({
+        model: 'claude-sonnet-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Auxiliary' }],
+      }),
+    )
+    expect(JSON.parse(await run.final.text()).thread).toBeUndefined()
+  }
+  const lane = await host.run(
+    scopeOf(),
+    hostRequest(sonnetPayload(), {
+      headers: { [LANE_START_REQUEST_HEADER]: '1' },
+    }),
+  )
+  expect(JSON.parse(await lane.final.text()).thread).toBeUndefined()
+  native.dispose()
+  const apiSource = makeSource({
+    authorize: () => apiKey('api-token', { custody: 'local', receipt: 'api' }),
+  }).source
+  const api = createNativeAnthropicAdapter({ source: apiSource })
+  const run = await new Host(api.adapter).run(
+    scopeOf(),
+    hostRequest(sonnetPayload()),
+  )
+  expect(JSON.parse(await run.final.text()).thread).toBeUndefined()
+  expect(run.final.headers.get('anthropic-beta')).not.toContain(
+    'message-threads-',
+  )
+  api.dispose()
+})

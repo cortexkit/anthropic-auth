@@ -38,7 +38,7 @@ import {
 import { createPiNativeCommands } from './native-commands.ts'
 import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
 import type { PiQuotaWaitOptions } from './quota-wait.ts'
-import { streamCortexKitAnthropic } from './stream.ts'
+import { forgetPiMessageThread, streamCortexKitAnthropic } from './stream.ts'
 
 function textImageInput(): Array<'text' | 'image'> {
   return ['text', 'image']
@@ -132,6 +132,7 @@ export default async function cortexKitPiAnthropicAuth(
       effortHistoryBySession.delete(sessionId)
       workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)
+      forgetPiMessageThread(sessionId)
     }
     await closePiNativeRuntime(storagePath)
   })

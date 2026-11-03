@@ -310,11 +310,18 @@ export async function buildCacheKeepPrewarmBody(
     return { ok: false, reason: 'body is not valid JSON' }
   }
 
+  if (isRecord(body.thread) && body.thread.type === 'continue')
+    return {
+      ok: false,
+      reason: 'a thread continuation is not a full cache prefix',
+    }
+
   if (!hasExplicitCacheControl(body)) {
     return { ok: false, reason: 'body has no explicit cache breakpoints' }
   }
 
   const warm = structuredClone(body) as Record<string, unknown>
+  delete warm.thread
   stripBillingLineageFromBody(warm)
   warm.max_tokens = 0
   delete warm.stream
@@ -846,6 +853,16 @@ export class CacheKeepManager {
     bodyBytes = Buffer.byteLength(input.bodyText, 'utf8')
     if (bodyBytes > CACHE_KEEP_MAX_BODY_BYTES) {
       return refuse('body exceeds cachekeep memory budget', 'body-budget')
+    }
+    if (input.bodyText.includes('"thread"')) {
+      try {
+        const body = JSON.parse(input.bodyText)
+        if (body.thread)
+          return refuse(
+            'thread wire bodies are not full stateless cache prefixes',
+            'message-thread-wire-body',
+          )
+      } catch {}
     }
     const window = getCacheKeepWindow(input.storage)
     if (!isCacheKeepActiveNow(input.storage, new Date(now))) {

@@ -48,6 +48,7 @@ export * from './json.ts'
 export * from './killswitch.ts'
 export * from './logger.ts'
 export * from './logging.ts'
+export * from './message-threads.ts'
 export * from './mid-conversation-output-config.ts'
 export type {
   ClaudeCodeBetaLists,

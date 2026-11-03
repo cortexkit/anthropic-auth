@@ -2,6 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- Claude requests now use Anthropic's message threads, as Claude Code does: after the first request in a conversation, each request sends only the new messages instead of the whole history, so requests are much smaller and faster to start. Anything that changes the earlier conversation or the request's settings sends a full request again.
+- Fixed relay requests failing after edits to earlier messages or effort controls caused overlapping upload patches.
+
 ## 2.4.13
 
 - Pi now offers Claude Opus 5.5's supported adaptive effort levels, `low` through `max`, including `xhigh`, instead of offering unsupported `off` and `minimal`. Thanks @mhismail3.

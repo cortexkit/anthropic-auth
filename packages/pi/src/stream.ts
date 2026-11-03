@@ -15,6 +15,7 @@ import {
   decideStickyQuotaFailure,
   decodeSseFrame,
   dumpDirectRequest,
+  effectiveRelayTransport,
   FAST_MODE_BETA,
   getCache1hPersistentMode,
   getClaudeCodeIdentityForVerifiedAccount,
@@ -38,6 +39,8 @@ import {
   isValidApiBaseURL,
   killswitchPassesPolicy,
   logger,
+  type MessageThreadRequest,
+  MessageThreadTracker,
   type MidConversationEffortTransition,
   mergeAnthropicBetas,
   NativeAccountRefusal,
@@ -50,6 +53,7 @@ import {
   type ProviderAccountUuid,
   type ProviderErrorResponseScope,
   parseSseFrame,
+  prepareMessageThreadRequest,
   QuotaManager,
   type QuotaManagerOptions,
   type QuotaState,
@@ -104,6 +108,11 @@ import {
   fetchPiOAuth,
   requirePiOAuthOrigin,
 } from './transport.ts'
+
+const messageThreads = new MessageThreadTracker()
+export function forgetPiMessageThread(sessionId: string): void {
+  messageThreads.forget(sessionId)
+}
 
 /** Dump label for a physical send that failed before any response arrived. */
 const PHYSICAL_SEND_FAILED = 'physical send failed before a response'
@@ -652,6 +661,7 @@ async function sendAnthropicRequest(
       }),
     },
   )
+  let wireBodyText = bodyText
   options.onResolvedToolNames?.(toolNames)
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
@@ -719,6 +729,28 @@ async function sendAnthropicRequest(
     if (attempt.accountIdentity !== verifiedUuid)
       throw new Error('Pi native OAuth route identity changed')
     return attempt
+  }
+  const relayConfig = options.apiAccount
+    ? null
+    : await (await native.service()).getRelayConfig()
+  let threadRequest: MessageThreadRequest | undefined
+  if (
+    !options.apiAccount &&
+    (!relayConfig ||
+      effectiveRelayTransport(relayConfig.transport, relayConfig.url) !==
+        'websocket')
+  ) {
+    nextAttempt = await takeAttempt()
+    threadRequest = await prepareMessageThreadRequest(messageThreads, {
+      session: relayAffinity ?? undefined,
+      account: nextAttempt.accountIdentity,
+      credential: piAttemptAccessToken(nextAttempt),
+      bodyText,
+      headers,
+      signal: init.signal ?? undefined,
+    })
+    wireBodyText = threadRequest.bodyText
+    init.body = wireBodyText
   }
   const directFetch = async () => {
     let attempt: PiNativeAttempt | undefined
@@ -794,7 +826,7 @@ async function sendAnthropicRequest(
             affinity: relayAffinity,
             route: options.route ?? 'oauth',
             status: response.status,
-            bodyText,
+            bodyText: wireBodyText,
             url: input.toString(),
             method: init.method,
             headers,
@@ -821,7 +853,7 @@ async function sendAnthropicRequest(
           options.route ??
           (options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth'),
         status: response.status,
-        bodyText,
+        bodyText: wireBodyText,
         url: input.toString(),
         method: init.method,
         headers: init.headers,
@@ -839,7 +871,7 @@ async function sendAnthropicRequest(
           (options.apiAccount ? `api:${options.apiAccount.id}` : 'oauth'),
         // A fixed label: the error text can repeat provider output or a credential.
         error: PHYSICAL_SEND_FAILED,
-        bodyText,
+        bodyText: wireBodyText,
         url: input.toString(),
         method: init.method,
         headers: init.headers,
@@ -868,11 +900,11 @@ async function sendAnthropicRequest(
   // scrubbed by directFetch.
   const sendRelayAttempt = async () =>
     sendViaRelay({
-      config: await (await native.service()).getRelayConfig(),
+      config: relayConfig,
       input,
       init,
       headers,
-      body: bodyText,
+      body: wireBodyText,
       fallback: directFetch,
       affinity: relayAffinity,
       authorizeAttempt: async () => {
@@ -926,6 +958,14 @@ async function sendAnthropicRequest(
   // If the request was cancelled since, end it as cancelled here.
   if (relay401Attempt && response.status === 401)
     await endIfCancelled(response, init.signal)
+  if (threadRequest) {
+    response = await threadRequest.recover(response, async (createBody) => {
+      wireBodyText = createBody
+      init.body = createBody
+      return sendRelayAttempt()
+    })
+    response = threadRequest.observe(response)
+  }
   if (response.ok && lastTransport === 'relay' && relayAttempt) {
     trackAcceptedRequest()
     markServed(relayAttempt)

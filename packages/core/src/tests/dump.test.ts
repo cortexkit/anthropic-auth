@@ -721,3 +721,35 @@ test('does not follow a pre-planted predictable partial symlink', async () => {
   expect(await readFile(finalFile, 'utf8')).toBe('safe dump content')
   expect((await lstat(finalFile)).isSymbolicLink()).toBe(false)
 })
+
+test('continuation dumps mark the thread and retain only the sent delta', async () => {
+  const dumpDir = await mkdtemp(
+    join(tmpdir(), 'opencode-anthropic-auth-dumps-test-'),
+  )
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const thread = { type: 'continue', previous_message_id: 'msg_anchor' }
+  const body = {
+    model: 'claude-opus-5-5',
+    thread,
+    messages: [{ role: 'user', content: 'new prompt' }],
+  }
+  await dumpDirectRequest({
+    affinity: 'ses-thread',
+    bodyText: JSON.stringify(body),
+  })
+  const files = await readdir(dumpDir)
+  const metaPath = files.find((name) => name.endsWith('.meta.json'))
+  const bodyPath = files.find((name) => name.endsWith('.body.json'))
+  expect(metaPath).toBeDefined()
+  expect(bodyPath).toBeDefined()
+  const metadata = JSON.parse(
+    await readFile(join(dumpDir, metaPath ?? ''), 'utf8'),
+  )
+  expect(metadata.thread).toEqual(thread)
+  expect(metadata.body.messagesCount).toBe(1)
+  expect(
+    JSON.parse(await readFile(join(dumpDir, bodyPath ?? ''), 'utf8')),
+  ).toEqual(body)
+})

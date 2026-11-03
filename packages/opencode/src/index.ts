@@ -60,6 +60,7 @@ import {
   dumpDirectRequest,
   dumpResponseArtifact,
   effectiveRelayStatus,
+  effectiveRelayTransport,
   exchange,
   executeAccountCommand,
   executeCache1hCommand,
@@ -126,6 +127,8 @@ import {
   killswitchPassesPolicy,
   log,
   logger,
+  type MessageThreadRequest,
+  MessageThreadTracker,
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
   NativeAccountRefusal,
@@ -172,6 +175,7 @@ import {
   parsePrimeCommandAction,
   parseRoutingCommandAction,
   parseSseFrame,
+  prepareMessageThreadRequest,
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
   type QuotaEntry,
@@ -1253,6 +1257,7 @@ const anthropicAuthPlugin = async (
   const { client } = ctx
   const profileFetch = globalThis.fetch
   const accountStoragePath = getAccountStoragePath()
+  const messageThreads = new MessageThreadTracker()
   const requestGzipLatch = getRequestGzipLatch(
     getRequestGzipLatchPath(accountStoragePath),
   )
@@ -6377,6 +6382,7 @@ const anthropicAuthPlugin = async (
 
       if (value.type === 'session.deleted') {
         sessionCacheActivity.forget(sessionId)
+        messageThreads.forget(sessionId)
         fableFallbackManager.clearSession(sessionId)
         dropSessionSourceWarms(sessionId)
         nativeCommands.delete(sessionId)
@@ -7970,6 +7976,33 @@ const anthropicAuthPlugin = async (
                 return localInvalidRequestResponse(error.message)
               throw error
             }
+            let threadRequest: MessageThreadRequest | undefined
+            if (
+              typeof body === 'string' &&
+              requestClass === 'main' &&
+              !laneStartRequest &&
+              (!relayConfig ||
+                effectiveRelayTransport(
+                  relayConfig.transport,
+                  relayConfig.url,
+                ) !== 'websocket')
+            ) {
+              threadRequest = await prepareMessageThreadRequest(
+                messageThreads,
+                {
+                  session: relayAffinity ?? undefined,
+                  account:
+                    nativeAuthorization.accountIdentity ?? oauthAccountId,
+                  credential:
+                    nativeAuthorization.scopedAttempt?.credentialId ??
+                    nativeAuthorization.accessToken,
+                  bodyText: body,
+                  headers: requestHeaders,
+                  signal: init?.signal ?? undefined,
+                },
+              )
+              body = threadRequest.bodyText
+            }
             const persistedFallbackAccount =
               oauthAccountId === 'main'
                 ? undefined
@@ -8167,6 +8200,16 @@ const anthropicAuthPlugin = async (
                     ? await directFetch()
                     : await sendOnce()
                 }
+              }
+              if (threadRequest) {
+                response = await threadRequest.recover(
+                  response,
+                  async (createBody) => {
+                    body = createBody
+                    return sendOnce()
+                  },
+                )
+                response = threadRequest.observe(response)
               }
               trace?.mark('send_headers_received', {
                 route,

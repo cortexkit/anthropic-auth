@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,6 +11,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import type { getSidebarState } from '../sidebar-state'
+import { rewriteRequestBody } from '../transform.ts'
 import type { createMockClient } from './support/opencode1-client.ts'
 import { installLoaderSetup } from './support/opencode1-loader-setup.ts'
 import {
@@ -1028,7 +1029,7 @@ describe('auth.loader', () => {
     expect((await readAccountStorage())?.relay?.transport).toBeUndefined()
 
     globalThis.fetch = mock(
-      withNativeAdmission((input: any) => {
+      withNativeAdmission((input: any, init?: RequestInit) => {
         if (extractUrl(input).includes('/api/oauth/usage'))
           return Promise.resolve(
             Response.json({
@@ -1036,6 +1037,10 @@ describe('auth.loader', () => {
               seven_day: { utilization: 0 },
             }),
           )
+        if (typeof init?.body === 'string') {
+          const payload = JSON.parse(init.body)
+          expect(JSON.parse(payload.body ?? init.body).thread).toBeUndefined()
+        }
         return Promise.resolve(
           new Response('event: message_stop\ndata: {}\n\n', { status: 200 }),
         )
@@ -1153,4 +1158,275 @@ describe('auth.loader', () => {
     )
     expect(state.relay).toBeNull()
   })
+})
+
+describe('message threads wire', () => {
+  const originalFetch = globalThis.fetch
+  const restores: Array<() => void> = []
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    for (const restore of restores.splice(0)) restore()
+  })
+  test.each(['direct', 'http'] as const)(
+    'create then continue sends only new messages over %s',
+    async (transport) => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          accounts: [],
+          claudeCache: { enabled: true, mode: 'hybrid' },
+          quota: {
+            enabled: false,
+            checkIntervalMinutes: 5,
+            minimumRemaining: {},
+            failClosedOnUnknownQuota: false,
+          },
+          relay: {
+            enabled: transport === 'http',
+            url: 'https://relay.example.test',
+            token: 'relay-token',
+            transport: 'http',
+            fallbackToDirect: false,
+          },
+        }),
+      )
+      const tracked = spyOn(Core.CacheKeepManager.prototype, 'track')
+      restores.push(() => tracked.mockRestore())
+      const sent: Array<{ body: any; text: string; headers: Headers }> = []
+      let rejection: string | undefined
+      let relayBody = ''
+      const applyPatch = new Function(
+        Core.WORKER_SCRIPT.replace(
+          /export default[\s\S]*$/,
+          'return applyPatchSet',
+        ),
+      )() as (base: string, patch: unknown) => string
+      globalThis.fetch = mock(
+        withNativeAdmission((_input: unknown, init?: RequestInit) => {
+          const url = extractUrl(_input as string | URL | Request)
+          if (
+            (!url.includes('/v1/messages') &&
+              !url.startsWith('https://relay.example.test')) ||
+            !init?.body
+          )
+            return Promise.resolve(
+              Response.json({
+                five_hour: { utilization: 0 },
+                seven_day: { utilization: 0 },
+              }),
+            )
+          const wireText =
+            init.body instanceof Uint8Array
+              ? gunzipSync(init.body).toString().trim()
+              : String(init.body)
+          const envelope = JSON.parse(wireText)
+          const text =
+            envelope.mode === 'patch'
+              ? applyPatch(relayBody, envelope.patch)
+              : typeof envelope.body === 'string'
+                ? envelope.body
+                : wireText
+          if (envelope.mode) relayBody = text
+
+          sent.push({
+            body: JSON.parse(text),
+            text,
+            headers: new Headers(envelope.upstream?.headers ?? init?.headers),
+          })
+          if (rejection) {
+            const code = rejection
+            rejection = undefined
+            return Promise.resolve(
+              Response.json(
+                {
+                  type: 'error',
+                  error: {
+                    type:
+                      code === 'thread_not_found'
+                        ? 'not_found_error'
+                        : 'invalid_request_error',
+                    details: { error_code: code },
+                  },
+                },
+                {
+                  status: code === 'thread_not_found' ? 404 : 400,
+                  headers: { 'request-id': 'req_thread_error' },
+                },
+              ),
+            )
+          }
+          return Promise.resolve(
+            new Response(
+              [
+                `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_thread_${sent.length}"}}\n\n`,
+                'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+                'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+              ].join(''),
+              {
+                headers: {
+                  'content-type': 'text/event-stream',
+                  'request-id': `req_thread_${sent.length}`,
+                },
+              },
+            ),
+          )
+        }),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      const auth = await plugin.auth.loader(
+        () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+        { models: {} },
+      )
+      const send = async (
+        messages: unknown[],
+        session = 'ses_message_thread',
+        auxiliary = false,
+      ) => {
+        const response = await auth.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: {
+            'x-session-affinity': session,
+            'x-cortexkit-request-class': auxiliary ? 'auxiliary' : 'main',
+            'x-client-request-id': 'thread-client',
+          },
+          body: JSON.stringify({
+            model: 'claude-sonnet-5',
+            max_tokens: 32,
+            stream: true,
+            system: 'Stable instructions',
+            tools: [{ name: 'read', input_schema: { type: 'object' } }],
+            messages,
+          }),
+        })
+        await response.text()
+      }
+      const first = {
+        role: 'user',
+        content: 'Original question for suffix pinning.',
+      }
+      await send([first])
+      await send([
+        first,
+        { role: 'assistant', content: 'Answer' },
+        { role: 'user', content: 'Next question' },
+      ])
+      expect(sent).toHaveLength(2)
+      expect(sent[1]?.body.messages).toHaveLength(1)
+      expect(sent[0]?.body.thread).toEqual({ type: 'create' })
+      expect(sent[1]?.body.thread).toEqual({
+        type: 'continue',
+        previous_message_id: 'msg_thread_1',
+      })
+      expect(sent[1]?.body.messages).toHaveLength(1)
+      expect(JSON.stringify(sent[1]?.body.messages)).toContain('Next question')
+      expect(JSON.stringify(sent[1]?.body.messages)).not.toContain(
+        'Original question',
+      )
+      expect(sent[1]?.body.tools).toEqual(sent[0]?.body.tools)
+      expect(sent[1]?.headers.get('anthropic-beta')).toBe(
+        sent[0]?.headers.get('anthropic-beta'),
+      )
+      expect(sent[1]?.headers.get('anthropic-beta')?.split(',').at(-1)).toBe(
+        Core.MESSAGE_THREADS_BETA,
+      )
+      const billing = sent.map(
+        (request) => request.body.system[0].text.match(/cc_version=[^;]+/)?.[0],
+      )
+      expect(billing[1]).toBe(billing[0])
+      expect(sent[1]?.text).toBe(
+        await Core.signRequestBody(sent[1]?.text ?? ''),
+      )
+      expect(
+        (sent[1]?.text.match(/"cache_control"/g) ?? []).length,
+      ).toBeLessThanOrEqual(4)
+      await plugin.event({
+        event: {
+          type: 'session.deleted',
+          properties: { info: { id: 'ses_message_thread' } },
+        },
+      })
+      await send([
+        first,
+        { role: 'assistant', content: 'Answer' },
+        { role: 'user', content: 'After deletion' },
+      ])
+      expect(sent[2]?.body.thread).toEqual({ type: 'create' })
+      const retained = tracked.mock.calls.at(-1)?.[0].bodyText
+      expect(retained).toBeDefined()
+      const full = JSON.parse(retained ?? '{}')
+      expect(full.thread).toBeUndefined()
+      expect(full.messages).toHaveLength(3)
+      const warm = await Core.buildCacheKeepPrewarmBody(retained ?? '{}')
+      expect(warm.ok).toBe(true)
+      if (warm.ok) expect(JSON.parse(warm.bodyText).thread).toBeUndefined()
+      for (const code of [
+        'thread_not_found',
+        'thread_fingerprint_mismatch',
+        'thread_already_continued',
+        'thread_continue_in_flight',
+        'thread_unsupported_request',
+        'unrelated',
+      ]) {
+        const session = `thread-error-${code}`
+        await send([first], session)
+        const history = [
+          first,
+          { role: 'assistant', content: 'Answer' },
+          { role: 'user', content: `Following ${code}` },
+        ]
+        const before = sent.length
+        rejection = code
+        await send(history, session)
+        expect(sent[before]?.body.thread.type, code).toBe('continue')
+        expect(sent.length - before).toBe(code === 'unrelated' ? 1 : 2)
+        if (code !== 'unrelated') {
+          expect(sent[before + 1]?.body.thread).toEqual({ type: 'create' })
+          expect(sent[before + 1]?.body.messages).toHaveLength(history.length)
+          expect(sent[before + 1]?.headers.get('x-client-request-id')).toBe(
+            sent[before]?.headers.get('x-client-request-id'),
+          )
+        }
+        await send(history, session)
+        expect(sent.at(-1)?.body.thread).toEqual({ type: 'create' })
+      }
+      await send([first], 'auxiliary-thread-exclusion', true)
+      expect(sent.at(-1)?.body.thread).toBeUndefined()
+    },
+  )
+})
+
+test('stateless OpenCode 1 HTTP relay handles an effort edit before a fixed-position billing cch', async () => {
+  const body = (effort: string) =>
+    JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 32,
+      stream: true,
+      system: 'Stable instructions',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'Original prompt' }] },
+        { role: 'system', content: [], output_config: { effort } },
+        { role: 'user', content: [{ type: 'text', text: 'Continue' }] },
+      ],
+    })
+  const previous = await rewriteRequestBody(body('low'), {
+    sessionId: 'stateless-relay-effort',
+  })
+  const next = await rewriteRequestBody(body('max'), {
+    sessionId: 'stateless-relay-effort',
+  })
+  expect(JSON.parse(previous).thread).toBeUndefined()
+  expect(JSON.parse(next).thread).toBeUndefined()
+  expect(previous.indexOf('cch=')).toBe(next.indexOf('cch='))
+  const applyPatchSet = new Function(
+    Core.WORKER_SCRIPT.replace(
+      /export default[\s\S]*$/,
+      'return applyPatchSet',
+    ),
+  )() as (
+    base: string,
+    patch: ReturnType<typeof Core.createRelayPatch>,
+  ) => unknown
+  expect(
+    applyPatchSet(previous, Core.createRelayPatch(previous, next)),
+    `stateless cch offset ${previous.indexOf('cch=')}`,
+  ).toBe(next)
 })

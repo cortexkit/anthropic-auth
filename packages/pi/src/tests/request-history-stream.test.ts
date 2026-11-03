@@ -9,7 +9,11 @@ import type {
   Context,
   Model,
 } from '@earendil-works/pi-ai'
-import { streamCortexKitAnthropic } from '../stream.ts'
+import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
+import {
+  __sendPiAnthropicRequestForTest,
+  streamCortexKitAnthropic,
+} from '../stream.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
 
 const originalFetch = globalThis.fetch
@@ -140,3 +144,60 @@ for (const apiKey of ['sk-ant-oat-fixture-history', 'fixture-api-key']) {
     },
   )
 }
+
+test('Pi API-key requests never use message threads', async () => {
+  directory = await mkdtemp(join(tmpdir(), 'pi-api-thread-exclusion-'))
+  const storagePath = join(directory, 'accounts.json')
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [
+        {
+          id: 'api-thread',
+          type: 'api',
+          apiKey: 'synthetic-api-thread-key',
+          baseURL: 'https://paid.invalid',
+        },
+      ],
+    },
+    storagePath,
+    { primary: false },
+  )
+  try {
+    const runtime = await getPiNativeRuntime(storagePath).service()
+    const apiAccount = (await runtime.read()).accounts.find(
+      (account) => account.id === 'api-thread',
+    )
+    if (!apiAccount) throw new Error('Missing API account fixture')
+    let sent: RequestInit | undefined
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      sent = init
+      return new Response(
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    }) as typeof fetch
+    await (
+      await __sendPiAnthropicRequestForTest(
+        {
+          model,
+          context: {
+            messages: [{ role: 'user', content: 'Hello', timestamp: 0 }],
+            tools: [],
+          },
+          apiAccount,
+          storagePath,
+          streamOptions: { sessionId: 'pi-api-thread' },
+        },
+        { fetch: fetchImpl },
+      )
+    ).text()
+    expect(JSON.parse(String(sent?.body)).thread).toBeUndefined()
+    expect(new Headers(sent?.headers).get('anthropic-beta')).not.toContain(
+      'message-threads-',
+    )
+  } finally {
+    await closePiNativeRuntime(storagePath)
+  }
+})
