@@ -1950,3 +1950,301 @@ test('recheck reply semantics: our trailing tool-whitespace removal preserves th
   }
   expect(tracker.prepare(candidate).decision.type).toBe('continue')
 })
+
+test.each(['citations', 'future_text_metadata'])(
+  'final review annotations: response text with %s cannot anchor',
+  async (field) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    await observeAuditReply(tracker.prepare(request), 'msg_annotated', [
+      { type: 'text', text: 'answer', [field]: [{ source: 'original' }] },
+    ])
+    const candidate = {
+      ...request,
+      body: {
+        ...request.body,
+        messages: [
+          ...(request.body.messages as unknown[]),
+          { role: 'assistant', content: 'answer' },
+          next,
+        ],
+      },
+    }
+    expect(tracker.prepare(candidate).decision.type).toBe('create')
+  },
+)
+
+test('final review annotations: same text with different citations creates', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  await observeAuditReply(tracker.prepare(request), 'msg_citations', [
+    { type: 'text', text: 'answer', citations: [{ source: 'original' }] },
+  ])
+  const candidate = {
+    ...request,
+    body: {
+      ...request.body,
+      messages: [
+        ...(request.body.messages as unknown[]),
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: 'answer',
+              citations: [{ source: 'changed' }],
+            },
+          ],
+        },
+        next,
+      ],
+    },
+  }
+  expect(tracker.prepare(candidate).decision.type).toBe('create')
+})
+
+test('final review annotations: adding metadata to a plain retained reply creates', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  anchor(tracker, request)
+  const candidate = {
+    ...request,
+    body: {
+      ...request.body,
+      messages: [
+        ...(request.body.messages as unknown[]),
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'answer', citations: [] }],
+        },
+        next,
+      ],
+    },
+  }
+  expect(tracker.prepare(candidate).decision.type).toBe('create')
+})
+
+test('final review annotations: protocol cache metadata still permits continuation', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  await observeAuditReply(tracker.prepare(request), 'msg_text_cache', [
+    { type: 'text', text: 'answer', cache_control: { type: 'ephemeral' } },
+  ])
+  expect(tracker.prepare(advance(request)).decision.type).toBe('continue')
+})
+
+test('final review annotations: citations_delta cannot anchor plain retained text', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  await observeMessageThreadResponse(
+    sse([
+      {
+        type: 'message_start',
+        message: { id: 'msg_citation_delta', content: [] },
+      },
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: 'answer' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'citations_delta', citation: { source: 'original' } },
+      },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      { type: 'message_stop' },
+    ]),
+    tracker.prepare(request),
+  ).text()
+  const candidate = {
+    ...request,
+    body: {
+      ...request.body,
+      messages: [
+        ...(request.body.messages as unknown[]),
+        { role: 'assistant', content: 'answer' },
+        next,
+      ],
+    },
+  }
+  expect(tracker.prepare(candidate).decision.type).toBe('create')
+})
+
+test.each(['', ' \n'])(
+  'final review no arguments: partial_json %j still anchors the start input',
+  async (partial) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    await observeMessageThreadResponse(
+      sse([
+        { type: 'message_start', message: { id: 'msg_no_args', content: [] } },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'tool_use',
+            id: 'empty_call',
+            name: 'mcp_Read',
+            input: {},
+          },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'input_json_delta', partial_json: partial },
+        },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+        { type: 'message_stop' },
+      ]),
+      tracker.prepare(request),
+    ).text()
+    const candidate = {
+      ...request,
+      body: {
+        ...request.body,
+        messages: [
+          ...(request.body.messages as unknown[]),
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'empty_call', name: 'read', input: {} },
+            ],
+          },
+          next,
+        ],
+      },
+    }
+    expect(tracker.prepare(candidate).decision).toEqual({
+      type: 'continue',
+      previousMessageId: 'msg_no_args',
+      deltaMessages: [next],
+    })
+  },
+)
+
+test('final review budget: oversized open tool JSON skips stop parsing and cannot anchor', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const parse = JSON.parse
+  let argumentParses = 0
+  JSON.parse = (text, reviver) => {
+    if (text === '' || text.startsWith('{"oversized":')) argumentParses++
+    return parse(text, reviver)
+  }
+  try {
+    await observeMessageThreadResponse(
+      sse([
+        {
+          type: 'message_start',
+          message: { id: 'msg_over_budget', content: [] },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'tool_use',
+            id: 'large_call',
+            name: 'mcp_Read',
+            input: {},
+          },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: `{"oversized":"${'x'.repeat(1_048_576)}"}`,
+          },
+        },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+        { type: 'message_stop' },
+      ]),
+      tracker.prepare(request),
+    ).text()
+  } finally {
+    JSON.parse = parse
+  }
+  const candidate = {
+    ...request,
+    body: {
+      ...request.body,
+      messages: [
+        ...(request.body.messages as unknown[]),
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'large_call', name: 'read', input: {} },
+          ],
+        },
+        next,
+      ],
+    },
+  }
+  expect(tracker.prepare(candidate).decision.type).toBe('create')
+  expect(argumentParses).toBe(0)
+})
+
+test.each(['citations', 'future_text_metadata'])(
+  'final review whitespace: history retains whitespace text carrying %s',
+  async (field) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    const tool = {
+      type: 'tool_use',
+      id: 'history_call',
+      name: 'read',
+      input: {},
+    }
+    const prefix = [
+      ...(request.body.messages as unknown[]),
+      {
+        role: 'assistant',
+        content: [
+          tool,
+          {
+            type: 'text',
+            text: ' \n',
+            [field]: [{ source: 'original' }],
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'history_call',
+            content: 'result',
+          },
+        ],
+      },
+    ]
+    request.body.messages = prefix
+    await observeAuditReply(tracker.prepare(request), 'msg_history_metadata', [
+      { type: 'text', text: 'answer' },
+    ])
+    const rewritten = prefix.map((message) => {
+      const record = message as Record<string, unknown>
+      return record.role === 'assistant'
+        ? { ...record, content: [tool] }
+        : message
+    })
+    const candidate = {
+      ...request,
+      body: {
+        ...request.body,
+        messages: [
+          ...rewritten,
+          { role: 'assistant', content: 'answer' },
+          next,
+        ],
+      },
+    }
+    expect(tracker.prepare(candidate).decision.type).toBe('create')
+  },
+)

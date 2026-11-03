@@ -92,6 +92,12 @@ interface ReplyBlockState {
 
 const MAX_REPLY_INPUT_CHARS = 1_048_576
 
+function hasOnlyTextFields(block: Body): boolean {
+  return Object.keys(block).every(
+    (key) => key === 'type' || key === 'text' || key === 'cache_control',
+  )
+}
+
 // Match semantic tool calls and ordered blocks, allowing only tool-name
 // normalization and whitespace rewrites. Retain only a digest of stopped tool JSON.
 class ReplyFingerprint {
@@ -99,6 +105,7 @@ class ReplyFingerprint {
   private readonly seen = new Set<number>()
   private readonly tools = new Map<number, [string, string, string]>()
   private readonly layout = new Map<number, Body>()
+  private readonly textBlocks = new Map<number, string>()
   private readonly signatures = new Map<number, [string, string]>()
   private readonly text = createHash('sha256')
   private committedText = this.text.copy()
@@ -146,6 +153,12 @@ class ReplyFingerprint {
       this.invalid = true
       return
     }
+    // Reject text blocks with citations or unknown metadata so replies differing
+    // only in those fields cannot continue the same stored conversation.
+    if (block.type === 'text' && !hasOnlyTextFields(block)) {
+      this.invalid = true
+      return
+    }
     this.seen.add(index)
     const state: ReplyBlockState = {
       type: block.type,
@@ -187,7 +200,7 @@ class ReplyFingerprint {
 
   delta(index: unknown, delta: unknown): void {
     const state = typeof index === 'number' ? this.open.get(index) : undefined
-    if (!state || !isBody(delta)) {
+    if (!state || !isBody(delta) || delta.type === 'citations_delta') {
       this.invalid = true
       return
     }
@@ -235,16 +248,18 @@ class ReplyFingerprint {
       return
     }
     this.open.delete(index)
+    if (this.invalid) return
     this.layout.set(index, {
       type: state.type,
       ...(state.type === 'text'
-        ? {
-            text: state.textHasContent ? '_' : '',
-            textFingerprint: state.committedText?.digest('hex'),
-          }
+        ? { text: state.textHasContent ? '_' : '' }
         : {}),
     })
-    if (state.type === 'text') this.activeText = undefined
+    if (state.type === 'text') {
+      this.activeText = undefined
+      if (state.committedText)
+        this.textBlocks.set(index, state.committedText.digest('hex'))
+    }
     if (state.signature) {
       if (!state.signatureLength) this.invalid = true
       this.signatures.set(index, [state.type, state.signature.digest('hex')])
@@ -252,10 +267,9 @@ class ReplyFingerprint {
     if (state.type === 'tool_use') {
       this.inputChars -= state.inputJson?.length ?? 0
       try {
-        const input =
-          state.inputJson === undefined
-            ? state.input
-            : JSON.parse(state.inputJson)
+        const input = state.inputJson?.trim()
+          ? JSON.parse(state.inputJson)
+          : state.input
         if (!state.id || !state.name || input === undefined) this.invalid = true
         else
           this.tools.set(index, [
@@ -271,16 +285,17 @@ class ReplyFingerprint {
 
   digest(): string | undefined {
     if (this.invalid || this.open.size) return undefined
-    const blocks = [...this.layout]
-      .sort(([a], [b]) => a - b)
-      .map(([, block]) => block)
-    const kept = withoutTrailingToolWhitespace(blocks) as Body[]
+    const ordered = [...this.layout].sort(([a], [b]) => a - b)
+    const kept = withoutTrailingToolWhitespace(
+      ordered.map(([, block]) => block),
+    ) as Body[]
     return hash({
       blocks: kept.map((block) => block.type),
       // Combined text alone cannot detect text moved across a tool call.
-      texts: kept
-        .filter((block) => block.type === 'text')
-        .map((block) => block.textFingerprint),
+      texts: ordered
+        .slice(0, kept.length)
+        .filter(([, block]) => block.type === 'text')
+        .map(([index]) => this.textBlocks.get(index)),
       tools: [...this.tools].sort(([a], [b]) => a - b).map(([, tool]) => tool),
       signatures: [...this.signatures]
         .sort(([a], [b]) => a - b)
@@ -354,6 +369,7 @@ function withoutTrailingToolWhitespace(content: unknown[]): unknown[] {
       !isBody(block) ||
       block.type !== 'text' ||
       typeof block.text !== 'string' ||
+      !hasOnlyTextFields(block) ||
       block.text.trim()
     )
       break

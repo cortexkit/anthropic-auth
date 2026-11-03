@@ -1462,6 +1462,9 @@ function stripLatestAssistantToolUseTrailingWhitespace(
         !isRecord(block) ||
         block.type !== 'text' ||
         typeof block.text !== 'string' ||
+        !Object.keys(block).every(
+          (key) => key === 'type' || key === 'text' || key === 'cache_control',
+        ) ||
         block.text.trim()
       ) {
         break

@@ -5230,3 +5230,87 @@ test('recheck assistant whitespace: latest-only OpenCode stripping does not chur
   )
   expect(second.messages[1].content).toHaveLength(2)
 })
+
+test.each(['citations', 'future_text_metadata'])(
+  'final review whitespace: latest OpenCode tool reply retains %s',
+  async (field) => {
+    const metadata = [{ source: 'retained' }]
+    const body = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-sonnet-5',
+          tools: [{ name: 'read', input_schema: { type: 'object' } }],
+          messages: [
+            { role: 'user', content: 'prompt' },
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'tool_use',
+                  id: 'metadata_call',
+                  name: 'read',
+                  input: {},
+                },
+                {
+                  type: 'text',
+                  text: ' \n',
+                  [field]: metadata,
+                  cache_control: { type: 'ephemeral' },
+                },
+              ],
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'metadata_call',
+                  content: 'result',
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    )
+    expect(body.messages[1].content).toHaveLength(2)
+    expect(body.messages[1].content[1][field]).toEqual(metadata)
+  },
+)
+
+test('final review whitespace: latest OpenCode tool reply drops plain cached whitespace', async () => {
+  const body = JSON.parse(
+    await rewriteRequestBody(
+      JSON.stringify({
+        model: 'claude-sonnet-5',
+        tools: [{ name: 'read', input_schema: { type: 'object' } }],
+        messages: [
+          { role: 'user', content: 'prompt' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'cached_call', name: 'read', input: {} },
+              {
+                type: 'text',
+                text: ' \n',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'cached_call',
+                content: 'result',
+              },
+            ],
+          },
+        ],
+      }),
+    ),
+  )
+  expect(body.messages[1].content).toHaveLength(1)
+  expect(body.messages[1].content[0].type).toBe('tool_use')
+})
