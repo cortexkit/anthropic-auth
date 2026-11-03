@@ -103,10 +103,22 @@ export default async () => ({
       )
     })
     expect(requests).toHaveLength(2)
+    const create = requests[0]?.body
+    expect(create?.thread).toEqual({ type: 'create' })
     const request = requests[1]
     if (!request) throw new Error('No generation request reached the mock')
     const body = request.body
-    const messages = body.messages as Array<{
+    expect(body.thread).toEqual({
+      type: 'continue',
+      previous_message_id: expect.stringMatching(/^msg_/),
+    })
+    expect(request.headers['anthropic-beta']?.split(',').at(-1)).toBe(
+      'message-threads-2026-08-12',
+    )
+    const thread = body.thread as { previous_message_id: string }
+    expect(body.diagnostics).toMatchObject({ previous_message_id: thread.previous_message_id })
+    expect(body.tools).toEqual(create?.tools)
+    const messages = create?.messages as Array<{
       role: string
       content: WireBlock[]
     }>
@@ -134,18 +146,21 @@ export default async () => ({
     } else {
       expect(content[0]?.cache_control).toEqual(control)
     }
-    // OpenCode merges the injected records with the first real user. That
-    // older user's text is not a prefix cache boundary; the user after the
-    // completed assistant owns the separate moving anchor.
+    // The create stores the merged mural prefix and its two breakpoints.
+    // The continue sends only the new prompt with its own moving breakpoint.
     expect(content.at(-1)?.text).toBe(prompt)
-    expect(content.at(-1)?.cache_control).toBeUndefined()
-    const latest = messages.at(-1)
+    const delta = body.messages as Array<{ role: string; content: WireBlock[] }>
+    expect(delta).toHaveLength(1)
+    const latest = delta[0]
     expect(latest?.role).toBe('user')
     expect(latest?.content).toHaveLength(1)
+    expect(latest?.content[0]?.text).toBe(prompt)
     expect(latest?.content[0]?.cache_control).toEqual(control)
     const systems = body.system as Array<{ cache_control?: unknown }>
     expect(systems.filter((block) => block.cache_control)).toHaveLength(1)
-    expect(content.filter((block) => block.cache_control)).toHaveLength(2)
+    expect(content.slice(0, -1).filter((block) => block.cache_control)).toHaveLength(2)
+    expect((JSON.stringify(body).match(/"cache_control":/g) ?? []).length).toBeLessThanOrEqual(4)
+    expect(create?.cache_control).toBeUndefined()
     expect(body.cache_control).toBeUndefined()
   }
 }, 120_000)

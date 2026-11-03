@@ -19,6 +19,28 @@ function isConversationGeneration(request: { body: Record<string, unknown> }) {
   )
 }
 
+function expectThreadedConversation(
+  requests: Array<{ body: Record<string, unknown>; headers: Record<string, string> }>,
+) {
+  expect(requests[0]?.body.thread).toEqual({ type: 'create' })
+  for (const request of requests) {
+    expect(request.headers['anthropic-beta']?.split(',').at(-1)).toBe(
+      'message-threads-2026-08-12',
+    )
+    expect((JSON.stringify(request.body).match(/"cache_control":/g) ?? []).length).toBeLessThanOrEqual(4)
+  }
+  for (const request of requests.slice(1)) {
+    expect(request.body.thread).toEqual({
+      type: 'continue',
+      previous_message_id: expect.stringMatching(/^msg_/),
+    })
+    const thread = request.body.thread as { previous_message_id: string }
+    expect(request.body.diagnostics).toMatchObject({
+      previous_message_id: thread.previous_message_id,
+    })
+  }
+}
+
 afterEach(async () => {
   const finished = harness
   harness = null
@@ -156,6 +178,7 @@ describe('OpenCode Anthropic auth e2e', () => {
       )
     })
     expect(generationRequests).toHaveLength(3)
+    expectThreadedConversation(generationRequests)
     for (const request of generationRequests) {
       expect(request.body.output_config).toMatchObject({ effort: 'low' })
     }
@@ -165,7 +188,18 @@ describe('OpenCode Anthropic auth e2e', () => {
       content: [],
       output_config: { effort: 'high' },
     })
-    expect(JSON.stringify(generationRequests[2]?.body)).toContain('tool_result')
+    const toolDelta = generationRequests[1]?.body.messages as Array<{
+      role: string
+      content: Array<{ type: string; cache_control?: unknown }>
+    }>
+    expect(toolDelta.map((message) => message.role)).toEqual(['user'])
+    expect(toolDelta[0]?.content[0]?.type).toBe('tool_result')
+    expect(toolDelta[0]?.content[0]?.cache_control).toMatchObject({ type: 'ephemeral' })
+    expect((switchedMessages as Array<{ role: string }>).map((message) => message.role)).toEqual(['system', 'user'])
+    expect(JSON.stringify(switchedMessages)).not.toContain('tool_result')
+    expect(JSON.stringify(switchedMessages)).not.toContain('start with low effort')
+    const highPrompt = (switchedMessages as Array<{ content: Array<{ cache_control?: unknown }> }>)[1]
+    expect(highPrompt?.content[0]?.cache_control).toMatchObject({ type: 'ephemeral' })
     for (const request of generationRequests) {
       const serialized = JSON.stringify(request.body)
       expect(serialized).not.toContain('cortexkit-internal-effort')
@@ -645,12 +679,24 @@ describe('Fable 5.1 effort correlation through real OpenCode lowering', () => {
       !JSON.stringify(request.body).includes('Generate a title for this conversation'),
     )
     expect(requests).toHaveLength(3)
+    expectThreadedConversation(requests)
     const continuation = requests[2]?.body
     expect(JSON.stringify(continuation?.messages)).toContain('tool_result')
     expect(continuation?.output_config).toEqual({ effort: 'low' })
-    expect(continuation?.messages).toContainEqual({
+    expect(requests[1]?.body.messages).toContainEqual({
       role: 'system', content: [], output_config: { effort: 'high' },
     })
+    // The preceding request already sent the high-effort system message;
+    // the tool continuation sends only its new result, not another system
+    // message carrying the effort setting.
+    const delta = continuation?.messages as Array<{
+      role: string
+      content: Array<{ type: string; cache_control?: unknown }>
+    }>
+    expect(delta.map((message) => message.role)).toEqual(['user'])
+    expect(delta[0]?.content.map((block) => block.type)).toEqual(['tool_result'])
+    expect(delta[0]?.content[0]?.cache_control).toMatchObject({ type: 'ephemeral' })
+    expect(JSON.stringify(delta)).not.toContain('first low request')
     for (const request of requests) expect(JSON.stringify(request.body)).not.toContain('cortexkit-internal-effort')
   }, 90_000)
 

@@ -591,6 +591,18 @@ interface PendingSend {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
+function inspectableThreadError(response: Response): Response {
+  if ((response.status !== 400 && response.status !== 404) || !response.body)
+    return response
+  // Bun 1.3 can drain a cached native response body when both the thread and
+  // gzip inspectors clone it. Own a JavaScript stream before those reads so
+  // later error redaction receives all bytes.
+  return new Response(
+    response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>()),
+    response,
+  )
+}
+
 function parseJson(text: string): unknown {
   try {
     return JSON.parse(text)
@@ -1429,7 +1441,7 @@ export function createNativeAnthropicAdapter<Q, P>(
                 }),
             })
           }
-          return response
+          return inspectableThreadError(response)
         },
       })
       ensureLive()
@@ -1585,7 +1597,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       if (data) threadRequests.delete(data)
       if (threaded && data && fromUpstream(response.headers, data)) {
         response = await threaded.thread.recover(
-          response,
+          inspectableThreadError(response),
           threaded.resend,
           threaded.beforeResend,
         )
