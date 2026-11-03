@@ -266,7 +266,7 @@ function fixedThreadFingerprint(input: MessageThreadInput): string {
       tools: JSON.stringify(body.tools),
       system: JSON.stringify(system),
       cache_control: JSON.stringify(body.cache_control),
-      fallbacks: Object.hasOwn(body, 'fallbacks'),
+      fallbacks: JSON.stringify(body.fallbacks),
       betas: input.betas,
     }),
   )

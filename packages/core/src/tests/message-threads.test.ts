@@ -1554,3 +1554,18 @@ test('audit hot path: serialized create preserves ordinary thread-named data and
     expect(sent.messages).toEqual(original.body.messages)
   }
 })
+
+test.each(['default', 'different-policy', null])(
+  'recheck fallbacks: value %j participates in the fixed fingerprint',
+  (value) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    request.body.fallbacks = 'default'
+    anchor(tracker, request)
+    const candidate = advance(request)
+    candidate.body.fallbacks = value
+    expect(tracker.prepare(candidate).decision.type).toBe(
+      value === 'default' ? 'continue' : 'create',
+    )
+  },
+)
