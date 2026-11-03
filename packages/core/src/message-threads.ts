@@ -137,6 +137,7 @@ export function messageThreadSnapshot(
         // Preserve fixed-field wire order and cache annotations in the digest.
         tools: JSON.stringify(body.tools),
         system: JSON.stringify(system),
+        cache_control: JSON.stringify(body.cache_control),
         fallbacks: Object.hasOwn(body, 'fallbacks'),
         betas: input.betas,
       }),
@@ -378,30 +379,31 @@ export function observeMessageThreadResponse(
 }
 
 function placeContinueCache(body: Body, full: Body): void {
-  // Fixed fields keep their exact wire shape, including existing breakpoints.
+  // Fixed fields and the top-level automatic control keep their wire shape.
   const fixed = fixedCacheHolders(body)
-  let remaining = Math.max(0, 4 - fixed.length)
-  const messages = structuredClone(body.messages) as Array<{
-    content?: unknown
-  }>
+  let remaining = Math.max(0, 4 - fixed.length - (body.cache_control ? 1 : 0))
+  const messages = structuredClone(body.messages) as Array<Body>
   body.messages = messages
-  delete body.cache_control
+  const last = messages.findLast((message) => message.role !== 'system')
+  const selected = new Set(contentCacheHolders(last?.content))
+  const fullMessages = Array.isArray(full.messages)
+    ? full.messages.filter(
+        (message) => isBody(message) && message.role !== 'system',
+      )
+    : []
   const template =
-    full.cache_control ??
-    [...messageCacheHolders(full.messages), ...fixed][0]?.cache_control
-  const last = messages.at(-1)
+    contentCacheHolders(last?.content).at(-1)?.cache_control ??
+    messageCacheHolders(fullMessages).at(-1)?.cache_control
   if (last && remaining > 0 && template && typeof last.content === 'string') {
     last.content = [{ type: 'text', text: last.content }]
   }
   const lastBlock = Array.isArray(last?.content)
     ? last.content.at(-1)
     : undefined
-  const cacheableLastBlock =
-    lastBlock && typeof lastBlock === 'object' ? (lastBlock as Body) : undefined
-  const lastControl =
-    full.cache_control ?? cacheableLastBlock?.cache_control ?? template
+  const cacheableLastBlock = isBody(lastBlock) ? lastBlock : undefined
+  const lastControl = cacheableLastBlock?.cache_control ?? template
   let reserved: Body | undefined
-  // Automatic caching belongs on the last delta block, within the remaining budget.
+  // System turn controls are never cache targets; automatic caching stays top-level.
   if (cacheableLastBlock && lastControl && remaining > 0) {
     cacheableLastBlock.cache_control = lastControl
     reserved = cacheableLastBlock
@@ -409,7 +411,7 @@ function placeContinueCache(body: Body, full: Body): void {
   }
   for (const holder of messageCacheHolders(messages)) {
     if (holder === reserved) continue
-    if (remaining > 0) remaining--
+    if (selected.has(holder) && remaining > 0) remaining--
     else delete holder.cache_control
   }
 }

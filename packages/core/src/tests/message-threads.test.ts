@@ -291,7 +291,7 @@ test.each([
   },
 )
 
-test('continue preserves fixed tool and system bytes and maps automatic caching onto the delta', () => {
+test('continue preserves fixed fields and the top-level automatic control', () => {
   const tracker = new MessageThreadTracker()
   const request = input()
   const cc = { type: 'ephemeral', ttl: '1h' }
@@ -309,7 +309,7 @@ test('continue preserves fixed tool and system bytes and maps automatic caching 
   anchor(tracker, request)
   const continued = tracker.prepare(advance(request)).body
   expect(continued.thread).toMatchObject({ type: 'continue' })
-  expect(continued.cache_control).toBeUndefined()
+  expect(continued.cache_control).toEqual(cc)
   expect(JSON.stringify(continued.tools)).toBe(
     JSON.stringify(request.body.tools),
   )
@@ -499,7 +499,7 @@ test.each([0, 1, 2, 3, 4])(
         cache_control: cc,
       }),
     )
-    request.body.cache_control = cc
+    if (fixedCount < 4) request.body.cache_control = cc
     anchor(tracker, request)
     const delta = ['early delta', 'last delta'].map((text) => ({
       role: 'user',
@@ -523,17 +523,19 @@ test.each([0, 1, 2, 3, 4])(
     expect(JSON.stringify(continued.tools)).toBe(
       JSON.stringify(request.body.tools),
     )
-    expect(continued.cache_control).toBeUndefined()
+    expect(continued.cache_control).toEqual(fixedCount < 4 ? cc : undefined)
     const count = (value: unknown) =>
       (JSON.stringify(value).match(/"cache_control"/g) ?? []).length
     expect(count(continued)).toBeLessThanOrEqual(4)
     expect(count({ tools: continued.tools, system: continued.system })).toBe(
       fixedCount,
     )
-    expect(count(continued.messages)).toBeLessThanOrEqual(4 - fixedCount)
+    expect(count(continued.messages)).toBeLessThanOrEqual(
+      4 - fixedCount - (fixedCount < 4 ? 1 : 0),
+    )
     const messages = continued.messages as typeof delta
     expect(messages.at(-1)?.content.at(-1)?.cache_control).toEqual(
-      fixedCount === 4 ? undefined : cc,
+      fixedCount >= 3 ? undefined : cc,
     )
     expect(
       delta.every((message) => message.content[0]?.cache_control === cc),
@@ -759,4 +761,124 @@ test('audit fixed wire: billing lineage alone remains reusable', () => {
     },
   ]
   expect(tracker.prepare(continued).decision.type).toBe('continue')
+})
+
+test('audit delta cache: automatic control stays top-level and creates no delta marker', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const cc = { type: 'ephemeral', ttl: '1h' }
+  request.body.cache_control = cc
+  anchor(tracker, request)
+  const body = tracker.prepare(advance(request)).body
+  expect(body.thread).toMatchObject({ type: 'continue' })
+  expect(body.cache_control).toEqual(cc)
+  expect(body.messages).toEqual([next])
+})
+
+test.each(['note', 'effort'])(
+  'audit delta cache: trailing system %s remains byte-stable',
+  (kind) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    const cc = { type: 'ephemeral', ttl: '1h' }
+    request.body.messages = [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'one', cache_control: cc }],
+      },
+    ]
+    request.body.system = [
+      { type: 'text', text: 'instructions', cache_control: cc },
+    ]
+    request.body.tools = [{ name: 'read', cache_control: cc }]
+    anchor(tracker, request)
+    const result = {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'call',
+          content: 'result',
+          cache_control: cc,
+        },
+      ],
+    }
+    const control =
+      kind === 'note'
+        ? {
+            role: 'system',
+            clear_at: 'next_user_message',
+            content: 'turn-end note',
+          }
+        : { role: 'system', content: '', output_config: { effort: 'high' } }
+    const body = tracker.prepare({
+      ...request,
+      body: {
+        ...request.body,
+        messages: [
+          ...(request.body.messages as unknown[]),
+          assistant,
+          result,
+          control,
+        ],
+      },
+    }).body
+    expect(body.thread).toMatchObject({ type: 'continue' })
+    expect(body.messages).toEqual([result, control])
+    expect(JSON.stringify(body.messages)).toContain(JSON.stringify(control))
+    expect(
+      (JSON.stringify(body).match(/"cache_control"/g) ?? []).length,
+    ).toBeLessThanOrEqual(4)
+  },
+)
+
+test.each(['removed', 'ttl'])(
+  'audit delta cache: changed top-level control %s creates',
+  (change) => {
+    const tracker = new MessageThreadTracker()
+    const request = input()
+    request.body.cache_control = { type: 'ephemeral', ttl: '1h' }
+    anchor(tracker, request)
+    const continued = advance(request)
+    if (change === 'removed') delete continued.body.cache_control
+    else continued.body.cache_control = { type: 'ephemeral', ttl: '5m' }
+    expect(tracker.prepare(continued).decision.type).toBe('create')
+  },
+)
+
+test('audit delta cache: only the last non-system message carries delta breakpoints', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const cc = { type: 'ephemeral', ttl: '1h' }
+  request.body.system = [
+    { type: 'text', text: 'instructions', cache_control: cc },
+  ]
+  anchor(tracker, request)
+  const early = {
+    role: 'user',
+    content: [{ type: 'text', text: 'early', cache_control: cc }],
+  }
+  const latest = {
+    role: 'user',
+    content: [{ type: 'text', text: 'latest', cache_control: cc }],
+  }
+  const note = { role: 'system', content: 'turn-end note' }
+  const body = tracker.prepare({
+    ...request,
+    body: {
+      ...request.body,
+      messages: [
+        ...(request.body.messages as unknown[]),
+        assistant,
+        early,
+        latest,
+        note,
+      ],
+    },
+  }).body
+  expect(body.messages).toEqual([
+    { role: 'user', content: [{ type: 'text', text: 'early' }] },
+    latest,
+    note,
+  ])
 })
