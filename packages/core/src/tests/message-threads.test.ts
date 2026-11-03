@@ -238,73 +238,72 @@ test.each([
   [400, 'thread_unsupported_request'],
   [400, 'unrelated'],
   [404, 'unknown_model'],
-] as const)(
-  'HTTP %s %s has a single bounded recovery',
-  async (status, code) => {
-    const tracker = new MessageThreadTracker()
-    const headers = new Headers({
-      'anthropic-beta': 'base',
-      'x-client-request-id': 'same-request',
-    })
-    const original = input()
-    const first = await prepareMessageThreadRequest(tracker, {
-      ...original,
-      bodyText: JSON.stringify(original.body),
-      headers,
-    })
-    await first
-      .observe(
-        sse([
-          {
-            type: 'message_start',
-            message: {
-              id: 'msg_1',
-              content: [{ type: 'text', text: 'answer' }],
-            },
-          },
-          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
-          { type: 'message_stop' },
-        ]),
-      )
-      .text()
-    const full = advance(original)
-    const request = await prepareMessageThreadRequest(tracker, {
-      ...full,
-      bodyText: JSON.stringify(full.body),
-      headers,
-    })
-    expect(JSON.parse(request.bodyText).messages).toEqual([next])
-    expect(headers.get('anthropic-beta')?.split(',').at(-1)).toBe(
-      MESSAGE_THREADS_BETA,
-    )
-    const rejection = () =>
-      Response.json(
+] as const)('HTTP %s %s has bounded thread recovery', async (status, code) => {
+  const tracker = new MessageThreadTracker()
+  const headers = new Headers({
+    'anthropic-beta': 'base',
+    'x-client-request-id': 'same-request',
+  })
+  const original = { ...input(), account: `bounded-recovery-${status}-${code}` }
+  const first = await prepareMessageThreadRequest(tracker, {
+    ...original,
+    bodyText: JSON.stringify(original.body),
+    headers,
+  })
+  await first
+    .observe(
+      sse([
         {
-          type: 'error',
-          error: {
-            type: status === 404 ? 'not_found_error' : 'invalid_request_error',
-            message: 'thread rejected',
-            details: { error_code: code },
+          type: 'message_start',
+          message: {
+            id: 'msg_1',
+            content: [{ type: 'text', text: 'answer' }],
           },
         },
-        { status },
-      )
-    const recovered = code.startsWith('thread_')
-    let sends = 0
-    const send = async (body: string) => {
-      sends++
-      expect(JSON.parse(body).thread).toEqual({ type: 'create' })
-      expect(JSON.parse(body).messages).toEqual(full.body.messages)
-      expect(headers.get('x-client-request-id')).toBe('same-request')
-      return rejection()
-    }
-    const response = await request.recover(rejection(), send)
-    await request.recover(response, send)
-    expect(sends).toBe(recovered ? 1 : 0)
-    await request.observe(response).text()
-    expect(tracker.prepare(full).decision.type).toBe('create')
-  },
-)
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+        { type: 'message_stop' },
+      ]),
+    )
+    .text()
+  const full = advance(original)
+  const request = await prepareMessageThreadRequest(tracker, {
+    ...full,
+    bodyText: JSON.stringify(full.body),
+    headers,
+  })
+  expect(JSON.parse(request.bodyText).messages).toEqual([next])
+  expect(headers.get('anthropic-beta')?.split(',').at(-1)).toBe(
+    MESSAGE_THREADS_BETA,
+  )
+  const rejection = () =>
+    Response.json(
+      {
+        type: 'error',
+        error: {
+          type: status === 404 ? 'not_found_error' : 'invalid_request_error',
+          message: 'thread rejected',
+          details: { error_code: code },
+        },
+      },
+      { status },
+    )
+  const recovered = code.startsWith('thread_')
+  let sends = 0
+  const send = async (body: string) => {
+    sends++
+    expect(JSON.parse(body).thread).toEqual(
+      sends === 1 ? { type: 'create' } : undefined,
+    )
+    expect(JSON.parse(body).messages).toEqual(full.body.messages)
+    expect(headers.get('x-client-request-id')).toBe('same-request')
+    return rejection()
+  }
+  const response = await request.recover(rejection(), send)
+  await request.recover(response, send)
+  expect(sends).toBe(recovered ? (status === 400 ? 2 : 1) : 0)
+  await request.observe(response).text()
+  expect(tracker.prepare(full).decision.type).toBe('create')
+})
 
 test('continue preserves fixed fields and the top-level automatic control', () => {
   const tracker = new MessageThreadTracker()
@@ -1223,3 +1222,132 @@ test.each([
     warn.mockRestore()
   }
 })
+
+test.each(['accepted', 'downstream rejected'])(
+  'audit recovered create: %s resend has a fresh lifecycle',
+  async (outcome) => {
+    const tracker = new MessageThreadTracker()
+    const original = anchor(tracker, {
+      ...input(),
+      account: `audit-reanchor-${outcome}`,
+      betas: ['base', MESSAGE_THREADS_BETA],
+    })
+    const full = advance(original)
+    const headers = new Headers({
+      'anthropic-beta': 'base',
+      'x-client-request-id': 'reanchor-id',
+    })
+    const request = await prepareMessageThreadRequest(tracker, {
+      ...full,
+      bodyText: JSON.stringify(full.body),
+      headers,
+    })
+    expect(JSON.parse(request.bodyText).thread.type).toBe('continue')
+    const rejection = Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          details: { error_code: 'thread_fingerprint_mismatch' },
+        },
+      },
+      { status: 400 },
+    )
+    let sends = 0
+    const response = await request.recover(rejection, async (body) => {
+      sends++
+      expect(JSON.parse(body).thread).toEqual({ type: 'create' })
+      expect(JSON.parse(body).messages).toEqual(full.body.messages)
+      expect(headers.get('x-client-request-id')).toBe('reanchor-id')
+      return sse([
+        {
+          type: 'message_start',
+          message: {
+            id: 'msg_recovered',
+            content: [{ type: 'text', text: 'Recovered answer' }],
+          },
+        },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+        { type: 'message_stop' },
+      ])
+    })
+    await request.observe(response).text()
+    if (outcome === 'downstream rejected') request.fail()
+    expect(sends).toBe(1)
+    const nextRequest = await prepareMessageThreadRequest(tracker, {
+      ...full,
+      bodyText: JSON.stringify({
+        ...full.body,
+        messages: [
+          ...(full.body.messages as unknown[]),
+          { role: 'assistant', content: 'Recovered answer' },
+          { role: 'user', content: 'Third prompt' },
+        ],
+      }),
+      headers,
+    })
+    expect(JSON.parse(nextRequest.bodyText).thread).toEqual(
+      outcome === 'accepted'
+        ? { type: 'continue', previous_message_id: 'msg_recovered' }
+        : { type: 'create' },
+    )
+  },
+)
+
+test.each([200, 400])(
+  'audit recovered create: continue-to-create-to-stateless ends at %s without a fourth send',
+  async (finalStatus) => {
+    const tracker = new MessageThreadTracker()
+    const original = anchor(tracker, {
+      ...input(),
+      account: `audit-three-sends-${finalStatus}`,
+      betas: ['base', MESSAGE_THREADS_BETA],
+    })
+    const full = advance(original)
+    const headers = new Headers({
+      'anthropic-beta': 'base',
+      'x-client-request-id': 'three-send-id',
+    })
+    const request = await prepareMessageThreadRequest(tracker, {
+      ...full,
+      bodyText: JSON.stringify(full.body),
+      headers,
+    })
+    const modes = [JSON.parse(request.bodyText).thread?.type]
+    const rejection = (status: number, code: string) =>
+      Response.json(
+        {
+          type: 'error',
+          error: {
+            type: status === 404 ? 'not_found_error' : 'invalid_request_error',
+            details: { error_code: code },
+          },
+        },
+        { status },
+      )
+    const send = async (text: string) => {
+      const mode = JSON.parse(text).thread?.type
+      modes.push(mode)
+      expect(headers.get('x-client-request-id')).toBe('three-send-id')
+      if (mode === 'create') return rejection(400, 'thread_unsupported_request')
+      expect(mode).toBeUndefined()
+      expect(headers.get('anthropic-beta')).toBe('base')
+      return finalStatus === 200
+        ? new Response('stateless works')
+        : rejection(400, 'thread_unsupported_request')
+    }
+    const response = await request.recover(
+      rejection(404, 'thread_not_found'),
+      send,
+    )
+    expect(response.status).toBe(finalStatus)
+    expect(modes).toEqual(['continue', 'create', undefined])
+    await request.recover(rejection(400, 'thread_unsupported_request'), send)
+    expect(modes).toHaveLength(3)
+    const later = await prepareMessageThreadRequest(
+      new MessageThreadTracker(),
+      { ...full, bodyText: JSON.stringify(full.body), headers },
+    )
+    expect(JSON.parse(later.bodyText).thread).toBeUndefined()
+  },
+)

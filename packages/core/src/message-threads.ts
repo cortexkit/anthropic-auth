@@ -686,7 +686,7 @@ export async function prepareMessageThreadRequest(
     if (input.session) tracker.forget(input.session)
   }
   // Without a host session, create a thread but retain no continuation state.
-  const prepared: ReturnType<MessageThreadTracker['prepare']> =
+  let prepared: ReturnType<MessageThreadTracker['prepare']> =
     threading && input.session
       ? tracker.prepare({ ...input, session: input.session, body: full, betas })
       : {
@@ -700,11 +700,20 @@ export async function prepareMessageThreadRequest(
   if (!threading) delete prepared.body.thread
   let bodyText = await signRequestBody(JSON.stringify(prepared.body))
   let recovered = false
+  const prepareStateless = async () => {
+    prepared.fail()
+    disableThreadsForAccount(accountKey)
+    threading = false
+    removeThreadBeta(input.headers)
+    const stateless = { ...full }
+    delete stateless.thread
+    bodyText = await signRequestBody(JSON.stringify(stateless))
+  }
   return {
     get bodyText() {
       return bodyText
     },
-    fail: prepared.fail,
+    fail: () => prepared.fail(),
     observe: (response: Response) => {
       if (!threading || disabledThreadAccounts.has(accountKey)) {
         prepared.fail()
@@ -734,18 +743,29 @@ export async function prepareMessageThreadRequest(
       prepared.fail()
       void response.body?.cancel().catch(() => {})
       if (rejectedCreate || disabledThreadAccounts.has(accountKey)) {
-        disableThreadsForAccount(accountKey)
-        threading = false
-        removeThreadBeta(input.headers)
-        const stateless = { ...full }
-        delete stateless.thread
-        bodyText = await signRequestBody(JSON.stringify(stateless))
-      } else {
-        bodyText = await signRequestBody(
-          JSON.stringify({ ...full, thread: { type: 'create' } }),
-        )
+        await prepareStateless()
+        return send(bodyText)
       }
-      return send(bodyText)
+      if (input.session) {
+        tracker.forget(input.session)
+        prepared = tracker.prepare({
+          ...input,
+          session: input.session,
+          body: full,
+          betas,
+        })
+      }
+      bodyText = await signRequestBody(
+        JSON.stringify({ ...full, thread: { type: 'create' } }),
+      )
+      const created = await send(bodyText)
+      // Only a rejected recovery create may add the final stateless attempt.
+      if (await isThreadCreateRejection(created)) {
+        void created.body?.cancel().catch(() => {})
+        await prepareStateless()
+        return send(bodyText)
+      }
+      return created
     },
   }
 }
