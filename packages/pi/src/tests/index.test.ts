@@ -527,10 +527,19 @@ async function auditPiPrimaryHarness(suffix: string) {
     },
     { preconnect: originalFetch.preconnect },
   ) as typeof fetch
-  const start = () =>
-    events.get('turn_start')?.({ type: 'turn_start' }, turnContext)
-  const settle = () =>
-    events.get('agent_settled')?.({ type: 'agent_settled' }, turnContext)
+  const contextFor = (sessionId: string) => ({
+    ...turnContext,
+    sessionManager: {
+      ...turnContext.sessionManager,
+      getSessionId: () => sessionId,
+    },
+  })
+  const startFor = (id: string) =>
+    events.get('turn_start')?.({ type: 'turn_start' }, contextFor(id))
+  const settleFor = (id: string) =>
+    events.get('agent_settled')?.({ type: 'agent_settled' }, contextFor(id))
+  const start = () => startFor(sessionId)
+  const settle = () => settleFor(sessionId)
   const send = async (
     history: Context,
     overrides: SimpleStreamOptions = options,
@@ -551,6 +560,8 @@ async function auditPiPrimaryHarness(suffix: string) {
     sent,
     start,
     settle,
+    startFor,
+    settleFor,
     send,
     setReply: (value: typeof reply) => {
       reply = value
@@ -733,3 +744,46 @@ test('recheck user text: Pi string prompts keep three consecutive requests reusa
     'continue',
   ])
 })
+
+test.each(['another turn starts', 'another session settles'])(
+  'recheck Pi leases: %s leaves the first session active',
+  async (kind) => {
+    const h = await auditPiPrimaryHarness(`concurrent-${kind}`)
+    const firstId = h.options.sessionId
+    if (!firstId) throw new Error('Missing session fixture')
+    const secondId = `${firstId}-other`
+    const secondOptions = { ...h.options, sessionId: secondId }
+    let kept: AssistantMessage
+    let previousId: string
+    if (kind === 'another turn starts') {
+      await h.startFor(firstId)
+      kept = await h.send(h.context)
+      previousId = 'msg_gate_1'
+      await h.startFor(secondId)
+      await h.send(h.context, secondOptions)
+    } else {
+      await h.startFor(secondId)
+      await h.send(h.context, secondOptions)
+      await h.startFor(firstId)
+      kept = await h.send(h.context)
+      previousId = 'msg_gate_2'
+      await h.settleFor(secondId)
+    }
+    await h.send({
+      ...h.context,
+      messages: [
+        ...h.context.messages,
+        kept,
+        { role: 'user', content: 'First session next', timestamp: 2 },
+      ],
+    })
+    expect(h.sent.at(-1)?.body.thread).toEqual({
+      type: 'continue',
+      previous_message_id: previousId,
+    })
+    if (kind === 'another session settles') {
+      await h.send(h.context, secondOptions)
+      expect(h.sent.at(-1)?.body.thread).toBeUndefined()
+    }
+  },
+)

@@ -111,15 +111,16 @@ import {
 } from './transport.ts'
 
 const messageThreads = new MessageThreadTracker()
+// Each session owns its lease; storage identifies which host may end it.
 const primaryTurns = new Map<string, string>()
 
 export function beginPiPrimaryTurn(
   storagePath: string,
   sessionId?: string,
 ): void {
-  primaryTurns.delete(storagePath)
   if (!sessionId) return
-  primaryTurns.set(storagePath, sessionId)
+  primaryTurns.delete(sessionId)
+  primaryTurns.set(sessionId, storagePath)
   while (primaryTurns.size > 128) {
     const oldest = primaryTurns.keys().next().value
     if (oldest === undefined) break
@@ -127,8 +128,12 @@ export function beginPiPrimaryTurn(
   }
 }
 
-export function endPiPrimaryTurn(storagePath: string): void {
-  primaryTurns.delete(storagePath)
+export function endPiPrimaryTurn(
+  storagePath: string,
+  sessionId?: string,
+): void {
+  if (sessionId && primaryTurns.get(sessionId) === storagePath)
+    primaryTurns.delete(sessionId)
 }
 
 function isPiPrimaryThreadRequest(
@@ -145,7 +150,7 @@ function isPiPrimaryThreadRequest(
     return false
   return Boolean(
     options?.sessionId &&
-      primaryTurns.get(storagePath) === options.sessionId &&
+      primaryTurns.get(options.sessionId) === storagePath &&
       typeof options.onPayload === 'function' &&
       typeof options.onResponse === 'function' &&
       typeof options.onProviderStreamEvent === 'function',

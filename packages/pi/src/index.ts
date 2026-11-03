@@ -132,10 +132,12 @@ export default async function cortexKitPiAnthropicAuth(
       else break
     }
   })
-  pi.on('agent_settled', () => endPiPrimaryTurn(storagePath))
+  pi.on('agent_settled', (_event, ctx) =>
+    endPiPrimaryTurn(storagePath, ctx.sessionManager.getSessionId()),
+  )
   pi.on('session_shutdown', async (_event, ctx) => {
-    endPiPrimaryTurn(storagePath)
     const sessionId = ctx.sessionManager.getSessionId()
+    endPiPrimaryTurn(storagePath, sessionId)
     if (sessionId) {
       effortHistoryBySession.delete(sessionId)
       workingMessageBySession.delete(sessionId)
