@@ -10,7 +10,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
@@ -24,6 +24,7 @@ import {
   formatLogLine,
   getLogLevel,
   logger,
+  type NativeLockEvent,
   resolveNativePoolPaths,
   runNativeMigration,
   sessionCacheActivity,
@@ -50,9 +51,86 @@ import { setupAnthropicAuth } from '../v2/setup'
 import type { NativeSource } from '../v2/source'
 
 const cleanups: Array<() => void | Promise<void>> = []
+let reportFailure: (() => void) | undefined
 afterEach(async () => {
+  const report = reportFailure
+  reportFailure = undefined
+  report?.()
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
+
+function cacheKeepFailureTrace() {
+  const started = performance.now()
+  const events: string[] = []
+  const pending = new Set<string>()
+  const locks = new Map<string, string>()
+  let completed = false
+  const record = (event: string) => {
+    events.push(`${Math.round(performance.now() - started)}ms ${event}`)
+    if (events.length > 100) events.shift()
+  }
+  const snapshot = () => ({
+    pending: [...pending],
+    locks: [...locks.values()],
+    events: [...events],
+  })
+  let nearDeadline: ReturnType<typeof snapshot> | undefined
+  // Capture the pending work before the five-second test timeout; report it only on failure.
+  const timer = setTimeout(() => {
+    nearDeadline = snapshot()
+  }, 4500)
+  reportFailure = () => {
+    clearTimeout(timer)
+    if (!completed)
+      console.error(
+        'policy-refused CacheKeep failure phases',
+        JSON.stringify({ nearDeadline, atFailure: snapshot() }, null, 2),
+      )
+  }
+  return {
+    record,
+    lock(event: NativeLockEvent) {
+      const key = `${event.path}:${event.name}`
+      const label = `${event.name} (${basename(event.path)}, ${event.detached ? 'background' : 'foreground'})`
+      if (event.type === 'released') locks.delete(key)
+      else locks.set(key, `${event.type}: ${label}`)
+      if (event.type !== 'contended') record(`lock ${event.type}: ${label}`)
+    },
+    async wait<T>(phase: string, work: () => T | Promise<T>): Promise<T> {
+      pending.add(phase)
+      record(`${phase} started`)
+      try {
+        const result = await work()
+        record(`${phase} settled`)
+        return result
+      } catch (error) {
+        record(`${phase} rejected`)
+        throw error
+      } finally {
+        pending.delete(phase)
+      }
+    },
+    observeStore(store: CacheKeepStore, label: string) {
+      const removed = store.removed.bind(store)
+      const removal = spyOn(store, 'removed').mockImplementation((id) => {
+        record(`${label} restart delete enqueued: ${id}`)
+        removed(id)
+      })
+      const drain = store.drain.bind(store)
+      const draining = spyOn(store, 'drain').mockImplementation(() =>
+        this.wait(`${label} persistence drain`, drain),
+      )
+      cleanups.push(() => {
+        removal.mockRestore()
+        draining.mockRestore()
+      })
+    },
+    complete() {
+      completed = true
+      clearTimeout(timer)
+    },
+  }
+}
 
 class Timers {
   constructor(
@@ -103,6 +181,7 @@ async function fixture(
   savedLevel?: string,
   vaultMode = false,
   unsafePersistence = false,
+  trace?: ReturnType<typeof cacheKeepFailureTrace>,
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -128,7 +207,11 @@ async function fixture(
     processFence: async () => {},
     removePiAnthropicAuth: false,
   })
-  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  const store = createNativePoolStore({
+    paths,
+    quota: nativeQuotaCodec,
+    ...(trace && { onLockEvent: trace.lock }),
+  })
   const identity = '11111111-2222-4333-8444-555555555555'
   for (const id of ['first', 'second']) {
     await store.add({
@@ -231,6 +314,7 @@ async function fixture(
         },
       },
       local: {
+        ...(trace && { onLockEvent: trace.lock }),
         resolveIdentity: async (access) =>
           ({
             accountUuid: access.endsWith('first')
@@ -240,8 +324,10 @@ async function fixture(
       },
       fetch: (async (input: string | URL | Request, init?: RequestInit) => {
         const request = new Request(input as Request, init)
-        if (new URL(request.url).pathname !== '/v1/messages')
+        if (new URL(request.url).pathname !== '/v1/messages') {
+          trace?.record(`lifecycle fetch: ${new URL(request.url).pathname}`)
           return Response.json({})
+        }
         sent.push(request.clone() as Request)
         return send(request as Request)
       }) as typeof fetch,
@@ -354,14 +440,16 @@ async function fixture(
   }
 }
 
-function captureStartupLogs() {
+function captureStartupLogs(onLine?: (line: string) => void) {
   const previous = getLogLevel()
   const env = process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
   const lines: string[] = []
   delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
   setLogLevel('info')
   __setLogTestSink(({ level, channel, message, payload }) => {
-    lines.push(formatLogLine(level, channel, message, payload))
+    const line = formatLogLine(level, channel, message, payload)
+    lines.push(line)
+    onLine?.(line)
   })
   cleanups.push(() => {
     __setLogTestSink(null)
@@ -1366,23 +1454,38 @@ test('OpenCode 2 staggers overdue restored prewarms instead of sending a burst',
 })
 
 test('a policy-refused OpenCode 2 target is also removed from restart storage', async () => {
-  const f = await fixture()
-  await f.live()
-  await f.dispose()
-  const next = await f.start()
-  await f.store.updateSettings((settings) => ({
-    ...settings,
-    killswitch: {
-      enabled: true,
-      main: { five_hour: 0, seven_day: 0 },
-      accounts: { first: { five_hour: 10 } },
-    },
-  }))
+  const trace = cacheKeepFailureTrace()
+  captureStartupLogs((line) => {
+    if (line.includes('stopped warming session')) trace.record(line)
+  })
+  const f = await trace.wait('fixture', () =>
+    fixture(false, false, undefined, false, false, trace),
+  )
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  trace.observeStore(owner.persistence, 'original')
+  await trace.wait('accepted live response', () => f.live())
+  await trace.wait('original dispose', () => f.dispose())
+  const next = await trace.wait('successor startup', () => f.start())
+  trace.observeStore(owner.persistence, 'successor')
+  await trace.wait('policy settings update', () =>
+    f.store.updateSettings((settings) => ({
+      ...settings,
+      killswitch: {
+        enabled: true,
+        main: { five_hour: 0, seven_day: 0 },
+        accounts: { first: { five_hour: 10 } },
+      },
+    })),
+  )
   f.due()
-  await f.timers.fire()
-  await next.dispose()
+  await trace.wait('tick and policy refusal', () => f.timers.fire())
+  await trace.wait('successor dispose', () => next.dispose())
   expect(next.sent).toHaveLength(0)
-  expect(await readdir(f.disk)).toEqual([])
+  expect(
+    await trace.wait('restart directory read', () => readdir(f.disk)),
+  ).toEqual([])
+  trace.complete()
 })
 
 test('nothing is sent while no OpenCode 2 instance exists, and the next one sends with the current token', async () => {
