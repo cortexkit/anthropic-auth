@@ -134,10 +134,9 @@ export function messageThreadSnapshot(
     fingerprint: hash(
       canonicalValue({
         ...fixed,
-        tools: Array.isArray(body.tools)
-          ? body.tools.map(withoutOwnCache)
-          : body.tools,
-        system: Array.isArray(system) ? system.map(withoutOwnCache) : system,
+        // Preserve fixed-field wire order and cache annotations in the digest.
+        tools: JSON.stringify(body.tools),
+        system: JSON.stringify(system),
         fallbacks: Object.hasOwn(body, 'fallbacks'),
         betas: input.betas,
       }),

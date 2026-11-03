@@ -115,7 +115,7 @@ describe('message threads', () => {
       expect(tracker.prepare(advance(request)).decision.type).toBe('create')
     },
   )
-  test('cache placement and billing lineage do not change identity', () => {
+  test('removing a system breakpoint changes identity', () => {
     const tracker = new MessageThreadTracker()
     const request = input()
     request.body.system = [
@@ -145,7 +145,7 @@ describe('message threads', () => {
       assistant,
       next,
     ]
-    expect(tracker.prepare(continued).decision.type).toBe('continue')
+    expect(tracker.prepare(continued).decision.type).toBe('create')
   })
   test('forget, rejection and LRU eviction prevent stale completion from restoring anchors', () => {
     const tracker = new MessageThreadTracker(1)
@@ -680,4 +680,83 @@ test('audit protocol cache: only nested tool-result block annotations are ignore
   }).body
   expect(body.thread).toMatchObject({ type: 'continue' })
   expect((request.body.messages as unknown[])[0]).toEqual(message('5m'))
+})
+
+test.each([
+  'system removal',
+  'system ttl',
+  'system order',
+  'tools removal',
+  'tools ttl',
+  'tools order',
+])('audit fixed wire: %s requires create', (change) => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const cc = { type: 'ephemeral', ttl: '1h' }
+  request.body.system = [
+    { type: 'text', text: 'instructions', cache_control: cc },
+  ]
+  request.body.tools = [
+    {
+      name: 'read',
+      input_schema: { type: 'object', properties: {} },
+      cache_control: cc,
+    },
+  ]
+  anchor(tracker, request)
+  const continued = advance(request)
+  const system = structuredClone(request.body.system) as Array<
+    Record<string, unknown>
+  >
+  const tools = structuredClone(request.body.tools) as Array<
+    Record<string, unknown>
+  >
+  const block = system[0]
+  const tool = tools[0]
+  if (!block || !tool) throw new Error('Missing fixed-field fixture')
+  if (change === 'system removal') delete block.cache_control
+  if (change === 'system ttl')
+    block.cache_control = { type: 'ephemeral', ttl: '5m' }
+  if (change === 'system order')
+    system[0] = {
+      cache_control: block.cache_control,
+      text: block.text,
+      type: block.type,
+    }
+  if (change === 'tools removal') delete tool.cache_control
+  if (change === 'tools ttl')
+    tool.cache_control = { type: 'ephemeral', ttl: '5m' }
+  if (change === 'tools order')
+    tools[0] = {
+      cache_control: tool.cache_control,
+      input_schema: tool.input_schema,
+      name: tool.name,
+    }
+  continued.body.system = system
+  continued.body.tools = tools
+  expect(tracker.prepare(continued).decision.type).toBe('create')
+})
+
+test('audit fixed wire: billing lineage alone remains reusable', () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  request.body.system = [
+    { type: 'text', text: 'x-anthropic-billing-header: old' },
+    {
+      type: 'text',
+      text: 'instructions',
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    },
+  ]
+  anchor(tracker, request)
+  const continued = advance(request)
+  continued.body.system = [
+    { type: 'text', text: 'x-anthropic-billing-header: new' },
+    {
+      type: 'text',
+      text: 'instructions',
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    },
+  ]
+  expect(tracker.prepare(continued).decision.type).toBe('continue')
 })
