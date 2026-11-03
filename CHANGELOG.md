@@ -5,6 +5,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Pi now offers Claude Opus 5.5's actual effort levels, `low` through `max`, including `xhigh` and `max`, and no longer offers `off` or `minimal`, which the always-adaptive model cannot honor. This matches Sonnet 5.5 and Haiku 5.5.
+- Pi now maps a tool name in Claude's reply back only through the tool names sent with that request. A name the request did not advertise, such as a tool removed earlier in the session or a differently cased custom tool, stays unknown instead of being matched case-insensitively onto a runnable host tool. A request whose tools collide on one Claude Code name is refused before it is sent.
 - Pi now stops immediately with a non-retryable refusal when no fresh reset time is known, instead of waiting on a five-minute fallback retry hint. Known reset times still use the bounded, cancelable wait.
 - Quota refusals now show the capped retry delay separately from the actual time an account can serve again, after all of its blocking limits reset. Successful keep-warm requests also refresh the session's cache lifetime for sticky routing.
 - Pi now waits inside the plugin when an account can reset within the selected wait budget, showing the reset time in its working message. Escape cancels immediately. After one bounded wait it checks the accounts again; if they still cannot serve, it stops instead of triggering Pi's automatic retries.

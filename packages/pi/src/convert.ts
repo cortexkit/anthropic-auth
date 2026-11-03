@@ -125,9 +125,40 @@ function toClaudeCodeToolName(name: string): string {
   return CLAUDE_CODE_TOOLS.get(name.toLowerCase()) ?? name
 }
 
-export function fromClaudeCodeToolName(name: string, tools?: Tool[]): string {
-  const lower = name.toLowerCase()
-  return tools?.find((tool) => tool.name.toLowerCase() === lower)?.name ?? name
+/**
+ * Snapshot the wire name sent for each host tool in one request.
+ *
+ * Claude Code aliases are case-insensitive, so two host tools can collapse onto
+ * one wire name; that request fails before dispatch rather than letting the
+ * response decoder pick either tool.
+ */
+export function createClaudeCodeToolNameMap(
+  tools: readonly Tool[],
+): ReadonlyMap<string, string> {
+  const names = new Map<string, string>()
+  for (const tool of tools) {
+    const wireName = toClaudeCodeToolName(tool.name)
+    const existing = names.get(wireName)
+    if (existing !== undefined) {
+      throw new Error(
+        `Anthropic tool name collision: "${existing}" and "${tool.name}" both map to "${wireName}"`,
+      )
+    }
+    names.set(wireName, tool.name)
+  }
+  return names
+}
+
+/**
+ * Map a response tool name back through the exact snapshot sent with the
+ * request. Unknown names stay unknown instead of being case-folded onto an
+ * executable host tool.
+ */
+export function fromClaudeCodeToolName(
+  name: string,
+  requestedToolNames: ReadonlyMap<string, string>,
+): string {
+  return requestedToolNames.get(name) ?? name
 }
 
 function getAssistantToolCallIds(message: Message | undefined): Set<string> {
@@ -390,6 +421,7 @@ function convertTools(
 ): AnthropicRequestBody['tools'] {
   if (!tools?.length) return undefined
   return tools.map((tool) => ({
+    // Names are checked for collisions by createClaudeCodeToolNameMap first.
     name: toClaudeCodeToolName(tool.name),
     description: tool.description,
     input_schema: {
@@ -597,7 +629,7 @@ export async function buildAnthropicRequest(
 ): Promise<{
   body: AnthropicRequestBody
   bodyText: string
-  hostTools: Tool[]
+  toolNames: ReadonlyMap<string, string>
 }> {
   // Pi 0.86 passes a normalized transcript to providers, and later system
   // messages can change the prompt, its named sections and the tool set. Resolve
@@ -676,6 +708,7 @@ export async function buildAnthropicRequest(
     messages,
   }
 
+  const toolNames = createClaudeCodeToolNameMap(context.tools ?? [])
   const tools = convertTools(context.tools)
   if (tools?.length) body.tools = tools
 
@@ -764,8 +797,8 @@ export async function buildAnthropicRequest(
 
   const unsigned = JSON.stringify(orderClaudeCodeBody(body))
   const bodyText = await signRequestBody(unsigned)
-  // The stream decoder must use the exact tool set that produced this body.
-  // Pi 0.86's transcript has no top-level context.tools, and normalizing it
-  // again after dispatch would duplicate work and risk a different mapping.
-  return { body, bodyText, hostTools: context.tools ?? [] }
+  // The stream decoder must use the exact wire-name snapshot that produced this
+  // body. Pi 0.86's transcript has no top-level context.tools, and normalizing
+  // it again after dispatch would duplicate work and risk a different mapping.
+  return { body, bodyText, toolNames }
 }

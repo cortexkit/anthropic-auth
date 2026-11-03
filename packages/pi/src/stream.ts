@@ -87,7 +87,6 @@ import {
   type StopReason,
   type TextContent,
   type ThinkingContent,
-  type Tool,
   type ToolCall,
 } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
@@ -583,7 +582,7 @@ async function sendAnthropicRequest(
     expectedAccountIdentity?: string
     route?: string
     effortTransitions?: readonly MidConversationEffortTransition[]
-    onResolvedTools?: (tools: Tool[]) => void
+    onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
   },
   deps: { fetch?: typeof fetch; cacheKeep?: CacheKeepManager } = {},
 ): Promise<Response> {
@@ -626,7 +625,7 @@ async function sendAnthropicRequest(
         verifiedUuid as ProviderAccountUuid,
       )
     : undefined
-  const { body, bodyText, hostTools } = await buildAnthropicRequest(
+  const { body, bodyText, toolNames } = await buildAnthropicRequest(
     options.model.id,
     options.context,
     options.streamOptions,
@@ -644,7 +643,7 @@ async function sendAnthropicRequest(
         : getThinkingPrefixMismatchBehavior(storage),
     },
   )
-  options.onResolvedTools?.(hostTools)
+  options.onResolvedToolNames?.(toolNames)
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
     ? new Headers()
@@ -1081,7 +1080,7 @@ async function executeWithFallback(options: {
   streamOptions?: SimpleStreamOptions
   storagePath: string
   effortTransitions?: readonly MidConversationEffortTransition[]
-  onResolvedTools?: (tools: Tool[]) => void
+  onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
 }): Promise<Response> {
   const native = getPiNativeRuntime(options.storagePath)
   let snapshot = await native.requestView(options.streamOptions?.signal)
@@ -1796,15 +1795,15 @@ export function streamCortexKitAnthropic(
     try {
       buildPiOAuthMessagesUrl(model.baseUrl)
       const storagePath = getPiAccountStoragePath()
-      let hostTools: Tool[] = []
+      let toolNames: ReadonlyMap<string, string> = new Map()
       const request = {
         model,
         context,
         streamOptions: options,
         storagePath,
         effortTransitions,
-        onResolvedTools: (tools: Tool[]) => {
-          hostTools = tools
+        onResolvedToolNames: (names: ReadonlyMap<string, string>) => {
+          toolNames = names
         },
       }
       const response = await runWithRequestSignal(options?.signal, () =>
@@ -1925,7 +1924,7 @@ export function streamCortexKitAnthropic(
             output.content.push({
               type: 'toolCall',
               id: String(block.id),
-              name: fromClaudeCodeToolName(String(block.name), hostTools),
+              name: fromClaudeCodeToolName(String(block.name), toolNames),
               arguments: {},
               partialJson: '',
               index: event.index,
