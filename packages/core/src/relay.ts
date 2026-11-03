@@ -391,7 +391,10 @@ function replaceRange(
   return `${text.slice(0, start)}${replacement}${text.slice(end)}`
 }
 
-function createRelayPatch(previous: string, next: string): RelayPatchSet {
+export function createRelayPatch(
+  previous: string,
+  next: string,
+): RelayPatchSet {
   const previousCch = findCchTokenRange(previous)
   const nextCch = findCchTokenRange(next)
 
@@ -414,6 +417,10 @@ function createRelayPatch(previous: string, next: string): RelayPatchSet {
       nextCch.token,
     )
     const tailPatch = createStringPatch(previousWithNextCch, next)
+    // The worker requires ascending, non-overlapping source offsets. An edit
+    // before billing can cover its checksum token (cch), so use one patch then.
+    if (tailPatch.start < cchPatch.start + cchPatch.deleteCount)
+      return createStringPatch(previous, next)
     return isNoopPatch(tailPatch) ? cchPatch : [cchPatch, tailPatch]
   }
 
