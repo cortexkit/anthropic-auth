@@ -16,6 +16,8 @@ export interface MessageThreadInput {
   account: string
   credential: string
   session: string
+  // Request-local spellings accepted by the host's response decoder.
+  replyToolNames?: ReadonlyMap<string, string | null>
 }
 export interface MessageThreadSnapshot {
   identity: string
@@ -36,22 +38,71 @@ function hash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex')
 }
 
-// Hosts may rename tools or trim text. Match replies by tool IDs, thinking
-// signatures and the combined trimmed text digest; retain only hashes and IDs.
+type ReplyToolName = (name: unknown) => string | undefined
+
+function normalizedReplyName(name: string): string {
+  const bare = name.startsWith('mcp_') ? name.slice(4) : name
+  return `${bare.charAt(0).toUpperCase()}${bare.slice(1)}`
+}
+
+// Host maps accept only spellings their response decoder can restore safely.
+// Otherwise exact declarations win over unambiguous prefix/leading-case aliases.
+function replyToolNameResolver(input: Pick<MessageThreadInput, 'body' | 'replyToolNames'>): ReplyToolName {
+  let exact: Map<string, string | null> | undefined
+  let aliases: Map<string, string | null> | undefined
+  return (value) => {
+    if (typeof value !== 'string' || !value) return undefined
+    if (input.replyToolNames) {
+      const target = input.replyToolNames.get(value)
+      return typeof target === 'string' ? target : undefined
+    }
+    if (!exact || !aliases) {
+      exact = new Map()
+      aliases = new Map()
+      const tools = Array.isArray(input.body.tools) ? input.body.tools : []
+      for (const [index, tool] of tools.entries()) {
+        if (!isBody(tool) || typeof tool.name !== 'string') continue
+        const name = normalizedReplyName(tool.name)
+        const target = `${index}:${name}`
+        exact.set(tool.name, exact.has(tool.name) ? null : target)
+        aliases.set(name, aliases.has(name) ? null : target)
+      }
+    }
+    const target = exact.has(value) ? exact.get(value) : aliases.get(normalizedReplyName(value))
+    return typeof target === 'string' ? target : undefined
+  }
+}
+
+interface ReplyBlockState {
+  type: string
+  signature?: Hash
+  signatureLength: number
+  id?: string
+  name?: string
+  input?: unknown
+  inputJson?: string
+  textHasContent: boolean
+}
+
+const MAX_REPLY_INPUT_CHARS = 1_048_576
+
+// Match semantic tool calls and ordered blocks, allowing only our own name and
+// whitespace rewrites. Buffer open tool JSON only; retain its digest after stop.
 class ReplyFingerprint {
-  private readonly open = new Map<
-    number,
-    { type: string; signature?: Hash; signatureLength: number }
-  >()
+  private readonly open = new Map<number, ReplyBlockState>()
   private readonly seen = new Set<number>()
-  private readonly tools = new Map<number, string>()
+  private readonly tools = new Map<number, [string, string, string]>()
+  private readonly layout = new Map<number, Body>()
   private readonly signatures = new Map<number, [string, string]>()
   private readonly text = createHash('sha256')
   private committedText = this.text.copy()
   private hasText = false
   private activeText: number | undefined
   private lastText = -1
+  private inputChars = 0
   private invalid = false
+
+  constructor(private readonly normalizeToolName: ReplyToolName) {}
 
   private appendText(value: string): void {
     const part = this.hasText ? value : value.trimStart()
@@ -65,104 +116,98 @@ class ReplyFingerprint {
   }
 
   start(index: unknown, block: unknown): void {
-    if (
-      typeof index !== 'number' ||
-      !Number.isInteger(index) ||
-      index < 0 ||
-      !isBody(block) ||
-      typeof block.type !== 'string' ||
-      this.seen.has(index)
-    ) {
-      this.invalid = true
-      return
-    }
+    if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || !isBody(block) || typeof block.type !== 'string' || this.seen.has(index)) { this.invalid = true; return }
     this.seen.add(index)
-    const state: { type: string; signature?: Hash; signatureLength: number } = {
-      type: block.type,
-      signatureLength: 0,
-    }
+    const state: ReplyBlockState = { type: block.type, signatureLength: 0, textHasContent: false }
+    if (!['text', 'tool_use', 'thinking', 'redacted_thinking'].includes(block.type)) this.invalid = true
     if (block.type === 'text') {
-      if (this.activeText !== undefined || index < this.lastText)
-        this.invalid = true
+      if (this.activeText !== undefined || index < this.lastText) this.invalid = true
       this.activeText = index
       this.lastText = index
-      this.appendText(typeof block.text === 'string' ? block.text : '')
+      const text = typeof block.text === 'string' ? block.text : ''
+      state.textHasContent = Boolean(text.trim())
+      this.appendText(text)
     }
     if (block.type === 'tool_use') {
-      if (typeof block.id !== 'string') this.invalid = true
-      else this.tools.set(index, block.id)
+      if (typeof block.id !== 'string' || !block.id) this.invalid = true
+      else state.id = block.id
+      state.name = this.normalizeToolName(block.name)
+      if (!state.name) this.invalid = true
+      state.input = block.input
     }
     if (block.type === 'thinking' || block.type === 'redacted_thinking') {
       state.signature = createHash('sha256')
-      const signature =
-        block.type === 'redacted_thinking' ? block.data : block.signature
-      if (typeof signature === 'string') {
-        state.signature.update(signature)
-        state.signatureLength += signature.length
-      }
+      const signature = block.type === 'redacted_thinking' ? block.data : block.signature
+      if (typeof signature === 'string') { state.signature.update(signature); state.signatureLength += signature.length }
     }
     this.open.set(index, state)
   }
 
   delta(index: unknown, delta: unknown): void {
     const state = typeof index === 'number' ? this.open.get(index) : undefined
-    if (!state || !isBody(delta)) {
-      this.invalid = true
-      return
-    }
+    if (!state || !isBody(delta)) { this.invalid = true; return }
+    if (this.invalid) return
     if (delta.type === 'text_delta') {
-      if (
-        state.type !== 'text' ||
-        this.activeText !== index ||
-        typeof delta.text !== 'string'
-      )
-        this.invalid = true
-      else this.appendText(delta.text)
+      if (state.type !== 'text' || this.activeText !== index || typeof delta.text !== 'string') this.invalid = true
+      else { state.textHasContent ||= Boolean(delta.text.trim()); this.appendText(delta.text) }
     }
     if (delta.type === 'signature_delta') {
-      if (!state.signature || typeof delta.signature !== 'string')
+      if (!state.signature || typeof delta.signature !== 'string') this.invalid = true
+      else { state.signature.update(delta.signature); state.signatureLength += delta.signature.length }
+    }
+    if (delta.type === 'input_json_delta') {
+      if (state.type !== 'tool_use' || typeof delta.partial_json !== 'string') this.invalid = true
+      else if (this.inputChars + delta.partial_json.length > MAX_REPLY_INPUT_CHARS) {
+        this.inputChars -= state.inputJson?.length ?? 0
+        state.inputJson = ''
         this.invalid = true
-      else {
-        state.signature.update(delta.signature)
-        state.signatureLength += delta.signature.length
+      } else {
+        this.inputChars += delta.partial_json.length
+        state.inputJson = (state.inputJson ?? '') + delta.partial_json
       }
     }
   }
 
   stop(index: unknown): void {
     const state = typeof index === 'number' ? this.open.get(index) : undefined
-    if (!state || typeof index !== 'number') {
-      this.invalid = true
-      return
-    }
+    if (!state || typeof index !== 'number') { this.invalid = true; return }
     this.open.delete(index)
+    this.layout.set(index, { type: state.type, ...(state.type === 'text' ? { text: state.textHasContent ? '_' : '' } : {}) })
     if (state.type === 'text') this.activeText = undefined
     if (state.signature) {
       if (!state.signatureLength) this.invalid = true
       this.signatures.set(index, [state.type, state.signature.digest('hex')])
     }
+    if (state.type === 'tool_use') {
+      this.inputChars -= state.inputJson?.length ?? 0
+      try {
+        const input = state.inputJson === undefined ? state.input : JSON.parse(state.inputJson)
+        if (!state.id || !state.name || input === undefined) this.invalid = true
+        else this.tools.set(index, [state.id, state.name, hash(canonicalValue(input))])
+      } catch { this.invalid = true }
+    }
   }
 
   digest(): string | undefined {
     if (this.invalid || this.open.size) return undefined
+    const blocks = [...this.layout].sort(([a], [b]) => a - b).map(([, block]) => block)
     return hash({
-      tools: [...this.tools].sort(([a], [b]) => a - b).map(([, id]) => id),
-      signatures: [...this.signatures]
-        .sort(([a], [b]) => a - b)
-        .map(([, signature]) => signature),
+      blocks: withoutTrailingToolWhitespace(blocks).map((block) => (block as Body).type),
+      tools: [...this.tools].sort(([a], [b]) => a - b).map(([, tool]) => tool),
+      signatures: [...this.signatures].sort(([a], [b]) => a - b).map(([, signature]) => signature),
       text: this.committedText.copy().digest('hex'),
     })
   }
 }
 
-function assistantReplyFingerprint(message: unknown): string | undefined {
+function assistantReplyFingerprint(message: unknown, normalizeToolName: ReplyToolName): string | undefined {
   if (!isBody(message) || message.role !== 'assistant') return undefined
   const content =
     typeof message.content === 'string'
       ? [{ type: 'text', text: message.content }]
       : message.content
   if (!Array.isArray(content)) return undefined
-  const reply = new ReplyFingerprint()
+  const reply = new ReplyFingerprint(normalizeToolName)
   for (const [index, block] of content.entries()) {
     reply.start(index, block)
     reply.stop(index)
@@ -342,7 +387,7 @@ function canContinueFrom(
     !messages
       .slice(anchor.messages.length + 1)
       .some((message) => message?.role === 'assistant') &&
-    assistantReplyFingerprint(messages[anchor.messages.length]) ===
+    assistantReplyFingerprint(messages[anchor.messages.length], replyToolNameResolver(input)) ===
       anchor.replyFingerprint
   )
 }
@@ -420,9 +465,11 @@ export class MessageThreadTracker {
   prepare(input: MessageThreadInput): {
     decision: MessageThreadDecision
     body: Body
+    normalizeToolName: ReplyToolName
     complete: (facts: MessageThreadCompletion) => void
     fail: () => void
   } {
+    const normalizeToolName = replyToolNameResolver(input)
     const previous = this.sessions.get(input.session)
     const anchor = previous?.anchor
     const now = this.now()
@@ -478,6 +525,7 @@ export class MessageThreadTracker {
       get body() {
         return outgoingBody()
       },
+      normalizeToolName,
       fail,
       complete: (facts) => {
         const current = this.sessions.get(input.session)
@@ -497,7 +545,7 @@ export class MessageThreadTracker {
           return
         }
         const replyFingerprint =
-          facts.replyFingerprint ?? assistantReplyFingerprint(facts.reply)
+          facts.replyFingerprint ?? assistantReplyFingerprint(facts.reply, normalizeToolName)
         if (!replyFingerprint) {
           fail()
           return
@@ -528,7 +576,7 @@ export function observeMessageThreadResponse(
   prepared: Pick<
     ReturnType<MessageThreadTracker['prepare']>,
     'complete' | 'fail'
-  >,
+  > & Partial<Pick<ReturnType<MessageThreadTracker['prepare']>, 'normalizeToolName'>>,
 ): Response {
   if (!response.ok || !response.body) {
     prepared.fail()
@@ -537,7 +585,7 @@ export function observeMessageThreadResponse(
   const reader = response.body.getReader()
   const framer = createSseFramer()
   const facts: MessageThreadCompletion = { stopped: false }
-  const reply = new ReplyFingerprint()
+  const reply = new ReplyFingerprint(prepared.normalizeToolName ?? (() => undefined))
   let inspecting = true
   let streamStart = true
   const parse = (frame: Uint8Array) => {
@@ -807,6 +855,7 @@ export async function prepareMessageThreadRequest(
       credential,
       session: input.session ?? '',
       betas,
+      replyToolNames: input.replyToolNames,
       get body() {
         return fullBody()
       },
@@ -827,6 +876,7 @@ export async function prepareMessageThreadRequest(
               : fullBody()
           },
           complete: () => {},
+          normalizeToolName: () => undefined,
           fail: ignoreThreadFailure,
         }
   const failure = threadFailureState(prepared.fail)
@@ -878,6 +928,7 @@ export async function prepareMessageThreadRequest(
       }
       return observeMessageThreadResponse(response, {
         fail: failure.fail,
+        normalizeToolName: prepared.normalizeToolName,
         complete: (facts) => {
           if (input.signal?.aborted) prepared.fail()
           else prepared.complete(facts)

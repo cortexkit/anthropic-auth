@@ -2964,3 +2964,17 @@ test('audit hot path: OC2 retains an unsigned full template and signs only the s
     native.dispose()
   }
 })
+
+test.each(['kept input', 'edited input'])('recheck reply semantics: OC2 request-bound name rewrite with %s', async (kind) => {
+  const { source } = makeSource()
+  const native = createNativeAnthropicAdapter({ source })
+  try {
+    const host = new Host(native.adapter)
+    const payload = { model: 'claude-sonnet-5', stream: true, tools: [{ name: 'aft_search', input_schema: { type: 'object' } }], messages: [{ role: 'user', content: 'first' }] }
+    const first = await host.run(scopeOf(), hostRequest(payload))
+    const raw = sse('message_start', { type: 'message_start', message: { id: 'msg_args', content: [] } }) + sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'same_id', name: 'search', input: {} } }) + sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"query":"original"}' } }) + sse('content_block_stop', { type: 'content_block_stop', index: 0 }) + sse('message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' } }) + sse('message_stop', { type: 'message_stop' })
+    await (await native.adapter.rewriteResponse?.({ ...first.attempt, attempt: first.attempt, request: first.final, response: new Response(raw, { headers: { 'content-type': 'text/event-stream' } }) } as never))?.text()
+    const next = await host.run(scopeOf(), hostRequest({ ...payload, messages: [...payload.messages, { role: 'assistant', content: [{ type: 'tool_use', id: 'same_id', name: 'aft_search', input: { query: kind === 'edited input' ? 'edited' : 'original' } }] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'same_id', content: 'result' }] }] }))
+    expect(JSON.parse(await next.final.text()).thread.type).toBe(kind === 'edited input' ? 'create' : 'continue')
+  } finally { native.dispose() }
+})

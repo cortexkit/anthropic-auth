@@ -1294,6 +1294,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         account: send.oauth.identity?.accountUuid ?? input.accountId,
         credential: send.oauth.accessToken,
         bodyText: body,
+        replyToolNames: responseToolNameMaps.get(data),
         headers,
         signal: request.signal,
       })

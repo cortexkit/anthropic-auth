@@ -984,10 +984,11 @@ test.each([
         thinking: 'lowered display',
         signature: 'signed-thinking',
       },
-      { type: 'text', text: 'answer' },
+      { type: 'text', text: 'an' },
       { type: 'tool_use', id: 'call_1', name: 'Read', input: {} },
       { type: 'redacted_thinking', data: 'redacted-signature' },
       { type: 'tool_use', id: 'call_2', name: 'Read', input: {} },
+      { type: 'text', text: 'swer' },
     ]
     if (change === 'tool id' && lowered[2]) lowered[2].id = 'different-call'
     if (change === 'tool order')
@@ -1086,8 +1087,8 @@ test('audit ancestry: fragmented signatures and trimmed text match the kept repl
     role: 'assistant',
     content: [
       { type: 'thinking', thinking: 'display', signature: 'signed-thinking' },
-      { type: 'redacted_thinking', data: 'opaque' },
       { type: 'text', text: 'answer' },
+      { type: 'redacted_thinking', data: 'opaque' },
       { type: 'tool_use', id: 'call', name: 'Read', input: {} },
     ],
   }
@@ -1715,4 +1716,55 @@ test.each([
       : 'continue',
   )
   expect(JSON.stringify(candidate.body.messages)).toBe(wireBefore)
+})
+
+test.each(['lowered name', 'sorted input', 'edited input', 'edited data key', 'edited name', 'block layout'])('recheck reply semantics: %s', async (change) => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  request.body.tools = [{ name: 'read' }, { name: 'write' }]
+  const events = [
+    { type: 'message_start', message: { id: 'msg_semantic', content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: 'private', signature: 'sig' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'same_id', name: 'mcp_Read', input: {} } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"path":"ori' } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: 'ginal","cache_control":"literal","nested":{"b":2,"a":1}}' } },
+    { type: 'content_block_stop', index: 1 },
+    { type: 'content_block_start', index: 2, content_block: { type: 'text', text: '  answer \n' } },
+    { type: 'content_block_stop', index: 2 },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+    { type: 'message_stop' },
+  ]
+  await observeMessageThreadResponse(sse(events), tracker.prepare(request)).text()
+  const args = change === 'sorted input' ? { nested: { a: 1, b: 2 }, cache_control: 'literal', path: 'original' } : { path: change === 'edited input' ? 'edited' : 'original', cache_control: change === 'edited data key' ? 'edited' : 'literal', nested: { b: 2, a: 1 } }
+  const content: Array<Record<string, unknown>> = [{ type: 'thinking', thinking: 'display', signature: 'sig' }, { type: 'tool_use', id: 'same_id', name: change === 'edited name' ? 'write' : 'read', input: args }, { type: 'text', text: 'answer' }]
+  if (change === 'block layout') [content[1], content[2]] = [content[2] as Record<string, unknown>, content[1] as Record<string, unknown>]
+  const candidate = { ...request, body: { ...request.body, messages: [...request.body.messages as unknown[], { role: 'assistant', content }, next] } }
+  expect(tracker.prepare(candidate).decision.type).toBe(change === 'lowered name' || change === 'sorted input' ? 'continue' : 'create')
+})
+
+test('recheck reply semantics: request-bound custom case targets remain distinct', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  request.body.tools = [{ name: 'CaseTool' }, { name: 'caseTool' }]
+  request.replyToolNames = new Map([['CaseTool', 'CaseTool'], ['caseTool', 'caseTool']])
+  await observeAuditReply(tracker.prepare(request), 'msg_case', [{ type: 'tool_use', id: 'same_id', name: 'CaseTool', input: {} }])
+  const candidate = { ...request, body: { ...request.body, messages: [...request.body.messages as unknown[], { role: 'assistant', content: [{ type: 'tool_use', id: 'same_id', name: 'caseTool', input: {} }] }, next] } }
+  expect(tracker.prepare(candidate).decision.type).toBe('create')
+})
+
+test('recheck reply semantics: malformed streamed arguments never establish an anchor', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  await observeMessageThreadResponse(sse([{ type: 'message_start', message: { id: 'msg_invalid', content: [] } }, { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'same_id', name: 'mcp_Read', input: {} } }, { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"path":' } }, { type: 'content_block_stop', index: 0 }, { type: 'message_delta', delta: { stop_reason: 'tool_use' } }, { type: 'message_stop' }]), tracker.prepare(request)).text()
+  const candidate = { ...request, body: { ...request.body, messages: [...request.body.messages as unknown[], { role: 'assistant', content: [{ type: 'tool_use', id: 'same_id', name: 'read', input: {} }] }, next] } }
+  expect(tracker.prepare(candidate).decision.type).toBe('create')
+})
+
+test('recheck reply semantics: our trailing tool-whitespace removal preserves the reply', async () => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  await observeAuditReply(tracker.prepare(request), 'msg_space', [{ type: 'tool_use', id: 'same_id', name: 'mcp_Read', input: {} }, { type: 'text', text: ' \n' }])
+  const candidate = { ...request, body: { ...request.body, messages: [...request.body.messages as unknown[], { role: 'assistant', content: [{ type: 'tool_use', id: 'same_id', name: 'read', input: {} }] }, next] } }
+  expect(tracker.prepare(candidate).decision.type).toBe('continue')
 })

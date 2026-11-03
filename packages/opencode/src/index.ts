@@ -8000,6 +8000,7 @@ const anthropicAuthPlugin = async (
                     nativeAuthorization.scopedAttempt?.credentialId ??
                     nativeAuthorization.accessToken,
                   bodyText: body,
+                  replyToolNames: toolNameMap,
                   headers: requestHeaders,
                   signal: init?.signal ?? undefined,
                 },

@@ -801,6 +801,7 @@ async function sendAnthropicRequest(
       account: nextAttempt.accountIdentity,
       credential: piAttemptAccessToken(nextAttempt),
       bodyText,
+      replyToolNames: toolNames,
       headers,
       signal: init.signal ?? undefined,
     })
