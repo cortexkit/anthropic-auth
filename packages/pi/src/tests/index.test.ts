@@ -544,10 +544,15 @@ async function auditPiPrimaryHarness(suffix: string) {
     history: Context,
     overrides: SimpleStreamOptions = options,
     raw = false,
+    marked = true,
   ) => {
     const call = raw ? provider.stream : provider.streamSimple
     if (!call) throw new Error('Missing Pi stream entry point')
-    const stream = call(fableModel, history, overrides) as {
+    const stream = (
+      raw || !marked
+        ? call(fableModel, history, overrides)
+        : call(fableModel, history, overrides, 'agent-loop')
+    ) as {
       result(): Promise<AssistantMessage>
     }
     const result = await stream.result()
@@ -569,7 +574,7 @@ async function auditPiPrimaryHarness(suffix: string) {
   }
 }
 
-test('audit primary gates: Pi three-step tool loop reuses the whole-turn lease', async () => {
+test('audit primary gates: explicitly marked Pi tool loop reuses the whole-turn lease', async () => {
   const h = await auditPiPrimaryHarness('tool-loop')
   await h.start()
   let history = h.context
@@ -719,7 +724,7 @@ test('audit hot path: Pi retains an unsigned full template and signs only the se
   }
 })
 
-test('recheck user text: Pi string prompts keep three consecutive requests reusable', async () => {
+test('recheck user text: marked Pi string prompts keep three consecutive requests reusable', async () => {
   const h = await auditPiPrimaryHarness('user-string-history')
   let history: Context = {
     ...h.context,
@@ -787,3 +792,24 @@ test.each(['another turn starts', 'another session settles'])(
     }
   },
 )
+
+test('recheck Pi origin: registered simplified side calls with callbacks remain direct', async () => {
+  const h = await auditPiPrimaryHarness('unmarked-simplified-side-call')
+  await h.start()
+  const kept = await h.send(h.context)
+  await h.send(h.context, h.options, false, false)
+  expect(h.sent.at(-1)?.body.thread).toBeUndefined()
+  expect(h.sent.at(-1)?.betas).not.toContain('message-threads-2026-08-12')
+  await h.send({
+    ...h.context,
+    messages: [
+      ...h.context.messages,
+      kept,
+      { role: 'user', content: 'Next primary prompt', timestamp: 2 },
+    ],
+  })
+  expect(h.sent.at(-1)?.body.thread).toEqual({
+    type: 'continue',
+    previous_message_id: 'msg_gate_1',
+  })
+})
