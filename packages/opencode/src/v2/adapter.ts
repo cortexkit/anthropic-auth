@@ -1571,6 +1571,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     async rewriteResponse({ response, attempt }) {
       const data = attempt.data
       const threaded = data ? threadRequests.get(data) : undefined
+      const failThread = threaded?.thread.fail
       if (data) threadRequests.delete(data)
       if (threaded && data && fromUpstream(response.headers, data)) {
         response = await threaded.thread.recover(
@@ -1699,6 +1700,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const baseStreamOptions = {
         ...options,
         toolNameMap: data ? responseToolNameMaps.get(data) : undefined,
+        onResponseFailure: failThread,
         // Unsafe response names depend on this request's tool declarations,
         // not the Anthropic account. Changing accounts must not bypass refusal.
         onToolNameRefusal: () => {

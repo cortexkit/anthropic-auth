@@ -354,6 +354,13 @@ export class MessageThreadTracker {
     }
   }
 
+  // Late stream-failure callbacks must not retain the full request body.
+  private failureFor(session: string, token: object): () => void {
+    return () => {
+      if (this.sessions.get(session)?.token === token) this.forget(session)
+    }
+  }
+
   prepare(input: MessageThreadInput): {
     decision: MessageThreadDecision
     body: Body
@@ -372,10 +379,7 @@ export class MessageThreadTracker {
     this.forget(input.session)
     this.sessions.set(input.session, { token })
     this.prune()
-    const fail = () => {
-      if (this.sessions.get(input.session)?.token === token)
-        this.forget(input.session)
-    }
+    const fail = this.failureFor(input.session, token)
     const body: Body = {
       ...input.body,
       thread:
@@ -668,6 +672,19 @@ function disableThreadsForAccount(key: string): void {
   )
 }
 
+function ignoreThreadFailure(): void {}
+
+// Recovery can replace the failure callback without retaining the prepared body.
+function threadFailureState(initial: () => void) {
+  const state = { current: initial }
+  return {
+    replace: (fail: () => void) => {
+      state.current = fail
+    },
+    fail: () => state.current(),
+  }
+}
+
 export async function prepareMessageThreadRequest(
   tracker: MessageThreadTracker,
   input: Omit<MessageThreadInput, 'body' | 'betas' | 'session'> & {
@@ -695,9 +712,10 @@ export async function prepareMessageThreadRequest(
             ? { ...full, thread: { type: 'create' } }
             : { ...full },
           complete: () => {},
-          fail: () => {},
+          fail: ignoreThreadFailure,
         }
   if (!threading) delete prepared.body.thread
+  const failure = threadFailureState(prepared.fail)
   let bodyText = await signRequestBody(JSON.stringify(prepared.body))
   let recovered = false
   let credential = input.credential
@@ -731,7 +749,7 @@ export async function prepareMessageThreadRequest(
     get bodyText() {
       return bodyText
     },
-    fail: () => prepared.fail(),
+    fail: failure.fail,
     observe: (response: Response) => {
       if (!threading || disabledThreadAccounts.has(accountKey)) {
         prepared.fail()
@@ -784,6 +802,7 @@ export async function prepareMessageThreadRequest(
           body: full,
           betas,
         })
+        failure.replace(prepared.fail)
       }
       bodyText = await signRequestBody(
         JSON.stringify({ ...full, thread: { type: 'create' } }),

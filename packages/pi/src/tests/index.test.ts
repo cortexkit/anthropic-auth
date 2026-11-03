@@ -1,8 +1,17 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
+import { MessageThreadTracker } from '@cortexkit/anthropic-auth-core'
 import {
   type AssistantMessage,
   type Context,
@@ -623,3 +632,54 @@ test.each([
     })
   },
 )
+
+test('audit downstream refusal: Pi revokes a response aborted after raw EOF', async () => {
+  const h = await auditPiPrimaryHarness('post-eof-abort')
+  await h.start()
+  const abort = new AbortController()
+  const prepare = MessageThreadTracker.prototype.prepare
+  let injected = false
+  const spy = spyOn(
+    MessageThreadTracker.prototype,
+    'prepare',
+  ).mockImplementation(function (this: MessageThreadTracker, input) {
+    const prepared = prepare.call(this, input)
+    if (input.session !== h.options.sessionId || injected) return prepared
+    return {
+      ...prepared,
+      complete: (facts) => {
+        prepared.complete(facts)
+        injected = true
+        abort.abort()
+      },
+    }
+  })
+  try {
+    const aborted = await h.send(h.context, {
+      ...h.options,
+      signal: abort.signal,
+    })
+    expect(injected).toBe(true)
+    expect(aborted.stopReason).toBe('aborted')
+    const kept: AssistantMessage = {
+      ...aborted,
+      stopReason: 'stop',
+      errorMessage: undefined,
+    }
+    await h.send({
+      ...h.context,
+      messages: [
+        ...h.context.messages,
+        kept,
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'Next prompt' }],
+          timestamp: 2,
+        },
+      ],
+    })
+    expect(h.sent.at(-1)?.body.thread).toEqual({ type: 'create' })
+  } finally {
+    spy.mockRestore()
+  }
+})

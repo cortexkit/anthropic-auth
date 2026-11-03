@@ -2307,6 +2307,7 @@ export function createStrippedStream(
   options: {
     toolNameMap?: ToolNameMap
     onToolNameRefusal?: () => void
+    onResponseFailure?: () => void
     perf?: RewritePerfCallback
     onContentFilter?: (context?: {
       completedToolUse: boolean
@@ -2650,6 +2651,7 @@ export function createStrippedStream(
           }
           if (rewritten) return
         } catch (caught) {
+          observe(options.onResponseFailure)
           const error = normalizeToolNameResponseError(
             caught,
             options.toolNameMap,
@@ -2668,6 +2670,7 @@ export function createStrippedStream(
       }
     },
     async cancel(reason) {
+      observe(options.onResponseFailure)
       logProgress('stream_tool_prefix_cancel')
       try {
         await reader.cancel(reason)

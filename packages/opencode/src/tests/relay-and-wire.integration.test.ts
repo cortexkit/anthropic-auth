@@ -1512,3 +1512,126 @@ describe('audit OC1 primary gates', () => {
     expect(sent?.thread).toBeUndefined()
   })
 })
+
+describe('audit OC1 downstream refusal', () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+  test('audit downstream refusal: OC1 revokes an anchor after final tool validation', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: false, mode: 'explicit' },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+      }),
+    )
+    const sent: Array<Record<string, any>> = []
+    globalThis.fetch = mock(
+      withNativeAdmission((_input: unknown, init?: RequestInit) => {
+        if (typeof init?.body === 'string') sent.push(JSON.parse(init.body))
+        if (sent.length > 1)
+          return Promise.resolve(
+            Response.json({
+              id: 'msg_second',
+              type: 'message',
+              role: 'assistant',
+              model: 'claude-sonnet-5',
+              content: [],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1, output_tokens: 1 },
+            }),
+          )
+        const frame = (type: string, data: unknown) =>
+          `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`
+        return Promise.resolve(
+          new Response(
+            frame('message_start', {
+              type: 'message_start',
+              message: { id: 'msg_refused', content: [] },
+            }) +
+              frame('content_block_start', {
+                type: 'content_block_start',
+                index: 0,
+                content_block: {
+                  type: 'tool_use',
+                  id: 'refused_call',
+                  name: 'mcp_Search',
+                  input: {},
+                },
+              }) +
+              frame('content_block_stop', {
+                type: 'content_block_stop',
+                index: 0,
+              }) +
+              frame('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: 'tool_use' },
+              }) +
+              frame('message_stop', { type: 'message_stop' }),
+            { headers: { 'content-type': 'application/json' } },
+          ),
+        )
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const auth = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const payload = {
+      model: 'claude-sonnet-5',
+      stream: false,
+      tools: ['search', 'mcp_Search'].map((name) => ({
+        name,
+        input_schema: { type: 'object' },
+      })),
+      messages: [{ role: 'user', content: 'first' }],
+    }
+    const send = (body: unknown) =>
+      auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'oc1-refused-reply' },
+        body: JSON.stringify(body),
+      })
+    const response = await send(payload)
+    await expect(response.text()).rejects.toThrow(
+      'Response tool-name mapping could not be validated safely',
+    )
+    await (
+      await send({
+        ...payload,
+        messages: [
+          ...payload.messages,
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'refused_call',
+                name: 'search',
+                input: {},
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'refused_call',
+                content: 'result',
+              },
+            ],
+          },
+        ],
+      })
+    ).text()
+    expect(sent[1]?.thread).toEqual({ type: 'create' })
+  })
+})

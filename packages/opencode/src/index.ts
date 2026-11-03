@@ -3362,6 +3362,7 @@ const anthropicAuthPlugin = async (
     messageStart?: Record<string, unknown>
     // Response inspection copies this metadata when it replaces the Response.
     toolNameMap?: ToolNameMap
+    failThread?: () => void
   }
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
@@ -8266,6 +8267,7 @@ const anthropicAuthPlugin = async (
               attachCacheDiagnosticsResponse(response, {
                 source: laneStartRequest ? 'start' : 'turn',
                 toolNameMap,
+                failThread: threadRequest?.fail,
                 accountId: oauthAccountId,
                 synthetic: laneStartRequest,
                 ...cacheDiagnosticsBetas,
@@ -9122,6 +9124,7 @@ const anthropicAuthPlugin = async (
                   cacheDiagnosticsResponses.get(response)
                 return createStrippedStream(response, {
                   toolNameMap: diagnosticsContext?.toolNameMap,
+                  onResponseFailure: diagnosticsContext?.failThread,
                   perf: (stage, data) => trace.mark(stage, data),
                   laneStart: laneStartRequest,
                   laneStartOAuthServed:

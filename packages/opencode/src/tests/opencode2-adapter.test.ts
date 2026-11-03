@@ -2851,3 +2851,89 @@ test('audit primary gates: OC2 title kind cannot replace a primary reply', async
     native.dispose()
   }
 })
+
+test('audit downstream refusal: OC2 revokes an anchor after raw EOF validation fails', async () => {
+  const { source } = makeSource()
+  const native = createNativeAnthropicAdapter({ source })
+  try {
+    const host = new Host(native.adapter)
+    const payload = {
+      model: 'claude-sonnet-5',
+      stream: true,
+      tools: ['search', 'mcp_Search'].map((name) => ({
+        name,
+        input_schema: { type: 'object' },
+      })),
+      messages: [{ role: 'user', content: 'first' }],
+    }
+    const first = await host.run(scopeOf(), hostRequest(payload))
+    const raw =
+      sse('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_refused', content: [] },
+      }) +
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: 'refused_call',
+          name: 'mcp_Search',
+          input: {},
+        },
+      }) +
+      sse('content_block_stop', { type: 'content_block_stop', index: 0 }) +
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use' },
+      }) +
+      sse('message_stop', { type: 'message_stop' })
+    const response = await native.adapter.rewriteResponse?.({
+      ...first.attempt,
+      attempt: first.attempt,
+      request: first.final,
+      response: new Response(raw, {
+        headers: { 'content-type': 'application/json' },
+      }),
+    } as never)
+    if (!response) throw new Error('Missing response')
+    await expect(response.text()).rejects.toThrow(
+      'Response tool-name mapping could not be validated safely',
+    )
+    const next = await host.run(
+      scopeOf(),
+      hostRequest({
+        ...payload,
+        messages: [
+          ...payload.messages,
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'refused_call',
+                name: 'search',
+                input: {},
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'refused_call',
+                content: 'result',
+              },
+            ],
+          },
+        ],
+      }),
+    )
+    expect(JSON.parse(await next.final.text()).thread).toEqual({
+      type: 'create',
+    })
+  } finally {
+    native.dispose()
+  }
+})

@@ -632,6 +632,7 @@ async function sendAnthropicRequest(
     route?: string
     effortTransitions?: readonly MidConversationEffortTransition[]
     onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
+    onThreadPrepared?: (fail: () => void) => void
   },
   deps: { fetch?: typeof fetch; cacheKeep?: CacheKeepManager } = {},
 ): Promise<Response> {
@@ -796,6 +797,7 @@ async function sendAnthropicRequest(
       headers,
       signal: init.signal ?? undefined,
     })
+    options.onThreadPrepared?.(threadRequest.fail)
     wireBodyText = threadRequest.bodyText
     init.body = wireBodyText
   }
@@ -1172,6 +1174,7 @@ async function executeWithFallback(options: {
   storagePath: string
   effortTransitions?: readonly MidConversationEffortTransition[]
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
+  onThreadPrepared?: (fail: () => void) => void
 }): Promise<Response> {
   const native = getPiNativeRuntime(options.storagePath)
   let snapshot = await native.requestView(options.streamOptions?.signal)
@@ -1882,6 +1885,7 @@ export function streamCortexKitAnthropic(
 
   void (async () => {
     const output = createOutput(model)
+    let failThread: (() => void) | undefined
     stream.push({ type: 'start', partial: output })
 
     try {
@@ -1894,6 +1898,9 @@ export function streamCortexKitAnthropic(
         streamOptions: options,
         requestOrigin,
         storagePath,
+        onThreadPrepared: (fail: () => void) => {
+          failThread = fail
+        },
         effortTransitions,
         onResolvedToolNames: (names: ReadonlyMap<string, string>) => {
           toolNames = names
@@ -2128,6 +2135,7 @@ export function streamCortexKitAnthropic(
       })
       stream.end()
     } catch (error) {
+      failThread?.()
       for (const block of output.content as Block[]) delete block.index
       output.stopReason = options?.signal?.aborted ? 'aborted' : 'error'
       output.errorMessage =
