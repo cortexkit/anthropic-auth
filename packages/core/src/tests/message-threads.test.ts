@@ -1607,3 +1607,54 @@ test.each([
     kind === 'user-only delta' ? 'continue' : 'create',
   )
 })
+
+test.each([
+  'string to block',
+  'block to string',
+  'changed text',
+  'extra metadata',
+])('recheck user text: %s', (kind) => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const originalContent =
+    kind === 'block to string'
+      ? [{ type: 'text', text: 'one', cache_control: { type: 'ephemeral' } }]
+      : 'one'
+  request.body.messages = [{ role: 'user', content: originalContent }]
+  anchor(tracker, request)
+  const content =
+    kind === 'block to string'
+      ? 'one'
+      : kind === 'changed text'
+        ? 'different'
+        : kind === 'extra metadata'
+          ? [
+              {
+                type: 'text',
+                text: 'one',
+                citations: [{ source: 'retained metadata' }],
+              },
+            ]
+          : [
+              {
+                type: 'text',
+                text: 'one',
+                cache_control: { type: 'ephemeral' },
+              },
+            ]
+  const candidate = {
+    ...request,
+    body: {
+      ...request.body,
+      messages: [{ role: 'user', content }, assistant, next],
+    },
+  }
+  expect(tracker.prepare(candidate).decision.type).toBe(
+    kind === 'changed text' || kind === 'extra metadata'
+      ? 'create'
+      : 'continue',
+  )
+  expect(
+    (request.body.messages as Array<{ content: unknown }>)[0]?.content,
+  ).toEqual(originalContent)
+})

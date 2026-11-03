@@ -206,7 +206,23 @@ function withoutContentCache(content: unknown): unknown {
 
 function withoutMessageCache(message: unknown): unknown {
   if (!isBody(message)) return message
-  return { ...message, content: withoutContentCache(message.content) }
+  let content = withoutContentCache(message.content)
+  // A user string and one text-only block represent the same message content.
+  if (
+    message.role === 'user' &&
+    Array.isArray(content) &&
+    content.length === 1
+  ) {
+    const block = content[0]
+    if (
+      isBody(block) &&
+      block.type === 'text' &&
+      typeof block.text === 'string' &&
+      Object.keys(block).every((key) => key === 'type' || key === 'text')
+    )
+      content = block.text
+  }
+  return { ...message, content }
 }
 
 // Only protocol annotation holders count; tool arguments and schemas are data.

@@ -707,3 +707,29 @@ test('audit hot path: Pi retains an unsigned full template and signs only the se
     track.mockRestore()
   }
 })
+
+test('recheck user text: Pi string prompts keep three consecutive requests reusable', async () => {
+  const h = await auditPiPrimaryHarness('user-string-history')
+  let history: Context = {
+    ...h.context,
+    messages: [{ role: 'user', content: 'First prompt', timestamp: 0 }],
+  }
+  for (let turn = 0; turn < 3; turn++) {
+    await h.start()
+    const reply = await h.send(history)
+    await h.settle()
+    history = {
+      ...history,
+      messages: [
+        ...history.messages,
+        reply,
+        { role: 'user', content: `Prompt ${turn + 2}`, timestamp: turn + 1 },
+      ],
+    }
+  }
+  expect(h.sent.map((request) => request.body.thread?.type)).toEqual([
+    'create',
+    'continue',
+    'continue',
+  ])
+})
