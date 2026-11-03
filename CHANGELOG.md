@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Claude requests now use Anthropic's message threads, as Claude Code does: after the first request in a conversation, each request sends only the new messages instead of the whole history, so requests are much smaller and faster to start. Anything that changes the earlier conversation or the request's settings sends a full request again.
-- Pi's current SDK calls send full requests. The SDK does not identify which calls belong to the main agent loop, so only a host integration that explicitly marks those calls can use message threads.
 - Fixed relay requests failing after edits to earlier messages or effort controls caused overlapping upload patches.
 
 ## 2.4.13

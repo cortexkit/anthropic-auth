@@ -284,13 +284,13 @@ export default async function cortexKitPiAnthropicAuth(
         maxTokens: CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
       },
     ],
-    // Stock Pi supplies three arguments and cannot attest the call's origin.
-    // Only an explicitly marked integration may opt a call into message threads.
+    // Stock Pi's simplified calls share the session's whole-turn lease. Core
+    // checks the exact history and retained reply before continuing any anchor.
     streamSimple: (
       model,
       context,
       options,
-      origin: 'agent-loop' | 'direct' = 'direct',
+      origin: 'agent-loop' | 'direct' = 'agent-loop',
     ) =>
       streamCortexKitAnthropic(
         model,

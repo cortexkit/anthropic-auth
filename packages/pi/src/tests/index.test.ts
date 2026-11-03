@@ -452,6 +452,7 @@ async function auditPiPrimaryHarness(suffix: string) {
   }
   const sent: Array<{ body: Record<string, any>; betas: string }> = []
   let reply: 'call_1' | 'call_2' | 'answer' = 'answer'
+  let toolPath = 'file'
   const frame = (type: string, data: unknown) =>
     `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`
   globalThis.fetch = Object.assign(
@@ -505,7 +506,10 @@ async function auditPiPrimaryHarness(suffix: string) {
         output += frame('content_block_delta', {
           type: 'content_block_delta',
           index: 0,
-          delta: { type: 'input_json_delta', partial_json: '{"path":"file"}' },
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify({ path: toolPath }),
+          },
         })
       }
       output += frame('content_block_stop', {
@@ -544,15 +548,10 @@ async function auditPiPrimaryHarness(suffix: string) {
     history: Context,
     overrides: SimpleStreamOptions = options,
     raw = false,
-    marked = true,
   ) => {
     const call = raw ? provider.stream : provider.streamSimple
     if (!call) throw new Error('Missing Pi stream entry point')
-    const stream = (
-      raw || !marked
-        ? call(fableModel, history, overrides)
-        : call(fableModel, history, overrides, 'agent-loop')
-    ) as {
+    const stream = call(fableModel, history, overrides) as {
       result(): Promise<AssistantMessage>
     }
     const result = await stream.result()
@@ -571,10 +570,13 @@ async function auditPiPrimaryHarness(suffix: string) {
     setReply: (value: typeof reply) => {
       reply = value
     },
+    setToolPath: (value: string) => {
+      toolPath = value
+    },
   }
 }
 
-test('audit primary gates: explicitly marked Pi tool loop reuses the whole-turn lease', async () => {
+test('audit primary gates: stock Pi three-step tool loop reuses the whole-turn lease', async () => {
   const h = await auditPiPrimaryHarness('tool-loop')
   await h.start()
   let history = h.context
@@ -724,7 +726,7 @@ test('audit hot path: Pi retains an unsigned full template and signs only the se
   }
 })
 
-test('recheck user text: marked Pi string prompts keep three consecutive requests reusable', async () => {
+test('recheck user text: stock Pi string prompts keep three consecutive requests reusable', async () => {
   const h = await auditPiPrimaryHarness('user-string-history')
   let history: Context = {
     ...h.context,
@@ -748,6 +750,18 @@ test('recheck user text: marked Pi string prompts keep three consecutive request
     'continue',
     'continue',
   ])
+})
+
+test('recheck Pi leases: an unleased session cannot borrow another session turn', async () => {
+  const h = await auditPiPrimaryHarness('unleased-session')
+  await h.start()
+  await h.send(h.context, {
+    ...h.options,
+    sessionId: `${h.options.sessionId}-other`,
+  })
+  expect(h.sent.at(-1)?.body.thread).toBeUndefined()
+  await h.send(h.context)
+  expect(h.sent.at(-1)?.body.thread).toEqual({ type: 'create' })
 })
 
 test.each(['another turn starts', 'another session settles'])(
@@ -793,23 +807,39 @@ test.each(['another turn starts', 'another session settles'])(
   },
 )
 
-test('recheck Pi origin: registered simplified side calls with callbacks remain direct', async () => {
-  const h = await auditPiPrimaryHarness('unmarked-simplified-side-call')
+test('recheck Pi ancestry: a callback-copying side anchor cannot continue primary history', async () => {
+  const h = await auditPiPrimaryHarness('callback-copying-side-call')
   await h.start()
+  h.setReply('call_1')
   const kept = await h.send(h.context)
-  await h.send(h.context, h.options, false, false)
-  expect(h.sent.at(-1)?.body.thread).toBeUndefined()
-  expect(h.sent.at(-1)?.betas).not.toContain('message-threads-2026-08-12')
+
+  // Reusing a tool ID cannot disguise a side reply with different arguments.
+  h.setToolPath('side-file')
+  const side = await h.send(h.context, { ...h.options })
+  expect(side.content).not.toEqual(kept.content)
+  expect(h.sent.at(-1)?.body.thread).toEqual({ type: 'create' })
+  expect(h.sent.at(-1)?.betas).toContain('message-threads-2026-08-12')
+
+  h.setReply('answer')
   await h.send({
     ...h.context,
     messages: [
       ...h.context.messages,
       kept,
-      { role: 'user', content: 'Next primary prompt', timestamp: 2 },
+      {
+        role: 'toolResult',
+        toolCallId: 'call_1',
+        toolName: 'read',
+        content: [{ type: 'text', text: 'Primary file contents' }],
+        isError: false,
+        timestamp: 2,
+      },
     ],
   })
-  expect(h.sent.at(-1)?.body.thread).toEqual({
-    type: 'continue',
-    previous_message_id: 'msg_gate_1',
-  })
+  expect(h.sent.map((request) => request.body.thread?.type)).toEqual([
+    'create',
+    'create',
+    'create',
+  ])
+  expect(h.sent.at(-1)?.body.messages).toHaveLength(3)
 })

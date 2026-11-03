@@ -45,9 +45,11 @@ function normalizedReplyName(name: string): string {
   return `${bare.charAt(0).toUpperCase()}${bare.slice(1)}`
 }
 
-// Host maps accept only spellings their response decoder can restore safely.
-// Otherwise exact declarations win over unambiguous prefix/leading-case aliases.
-function replyToolNameResolver(input: Pick<MessageThreadInput, 'body' | 'replyToolNames'>): ReplyToolName {
+// Use the host's response-decoder map to identify the original tool target.
+// Without a host map, prefer exact declarations, then unambiguous aliases.
+function replyToolNameResolver(
+  input: Pick<MessageThreadInput, 'body' | 'replyToolNames'>,
+): ReplyToolName {
   let exact: Map<string, string | null> | undefined
   let aliases: Map<string, string | null> | undefined
   return (value) => {
@@ -68,7 +70,9 @@ function replyToolNameResolver(input: Pick<MessageThreadInput, 'body' | 'replyTo
         aliases.set(name, aliases.has(name) ? null : target)
       }
     }
-    const target = exact.has(value) ? exact.get(value) : aliases.get(normalizedReplyName(value))
+    const target = exact.has(value)
+      ? exact.get(value)
+      : aliases.get(normalizedReplyName(value))
     return typeof target === 'string' ? target : undefined
   }
 }
@@ -82,12 +86,14 @@ interface ReplyBlockState {
   input?: unknown
   inputJson?: string
   textHasContent: boolean
+  text?: Hash
+  committedText?: Hash
 }
 
 const MAX_REPLY_INPUT_CHARS = 1_048_576
 
-// Match semantic tool calls and ordered blocks, allowing only our own name and
-// whitespace rewrites. Buffer open tool JSON only; retain its digest after stop.
+// Match semantic tool calls and ordered blocks, allowing only tool-name
+// normalization and whitespace rewrites. Retain only a digest of stopped tool JSON.
 class ReplyFingerprint {
   private readonly open = new Map<number, ReplyBlockState>()
   private readonly seen = new Set<number>()
@@ -115,18 +121,50 @@ class ReplyFingerprint {
     if (this.hasText) this.text.update(part.slice(visible.length))
   }
 
+  private appendBlockText(state: ReplyBlockState, value: string): void {
+    state.text ??= createHash('sha256')
+    state.committedText ??= state.text.copy()
+    const part = state.textHasContent ? value : value.trimStart()
+    const visible = part.trimEnd()
+    if (visible) {
+      state.committedText = state.text.copy().update(visible)
+      state.textHasContent = true
+    }
+    state.text.update(part)
+    this.appendText(value)
+  }
+
   start(index: unknown, block: unknown): void {
-    if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || !isBody(block) || typeof block.type !== 'string' || this.seen.has(index)) { this.invalid = true; return }
+    if (
+      typeof index !== 'number' ||
+      !Number.isInteger(index) ||
+      index < 0 ||
+      !isBody(block) ||
+      typeof block.type !== 'string' ||
+      this.seen.has(index)
+    ) {
+      this.invalid = true
+      return
+    }
     this.seen.add(index)
-    const state: ReplyBlockState = { type: block.type, signatureLength: 0, textHasContent: false }
-    if (!['text', 'tool_use', 'thinking', 'redacted_thinking'].includes(block.type)) this.invalid = true
+    const state: ReplyBlockState = {
+      type: block.type,
+      signatureLength: 0,
+      textHasContent: false,
+    }
+    if (
+      !['text', 'tool_use', 'thinking', 'redacted_thinking'].includes(
+        block.type,
+      )
+    )
+      this.invalid = true
     if (block.type === 'text') {
-      if (this.activeText !== undefined || index < this.lastText) this.invalid = true
+      if (this.activeText !== undefined || index < this.lastText)
+        this.invalid = true
       this.activeText = index
       this.lastText = index
       const text = typeof block.text === 'string' ? block.text : ''
-      state.textHasContent = Boolean(text.trim())
-      this.appendText(text)
+      this.appendBlockText(state, text)
     }
     if (block.type === 'tool_use') {
       if (typeof block.id !== 'string' || !block.id) this.invalid = true
@@ -137,27 +175,49 @@ class ReplyFingerprint {
     }
     if (block.type === 'thinking' || block.type === 'redacted_thinking') {
       state.signature = createHash('sha256')
-      const signature = block.type === 'redacted_thinking' ? block.data : block.signature
-      if (typeof signature === 'string') { state.signature.update(signature); state.signatureLength += signature.length }
+      const signature =
+        block.type === 'redacted_thinking' ? block.data : block.signature
+      if (typeof signature === 'string') {
+        state.signature.update(signature)
+        state.signatureLength += signature.length
+      }
     }
     this.open.set(index, state)
   }
 
   delta(index: unknown, delta: unknown): void {
     const state = typeof index === 'number' ? this.open.get(index) : undefined
-    if (!state || !isBody(delta)) { this.invalid = true; return }
+    if (!state || !isBody(delta)) {
+      this.invalid = true
+      return
+    }
     if (this.invalid) return
     if (delta.type === 'text_delta') {
-      if (state.type !== 'text' || this.activeText !== index || typeof delta.text !== 'string') this.invalid = true
-      else { state.textHasContent ||= Boolean(delta.text.trim()); this.appendText(delta.text) }
+      if (
+        state.type !== 'text' ||
+        this.activeText !== index ||
+        typeof delta.text !== 'string'
+      )
+        this.invalid = true
+      else {
+        this.appendBlockText(state, delta.text)
+      }
     }
     if (delta.type === 'signature_delta') {
-      if (!state.signature || typeof delta.signature !== 'string') this.invalid = true
-      else { state.signature.update(delta.signature); state.signatureLength += delta.signature.length }
+      if (!state.signature || typeof delta.signature !== 'string')
+        this.invalid = true
+      else {
+        state.signature.update(delta.signature)
+        state.signatureLength += delta.signature.length
+      }
     }
     if (delta.type === 'input_json_delta') {
-      if (state.type !== 'tool_use' || typeof delta.partial_json !== 'string') this.invalid = true
-      else if (this.inputChars + delta.partial_json.length > MAX_REPLY_INPUT_CHARS) {
+      if (state.type !== 'tool_use' || typeof delta.partial_json !== 'string')
+        this.invalid = true
+      else if (
+        this.inputChars + delta.partial_json.length >
+        MAX_REPLY_INPUT_CHARS
+      ) {
         this.inputChars -= state.inputJson?.length ?? 0
         state.inputJson = ''
         this.invalid = true
@@ -170,9 +230,20 @@ class ReplyFingerprint {
 
   stop(index: unknown): void {
     const state = typeof index === 'number' ? this.open.get(index) : undefined
-    if (!state || typeof index !== 'number') { this.invalid = true; return }
+    if (!state || typeof index !== 'number') {
+      this.invalid = true
+      return
+    }
     this.open.delete(index)
-    this.layout.set(index, { type: state.type, ...(state.type === 'text' ? { text: state.textHasContent ? '_' : '' } : {}) })
+    this.layout.set(index, {
+      type: state.type,
+      ...(state.type === 'text'
+        ? {
+            text: state.textHasContent ? '_' : '',
+            textFingerprint: state.committedText?.digest('hex'),
+          }
+        : {}),
+    })
     if (state.type === 'text') this.activeText = undefined
     if (state.signature) {
       if (!state.signatureLength) this.invalid = true
@@ -181,26 +252,48 @@ class ReplyFingerprint {
     if (state.type === 'tool_use') {
       this.inputChars -= state.inputJson?.length ?? 0
       try {
-        const input = state.inputJson === undefined ? state.input : JSON.parse(state.inputJson)
+        const input =
+          state.inputJson === undefined
+            ? state.input
+            : JSON.parse(state.inputJson)
         if (!state.id || !state.name || input === undefined) this.invalid = true
-        else this.tools.set(index, [state.id, state.name, hash(canonicalValue(input))])
-      } catch { this.invalid = true }
+        else
+          this.tools.set(index, [
+            state.id,
+            state.name,
+            hash(canonicalValue(input)),
+          ])
+      } catch {
+        this.invalid = true
+      }
     }
   }
 
   digest(): string | undefined {
     if (this.invalid || this.open.size) return undefined
-    const blocks = [...this.layout].sort(([a], [b]) => a - b).map(([, block]) => block)
+    const blocks = [...this.layout]
+      .sort(([a], [b]) => a - b)
+      .map(([, block]) => block)
+    const kept = withoutTrailingToolWhitespace(blocks) as Body[]
     return hash({
-      blocks: withoutTrailingToolWhitespace(blocks).map((block) => (block as Body).type),
+      blocks: kept.map((block) => block.type),
+      // Combined text alone cannot detect text moved across a tool call.
+      texts: kept
+        .filter((block) => block.type === 'text')
+        .map((block) => block.textFingerprint),
       tools: [...this.tools].sort(([a], [b]) => a - b).map(([, tool]) => tool),
-      signatures: [...this.signatures].sort(([a], [b]) => a - b).map(([, signature]) => signature),
+      signatures: [...this.signatures]
+        .sort(([a], [b]) => a - b)
+        .map(([, signature]) => signature),
       text: this.committedText.copy().digest('hex'),
     })
   }
 }
 
-function assistantReplyFingerprint(message: unknown, normalizeToolName: ReplyToolName): string | undefined {
+function assistantReplyFingerprint(
+  message: unknown,
+  normalizeToolName: ReplyToolName,
+): string | undefined {
   if (!isBody(message) || message.role !== 'assistant') return undefined
   const content =
     typeof message.content === 'string'
@@ -387,8 +480,10 @@ function canContinueFrom(
     !messages
       .slice(anchor.messages.length + 1)
       .some((message) => message?.role === 'assistant') &&
-    assistantReplyFingerprint(messages[anchor.messages.length], replyToolNameResolver(input)) ===
-      anchor.replyFingerprint
+    assistantReplyFingerprint(
+      messages[anchor.messages.length],
+      replyToolNameResolver(input),
+    ) === anchor.replyFingerprint
   )
 }
 
@@ -545,7 +640,8 @@ export class MessageThreadTracker {
           return
         }
         const replyFingerprint =
-          facts.replyFingerprint ?? assistantReplyFingerprint(facts.reply, normalizeToolName)
+          facts.replyFingerprint ??
+          assistantReplyFingerprint(facts.reply, normalizeToolName)
         if (!replyFingerprint) {
           fail()
           return
@@ -576,7 +672,10 @@ export function observeMessageThreadResponse(
   prepared: Pick<
     ReturnType<MessageThreadTracker['prepare']>,
     'complete' | 'fail'
-  > & Partial<Pick<ReturnType<MessageThreadTracker['prepare']>, 'normalizeToolName'>>,
+  > &
+    Partial<
+      Pick<ReturnType<MessageThreadTracker['prepare']>, 'normalizeToolName'>
+    >,
 ): Response {
   if (!response.ok || !response.body) {
     prepared.fail()
@@ -585,7 +684,9 @@ export function observeMessageThreadResponse(
   const reader = response.body.getReader()
   const framer = createSseFramer()
   const facts: MessageThreadCompletion = { stopped: false }
-  const reply = new ReplyFingerprint(prepared.normalizeToolName ?? (() => undefined))
+  const reply = new ReplyFingerprint(
+    prepared.normalizeToolName ?? (() => undefined),
+  )
   let inspecting = true
   let streamStart = true
   const parse = (frame: Uint8Array) => {
