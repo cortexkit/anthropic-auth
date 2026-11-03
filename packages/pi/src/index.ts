@@ -38,7 +38,12 @@ import {
 import { createPiNativeCommands } from './native-commands.ts'
 import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
 import type { PiQuotaWaitOptions } from './quota-wait.ts'
-import { forgetPiMessageThread, streamCortexKitAnthropic } from './stream.ts'
+import {
+  beginPiPrimaryTurn,
+  endPiPrimaryTurn,
+  forgetPiMessageThread,
+  streamCortexKitAnthropic,
+} from './stream.ts'
 
 function textImageInput(): Array<'text' | 'image'> {
   return ['text', 'image']
@@ -85,6 +90,7 @@ export default async function cortexKitPiAnthropicAuth(
   const workingMessageBySession = new Map<string, (message?: string) => void>()
   pi.on('turn_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
+    beginPiPrimaryTurn(storagePath, sessionId)
     if (!sessionId) return
     if (ctx.hasUI) {
       workingMessageBySession.set(sessionId, (message) => {
@@ -126,7 +132,9 @@ export default async function cortexKitPiAnthropicAuth(
       else break
     }
   })
+  pi.on('agent_settled', () => endPiPrimaryTurn(storagePath))
   pi.on('session_shutdown', async (_event, ctx) => {
+    endPiPrimaryTurn(storagePath)
     const sessionId = ctx.sessionManager.getSessionId()
     if (sessionId) {
       effortHistoryBySession.delete(sessionId)
@@ -274,7 +282,12 @@ export default async function cortexKitPiAnthropicAuth(
         maxTokens: CLAUDE_SONNET_5_5_MAX_OUTPUT_TOKENS,
       },
     ],
-    streamSimple: (model, context, options) =>
+    streamSimple: (
+      model,
+      context,
+      options,
+      origin: 'agent-loop' | 'direct' = 'agent-loop',
+    ) =>
       streamCortexKitAnthropic(
         model,
         context,
@@ -289,6 +302,7 @@ export default async function cortexKitPiAnthropicAuth(
               ? workingMessageBySession.get(options.sessionId)
               : undefined) ?? quotaWait?.setWorkingMessage,
         },
+        origin,
       ),
   } satisfies ProviderConfig
 
@@ -364,7 +378,7 @@ export default async function cortexKitPiAnthropicAuth(
         })),
       // Preserve the legacy provider's simplified option surface for raw calls.
       stream: (model, context, options) =>
-        streamSimple(model, context, options as SimpleStreamOptions),
+        streamSimple(model, context, options as SimpleStreamOptions, 'direct'),
       streamSimple,
     }
     pi.registerProvider(provider)

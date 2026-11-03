@@ -1452,3 +1452,63 @@ test('stateless OpenCode 1 HTTP relay handles an effort edit before a fixed-posi
     `stateless cch offset ${previous.indexOf('cch=')}`,
   ).toBe(next)
 })
+
+describe('audit OC1 primary gates', () => {
+  const originalFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+  test('audit primary gates: OC1 compaction requests remain stateless', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+      }),
+    )
+    let sent: Record<string, unknown> | undefined
+    globalThis.fetch = mock(
+      withNativeAdmission((_input: unknown, init?: RequestInit) => {
+        if (typeof init?.body === 'string') sent = JSON.parse(init.body)
+        return Promise.resolve(
+          new Response(
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ),
+        )
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const auth = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const output = { headers: {} as Record<string, string> }
+    await plugin['chat.headers'](
+      {
+        sessionID: 'compaction-session',
+        agent: 'compaction',
+        message: { id: 'summary-input' },
+      },
+      output,
+    )
+    const response = await auth.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: {
+        ...output.headers,
+        'x-session-affinity': 'compaction-session',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'Summarize the conversation' }],
+      }),
+    })
+    await response.text()
+    expect(sent).toBeDefined()
+    expect(sent?.thread).toBeUndefined()
+  })
+})

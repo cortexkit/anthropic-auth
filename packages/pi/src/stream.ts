@@ -110,6 +110,47 @@ import {
 } from './transport.ts'
 
 const messageThreads = new MessageThreadTracker()
+const primaryTurns = new Map<string, string>()
+
+export function beginPiPrimaryTurn(
+  storagePath: string,
+  sessionId?: string,
+): void {
+  primaryTurns.delete(storagePath)
+  if (!sessionId) return
+  primaryTurns.set(storagePath, sessionId)
+  while (primaryTurns.size > 128) {
+    const oldest = primaryTurns.keys().next().value
+    if (oldest === undefined) break
+    primaryTurns.delete(oldest)
+  }
+}
+
+export function endPiPrimaryTurn(storagePath: string): void {
+  primaryTurns.delete(storagePath)
+}
+
+function isPiPrimaryThreadRequest(
+  storagePath: string,
+  options: SimpleStreamOptions | undefined,
+  origin: 'agent-loop' | 'direct' | undefined,
+): boolean {
+  // SDK summaries disable caching; SDK cache warms request exactly one token.
+  if (
+    origin !== 'agent-loop' ||
+    options?.cacheRetention === 'none' ||
+    options?.maxTokens === 1
+  )
+    return false
+  return Boolean(
+    options?.sessionId &&
+      primaryTurns.get(storagePath) === options.sessionId &&
+      typeof options.onPayload === 'function' &&
+      typeof options.onResponse === 'function' &&
+      typeof options.onProviderStreamEvent === 'function',
+  )
+}
+
 export function forgetPiMessageThread(sessionId: string): void {
   messageThreads.forget(sessionId)
 }
@@ -583,6 +624,7 @@ async function sendAnthropicRequest(
     model: Model<Api>
     context: Context
     streamOptions?: SimpleStreamOptions
+    requestOrigin?: 'agent-loop' | 'direct'
     apiAccount?: NativeAccountView
     storagePath: string
     oauthAccountId?: string
@@ -736,6 +778,11 @@ async function sendAnthropicRequest(
   let threadRequest: MessageThreadRequest | undefined
   if (
     !options.apiAccount &&
+    isPiPrimaryThreadRequest(
+      options.storagePath,
+      options.streamOptions,
+      options.requestOrigin,
+    ) &&
     (!relayConfig ||
       effectiveRelayTransport(relayConfig.transport, relayConfig.url) !==
         'websocket')
@@ -1121,6 +1168,7 @@ async function executeWithFallback(options: {
   model: Model<Api>
   context: Context
   streamOptions?: SimpleStreamOptions
+  requestOrigin?: 'agent-loop' | 'direct'
   storagePath: string
   effortTransitions?: readonly MidConversationEffortTransition[]
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
@@ -1828,6 +1876,7 @@ export function streamCortexKitAnthropic(
   options?: SimpleStreamOptions,
   effortTransitions?: readonly MidConversationEffortTransition[],
   wait?: PiQuotaWaitOptions,
+  requestOrigin: 'agent-loop' | 'direct' = 'direct',
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream()
 
@@ -1843,6 +1892,7 @@ export function streamCortexKitAnthropic(
         model,
         context,
         streamOptions: options,
+        requestOrigin,
         storagePath,
         effortTransitions,
         onResolvedToolNames: (names: ReadonlyMap<string, string>) => {

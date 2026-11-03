@@ -9,12 +9,12 @@ export const REQUEST_CLASS_REQUEST_HEADER = 'x-cortexkit-request-class'
 
 /**
  * Agents whose requests Claude Code would mark `auxiliary`: they run beside a
- * conversation rather than answering a prompt. `title` and `summary` are
- * OpenCode's background agents; `prime` is this plugin's tiny request that
+ * conversation rather than answering a prompt. `title`, `summary` and
+ * `compaction` are OpenCode's background agents; `prime` is this plugin's tiny request that
  * starts an account's five-hour quota window, like Claude Code's own
  * auxiliary quota check. Every other request is `main`.
  */
-const AUXILIARY_AGENTS = new Set(['title', 'summary', 'prime'])
+const AUXILIARY_AGENTS = new Set(['title', 'summary', 'compaction', 'prime'])
 
 export function isAuxiliaryAgent(agent: unknown): boolean {
   return typeof agent === 'string' && AUXILIARY_AGENTS.has(agent)

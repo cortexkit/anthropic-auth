@@ -2562,16 +2562,52 @@ for (const transport of ['direct', 'http'] as const) {
       )
     }) as typeof fetch
     globalThis.fetch = fetchImpl
-    const send = (requestContext: Context, sessionId = 'pi-message-thread') =>
-      __sendPiAnthropicRequestForTest(
+    const primaryHooks = new Map<
+      string,
+      (event: unknown, ctx: unknown) => unknown
+    >()
+    await cortexKitPiAnthropicAuth(
+      {
+        registerCommand() {},
+        registerProvider() {},
+        on: (
+          event: string,
+          handler: (event: unknown, ctx: unknown) => unknown,
+        ) => primaryHooks.set(event, handler),
+      } as unknown as ExtensionAPI,
+      { connectScoped: f.connect },
+    )
+    const send = async (
+      requestContext: Context,
+      sessionId = 'pi-message-thread',
+    ) => {
+      await primaryHooks.get('turn_start')?.(
+        {},
+        {
+          hasUI: false,
+          sessionManager: {
+            getSessionId: () => sessionId,
+            getBranch: () => [],
+            getEntries: () => [],
+          },
+        },
+      )
+      return __sendPiAnthropicRequestForTest(
         {
           model,
           context: requestContext,
           storagePath: f.path,
-          streamOptions: { sessionId },
+          requestOrigin: 'agent-loop',
+          streamOptions: {
+            sessionId,
+            onPayload: (payload) => payload,
+            onResponse: () => {},
+            onProviderStreamEvent: () => {},
+          },
         },
         { fetch: fetchImpl, cacheKeep: keep },
       )
+    }
     const threadContext: Context = {
       ...context,
       tools: [

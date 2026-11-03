@@ -2,16 +2,23 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
+  type AssistantMessage,
+  type Context,
   getSupportedThinkingLevels,
   type Provider,
+  type SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { buildAnthropicRequest } from '../convert.ts'
 import cortexKitPiAnthropicAuth from '../index'
-import { closePiNativeRuntime } from '../native.ts'
+import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
-import { saveNativePiFixture } from './native-fixture.ts'
+import {
+  fixtureAccountIdentity,
+  saveNativePiFixture,
+} from './native-fixture.ts'
 
 let tempDir: string | undefined
 const originalFetch = globalThis.fetch
@@ -53,6 +60,7 @@ function mockPi() {
     {
       models?: Array<Record<string, unknown>>
       streamSimple?: (...args: any[]) => unknown
+      stream?: (...args: any[]) => unknown
     }
   >()
   const events = new Map<string, (...args: any[]) => unknown>()
@@ -64,6 +72,7 @@ function mockPi() {
       config?: {
         models?: Array<Record<string, unknown>>
         streamSimple?: (...args: any[]) => unknown
+        stream?: (...args: any[]) => unknown
       },
     ) => {
       if (typeof name === 'string') {
@@ -72,6 +81,7 @@ function mockPi() {
         providers.set(name.id, {
           models: name.getModels().map((model) => ({ ...model })),
           streamSimple: name.streamSimple,
+          stream: name.stream,
         })
       }
     },
@@ -379,3 +389,237 @@ describe('cortexKitPiAnthropicAuth turn_start effort history', () => {
     expect(await handler?.({ type: 'turn_start' }, ctx)).toBeUndefined()
   })
 })
+
+async function auditPiPrimaryHarness(suffix: string) {
+  const runtime = await getPiNativeRuntime(getPiAccountStoragePath()).service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: false },
+    claudeCache: { enabled: false, mode: 'explicit' },
+    cacheKeep: { enabled: false },
+  }))
+  const { pi, providers, events } = mockPi()
+  await cortexKitPiAnthropicAuth(pi)
+  const provider = providers.get('anthropic')
+  if (!provider?.streamSimple) throw new Error('Missing registered Pi provider')
+  const sessionId = `audit-pi-${suffix}`
+  const context: Context = {
+    systemPrompt: 'test',
+    tools: [
+      {
+        name: 'read',
+        description: 'Read a file',
+        parameters: {
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+      },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'Inspect the file' }],
+        timestamp: 0,
+      },
+    ],
+  }
+  const turnContext = {
+    hasUI: false,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getBranch: () => [],
+      getEntries: () => [],
+    },
+  }
+  const options: SimpleStreamOptions = {
+    sessionId,
+    onPayload: (payload) => payload,
+    onResponse: () => {},
+    onProviderStreamEvent: () => {},
+  }
+  const sent: Array<{ body: Record<string, any>; betas: string }> = []
+  let reply: 'call_1' | 'call_2' | 'answer' = 'answer'
+  const frame = (type: string, data: unknown) =>
+    `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`
+  globalThis.fetch = Object.assign(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url.includes('/api/claude_cli/bootstrap'))
+        return Response.json({
+          oauth_account: { account_uuid: fixtureAccountIdentity('main') },
+        })
+      if (!url.includes('/v1/messages'))
+        throw new Error('Unexpected primary-gate request')
+      const text =
+        init?.body instanceof Uint8Array
+          ? gunzipSync(init.body).toString().trim()
+          : String(init?.body)
+      sent.push({
+        body: JSON.parse(text),
+        betas: new Headers(init?.headers).get('anthropic-beta') ?? '',
+      })
+      let output = frame('message_start', {
+        type: 'message_start',
+        message: {
+          id: `msg_gate_${sent.length}`,
+          model: fableModel.id,
+          content: [],
+          usage: { input_tokens: 1, output_tokens: 0 },
+        },
+      })
+      if (reply === 'answer') {
+        output += frame('content_block_start', {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: '' },
+        })
+        output += frame('content_block_delta', {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'answer' },
+        })
+      } else {
+        output += frame('content_block_start', {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'tool_use',
+            id: reply,
+            name: 'Read',
+            input: {},
+          },
+        })
+        output += frame('content_block_delta', {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'input_json_delta', partial_json: '{"path":"file"}' },
+        })
+      }
+      output += frame('content_block_stop', {
+        type: 'content_block_stop',
+        index: 0,
+      })
+      output += frame('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: reply === 'answer' ? 'end_turn' : 'tool_use' },
+        usage: { output_tokens: 1 },
+      })
+      output += frame('message_stop', { type: 'message_stop' })
+      return new Response(output, {
+        headers: {
+          'content-type': 'text/event-stream',
+          'request-id': `req_gate_${sent.length}`,
+        },
+      })
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  const start = () =>
+    events.get('turn_start')?.({ type: 'turn_start' }, turnContext)
+  const settle = () =>
+    events.get('agent_settled')?.({ type: 'agent_settled' }, turnContext)
+  const send = async (
+    history: Context,
+    overrides: SimpleStreamOptions = options,
+    raw = false,
+  ) => {
+    const call = raw ? provider.stream : provider.streamSimple
+    if (!call) throw new Error('Missing Pi stream entry point')
+    const stream = call(fableModel, history, overrides) as {
+      result(): Promise<AssistantMessage>
+    }
+    const result = await stream.result()
+    expect(result.stopReason).not.toBe('error')
+    return result
+  }
+  return {
+    context,
+    options,
+    sent,
+    start,
+    settle,
+    send,
+    setReply: (value: typeof reply) => {
+      reply = value
+    },
+  }
+}
+
+test('audit primary gates: Pi three-step tool loop reuses the whole-turn lease', async () => {
+  const h = await auditPiPrimaryHarness('tool-loop')
+  await h.start()
+  let history = h.context
+  for (const id of ['call_1', 'call_2'] as const) {
+    h.setReply(id)
+    const reply = await h.send(history)
+    expect(reply.stopReason).toBe('toolUse')
+    history = {
+      ...history,
+      messages: [
+        ...history.messages,
+        reply,
+        {
+          role: 'toolResult',
+          toolCallId: id,
+          toolName: 'read',
+          content: [{ type: 'text', text: `result ${id}` }],
+          isError: false,
+          timestamp: 1,
+        },
+      ],
+    }
+  }
+  h.setReply('answer')
+  await h.send(history)
+  expect(h.sent.map((request) => request.body.thread?.type)).toEqual([
+    'create',
+    'continue',
+    'continue',
+  ])
+  expect(h.sent[1]?.body.messages).toHaveLength(1)
+  expect(h.sent[2]?.body.messages).toHaveLength(1)
+})
+
+test.each([
+  'summary',
+  'SDK warm',
+  'missing callbacks',
+  'raw call',
+  'after settled',
+])(
+  'audit primary gates: Pi %s is stateless without disturbing the reply',
+  async (kind) => {
+    const h = await auditPiPrimaryHarness(kind)
+    await h.start()
+    const reply = await h.send(h.context)
+    if (kind === 'after settled') await h.settle()
+    const sideOptions: SimpleStreamOptions =
+      kind === 'summary'
+        ? { ...h.options, cacheRetention: 'none' }
+        : kind === 'SDK warm'
+          ? { ...h.options, maxTokens: 1 }
+          : kind === 'missing callbacks'
+            ? { sessionId: h.options.sessionId }
+            : h.options
+    await h.send(h.context, sideOptions, kind === 'raw call')
+    expect(h.sent.at(-1)?.body.thread).toBeUndefined()
+    expect(h.sent.at(-1)?.betas).not.toContain('message-threads-2026-08-12')
+    if (kind === 'after settled') await h.start()
+    await h.send({
+      ...h.context,
+      messages: [
+        ...h.context.messages,
+        reply,
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'Next prompt' }],
+          timestamp: 2,
+        },
+      ],
+    })
+    expect(h.sent.at(-1)?.body.thread).toEqual({
+      type: 'continue',
+      previous_message_id: 'msg_gate_1',
+    })
+  },
+)

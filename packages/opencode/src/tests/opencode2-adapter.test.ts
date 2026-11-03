@@ -2786,3 +2786,68 @@ test.each(['changed identity', 'replacement scope', 'configured 400'])(
     }
   },
 )
+
+test('audit primary gates: OC2 title kind cannot replace a primary reply', async () => {
+  const { source } = makeSource()
+  const native = createNativeAnthropicAdapter({ source })
+  try {
+    const host = new Host(native.adapter)
+    const payload = {
+      model: 'claude-sonnet-5',
+      stream: true,
+      messages: [{ role: 'user', content: 'first' }],
+    }
+    const first = await host.run(scopeOf(), hostRequest(payload))
+    const response = new Response(
+      sse('message_start', {
+        type: 'message_start',
+        message: {
+          id: 'msg_primary',
+          content: [{ type: 'text', text: 'answer' }],
+        },
+      }) +
+        sse('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+        }) +
+        sse('message_stop', { type: 'message_stop' }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    await (
+      await native.adapter.rewriteResponse?.({
+        ...first.attempt,
+        attempt: first.attempt,
+        request: first.final,
+        response,
+      } as never)
+    )?.text()
+    const title = await host.run(
+      scopeOf({ kind: 'title', agent: 'build' }),
+      hostRequest({
+        ...payload,
+        messages: [{ role: 'user', content: 'Title request' }],
+      }),
+    )
+    expect(JSON.parse(await title.final.text()).thread).toBeUndefined()
+    expect(title.final.headers.get('anthropic-beta')).not.toContain(
+      'message-threads-',
+    )
+    const next = await host.run(
+      scopeOf(),
+      hostRequest({
+        ...payload,
+        messages: [
+          ...payload.messages,
+          { role: 'assistant', content: 'answer' },
+          { role: 'user', content: 'next' },
+        ],
+      }),
+    )
+    expect(JSON.parse(await next.final.text()).thread).toEqual({
+      type: 'continue',
+      previous_message_id: 'msg_primary',
+    })
+  } finally {
+    native.dispose()
+  }
+})

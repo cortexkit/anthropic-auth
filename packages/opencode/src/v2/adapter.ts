@@ -1209,7 +1209,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         setOAuthHeaders(headers, accessToken, {
           body: finalBody,
           ...(identity ? { identity } : {}),
-          requestClass: isAuxiliaryAgent(attempt.agent) ? 'auxiliary' : 'main',
+          requestClass:
+            attempt.kind !== 'primary' || isAuxiliaryAgent(attempt.agent)
+              ? 'auxiliary'
+              : 'main',
         })
       } else {
         if (body !== undefined && messages) body = rewriteApiBody(body)
@@ -1279,6 +1282,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       send.oauth &&
       messages &&
       body !== undefined &&
+      attempt.kind === 'primary' &&
       !isAuxiliaryAgent(attempt.agent) &&
       attempt.agent !== 'cachekeep' &&
       attempt.agent !== 'compaction' &&
