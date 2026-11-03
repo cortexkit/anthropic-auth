@@ -5,6 +5,7 @@ import {
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   FAST_MODE_BETA,
+  MessageThreadTracker,
   OPENCODE_IDENTITY_PREFIX,
   PER_TURN_CONTROL_BETA,
   REQUIRED_BETAS,
@@ -5173,4 +5174,59 @@ test('audit hot path: OpenCode defers signing until the final thread shape', asy
   expect(unsigned).toContain('cch=00000;')
   const signed = await rewriteRequestBody(input)
   expect(signed).toBe(await signRequestBody(unsigned))
+})
+
+test('recheck assistant whitespace: latest-only OpenCode stripping does not churn the next prefix', async () => {
+  const user = { role: 'user', content: 'prompt' }
+  const old = {
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'old_call', name: 'read', input: {} },
+      { type: 'text', text: ' \n' },
+    ],
+  }
+  const result = {
+    role: 'user',
+    content: [
+      { type: 'tool_result', tool_use_id: 'old_call', content: 'result' },
+    ],
+  }
+  const reply = {
+    role: 'assistant',
+    content: [{ type: 'text', text: 'reply' }],
+  }
+  const payload = (messages: unknown[]) =>
+    JSON.stringify({
+      model: 'claude-sonnet-5',
+      tools: [{ name: 'read', input_schema: { type: 'object' } }],
+      messages,
+    })
+  const first = JSON.parse(
+    await rewriteRequestBody(payload([user, old, result])),
+  )
+  const second = JSON.parse(
+    await rewriteRequestBody(
+      payload([user, old, result, reply, { role: 'user', content: 'next' }]),
+    ),
+  )
+  expect(first.messages[1].content).toHaveLength(1)
+  expect(second.messages[1].content).toHaveLength(2)
+  const tracker = new MessageThreadTracker()
+  const input = {
+    body: first,
+    betas: ['base'],
+    account: 'account',
+    credential: 'credential',
+    session: 'latest-whitespace',
+  }
+  tracker.prepare(input).complete({
+    messageId: 'msg_after_tool',
+    stopped: true,
+    stopReason: 'end_turn',
+    reply: second.messages[3],
+  })
+  expect(tracker.prepare({ ...input, body: second }).decision.type).toBe(
+    'continue',
+  )
+  expect(second.messages[1].content).toHaveLength(2)
 })

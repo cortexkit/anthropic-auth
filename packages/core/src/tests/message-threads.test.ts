@@ -1658,3 +1658,61 @@ test.each([
     (request.body.messages as Array<{ content: unknown }>)[0]?.content,
   ).toEqual(originalContent)
 })
+
+test.each([
+  'whitespace reappears',
+  'whitespace removed',
+  'meaningful suffix',
+  'tool input edit',
+])('recheck assistant whitespace: %s', (kind) => {
+  const tracker = new MessageThreadTracker()
+  const request = input()
+  const first = (request.body.messages as unknown[])[0]
+  const call = {
+    type: 'tool_use',
+    id: 'historic_call',
+    name: 'read',
+    input: { path: 'original' },
+  }
+  const whitespace = [
+    { type: 'text', text: ' \n' },
+    { type: 'text', text: '\t' },
+  ]
+  const result = {
+    role: 'user',
+    content: [
+      { type: 'tool_result', tool_use_id: 'historic_call', content: 'result' },
+    ],
+  }
+  const before = {
+    role: 'assistant',
+    content: kind === 'whitespace removed' ? [call, ...whitespace] : [call],
+  }
+  request.body.messages = [first, before, result]
+  anchor(tracker, request)
+  const after = {
+    role: 'assistant',
+    content:
+      kind === 'whitespace removed'
+        ? [call]
+        : kind === 'meaningful suffix'
+          ? [call, { type: 'text', text: 'meaningful text' }]
+          : kind === 'tool input edit'
+            ? [{ ...call, input: { path: 'edited' } }, ...whitespace]
+            : [call, ...whitespace],
+  }
+  const candidate = {
+    ...request,
+    body: {
+      ...request.body,
+      messages: [first, after, result, assistant, next],
+    },
+  }
+  const wireBefore = JSON.stringify(candidate.body.messages)
+  expect(tracker.prepare(candidate).decision.type).toBe(
+    kind === 'meaningful suffix' || kind === 'tool input edit'
+      ? 'create'
+      : 'continue',
+  )
+  expect(JSON.stringify(candidate.body.messages)).toBe(wireBefore)
+})

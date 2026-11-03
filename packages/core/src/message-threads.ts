@@ -204,9 +204,31 @@ function withoutContentCache(content: unknown): unknown {
   })
 }
 
+// OpenCode drops whitespace-only suffix blocks from its latest tool reply.
+// Use that same form for every assistant history digest.
+function withoutTrailingToolWhitespace(content: unknown[]): unknown[] {
+  if (!content.some((block) => isBody(block) && block.type === 'tool_use'))
+    return content
+  let end = content.length
+  while (end > 0) {
+    const block = content[end - 1]
+    if (
+      !isBody(block) ||
+      block.type !== 'text' ||
+      typeof block.text !== 'string' ||
+      block.text.trim()
+    )
+      break
+    end--
+  }
+  return end === content.length ? content : content.slice(0, end)
+}
+
 function withoutMessageCache(message: unknown): unknown {
   if (!isBody(message)) return message
   let content = withoutContentCache(message.content)
+  if (message.role === 'assistant' && Array.isArray(content))
+    content = withoutTrailingToolWhitespace(content)
   // A user string and one text-only block represent the same message content.
   if (
     message.role === 'user' &&
