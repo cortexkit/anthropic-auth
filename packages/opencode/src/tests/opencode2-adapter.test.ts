@@ -2600,8 +2600,184 @@ describe.each(['direct', 'http'] as const)(
         native.dispose()
       },
     )
+
+    test.each([
+      'connection reset',
+      'Bun connection closed',
+      'nested socket error',
+      'caller abort',
+      'abort exception',
+      'non-transport error',
+    ] as const)(
+      'recovery resend handles %s without retaining the rejected thread',
+      async (failure) => {
+        const controller = new AbortController()
+        const aborted = new DOMException('Turn cancelled', 'AbortError')
+        const error =
+          failure === 'non-transport error'
+            ? new TypeError('Unexpected recovery bug')
+            : failure === 'Bun connection closed'
+              ? Object.assign(new TypeError('Private connection details'), {
+                  code: 'ConnectionClosed',
+                })
+              : failure === 'abort exception'
+                ? new DOMException('ECONNRESET while cancelling', 'AbortError')
+                : failure === 'nested socket error'
+                  ? new TypeError('Request failed', {
+                      cause: Object.assign(
+                        new Error('Private socket details'),
+                        {
+                          code: 'UND_ERR_SOCKET',
+                        },
+                      ),
+                    })
+                  : new TypeError('ECONNRESET: private transport details')
+        const resent: Request[] = []
+        const { source } = makeSource({ authorize })
+        const native = createNativeAnthropicAdapter({
+          source,
+          fetch: Object.assign(
+            async (url: string | URL | Request, init?: RequestInit) => {
+              resent.push(
+                url instanceof Request
+                  ? new Request(url, init)
+                  : new Request(url.toString(), init),
+              )
+              if (failure === 'caller abort') controller.abort(aborted)
+              throw error
+            },
+            { preconnect: globalThis.fetch.preconnect },
+          ) as typeof fetch,
+        })
+        try {
+          const host = new Host(native.adapter)
+          const payload = {
+            model: 'claude-sonnet-5',
+            stream: true,
+            messages: [{ role: 'user', content: 'first' }],
+          }
+          const first = await host.run(scopeOf(), hostRequest(payload))
+          await (
+            await native.adapter.rewriteResponse?.({
+              ...first.attempt,
+              attempt: first.attempt,
+              request: first.final,
+              response: sseResponse(
+                sse('message_start', {
+                  type: 'message_start',
+                  message: {
+                    id: 'msg_before_reset',
+                    content: [{ type: 'text', text: 'answer' }],
+                  },
+                }) +
+                  sse('message_delta', {
+                    type: 'message_delta',
+                    delta: { stop_reason: 'end_turn' },
+                  }) +
+                  sse('message_stop', { type: 'message_stop' }),
+              ),
+            } as never)
+          )?.text()
+          const messages = [
+            ...payload.messages,
+            { role: 'assistant', content: 'answer' },
+            { role: 'user', content: 'next' },
+          ]
+          const second = await host.run(
+            scopeOf(),
+            hostRequest(
+              { ...payload, messages },
+              { signal: controller.signal },
+            ),
+          )
+          expect(
+            JSON.parse(upstreamText(await second.final.clone().text())).thread,
+          ).toEqual({
+            type: 'continue',
+            previous_message_id: 'msg_before_reset',
+          })
+          const rewritten = native.adapter.rewriteResponse?.({
+            ...second.attempt,
+            attempt: second.attempt,
+            request: second.final,
+            response: Response.json(
+              {
+                type: 'error',
+                error: {
+                  type: 'not_found_error',
+                  details: { error_code: 'thread_not_found' },
+                },
+              },
+              {
+                status: 404,
+                headers: { 'request-id': 'req_rejected_continue' },
+              },
+            ),
+          } as never)
+          if (
+            failure === 'connection reset' ||
+            failure === 'Bun connection closed' ||
+            failure === 'nested socket error'
+          ) {
+            const response = await rewritten
+            expect(response?.status).toBe(502)
+            expect(await response?.json()).toEqual({
+              type: 'error',
+              error: {
+                type: 'api_error',
+                message:
+                  'Connection lost while resending a rejected thread request',
+              },
+            })
+          } else {
+            await expect(rewritten).rejects.toBe(
+              failure === 'caller abort' ? aborted : error,
+            )
+          }
+          expect(resent).toHaveLength(1)
+          const recovery = JSON.parse(upstreamText(await resent[0]!.text()))
+          expect(recovery.thread).toEqual({ type: 'create' })
+          expect(recovery.messages).toEqual(messages)
+          const next = await host.run(
+            scopeOf(),
+            hostRequest({ ...payload, messages }),
+          )
+          const retried = JSON.parse(upstreamText(await next.final.text()))
+          expect(retried.thread).toEqual({ type: 'create' })
+          expect(retried.messages).toEqual(messages)
+        } finally {
+          native.dispose()
+        }
+      },
+    )
   },
 )
+
+test('OpenCode 2 ordinary non-thread sends leave transport failures to the host', async () => {
+  const error = new TypeError('ECONNRESET: ordinary send')
+  let sends = 0
+  const fetch = Object.assign(
+    async () => {
+      sends++
+      throw error
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  ) as typeof globalThis.fetch
+  const { source } = makeSource({
+    authorize: () => apiKey('api-key', { custody: 'local', receipt: 'api' }),
+  })
+  const native = createNativeAnthropicAdapter({ source, fetch })
+  try {
+    const host = new Host(native.adapter)
+    const run = await host.run(scopeOf(), hostRequest(sonnetPayload()))
+    expect(JSON.parse(await run.final.clone().text()).thread).toBeUndefined()
+    expect(sends).toBe(0)
+    await expect(fetch(run.final)).rejects.toBe(error)
+    expect(sends).toBe(1)
+  } finally {
+    native.dispose()
+  }
+})
 
 test('OpenCode 2 auxiliary, prewarm, lane-start and API-key requests stay stateless', async () => {
   const { source } = makeSource()

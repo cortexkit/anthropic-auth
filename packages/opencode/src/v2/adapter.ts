@@ -591,6 +591,29 @@ interface PendingSend {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
+function isRecoveryTransportFailure(error: unknown): boolean {
+  const seen = new Set<unknown>()
+  while (isRecord(error) && !seen.has(error)) {
+    seen.add(error)
+    if (error.name === 'AbortError') return false
+    if (
+      (typeof error.code === 'string' &&
+        /^(?:ConnectionRefused|ConnectionClosed|FailedToOpenSocket|EAI_AGAIN|ECONNABORTED|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EPIPE|ETIMEDOUT|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET))$/.test(
+          error.code,
+        )) ||
+      error.name === 'TimeoutError' ||
+      (error.name === 'TypeError' &&
+        typeof error.message === 'string' &&
+        /fetch failed|Failed to fetch|Load failed|NetworkError|ECONNRESET|socket connection was closed unexpectedly/i.test(
+          error.message,
+        ))
+    )
+      return true
+    error = error.cause
+  }
+  return false
+}
+
 function inspectableThreadError(response: Response): Response {
   if ((response.status !== 400 && response.status !== 404) || !response.body)
     return response
@@ -1376,6 +1399,27 @@ export function createNativeAnthropicAdapter<Q, P>(
             retryHeaders,
           )
           const dispatch = authorized.dispatch
+          const resendFetch = async (url: string, init: RequestInit) => {
+            try {
+              return await (deps.fetch ?? globalThis.fetch)(url, init)
+            } catch (error) {
+              request.signal.throwIfAborted()
+              if (!isRecoveryTransportFailure(error)) throw error
+              // Return an HTTP failure instead of rejecting the response hook,
+              // so OpenCode can classify it and retry before any output starts.
+              return Response.json(
+                {
+                  type: 'error',
+                  error: {
+                    type: 'api_error',
+                    message:
+                      'Connection lost while resending a rejected thread request',
+                  },
+                },
+                { status: 502 },
+              )
+            }
+          }
           let response: Response
           if (dispatch?.kind === 'http-relay') {
             const envelope = {
@@ -1404,7 +1448,7 @@ export function createNativeAnthropicAdapter<Q, P>(
               envelope,
               relayBytes: JSON.stringify(envelope).length,
             })
-            response = await (deps.fetch ?? globalThis.fetch)(dispatch.url, {
+            response = await resendFetch(dispatch.url, {
               method: 'POST',
               headers: {
                 'content-type': 'application/json',
@@ -1432,7 +1476,7 @@ export function createNativeAnthropicAdapter<Q, P>(
               headers: retryHeaders,
               latch: requestGzipLatch,
               send: (wireBody, wireHeaders) =>
-                (deps.fetch ?? globalThis.fetch)(url, {
+                resendFetch(url, {
                   method: request.method,
                   body: wireBody,
                   headers: wireHeaders,
