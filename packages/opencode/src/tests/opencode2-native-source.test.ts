@@ -110,6 +110,13 @@ const sameAccountInput = (limit: LimitSignal, input = scope) => ({
   attempt: 1,
   error: { type: 'provider_error', message: 'provider refused the attempt' },
 })
+const continuationInput = (input = scope) => ({
+  ...input,
+  accountId: 'main',
+  continuation: 'interrupted-read' as const,
+  attempt: 1,
+  error: { type: 'provider.transport', message: 'connection lost mid-body' },
+})
 const exists = (path: string) =>
   access(path).then(
     () => true,
@@ -1715,11 +1722,60 @@ async function retryHost(native: ReturnType<typeof source>) {
       await run('http.response', draft)
       await draft.response.text()
     },
-    async retry(retry = true, input = scope) {
+    /** Delivers visible output, then fails the body read rather than an SSE frame. */
+    async interrupted(request: Request, input = scope) {
+      let sent = false
+      const draft = {
+        ...hostScope(input),
+        request,
+        response: new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              pull(controller) {
+                if (sent) {
+                  controller.error(new Error('connection lost mid-body'))
+                  return
+                }
+                sent = true
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+                  ),
+                )
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+      }
+      await run('http.response', draft)
+      const reader = draft.response.body?.getReader()
+      if (!reader) throw new Error('Missing interrupted response body')
+      let output = ''
+      await expect(
+        (async () => {
+          while (true) {
+            const chunk = await reader.read()
+            if (chunk.done) return
+            output += new TextDecoder().decode(chunk.value)
+          }
+        })(),
+      ).rejects.toThrow('connection lost mid-body')
+      expect(output).toContain('partial')
+    },
+    async retry(
+      retry = true,
+      input = scope,
+      error: SessionHooks['retry']['error'] = {
+        type: 'unknown',
+        message: 'provider refused the attempt',
+      },
+    ) {
       const draft: SessionHooks['retry'] = {
         ...hostScope(input),
         attempt: 1,
-        error: { type: 'unknown', message: 'provider refused the attempt' },
+        error,
         decision: retry ? { retry: true, delay: 1234 } : { retry: false },
       }
       await run('retry', draft)
@@ -1727,6 +1783,274 @@ async function retryHost(native: ReturnType<typeof source>) {
     },
   }
 }
+
+describe('OC2 interrupted-read continuation (requires common-auth 0.36.0)', () => {
+  test('a sticky session continues on the same account after visible output and a failed body read', async () => {
+    const fixture = await vaultWithFallback()
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const retry = spyOn(native, 'retrySameAccount')
+    const host = await retryHost(native)
+    const first = await host.send()
+    expect(first.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-oauth:anthropic',
+    )
+    await native.drainRoutingPublications()
+    const { routingPath } = await fixture.runtime.read()
+    if (!routingPath) throw new Error('Missing sticky routing path')
+    const pin = await readFile(routingPath, 'utf8')
+    await host.interrupted(first)
+    expect(await host.retry(true, scope, continuationInput().error)).toEqual({
+      retry: true,
+      delay: 1234,
+    })
+    expect(retry).toHaveBeenCalledTimes(1)
+    expect(retry.mock.calls[0]?.[0]).toMatchObject({
+      accountId: 'main',
+      continuation: 'interrupted-read',
+    })
+    expect(retry.mock.calls[0]?.[0].limit).toBeUndefined()
+    const next = await host.send()
+    expect(next.headers.get('authorization')).toBe(
+      first.headers.get('authorization'),
+    )
+    expect(choose).toHaveBeenCalledTimes(1)
+    expect(
+      host.installation.installation.accountFor(scope.sessionID, scope.kind),
+    ).toBe('main')
+    await native.drainRoutingPublications()
+    expect(await readFile(routingPath, 'utf8')).toBe(pin)
+  })
+
+  test.each(['disabled', 'identity', 'model-scope'] as const)(
+    'the installed continuation refuses an account changed during the attempt: %s',
+    async (change) => {
+      const fixture = await vaultWithFallback()
+      const native = source(fixture.runtime, fixture.paths)
+      const choose = spyOn(native, 'chooseAccount')
+      const retry = spyOn(native, 'retrySameAccount')
+      const host = await retryHost(native)
+      const input = { ...scope, modelID: 'claude-fable-5-1' }
+      const first = await host.send(input)
+      const snapshot = await fixture.runtime.read()
+      const checkedAt = Date.now()
+      const read = spyOn(fixture.runtime, 'read').mockResolvedValue({
+        ...snapshot,
+        accounts: snapshot.accounts.map((account) =>
+          account.id !== 'main'
+            ? account
+            : {
+                ...account,
+                ...(change === 'disabled' ? { enabled: false } : {}),
+                ...(change === 'identity'
+                  ? { accountIdentity: changedIdentity }
+                  : {}),
+                ...(change === 'model-scope'
+                  ? {
+                      quota: {
+                        checkedAt,
+                        five_hour: {
+                          usedPercent: 0,
+                          remainingPercent: 100,
+                          checkedAt,
+                        },
+                        seven_day: {
+                          usedPercent: 0,
+                          remainingPercent: 100,
+                          checkedAt,
+                        },
+                        scoped: [
+                          {
+                            id: 'seven_day_fable',
+                            title: 'Fable weekly',
+                            modelName: 'Fable 5.1',
+                            modelId: input.modelID,
+                            remainingPercent: 0,
+                            usedPercent: 100,
+                            checkedAt,
+                          },
+                        ],
+                      },
+                    }
+                  : {}),
+              },
+        ),
+      })
+      try {
+        await host.interrupted(first, input)
+        expect(
+          await host.retry(true, input, continuationInput(input).error),
+        ).toEqual({ retry: false })
+        expect(retry).toHaveBeenCalledTimes(1)
+        expect(await retry.mock.results[0]?.value).toBeUndefined()
+        expect(choose).toHaveBeenCalledTimes(1)
+      } finally {
+        read.mockRestore()
+      }
+    },
+  )
+})
+
+describe('OC2 interrupted-read source admission', () => {
+  test.each(['vault-newer', 'relay-direct'] as const)(
+    'a continuation and its drop leave a queued %s recovery untouched',
+    async (recovery) => {
+      const fixture = await vault([7, 8, 9])
+      await fixture.runtime.updateRelay({
+        enabled: true,
+        transport: 'http',
+        url: 'https://relay.invalid',
+        fallbackToDirect: true,
+        token: 'synthetic-relay-token',
+      })
+      const native = source(fixture.runtime, fixture.paths)
+      const first = await native.authorizeAccount(scope, 'main')
+      if (!first) throw new Error('Vault authorization refused')
+      const attempt = {
+        ...context(first.provenance),
+        dispatch: 'http-relay' as const,
+      }
+      const limit =
+        recovery === 'vault-newer'
+          ? await native.limitFromResponse?.({
+              ...attempt,
+              status: 401,
+              headers: new Headers(),
+              body: async () => '{}',
+            })
+          : await native.limitFromRelayFailure?.({ ...attempt, status: 502 })
+      if (!limit) throw new Error('Same-account recovery was not offered')
+      expect(limit.reason).toStartWith(`${recovery}:`)
+      expect(await native.retrySameAccount?.(sameAccountInput(limit))).toEqual({
+        accountId: 'main',
+      })
+      const continuation = continuationInput()
+      expect(await native.retrySameAccount?.(continuation)).toEqual({
+        accountId: 'main',
+      })
+      native.dropSameAccountRetry?.(continuation)
+      native.dropSameAccountRetry?.(sameAccountInput({ reason: 'unrelated' }))
+      const next = await native.authorizeAccount(scope, 'main')
+      expect(next).toMatchObject({
+        accessToken: 'sk-ant-oat01-vault-8',
+        dispatch: {
+          kind: recovery === 'vault-newer' ? 'http-relay' : 'direct',
+        },
+      })
+      expect(fixture.gets).toHaveLength(2)
+      expect(
+        (await native.authorizeAccount(scope, 'main'))?.dispatch?.kind,
+      ).toBe('http-relay')
+      expect(fixture.gets).toHaveLength(3)
+    },
+  )
+
+  test('the source remembers the serving identity after teardown but permits refreshed tokens', async () => {
+    const fixture = await vault([7, 8])
+    const native = source(fixture.runtime, fixture.paths)
+    const input = continuationInput()
+    expect(await native.retrySameAccount?.(input)).toBeUndefined()
+    const first = await native.authorizeAccount(scope, 'main')
+    if (!first) throw new Error('Vault authorization refused')
+    await native.onAttemptEnd?.(context(first.provenance), {
+      status: 200,
+      outputStarted: true,
+    })
+    for (const wrong of [
+      { accountId: 'other' },
+      { sessionID: 'other' },
+      { agent: 'plan' },
+      { modelID: 'other' },
+      { kind: 'compaction' as const },
+      { providerID: 'other' },
+    ]) {
+      expect(
+        await native.retrySameAccount?.({ ...input, ...wrong }),
+      ).toBeUndefined()
+    }
+    expect(await native.retrySameAccount?.(input)).toEqual({
+      accountId: 'main',
+    })
+    const next = await native.authorizeAccount(scope, 'main')
+    expect(next).toMatchObject({ accessToken: 'sk-ant-oat01-vault-8' })
+    native.forgetSession?.(scope.sessionID)
+    expect(await native.retrySameAccount?.(input)).toBeUndefined()
+  })
+
+  test.each(['missing', 'revoked', 'credential', 'source'] as const)(
+    'the source refuses a serving row that is now %s',
+    async (change) => {
+      const fixture = await vault()
+      const native = source(fixture.runtime, fixture.paths)
+      expect(await native.authorizeAccount(scope, 'main')).toBeDefined()
+      const snapshot = await fixture.runtime.read()
+      const read = spyOn(fixture.runtime, 'read').mockResolvedValue({
+        ...snapshot,
+        accounts:
+          change === 'missing'
+            ? []
+            : snapshot.accounts.map((account) => ({
+                ...account,
+                ...(change === 'revoked' ? { state: 'revoked' } : {}),
+                ...(change === 'credential' ? { credentialId: 'other' } : {}),
+                ...(change === 'source' ? { source: 'local' as const } : {}),
+              })),
+      })
+      try {
+        expect(
+          await native.retrySameAccount?.(continuationInput()),
+        ).toBeUndefined()
+      } finally {
+        read.mockRestore()
+      }
+    },
+  )
+
+  test.each(['killswitch', 'quota-floor', 'model-scope'] as const)(
+    'the source rechecks %s for the requested model after serving',
+    async (policy) => {
+      const fixture = await vault()
+      const native = source(fixture.runtime, fixture.paths)
+      const input = { ...scope, modelID: 'claude-fable-5-1' }
+      expect(await native.authorizeAccount(input, 'main')).toBeDefined()
+      await fixture.store.updateSettings((settings) => ({
+        ...settings,
+        quota: {
+          enabled: policy === 'quota-floor',
+          minimumRemaining: { five_hour: 20, seven_day: 0 },
+        },
+        killswitch: {
+          enabled: policy === 'killswitch',
+          main: { five_hour: 20 },
+        },
+      }))
+      const receipt = await fixture.runtime.authorizeVault('main')
+      const checkedAt = Date.now()
+      await fixture.runtime.vault.publish(receipt, {
+        quota: {
+          accountIdentity: identity,
+          checkedAt,
+          five_hour: { usedPercent: 90, remainingPercent: 10, checkedAt },
+          seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt },
+          scoped: [
+            {
+              id: 'seven_day_fable',
+              title: 'Fable weekly',
+              modelId: input.modelID,
+              modelName: 'Fable 5.1',
+              usedPercent: policy === 'model-scope' ? 100 : 0,
+              remainingPercent: policy === 'model-scope' ? 0 : 100,
+              checkedAt,
+            },
+          ],
+        },
+      })
+      expect(
+        await native.retrySameAccount?.(continuationInput(input)),
+      ).toBeUndefined()
+    },
+  )
+})
 
 describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
   test('installed unconfirmed 429 holds twice per turn and account before moving', async () => {

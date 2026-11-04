@@ -306,6 +306,12 @@ export function createNativeAnthropicSource(
   // The account behind each session's latest authorization, for the sidebar.
   // Entries leave with forgetSession, which also bounds `sessions`.
   const servedBy = new Map<string, string>()
+  // Keep token-free identity snapshots after attempt teardown: an interrupted
+  // body has already ended when the host asks whether the reply may continue.
+  const servedAccounts = new Map<
+    string,
+    { scope: RequestScope; account: NativeAccountView }
+  >()
   const reported = new WeakSet<NativeCustodyReceipt>()
   let closed = false
   const boundRetries = () => {
@@ -386,6 +392,16 @@ export function createNativeAnthropicSource(
     account.source === expected.source &&
     account.accountIdentity === expected.accountIdentity &&
     account.credentialId === expected.credentialId
+  const recordServed = (scope: RequestScope, account: NativeAccountView) => {
+    servedBy.set(scope.sessionID, account.id)
+    const servedKey = key(scope, account.id)
+    servedAccounts.delete(servedKey)
+    servedAccounts.set(servedKey, { scope: retryScope(scope), account })
+    if (servedAccounts.size > 512) {
+      const oldest = servedAccounts.keys().next().value
+      if (oldest !== undefined) servedAccounts.delete(oldest)
+    }
+  }
   const admitted = async (
     accountId: string,
     modelID: string,
@@ -802,6 +818,26 @@ export function createNativeAnthropicSource(
       // an unused choice; same-account recoveries have their own release hook.
     },
     async retrySameAccount(input) {
+      if (input.continuation === 'interrupted-read') {
+        const served = servedAccounts.get(key(input, input.accountId))
+        if (!served) return undefined
+        const active = controller(input)
+        const snapshot = await runtime.read()
+        active.signal.throwIfAborted()
+        assertTransport(snapshot)
+        const modelID = remapModelId(
+          (await options.resolveModelId?.(input)) ?? input.modelID,
+        )
+        active.signal.throwIfAborted()
+        const account = snapshot.accounts.find(
+          (row) => row.id === input.accountId,
+        )
+        return account &&
+          sameAccount(account, served.account) &&
+          eligible(account, snapshot, modelID)
+          ? { accountId: input.accountId }
+          : undefined
+      }
       const reason = input.limit?.reason
       const retry = reason ? retries.get(reason) : undefined
       if (
@@ -836,12 +872,11 @@ export function createNativeAnthropicSource(
       return { accountId: input.accountId }
     },
     dropSameAccountRetry(input) {
+      if (!input.limit) return
       const queueKey = key(input, input.accountId)
       const queue = recoveries.get(queueKey)
       const index =
-        queue?.findIndex(
-          (retry) => !input.limit || retry.reason === input.limit.reason,
-        ) ?? -1
+        queue?.findIndex((retry) => retry.reason === input.limit?.reason) ?? -1
       if (index !== -1) queue?.splice(index, 1)
       if (queue?.length === 0) recoveries.delete(queueKey)
     },
@@ -900,7 +935,7 @@ export function createNativeAnthropicSource(
             active,
             relayFallback,
           })
-        servedBy.set(scope.sessionID, accountId)
+        recordServed(scope, account)
         return { ...choice.auth, dispatch }
       }
       const common = {
@@ -930,7 +965,7 @@ export function createNativeAnthropicSource(
           subject: material.subject,
         }
         states.set(provenance, common)
-        servedBy.set(scope.sessionID, accountId)
+        recordServed(scope, account)
         const headers: HeaderEdits =
           material.authHeader === 'authorization-bearer'
             ? { authorization: `Bearer ${material.apiKey}` }
@@ -965,7 +1000,7 @@ export function createNativeAnthropicSource(
           onRefusal?.('account-unavailable')
           return undefined
         }
-        servedBy.set(scope.sessionID, accountId)
+        recordServed(scope, account)
         return {
           route: 'oauth',
           accessToken: receipt.accessToken,
@@ -994,7 +1029,7 @@ export function createNativeAnthropicSource(
         subject: material.subject,
       }
       states.set(provenance, { ...common, access: material.access })
-      servedBy.set(scope.sessionID, accountId)
+      recordServed(scope, account)
       const identity = material.subject.binding.identity
       return {
         route: 'oauth',
@@ -1367,6 +1402,9 @@ export function createNativeAnthropicSource(
       sessions.get(sessionID)?.abort()
       sessions.delete(sessionID)
       servedBy.delete(sessionID)
+      for (const [servedKey, served] of servedAccounts)
+        if (served.scope.sessionID === sessionID)
+          servedAccounts.delete(servedKey)
       for (const [reason, retry] of retries)
         if (retry.scope.sessionID === sessionID) retries.delete(reason)
       for (const [queueKey, queue] of recoveries)
@@ -1404,6 +1442,7 @@ export function createNativeAnthropicSource(
       closed = true
       for (const active of sessions.values()) active.abort()
       sessions.clear()
+      servedAccounts.clear()
       recoveries.clear()
       retries.clear()
       return Promise.all([
