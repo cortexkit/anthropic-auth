@@ -693,7 +693,7 @@ async function opencode1WouldSkipInstall(dir: string) {
   )
 }
 
-// The genuine npm-installed OC1 1.19.4 SDK tree the process E2E suite uses.
+// The genuine npm-installed OC1 1.19.5 SDK tree the process E2E suite uses.
 // Its committed manifest and lockfile are always present; the runner must
 // provision node_modules from that lockfile before this suite runs.
 const genuineConfigDeps = resolve(
@@ -813,7 +813,7 @@ test('captured OC1 seeding gives every config directory and the plugin cache a c
       layout.project,
       layout.env,
       captured.PACKAGE,
-      { fixture: genuineConfigDeps, version: '1.19.4' },
+      { fixture: genuineConfigDeps, version: '1.19.5' },
     )
     expect([...targets].sort()).toEqual(
       layout.configDirectories.map((directory) => resolve(directory)).sort(),
@@ -832,7 +832,7 @@ test('captured OC1 seeding gives every config directory and the plugin cache a c
       const manifest = JSON.parse(
         await readFile(join(sdk, 'package.json'), 'utf8'),
       )
-      expect(manifest.version).toBe('1.19.4')
+      expect(manifest.version).toBe('1.19.5')
       expect(
         (await lstat(join(sdk, manifest.exports['.'].import))).size,
       ).toBeGreaterThan(0)
@@ -849,7 +849,7 @@ test('captured OC1 seeding gives every config directory and the plugin cache a c
     expect(cacheLinks.length).toBeGreaterThan(0)
     expectLinksOwnedBy(cache, cacheLinks)
     expect(await captured.hostBootstrapReport(layout.env)).toContain(
-      'config plugin SDK: 1.19.4',
+      'config plugin SDK: 1.19.5',
     )
   })
 })
@@ -858,10 +858,8 @@ test('captured OC1 seeding refuses an SDK tree from another OC1 version before c
   const captured = await captureOc1Bootstrap()
   await fixture(async (root) => {
     const layout = await oc1Layout(root, captured.PACKAGE)
-    // The committed fixture holds the SDK for OpenCode 1.19.4. The OC1 host in
-    // opencode2-e2e.test.ts is pinned to 1.18.31, so seeding must refuse an SDK
-    // tree from another version rather than silently pair the host with
-    // another version's plugin SDK.
+    // An older host must not silently reuse the committed SDK fixture for
+    // OpenCode 1.19.5. Keep a different version here to exercise that refusal.
     await expect(
       captured.seedOc1Bootstrap(
         root,
@@ -870,7 +868,7 @@ test('captured OC1 seeding refuses an SDK tree from another OC1 version before c
         captured.PACKAGE,
         { fixture: genuineConfigDeps, version: '1.18.31' },
       ),
-    ).rejects.toThrow('the config dependency fixture declares 1.19.4')
+    ).rejects.toThrow('the config dependency fixture declares 1.19.5')
     for (const directory of layout.configDirectories) {
       expect(await present(join(directory, 'node_modules'))).toBe(false)
       expect(await opencode1WouldSkipInstall(directory)).toBe(false)
@@ -893,7 +891,7 @@ test('captured OC1 seeding refuses a manifest and lockfile without the installed
         layout.project,
         layout.env,
         captured.PACKAGE,
-        { fixture: incomplete, version: '1.19.4' },
+        { fixture: incomplete, version: '1.19.5' },
       ),
     ).rejects.toThrow('has no npm-installed node_modules')
     for (const directory of layout.configDirectories)

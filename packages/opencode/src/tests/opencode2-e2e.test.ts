@@ -350,7 +350,7 @@ async function seed(
 }
 
 /**
- * OpenCode 1.18.31 prepares two dependency trees before it loads plugins and
+ * OpenCode 1 prepares two dependency trees before it loads plugins and
  * sends the model request, and installs either one from the npm registry
  * when it is missing. The scenario's proxy blocks the registry, and npm's
  * retry backoff can outlast the 60-second host deadline, so the host never

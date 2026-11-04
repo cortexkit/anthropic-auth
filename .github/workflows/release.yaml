@@ -98,7 +98,7 @@ jobs:
         run: bun run test:pi-host
 
       - name: Install OpenCode CLI for e2e
-        run: npm install -g opencode-ai@1.17.13
+        run: npm install -g opencode-ai@1.19.5
 
       - name: E2E tests
         run: bun run test:e2e

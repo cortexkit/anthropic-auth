@@ -34,14 +34,14 @@
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-coding-agent": "1.4.0",
     "@earendil-works/pi-tui": "1.4.0",
-    "@opencode-ai/plugin": "1.19.4",
+    "@opencode-ai/plugin": "1.19.5",
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.4",
     "dedent": "^1.7.2",
     "jsonc-parser": "^3.3.1",
     "lefthook": "2.2.2",
     "miniflare": "^4.20260730.0",
-    "opencode-ai": "1.19.4",
+    "opencode-ai": "1.19.5",
     "pi-coding-agent-1": "npm:@earendil-works/pi-coding-agent@1.0.4",
     "typescript": "7.0.2"
   }

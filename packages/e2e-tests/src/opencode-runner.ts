@@ -893,7 +893,7 @@ async function isDirectory(path: string) {
 }
 
 /**
- * OpenCode 1.19.4 installs its plugin SDK in each config directory it finds.
+ * OpenCode 1.19.5 installs its plugin SDK in each config directory it finds.
  * Include the XDG and explicit config directories, HOME/.opencode if it exists,
  * and every existing .opencode directory from the project up to the fixture's
  * temporary root. Reject paths outside that root before copying dependencies
