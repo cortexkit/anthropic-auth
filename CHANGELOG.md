@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Uses common-auth 0.35.0.
-
 ## 2.5.2
 
 - On OpenCode 2, a dropped connection while resending a rejected thread request is now retried by OpenCode like any other dropped connection, instead of ending the turn. Addresses #613.
