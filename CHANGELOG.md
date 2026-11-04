@@ -2,9 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.5.2
 
 - On OpenCode 2, a dropped connection while resending a rejected thread request is now retried by OpenCode like any other dropped connection, instead of ending the turn. Addresses #613.
+
 ## 2.5.1
 
 - Keep-warm now retries a failed keep-warm request several times before the session's cache expires, instead of at most twice, and its warning names which step failed and why (without credentials). Addresses #610.
