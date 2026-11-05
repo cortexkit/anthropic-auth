@@ -507,6 +507,11 @@ function mapStopReason(reason: string | null | undefined): StopReason {
   }
 }
 
+function safeStopLabel(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  return /^[a-z0-9_]{1,40}$/.exec(value)?.[0] === value ? value : undefined
+}
+
 function createOutput(model: Model<Api>): AssistantMessage {
   return {
     role: 'assistant',
@@ -2158,12 +2163,43 @@ export function streamCortexKitAnthropic(
             String(event.delta?.stop_reason ?? ''),
           )
           updateUsage(model, output, event.usage)
+          if (output.stopReason === 'error' && !output.errorMessage) {
+            const stopReason =
+              safeStopLabel(event.delta?.stop_reason) ?? 'unknown'
+            const details = event.delta?.stop_details
+            const category =
+              stopReason === 'refusal' &&
+              details !== null &&
+              typeof details === 'object' &&
+              'type' in details &&
+              details.type === 'refusal' &&
+              'category' in details
+                ? safeStopLabel(details.category)
+                : undefined
+            // Provider explanations can echo the prompt; expose only bounded labels.
+            output.errorMessage =
+              stopReason === 'refusal'
+                ? `Claude refused this request (stop_reason: refusal${category ? `, category: ${category}` : ''}).`
+                : `Claude ended this request with an unsupported stop reason (stop_reason: ${stopReason}).`
+            logger.warn(
+              'pi',
+              'Anthropic response ended with an error stop reason',
+              {
+                stopReason,
+                ...(category ? { category } : {}),
+                model: model.id,
+                sessionId: options?.sessionId,
+              },
+            )
+            failThread?.()
+          }
         } else if (event.type === 'error') {
           throw new Error(JSON.stringify(event))
         }
       }
 
       if (options?.signal?.aborted) throw new Error('Request was aborted')
+      if (output.errorMessage) throw new Error(output.errorMessage)
       for (const block of output.content as Block[]) delete block.index
       stream.push({
         type: 'done',

@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
+  __setLogTestSink,
   createNativePoolStore,
+  type LogTestRecord,
   resetBillingHeaderCCH,
   resolveNativePoolPaths,
   sessionCacheActivity,
@@ -13,15 +15,22 @@ import {
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { getPiNativeRuntime } from '../native.ts'
 import {
+  beginPiPrimaryTurn,
   buildExplicitBaseMessagesUrl,
   clearPiStickyQuotaRetries,
   configureApiRouteHeaders,
+  endPiPrimaryTurn,
+  forgetPiMessageThread,
   parseSse,
   primaryResponseAllowsApiFallback,
   streamCortexKitAnthropic,
 } from '../stream.ts'
 import { normalizeContext } from '../transcript.ts'
-import { readNativePiFixture, saveNativePiFixture } from './native-fixture.ts'
+import {
+  fixtureAccountIdentity,
+  readNativePiFixture,
+  saveNativePiFixture,
+} from './native-fixture.ts'
 
 let tempDir: string | undefined
 const originalFetch = globalThis.fetch
@@ -45,12 +54,303 @@ const anthropicContext = {
 } as any
 
 afterEach(async () => {
+  __setLogTestSink(null)
   globalThis.fetch = originalFetch
   Date.now = originalNow
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   delete process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE
   if (tempDir) await rm(tempDir, { recursive: true, force: true })
   tempDir = undefined
+})
+
+describe('Pi stream stop reasons', () => {
+  const refusal = 'Claude refused this request (stop_reason: refusal).'
+  const cases = [
+    {
+      name: 'refusal without category',
+      reason: 'refusal',
+      details: undefined,
+      errorMessage: refusal,
+      loggedReason: 'refusal',
+      category: undefined,
+    },
+    {
+      name: 'refusal with category',
+      reason: 'refusal',
+      details: { type: 'refusal', category: 'cyber' },
+      errorMessage:
+        'Claude refused this request (stop_reason: refusal, category: cyber).',
+      loggedReason: 'refusal',
+      category: 'cyber',
+    },
+    {
+      name: 'refusal with unsafe category',
+      reason: 'refusal',
+      details: { type: 'refusal', category: 'private prompt\ntext' },
+      errorMessage: refusal,
+      loggedReason: 'refusal',
+      category: undefined,
+    },
+    {
+      name: 'refusal with trailing newline in category',
+      reason: 'refusal',
+      details: { type: 'refusal', category: 'cyber\n' },
+      errorMessage: refusal,
+      loggedReason: 'refusal',
+      category: undefined,
+    },
+    {
+      name: 'refusal with oversized category',
+      reason: 'refusal',
+      details: { type: 'refusal', category: 'a'.repeat(41) },
+      errorMessage: refusal,
+      loggedReason: 'refusal',
+      category: undefined,
+    },
+    {
+      name: 'refusal with null category',
+      reason: 'refusal',
+      details: { type: 'refusal', category: null },
+      errorMessage: refusal,
+      loggedReason: 'refusal',
+      category: undefined,
+    },
+    {
+      name: 'unknown stop reason',
+      reason: 'new_stop_reason',
+      details: undefined,
+      errorMessage:
+        'Claude ended this request with an unsupported stop reason (stop_reason: new_stop_reason).',
+      loggedReason: 'new_stop_reason',
+      category: undefined,
+    },
+    {
+      name: 'unsafe stop reason',
+      reason: 'private prompt\ntext',
+      details: undefined,
+      errorMessage:
+        'Claude ended this request with an unsupported stop reason (stop_reason: unknown).',
+      loggedReason: 'unknown',
+      category: undefined,
+    },
+  ]
+
+  for (const fixture of cases) {
+    test(`${fixture.name} emits a safe error event`, async () => {
+      tempDir = await mkdtemp(join(tmpdir(), 'pi-stop-reason-'))
+      const storagePath = join(tempDir, 'anthropic-auth.json')
+      process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+      await saveNativePiFixture(
+        {
+          version: 1,
+          main: { type: 'opencode', provider: 'anthropic' },
+          accounts: [],
+        },
+        storagePath,
+      )
+      const records: LogTestRecord[] = []
+      __setLogTestSink((record) => records.push(record))
+      const delta = {
+        stop_reason: fixture.reason,
+        stop_details: fixture.details && {
+          ...fixture.details,
+          explanation: 'private prompt echoed by provider explanation',
+        },
+      }
+      const events = [
+        {
+          type: 'message_start',
+          message: {
+            usage: {
+              input_tokens: 3,
+              output_tokens: 0,
+              cache_read_input_tokens: 11,
+              cache_creation_input_tokens: 13,
+            },
+          },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'private prompt in model text' },
+        },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta, usage: { output_tokens: 7 } },
+        // A repeated delta must not produce a second warning for one response.
+        { type: 'message_delta', delta, usage: { output_tokens: 7 } },
+        { type: 'message_stop' },
+      ]
+      globalThis.fetch = mock(async (input: string | URL | Request) => {
+        if (input.toString().includes('/api/claude_cli/bootstrap'))
+          return new Response(
+            JSON.stringify({ oauth_account: { account_uuid: 'pi-stop-uuid' } }),
+          )
+        return new Response(
+          events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      }) as unknown as typeof fetch
+
+      const stream = streamCortexKitAnthropic(
+        anthropicModel,
+        anthropicContext,
+        {
+          apiKey: 'sk-ant-oat-pi-stop',
+          sessionId: 'ses_pi_stop_reason',
+        },
+      )
+      const emitted = []
+      for await (const event of stream) emitted.push(event)
+      const result = await stream.result()
+
+      expect(result.stopReason).toBe('error')
+      expect(result.errorMessage).toBe(fixture.errorMessage)
+      expect(emitted.at(-1)).toEqual({
+        type: 'error',
+        reason: 'error',
+        error: result,
+      })
+      expect(emitted.some((event) => event.type === 'done')).toBe(false)
+      expect(result.usage).toMatchObject({
+        input: 3,
+        output: 7,
+        cacheRead: 11,
+        cacheWrite: 13,
+        totalTokens: 34,
+      })
+      expect(records.filter((record) => record.level === 'warn')).toEqual([
+        {
+          level: 'warn',
+          channel: 'pi',
+          message: 'Anthropic response ended with an error stop reason',
+          payload: {
+            stopReason: fixture.loggedReason,
+            ...(fixture.category ? { category: fixture.category } : {}),
+            model: 'claude-fable-5',
+            sessionId: 'ses_pi_stop_reason',
+          },
+        },
+      ])
+      expect(JSON.stringify(records)).not.toContain('private prompt')
+    })
+  }
+
+  test.each(['refusal', 'new_stop_reason', 'end_turn'])(
+    '%s response preserves thread anchor safety',
+    async (stopReason) => {
+      tempDir = await mkdtemp(join(tmpdir(), 'pi-stop-thread-'))
+      const storagePath = join(tempDir, 'anthropic-auth.json')
+      process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+      await saveNativePiFixture(
+        {
+          version: 1,
+          main: { type: 'opencode', provider: 'anthropic' },
+          accounts: [],
+        },
+        storagePath,
+      )
+      const runtime = await getPiNativeRuntime(storagePath).service()
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        quota: { enabled: false },
+        claudeCache: { enabled: false, mode: 'explicit' },
+        cacheKeep: { enabled: false },
+      }))
+      const sent: Array<{
+        thread?: { type: string }
+        messages: unknown[]
+      }> = []
+      globalThis.fetch = mock(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          if (input.toString().includes('/api/claude_cli/bootstrap'))
+            return Response.json({
+              oauth_account: { account_uuid: fixtureAccountIdentity('main') },
+            })
+          const body =
+            init?.body instanceof Uint8Array
+              ? gunzipSync(init.body).toString().trim()
+              : String(init?.body)
+          sent.push(JSON.parse(body))
+          return new Response(
+            [
+              { type: 'message_start', message: { id: `msg_${sent.length}` } },
+              {
+                type: 'content_block_start',
+                index: 0,
+                content_block: { type: 'text', text: '' },
+              },
+              {
+                type: 'content_block_delta',
+                index: 0,
+                delta: { type: 'text_delta', text: 'answer' },
+              },
+              { type: 'content_block_stop', index: 0 },
+              {
+                type: 'message_delta',
+                delta: {
+                  stop_reason: sent.length === 1 ? stopReason : 'end_turn',
+                },
+              },
+              { type: 'message_stop' },
+            ]
+              .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+              .join(''),
+            { headers: { 'content-type': 'text/event-stream' } },
+          )
+        },
+      ) as unknown as typeof fetch
+      const sessionId = `ses_pi_stop_thread_${stopReason}`
+      const options = {
+        sessionId,
+        onPayload: (payload: unknown) => payload,
+        onResponse: () => {},
+        onProviderStreamEvent: () => {},
+      }
+      const send = (context: typeof anthropicContext) =>
+        streamCortexKitAnthropic(
+          anthropicModel,
+          context,
+          options,
+          undefined,
+          undefined,
+          'agent-loop',
+        ).result()
+      beginPiPrimaryTurn(storagePath, sessionId)
+      try {
+        const result = await send(anthropicContext)
+        expect(result.stopReason).toBe(
+          stopReason === 'end_turn' ? 'stop' : 'error',
+        )
+        // Retaining a failed reply as successful history must not let the next
+        // request continue the failed thread.
+        const kept = { ...result, stopReason: 'stop', errorMessage: undefined }
+        const next = await send({
+          ...anthropicContext,
+          messages: [
+            ...anthropicContext.messages,
+            kept,
+            { role: 'user', content: 'Next prompt', timestamp: 2 },
+          ],
+        })
+        expect(next.stopReason).toBe('stop')
+        expect(sent[0]?.thread).toEqual({ type: 'create' })
+        expect(sent[1]?.thread?.type).toBe(
+          stopReason === 'end_turn' ? 'continue' : 'create',
+        )
+        expect(sent[1]?.messages).toHaveLength(
+          stopReason === 'end_turn' ? 1 : 3,
+        )
+      } finally {
+        endPiPrimaryTurn(storagePath, sessionId)
+        forgetPiMessageThread(sessionId)
+      }
+    },
+  )
 })
 
 describe('Pi API fallback routing helpers', () => {
