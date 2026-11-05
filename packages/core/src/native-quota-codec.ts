@@ -258,6 +258,10 @@ export function toNativeQuotaMap(snapshot: OAuthQuotaSnapshot): NativeQuotaMap {
   if (!isNativeOAuthQuotaSnapshot(snapshot)) throw new NativeQuotaCodecError()
   const json: unknown = JSON.parse(JSON.stringify(snapshot))
   if (!isNativeOAuthQuotaSnapshot(json)) throw new NativeQuotaCodecError()
+  return encodeNativeQuotaMap(json)
+}
+
+function encodeNativeQuotaMap(json: OAuthQuotaSnapshot): NativeQuotaMap {
   const { five_hour, seven_day, scoped, ...metadata } = json
   const limits: QuotaReadingEntry[] = []
   const remainingPercent: NativeQuotaMetadata['remainingPercent'] = {}
@@ -337,10 +341,13 @@ function reading(value: unknown): value is QuotaReadingEntry {
 }
 
 function equalJson(a: unknown, b: unknown): boolean {
-  if (Array.isArray(a) && Array.isArray(b))
-    return (
-      a.length === b.length && a.every((value, i) => equalJson(value, b[i]))
-    )
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (!equalJson(a[i], b[i])) return false
+    }
+    return true
+  }
   if (record(a) && record(b))
     return (
       Object.keys(a).length === Object.keys(b).length &&
@@ -348,7 +355,9 @@ function equalJson(a: unknown, b: unknown): boolean {
         (key) => Object.hasOwn(b, key) && equalJson(a[key], b[key]),
       )
     )
-  return a === b
+  // Stored maps must be JSON-canonical: explicit undefineds and array holes
+  // used to disappear or become null in the encoder's JSON round trip.
+  return a !== undefined && a === b
 }
 
 /** Reject missing Anthropic metadata, extra keys, duplicate/unowned limits, absent/retired entries and inconsistent budgets. */
@@ -401,8 +410,12 @@ export function fromNativeQuotaMap(value: unknown): OAuthQuotaSnapshot {
       }
     })
   }
-  // This also rejects extension/map disagreement, unowned limits and budgets.
-  if (!equalJson(toNativeQuotaMap(snapshot), value))
+  // Reconstruction already detached the metadata. Re-encode only to compare,
+  // without another JSON clone of the same snapshot.
+  if (
+    !isNativeOAuthQuotaSnapshot(snapshot) ||
+    !equalJson(encodeNativeQuotaMap(snapshot), value)
+  )
     throw new NativeQuotaCodecError()
   return snapshot
 }

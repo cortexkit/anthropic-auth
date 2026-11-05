@@ -758,6 +758,7 @@ test('reader calls leave files byte-identical with no mutation locks or provider
   const http = spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'))
   try {
     await f.hooks.readRestrictions(f.subject)
+    expect(open.mock.calls).toHaveLength(1)
     await f.hooks.readAdmission(f.subject)
     expect(await snapshot(f.root)).toEqual(before)
     for (const observation of [
@@ -773,7 +774,7 @@ test('reader calls leave files byte-identical with no mutation locks or provider
       http,
     ])
       expect(observation).toHaveBeenCalledTimes(0)
-    expect(open.mock.calls).toHaveLength(2)
+    expect(open.mock.calls).toHaveLength(1)
     expect(
       open.mock.calls.every(
         (call) => call[1] === (constants.O_RDONLY | constants.O_NOFOLLOW),

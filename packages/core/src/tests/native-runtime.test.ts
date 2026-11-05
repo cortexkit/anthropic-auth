@@ -17,6 +17,7 @@ import { dirname, join } from 'node:path'
 import { fingerprintOf } from '@cortexkit/common-auth/store'
 
 import { hashRefreshToken } from '../accounts.ts'
+import * as json from '../json.ts'
 import { toNativeQuotaMap } from '../native-quota-codec.ts'
 import {
   decodeNativeRuntime,
@@ -110,6 +111,220 @@ async function fixture() {
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   return join(root, 'private', 'native-state.json')
 }
+
+test('runtime cache second read does not reopen or parse an unchanged file', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  const opens = spyOn(fsPromises, 'open')
+  const parses = spyOn(json, 'parseJsonRedacted')
+  const stats = spyOn(fsPromises, 'lstat')
+  try {
+    const first = await readNativeRuntime(path, storageId)
+    expect(first).toMatchObject({ status: 'ready', state: full })
+    expect(opens).toHaveBeenCalledTimes(1)
+    expect(parses).toHaveBeenCalledTimes(1)
+    const second = await readNativeRuntime(path, storageId)
+    expect(second).toEqual(first)
+    expect(opens).toHaveBeenCalledTimes(1)
+    expect(parses).toHaveBeenCalledTimes(1)
+    expect(stats).toHaveBeenCalledTimes(2)
+  } finally {
+    opens.mockRestore()
+    parses.mockRestore()
+    stats.mockRestore()
+  }
+})
+
+test('runtime cache rereads a rename replacement with the same size and mtime', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  await fsPromises.utimes(path, 1_700_000_000, 1_700_000_000)
+  await readNativeRuntime(path, storageId)
+  const before = await lstat(path)
+  const replacement = state()
+  replacement.accounts['local-row']!.lastUsed = 222
+  const stage = `${path}.replacement`
+  await writeFile(stage, `${JSON.stringify(replacement, null, 2)}\n`, {
+    mode: 0o600,
+  })
+  await fsPromises.utimes(stage, before.atime, before.mtime)
+  await fsPromises.rename(stage, path)
+  const after = await lstat(path)
+  expect(after.ino).not.toBe(before.ino)
+  expect(after.size).toBe(before.size)
+  expect(after.mtimeMs).toBe(before.mtimeMs)
+  const opens = spyOn(fsPromises, 'open')
+  const parses = spyOn(json, 'parseJsonRedacted')
+  try {
+    expect(await readNativeRuntime(path, storageId)).toMatchObject({
+      status: 'ready',
+      state: { accounts: { 'local-row': { lastUsed: 222 } } },
+    })
+    expect(opens).toHaveBeenCalledTimes(1)
+    expect(parses).toHaveBeenCalledTimes(1)
+  } finally {
+    opens.mockRestore()
+    parses.mockRestore()
+  }
+})
+
+test('runtime cache refuses widened permissions before serving an unchanged file', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  await readNativeRuntime(path, storageId)
+  await chmod(path, 0o644)
+  const opens = spyOn(fsPromises, 'open')
+  try {
+    await expect(readNativeRuntime(path, storageId)).rejects.toMatchObject({
+      code: 'unsafe-runtime',
+    })
+    expect(opens).not.toHaveBeenCalled()
+  } finally {
+    opens.mockRestore()
+  }
+})
+
+test('runtime cache misses on ctime alone after owner-only permissions are restored', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  await readNativeRuntime(path, storageId)
+  const before = await lstat(path, { bigint: true })
+  await chmod(path, 0o400)
+  await chmod(path, 0o600)
+  const after = await lstat(path, { bigint: true })
+  expect(after.ino).toBe(before.ino)
+  expect(after.size).toBe(before.size)
+  expect(after.mtimeNs).toBe(before.mtimeNs)
+  expect(after.ctimeNs).not.toBe(before.ctimeNs)
+  const opens = spyOn(fsPromises, 'open')
+  try {
+    await readNativeRuntime(path, storageId)
+    expect(opens).toHaveBeenCalledTimes(1)
+  } finally {
+    opens.mockRestore()
+  }
+})
+
+test('runtime cache freezes nested state on cold reads and hits against caller mutation', async () => {
+  const path = await fixture()
+  await updateNativeRuntime(path, storageId, () => state())
+  for (let read = 0; read < 2; read++) {
+    const result = await readNativeRuntime(path, storageId)
+    if (result.status !== 'ready') throw new Error('Expected runtime state')
+    expect(Object.isFrozen(result.state)).toBe(true)
+    expect(Reflect.set(result.state.accounts, 'injected', {})).toBe(false)
+    expect(
+      Reflect.set(
+        result.state.accounts['local-row']!.binding,
+        'rowId',
+        'other',
+      ),
+    ).toBe(false)
+    expect(Reflect.set(result.state.relay!, 'token', 'changed')).toBe(false)
+    expect(() =>
+      result.state.accounts['vault-route']!.quota!.limits.push({
+        kind: 'absent',
+        scope: 'all',
+        label: 'injected',
+        checkedAt: 1,
+      }),
+    ).toThrow(TypeError)
+  }
+  expect<unknown>(await readNativeRuntime(path, storageId)).toEqual({
+    status: 'ready',
+    state: full,
+  })
+})
+
+for (const fault of [
+  'missing',
+  'io',
+  'unsafe',
+  'invalid-storage-id',
+  'wrong-storage-id',
+  'open',
+  'parse',
+] as const) {
+  test(`runtime cache clears its prior entry after ${fault}`, async () => {
+    const path = await fixture()
+    await updateNativeRuntime(path, storageId, () => state())
+    await readNativeRuntime(path, storageId)
+    const info = await lstat(path, { bigint: true })
+    const stats = spyOn(fsPromises, 'lstat')
+    const opens = spyOn(fsPromises, 'open')
+    const parses = spyOn(json, 'parseJsonRedacted')
+    try {
+      if (fault === 'missing' || fault === 'io')
+        stats.mockRejectedValueOnce(
+          Object.assign(new Error('Injected stat failure'), {
+            code: fault === 'missing' ? 'ENOENT' : 'EIO',
+          }),
+        )
+      if (fault === 'unsafe' || fault === 'open' || fault === 'parse') {
+        Object.defineProperty(info, fault === 'unsafe' ? 'mode' : 'mtimeNs', {
+          value: fault === 'unsafe' ? 0o100644n : info.mtimeNs + 1n,
+        })
+        stats.mockResolvedValueOnce(info)
+      }
+      if (fault === 'open')
+        opens.mockRejectedValueOnce(new Error('Open failed'))
+      if (fault === 'parse')
+        parses.mockImplementationOnce(() => {
+          throw new SyntaxError('Invalid JSON')
+        })
+      const id =
+        fault === 'invalid-storage-id'
+          ? 'invalid'
+          : fault === 'wrong-storage-id'
+            ? 'b'.repeat(64)
+            : storageId
+      const outcome = readNativeRuntime(path, id)
+      if (fault === 'missing')
+        await expect(outcome).resolves.toEqual({ status: 'missing' })
+      else
+        await expect(outcome).rejects.toMatchObject({
+          code:
+            fault === 'unsafe'
+              ? 'unsafe-runtime'
+              : fault === 'io' || fault === 'open'
+                ? 'runtime-io'
+                : 'invalid-runtime',
+        })
+      opens.mockClear()
+      parses.mockClear()
+      // The real file never changed. Only eviction can force this fresh read.
+      expect(await readNativeRuntime(path, storageId)).toMatchObject({
+        status: 'ready',
+        state: full,
+      })
+      expect(opens).toHaveBeenCalledTimes(1)
+      expect(parses).toHaveBeenCalledTimes(1)
+    } finally {
+      stats.mockRestore()
+      opens.mockRestore()
+      parses.mockRestore()
+    }
+  })
+}
+
+test('runtime cache bounds retained paths to four entries', async () => {
+  const paths: string[] = []
+  for (let i = 0; i < 5; i++) {
+    const path = await fixture()
+    await updateNativeRuntime(path, storageId, () => state())
+    await readNativeRuntime(path, storageId)
+    paths.push(path)
+  }
+  const opens = spyOn(fsPromises, 'open')
+  try {
+    await readNativeRuntime(paths[4]!, storageId)
+    expect(opens).not.toHaveBeenCalled()
+    await readNativeRuntime(paths[0]!, storageId)
+    expect(opens).toHaveBeenCalledTimes(1)
+  } finally {
+    opens.mockRestore()
+  }
+})
 
 test('runtime reader accepts owner-only atomic replacement between stat and open', async () => {
   const path = await fixture()
@@ -219,9 +434,9 @@ test('runtime reader refuses a foreign owner on the opened handle', async () => 
       if (openedPath === path) {
         const realStat = file.stat.bind(file)
         Object.defineProperty(file, 'stat', {
-          value: async () => {
-            const opened = await realStat()
-            Object.defineProperty(opened, 'uid', { value: opened.uid + 1 })
+          value: async (options: { bigint: true }) => {
+            const opened = await realStat(options)
+            Object.defineProperty(opened, 'uid', { value: opened.uid + 1n })
             changedOwner = true
             return opened
           },

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { constants } from 'node:fs'
+import { type BigIntStats, constants } from 'node:fs'
 import { lstat, mkdir, open, rename, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { types as utilTypes } from 'node:util'
@@ -532,40 +532,62 @@ function checkPath(path: string): void {
   if (!isAbsolute(path)) throw new NativeRuntimeError('unsafe-runtime')
 }
 
+const runtimeCacheLimit = 4
+const runtimeCache = new Map<
+  string,
+  { storageId: string; identity: string; state: NativeRuntimeState }
+>()
+
+function runtimeFileIdentity(info: BigIntStats): string {
+  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
+}
+
+function freezeRuntime(value: unknown): void {
+  if (value === null || typeof value !== 'object') return
+  for (const child of Object.values(value)) freezeRuntime(child)
+  Object.freeze(value)
+}
+
+/** Read snapshots are deeply frozen; writer callbacks receive a mutable clone. */
 export async function readNativeRuntime(
   path: string,
   storageId: string,
   ownership: OwnerOnlyOptions = {},
 ): Promise<NativeRuntimeRead> {
-  checkPath(path)
-  if (!digest(storageId)) throw new NativeRuntimeError('invalid-runtime')
   const noFollow = constants.O_NOFOLLOW ?? 0
   try {
+    checkPath(path)
+    if (!digest(storageId)) throw new NativeRuntimeError('invalid-runtime')
     for (let attempt = 0; attempt < 2; attempt++) {
-      const info = await lstat(path)
+      const info = await lstat(path, { bigint: true })
       if (
         !info.isFile() ||
         !(await isOwnerOnly(
           path,
           () =>
-            (info.mode & 0o777) === 0o600 &&
+            (info.mode & 0o777n) === 0o600n &&
             (typeof process.geteuid !== 'function' ||
-              info.uid === process.geteuid()),
+              info.uid === BigInt(process.geteuid())),
           ownership,
         ))
       )
         throw new NativeRuntimeError('unsafe-runtime')
+      const identity = runtimeFileIdentity(info)
+      const cached = runtimeCache.get(path)
+      // Recheck ownership (including Windows ACLs) before trusting any cached bytes.
+      if (cached?.storageId === storageId && cached.identity === identity)
+        return { status: 'ready', state: cached.state }
       const file = await open(path, constants.O_RDONLY | noFollow)
       try {
-        const opened = await file.stat()
+        const opened = await file.stat({ bigint: true })
         if (
           !opened.isFile() ||
           !(await isOwnerOnly(
             path,
             () =>
-              (opened.mode & 0o777) === 0o600 &&
+              (opened.mode & 0o777n) === 0o600n &&
               (typeof process.geteuid !== 'function' ||
-                opened.uid === process.geteuid()),
+                opened.uid === BigInt(process.geteuid())),
             ownership,
           ))
         )
@@ -589,16 +611,29 @@ export async function readNativeRuntime(
             throw new NativeRuntimeError('invalid-runtime')
           throw error
         }
-        return {
-          status: 'ready',
-          state: decodeNativeRuntime(parseJsonRedacted(contents), storageId),
+        const state = decodeNativeRuntime(
+          parseJsonRedacted(contents),
+          storageId,
+        )
+        freezeRuntime(state)
+        // A replacement between lstat and open is safe to read, but its bytes
+        // must not be cached under the preceding file's identity.
+        if (runtimeFileIdentity(opened) === identity) {
+          runtimeCache.delete(path)
+          runtimeCache.set(path, { storageId, identity, state })
+          if (runtimeCache.size > runtimeCacheLimit) {
+            const oldest = runtimeCache.keys().next().value
+            if (oldest !== undefined) runtimeCache.delete(oldest)
+          }
         }
+        return { status: 'ready', state }
       } finally {
         await file.close()
       }
     }
     throw new NativeRuntimeError('unsafe-runtime')
   } catch (error) {
+    runtimeCache.delete(path)
     if (missing(error)) return { status: 'missing' }
     if (error instanceof NativeRuntimeError) throw error
     if (error instanceof SyntaxError)

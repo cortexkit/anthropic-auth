@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
 
 import {
@@ -125,6 +125,85 @@ test('quota full fixture preserves independent timestamps, scope, provenance and
       'anthropic/claude-fable-5@fast',
     )?.remainingPercent,
   ).toBe(0)
+})
+
+test('quota decoding detaches nested metadata without another JSON round-trip clone', () => {
+  const map = toNativeQuotaMap(full)
+  const before = structuredClone(map)
+  const parses = spyOn(JSON, 'parse')
+  const serializes = spyOn(JSON, 'stringify')
+  let decoded: OAuthQuotaSnapshot
+  try {
+    decoded = fromNativeQuotaMap(map)
+    expect(parses).not.toHaveBeenCalled()
+    // Shared quota validation serializes limit-key pairs, not whole snapshots.
+    expect(serializes.mock.calls.every(([value]) => Array.isArray(value))).toBe(
+      true,
+    )
+  } finally {
+    parses.mockRestore()
+    serializes.mockRestore()
+  }
+  expect(decoded).toEqual(full)
+  decoded.extraUsage!.used.amountMinor = 999
+  decoded.scoped![0]!.title = 'Changed'
+  decoded.fieldSources!.five_hour = 'poll'
+  expect(map).toEqual(before)
+})
+
+test('quota canonical validation still rejects explicit undefineds, holes and duplicate scoped ids', () => {
+  const map = toNativeQuotaMap(full)
+  const malformed: unknown[] = [
+    { ...map, anthropic: { ...map.anthropic, source: undefined } },
+    {
+      ...map,
+      anthropic: {
+        ...map.anthropic,
+        extraUsage: { ...map.anthropic.extraUsage, severity: undefined },
+      },
+    },
+    {
+      ...map,
+      limits: map.limits.map((limit) => ({ ...limit, resetsAt: undefined })),
+    },
+    {
+      limits: [],
+      anthropic: { version: 1, remainingPercent: {}, scoped: Array(1) },
+    },
+    {
+      ...map,
+      anthropic: {
+        ...map.anthropic,
+        scoped: [map.anthropic.scoped![0], map.anthropic.scoped![0]],
+      },
+    },
+  ]
+  for (const value of malformed) {
+    expect(() => fromNativeQuotaMap(value)).toThrow()
+    expect(nativeQuotaCodec.validate(value)).toBe(false)
+  }
+  const negativeZero = toNativeQuotaMap({ checkedAt: 0 })
+  negativeZero.anthropic.checkedAt = -0
+  expect(Object.is(fromNativeQuotaMap(negativeZero).checkedAt, -0)).toBe(true)
+})
+
+test('quota encoding retains the existing serialized field order and undefined normalization', () => {
+  const snapshot: OAuthQuotaSnapshot = {
+    checkedAt: 10,
+    source: 'poll',
+    five_hour: {
+      usedPercent: 12.5,
+      remainingPercent: 87.5,
+      checkedAt: 9,
+      resetsAt: undefined,
+    },
+  }
+  const bytes =
+    '{"limits":[{"scope":"all","label":"five_hour","kind":"reading","usedPercent":12.5,"checkedAt":9}],"anthropic":{"version":1,"remainingPercent":{"five_hour":87.5},"checkedAt":10,"source":"poll"}}'
+  expect(JSON.stringify(toNativeQuotaMap(snapshot))).toBe(bytes)
+  expect(
+    JSON.stringify(toNativeQuotaMap(fromNativeQuotaMap(JSON.parse(bytes)))),
+  ).toBe(bytes)
 })
 
 test('quota timestamp metadata control preserves a windowless empty scoped observation', () => {
