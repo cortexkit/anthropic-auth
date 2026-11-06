@@ -1,4 +1,4 @@
-import { describe, expect, mock } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, mock } from 'bun:test'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -65,6 +65,89 @@ const fixtureEnvKeys = [
   'OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE',
 ] as const
 
+class CensusTeardownTrace {
+  private readonly started = performance.now()
+  private readonly events: string[] = []
+  private readonly pending = new Map<string, number>()
+  private failed = false
+
+  constructor(private readonly name: string) {}
+
+  record(event: string): void {
+    this.events.push(
+      `${Math.round(performance.now() - this.started)}ms ${event}`,
+    )
+    if (this.events.length > 100) this.events.shift()
+  }
+
+  async wait<T>(phase: string, work: () => T | Promise<T>): Promise<T> {
+    const started = performance.now()
+    this.pending.set(phase, started)
+    this.record(`${phase} started`)
+    try {
+      return await work()
+    } catch (error) {
+      this.failed = true
+      this.record(`${phase} rejected`)
+      throw error
+    } finally {
+      this.record(
+        `${phase} settled (${Math.round(performance.now() - started)}ms)`,
+      )
+      this.pending.delete(phase)
+    }
+  }
+
+  teardownStarted(bodySettled: boolean): void {
+    this.record('lifetime afterEach started')
+    unfinishedTeardowns.add(this)
+    if (!bodySettled) {
+      this.reportUnfinished('body still pending at teardown')
+    }
+  }
+
+  complete(): void {
+    unfinishedTeardowns.delete(this)
+    this.record('lifetime cleanup completed')
+    if (this.failed) this.report('cleanup settled after a failure')
+  }
+
+  reportUnfinished(reason: string): void {
+    this.failed = true
+    this.report(reason)
+  }
+
+  private report(reason: string): void {
+    console.error(
+      'fallback census teardown phases',
+      JSON.stringify({
+        test: this.name,
+        reason,
+        pending: [...this.pending].map(([phase, started]) => ({
+          phase,
+          elapsedMs: Math.round(performance.now() - started),
+        })),
+        events: this.events,
+      }),
+    )
+  }
+}
+
+// A timed-out hook can skip later afterEach hooks, and Bun can exit before
+// a diagnostic timer fires. A new test or afterAll with unfinished cleanup
+// is already a failure; ordinary cleanup removes its trace before either.
+const unfinishedTeardowns = new Set<CensusTeardownTrace>()
+beforeEach(() => {
+  for (const trace of unfinishedTeardowns)
+    trace.reportUnfinished(
+      'next test started before lifetime cleanup completed',
+    )
+})
+afterAll(() => {
+  for (const trace of unfinishedTeardowns)
+    trace.reportUnfinished('file ended before lifetime cleanup completed')
+})
+
 /**
  * Everything one census body replaces or starts: the process-global fetch,
  * clock and fixture environment, and the plugins it creates.
@@ -81,6 +164,8 @@ const fixtureEnvKeys = [
  * keep a new plugin alive.
  */
 class CensusScope {
+  readonly trace: CensusTeardownTrace
+  bodySettled = false
   private readonly plugins = new Set<PluginHooks>()
   private readonly savedFetch = globalThis.fetch
   private readonly savedNow = Date.now
@@ -90,6 +175,23 @@ class CensusScope {
   private closing: Promise<void> | undefined
   /** Set when the body starts waiting for close, so teardown need not report a close failure the body already reports. */
   joinedByBody = false
+
+  constructor(name: string) {
+    this.trace = new CensusTeardownTrace(name)
+  }
+
+  deferCleanup(label: string, cleanup: () => void | Promise<void>): void {
+    lifetimes.deferCleanup(() => this.trace.wait(label, cleanup))
+  }
+
+  readonly fixtureLifetime = {
+    deferCleanup: (cleanup: () => void | Promise<void>) =>
+      this.deferCleanup('migration fixture removal', cleanup),
+    trackDetached: (work: Promise<unknown>) =>
+      lifetimes.trackDetached(
+        this.trace.wait('migration detached work', () => work),
+      ),
+  }
 
   /** Call before replacing fetch, Date.now or a fixture env key, and between polls. */
   assertOpen(): void {
@@ -112,7 +214,11 @@ class CensusScope {
 
   close(): Promise<void> {
     if (!this.closing) {
+      this.trace.record('restore fetch, clock and environment started')
       this.restoreGlobals()
+      this.trace.record(
+        'restore fetch, clock and environment settled (synchronous)',
+      )
       this.closing = this.disposeOwned()
     }
     return this.closing
@@ -132,11 +238,19 @@ class CensusScope {
     const plugins = [...this.plugins]
     this.plugins.clear()
     try {
-      await disposeAll(plugins, 'Fallback census plugin cleanup failed')
+      await this.trace.wait('plugin disposal', () =>
+        disposeAll(
+          plugins,
+          'Fallback census plugin cleanup failed',
+          this.trace,
+        ),
+      )
     } finally {
-      await drainSidebarWrites()
+      await this.trace.wait('sidebar write drain', drainSidebarWrites)
+      this.trace.record('cache and identity resets started')
       resetCache1hState()
       resetClaudeCodeIdentityCachesForTest()
+      this.trace.record('cache and identity resets settled (synchronous)')
     }
   }
 }
@@ -158,22 +272,32 @@ const test = {
     lifetimes.test(
       name,
       async () => {
-        const scope = new CensusScope()
+        const scope = new CensusScope(name)
         // Teardown opens every gate as soon as its hook starts, before it
         // waits for this body; closing then restores the globals even if
         // the body is still running past its timeout. A disposal failure
         // is reported by the body or by the cleanup below, not here.
-        void lifetimes.gate().wait.then(() => scope.close().catch(() => {}))
+        void lifetimes.gate().wait.then(() => {
+          scope.trace.teardownStarted(scope.bodySettled)
+          return scope.close().catch(() => {})
+        })
         // Teardown joins a disposal the body did not wait for before it
         // removes the body's files.
-        lifetimes.deferCleanup(() =>
+        scope.deferCleanup('join scope disposal', () =>
           scope.joinedByBody ? undefined : scope.close(),
         )
         try {
-          return await censusScope.run(scope, body)
+          return await scope.trace.wait('test body', () =>
+            censusScope.run(scope, body),
+          )
         } finally {
           scope.joinedByBody = true
-          await scope.close()
+          try {
+            await scope.close()
+          } finally {
+            scope.bodySettled = true
+            lifetimes.deferCleanup(() => scope.trace.complete())
+          }
         }
       },
       timeout,
@@ -181,9 +305,19 @@ const test = {
   },
 }
 
-async function disposeAll(plugins: PluginHooks[], message: string) {
+async function disposeAll(
+  plugins: PluginHooks[],
+  message: string,
+  trace?: CensusTeardownTrace,
+) {
   const results = await Promise.allSettled(
-    plugins.map((plugin) => Promise.resolve().then(() => plugin.dispose?.())),
+    plugins.map((plugin, index) =>
+      Promise.resolve().then(() =>
+        trace
+          ? trace.wait(`plugin ${index + 1} dispose`, () => plugin.dispose?.())
+          : plugin.dispose?.(),
+      ),
+    ),
   )
   const failed = results.filter((result) => result.status === 'rejected')
   if (failed.length)
@@ -201,7 +335,9 @@ async function startBody(prefix: string) {
   const root = await mkdtemp(join(tmpdir(), prefix))
   // migrateNativeOpencodeFixture also removes the root once it accepts it;
   // this covers a body that fails before handing the root to it.
-  lifetimes.deferCleanup(() => rm(root, { recursive: true, force: true }))
+  scope.deferCleanup('body fixture removal', () =>
+    rm(root, { recursive: true, force: true }),
+  )
   return { root, scope }
 }
 
@@ -496,7 +632,7 @@ async function createFixture(
   // reads, so every recorded credential read happened while serving.
   const fixture = await migrateNativeOpencodeFixture({
     root,
-    lifetime: lifetimes,
+    lifetime: scope.fixtureLifetime,
     legacyConfig: storage as unknown as Record<string, unknown>,
     hostAuth: { anthropic: custodyTombstoneOAuth('anthropic') },
     custody: {
@@ -1555,7 +1691,7 @@ describe('vault fallback eligibility', () => {
         host: 'opencode',
         vault: { connect: async () => fixture.scopedClient },
       })
-      lifetimes.deferCleanup(() => runtime.close())
+      currentScope().deferCleanup('native runtime close', () => runtime.close())
       const getScoped = fixture.scopedClient.getScoped
       let changed = false
       fixture.scopedClient.getScoped = async (input) => {
