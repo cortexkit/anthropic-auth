@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { lstat, open, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import {
   createWindowsOwnerOnly,
   ensureHolderDirectory,
@@ -78,6 +79,17 @@ export class PiCacheKeepClaim {
   async acquire() {
     if (this.held) return true
     await ensureHolderDirectory(this.directory, this.options.ownerOnly)
+    for (;;) {
+      const result = await this.tryAcquire()
+      if (result !== 'sweep') return result
+      // A sweep borrows ownership only while reading one record. A resuming
+      // session waits in the background instead of mistaking temporary sweep
+      // ownership for an active session claim.
+      await delay(25)
+    }
+  }
+
+  private tryAcquire() {
     return withNativeLock(
       this.path,
       {
@@ -90,7 +102,9 @@ export class PiCacheKeepClaim {
         const existing = await this.read()
         const life = holderEntryLiveness(existing)
         if (life && (await holderEntryIsLive(life, this.options.liveness)))
-          return false
+          return !this.options.sessionHash && existing?.purpose === 'sweep'
+            ? ('sweep' as const)
+            : false
         const bytes = JSON.stringify({
           pid: process.pid,
           incarnation: await (
@@ -98,6 +112,7 @@ export class PiCacheKeepClaim {
           )(process.pid),
           registeredAt: Date.now(),
           token: this.token,
+          purpose: this.options.sessionHash ? 'sweep' : 'session',
         })
         const temp = `${this.path}.${this.token}.tmp`
         try {

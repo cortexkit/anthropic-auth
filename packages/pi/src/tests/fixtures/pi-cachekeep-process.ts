@@ -1,7 +1,14 @@
+import { createHash } from 'node:crypto'
+import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   CLAUDE_SONNET_5_5_MODEL_ID,
+  cacheKeepStoreDirectory,
+  ensureHolderDirectory,
+  LEGACY_STATE_LAYOUT,
+  resolveNativePoolPaths,
+  withNativeLock,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   Api,
@@ -20,6 +27,7 @@ import {
 // Each invocation is a real process boundary: no module manager, timer or
 // credential runtime can be inherited from the preceding Pi instance.
 const phase = process.argv[2]
+const sessionId = 'pi-restart-session-S'
 __setLogTestSink((record) => {
   if (JSON.stringify(record).includes('cachekeep'))
     console.error(JSON.stringify(record))
@@ -97,7 +105,7 @@ globalThis.fetch = Object.assign(
   { preconnect: originalFetch.preconnect },
 ) as typeof fetch
 
-if (phase === 'seed') {
+if (phase !== 'resume') {
   await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
   const runtime = await getPiNativeRuntime(storagePath).service()
   // The synthetic login outlives the clock advance; this test is about cache
@@ -155,31 +163,113 @@ const ctx = {
   model,
   thinkingLevel: 'high',
   sessionManager: {
-    getSessionId: () => 'pi-restart-session-S',
+    getSessionId: () => sessionId,
     getBranch: () => [],
   },
 }
-await events.get('session_start')?.(
-  { type: 'session_start', reason: 'startup' },
-  ctx,
-)
-if (phase === 'seed') {
-  await events.get('turn_start')?.({ type: 'turn_start', turnIndex: 0 }, ctx)
-  const stream = provider?.streamSimple?.(
-    model,
-    {
-      systemPrompt: 'Keep the same prompt prefix across the Pi restart.',
-      messages: [{ role: 'user', content: 'hello', timestamp: now }],
-    },
-    { sessionId: 'pi-restart-session-S' },
+let releaseLock = () => {}
+let holding: Promise<void> | undefined
+if (phase === 'locked') {
+  const paths = await resolveNativePoolPaths(
+    storagePath,
+    undefined,
+    LEGACY_STATE_LAYOUT,
   )
-  if (!stream) throw new Error('Pi did not register its stream')
-  const result = await stream.result()
-  if (result.stopReason === 'error') throw new Error(result.errorMessage)
-  await events.get('agent_settled')?.({ type: 'agent_settled' }, ctx)
-} else {
-  now += 60_000
-  for (const callback of [...intervals.values()]) await callback()
+  const directory = cacheKeepStoreDirectory(paths.storageId)
+  const piDirectory = cacheKeepStoreDirectory(paths.storageId, undefined, 'pi')
+  if (directory === piDirectory)
+    throw new Error('Pi must have its own namespace')
+  await ensureHolderDirectory(piDirectory)
+  const path = join(
+    piDirectory,
+    `${createHash('sha256').update(sessionId).digest('hex')}.claim.json`,
+  )
+  const released = new Promise<void>((resolve) => {
+    releaseLock = resolve
+  })
+  let ready = () => {}
+  const acquired = new Promise<void>((resolve) => {
+    ready = resolve
+  })
+  holding = withNativeLock(
+    path,
+    { name: 'cachekeep-session', ttlMs: 10_000, timeoutMs: 2000, renew: true },
+    async () => {
+      ready()
+      await released
+    },
+  )
+  await acquired
+}
+
+async function emit(name: string, event: unknown) {
+  const result = Promise.resolve(events.get(name)?.(event, ctx))
+  if (phase === 'locked') {
+    let completed = false
+    void result.then(() => {
+      completed = true
+    })
+    // No wall-clock race: a detached lifecycle handler settles in microtasks
+    // even while the real native lock is held by the fixture.
+    await Promise.resolve()
+    await Promise.resolve()
+    if (!completed) throw new Error(`${name} waited on keep-warm bookkeeping`)
+  }
+  await result
+}
+
+try {
+  await emit('session_start', { type: 'session_start', reason: 'startup' })
+  if (phase !== 'resume') {
+    await emit('turn_start', { type: 'turn_start', turnIndex: 0 })
+    const stream = provider?.streamSimple?.(
+      model,
+      {
+        systemPrompt: 'Keep the same prompt prefix across the Pi restart.',
+        messages: [{ role: 'user', content: 'hello', timestamp: now }],
+      },
+      { sessionId },
+    )
+    if (!stream) throw new Error('Pi did not register its stream')
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const result = await (phase === 'locked'
+      ? Promise.race([
+          stream.result(),
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    'accepted response waited on keep-warm bookkeeping',
+                  ),
+                ),
+              1000,
+            )
+          }),
+        ]).finally(() => clearTimeout(timeout))
+      : stream.result())
+    if (result.stopReason === 'error') throw new Error(result.errorMessage)
+    await events.get('agent_settled')?.({ type: 'agent_settled' }, ctx)
+  } else {
+    // Observe the public registry, not a private restore API. Production starts
+    // restoration detached. An implementation without restart restoration
+    // still reaches the warm-count assertion instead of hanging at startup.
+    const { getPiTrackedCacheKeepSessions } = await import('../../stream.ts')
+    for (let attempt = 0; attempt < 200; attempt++) {
+      if (
+        (await getPiTrackedCacheKeepSessions()).some(
+          (row) => row.id === sessionId,
+        )
+      )
+        break
+      await Bun.sleep(10)
+    }
+    now += 60_000
+    for (const callback of [...intervals.values()]) await callback()
+  }
+} finally {
+  releaseLock()
+  await holding
 }
 await events.get('session_shutdown')?.(
   { type: 'session_shutdown', reason: 'quit' },

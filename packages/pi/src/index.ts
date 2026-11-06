@@ -93,13 +93,13 @@ export default async function cortexKitPiAnthropicAuth(
   const workingMessageBySession = new Map<string, (message?: string) => void>()
   pi.on('session_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
-    if (sessionId) await startPiCacheKeepSession(storagePath, sessionId)
+    if (sessionId) void startPiCacheKeepSession(storagePath, sessionId)
   })
   pi.on('turn_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
     // Older hosts may deliver their first turn before session_start. Both
-    // hooks join the same restore, so an idle resumed session needs no request.
-    if (sessionId) await startPiCacheKeepSession(storagePath, sessionId)
+    // hooks start the same detached restore; bookkeeping never delays a turn.
+    if (sessionId) void startPiCacheKeepSession(storagePath, sessionId)
     beginPiPrimaryTurn(storagePath, sessionId)
     if (!sessionId) return
     if (ctx.hasUI) {

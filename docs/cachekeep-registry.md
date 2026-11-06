@@ -64,6 +64,9 @@ shutdown. Stopping warming deletes the record.
 OpenCode 2 restores all eligible sessions in its storage. Pi restores only the
 session named by `session_start` (or the first `turn_start` on a host that
 delivers it first), without waiting for another request. A per-session claim
+is acquired in the background: startup, turns and accepted responses never
+wait for restart-store I/O. An early accepted body is saved after its claim
+arrives, including during a clean shutdown. The claim
 records the process id and OS start identity, so only one live Pi process warms
 that session; shutdown drains writes and releases the claim. Other sessions'
 records remain untouched until expiry cleanup. Both hosts reject expired,

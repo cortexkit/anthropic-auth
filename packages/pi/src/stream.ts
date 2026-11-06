@@ -778,7 +778,7 @@ async function sendAnthropicRequest(
     signal: options.streamOptions?.signal,
     ...(!options.apiAccount && { redirect: 'error' as const }),
   }
-  const trackAcceptedRequest = async () => {
+  const trackAcceptedRequest = () => {
     if (options.apiAccount || init.signal?.aborted) return
     if (relayAffinity)
       sessionCacheActivity.record(relayAffinity, routeId, cacheTtlMs)
@@ -795,7 +795,7 @@ async function sendAnthropicRequest(
       accountStoragePath: options.storagePath,
     }
     if (deps.cacheKeep) keep.track(target)
-    else await piCacheKeep.trackAccepted(target, snapshot)
+    else void piCacheKeep.trackAccepted(target, snapshot)
   }
 
   const reported = new Set<PiNativeAttempt>()
@@ -998,7 +998,7 @@ async function sendAnthropicRequest(
       )
     }
     if (attempt && response.ok) {
-      await trackAcceptedRequest()
+      trackAcceptedRequest()
       markServed(attempt)
     }
     return response
@@ -1080,7 +1080,7 @@ async function sendAnthropicRequest(
     response = threadRequest.observe(response)
   }
   if (response.ok && lastTransport === 'relay' && relayAttempt) {
-    await trackAcceptedRequest()
+    trackAcceptedRequest()
     markServed(relayAttempt)
   }
   return response

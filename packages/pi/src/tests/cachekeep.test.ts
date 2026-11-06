@@ -1,10 +1,12 @@
 import { afterEach, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   cacheKeepStoreDirectory,
   createEmptyStorage,
+  type HolderLiveness,
   type NativeAccountSnapshot,
 } from '@cortexkit/anthropic-auth-core'
 import { PiCacheKeep } from '../cachekeep.ts'
@@ -45,7 +47,7 @@ async function fixture() {
   }
   const sends: Array<{ session: string; body: Record<string, unknown> }> = []
   const delays: number[] = []
-  const create = () => {
+  const create = (liveness?: HolderLiveness) => {
     const timers = new Map<object, () => unknown>()
     const process = new PiCacheKeep(
       {
@@ -78,6 +80,7 @@ async function fixture() {
         read: async () => snapshot,
         storageId: async () => 'shared-storage',
         persistence: { root },
+        liveness,
         restoreDelay: async (ms) => {
           delays.push(ms)
         },
@@ -120,6 +123,7 @@ async function fixture() {
     input,
     sends,
     delays,
+    now: () => now,
     advance: (ms: number) => {
       now += ms
     },
@@ -265,4 +269,99 @@ test('a reused pid cannot hold a Pi session and an old release cannot remove its
   await next.release()
   expect(await contender.acquire()).toBe(true)
   await contender.release()
+})
+
+test('a Pi owner waits out a sweep and restores without another turn or request', async () => {
+  const f = await fixture()
+  const seed = f.create()
+  await seed.process.trackAccepted(f.input('session-S'), f.snapshot)
+  await seed.process.stop()
+  f.advance(55 * 60_000)
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const hash = createHash('sha256').update('session-S').digest('hex')
+  const sweep = new PiCacheKeepClaim(directory, hash, {
+    sessionHash: true,
+    liveness: { pidAlive: () => true, incarnation: async () => 'same-start' },
+  })
+  expect(await sweep.acquire()).toBe(true)
+  let observed = () => {}
+  const sawSweep = new Promise<void>((resolve) => {
+    observed = resolve
+  })
+  const owner = f.create({
+    pidAlive: () => true,
+    incarnation: async () => {
+      observed()
+      return 'same-start'
+    },
+  })
+  const starting = owner.process.startSession('pi-storage', 'session-S')
+  try {
+    await sawSweep
+    expect(owner.process.manager.trackedCount()).toBe(0)
+  } finally {
+    await sweep.release()
+  }
+  await starting
+  expect(owner.process.manager.trackedCount()).toBe(1)
+  await owner.tick()
+  expect(f.sends).toHaveLength(1)
+})
+
+test('a failed live-owner claim is retried on the next Pi session event', async () => {
+  const f = await fixture()
+  const first = f.create()
+  await first.process.trackAccepted(f.input('session-S'), f.snapshot)
+  const next = f.create()
+  await next.process.startSession('pi-storage', 'session-S')
+  expect(next.process.manager.trackedCount()).toBe(0)
+  await first.process.stop()
+  await next.process.startSession('pi-storage', 'session-S')
+  expect(next.process.manager.trackedCount()).toBe(1)
+  f.advance(55 * 60_000)
+  await next.tick()
+  expect(f.sends).toHaveLength(1)
+})
+
+test('shutdown saves an accepted body queued before a sweep releases its claim', async () => {
+  const f = await fixture()
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const hash = createHash('sha256').update('session-S').digest('hex')
+  const sweep = new PiCacheKeepClaim(directory, hash, {
+    sessionHash: true,
+    liveness: { pidAlive: () => true, incarnation: async () => 'same-start' },
+  })
+  expect(await sweep.acquire()).toBe(true)
+  let observed = () => {}
+  const sawSweep = new Promise<void>((resolve) => {
+    observed = resolve
+  })
+  const first = f.create({
+    pidAlive: () => true,
+    incarnation: async () => {
+      observed()
+      return 'same-start'
+    },
+  })
+  const acceptedAt = f.now()
+  const tracking = first.process.trackAccepted(
+    f.input('session-S', 'queued accepted body'),
+    f.snapshot,
+  )
+  const stopping = first.process.stop()
+  try {
+    await sawSweep
+    f.advance(10_000)
+  } finally {
+    await sweep.release()
+  }
+  await Promise.all([tracking, stopping])
+  const next = f.create()
+  await next.process.startSession('pi-storage', 'session-S')
+  const target = next.process.manager.trackedRequest('session-S')
+  expect(target?.bodyText).toContain('queued accepted body')
+  expect(target?.cacheExpiresAt).toBe(acceptedAt + 3_600_000)
+  expect(next.process.manager.registrySessions()[0]?.lastTouchAt).toBe(
+    acceptedAt,
+  )
 })

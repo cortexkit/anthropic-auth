@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  CACHE_KEEP_PREWARM_LEAD_MS,
+  CACHE_KEEP_TTL_MS,
   CacheKeepManager,
   CacheKeepStore,
   type CacheKeepStoreOptions,
@@ -44,6 +46,7 @@ export class PiCacheKeep {
   private readonly claims = new Map<string, Promise<Session | undefined>>()
   private readonly starts = new Map<string, Promise<void>>()
   private readonly restored = new Map<string, number>()
+  private readonly tracking = new Set<Promise<unknown>>()
   private stopping = false
   private ticking?: Promise<void>
   private cleaning?: Promise<void>
@@ -143,7 +146,8 @@ export class PiCacheKeep {
   private claim(storagePath: string, sessionId: string) {
     const existing = this.claims.get(sessionId)
     if (existing) return existing
-    const claiming = (async () => {
+    let claiming: Promise<Session | undefined>
+    claiming = (async () => {
       const store = await this.store(storagePath)
       const claim = new PiCacheKeepClaim(store.directory, sessionId, {
         ownerOnly: this.options.persistence?.ownerOnly,
@@ -153,10 +157,21 @@ export class PiCacheKeep {
       const session: Session = { storagePath, claim, store }
       this.sessions.set(sessionId, session)
       return session
-    })().catch(() => {
-      logger.warn('cachekeep', 'session claim unavailable; not warming session')
-      return undefined
-    })
+    })()
+      .catch(() => {
+        logger.warn(
+          'cachekeep',
+          'session claim unavailable; not warming session',
+        )
+        return undefined
+      })
+      .finally(() => {
+        if (
+          !this.sessions.has(sessionId) &&
+          this.claims.get(sessionId) === claiming
+        )
+          this.claims.delete(sessionId)
+      })
     this.claims.set(sessionId, claiming)
     return claiming
   }
@@ -214,7 +229,9 @@ export class PiCacheKeep {
     const existing = this.starts.get(sessionId)
     if (existing) return existing
     this.stopping = false
-    const starting = (async () => {
+    let completed = false
+    let starting: Promise<void>
+    starting = (async () => {
       const session = await this.claim(storagePath, sessionId)
       // Even a non-owner may clean up expired records, but cannot restore one.
       const store = await this.store(storagePath)
@@ -269,32 +286,62 @@ export class PiCacheKeep {
         (hash) => this.access(store, hash, true),
       )
       this.startCleanup()
-    })().catch(() =>
-      logger.warn('cachekeep', 'failed to restore tracked session'),
-    )
+      completed = !!session
+    })()
+      .catch(() =>
+        logger.warn('cachekeep', 'failed to restore tracked session'),
+      )
+      .finally(() => {
+        if (!completed && this.starts.get(sessionId) === starting)
+          this.starts.delete(sessionId)
+      })
     this.starts.set(sessionId, starting)
     return starting
   }
 
-  async trackAccepted(input: TrackInput, snapshot: NativeAccountSnapshot) {
-    if (this.stopping || !input.sessionId || !input.accountStoragePath) return
-    const session = await this.claim(input.accountStoragePath, input.sessionId)
-    if (!session || this.stopping) return
-    const account =
-      snapshot.accounts.find((row) => row.id === input.oauthAccountId) ??
-      snapshot.accounts.find(
-        (row) => row.accountIdentity === input.oauthAccountIdentity,
+  trackAccepted(input: TrackInput, snapshot: NativeAccountSnapshot) {
+    if (this.stopping || !input.sessionId || !input.accountStoragePath)
+      return Promise.resolve()
+    const sessionId = input.sessionId
+    const storagePath = input.accountStoragePath
+    const acceptedAt = this.now()
+    const tracking = (async () => {
+      const session = await this.claim(storagePath, sessionId)
+      if (!session) return
+      const account =
+        snapshot.accounts.find((row) => row.id === input.oauthAccountId) ??
+        snapshot.accounts.find(
+          (row) => row.accountIdentity === input.oauthAccountIdentity,
+        )
+      if (
+        account?.type !== 'oauth' ||
+        !nativeAccountCanServe(account) ||
+        account.accountIdentity !== input.oauthAccountIdentity
       )
-    if (
-      account?.type !== 'oauth' ||
-      !nativeAccountCanServe(account) ||
-      account.accountIdentity !== input.oauthAccountIdentity
+        return
+      session.identity = accountKey(account)
+      // Claim I/O may finish after the response, or even during shutdown. Keep
+      // that accepted body, but never grant the cache the time spent waiting.
+      const ttlMs = input.ttlMs ?? CACHE_KEEP_TTL_MS
+      const result = this.manager.track({
+        ...input,
+        retained: input.retained ?? {
+          cacheExpiresAt: acceptedAt + ttlMs,
+          nextPrewarmAt: acceptedAt + ttlMs - CACHE_KEEP_PREWARM_LEAD_MS,
+          ttlMs,
+          lastTouchAt: acceptedAt,
+          lastTouchKind: 'response',
+        },
+      })
+      if (result.tracked) this.restored.delete(sessionId)
+      if (this.stopping) this.manager.stop()
+      return result
+    })().catch(() =>
+      logger.warn('cachekeep', 'accepted response tracking failed'),
     )
-      return
-    session.identity = accountKey(account)
-    const result = this.manager.track(input)
-    if (result.tracked) this.restored.delete(input.sessionId)
-    return result
+    this.tracking.add(tracking)
+    void tracking.then(() => this.tracking.delete(tracking))
+    return tracking
   }
 
   async stop() {
@@ -304,6 +351,8 @@ export class PiCacheKeep {
     this.manager.stop()
     await Promise.all(this.starts.values())
     await Promise.all(this.claims.values())
+    await Promise.all(this.tracking)
+    this.manager.stop()
     await this.ticking
     await this.cleaning
     // Drain before releasing claims so a successor can never read an older body.

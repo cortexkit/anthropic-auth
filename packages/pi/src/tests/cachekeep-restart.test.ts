@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-test('Pi session_start warms an idle session after a real process restart without a new request', async () => {
+async function restart(seedPhase: 'seed' | 'locked') {
   const root = await mkdtemp(join(tmpdir(), 'pi-extension-restart-'))
   try {
     const env = {
@@ -53,9 +53,21 @@ test('Pi session_start warms an idle session after a real process restart withou
         throw new Error(`Pi resumed with ${result.warm} warms: ${stderr}`)
       return result
     }
-    expect(await run('seed')).toEqual({ live: 1, warm: 0 })
+    expect(await run(seedPhase)).toEqual({ live: 1, warm: 0 })
     expect(await run('resume')).toEqual({ live: 0, warm: 1 })
   } finally {
     await rm(root, { recursive: true, force: true })
   }
-}, 20_000)
+}
+
+test(
+  'Pi session_start warms an idle session after a real process restart without a new request',
+  () => restart('seed'),
+  20_000,
+)
+
+test(
+  'Pi startup, turn and accepted response proceed while the keep-warm lock is held',
+  () => restart('locked'),
+  20_000,
+)
