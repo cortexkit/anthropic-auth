@@ -7244,6 +7244,10 @@ const anthropicAuthPlugin = async (
                   cache1hMode: getCache1hMode(),
                   fastModeEnabled: fastModeRequested,
                   sessionId: directAffinity || undefined,
+                  modelId:
+                    fableRequest?.plan.requestedModel ??
+                    parseRequestModel(body) ??
+                    '',
                   midConversationEffortEnabled: false,
                   midConversationEffortPlan: effortPlanHeader,
                   midConversationEffortResolvedPlan: resolvedEffortPlan,
@@ -7537,6 +7541,8 @@ const anthropicAuthPlugin = async (
                   fastModeEnabled: fastModeRequested,
                   identity,
                   sessionId: relayAffinity || undefined,
+                  modelId:
+                    fableRequest?.plan.requestedModel ?? modelForIdentity ?? '',
                   isOAuth: true,
                   thinkingPrefixMismatchBehavior:
                     getThinkingPrefixMismatchBehavior(

@@ -1556,6 +1556,8 @@ export async function rewriteRequestBody(
     deferSigning?: boolean
     identity?: ClaudeCodeIdentity
     sessionId?: string
+    /** Raw model id supplied by the host, not the wire body model. */
+    modelId?: string
     /** Whether this request uses OAuth. */
     isOAuth?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
@@ -1658,6 +1660,7 @@ export async function rewriteRequestBody(
     }
     applyRunnerTurnNotes(parsed, {
       sessionId: options.sessionId,
+      modelId: options.modelId ?? '',
       isOAuth: options.isOAuth === true,
     })
 

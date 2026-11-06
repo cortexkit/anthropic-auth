@@ -47,24 +47,32 @@ function readRunnerNotes(handle: Record<string, unknown>): RunnerTurnNote[] {
     const read = handle.turn_notes
     if (typeof read !== 'function') return []
     const answer: unknown = read.call(handle)
-    if (!Array.isArray(answer)) {
-      if (isRecord(answer) && typeof answer.then === 'function')
-        void Promise.resolve(answer).catch(() => {})
+    if (
+      answer !== null &&
+      (typeof answer === 'object' || typeof answer === 'function') &&
+      typeof Reflect.get(answer, 'then') === 'function'
+    ) {
+      void Promise.resolve(answer).catch(() => {})
       return []
     }
+    if (!Array.isArray(answer)) return []
     const notes: RunnerTurnNote[] = []
-    for (const entry of answer) {
-      if (!isRecord(entry)) return []
-      const { after_tool_use_id, text } = entry
-      if (
-        typeof after_tool_use_id !== 'string' ||
-        typeof text !== 'string' ||
-        !text.trim() ||
-        text.length > 16_384 ||
-        new TextEncoder().encode(text).byteLength > 16_384
-      )
-        return []
-      notes.push({ after_tool_use_id, text })
+    for (let index = 0; index < answer.length; index++) {
+      try {
+        const entry: unknown = answer[index]
+        if (!isRecord(entry) || Array.isArray(entry)) continue
+        const { after_tool_use_id, text } = entry
+        if (
+          typeof after_tool_use_id !== 'string' ||
+          typeof text !== 'string' ||
+          !text.trim() ||
+          new TextEncoder().encode(text).byteLength > 16_384
+        )
+          continue
+        notes.push({ after_tool_use_id, text })
+      } catch {
+        // One unreadable entry must not discard valid reminders beside it.
+      }
     }
     return notes
   } catch {
@@ -106,7 +114,12 @@ function reportRunnerNote(
 /** Apply after our own turn-end notes, so runner notes land before them. */
 export function applyRunnerTurnNotes(
   body: Record<string, unknown>,
-  options: { sessionId?: string; isOAuth: boolean },
+  options: {
+    sessionId?: string
+    /** Raw model id supplied by the host, not the wire body model. */
+    modelId: string
+    isOAuth: boolean
+  },
 ): number {
   if (!options.sessionId) return 0
   const runner = runnerNotes(options.sessionId)
@@ -117,7 +130,7 @@ export function applyRunnerTurnNotes(
     runnerReports.set(options.sessionId, reported)
   }
   const supported = options.isOAuth && supportsTurnEndNote(body.model)
-  const model = typeof body.model === 'string' ? body.model : ''
+  const model = options.modelId
   if (reported.models.get(model) !== supported) {
     reported.models.set(model, supported)
     reportRunnerNote(runner.handle, {

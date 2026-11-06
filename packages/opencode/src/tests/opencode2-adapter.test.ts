@@ -474,6 +474,7 @@ const bodyOf = async (request: Request) =>
 describe('OpenCode 2 native Anthropic adapter: request shape', () => {
   test('OC2 runner notes use the adapter session on OAuth and report API skips without changing bytes', async () => {
     const reports: unknown[] = []
+    const hostModelId = 'claude-opus-5-5[1m]'
     globals[routingKey] = (sessionId: string) => {
       expect(sessionId).toBe('ses_runner_notes_oc2')
       return {
@@ -516,7 +517,7 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
         ],
       }
       const { final } = await host.run(
-        scopeOf({ modelID: payload.model, sessionID: 'ses_runner_notes_oc2' }),
+        scopeOf({ modelID: hostModelId, sessionID: 'ses_runner_notes_oc2' }),
         hostRequest(payload),
       )
       const text = await final.text()
@@ -534,6 +535,11 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
       }
     }
     await Promise.resolve()
+    expect(reports).toContainEqual({
+      kind: 'turn_notes_supported',
+      model: hostModelId,
+      supported: true,
+    })
     expect(reports).toContainEqual({
       kind: 'turn_note_skipped',
       after_tool_use_id: 'runner-call',

@@ -242,7 +242,12 @@ type RewriteBodyOptions = NonNullable<Parameters<typeof rewriteRequestBody>[1]>
  */
 export type NativeAnthropicBodyOptions = Omit<
   RewriteBodyOptions,
-  'identity' | 'sessionId' | 'isOAuth' | 'onToolNameMap' | 'deferSigning'
+  | 'identity'
+  | 'sessionId'
+  | 'modelId'
+  | 'isOAuth'
+  | 'onToolNameMap'
+  | 'deferSigning'
 >
 
 type StrippedStreamOptions = NonNullable<
@@ -724,7 +729,7 @@ function apiBetas(value: string) {
  * No Claude Code identity, tool-name prefix or body signature is added.
  * Preserve the original text when no field changes or the body is not an object.
  */
-function rewriteApiBody(body: string, sessionId: string) {
+function rewriteApiBody(body: string, sessionId: string, modelId: string) {
   const parsed = parseJson(body)
   if (!isRecord(parsed)) return body
   const removed = stripEmptyTrailingAssistantMessages(parsed.messages)
@@ -732,7 +737,7 @@ function rewriteApiBody(body: string, sessionId: string) {
   const { droppedMarkers } = applyServerSideFallbackToBody(parsed, false)
   const fallbacksRemoved = hadFallbacks && !Object.hasOwn(parsed, 'fallbacks')
   const remapped = remapRequestBodyModel(parsed)
-  applyRunnerTurnNotes(parsed, { sessionId, isOAuth: false })
+  applyRunnerTurnNotes(parsed, { sessionId, modelId, isOAuth: false })
   return removed > 0 || droppedMarkers > 0 || fallbacksRemoved || remapped
     ? JSON.stringify(parsed)
     : body
@@ -1239,6 +1244,7 @@ export function createNativeAnthropicAdapter<Q, P>(
               deferSigning: true,
               ...(identity ? { identity } : {}),
               sessionId: input.sessionID,
+              modelId: input.modelID,
               isOAuth: true,
               onToolNameMap: (map) => responseToolNameMaps.set(data, map),
             })
@@ -1255,7 +1261,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         })
       } else {
         if (body !== undefined && messages)
-          body = rewriteApiBody(body, input.sessionID)
+          body = rewriteApiBody(body, input.sessionID, input.modelID)
         headers.delete('authorization')
         headers.delete('x-api-key')
         for (const [name, value] of Object.entries(send.apiHeaders ?? {})) {

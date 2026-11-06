@@ -76,6 +76,7 @@ describe('OpenCode turn-end notes', () => {
     }
     const body = await build(reply('a'), {
       sessionId: 'ses_runner_notes_oc1',
+      modelId: 'claude-opus-5-5',
       isOAuth: true,
       turnEndNote: { tools: [] },
     })
@@ -91,6 +92,7 @@ describe('OpenCode turn-end notes', () => {
     )
     const apiBody = await build(reply('a'), {
       sessionId: 'ses_runner_notes_oc1',
+      modelId: 'claude-opus-5-5',
       turnEndNote: { tools: [] },
     })
     expect(apiBody.messages.some((m: any) => m.clear_at)).toBe(false)

@@ -808,6 +808,7 @@ export async function buildAnthropicRequest(
   }
   applyRunnerTurnNotes(body, {
     sessionId: options?.sessionId,
+    modelId,
     isOAuth: !!identity,
   })
   addEphemeralCacheControl(body)

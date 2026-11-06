@@ -16,6 +16,7 @@ afterEach(() => {
 let session = 0
 const options = () => ({
   sessionId: `runner-notes-${++session}`,
+  modelId: 'claude-opus-5-5',
   isOAuth: true,
 })
 const runnerNote = (text: string) => ({
@@ -170,7 +171,13 @@ describe('runner turn notes', () => {
             },
           },
         ],
-        [{ after_tool_use_id: 'a', text: 'Valid' }, { text: 'Invalid' }],
+        Object.defineProperty(
+          [{ after_tool_use_id: 'a', text: 'Reminder' }],
+          'then',
+          {
+            value: () => {},
+          },
+        ),
       ].map((answer) => ({ turn_notes: () => answer })),
     ]
     for (const accessor of bad) {
@@ -198,6 +205,53 @@ describe('runner turn notes', () => {
       expect(applyRunnerTurnNotes(body, options())).toBe(0)
       expect(JSON.stringify(body)).toBe(before)
     }
+  })
+
+  test('drops invalid entries but copies valid neighbours in landing order at the UTF-8 byte limit', () => {
+    let reads = 0
+    const first = {
+      after_tool_use_id: 'a',
+      get text() {
+        return ++reads === 1 ? 'First reminder' : 'Changed'
+      },
+    }
+    const last = { after_tool_use_id: 'a', text: 'Last reminder' }
+    const exactLimit = '😀'.repeat(4096)
+    install([
+      first,
+      null,
+      { after_tool_use_id: 1, text: 'Invalid anchor' },
+      { after_tool_use_id: 'a', text: '' },
+      { after_tool_use_id: 'a', text: `${exactLimit}a` },
+      {
+        after_tool_use_id: 'a',
+        get text() {
+          throw new Error('private')
+        },
+      },
+      { after_tool_use_id: 'a', text: exactLimit },
+      { text: 'Missing anchor' },
+      last,
+    ])
+    const body = request()
+    expect(applyRunnerTurnNotes(body, options())).toBe(3)
+    last.text = 'Changed after rendering'
+    expect(reads).toBe(1)
+    expect(body.messages.slice(2)).toEqual([
+      runnerNote('First reminder'),
+      runnerNote(exactLimit),
+      runnerNote('Last reminder'),
+    ])
+  })
+
+  test('matches the exact provider tool-call id rather than a shortened host id', () => {
+    install([
+      { after_tool_use_id: 'provider_1', text: 'Wrong anchor' },
+      { after_tool_use_id: 'toolu_provider_1', text: 'Provider anchor' },
+    ])
+    const body = request(pair('toolu_provider_1'))
+    expect(applyRunnerTurnNotes(body, options())).toBe(1)
+    expect(body.messages.at(-1)).toEqual(runnerNote('Provider anchor'))
   })
 
   test('legacy routing handles without the note member receive no new reports', async () => {
@@ -245,7 +299,10 @@ describe('runner turn notes', () => {
     applyRunnerTurnNotes(request(), { ...opts, isOAuth: false })
     applyRunnerTurnNotes(request(), { ...opts, isOAuth: false })
     applyRunnerTurnNotes(request(), opts)
-    applyRunnerTurnNotes({ ...request(), model: 'claude-sonnet-4-5' }, opts)
+    applyRunnerTurnNotes(
+      { ...request(), model: 'claude-sonnet-4-5' },
+      { ...opts, modelId: 'claude-sonnet-4-5' },
+    )
     applyRunnerTurnNotes(request(), options())
     await flush()
     const supported = reports.filter(
@@ -281,6 +338,35 @@ describe('runner turn notes', () => {
     expect(
       reports.filter((r: any) => r.kind === 'turn_note_skipped'),
     ).toHaveLength(2)
+  })
+
+  test('reports and dedupes by host model id but decides support from the wire model', async () => {
+    const reports = install([{ after_tool_use_id: 'a', text: 'Reminder' }])
+    const opts = { ...options(), modelId: 'claude-sonnet-4-5[1m]' }
+    expect(applyRunnerTurnNotes(request(), opts)).toBe(1)
+    expect(
+      applyRunnerTurnNotes(request(), { ...opts, modelId: 'host-alias' }),
+    ).toBe(1)
+    expect(applyRunnerTurnNotes(request(), opts)).toBe(1)
+    expect(
+      applyRunnerTurnNotes({ ...request(), model: 'claude-sonnet-4-5' }, opts),
+    ).toBe(0)
+    await flush()
+    expect(
+      reports.filter((r: any) => r.kind === 'turn_notes_supported'),
+    ).toEqual([
+      {
+        kind: 'turn_notes_supported',
+        model: 'claude-sonnet-4-5[1m]',
+        supported: true,
+      },
+      { kind: 'turn_notes_supported', model: 'host-alias', supported: true },
+      {
+        kind: 'turn_notes_supported',
+        model: 'claude-sonnet-4-5[1m]',
+        supported: false,
+      },
+    ])
   })
 
   test('a report that never settles cannot delay rendering; throws and rejections are ignored', async () => {
