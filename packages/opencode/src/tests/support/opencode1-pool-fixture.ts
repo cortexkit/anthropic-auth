@@ -740,12 +740,17 @@ export async function publishPoolMetadata(
   ) => Parameters<
     ReturnType<typeof createNativeAccountRuntime>['publishLocal']
   >[1],
+  options: Pick<
+    Parameters<typeof createNativeAccountRuntime>[0],
+    'beforePoolWrite'
+  > = {},
 ) {
   const pool = ctx.migratedPool
   if (!pool) throw new Error('This test has no migrated pool')
   const runtime = createNativeAccountRuntime({
     paths: pool.paths,
     host: 'opencode',
+    ...options,
   })
   try {
     const authorization = await runtime.authorizeLocal(routeId)
@@ -760,7 +765,9 @@ export async function publishPoolMetadata(
     )
     if (!published) throw new Error(`Metadata for ${routeId} was not published`)
   } finally {
-    runtime.close()
+    // Quota publication acknowledges queue admission, not a disk commit. A
+    // separate runtime can observe the reading only after this store drains.
+    await runtime.close()
   }
 }
 

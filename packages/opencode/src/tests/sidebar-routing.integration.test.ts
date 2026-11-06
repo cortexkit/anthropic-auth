@@ -34,6 +34,7 @@ import {
   createFallbackStorage,
   getPlugin as getPluginWithCtx,
   nativeAdmissionAnswer as nativeAdmissionAnswerWithCtx,
+  publishPoolMetadata as publishPoolMetadataWithCtx,
   publishPoolQuota as publishPoolQuotaWithCtx,
   readNativeRuntimeState as readNativeRuntimeStateWithCtx,
   requireKnownPoolSubject,
@@ -1136,6 +1137,57 @@ describe('auth.loader', () => {
     const state = await getSidebarState()
     expect(state.activeId).toBe('main')
     expect(state.route).toBe('main')
+  })
+
+  test('pool quota fixture waits for the other runtime to commit', async () => {
+    await useTempAccountFile(createFallbackStorage({ accounts: [] }))
+    globalThis.fetch = mock(
+      withNativeAdmission(() =>
+        Promise.resolve(new Response(null, { status: 200 })),
+      ),
+    ) as unknown as typeof fetch
+
+    const committing = bodyLifetime().gate()
+    const allowCommit = bodyLifetime().gate()
+    let returned = false
+    const publication = publishPoolMetadataWithCtx(
+      testContext,
+      'main',
+      (identity) => ({
+        quota: {
+          accountIdentity: identity,
+          seven_day: {
+            usedPercent: 2,
+            remainingPercent: 98,
+            checkedAt: Date.now(),
+          },
+          checkedAt: Date.now(),
+        },
+      }),
+      {
+        beforePoolWrite: async () => {
+          committing.open()
+          await allowCommit.wait
+        },
+      },
+    ).then(() => {
+      returned = true
+    })
+    bodyLifetime().trackDetached(publication)
+
+    await Promise.race([committing.wait, publication])
+    try {
+      // Hold the real quota commit, not the publication's in-memory overlay.
+      expect(returned).toBe(false)
+      const before = await readAccountStorage()
+      expect(before?.quota?.mainQuota?.seven_day).toBeUndefined()
+    } finally {
+      allowCommit.open()
+    }
+    await publication
+
+    const committed = await readAccountStorage()
+    expect(committed?.quota?.mainQuota?.seven_day?.usedPercent).toBe(2)
   })
 
   test('sidebar shows persisted main quota written after plugin startup', async () => {
