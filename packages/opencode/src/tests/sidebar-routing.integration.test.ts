@@ -46,6 +46,7 @@ import {
 import {
   readAccountStorage as readAccountStorageWithCtx,
   seedSidebarRouting,
+  waitForNativePoolQuota,
   waitForSidebarState as waitForSidebarStateWithCtx,
 } from './support/opencode1-state-observers.ts'
 import type { PluginRuntimeOverrides } from './support/opencode1-test-context.ts'
@@ -1230,6 +1231,11 @@ describe('auth.loader', () => {
       },
       checkedAt: Date.now(),
     })
+    await waitForNativePoolQuota(
+      testContext,
+      'main',
+      (quota) => quota?.seven_day?.usedPercent === 2,
+    )
 
     const result = await plugin.auth.loader(
       () =>
