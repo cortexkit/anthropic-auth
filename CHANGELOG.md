@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Uses common-auth 0.38.0 (no user-visible change).
-
 ## 2.5.4
 
 - Uses common-auth 0.37.1, which reuses the vault account list while its file is unchanged. Addresses #627.
