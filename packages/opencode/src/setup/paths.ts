@@ -1,19 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { getHostDataHome, getHostHome } from '@cortexkit/anthropic-auth-core'
 
 export const OPENCODE_PACKAGE_NAME = '@cortexkit/opencode-anthropic-auth'
 export const PI_PACKAGE_NAME = '@cortexkit/pi-anthropic-auth'
 
-export function getHostHome(
-  env: NodeJS.ProcessEnv = process.env,
-  platform: NodeJS.Platform = process.platform,
-): string {
-  return (
-    (platform === 'win32' ? env.USERPROFILE || env.HOME : env.HOME) || homedir()
-  )
-}
+export { getHostHome }
 
 export function getOpenCodeConfigDir(
   env: NodeJS.ProcessEnv = process.env,
@@ -30,9 +23,7 @@ export function getOpenCodeConfigDir(
 export function getOpenCodeDataDir(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const xdg = env.XDG_DATA_HOME?.trim()
-  if (xdg) return join(resolve(xdg), 'opencode')
-  return join(homedir(), '.local', 'share', 'opencode')
+  return join(getHostDataHome(env), 'opencode')
 }
 
 export function getOpenCodeAuthPath(

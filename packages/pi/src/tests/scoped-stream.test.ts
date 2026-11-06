@@ -1732,7 +1732,9 @@ for (const cacheKeepEnabled of [true, false]) {
       claudeCache: { enabled: true, mode: 'hybrid' },
       cacheKeep: { enabled: cacheKeepEnabled, always: true },
     }))
+    const acceptedAt = Date.now()
     const keep = new CacheKeepManager({
+      now: () => acceptedAt,
       loadStorage: async () => (await runtime.read()).policyStorage,
       setIntervalImpl: (() => ({
         unref() {},
@@ -1763,6 +1765,18 @@ for (const cacheKeepEnabled of [true, false]) {
       )
     await (await send('accepted')).text()
     const before = keep.trackedRequest(sessionId)
+    const facts = keep.registrySessions()
+    if (cacheKeepEnabled)
+      expect(facts).toMatchObject([
+        {
+          id: sessionId,
+          ttlMs: 3_600_000,
+          lastTouchAt: acceptedAt,
+          lastTouchKind: 'response',
+          cacheExpiresAt: acceptedAt + 3_600_000,
+        },
+      ])
+    else expect(facts).toEqual([])
     if (cacheKeepEnabled) expect(before).toBeDefined()
     else expect(before).toBeUndefined()
     const cacheExpiry = sessionCacheActivity.holdUntil(
@@ -1775,6 +1789,7 @@ for (const cacheKeepEnabled of [true, false]) {
     for (status of [400, 413, 429, 500]) {
       await (await send('rejected')).text()
       expect(keep.trackedRequest(sessionId)).toEqual(before)
+      expect(keep.registrySessions()).toEqual(facts)
       expect(
         sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
       ).toBe(cacheExpiry)

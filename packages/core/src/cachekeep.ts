@@ -6,7 +6,10 @@ import {
   CacheKeepPrewarmError,
   classifyCacheKeepFailure,
 } from './cachekeep-failure.ts'
-import type { CacheKeepTrackedSession } from './cachekeep-registry.ts'
+import type {
+  CacheKeepStopReason,
+  CacheKeepTrackedSession,
+} from './cachekeep-registry.ts'
 import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
@@ -387,6 +390,39 @@ export type CacheKeepTarget = {
    * untrack() when the round ends or its prefix becomes unusable.
    */
   sourceWarm?: boolean
+} & Pick<CacheKeepTrackedSession, 'ttlMs' | 'lastTouchAt' | 'lastTouchKind'>
+
+function sessionMetadata(target: CacheKeepTarget): CacheKeepTrackedSession {
+  return {
+    id: target.id,
+    cacheExpiresAt: target.cacheExpiresAt,
+    nextPrewarmAt: target.nextPrewarmAt,
+    ...(target.ttlMs !== undefined && { ttlMs: target.ttlMs }),
+    ...(target.lastTouchAt !== undefined && {
+      lastTouchAt: target.lastTouchAt,
+    }),
+    ...(target.lastTouchKind !== undefined && {
+      lastTouchKind: target.lastTouchKind,
+    }),
+  }
+}
+
+function stopReason(reason: string): CacheKeepStopReason {
+  switch (reason) {
+    case 'budget':
+    case 'count':
+      return 'evicted'
+    case 'schedule-period-ended':
+      return 'schedule'
+    case 'retry-window-ended':
+      return 'retries-exhausted'
+    case 'cachekeep-hybrid-inactive':
+      return 'disabled'
+    case 'source-warm-idle-cap':
+      return 'cost-cap'
+    default:
+      return 'policy-refused'
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -549,6 +585,8 @@ export type CacheKeepPrewarmValidation =
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
+  // Only the body-free public projection survives when warming stops.
+  private readonly stoppedSessions = new Map<string, CacheKeepTrackedSession>()
   private timer: ReturnType<typeof setInterval> | null = null
   private tickPromise: Promise<void> | null = null
   private nextPrewarmAttemptId = 0
@@ -659,6 +697,16 @@ export class CacheKeepManager {
       .sort((left, right) => left.id.localeCompare(right.id))
   }
 
+  registrySessions(): CacheKeepTrackedSession[] {
+    const now = this.options.now?.() ?? Date.now()
+    for (const [id, session] of this.stoppedSessions)
+      if (session.cacheExpiresAt <= now) this.stoppedSessions.delete(id)
+    return [
+      ...this.stoppedSessions.values(),
+      ...[...this.targets.values()].map(sessionMetadata),
+    ].sort((left, right) => left.id.localeCompare(right.id))
+  }
+
   trackedOAuthRoute(
     sessionId: string,
   ): { oauthAccountId?: string } | undefined {
@@ -704,8 +752,13 @@ export class CacheKeepManager {
    * (a finished recovery round, a model change, a cleared session) and
    * logs it where the decision is made. Returns whether a target existed.
    */
-  untrack(id: string): boolean {
-    if (!this.targets.has(id)) return false
+  untrack(
+    id: string,
+    reason: CacheKeepStopReason = 'session-forgotten',
+  ): boolean {
+    const target = this.targets.get(id)
+    if (!target) return false
+    this.retainStopped(target, reason, this.options.now?.() ?? Date.now())
     this.targets.delete(id)
     this.options.onTargetRemoved?.(id)
     this.publishTrackedSessions()
@@ -739,7 +792,7 @@ export class CacheKeepManager {
     if (!callback) return
     try {
       // Host callback failures may echo arbitrary text; log the stage only.
-      void Promise.resolve(callback(this.trackedSessions())).catch(() => {
+      void Promise.resolve(callback(this.registrySessions())).catch(() => {
         logger.warn('cachekeep', 'failed to publish tracked sessions')
       })
     } catch {
@@ -774,8 +827,21 @@ export class CacheKeepManager {
         nextPrewarmAt: target.nextPrewarmAt,
         ...details,
       })
+    this.retainStopped(target, stopReason(reason), now)
     this.targets.delete(target.id)
     this.options.onTargetRemoved?.(target.id)
+  }
+
+  private retainStopped(
+    target: CacheKeepTarget,
+    reason: CacheKeepStopReason,
+    now: number,
+  ) {
+    if (now >= target.cacheExpiresAt) return
+    this.stoppedSessions.set(target.id, {
+      ...sessionMetadata(target),
+      warmStopped: { at: now, reason },
+    })
   }
 
   private evictOldestTarget(now: number, reason: 'budget' | 'count') {
@@ -825,8 +891,16 @@ export class CacheKeepManager {
     accountStoragePath?: string
     isSubagent?: boolean
     sourceWarm?: boolean
+    ttlMs?: number
     /** Restore only the remaining lifetime, never grant a restarted cache a new hour. */
-    retained?: Pick<CacheKeepTarget, 'cacheExpiresAt' | 'nextPrewarmAt'>
+    retained?: Pick<
+      CacheKeepTarget,
+      | 'cacheExpiresAt'
+      | 'nextPrewarmAt'
+      | 'ttlMs'
+      | 'lastTouchAt'
+      | 'lastTouchKind'
+    >
   }): { tracked: true } | { tracked: false; reason: string } {
     const now = this.options.now?.() ?? Date.now()
     if (input.retained && input.retained.cacheExpiresAt <= now)
@@ -887,6 +961,7 @@ export class CacheKeepManager {
     const today = cacheKeepPeriodKey(input.storage, window, new Date(now))
     this.pruneTargets(now, today)
     if (this.targets.has(input.sessionId)) this.targets.delete(input.sessionId)
+    this.stoppedSessions.delete(input.sessionId)
 
     const headers: Record<string, string> = {}
     input.headers.forEach((value, key) => {
@@ -899,10 +974,26 @@ export class CacheKeepManager {
       headers,
       bodyText: input.bodyText,
       bodyBytes,
-      cacheExpiresAt: input.retained?.cacheExpiresAt ?? now + CACHE_KEEP_TTL_MS,
+      // Restoring a replay prefix is not evidence of a newly accepted response.
+      ...(input.retained
+        ? {
+            ttlMs: input.retained.ttlMs,
+            lastTouchAt: input.retained.lastTouchAt,
+            lastTouchKind: input.retained.lastTouchKind,
+          }
+        : input.sourceWarm
+          ? {}
+          : {
+              ttlMs: input.ttlMs ?? CACHE_KEEP_TTL_MS,
+              lastTouchAt: now,
+              lastTouchKind: 'response' as const,
+            }),
+      cacheExpiresAt:
+        input.retained?.cacheExpiresAt ??
+        now + (input.ttlMs ?? CACHE_KEEP_TTL_MS),
       nextPrewarmAt:
         input.retained?.nextPrewarmAt ??
-        now + CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS,
+        now + (input.ttlMs ?? CACHE_KEEP_TTL_MS) - CACHE_KEEP_PREWARM_LEAD_MS,
       consecutiveFailures: 0,
       dayKey: today,
       oauthAccountId: input.oauthAccountId,
@@ -975,22 +1066,19 @@ export class CacheKeepManager {
     this.pruneTargets(now, today)
     if (!this.targets.size) {
       this.publishTrackedSessions()
-      this.stop()
+      if (!this.stoppedSessions.size) this.stop()
       return
     }
 
     if (!isCacheKeepHybridActive(storage)) {
-      // CacheKeep (or hybrid mode) was turned off mid-round. Live targets
-      // keep their entries until their cache expires; recovery-round source
-      // warms stop for good instead of resuming on re-enable.
-      for (const target of this.targets.values()) {
-        if (target.sourceWarm)
-          this.removeTarget(target, 'cachekeep-hybrid-inactive', now)
-      }
+      for (const target of this.targets.values())
+        this.removeTarget(target, 'cachekeep-hybrid-inactive', now)
       this.publishTrackedSessions()
       return
     }
     if (!isCacheKeepActiveNow(storage, new Date(now))) {
+      for (const target of this.targets.values())
+        this.removeTarget(target, 'schedule-period-ended', now)
       this.publishTrackedSessions()
       return
     }
@@ -1050,6 +1138,7 @@ export class CacheKeepManager {
 
   private async sendPrewarm(
     target: CacheKeepTarget,
+    onAccepted?: (receivedAt: number) => void,
   ): Promise<CacheKeepPrewarmResult> {
     const attempt = {
       id: ++this.nextPrewarmAttemptId,
@@ -1242,6 +1331,7 @@ export class CacheKeepManager {
             cache_read_input_tokens?: number
           }
         | undefined
+      onAccepted?.(receivedAt)
       return { ok: true, ...(usage && { usage }) }
     } catch (error) {
       const failure = classifyCacheKeepFailure(error, stage, responseStatus)
@@ -1269,7 +1359,10 @@ export class CacheKeepManager {
   }
 
   private async prewarm(target: CacheKeepTarget, now: number) {
-    const result = await this.sendPrewarm(target)
+    let acceptedAt: number | undefined
+    const result = await this.sendPrewarm(target, (receivedAt) => {
+      acceptedAt = receivedAt
+    })
     if (!result.ok) {
       if (result.refused === true) {
         this.removeTarget(target, result.reason, now, {
@@ -1313,7 +1406,12 @@ export class CacheKeepManager {
       return
     }
 
-    target.cacheExpiresAt = now + CACHE_KEEP_TTL_MS
+    if (this.targets.get(target.id) !== target) return
+    acceptedAt ??= this.options.now?.() ?? Date.now()
+    target.ttlMs = CACHE_KEEP_TTL_MS
+    target.lastTouchAt = acceptedAt
+    target.lastTouchKind = 'warm'
+    target.cacheExpiresAt = acceptedAt + CACHE_KEEP_TTL_MS
     target.nextPrewarmAt = target.cacheExpiresAt - CACHE_KEEP_PREWARM_LEAD_MS
     target.consecutiveFailures = 0
     logger.debug('cachekeep', 'prewarm succeeded', {

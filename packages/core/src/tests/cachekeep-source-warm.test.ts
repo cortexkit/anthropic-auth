@@ -200,7 +200,7 @@ describe('CacheKeepManager source-warm targets', () => {
     manager.stop()
   })
 
-  test('drops the source warm when hybrid mode turns off but keeps the live target', async () => {
+  test('hybrid off drops replay bodies and keeps only stopped cache metadata', async () => {
     const now = new Date('2026-05-18T10:00:00').getTime()
     const fetchImpl = mock(() =>
       Promise.resolve(new Response('{}', { status: 200 })),
@@ -231,8 +231,22 @@ describe('CacheKeepManager source-warm targets', () => {
     await manager.tick()
 
     expect(fetchImpl).not.toHaveBeenCalled()
-    expect(manager.trackedSessions().map((session) => session.id)).toEqual([
-      'ses_round',
+    expect(manager.trackedSessions()).toEqual([])
+    expect(manager.trackedRequest('ses_round')).toBeUndefined()
+    expect(
+      manager.trackedRequest('source-warm:ses_round:fable-5'),
+    ).toBeUndefined()
+    expect(
+      manager.registrySessions().map((session) => ({
+        id: session.id,
+        warmStopped: session.warmStopped,
+      })),
+    ).toEqual([
+      { id: 'ses_round', warmStopped: { at: now, reason: 'disabled' } },
+      {
+        id: 'source-warm:ses_round:fable-5',
+        warmStopped: { at: now, reason: 'disabled' },
+      },
     ])
     manager.stop()
   })

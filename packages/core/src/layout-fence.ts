@@ -2,7 +2,10 @@ import { open, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 
-import { getDefaultCacheKeepRegistryDirectory } from './cachekeep-registry.ts'
+import {
+  getDefaultCacheKeepRegistryDirectory,
+  getLegacyCacheKeepRegistryDirectory,
+} from './cachekeep-registry.ts'
 import {
   HOLDER_FILE_NAME,
   type HolderLiveness,
@@ -169,8 +172,11 @@ export function defaultPreNArtifactLocations(
     cacheKeepDirs: [
       ...new Set(
         [
-          getDefaultCacheKeepRegistryDirectory('opencode'),
-          getDefaultCacheKeepRegistryDirectory('pi'),
+          getDefaultCacheKeepRegistryDirectory('opencode', env),
+          getDefaultCacheKeepRegistryDirectory('pi', env),
+          // Remove in the release after the next one: fence older temp records too.
+          getLegacyCacheKeepRegistryDirectory('opencode'),
+          getLegacyCacheKeepRegistryDirectory('pi'),
           env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR?.trim(),
           env.PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR?.trim(),
         ].filter((dir): dir is string => Boolean(dir)),

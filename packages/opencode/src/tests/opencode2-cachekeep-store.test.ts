@@ -4,6 +4,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -14,10 +15,15 @@ import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   type CacheKeepTarget,
+  getHostDataHome,
   type LogTestRecord,
   type OwnerOnlyOptions,
 } from '@cortexkit/anthropic-auth-core'
-import { CacheKeepStore, cacheKeepStoreDirectory } from '../v2/cachekeep-store'
+import {
+  CacheKeepStore,
+  cacheKeepStoreDirectory,
+  legacyCacheKeepStoreDirectory,
+} from '../v2/cachekeep-store'
 
 const cleanups: Array<() => unknown | Promise<unknown>> = []
 afterEach(async () => {
@@ -57,12 +63,12 @@ async function fixture(ownerOnly?: OwnerOnlyOptions) {
   return { root, store, target, saved }
 }
 
-test('restart storage defaults to a hashed system-temp folder, never the config folder', () => {
+test('restart storage defaults to a hashed private data folder, never the config folder', () => {
   const path = cacheKeepStoreDirectory('../../config/my-account')
-  expect(dirname(path)).toBe(tmpdir())
-  expect(basename(path)).toMatch(
-    /^cortexkit-anthropic-auth-cachekeep-[a-f0-9]{16}$/,
+  expect(dirname(path)).toBe(
+    join(getHostDataHome(), 'cortexkit', 'anthropic-auth', 'cachekeep-restore'),
   )
+  expect(basename(path)).toMatch(/^[a-f0-9]{16}$/)
   expect(path).not.toContain('my-account')
   expect(cacheKeepStoreDirectory('another-account')).not.toBe(path)
 })
@@ -158,7 +164,7 @@ test.skipIf(process.platform === 'win32')(
     const logs: LogTestRecord[] = []
     __setLogTestSink((record) => logs.push(record))
     cleanups.push(() => __setLogTestSink(null))
-    await mkdir(f.store.directory, { mode: 0o755 })
+    await mkdir(f.store.directory, { recursive: true, mode: 0o755 })
     await f.store.load(Date.now(), () => true)
     f.store.changed(f.target)
     await f.store.drain()
@@ -202,7 +208,12 @@ test('the Windows path creates the directory and file with native owner-only ACL
   const f = await fixture({ platform: 'win32', privateFiles })
   f.store.changed(f.target)
   await f.store.drain()
-  expect(createdDirectories).toEqual([f.store.directory])
+  expect(createdDirectories).toEqual([
+    join(f.root, 'cortexkit'),
+    join(f.root, 'cortexkit', 'anthropic-auth'),
+    join(f.root, 'cortexkit', 'anthropic-auth', 'cachekeep-restore'),
+    f.store.directory,
+  ])
   expect(createdFiles).toHaveLength(1)
   expect(createdFiles[0]).toStartWith(f.store.directory)
   expect(verified).toContain(f.store.directory)
@@ -212,4 +223,48 @@ test('the Windows path creates the directory and file with native owner-only ACL
     return true
   })
   expect(restored).toEqual([f.target.id])
+})
+
+test('an empty data store restores the old temp folder once and retires loaded files', async () => {
+  const f = await fixture()
+  f.store.changed(f.target)
+  await f.store.drain()
+  const legacy = legacyCacheKeepStoreDirectory('store', f.root)
+  await rename(f.store.directory, legacy)
+  const next = new CacheKeepStore({ storageId: 'store', root: f.root })
+  const ids: string[] = []
+  await next.load(Date.now(), (entry) => {
+    ids.push(entry.id)
+    return true
+  })
+  expect(ids).toEqual([f.target.id])
+  expect(await readdir(legacy)).toEqual([])
+  expect(await readdir(next.directory)).toHaveLength(1)
+  await rm(next.directory, { recursive: true })
+  await rename(legacy, next.directory)
+  // A new old-folder file appearing later cannot resurrect a removed session.
+  f.store.changed({ ...f.target, id: 'late' })
+  await f.store.drain()
+  await rename(next.directory, legacy)
+  await next.load(Date.now(), () => {
+    throw new Error('must not load old folder twice')
+  })
+  expect(await readdir(next.directory)).toEqual([])
+  expect(await readdir(legacy)).toHaveLength(1)
+})
+
+test('a nonempty data store wins over old temp restart records', async () => {
+  const f = await fixture()
+  f.store.changed(f.target)
+  await f.store.drain()
+  const legacy = legacyCacheKeepStoreDirectory('store', f.root)
+  await mkdir(legacy, { mode: 0o700 })
+  await writeFile(join(legacy, 'unreadable.json.gz'), 'old')
+  const ids: string[] = []
+  await f.store.load(Date.now(), (entry) => {
+    ids.push(entry.id)
+    return true
+  })
+  expect(ids).toEqual([f.target.id])
+  expect(await readdir(legacy)).toEqual(['unreadable.json.gz'])
 })

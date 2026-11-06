@@ -82,11 +82,11 @@ import {
   getAccountStoragePath,
   getCache1hMode,
   getCache1hPersistentMode,
+  getCacheKeepRegistryDirectories,
   getCacheKeepWindow,
   getClaudeCodeIdentityForVerifiedAccount,
   getClaudeModelCatalogue,
   getClaustrumMode,
-  getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getHostClaustrumEnrollmentPaths,
   getKillswitchConfig,
@@ -3631,9 +3631,7 @@ const anthropicAuthPlugin = async (
     },
   }
   const cacheKeepRegistry = new CacheKeepSessionRegistry({
-    directory:
-      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
-      getDefaultCacheKeepRegistryDirectory('opencode'),
+    ...getCacheKeepRegistryDirectories('opencode'),
   })
   let aggregateCacheKeepSessions: ReturnType<
     CacheKeepManager['trackedSessions']
@@ -3881,7 +3879,7 @@ const anthropicAuthPlugin = async (
             finalCredential.accountIdentity !== kept.accountIdentity)
         ) {
           fableFallbackManager.dropSourceWarmForTarget(target.id)
-          cacheKeepManager.untrack(target.id)
+          cacheKeepManager.untrack(target.id, 'policy-refused')
           logger.warn(
             'cachekeep',
             'source warm refused: bound account changed',
@@ -7696,6 +7694,7 @@ const anthropicAuthPlugin = async (
                     bodyText,
                     storage,
                     cacheMode: 'hybrid',
+                    ttlMs: acceptedCacheTtlMs,
                     oauthAccountId,
                     oauthAccountIdentity: nativeAuthorization?.accountIdentity,
                     isSubagent: subagentRequest,
@@ -7793,7 +7792,7 @@ const anthropicAuthPlugin = async (
                     ) {
                       fableFallbackManager.dropSourceWarm(recoveryKey)
                       if (targetId !== undefined)
-                        cacheKeepManager.untrack(targetId)
+                        cacheKeepManager.untrack(targetId, 'policy-refused')
                       logger.info(
                         'fable-fallback',
                         'source warm stopped: bound account unavailable',
@@ -7816,7 +7815,7 @@ const anthropicAuthPlugin = async (
                     ) {
                       fableFallbackManager.dropSourceWarm(recoveryKey)
                       if (targetId !== undefined)
-                        cacheKeepManager.untrack(targetId)
+                        cacheKeepManager.untrack(targetId, 'policy-refused')
                       logger.warn(
                         'fable-fallback',
                         'source warm stopped: history no longer starts with the kept prefix',
@@ -9888,6 +9887,7 @@ const anthropicAuthPlugin = async (
                       if (family)
                         cacheKeepManager.untrack(
                           sourceWarmTargetId(fablePlan.sessionId, family),
+                          'policy-refused',
                         )
                       logger.info(
                         'fable-fallback',
@@ -10183,6 +10183,7 @@ const anthropicAuthPlugin = async (
                             if (family)
                               cacheKeepManager.untrack(
                                 sourceWarmTargetId(fablePlan.sessionId, family),
+                                'policy-refused',
                               )
                           }
                           return completeRoute(route, await sendRoute(route))

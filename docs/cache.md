@@ -16,7 +16,7 @@ Cache settings do not reduce the complete input that Anthropic receives through 
 
 CacheKeep keeps recently used hybrid-cache sessions warm while their host process is running. Choose **Keep cache warm always**, **Cache keep window**, or **Disable cache keep** in the Cache menu. The window uses local hours; `always` remains active across midnight. Subagent keepalive can be controlled separately.
 
-About five minutes before a one-hour cache lifetime expires, CacheKeep sends a `max_tokens: 0` prewarm through the selected account's custody path. Failure preserves the known expiry and can schedule a bounded retry while the cache may still be alive. A host-scoped temporary lease registry aggregates session/cache timing across processes without publishing request bodies, headers or tokens. Stale leases age out; closing the host stops that process's keepalive work.
+About five minutes before a one-hour cache lifetime expires, CacheKeep sends a `max_tokens: 0` prewarm through the selected account's custody path. Failure preserves the known expiry and can schedule a bounded retry while the cache may still be alive. A [documented session registry](cachekeep-registry.md#cachekeep-session-registry) in the CortexKit data folder aggregates session/cache timing across processes without publishing request bodies, headers or tokens. Stopped sessions retain metadata until cache expiry; missing or stale leases mean unknown, not expired. Closing the host stops that process's keepalive work.
 
 ## Prime and lane start
 

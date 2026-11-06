@@ -38,6 +38,7 @@ Pi: open `/claude` and use **Start OAuth sign-in**, then **Finish OAuth sign-in*
 - [Credential custody contract](docs/custody-state-machine.md#anthropic-credential-custody)
 - [Commands and menus](docs/commands.md#commands-and-menus)
 - [Cache, keepalive and quota priming](docs/cache.md#cache-keepalive-and-quota-priming)
+- [CacheKeep session registry interface](docs/cachekeep-registry.md#cachekeep-session-registry)
 - [Cache diagnostics](docs/cache-diagnostics.md#cache-diagnostics)
 - [OpenCode 2](docs/opencode-2.md#opencode-2)
 - [OpenCode sidebar and TUI preferences](docs/sidebar.md#opencode-sidebar-and-tui-preferences)

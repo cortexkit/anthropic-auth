@@ -273,6 +273,7 @@ async function fixture(
   })
   if (unsafePersistence)
     await mkdir(cacheKeepStoreDirectory(paths.storageId, directory), {
+      recursive: true,
       mode: 0o755,
     })
   const start = async (enrollmentFile = 'enrollment.json') => {
@@ -434,6 +435,7 @@ async function fixture(
     registry,
     disk: cacheKeepStoreDirectory(paths.storageId, directory),
     timers,
+    now: () => now,
     due: () => {
       now += CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
     },
@@ -537,6 +539,33 @@ test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes i
   await f.dispose()
   expect(f.timers.callbacks.size).toBe(0)
   expect(await f.registry.list()).toEqual([])
+})
+
+test('OpenCode 2 publishes response and warm cache facts with the actual touch times', async () => {
+  const f = await fixture()
+  await f.live()
+  expect(await f.registry.list()).toEqual([
+    {
+      id: 'ses_oc2_keep',
+      ttlMs: 3_600_000,
+      lastTouchAt: f.now(),
+      lastTouchKind: 'response',
+      cacheExpiresAt: f.now() + 3_600_000,
+      nextPrewarmAt: f.now() + 3_300_000,
+    },
+  ])
+  f.due()
+  await f.timers.fire()
+  expect(await f.registry.list()).toEqual([
+    {
+      id: 'ses_oc2_keep',
+      ttlMs: 3_600_000,
+      lastTouchAt: f.now(),
+      lastTouchKind: 'warm',
+      cacheExpiresAt: f.now() + 3_600_000,
+      nextPrewarmAt: f.now() + 3_300_000,
+    },
+  ])
 })
 
 for (const status of [200, 400]) {
@@ -747,7 +776,9 @@ test('a killswitch-refused OpenCode 2 target warns once, stops, and tracks the n
   expect(warnings()[0]).toContain('"reason":"account-policy"')
   expect(warnings()[0]).toContain('"stage":"authorization"')
   expect(warnings()[0]).toContain('"class":"account-policy"')
-  expect(await f.registry.list()).toEqual([])
+  expect(await f.registry.list()).toMatchObject([
+    { id: 'ses_oc2_keep', warmStopped: { reason: 'policy-refused' } },
+  ])
   f.advance(2 * 60_000)
   await f.timers.fire()
   expect(warnings()).toHaveLength(1)
@@ -1023,7 +1054,9 @@ test('OpenCode 2 never prewarms a replacement login in the same account row', as
   f.due()
   await f.timers.fire()
   expect(f.sent).toHaveLength(0)
-  expect(await f.registry.list()).toEqual([])
+  expect(await f.registry.list()).toMatchObject([
+    { id: 'ses_oc2_keep', warmStopped: { reason: 'policy-refused' } },
+  ])
   expect(lines.filter((line) => line.includes(' WARN '))).toHaveLength(1)
   expect(lines.find((line) => line.includes(' WARN '))).toContain(
     '"reason":"credential-changed"',

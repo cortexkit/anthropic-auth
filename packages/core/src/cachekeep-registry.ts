@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   link,
+  lstat,
   mkdir,
   readdir,
   readFile,
@@ -9,16 +10,45 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import * as nodePath from 'node:path'
+import { dirname, join } from 'node:path'
 
-import { type WriterStamp, writerStamp } from './holder-registry.ts'
+import {
+  type HolderLiveness,
+  holderEntryIsLive,
+  type WriterStamp,
+  writerStamp,
+} from './holder-registry.ts'
+import { getHostDataHome } from './host-paths.ts'
+import {
+  createWindowsOwnerOnly,
+  ensureWindowsOwnerOnlyDirectory,
+  isOwnerOnly,
+  type OwnerOnlyOptions,
+} from './owner-only.ts'
+import { renameWithWindowsSharingRetry } from './publication-rename.ts'
 
 export const CACHE_KEEP_REGISTRY_LEASE_MS = 3 * 60_000
+
+export const CACHE_KEEP_STOP_REASONS = [
+  'cost-cap',
+  'schedule',
+  'evicted',
+  'policy-refused',
+  'retries-exhausted',
+  'session-forgotten',
+  'disabled',
+] as const
+export type CacheKeepStopReason = (typeof CACHE_KEEP_STOP_REASONS)[number]
 
 export type CacheKeepTrackedSession = {
   id: string
   cacheExpiresAt: number
   nextPrewarmAt: number
+  ttlMs?: number
+  lastTouchAt?: number
+  lastTouchKind?: 'response' | 'warm'
+  warmStopped?: { at: number; reason: CacheKeepStopReason }
 }
 
 type CacheKeepRegistryRecord = {
@@ -50,6 +80,37 @@ function normalizeSession(value: unknown): CacheKeepTrackedSession | undefined {
     id: record.id,
     cacheExpiresAt: record.cacheExpiresAt,
     nextPrewarmAt: record.nextPrewarmAt,
+    ...(typeof record.ttlMs === 'number' &&
+      Number.isFinite(record.ttlMs) &&
+      record.ttlMs > 0 && { ttlMs: record.ttlMs }),
+    ...(typeof record.lastTouchAt === 'number' &&
+      Number.isFinite(record.lastTouchAt) && {
+        lastTouchAt: record.lastTouchAt,
+      }),
+    ...((record.lastTouchKind === 'response' ||
+      record.lastTouchKind === 'warm') && {
+      lastTouchKind: record.lastTouchKind,
+    }),
+    ...normalizeStopped(record.warmStopped),
+  }
+}
+
+function normalizeStopped(
+  value: unknown,
+): Pick<CacheKeepTrackedSession, 'warmStopped'> {
+  if (!value || typeof value !== 'object') return {}
+  const stopped = value as { at?: unknown; reason?: unknown }
+  if (
+    typeof stopped.at !== 'number' ||
+    !Number.isFinite(stopped.at) ||
+    !CACHE_KEEP_STOP_REASONS.includes(stopped.reason as CacheKeepStopReason)
+  )
+    return {}
+  return {
+    warmStopped: {
+      at: stopped.at,
+      reason: stopped.reason as CacheKeepStopReason,
+    },
   }
 }
 
@@ -82,25 +143,77 @@ function isExpiredRecord(
   return record.updatedAt <= now && now - record.updatedAt > leaseMs
 }
 
-export function getDefaultCacheKeepRegistryDirectory(scope: 'opencode' | 'pi') {
+export function getLegacyCacheKeepRegistryDirectory(scope: 'opencode' | 'pi') {
+  // Remove in the release after the next one: 2.5.3 reads only the temp registry.
   return join(tmpdir(), 'opencode-anthropic-auth', 'cachekeep-sessions', scope)
 }
 
+export function getDefaultCacheKeepRegistryDirectory(
+  scope: 'opencode' | 'pi',
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  pathApi: Pick<typeof nodePath, 'join' | 'resolve'> = nodePath,
+) {
+  return pathApi.join(
+    getHostDataHome(env, platform, pathApi),
+    'cortexkit',
+    'anthropic-auth',
+    'cachekeep-sessions',
+    scope,
+  )
+}
+
+export function getCacheKeepRegistryDirectories(
+  scope: 'opencode' | 'pi',
+  override?: string,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const directory =
+    override ||
+    env[
+      scope === 'pi'
+        ? 'PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR'
+        : 'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR'
+    ]
+  return {
+    directory: directory || getDefaultCacheKeepRegistryDirectory(scope, env),
+    // Remove in the release after the next one: overrides must not leak into
+    // default folders, but default writers also serve 2.5.3 temp-folder readers.
+    legacyDirectory: directory
+      ? undefined
+      : getLegacyCacheKeepRegistryDirectory(scope),
+  }
+}
+
 export class CacheKeepSessionRegistry {
-  private readonly filePath: string
+  private readonly directories: string[]
+  private readonly filePaths: string[]
   private writeChain: Promise<void> = Promise.resolve()
   private lastSweepAt?: number
 
   constructor(
     private readonly options: {
       directory: string
+      legacyDirectory?: string
+      ownerOnly?: OwnerOnlyOptions
+      liveness?: HolderLiveness
       now?: () => number
       leaseMs?: number
       instanceId?: string
     },
   ) {
     const instanceId = options.instanceId ?? `${process.pid}-${randomUUID()}`
-    this.filePath = join(options.directory, `${instanceId}.json`)
+    // Remove in the release after the next one: dual publication and merged reads.
+    this.directories = [
+      ...new Set(
+        [options.directory, options.legacyDirectory].filter(
+          (dir): dir is string => !!dir,
+        ),
+      ),
+    ]
+    this.filePaths = this.directories.map((dir) =>
+      join(dir, `${instanceId}.json`),
+    )
   }
 
   publish(sessions: readonly CacheKeepTrackedSession[]): Promise<void> {
@@ -110,21 +223,56 @@ export class CacheKeepSessionRegistry {
       .then(async () => {
         const now = this.options.now?.() ?? Date.now()
         const leaseMs = this.options.leaseMs ?? CACHE_KEEP_REGISTRY_LEASE_MS
-        if (snapshot.length === 0) {
-          await rm(this.filePath, { force: true })
-        } else {
-          await mkdir(this.options.directory, { recursive: true, mode: 0o700 })
-          const tempPath = `${this.filePath}.${randomUUID()}.tmp`
-          const record: CacheKeepRegistryRecord = {
-            version: 1,
-            updatedAt: now,
-            sessions: snapshot,
-            writer: writerStamp(),
+        const record: CacheKeepRegistryRecord = {
+          version: 1,
+          updatedAt: now,
+          sessions: snapshot,
+          writer: writerStamp(),
+        }
+        for (const filePath of this.filePaths) {
+          if (snapshot.length === 0) {
+            await rm(filePath, { force: true })
+            continue
           }
-          await writeFile(tempPath, `${JSON.stringify(record)}\n`, {
-            mode: 0o600,
-          })
-          await rename(tempPath, this.filePath)
+          const directory = dirname(filePath)
+          if (
+            !(await ensureWindowsOwnerOnlyDirectory(
+              directory,
+              this.options.ownerOnly,
+            ))
+          ) {
+            await mkdir(directory, { recursive: true, mode: 0o700 })
+          }
+          const stat = await lstat(directory)
+          if (
+            !stat.isDirectory() ||
+            stat.isSymbolicLink() ||
+            !(await isOwnerOnly(
+              directory,
+              () =>
+                stat.uid === process.getuid?.() &&
+                (stat.mode & 0o777) === 0o700,
+              this.options.ownerOnly,
+            ))
+          )
+            throw new Error('Unsafe CacheKeep registry directory')
+          const tempPath = `${filePath}.${randomUUID()}.tmp`
+          try {
+            const bytes = `${JSON.stringify(record)}\n`
+            if (
+              !(await createWindowsOwnerOnly(
+                tempPath,
+                bytes,
+                this.options.ownerOnly,
+              ))
+            )
+              await writeFile(tempPath, bytes, { flag: 'wx', mode: 0o600 })
+            await renameWithWindowsSharingRetry(tempPath, filePath, {
+              platform: this.options.ownerOnly?.platform,
+            })
+          } finally {
+            await rm(tempPath, { force: true })
+          }
         }
         await this.sweepExpiredRecords(now, leaseMs)
       })
@@ -138,19 +286,10 @@ export class CacheKeepSessionRegistry {
     const now = this.options.now?.() ?? Date.now()
     const leaseMs = this.options.leaseMs ?? CACHE_KEEP_REGISTRY_LEASE_MS
     await this.sweepExpiredRecords(now, leaseMs)
-    let names: string[]
-    try {
-      names = (await readdir(this.options.directory)).filter((name) =>
-        name.endsWith('.json'),
-      )
-    } catch {
-      names = []
-    }
-
     const records = await Promise.all(
-      names.map(async (name) => {
+      (await this.recordPaths()).map(async (path) => {
         try {
-          const raw = await readFile(join(this.options.directory, name), 'utf8')
+          const raw = await readFile(path, 'utf8')
           return normalizeRecord(JSON.parse(raw))
         } catch {
           return undefined
@@ -186,7 +325,40 @@ export class CacheKeepSessionRegistry {
 
   async dispose(): Promise<void> {
     await this.writeChain.catch(() => {})
-    await rm(this.filePath, { force: true })
+    await Promise.all(this.filePaths.map((path) => rm(path, { force: true })))
+  }
+
+  private async recordPaths(): Promise<string[]> {
+    return (
+      await Promise.all(
+        this.directories.map(async (directory) => {
+          try {
+            return (await readdir(directory))
+              .filter((name) => name.endsWith('.json'))
+              .map((name) => join(directory, name))
+          } catch {
+            return []
+          }
+        }),
+      )
+    ).flat()
+  }
+
+  private async mayRemove(
+    recordPath: string,
+    record: CacheKeepRegistryRecord,
+    now: number,
+    leaseMs: number,
+  ) {
+    if (!isExpiredRecord(record, now, leaseMs)) return false
+    const pid = Number(
+      /(?:^|[/\\])(\d+)-[^/\\]+\.json(?:\..+\.sweep)?$/.exec(recordPath)?.[1],
+    )
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false
+    return !(await holderEntryIsLive(
+      { pid, incarnation: null, registeredAt: record.updatedAt },
+      this.options.liveness,
+    ))
   }
 
   private async sweepExpiredRecords(
@@ -198,19 +370,9 @@ export class CacheKeepSessionRegistry {
     }
     this.lastSweepAt = now
 
-    let names: string[]
-    try {
-      names = (await readdir(this.options.directory)).filter((name) =>
-        name.endsWith('.json'),
-      )
-    } catch {
-      return
-    }
-
     await Promise.all(
-      names.map(async (name) => {
-        const recordPath = join(this.options.directory, name)
-        if (recordPath === this.filePath) return
+      (await this.recordPaths()).map(async (recordPath) => {
+        if (this.filePaths.includes(recordPath)) return
 
         let initialRecord: CacheKeepRegistryRecord | undefined
         try {
@@ -220,7 +382,10 @@ export class CacheKeepSessionRegistry {
         } catch {
           return
         }
-        if (!initialRecord || !isExpiredRecord(initialRecord, now, leaseMs)) {
+        if (
+          !initialRecord ||
+          !(await this.mayRemove(recordPath, initialRecord, now, leaseMs))
+        ) {
           return
         }
 
@@ -241,7 +406,10 @@ export class CacheKeepSessionRegistry {
           // Unreadable records are not safe to classify as expired.
         }
 
-        if (record && isExpiredRecord(record, now, leaseMs)) {
+        if (
+          record &&
+          (await this.mayRemove(recordPath, record, now, leaseMs))
+        ) {
           try {
             await rm(sweptPath, { force: true })
           } catch {
@@ -279,11 +447,18 @@ export class CacheKeepSessionRegistry {
       if (raw === undefined) return
 
       try {
-        await writeFile(recordPath, raw, {
-          encoding: 'utf8',
-          flag: 'wx',
-          mode: 0o600,
-        })
+        if (
+          !(await createWindowsOwnerOnly(
+            recordPath,
+            raw,
+            this.options.ownerOnly,
+          ))
+        )
+          await writeFile(recordPath, raw, {
+            encoding: 'utf8',
+            flag: 'wx',
+            mode: 0o600,
+          })
       } catch (writeError) {
         const writeCode =
           writeError && typeof writeError === 'object' && 'code' in writeError

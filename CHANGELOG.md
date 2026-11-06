@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Document the CacheKeep session registry and cache lifetime facts; session files now live in `<data>/cortexkit/anthropic-auth/cachekeep-sessions/{opencode,pi}` and OpenCode 2 restart files in `<data>/cortexkit/anthropic-auth/cachekeep-restore/`, using `$XDG_DATA_HOME` or `~/.local/share` for `<data>`. Addresses #592.
 - Reuse unchanged native runtime state on OpenCode 2 without skipping file safety checks, reducing idle vault-mode CPU use. Addresses #627.
 
 ## 2.5.3

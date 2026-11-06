@@ -48,7 +48,7 @@ A legacy sidecar is an old migration-source file. The native files beside it sto
 | `OPENCODE_TUI_PREFERENCES_FILE` | Full path override for the optional shared `tui-preferences.jsonc` |
 | `PI_CODING_AGENT_DIR`, `PI_AGENT_DIR` | Pi extension default storage directory, in that precedence order |
 | `XDG_CONFIG_HOME` | Base for the default OpenCode config directory |
-| `XDG_DATA_HOME` | Base for OpenCode's data directory used to resolve OC1 `auth.json` during setup |
+| `XDG_DATA_HOME` | Base for OpenCode's data directory used to resolve OpenCode 1 `auth.json` during setup, and for the [CacheKeep session registry and restart store](cachekeep-registry.md#location-and-permissions) |
 | `XDG_STATE_HOME` | Base for default enrollment files, `cortexkit/anthropic-auth/<host>-enrollment.json`; otherwise `~/.local/state` (`%USERPROFILE%\.local\state` on Windows) |
 
 A completed import records its routing destination in the journal; serving uses that recorded path rather than retroactively relocating it when an override changes. See [local storage](accounts-and-routing.md#local-storage). Pi SDK login-path resolution uses `PI_CODING_AGENT_DIR` (including home expansion), not the extension-only `PI_AGENT_DIR` fallback; the two are not interchangeable for host auth.
@@ -59,8 +59,8 @@ A completed import records its routing destination in the journal; serving uses 
 | --- | --- |
 | `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` | OpenCode 1: `legacy` skips Anthropic's server fallback and uses client safety recovery; default tries the server first, then client recovery |
 | `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK` | OpenCode 2 wire policy: `legacy` disables its server-side fallback opt-in; it does not enable OC1's client recovery |
-| `OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | OpenCode 1 temporary CacheKeep session-lease directory |
-| `PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Pi temporary CacheKeep session-lease directory |
+| `OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | OpenCode 1 and 2 [CacheKeep session registry](cachekeep-registry.md#location-and-permissions) directory override |
+| `PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR` | Pi [CacheKeep session registry](cachekeep-registry.md#location-and-permissions) directory override |
 | `OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR` | OpenCode 1 quota-header-feed lease directory; publishing still requires `quotaHeaderFeed.enabled` |
 | `OPENCODE_ANTHROPIC_AUTH_RPC_DIR` | OpenCode TUI menu bridge's port/token directory; default is per-project under OpenCode state |
 | `OPENCODE_ANTHROPIC_AUTH_PERF` | `1` enables structural request/relay/stream performance instrumentation |

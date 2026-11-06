@@ -7,6 +7,7 @@ import {
   CACHE_KEEP_TTL_MS,
   CacheKeepManager,
 } from '../cachekeep.ts'
+import type { CacheKeepTrackedSession } from '../cachekeep-registry.ts'
 import {
   __setLogTestSink,
   getLogLevel,
@@ -66,6 +67,77 @@ function fixture(
     })
   return { manager, track }
 }
+
+test('stopped registry entries survive without a body until cache expiry, then disappear', async () => {
+  let published: readonly CacheKeepTrackedSession[] = []
+  const { manager, track } = fixture({
+    onTrackedSessionsChanged: (sessions) => {
+      published = sessions
+    },
+  })
+  track('stopped')
+  const expiry = now + CACHE_KEEP_TTL_MS
+  now += 1000
+  manager.untrack('stopped')
+  expect(manager.trackedRequest('stopped')).toBeUndefined()
+  expect(manager.trackedCount()).toBe(0)
+  expect(published).toEqual([
+    {
+      id: 'stopped',
+      cacheExpiresAt: expiry,
+      nextPrewarmAt: expiry - CACHE_KEEP_PREWARM_LEAD_MS,
+      ttlMs: CACHE_KEEP_TTL_MS,
+      lastTouchAt: now - 1000,
+      lastTouchKind: 'response',
+      warmStopped: { at: now, reason: 'session-forgotten' },
+    },
+  ])
+  now = expiry - 1
+  await manager.tick()
+  expect(published).toHaveLength(1)
+  now = expiry
+  await manager.tick()
+  expect(published).toEqual([])
+})
+
+test('registry facts use accepted response TTL and successful warm receipt time', async () => {
+  const { manager } = fixture({
+    onResponse: () => {
+      now += 5000
+    },
+    fetchImpl: Object.assign(
+      async () => {
+        now += 100
+        return Response.json({})
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  const accepted = now
+  manager.track({
+    sessionId: 'facts',
+    url: 'https://api.anthropic.com/v1/messages',
+    headers: new Headers(),
+    bodyText: body,
+    storage,
+    cacheMode: 'hybrid',
+    ttlMs: 300_000,
+  })
+  expect(manager.registrySessions()[0]).toMatchObject({
+    ttlMs: 300_000,
+    lastTouchAt: accepted,
+    lastTouchKind: 'response',
+    cacheExpiresAt: accepted + 300_000,
+  })
+  await manager.tick()
+  expect(manager.registrySessions()[0]).toMatchObject({
+    ttlMs: 3_600_000,
+    lastTouchAt: accepted + 100,
+    lastTouchKind: 'warm',
+    cacheExpiresAt: accepted + 100 + 3_600_000,
+  })
+  expect(manager.registrySessions()[0]?.warmStopped).toBeUndefined()
+})
 
 test.each(['prepareHeaders', 'fetchImpl'] as const)(
   'a typed account refusal from %s removes the target with one closed warning',

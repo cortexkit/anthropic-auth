@@ -6,7 +6,7 @@ import {
   CacheKeepPrewarmError,
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
-  getDefaultCacheKeepRegistryDirectory,
+  getCacheKeepRegistryDirectories,
   isCacheKeepActiveNow,
   isCacheKeepHybridActive,
   isCacheKeepSubagentsEnabled,
@@ -159,10 +159,7 @@ function createSharedCacheKeep(
   const restored = new Set<string>()
   let lastRestoredSend = 0
   const registry = new CacheKeepSessionRegistry({
-    directory:
-      options.registryDirectory ||
-      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
-      getDefaultCacheKeepRegistryDirectory('opencode'),
+    ...getCacheKeepRegistryDirectories('opencode', options.registryDirectory),
     now: options.now,
   })
   const newestLease = () => {
@@ -177,7 +174,7 @@ function createSharedCacheKeep(
       const storage = lease ? await lease.loadStorage() : null
       if (lease && !isCacheKeepHybridActive(storage)) {
         for (const session of manager.trackedSessions())
-          manager.untrack(session.id)
+          manager.untrack(session.id, 'disabled')
         shared.persistence.clear()
       }
       return storage
@@ -328,7 +325,13 @@ function createSharedCacheKeep(
             oauthAccountId: account.id,
             oauthAccountIdentity: entry.oauthAccountIdentity,
             isSubagent: entry.isSubagent,
-            retained: { cacheExpiresAt: entry.cacheExpiresAt, nextPrewarmAt },
+            retained: {
+              cacheExpiresAt: entry.cacheExpiresAt,
+              nextPrewarmAt,
+              ttlMs: entry.ttlMs,
+              lastTouchAt: entry.lastTouchAt,
+              lastTouchKind: entry.lastTouchKind,
+            },
           })
           if (result.tracked) restored.add(entry.id)
           return result.tracked ? true : 'invalid'
@@ -342,7 +345,7 @@ function createSharedCacheKeep(
       // left to keep warm; drop it rather than prewarm it.
       if (manager.dropExpiredTargets() === undefined) return
       manager.start()
-      registry.publish(manager.trackedSessions()).catch(() => {
+      registry.publish(manager.registrySessions()).catch(() => {
         logger.warn('cachekeep', 'failed to publish tracked sessions')
       })
     },
@@ -662,7 +665,7 @@ export function createNativeCacheKeep(
       if (lease.stopped) return skipped('lease-stopped')
       if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
         for (const session of manager.trackedSessions())
-          manager.untrack(session.id)
+          manager.untrack(session.id, 'disabled')
         owner.persistence.clear()
         return skipped('hybrid-inactive')
       }
@@ -715,7 +718,7 @@ export function createNativeCacheKeep(
       ) {
         const result = manager.track(target)
         if (result.tracked)
-          registry.publish(manager.trackedSessions()).catch(() => {
+          registry.publish(manager.registrySessions()).catch(() => {
             logger.warn('cachekeep', 'failed to publish tracked sessions')
           })
         return result
@@ -725,6 +728,7 @@ export function createNativeCacheKeep(
       discardAttempt(attemptId)
     },
     forgetSession(sessionID: string) {
+      manager.untrack(sessionID)
       for (const [attemptId, entry] of pending)
         if (entry.sessionID === sessionID) discardAttempt(attemptId)
     },

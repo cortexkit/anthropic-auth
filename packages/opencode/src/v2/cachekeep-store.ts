@@ -10,6 +10,7 @@ import {
   type CacheKeepTarget,
   createWindowsOwnerOnly,
   ensureWindowsOwnerOnlyDirectory,
+  getHostDataHome,
   isOwnerOnly,
   logger,
   type OwnerOnlyOptions,
@@ -29,7 +30,24 @@ const MAX_RECORD_BYTES = 2 * CACHE_KEEP_MAX_BODY_BYTES + 64 * 1024
 // previous format so updates do not discard still-live caches.
 const RECORD_FORMAT_VERSION = 1
 
-export function cacheKeepStoreDirectory(storageId: string, root = tmpdir()) {
+export function cacheKeepStoreDirectory(
+  storageId: string,
+  root = getHostDataHome(),
+) {
+  return join(
+    root,
+    'cortexkit',
+    'anthropic-auth',
+    'cachekeep-restore',
+    hash(storageId).slice(0, 16),
+  )
+}
+
+export function legacyCacheKeepStoreDirectory(
+  storageId: string,
+  root = tmpdir(),
+) {
+  // Remove in the release after the next one: recover 2.5.3 restart files once.
   return join(
     root,
     `cortexkit-anthropic-auth-cachekeep-${hash(storageId).slice(0, 16)}`,
@@ -45,6 +63,9 @@ export type SavedCacheKeepTarget = Pick<
   | 'nextPrewarmAt'
   | 'oauthAccountIdentity'
   | 'isSubagent'
+  | 'ttlMs'
+  | 'lastTouchAt'
+  | 'lastTouchKind'
 > & { v: typeof RECORD_FORMAT_VERSION; pluginVersion: string }
 
 type DropReason =
@@ -77,6 +98,9 @@ function record(target: Readonly<CacheKeepTarget>): SavedCacheKeepTarget {
     nextPrewarmAt: target.nextPrewarmAt,
     oauthAccountIdentity: target.oauthAccountIdentity,
     isSubagent: target.isSubagent,
+    ttlMs: target.ttlMs,
+    lastTouchAt: target.lastTouchAt,
+    lastTouchKind: target.lastTouchKind,
   }
 }
 
@@ -130,8 +154,10 @@ function invalidReason(
 
 export interface CacheKeepStoreOptions {
   storageId: string
-  /** Test seam; production always uses os.tmpdir(), never OpenCode's config. */
+  /** Test seam for the data home; never OpenCode's config. */
   root?: string
+  /** Remove in the release after the next one: old temp-root migration seam. */
+  legacyRoot?: string
   ownerOnly?: OwnerOnlyOptions
   now?: () => number
   setTimeoutImpl?: typeof globalThis.setTimeout
@@ -142,6 +168,7 @@ export interface CacheKeepStoreOptions {
 export class CacheKeepStore {
   readonly directory: string
   private disabled = false
+  private legacyLoadAttempted = false
   private chain: Promise<void> = Promise.resolve()
   private readonly pending = new Map<string, SavedCacheKeepTarget>()
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -173,27 +200,27 @@ export class CacheKeepStore {
     )
   }
 
-  private async directoryReady() {
+  private async directoryReady(directory = this.directory) {
     if (this.disabled) return false
     try {
       if (
         !(await ensureWindowsOwnerOnlyDirectory(
-          this.directory,
+          directory,
           this.options.ownerOnly,
         ))
       ) {
         try {
-          await mkdir(this.directory, { mode: 0o700 })
+          await mkdir(directory, { recursive: true, mode: 0o700 })
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
         }
       }
-      const stat = await lstat(this.directory)
+      const stat = await lstat(directory)
       if (
         !stat.isDirectory() ||
         stat.isSymbolicLink() ||
         !(await isOwnerOnly(
-          this.directory,
+          directory,
           () =>
             stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o700,
           this.options.ownerOnly,
@@ -220,12 +247,30 @@ export class CacheKeepStore {
   async load(now: number, accept: (entry: SavedCacheKeepTarget) => Acceptance) {
     await this.chain
     if (!(await this.directoryReady())) return
+    let directory = this.directory
+    // Remove in the release after the next one: only an empty new store may
+    // fall back to the temp store, and each writer tries that fallback once.
+    const firstLoad = !this.legacyLoadAttempted
+    this.legacyLoadAttempted = true
+    if (firstLoad && (await readdir(directory)).length === 0) {
+      const legacy = legacyCacheKeepStoreDirectory(
+        this.options.storageId,
+        this.options.legacyRoot ?? this.options.root,
+      )
+      try {
+        await lstat(legacy)
+        if (!(await this.directoryReady(legacy))) return
+        directory = legacy
+      } catch {
+        return
+      }
+    }
     let restored = 0
     let dropped = 0
     try {
-      for (const name of (await readdir(this.directory)).sort()) {
+      for (const name of (await readdir(directory)).sort()) {
         if (!FILE.test(name) && !TEMP.test(name)) continue
-        const path = join(this.directory, name)
+        const path = join(directory, name)
         let reason: DropReason = 'unreadable'
         try {
           if (TEMP.test(name)) {
@@ -271,7 +316,20 @@ export class CacheKeepStore {
             reason = accepted || 'invalid'
             throw new Error('Stale restart file')
           }
-          if (accepted === true) restored++
+          if (accepted === true) {
+            // Remove in the release after the next one: retire old files only
+            // after the accepted record is durable in the private data store.
+            if (directory !== this.directory) {
+              try {
+                await this.writeEntry(entry)
+              } catch {
+                this.refuse()
+                return
+              }
+              await rm(path, { force: true })
+            }
+            restored++
+          }
         } catch {
           logger.debug('cachekeep', 'restart record dropped', {
             file: name,
@@ -303,6 +361,9 @@ export class CacheKeepStore {
       previous.oauthAccountIdentity === entry.oauthAccountIdentity &&
       previous.cacheExpiresAt === entry.cacheExpiresAt &&
       previous.nextPrewarmAt === entry.nextPrewarmAt &&
+      previous.ttlMs === entry.ttlMs &&
+      previous.lastTouchAt === entry.lastTouchAt &&
+      previous.lastTouchKind === entry.lastTouchKind &&
       previous.isSubagent === entry.isSubagent
     )
       return
@@ -334,24 +395,24 @@ export class CacheKeepStore {
     this.pending.delete(id)
     if (!entry) return this.chain
     this.lastWrite.set(id, this.options.now?.() ?? Date.now())
-    this.enqueue(async () => {
-      const path = join(this.directory, `${hash(id)}.json.gz`)
-      const temp = `${path}.${randomUUID()}.tmp`
-      try {
-        const safe = { ...entry, bodyText: sanitizedBody(entry.bodyText) }
-        const bytes = await compress(JSON.stringify(safe))
-        if (
-          !(await createWindowsOwnerOnly(temp, bytes, this.options.ownerOnly))
-        )
-          await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
-        await renameWithWindowsSharingRetry(temp, path, {
-          platform: this.options.ownerOnly?.platform,
-        })
-      } finally {
-        await rm(temp, { force: true })
-      }
-    })
+    this.enqueue(() => this.writeEntry(entry))
     return this.chain
+  }
+
+  private async writeEntry(entry: SavedCacheKeepTarget) {
+    const path = join(this.directory, `${hash(entry.id)}.json.gz`)
+    const temp = `${path}.${randomUUID()}.tmp`
+    try {
+      const safe = { ...entry, bodyText: sanitizedBody(entry.bodyText) }
+      const bytes = await compress(JSON.stringify(safe))
+      if (!(await createWindowsOwnerOnly(temp, bytes, this.options.ownerOnly)))
+        await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
+      await renameWithWindowsSharingRetry(temp, path, {
+        platform: this.options.ownerOnly?.platform,
+      })
+    } finally {
+      await rm(temp, { force: true })
+    }
   }
 
   removed(id: string) {

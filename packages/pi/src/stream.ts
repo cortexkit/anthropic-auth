@@ -18,8 +18,8 @@ import {
   effectiveRelayTransport,
   FAST_MODE_BETA,
   getCache1hPersistentMode,
+  getCacheKeepRegistryDirectories,
   getClaudeCodeIdentityForVerifiedAccount,
-  getDefaultCacheKeepRegistryDirectory,
   getFallbackReauthLabels,
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
@@ -337,11 +337,10 @@ export async function clearPiStickyRoutingSession(
 }
 
 function getPiCacheKeepRegistry() {
-  const directory =
-    process.env.PI_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR ||
-    getDefaultCacheKeepRegistryDirectory('pi')
+  const paths = getCacheKeepRegistryDirectories('pi')
+  const { directory } = paths
   if (!cacheKeepRegistry || cacheKeepRegistryDirectory !== directory) {
-    cacheKeepRegistry = new CacheKeepSessionRegistry({ directory })
+    cacheKeepRegistry = new CacheKeepSessionRegistry(paths)
     cacheKeepRegistryDirectory = directory
   }
   return cacheKeepRegistry
@@ -754,6 +753,7 @@ async function sendAnthropicRequest(
       bodyText,
       storage,
       cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
+      ttlMs: cacheTtlMs,
       oauthAccountId: routeId,
       oauthAccountIdentity: verifiedUuid,
       accountStoragePath: options.storagePath,
