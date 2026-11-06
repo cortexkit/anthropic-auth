@@ -567,7 +567,10 @@ test('completed routing seed adds no legacy or routing file reads to later Core 
         path === f.vault.routing,
     ),
   ).toEqual([])
-  expect(reads.filter((path) => path === f.vault.roster)).toHaveLength(2)
+  // common-auth can reuse the unchanged parsed roster, so reads can be zero.
+  expect(
+    reads.filter((path) => path === f.vault.roster).length,
+  ).toBeLessThanOrEqual(2)
 })
 
 test('malformed routing stays untouched while requests can still select an admitted account', async () => {
