@@ -7537,6 +7537,7 @@ const anthropicAuthPlugin = async (
                   fastModeEnabled: fastModeRequested,
                   identity,
                   sessionId: relayAffinity || undefined,
+                  isOAuth: true,
                   thinkingPrefixMismatchBehavior:
                     getThinkingPrefixMismatchBehavior(
                       await getRequestStorage(),

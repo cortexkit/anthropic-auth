@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock } from 'bun:test'
+import { gunzipSync } from 'node:zlib'
 import { tokenFingerprint } from '@cortexkit/anthropic-auth-core'
 import { ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
 import { installLoaderSetup } from './support/opencode1-loader-setup'
@@ -127,22 +128,91 @@ describe('OC1 shared routing relay', () => {
       }),
       { models: {} } as any,
     )) as any
-    const send = () =>
+    const send = (payload?: Record<string, unknown>) =>
       loader.fetch(MESSAGES_URL, {
         method: 'POST',
         headers: { 'x-session-affinity': 'ses_relay_oc1' },
-        body: JSON.stringify({
-          model: mode.startsWith('fable')
-            ? 'claude-fable-5'
-            : mode === 'reserve'
-              ? 'claude-opus-4-8'
-              : 'claude-sonnet-5',
-          messages: [{ role: 'user', content: 'hello' }],
-          max_tokens: 10,
-        }),
+        body: JSON.stringify(
+          payload ?? {
+            model: mode.startsWith('fable')
+              ? 'claude-fable-5'
+              : mode === 'reserve'
+                ? 'claude-opus-4-8'
+                : 'claude-sonnet-5',
+            messages: [{ role: 'user', content: 'hello' }],
+            max_tokens: 10,
+          },
+        ),
       }) as Promise<Response>
     return { sends, send }
   }
+
+  test('OC1 OAuth sends runner notes from its session handle in the final signed body', async () => {
+    const f = await fixture()
+    const reports: unknown[] = []
+    globals[key] = (sessionId: string) => {
+      expect(sessionId).toBe('ses_relay_oc1')
+      return {
+        turn_notes: () => [
+          { after_tool_use_id: 'runner-call', text: 'Runner reminder' },
+        ],
+        report: (payload: unknown) => reports.push(payload),
+      }
+    }
+    let sent: any
+    let sentHeaders = new Headers()
+    const fetchImpl = globalThis.fetch
+    globalThis.fetch = mock(async (input: any, init: any) => {
+      if (extractUrl(input).includes('/v1/messages')) {
+        sentHeaders = new Headers(init.headers)
+        const text =
+          sentHeaders.get('content-encoding') === 'gzip'
+            ? gunzipSync(init.body).toString()
+            : typeof init.body === 'string'
+              ? init.body
+              : Buffer.from(init.body).toString()
+        sent = JSON.parse(text)
+      }
+      return fetchImpl(input, init)
+    }) as unknown as typeof fetch
+    await (
+      await f.send({
+        model: 'claude-opus-5-5',
+        max_tokens: 10,
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'runner-call', name: 'board', input: {} },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'runner-call',
+                content: 'Done',
+              },
+            ],
+          },
+        ],
+      })
+    ).text()
+    expect(sent.messages.at(-1)).toEqual({
+      role: 'system',
+      clear_at: 'next_user_message',
+      content: 'Runner reminder',
+    })
+    expect(sentHeaders.get('anthropic-beta')?.split(',')).toContain(
+      'mid-conversation-system-clear-at-2026-08-21',
+    )
+    expect(reports).toContainEqual({
+      kind: 'turn_notes_supported',
+      model: 'claude-opus-5-5',
+      supported: true,
+    })
+  })
 
   test('accepts advice installed after load, pins it and reports only safe headers', async () => {
     const f = await fixture()

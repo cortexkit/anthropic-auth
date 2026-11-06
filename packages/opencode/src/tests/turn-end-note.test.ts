@@ -1,6 +1,14 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { signRequestBody } from '@cortexkit/anthropic-auth-core'
 import { rewriteRequestBody, setOAuthHeaders } from '../transform'
+
+const routingKey = Symbol.for('cortexkit.routing')
+const globals = globalThis as Record<symbol, unknown>
+const originalRouting = globals[routingKey]
+afterEach(() => {
+  if (originalRouting === undefined) delete globals[routingKey]
+  else globals[routingKey] = originalRouting
+})
 
 const note = {
   role: 'system',
@@ -55,6 +63,45 @@ async function build(
 }
 
 describe('OpenCode turn-end notes', () => {
+  test('OC1 reads runner notes with the host session even when our own note is disabled', async () => {
+    const reports: unknown[] = []
+    globals[routingKey] = (sessionId: string) => {
+      expect(sessionId).toBe('ses_runner_notes_oc1')
+      return {
+        turn_notes: () => [
+          { after_tool_use_id: 'a_0', text: 'Runner reminder' },
+        ],
+        report: (payload: unknown) => reports.push(payload),
+      }
+    }
+    const body = await build(reply('a'), {
+      sessionId: 'ses_runner_notes_oc1',
+      isOAuth: true,
+      turnEndNote: { tools: [] },
+    })
+    expect(body.messages.at(-1)).toEqual({
+      role: 'system',
+      clear_at: 'next_user_message',
+      content: 'Runner reminder',
+    })
+    const headers = new Headers()
+    setOAuthHeaders(headers, 'sk-ant-oat01-synthetic', { body })
+    expect(headers.get('anthropic-beta')?.split(',')).toContain(
+      'mid-conversation-system-clear-at-2026-08-21',
+    )
+    const apiBody = await build(reply('a'), {
+      sessionId: 'ses_runner_notes_oc1',
+      turnEndNote: { tools: [] },
+    })
+    expect(apiBody.messages.some((m: any) => m.clear_at)).toBe(false)
+    await Promise.resolve()
+    expect(reports).toContainEqual({
+      kind: 'turn_note_skipped',
+      after_tool_use_id: 'a_0',
+      reason: 'not_oauth',
+    })
+  })
+
   test('inserts the exact note after results, before signing, with its beta', async () => {
     const body = await build([
       { role: 'user', content: 'Question' },

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
+  applyRunnerTurnNotes,
   applyThinkingBindingControls,
   applyTurnEndNotes,
   assertNotCustodyTombstone,
@@ -1555,6 +1556,8 @@ export async function rewriteRequestBody(
     deferSigning?: boolean
     identity?: ClaudeCodeIdentity
     sessionId?: string
+    /** Whether this request uses OAuth. */
+    isOAuth?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     midConversationEffortEnabled?: boolean
     midConversationEffortPlan?: string
@@ -1653,6 +1656,10 @@ export async function rewriteRequestBody(
       // History still carries host tool names here, before mcp_ wire prefixing.
       applyTurnEndNotes(parsed, { tools: options.turnEndNote?.tools })
     }
+    applyRunnerTurnNotes(parsed, {
+      sessionId: options.sessionId,
+      isOAuth: options.isOAuth === true,
+    })
 
     const billingStart = rewriteNowMs()
     const billingHeader =

@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto'
 import {
   AnthropicOAuthOriginError,
   applyCustomHeaders,
+  applyRunnerTurnNotes,
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
   classifyGzipRejection,
@@ -241,7 +242,7 @@ type RewriteBodyOptions = NonNullable<Parameters<typeof rewriteRequestBody>[1]>
  */
 export type NativeAnthropicBodyOptions = Omit<
   RewriteBodyOptions,
-  'identity' | 'sessionId' | 'onToolNameMap' | 'deferSigning'
+  'identity' | 'sessionId' | 'isOAuth' | 'onToolNameMap' | 'deferSigning'
 >
 
 type StrippedStreamOptions = NonNullable<
@@ -723,7 +724,7 @@ function apiBetas(value: string) {
  * No Claude Code identity, tool-name prefix or body signature is added.
  * Preserve the original text when no field changes or the body is not an object.
  */
-function rewriteApiBody(body: string) {
+function rewriteApiBody(body: string, sessionId: string) {
   const parsed = parseJson(body)
   if (!isRecord(parsed)) return body
   const removed = stripEmptyTrailingAssistantMessages(parsed.messages)
@@ -731,6 +732,7 @@ function rewriteApiBody(body: string) {
   const { droppedMarkers } = applyServerSideFallbackToBody(parsed, false)
   const fallbacksRemoved = hadFallbacks && !Object.hasOwn(parsed, 'fallbacks')
   const remapped = remapRequestBodyModel(parsed)
+  applyRunnerTurnNotes(parsed, { sessionId, isOAuth: false })
   return removed > 0 || droppedMarkers > 0 || fallbacksRemoved || remapped
     ? JSON.stringify(parsed)
     : body
@@ -1237,6 +1239,7 @@ export function createNativeAnthropicAdapter<Q, P>(
               deferSigning: true,
               ...(identity ? { identity } : {}),
               sessionId: input.sessionID,
+              isOAuth: true,
               onToolNameMap: (map) => responseToolNameMaps.set(data, map),
             })
           const parsed = parseJson(body)
@@ -1251,7 +1254,8 @@ export function createNativeAnthropicAdapter<Q, P>(
               : 'main',
         })
       } else {
-        if (body !== undefined && messages) body = rewriteApiBody(body)
+        if (body !== undefined && messages)
+          body = rewriteApiBody(body, input.sessionID)
         headers.delete('authorization')
         headers.delete('x-api-key')
         for (const [name, value] of Object.entries(send.apiHeaders ?? {})) {

@@ -1,6 +1,7 @@
 import {
   applyClaudeCodeMetadata,
   applyMidConversationOutputConfig,
+  applyRunnerTurnNotes,
   applyThinkingBindingControls,
   applyTurnEndNotes,
   assertNoMeaningfulTrailingAssistant,
@@ -805,6 +806,10 @@ export async function buildAnthropicRequest(
       visibleText: (message) => visibleReplies.get(message) ?? '',
     })
   }
+  applyRunnerTurnNotes(body, {
+    sessionId: options?.sessionId,
+    isOAuth: !!identity,
+  })
   addEphemeralCacheControl(body)
   applyCacheMode(body, cache.enabled, cache.mode)
   if (identity) {

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import {
   applyClaudeCodeHeaders,
   type ClaudeCodeIdentity,
@@ -7,6 +7,14 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { type Context, type Message, Type } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
+
+const routingKey = Symbol.for('cortexkit.routing')
+const globals = globalThis as Record<symbol, unknown>
+const originalRouting = globals[routingKey]
+afterEach(() => {
+  if (originalRouting === undefined) delete globals[routingKey]
+  else globals[routingKey] = originalRouting
+})
 
 const note = {
   role: 'system',
@@ -78,6 +86,54 @@ async function build(
 }
 
 describe('Pi turn-end notes', () => {
+  test('reads runner notes using Pi session id, independently of housekeeping settings and only on OAuth', async () => {
+    const reports: unknown[] = []
+    globals[routingKey] = (sessionId: string) => {
+      expect(sessionId).toBe('ses_runner_notes_pi')
+      return {
+        turn_notes: () => [{ after_tool_use_id: 'a', text: 'Runner reminder' }],
+        report: (payload: unknown) => reports.push(payload),
+      }
+    }
+    for (const oauth of [true, false]) {
+      const result = await buildAnthropicRequest(
+        'claude-opus-5-5',
+        { messages: [user('Question'), ...pair('a')], tools: [] },
+        { sessionId: 'ses_runner_notes_pi' },
+        { enabled: false, mode: 'automatic' },
+        false,
+        oauth ? identity : undefined,
+        { turnEndNote: { tools: [] } },
+      )
+      expect(await signRequestBody(result.bodyText)).toBe(result.bodyText)
+      const messages = JSON.parse(result.bodyText).messages
+      expect(messages.filter((m: any) => m.clear_at)).toEqual(
+        oauth
+          ? [
+              {
+                role: 'system',
+                clear_at: 'next_user_message',
+                content: 'Runner reminder',
+              },
+            ]
+          : [],
+      )
+      if (oauth) {
+        const headers = new Headers()
+        applyClaudeCodeHeaders(headers, '', { body: result.body, identity })
+        expect(headers.get('anthropic-beta')?.split(',')).toContain(
+          'mid-conversation-system-clear-at-2026-08-21',
+        )
+      }
+    }
+    await Promise.resolve()
+    expect(reports).toContainEqual({
+      kind: 'turn_note_skipped',
+      after_tool_use_id: 'a',
+      reason: 'not_oauth',
+    })
+  })
+
   test('N N+1 N+2 preserve every earlier note, including after tool declarations change', async () => {
     const history = [user('Question'), ...pair('a')]
     const first = await build(history)

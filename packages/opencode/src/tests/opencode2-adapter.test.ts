@@ -80,6 +80,9 @@ const ENV_KEYS = [
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
 ]
 const savedEnv = new Map<string, string | undefined>()
+const routingKey = Symbol.for('cortexkit.routing')
+const globals = globalThis as Record<symbol, unknown>
+const originalRouting = globals[routingKey]
 beforeEach(() => {
   for (const key of ENV_KEYS) {
     savedEnv.set(key, process.env[key])
@@ -87,6 +90,8 @@ beforeEach(() => {
   }
 })
 afterEach(() => {
+  if (originalRouting === undefined) delete globals[routingKey]
+  else globals[routingKey] = originalRouting
   for (const [key, value] of savedEnv) {
     if (value === undefined) delete process.env[key]
     else process.env[key] = value
@@ -467,6 +472,75 @@ const bodyOf = async (request: Request) =>
   JSON.parse(await request.clone().text()) as InspectedBody
 
 describe('OpenCode 2 native Anthropic adapter: request shape', () => {
+  test('OC2 runner notes use the adapter session on OAuth and report API skips without changing bytes', async () => {
+    const reports: unknown[] = []
+    globals[routingKey] = (sessionId: string) => {
+      expect(sessionId).toBe('ses_runner_notes_oc2')
+      return {
+        turn_notes: () => [
+          { after_tool_use_id: 'runner-call', text: 'Runner reminder' },
+        ],
+        report: (payload: unknown) => reports.push(payload),
+      }
+    }
+    for (const route of ['oauth', 'api'] as const) {
+      const { source } = makeSource({
+        options: { turnEndNoteEnabled: true, turnEndNote: { tools: [] } },
+        ...(route === 'api'
+          ? {
+              authorize: () =>
+                apiKey('synthetic-key', { custody: 'api', receipt: 'api' }),
+            }
+          : {}),
+      })
+      const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+      const payload = {
+        model: 'claude-opus-5-5',
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', name: 'board', id: 'runner-call', input: {} },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'runner-call',
+                content: 'Done',
+              },
+            ],
+          },
+        ],
+      }
+      const { final } = await host.run(
+        scopeOf({ modelID: payload.model, sessionID: 'ses_runner_notes_oc2' }),
+        hostRequest(payload),
+      )
+      const text = await final.text()
+      if (route === 'api') expect(text).toBe(JSON.stringify(payload))
+      else {
+        expect(await signRequestBody(text)).toBe(text)
+        expect(JSON.parse(text).messages.at(-1)).toEqual({
+          role: 'system',
+          clear_at: 'next_user_message',
+          content: 'Runner reminder',
+        })
+        expect(final.headers.get('anthropic-beta')?.split(',')).toContain(
+          'mid-conversation-system-clear-at-2026-08-21',
+        )
+      }
+    }
+    await Promise.resolve()
+    expect(reports).toContainEqual({
+      kind: 'turn_note_skipped',
+      after_tool_use_id: 'runner-call',
+      reason: 'not_oauth',
+    })
+  })
+
   test('qualifying reply histories on an API proxy are byte-identical despite OAuth note settings', async () => {
     const { source } = makeSource({
       options: { turnEndNoteEnabled: true },
