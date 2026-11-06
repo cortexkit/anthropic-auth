@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Keep OpenCode 2 CacheKeep tracking and registry publication working when a reload reuses an older shared owner. Addresses #637.
 - Uses common-auth 0.38.0 (no user-visible change).
 ## 2.5.4
 
