@@ -30,7 +30,8 @@ test('quota maps written by the shared store remain accepted by the published Co
   await mkdir(scratch, { recursive: true })
   const root = await mkdtemp(join(scratch, 'quota-format-227-'))
   try {
-    const [pack] = JSON.parse(
+    // npm 11 prints an array of records, npm 12 an object keyed by package name.
+    const packed: unknown = JSON.parse(
       await run(
         [
           'npm',
@@ -42,6 +43,9 @@ test('quota maps written by the shared store remain accepted by the published Co
         ],
         root,
       ),
+    )
+    const [pack] = (
+      Array.isArray(packed) ? packed : Object.values(packed as object)
     ) as Array<{ filename: string; version: string; shasum: string }>
     if (pack?.version !== '2.2.7')
       throw new Error('Wrong compatibility release')

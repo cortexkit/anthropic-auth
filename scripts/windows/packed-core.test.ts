@@ -72,7 +72,11 @@ test('packed Core exports every function referenced by the Windows verifier and 
       ['pack', '--json', '--ignore-scripts', '--pack-destination', root],
       { cwd: join(repo, 'packages/core') },
     )
-    const [{ filename }] = JSON.parse(packed.stdout)
+    // npm 11 prints an array of records, npm 12 an object keyed by package name.
+    const parsed = JSON.parse(packed.stdout)
+    const [{ filename }] = Array.isArray(parsed)
+      ? parsed
+      : Object.values(parsed as Record<string, { filename: string }>)
     const extracted = join(root, 'extracted')
     await mkdir(extracted)
     await run('tar', ['-xzf', join(root, filename), '-C', extracted])

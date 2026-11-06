@@ -134,10 +134,17 @@ function runBounded(
   return result.stdout
 }
 
+// npm 11 prints `npm pack --json` as an array of records, npm 12 as an object
+// keyed by package name with the same record fields.
+function packRecords(value: unknown): Array<{ filename?: unknown }> {
+  if (Array.isArray(value)) return value
+  if (value && typeof value === 'object') return Object.values(value)
+  return []
+}
+
 function parsePackedFilename(stdout: string): string {
   try {
-    const packed = JSON.parse(stdout.trim()) as Array<{ filename?: string }>
-    const filename = packed[0]?.filename
+    const filename = packRecords(JSON.parse(stdout.trim()))[0]?.filename
     if (typeof filename === 'string' && filename.length > 0) return filename
   } catch {
     // npm may print warnings around JSON; fall back to its tarball line.
