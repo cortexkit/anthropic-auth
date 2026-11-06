@@ -41,6 +41,10 @@ const runnerReports = new Map<
   { models: Map<string, boolean>; skipped: Set<string> }
 >()
 const SKIP_REPORT_LIMIT = 512
+// One long-running OpenCode 2 server serves many sessions; keep the report
+// dedupe state for recently active ones only. A forgotten session at worst
+// repeats its support report once.
+const RUNNER_REPORT_SESSION_LIMIT = 1024
 
 function readRunnerNotes(handle: Record<string, unknown>): RunnerTurnNote[] {
   try {
@@ -125,10 +129,17 @@ export function applyRunnerTurnNotes(
   const runner = runnerNotes(options.sessionId)
   if (!runner) return 0
   let reported = runnerReports.get(options.sessionId)
-  if (!reported) {
+  if (reported) {
+    // Move to the newest position so eviction drops the least recently used.
+    runnerReports.delete(options.sessionId)
+  } else {
     reported = { models: new Map(), skipped: new Set() }
-    runnerReports.set(options.sessionId, reported)
+    if (runnerReports.size >= RUNNER_REPORT_SESSION_LIMIT) {
+      const oldest = runnerReports.keys().next()
+      if (!oldest.done) runnerReports.delete(oldest.value)
+    }
   }
+  runnerReports.set(options.sessionId, reported)
   const supported = options.isOAuth && supportsTurnEndNote(body.model)
   const model = options.modelId
   if (reported.models.get(model) !== supported) {
