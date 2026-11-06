@@ -109,7 +109,8 @@ interface CacheKeepLease {
  * plugin file changes, so the tracked sessions must outlive any one instance.
  */
 interface SharedCacheKeep {
-  readonly manager: CacheKeepManager
+  readonly manager: Omit<CacheKeepManager, 'registrySessions'> &
+    Partial<Pick<CacheKeepManager, 'registrySessions'>>
   readonly registry: CacheKeepSessionRegistry
   persistence: CacheKeepStore
   readonly persistenceFollowsOwner?: true
@@ -345,9 +346,11 @@ function createSharedCacheKeep(
       // left to keep warm; drop it rather than prewarm it.
       if (manager.dropExpiredTargets() === undefined) return
       manager.start()
-      registry.publish(manager.registrySessions()).catch(() => {
-        logger.warn('cachekeep', 'failed to publish tracked sessions')
-      })
+      registry
+        .publish(manager.registrySessions?.() ?? manager.trackedSessions())
+        .catch(() => {
+          logger.warn('cachekeep', 'failed to publish tracked sessions')
+        })
     },
   }
   return shared
@@ -379,6 +382,10 @@ export function createNativeCacheKeep(
     { storageId: options.storageId, ...options.persistence },
     previous?.persistence,
   )
+  // Reloads keep the older manager, registry and timers, publishing only the
+  // fields they support. The registry's new data-directory location and its
+  // ttlMs, lastTouchAt, lastTouchKind and warmStopped fields take effect after
+  // a server restart, not when a plugin copy is reloaded.
   const owner =
     previous ?? createSharedCacheKeep(options.storageId, options, persistence)
   if (previous && !previous.persistenceFollowsOwner) {
@@ -718,9 +725,11 @@ export function createNativeCacheKeep(
       ) {
         const result = manager.track(target)
         if (result.tracked)
-          registry.publish(manager.registrySessions()).catch(() => {
-            logger.warn('cachekeep', 'failed to publish tracked sessions')
-          })
+          registry
+            .publish(manager.registrySessions?.() ?? manager.trackedSessions())
+            .catch(() => {
+              logger.warn('cachekeep', 'failed to publish tracked sessions')
+            })
         return result
       }
     },
