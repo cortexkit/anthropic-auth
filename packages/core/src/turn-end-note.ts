@@ -1,4 +1,9 @@
 import {
+  type ReportRoutingInput,
+  reportRouting,
+  turnNotes,
+} from '@cortexkit/common-auth/routing-accessor'
+import {
   resolveClaudeModelCapabilities,
   TURN_END_NOTE_BETA,
 } from './model-capabilities.ts'
@@ -23,19 +28,12 @@ export function supportsTurnEndNote(model: unknown): boolean {
   return resolveClaudeModelCapabilities(model)?.turnEndNote === true
 }
 
-type RunnerTurnNote = { after_tool_use_id: string; text: string }
+type RunnerTurnNote = ReturnType<typeof turnNotes>[number]
 type SkipReason =
   | 'anchor_missing'
   | 'before_user_message'
   | 'unsupported_model'
   | 'not_oauth'
-type TurnNoteReport =
-  | { kind: 'turn_notes_supported'; model: string; supported: boolean }
-  | {
-      kind: 'turn_note_skipped'
-      after_tool_use_id: string
-      reason: SkipReason
-    }
 const runnerReports = new Map<
   string,
   { models: Map<string, boolean>; skipped: Set<string> }
@@ -46,72 +44,24 @@ const SKIP_REPORT_LIMIT = 512
 // repeats its support report once.
 const RUNNER_REPORT_SESSION_LIMIT = 1024
 
-function readRunnerNotes(handle: Record<string, unknown>): RunnerTurnNote[] {
+function hasRunnerTurnNotes(sessionId: string): boolean {
   try {
-    const read = handle.turn_notes
-    if (typeof read !== 'function') return []
-    const answer: unknown = read.call(handle)
-    if (
-      answer !== null &&
-      (typeof answer === 'object' || typeof answer === 'function') &&
-      typeof Reflect.get(answer, 'then') === 'function'
-    ) {
-      void Promise.resolve(answer).catch(() => {})
-      return []
-    }
-    if (!Array.isArray(answer)) return []
-    const notes: RunnerTurnNote[] = []
-    for (let index = 0; index < answer.length; index++) {
-      try {
-        const entry: unknown = answer[index]
-        if (!isRecord(entry) || Array.isArray(entry)) continue
-        const { after_tool_use_id, text } = entry
-        if (
-          typeof after_tool_use_id !== 'string' ||
-          typeof text !== 'string' ||
-          !text.trim() ||
-          new TextEncoder().encode(text).byteLength > 16_384
-        )
-          continue
-        notes.push({ after_tool_use_id, text })
-      } catch {
-        // One unreadable entry must not discard valid reminders beside it.
-      }
-    }
-    return notes
-  } catch {
-    // Runner input is optional and untrusted; never expose reminder text in logs.
-    return []
-  }
-}
-
-function runnerNotes(
-  sessionId: string,
-): { handle: Record<string, unknown>; notes: RunnerTurnNote[] } | undefined {
-  try {
-    // common-auth's routing helper does not yet expose notes or their reports.
-    // Resolve the session handle afresh: the runner can attach after plugin load.
+    // The shared reader cannot distinguish an absent member from an empty list;
+    // legacy handles without turn_notes must not receive note reports.
     const routing = Reflect.get(globalThis, Symbol.for('cortexkit.routing'))
-    if (typeof routing !== 'function') return
+    if (typeof routing !== 'function') return false
     const handle: unknown = routing(sessionId)
-    if (isRecord(handle) && typeof handle.turn_notes === 'function')
-      return { handle, notes: readRunnerNotes(handle) }
+    return isRecord(handle) && typeof handle.turn_notes === 'function'
   } catch {
     // A broken routing bridge must not change an authentication request.
-    return
+    return false
   }
 }
 
-function reportRunnerNote(
-  handle: Record<string, unknown>,
-  payload: TurnNoteReport,
-) {
+function reportRunnerNote(payload: ReportRoutingInput) {
   // Keep synchronous bridge work off the request path as well as rejected promises.
   void Promise.resolve()
-    .then(() => {
-      const report = handle.report
-      if (typeof report === 'function') return report.call(handle, payload)
-    })
+    .then(() => reportRouting(payload))
     .catch(() => {})
 }
 
@@ -126,8 +76,9 @@ export function applyRunnerTurnNotes(
   },
 ): number {
   if (!options.sessionId) return 0
-  const runner = runnerNotes(options.sessionId)
-  if (!runner) return 0
+  if (!hasRunnerTurnNotes(options.sessionId)) return 0
+  // The shared reader only rejects empty text, so also drop whitespace-only notes.
+  const notes = turnNotes(options.sessionId).filter((note) => note.text.trim())
   let reported = runnerReports.get(options.sessionId)
   if (reported) {
     // Move to the newest position so eviction drops the least recently used.
@@ -144,7 +95,8 @@ export function applyRunnerTurnNotes(
   const model = options.modelId
   if (reported.models.get(model) !== supported) {
     reported.models.set(model, supported)
-    reportRunnerNote(runner.handle, {
+    reportRunnerNote({
+      sessionId: options.sessionId,
       kind: 'turn_notes_supported',
       model,
       supported,
@@ -171,8 +123,8 @@ export function applyRunnerTurnNotes(
   }
   const insertions = new Map<number, RunnerTurnNote[]>()
   let inserted = 0
-  for (const note of runner.notes) {
-    const index = anchors.get(note.after_tool_use_id)
+  for (const note of notes) {
+    const index = anchors.get(note.afterToolUseId)
     const next = index === undefined ? undefined : messages[index + 1]
     const reason: SkipReason | undefined = !options.isOAuth
       ? 'not_oauth'
@@ -184,15 +136,16 @@ export function applyRunnerTurnNotes(
             ? 'before_user_message'
             : undefined
     if (reason) {
-      if (!reported.skipped.has(note.after_tool_use_id)) {
+      if (!reported.skipped.has(note.afterToolUseId)) {
         if (reported.skipped.size >= SKIP_REPORT_LIMIT) {
           const oldest = reported.skipped.values().next()
           if (!oldest.done) reported.skipped.delete(oldest.value)
         }
-        reported.skipped.add(note.after_tool_use_id)
-        reportRunnerNote(runner.handle, {
+        reported.skipped.add(note.afterToolUseId)
+        reportRunnerNote({
+          sessionId: options.sessionId,
           kind: 'turn_note_skipped',
-          after_tool_use_id: note.after_tool_use_id,
+          after_tool_use_id: note.afterToolUseId,
           reason,
         })
       }
