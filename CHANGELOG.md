@@ -2,9 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## 2.5.6
+## Unreleased
 
 - Uses common-auth 0.39.0 and its shared turn-notes reader (no behaviour change).
+## 2.5.6
+
 - Pi keeps warming its prompt cache across a Pi restart, like OpenCode 2.
 
 ## 2.5.5
