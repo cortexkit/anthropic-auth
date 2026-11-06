@@ -18,6 +18,8 @@ CacheKeep keeps recently used hybrid-cache sessions warm while their host proces
 
 About five minutes before a one-hour cache lifetime expires, CacheKeep sends a `max_tokens: 0` prewarm through the selected account's custody path. Failure preserves the known expiry and can schedule a bounded retry while the cache may still be alive. A [documented session registry](cachekeep-registry.md#cachekeep-session-registry) in the CortexKit data folder aggregates session/cache timing across processes without publishing request bodies, headers or tokens. Stopped sessions retain metadata until cache expiry; missing or stale leases mean unknown, not expired. Closing the host stops that process's keepalive work.
 
+OpenCode 2 and Pi privately save accepted keep-warm targets across restarts. A restarted Pi head resumes warming its own session at session startup, even while idle and before any new request; a per-session process claim prevents duplicate warming. Only still-live caches on the same eligible login are restored. See the [private restart store](cachekeep-registry.md#location-and-permissions) for storage locations and ownership rules.
+
 ## Prime and lane start
 
 Prime is opt-in quota-window priming. OpenCode's **Extras** group can enable or disable it; Pi reports status only. After a confirmed five-hour reset, Prime checks fresh quota and limits, then approximately one minute after reset can send a minimal `claude-haiku-4-5` request. Cross-process claims prevent duplicate priming for the same account/reset. This is a real request, not a quota API trick or a guarantee of free usage.

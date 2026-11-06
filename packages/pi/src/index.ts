@@ -43,6 +43,8 @@ import {
   clearPiStickyQuotaRetries,
   endPiPrimaryTurn,
   forgetPiMessageThread,
+  startPiCacheKeepSession,
+  stopPiCacheKeep,
   streamCortexKitAnthropic,
 } from './stream.ts'
 
@@ -89,8 +91,15 @@ export default async function cortexKitPiAnthropicAuth(
     MidConversationEffortTransition[]
   >()
   const workingMessageBySession = new Map<string, (message?: string) => void>()
+  pi.on('session_start', async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId()
+    if (sessionId) await startPiCacheKeepSession(storagePath, sessionId)
+  })
   pi.on('turn_start', async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId()
+    // Older hosts may deliver their first turn before session_start. Both
+    // hooks join the same restore, so an idle resumed session needs no request.
+    if (sessionId) await startPiCacheKeepSession(storagePath, sessionId)
     beginPiPrimaryTurn(storagePath, sessionId)
     if (!sessionId) return
     if (ctx.hasUI) {
@@ -148,6 +157,7 @@ export default async function cortexKitPiAnthropicAuth(
       sessionCacheActivity.forget(sessionId)
       forgetPiMessageThread(sessionId)
     }
+    await stopPiCacheKeep()
     await closePiNativeRuntime(storagePath)
   })
 

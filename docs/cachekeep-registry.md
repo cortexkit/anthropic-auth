@@ -50,11 +50,28 @@ The first release shipping this data-folder interface is the transition
 release; the following release removes the compatibility paths. Version 2.5.3
 predates the data-folder interface.
 
-OpenCode 2's **private restart store**, which does contain compressed replay
-bodies, is separate and is not this public interface. It lives under
-`<data>/cortexkit/anthropic-auth/cachekeep-restore/<storage-id-hash>/`, with the
-same owner-only protections. It writes only there. For the transition release,
-an empty new store loads once from the old
+OpenCode 2 and Pi share a **private restart store** implementation, which does
+contain compressed replay bodies and is not this public interface. OpenCode 2
+keeps its existing location,
+`<data>/cortexkit/anthropic-auth/cachekeep-restore/<storage-id-hash>/`; Pi uses
+`<data>/cortexkit/anthropic-auth/cachekeep-restore/pi/<storage-id-hash>/`.
+Both use the same owner-only protections, including Windows ACLs, and the same
+versioned gzip format. Records whitelist replay fields, never transport headers
+or credentials. Only an accepted response updates the saved body; writes keep
+the latest body, at most once per five seconds per session, and drain on clean
+shutdown. Stopping warming deletes the record.
+
+OpenCode 2 restores all eligible sessions in its storage. Pi restores only the
+session named by `session_start` (or the first `turn_start` on a host that
+delivers it first), without waiting for another request. A per-session claim
+records the process id and OS start identity, so only one live Pi process warms
+that session; shutdown drains writes and releases the claim. Other sessions'
+records remain untouched until expiry cleanup. Both hosts reject expired,
+foreign-account, changed-login and disabled-account records, and reauthorize
+and re-sign prewarms through their normal send path. Overdue restored warms are
+staggered rather than sent in a restart burst.
+
+For the transition release, an empty OpenCode 2 store loads once from the old
 `<temp>/cortexkit-anthropic-auth-cachekeep-<storage-id-hash>/` folder. Successfully
 restored files are saved in the new store before their old copies are removed;
 stale old records are discarded. This fallback is removed immediately after

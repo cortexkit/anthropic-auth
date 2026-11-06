@@ -35,6 +35,7 @@ export * from './cache1h.ts'
 export * from './cachekeep.ts'
 export * from './cachekeep-failure.ts'
 export * from './cachekeep-registry.ts'
+export * from './cachekeep-store.ts'
 export * from './cch.ts'
 export * from './claude-code.ts'
 export * from './claustrum.ts'
@@ -153,6 +154,7 @@ export type {
 export { createNativeLocalCredentialService } from './native-local-credential-service.ts'
 export type { NativeLocalExternalPolicy } from './native-local-runtime-readers.ts'
 export type { NativeLockEvent } from './native-lock-observer.ts'
+export { withNativeLock } from './native-lock-observer.ts'
 export type {
   NativeMenuActionValues,
   NativeMenuCapabilityOutcome,

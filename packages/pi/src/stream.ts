@@ -4,7 +4,7 @@ import {
   applyClaudeCodeHeaders,
   applyCustomHeaders,
   CACHE_KEEP_EXTENDED_TTL_BETA,
-  CacheKeepManager,
+  type CacheKeepManager,
   CacheKeepSessionRegistry,
   type ClaudeCodeIdentity,
   createNativeVaultNoRouteResponse,
@@ -38,6 +38,7 @@ import {
   isPermanentRefreshError,
   isValidApiBaseURL,
   killswitchPassesPolicy,
+  LEGACY_STATE_LAYOUT,
   logger,
   type MessageThreadRequest,
   MessageThreadTracker,
@@ -64,6 +65,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  resolveNativePoolPaths,
   runWithRequestSignal,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   StickyQuotaRetryCounter,
@@ -93,6 +95,7 @@ import {
   type ThinkingContent,
   type ToolCall,
 } from '@earendil-works/pi-ai'
+import { PiCacheKeep } from './cachekeep.ts'
 import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import {
   getPiNativeRuntime,
@@ -385,100 +388,133 @@ const nativePrewarmAttempts = new Map<
     reported: boolean
   }
 >()
-const cacheKeepManager = new CacheKeepManager({
-  fetchImpl: fetchPiOAuth,
-  loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
-  onTrackedSessionsChanged: (sessions) =>
-    getPiCacheKeepRegistry().publish(sessions),
-  prepareHeaders: async (headers, target, attempt) => {
-    requirePiOAuthOrigin(target.url)
-    const runtime = getPiNativeRuntime(
-      target.accountStoragePath ?? getPiAccountStoragePath(),
-    )
-    const id = target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
-    const current = await runtime.view()
-    const body = JSON.parse(target.bodyText) as Record<string, unknown>
-    const served = await runtime.authorize(
-      id,
-      attempt.signal,
-      typeof body.model === 'string' ? body.model : undefined,
-      'cachekeep',
-    )
-    if (
-      !target.oauthAccountIdentity ||
-      served.accountIdentity !== target.oauthAccountIdentity
-    )
-      throw new NativeAccountRefusal('credential-changed')
-    const identity = getClaudeCodeIdentityForVerifiedAccount(
-      id === STICKY_ROUTING_MAIN_ACCOUNT_ID
-        ? (current.policyStorage.mainAccountId ?? id)
-        : id,
-      served.accountIdentity as ProviderAccountUuid,
-    )
-    headers.delete('anthropic-beta')
-    applyPiOAuthRequestHeaders(headers, piAttemptAccessToken(served), {
-      body,
-      identity,
-      leadingBetas: [CACHE_KEEP_EXTENDED_TTL_BETA],
-    })
-    nativePrewarmAttempts.set(attempt.id, { runtime, served, reported: false })
-    return headers
-  },
-  retryOnUnauthorized: async ({ target, headers, attempt }) => {
-    const entry = nativePrewarmAttempts.get(attempt.id)
-    if (!entry) return undefined
-    await entry.runtime.report(entry.served, 401, 'direct').catch(() => {
-      logger.warn('native-auth', 'Pi CacheKeep auth-failure report unavailable')
-    })
-    entry.reported = true
-    const retryBody = JSON.parse(target.bodyText) as Record<string, unknown>
-    const rotated = await entry.runtime
-      .retry(
-        target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
-        entry.served,
+const piCacheKeep = new PiCacheKeep(
+  {
+    fetchImpl: fetchPiOAuth,
+    loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
+    onTrackedSessionsChanged: (sessions) =>
+      getPiCacheKeepRegistry().publish(sessions),
+    prepareHeaders: async (headers, target, attempt) => {
+      requirePiOAuthOrigin(target.url)
+      const runtime = getPiNativeRuntime(
+        target.accountStoragePath ?? getPiAccountStoragePath(),
+      )
+      const id = target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
+      const current = await runtime.view()
+      const body = JSON.parse(target.bodyText) as Record<string, unknown>
+      const served = await runtime.authorize(
+        id,
         attempt.signal,
-        typeof retryBody.model === 'string' ? retryBody.model : undefined,
+        typeof body.model === 'string' ? body.model : undefined,
+        'cachekeep',
       )
-      .catch(() => undefined)
-    if (!rotated) return undefined
-    const rotatedHeaders = new Headers(headers)
-    rotatedHeaders.set(
-      'authorization',
-      `Bearer ${piAttemptAccessToken(rotated)}`,
-    )
-    nativePrewarmAttempts.set(attempt.id, {
-      runtime: entry.runtime,
-      served: rotated,
-      reported: false,
-    })
-    return rotatedHeaders
-  },
-  onResponse: async ({ target, attempt, status, receivedAt }) => {
-    const entry = nativePrewarmAttempts.get(attempt.id)
-    if (
-      entry &&
-      status >= 200 &&
-      status < 300 &&
-      !attempt.signal?.aborted &&
-      !target.sourceWarm
-    )
-      sessionCacheActivity.recordPrewarm(
-        target.id,
-        target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
-        receivedAt,
+      if (
+        !target.oauthAccountIdentity ||
+        served.accountIdentity !== target.oauthAccountIdentity
       )
-    if (entry && status === 401 && !entry.reported)
-      await entry.runtime.report(entry.served, status, 'direct').catch(() => {
+        throw new NativeAccountRefusal('credential-changed')
+      const identity = getClaudeCodeIdentityForVerifiedAccount(
+        id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+          ? (current.policyStorage.mainAccountId ?? id)
+          : id,
+        served.accountIdentity as ProviderAccountUuid,
+      )
+      headers.delete('anthropic-beta')
+      applyPiOAuthRequestHeaders(headers, piAttemptAccessToken(served), {
+        body,
+        identity,
+        leadingBetas: [CACHE_KEEP_EXTENDED_TTL_BETA],
+      })
+      nativePrewarmAttempts.set(attempt.id, {
+        runtime,
+        served,
+        reported: false,
+      })
+      return headers
+    },
+    retryOnUnauthorized: async ({ target, headers, attempt }) => {
+      const entry = nativePrewarmAttempts.get(attempt.id)
+      if (!entry) return undefined
+      await entry.runtime.report(entry.served, 401, 'direct').catch(() => {
         logger.warn(
           'native-auth',
           'Pi CacheKeep auth-failure report unavailable',
         )
       })
+      entry.reported = true
+      const retryBody = JSON.parse(target.bodyText) as Record<string, unknown>
+      const rotated = await entry.runtime
+        .retry(
+          target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+          entry.served,
+          attempt.signal,
+          typeof retryBody.model === 'string' ? retryBody.model : undefined,
+        )
+        .catch(() => undefined)
+      if (!rotated) return undefined
+      const rotatedHeaders = new Headers(headers)
+      rotatedHeaders.set(
+        'authorization',
+        `Bearer ${piAttemptAccessToken(rotated)}`,
+      )
+      nativePrewarmAttempts.set(attempt.id, {
+        runtime: entry.runtime,
+        served: rotated,
+        reported: false,
+      })
+      return rotatedHeaders
+    },
+    onResponse: async ({ target, attempt, status, receivedAt }) => {
+      const entry = nativePrewarmAttempts.get(attempt.id)
+      if (
+        entry &&
+        status >= 200 &&
+        status < 300 &&
+        !attempt.signal?.aborted &&
+        !target.sourceWarm
+      )
+        sessionCacheActivity.recordPrewarm(
+          target.id,
+          target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
+          receivedAt,
+        )
+      if (entry && status === 401 && !entry.reported)
+        await entry.runtime.report(entry.served, status, 'direct').catch(() => {
+          logger.warn(
+            'native-auth',
+            'Pi CacheKeep auth-failure report unavailable',
+          )
+        })
+    },
+    onComplete: ({ attempt }) => {
+      nativePrewarmAttempts.delete(attempt.id)
+    },
   },
-  onComplete: ({ attempt }) => {
-    nativePrewarmAttempts.delete(attempt.id)
+  {
+    storageId: async (storagePath) =>
+      (
+        await resolveNativePoolPaths(
+          storagePath,
+          undefined,
+          LEGACY_STATE_LAYOUT,
+        )
+      ).storageId,
+    read: (storagePath) => getPiNativeRuntime(storagePath).view(),
   },
-})
+)
+const cacheKeepManager = piCacheKeep.manager
+
+export function startPiCacheKeepSession(
+  storagePath: string,
+  sessionId: string,
+) {
+  return piCacheKeep.startSession(storagePath, sessionId)
+}
+
+export async function stopPiCacheKeep() {
+  await piCacheKeep.stop()
+  await getPiCacheKeepRegistry().dispose()
+}
 
 export async function getPiTrackedCacheKeepSessions() {
   return getPiCacheKeepRegistry().list(cacheKeepManager.trackedSessions())
@@ -742,11 +778,11 @@ async function sendAnthropicRequest(
     signal: options.streamOptions?.signal,
     ...(!options.apiAccount && { redirect: 'error' as const }),
   }
-  const trackAcceptedRequest = () => {
+  const trackAcceptedRequest = async () => {
     if (options.apiAccount || init.signal?.aborted) return
     if (relayAffinity)
       sessionCacheActivity.record(relayAffinity, routeId, cacheTtlMs)
-    keep.track({
+    const target: Parameters<CacheKeepManager['track']>[0] = {
       sessionId: relayAffinity,
       url: input.toString(),
       headers,
@@ -757,7 +793,9 @@ async function sendAnthropicRequest(
       oauthAccountId: routeId,
       oauthAccountIdentity: verifiedUuid,
       accountStoragePath: options.storagePath,
-    })
+    }
+    if (deps.cacheKeep) keep.track(target)
+    else await piCacheKeep.trackAccepted(target, snapshot)
   }
 
   const reported = new Set<PiNativeAttempt>()
@@ -960,7 +998,7 @@ async function sendAnthropicRequest(
       )
     }
     if (attempt && response.ok) {
-      trackAcceptedRequest()
+      await trackAcceptedRequest()
       markServed(attempt)
     }
     return response
@@ -1042,7 +1080,7 @@ async function sendAnthropicRequest(
     response = threadRequest.observe(response)
   }
   if (response.ok && lastTransport === 'relay' && relayAttempt) {
-    trackAcceptedRequest()
+    await trackAcceptedRequest()
     markServed(relayAttempt)
   }
   return response
