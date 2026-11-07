@@ -88,8 +88,6 @@ const piUnavailable = [
   'killswitch-on',
   'killswitch-off',
   'killswitch-set',
-  'prime-on',
-  'prime-off',
   'start-fire',
 ]
 

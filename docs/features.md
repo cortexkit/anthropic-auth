@@ -13,7 +13,7 @@
 | Legacy migration source | `~/.config/opencode/anthropic-auth.json` | `~/.pi/agent/anthropic-auth.json` |
 | Accounts, routing, cache and diagnostics controls | `/claude` menu | `/claude` menu |
 | Quota refresh and killswitch edits | Menu actions | Summary only; no killswitch edits |
-| Prime quota-window scheduler | Status and on/off actions | Status only |
+| Prime quota-window scheduler | Status and on/off actions | Status and on/off actions |
 | Lane start | Menu action | Not available |
 | Quota sidebar | OpenCode 1 and OpenCode 2 TUI | Not available |
 | Cloudflare relay | HTTP; OpenCode 1 also supports WebSocket | HTTP or WebSocket |

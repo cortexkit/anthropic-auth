@@ -12,7 +12,7 @@ Both hosts register one `/claude` command. It opens a menu whose actions collect
 | Limits | Killswitch enable/disable and thresholds | OpenCode only |
 | Cache | Cache mode, enable/disable, keepalive schedule and subagent setting | Both hosts |
 | Diagnostics | Request dumps and logging level | Both hosts |
-| Extras | Fast mode, Prime status/toggle and lane start | Pi has fast mode and Prime status, not Prime toggles or lane start |
+| Extras | Fast mode, Prime status/toggle and lane start | Both hosts have fast mode and Prime status/toggles; Pi has no lane start |
 
 In local custody, Accounts offers local management and enrollment reset, not disconnect. While enrolled, only enable/disable, reset backoff and disconnect remain. Unreadable enrollment keeps that reduced set so disconnect is available. **Custody setup guidance** explains the stopped-host requirement without changing custody.
 

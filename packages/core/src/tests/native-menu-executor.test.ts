@@ -502,8 +502,6 @@ test('actions the host does not offer and unknown actions are refused', async ()
         'killswitch-on',
         'killswitch-off',
         'killswitch-set',
-        'prime-on',
-        'prime-off',
         'start-fire',
       ] satisfies NativeMenuActionId[]
     ).sort(),

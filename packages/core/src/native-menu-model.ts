@@ -748,7 +748,7 @@ function offeredUnder(
 function hostOffers(host: NativeMenuHost, action: NativeMenuAction): boolean {
   return (
     host === 'opencode' ||
-    !['quota', 'killswitch', 'prime', 'start'].includes(action.command)
+    !['quota', 'killswitch', 'start'].includes(action.command)
   )
 }
 

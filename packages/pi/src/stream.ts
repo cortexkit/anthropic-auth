@@ -2,10 +2,15 @@ import {
   type AccountStorage,
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
+  applyClaudeCodeMetadata,
   applyCustomHeaders,
+  buildBillingHeaderValue,
+  buildPrimeRequestBody,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   type CacheKeepManager,
   CacheKeepSessionRegistry,
+  CLAUDE_CODE_ENTRYPOINT,
+  CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
@@ -51,6 +56,7 @@ import {
   nativeAccountCanServe,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  orderClaudeCodeBody,
   type ProviderAccountUuid,
   type ProviderErrorResponseScope,
   parseSseFrame,
@@ -100,6 +106,7 @@ import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
 import {
   getPiNativeRuntime,
   type PiNativeAttempt,
+  type PiNativeRuntime,
   piAttemptAccessToken,
 } from './native.ts'
 import { getPiAccountStoragePath } from './paths.ts'
@@ -364,6 +371,7 @@ function applyPiOAuthRequestHeaders(
     body: Record<string, unknown>
     identity: ClaudeCodeIdentity | undefined
     leadingBetas?: string[]
+    requestClass?: 'main' | 'auxiliary'
   },
 ) {
   const { body } = options
@@ -371,6 +379,7 @@ function applyPiOAuthRequestHeaders(
     body,
     identity: options.identity,
     extraBetas: options.leadingBetas,
+    requestClass: options.requestClass,
   })
   if (body.speed === 'fast')
     headers.set(
@@ -675,6 +684,67 @@ export async function* parseSse(
   }
 }
 
+function buildPiPrimeBody(identity?: ClaudeCodeIdentity) {
+  const prime = buildPrimeRequestBody()
+  const body: Record<string, unknown> = {
+    ...prime,
+    system: [
+      {
+        type: 'text',
+        text: buildBillingHeaderValue(
+          prime.messages,
+          undefined,
+          CLAUDE_CODE_ENTRYPOINT,
+        ),
+      },
+      { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      { type: 'text', text: prime.system },
+    ],
+  }
+  if (identity) applyClaudeCodeMetadata(body, identity)
+  return {
+    body,
+    bodyText: JSON.stringify(orderClaudeCodeBody(body)),
+    toolNames: new Map<string, string>(),
+    cacheTtlMs: 0,
+  }
+}
+
+/** Prime uses the model transport without a conversation, thread or cache target. */
+export function sendPiPrimeRequest(options: {
+  native: PiNativeRuntime
+  storagePath: string
+  accountId: string
+  signal: AbortSignal
+  beforeSend: () => Promise<void>
+  onServed: (attempt: PiNativeAttempt) => void
+  fetch?: typeof fetch
+}) {
+  return sendAnthropicRequest(
+    {
+      model: {
+        id: buildPrimeRequestBody().model,
+        name: 'Prime',
+        api: 'anthropic-messages',
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+        reasoning: false,
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200_000,
+        maxTokens: 1,
+      },
+      context: { messages: [] },
+      storagePath: options.storagePath,
+      oauthAccountId: options.accountId,
+      streamOptions: { signal: options.signal },
+      route: 'prime',
+      prime: options,
+    },
+    { native: options.native, fetch: options.fetch },
+  )
+}
+
 async function sendAnthropicRequest(
   options: {
     model: Model<Api>
@@ -689,12 +759,20 @@ async function sendAnthropicRequest(
     effortTransitions?: readonly MidConversationEffortTransition[]
     onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
     onThreadPrepared?: (fail: () => void) => void
+    prime?: {
+      beforeSend: () => Promise<void>
+      onServed: (attempt: PiNativeAttempt) => void
+    }
   },
-  deps: { fetch?: typeof fetch; cacheKeep?: CacheKeepManager } = {},
+  deps: {
+    fetch?: typeof fetch
+    cacheKeep?: CacheKeepManager
+    native?: PiNativeRuntime
+  } = {},
 ): Promise<Response> {
   const fetchImpl = deps.fetch ?? globalThis.fetch
   const keep = deps.cacheKeep ?? cacheKeepManager
-  const native = getPiNativeRuntime(options.storagePath)
+  const native = deps.native ?? getPiNativeRuntime(options.storagePath)
   // Capture the serving service while authorization is open. Shutdown rejects
   // new serving work immediately but drains writes for already-served attempts.
   const servingRuntime = await native.service()
@@ -738,35 +816,43 @@ async function sendAnthropicRequest(
   const oneHourCache =
     isCache1hPersistentlyEnabled(storage) ||
     options.streamOptions?.cacheRetention === 'long'
-  const { body, bodyText, toolNames, cacheTtlMs } = await buildAnthropicRequest(
-    options.model.id,
-    options.context,
-    options.streamOptions,
-    {
-      enabled: oneHourCache,
-      mode: getCache1hPersistentMode(storage),
-    },
-    isFastModePersistentlyEnabled(storage),
-    identity,
-    {
-      deferSigning: true,
-      effortTransitions: options.apiAccount ? [] : options.effortTransitions,
-      turnEndNote: storage.turnEndNote,
-      thinkingPrefixMismatchBehavior: options.apiAccount
-        ? 'account-default'
-        : getThinkingPrefixMismatchBehavior(storage),
-      ...(options.streamOptions?.onPayload && {
-        onPayload: (payload: unknown) =>
-          options.streamOptions?.onPayload?.(payload, options.model),
-      }),
-    },
-  )
+  const { body, bodyText, toolNames, cacheTtlMs } = options.prime
+    ? buildPiPrimeBody(identity)
+    : await buildAnthropicRequest(
+        options.model.id,
+        options.context,
+        options.streamOptions,
+        {
+          enabled: oneHourCache,
+          mode: getCache1hPersistentMode(storage),
+        },
+        isFastModePersistentlyEnabled(storage),
+        identity,
+        {
+          deferSigning: true,
+          effortTransitions: options.apiAccount
+            ? []
+            : options.effortTransitions,
+          turnEndNote: storage.turnEndNote,
+          thinkingPrefixMismatchBehavior: options.apiAccount
+            ? 'account-default'
+            : getThinkingPrefixMismatchBehavior(storage),
+          ...(options.streamOptions?.onPayload && {
+            onPayload: (payload: unknown) =>
+              options.streamOptions?.onPayload?.(payload, options.model),
+          }),
+        },
+      )
   let wireBodyText = bodyText
   options.onResolvedToolNames?.(toolNames)
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
     ? new Headers()
-    : applyPiOAuthRequestHeaders(new Headers(), '', { body, identity })
+    : applyPiOAuthRequestHeaders(new Headers(), '', {
+        body,
+        identity,
+        ...(options.prime && { requestClass: 'auxiliary' }),
+      })
   const relayAffinity = options.streamOptions?.sessionId ?? null
   let input = options.apiAccount
     ? new URL('https://api.anthropic.com/v1/messages')
@@ -779,7 +865,7 @@ async function sendAnthropicRequest(
     ...(!options.apiAccount && { redirect: 'error' as const }),
   }
   const trackAcceptedRequest = () => {
-    if (options.apiAccount || init.signal?.aborted) return
+    if (options.prime || options.apiAccount || init.signal?.aborted) return
     if (relayAffinity)
       sessionCacheActivity.record(relayAffinity, routeId, cacheTtlMs)
     const target: Parameters<CacheKeepManager['track']>[0] = {
@@ -814,6 +900,7 @@ async function sendAnthropicRequest(
     })
   }
   const markServed = (attempt: PiNativeAttempt) => {
+    options.prime?.onServed(attempt)
     if (used.has(attempt)) return
     used.add(attempt)
     native.usagePublications.publish(() =>
@@ -839,6 +926,7 @@ async function sendAnthropicRequest(
   let threadRequest: MessageThreadRequest | undefined
   if (
     !options.apiAccount &&
+    !options.prime &&
     isPiPrimaryThreadRequest(
       options.storagePath,
       options.streamOptions,
@@ -897,6 +985,8 @@ async function sendAnthropicRequest(
     // it is reported, dumped or cancelled.
     const physical: { scope?: ProviderErrorResponseScope } = {}
     const send = async () => {
+      await options.prime?.beforeSend()
+      init.signal?.throwIfAborted()
       const scope = createProviderErrorResponseScope([secret], 'event-stream')
       physical.scope = scope
       // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
@@ -911,8 +1001,15 @@ async function sendAnthropicRequest(
           latch: getRequestGzipLatch(
             getRequestGzipLatchPath(options.storagePath),
           ),
-          send: (wireBody, wireHeaders) =>
-            fetchImpl(input, { ...init, body: wireBody, headers: wireHeaders }),
+          send: async (wireBody, wireHeaders) => {
+            await options.prime?.beforeSend()
+            init.signal?.throwIfAborted()
+            return fetchImpl(input, {
+              ...init,
+              body: wireBody,
+              headers: wireHeaders,
+            })
+          },
         }),
       )
     }
@@ -1026,6 +1123,8 @@ async function sendAnthropicRequest(
       affinity: relayAffinity,
       authorizeAttempt: async () => {
         const attempt = await takeAttempt()
+        await options.prime?.beforeSend()
+        init.signal?.throwIfAborted()
         relayAttempt = attempt
         lastTransport = 'relay'
         const authorizedHeaders = new Headers(headers)
@@ -1084,6 +1183,13 @@ async function sendAnthropicRequest(
     response = threadRequest.observe(response)
   }
   if (response.ok && lastTransport === 'relay' && relayAttempt) {
+    if (
+      options.prime &&
+      !/^req_[A-Za-z0-9_-]+$/.test(response.headers.get('request-id') ?? '')
+    ) {
+      void response.body?.cancel().catch(() => {})
+      throw new Error('Pi Prime relay response has no upstream provenance')
+    }
     trackAcceptedRequest()
     markServed(relayAttempt)
   }

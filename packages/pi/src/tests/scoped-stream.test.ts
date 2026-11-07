@@ -95,6 +95,66 @@ const context: Context = {
   messages: [{ role: 'user', content: 'Hello', timestamp: 0 }],
   tools: [],
 }
+
+test('Pi Prime authorizes vault custody for a stateless signed physical send', async () => {
+  const f = await fixture()
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    prime: { enabled: true },
+  }))
+  f.native.prime!.manager.options.markerDir = join(dir!, 'prime')
+  const bodies: string[] = []
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const request =
+        input instanceof Request
+          ? new Request(input, init)
+          : new Request(String(input), init)
+      expect(request.headers.get('authorization')).toMatch(
+        /^Bearer vault-test-access-/,
+      )
+      if (request.url.includes('/api/oauth/usage'))
+        return Response.json({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(Date.now() - 120_000).toISOString(),
+          },
+          seven_day: {
+            utilization: 0,
+            resets_at: new Date(Date.now() + 604_800_000).toISOString(),
+          },
+        })
+      expect(request.url).toBe(
+        'https://api.anthropic.com/v1/messages?beta=true',
+      )
+      expect(request.headers.get('x-claude-code-request-class')).toBe(
+        'auxiliary',
+      )
+      const bytes = Buffer.from(await request.arrayBuffer())
+      bodies.push(
+        (request.headers.get('content-encoding') === 'gzip'
+          ? gunzipSync(bytes)
+          : bytes
+        ).toString(),
+      )
+      return Response.json({ usage: { input_tokens: 11, output_tokens: 1 } })
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  await f.native.prime!.manager.tick()
+  expect(bodies).toHaveLength(1)
+  expect(await signRequestBody(bodies[0]!)).toBe(bodies[0]!)
+  expect(JSON.parse(bodies[0]!)).toMatchObject({
+    max_tokens: 1,
+    messages: [{ role: 'user', content: '0' }],
+  })
+  expect(f.gets.length).toBeGreaterThanOrEqual(3)
+  expect(
+    (await runtime.read()).accounts.find((account) => account.id === 'main')
+      ?.prime,
+  ).toMatchObject({ count: 1, inputTokens: 11, outputTokens: 1 })
+})
 const success = () =>
   new Response(
     'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',

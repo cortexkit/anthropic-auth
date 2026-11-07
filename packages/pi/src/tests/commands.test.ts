@@ -427,21 +427,18 @@ describe('single /claude menu and Pi Prime status', () => {
     )
     expect(await bytes()).toEqual(before)
   })
-  test('Prime on is unsupported in Pi and never toggles the persistent setting', async () => {
-    const before = await bytes()
+  test('Prime on persists the enabled setting in Pi', async () => {
     expect(await controller().execute({ action: 'prime-on' })).toMatchObject({
-      status: 'refused',
-      code: 'unsupported-action',
+      status: 'executed',
     })
-    expect(await bytes()).toEqual(before)
+    expect((await readNativePiFixture(storagePath)).prime?.enabled).toBe(true)
   })
-  test('Prime off is unsupported in Pi and never toggles the persistent setting', async () => {
-    const before = await bytes()
+  test('Prime off persists the disabled setting in Pi', async () => {
+    await controller().execute({ action: 'prime-on' })
     expect(await controller().execute({ action: 'prime-off' })).toMatchObject({
-      status: 'refused',
-      code: 'unsupported-action',
+      status: 'executed',
     })
-    expect(await bytes()).toEqual(before)
+    expect((await readNativePiFixture(storagePath)).prime?.enabled).toBe(false)
   })
   test('empty headless claude invocation shows status without mutating native storage', async () => {
     const before = await bytes()

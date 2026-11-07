@@ -781,6 +781,24 @@ const fixture: Record<
         false,
         'packages/core/src/fast.ts:FastModeCommandAction; packages/pi/src/commands.ts:claude-fast:198-229',
       ],
+      [
+        'prime-on',
+        'prime',
+        'Extras',
+        [],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
+      ],
+      [
+        'prime-off',
+        'prime',
+        'Extras',
+        [],
+        false,
+        false,
+        'packages/pi/src/native-commands.ts:createPiNativeCommands',
+      ],
     ],
     statuses: [
       [
@@ -953,7 +971,7 @@ for (const host of ['opencode', 'pi'] as const) {
     expect(actualStatuses).toEqual(
       fixture[host].statuses.map((row) => row.slice(0, 6)),
     )
-    expect(actual).toHaveLength(host === 'opencode' ? 33 : 26)
+    expect(actual).toHaveLength(host === 'opencode' ? 33 : 28)
     const families: string[] = [
       ...new Set(
         [...allActions(host), ...statuses].map(
@@ -973,7 +991,7 @@ for (const host of ['opencode', 'pi'] as const) {
   })
 }
 
-test('Pi Prime and quota remain status-only with no Limits or start actions', () => {
+test('Pi offers Prime toggles but no Limits, quota refresh or start actions', () => {
   const pi = getNativeMenuModel('pi', 'local')
   expect(pi.groups.find((group) => group.id === 'Limits')).toEqual({
     id: 'Limits',
@@ -982,9 +1000,14 @@ test('Pi Prime and quota remain status-only with no Limits or start actions', ()
   })
   expect(
     allActions('pi').filter((action) =>
-      ['prime', 'quota', 'killswitch', 'start'].includes(action.command),
+      ['quota', 'killswitch', 'start'].includes(action.command),
     ),
   ).toEqual([])
+  expect(
+    allActions('pi')
+      .filter((action) => action.command === 'prime')
+      .map((action) => action.id),
+  ).toEqual(['prime-on', 'prime-off'])
   expect(
     pi.groups
       .flatMap((group) => group.statuses)

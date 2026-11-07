@@ -22,7 +22,7 @@ OpenCode 2 and Pi privately save accepted keep-warm targets across restarts. A r
 
 ## Prime and lane start
 
-Prime is opt-in quota-window priming. OpenCode's **Extras** group can enable or disable it; Pi reports status only. After a confirmed five-hour reset, Prime checks fresh quota and limits, then approximately one minute after reset can send a minimal `claude-haiku-4-5` request. Cross-process claims prevent duplicate priming for the same account/reset. This is a real request, not a quota API trick or a guarantee of free usage.
+Prime is opt-in quota-window priming. The **Extras** group in OpenCode and Pi can enable or disable it and shows each account's next due time and last result. After a confirmed five-hour reset, Prime checks fresh quota and limits, then approximately one minute after reset can send a minimal `claude-haiku-4-5` request. Cross-process claims prevent duplicate priming for the same account/reset when the hosts share account storage. This is a real request, not a quota API trick or a guarantee of free usage. Prime is stateless: it creates neither a message thread nor a keep-warm target, and stops when the host shuts down.
 
 OpenCode's **Fire lane start** is an explicit one-shot action. It inserts a visible synthetic lane-start marker and runs a one-token request through normal routing, custody, limits, cache shaping and transport. It is also billed usage; it neither enables Prime nor installs an automatic schedule. Pi does not expose lane start.
 

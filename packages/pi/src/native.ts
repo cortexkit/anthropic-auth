@@ -43,6 +43,7 @@ import {
   getPiConfigDir,
   requirePiNativeHostAuth,
 } from './paths.ts'
+import type { PiPrimeLease, PiPrimeOptions } from './prime.ts'
 
 export type PiNativeAttempt =
   | {
@@ -181,6 +182,7 @@ export class PiNativeRuntime {
   private vaultWatch: NativeVaultWatch | undefined
   private closed = false
   private closing: Promise<void> | undefined
+  prime: PiPrimeLease | undefined
   readonly usagePublications = createNativeUsagePublisher('native-auth')
   private readonly routingPublications = new Set<{ drain(): Promise<void> }>()
 
@@ -204,6 +206,7 @@ export class PiNativeRuntime {
       connect?: () => Promise<NativeCustodyClient>
       local?: NativeAccountRuntimeOptions['local']
       vaultPoll?: PiVaultPollOptions
+      prime?: PiPrimeOptions
     } = {},
   ) {
     const env = { ...process.env }
@@ -255,7 +258,14 @@ export class PiNativeRuntime {
       if (this.closed) runtime.close()
       // Refresh returns at once while this host uses local accounts, so the
       // poll costs one enrollment read per tick outside vault custody.
-      else if (poll.intervalMs > 0) {
+      else {
+        const { acquirePiPrime } = await import('./prime.ts')
+        if (!this.closed)
+          this.prime = acquirePiPrime(
+            { native: this, storagePath: paths.legacyConfig },
+            options.prime,
+          )
+        if (this.closed || poll.intervalMs <= 0) return runtime
         this.vaultWatch = runtime.vault.watch({
           intervalMs: poll.intervalMs,
           setInterval: poll.setInterval,
@@ -521,6 +531,7 @@ export class PiNativeRuntime {
   }
 
   close(): Promise<void> {
+    this.prime?.stop()
     this.closed = true
     this.vaultWatch?.close()
     void this.holderRegistration.then(
@@ -539,6 +550,7 @@ export class PiNativeRuntime {
       this.routingPublications.clear()
       await this.initialization.then(
         async (runtime) => {
+          await this.prime?.release()
           await runtime.drainRoutingPublications()
           await this.drainReports()
           await runtime.close()
@@ -556,6 +568,7 @@ export function getPiNativeRuntime(
     connect?: () => Promise<NativeCustodyClient>
     local?: NativeAccountRuntimeOptions['local']
     vaultPoll?: PiVaultPollOptions
+    prime?: PiPrimeOptions
   } = {},
 ): PiNativeRuntime {
   const contextKey = runtimeCacheKey(storagePath)

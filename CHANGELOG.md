@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Pi now starts the five-hour window when Prime is on, like OpenCode (the setting previously had no effect on Pi).
 - OpenCode and Pi no longer pause for up to 15 seconds at shutdown when another process holds the account bookkeeping file.
 ## 2.5.8
 

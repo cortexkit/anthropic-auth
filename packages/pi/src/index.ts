@@ -82,7 +82,7 @@ export default async function cortexKitPiAnthropicAuth(
 ) {
   const storagePath = getPiAccountStoragePath()
   const quotaWait = options.quotaWait
-  getPiNativeRuntime(storagePath, {
+  const native = getPiNativeRuntime(storagePath, {
     ...(options.connectScoped && { connect: options.connectScoped }),
   })
   registerCommands(pi, createPiNativeCommands(storagePath))
@@ -148,6 +148,7 @@ export default async function cortexKitPiAnthropicAuth(
     if (sessionId) clearPiStickyQuotaRetries(storagePath, sessionId)
   })
   pi.on('session_shutdown', async (_event, ctx) => {
+    native.prime?.stop()
     const sessionId = ctx.sessionManager.getSessionId()
     endPiPrimaryTurn(storagePath, sessionId)
     if (sessionId) {

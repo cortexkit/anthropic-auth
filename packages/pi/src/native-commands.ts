@@ -306,10 +306,13 @@ export function createPiNativeCommands(
         return { ok: true, text: 'Native fast mode setting updated.' }
       case 'prime-on':
       case 'prime-off':
+        await setSection('prime', { enabled: request.action === 'prime-on' })
+        native.prime?.settingsChanged()
+        return { ok: true, text: 'Native Prime setting updated.' }
       case 'start-fire':
         return {
           ok: false,
-          text: 'Pi supports Prime status only and has no lane-start action.',
+          text: 'Pi has no lane-start action.',
         }
     }
   }
@@ -394,7 +397,9 @@ export function createPiNativeCommands(
           return executePrimeCommand({
             argumentsText: 'status',
             enabled: isPrimePersistentlyEnabled(storage),
-            accounts: buildPrimeAccountStatuses(storage, { now: Date.now() }),
+            accounts:
+              native.prime?.manager.stats(storage) ??
+              buildPrimeAccountStatuses(storage, { now: Date.now() }),
           }).text
       }
     },
