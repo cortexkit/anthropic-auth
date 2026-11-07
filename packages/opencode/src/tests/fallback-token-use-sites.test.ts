@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, mock } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, mock, spyOn } from 'bun:test'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -21,6 +21,7 @@ import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.t
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
 import { drainSidebarWrites, getSidebarState } from '../sidebar-state'
+import { CensusLockDiagnostics } from './fallback-census-lock-diagnostics'
 import { migrateNativeOpencodeFixture } from './native-fixture'
 import { getPluginTestHandles } from './plugin-test-handles'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
@@ -70,8 +71,11 @@ class CensusTeardownTrace {
   private readonly events: string[] = []
   private readonly pending = new Map<string, number>()
   private failed = false
+  readonly locks: CensusLockDiagnostics
 
-  constructor(private readonly name: string) {}
+  constructor(private readonly name: string) {
+    this.locks = new CensusLockDiagnostics(name)
+  }
 
   record(event: string): void {
     this.events.push(
@@ -80,14 +84,18 @@ class CensusTeardownTrace {
     if (this.events.length > 100) this.events.shift()
   }
 
-  async wait<T>(phase: string, work: () => T | Promise<T>): Promise<T> {
+  async wait<T>(
+    phase: string,
+    work: () => T | Promise<T>,
+    failureIsTestFailure = true,
+  ): Promise<T> {
     const started = performance.now()
     this.pending.set(phase, started)
     this.record(`${phase} started`)
     try {
       return await work()
     } catch (error) {
-      this.failed = true
+      if (failureIsTestFailure) this.failed = true
       this.record(`${phase} rejected`)
       throw error
     } finally {
@@ -128,6 +136,7 @@ class CensusTeardownTrace {
           elapsedMs: Math.round(performance.now() - started),
         })),
         events: this.events,
+        lockEvidence: this.locks.snapshot(),
       }),
     )
   }
@@ -660,6 +669,7 @@ async function createFixture(
   const migrated = createNativeAccountRuntime({
     paths: fixture.paths,
     host: 'opencode',
+    local: { onLockEvent: scope.trace.locks.observe },
   })
   try {
     const snapshot = await migrated.read()
@@ -896,13 +906,48 @@ async function createFixture(
       },
     },
     {
-      claustrumScopedConnect: async () => scopedClient,
+      claustrumScopedConnect: () =>
+        scope.trace.wait(
+          'fixture scoped connect',
+          async () => scopedClient,
+          false,
+        ),
+      nativeLocal: { onLockEvent: scope.trace.locks.observe },
       setInterval,
       clearInterval,
       ...(options.recovery ? { quotaCallPause } : {}),
     },
   )) as any
   scope.own(plugin)
+  const handles = getPluginTestHandles(plugin)
+  const scopedRuntime = handles.scopedRuntime
+  const publish = scopedRuntime.publish.bind(scopedRuntime)
+  let publication = 0
+  // Advisory refusals are handled by the plugin; only body/cleanup failures
+  // should trigger output from these operation timings.
+  scopedRuntime.publish = (receipt, patch) =>
+    scope.trace.wait(
+      `vault publication ${++publication} (${Object.keys(patch).sort().join(',')})`,
+      () => publish(receipt, patch),
+      false,
+    )
+  const close = scopedRuntime.close.bind(scopedRuntime)
+  scopedRuntime.close = () =>
+    scope.trace.wait('vault lease close', close, false)
+  const observations = scopedRuntime.quotaObservations
+  const drain = observations.drain.bind(observations)
+  let quotaDrain = 0
+  observations.drain = () =>
+    scope.trace.wait(`vault quota drain ${++quotaDrain}`, drain, false)
+  const stop = handles.cacheKeepManager.stop.bind(handles.cacheKeepManager)
+  handles.cacheKeepManager.stop = () => {
+    scope.trace.record('CacheKeep stop started')
+    try {
+      return stop()
+    } finally {
+      scope.trace.record('CacheKeep stop settled (synchronous)')
+    }
+  }
   const result = await plugin.auth.loader(
     // The OpenCode auth entry exactly as the migration left it in host auth.
     async () =>
@@ -955,6 +1000,24 @@ test.serial(
     expect(usage().map((record) => record.authorization)).toEqual([
       `Bearer ${vaultToken('request')}-next`,
     ])
+  },
+)
+
+test.serial(
+  'handled advisory refusals keep teardown diagnostics silent',
+  async () => {
+    const trace = new CensusTeardownTrace('handled advisory refusal')
+    const output = spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const refusal = new Error('expected advisory refusal')
+      await expect(
+        trace.wait('vault publication', () => Promise.reject(refusal), false),
+      ).rejects.toBe(refusal)
+      trace.complete()
+      expect(output).not.toHaveBeenCalled()
+    } finally {
+      output.mockRestore()
+    }
   },
 )
 
