@@ -23,6 +23,7 @@ docs/           public user and contributor documentation
   - `native-account-runtime.ts` is the shared account service. `native-account-view.ts` holds its secret-free views and `native-settings.ts` its settings transforms.
   - Local custody: `native-local-*.ts`, `native-refresh-coordinator.ts`, `native-runtime.ts` and `pool-*.ts` (paths, store, binding, authority).
   - Vault custody: `native-vault-*.ts`, `native-custody.ts` (the common-auth receipt adapter), `native-enrollment-authority.ts`, `claustrum.ts` and `claustrum-enrollment.ts`.
+  - Hosted mode under Thalamus: `native-vault-host.ts` (the marker latch); the relay client is built in `native-custody.ts`.
   - Host auth slots: `native-host-auth*.ts`.
   - Offline migration from 1.x sidecars: `native-migration*.ts` and `migration-source.ts`.
 - **Menus:** `native-menu-model.ts`, `native-menu-executor.ts` and `native-ui.ts`. `commands/account.ts` holds the account command execution.
@@ -69,6 +70,7 @@ docs/           public user and contributor documentation
 - `stream.ts` and `transport.ts`: send, relay, threads and stream mapping.
 - `native.ts` and `native-commands.ts`: the account runtime and menu.
 - `cachekeep.ts` and `cachekeep-claim.ts`: keep-warm, with the restart store and the per-session claim.
+- `prime.ts`: the Prime scheduler, which sends through `stream.ts`'s registered Prime sender.
 - Other files: `effort-history.ts`, `quota-wait.ts`, `custody.ts` and `paths.ts`.
 
 ## Where to add new code

@@ -27,7 +27,7 @@ Accounts are kept either in a **local pool** on disk or in the **Claustrum vault
 - **Effort marker:** an empty system message carrying a changed reasoning effort mid-conversation, so the top-level effort (part of the cached prefix) never changes.
 - **Turn note:** a turn-scoped system message (`clear_at: "next_user_message"`). The plugin adds its own turn-end note, and places notes a Thalamus runner supplies.
 - **Insula:** the vault side's shared quota cache. In vault mode the plugin reads quota from it instead of polling Anthropic for every account.
-- **Thalamus:** the runner that hosts agent sessions on this machine. It reads routing advice, cache policy and turn notes from the plugin through the `cortexkit.routing` accessor.
+- **Thalamus:** the runner that hosts agent sessions on this machine. The plugin reads routing advice and turn notes from it through the `cortexkit.routing` accessor, and in hosted mode reads vault accounts through its relay (see Custody).
 
 ## Code map
 
@@ -101,6 +101,10 @@ The order is the same on every host. Only the hook that runs each step differs (
   - **Roster:** the vault runtime discovers a secret-free, UUID-verified account list and keeps it, with vault settings, routing pins and quota, in a separate `anthropic-auth-vault-*.json` namespace.
   - **Receipts:** each send gets a fresh common-auth receipt. A rejected send is retried once on the same account only if the vault proves a newer record version.
   - **Outages:** an unreachable vault never falls back to local credentials.
+- **Hosted mode (Thalamus):** when Thalamus launches the host with `CORTEXKIT_VAULT_HOST=thalamus`, the plugin reads vault accounts through Thalamus's relay (common-auth's `connectVaultHost()`), with no enrollment of its own. The same vault folders, routing pins and Insula quota are used, so a session keeps its account when its host moves under Thalamus. Local accounts never serve, and setup, Connect and Disconnect are refused.
+  - **Marker latch:** the marker is read once and fixed for the life of the process (`native-vault-host.ts`). If it ever reads differently, every request is refused until restart, and a synchronous check runs right before each credential is returned, sent or saved.
+  - **Relay outages:** the current connection keeps serving its kept receipts while a new client is tried in the background. The plugin switches only after a real roster read through the new client succeeds, then closes the old one once. A switch never retires a token already in use. A 401 on a token issued before the switch gets one fresh authorization and one retry.
+  - **Pi:** Pi only reads its auth slot. A real Claude login there is refused per prompt with a fixed message; Pi still starts, and other providers are unaffected.
 - **Moving between modes:** both directions happen only in stopped-host setup: migrating 1.x sidecar files into the native pool, enrolling, and disconnecting (which restores local state byte for byte). Running hosts only read enrollment state. The `/claude` menu explains, but never enrolls. `docs/custody-state-machine.md` has the file map and transitions.
 
 ## Routing
@@ -132,18 +136,18 @@ Modes are `main-first` (default), `fallback-first` and `sticky-balanced` (`routi
   - **Restarts:** OpenCode 2 and Pi save the latest accepted body per session, gzipped and owner-only, under `cortexkit/anthropic-auth/cachekeep-restore/` in the data folder. A restarted host warms again from there.
   - **Session list:** each process publishes session ids and cache timing, never bodies or tokens, to `cortexkit/anthropic-auth/cachekeep-sessions/` (documented in `docs/cachekeep-registry.md`).
 - **Activity:** `session-cache-activity.ts` records when each session's cache was last refreshed by an accepted response or a successful prewarm. The sticky hold rule uses it.
-- **Prime:** an opt-in five-hour window starter. On OpenCode 1 and 2 it sends one `max_tokens: 1` Haiku request per account when the window's reset has passed. A marker file makes sure only one process fires per reset.
+- **Prime:** an opt-in five-hour window starter. On OpenCode 1, OpenCode 2 and Pi it sends one `max_tokens: 1` Haiku request per account when the window's reset has passed. A marker keyed by the verified Claude account makes sure only one process fires per reset, even across separate account files and hosts.
 
 ## Message threads
 
 `message-threads.ts` is shared by all three hosts and runs on the final wire body. A request continues the thread only when all of these hold:
 
-- it has an anchor from the previous accepted response, on the same account and credential, less than 5 minutes old;
+- it has an anchor from the previous accepted response, on the same account and credential, less than 5 minutes old. The credential is the stable row, not the token: the vault credential id, or the local account row and its login epoch, so a routine token refresh keeps the thread;
 - every fixed field is identical: model, thinking, effort, tool choice, context management, fallbacks, betas, system and tools;
 - every earlier message is unchanged by canonical hash (only `cache_control` is ignored);
 - exactly one new assistant reply matches the reply fingerprint the stream recorded.
 
-Anything else sends a full `create` request. Title, summary, compaction, keep-warm, Prime and WebSocket relay requests stay stateless.
+Anything else sends a full `create` request. Title, summary, compaction, keep-warm, Prime and WebSocket relay requests stay stateless. Each full request inside a session logs one debug line with a fixed reason code (for example `reply_changed` or `identity_changed`) and no content.
 
 **Recovery:** if Anthropic rejects a continue, the plugin resends once with the full conversation as a new thread. If that create is rejected for using threads, it resends once more statelessly and turns threads off for that account until restart. A thread problem never reaches the user as an error when a stateless send would work.
 
