@@ -575,3 +575,92 @@ test('offline controller imports synthetic Pi host OAuth with consent before nat
       ])
     })(),
   ))
+
+test('a local 401 retry held at response cancellation refuses a newly hosted marker before physical resend', () =>
+  trackPiTestBody(
+    (async () => {
+      let cancelling = () => {}
+      let release = () => {}
+      const cancelled = new Promise<void>((resolve) => {
+        cancelling = resolve
+      })
+      const resume = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const sent: string[] = []
+      let exchanges = 0
+      getPiNativeRuntime(storagePath, {
+        local: {
+          refreshToken: async () => {
+            exchanges++
+            return {
+              access: 'sk-ant-oat01-synthetic-native-retry',
+              refresh: 'synthetic-native-retry-refresh',
+              expires: Date.now() + 3_600_000,
+              expiresIn: 3600,
+            }
+          },
+          resolveIdentity: async () =>
+            getClaudeCodeIdentityForVerifiedAccount(
+              'main',
+              fixtureAccountIdentity('main'),
+            ),
+        },
+      })
+      globalThis.fetch = Object.assign(
+        async (
+          input: Parameters<typeof fetch>[0],
+          init?: Parameters<typeof fetch>[1],
+        ) => {
+          const url = String(input)
+          if (!url.includes('/v1/messages'))
+            return Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            })
+          sent.push(new Headers(init?.headers).get('authorization') ?? '')
+          if (sent.length > 1) return success()
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    '{"error":{"type":"authentication_error","message":"synthetic rejection"}}',
+                  ),
+                )
+              },
+              cancel() {
+                cancelling()
+                return resume
+              },
+            }),
+            { status: 401, headers: { 'content-type': 'application/json' } },
+          )
+        },
+        { preconnect: originalFetch.preconnect },
+      )
+      const pending = streamCortexKitAnthropic(model, context, {
+        apiKey: 'synthetic-host-access',
+      }).result()
+      const settled = Promise.allSettled([pending])
+      try {
+        await Promise.race([
+          cancelled,
+          pending.then(() => {
+            throw new Error('request completed before cancellation barrier')
+          }),
+        ])
+        expect(exchanges).toBe(1)
+        process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+        release()
+        expect((await pending).stopReason).toBe('error')
+        expect(sent).toEqual([
+          'Bearer sk-ant-oat01-synthetic-native-main-access',
+        ])
+      } finally {
+        release()
+        await settled
+        delete process.env.CORTEXKIT_VAULT_HOST
+      }
+    })(),
+  ))

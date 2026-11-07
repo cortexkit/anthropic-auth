@@ -44,6 +44,7 @@ import {
 } from './native-account-view.ts'
 import {
   createNativeCustody,
+  type NativeCustody,
   type NativeCustodyClient,
   NativeCustodyError,
   type NativeCustodyInventory,
@@ -86,7 +87,11 @@ import {
   nativeRuntimeStorageKey,
 } from './native-runtime-registry.ts'
 import { waitForNativeUsageDrain } from './native-usage-publication.ts'
-import { isVaultHosted } from './native-vault-host.ts'
+import {
+  assertHostAuthorityStable,
+  isVaultHosted,
+  onHostAuthorityChanged,
+} from './native-vault-host.ts'
 import {
   retainNativeVaultRoster,
   watchNativeVaultAuthority,
@@ -465,6 +470,11 @@ export function createNativeVaultRuntime(
       env,
       setTimeout: options.setTimeout,
       clearTimeout: options.clearTimeout,
+      onConnectionChanged: () => {
+        closeRosterWatch()
+        insula?.release()
+        insula = undefined
+      },
     })
   let custody = newCustody()
   let custodyHosted = isVaultHosted()
@@ -472,10 +482,13 @@ export function createNativeVaultRuntime(
   function closeCustody() {
     // Closing the custody also stops its roster watch.
     closeRosterWatch()
-    custody.close()
-    custodyClosed = true
-    insula?.release()
-    insula = undefined
+    try {
+      custody.close()
+    } finally {
+      custodyClosed = true
+      insula?.release()
+      insula = undefined
+    }
   }
   function retainRoster(roster: NativeVaultRosterDocument | undefined) {
     rosterView = roster?.view
@@ -500,7 +513,14 @@ export function createNativeVaultRuntime(
   // the same connection file as native custody but must never reuse its source.
   const hostedInsulaCacheKey = `${tokenPath}.host-anthropic-auth`
   const clock = options.now ?? Date.now
-  let insula: { source: InsulaQuotaSource; release(): void } | undefined
+  let insula:
+    | {
+        source: InsulaQuotaSource
+        release(): void
+        owner: NativeCustody
+        generation: number
+      }
+    | undefined
   const unwatchAuthority = watchNativeVaultAuthority({
     roster: paths.roster,
     tokenPath,
@@ -508,6 +528,7 @@ export function createNativeVaultRuntime(
     close: closeCustody,
     isHosted: () => isVaultHosted(),
   })
+  const unwatchHostAuthority = onHostAuthorityChanged(closeCustody)
   /**
    * Refresh insula's cache for one background tick. Enrollment is read fresh
    * each time: outside vault custody, or with a missing or unreadable token,
@@ -516,16 +537,36 @@ export function createNativeVaultRuntime(
   async function refreshInsula(): Promise<void> {
     try {
       if (!(await active())) return
-      if (!isVaultHosted()) await readClaustrumEnrollmentToken(tokenPath)
-      if (!insula) {
-        const transport = await custody.insulaTransport()
-        check()
-        if (!transport) return
-        insula ??= acquireInsulaQuotaSource(
-          transport,
-          custodyHosted ? hostedInsulaCacheKey : tokenPath,
-        )
+      const owner = custody
+      const hosted = custodyHosted
+      const generation = owner.generation ?? 0
+      if (!hosted) await readClaustrumEnrollmentToken(tokenPath)
+      assertCustodyOwner(owner, generation)
+      if (
+        insula &&
+        (insula.owner !== owner || insula.generation !== generation)
+      ) {
+        insula.release()
+        insula = undefined
       }
+      if (!insula) {
+        const transport = await owner.insulaTransport()
+        assertCustodyOwner(owner, generation)
+        if (!transport) return
+        const acquired = acquireInsulaQuotaSource(
+          transport,
+          hosted ? hostedInsulaCacheKey : tokenPath,
+        )
+        try {
+          assertCustodyOwner(owner, generation)
+          if (!insula) insula = { ...acquired, owner, generation }
+          else acquired.release()
+        } catch (error) {
+          acquired.release()
+          throw error
+        }
+      }
+      assertCustodyOwner(owner, generation)
       await insula.source.refresh(clock())
     } catch {
       // Insula is optional: without it every account keeps its own poll.
@@ -539,6 +580,15 @@ export function createNativeVaultRuntime(
   function insulaLookup(
     accountId: string | undefined,
   ): InsulaQuotaResult<InsulaClaudeQuota> {
+    assertHostAuthorityStable()
+    if (
+      insula &&
+      (insula.owner !== custody ||
+        insula.generation !== (custody.generation ?? 0))
+    ) {
+      insula.release()
+      insula = undefined
+    }
     if (!insula || !accountId || shutdown.signal.aborted)
       return { miss: 'unreachable' }
     const result = insula.source.lookup('claude', accountId, clock())
@@ -568,7 +618,12 @@ export function createNativeVaultRuntime(
   }
   const issued = new WeakMap<
     NativeCustodyReceipt,
-    { routeId: string; logicalId: string }
+    {
+      routeId: string
+      logicalId: string
+      owner: NativeCustody
+      generation: number
+    }
   >()
   const retryUsed = new WeakSet<NativeCustodyReceipt>()
   const versions = new Map<string, number>()
@@ -702,8 +757,18 @@ export function createNativeVaultRuntime(
   }
 
   function check(signal?: AbortSignal) {
+    assertHostAuthorityStable()
     if (shutdown.signal.aborted) throw new NativeCustodyError('closed')
     signal?.throwIfAborted()
+  }
+  function assertCustodyOwner(owner: NativeCustody, generation: number) {
+    assertHostAuthorityStable()
+    if (
+      custodyClosed ||
+      custody !== owner ||
+      (owner.generation ?? 0) !== generation
+    )
+      throw new NativeCustodyError('route-unavailable')
   }
   function signalFor(signal?: AbortSignal) {
     check(signal)
@@ -731,6 +796,8 @@ export function createNativeVaultRuntime(
   }
   async function publishPrimaryPin(signal?: AbortSignal, absentOnly = false) {
     await requireActive(signal)
+    const owner = custody
+    const generation = owner.generation ?? 0
     // Existing settings need no initialization. Avoid the shared roster write
     // lock so concurrent plugin starts cannot delay reads of that complete file.
     if (absentOnly && !(await nativeVaultFileAbsent(paths.config))) return
@@ -771,6 +838,7 @@ export function createNativeVaultRuntime(
         pinned?.accountIdentity !== primary?.accountIdentity
       )
         throw new NativeRuntimeError('publication-refused')
+      assertCustodyOwner(owner, generation)
     }
     const writer = createNativePoolStore({
       paths,
@@ -820,6 +888,7 @@ export function createNativeVaultRuntime(
     check()
     const route = issued.get(receipt)
     if (!route) throw new NativeCustodyError('no-receipt')
+    assertCustodyOwner(route.owner, route.generation)
     return route
   }
   const quotaObservations = new NativeQuotaObservations()
@@ -892,8 +961,11 @@ export function createNativeVaultRuntime(
         signal: shutdown.signal,
         // Common-auth asks again under the roster write lock before it stages
         // a new roster; false there publishes nothing.
-        isActive: async () =>
-          (await active()) && !(await relocation.isRelocated()),
+        isActive: async () => {
+          const allowed = (await active()) && !(await relocation.isRelocated())
+          assertHostAuthorityStable()
+          return allowed
+        },
         projection: () => ({ reservedRouteIds }),
       })
         .then(async (roster) => {
@@ -921,7 +993,9 @@ export function createNativeVaultRuntime(
       if (!row.enabled) throw new NativeCustodyError('route-declined')
       if (!nativeAccountCanServe(row))
         throw new NativeCustodyError('not-active')
-      const receipt = await custody.authorize(
+      const owner = custody
+      const generation = owner.generation ?? 0
+      const receipt = await owner.authorize(
         {
           credentialId: row.credentialId,
           accountIdentity: row.accountIdentity,
@@ -949,7 +1023,13 @@ export function createNativeVaultRuntime(
       // reissues it per send, and nothing is written here.
       await relocation.assertNotRelocated()
       check(combined)
-      issued.set(receipt, { routeId: row.routeId, logicalId })
+      assertCustodyOwner(owner, generation)
+      issued.set(receipt, {
+        routeId: row.routeId,
+        logicalId,
+        owner,
+        generation,
+      })
       const key = JSON.stringify([
         row.routeId,
         receipt.credentialId,
@@ -1306,6 +1386,7 @@ export function createNativeVaultRuntime(
       const finish = () => {
         shutdown.abort(new NativeCustodyError('closed'))
         unwatchAuthority()
+        unwatchHostAuthority()
         closeCustody()
         return store.close()
       }
@@ -1450,6 +1531,7 @@ export function createNativeVaultRuntime(
             const superseded = (versions.get(key) ?? 0) > receipt.recordVersion
             if (superseded && onSuperseded === 'refuse')
               throw new NativeRuntimeError('runtime-conflict')
+            assertCustodyOwner(route.owner, route.generation)
             return superseded ? 'skip' : 'publish'
           },
         },

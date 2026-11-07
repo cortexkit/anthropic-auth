@@ -285,7 +285,11 @@ export {
   nativePiAuthSlotPaths,
   openNativePiAuthSlot,
 } from './native-vault-connection.ts'
-export { isVaultHosted } from './native-vault-host.ts'
+export {
+  assertHostAuthorityStable,
+  isVaultHosted,
+  resetVaultHostAuthorityForTests,
+} from './native-vault-host.ts'
 export {
   createNativeVaultNoRouteResponse,
   NativeVaultQuotaPolicyError,

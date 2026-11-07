@@ -35,12 +35,17 @@ import {
   type NativeLocalCredentialVersion,
   nativeLocalCredentialValidationMatches,
 } from './native-credential-validation.ts'
+import { NativeCustodyError } from './native-custody.ts'
 import { nativeLockObserver } from './native-lock-observer.ts'
 import {
   isNativeTransientAccountError,
   joinNativePoolWrite,
   NativeTransientAccountError,
 } from './native-transient-account.ts'
+import {
+  assertHostAuthorityStable,
+  isVaultHosted,
+} from './native-vault-host.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import {
   isNativeLocalPoolBinding,
@@ -1026,6 +1031,9 @@ export function createNativeRefreshCoordinator(
                 ? 'cancelled'
                 : restrictionReason(policy.restriction, fingerprint)
               if (reason) throw new LocalRefreshRefusal(reason)
+              assertHostAuthorityStable()
+              if (isVaultHosted())
+                throw new NativeCustodyError('route-unavailable')
               endpointCalled = true
               const successor = await provider({
                 refreshToken: credential.refresh,
@@ -1036,6 +1044,9 @@ export function createNativeRefreshCoordinator(
               // reject the callback: the refresh token has already been consumed.
               consumed = true
               try {
+                // Save an already-consumed successor even after authority loss,
+                // but do not use its access token for an account lookup then.
+                assertHostAuthorityStable()
                 const returnedIdentity = (
                   await bootstrap(successor.access, undefined, undefined)
                 ).accountUuid
@@ -1485,5 +1496,15 @@ export function createNativeRefreshCoordinator(
     }
   }
 
-  return { authorize }
+  return {
+    async authorize(request: NativeRefreshRequest) {
+      assertHostAuthorityStable()
+      if (isVaultHosted()) throw new NativeCustodyError('route-unavailable')
+      const result = await authorize(request)
+      // The job may have persisted an already-consumed successor. Its result
+      // still cannot admit local credentials after host authority changes.
+      assertHostAuthorityStable()
+      return result
+    },
+  }
 }

@@ -37,7 +37,11 @@ import {
   isNativeMigrationRequired,
 } from './native.ts'
 import { createPiNativeCommands } from './native-commands.ts'
-import { getPiAccountStoragePath, requirePiNativeHostAuth } from './paths.ts'
+import {
+  getPiAccountStoragePath,
+  PI_HOSTED_LOGIN_REFUSAL,
+  requirePiNativeHostAuth,
+} from './paths.ts'
 import type { PiQuotaWaitOptions } from './quota-wait.ts'
 import {
   beginPiPrimaryTurn,
@@ -71,6 +75,24 @@ function refuseUnmigratedPrompts(pi: ExtensionAPI, storagePath: string) {
     if (ctx.hasUI) ctx.ui.notify(refusal.message, 'error')
     else process.stderr.write(`${refusal.message}\n`)
     return { action: 'handled' }
+  })
+}
+
+/** Pi rejects stored OAuth before calling our native provider. Report the Thalamus-owned slot refusal before Pi's generic authentication error, without inspecting or changing the slot at startup. */
+function refuseHostedPiLoginPrompts(pi: ExtensionAPI) {
+  pi.on('input', async (_event, ctx) => {
+    if (ctx.model?.provider !== 'anthropic') return { action: 'continue' }
+    try {
+      if (!isVaultHosted()) return { action: 'continue' }
+      await requirePiNativeHostAuth()
+      return { action: 'continue' }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : PI_HOSTED_LOGIN_REFUSAL
+      if (ctx.hasUI) ctx.ui.notify(message, 'error')
+      else process.stderr.write(`${message}\n`)
+      return { action: 'handled' }
+    }
   })
 }
 
@@ -336,7 +358,6 @@ export default async function cortexKitPiAnthropicAuth(
     const startupMode = await readNativeEnrollmentMode('pi').catch(
       () => undefined,
     )
-    if (isVaultHosted()) await requirePiNativeHostAuth()
     try {
       if (startupMode === 'local') await getPiNativeRuntime(storagePath).view()
     } catch (error) {
@@ -405,4 +426,5 @@ export default async function cortexKitPiAnthropicAuth(
     pi.registerProvider(provider)
   }
   await configureProvider()
+  if (isVaultHosted()) refuseHostedPiLoginPrompts(pi)
 }

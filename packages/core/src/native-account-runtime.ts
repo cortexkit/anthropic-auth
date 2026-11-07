@@ -87,6 +87,7 @@ import {
   createNativeUsagePublisher,
   waitForNativeUsageDrain,
 } from './native-usage-publication.ts'
+import { assertHostAuthorityStable } from './native-vault-host.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
@@ -475,6 +476,7 @@ export function createNativeAccountRuntime(
     onLockEvent,
   })
   function check(signal?: AbortSignal) {
+    assertHostAuthorityStable()
     if (shutdown.signal.aborted) throw new NativeCustodyError('closed')
     signal?.throwIfAborted()
   }
@@ -894,6 +896,7 @@ export function createNativeAccountRuntime(
       if (localRouting.source !== localRouting.destination)
         snapshot.routingRecoveryPath = localRouting.source
     }
+    assertHostAuthorityStable()
     return {
       snapshot,
       rows: read.rows,
@@ -1188,7 +1191,8 @@ export function createNativeAccountRuntime(
         now,
         publicationGuard: async (event) => {
           // An exchange has already consumed the predecessor. Keep its committed
-          // successor recoverable even if host enrollment lands before completion.
+          // successor recoverable even if enrollment or host authority changes
+          // after the provider consumed its refresh token. It is never served.
           if (
             event.status === 'persisted' ||
             (event.status === 'failed' &&
@@ -1205,7 +1209,10 @@ export function createNativeAccountRuntime(
             return false
           }
         },
-        externalPolicy: () => baseGate(account, snapshot),
+        externalPolicy: () => {
+          assertHostAuthorityStable()
+          return baseGate(account, snapshot)
+        },
         failurePolicy:
           options.local?.failurePolicy ??
           ((input) => {
@@ -1284,6 +1291,7 @@ export function createNativeAccountRuntime(
             persisted: false,
           }
       }
+      assertHostAuthorityStable()
       return result
     },
     async authorizeApi(routeId, signal) {
@@ -1301,6 +1309,7 @@ export function createNativeAccountRuntime(
       // Reading the credential yields to other processes. Recheck custody
       // before returning a local key that vault mode would exclude.
       await localAuthority(signal)
+      assertHostAuthorityStable()
       return {
         ...row.credential,
         subject: {

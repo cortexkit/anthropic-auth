@@ -31,6 +31,11 @@ const HOST_PATH_ENV_VARS = [
 ] as const
 
 beforeEach(async () => {
+  delete process.env.CORTEXKIT_VAULT_HOST
+  const core = await import('@cortexkit/anthropic-auth-core')
+  core.resetVaultHostAuthorityForTests?.()
+  const source = await import('../../../core/src/native-vault-host.ts')
+  source.resetVaultHostAuthorityForTests?.()
   testDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-pi-test-'))
   originalXdgStateHome = process.env.XDG_STATE_HOME
   for (const key of HOST_PATH_ENV_VARS) delete process.env[key]

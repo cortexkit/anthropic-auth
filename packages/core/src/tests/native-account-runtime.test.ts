@@ -2910,3 +2910,175 @@ test('pending poll quota cannot cross a replaced credential epoch', async () => 
   await f.runtime.drainQuotaPublications()
   expect((await f.runtime.read()).accounts[0]?.quota).toBeUndefined()
 })
+
+test('a local view held after its selected pool read refuses a newly hosted marker', async () => {
+  const f = await fixture()
+  expect((await f.runtime.authorizeLocal('main')).status).toBe('usable')
+  const before = await Promise.all(
+    [f.paths.config, f.paths.state, f.paths.runtime].map((path) =>
+      readFile(path),
+    ),
+  )
+  const entered = gate()
+  const release = gate()
+  const original = filesystem.readFile
+  let held = false
+  const replacement = (async (...args: Parameters<typeof original>) => {
+    const value = await original(...args)
+    if (!held && String(args[0]) === f.paths.config) {
+      held = true
+      entered.open()
+      await release.wait
+    }
+    return value
+  }) as typeof original
+  const spy = spyOn(filesystem, 'readFile').mockImplementation(replacement)
+  deferCleanup(() => {
+    release.open()
+    spy.mockRestore()
+    delete process.env.CORTEXKIT_VAULT_HOST
+  })
+  const pending = f.runtime.read()
+  const settled = Promise.allSettled([pending])
+  trackDetached(settled)
+  try {
+    await Promise.race([
+      entered.wait,
+      pending.then(() => {
+        throw new Error('view returned before barrier')
+      }),
+    ])
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+  } finally {
+    release.open()
+    spy.mockRestore()
+  }
+  expect((await settled)[0]).toMatchObject({
+    status: 'rejected',
+    reason: { code: 'route-unavailable' },
+  })
+  expect(
+    await Promise.all(
+      [f.paths.config, f.paths.state, f.paths.runtime].map((path) =>
+        readFile(path),
+      ),
+    ),
+  ).toEqual(before)
+  expect(f.counts.refresh).toBe(0)
+})
+
+test('a usable local admission held at its final snapshot refuses a newly hosted marker', async () => {
+  const f = await fixture()
+  expect((await f.runtime.authorizeLocal('main')).status).toBe('usable')
+  const entered = gate()
+  const release = gate()
+  const read = f.runtime.read.bind(f.runtime)
+  let reads = 0
+  const spy = spyOn(f.runtime, 'read').mockImplementation(async () => {
+    const snapshot = await read()
+    if (++reads === 2) {
+      entered.open()
+      await release.wait
+    }
+    return snapshot
+  })
+  deferCleanup(() => {
+    release.open()
+    spy.mockRestore()
+    delete process.env.CORTEXKIT_VAULT_HOST
+  })
+  const before = await Promise.all(
+    [f.paths.config, f.paths.state, f.paths.runtime].map((path) =>
+      readFile(path),
+    ),
+  )
+  const pending = f.runtime.authorizeLocal('main')
+  const settled = Promise.allSettled([pending])
+  trackDetached(settled)
+  try {
+    await Promise.race([
+      entered.wait,
+      pending.then(() => {
+        throw new Error('admission returned before barrier')
+      }),
+    ])
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+  } finally {
+    release.open()
+    spy.mockRestore()
+  }
+  expect((await settled)[0]).toMatchObject({
+    status: 'rejected',
+    reason: { code: 'route-unavailable' },
+  })
+  expect(
+    await Promise.all(
+      [f.paths.config, f.paths.state, f.paths.runtime].map((path) =>
+        readFile(path),
+      ),
+    ),
+  ).toEqual(before)
+  expect(f.counts.refresh).toBe(0)
+})
+
+test('a refresh consumed before a hosted flip persists its successor but never serves or exchanges again', async () => {
+  const entered = gate()
+  const release = gate()
+  let exchanges = 0
+  let owned: ReturnType<typeof createNativeAccountRuntime> | undefined
+  deferCleanup(() => {
+    release.open()
+    delete process.env.CORTEXKIT_VAULT_HOST
+    owned?.close()
+  })
+  const f = await fixture({
+    refreshToken: async () => {
+      exchanges++
+      entered.open()
+      await release.wait
+      return {
+        access: 'sk-ant-oat01-synthetic-consumed',
+        refresh: 'synthetic-consumed-successor',
+        expires: now + 4_000_000,
+        expiresIn: 4000,
+      }
+    },
+  })
+  owned = f.runtime
+  await f.store.rotate('imported-main', {
+    type: 'oauth',
+    access: 'sk-ant-oat01-synthetic-expired',
+    refresh: 'synthetic-predecessor',
+    expires: now - 1,
+  })
+  const pending = f.runtime.authorizeLocal('main')
+  const settled = Promise.allSettled([pending])
+  trackDetached(settled)
+  await Promise.race([
+    entered.wait,
+    pending.then(() => {
+      throw new Error('admission returned before consuming its refresh token')
+    }),
+  ])
+  const lookups = f.counts.lookups
+  process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+  release.open()
+  const outcome = (await settled)[0]!
+  if (outcome.status === 'fulfilled')
+    expect(outcome.value.status).not.toBe('usable')
+  else expect(outcome.reason).toMatchObject({ code: 'route-unavailable' })
+  const loaded = await f.store.read()
+  if (loaded.status !== 'ready')
+    throw new Error('Pool unexpectedly unavailable')
+  const row = loaded.rows.find((row) => row.id === 'imported-main')
+  expect(row?.credential).toMatchObject({
+    access: 'sk-ant-oat01-synthetic-consumed',
+    refresh: 'synthetic-consumed-successor',
+  })
+  expect(f.counts.lookups).toBe(lookups)
+  delete process.env.CORTEXKIT_VAULT_HOST
+  await expect(f.runtime.authorizeLocal('main')).rejects.toMatchObject({
+    code: 'route-unavailable',
+  })
+  expect(exchanges).toBe(1)
+})

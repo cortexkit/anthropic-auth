@@ -7,7 +7,11 @@ import {
   connectVaultHost,
 } from '@cortexkit/common-auth/claustrum'
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
-import { isVaultHosted } from './native-vault-host.ts'
+import {
+  assertHostAuthorityStable,
+  isVaultHosted,
+  onHostAuthorityChanged,
+} from './native-vault-host.ts'
 
 /**
  * Reads insula's quota cache from the vault daemon. Declared here with the
@@ -164,6 +168,7 @@ export interface NativeCustodyLogger {
 }
 
 export interface NativeCustodyOptions {
+  onConnectionChanged?: () => void
   host: 'opencode' | 'pi'
   connect: () => Promise<NativeCustodyClient>
   readToken?: () => Promise<{ token: string; token_generation: number }>
@@ -306,6 +311,7 @@ export type NativeCustodyRetry =
     }
 
 export interface NativeCustody {
+  readonly generation?: number
   discover: (signal?: AbortSignal) => Promise<NativeCustodyInventory>
   authorize: (
     identity: NativeCustodyIdentity,
@@ -348,15 +354,18 @@ export function createNativeCustody(
   const connect = options.connect
   const logger = options.logger
   let closed = false
+  let authorityChanged = false
   let revoked = false
   let client: NativeCustodyClient | undefined
   let connecting: Promise<NativeCustodyClient> | undefined
   const onClose = new Set<() => void>()
   // Weak membership rejects copied or foreign receipts without retaining them.
   // Common-auth keeps the original receipt's send-time enrollment token private.
-  const receipts = new WeakSet<object>()
+  const receipts = new WeakMap<object, number>()
+  let generation = 0
 
   function check(signal?: AbortSignal): void {
+    if (authorityChanged) throw new NativeCustodyError('route-unavailable')
     if (closed) throw new NativeCustodyError('closed')
     if (hosted !== isVaultHosted())
       throw new NativeCustodyError('route-unavailable')
@@ -390,7 +399,12 @@ export function createNativeCustody(
     try {
       const owned = await connection()
       check()
-      return await operation(owned)
+      const ownerGeneration = generation
+      const result = await operation(owned)
+      check()
+      if (generation !== ownerGeneration)
+        throw new NativeCustodyError('route-unavailable')
+      return result
     } catch (error) {
       check()
       if (
@@ -467,8 +481,125 @@ export function createNativeCustody(
 
   let primitive: ClaustrumScopedCustody | undefined
   let retained: Parameters<ClaustrumScopedCustody['retain']>[0] | undefined
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+  let reconnectFailures = 0
+  type RelayProbe = {
+    client?: NativeCustodyClient
+    primitive?: ClaustrumScopedCustody
+    abort: AbortController
+    closed: boolean
+    promoted: boolean
+  }
+  let probe: RelayProbe | undefined
+  const setTimer = options.setTimeout ?? setTimeout
+  const clearTimer = options.clearTimeout ?? clearTimeout
+  const guardedTimer = ((
+    callback: (...args: unknown[]) => void,
+    delay?: number,
+    ...args: unknown[]
+  ) =>
+    setTimer(() => {
+      try {
+        check()
+      } catch {
+        return
+      }
+      callback(...args)
+    }, delay)) as typeof setTimeout
+
+  function closeProbe(held: RelayProbe) {
+    if (held.closed || held.promoted) return
+    held.closed = true
+    held.abort.abort(new NativeCustodyError('closed'))
+    try {
+      if (held.primitive) held.primitive.close()
+      else held.client?.close()
+    } catch {
+      // Closing an unavailable relay must not replace an admission refusal.
+    }
+  }
+
+  function scheduleReconnect() {
+    if (!hosted || closed || revoked || probe || reconnectTimer) return
+    try {
+      check()
+    } catch {
+      return
+    }
+    const delays = [0, 1_000, 2_000, 5_000, 10_000]
+    reconnectTimer = setTimer(
+      () => {
+        reconnectTimer = undefined
+        void reconnect()
+      },
+      delays[Math.min(reconnectFailures, delays.length - 1)],
+    )
+    reconnectTimer.unref?.()
+  }
+
+  async function reconnect() {
+    if (closed || revoked || probe || !primitive) return
+    const previous = primitive
+    const held: RelayProbe = {
+      abort: new AbortController(),
+      closed: false,
+      promoted: false,
+    }
+    probe = held
+    try {
+      check()
+      held.client = connectVaultHost('anthropic-auth')
+      if (held.closed) {
+        held.client.close()
+        held.client = undefined
+        return
+      }
+      check()
+      held.primitive = makePrimitive(held.client)
+      if (retained) held.primitive.retain(retained)
+      // A new accessor result is not proof that the relay is back. Keep the
+      // old primitive's expiry-bounded receipts until a real roster read works.
+      // The 0.40.0 host client has no ready(); this read proves it can answer.
+      await held.primitive.discover(held.abort.signal)
+      check()
+      if (held.closed || primitive !== previous) return
+      primitive = held.primitive
+      client = held.client
+      connecting = Promise.resolve(held.client)
+      generation++
+      held.promoted = true
+      reconnectFailures = 0
+      try {
+        previous.close()
+      } finally {
+        options.onConnectionChanged?.()
+      }
+    } catch (error) {
+      if (
+        error instanceof ClaustrumCredentialError &&
+        error.code === 'enrollment_revoked'
+      ) {
+        revoked = true
+        custody.close()
+      }
+      reconnectFailures++
+    } finally {
+      closeProbe(held)
+      if (probe === held) probe = undefined
+      if (!held.promoted) scheduleReconnect()
+    }
+  }
+
+  class HostedCustody extends ClaustrumScopedCustody {
+    override transportLost(error?: unknown) {
+      super.transportLost(error)
+      if (primitive === this) scheduleReconnect()
+    }
+  }
+
   function makePrimitive(hostClient?: NativeCustodyClient) {
-    return new ClaustrumScopedCustody({
+    const ScopedCustody = hosted ? HostedCustody : ClaustrumScopedCustody
+    return new ScopedCustody({
       client: hostClient ?? {
         listScoped: (token) => scoped((owned) => owned.listScoped(token)),
         getScoped: (input) => scoped((owned) => owned.getScoped(input)),
@@ -492,8 +623,10 @@ export function createNativeCustody(
                 .tokenPath,
             }),
       now: options.now,
-      ...(options.setTimeout && { setTimeoutImpl: options.setTimeout }),
-      ...(options.clearTimeout && { clearTimeoutImpl: options.clearTimeout }),
+      // Common-auth also probes outages while idle. Fence those callbacks so
+      // its own fresh marker read cannot bypass the process authority latch.
+      setTimeoutImpl: guardedTimer,
+      clearTimeoutImpl: clearTimer,
       // Supply logger callbacks so common-auth cannot select its default logger.
       // Only the fixed messages below reach the caller; record details never do.
       logger: {
@@ -534,6 +667,12 @@ export function createNativeCustody(
       check(signal)
       return result
     } catch (error) {
+      if (
+        hosted &&
+        error instanceof ClaustrumCredentialError &&
+        error.code === 'enrollment_revoked'
+      )
+        revoked = true
       check(signal)
       // Copy no vault error details into public errors. Map only common-auth's
       // closed error kind; discard code, message, cause and data.
@@ -553,11 +692,23 @@ export function createNativeCustody(
 
   function requireReceipt(receipt: NativeCustodyReceipt): void {
     if (!receipts.has(receipt)) throw new NativeCustodyError('no-receipt')
+    if (receipts.get(receipt) !== generation)
+      throw new NativeCustodyError('route-unavailable')
   }
 
   const custody: NativeCustody = {
+    get generation() {
+      return generation
+    },
     discover: (signal) =>
-      run(async () => (await ready()).discover(signal), signal),
+      run(async () => {
+        const owner = await ready()
+        check(signal)
+        const inventory = await owner.discover(signal)
+        if (owner !== primitive)
+          throw new NativeCustodyError('route-unavailable')
+        return inventory
+      }, signal),
     authorize: (identity, signal) =>
       run(async () => {
         // Capture only route fields before awaiting common-auth authorization.
@@ -573,7 +724,9 @@ export function createNativeCustody(
         }
         if (!accountIdentity?.trim())
           throw new NativeCustodyError('identity-unasserted')
-        const receipt = await (await ready()).authorize(
+        const owner = await ready()
+        check(signal)
+        const receipt = await owner.authorize(
           {
             credentialId,
             accountIdentity,
@@ -582,7 +735,9 @@ export function createNativeCustody(
           signal,
         )
         check(signal)
-        receipts.add(receipt)
+        if (owner !== primitive)
+          throw new NativeCustodyError('route-unavailable')
+        receipts.set(receipt, generation)
         // Fixed OAuth input narrows common-auth's two-credential-type declaration.
         // Return the original object, preserving its non-enumerable accessToken.
         return receipt as NativeCustodyReceipt
@@ -590,7 +745,10 @@ export function createNativeCustody(
     reportFailure: (receipt, status, reporterSource) =>
       run(async () => {
         requireReceipt(receipt)
-        await (await ready()).reportFailure(receipt, status, reporterSource)
+        const owner = await ready()
+        check()
+        requireReceipt(receipt)
+        await owner.reportFailure(receipt, status, reporterSource)
       }),
     prepareRetry: async (served, signal) => {
       check(signal)
@@ -625,6 +783,8 @@ export function createNativeCustody(
         }
       }
       check(signal)
+      requireReceipt(served)
+      requireReceipt(current)
       if (current.credentialId !== served.credentialId) {
         return { retry: false, reason: 'credential-changed' }
       }
@@ -641,12 +801,18 @@ export function createNativeCustody(
     },
     insulaTransport: () => scoped(async (owned) => owned.insula),
     retain: (rows) => {
+      assertHostAuthorityStable()
       retained = rows.map((row) => ({ ...row, credentialType: 'oauth' }))
       primitive?.retain(retained)
     },
-    forget: (credentialId) => primitive?.forget(credentialId),
-    keptReceiptState: () =>
-      primitive?.keptReceiptState() ?? { active: false, since: null },
+    forget: (credentialId) => {
+      assertHostAuthorityStable()
+      primitive?.forget(credentialId)
+    },
+    keptReceiptState: () => {
+      assertHostAuthorityStable()
+      return primitive?.keptReceiptState() ?? { active: false, since: null }
+    },
     watchRoster: (watchOptions) => {
       check()
       if (!primitive) throw new NativeCustodyError('unavailable')
@@ -671,10 +837,18 @@ export function createNativeCustody(
     close: () => {
       if (closed) return
       closed = true
+      unwatchHostAuthority()
+      if (reconnectTimer) clearTimer(reconnectTimer)
+      reconnectTimer = undefined
+      if (probe) closeProbe(probe)
       for (const stop of onClose) stop()
       if (primitive) primitive.close()
       else client?.close()
     },
   }
+  const unwatchHostAuthority = onHostAuthorityChanged(() => {
+    authorityChanged = true
+    custody.close()
+  })
   return custody
 }

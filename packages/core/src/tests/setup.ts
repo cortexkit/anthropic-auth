@@ -8,6 +8,7 @@ delete process.env.CORTEXKIT_VAULT_HOST
 let testDir: string | undefined
 
 beforeEach(async () => {
+  delete process.env.CORTEXKIT_VAULT_HOST
   testDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-core-test-'))
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(
     testDir,
@@ -21,6 +22,8 @@ beforeEach(async () => {
     'quota-header-feed',
   )
   process.env.OPENCODE_ANTHROPIC_AUTH_LOG_FILE = join(testDir, 'auth.log')
+  const authority = await import('../native-vault-host.ts')
+  authority.resetVaultHostAuthorityForTests?.()
 })
 
 afterEach(async () => {

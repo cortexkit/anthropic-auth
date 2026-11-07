@@ -188,7 +188,8 @@ export function claudeLoginMethods(
           if (input.verifyVault) await input.verifyVault()
           else {
             try {
-              connectVaultHost('anthropic-auth').close()
+              const client = connectVaultHost('anthropic-auth')
+              await Promise.resolve(client.close()).catch(() => undefined)
             } catch {
               throw new NativeCustodyError('unavailable')
             }

@@ -199,7 +199,14 @@ afterEach(() => {
 // the captured guarded implementation afterward.
 globalThis.fetch = guardedFetch
 
-beforeEach(restoreTestSafetyPaths)
+beforeEach(async () => {
+  delete process.env.CORTEXKIT_VAULT_HOST
+  restoreTestSafetyPaths()
+  const core = await import('@cortexkit/anthropic-auth-core')
+  core.resetVaultHostAuthorityForTests?.()
+  const source = await import('../../../core/src/native-vault-host.ts')
+  source.resetVaultHostAuthorityForTests?.()
+})
 afterEach(restoreTestSafetyPaths)
 // User-level Anthropic overrides are valid runtime configuration, but they make
 // request-transform tests depend on the developer machine. Tests set these

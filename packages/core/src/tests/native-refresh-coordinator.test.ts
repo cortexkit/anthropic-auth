@@ -4377,3 +4377,62 @@ for (const refreshToken of [
     ).toEqual(before)
   })
 }
+
+test('a hosted marker appearing during the final physical refresh policy read prevents the provider call', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const entered = barrier()
+  const release = barrier()
+  let physical = false
+  let paused = false
+  let exchanges = 0
+  const c = f.coordinator({
+    hold: async () => {
+      physical = true
+    },
+    readRestrictions: async (subject) => {
+      if (physical && !paused) {
+        paused = true
+        entered.release()
+        await release.promise
+      }
+      return policyFor(subject)
+    },
+    refreshToken: async () => {
+      exchanges++
+      return { ...credential('forbidden-hosted'), expiresIn: 3600 }
+    },
+  })
+  const before = await Promise.all(
+    [f.paths.config, f.paths.state].map((path) => readFile(path)),
+  )
+  const pending = c.refresh({ mode: 'local', binding: await f.binding('a') })
+  const settled = Promise.allSettled([pending])
+  try {
+    try {
+      await Promise.race([
+        entered.promise,
+        pending.then(() => {
+          throw new Error('refresh completed before barrier')
+        }),
+      ])
+      process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    } finally {
+      release.release()
+    }
+    expect((await settled)[0]).toMatchObject({
+      status: 'rejected',
+      reason: { code: 'route-unavailable' },
+    })
+    expect(exchanges).toBe(0)
+    expect(
+      await Promise.all(
+        [f.paths.config, f.paths.state].map((path) => readFile(path)),
+      ),
+    ).toEqual(before)
+  } finally {
+    release.release()
+    await settled
+    delete process.env.CORTEXKIT_VAULT_HOST
+  }
+})

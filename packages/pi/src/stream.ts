@@ -4,6 +4,7 @@ import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyCustomHeaders,
+  assertHostAuthorityStable,
   buildBillingHeaderValue,
   buildPrimeRequestBody,
   CACHE_KEEP_EXTENDED_TTL_BETA,
@@ -765,6 +766,7 @@ async function sendAnthropicRequest(
     native?: PiNativeRuntime
   } = {},
 ): Promise<Response> {
+  assertHostAuthorityStable()
   const fetchImpl = deps.fetch ?? globalThis.fetch
   const keep = deps.cacheKeep ?? cacheKeepManager
   const native = deps.native ?? getPiNativeRuntime(options.storagePath)
@@ -982,6 +984,7 @@ async function sendAnthropicRequest(
     const send = async () => {
       await options.prime?.beforeSend()
       init.signal?.throwIfAborted()
+      assertHostAuthorityStable()
       const scope = createProviderErrorResponseScope([secret], 'event-stream')
       physical.scope = scope
       // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
@@ -999,6 +1002,7 @@ async function sendAnthropicRequest(
           send: async (wireBody, wireHeaders) => {
             await options.prime?.beforeSend()
             init.signal?.throwIfAborted()
+            assertHostAuthorityStable()
             return fetchImpl(input, {
               ...init,
               body: wireBody,
@@ -1120,6 +1124,7 @@ async function sendAnthropicRequest(
         const attempt = await takeAttempt()
         await options.prime?.beforeSend()
         init.signal?.throwIfAborted()
+        assertHostAuthorityStable()
         relayAttempt = attempt
         lastTransport = 'relay'
         const authorizedHeaders = new Headers(headers)

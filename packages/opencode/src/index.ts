@@ -5372,7 +5372,16 @@ const anthropicAuthPlugin = async (
     const action = checkedAction ?? parseAccountCommandAction(argumentsText)
     if (
       isVaultHosted() &&
-      !['status', 'enable', 'disable', 'reset-backoff'].includes(action.type)
+      [
+        'claustrum-mode',
+        'enrollment-reset',
+        'add-apikey',
+        'add-oauth-start',
+        'add-oauth-finish',
+        'remove',
+        'move-up',
+        'move-down',
+      ].includes(action.type)
     )
       throw new Error(VAULT_HOST_CONNECT_REFUSAL)
     if (isVaultHosted() && action.type === 'status')

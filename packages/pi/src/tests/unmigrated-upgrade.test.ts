@@ -14,9 +14,14 @@ import {
   resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
 import {
+  type AssistantMessage,
+  createAssistantMessageEventStream,
+} from '@earendil-works/pi-ai'
+import {
   type AgentSession,
   createAgentSessionFromServices,
   createAgentSessionServices,
+  type ExtensionContext,
   type ExtensionError,
   type ExtensionUIContext,
   SessionManager,
@@ -26,6 +31,8 @@ import { NativeAuthorityError } from '../../../core/src/pool-authority.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import { closePiNativeRuntime, PiNativeRuntime } from '../native.ts'
+import * as paths from '../paths.ts'
+import { PI_HOSTED_LOGIN_REFUSAL } from '../paths.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
 
 const lifetime = createTestLifetimeSuite()
@@ -395,5 +402,113 @@ test(
     expect(routes.getAuth).toHaveBeenCalled()
     expect(routes.providerStream).toHaveBeenCalledTimes(1)
     expect(sent.length).toBe(1)
+  }),
+)
+
+test(
+  'a Thalamus-hosted Pi head with its own login loads and refuses its first request without changing auth.json',
+  lifetime.wrapBody(async () => {
+    const fixture = await createPiFixture()
+    await writeLegacyPiInstall(fixture, true)
+    const before = await readFile(join(fixture.agentDir, 'auth.json'))
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    lifetime.deferCleanup(() => {
+      delete process.env.CORTEXKIT_VAULT_HOST
+    })
+    const slotRead = spyOn(paths, 'requirePiNativeHostAuth')
+    lifetime.deferCleanup(() => slotRead.mockRestore())
+    const { session, extension, routes } = await startPi(fixture)
+    expect(extension.commands.has('claude')).toBe(true)
+    expect(slotRead).toHaveBeenCalledTimes(0)
+    const notices: string[] = []
+    const writeStderr = spyOn(process.stderr, 'write').mockImplementation(
+      (chunk: string | Uint8Array) => {
+        notices.push(String(chunk))
+        return true
+      },
+    )
+    lifetime.deferCleanup(() => writeStderr.mockRestore())
+    await session.bindExtensions({
+      onError: (error) => {
+        throw error
+      },
+    })
+    await session.prompt('hello')
+    expect(notices).toEqual([`${PI_HOSTED_LOGIN_REFUSAL}\n`])
+    expect(session.messages).toEqual([])
+    expect(slotRead).toHaveBeenCalledTimes(1)
+    for (const route of Object.values(routes))
+      expect(route).toHaveBeenCalledTimes(0)
+    expect(fixture.fetches).toEqual([])
+    expect(await readFile(join(fixture.agentDir, 'auth.json'))).toEqual(before)
+  }),
+)
+
+test(
+  'a Thalamus-hosted Pi head with its own Claude login still serves prompts on another provider',
+  lifetime.wrapBody(async () => {
+    const fixture = await createPiFixture()
+    await writeLegacyPiInstall(fixture, true)
+    const before = await readFile(join(fixture.agentDir, 'auth.json'))
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    lifetime.deferCleanup(() => {
+      delete process.env.CORTEXKIT_VAULT_HOST
+    })
+    const slotRead = spyOn(paths, 'requirePiNativeHostAuth')
+    lifetime.deferCleanup(() => slotRead.mockRestore())
+    const { session, extension, available, routes } = await startPi(fixture)
+    const model = available.find((candidate) => candidate.provider === 'openai')
+    if (!model) throw new Error('Fixture OpenAI provider unavailable')
+    await session.setModel(model)
+    const inputs = extension.handlers.get('input')
+    expect(inputs).toHaveLength(1)
+    // Background vault and CacheKeep restoration also inspect the slot.
+    // Isolate the input handler's synchronous provider gate before awaiting.
+    slotRead.mockClear()
+    const input = inputs![0]!(
+      { type: 'input', text: 'another provider', source: 'interactive' },
+      { model } as ExtensionContext,
+    )
+    expect(slotRead).toHaveBeenCalledTimes(0)
+    expect(await input).toEqual({ action: 'continue' })
+    routes.runtimeStream.mockImplementation((selected) => {
+      expect(selected.provider).toBe('openai')
+      const stream = createAssistantMessageEventStream()
+      const message: AssistantMessage = {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'synthetic other-provider reply' }],
+        api: selected.api,
+        provider: selected.provider,
+        model: selected.id,
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: 'stop',
+        timestamp: Date.now(),
+      }
+      stream.push({ type: 'done', reason: 'stop', message })
+      stream.end()
+      return stream
+    })
+    await session.bindExtensions({
+      onError: (error) => {
+        throw error
+      },
+    })
+    await session.prompt('hello from another provider')
+    expect(session.messages.at(-1)).toMatchObject({
+      role: 'assistant',
+      stopReason: 'stop',
+      provider: 'openai',
+    })
+    expect(routes.runtimeStream).toHaveBeenCalledTimes(1)
+    expect(routes.providerStream).toHaveBeenCalledTimes(0)
+    expect(fixture.fetches).toEqual([])
+    expect(await readFile(join(fixture.agentDir, 'auth.json'))).toEqual(before)
   }),
 )

@@ -2,6 +2,7 @@ import { expect } from 'bun:test'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
   createNativeAccountRuntime,
@@ -17,6 +18,7 @@ import {
 import type { CommandApplyResult } from '@cortexkit/common-auth/commands'
 import { createOpencodeClient } from '@opencode-ai/sdk'
 import { $ } from 'bun'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { createRpcClient } from '../rpc/rpc-client.ts'
@@ -65,7 +67,7 @@ const nativeLocal = {
  * Cleanups run in registration order, so the plugin is disposed and process
  * state restored before the fixture removes its root.
  */
-async function start(settings: Record<string, unknown>) {
+async function start(settings: Record<string, unknown>, hosted = false) {
   const savedFetch = globalThis.fetch
   const savedEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
   // Starting the plugin applies the stored dump and log settings to
@@ -120,6 +122,14 @@ async function start(settings: Record<string, unknown>) {
     await seeding.updateSettings((current) => ({ ...current, ...settings }))
   } finally {
     seeding.close()
+  }
+  if (hosted) {
+    core.resetVaultHostAuthorityForTests?.()
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    deferCleanup(() => {
+      delete process.env.CORTEXKIT_VAULT_HOST
+      core.resetVaultHostAuthorityForTests?.()
+    })
   }
   const unexpected: string[] = []
   globalThis.fetch = Object.assign(
@@ -180,7 +190,7 @@ async function start(settings: Record<string, unknown>) {
 }
 
 /** The settings stored in the pool config file. */
-async function storedSettings(paths: NativePoolPaths) {
+async function storedSettings(paths: Pick<NativePoolPaths, 'config'>) {
   const config: unknown = JSON.parse(await readFile(paths.config, 'utf8'))
   if (!config || typeof config !== 'object')
     throw new Error('Pool config is not an object')
@@ -261,4 +271,47 @@ test('cachekeep-always removes the stored hour window and keeps other keep-warm 
     },
   ])
   expect(s.unexpected).toEqual([])
+})
+
+test('hosted OC1 vault settings remain available without connecting', async () => {
+  const s = await start({}, true)
+  const local = await Promise.all(
+    [s.paths.config, s.paths.state, s.paths.runtime].map((path) =>
+      readFile(path),
+    ),
+  )
+  expect((await s.apply('cache-on')).ok).toBe(true)
+  const stored = await storedSettings(nativeVaultPaths(s.paths))
+  expect(stored.claudeCache).toEqual({ enabled: true, mode: 'explicit' })
+  expect(
+    await Promise.all(
+      [s.paths.config, s.paths.state, s.paths.runtime].map((path) =>
+        readFile(path),
+      ),
+    ),
+  ).toEqual(local)
+  expect(s.unexpected).toEqual([])
+})
+
+test('hosted OC1 account dispatch denies only local and enrollment actions, not vault-compatible commands', async () => {
+  const source = await readFile(new URL('../index.ts', import.meta.url), 'utf8')
+  const body = source.slice(
+    source.indexOf('async function executePersistentAccountCommand('),
+  )
+  const guard = body.match(
+    /if\s*\(([\s\S]*?)\)\s*throw new Error\(VAULT_HOST_CONNECT_REFUSAL\)/,
+  )?.[1]
+  expect(guard).toBeDefined()
+  expect(guard).toContain('isVaultHosted() &&')
+  expect(guard).not.toMatch(/&&\s*!/)
+  expect([...guard!.matchAll(/'([^']+)'/g)].map((match) => match[1])).toEqual([
+    'claustrum-mode',
+    'enrollment-reset',
+    'add-apikey',
+    'add-oauth-start',
+    'add-oauth-finish',
+    'remove',
+    'move-up',
+    'move-down',
+  ])
 })

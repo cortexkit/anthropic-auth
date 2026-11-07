@@ -6,6 +6,7 @@ import {
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
 import { logger } from './logger.ts'
 import { NativeCustodyError } from './native-custody.ts'
+import { assertHostAuthorityStable } from './native-vault-host.ts'
 import { closeNativeVaultAuthority } from './native-vault-invalidation.ts'
 
 const stages = new Set([
@@ -192,11 +193,13 @@ export async function readNativeEnrollmentMode(
     readClaustrumEnrollmentStatus,
   },
 ): Promise<'local' | 'claustrum'> {
+  assertHostAuthorityStable()
   const paths = getHostClaustrumEnrollmentPaths(host, env)
   const authority = await dependencies.enrollmentAuthority(
     paths,
     `anthropic-auth-${host}`,
   )
+  assertHostAuthorityStable()
   if (authority === 'host') return 'claustrum'
   if (authority !== 'vault')
     closeNativeVaultAuthority(
@@ -208,6 +211,7 @@ export async function readNativeEnrollmentMode(
       paths,
       dependencies.readClaustrumEnrollmentStatus,
     )
+    assertHostAuthorityStable()
     if (privateFilesUnavailableReasons.has(reason))
       throw new NativePrivateFilesUnavailableError()
     throw new NativeCustodyError('invalid-token')
@@ -220,5 +224,6 @@ export async function readNativeEnrollmentMode(
     env,
     dependencies.readClaustrumEnrollmentStatus,
   )
+  assertHostAuthorityStable()
   return mode
 }

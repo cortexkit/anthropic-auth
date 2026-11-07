@@ -30,7 +30,7 @@ export function nativeRuntimeStorageKey(options: {
   const paths = options.paths
   return JSON.stringify([
     options.host,
-    isVaultHosted() ? 'host-anthropic-auth' : 'native',
+    ...(isVaultHosted() ? ['host-anthropic-auth'] : []),
     paths.storageId,
     ...(
       [

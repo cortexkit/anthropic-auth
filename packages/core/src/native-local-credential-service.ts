@@ -1,4 +1,5 @@
 import { types as utilTypes } from 'node:util'
+import { NativeCustodyError } from './native-custody.ts'
 import {
   createNativeLocalRuntimeReaders,
   type NativeLocalExternalPolicy,
@@ -23,6 +24,10 @@ import {
   publishNativeLocalFirstIdentity,
   publishNativeLocalRefreshFailure,
 } from './native-runtime.ts'
+import {
+  assertHostAuthorityStable,
+  isVaultHosted,
+} from './native-vault-host.ts'
 import {
   NativeAuthorityError,
   requireNativePoolAuthority,
@@ -353,6 +358,8 @@ export function createNativeLocalCredentialService(
   async function authorize(
     request: NativeRefreshRequest,
   ): Promise<NativeRefreshResult> {
+    assertHostAuthorityStable()
+    if (isVaultHosted()) throw new NativeCustodyError('route-unavailable')
     try {
       await requireNativePoolAuthority(paths)
     } catch (error) {
@@ -365,7 +372,10 @@ export function createNativeLocalCredentialService(
     // means the successor is already durable; refusal must report that fact
     // without returning the credential or undoing its saved state.
     return requireNativePoolAuthority(paths).then(
-      () => result,
+      () => {
+        assertHostAuthorityStable()
+        return result
+      },
       (error: unknown) => authorityRefusal(error, result.source === 'rotated'),
     )
   }

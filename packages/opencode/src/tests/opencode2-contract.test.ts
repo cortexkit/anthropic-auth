@@ -978,11 +978,14 @@ test('hosted OC2 activation requires a relay and returns only the vault placehol
       'Native custody refused: unavailable',
     )
     let connects = 0
+    const closed: number[] = []
     globals[key] = (id: string) => {
       expect(id).toBe('anthropic-auth')
-      connects++
+      const index = connects++
       return {
-        close() {},
+        close() {
+          closed.push(index)
+        },
         listScoped() {},
         getScoped() {},
         reportAuthFailureScoped() {},
@@ -992,10 +995,63 @@ test('hosted OC2 activation requires a relay and returns only the vault placehol
     expect(isPlaceholderCredential(marker, 'anthropic')).toBe(true)
     expect(marker.access).toBe(placeholderSecret('anthropic'))
     expect(connects).toBe(1)
+    expect(closed).toEqual([0])
     expect(login.writes).toEqual([])
     expect(login.browserStarts()).toBe(0)
     expect(login.connectionWrites()).toBe(0)
   } finally {
+    delete process.env.CORTEXKIT_VAULT_HOST
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  }
+})
+
+test('hosted OC2 activation awaits and tolerates probe-client close rejection', async () => {
+  const key = Symbol.for('cortexkit.vault')
+  const globals = globalThis as unknown as Record<symbol, unknown>
+  const previous = globals[key]
+  process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+  let entered = () => {}
+  let release = () => {}
+  const closing = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  const finish = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let closes = 0
+  let pending:
+    | ReturnType<Awaited<ReturnType<typeof enrollmentLogin>>['activateVault']>
+    | undefined
+  globals[key] = () => ({
+    listScoped() {},
+    getScoped() {},
+    reportAuthFailureScoped() {},
+    async close() {
+      closes++
+      entered()
+      await finish
+      throw new Error('synthetic probe close rejection')
+    },
+  })
+  try {
+    const login = await enrollmentLogin(() =>
+      readNativeEnrollmentMode('opencode'),
+    )
+    pending = login.activateVault()
+    await closing
+    const waited = await Promise.race([
+      pending.then(() => false),
+      new Promise<boolean>((resolve) => setImmediate(() => resolve(true))),
+    ])
+    expect(waited).toBe(true)
+    release()
+    expect(isPlaceholderCredential(await pending, 'anthropic')).toBe(true)
+    expect(closes).toBe(1)
+    expect(login.writes).toEqual([])
+  } finally {
+    release()
+    if (pending) await Promise.allSettled([pending])
     delete process.env.CORTEXKIT_VAULT_HOST
     if (previous === undefined) delete globals[key]
     else globals[key] = previous
