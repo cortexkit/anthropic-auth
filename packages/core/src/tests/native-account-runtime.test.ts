@@ -28,7 +28,7 @@ import {
   createNativeLocalCredentialService,
   type NativeLocalCredentialServiceOptions,
 } from '../native-local-credential-service.ts'
-import { nativeQuotaCodec } from '../native-quota-codec.ts'
+import { fromNativeQuotaMap, nativeQuotaCodec } from '../native-quota-codec.ts'
 import {
   NativeQuotaObservations,
   nativePollQuotaGenerallyExhausted,
@@ -2573,12 +2573,35 @@ test('slow superseded poll publication cannot overwrite newer quota on disk', as
   const admission = await f.runtime.authorizeLocal('main')
   if (admission.status !== 'usable') throw new Error('Expected usable account')
   await publish(admission.subject, { quota: latest.entry.quota })
-  const before = await f.store.read()
+  // Accepted readings are coalesced; this separate handle sees only disk.
+  const committedNewerQuota = async () => {
+    const deadline = performance.now() + 1_000
+    while (true) {
+      const stored = await f.store.read()
+      if (stored.status !== 'ready') throw new Error('Expected ready pool')
+      const quota = stored.rows.find((row) => row.id === 'imported-main')?.quota
+      if (quota && fromNativeQuotaMap(quota).five_hour?.checkedAt === now + 1)
+        return stored
+      if (performance.now() >= deadline)
+        throw new Error(
+          'Newer quota reading was not committed to disk within 1000 ms',
+        )
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+  const before = await committedNewerQuota()
+  expect(
+    fromNativeQuotaMap(
+      before.rows.find((row) => row.id === 'imported-main')?.quota,
+    ).five_hour,
+  ).toMatchObject({ checkedAt: now + 1, remainingPercent: 2 })
   held.open()
   await f.runtime.drainQuotaPublications()
   expect(
     (await f.runtime.read()).accounts[0]?.quota?.five_hour?.remainingPercent,
   ).toBe(2)
+  // Draining publications does not wait for disk writes; close flushes the writer.
+  await f.runtime.close()
   expect(await f.store.read()).toEqual(before)
 })
 
