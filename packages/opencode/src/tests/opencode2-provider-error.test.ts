@@ -169,6 +169,7 @@ function oauthFor(token: string, receipt = token) {
   return (): NativeAnthropicAuthorization<Provenance> => ({
     route: 'oauth',
     accessToken: token,
+    credentialId: 'synthetic-credential-row',
     provenance: { receipt },
   })
 }
@@ -438,6 +439,7 @@ test('OC2 HTTP relay errors omit the upstream credential and the private relay t
   const { source } = makeSource(() => ({
     route: 'oauth',
     accessToken: ACCESS_A,
+    credentialId: 'synthetic-credential-row',
     provenance: { receipt: 'relay' },
     dispatch: { kind: 'http-relay', url: RELAY, token: RELAY_TOKEN },
   }))
@@ -525,6 +527,7 @@ test('OC2 public attempt metadata carries no credential or redaction function', 
   const { source } = makeSource(() => ({
     route: 'oauth',
     accessToken: ACCESS_A,
+    credentialId: 'synthetic-credential-row',
     provenance: { receipt: 'metadata' },
     dispatch: { kind: 'http-relay', url: RELAY, token: RELAY_TOKEN },
   }))
@@ -1224,6 +1227,7 @@ test('OC2 relay-local 401 cancels the physical body and retires its credentials 
   const { source } = makeSource(() => ({
     route: 'oauth',
     accessToken: ACCESS_A,
+    credentialId: 'synthetic-credential-row',
     provenance: { receipt: 'relay' },
     dispatch: { kind: 'http-relay', url: RELAY, token: RELAY_TOKEN },
   }))

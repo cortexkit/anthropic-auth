@@ -1,6 +1,7 @@
-import { createHash, type Hash } from 'node:crypto'
+import { createHash, type Hash, randomUUID } from 'node:crypto'
 import { signRequestBody } from './cch.ts'
 import { logger } from './logger.ts'
+import type { NativeLocalPoolBinding } from './pool-binding.ts'
 import { isServerFallbackUsageMarker } from './server-fallback-usage.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
 
@@ -15,13 +16,17 @@ export interface MessageThreadInput {
   body: Body
   betas: string[]
   account: string
+  // Credential row identity: stable on refresh, replaced on re-login; never a token.
   credential: string
   session: string
+  request?: string
   // Request-local spellings accepted by the host's response decoder.
   replyToolNames?: ReadonlyMap<string, string | null>
 }
 export interface MessageThreadSnapshot {
   identity: string
+  accountIdentity: string
+  credentialIdentity: string
   fingerprint: string
   messages: string[]
   prefix: string
@@ -34,6 +39,47 @@ export interface MessageThreadAnchor extends MessageThreadSnapshot {
 export type MessageThreadDecision =
   | { type: 'create' }
   | { type: 'continue'; previousMessageId: string; deltaMessages: unknown[] }
+
+export type MessageThreadCreateReason =
+  | 'no_anchor'
+  | 'clock_rollback'
+  | 'expired'
+  | 'identity_changed'
+  | 'too_few_messages'
+  | 'assistant_missing'
+  | 'extra_assistant'
+  | 'reply_invalid'
+  | 'reply_changed'
+  | 'fixed_changed'
+  | 'prefix_changed'
+
+export type MessageThreadDisposition =
+  | 'never_seen'
+  | 'superseded'
+  | 'stream_cancelled'
+  | 'stream_error'
+  | 'signal_aborted'
+  | 'invalid_completion'
+  | 'invalid_reply'
+  | 'response_refusal'
+  | 'response_fallback'
+  | 'response_rewritten'
+  | 'thread_rejected'
+  | 'account_disabled'
+  | 'evicted'
+  | 'session_deleted'
+
+/** Refresh preserves the local epoch; replacing a login advances it even when the row id is reused. */
+export function localMessageThreadCredential(
+  binding: NativeLocalPoolBinding,
+): string {
+  return JSON.stringify([
+    'local',
+    binding.storageId,
+    binding.rowId,
+    binding.credentialEpoch,
+  ])
+}
 
 function hash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -482,35 +528,42 @@ export function messageThreadSnapshot(
   const messages = (
     Array.isArray(input.body.messages) ? input.body.messages : []
   ).map((message) => hash(canonicalValue(withoutMessageCache(message))))
-  return { identity, fingerprint, messages, prefix: hash(messages) }
+  return {
+    identity,
+    accountIdentity: hash(input.account),
+    credentialIdentity: hash(input.credential),
+    fingerprint,
+    messages,
+    prefix: hash(messages),
+  }
 }
 
-function canContinueFrom(
+function continuationBlocker(
   anchor: MessageThreadAnchor | undefined,
   input: MessageThreadInput,
   identity: string | undefined,
   now: number,
-): anchor is MessageThreadAnchor {
-  if (
-    !anchor ||
-    !identity ||
-    anchor.identity !== identity ||
-    now < anchor.completedAt ||
-    now - anchor.completedAt >= MAX_AGE_MS
-  )
-    return false
+): MessageThreadCreateReason | undefined {
+  if (!anchor) return 'no_anchor'
+  if (now < anchor.completedAt) return 'clock_rollback'
+  if (now - anchor.completedAt >= MAX_AGE_MS) return 'expired'
+  if (!identity || anchor.identity !== identity) return 'identity_changed'
   const messages = Array.isArray(input.body.messages) ? input.body.messages : []
-  return (
-    messages.length >= anchor.messages.length + 2 &&
-    messages[anchor.messages.length]?.role === 'assistant' &&
-    !messages
+  if (messages.length < anchor.messages.length + 2) return 'too_few_messages'
+  if (messages[anchor.messages.length]?.role !== 'assistant')
+    return 'assistant_missing'
+  if (
+    messages
       .slice(anchor.messages.length + 1)
-      .some((message) => message?.role === 'assistant') &&
-    assistantReplyFingerprint(
-      messages[anchor.messages.length],
-      replyToolNameResolver(input),
-    ) === anchor.replyFingerprint
+      .some((message) => message?.role === 'assistant')
   )
+    return 'extra_assistant'
+  const reply = assistantReplyFingerprint(
+    messages[anchor.messages.length],
+    replyToolNameResolver(input),
+  )
+  if (!reply) return 'reply_invalid'
+  if (reply !== anchor.replyFingerprint) return 'reply_changed'
 }
 
 /** Decide from immutable request facts; no session state or clock is read here. */
@@ -521,7 +574,8 @@ export function decideMessageThread(
   now: number,
 ): MessageThreadDecision {
   if (
-    !canContinueFrom(anchor, input, snapshot.identity, now) ||
+    continuationBlocker(anchor, input, snapshot.identity, now) ||
+    !anchor ||
     anchor.fingerprint !== snapshot.fingerprint ||
     hash(snapshot.messages.slice(0, anchor.messages.length)) !== anchor.prefix
   )
@@ -552,6 +606,8 @@ export class MessageThreadTracker {
   >()
 
   private messageHashes = 0
+  private readonly dispositions = new Map<string, MessageThreadDisposition>()
+  private readonly instance = randomUUID()
 
   constructor(
     private readonly capacity = MAX_SESSIONS,
@@ -559,10 +615,20 @@ export class MessageThreadTracker {
     private readonly hashBudget = MAX_MESSAGE_HASHES,
   ) {}
 
-  forget(session: string): void {
+  forget(
+    session: string,
+    disposition: MessageThreadDisposition = 'session_deleted',
+  ): void {
     this.messageHashes -=
       this.sessions.get(session)?.anchor?.messages.length ?? 0
     this.sessions.delete(session)
+    this.dispositions.delete(session)
+    this.dispositions.set(session, disposition)
+    while (this.dispositions.size > this.capacity) {
+      const oldest = this.dispositions.keys().next().value
+      if (oldest === undefined) break
+      this.dispositions.delete(oldest)
+    }
   }
 
   private prune(): void {
@@ -572,15 +638,47 @@ export class MessageThreadTracker {
     ) {
       const oldest = this.sessions.keys().next().value
       if (oldest === undefined) break
-      this.forget(oldest)
+      this.forget(oldest, 'evicted')
     }
   }
 
   // Late stream-failure callbacks must not retain the full request body.
-  private failureFor(session: string, token: object): () => void {
-    return () => {
-      if (this.sessions.get(session)?.token === token) this.forget(session)
+  private failureFor(session: string, token: object) {
+    return (disposition: MessageThreadDisposition = 'stream_error') => {
+      if (this.sessions.get(session)?.token === token)
+        this.forget(session, disposition)
     }
+  }
+
+  logCreate(
+    session: string,
+    reason: MessageThreadCreateReason,
+    anchor?: MessageThreadAnchor,
+    input?: Pick<MessageThreadInput, 'account' | 'credential' | 'request'>,
+    now = this.now(),
+  ): void {
+    logger.debug('message-threads', 'message_thread_create', {
+      event: 'message_thread_create',
+      session,
+      request: input?.request ?? null,
+      instance: this.instance,
+      reason,
+      anchor_present: !!anchor,
+      anchor_age_ms: anchor ? now - anchor.completedAt : null,
+      account_equal:
+        !!anchor && !!input && anchor.accountIdentity === hash(input.account),
+      credential_equal:
+        !!anchor &&
+        !!input &&
+        anchor.credentialIdentity === hash(input.credential),
+      previous_message_id: anchor?.messageId ?? null,
+      last_anchor_disposition:
+        reason === 'no_anchor'
+          ? this.sessions.has(session)
+            ? 'superseded'
+            : (this.dispositions.get(session) ?? 'never_seen')
+          : null,
+    })
   }
 
   prepare(input: MessageThreadInput): {
@@ -588,7 +686,7 @@ export class MessageThreadTracker {
     body: Body
     normalizeToolName: ReplyToolName
     complete: (facts: MessageThreadCompletion) => void
-    fail: () => void
+    fail: (disposition?: MessageThreadDisposition) => void
   } {
     const normalizeToolName = replyToolNameResolver(input)
     const previous = this.sessions.get(input.session)
@@ -602,16 +700,26 @@ export class MessageThreadTracker {
         ? hash([input.account, input.credential])
         : undefined
     let snapshot: MessageThreadSnapshot | undefined
-    if (canContinueFrom(anchor, input, identity, now)) {
+    let reason = continuationBlocker(anchor, input, identity, now)
+    if (!reason && anchor) {
       const fingerprint = fixedThreadFingerprint(input)
       if (fingerprint === anchor.fingerprint)
         snapshot = messageThreadSnapshot(input, identity, fingerprint)
+      else reason = 'fixed_changed'
     }
     const decision: MessageThreadDecision = snapshot
       ? decideMessageThread(anchor, input, snapshot, now)
       : { type: 'create' }
+    if (decision.type === 'create')
+      this.logCreate(
+        input.session,
+        reason ?? 'prefix_changed',
+        anchor,
+        input,
+        now,
+      )
     const token = {}
-    this.forget(input.session)
+    this.forget(input.session, 'superseded')
     this.sessions.set(input.session, { token })
     this.prune()
     const fail = this.failureFor(input.session, token)
@@ -662,14 +770,25 @@ export class MessageThreadTracker {
           (Array.isArray(input.body.messages) &&
             input.body.messages.length > this.hashBudget)
         ) {
-          fail()
+          fail(
+            facts.refusal || facts.stopReason === 'refusal'
+              ? 'response_refusal'
+              : facts.fallback
+                ? 'response_fallback'
+                : facts.rewritten
+                  ? 'response_rewritten'
+                  : Array.isArray(input.body.messages) &&
+                      input.body.messages.length > this.hashBudget
+                    ? 'evicted'
+                    : 'invalid_completion',
+          )
           return
         }
         const replyFingerprint =
           facts.replyFingerprint ??
           assistantReplyFingerprint(facts.reply, normalizeToolName)
         if (!replyFingerprint) {
-          fail()
+          fail('invalid_reply')
           return
         }
         const completedAt = this.now()
@@ -751,7 +870,10 @@ export function observeMessageThreadResponse(
       )
         facts.fallback = true
       if (event.type === 'message_stop') facts.stopped = true
-      if (event.type === 'error') facts.rewritten = true
+      if (event.type === 'error') {
+        prepared.fail('stream_error')
+        facts.rewritten = true
+      }
     } catch {
       facts.rewritten = true
     }
@@ -777,17 +899,17 @@ export function observeMessageThreadResponse(
                 for (const frame of framer.push(chunk.value)) parse(frame)
               } catch {
                 inspecting = false
-                prepared.fail()
+                prepared.fail('response_rewritten')
               }
             }
             controller.enqueue(chunk.value)
           } catch (error) {
-            prepared.fail()
+            prepared.fail('stream_error')
             controller.error(error)
           }
         },
         cancel(reason) {
-          prepared.fail()
+          prepared.fail('stream_cancelled')
           return reader.cancel(reason)
         },
       },
@@ -929,13 +1051,16 @@ function disableThreadsForAccount(key: string): void {
 function ignoreThreadFailure(): void {}
 
 // Recovery can replace the failure callback without retaining the prepared body.
-function threadFailureState(initial: () => void) {
+function threadFailureState(
+  initial: (disposition?: MessageThreadDisposition) => void,
+) {
   const state = { current: initial }
   return {
-    replace: (fail: () => void) => {
+    replace: (fail: (disposition?: MessageThreadDisposition) => void) => {
       state.current = fail
     },
-    fail: () => state.current(),
+    fail: (disposition?: MessageThreadDisposition) =>
+      state.current(disposition),
   }
 }
 
@@ -981,6 +1106,8 @@ export async function prepareMessageThreadRequest(
       account: input.account,
       credential,
       session: input.session ?? '',
+      request:
+        input.request ?? input.headers.get('x-client-request-id') ?? undefined,
       betas,
       replyToolNames: input.replyToolNames,
       get body() {
@@ -989,9 +1116,16 @@ export async function prepareMessageThreadRequest(
     })
   if (!threading) {
     removeThreadBeta(input.headers)
-    if (input.session) tracker.forget(input.session)
+    if (input.session) tracker.forget(input.session, 'account_disabled')
   }
   // Without a host session, create a thread but retain no continuation state.
+  if (threading && !input.session)
+    tracker.logCreate('', 'no_anchor', undefined, {
+      account: input.account,
+      credential: input.credential,
+      request:
+        input.request ?? input.headers.get('x-client-request-id') ?? undefined,
+    })
   let prepared: ReturnType<MessageThreadTracker['prepare']> =
     threading && input.session
       ? prepareForSession(input.credential)
@@ -1035,7 +1169,7 @@ export async function prepareMessageThreadRequest(
     removeThreadBeta(input.headers)
   }
   const prepareStateless = async () => {
-    prepared.fail()
+    prepared.fail('account_disabled')
     latchStateless()
     bodyText = await signRequestBody(serializedStateless(fullText, fullBody))
   }
@@ -1050,14 +1184,15 @@ export async function prepareMessageThreadRequest(
         !input.session ||
         disabledThreadAccounts.has(accountKey)
       ) {
-        prepared.fail()
+        prepared.fail('account_disabled')
         return response
       }
       return observeMessageThreadResponse(response, {
-        fail: failure.fail,
+        fail: (disposition) =>
+          failure.fail(input.signal?.aborted ? 'signal_aborted' : disposition),
         normalizeToolName: prepared.normalizeToolName,
         complete: (facts) => {
-          if (input.signal?.aborted) prepared.fail()
+          if (input.signal?.aborted) prepared.fail('signal_aborted')
           else prepared.complete(facts)
         },
       })
@@ -1085,18 +1220,17 @@ export async function prepareMessageThreadRequest(
       if (!rejectedCreate && !rejectedContinue) return response
       recovered = true
       if (!(await mayResend(response, beforeResend))) {
-        prepared.fail()
+        prepared.fail('thread_rejected')
         if (rejectedCreate) latchStateless()
         return response
       }
-      prepared.fail()
+      prepared.fail('thread_rejected')
       void response.body?.cancel().catch(() => {})
       if (rejectedCreate || disabledThreadAccounts.has(accountKey)) {
         await prepareStateless()
         return send(bodyText)
       }
       if (input.session) {
-        tracker.forget(input.session)
         prepared = prepareForSession(credential)
         failure.replace(prepared.fail)
       }
@@ -1105,7 +1239,7 @@ export async function prepareMessageThreadRequest(
       // Only a rejected recovery create may add the final stateless attempt.
       if (await isThreadCreateRejection(created)) {
         if (!(await mayResend(created, beforeResend))) {
-          prepared.fail()
+          prepared.fail('thread_rejected')
           latchStateless()
           return created
         }

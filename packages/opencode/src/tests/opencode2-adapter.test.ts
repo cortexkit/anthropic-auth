@@ -130,6 +130,7 @@ function oauth(
   return {
     route: 'oauth',
     accessToken: token,
+    credentialId: 'synthetic-credential-row',
     identity: IDENTITY,
     provenance,
     ...extra,
@@ -2476,6 +2477,101 @@ describe.each(['direct', 'http'] as const)(
       transport === 'http'
         ? new Headers(JSON.parse(text).upstream.headers)
         : headers
+    test.each([
+      'vault refresh',
+      'local refresh',
+      'different credential',
+      'different account',
+    ])('thread credential identity: %s', async (change) => {
+      let version = 1
+      const { source } = makeSource({
+        authorize: () =>
+          oauth(
+            `thread-access-${version}`,
+            {
+              custody: change === 'local refresh' ? 'local' : 'vault',
+              receipt: 'row',
+              version,
+            },
+            {
+              dispatch:
+                transport === 'http'
+                  ? {
+                      kind: 'http-relay',
+                      url: 'https://relay.example.test',
+                      token: 'relay-token',
+                    }
+                  : { kind: 'direct' },
+              credentialId:
+                change === 'different credential' && version === 2
+                  ? 'replacement-row'
+                  : 'stable-row',
+              identity:
+                change === 'different account' && version === 2
+                  ? {
+                      ...IDENTITY,
+                      accountUuid: 'another-account' as ProviderAccountUuid,
+                    }
+                  : IDENTITY,
+            },
+          ),
+      })
+      const native = createNativeAnthropicAdapter({ source })
+      try {
+        const host = new Host(native.adapter)
+        const payload = {
+          ...sonnetPayload(),
+          messages: [{ role: 'user', content: 'Question' }],
+        }
+        const first = await host.run(scopeOf(), hostRequest(payload))
+        const response = await native.adapter.rewriteResponse?.({
+          ...first.attempt,
+          request: first.final,
+          attempt: first.attempt,
+          response: new Response(
+            sse('message_start', {
+              type: 'message_start',
+              message: {
+                id: 'msg_refresh',
+                content: [{ type: 'text', text: 'Answer' }],
+              },
+            }) +
+              sse('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: 'end_turn' },
+              }) +
+              sse('message_stop', { type: 'message_stop' }),
+            {
+              headers: {
+                'content-type': 'text/event-stream',
+                'request-id': 'req_thread_refresh',
+              },
+            },
+          ),
+        } as never)
+        await response?.text()
+        version = 2
+        const second = await host.run(
+          scopeOf(),
+          hostRequest({
+            ...payload,
+            messages: [
+              ...payload.messages,
+              { role: 'assistant', content: 'Answer' },
+              { role: 'user', content: 'Next' },
+            ],
+          }),
+        )
+        const body = JSON.parse(upstreamText(await second.final.text()))
+        expect(body.thread).toEqual(
+          change.endsWith('refresh')
+            ? { type: 'continue', previous_message_id: 'msg_refresh' }
+            : { type: 'create' },
+        )
+      } finally {
+        native.dispose()
+      }
+    })
     test('create then continue sends only new messages and keeps the full keep-warm body', async () => {
       const warmBodies: string[] = []
       const { source } = makeSource({

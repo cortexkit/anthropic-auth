@@ -98,6 +98,7 @@ function source(overrides: Partial<Source> = {}): Source {
     authorizeAccount: () => ({
       route: 'oauth',
       accessToken: 'sk-ant-oat01-synthetic',
+      credentialId: 'synthetic-credential-row',
       provenance: { version: 7 },
     }),
     ...overrides,
@@ -234,6 +235,7 @@ describe('OpenCode 2 published installation contract', () => {
           authorizeAccount: () => ({
             route: 'oauth',
             accessToken: 'sk-ant-oat01-synthetic',
+            credentialId: 'synthetic-credential-row',
             provenance: { version: 7 },
             headers: { 'anthropic-beta': 'user-extra-beta' },
           }),
@@ -555,6 +557,7 @@ describe('OpenCode 2 published installation contract', () => {
           authorizeAccount: () => ({
             route: 'oauth',
             accessToken: 'synthetic',
+            credentialId: 'synthetic-credential-row',
             provenance: { version: 7 },
             dispatch: { kind: 'websocket-relay' },
           }),
@@ -612,6 +615,7 @@ describe('OpenCode 2 published installation contract', () => {
     completion.resolve({
       route: 'oauth',
       accessToken: 'revoked-synthetic',
+      credentialId: 'synthetic-credential-row',
       provenance: { version: 7 },
     })
     expect(await result).toBeInstanceOf(NativeAnthropicRevokedError)
@@ -651,6 +655,7 @@ describe('OpenCode 2 published installation contract', () => {
           authorizeAccount: () => ({
             route: 'oauth',
             accessToken: `sk-ant-oat01-synthetic-${version++}`,
+            credentialId: 'synthetic-credential-row',
             headers: { 'x-native-account-header': 'preserved' },
             provenance: { version },
             dispatch: {
@@ -712,6 +717,7 @@ describe('OpenCode 2 published installation contract', () => {
           authorizeAccount: () => ({
             route: 'oauth',
             accessToken: 'synthetic',
+            credentialId: 'synthetic-credential-row',
             provenance: { version: 7 },
             dispatch: {
               kind: 'http-relay',

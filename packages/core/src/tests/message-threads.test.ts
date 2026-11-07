@@ -1,9 +1,18 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { buildCacheKeepPrewarmBody, CacheKeepManager } from '../cachekeep.ts'
 import { signRequestBody } from '../cch.ts'
-import { logger } from '../logger.ts'
 import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  logger,
+  setLogLevel,
+} from '../logger.ts'
+import {
+  localMessageThreadCredential,
   MESSAGE_THREADS_BETA,
+  type MessageThreadCreateReason,
+  type MessageThreadDisposition,
   type MessageThreadInput,
   MessageThreadTracker,
   observeMessageThreadResponse,
@@ -52,6 +61,22 @@ function advance(request: MessageThreadInput): MessageThreadInput {
 }
 
 describe('message threads', () => {
+  test('local row identity survives refresh but separates replacement logins and stores', () => {
+    const binding = {
+      kind: 'local' as const,
+      storageId: 'store-a',
+      rowId: 'main',
+      credentialEpoch: 1,
+    }
+    const key = localMessageThreadCredential(binding)
+    expect(localMessageThreadCredential({ ...binding })).toBe(key)
+    for (const replacement of [
+      { ...binding, credentialEpoch: 2 },
+      { ...binding, rowId: 'other' },
+      { ...binding, storageId: 'store-b' },
+    ])
+      expect(localMessageThreadCredential(replacement)).not.toBe(key)
+  })
   test('create then continue sends only the new messages', () => {
     const tracker = new MessageThreadTracker()
     expect(
@@ -2288,5 +2313,249 @@ test.each(['citations', 'future_text_metadata'])(
       },
     }
     expect(tracker.prepare(candidate).decision.type).toBe('create')
+  },
+)
+
+describe('message thread create diagnostics', () => {
+  function capture(run: (records: LogTestRecord[]) => void) {
+    const level = getLogLevel()
+    const records: LogTestRecord[] = []
+    setLogLevel('debug')
+    __setLogTestSink((record) => {
+      if (record.message === 'message_thread_create') records.push(record)
+    })
+    try {
+      run(records)
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(level)
+    }
+  }
+
+  test.each<MessageThreadCreateReason>([
+    'no_anchor',
+    'clock_rollback',
+    'expired',
+    'identity_changed',
+    'too_few_messages',
+    'assistant_missing',
+    'extra_assistant',
+    'reply_invalid',
+    'reply_changed',
+    'fixed_changed',
+    'prefix_changed',
+  ])('explains %s with one debug line', (reason) => {
+    capture((records) => {
+      let now = 1_000
+      const tracker = new MessageThreadTracker(10, () => now)
+      const original = reason === 'no_anchor' ? input() : anchor(tracker)
+      const request = advance(original)
+      const messages = request.body.messages as unknown[]
+      records.length = 0
+      if (reason === 'clock_rollback') now = 999
+      if (reason === 'expired') now += 300_000
+      if (reason === 'identity_changed') request.credential = 'replacement-row'
+      if (reason === 'too_few_messages') messages.pop()
+      if (reason === 'assistant_missing') messages[1] = next
+      if (reason === 'extra_assistant') messages.push(assistant)
+      if (reason === 'reply_invalid')
+        messages[1] = { role: 'assistant', content: [{ type: 'unknown' }] }
+      if (reason === 'reply_changed')
+        messages[1] = { role: 'assistant', content: 'edited reply' }
+      if (reason === 'fixed_changed') request.body.model = 'another-model'
+      if (reason === 'prefix_changed') messages[0] = next
+      expect(tracker.prepare(request).decision.type).toBe('create')
+      expect(records).toHaveLength(1)
+      expect(records[0]?.level).toBe('debug')
+      expect(records[0]?.payload?.reason).toBe(reason)
+      expect(records[0]?.payload?.anchor_present).toBe(reason !== 'no_anchor')
+      expect(records[0]?.payload?.account_equal).toBe(reason !== 'no_anchor')
+      expect(records[0]?.payload?.credential_equal).toBe(
+        reason !== 'no_anchor' && reason !== 'identity_changed',
+      )
+    })
+  })
+
+  test('earlier checks take precedence over later mismatches', () => {
+    capture((records) => {
+      let now = 1_000
+      const tracker = new MessageThreadTracker(10, () => now)
+      const request = advance(anchor(tracker))
+      request.account = 'different-account'
+      request.body.messages = []
+      now = 999
+      tracker.prepare(request)
+      expect(records.at(-1)?.payload?.reason).toBe('clock_rollback')
+      anchor(tracker)
+      now += 300_000
+      tracker.prepare(request)
+      expect(records.at(-1)?.payload?.reason).toBe('expired')
+      anchor(tracker)
+      tracker.prepare(request)
+      expect(records.at(-1)?.payload?.reason).toBe('identity_changed')
+      expect(records.at(-1)?.payload?.account_equal).toBe(false)
+    })
+  })
+
+  test('continues are silent, creates are debug-only and metadata cannot leak request contents', () => {
+    capture((records) => {
+      const tracker = new MessageThreadTracker()
+      const original = input()
+      original.account = 'private-account-uuid'
+      original.credential = 'private-credential-row'
+      original.body.system = 'private-system'
+      original.body.tools = [
+        {
+          name: 'private-tool',
+          input_schema: { description: 'private-schema' },
+        },
+      ]
+      original.body.messages = [{ role: 'user', content: 'private-prompt' }]
+      original.body.access_token = 'sk-ant-oat01-private-access-token'
+      const privateReply = {
+        role: 'assistant',
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'private-thinking',
+            signature: 'private-signature',
+          },
+          {
+            type: 'tool_use',
+            id: 'call_safe',
+            name: 'private-tool',
+            input: { argument: 'private-tool-input' },
+          },
+        ],
+      }
+      const first = tracker.prepare(original)
+      first.complete({
+        messageId: 'msg_safe',
+        stopped: true,
+        stopReason: 'end_turn',
+        reply: privateReply,
+      })
+      const following = advance(original)
+      ;(following.body.messages as unknown[])[1] = privateReply
+      const continued = tracker.prepare(following)
+      expect(continued.decision.type).toBe('continue')
+      expect(records).toHaveLength(1)
+      continued.fail('stream_cancelled')
+      tracker.prepare(original)
+      expect(records).toHaveLength(2)
+      expect(records[1]?.payload?.instance).toBe(records[0]?.payload?.instance)
+      new MessageThreadTracker().prepare(original)
+      expect(records[2]?.payload?.instance).not.toBe(
+        records[0]?.payload?.instance,
+      )
+      const payload = records[0]?.payload
+      expect(Object.keys(payload ?? {}).sort()).toEqual(
+        [
+          'account_equal',
+          'anchor_age_ms',
+          'anchor_present',
+          'credential_equal',
+          'event',
+          'instance',
+          'last_anchor_disposition',
+          'previous_message_id',
+          'reason',
+          'request',
+          'session',
+        ].sort(),
+      )
+      expect(JSON.stringify(records)).not.toContain('private-')
+      expect(JSON.stringify(records)).not.toMatch(/[a-f0-9]{64}/)
+      setLogLevel('info')
+      tracker.prepare(original)
+      expect(records).toHaveLength(3)
+    })
+  })
+
+  test.each<MessageThreadDisposition>([
+    'stream_cancelled',
+    'stream_error',
+    'signal_aborted',
+    'invalid_completion',
+    'invalid_reply',
+    'response_refusal',
+    'response_fallback',
+    'response_rewritten',
+    'thread_rejected',
+    'account_disabled',
+    'session_deleted',
+  ])('no_anchor retains %s without an extra event', (disposition) => {
+    capture((records) => {
+      const tracker = new MessageThreadTracker()
+      const prepared = tracker.prepare(input())
+      prepared.fail(disposition)
+      expect(records).toHaveLength(1)
+      tracker.prepare(input())
+      expect(records.at(-1)?.payload?.last_anchor_disposition).toBe(disposition)
+    })
+  })
+
+  test('tracks never seen, superseded and evicted sessions within the session bound', () => {
+    capture((records) => {
+      const tracker = new MessageThreadTracker(2)
+      const first = tracker.prepare(input())
+      expect(records.at(-1)?.payload?.last_anchor_disposition).toBe(
+        'never_seen',
+      )
+      tracker.prepare(input())
+      first.fail('stream_cancelled')
+      expect(records.at(-1)?.payload?.last_anchor_disposition).toBe(
+        'superseded',
+      )
+      tracker.prepare({ ...input(), session: 'second' })
+      tracker.prepare({ ...input(), session: 'third' })
+      tracker.prepare(input())
+      expect(records.at(-1)?.payload?.last_anchor_disposition).toBe('evicted')
+      for (let i = 0; i < 20; i++) tracker.forget(`deleted-${i}`)
+      expect(
+        (tracker as unknown as { dispositions: Map<string, unknown> })
+          .dispositions.size,
+      ).toBe(2)
+    })
+  })
+})
+
+test.each(['SSE error', 'aborted stream error'] as const)(
+  'create diagnostics distinguish %s after response observation',
+  async (kind) => {
+    const debug = spyOn(logger, 'debug').mockImplementation(() => {})
+    try {
+      const tracker = new MessageThreadTracker()
+      const abort = new AbortController()
+      const request = input()
+      request.account = `diagnostic-${kind}`
+      const prepared = await prepareMessageThreadRequest(tracker, {
+        ...request,
+        bodyText: JSON.stringify(request.body),
+        headers: new Headers(),
+        signal: abort.signal,
+      })
+      const response =
+        kind === 'SSE error'
+          ? sse([{ type: 'error' }])
+          : new Response(
+              new ReadableStream({
+                pull() {
+                  abort.abort()
+                  throw new Error('transport ended')
+                },
+              }),
+            )
+      await prepared
+        .observe(response)
+        .text()
+        .catch(() => {})
+      tracker.prepare(request)
+      expect(debug.mock.calls.at(-1)?.[2]?.last_anchor_disposition).toBe(
+        kind === 'SSE error' ? 'stream_error' : 'signal_aborted',
+      )
+    } finally {
+      debug.mockRestore()
+    }
   },
 )

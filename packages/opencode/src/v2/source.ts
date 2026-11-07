@@ -9,6 +9,7 @@ import {
   getRoutingMode,
   isDumpPersistentlyEnabled,
   isQuotaBearingHeaderFrame,
+  localMessageThreadCredential,
   logger,
   mergeHeaderQuotaForPersistence,
   type NativeAccountPolicy,
@@ -1016,6 +1017,7 @@ export function createNativeAnthropicSource(
         return {
           route: 'oauth',
           accessToken: receipt.accessToken,
+          credentialId: receipt.credentialId,
           provenance,
           dispatch,
           identity: getClaudeCodeIdentityForVerifiedAccount(
@@ -1046,6 +1048,7 @@ export function createNativeAnthropicSource(
       return {
         route: 'oauth',
         accessToken: material.access,
+        credentialId: localMessageThreadCredential(material.subject.binding),
         provenance,
         dispatch,
         identity: getClaudeCodeIdentityForVerifiedAccount(
@@ -1265,6 +1268,7 @@ export function createNativeAnthropicSource(
           auth: {
             route: 'oauth',
             accessToken: receipt.accessToken,
+            credentialId: receipt.credentialId,
             provenance,
             identity: getClaudeCodeIdentityForVerifiedAccount(
               identity,
@@ -1308,6 +1312,7 @@ export function createNativeAnthropicSource(
           auth: {
             route: 'oauth',
             accessToken: result.access,
+            credentialId: localMessageThreadCredential(result.subject.binding),
             provenance,
             identity: getClaudeCodeIdentityForVerifiedAccount(
               identity,

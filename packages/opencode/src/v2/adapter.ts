@@ -192,6 +192,8 @@ export type NativeAnthropicAuthorization<P> =
   | {
       readonly route: 'oauth'
       readonly accessToken: string
+      /** Stable credential row identity, unchanged by token refresh and changed by login replacement. */
+      readonly credentialId: string
       /** The Claude Code identity of the account, when the source knows it. */
       readonly identity?: ClaudeCodeIdentity
       /** Additional OAuth request headers; authorization and x-api-key edits are ignored so they cannot replace the authorized bearer. */
@@ -587,6 +589,7 @@ interface PendingSend {
   readonly sessionID: string
   readonly oauth?: {
     readonly accessToken: string
+    readonly credentialId: string
     readonly identity?: ClaudeCodeIdentity
   }
   readonly baseURL?: string
@@ -1106,6 +1109,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         sessionID: scope.sessionID,
         oauth: {
           accessToken: auth.accessToken,
+          credentialId: auth.credentialId,
           ...(auth.identity ? { identity: auth.identity } : {}),
         },
         dispatch: auth.dispatch,
@@ -1340,7 +1344,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const thread = await prepareMessageThreadRequest(messageThreads, {
         session: input.sessionID,
         account: send.oauth.identity?.accountUuid ?? input.accountId,
-        credential: send.oauth.accessToken,
+        credential: send.oauth.credentialId,
         bodyText: body,
         replyToolNames: responseToolNameMaps.get(data),
         headers,
@@ -1382,7 +1386,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           ensureLive()
           if (!owned.has(data)) return false
           resendAuthorization = authorized
-          return { credential: authorized.accessToken }
+          return { credential: authorized.credentialId }
         },
         resend: async (createBody) => {
           ensureLive()
@@ -1403,6 +1407,7 @@ export function createNativeAnthropicAdapter<Q, P>(
               ...send,
               oauth: {
                 accessToken: authorized.accessToken,
+                credentialId: authorized.credentialId,
                 identity: authorized.identity,
               },
             },

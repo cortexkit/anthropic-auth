@@ -46,6 +46,7 @@ async function instance(
       return {
         route: 'oauth',
         accessToken: `sk-ant-oat01-${label}`,
+        credentialId: 'synthetic-credential-row',
         provenance: label,
       }
     },

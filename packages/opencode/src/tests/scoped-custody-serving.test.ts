@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   createNativeAccountRuntime,
   custodyTombstoneOAuth,
@@ -1693,5 +1694,108 @@ test('optimistic WebSocket reports only the scoped version used by its real upst
     await disposeAll([...plugins], 'Scoped custody plugin cleanup failed')
     plugins.clear()
     await server.stop(true)
+  }
+})
+
+test('message threads keep vault refreshes but isolate credential and account replacements', async () => {
+  const { root, plugins } = await startBody('opencode-vault-threads-')
+  let rows = [{ ...mainRow }]
+  let version = 10
+  const fixture = await migrateScopedSeat(root, {
+    rows: () => rows,
+    token: 'bc'.repeat(32),
+    expectedCredentials: [mainRow.id],
+    legacyConfig: scopedLegacyConfig(),
+  })
+  const client: NativeCustodyClient = {
+    listScoped: async () => ({
+      view: `thread-${version}`,
+      rows,
+      grants: undefined,
+      grantTuples: undefined,
+    }),
+    getScoped: async ({ credentialId }) => ({
+      credentialId,
+      accountId: rows.find((row) => row.id === credentialId)?.accountId,
+      material: `thread-vault-access-${version}`,
+      recordVersion: version,
+      expiresAtMs: Date.now() + 3_600_000,
+    }),
+    reportAuthFailureScoped: async () => {},
+    close: () => {},
+  }
+  const sent: Array<{ body: any; authorization: string | null }> = []
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    if (String(input).includes('/api/oauth/usage'))
+      return Response.json({
+        five_hour: { utilization: 0 },
+        seven_day: { utilization: 0 },
+      })
+    const text =
+      init?.body instanceof Uint8Array
+        ? gunzipSync(init.body).toString()
+        : String(init?.body)
+    sent.push({
+      body: JSON.parse(text),
+      authorization: new Headers(init?.headers).get('authorization'),
+    })
+    return new Response(
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_vault_thread","content":[{"type":"text","text":"Answer"}]}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+  }) as typeof fetch
+  const plugin = await createPlugin(plugins, fixture, {
+    claustrumScopedConnect: async () => client,
+    scopedRosterPollIntervalMs: 0,
+  })
+  const loader = await (plugin as any).auth.loader(
+    migratedActivation(fixture),
+    { models: {} },
+  )
+  const question = { role: 'user', content: 'Question' }
+  const history = [
+    question,
+    { role: 'assistant', content: 'Answer' },
+    { role: 'user', content: 'Next' },
+  ]
+  const send = async (messages: unknown[], session: string) => {
+    const response = await loader.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': session },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        max_tokens: 32,
+        stream: true,
+        system: 'Stable',
+        messages,
+      }),
+    })
+    await response.text()
+  }
+  for (const change of ['refresh', 'credential', 'account'] as const) {
+    const session = `vault-thread-${change}`
+    await send([question], session)
+    const previous = sent.at(-1)
+    version++
+    rows = [
+      {
+        ...rows[0]!,
+        recordVersion: version,
+        ...(change === 'credential'
+          ? { id: 'oauth:anthropic:replacement' }
+          : {}),
+        ...(change === 'account'
+          ? { accountId: 'provider-replacement-uuid' }
+          : {}),
+      },
+    ]
+    await publishScopedRoster(fixture, client)
+    await send(history, session)
+    expect(sent.at(-1)?.authorization).not.toBe(previous?.authorization)
+    expect(sent.at(-1)?.body.thread).toEqual(
+      change === 'refresh'
+        ? { type: 'continue', previous_message_id: 'msg_vault_thread' }
+        : { type: 'create' },
+    )
   }
 })

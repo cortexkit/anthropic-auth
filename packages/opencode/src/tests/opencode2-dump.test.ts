@@ -76,6 +76,7 @@ function makeSource(
     authorizeAccount: () => ({
       route: 'oauth' as const,
       accessToken: TOKEN,
+      credentialId: 'synthetic-credential-row',
       identity: IDENTITY as never,
       provenance: { custody: 'local', receipt: 'local:main' },
       ...(over.dispatch ? { dispatch: over.dispatch } : {}),

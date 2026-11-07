@@ -17,6 +17,8 @@ import { installLoaderSetup } from './support/opencode1-loader-setup.ts'
 import {
   createFallbackStorage,
   getPlugin as getPluginWithCtx,
+  refreshPoolMainElsewhere,
+  replacePoolMainLogin,
   syntheticMainHostAuth,
   updatePoolRelay as updatePoolRelayWithCtx,
   useTempAccountFile as useTempAccountFileWithCtx,
@@ -1168,7 +1170,7 @@ describe('message threads wire', () => {
     for (const restore of restores.splice(0)) restore()
   })
   test.each(['direct', 'http'] as const)(
-    'create then continue sends only new messages over %s',
+    'create then continue survives local refresh and sends only new messages over %s',
     async (transport) => {
       await useTempAccountFile(
         createFallbackStorage({
@@ -1306,12 +1308,20 @@ describe('message threads wire', () => {
         content: 'Original question for suffix pinning.',
       }
       await send([first])
+      await refreshPoolMainElsewhere(testContext, {
+        access: 'sk-ant-oat01-refreshed-thread-access',
+        refresh: 'refreshed-thread-refresh',
+        expires: Date.now() + 3_600_000,
+      })
       await send([
         first,
         { role: 'assistant', content: 'Answer' },
         { role: 'user', content: 'Next question' },
       ])
       expect(sent).toHaveLength(2)
+      expect(sent[1]?.headers.get('authorization')).not.toBe(
+        sent[0]?.headers.get('authorization'),
+      )
       expect(sent[1]?.body.messages).toHaveLength(1)
       expect(sent[0]?.body.thread).toEqual({ type: 'create' })
       expect(sent[1]?.body.thread).toEqual({
@@ -1412,6 +1422,34 @@ describe('message threads wire', () => {
         type: 'continue',
         previous_message_id: parentMessageId,
       })
+      for (const change of ['replacement', 'account'] as const) {
+        const session = `thread-${change}`
+        await send([first], session)
+        const credential = {
+          access: `sk-ant-oat01-thread-${change}-access`,
+          refresh: `thread-${change}-refresh`,
+          expires: Date.now() + 3_600_000,
+        }
+        const accountIdentity = '22222222-3333-4444-8555-666666666666'
+        if (change === 'account')
+          testContext.poolLogins.push({
+            ...credential,
+            identity: accountIdentity,
+          })
+        await replacePoolMainLogin(testContext, credential, {
+          sameAccount: change !== 'account',
+          ...(change === 'account' ? { accountIdentity } : {}),
+        })
+        await send(
+          [
+            first,
+            { role: 'assistant', content: 'Answer' },
+            { role: 'user', content: 'After login replacement' },
+          ],
+          session,
+        )
+        expect(sent.at(-1)?.body.thread).toEqual({ type: 'create' })
+      }
     },
   )
 })

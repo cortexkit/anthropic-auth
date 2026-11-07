@@ -126,6 +126,7 @@ import {
   isValidApiBaseURL,
   isVaultHosted,
   killswitchPassesPolicy,
+  localMessageThreadCredential,
   log,
   logger,
   type MessageThreadRequest,
@@ -1665,6 +1666,7 @@ const anthropicAuthPlugin = async (
   }
   type NativeOAuthAuthorization = {
     accessToken: string
+    credentialId: string
     expires?: number
     accountIdentity?: string
     localSubject?: NativeKnownCredentialSubject
@@ -1789,6 +1791,7 @@ const anthropicAuthPlugin = async (
         })
       result = {
         accessToken: receipt.accessToken,
+        credentialId: receipt.credentialId,
         expires: receipt.expiresAtMs ?? undefined,
         accountIdentity: receipt.accountIdentity,
         scopedAttempt: receipt,
@@ -1818,6 +1821,7 @@ const anthropicAuthPlugin = async (
       }
       result = {
         accessToken: authorization.access,
+        credentialId: localMessageThreadCredential(authorization.binding),
         expires: authorization.expires,
         accountIdentity: authorization.binding.identity,
         localSubject: authorization.subject,
@@ -8059,9 +8063,7 @@ const anthropicAuthPlugin = async (
                   session: relayAffinity ?? undefined,
                   account:
                     nativeAuthorization.accountIdentity ?? oauthAccountId,
-                  credential:
-                    nativeAuthorization.scopedAttempt?.credentialId ??
-                    nativeAuthorization.accessToken,
+                  credential: nativeAuthorization.credentialId,
                   bodyText: body,
                   replyToolNames: toolNameMap,
                   headers: requestHeaders,

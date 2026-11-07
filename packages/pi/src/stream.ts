@@ -45,6 +45,7 @@ import {
   isValidApiBaseURL,
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
+  localMessageThreadCredential,
   logger,
   type MessageThreadRequest,
   MessageThreadTracker,
@@ -937,7 +938,10 @@ async function sendAnthropicRequest(
     threadRequest = await prepareMessageThreadRequest(messageThreads, {
       session: relayAffinity ?? undefined,
       account: nextAttempt.accountIdentity,
-      credential: piAttemptAccessToken(nextAttempt),
+      credential:
+        nextAttempt.source === 'vault'
+          ? nextAttempt.receipt.credentialId
+          : localMessageThreadCredential(nextAttempt.admission.binding),
       bodyText,
       replyToolNames: toolNames,
       headers,

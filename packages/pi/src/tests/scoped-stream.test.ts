@@ -10,6 +10,8 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   type NativeCustodyClient as ClaustrumScopedClient,
+  createNativeAccountRuntime,
+  getClaudeCodeIdentityForVerifiedAccount,
   getLogLevel,
   type LogTestRecord,
   NativeCustodyError,
@@ -175,6 +177,8 @@ const row = (id: string, accountId: string): ScopedInventoryRow => ({
 async function fixture(
   mode: 'main-first' | 'fallback-first' | 'sticky-balanced' = 'main-first',
   relay = false,
+  local = false,
+  localIdentity = () => fixtureAccountIdentity('main'),
 ) {
   dir = await mkdtemp(join(tmpdir(), 'pi-scoped-stream-'))
   path = join(dir, 'accounts.json')
@@ -219,6 +223,7 @@ async function fixture(
         },
       ],
       routing: { mode },
+      prime: { enabled: false },
       ...(relay
         ? {
             relay: {
@@ -232,7 +237,7 @@ async function fixture(
         : {}),
     },
     path,
-    { primary: false },
+    { primary: local, mainAccess: 'sk-ant-oat01-thread-access-1' },
   )
   const localPaths = await resolveNativePoolPaths(
     storagePath,
@@ -247,11 +252,12 @@ async function fixture(
   const beforeLocal = await Promise.all(
     localFiles.map((file) => readFile(file)),
   )
-  await writeFile(
-    tokenPath,
-    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
-    { mode: 0o600 },
-  )
+  if (!local)
+    await writeFile(
+      tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
   const rows = [row('oauth:anthropic', fixtureAccountIdentity('main'))]
   const gets: Array<Parameters<ClaustrumScopedClient['getScoped']>[0]> = []
   const reports: Array<
@@ -288,9 +294,17 @@ async function fixture(
   const native = getPiNativeRuntime(path, {
     connect,
     vaultPoll: { intervalMs: 0 },
+    ...(local
+      ? {
+          local: {
+            resolveIdentity: async () =>
+              getClaudeCodeIdentityForVerifiedAccount('main', localIdentity()),
+          },
+        }
+      : {}),
   })
   const service = await native.service()
-  const roster = await service.vault.refresh()
+  const roster = local ? undefined : await service.vault.refresh()
   await service.updateSettings((settings) => ({
     ...settings,
     routing: { mode },
@@ -306,7 +320,7 @@ async function fixture(
   const primary = roster?.rows.find(
     (account) => account.credentialId === 'oauth:anthropic',
   )
-  if (!primary?.accountIdentity)
+  if (!local && !primary?.accountIdentity)
     throw new Error('Fixture vault primary identity is missing')
   return {
     rows,
@@ -2635,19 +2649,54 @@ test('Pi serves through a vault outage without local token rescue', async () => 
   )
 })
 
-for (const transport of ['direct', 'http'] as const) {
-  test(`Pi create then continue sends only new messages and keep-warm retains full history over ${transport}`, async () => {
-    const f = await fixture('main-first', transport === 'http')
+for (const [transport, credentialSource] of [
+  ['direct', 'vault'],
+  ['http', 'vault'],
+  ['direct', 'local'],
+  ['http', 'local'],
+] as const) {
+  test(`Pi create then continue survives ${credentialSource} refresh and keep-warm retains full history over ${transport}`, async () => {
+    // Relay requests can contain edits to the previous request. Each fake relay
+    // starts without earlier tests' request bodies, so its session must be distinct.
+    const primarySession = `pi-message-thread-${credentialSource}-${transport}`
+    let localAccount = fixtureAccountIdentity('main')
+    const f = await fixture(
+      'main-first',
+      transport === 'http',
+      credentialSource === 'local',
+      () => localAccount,
+    )
+    let version = 1
     const get = f.client.getScoped.bind(f.client)
     const credentials = spyOn(f.client, 'getScoped').mockImplementation(
       async (input) => ({
         ...(await get(input)),
-        material: 'stable-thread-access',
-        recordVersion: 1,
+        material: `sk-ant-oat01-thread-access-${version}`,
+        recordVersion: version,
       }),
     )
     deferCleanup(() => credentials.mockRestore())
     const runtime = await f.native.service()
+    const local =
+      credentialSource === 'local'
+        ? createNativeAccountRuntime({
+            paths: await resolveNativePoolPaths(f.path),
+            host: 'pi',
+            local: {
+              resolveIdentity: async () =>
+                getClaudeCodeIdentityForVerifiedAccount('main', localAccount),
+              refreshToken: async () => ({
+                access: `sk-ant-oat01-thread-access-${version}`,
+                refresh: `thread-refresh-${version}`,
+                expires: Date.now() + 3_600_000,
+                expiresIn: 3600,
+              }),
+            },
+          })
+        : undefined
+    if (local) {
+      deferCleanup(() => local.close())
+    }
     await runtime.updateSettings((settings) => ({
       ...settings,
       quota: { enabled: false },
@@ -2669,6 +2718,14 @@ for (const transport of ['direct', 'http'] as const) {
       WORKER_SCRIPT.replace(/export default[\s\S]*$/, 'return applyPatchSet'),
     )() as (base: string, patch: unknown) => string
     const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const url = _input instanceof Request ? _input.url : String(_input)
+      if (url.includes('/api/claude_cli/bootstrap'))
+        return Response.json({ oauth_account: { account_uuid: localAccount } })
+      if (url.includes('/api/oauth/usage'))
+        return Response.json({
+          five_hour: { utilization: 0 },
+          seven_day: { utilization: 0 },
+        })
       const wireText =
         init?.body instanceof Uint8Array
           ? gunzipSync(init.body).toString().trim()
@@ -2726,9 +2783,10 @@ for (const transport of ['direct', 'http'] as const) {
       } as unknown as ExtensionAPI,
       { connectScoped: f.connect },
     )
+    let oauthAccountId = 'main'
     const send = async (
       requestContext: Context,
-      sessionId = 'pi-message-thread',
+      sessionId = primarySession,
     ) => {
       await primaryHooks.get('turn_start')?.(
         {},
@@ -2746,6 +2804,7 @@ for (const transport of ['direct', 'http'] as const) {
           model,
           context: requestContext,
           storagePath: f.path,
+          oauthAccountId,
           requestOrigin: 'agent-loop',
           streamOptions: {
             sessionId,
@@ -2754,7 +2813,7 @@ for (const transport of ['direct', 'http'] as const) {
             onProviderStreamEvent: () => {},
           },
         },
-        { fetch: fetchImpl, cacheKeep: keep },
+        { fetch: fetchImpl, cacheKeep: keep, native: f.native },
       )
     }
     const threadContext: Context = {
@@ -2798,10 +2857,23 @@ for (const transport of ['direct', 'http'] as const) {
         { role: 'user', content: 'Next prompt', timestamp: 2 },
       ],
     }
+    version = 2
+    if (local) {
+      const before = await local.captureLocalSubject('main')
+      const refreshed = await local.authorizeLocal('main', {
+        intent: 'refresh',
+      })
+      expect(refreshed.status).toBe('usable')
+      if (refreshed.status === 'usable')
+        expect(refreshed.binding).toEqual(before.binding)
+    }
     await (await send(history)).text()
     const first = JSON.parse(sent[0]?.text ?? '{}')
     const second = JSON.parse(sent[1]?.text ?? '{}')
     expect(second.messages).toHaveLength(1)
+    expect(sent[1]?.headers.get('authorization')).not.toBe(
+      sent[0]?.headers.get('authorization'),
+    )
     expect(first.thread).toEqual({ type: 'create' })
     expect(second.thread).toEqual({
       type: 'continue',
@@ -2832,7 +2904,7 @@ for (const transport of ['direct', 'http'] as const) {
     expect(
       (sent[1]?.text.match(/"cache_control"/g) ?? []).length,
     ).toBeLessThanOrEqual(4)
-    const stored = keep.trackedRequest('pi-message-thread')
+    const stored = keep.trackedRequest(primarySession)
     expect(stored).toBeDefined()
     const warm = await buildCacheKeepPrewarmBody(stored?.bodyText ?? '{}')
     expect(warm.ok).toBe(true)
@@ -2851,7 +2923,7 @@ for (const transport of ['direct', 'http'] as const) {
       'thread_unsupported_request',
       'unrelated',
     ]) {
-      const sessionId = `pi-thread-error-${code}`
+      const sessionId = `pi-thread-error-${code}-${credentialSource}-${transport}`
       await (await send(threadContext, sessionId)).text()
       const current: Context = {
         ...threadContext,
@@ -2877,6 +2949,45 @@ for (const transport of ['direct', 'http'] as const) {
         )
       }
       await (await send(current, sessionId)).text()
+      expect(JSON.parse(sent.at(-1)?.text ?? '{}').thread).toEqual({
+        type: 'create',
+      })
+    }
+    for (const change of ['credential', 'account'] as const) {
+      const session = `pi-thread-${change}-${credentialSource}-${transport}`
+      await (await send(threadContext, session)).text()
+      version++
+      if (local) {
+        if (change === 'account')
+          localAccount = fixtureAccountIdentity('replacement')
+        await local.loginOAuth({
+          routeId: 'main',
+          replace: true,
+          credential: {
+            access: `sk-ant-oat01-thread-access-${version}`,
+            refresh: `thread-refresh-${version}`,
+            expires: Date.now() + 3_600_000,
+          },
+        })
+      } else {
+        f.rows[0] = {
+          ...f.rows[0]!,
+          id: 'oauth:anthropic:replacement',
+          ...(change === 'account'
+            ? { accountId: fixtureAccountIdentity('replacement') }
+            : {}),
+          recordVersion: version,
+        }
+        await runtime.vault.refresh()
+        const account = (await runtime.read()).accounts.find(
+          (account) =>
+            account.source === 'vault' &&
+            account.credentialId === f.rows[0]?.id,
+        )
+        if (!account) throw new Error('Replacement vault credential is missing')
+        oauthAccountId = account.id
+      }
+      await (await send(history, session)).text()
       expect(JSON.parse(sent.at(-1)?.text ?? '{}').thread).toEqual({
         type: 'create',
       })
