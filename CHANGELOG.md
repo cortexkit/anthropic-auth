@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Message threads now continue across a routine login refresh on OpenCode 2 and Pi, and in local mode on OpenCode 1, instead of resending the whole conversation. Debug logs now explain why a conversation starts a new thread without logging its contents or credentials.
 - Hosts launched by Thalamus now use its vault relay without separate enrollment; `/claude` shows “Served by Thalamus” and local accounts remain untouched when the relay is unavailable.
 - Prime no longer primes the same Claude account twice when OpenCode and Pi (or two OpenCode installs) use separate account files.
 - Pi now starts the five-hour window when Prime is on, like OpenCode (the setting previously had no effect on Pi).
