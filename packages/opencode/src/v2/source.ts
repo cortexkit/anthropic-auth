@@ -478,15 +478,27 @@ export function createNativeAnthropicSource(
     patch: { quota?: OAuthQuotaSnapshot; lastUsed?: number },
   ): Promise<boolean> {
     if (provenance.kind === 'local') {
-      const kept = await runtime.publishLocal(provenance.subject, patch)
+      const kept = await runtime.publishLocal(
+        provenance.subject,
+        patch,
+        usagePublications.signal,
+      )
       if (!kept && patch.quota)
         logger.warn('quota', 'Quota publication discarded')
       return kept
     }
     if (provenance.kind === 'vault' && state.receipt)
-      await runtime.vault.publish(state.receipt, patch)
+      await runtime.vault.publish(
+        state.receipt,
+        patch,
+        usagePublications.signal,
+      )
     else if (provenance.kind === 'api' && patch.lastUsed !== undefined)
-      await runtime.publishApi(provenance.subject, { lastUsed: patch.lastUsed })
+      await runtime.publishApi(
+        provenance.subject,
+        { lastUsed: patch.lastUsed },
+        usagePublications.signal,
+      )
     return true
   }
 
@@ -1447,6 +1459,7 @@ export function createNativeAnthropicSource(
       retries.clear()
       return Promise.all([
         usagePublications.drain(),
+        runtime.drainQuotaPublications(),
         source.drainRoutingPublications(),
       ]).then(() => {})
     },

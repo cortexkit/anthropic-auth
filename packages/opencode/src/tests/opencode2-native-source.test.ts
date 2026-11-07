@@ -51,7 +51,10 @@ import {
 import { fingerprintOf } from '@cortexkit/common-auth/store'
 import type { IntegrationOAuthMethodRegistration } from '@opencode/plugin/promise/integration'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
-import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
+import {
+  fromNativeQuotaMap,
+  nativeQuotaCodec,
+} from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import { nativePoolStoreLocks } from '../../../core/src/pool-store'
 import {
@@ -762,6 +765,53 @@ usageTests.test(
         ?.remainingPercent,
     ).toBe(75)
   },
+)
+
+usageTests.test(
+  'OC2 advisory shutdown drops contended local lastUsed but drains accepted quota',
+  async () => {
+    const owned: Array<() => Promise<void> | void> = []
+    usageTests.deferCleanup(async () => {
+      for (const cleanup of owned.reverse()) await cleanup()
+    })
+    const fixture = await local(undefined, owned)
+    const native = source(fixture.runtime, fixture.paths, owned)
+    const auth = await native.authorizeAccount(scope, 'main')
+    if (!auth) throw new Error('Missing local authorization')
+    const before = await readFile(fixture.paths.runtime, 'utf8')
+    const lease = await acquireRefreshFileLock({
+      path: fixture.paths.runtime,
+      name: 'native-runtime',
+      ttlMs: 10_000,
+    })
+    if (!lease) throw new Error('Runtime fixture lock unavailable')
+    owned.push(() => lease.release())
+    native.quotaFromHeaders?.(
+      new Headers({ 'anthropic-ratelimit-unified-5h-utilization': '0.25' }),
+      { ...context(auth.provenance), status: 200 },
+    )
+    await native.onAttemptEnd!(context(auth.provenance), {
+      status: 200,
+      outputStarted: true,
+    })
+    const closingAt = performance.now()
+    await native.close()
+    await fixture.runtime.close()
+    expect(performance.now() - closingAt).toBeLessThan(1_750)
+    await lease.assertOwned()
+    expect(await readFile(fixture.paths.runtime, 'utf8')).toBe(before)
+    const disk = createNativePoolStore({
+      paths: fixture.paths,
+      quota: nativeQuotaCodec,
+    })
+    owned.push(() => disk.close())
+    const saved = await disk.read()
+    if (saved.status !== 'ready') throw new Error('Expected persisted pool')
+    expect(
+      fromNativeQuotaMap(saved.rows[0]?.quota).five_hour?.remainingPercent,
+    ).toBe(75)
+  },
+  15_000,
 )
 
 for (const concurrency of [4, 8]) {

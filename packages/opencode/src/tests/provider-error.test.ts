@@ -22,7 +22,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
-import { lockPathFor } from '@cortexkit/common-auth/fs'
+import { acquireRefreshFileLock, lockPathFor } from '@cortexkit/common-auth/fs'
 import { createOpencodeClient, type Provider } from '@opencode-ai/sdk'
 import { $, type ServerWebSocket } from 'bun'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
@@ -1908,6 +1908,69 @@ test('OC1 serves first byte and full body while the roster lock is held, then dr
     ),
   ).toBe(true)
 })
+
+for (const contended of [false, true]) {
+  test(`OC1 advisory shutdown ${contended ? 'drops contended bookkeeping without disturbing its holder' : 'persists uncontended lastUsed'}`, async () => {
+    const { owner, client } = await vaultFixture()
+    const plugin = await createPlugin(owner, client)
+    const paths = nativeVaultPaths(
+      await resolveNativePoolPaths(
+        join(owner.directory, 'anthropic-auth.json'),
+        process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE,
+      ),
+    )
+    const logs = captureLogs()
+    const disk = () =>
+      readFile(paths.runtime, 'utf8').catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return null
+        throw error
+      })
+    const before = await disk()
+    const started = Date.now()
+    let holder: Awaited<ReturnType<typeof acquireRefreshFileLock>>
+    owner.network.current = async () => {
+      if (contended) {
+        holder = await acquireRefreshFileLock({
+          path: paths.runtime,
+          name: 'native-runtime',
+          ttlMs: 10_000,
+        })
+        expect(holder).not.toBeNull()
+        lifetimes.deferCleanup(async () => {
+          await holder?.release()
+        })
+      }
+      const response = eventStream(healthy('served before bookkeeping'))
+      response.headers.set('anthropic-ratelimit-unified-5h-utilization', '0.25')
+      return response
+    }
+    expect((await sendNative(owner, plugin, 'oc1-shutdown-grace')).status).toBe(
+      200,
+    )
+    const closingAt = performance.now()
+    await plugin.dispose?.()
+    expect(performance.now() - closingAt).toBeLessThan(1_750)
+    const drops = logs.filter(
+      (record) =>
+        record.message === 'Account usage publications dropped at shutdown',
+    )
+    if (contended) {
+      await holder!.assertOwned()
+      expect(await disk()).toBe(before)
+      expect(drops).toMatchObject([{ level: 'debug', payload: { count: 2 } }])
+      expect(Object.keys(drops[0]!.payload!)).toEqual(['count'])
+    } else {
+      const runtime = JSON.parse(await readFile(paths.runtime, 'utf8'))
+      expect(
+        Object.values(runtime.accounts).some(
+          (entry) =>
+            Number(Reflect.get(entry as object, 'lastUsed')) >= started,
+        ),
+      ).toBe(true)
+      expect(drops).toEqual([])
+    }
+  }, 15_000)
+}
 
 test('OC1 absorbs real runtime lease loss after serving the intact reply', async () => {
   const { owner, client } = await vaultFixture()

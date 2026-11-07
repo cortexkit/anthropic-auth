@@ -1,4 +1,7 @@
 import { expect } from 'bun:test'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   __setLogTestSink,
   getLogLevel,
@@ -6,7 +9,7 @@ import {
   setLogLevel,
 } from '../logger.ts'
 import { NativeCustodyError } from '../native-custody.ts'
-import { NativeRuntimeError } from '../native-runtime.ts'
+import { NativeRuntimeError, updateNativeRuntime } from '../native-runtime.ts'
 import {
   classifySafeErrorForLog,
   createNativeUsagePublisher,
@@ -123,6 +126,67 @@ test('observed quota publication keeps its join until the already-started write 
   await draining
   expect(joined).toBe(true)
   expect(drained).toBe(true)
+})
+
+test('shutdown cancellation logs one content-free count for all dropped writes', async () => {
+  const records: LogTestRecord[] = []
+  const previous = getLogLevel()
+  setLogLevel('debug')
+  __setLogTestSink((record) => records.push(record))
+  deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previous)
+  })
+  const publisher = createNativeUsagePublisher('native-auth')
+  for (let i = 0; i < 3; i++)
+    publisher.publish(
+      (signal) =>
+        new Promise((_, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), {
+            once: true,
+          })
+        }),
+    )
+  await Promise.all([publisher.drain(), publisher.drain()])
+  expect(records).toEqual([
+    {
+      level: 'debug',
+      channel: 'native-auth',
+      message: 'Account usage publications dropped at shutdown',
+      payload: { count: 3 },
+    },
+  ])
+})
+
+test('shutdown cancellation still joins a runtime write that already acquired its lock', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'advisory-acquired-'))
+  deferCleanup(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'runtime.json')
+  const storageId = 'a'.repeat(64)
+  const publisher = createNativeUsagePublisher('native-auth')
+  const acquired = gate()
+  let finished = false
+  publisher.publish(async (signal) => {
+    await updateNativeRuntime(path, storageId, (state) => state, {
+      signal,
+      beforePublish: async () => {
+        acquired.open()
+        await new Promise<void>((resolve) =>
+          signal.addEventListener('abort', () => resolve(), { once: true }),
+        )
+      },
+    })
+    finished = true
+  })
+  await acquired.wait
+  await publisher.drain()
+  expect(publisher.signal.aborted).toBe(true)
+  expect(finished).toBe(true)
+  expect(JSON.parse(await readFile(path, 'utf8'))).toEqual({
+    version: 1,
+    storageId,
+    accounts: {},
+  })
 })
 
 test('every publication rejection is absorbed with one fixed closed diagnostic', async () => {

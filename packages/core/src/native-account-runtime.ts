@@ -248,10 +248,12 @@ export interface NativeAccountRuntime {
   publishLocal(
     subject: NativeKnownCredentialSubject,
     patch: NativeAccountMetadataPatch,
+    signal?: AbortSignal,
   ): Promise<boolean>
   publishApi(
     subject: NativeApiSubject,
     patch: { lastUsed: number },
+    signal?: AbortSignal,
   ): Promise<boolean>
   resetBackoff(
     routeId: string,
@@ -343,8 +345,10 @@ export function acquireNativeAccountRuntime(
     remove: (id) => use().remove(id),
     reorder: (ids, moved) => use().reorder(ids, moved),
     captureLocalSubject: (id) => use().captureLocalSubject(id),
-    publishLocal: (subject, patch) => use().publishLocal(subject, patch),
-    publishApi: (subject, patch) => use().publishApi(subject, patch),
+    publishLocal: (subject, patch, signal) =>
+      use().publishLocal(subject, patch, signal),
+    publishApi: (subject, patch, signal) =>
+      use().publishApi(subject, patch, signal),
     resetBackoff: (id, fence, kind) => use().resetBackoff(id, fence, kind),
     getOrCreateAuthLineage: (id, fence) =>
       use().getOrCreateAuthLineage(id, fence),
@@ -663,6 +667,7 @@ export function createNativeAccountRuntime(
   async function localMetadataWrite(
     subject: NativeRefreshSubject | NativeApiSubject,
     change: (entry: NativeRuntimeEntry) => NativeRuntimeEntry,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const binding = subject.binding
     if ((await authority()) !== 'local') return false
@@ -688,6 +693,7 @@ export function createNativeAccountRuntime(
         },
         {
           onLockEvent: options.local?.onLockEvent,
+          signal,
           beforeRename: async () => {
             if (!(await localMetadataMatches(subject)))
               throw new NativeRuntimeError('publication-refused')
@@ -926,8 +932,8 @@ export function createNativeAccountRuntime(
     vault,
     quotaObservations: vault.quotaObservations,
     drainQuotaPublications: async () => {
-      await vault.quotaObservations.drain()
       await Promise.all([
+        vault.quotaObservations.drain(),
         quotaPublications.drain(),
         metadataPublications.drain(),
       ])
@@ -1580,7 +1586,7 @@ export function createNativeAccountRuntime(
         },
       }
     },
-    async publishLocal(subject, rawPatch) {
+    async publishLocal(subject, rawPatch, signal) {
       const captured = captureNativeMetadataPatch(rawPatch)
       const { quota: _quota, ...metadata } = captured
       // Track writes before awaiting admission so close cannot miss an accepted write.
@@ -1595,7 +1601,8 @@ export function createNativeAccountRuntime(
           await localAuthority()
           return matches
         })())
-      const key = JSON.stringify(subject)
+      // Keep writes with different cancellation signals out of the same metadata batch.
+      const key = JSON.stringify([subject, nativeRuntimeOptionIdentity(signal)])
       const writes: Promise<boolean>[] = []
       if (captured.quota) {
         const quota = captured.quota
@@ -1630,19 +1637,26 @@ export function createNativeAccountRuntime(
             metadata,
             async (patch) => {
               if (mixed && !(await admitted())) return false
-              return localMetadataWrite(subject, (old) =>
-                applyNativeMetadataPatch(old, patch),
+              return localMetadataWrite(
+                subject,
+                (old) => applyNativeMetadataPatch(old, patch),
+                signal,
               )
             },
           ),
         )
       return (await Promise.all(writes)).every(Boolean)
     },
-    publishApi: (subject, patch) =>
-      metadataPublications.enqueue(JSON.stringify(subject), patch, (merged) =>
-        localMetadataWrite(subject, (old) =>
-          applyNativeMetadataPatch(old, merged),
-        ),
+    publishApi: (subject, patch, signal) =>
+      metadataPublications.enqueue(
+        JSON.stringify([subject, nativeRuntimeOptionIdentity(signal)]),
+        patch,
+        (merged) =>
+          localMetadataWrite(
+            subject,
+            (old) => applyNativeMetadataPatch(old, merged),
+            signal,
+          ),
       ),
     async resetBackoff(routeId, fence, kind = 'all') {
       if ('accessToken' in fence) return vault.resetBackoff(fence, kind)
@@ -1740,10 +1754,17 @@ export function createNativeAccountRuntime(
             Math.max(now(), (matched?.quotaErrorClearedAt ?? -1) + 1),
             matched?.lastQuotaRefreshError,
           )
-          if (failure)
-            await runtime.publishLocal(attempt.subject, {
-              lastQuotaRefreshError: failure,
-            })
+          if (failure) {
+            const pending = runtime.publishLocal(
+              attempt.subject,
+              {
+                lastQuotaRefreshError: failure,
+              },
+              quotaPublications.signal,
+            )
+            void quotaPublications.observe(pending)
+            await pending
+          }
         },
         dispatch,
       )
@@ -1777,11 +1798,15 @@ export function createNativeAccountRuntime(
           generalExhausted: nativePollQuotaGenerallyExhausted(quota),
           quotaErrorClearedAt,
         },
-        () =>
-          runtime.publishLocal(result.attempt.subject, {
-            quota,
-            quotaErrorClearedAt,
-          }),
+        (publicationSignal) =>
+          runtime.publishLocal(
+            result.attempt.subject,
+            {
+              quota,
+              quotaErrorClearedAt,
+            },
+            publicationSignal,
+          ),
       )
       return quota
     },

@@ -994,7 +994,11 @@ async function sendAnthropicRequest(
     if (apiSubject && response.ok) {
       const subject = apiSubject
       native.usagePublications.publish(() =>
-        servingRuntime.publishApi(subject, { lastUsed: Date.now() }),
+        servingRuntime.publishApi(
+          subject,
+          { lastUsed: Date.now() },
+          native.usagePublications.signal,
+        ),
       )
     }
     if (attempt && response.ok) {

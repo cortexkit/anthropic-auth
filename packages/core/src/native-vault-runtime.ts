@@ -268,6 +268,7 @@ export interface NativeVaultRuntime {
   publish(
     receipt: NativeCustodyReceipt,
     patch: NativeAccountMetadataPatch,
+    signal?: AbortSignal,
   ): Promise<boolean>
   fetchQuota(
     routeId: string,
@@ -999,7 +1000,7 @@ export function createNativeVaultRuntime(
         })
       return result
     },
-    publish(receipt, rawPatch) {
+    publish(receipt, rawPatch, signal) {
       const patch = captureNativeMetadataPatch(rawPatch)
       return mutateReceipt(
         receipt,
@@ -1015,6 +1016,7 @@ export function createNativeVaultRuntime(
           return applyNativeMetadataPatch(old, patch)
         },
         recencyOnly(patch) ? 'skip' : 'refuse',
+        signal,
       )
     },
     resetBackoff(receipt, kind = 'all') {
@@ -1170,7 +1172,13 @@ export function createNativeVaultRuntime(
             matched?.lastQuotaRefreshError,
           )
           if (failure)
-            await runtime.publish(receipt, { lastQuotaRefreshError: failure })
+            await quotaObservations.publishFailure((publicationSignal) =>
+              runtime.publish(
+                receipt,
+                { lastQuotaRefreshError: failure },
+                publicationSignal,
+              ),
+            )
         },
         dispatch,
       )
@@ -1201,7 +1209,12 @@ export function createNativeVaultRuntime(
           generalExhausted: nativePollQuotaGenerallyExhausted(quota),
           quotaErrorClearedAt,
         },
-        () => runtime.publish(result.receipt, { quota, quotaErrorClearedAt }),
+        (publicationSignal) =>
+          runtime.publish(
+            result.receipt,
+            { quota, quotaErrorClearedAt },
+            publicationSignal,
+          ),
       )
       return quota
     },
@@ -1332,6 +1345,7 @@ export function createNativeVaultRuntime(
     receipt: NativeCustodyReceipt,
     change: (old: NativeRuntimeEntry) => NativeRuntimeEntry,
     onSuperseded: 'refuse' | 'skip' = 'refuse',
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const route = requireIssued(receipt)
     await requireActive()
@@ -1390,6 +1404,7 @@ export function createNativeVaultRuntime(
         },
         {
           onLockEvent: options.onLockEvent,
+          signal,
           beforeRename: async () => {
             await requireActive()
             const pinned = await rowFor(
@@ -1661,7 +1676,7 @@ export function leaseNativeVaultRuntime(
       use().reportFailure(receipt, status, source),
     prepareRetry: (receipt, signal, site) =>
       use().prepareRetry(receipt, signal, site),
-    publish: (receipt, patch) => use().publish(receipt, patch),
+    publish: (receipt, patch, signal) => use().publish(receipt, patch, signal),
     fetchQuota: (id, transport, signal, dispatch, purpose) =>
       use().fetchQuota(id, transport, signal, dispatch, purpose),
     fetchProfile: (id, transport, signal) =>

@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.5.8
 
+- OpenCode and Pi no longer pause for up to 15 seconds at shutdown when another process holds the account bookkeeping file.
 - On OpenCode 1 and 2, a step answered through Anthropic's server-side safety fallback now also carries a hidden reasoning part with the per-attempt token usage, so tools that size the conversation can use the final attempt's context instead of the billed sum of both. Billed totals and what is sent to Anthropic are unchanged; see docs/request-rewriting.md. Addresses #648.
 
 ## 2.5.7

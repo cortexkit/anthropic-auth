@@ -643,6 +643,8 @@ export async function readNativeRuntime(
 }
 
 export interface NativeRuntimeWriteHooks {
+  /** Cancels lock acquisition only, never a write that already owns the lock. */
+  signal?: AbortSignal
   onLockEvent?: (event: NativeLockEvent) => void
   publication?: PublicationOptions
   /** Verify that the observed account still matches the current pool record or vault roster and that the caller still owns the locks protecting those records. */
@@ -802,6 +804,7 @@ export type NativeRuntimeOptionalPublication =
   | { status: 'skipped' }
 
 export interface NativeRuntimeOptionalWriteHooks {
+  signal?: AbortSignal
   onLockEvent?: (event: NativeLockEvent) => void
   publication?: PublicationOptions
   /**
@@ -830,6 +833,7 @@ export async function updateNativeRuntimeOptional(
     beforeRename: hooks.beforeRename,
     publication: hooks.publication,
     onLockEvent: hooks.onLockEvent,
+    signal: hooks.signal,
   })
 }
 
@@ -860,6 +864,7 @@ async function writeNativeRuntime(
       afterRename: hooks.afterRename,
       publication: hooks.publication,
       onLockEvent: hooks.onLockEvent,
+      signal: hooks.signal,
     },
     firstIdentity,
   )
@@ -892,6 +897,7 @@ async function writeNativeRuntimeOutcome(
         timeoutMs: 15_000,
         renew: true,
         onLockEvent: hooks.onLockEvent,
+        signal: hooks.signal,
       },
       async (lock) => {
         const read = await readNativeRuntime(path, storageId)
@@ -986,6 +992,7 @@ async function writeNativeRuntimeOutcome(
       },
     )
   } catch (error) {
+    if (hooks.signal?.aborted && error === hooks.signal.reason) throw error
     if (error instanceof NativeRuntimeError) throw error
     throw new NativeRuntimeError('runtime-io')
   }

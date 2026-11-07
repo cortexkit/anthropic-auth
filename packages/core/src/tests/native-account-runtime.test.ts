@@ -789,6 +789,48 @@ test('local quota auth failures never arm quota backoff while 429 still does', a
   }
 })
 
+test('shutdown cancels a failed quota poll waiting to persist its backoff', async () => {
+  const f = await fixture()
+  await localSubject(f)
+  const lease = await acquireRefreshFileLock({
+    path: f.paths.runtime,
+    name: 'native-runtime',
+    ttlMs: 10_000,
+  })
+  if (!lease) throw new Error('Runtime fixture lock unavailable')
+  deferCleanup(() => lease.release())
+  const entered = gate()
+  const publish = f.runtime.publishLocal
+  const observer = spyOn(f.runtime, 'publishLocal').mockImplementation(
+    (subject, patch, signal) => {
+      const pending = publish(subject, patch, signal)
+      if (patch.lastQuotaRefreshError) entered.open()
+      return pending
+    },
+  )
+  deferCleanup(() => observer.mockRestore())
+  const transport: typeof fetch = Object.assign(
+    async () => new Response('rate limited', { status: 429 }),
+    { preconnect: fetch.preconnect },
+  )
+  const poll = f.runtime.fetchQuota('main', transport).then(
+    () => false,
+    () => true,
+  )
+  trackDetached(poll)
+  await entered.wait
+  const closingAt = performance.now()
+  await f.runtime.close()
+  expect(performance.now() - closingAt).toBeLessThan(1_750)
+  expect(await poll).toBe(true)
+  await lease.assertOwned()
+  const disk = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(
+    disk.status === 'ready' &&
+      disk.state.accounts['imported-main']?.lastQuotaRefreshError,
+  ).toBeUndefined()
+}, 15_000)
+
 test('local quota retry admits only after deferred body cleanup so disable prevents a second HTTP', async () => {
   const f = await fixture()
   const entered = gate(),

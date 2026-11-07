@@ -1643,8 +1643,10 @@ const anthropicAuthPlugin = async (
     // Aborting the caller does not cancel a version-fenced 401 report.
     // Finish dispatch cleanup before closing the custody client it uses.
     await drainDispatchWork()
-    await usagePublications.drain()
-    await nativeAccounts.drainQuotaPublications()
+    await Promise.all([
+      usagePublications.drain(),
+      nativeAccounts.drainQuotaPublications(),
+    ])
     await Promise.all(
       [...stickySessionRouters.values()].map((router) => router.drain()),
     )
@@ -2712,9 +2714,17 @@ const anthropicAuthPlugin = async (
       accountIdentity: account.accountIdentity,
     }
     const persisted = served.scopedAttempt
-      ? await nativeAccounts.vault.publish(served.scopedAttempt, { quota })
+      ? await nativeAccounts.vault.publish(
+          served.scopedAttempt,
+          { quota },
+          usagePublications.signal,
+        )
       : served.localSubject
-        ? await nativeAccounts.publishLocal(served.localSubject, { quota })
+        ? await nativeAccounts.publishLocal(
+            served.localSubject,
+            { quota },
+            usagePublications.signal,
+          )
         : false
     if (!persisted) {
       if (served.accountId === 'main') {
@@ -2974,12 +2984,19 @@ const anthropicAuthPlugin = async (
         try {
           let persistedEntry: QuotaEntry | null
           try {
-            persistedEntry = await persistPushedQuota(
+            const publication = persistPushedQuota(
               served,
               { quota: incoming, checkedAt, refreshAfter: checkedAt },
               previousEntry,
             )
+            void usagePublications.observe(publication)
+            persistedEntry = await publication
           } catch (error) {
+            if (
+              usagePublications.signal.aborted &&
+              error === usagePublications.signal.reason
+            )
+              return
             logPersistFailure(error)
             return
           }
@@ -2990,9 +3007,9 @@ const anthropicAuthPlugin = async (
               mainQuotaIdentity?.generation
           )
             return
-          // Store acceptance fences the row, credential epoch and identity:
-          // only accepted readings reach cache, sidebar or feed. Acceptance
-          // need not mean the shared pool write has reached disk yet.
+          // Store acceptance checks that the row still has the observed
+          // credential epoch and account identity before updating cache or feed.
+          // The accepted write may still be queued rather than on disk.
           const entry = persistedEntry
           if (
             observation &&
@@ -3022,9 +3039,10 @@ const anthropicAuthPlugin = async (
             headerRoutingObservations.get(served.accountId) === observation
           ) {
             headerRoutingObservations.delete(served.accountId)
-            logger.debug('quota', 'discarded pending response quota', {
-              accountId: served.accountId,
-            })
+            if (!usagePublications.signal.aborted)
+              logger.debug('quota', 'discarded pending response quota', {
+                accountId: served.accountId,
+              })
           }
         }
       })().catch(logQuotaHeaderFeedFailure)
@@ -7369,10 +7387,14 @@ const anthropicAuthPlugin = async (
               baseURL: account.baseURL,
             })
             if (response.ok)
-              usagePublications.publish(() =>
-                nativeAccounts.publishApi(apiCredential.subject, {
-                  lastUsed: Date.now(),
-                }),
+              usagePublications.publish((signal) =>
+                nativeAccounts.publishApi(
+                  apiCredential.subject,
+                  {
+                    lastUsed: Date.now(),
+                  },
+                  signal,
+                ),
               )
             return response
           }
@@ -8305,15 +8327,23 @@ const anthropicAuthPlugin = async (
               if (response.status === 401)
                 await endIfCancelled(response, init?.signal)
               if (response.ok) {
-                usagePublications.publish(async () => {
+                usagePublications.publish(async (signal) => {
                   if (served.scopedAttempt)
-                    await nativeAccounts.vault.publish(served.scopedAttempt, {
-                      lastUsed: Date.now(),
-                    })
+                    await nativeAccounts.vault.publish(
+                      served.scopedAttempt,
+                      {
+                        lastUsed: Date.now(),
+                      },
+                      signal,
+                    )
                   else if (served.localSubject)
-                    await nativeAccounts.publishLocal(served.localSubject, {
-                      lastUsed: Date.now(),
-                    })
+                    await nativeAccounts.publishLocal(
+                      served.localSubject,
+                      {
+                        lastUsed: Date.now(),
+                      },
+                      signal,
+                    )
                 })
               }
               return response

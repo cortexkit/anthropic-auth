@@ -119,13 +119,24 @@ function logPublicationFailure(channel: string, error: unknown): void {
   )
 }
 
+// Bookkeeping must not hold shutdown behind another process's 10–15s lease.
+// Only lock acquisition is cancelled; acquired writes and accepted store queues drain.
+const ADVISORY_SHUTDOWN_GRACE_MS = 1_000
+
 /** Own advisory writes for one host instance and join them before runtime close. */
 export function createNativeUsagePublisher(channel: string) {
   const pending = new Set<Promise<void>>()
+  const shutdown = new AbortController()
+  let draining: Promise<void> | undefined
+  let dropped = 0
   const observe = (write: Promise<unknown>): Promise<void> => {
     const work = write.then(
       () => {},
-      (error: unknown) => logPublicationFailure(channel, error),
+      (error: unknown) => {
+        if (shutdown.signal.aborted && error === shutdown.signal.reason)
+          dropped++
+        else logPublicationFailure(channel, error)
+      },
     )
     pending.add(work)
     void work.then(
@@ -135,17 +146,42 @@ export function createNativeUsagePublisher(channel: string) {
     return work
   }
   return {
+    signal: shutdown.signal,
     // Header writes start at receipt; disposal, not attempt end, joins them.
     observe,
-    publish(write: () => Promise<unknown>): void {
+    publish(write: (signal: AbortSignal) => Promise<unknown>): void {
       // A new event-loop turn gives the host its response before bookkeeping
       // starts, including when the writer does synchronous work before await.
       void observe(
-        new Promise<void>((resolve) => setTimeout(resolve, 0)).then(write),
+        new Promise<void>((resolve) => setTimeout(resolve, 0)).then(() =>
+          write(shutdown.signal),
+        ),
       )
     },
-    async drain(): Promise<void> {
-      while (pending.size) await Promise.allSettled([...pending])
+    drain(): Promise<void> {
+      if (draining) return draining
+      draining = (async () => {
+        const timer = setTimeout(
+          () => shutdown.abort(),
+          ADVISORY_SHUTDOWN_GRACE_MS,
+        )
+        try {
+          while (pending.size) await Promise.allSettled([...pending])
+        } finally {
+          clearTimeout(timer)
+          if (dropped) {
+            logger.debug(
+              channel,
+              'Account usage publications dropped at shutdown',
+              { count: dropped },
+            )
+            dropped = 0
+          }
+        }
+      })().finally(() => {
+        draining = undefined
+      })
+      return draining
     },
   }
 }

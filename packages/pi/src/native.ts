@@ -507,8 +507,17 @@ export class PiNativeRuntime {
     const runtime = servingRuntime ?? (await this.service())
     const patch = { lastUsed: Date.now() }
     if (served.source === 'vault')
-      await runtime.vault.publish(served.receipt, patch)
-    else await runtime.publishLocal(served.admission.subject, patch)
+      await runtime.vault.publish(
+        served.receipt,
+        patch,
+        this.usagePublications.signal,
+      )
+    else
+      await runtime.publishLocal(
+        served.admission.subject,
+        patch,
+        this.usagePublications.signal,
+      )
   }
 
   close(): Promise<void> {
@@ -519,12 +528,17 @@ export class PiNativeRuntime {
       () => {},
     )
     this.closing ??= (async () => {
-      await this.usagePublications.drain()
+      await Promise.all([
+        this.usagePublications.drain(),
+        this.initialization.then(
+          (runtime) => runtime.drainQuotaPublications(),
+          () => {},
+        ),
+      ])
       await this.drainRoutingPublications()
       this.routingPublications.clear()
       await this.initialization.then(
         async (runtime) => {
-          await runtime.drainQuotaPublications()
           await runtime.drainRoutingPublications()
           await this.drainReports()
           await runtime.close()

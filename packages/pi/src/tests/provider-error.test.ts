@@ -17,6 +17,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { ScopedInventoryRow } from '@cortexkit/claustrum-client'
 import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import type { TestGate } from '../../../core/src/tests/test-lifetime.ts'
@@ -1194,6 +1195,59 @@ test('Pi serves first delta and full reply while the roster lock is held, then d
     ),
   ).toBe(true)
 })
+
+for (const contended of [false, true]) {
+  test(`Pi advisory shutdown ${contended ? 'drops contended bookkeeping without disturbing its holder' : 'persists uncontended lastUsed'}`, async () => {
+    const { storagePath } = await vaultFixture()
+    const paths = nativeVaultPaths(await resolveNativePoolPaths(storagePath))
+    const logs = captureUsageLogs()
+    const disk = () =>
+      readFile(paths.runtime, 'utf8').catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return null
+        throw error
+      })
+    const before = await disk()
+    const started = Date.now()
+    let holder: Awaited<ReturnType<typeof acquireRefreshFileLock>>
+    useFetch(async () => {
+      if (contended) {
+        holder = await acquireRefreshFileLock({
+          path: paths.runtime,
+          name: 'native-runtime',
+          ttlMs: 10_000,
+        })
+        expect(holder).not.toBeNull()
+        deferCleanup(async () => {
+          await holder?.release()
+        })
+      }
+      return eventStream(healthy('served before bookkeeping'))
+    })
+    expect((await run('pi-shutdown-grace')).result.stopReason).toBe('stop')
+    const closingAt = performance.now()
+    await closePiNativeRuntime(storagePath)
+    expect(performance.now() - closingAt).toBeLessThan(1_750)
+    const drops = logs.filter(
+      (record) =>
+        record.message === 'Account usage publications dropped at shutdown',
+    )
+    if (contended) {
+      await holder!.assertOwned()
+      expect(await disk()).toBe(before)
+      expect(drops).toMatchObject([{ level: 'debug', payload: { count: 1 } }])
+      expect(Object.keys(drops[0]!.payload!)).toEqual(['count'])
+    } else {
+      const runtime = JSON.parse(await readFile(paths.runtime, 'utf8'))
+      expect(
+        Object.values(runtime.accounts).some(
+          (entry) =>
+            Number(Reflect.get(entry as object, 'lastUsed')) >= started,
+        ),
+      ).toBe(true)
+      expect(drops).toEqual([])
+    }
+  }, 15_000)
+}
 
 test('Pi API lastUsed storage failure is detached, drained and warns without changing reply content', async () => {
   const { quotaPauses } = await routingFixture(false)

@@ -119,7 +119,7 @@ export class NativeQuotaObservations extends Map<
   publish(
     accountId: string,
     observation: NativeQuotaObservation,
-    write: () => Promise<boolean>,
+    write: (signal: AbortSignal) => Promise<boolean>,
   ): Promise<void> {
     const previous = this.get(accountId)
     if (
@@ -132,6 +132,7 @@ export class NativeQuotaObservations extends Map<
     return this.publications.observe(
       Promise.resolve().then(async () => {
         let kept = false
+        let cancelled = false
         try {
           const current = this.get(accountId)
           if (
@@ -141,13 +142,20 @@ export class NativeQuotaObservations extends Map<
               quotaSnapshotCheckedAt(observation.entry.quota)
           )
             return
-          kept = await write()
-        } catch {
+          kept = await write(this.publications.signal)
+        } catch (error) {
+          if (
+            this.publications.signal.aborted &&
+            error === this.publications.signal.reason
+          ) {
+            cancelled = true
+            throw error
+          }
           // A quota bookkeeping failure must not reject a successful poll.
         } finally {
           if (!kept) {
             if (this.get(accountId) === observation) this.delete(accountId)
-            logger.warn('quota', 'Quota publication discarded')
+            if (!cancelled) logger.warn('quota', 'Quota publication discarded')
           }
         }
       }),
@@ -176,6 +184,13 @@ export class NativeQuotaObservations extends Map<
   /** Forgets a held reading whose save was refused, unless a later reading already replaced it. */
   forget(accountId: string, observation: NativeQuotaObservation): void {
     if (this.get(accountId) === observation) this.delete(accountId)
+  }
+
+  /** Preserve failed-poll persistence while making its lock wait cancellable at shutdown. */
+  publishFailure<T>(write: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const pending = write(this.publications.signal)
+    void this.publications.observe(pending)
+    return pending
   }
 
   drain(): Promise<void> {
