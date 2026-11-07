@@ -22,3 +22,8 @@
 - For a bug fix, show once that the new test fails without the fix. Remote Linux jobs cannot change tracked files, so a revert made inside the job fails and the test quietly runs against the fix. Instead, in the same job, copy the checkout to `$TMPDIR` (`cp -R . "$TMPDIR/red"`), undo the fix in that copy, and run the test there; or do it locally.
 - Don't write mutation proofs or lists of deliberate code breaks, don't run the full suites, and don't repeat a run. GitHub CI runs the full Core, OpenCode and Pi suites on every PR, and its result decides the merge.
 - In your report, list what you ran and what you left to CI.
+
+## Changelog
+
+- Add your line to the **root** `CHANGELOG.md`, under `## Unreleased`, one line per change, ending with `Addresses #N.` when an issue exists. Write it for users: what changes for them, not how.
+- Never edit `packages/opencode/CHANGELOG.md` or any other per-package changelog. Those are inherited from the original fork and are no longer released.
