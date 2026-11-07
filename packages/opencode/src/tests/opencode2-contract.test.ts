@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   custodyTombstoneOAuth,
   fetchOAuthQuotaSnapshot,
+  readNativeEnrollmentMode,
   THINKING_BINDING_CONTROLS_BETA,
 } from '@cortexkit/anthropic-auth-core'
 import type { OpenCode2HookContext } from '@cortexkit/common-auth/opencode2'
@@ -958,4 +959,45 @@ describe('Claude login methods follow vault enrollment', () => {
       await native.dispose()
     }
   })
+})
+
+test('hosted OC2 activation requires a relay and returns only the vault placeholder without local writes', async () => {
+  const key = Symbol.for('cortexkit.vault')
+  const globals = globalThis as unknown as Record<symbol, unknown>
+  const previous = globals[key]
+  process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+  delete globals[key]
+  try {
+    const login = await enrollmentLogin(() =>
+      readNativeEnrollmentMode('opencode'),
+    )
+    await expect(
+      login.method(CLAUDE_POOL_LOGIN_METHOD_ID).authorize({}),
+    ).rejects.toThrow(LOCAL_LOGIN_REFUSED_IN_VAULT)
+    await expect(login.activateVault()).rejects.toThrow(
+      'Native custody refused: unavailable',
+    )
+    let connects = 0
+    globals[key] = (id: string) => {
+      expect(id).toBe('anthropic-auth')
+      connects++
+      return {
+        close() {},
+        listScoped() {},
+        getScoped() {},
+        reportAuthFailureScoped() {},
+      }
+    }
+    const marker = await login.activateVault()
+    expect(isPlaceholderCredential(marker, 'anthropic')).toBe(true)
+    expect(marker.access).toBe(placeholderSecret('anthropic'))
+    expect(connects).toBe(1)
+    expect(login.writes).toEqual([])
+    expect(login.browserStarts()).toBe(0)
+    expect(login.connectionWrites()).toBe(0)
+  } finally {
+    delete process.env.CORTEXKIT_VAULT_HOST
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  }
 })

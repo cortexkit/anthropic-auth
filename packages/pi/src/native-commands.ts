@@ -23,10 +23,13 @@ import {
   isFastModePersistentlyEnabled,
   isKillswitchEnabled,
   isPrimePersistentlyEnabled,
+  isVaultHosted,
   type NativeMenuDispatch,
   type NativeMenuKillswitchEntry,
   nativeAccountCanServe,
   setDumpEnabled,
+  VAULT_HOST_CONNECT_REFUSAL,
+  VAULT_HOST_STATUS,
 } from '@cortexkit/anthropic-auth-core'
 import type { PiNativeCommands } from './commands.ts'
 import { createPiCustodyCommands } from './custody.ts'
@@ -80,6 +83,16 @@ export function createPiNativeCommands(
     })
   }
   const dispatch: NativeMenuDispatch = async (request, options) => {
+    if (
+      isVaultHosted() &&
+      [
+        'enrollment-reset',
+        'add-oauth-start',
+        'add-oauth-finish',
+        'add-apikey',
+      ].includes(request.action)
+    )
+      return { ok: false, text: VAULT_HOST_CONNECT_REFUSAL }
     const runtime = await native.service()
     switch (request.action) {
       case 'enable':
@@ -333,10 +346,12 @@ export function createPiNativeCommands(
               (account) =>
                 `${account.id}: ${account.label ?? account.id} (${account.type}, ${account.enabled ? 'enabled' : 'disabled'}, ${account.source}${account.state ? `, ${formatNativeAccountState(account)}` : ''}${formatOAuthAccountTier(account.profile) ? `, ${formatOAuthAccountTier(account.profile)}` : ''}); identity: ${account.accountIdentity ?? 'unverified'}${account.lastRefreshError ? `; refresh: ${account.lastRefreshError.permanent ? 'requires login' : 'backoff'}` : ''}`,
             ),
-            ...formatEnrollmentStatus(
-              await custody.status(),
-              snapshot.mode === 'claustrum',
-            ),
+            ...(isVaultHosted()
+              ? [VAULT_HOST_STATUS]
+              : formatEnrollmentStatus(
+                  await custody.status(),
+                  snapshot.mode === 'claustrum',
+                )),
           ].join('\n')
         case 'quota':
           return buildClaudeQuotaSummary({

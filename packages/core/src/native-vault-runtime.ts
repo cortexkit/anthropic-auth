@@ -86,6 +86,7 @@ import {
   nativeRuntimeStorageKey,
 } from './native-runtime-registry.ts'
 import { waitForNativeUsageDrain } from './native-usage-publication.ts'
+import { isVaultHosted } from './native-vault-host.ts'
 import {
   retainNativeVaultRoster,
   watchNativeVaultAuthority,
@@ -466,6 +467,7 @@ export function createNativeVaultRuntime(
       clearTimeout: options.clearTimeout,
     })
   let custody = newCustody()
+  let custodyHosted = isVaultHosted()
   let custodyClosed = false
   function closeCustody() {
     // Closing the custody also stops its roster watch.
@@ -494,6 +496,9 @@ export function createNativeVaultRuntime(
   // fetch a minute between them). Acquired on the first background tick that
   // finds vault custody, released when this runtime closes.
   const tokenPath = getHostClaustrumEnrollmentPaths(options.host, env).tokenPath
+  // Insula keys sources by token path and connection file; a relay may name
+  // the same connection file as native custody but must never reuse its source.
+  const hostedInsulaCacheKey = `${tokenPath}.host-anthropic-auth`
   const clock = options.now ?? Date.now
   let insula: { source: InsulaQuotaSource; release(): void } | undefined
   const unwatchAuthority = watchNativeVaultAuthority({
@@ -501,6 +506,7 @@ export function createNativeVaultRuntime(
     tokenPath,
     retain: retainRoster,
     close: closeCustody,
+    isHosted: () => isVaultHosted(),
   })
   /**
    * Refresh insula's cache for one background tick. Enrollment is read fresh
@@ -510,12 +516,15 @@ export function createNativeVaultRuntime(
   async function refreshInsula(): Promise<void> {
     try {
       if (!(await active())) return
-      await readClaustrumEnrollmentToken(tokenPath)
+      if (!isVaultHosted()) await readClaustrumEnrollmentToken(tokenPath)
       if (!insula) {
         const transport = await custody.insulaTransport()
         check()
         if (!transport) return
-        insula ??= acquireInsulaQuotaSource(transport, tokenPath)
+        insula ??= acquireInsulaQuotaSource(
+          transport,
+          custodyHosted ? hostedInsulaCacheKey : tokenPath,
+        )
       }
       await insula.source.refresh(clock())
     } catch {
@@ -704,6 +713,11 @@ export function createNativeVaultRuntime(
     check()
     const mode = await readNativeEnrollmentMode(options.host, env)
     check()
+    const hosted = isVaultHosted()
+    if (hosted !== custodyHosted) {
+      closeCustody()
+      custodyHosted = hosted
+    }
     if (mode === 'claustrum' && custodyClosed) {
       custody = newCustody()
       custodyClosed = false

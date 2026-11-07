@@ -3,6 +3,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+delete process.env.CORTEXKIT_VAULT_HOST
+
 let testDir: string | undefined
 let originalXdgStateHome: string | undefined
 const activeBodies = new Set<Promise<unknown>>()

@@ -4,6 +4,8 @@ import { join } from 'node:path'
 
 import {
   ACCOUNT_FILE_NAME,
+  isVaultHosted,
+  nativePiAuthSlotPaths,
   parseJsonRedacted,
   primeStorageFingerprint,
 } from '@cortexkit/anthropic-auth-core'
@@ -68,9 +70,37 @@ export async function hasPiLocalAnthropicOAuth(): Promise<boolean> {
 
 /** The user must approve removing the host’s Anthropic OAuth credential before the shared account store can serve requests. */
 export async function requirePiNativeHostAuth(): Promise<void> {
+  if (isVaultHosted()) {
+    const authPath = join(getPiConfigDir(), 'auth.json')
+    let root: unknown
+    try {
+      root = parseJsonRedacted(await readFile(authPath, 'utf8'))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw new Error('Cannot safely inspect Pi authentication metadata')
+    }
+    if (!root || typeof root !== 'object' || Array.isArray(root))
+      throw new Error('Cannot safely inspect Pi authentication metadata')
+    const entry = (root as Record<string, unknown>).anthropic
+    if (entry === undefined) return
+    const placeholder = nativePiAuthSlotPaths({ authPath }).placeholderKey
+    if (
+      entry &&
+      typeof entry === 'object' &&
+      !Array.isArray(entry) &&
+      Object.keys(entry).length === 2 &&
+      (entry as Record<string, unknown>).type === 'api_key' &&
+      (entry as Record<string, unknown>).key === placeholder
+    )
+      return
+    throw new Error(PI_HOSTED_LOGIN_REFUSAL)
+  }
   if (await hasPiLocalAnthropicOAuth()) {
     throw new Error(
       'Pi still has a host Anthropic OAuth credential. Run offline setup to migrate it and approve its removal before using the native pool.',
     )
   }
 }
+
+export const PI_HOSTED_LOGIN_REFUSAL =
+  'This Thalamus-hosted head has its own Claude login. Remove it so Thalamus can serve Claude accounts, and let Thalamus install the vault placeholder.'

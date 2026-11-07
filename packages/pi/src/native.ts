@@ -7,6 +7,7 @@ import {
   getHostClaustrumEnrollmentPaths,
   getPersistedLogLevel,
   isKillswitchEnabled,
+  isVaultHosted,
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
   logger,
@@ -270,6 +271,10 @@ export class PiNativeRuntime {
           )
         if (this.closed || poll.intervalMs <= 0) return runtime
         this.vaultWatch = runtime.vault.watch({
+          shouldRefresh: async () => {
+            if (isVaultHosted()) await requirePiNativeHostAuth()
+            return true
+          },
           intervalMs: poll.intervalMs,
           setInterval: poll.setInterval,
           clearInterval: poll.clearInterval,

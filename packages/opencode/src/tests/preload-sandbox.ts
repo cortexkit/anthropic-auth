@@ -4,6 +4,8 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+delete process.env.CORTEXKIT_VAULT_HOST
+
 // This must run before setup.ts imports Core. Core's logger and dump modules
 // capture default paths at import time; setting TMPDIR in setup.ts is too late.
 const testDir = mkdtempSync(join(tmpdir(), 'anthropic-auth-opencode-test-'))

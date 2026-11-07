@@ -7,9 +7,9 @@ const pExecFile = promisify(execFile)
 export const defaultCommandRunner: CommandRunner = {
   async run(command, args, options = {}) {
     try {
-      const childEnv = options.env
-        ? { ...process.env, ...options.env }
-        : process.env
+      const childEnv = { ...process.env, ...options.env }
+      // Children have no in-process relay accessor and must not assume host authority.
+      delete childEnv.CORTEXKIT_VAULT_HOST
       const { stdout, stderr } = await pExecFile(command, args, {
         env: childEnv,
         timeout: options.timeoutMs ?? 15_000,

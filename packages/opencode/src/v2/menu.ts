@@ -16,6 +16,7 @@ import {
   isCacheKeepAlways,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
+  isVaultHosted,
   type NativeAccountRuntime,
   type NativeAccountSnapshot,
   type NativeMenuDispatch,
@@ -23,6 +24,7 @@ import {
   parseLogLevel,
   resetClaustrumEnrollmentState,
   setDumpEnabled,
+  VAULT_HOST_CONNECT_REFUSAL,
 } from '@cortexkit/anthropic-auth-core'
 import { LANE_START_TEXT } from '../lane-start'
 import { normalizeSidebarState } from '../sidebar-state'
@@ -115,6 +117,16 @@ export function createNativeMenuCapabilities(options: {
   }
   const done = () => ({ ok: true, text: 'Native Claude settings updated.' })
   const dispatch: NativeMenuDispatch = async (request, options) => {
+    if (
+      isVaultHosted() &&
+      [
+        'enrollment-reset',
+        'add-oauth-start',
+        'add-oauth-finish',
+        'add-apikey',
+      ].includes(request.action)
+    )
+      throw new Error(VAULT_HOST_CONNECT_REFUSAL)
     if (closed) throw new Error('Native menu is closed')
     options.signal?.throwIfAborted()
     switch (request.action) {

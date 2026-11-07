@@ -15,6 +15,7 @@ import {
   type NativeMenuRefusalCode,
   type NativeMenuRoutingMode,
 } from './native-menu-model.ts'
+import { isVaultHosted } from './native-vault-host.ts'
 
 /**
  * Typed input checking and safety gating for native menu actions.
@@ -605,6 +606,13 @@ function plan(
   // Unknown names and actions this host does not offer are refused alike.
   const action = actions.get(actionId)
   if (!action) return done(refused('unsupported-action'))
+  if (
+    isVaultHosted() &&
+    (action.id === 'custody-mode' ||
+      action.id === 'vault-disconnect' ||
+      isNativeMenuLocalCustodyAction(action.id))
+  )
+    return done(refused('vault-managed', action.id))
 
   const context = readContext(rawContext)
   if (!context) return done(refused('invalid-context', action.id))

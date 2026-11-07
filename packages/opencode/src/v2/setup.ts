@@ -2,15 +2,18 @@ import {
   acquireNativeAccountRuntime,
   assertUnmanagedInjectedPaths,
   authorize,
+  connectVaultHost,
   createNativeUi,
   decideOpenCodeStateLayoutOnce,
   disconnectNativeVaultForHost,
   exchange,
   getPersistedLogLevel,
   isDumpPersistentlyEnabled,
+  isVaultHosted,
   logger,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
+  NativeCustodyError,
   type NativeHolderRegistration,
   type NativePoolPaths,
   type NativeUiOptions,
@@ -86,6 +89,7 @@ export const ENROLLMENT_UNREADABLE =
   'The Claude vault enrollment could not be read; repair it and retry. Nothing was changed.'
 
 export interface ClaudeLoginMethodsInput {
+  readonly verifyVault?: () => Promise<unknown>
   /** False once setup is disposed; every step refuses after that. */
   readonly isActive: () => boolean
   readonly readMode: () => Promise<NativeEnrollmentMode>
@@ -180,6 +184,19 @@ export function claudeLoginMethods(
         ensureActive()
         if ((await mode()) !== 'claustrum')
           throw new Error(VAULT_ACTIVATION_REFUSED_LOCALLY)
+        if (isVaultHosted()) {
+          if (input.verifyVault) await input.verifyVault()
+          else {
+            try {
+              connectVaultHost('anthropic-auth').close()
+            } catch {
+              throw new NativeCustodyError('unavailable')
+            }
+          }
+          ensureActive()
+          if ((await mode()) !== 'claustrum')
+            throw new Error(VAULT_ACTIVATION_REFUSED_LOCALLY)
+        }
       },
     },
     async onLogin(credential) {
@@ -455,6 +472,7 @@ export async function setupAnthropicAuth(
         claudeLoginMethods({
           isActive: () => active,
           readMode: enrollment.readMode,
+          verifyVault: () => runtime.vault.refresh(),
           runtime,
         }),
       ),

@@ -12,6 +12,7 @@ import {
   CLAUDE_SONNET_5_5_PRICING,
   defaultAdaptiveEffort,
   getClaudeModelCatalogue,
+  isVaultHosted,
   type MidConversationEffortTransition,
   type NativeAccountSnapshot,
   type NativeCustodyClient,
@@ -335,6 +336,7 @@ export default async function cortexKitPiAnthropicAuth(
     const startupMode = await readNativeEnrollmentMode('pi').catch(
       () => undefined,
     )
+    if (isVaultHosted()) await requirePiNativeHostAuth()
     try {
       if (startupMode === 'local') await getPiNativeRuntime(storagePath).view()
     } catch (error) {

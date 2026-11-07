@@ -4,8 +4,10 @@ import {
   ClaustrumScopedCustody,
   ClaustrumUnreachableError,
   classifyVaultFailure,
+  connectVaultHost,
 } from '@cortexkit/common-auth/claustrum'
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
+import { isVaultHosted } from './native-vault-host.ts'
 
 /**
  * Reads insula's quota cache from the vault daemon. Declared here with the
@@ -337,11 +339,12 @@ export interface NativeCustody {
   close: () => void
 }
 
-/** Share a lazy Claustrum connection; each authorize call reads a fresh enrollment token and OAuth receipt. */
+/** Share a lazy vault connection; each authorization obtains a fresh scoped OAuth receipt. */
 export function createNativeCustody(
   options: NativeCustodyOptions,
 ): NativeCustody {
   const env = { ...(options.env ?? process.env) }
+  const hosted = isVaultHosted()
   const connect = options.connect
   const logger = options.logger
   let closed = false
@@ -355,13 +358,15 @@ export function createNativeCustody(
 
   function check(signal?: AbortSignal): void {
     if (closed) throw new NativeCustodyError('closed')
+    if (hosted !== isVaultHosted())
+      throw new NativeCustodyError('route-unavailable')
     signal?.throwIfAborted()
   }
 
   function connection(): Promise<NativeCustodyClient> {
     check()
     connecting ??= Promise.resolve()
-      .then(connect)
+      .then(() => (hosted ? connectVaultHost('anthropic-auth') : connect()))
       .then((owned) => {
         if (closed) {
           owned.close()
@@ -460,37 +465,56 @@ export function createNativeCustody(
     }
   }
 
-  const primitive = new ClaustrumScopedCustody({
-    client: {
-      listScoped: (token) => scoped((owned) => owned.listScoped(token)),
-      getScoped: (input) => scoped((owned) => owned.getScoped(input)),
-      reportAuthFailureScoped: (input) =>
-        scoped((owned) => owned.reportAuthFailureScoped(input)),
-      watchScoped,
-      close: () => client?.close(),
-    },
-    family: {
-      refreshAdapter: 'anthropic',
-      category: 'anthropic-native',
-      apiKeys: false,
-    },
-    requireAssertion: true,
-    ...(options.readToken
-      ? { readToken: options.readToken }
-      : {
-          tokenPath: getHostClaustrumEnrollmentPaths(options.host, env)
-            .tokenPath,
-        }),
-    now: options.now,
-    ...(options.setTimeout && { setTimeoutImpl: options.setTimeout }),
-    ...(options.clearTimeout && { clearTimeoutImpl: options.clearTimeout }),
-    // Supply logger callbacks so common-auth cannot select its default logger.
-    // Only the fixed messages below reach the caller; record details never do.
-    logger: {
-      warn: () => logger?.warn('Native custody inventory record skipped'),
-      debug: () => logger?.debug('Native custody failure reported'),
-    },
-  })
+  let primitive: ClaustrumScopedCustody | undefined
+  let retained: Parameters<ClaustrumScopedCustody['retain']>[0] | undefined
+  function makePrimitive(hostClient?: NativeCustodyClient) {
+    return new ClaustrumScopedCustody({
+      client: hostClient ?? {
+        listScoped: (token) => scoped((owned) => owned.listScoped(token)),
+        getScoped: (input) => scoped((owned) => owned.getScoped(input)),
+        reportAuthFailureScoped: (input) =>
+          scoped((owned) => owned.reportAuthFailureScoped(input)),
+        watchScoped,
+        close: () => client?.close(),
+      },
+      family: {
+        refreshAdapter: 'anthropic',
+        category: 'anthropic-native',
+        apiKeys: false,
+      },
+      requireAssertion: true,
+      ...(hosted
+        ? {}
+        : options.readToken
+          ? { readToken: options.readToken }
+          : {
+              tokenPath: getHostClaustrumEnrollmentPaths(options.host, env)
+                .tokenPath,
+            }),
+      now: options.now,
+      ...(options.setTimeout && { setTimeoutImpl: options.setTimeout }),
+      ...(options.clearTimeout && { clearTimeoutImpl: options.clearTimeout }),
+      // Supply logger callbacks so common-auth cannot select its default logger.
+      // Only the fixed messages below reach the caller; record details never do.
+      logger: {
+        warn: () => logger?.warn('Native custody inventory record skipped'),
+        debug: () => logger?.debug('Native custody failure reported'),
+      },
+    })
+  }
+  // Hosted clients are branded by common-auth. Construct custody only after
+  // connecting, passing that exact object rather than the native lazy adapter.
+  async function ready() {
+    check()
+    if (!primitive) {
+      const owned = await connection()
+      check()
+      primitive ??= makePrimitive(owned)
+      if (retained) primitive.retain(retained)
+    }
+    return primitive
+  }
+  if (!hosted) primitive = makePrimitive()
 
   async function run<T>(
     operation: () => Promise<T>,
@@ -532,7 +556,8 @@ export function createNativeCustody(
   }
 
   const custody: NativeCustody = {
-    discover: (signal) => run(() => primitive.discover(signal), signal),
+    discover: (signal) =>
+      run(async () => (await ready()).discover(signal), signal),
     authorize: (identity, signal) =>
       run(async () => {
         // Capture only route fields before awaiting common-auth authorization.
@@ -548,7 +573,7 @@ export function createNativeCustody(
         }
         if (!accountIdentity?.trim())
           throw new NativeCustodyError('identity-unasserted')
-        const receipt = await primitive.authorize(
+        const receipt = await (await ready()).authorize(
           {
             credentialId,
             accountIdentity,
@@ -565,13 +590,13 @@ export function createNativeCustody(
     reportFailure: (receipt, status, reporterSource) =>
       run(async () => {
         requireReceipt(receipt)
-        await primitive.reportFailure(receipt, status, reporterSource)
+        await (await ready()).reportFailure(receipt, status, reporterSource)
       }),
     prepareRetry: async (served, signal) => {
       check(signal)
       requireReceipt(served)
       if (served.fromKeptReceipt) {
-        primitive.forget(served.credentialId)
+        primitive?.forget(served.credentialId)
         return { retry: false, reason: 'reauthorize-failed' }
       }
       if (served.assertedAccountIdentity === undefined) {
@@ -615,14 +640,16 @@ export function createNativeCustody(
       return { retry: true, receipt: current }
     },
     insulaTransport: () => scoped(async (owned) => owned.insula),
-    retain: (rows) =>
-      primitive.retain(
-        rows.map((row) => ({ ...row, credentialType: 'oauth' })),
-      ),
-    forget: (credentialId) => primitive.forget(credentialId),
-    keptReceiptState: () => primitive.keptReceiptState(),
+    retain: (rows) => {
+      retained = rows.map((row) => ({ ...row, credentialType: 'oauth' }))
+      primitive?.retain(retained)
+    },
+    forget: (credentialId) => primitive?.forget(credentialId),
+    keptReceiptState: () =>
+      primitive?.keptReceiptState() ?? { active: false, since: null },
     watchRoster: (watchOptions) => {
       check()
+      if (!primitive) throw new NativeCustodyError('unavailable')
       return primitive.watchRoster({
         onView: watchOptions.onView,
         ...(watchOptions.view && { view: watchOptions.view }),
@@ -645,7 +672,8 @@ export function createNativeCustody(
       if (closed) return
       closed = true
       for (const stop of onClose) stop()
-      primitive.close()
+      if (primitive) primitive.close()
+      else client?.close()
     },
   }
   return custody

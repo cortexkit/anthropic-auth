@@ -1,5 +1,9 @@
 import { types as utilTypes } from 'node:util'
 import {
+  VAULT_HOST_CONNECT_REFUSAL,
+  VAULT_HOST_STATUS,
+} from '@cortexkit/common-auth/claustrum'
+import {
   type CommandApplyResult,
   type CommandInvocation,
   type CommandMenu,
@@ -9,6 +13,7 @@ import {
   parseApplyRequest,
   type SectionSlot,
 } from '@cortexkit/common-auth/commands'
+import { isVaultHosted } from './native-vault-host.ts'
 
 export type {
   CommandApplyRequest,
@@ -452,6 +457,7 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
    * is not inspected because it could quote credentials.
    */
   async function readCustody(): Promise<NativeMenuCustodyMode | undefined> {
+    if (isVaultHosted()) return 'claustrum'
     try {
       const mode: unknown = await readMode()
       return mode === 'local' || mode === 'claustrum' ? mode : undefined
@@ -467,6 +473,7 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
   ): Promise<CommandMenuModel> {
     const safeInvocation = capture(invocation, scrub)
     const custody = await readCustody()
+    const hosted = isVaultHosted()
     // When the custody mode cannot be read, the menu shows the vault
     // (claustrum) action set. Sign-in, API-key, removal and reordering
     // actions stay hidden because they would write this host's own account
@@ -489,9 +496,11 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
       }
       if (group.id === 'Accounts' && custody !== 'local')
         lines.push(
-          custody === 'claustrum'
-            ? VAULT_ACCOUNTS_GUIDANCE
-            : UNKNOWN_CUSTODY_GUIDANCE,
+          hosted
+            ? VAULT_HOST_STATUS
+            : custody === 'claustrum'
+              ? VAULT_ACCOUNTS_GUIDANCE
+              : UNKNOWN_CUSTODY_GUIDANCE,
         )
       if (
         group.id === 'Accounts' &&
@@ -536,25 +545,34 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
         title: group.id,
         lines,
         items: [],
-        actions: group.actions.map((action) => ({
-          id: action.id,
-          label: action.label,
-          knobs: action.parameters.map(knob),
-          ...(action.destructive
-            ? {
-                confirm: {
-                  message: action.confirm,
-                  // Disconnecting is reversed by connecting the host to the
-                  // vault again with offline setup. Removal and enrollment
-                  // reset cannot be reversed that way.
-                  irreversible: action.kind !== 'vault-disconnect',
-                },
-              }
-            : {}),
-          ...(action.kind === 'setup-guidance'
-            ? { description: 'Offline guidance only; no settings are changed.' }
-            : {}),
-        })),
+        actions: group.actions
+          .filter(
+            (action) =>
+              !hosted ||
+              !['custody-mode', 'vault-disconnect'].includes(action.id),
+          )
+          .map((action) => ({
+            id: action.id,
+            label: action.label,
+            knobs: action.parameters.map(knob),
+            ...(action.destructive
+              ? {
+                  confirm: {
+                    message: action.confirm,
+                    // Disconnecting is reversed by connecting the host to the
+                    // vault again with offline setup. Removal and enrollment
+                    // reset cannot be reversed that way.
+                    irreversible: action.kind !== 'vault-disconnect',
+                  },
+                }
+              : {}),
+            ...(action.kind === 'setup-guidance'
+              ? {
+                  description:
+                    'Offline guidance only; no settings are changed.',
+                }
+              : {}),
+          })),
       })
     }
     return { command: 'claude', title: 'Claude', sections }
@@ -658,6 +676,15 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
       // been opened under the other mode, and an action the current mode
       // does not offer must be refused before it reaches the host.
       const custody = await readCustody()
+      if (
+        isVaultHosted() &&
+        ['custody-mode', 'vault-disconnect'].includes(action.id)
+      )
+        return finish({
+          ok: false,
+          code: 'custody-unavailable',
+          text: VAULT_HOST_CONNECT_REFUSAL,
+        })
       // Unknown custody refuses local-custody actions here. Vault disconnect
       // stays available because a corrupted enrollment must keep a recovery
       // action. The host's disconnect callback does the safety checks: it

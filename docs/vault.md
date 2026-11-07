@@ -4,6 +4,22 @@ Claustrum is a local credential-vault service. Each host explicitly proposes enr
 
 ## Setup
 
+### Running under Thalamus
+
+No plugin setup or enrollment is needed when Thalamus launches the host with
+`CORTEXKIT_VAULT_HOST=thalamus`. Accounts come through Thalamus's vault relay;
+`/claude` shows **Served by Thalamus** and offers neither Connect nor Disconnect.
+The setup CLI refuses in this mode. Local accounts stay untouched and are never
+used as a fallback if the relay is unavailable. Existing vault settings, quotas
+and session pins continue to work when switching from this host's own vault enrollment.
+
+Thalamus installs the host's non-secret vault placeholder. Pi's auth slot is
+only inspected at runtime, never moved or rewritten: if this Pi process has
+its own Claude login, remove it and let Thalamus install the placeholder.
+Outside Thalamus, use the enrollment setup below as before.
+
+### Standalone enrollment
+
 Vault setup needs [Claustrum v0.2.0](https://github.com/cortexkit/claustrum/releases/tag/v0.2.0) or newer, which needs subc-core 0.20.83 or newer. Older Claustrum versions can't connect plugins, and setup stops with a message saying so.
 
 Stop all OpenCode, LiteCode and Pi processes. With `ck` installed and the Claustrum daemon running, run:

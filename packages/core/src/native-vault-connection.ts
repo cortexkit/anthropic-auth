@@ -1,8 +1,12 @@
 import { dirname, join, resolve } from 'node:path'
-import { disconnectClaustrumEnrollment } from '@cortexkit/common-auth/claustrum'
+import {
+  disconnectClaustrumEnrollment,
+  VAULT_HOST_CONNECT_REFUSAL,
+} from '@cortexkit/common-auth/claustrum'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { openPiSlot, type PiSlot } from '@cortexkit/common-auth/pi-slot'
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
+import { isVaultHosted } from './native-vault-host.ts'
 import { closeNativeVaultAuthority } from './native-vault-invalidation.ts'
 
 export type {
@@ -56,6 +60,7 @@ export type NativeVaultDisconnectResult =
 export async function disconnectNativeVaultForHost(
   options: NativeVaultDisconnectOptions,
 ): Promise<NativeVaultDisconnectResult> {
+  if (isVaultHosted()) throw new Error(VAULT_HOST_CONNECT_REFUSAL)
   if (options.host === 'pi' && (await options.slot.exitVault()) === 'conflict')
     return 'conflict'
   const paths = getHostClaustrumEnrollmentPaths(options.host, options.env)

@@ -1,6 +1,6 @@
 import {
-  enrollmentAuthority,
   readClaustrumEnrollmentStatus,
+  vaultAuthority,
 } from '@cortexkit/common-auth/claustrum'
 
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
@@ -183,17 +183,21 @@ export class NativePrivateFilesUnavailableError extends NativeCustodyError {
   }
 }
 
-/** Enrollment files, not account settings, choose the host's credential source. */
+/** Host authority takes precedence over enrollment files and account settings. */
 export async function readNativeEnrollmentMode(
   host: 'opencode' | 'pi',
   env: NodeJS.ProcessEnv = process.env,
-  dependencies = { enrollmentAuthority, readClaustrumEnrollmentStatus },
+  dependencies = {
+    enrollmentAuthority: vaultAuthority,
+    readClaustrumEnrollmentStatus,
+  },
 ): Promise<'local' | 'claustrum'> {
   const paths = getHostClaustrumEnrollmentPaths(host, env)
   const authority = await dependencies.enrollmentAuthority(
     paths,
     `anthropic-auth-${host}`,
   )
+  if (authority === 'host') return 'claustrum'
   if (authority !== 'vault')
     closeNativeVaultAuthority(
       getHostClaustrumEnrollmentPaths(host, env).tokenPath,

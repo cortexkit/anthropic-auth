@@ -1,4 +1,9 @@
 export {
+  connectVaultHost,
+  VAULT_HOST_CONNECT_REFUSAL,
+  VAULT_HOST_STATUS,
+} from '@cortexkit/common-auth/claustrum'
+export {
   askRouting,
   type ReportRoutingInput,
   reportRouting,
@@ -280,6 +285,7 @@ export {
   nativePiAuthSlotPaths,
   openNativePiAuthSlot,
 } from './native-vault-connection.ts'
+export { isVaultHosted } from './native-vault-host.ts'
 export {
   createNativeVaultNoRouteResponse,
   NativeVaultQuotaPolicyError,

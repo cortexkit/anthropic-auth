@@ -124,6 +124,7 @@ import {
   isPrimePersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   isValidApiBaseURL,
+  isVaultHosted,
   killswitchPassesPolicy,
   log,
   logger,
@@ -221,6 +222,8 @@ import {
   stickyRouteFamilyForModel,
   TrailingAssistantHistoryError,
   tokenFingerprint,
+  VAULT_HOST_CONNECT_REFUSAL,
+  VAULT_HOST_STATUS,
   withAbortableFetch,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
@@ -3623,6 +3626,11 @@ const anthropicAuthPlugin = async (
       throw new Error(
         'OpenCode already holds an Anthropic login; remove it before choosing the vault login',
       )
+    if (isVaultHosted()) {
+      await nativeAccounts.vault.refresh()
+      if ((await readNativeEnrollmentMode('opencode')) !== 'claustrum')
+        throw new Error('Vault authority changed; retry the vault login.')
+    }
   }
   const vaultLoginMethod = {
     label: 'Claude via credential vault',
@@ -5362,6 +5370,16 @@ const anthropicAuthPlugin = async (
     checkedAction?: ReturnType<typeof parseAccountCommandAction>,
   ) {
     const action = checkedAction ?? parseAccountCommandAction(argumentsText)
+    if (
+      isVaultHosted() &&
+      !['status', 'enable', 'disable', 'reset-backoff'].includes(action.type)
+    )
+      throw new Error(VAULT_HOST_CONNECT_REFUSAL)
+    if (isVaultHosted() && action.type === 'status')
+      return {
+        text: VAULT_HOST_STATUS,
+        accounts: buildAccountList((await nativeAccounts.read()).policyStorage),
+      }
 
     // -- add-apikey --------------------------------------------------------
     if (action.type === 'add-apikey') {
@@ -5684,7 +5702,7 @@ const anthropicAuthPlugin = async (
     )
     const custodyMode = getClaustrumMode(accountStorage)
     const claustrumEnrollment =
-      custodyMode === 'claustrum'
+      custodyMode === 'claustrum' && !isVaultHosted()
         ? await readClaustrumEnrollmentStatus(
             getHostClaustrumEnrollmentPaths('opencode'),
             CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
@@ -6052,14 +6070,14 @@ const anthropicAuthPlugin = async (
         AbortSignal.timeout(3_000),
       )
       const enrollment =
-        snapshot.mode === 'claustrum'
+        snapshot.mode === 'claustrum' && !isVaultHosted()
           ? await readClaustrumEnrollmentStatus(
               getHostClaustrumEnrollmentPaths('opencode'),
               CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
             )
           : undefined
       return [
-        `Custody mode: ${snapshot.mode}`,
+        isVaultHosted() ? VAULT_HOST_STATUS : `Custody mode: ${snapshot.mode}`,
         ...(enrollment
           ? formatEnrollmentStatus(
               enrollment,
@@ -10943,11 +10961,12 @@ const anthropicAuthPlugin = async (
 
         return {}
       },
-      // Offered only while this host holds a vault enrollment token; the
-      // method itself rechecks vault authority and the empty slot.
+      // Hosted authority needs no enrollment token. The method itself checks
+      // vault availability and the empty host slot before returning a marker.
       get methods() {
         return [
-          ...(existsSync(getHostClaustrumEnrollmentPaths('opencode').tokenPath)
+          ...(isVaultHosted() ||
+          existsSync(getHostClaustrumEnrollmentPaths('opencode').tokenPath)
             ? [vaultLoginMethod]
             : []),
           {

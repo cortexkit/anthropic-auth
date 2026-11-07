@@ -3,6 +3,7 @@ import {
   createProcessFence,
   decideOpenCodeStateLayoutOnce,
   decidePiStateLayout,
+  isVaultHosted,
   type NativeHolderRegistration,
   NativePiAuthSlotError,
   openNativePiAuthSlot,
@@ -17,6 +18,7 @@ import {
   type SetupPlugin,
   StateLayoutRefusalError,
   setupUsage,
+  VAULT_HOST_CONNECT_REFUSAL,
 } from '@cortexkit/anthropic-auth-core'
 import { confirm } from '@cortexkit/common-auth/auth-menu'
 import {
@@ -151,6 +153,10 @@ export async function runSetupCommand(
   if (argv.some((arg) => HELP_FLAGS.includes(arg))) {
     print(setupHelpText())
     return 0
+  }
+  if (isVaultHosted()) {
+    print(VAULT_HOST_CONNECT_REFUSAL)
+    return 1
   }
   if (argv.includes(RESTORE_LEGACY))
     return runRestoreLegacy(argv, options, env, print)

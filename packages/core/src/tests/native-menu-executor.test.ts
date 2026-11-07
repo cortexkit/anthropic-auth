@@ -1471,7 +1471,7 @@ test('construction captures only a known host and a plain function capability', 
   })
 })
 
-test('the module imports only the menu model and node:util at runtime', async () => {
+test('the module imports only the menu model, hosted marker helper and node:util at runtime', async () => {
   const source = await readFile(
     new URL('../native-menu-executor.ts', import.meta.url),
     'utf8',
@@ -1480,7 +1480,11 @@ test('the module imports only the menu model and node:util at runtime', async ()
     .scanImports(source)
     .map(({ path }) => path)
     .sort()
-  expect(runtime).toEqual(['./native-menu-model.ts', 'node:util'])
+  expect(runtime).toEqual([
+    './native-menu-model.ts',
+    './native-vault-host.ts',
+    'node:util',
+  ])
   // Neither file relies on suppressing type errors.
   const testSource = await readFile(new URL(import.meta.url), 'utf8')
   const suppression = new RegExp(

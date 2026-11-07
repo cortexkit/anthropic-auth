@@ -8,6 +8,7 @@ const holders = new Set<{
   tokenPath: string
   retain: (roster: NativeVaultRosterDocument | undefined) => void
   close: () => void
+  isHosted?: () => boolean
 }>()
 
 export function watchNativeVaultAuthority(holder: {
@@ -15,6 +16,7 @@ export function watchNativeVaultAuthority(holder: {
   tokenPath: string
   retain: (roster: NativeVaultRosterDocument | undefined) => void
   close: () => void
+  isHosted?: () => boolean
 }): () => void {
   const held = {
     ...holder,
@@ -37,5 +39,6 @@ export function retainNativeVaultRoster(
 
 export function closeNativeVaultAuthority(tokenPath: string): void {
   for (const holder of holders)
-    if (holder.tokenPath === resolve(tokenPath)) holder.close()
+    if (holder.tokenPath === resolve(tokenPath) && !holder.isHosted?.())
+      holder.close()
 }

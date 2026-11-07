@@ -4,11 +4,14 @@ import {
   type ClaustrumEnrollmentStatus,
   type ClaustrumMode,
   getHostClaustrumEnrollmentPaths,
+  isVaultHosted,
   readClaustrumEnrollmentStatus,
   resetClaustrumEnrollmentState,
+  VAULT_HOST_CONNECT_REFUSAL,
 } from '@cortexkit/anthropic-auth-core'
 
 export async function requirePiEnrollment() {
+  if (isVaultHosted()) throw new Error(VAULT_HOST_CONNECT_REFUSAL)
   const status = await readClaustrumEnrollmentStatus(
     getHostClaustrumEnrollmentPaths('pi'),
     CLAUSTRUM_PI_ENROLLMENT_NAME,
@@ -33,9 +36,16 @@ export interface PiCustodyCommands {
 export function createPiCustodyCommands(): PiCustodyCommands {
   const paths = () => getHostClaustrumEnrollmentPaths('pi')
   return {
-    status: () =>
-      readClaustrumEnrollmentStatus(paths(), CLAUSTRUM_PI_ENROLLMENT_NAME),
+    status: () => {
+      if (isVaultHosted()) throw new Error(VAULT_HOST_CONNECT_REFUSAL)
+      return readClaustrumEnrollmentStatus(
+        paths(),
+        CLAUSTRUM_PI_ENROLLMENT_NAME,
+      )
+    },
     async reset() {
+      if (isVaultHosted())
+        return { text: `Refused: ${VAULT_HOST_CONNECT_REFUSAL}` }
       const result = await resetClaustrumEnrollmentState(
         paths(),
         CLAUSTRUM_PI_ENROLLMENT_NAME,
@@ -56,6 +66,8 @@ export function createPiCustodyCommands(): PiCustodyCommands {
       return { text: messages[result] }
     },
     async transition(mode) {
+      if (isVaultHosted())
+        return { text: `Refused: ${VAULT_HOST_CONNECT_REFUSAL}` }
       // Mode changes can remove host credentials and require offline consent.
       // A menu never enrolls, grants custody or writes the authority journal.
       return {

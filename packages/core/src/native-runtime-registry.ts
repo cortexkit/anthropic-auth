@@ -2,6 +2,7 @@ import { resolve } from 'node:path'
 import { resolveClaustrumConnectionPath } from './claustrum.ts'
 import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
 import { NativeCustodyError } from './native-custody.ts'
+import { isVaultHosted } from './native-vault-host.ts'
 import type { NativePoolPaths } from './pool-paths.ts'
 
 const identities = new WeakMap<object, number>()
@@ -29,6 +30,7 @@ export function nativeRuntimeStorageKey(options: {
   const paths = options.paths
   return JSON.stringify([
     options.host,
+    isVaultHosted() ? 'host-anthropic-auth' : 'native',
     paths.storageId,
     ...(
       [
