@@ -4,11 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Hosts launched by Thalamus now use its vault relay without separate enrollment; `/claude` shows “Served by Thalamus” and local accounts remain untouched when the relay is unavailable.
 - Prime no longer primes the same Claude account twice when OpenCode and Pi (or two OpenCode installs) use separate account files.
 - Pi now starts the five-hour window when Prime is on, like OpenCode (the setting previously had no effect on Pi).
 - OpenCode and Pi no longer pause for up to 15 seconds at shutdown when another process holds the account bookkeeping file.
-- Hosts launched by Thalamus now use its vault relay without separate enrollment; `/claude` shows “Served by Thalamus” and local accounts remain untouched when the relay is unavailable.
-
 ## 2.5.8
 
 - On OpenCode 1 and 2, a step answered through Anthropic's server-side safety fallback now also carries a hidden reasoning part with the per-attempt token usage, so tools that size the conversation can use the final attempt's context instead of the billed sum of both. Billed totals and what is sent to Anthropic are unchanged; see docs/request-rewriting.md. Addresses #648.
