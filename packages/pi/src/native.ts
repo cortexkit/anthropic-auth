@@ -529,7 +529,7 @@ export class PiNativeRuntime {
     )
     this.closing ??= (async () => {
       await Promise.all([
-        this.usagePublications.drain(),
+        this.usagePublications.close(),
         this.initialization.then(
           (runtime) => runtime.drainQuotaPublications(),
           () => {},

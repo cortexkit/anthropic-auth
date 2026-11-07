@@ -1458,8 +1458,7 @@ export function createNativeAnthropicSource(
       recoveries.clear()
       retries.clear()
       return Promise.all([
-        usagePublications.drain(),
-        runtime.drainQuotaPublications(),
+        usagePublications.close(),
         source.drainRoutingPublications(),
       ]).then(() => {})
     },

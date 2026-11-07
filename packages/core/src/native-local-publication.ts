@@ -44,7 +44,9 @@ function createPublisher() {
       key: string,
       patch: NativeAccountMetadataPatch,
       write: (patch: NativeAccountMetadataPatch) => Promise<boolean>,
+      signal?: AbortSignal,
     ): Promise<boolean> {
+      if (signal?.aborted) return Promise.reject(signal.reason)
       const queued = pending.get(key)
       if (queued) {
         const previous = queued.patch
@@ -74,13 +76,30 @@ function createPublisher() {
       }
       const batch = { patch, result: Promise.resolve(false) }
       pending.set(key, batch)
-      batch.result = run(async () => {
+      let stopWaiting = () => {}
+      const result = run(async () => {
         // Wait one event-loop turn so runtime metadata updates for the same
         // account can join the pending write.
         await new Promise<void>((resolve) => setTimeout(resolve, 0))
+        stopWaiting()
+        signal?.throwIfAborted()
         pending.delete(key)
         return write(batch.patch)
       })
+      // A queued write may sit behind another live runtime's lock wait. Cancel
+      // its wait independently, but never detach a writer that already started.
+      batch.result = signal
+        ? new Promise<boolean>((resolve, reject) => {
+            const abort = () => {
+              if (pending.get(key) === batch) pending.delete(key)
+              reject(signal.reason)
+            }
+            stopWaiting = () => signal.removeEventListener('abort', abort)
+            signal.addEventListener('abort', abort, { once: true })
+            void result.then(resolve, reject).finally(stopWaiting)
+            if (signal.aborted) abort()
+          })
+        : result
       return batch.result
     },
     async drain(): Promise<void> {

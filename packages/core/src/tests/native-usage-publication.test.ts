@@ -147,7 +147,7 @@ test('shutdown cancellation logs one content-free count for all dropped writes',
           })
         }),
     )
-  await Promise.all([publisher.drain(), publisher.drain()])
+  await Promise.all([publisher.close(), publisher.close()])
   expect(records).toEqual([
     {
       level: 'debug',
@@ -156,6 +156,26 @@ test('shutdown cancellation logs one content-free count for all dropped writes',
       payload: { count: 3 },
     },
   ])
+})
+
+test('a nonterminal drain does not poison later publications', async () => {
+  const publisher = createNativeUsagePublisher('quota')
+  const release = gate()
+  publisher.publish(async () => {
+    await release.wait
+  })
+  const draining = publisher.drain()
+  const timer = setTimeout(() => release.open(), 1_100)
+  deferCleanup(() => clearTimeout(timer))
+  await draining
+  expect(publisher.signal.aborted).toBe(false)
+  let saved = false
+  publisher.publish(async (signal) => {
+    signal.throwIfAborted()
+    saved = true
+  })
+  await publisher.drain()
+  expect(saved).toBe(true)
 })
 
 test('shutdown cancellation still joins a runtime write that already acquired its lock', async () => {
@@ -179,7 +199,7 @@ test('shutdown cancellation still joins a runtime write that already acquired it
     finished = true
   })
   await acquired.wait
-  await publisher.drain()
+  await publisher.close()
   expect(publisher.signal.aborted).toBe(true)
   expect(finished).toBe(true)
   expect(JSON.parse(await readFile(path, 'utf8'))).toEqual({

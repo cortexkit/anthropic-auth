@@ -416,8 +416,7 @@ export async function setupAnthropicAuth(
     holderRegistration?.close()
     capabilities.close()
     await cacheKeep?.dispose()
-    await source.close()
-    await runtime.drainQuotaPublications()
+    await Promise.all([source.close(), runtime.drainQuotaPublications()])
     await runtime.close()
     throw error
   })
@@ -440,13 +439,9 @@ export async function setupAnthropicAuth(
       // Prime and transport teardown can finish attempts after source shutdown
       // begins. Join their advisory usage writes before closing the runtime.
       await installation.drain()
-      await source.close()
-      // A quota reading taken by a request or poll is written after the
-      // reading returns. Closing the runtime first would refuse that write and
-      // lose the reading, so wait for it as OpenCode 1 and Pi do on close. Each
-      // write stops waiting for its file lock after a fixed timeout, so this
-      // wait is bounded.
-      await runtime.drainQuotaPublications()
+      // Retiring this host can stop waiting for shared quota work, but only
+      // the final runtime close may cancel its pending lock acquisitions.
+      await Promise.all([source.close(), runtime.drainQuotaPublications()])
       await runtime.close()
     })()
     return cleanup

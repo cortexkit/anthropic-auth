@@ -1644,7 +1644,7 @@ const anthropicAuthPlugin = async (
     // Finish dispatch cleanup before closing the custody client it uses.
     await drainDispatchWork()
     await Promise.all([
-      usagePublications.drain(),
+      usagePublications.close(),
       nativeAccounts.drainQuotaPublications(),
     ])
     await Promise.all(

@@ -7,13 +7,16 @@ import {
   mutateVaultRoster,
   readVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
-import { lockPathFor } from '@cortexkit/common-auth/fs'
-import { createNativeAccountRuntime } from '../native-account-runtime.ts'
+import { acquireRefreshFileLock, lockPathFor } from '@cortexkit/common-auth/fs'
+import {
+  acquireNativeAccountRuntime,
+  createNativeAccountRuntime,
+} from '../native-account-runtime.ts'
 import type {
   NativeCustodyClient,
   NativeCustodyReceipt,
 } from '../native-custody.ts'
-import { nativeQuotaCodec } from '../native-quota-codec.ts'
+import { fromNativeQuotaMap, nativeQuotaCodec } from '../native-quota-codec.ts'
 import {
   isNativeRuntimeStagingName,
   NativeRuntimeError,
@@ -143,6 +146,103 @@ async function fixture() {
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>
+
+for (const lastLease of [false, true]) {
+  test(`shared bookkeeping ${lastLease ? 'aborts only at final lease close' : 'survives another lease disposal'}`, async () => {
+    const f = await fixture()
+    const waiting = gate()
+    let watching = false
+    const options = {
+      paths: f.options.paths,
+      host: 'opencode' as const,
+      vault: {
+        ...f.options,
+        onLockEvent: (event: { name: string; type: string }) => {
+          if (
+            watching &&
+            event.name === 'native-runtime' &&
+            event.type === 'acquiring'
+          )
+            waiting.open()
+        },
+      },
+    }
+    const a = acquireNativeAccountRuntime(options)
+    const b = acquireNativeAccountRuntime(options)
+    deferCleanup(() => a.close())
+    deferCleanup(() => b.close())
+    expect(a.quotaObservations).toBe(b.quotaObservations)
+    await a.vault.refresh()
+    const receipt = await b.vault.authorize('main')
+    const accountIdentity = receipt.assertedAccountIdentity
+    if (!accountIdentity)
+      throw new Error('Fixture receipt has no account identity')
+    await a.vault.publish(receipt, { lastUsed: now })
+    const holder = await acquireRefreshFileLock({
+      path: f.vaultPaths.runtime,
+      name: 'native-runtime',
+      ttlMs: 10_000,
+    })
+    if (!holder) throw new Error('Runtime fixture lock unavailable')
+    deferCleanup(() => holder.release())
+    watching = true
+    const publish = (runtime: typeof a, usedPercent: number) => {
+      const quota = {
+        source: 'headers' as const,
+        accountIdentity,
+        checkedAt: now + usedPercent,
+        five_hour: {
+          usedPercent,
+          remainingPercent: 100 - usedPercent,
+          checkedAt: now + usedPercent,
+        },
+      }
+      return runtime.quotaObservations.publish(
+        'main',
+        {
+          lineage: 'shared-fixture',
+          accountUuid: accountIdentity,
+          generalExhausted: false,
+          entry: {
+            quota,
+            checkedAt: now + usedPercent,
+            refreshAfter: now + 60_000,
+          },
+        },
+        (signal) =>
+          runtime.vault.publish(
+            receipt,
+            { quota, lastUsed: now + usedPercent },
+            signal,
+          ),
+      )
+    }
+    if (lastLease) await a.close()
+    const pending = publish(lastLease ? b : a, 25)
+    trackDetached(pending)
+    await waiting.wait
+    const closingAt = performance.now()
+    if (!lastLease) await a.drainQuotaPublications()
+    await (lastLease ? b : a).close()
+    expect(performance.now() - closingAt).toBeLessThan(1_750)
+    await holder.assertOwned()
+    if (lastLease) {
+      await pending
+      expect((await runtimeEntry(f))?.lastUsed).toBe(now)
+    } else {
+      const next = publish(b, 50)
+      trackDetached(next)
+      await holder.release()
+      await Promise.all([pending, next])
+      await b.close()
+      const entry = await runtimeEntry(f)
+      expect(entry?.lastUsed).toBe(now + 50)
+      expect(fromNativeQuotaMap(entry?.quota).five_hour?.remainingPercent).toBe(
+        50,
+      )
+    }
+  }, 15_000)
+}
 
 /**
  * Pause the next vault runtime write after it opens its staging file, which is

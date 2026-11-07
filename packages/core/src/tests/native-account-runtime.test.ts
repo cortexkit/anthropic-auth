@@ -35,6 +35,7 @@ import {
 } from '../native-quota-observations.ts'
 import * as runtimeWriter from '../native-runtime.ts'
 import { readNativeRuntime } from '../native-runtime.ts'
+import { createNativeUsagePublisher } from '../native-usage-publication.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
@@ -258,7 +259,8 @@ test('local runtime metadata combines across handles and each close drains its p
   })
   expect(await Promise.all(writes)).toEqual([true, true])
   expect(locks.filter((name) => name === 'pool-config')).toHaveLength(2)
-  expect(locks.filter((name) => name === 'native-runtime')).toHaveLength(1)
+  // Independent runtime owners cannot share a batch that either close may cancel.
+  expect(locks.filter((name) => name === 'native-runtime')).toHaveLength(2)
 })
 
 test('local readers reject bookkeeping if replacement lands after the final row check', async () => {
@@ -829,6 +831,61 @@ test('shutdown cancels a failed quota poll waiting to persist its backoff', asyn
     disk.status === 'ready' &&
       disk.state.accounts['imported-main']?.lastQuotaRefreshError,
   ).toBeUndefined()
+}, 15_000)
+
+test('retiring one lease cancels only its queued metadata behind a live shared poll', async () => {
+  const waiting = gate()
+  let watching = false
+  const onLockEvent = (event: { type: string; name: string }) => {
+    if (
+      watching &&
+      event.type === 'acquiring' &&
+      event.name === 'native-runtime'
+    )
+      waiting.open()
+  }
+  const f = await fixture({ onLockEvent })
+  const subject = await localSubject(f)
+  await f.runtime.close()
+  const options = {
+    paths: f.paths,
+    host: 'opencode' as const,
+    vault: { env: f.env },
+    local: { now: () => now, onLockEvent },
+  }
+  const a = acquireNativeAccountRuntime(options)
+  const b = acquireNativeAccountRuntime(options)
+  deferCleanup(() => a.close())
+  deferCleanup(() => b.close())
+  const holder = await acquireRefreshFileLock({
+    path: f.paths.runtime,
+    name: 'native-runtime',
+    ttlMs: 10_000,
+  })
+  if (!holder) throw new Error('Runtime fixture lock unavailable')
+  deferCleanup(() => holder.release())
+  watching = true
+  const transport: typeof fetch = Object.assign(async () => Response.json({}), {
+    preconnect: fetch.preconnect,
+  })
+  await b.fetchQuota('main', transport)
+  await waiting.wait
+  const instance = createNativeUsagePublisher('native-auth')
+  instance.publish((signal) =>
+    a.publishLocal(subject, { lastUsed: now + 1 }, signal),
+  )
+  const closingAt = performance.now()
+  await Promise.all([instance.close(), a.drainQuotaPublications()])
+  await a.close()
+  expect(performance.now() - closingAt).toBeLessThan(1_750)
+  await holder.assertOwned()
+  await holder.release()
+  await b.publishLocal(subject, { lastUsed: now + 2 })
+  await b.close()
+  const disk = await readNativeRuntime(f.paths.runtime, f.paths.storageId)
+  expect(
+    disk.status === 'ready' && disk.state.accounts['imported-main']?.lastUsed,
+  ).toBe(now + 2)
 }, 15_000)
 
 test('local quota retry admits only after deferred body cleanup so disable prevents a second HTTP', async () => {

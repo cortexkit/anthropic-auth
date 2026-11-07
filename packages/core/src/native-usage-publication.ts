@@ -123,7 +123,24 @@ function logPublicationFailure(channel: string, error: unknown): void {
 // Only lock acquisition is cancelled; acquired writes and accepted store queues drain.
 const ADVISORY_SHUTDOWN_GRACE_MS = 1_000
 
-/** Own advisory writes for one host instance and join them before runtime close. */
+/** A retiring lease may stop waiting, but cannot cancel a shared runtime's writes. */
+export async function waitForNativeUsageDrain(
+  work: Promise<unknown>,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      work,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ADVISORY_SHUTDOWN_GRACE_MS)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Own advisory writes; only terminal close may cancel pending lock acquisition. */
 export function createNativeUsagePublisher(channel: string) {
   const pending = new Set<Promise<void>>()
   const shutdown = new AbortController()
@@ -145,8 +162,12 @@ export function createNativeUsagePublisher(channel: string) {
     )
     return work
   }
+  const drain = async (): Promise<void> => {
+    while (pending.size) await Promise.allSettled([...pending])
+  }
   return {
     signal: shutdown.signal,
+    hasPending: () => pending.size > 0,
     // Header writes start at receipt; disposal, not attempt end, joins them.
     observe,
     publish(write: (signal: AbortSignal) => Promise<unknown>): void {
@@ -158,7 +179,8 @@ export function createNativeUsagePublisher(channel: string) {
         ),
       )
     },
-    drain(): Promise<void> {
+    drain,
+    close(): Promise<void> {
       if (draining) return draining
       draining = (async () => {
         const timer = setTimeout(
@@ -166,7 +188,7 @@ export function createNativeUsagePublisher(channel: string) {
           ADVISORY_SHUTDOWN_GRACE_MS,
         )
         try {
-          while (pending.size) await Promise.allSettled([...pending])
+          await drain()
         } finally {
           clearTimeout(timer)
           if (dropped) {

@@ -186,8 +186,8 @@ export class NativeQuotaObservations extends Map<
     if (this.get(accountId) === observation) this.delete(accountId)
   }
 
-  /** Preserve failed-poll persistence while making its lock wait cancellable at shutdown. */
-  publishFailure<T>(write: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  /** Preserve the writer's result while tracking its lock wait for terminal shutdown. */
+  trackPublication<T>(write: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const pending = write(this.publications.signal)
     void this.publications.observe(pending)
     return pending
@@ -195,5 +195,13 @@ export class NativeQuotaObservations extends Map<
 
   drain(): Promise<void> {
     return this.publications.drain()
+  }
+
+  close(): Promise<void> {
+    return this.publications.close()
+  }
+
+  hasPendingPublications(): boolean {
+    return this.publications.hasPending()
   }
 }

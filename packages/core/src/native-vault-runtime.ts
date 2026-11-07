@@ -85,6 +85,7 @@ import {
   nativeRuntimeOptionIdentity,
   nativeRuntimeStorageKey,
 } from './native-runtime-registry.ts'
+import { waitForNativeUsageDrain } from './native-usage-publication.ts'
 import {
   retainNativeVaultRoster,
   watchNativeVaultAuthority,
@@ -431,6 +432,7 @@ export function createNativeVaultRuntime(
   const connectionFile = nativeRuntimeConnectionFile(options.host, env)
   const identity = options.identity ? { ...options.identity } : undefined
   const shutdown = new AbortController()
+  let closing: Promise<void> | undefined
   const store = createNativePoolStore({
     paths,
     quota: nativeQuotaCodec,
@@ -809,7 +811,8 @@ export function createNativeVaultRuntime(
   const quotaObservations = new NativeQuotaObservations()
   const runtime: NativeVaultRuntime = {
     quotaObservations,
-    drainQuotaPublications: () => quotaObservations.drain(),
+    drainQuotaPublications: () =>
+      waitForNativeUsageDrain(quotaObservations.drain()),
     quotaLineage(routeId, credentialId, accountIdentity) {
       if (!credentialId || !accountIdentity) return undefined
       const key = JSON.stringify([routeId, credentialId, accountIdentity])
@@ -1002,22 +1005,24 @@ export function createNativeVaultRuntime(
     },
     publish(receipt, rawPatch, signal) {
       const patch = captureNativeMetadataPatch(rawPatch)
-      return mutateReceipt(
-        receipt,
-        (old) => {
-          if (
-            patch.quota &&
-            patch.quota.source !== 'headers' &&
-            old.quota &&
-            quotaSnapshotCheckedAt(fromNativeQuotaMap(old.quota)) >
-              quotaSnapshotCheckedAt(patch.quota)
-          )
-            throw new NativeRuntimeError('runtime-conflict')
-          return applyNativeMetadataPatch(old, patch)
-        },
-        recencyOnly(patch) ? 'skip' : 'refuse',
-        signal,
-      )
+      const write = (publicationSignal: AbortSignal) =>
+        mutateReceipt(
+          receipt,
+          (old) => {
+            if (
+              patch.quota &&
+              patch.quota.source !== 'headers' &&
+              old.quota &&
+              quotaSnapshotCheckedAt(fromNativeQuotaMap(old.quota)) >
+                quotaSnapshotCheckedAt(patch.quota)
+            )
+              throw new NativeRuntimeError('runtime-conflict')
+            return applyNativeMetadataPatch(old, patch)
+          },
+          recencyOnly(patch) ? 'skip' : 'refuse',
+          publicationSignal,
+        )
+      return signal ? write(signal) : quotaObservations.trackPublication(write)
     },
     resetBackoff(receipt, kind = 'all') {
       return mutateReceipt(receipt, (old) => {
@@ -1172,7 +1177,7 @@ export function createNativeVaultRuntime(
             matched?.lastQuotaRefreshError,
           )
           if (failure)
-            await quotaObservations.publishFailure((publicationSignal) =>
+            await quotaObservations.trackPublication((publicationSignal) =>
               runtime.publish(
                 receipt,
                 { lastQuotaRefreshError: failure },
@@ -1279,14 +1284,23 @@ export function createNativeVaultRuntime(
       return changed
     },
     close() {
+      if (closing) return closing
       watchers.clear()
       closeRosterWatch()
       schedulePoll()
       if (shutdown.signal.aborted) return
-      shutdown.abort(new NativeCustodyError('closed'))
-      unwatchAuthority()
-      closeCustody()
-      return store.close()
+      const finish = () => {
+        shutdown.abort(new NativeCustodyError('closed'))
+        unwatchAuthority()
+        closeCustody()
+        return store.close()
+      }
+      // Metadata writes recheck active custody before renaming. Leave custody
+      // active until those writes finish, but close idle custody synchronously.
+      closing = quotaObservations.hasPendingPublications()
+        ? quotaObservations.close().finally(finish)
+        : Promise.resolve(finish())
+      return closing
     },
   }
   function currentDisplaySubject(receipt: NativeCustodyReceipt) {
@@ -1654,7 +1668,8 @@ export function leaseNativeVaultRuntime(
   const quotaObservations = use().quotaObservations
   return {
     quotaObservations,
-    drainQuotaPublications: () => quotaObservations.drain(),
+    drainQuotaPublications: () =>
+      waitForNativeUsageDrain(quotaObservations.drain()),
     quotaLineage: (routeId, credentialId, accountIdentity) =>
       use().quotaLineage(routeId, credentialId, accountIdentity),
     watch: (options) => {

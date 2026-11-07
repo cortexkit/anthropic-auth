@@ -83,7 +83,10 @@ import {
   joinNativePoolWrite,
   NativeTransientAccountError,
 } from './native-transient-account.ts'
-import { createNativeUsagePublisher } from './native-usage-publication.ts'
+import {
+  createNativeUsagePublisher,
+  waitForNativeUsageDrain,
+} from './native-usage-publication.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import {
   acquireNativeVaultRuntime,
@@ -362,11 +365,7 @@ export function acquireNativeAccountRuntime(
       use().fetchProfileForDisplay(id, transport, signal),
     close: () => {
       const closing = vault.close()
-      return Promise.all([
-        closing,
-        drainQuotaPublications(),
-        drainRoutingPublications(),
-      ]).then(() => {})
+      return Promise.all([closing, drainRoutingPublications()]).then(() => {})
     },
   }
 }
@@ -932,11 +931,13 @@ export function createNativeAccountRuntime(
     vault,
     quotaObservations: vault.quotaObservations,
     drainQuotaPublications: async () => {
-      await Promise.all([
-        vault.quotaObservations.drain(),
-        quotaPublications.drain(),
-        metadataPublications.drain(),
-      ])
+      await waitForNativeUsageDrain(
+        Promise.all([
+          vault.quotaObservations.drain(),
+          quotaPublications.drain(),
+          metadataPublications.drain(),
+        ]),
+      )
     },
     drainRoutingPublications: () => vaultRouter.drain(),
     async getRelayConfig() {
@@ -1602,7 +1603,11 @@ export function createNativeAccountRuntime(
           return matches
         })())
       // Keep writes with different cancellation signals out of the same metadata batch.
-      const key = JSON.stringify([subject, nativeRuntimeOptionIdentity(signal)])
+      const publicationSignal = signal ?? quotaPublications.signal
+      const key = JSON.stringify([
+        subject,
+        nativeRuntimeOptionIdentity(publicationSignal),
+      ])
       const writes: Promise<boolean>[] = []
       if (captured.quota) {
         const quota = captured.quota
@@ -1630,34 +1635,44 @@ export function createNativeAccountRuntime(
         void quotaPublications.observe(write)
         writes.push(write)
       }
-      if (Object.keys(metadata).length)
-        writes.push(
-          metadataPublications.enqueue(
-            mixed ? `${key}:mixed` : key,
-            metadata,
-            async (patch) => {
-              if (mixed && !(await admitted())) return false
-              return localMetadataWrite(
-                subject,
-                (old) => applyNativeMetadataPatch(old, patch),
-                signal,
-              )
-            },
-          ),
+      if (Object.keys(metadata).length) {
+        const write = metadataPublications.enqueue(
+          mixed ? `${key}:mixed` : key,
+          metadata,
+          async (patch) => {
+            if (mixed && !(await admitted())) return false
+            return localMetadataWrite(
+              subject,
+              (old) => applyNativeMetadataPatch(old, patch),
+              publicationSignal,
+            )
+          },
+          publicationSignal,
         )
+        if (!signal) void quotaPublications.observe(write)
+        writes.push(write)
+      }
       return (await Promise.all(writes)).every(Boolean)
     },
-    publishApi: (subject, patch, signal) =>
-      metadataPublications.enqueue(
-        JSON.stringify([subject, nativeRuntimeOptionIdentity(signal)]),
+    publishApi: (subject, patch, signal) => {
+      const publicationSignal = signal ?? quotaPublications.signal
+      const write = metadataPublications.enqueue(
+        JSON.stringify([
+          subject,
+          nativeRuntimeOptionIdentity(publicationSignal),
+        ]),
         patch,
         (merged) =>
           localMetadataWrite(
             subject,
             (old) => applyNativeMetadataPatch(old, merged),
-            signal,
+            publicationSignal,
           ),
-      ),
+        publicationSignal,
+      )
+      if (!signal) void quotaPublications.observe(write)
+      return write
+    },
     async resetBackoff(routeId, fence, kind = 'all') {
       if ('accessToken' in fence) return vault.resetBackoff(fence, kind)
       if ((await authority()) !== 'local') return false
@@ -1851,7 +1866,10 @@ export function createNativeAccountRuntime(
     },
     close() {
       if (closing) return closing
-      const draining = runtime.drainQuotaPublications()
+      const draining = Promise.all([
+        quotaPublications.close(),
+        metadataPublications.drain(),
+      ])
       // Release this vault lease synchronously, as callers of the shared
       // registry rely on the last close releasing its consumer immediately.
       const vaultClosing = vault.close()
