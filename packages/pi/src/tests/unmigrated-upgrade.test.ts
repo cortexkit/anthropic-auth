@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import {
   getStickyRoutingStatePath,
+  resetVaultHostAuthorityForTests,
   resolveNativePoolPaths,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -27,6 +28,7 @@ import {
   SessionManager,
   SettingsManager,
 } from '@earendil-works/pi-coding-agent'
+import { resetVaultHostAuthorityForTests as resetSourceHostAuthority } from '../../../core/src/native-vault-host.ts'
 import { NativeAuthorityError } from '../../../core/src/pool-authority.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
@@ -405,16 +407,23 @@ test(
   }),
 )
 
+function beginHostedHeadFixture() {
+  // Each hosted fixture models a new process, not a live authority change.
+  resetVaultHostAuthorityForTests()
+  resetSourceHostAuthority()
+  process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+  lifetime.deferCleanup(() => {
+    delete process.env.CORTEXKIT_VAULT_HOST
+  })
+}
+
 test(
   'a Thalamus-hosted Pi head with its own login loads and refuses its first request without changing auth.json',
   lifetime.wrapBody(async () => {
     const fixture = await createPiFixture()
+    beginHostedHeadFixture()
     await writeLegacyPiInstall(fixture, true)
     const before = await readFile(join(fixture.agentDir, 'auth.json'))
-    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
-    lifetime.deferCleanup(() => {
-      delete process.env.CORTEXKIT_VAULT_HOST
-    })
     const slotRead = spyOn(paths, 'requirePiNativeHostAuth')
     lifetime.deferCleanup(() => slotRead.mockRestore())
     const { session, extension, routes } = await startPi(fixture)
@@ -448,12 +457,9 @@ test(
   'a Thalamus-hosted Pi head with its own Claude login still serves prompts on another provider',
   lifetime.wrapBody(async () => {
     const fixture = await createPiFixture()
+    beginHostedHeadFixture()
     await writeLegacyPiInstall(fixture, true)
     const before = await readFile(join(fixture.agentDir, 'auth.json'))
-    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
-    lifetime.deferCleanup(() => {
-      delete process.env.CORTEXKIT_VAULT_HOST
-    })
     const slotRead = spyOn(paths, 'requirePiNativeHostAuth')
     lifetime.deferCleanup(() => slotRead.mockRestore())
     const { session, extension, available, routes } = await startPi(fixture)

@@ -31,6 +31,7 @@ import type {
   NativeRefreshObservation,
   NativeRefreshSubject,
 } from './native-refresh-coordinator.ts'
+import { assertHostAuthorityStable } from './native-vault-host.ts'
 import {
   createWindowsOwnerOnly,
   isOwnerOnly,
@@ -645,6 +646,8 @@ export async function readNativeRuntime(
 export interface NativeRuntimeWriteHooks {
   /** Cancels lock acquisition only, never a write that already owns the lock. */
   signal?: AbortSignal
+  /** Synchronous authority and ownership check at each physical rename. */
+  beforeCommit?: () => void
   onLockEvent?: (event: NativeLockEvent) => void
   publication?: PublicationOptions
   /** Verify that the observed account still matches the current pool record or vault roster and that the caller still owns the locks protecting those records. */
@@ -805,6 +808,7 @@ export type NativeRuntimeOptionalPublication =
 
 export interface NativeRuntimeOptionalWriteHooks {
   signal?: AbortSignal
+  beforeCommit?: () => void
   onLockEvent?: (event: NativeLockEvent) => void
   publication?: PublicationOptions
   /**
@@ -830,6 +834,7 @@ export async function updateNativeRuntimeOptional(
   hooks: NativeRuntimeOptionalWriteHooks,
 ): Promise<NativeRuntimeOptionalPublication> {
   return writeNativeRuntimeOutcome(path, storageId, change, {
+    beforeCommit: hooks.beforeCommit,
     beforeRename: hooks.beforeRename,
     publication: hooks.publication,
     onLockEvent: hooks.onLockEvent,
@@ -861,6 +866,7 @@ async function writeNativeRuntime(
         return 'publish'
       },
       beforePublish: hooks.beforePublish,
+      beforeCommit: hooks.beforeCommit,
       afterRename: hooks.afterRename,
       publication: hooks.publication,
       onLockEvent: hooks.onLockEvent,
@@ -887,6 +893,15 @@ async function writeNativeRuntimeOutcome(
 ): Promise<NativeRuntimeOptionalPublication> {
   checkPath(path)
   const publication = capturePublicationOptions(hooks.publication)
+  const commitRename = (from: string, to: string): Promise<void> => {
+    try {
+      assertHostAuthorityStable()
+      hooks.beforeCommit?.()
+    } catch {
+      throw new NativeRuntimeError('publication-refused')
+    }
+    return (publication.rename ?? rename)(from, to)
+  }
   try {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 })
     return await withLock(
@@ -954,7 +969,7 @@ async function writeNativeRuntimeOutcome(
             const result = await renameWithWindowsSharingRetry(
               stage,
               path,
-              publication,
+              { ...publication, rename: commitRename },
               async () => {
                 let decision: 'publish' | 'skip'
                 try {
@@ -978,7 +993,7 @@ async function writeNativeRuntimeOutcome(
               },
             )
             if (result === 'skipped') return { status: 'skipped' }
-          } else await (publication.rename ?? rename)(stage, path)
+          } else await commitRename(stage, path)
           ownsStage = false
           try {
             await hooks.afterRename?.()

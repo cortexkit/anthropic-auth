@@ -10,6 +10,7 @@ import {
   AnthropicOAuthOriginError,
   applyCustomHeaders,
   applyRunnerTurnNotes,
+  assertHostAuthorityStable,
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
   classifyGzipRejection,
@@ -1411,6 +1412,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           const dispatch = authorized.dispatch
           const resendFetch = async (url: string, init: RequestInit) => {
             try {
+              assertHostAuthorityStable()
               return await (deps.fetch ?? globalThis.fetch)(url, init)
             } catch (error) {
               request.signal.throwIfAborted()
@@ -1485,14 +1487,16 @@ export function createNativeAnthropicAdapter<Q, P>(
               body: createBody,
               headers: retryHeaders,
               latch: requestGzipLatch,
-              send: (wireBody, wireHeaders) =>
-                resendFetch(url, {
+              send: (wireBody, wireHeaders) => {
+                assertHostAuthorityStable()
+                return resendFetch(url, {
                   method: request.method,
                   body: wireBody,
                   headers: wireHeaders,
                   signal: request.signal,
                   redirect: 'error',
-                }),
+                })
+              },
             })
           }
           return inspectableThreadError(response)
@@ -1553,6 +1557,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       } else {
         dropDumpContext(data)
       }
+      assertHostAuthorityStable()
       return new Request(send.dispatch.url, {
         method: 'POST',
         headers: {
@@ -1599,6 +1604,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     } else {
       dropDumpContext(data)
     }
+    assertHostAuthorityStable()
     return new Request(url, {
       method: request.method,
       headers,

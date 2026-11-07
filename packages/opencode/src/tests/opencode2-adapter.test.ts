@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { gunzipSync } from 'node:zlib'
+import * as core from '@cortexkit/anthropic-auth-core'
 import {
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   CLAUDE_CODE_IDENTITY,
@@ -3327,3 +3328,191 @@ test.each(['kept input', 'edited input'])(
     }
   },
 )
+
+for (const transport of ['direct', 'http-relay'] as const) {
+  test(`OC2 ${transport} final request refuses an authority flip during awaited body preparation`, async () => {
+    core.isVaultHosted()
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>()
+    const { source } = makeSource({
+      authorize: () =>
+        oauth(
+          'synthetic-vault-token',
+          { custody: 'vault', receipt: 'original', version: 7 },
+          {
+            dispatch:
+              transport === 'http-relay'
+                ? {
+                    kind: 'http-relay',
+                    url: 'https://relay.invalid',
+                    token: 'synthetic-relay',
+                  }
+                : { kind: 'direct' },
+          },
+        ),
+      onRequestPrepared: async () => {
+        entered.resolve()
+        await release.promise
+      },
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+    const pending = host.run(scopeOf(), hostRequest(sonnetPayload()))
+    const settled = Promise.allSettled([pending])
+    try {
+      await Promise.race([
+        entered.promise,
+        pending.then(() => {
+          throw new Error('request passed the body-preparation barrier')
+        }),
+      ])
+      process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+      release.resolve()
+      expect((await settled)[0]?.status).toBe('rejected')
+      expect(host.sent).toEqual([])
+    } finally {
+      release.resolve()
+      await settled
+      native.dispose()
+      delete process.env.CORTEXKIT_VAULT_HOST
+    }
+  })
+}
+
+for (const transport of ['direct-gzip', 'http-relay'] as const) {
+  test(`OC2 ${transport} thread resend refuses an authority flip after awaited resend preparation`, async () => {
+    core.isVaultHosted()
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>()
+    let armed = false,
+      sends = 0
+    const { source } = makeSource({
+      authorize: () =>
+        oauth(
+          'synthetic-thread-vault',
+          { custody: 'vault', receipt: 'thread', version: 7 },
+          {
+            dispatch:
+              transport === 'http-relay'
+                ? {
+                    kind: 'http-relay',
+                    url: 'https://relay.invalid',
+                    token: 'synthetic-relay',
+                  }
+                : { kind: 'direct' },
+          },
+        ),
+      admitRequest: async () => {
+        if (armed && transport === 'http-relay') {
+          entered.resolve()
+          await release.promise
+        }
+      },
+    })
+    const gzip = core.sendWithRequestGzip
+    const gzipSpy = spyOn(core, 'sendWithRequestGzip').mockImplementation(
+      (options) =>
+        gzip({
+          ...options,
+          send: async (...args) => {
+            if (armed) {
+              entered.resolve()
+              await release.promise
+            }
+            return options.send(...args)
+          },
+        }),
+    )
+    const native = createNativeAnthropicAdapter({
+      source,
+      fetch: Object.assign(
+        async () => {
+          sends++
+          return new Response('unexpected resend', { status: 400 })
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    })
+    const host = new Host(native.adapter)
+    const payload = {
+      model: 'claude-sonnet-5',
+      stream: true,
+      messages: [{ role: 'user', content: `first ${'x'.repeat(9000)}` }],
+    }
+    let settled: Promise<unknown> | undefined
+    try {
+      const first = await host.run(scopeOf(), hostRequest(payload))
+      await (
+        await native.adapter.rewriteResponse?.({
+          ...first.attempt,
+          attempt: first.attempt,
+          request: first.final,
+          response: new Response(
+            sse('message_start', {
+              type: 'message_start',
+              message: {
+                id: 'msg_host_flip',
+                content: [{ type: 'text', text: 'answer' }],
+              },
+            }) +
+              sse('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: 'end_turn' },
+              }) +
+              sse('message_stop', { type: 'message_stop' }),
+            {
+              headers: {
+                'content-type': 'text/event-stream',
+                'request-id': 'req_flip_anchor',
+              },
+            },
+          ),
+        } as never)
+      )?.text()
+      const second = await host.run(
+        scopeOf(),
+        hostRequest({
+          ...payload,
+          messages: [
+            ...payload.messages,
+            { role: 'assistant', content: 'answer' },
+            { role: 'user', content: 'next' },
+          ],
+        }),
+      )
+      armed = true
+      const pending = native.adapter.rewriteResponse?.({
+        ...second.attempt,
+        attempt: second.attempt,
+        request: second.final,
+        response: Response.json(
+          {
+            type: 'error',
+            error: {
+              type: 'not_found_error',
+              details: { error_code: 'thread_not_found' },
+            },
+          },
+          { status: 404, headers: { 'request-id': 'req_flip_rejected' } },
+        ),
+      } as never)
+      settled = Promise.allSettled([pending])
+      await Promise.race([
+        entered.promise,
+        Promise.resolve(pending).then(() => {
+          throw new Error('thread resend passed its preparation barrier')
+        }),
+      ])
+      process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+      release.resolve()
+      await settled
+      expect(sends).toBe(0)
+    } finally {
+      release.resolve()
+      await settled
+      gzipSpy.mockRestore()
+      native.dispose()
+      delete process.env.CORTEXKIT_VAULT_HOST
+    }
+  })
+}

@@ -458,6 +458,7 @@ export function createNativeVaultRuntime(
   // notice that carries it runs no discovery. Tracked here rather than left
   // to custody, because a refresh can adopt a roster a peer process listed.
   let rosterView: string | undefined
+  let insulaTransportEpoch = 0
   const newCustody = () =>
     createNativeCustody({
       host: options.host,
@@ -470,7 +471,14 @@ export function createNativeVaultRuntime(
       env,
       setTimeout: options.setTimeout,
       clearTimeout: options.clearTimeout,
+      logger: isVaultHosted()
+        ? {
+            warn: (message) => logger.warn('claustrum', message),
+            debug: (message) => logger.debug('claustrum', message),
+          }
+        : undefined,
       onConnectionChanged: () => {
+        insulaTransportEpoch++
         closeRosterWatch()
         insula?.release()
         insula = undefined
@@ -519,6 +527,7 @@ export function createNativeVaultRuntime(
         release(): void
         owner: NativeCustody
         generation: number
+        transportEpoch: number
       }
     | undefined
   const unwatchAuthority = watchNativeVaultAuthority({
@@ -540,33 +549,42 @@ export function createNativeVaultRuntime(
       const owner = custody
       const hosted = custodyHosted
       const generation = owner.generation ?? 0
+      const transportEpoch = insulaTransportEpoch
+      const assertTransport = () => {
+        assertCustodyOwner(owner, generation)
+        if (transportEpoch !== insulaTransportEpoch)
+          throw new NativeCustodyError('route-unavailable')
+      }
       if (!hosted) await readClaustrumEnrollmentToken(tokenPath)
-      assertCustodyOwner(owner, generation)
+      assertTransport()
       if (
         insula &&
-        (insula.owner !== owner || insula.generation !== generation)
+        (insula.owner !== owner ||
+          insula.generation !== generation ||
+          insula.transportEpoch !== transportEpoch)
       ) {
         insula.release()
         insula = undefined
       }
       if (!insula) {
         const transport = await owner.insulaTransport()
-        assertCustodyOwner(owner, generation)
+        assertTransport()
         if (!transport) return
         const acquired = acquireInsulaQuotaSource(
           transport,
           hosted ? hostedInsulaCacheKey : tokenPath,
         )
         try {
-          assertCustodyOwner(owner, generation)
-          if (!insula) insula = { ...acquired, owner, generation }
+          assertTransport()
+          if (!insula)
+            insula = { ...acquired, owner, generation, transportEpoch }
           else acquired.release()
         } catch (error) {
           acquired.release()
           throw error
         }
       }
-      assertCustodyOwner(owner, generation)
+      assertTransport()
       await insula.source.refresh(clock())
     } catch {
       // Insula is optional: without it every account keeps its own poll.
@@ -1072,9 +1090,12 @@ export function createNativeVaultRuntime(
           return [{ retry: false, reason: 'credential-changed' }, next]
         if (next.assertedAccountIdentity !== served.assertedAccountIdentity)
           return [{ retry: false, reason: 'account-changed' }, next]
+        const replacementReceipt =
+          custody.isPreviousConnectionReceipt?.(served) &&
+          !custody.isPreviousConnectionReceipt?.(next)
         if (
           next.fromKeptReceipt ||
-          !(next.recordVersion > served.recordVersion)
+          (!replacementReceipt && !(next.recordVersion > served.recordVersion))
         )
           return [{ retry: false, reason: 'version-not-newer' }, next]
         // Mark the retry-issued receipt too, so handing it back cannot restart
@@ -1095,6 +1116,8 @@ export function createNativeVaultRuntime(
           retry: result.retry,
           reason: result.retry ? 'rotated' : result.reason,
         })
+      requireIssued(served)
+      if (current) requireIssued(current)
       return result
     },
     publish(receipt, rawPatch, signal) {
@@ -1332,6 +1355,8 @@ export function createNativeVaultRuntime(
     },
     async setEnabled(routeId, enabled) {
       await requireActive()
+      const owner = custody
+      const generation = owner.generation ?? 0
       const roster = await readVaultRoster(paths.roster)
       const row = await rowFor(roster, routeId)
       if (!row) throw new NativeCustodyError('route-unavailable')
@@ -1340,41 +1365,52 @@ export function createNativeVaultRuntime(
       // disable calls report no change. Enabling removes this credential/account
       // pair from declined entries; disabling adds it so discovery cannot enable
       // it again.
-      const changed = await mutateVaultRoster(paths.roster, async (current) => {
-        // Runs under the roster write lock, which a mover holds while it
-        // replaces the runtime files with tombstones.
-        await relocation.assertNotRelocated()
-        const held = current?.rows.find(
-          (entry) => entry.routeId === row.routeId,
-        )
-        if (!current || !held)
-          throw new ClaustrumConsumerError(
-            'route-unavailable',
-            'Claustrum route is not in the roster',
+      const changed = await mutateVaultRoster(
+        paths.roster,
+        async (current) => {
+          // Runs under the roster write lock, which a mover holds while it
+          // replaces the runtime files with tombstones.
+          await relocation.assertNotRelocated()
+          assertCustodyOwner(owner, generation)
+          const held = current?.rows.find(
+            (entry) => entry.routeId === row.routeId,
           )
-        if (!enabled) custody.forget(held.credentialId)
-        return {
-          next: {
-            ...current,
-            declined: enabled
-              ? acceptAccount(
-                  current.declined,
-                  [held.credentialId, ...(held.aliases ?? [])],
-                  held.accountIdentity,
-                )
-              : declineAccount(
-                  current.declined,
-                  held.credentialId,
-                  held.accountIdentity,
-                ),
-            rows: current.rows.map((entry) =>
-              entry === held ? { ...entry, enabled } : entry,
-            ),
+          if (!current || !held)
+            throw new ClaustrumConsumerError(
+              'route-unavailable',
+              'Claustrum route is not in the roster',
+            )
+          if (!enabled) custody.forget(held.credentialId)
+          return {
+            next: {
+              ...current,
+              declined: enabled
+                ? acceptAccount(
+                    current.declined,
+                    [held.credentialId, ...(held.aliases ?? [])],
+                    held.accountIdentity,
+                  )
+                : declineAccount(
+                    current.declined,
+                    held.credentialId,
+                    held.accountIdentity,
+                  ),
+              rows: current.rows.map((entry) =>
+                entry === held ? { ...entry, enabled } : entry,
+              ),
+            },
+            result: held.enabled !== enabled,
+          }
+        },
+        {
+          beforePublish: () => {
+            assertCustodyOwner(owner, generation)
+            return Promise.resolve()
           },
-          result: held.enabled !== enabled,
-        }
-      })
+        },
+      )
       retainNativeVaultRoster(paths.roster, await readVaultRoster(paths.roster))
+      assertCustodyOwner(owner, generation)
       return changed
     },
     close() {
@@ -1514,6 +1550,7 @@ export function createNativeVaultRuntime(
         {
           onLockEvent: options.onLockEvent,
           signal,
+          beforeCommit: () => assertCustodyOwner(route.owner, route.generation),
           beforeRename: async () => {
             await requireActive()
             const pinned = await rowFor(
@@ -1567,13 +1604,15 @@ export function createNativeVaultRuntime(
       input: Parameters<typeof fetch>[0],
       init?: Parameters<typeof fetch>[1],
     ) => {
-      const physical = () =>
-        fetchImpl(input, {
+      const physical = () => {
+        requireIssued(served)
+        return fetchImpl(input, {
           ...init,
           signal: init?.signal
             ? AbortSignal.any([combined, init.signal])
             : combined,
         })
+      }
       if (!dispatch) return physical()
       return dispatch(physical, async () => {
         await requireActive(combined)

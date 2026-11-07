@@ -4436,3 +4436,53 @@ test('a hosted marker appearing during the final physical refresh policy read pr
     delete process.env.CORTEXKIT_VAULT_HOST
   }
 })
+
+test('existing-access identity bootstrap refuses a hosted flip during its awaited admission read', async () => {
+  const f = await fixture()
+  await f.add('a', 'A')
+  const entered = barrier(),
+    release = barrier()
+  let lookups = 0,
+    exchanges = 0
+  const c = f.coordinator({
+    readAdmission: async () => {
+      entered.release()
+      await release.promise
+      return { status: 'unproven' }
+    },
+    resolveIdentity: async () => {
+      lookups++
+      return identity('a', undefined, undefined)
+    },
+    refreshToken: async () => {
+      exchanges++
+      return { ...credential('forbidden-hosted'), expiresIn: 3600 }
+    },
+  })
+  const pending = c.authorize({
+    mode: 'local',
+    binding: await f.binding('a'),
+    intent: 'serve',
+  })
+  const settled = Promise.allSettled([pending])
+  try {
+    await Promise.race([
+      entered.promise,
+      pending.then(() => {
+        throw new Error('admission completed before barrier')
+      }),
+    ])
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    release.release()
+    expect((await settled)[0]).not.toMatchObject({
+      status: 'fulfilled',
+      value: { status: 'usable' },
+    })
+    expect(lookups).toBe(0)
+    expect(exchanges).toBe(0)
+  } finally {
+    release.release()
+    await settled
+    delete process.env.CORTEXKIT_VAULT_HOST
+  }
+})

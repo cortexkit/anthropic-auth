@@ -35,12 +35,14 @@ import {
   quotaSnapshotPassesPolicy,
   readNativeAccountsForRequest,
   readNativeEnrollmentMode,
+  resetVaultHostAuthorityForTests,
   resolveNativePoolPaths,
   runNativeMigration,
   sessionCacheActivity,
   setLogLevel,
   stickyRetryAfterWithJitter,
 } from '@cortexkit/anthropic-auth-core'
+import { ClaustrumUnreachableError } from '@cortexkit/common-auth/claustrum'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
   type LimitSignal,
@@ -1435,6 +1437,11 @@ async function vault(
   servedIdentity: (get: number) => string = () => identity,
   routing: { mode: string } = { mode: 'main-first' },
   onLockEvent?: NativeAccountRuntime['onLockEvent'],
+  hosted?: {
+    install(client: NativeCustodyClient): void
+    setTimeout: typeof setTimeout
+    clearTimeout: typeof clearTimeout
+  },
 ) {
   const { paths, env, store: localStore } = await storage()
   await writeFile(
@@ -1496,6 +1503,7 @@ async function vault(
     },
     close() {},
   }
+  hosted?.install(client)
   const runtime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
@@ -1504,6 +1512,8 @@ async function vault(
       env,
       connect: async () => client,
       readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
+      setTimeout: hosted?.setTimeout,
+      clearTimeout: hosted?.clearTimeout,
     },
   })
   await runtime.vault.refresh()
@@ -4141,4 +4151,189 @@ test('audit OC2 configured 400 policy reaches the installed retry hook and can m
   expect(next.headers.get('authorization')).toBe(
     'Bearer sk-ant-oat01-oauth:anthropic:work',
   )
+})
+
+async function hostedVault(versions = [7, 7]) {
+  const key = Symbol.for('cortexkit.vault')
+  const globals = globalThis as unknown as Record<symbol, unknown>
+  const prior = globals[key]
+  const closed = Promise.withResolvers<void>()
+  let outage = false,
+    connections = 0
+  type Timer = {
+    callback(): void
+    delay: number
+    cleared: boolean
+    unref(): void
+  }
+  const timers: Timer[] = []
+  const f = await vault(
+    versions,
+    () => identity,
+    { mode: 'main-first' },
+    undefined,
+    {
+      setTimeout: ((callback: () => void, delay: number) => {
+        const timer = { callback, delay, cleared: false, unref() {} }
+        timers.push(timer)
+        return timer
+      }) as unknown as typeof setTimeout,
+      clearTimeout: ((timer: Timer) => {
+        timer.cleared = true
+      }) as unknown as typeof clearTimeout,
+      install(client) {
+        resetVaultHostAuthorityForTests?.()
+        process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+        cleanups.push(() => {
+          delete process.env.CORTEXKIT_VAULT_HOST
+          if (prior === undefined) delete globals[key]
+          else globals[key] = prior
+        })
+        globals[key] = () => {
+          const connection = connections++
+          const check = () => {
+            if (connection === 0 && outage)
+              throw new ClaustrumUnreachableError()
+          }
+          return {
+            ...client,
+            listScoped: async (
+              ...args: Parameters<NativeCustodyClient['listScoped']>
+            ) => {
+              check()
+              return client.listScoped(...args)
+            },
+            getScoped: async (
+              ...args: Parameters<NativeCustodyClient['getScoped']>
+            ) => {
+              check()
+              return client.getScoped(...args)
+            },
+            close: () => {
+              if (connection === 0) closed.resolve()
+            },
+          }
+        }
+      },
+    },
+  )
+  return {
+    ...f,
+    swap: async () => {
+      outage = true
+      await f.runtime.vault.authorize('main')
+      const timer = timers.find((timer) => timer.delay === 0 && !timer.cleared)
+      if (!timer) throw new Error('Reconnect was not scheduled')
+      timer.cleared = true
+      timer.callback()
+      await closed.promise
+    },
+  }
+}
+
+test('OC2 admitted-then-send preserves its pre-swap receipt and retries its first 401 on current custody', async () => {
+  const f = await hostedVault()
+  const native = source(f.runtime, f.paths)
+  const managed = createNativeAnthropicAdapter({ source: native })
+  cleanups.push(() => managed.dispose())
+  const input = { ...scope, accountId: 'main' }
+  const headers = await managed.adapter.accountHeaders(input)
+  if (!headers.attempt || typeof headers.attempt !== 'object')
+    throw new Error('Native account headers did not return attempt provenance')
+  const attempt = {
+    ...input,
+    attemptId: 'host-swap-send',
+    transport: 'http' as const,
+    data: headers.attempt,
+  }
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>()
+  const admit = native.admitRequest!.bind(native)
+  const spy = spyOn(native, 'admitRequest').mockImplementation(
+    async (...args) => {
+      await admit(...args)
+      entered.resolve()
+      await release.promise
+    },
+  )
+  const pending = managed.adapter.rewriteRequest!({
+    ...attempt,
+    attempt,
+    request: new Request('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }),
+  })
+  const settled = Promise.allSettled([pending])
+  cleanups.push(async () => {
+    release.resolve()
+    await settled
+    spy.mockRestore()
+  })
+  await entered.promise
+  await f.swap()
+  release.resolve()
+  expect(await pending).toBeInstanceOf(Request)
+  expect(f.gets).toHaveLength(1)
+  const limit = await managed.adapter.limitFromResponse?.({
+    status: 401,
+    headers: new Headers(),
+    body: async () => '{}',
+    attempt,
+  })
+  expect(limit).toBeDefined()
+  expect(f.reports).toEqual([])
+  expect(f.gets).toHaveLength(2)
+})
+
+test('OC2 queued authorization survives a relay swap during its receipt-held admission read', async () => {
+  const f = await hostedVault([7, 8, 8])
+  const native = source(f.runtime, f.paths)
+  const first = await native.authorizeAccount(scope, 'main')
+  if (!first) throw new Error('Initial authorization refused')
+  const limit = await native.limitFromResponse?.({
+    ...context(first.provenance),
+    status: 401,
+    headers: new Headers(),
+    body: async () => '{}',
+  })
+  if (!limit) throw new Error('Retry refused')
+  expect(await native.retrySameAccount?.(sameAccountInput(limit))).toEqual({
+    accountId: 'main',
+  })
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>()
+  const read = f.runtime.read.bind(f.runtime)
+  let held = false
+  const spy = spyOn(f.runtime, 'read').mockImplementation(async (...args) => {
+    const snapshot = await read(...args)
+    if (!held) {
+      held = true
+      entered.resolve()
+      await release.promise
+    }
+    return snapshot
+  })
+  const pending = native.authorizeAccount(scope, 'main')
+  const settled = Promise.allSettled([pending])
+  cleanups.push(async () => {
+    release.resolve()
+    await settled
+    spy.mockRestore()
+  })
+  await entered.promise
+  await f.swap()
+  release.resolve()
+  const auth = await pending
+  if (auth?.route !== 'oauth') throw new Error('Queued receipt was lost')
+  expect(auth.accessToken).toBe('sk-ant-oat01-vault-8')
+  await native.onAttemptEnd?.(context(auth.provenance, 'queued-after-swap'), {
+    status: 401,
+    outputStarted: false,
+  })
+  expect(f.reports.map((report) => report.recordVersion)).toEqual([7])
+  expect(f.gets).toHaveLength(2)
 })

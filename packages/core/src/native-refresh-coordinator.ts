@@ -922,6 +922,7 @@ export function createNativeRefreshCoordinator(
             let validatedIdentity: string | undefined
             let validationFailure: NativeRefreshFailure | undefined
             try {
+              assertHostAuthorityStable()
               validatedIdentity = (
                 await bootstrap(seen.credential.access, undefined, undefined)
               ).accountUuid

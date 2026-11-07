@@ -311,6 +311,9 @@ export type NativeCustodyRetry =
     }
 
 export interface NativeCustody {
+  /** Whether a 401 needs fresh authorization because a previous relay issued the receipt. */
+  isPreviousConnectionReceipt?: (receipt: NativeCustodyReceipt) => boolean
+  /** Authority lifetime only; replacing a relay does not retire issued tokens. */
   readonly generation?: number
   discover: (signal?: AbortSignal) => Promise<NativeCustodyInventory>
   authorize: (
@@ -361,7 +364,12 @@ export function createNativeCustody(
   const onClose = new Set<() => void>()
   // Weak membership rejects copied or foreign receipts without retaining them.
   // Common-auth keeps the original receipt's send-time enrollment token private.
-  const receipts = new WeakMap<object, number>()
+  const receipts = new WeakMap<
+    object,
+    { generation: number; owner: ClaustrumScopedCustody }
+  >()
+  const retryUsed = new WeakSet<object>()
+  const reconnectReports = new WeakSet<object>()
   let generation = 0
 
   function check(signal?: AbortSignal): void {
@@ -546,6 +554,7 @@ export function createNativeCustody(
       promoted: false,
     }
     probe = held
+    let retry = false
     try {
       check()
       held.client = connectVaultHost('anthropic-auth')
@@ -563,10 +572,12 @@ export function createNativeCustody(
       await held.primitive.discover(held.abort.signal)
       check()
       if (held.closed || primitive !== previous) return
+      if (previous instanceof HostedCustody && !previous.relayUnavailable)
+        return
+      if (retained) held.primitive.retain(retained)
       primitive = held.primitive
       client = held.client
       connecting = Promise.resolve(held.client)
-      generation++
       held.promoted = true
       reconnectFailures = 0
       try {
@@ -580,20 +591,31 @@ export function createNativeCustody(
         error.code === 'enrollment_revoked'
       ) {
         revoked = true
-        custody.close()
+        try {
+          custody.close()
+        } catch {
+          /* A failed shutdown must not reject the background probe. */
+        }
       }
-      reconnectFailures++
+      retry = classifyVaultFailure(error) === 'unreachable'
+      if (retry) reconnectFailures++
     } finally {
       closeProbe(held)
       if (probe === held) probe = undefined
-      if (!held.promoted) scheduleReconnect()
+      if (retry && !held.promoted) scheduleReconnect()
     }
   }
 
   class HostedCustody extends ClaustrumScopedCustody {
+    relayUnavailable = false
     override transportLost(error?: unknown) {
+      this.relayUnavailable = true
       super.transportLost(error)
       if (primitive === this) scheduleReconnect()
+    }
+    override reachable() {
+      this.relayUnavailable = false
+      super.reachable()
     }
   }
 
@@ -625,7 +647,7 @@ export function createNativeCustody(
       now: options.now,
       // Common-auth also probes outages while idle. Fence those callbacks so
       // its own fresh marker read cannot bypass the process authority latch.
-      setTimeoutImpl: guardedTimer,
+      setTimeoutImpl: hosted ? guardedTimer : setTimer,
       clearTimeoutImpl: clearTimer,
       // Supply logger callbacks so common-auth cannot select its default logger.
       // Only the fixed messages below reach the caller; record details never do.
@@ -692,21 +714,30 @@ export function createNativeCustody(
 
   function requireReceipt(receipt: NativeCustodyReceipt): void {
     if (!receipts.has(receipt)) throw new NativeCustodyError('no-receipt')
-    if (receipts.get(receipt) !== generation)
+    if (receipts.get(receipt)?.generation !== generation)
       throw new NativeCustodyError('route-unavailable')
+  }
+  function currentPrimitive(): ClaustrumScopedCustody {
+    if (!primitive) throw new NativeCustodyError('unavailable')
+    return primitive
+  }
+  function previousConnectionReceipt(receipt: NativeCustodyReceipt): boolean {
+    check()
+    requireReceipt(receipt)
+    return hosted && receipts.get(receipt)?.owner !== primitive
   }
 
   const custody: NativeCustody = {
+    isPreviousConnectionReceipt: previousConnectionReceipt,
     get generation() {
       return generation
     },
     discover: (signal) =>
       run(async () => {
-        const owner = await ready()
+        await ready()
         check(signal)
+        const owner = currentPrimitive()
         const inventory = await owner.discover(signal)
-        if (owner !== primitive)
-          throw new NativeCustodyError('route-unavailable')
         return inventory
       }, signal),
     authorize: (identity, signal) =>
@@ -724,8 +755,9 @@ export function createNativeCustody(
         }
         if (!accountIdentity?.trim())
           throw new NativeCustodyError('identity-unasserted')
-        const owner = await ready()
+        await ready()
         check(signal)
+        const owner = currentPrimitive()
         const receipt = await owner.authorize(
           {
             credentialId,
@@ -735,9 +767,7 @@ export function createNativeCustody(
           signal,
         )
         check(signal)
-        if (owner !== primitive)
-          throw new NativeCustodyError('route-unavailable')
-        receipts.set(receipt, generation)
+        receipts.set(receipt, { generation, owner })
         // Fixed OAuth input narrows common-auth's two-credential-type declaration.
         // Return the original object, preserving its non-enumerable accessToken.
         return receipt as NativeCustodyReceipt
@@ -745,14 +775,28 @@ export function createNativeCustody(
     reportFailure: (receipt, status, reporterSource) =>
       run(async () => {
         requireReceipt(receipt)
-        const owner = await ready()
+        await ready()
         check()
         requireReceipt(receipt)
-        await owner.reportFailure(receipt, status, reporterSource)
+        if (previousConnectionReceipt(receipt)) {
+          if (status === 401 && !reconnectReports.has(receipt)) {
+            reconnectReports.add(receipt)
+            logger?.debug(
+              'Native custody 401 crossed a relay replacement; fresh authorization required',
+            )
+          }
+          return
+        }
+        await currentPrimitive().reportFailure(receipt, status, reporterSource)
       }),
     prepareRetry: async (served, signal) => {
       check(signal)
       requireReceipt(served)
+      if (hosted) {
+        if (retryUsed.has(served))
+          return { retry: false, reason: 'version-not-newer' }
+        retryUsed.add(served)
+      }
       if (served.fromKeptReceipt) {
         primitive?.forget(served.credentialId)
         return { retry: false, reason: 'reauthorize-failed' }
@@ -791,12 +835,16 @@ export function createNativeCustody(
       if (current.assertedAccountIdentity !== served.assertedAccountIdentity) {
         return { retry: false, reason: 'account-changed' }
       }
+      // Only a replacement relay's fresh authorization may reuse the version.
+      const replacementReceipt =
+        previousConnectionReceipt(served) && !previousConnectionReceipt(current)
       if (
         current.fromKeptReceipt ||
-        !(current.recordVersion > served.recordVersion)
+        (!replacementReceipt && !(current.recordVersion > served.recordVersion))
       ) {
         return { retry: false, reason: 'version-not-newer' }
       }
+      if (hosted) retryUsed.add(current)
       return { retry: true, receipt: current }
     },
     insulaTransport: () => scoped(async (owned) => owned.insula),
@@ -837,13 +885,19 @@ export function createNativeCustody(
     close: () => {
       if (closed) return
       closed = true
+      generation++
       unwatchHostAuthority()
       if (reconnectTimer) clearTimer(reconnectTimer)
       reconnectTimer = undefined
       if (probe) closeProbe(probe)
       for (const stop of onClose) stop()
-      if (primitive) primitive.close()
-      else client?.close()
+      try {
+        if (primitive) primitive.close()
+        else client?.close()
+      } catch (error) {
+        if (!hosted) throw error
+        // A dead relay's close must not reject a request or background probe.
+      }
     },
   }
   const unwatchHostAuthority = onHostAuthorityChanged(() => {
