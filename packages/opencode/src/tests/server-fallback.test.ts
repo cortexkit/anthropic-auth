@@ -5,12 +5,77 @@ import {
   resolveContentFilterFallbackMode,
   SERVER_FALLBACK_MARKER_TEXT,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_FALLBACK_USAGE_MARKER_TEXT,
+  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
   type ServerSideFallbackOutcome,
 } from '../server-fallback'
+import { createStrippedStream, rewriteRequestBody } from '../transform'
 
 const sse = (event: string, data: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+
+const iterations = [
+  {
+    type: 'message',
+    model: 'claude-opus-5-5',
+    input_tokens: 100,
+    cache_read_input_tokens: 400_000,
+    cache_creation_input_tokens: 500,
+    output_tokens: 0,
+  },
+  {
+    type: 'fallback_message',
+    model: 'claude-opus-4-8',
+    input_tokens: 120,
+    cache_read_input_tokens: 390_000,
+    cache_creation_input_tokens: 10_480,
+    output_tokens: 80,
+  },
+]
+
+const terminalUsage = {
+  input_tokens: 220,
+  cache_read_input_tokens: 790_000,
+  cache_creation_input_tokens: 10_980,
+  output_tokens: 80,
+  iterations,
+}
+
+const events = (stream: string) =>
+  stream
+    .split('\n\n')
+    .filter(Boolean)
+    .map((frame) => JSON.parse(frame.split('\ndata: ')[1] ?? 'null'))
+
+function usageStream(usage: unknown = terminalUsage, handoff = true) {
+  const beforeTerminal = fallbackStream({
+    requestedModel: 'claude-opus-5-5',
+    servedModel: 'claude-opus-4-8',
+    includeHandoff: handoff,
+  }).split('event: message_delta')[0]
+  return {
+    beforeTerminal:
+      beforeTerminal +
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 4,
+        content_block: { type: 'text', text: '' },
+      }) +
+      sse('content_block_delta', {
+        type: 'content_block_delta',
+        index: 4,
+        delta: { type: 'text_delta', text: 'fallback answer' },
+      }) +
+      sse('content_block_stop', { type: 'content_block_stop', index: 4 }),
+    terminal:
+      sse('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage,
+      }) + sse('message_stop', { type: 'message_stop' }),
+  }
+}
 
 function fallbackStream(options?: {
   requestedModel?: string
@@ -281,6 +346,151 @@ describe('applyServerSideFallbackToBody', () => {
 })
 
 describe('createServerSideFallbackStreamRewriter', () => {
+  test('exposes terminal fallback iterations in a separate complete hidden marker without changing billed usage', async () => {
+    for (const handoff of [true, false]) {
+      const { beforeTerminal, terminal } = usageStream(terminalUsage, handoff)
+      const rewriter = createServerSideFallbackStreamRewriter({
+        requestedModel: 'claude-opus-5-5',
+      })
+      const early = rewriter.push(beforeTerminal)
+      expect(early).toContain('fallback answer')
+      expect(early).not.toContain(SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX)
+      const late = rewriter.push(terminal) + rewriter.flush()
+      expect(late.endsWith(terminal)).toBe(true)
+      const frames = events(late)
+      expect(frames.slice(0, 3)).toEqual([
+        {
+          type: 'content_block_start',
+          index: 5,
+          content_block: {
+            type: 'thinking',
+            thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
+          },
+        },
+        {
+          type: 'content_block_delta',
+          index: 5,
+          delta: {
+            type: 'signature_delta',
+            signature: expect.stringContaining(
+              SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+            ),
+          },
+        },
+        { type: 'content_block_stop', index: 5 },
+      ])
+      expect(
+        JSON.parse(
+          frames[1].delta.signature.slice(
+            SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX.length,
+          ),
+        ),
+      ).toEqual({ iterations })
+      expect(frames[3].usage).toEqual(terminalUsage)
+      const wrapped = createStrippedStream(
+        new Response(beforeTerminal + terminal),
+        {
+          serverSideFallbackModel: 'claude-opus-5-5',
+        },
+      )
+      expect(await wrapped.text()).toBe(early + late)
+    }
+  })
+
+  test('bounds fallback usage metadata and ignores unknown fields', () => {
+    const rewrite = (usage: unknown) => {
+      const { beforeTerminal, terminal } = usageStream(usage)
+      const rewriter = createServerSideFallbackStreamRewriter({
+        requestedModel: 'claude-opus-5-5',
+      })
+      return rewriter.push(beforeTerminal + terminal) + rewriter.flush()
+    }
+    const output = rewrite({
+      ...terminalUsage,
+      iterations: iterations.map((item) => ({
+        ...item,
+        secret: 'never store',
+      })),
+    })
+    const marker = events(output).find((frame) =>
+      frame.delta?.signature?.startsWith(
+        SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+      ),
+    )
+    expect(
+      JSON.parse(
+        marker.delta.signature.slice(
+          SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX.length,
+        ),
+      ),
+    ).toEqual({ iterations })
+    for (const invalid of [
+      [],
+      Array(9).fill(iterations[1]),
+      [{ ...iterations[1], input_tokens: -1 }],
+      [{ ...iterations[1], output_tokens: 1.5 }],
+      [
+        {
+          ...iterations[1],
+          cache_read_input_tokens: Number.MAX_SAFE_INTEGER + 1,
+        },
+      ],
+      [{ ...iterations[1], model: `claude-${'a'.repeat(128)}` }],
+      [{ ...iterations[1], type: 'unknown' }],
+      [iterations[0]],
+    ]) {
+      expect(rewrite({ ...terminalUsage, iterations: invalid })).not.toContain(
+        SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+      )
+    }
+  })
+
+  test('strips usage markers with valid or forged signatures from byte-identical outgoing history', async () => {
+    const body = {
+      model: 'claude-opus-5-5',
+      max_tokens: 100,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: SERVER_FALLBACK_MARKER_TEXT,
+              signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-opus-5-5|claude-opus-4-8`,
+            },
+            { type: 'text', text: 'fallback answer' },
+          ],
+        },
+        { role: 'user', content: [{ type: 'text', text: 'continue' }] },
+      ],
+    }
+    for (const signature of [
+      SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX + JSON.stringify({ iterations }),
+      'forged-provider-signature',
+    ]) {
+      for (const enabled of [true, false]) {
+        const marked = structuredClone(body)
+        marked.messages[1]!.content.push({
+          type: 'thinking',
+          thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
+          signature,
+        })
+        const markedText = JSON.stringify(marked)
+        const plain = structuredClone(body)
+        applyServerSideFallbackToBody(marked, enabled)
+        applyServerSideFallbackToBody(plain, enabled)
+        expect(JSON.stringify(marked)).toBe(JSON.stringify(plain))
+        for (const isOAuth of [true, false]) {
+          const options = { serverSideFallbackEnabled: enabled, isOAuth }
+          expect(await rewriteRequestBody(markedText, options)).toBe(
+            await rewriteRequestBody(JSON.stringify(body), options),
+          )
+        }
+      }
+    }
+  })
+
   test('turns a pre-output handoff into a durable hidden reasoning marker', () => {
     const outcomes: ServerSideFallbackOutcome[] = []
     const stream = fallbackStream()

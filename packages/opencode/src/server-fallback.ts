@@ -1,9 +1,59 @@
-import { resolveClaudeModelCapabilities } from '@cortexkit/anthropic-auth-core'
+import {
+  resolveClaudeModelCapabilities,
+  SERVER_FALLBACK_USAGE_MARKER_TEXT,
+  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+  stripServerFallbackUsageMarkers,
+} from '@cortexkit/anthropic-auth-core'
 import { recoverableRefusalFamily } from './fable-fallback'
 
 export const SERVER_SIDE_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
 export const SERVER_FALLBACK_MARKER_TEXT = '\u2060'
 export const SERVER_FALLBACK_SIGNATURE_PREFIX = 'cortexkit-server-fallback-v1:'
+export {
+  SERVER_FALLBACK_USAGE_MARKER_TEXT,
+  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+}
+
+function usageMarkerSignature(usage: Record<string, unknown> | undefined) {
+  const raw = usage?.iterations
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 8) return
+  const iterations: Record<string, unknown>[] = []
+  for (const value of raw) {
+    const iteration = asRecord(value)
+    if (
+      !iteration ||
+      (iteration.type !== 'message' && iteration.type !== 'fallback_message') ||
+      !safeModelId(iteration.model)
+    )
+      return
+    const clean: Record<string, unknown> = {
+      type: iteration.type,
+      model: iteration.model,
+    }
+    for (const field of [
+      'input_tokens',
+      'output_tokens',
+      'cache_read_input_tokens',
+      'cache_creation_input_tokens',
+    ]) {
+      const count = iteration[field]
+      if (count === undefined && field.startsWith('cache_')) continue
+      if (
+        typeof count !== 'number' ||
+        !Number.isSafeInteger(count) ||
+        count < 0
+      )
+        return
+      clean[field] = count
+    }
+    iterations.push(clean)
+  }
+  if (!iterations.some((iteration) => iteration.type === 'fallback_message'))
+    return
+  const payload = JSON.stringify({ iterations })
+  if (payload.length > 4096) return
+  return SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX + payload
+}
 
 export type ContentFilterFallbackMode = 'server' | 'legacy'
 
@@ -91,7 +141,7 @@ function fallbackBlock(marker: ServerSideFallbackMarker) {
 
 function rewriteStoredMarkers(body: Record<string, unknown>, enabled: boolean) {
   let restoredMarkers = 0
-  let droppedMarkers = 0
+  let droppedMarkers = stripServerFallbackUsageMarkers(body)
   if (!Array.isArray(body.messages)) {
     return { restoredMarkers, droppedMarkers }
   }
@@ -186,14 +236,14 @@ function sseFrame(event: string, data: Record<string, unknown>) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
-function hiddenMarkerFrames(index: number, marker: ServerSideFallbackMarker) {
+function hiddenThinkingFrames(index: number, text: string, signature: string) {
   return (
     sseFrame('content_block_start', {
       type: 'content_block_start',
       index,
       content_block: {
         type: 'thinking',
-        thinking: SERVER_FALLBACK_MARKER_TEXT,
+        thinking: text,
       },
     }) +
     sseFrame('content_block_delta', {
@@ -201,7 +251,7 @@ function hiddenMarkerFrames(index: number, marker: ServerSideFallbackMarker) {
       index,
       delta: {
         type: 'signature_delta',
-        signature: encodeMarkerSignature(marker),
+        signature,
       },
     })
   )
@@ -229,6 +279,8 @@ export function createServerSideFallbackStreamRewriter(options: {
   let fallbackIterationModel: string | undefined
   let completed = false
   let hasCompletedToolUse = false
+  let maxBlockIndex = -1
+  let usageMarkerEmitted = false
   const openToolUseIndexes = new Set<number>()
 
   const observeIterations = (usage: Record<string, unknown> | undefined) => {
@@ -273,6 +325,12 @@ export function createServerSideFallbackStreamRewriter(options: {
       const block = asRecord(data?.content_block)
       const index = data?.index
       if (
+        typeof index === 'number' &&
+        Number.isSafeInteger(index) &&
+        index >= 0
+      )
+        maxBlockIndex = Math.max(maxBlockIndex, index)
+      if (
         block?.type === 'tool_use' &&
         typeof index === 'number' &&
         Number.isInteger(index) &&
@@ -288,7 +346,11 @@ export function createServerSideFallbackStreamRewriter(options: {
           Number.isInteger(index) &&
           index >= 0
         ) {
-          return hiddenMarkerFrames(index, marker)
+          return hiddenThinkingFrames(
+            index,
+            SERVER_FALLBACK_MARKER_TEXT,
+            encodeMarkerSignature(marker),
+          )
         }
       }
     } else if (type === 'content_block_stop') {
@@ -301,6 +363,28 @@ export function createServerSideFallbackStreamRewriter(options: {
       const delta = asRecord(data?.delta)
       const stopReason = stringField(delta, 'stop_reason')
       if (stopReason) complete(stopReason)
+      let usageMarker = ''
+      if (
+        stopReason &&
+        !usageMarkerEmitted &&
+        maxBlockIndex < Number.MAX_SAFE_INTEGER
+      ) {
+        const signature = usageMarkerSignature(asRecord(data?.usage))
+        if (signature) {
+          usageMarkerEmitted = true
+          const index = ++maxBlockIndex
+          usageMarker =
+            hiddenThinkingFrames(
+              index,
+              SERVER_FALLBACK_USAGE_MARKER_TEXT,
+              signature,
+            ) +
+            sseFrame('content_block_stop', {
+              type: 'content_block_stop',
+              index,
+            })
+        }
+      }
       if (
         stopReason === 'refusal' &&
         hasCompletedToolUse &&
@@ -310,8 +394,9 @@ export function createServerSideFallbackStreamRewriter(options: {
         options.onRefusalAfterToolUse() !== false
       ) {
         delta.stop_reason = 'tool_use'
-        return `${parsed.event ? `event: ${parsed.event}\n` : ''}${data ? `data: ${JSON.stringify(data)}\n` : ''}${boundary}`
+        return `${usageMarker}${parsed.event ? `event: ${parsed.event}\n` : ''}${data ? `data: ${JSON.stringify(data)}\n` : ''}${boundary}`
       }
+      return usageMarker + rawEvent + boundary
     }
     return rawEvent + boundary
   }

@@ -1,6 +1,7 @@
 import { createHash, type Hash } from 'node:crypto'
 import { signRequestBody } from './cch.ts'
 import { logger } from './logger.ts'
+import { isServerFallbackUsageMarker } from './server-fallback-usage.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
 
 export const MESSAGE_THREADS_BETA = 'message-threads-2026-08-12'
@@ -103,6 +104,7 @@ function hasOnlyTextFields(block: Body): boolean {
 class ReplyFingerprint {
   private readonly open = new Map<number, ReplyBlockState>()
   private readonly seen = new Set<number>()
+  private readonly ignored = new Set<number>()
   private readonly tools = new Map<number, [string, string, string]>()
   private readonly layout = new Map<number, Body>()
   private readonly textBlocks = new Map<number, string>()
@@ -160,6 +162,12 @@ class ReplyFingerprint {
       return
     }
     this.seen.add(index)
+    // Host-only usage parts are stripped before sending history and must not
+    // change the provider reply fingerprint used to continue a message thread.
+    if (isServerFallbackUsageMarker(block)) {
+      this.ignored.add(index)
+      return
+    }
     const state: ReplyBlockState = {
       type: block.type,
       signatureLength: 0,
@@ -199,6 +207,7 @@ class ReplyFingerprint {
   }
 
   delta(index: unknown, delta: unknown): void {
+    if (typeof index === 'number' && this.ignored.has(index)) return
     const state = typeof index === 'number' ? this.open.get(index) : undefined
     if (!state || !isBody(delta) || delta.type === 'citations_delta') {
       this.invalid = true
@@ -242,6 +251,7 @@ class ReplyFingerprint {
   }
 
   stop(index: unknown): void {
+    if (typeof index === 'number' && this.ignored.delete(index)) return
     const state = typeof index === 'number' ? this.open.get(index) : undefined
     if (!state || typeof index !== 'number') {
       this.invalid = true
@@ -284,7 +294,7 @@ class ReplyFingerprint {
   }
 
   digest(): string | undefined {
-    if (this.invalid || this.open.size) return undefined
+    if (this.invalid || this.open.size || this.ignored.size) return undefined
     const ordered = [...this.layout].sort(([a], [b]) => a - b)
     const kept = withoutTrailingToolWhitespace(
       ordered.map(([, block]) => block),

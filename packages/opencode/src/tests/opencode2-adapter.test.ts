@@ -31,6 +31,8 @@ import { LANE_START_REQUEST_HEADER } from '../lane-start'
 import {
   SERVER_FALLBACK_MARKER_TEXT,
   SERVER_FALLBACK_SIGNATURE_PREFIX,
+  SERVER_FALLBACK_USAGE_MARKER_TEXT,
+  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
   SERVER_SIDE_FALLBACK_BETA,
 } from '../server-fallback'
 import {
@@ -792,6 +794,16 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
                   thinking: SERVER_FALLBACK_MARKER_TEXT,
                   signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5`,
                 },
+                {
+                  type: 'thinking',
+                  thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
+                  signature: `${SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX}{"iterations":[]}`,
+                },
+                {
+                  type: 'thinking',
+                  thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
+                  signature: 'forged-provider-signature',
+                },
                 ...message.content,
               ],
             }
@@ -818,6 +830,7 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
       'fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07',
     )
     expect(await bodyOf(final)).toEqual(clean)
+    expect(await final.clone().text()).toBe(JSON.stringify(clean))
     expect(final.headers.get('x-api-key')).toBe('sk-ant-api03-row-key')
     expect(final.headers.get('authorization')).toBeNull()
     expect(final.url).toBe(

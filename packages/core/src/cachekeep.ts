@@ -26,6 +26,7 @@ import {
   type ProviderErrorSummary,
   summarizePrewarmProviderError,
 } from './provider-error.ts'
+import { stripServerFallbackUsageMarkers } from './server-fallback-usage.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
 export const CACHE_KEEP_TTL_MS = 60 * 60_000
@@ -337,6 +338,7 @@ export async function buildCacheKeepPrewarmBody(
   }
 
   const warm = structuredClone(body) as Record<string, unknown>
+  stripServerFallbackUsageMarkers(warm)
   delete warm.thread
   stripBillingLineageFromBody(warm)
   warm.max_tokens = 0

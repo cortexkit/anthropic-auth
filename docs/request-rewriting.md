@@ -43,6 +43,24 @@ Unset `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` and restart to return to server-fi
 
 OpenCode 2 applies server-side fallback and response-boundary rewriting in its Anthropic provider integration. It does not run OpenCode 1's client recovery backoff. `OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK` controls the server opt-in: `legacy` disables it without adding client recovery. The OpenCode 1 variable `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE` is not an OpenCode 2 recovery switch.
 
+### Per-iteration usage (OpenCode 1 and 2)
+
+On a server-fallback step, Anthropic's top-level `usage` is the **billed sum of both attempts**. The plugin leaves that usage unchanged, so OpenCode's step tokens and cost retain the billed total. Do not use that total as the final model's context size.
+
+The supported per-iteration breakdown is a separate hidden reasoning part, emitted after the answer's content blocks and before the terminal `message_delta`. Its thinking text is two word joiners (`"\u2060\u2060"`), and its Anthropic signature has this format:
+
+```text
+cortexkit-server-fallback-usage-v1:{"iterations":[{"type":"message","model":"claude-opus-5-5","input_tokens":100,"output_tokens":0,"cache_read_input_tokens":400000,"cache_creation_input_tokens":500},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":120,"output_tokens":80,"cache_read_input_tokens":390000,"cache_creation_input_tokens":10480}]}
+```
+
+Read the signature from the stored reasoning part: `metadata.anthropic.signature` on OpenCode 1, or `state.signature` on OpenCode 2's direct Anthropic provider. Parse the JSON after `cortexkit-server-fallback-usage-v1:`. `iterations` preserves the order of Anthropic's `usage.iterations`; each entry contains `type` (`message` or `fallback_message`), `model`, `input_tokens`, `output_tokens`, and optional `cache_read_input_tokens` and `cache_creation_input_tokens` (absent cache counts mean zero). To size the final fallback context, use the last `fallback_message` entry's input plus cache-read plus cache-write counts, **not** the sum over iterations. Output remains separate.
+
+The usage marker is present only on fallback steps, including turns that continue on server fallback without a new boundary block. It accepts at most eight iterations, model IDs of at most 128 ASCII characters, nonnegative safe-integer token counts, and a JSON payload of at most 4096 bytes. Unknown fields are omitted; invalid or oversized breakdowns produce no usage marker rather than a partial or misleading breakdown. Top-level usage is still forwarded unchanged in those cases.
+
+This usage-only marker is distinct from the existing `cortexkit-server-fallback-v1:` conversation boundary. Before every subsequent send, the plugin removes usage markers entirely, even with server fallback disabled or on an API-key route. They are never restored to Anthropic thinking or fallback blocks and do not alter the outgoing request. The original conversation-boundary marker still restores the same Anthropic `fallback` block.
+
+The tested hosts are OpenCode 1.19.5 (AI SDK Anthropic provider 3.0.111) and OpenCode 2.0.22 (its native Anthropic protocol). Both AI SDK 3.0.111 and the newer 4.0.94 used by this repository's direct provider tests expose raw-shaped `providerMetadata.anthropic.usage` and mapped `providerMetadata.anthropic.iterations`, including `fallback_message` entries. OpenCode 1 does not persist that finish metadata on step records. OpenCode 2's parser retains raw usage in its usage metadata, but step settlement projects it to numeric tokens and discards the breakdown. The hidden usage part provides a durable shared path instead. Pi does not opt into server-side fallback by default and is unchanged.
+
 ## Implementation
 
 - [OpenCode wire shaping and sanitizer](../packages/opencode/src/transform.ts)

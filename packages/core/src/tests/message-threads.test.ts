@@ -9,6 +9,10 @@ import {
   observeMessageThreadResponse,
   prepareMessageThreadRequest,
 } from '../message-threads.ts'
+import {
+  SERVER_FALLBACK_USAGE_MARKER_TEXT,
+  SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
+} from '../server-fallback-usage.ts'
 
 function input(): MessageThreadInput {
   return {
@@ -917,6 +921,44 @@ async function observeAuditReply(
   )
   await observeMessageThreadResponse(sse(events), prepared).text()
 }
+
+test('usage-only fallback markers do not change reply fingerprints', async () => {
+  const marker = {
+    type: 'thinking',
+    thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
+    signature: `${SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX}{"iterations":[]}`,
+  }
+  for (const observedMarker of [true, false]) {
+    for (const storedMarker of [true, false]) {
+      const tracker = new MessageThreadTracker()
+      const request = input()
+      const content = [{ type: 'text', text: 'answer' }]
+      await observeAuditReply(tracker.prepare(request), 'msg_usage', [
+        ...content,
+        ...(observedMarker ? [marker] : []),
+      ])
+      expect(
+        tracker.prepare({
+          ...request,
+          body: {
+            ...request.body,
+            messages: [
+              ...(request.body.messages as unknown[]),
+              {
+                role: 'assistant',
+                content: [
+                  ...content,
+                  ...(storedMarker ? [{ ...marker, thinking: '' }] : []),
+                ],
+              },
+              next,
+            ],
+          },
+        }).decision.type,
+      ).toBe('continue')
+    }
+  }
+})
 
 test.each([
   'retry keeps A',

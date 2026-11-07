@@ -10,6 +10,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
+- Expose bounded per-iteration token usage on OpenCode 1 and 2 server-fallback steps through a hidden usage-only reasoning marker, without changing billed totals or outgoing Anthropic history. Addresses #648.
 - Back off client refusal recovery through Opus 4.8 for 10, 20, then 40 completed responses, repeating at 40 and always retrying the source. Ten consecutive successful source responses reset the next round to 10; tool-use responses count. Model changes and session deletion clear state, as does an OpenCode restart, so a restarted session may try the original model once more. Server-first and legacy modes share this in-memory policy. Remove the mismatched immediate source-model warms and waits, keeping ordinary active-model CacheKeep, account binding, and the Opus standby cache anchor.
 - Stop silently dropping a trailing assistant message that has content. When OpenCode's history briefly ends on the previous answer, the plugin used to delete that answer and resend the earlier question, repeating completed work. Only provably empty trailing assistant messages are still removed; any other trailing assistant content now fails locally with a non-retryable `invalid_request_error` 400 on both OAuth and API-key routes, before anything is sent to the model.
 
