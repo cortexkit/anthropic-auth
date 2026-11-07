@@ -1,4 +1,5 @@
 import {
+  logger,
   PrimeManager,
   type PrimeManagerOptions,
   type PrimeSendResult,
@@ -6,7 +7,24 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import type { PiNativeAttempt, PiNativeRuntime } from './native.ts'
-import { sendPiPrimeRequest } from './stream.ts'
+
+export type PiPrimeSendOptions = {
+  native: PiNativeRuntime
+  storagePath: string
+  accountId: string
+  signal: AbortSignal
+  beforeSend: () => Promise<void>
+  onServed: (attempt: PiNativeAttempt) => void
+  fetch?: typeof fetch
+}
+
+type PiPrimeSender = (options: PiPrimeSendOptions) => Promise<Response>
+let sendPrimeRequest: PiPrimeSender | undefined
+
+/** Stream installs its normal sender without making native startup load the keep-warm manager. */
+export function registerPiPrimeSender(sender: PiPrimeSender) {
+  sendPrimeRequest = sender
+}
 
 export type PiPrimeOptions = Pick<
   PrimeManagerOptions,
@@ -31,11 +49,17 @@ class PiPrime {
     this.owners.add(owner)
     this.manager = new PrimeManager({
       ...options,
+      setIntervalImpl: ((tick: () => void, ms: number) =>
+        (options.setIntervalImpl ?? globalThis.setInterval)(
+          () => this.tickIfEnabled(tick),
+          ms,
+        )) as typeof setInterval,
       // Keep the shared scheduler's default claim directory and OpenCode's
       // storage identity so the two hosts compete for the same atomic claim.
       storagePath: owner.storagePath,
       loadStorage: async () => (await this.owner().native.view()).policyStorage,
       getAccountFingerprint: async (accountId) => {
+        if (!sendPrimeRequest) return undefined
         const runtime = await this.owner().native.service()
         const signal = this.abort.signal
         const account = (await runtime.read()).accounts.find(
@@ -88,6 +112,20 @@ class PiPrime {
     return owner
   }
 
+  private async tickIfEnabled(tick: () => void) {
+    const signal = this.abort.signal
+    if (signal.aborted || this.manager.isStopped() || !sendPrimeRequest) return
+    try {
+      const snapshot = await this.owner().native.view(signal)
+      // Keep the opt-in poll, but disabled Prime must not sweep claim markers,
+      // authorize an account or refresh quota alongside keep-warm restoration.
+      if (!signal.aborted && snapshot.policyStorage.prime?.enabled === true)
+        tick()
+    } catch {
+      if (!signal.aborted) logger.warn('prime', 'Pi settings check failed')
+    }
+  }
+
   settingsChanged() {
     this.manager.stop()
     this.abort.abort()
@@ -116,9 +154,11 @@ class PiPrime {
     const started = performance.now()
     let response: Response | undefined
     try {
+      const send = sendPrimeRequest
+      if (!send) throw new Error('Pi Prime transport is unavailable')
       const runtime = await native.service()
       let served: PiNativeAttempt | undefined
-      response = await sendPiPrimeRequest({
+      response = await send({
         native,
         storagePath,
         accountId,

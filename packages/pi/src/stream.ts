@@ -110,6 +110,7 @@ import {
   piAttemptAccessToken,
 } from './native.ts'
 import { getPiAccountStoragePath } from './paths.ts'
+import { type PiPrimeSendOptions, registerPiPrimeSender } from './prime.ts'
 import {
   markPiAccountHold,
   type PiQuotaWaitOptions,
@@ -711,15 +712,7 @@ function buildPiPrimeBody(identity?: ClaudeCodeIdentity) {
 }
 
 /** Prime uses the model transport without a conversation, thread or cache target. */
-export function sendPiPrimeRequest(options: {
-  native: PiNativeRuntime
-  storagePath: string
-  accountId: string
-  signal: AbortSignal
-  beforeSend: () => Promise<void>
-  onServed: (attempt: PiNativeAttempt) => void
-  fetch?: typeof fetch
-}) {
+export function sendPiPrimeRequest(options: PiPrimeSendOptions) {
   return sendAnthropicRequest(
     {
       model: {
@@ -744,6 +737,8 @@ export function sendPiPrimeRequest(options: {
     { native: options.native, fetch: options.fetch },
   )
 }
+
+registerPiPrimeSender(sendPiPrimeRequest)
 
 async function sendAnthropicRequest(
   options: {
