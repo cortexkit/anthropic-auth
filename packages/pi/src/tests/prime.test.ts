@@ -16,7 +16,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
-import { getPiTrackedCacheKeepSessions } from '../stream.ts'
+import { getPiTrackedCacheKeepSessions, sendPiPrimeRequest } from '../stream.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
 
 const originalFetch = globalThis.fetch
@@ -386,3 +386,68 @@ test('Pi Prime stops on the extension session_shutdown event', async () => {
   await native.prime?.manager.tick()
   expect(sends).toHaveLength(0)
 })
+
+test('Pi Prime refuses host authority drift before touching the native service', async () => {
+  const native = await fixture()
+  const service = spyOn(native, 'service')
+  process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+  try {
+    await expect(
+      sendPiPrimeRequest({
+        native,
+        storagePath,
+        accountId: 'main',
+        signal: new AbortController().signal,
+        beforeSend: async () => {},
+        onServed: () => {},
+      }),
+    ).rejects.toMatchObject({ code: 'route-unavailable' })
+    expect(service).not.toHaveBeenCalled()
+    expect(sends).toHaveLength(0)
+  } finally {
+    service.mockRestore()
+    delete process.env.CORTEXKIT_VAULT_HOST
+  }
+})
+
+for (const [boundary, target] of [
+  ['direct preparation', 1],
+  ['gzip preparation', 2],
+] as const) {
+  test(`Pi Prime refuses host authority drift during awaited ${boundary}`, async () => {
+    const native = await fixture()
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>()
+    let admissions = 0
+    const pending = sendPiPrimeRequest({
+      native,
+      storagePath,
+      accountId: 'main',
+      signal: new AbortController().signal,
+      beforeSend: async () => {
+        if (++admissions === target) {
+          entered.resolve()
+          await release.promise
+        }
+      },
+      onServed: () => {},
+    })
+    const settled = Promise.allSettled([pending])
+    try {
+      await Promise.race([
+        entered.promise,
+        pending.then(() => {
+          throw new Error('Prime completed before its physical-send barrier')
+        }),
+      ])
+      process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+      release.resolve()
+      await expect(pending).rejects.toBeInstanceOf(Error)
+      expect(sends).toHaveLength(0)
+    } finally {
+      release.resolve()
+      await settled
+      delete process.env.CORTEXKIT_VAULT_HOST
+    }
+  })
+}
