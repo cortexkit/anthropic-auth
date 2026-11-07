@@ -77,8 +77,7 @@ export function applyRunnerTurnNotes(
 ): number {
   if (!options.sessionId) return 0
   if (!hasRunnerTurnNotes(options.sessionId)) return 0
-  // The shared reader only rejects empty text, so also drop whitespace-only notes.
-  const notes = turnNotes(options.sessionId).filter((note) => note.text.trim())
+  const notes = turnNotes(options.sessionId)
   let reported = runnerReports.get(options.sessionId)
   if (reported) {
     // Move to the newest position so eviction drops the least recently used.
