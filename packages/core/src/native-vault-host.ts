@@ -5,7 +5,11 @@ let hosted: boolean | undefined
 let changed = false
 const listeners = new Set<() => void>()
 
-/** Latches process authority using common-auth's hasVaultHost marker check. Replace only that read with its public export when pinning 0.41.0. */
+/**
+ * Latches the Thalamus vault-host marker for the life of the process. The read
+ * mirrors common-auth's `hasVaultHost()`, which the pinned common-auth doesn't
+ * export yet. A later change of the marker refuses every request until restart.
+ */
 export function isVaultHosted(): boolean {
   const observed = process.env.CORTEXKIT_VAULT_HOST === 'thalamus'
   hosted ??= observed
