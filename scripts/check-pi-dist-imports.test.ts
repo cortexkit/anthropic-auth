@@ -83,6 +83,31 @@ describe('Pi dist host-import guard', () => {
     )
   })
 
+  test('rejects relative dynamic imports that bypass the Pi extension loader', () => {
+    for (const specifier of ['./prime.js', '../shared.js']) {
+      expect(
+        violations(
+          `export async function load() { return import('${specifier}') }`,
+        ),
+      ).toEqual([
+        `stream.js: relative dynamic import '${specifier}' bypasses Pi's extension loader; use a static import`,
+      ])
+    }
+    expect(violations(`import { prime } from './prime.js'`)).toEqual([])
+    expect(
+      violations(
+        `// import('./prime.js')\nconst text = "import('../shared.js')"`,
+      ),
+    ).toEqual([])
+    expect(
+      findHostImportViolations(
+        `export const load = () => import('./prime.js')`,
+        'cli.js',
+        'standalone-cli',
+      ),
+    ).toEqual([])
+  })
+
   test('rejects a disallowed name re-exported from the host', () => {
     expect(
       violations(`export { normalizeContext } from '@earendil-works/pi-ai'`),
@@ -162,6 +187,21 @@ describe('Pi dist host-import guard', () => {
     } finally {
       await rm(empty, { recursive: true, force: true })
     }
+  })
+
+  test('the Pi dist scan rejects relative dynamic imports in nested emitted modules', async () => {
+    await withModules(
+      {
+        'index.js': `export { load } from './nested/native.js'`,
+        'nested/native.js': `export const load = () => import('../prime.js')`,
+        'prime.js': 'export const prime = true',
+      },
+      async (root) => {
+        await expect(verifyPiDistRuntimeImports(root)).rejects.toThrow(
+          "nested/native.js: relative dynamic import '../prime.js' bypasses Pi's extension loader; use a static import",
+        )
+      },
+    )
   })
 })
 

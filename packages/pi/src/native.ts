@@ -43,7 +43,11 @@ import {
   getPiConfigDir,
   requirePiNativeHostAuth,
 } from './paths.ts'
-import type { PiPrimeLease, PiPrimeOptions } from './prime.ts'
+import {
+  acquirePiPrime,
+  type PiPrimeLease,
+  type PiPrimeOptions,
+} from './prime.ts'
 
 export type PiNativeAttempt =
   | {
@@ -259,7 +263,6 @@ export class PiNativeRuntime {
       // Refresh returns at once while this host uses local accounts, so the
       // poll costs one enrollment read per tick outside vault custody.
       else {
-        const { acquirePiPrime } = await import('./prime.ts')
         if (!this.closed)
           this.prime = acquirePiPrime(
             { native: this, storagePath: paths.legacyConfig },

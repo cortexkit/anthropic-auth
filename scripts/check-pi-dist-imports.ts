@@ -206,6 +206,16 @@ export function findHostImportViolations(
     if (argument === undefined) continue
     const specifier = stringValue(argument)
     if (specifier !== undefined) {
+      // Relative dynamic imports bypass Pi's extension loader. Node then loads
+      // the target graph itself, losing the loader's JSON and SDK handling.
+      if (
+        runtime === 'pi-extension' &&
+        (specifier.startsWith('./') || specifier.startsWith('../'))
+      ) {
+        findings.push(
+          `${origin}: relative dynamic import '${specifier}' bypasses Pi's extension loader; use a static import`,
+        )
+      }
       check(specifier, 'opaque')
     } else {
       // Template literals and computed specifiers may resolve to a host SDK
@@ -312,7 +322,7 @@ export async function verifyPiDistRuntimeImports(
 
   if (findings.length > 0) {
     throw new Error(
-      `Pi extension reaches into host SDK packages at runtime:\n${findings
+      `Pi extension runtime import violations:\n${findings
         .map((finding) => `  ${finding}`)
         .join('\n')}`,
     )
