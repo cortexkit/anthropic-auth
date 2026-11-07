@@ -160,6 +160,13 @@ async function fixture(enabled = true, extra: Partial<AccountStorage> = {}) {
 
 test('Pi Prime enabled with a due account fires once through the signed model transport', async () => {
   const native = await fixture()
+  const identity = (await native.view()).accounts.find(
+    (row) => row.id === 'main',
+  )?.accountIdentity
+  expect(identity).toBeString()
+  expect(await native.prime?.manager.options.getAccountIdentity?.('main')).toBe(
+    identity,
+  )
   await native.prime?.manager.tick()
   await native.prime?.manager.tick()
   expect(sends).toHaveLength(1)

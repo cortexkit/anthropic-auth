@@ -182,10 +182,17 @@ test('a due OC2 account fires once through the real Prime manager', async () => 
     fetch: countingFetch,
   })
   deferCleanup(() => prime.dispose())
+  prime.manager.updateOptions({
+    ...prime.manager.options,
+    markerDir: join(directory, 'prime-markers'),
+  })
 
   // The manager hashes the lineage before using it as a marker folder name.
   const fingerprint = await prime.manager.options.getAccountFingerprint('main')
   expect(fingerprint).toMatch(/^[a-f0-9]{16}$/)
+  expect(await prime.manager.options.getAccountIdentity?.('main')).toBe(
+    IDENTITY,
+  )
 
   await prime.manager.tick()
   await prime.manager.tick()

@@ -4294,6 +4294,10 @@ const anthropicAuthPlugin = async (
       )
       return authLineageId ? tokenFingerprint(authLineageId) : undefined
     },
+    getAccountIdentity: async (accountId) =>
+      (await nativeAccounts.read()).accounts.find(
+        (account) => account.id === accountId,
+      )?.accountIdentity,
     refreshQuota: async (accountId) => {
       if (accountId === 'main') return refreshPrimeMainQuota()
       return refreshPrimeFallbackQuota(accountId)

@@ -254,6 +254,10 @@ export function createNativePrime(options: {
       )
       return lineage ? tokenFingerprint(lineage) : undefined
     },
+    getAccountIdentity: async (accountId) =>
+      (await runtime.read()).accounts.find(
+        (account) => account.id === accountId,
+      )?.accountIdentity,
     async refreshQuota(accountId) {
       const snapshot = await runtime.read()
       if (

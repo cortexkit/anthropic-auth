@@ -54,8 +54,8 @@ class PiPrime {
           () => this.tickIfEnabled(tick),
           ms,
         )) as typeof setInterval,
-      // Keep the shared scheduler's default claim directory and OpenCode's
-      // storage identity so the two hosts compete for the same atomic claim.
+      // The default marker root lets verified Claude accounts share claims
+      // across hosts, even when their local account files differ.
       storagePath: owner.storagePath,
       loadStorage: async () => (await this.owner().native.view()).policyStorage,
       getAccountFingerprint: async (accountId) => {
@@ -80,6 +80,10 @@ class PiPrime {
         const lineage = await runtime.getOrCreateAuthLineage(accountId, fence)
         return lineage ? tokenFingerprint(lineage) : undefined
       },
+      getAccountIdentity: async (accountId) =>
+        (await this.owner().native.view()).accounts.find(
+          (account) => account.id === accountId,
+        )?.accountIdentity,
       refreshQuota: async (accountId) => ({
         quota: await (await this.owner().native.service()).fetchQuota(
           accountId,

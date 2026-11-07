@@ -521,8 +521,8 @@ function storedResetMs(window?: AccountQuotaWindow): number | undefined {
 /**
  * Scheduler for `/claude-prime`. Mirrors `CacheKeepManager` lifecycle (unref'd
  * 60s interval, idempotent start/stop, swallowed tick errors) but adds the
- * cross-process atomic marker claim before firing — exactly one OpenCode
- * process fires per reset epoch even with N concurrent instances.
+ * cross-process atomic marker claim before firing, shared across hosts and
+ * account stores when the Claude account identity is verified.
  *
  * Dependencies are injected so the manager can be exercised deterministically
  * without filesystem, network, or live OAuth state.
@@ -531,6 +531,10 @@ export type PrimeManagerOptions = {
   loadStorage: () => Promise<AccountStorage | null>
   /** Returns a non-secret digest, or undefined when identity is unavailable. */
   getAccountFingerprint: (
+    accountId: 'main' | string,
+  ) => Promise<string | undefined>
+  /** Returns the verified Claude account UUID, never a local route id. */
+  getAccountIdentity?: (
     accountId: 'main' | string,
   ) => Promise<string | undefined>
   refreshQuota: (accountId: 'main' | string) => Promise<PrimeRefreshResult>
@@ -874,11 +878,16 @@ export class PrimeManager {
       // Claiming the marker is the cross-process exactly-once gate; only one
       // process per reset epoch reaches the send.
       stage = 'claim'
-      const markerPath =
-        markerEpoch === undefined
-          ? await this.tryClaimBootstrap(evaluation.id, accountFingerprint)
-          : await this.tryClaim(evaluation.id, accountFingerprint, markerEpoch)
-      if (!markerPath) {
+      const accountIdentity = await this.options.getAccountIdentity?.(
+        evaluation.id,
+      )
+      const markerPaths = await this.tryClaim(
+        evaluation.id,
+        accountFingerprint,
+        markerEpoch,
+        accountIdentity,
+      )
+      if (!markerPaths) {
         logger.debug('prime', 'claim lost', {
           account: evaluation.label,
           marker: `${evaluation.id}-${markerEpoch ?? 'bootstrap'}`,
@@ -888,7 +897,7 @@ export class PrimeManager {
 
       const postClaimStorage = await this.options.loadStorage()
       if (this.stopped || postClaimStorage?.prime?.enabled !== true) {
-        await rm(markerPath, { force: true })
+        await Promise.all(markerPaths.map((path) => rm(path, { force: true })))
         return
       }
 
@@ -896,8 +905,13 @@ export class PrimeManager {
         // Create the epoch claim before releasing the bootstrap sentinel so
         // concurrent processes never observe an unclaimed transition gap.
         await rm(bootstrapMarkerPath, { force: true })
+        if (accountIdentity) {
+          await rm(this.verifiedMarkerPath(accountIdentity), { force: true })
+        }
         if (this.stopped) {
-          await rm(markerPath, { force: true })
+          await Promise.all(
+            markerPaths.map((path) => rm(path, { force: true })),
+          )
           return
         }
       }
@@ -917,20 +931,60 @@ export class PrimeManager {
   private async tryClaim(
     accountId: 'main' | string,
     accountFingerprint: string,
-    resetsAtEpochMs: number,
-  ): Promise<string | null> {
+    resetsAtEpochMs: number | undefined,
+    accountIdentity: string | undefined,
+  ): Promise<string[] | null> {
     const dir = this.markerDir(accountFingerprint)
-    const markerPath = primeMarkerPath(dir, accountId, resetsAtEpochMs)
-    return this.tryClaimPath(dir, markerPath)
+    const markerPath =
+      resetsAtEpochMs === undefined
+        ? primeBootstrapMarkerPath(dir, accountId)
+        : primeMarkerPath(dir, accountId, resetsAtEpochMs)
+    // Older hosts claim only the storage-scoped marker. Always win it first,
+    // and leave it to age out if another store already owns the UUID claim.
+    if (!(await this.tryClaimPath(dir, markerPath))) return null
+    if (!accountIdentity) return [markerPath]
+    const verifiedPath = this.verifiedMarkerPath(
+      accountIdentity,
+      resetsAtEpochMs,
+    )
+    if (resetsAtEpochMs === undefined) {
+      // An account in another store may already have replaced its bootstrap
+      // sentinel with an epoch claim while this store still has no reset.
+      const digest = createHash('sha256').update(accountIdentity).digest('hex')
+      if (
+        (await this.readMarkerNames(this.verifiedMarkerDir())).some((name) =>
+          name.startsWith(`${digest}-`),
+        )
+      )
+        return null
+    }
+    if (!(await this.tryClaimPath(this.verifiedMarkerDir(), verifiedPath)))
+      return null
+    return [markerPath, verifiedPath]
   }
 
-  private async tryClaimBootstrap(
-    accountId: 'main' | string,
-    accountFingerprint: string,
-  ): Promise<string | null> {
-    const dir = this.markerDir(accountFingerprint)
-    const markerPath = primeBootstrapMarkerPath(dir, accountId)
-    return this.tryClaimPath(dir, markerPath)
+  private verifiedMarkerDir(): string {
+    return join(this.options.markerDir ?? defaultMarkerDir(), 'accounts')
+  }
+
+  private verifiedMarkerPath(
+    accountIdentity: string,
+    resetsAtEpochMs?: number,
+  ): string {
+    const digest = createHash('sha256').update(accountIdentity).digest('hex')
+    return join(
+      this.verifiedMarkerDir(),
+      `${digest}-${resetsAtEpochMs ?? 'bootstrap'}`,
+    )
+  }
+
+  private async readMarkerNames(dir: string): Promise<string[]> {
+    try {
+      return await readdir(dir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+      throw error
+    }
   }
 
   private async tryClaimPath(
@@ -1083,7 +1137,9 @@ export class PrimeManager {
 
   private async sweepMarkers(now: number): Promise<void> {
     const dir = this.storageMarkerDir()
-    const swept = await this.sweepMarkerDirectory(dir, now)
+    const swept =
+      (await this.sweepMarkerDirectory(dir, now)) +
+      (await this.sweepMarkerDirectory(this.verifiedMarkerDir(), now))
     if (swept > 0) {
       logger.trace('prime', 'swept stale markers', { swept })
     }

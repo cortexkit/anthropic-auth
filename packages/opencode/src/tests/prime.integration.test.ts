@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock } from 'bun:test'
+import { join } from 'node:path'
 import type { PrimeManager } from '@cortexkit/anthropic-auth-core'
 import * as Core from '@cortexkit/anthropic-auth-core'
 import {
@@ -31,7 +32,6 @@ import {
   getPlugin as getPluginWithCtx,
   loginIssues as loginIssuesWithCtx,
   mainAccountIssues as mainAccountIssuesWithCtx,
-  ownPrimeMarkerNamespace,
   poolMainAccess as poolMainAccessWithCtx,
   readNativeRuntimeState as readNativeRuntimeStateWithCtx,
   refreshPoolLoginElsewhere as refreshPoolLoginElsewhereWithCtx,
@@ -56,13 +56,13 @@ import { extractUrl, MESSAGES_URL } from './test-fetch'
 const testContext = createOpencode1TestContext()
 installOpencode1TestHooks(testContext)
 const test = createOpencode1Test(testContext)
+const primeMarkerRoots = new WeakMap<TestLifetime, string>()
 
 function bodyLifetime(): TestLifetime {
   return getBodyLifetime(testContext)
 }
-// Every Prime case clears its own marker namespace here, after the account
-// file exists and before any plugin starts, instead of sweeping the shared
-// marker root that other test files' plugins may also be using.
+// Repeated synthetic UUIDs must not share claims with other test bodies.
+// Plugins within one body keep a shared root, including across account files.
 async function useTempAccountFile(
   storage: AccountStorage,
   mainHostAuth: {
@@ -72,7 +72,13 @@ async function useTempAccountFile(
   } = syntheticMainHostAuth(),
 ) {
   await useTempAccountFileWithCtx(testContext, storage, mainHostAuth)
-  await ownPrimeMarkerNamespace(testContext)
+  const lifetime = bodyLifetime()
+  if (!primeMarkerRoots.has(lifetime)) {
+    primeMarkerRoots.set(
+      lifetime,
+      join(testContext.tempConfigDir!, 'prime-markers'),
+    )
+  }
 }
 function mainAccountIssues(...accesses: string[]) {
   return mainAccountIssuesWithCtx(testContext, ...accesses)
@@ -112,12 +118,23 @@ function poolMainAccess(): Promise<string> {
 function readNativeRuntimeState() {
   return readNativeRuntimeStateWithCtx(testContext)
 }
-function getPlugin(
+async function getPlugin(
   client?: ReturnType<typeof createMockClient>,
   directory?: string,
   runtimeOverrides: PluginRuntimeOverrides = {},
-): any {
-  return getPluginWithCtx(testContext, client, directory, runtimeOverrides)
+): Promise<any> {
+  const plugin = await getPluginWithCtx(
+    testContext,
+    client,
+    directory,
+    runtimeOverrides,
+  )
+  const manager = getPluginTestHandles(plugin).primeManager
+  manager.updateOptions({
+    ...manager.options,
+    markerDir: primeMarkerRoots.get(bodyLifetime()),
+  })
+  return plugin
 }
 function readAccountStorage(): Promise<AccountStorage | null> {
   return readAccountStorageWithCtx(testContext)
@@ -372,6 +389,9 @@ describe('claude-prime direct request', () => {
     const mgr = getPluginTestHandles(plugin).primeManager
     if (!(mgr instanceof Core.PrimeManager))
       throw new Error('Expected the native Prime manager')
+    expect(await mgr.options.getAccountIdentity?.('main')).toBe(
+      syntheticMainAccountUuid,
+    )
     await mgr.tick()
 
     await assertPrimeWithPublicDiagnostics(mgr, requestStages, () => {
