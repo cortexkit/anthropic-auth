@@ -377,7 +377,7 @@ export async function setupAnthropicAuth(
       .then((session) => {
         if (!active || parents.get(sessionID) !== entry) return
         entry.value = Boolean(session.parentID)
-        cacheKeep?.resolvedParent(sessionID, entry.value)
+        return cacheKeep?.resolvedParent(sessionID, entry.value)
       })
       .catch(() => {
         if (parents.get(sessionID) === entry) parents.delete(sessionID)
@@ -389,7 +389,8 @@ export async function setupAnthropicAuth(
     paths,
     fetch: options.fetch,
     requestOptions: (input, snapshot) => {
-      subagent(input.sessionID)
+      if (input.agent !== 'cachekeep' && input.agent !== 'prime')
+        subagent(input.sessionID)
       return wire.requestOptions(input, snapshot)
     },
     responseOptions: wire.responseOptions,

@@ -48,6 +48,7 @@ import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
 } from '../v2/adapter'
+import * as cacheKeepFactory from '../v2/cachekeep'
 import { createNativeCacheKeep } from '../v2/cachekeep'
 import {
   type CacheKeepStore,
@@ -365,10 +366,11 @@ async function fixture(
       extra: Record<string, unknown> = {},
       sessionID = 'ses_oc2_keep',
       signal?: AbortSignal,
+      agent = 'build',
     ) => {
       const draft = {
         sessionID: sessionID as SessionHooks['http.request']['sessionID'],
-        agent: 'build',
+        agent,
         model: { providerID: 'anthropic', id: 'claude-sonnet-4-6' },
         kind: 'primary',
         request: new Request(url, {
@@ -456,6 +458,32 @@ async function fixture(
       now += ms
     },
   }
+}
+
+function firstLeaseParentSettlement() {
+  let done!: () => void
+  const settled = new Promise<void>((resolve) => {
+    done = resolve
+  })
+  const create = cacheKeepFactory.createNativeCacheKeep
+  let leases = 0
+  const factory = spyOn(
+    cacheKeepFactory,
+    'createNativeCacheKeep',
+  ).mockImplementation((options) => {
+    const result = create(options)
+    if (leases++ === 0) {
+      const resolved = result.resolvedParent
+      result.resolvedParent = (...args) => {
+        const pending = Promise.resolve(resolved(...args))
+        void pending.then(done, done)
+        return pending
+      }
+    }
+    return result
+  })
+  cleanups.push(() => factory.mockRestore())
+  return settled
 }
 
 function captureStartupLogs(onLine?: (line: string) => void) {
@@ -2155,6 +2183,7 @@ test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted u
           'reserveWarmDispatch',
           'isCurrentTarget',
           'recordAcceptedUsage',
+          'trackedPolicyState',
         ].includes(String(name))
       )
         return undefined
@@ -2560,6 +2589,7 @@ test('OC2 dispatch and accepted capture do not await tracking readView or an unk
 })
 
 test('an unknown-parent OC2 child is captured then retired as soon as lookup resolves', async () => {
+  const settled = firstLeaseParentSettlement()
   let resolve!: (session: { parentID?: string }) => void
   const held = new Promise<{ parentID?: string }>((done) => {
     resolve = done
@@ -2588,8 +2618,8 @@ test('an unknown-parent OC2 child is captured then retired as soon as lookup res
   expect(lookups).toBe(1)
   resolve({ parentID: 'ses_parent' })
   await held
-  // Join the detached lookup's continuation, not any storage work.
-  await new Promise((done) => setTimeout(done, 0))
+  // Join the detached retirement decision, including its current settings read.
+  await settled
   expect(owner.manager.trackedRequest('ses_oc2_keep')).toBeUndefined()
   await owner.persistence.drain()
   f.due()
@@ -2643,3 +2673,172 @@ test.each(['pending', 'failed'] as const)(
     expect(f.sent).toHaveLength(1)
   },
 )
+
+test.each([false, true])(
+  'old lease parent resolution uses current settings and cannot retire a newer capture (replacement=%s)',
+  async (replacement) => {
+    let resolve!: (session: { parentID?: string }) => void
+    const held = new Promise<{ parentID?: string }>((done) => {
+      resolve = done
+    })
+    const settled = firstLeaseParentSettlement()
+    let lookups = 0
+    const f = await fixture(
+      false,
+      false,
+      undefined,
+      false,
+      false,
+      undefined,
+      undefined,
+      async () => (++lookups === 1 ? held : { parentID: 'ses_parent' }),
+    )
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      cacheKeep: { enabled: true, always: true, subagents: false },
+    }))
+    await f.live()
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    const first = owner.manager.targets.get('ses_oc2_keep')
+    expect(first).toBeDefined()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      cacheKeep: { enabled: true, always: true, subagents: true },
+    }))
+    const next = await f.start()
+    if (replacement)
+      await next.live(undefined, {
+        messages: [{ role: 'user', content: 'New allowed child prefix' }],
+      })
+    const current = owner.manager.targets.get('ses_oc2_keep')
+    if (replacement) expect(current.policyState).not.toBe(first.policyState)
+    resolve({ parentID: 'ses_parent' })
+    await settled
+    expect(owner.manager.targets.get('ses_oc2_keep')).toBe(current)
+    f.due()
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(1)
+    expect(f.sent).toEqual([])
+    if (replacement)
+      expect(await next.sent[0]!.clone().text()).toContain(
+        'New allowed child prefix',
+      )
+  },
+)
+
+test.each(['cachekeep', 'prime'])(
+  'the %s agent does not look up a synthetic session parent',
+  async (agent) => {
+    const lookups: string[] = []
+    const f = await fixture(
+      false,
+      false,
+      undefined,
+      false,
+      false,
+      undefined,
+      undefined,
+      async () => {
+        lookups.push(agent)
+        return { parentID: undefined }
+      },
+    )
+    await f.live(undefined, {}, `${agent}:synthetic-session`, undefined, agent)
+    expect(lookups).toEqual([])
+  },
+)
+
+test('explicit runner keep_warm sends before an advisory parent lookup resolves', async () => {
+  let resolve!: (session: { parentID?: string }) => void
+  const held = new Promise<{ parentID?: string }>((done) => {
+    resolve = done
+  })
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    undefined,
+    () => held,
+  )
+  runnerPolicyForReview({ ttl: 'short', keep_warm: 'always' })
+  try {
+    await f.live()
+    f.advance(270_000)
+    await f.timers.fireTimeouts()
+    expect(f.sent).toHaveLength(1)
+  } finally {
+    resolve({ parentID: 'ses_parent' })
+  }
+})
+
+test('OC2 priced auto settles a same-generation known failure and charges the next success once', async () => {
+  const f = await fixture()
+  runnerPolicyForReview({ ttl: 'long', keep_warm: 'auto' })
+  const draft = await f.prepare(undefined, { model: 'claude-opus-5-5' })
+  await f.respond(
+    draft,
+    Response.json({ usage: { cache_read_input_tokens: 1_000 } }),
+  )
+  const owner = (globalThis as any)[
+    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ].get(f.paths.storageId)
+  const target = owner.manager.targets.get('ses_oc2_keep') as CacheKeepTarget
+  const state = target.policyState!
+  let entered!: () => void
+  const sending = new Promise<void>((done) => {
+    entered = done
+  })
+  let finish!: (response: Response) => void
+  const held = new Promise<Response>((done) => {
+    finish = done
+  })
+  f.setSend(async () => {
+    entered()
+    return held
+  })
+  f.advance(3_570_000)
+  const warming = f.timers.fireTimeouts()
+  await sending
+  const [name] = await readdir(f.disk)
+  const saved = async () =>
+    JSON.parse(gunzipSync(await readFile(join(f.disk, name!))).toString())
+      .policyState
+  expect(state).toMatchObject({
+    warmCostSoFar: 0,
+    pendingWarmCost: 200,
+    warmsSinceLastRealRequest: 1,
+  })
+  expect(await saved()).toMatchObject({
+    warmCostSoFar: 0,
+    pendingWarmCost: 200,
+  })
+  finish(Response.json({}, { status: 503 }))
+  await warming
+  expect(owner.manager.targets.get('ses_oc2_keep')?.policyState).toBe(state)
+  expect(state.warmCostSoFar).toBe(0)
+  expect(state.pendingWarmCost).toBeUndefined()
+  expect((await saved()).warmCostSoFar).toBe(0)
+  expect((await saved()).pendingWarmCost).toBeUndefined()
+  f.setSend(async () =>
+    Response.json({ usage: { cache_read_input_tokens: 1_000 } }),
+  )
+  f.advance(20_000)
+  await f.timers.fireTimeouts()
+  await owner.persistence.drain()
+  expect(f.sent).toHaveLength(2)
+  expect(owner.manager.targets.get('ses_oc2_keep')?.policyState).toBe(state)
+  expect(state).toMatchObject({
+    warmCostSoFar: 200,
+    warmsSinceLastRealRequest: 2,
+  })
+  expect(state.pendingWarmCost).toBeUndefined()
+  expect(await saved()).toMatchObject({
+    warmCostSoFar: 200,
+    warmsSinceLastRealRequest: 2,
+  })
+  expect((await saved()).pendingWarmCost).toBeUndefined()
+})
