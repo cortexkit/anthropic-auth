@@ -1427,7 +1427,8 @@ test.each([false, true])(
         messages: [{ role: 'user', content: 'A request after plugin reload' }],
       })
     ).json()) as Record<string, any>
-    // Capture finishes before hand-off; usage arrives when the response drains.
+    // The first target notification carries no token counts; after the response
+    // drains, one later notification adds them.
     expect(changed).toHaveBeenCalledTimes(2)
     expect(notifications[0]!.policyState?.prefixTokens).toBeUndefined()
     expect(notifications[0]!.policyState?.inputTokens).toBeUndefined()
