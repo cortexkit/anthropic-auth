@@ -234,6 +234,7 @@ export interface NativeSourceOptions {
     attemptId: string
     acceptedAt?: number
     ttlMs?: number
+    acceptedUsage?: Record<string, number>
   }) => void
   readonly fetch?: typeof fetch
   /** Resolve a host model alias to the upstream ID before request-local policy. */
@@ -1198,6 +1199,7 @@ export function createNativeAnthropicSource(
       )
       options.onCacheResponse?.({
         attemptId,
+        acceptedUsage: cached.usage,
         ...(cached.accepted && accepted && { acceptedAt: accepted.at }),
         ttlMs:
           cached.finalWire?.ttlMs === 0 && !cached.ttlOverridden

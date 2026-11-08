@@ -435,6 +435,7 @@ export async function setupAnthropicAuth(
     ctx,
     {
       source,
+      now: options.cacheKeep?.now,
       log: { warn: (message, data) => logger.warn('opencode2', message, data) },
     },
     { credential: preparedAnthropicCredential },

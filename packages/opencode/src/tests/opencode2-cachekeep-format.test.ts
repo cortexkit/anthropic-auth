@@ -8,6 +8,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { CacheKeepStore } from '../v2/cachekeep-store.ts'
 import { CacheKeepStore as ReleasedStore } from './fixtures/cachekeep-store-2.5.5.ts'
+import { CacheKeepStore as Published260Store } from './fixtures/cachekeep-store-2.6.0.ts'
 
 const roots: string[] = []
 afterEach(async () => {
@@ -96,4 +97,45 @@ test('the shared writer produces byte-identical v2.5.5 gzip records', async () =
   expect(await readFile(join(shared.directory, name!))).toEqual(
     await readFile(join(released.directory, name!)),
   )
+})
+
+test('published Core 2.6.0 reader accepts format-one records with bounded policy and unresolved dispatch cost', async () => {
+  const options = {
+    storageId: 'published-260-compatibility',
+    root: await root(),
+    pluginVersion: '2.6.0',
+  }
+  const current = new CacheKeepStore(options)
+  const released = new Published260Store(options, undefined)
+  const policyState = {
+    ownerSessionId: target.id,
+    planned: true,
+    lastRealRequestAt: now,
+    warmsSinceLastRealRequest: 23,
+    warmCostSoFar: 100,
+    pendingWarmCost: 5,
+    prefixTokens: 1_000,
+    inputTokens: 1_100,
+    hasWarmed: true,
+  }
+  current.changed({ ...target, policyState })
+  await current.drain()
+  const read: unknown[] = []
+  await released.load(
+    now,
+    (entry: unknown) => {
+      read.push(entry)
+      return true
+    },
+    undefined,
+  )
+  expect(read).toEqual([
+    expect.objectContaining({
+      v: 1,
+      id: target.id,
+      bodyText: target.bodyText,
+      policyState,
+    }),
+  ])
+  expect(await readdir(current.directory)).toHaveLength(1)
 })

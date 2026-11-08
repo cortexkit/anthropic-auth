@@ -268,7 +268,7 @@ test('failed durable reservation pauses dispatch and retries within expiry', asy
   f.advance(f.target.nextPrewarmAt - f.now)
   await f.manager.tick()
   expect(f.sends).toBe(1)
-  expect(f.target.policyState?.warmsSinceLastRealRequest).toBe(2)
+  expect(f.target.policyState?.warmsSinceLastRealRequest).toBe(1)
 })
 
 test('new real acceptance resets reserved count and cost but retains successful-warm history', async () => {
@@ -553,4 +553,155 @@ test('ttl-only short never stretches a replay to the local one-hour cadence', as
   await f.manager.tick()
   expect(f.sends).toBe(0)
   expect(f.manager.trackedCount()).toBe(0)
+})
+
+test('auto keeps the real response pricing baseline and charges the admitted cost', async () => {
+  const f = plannedFixture(
+    {
+      fetchImpl: Object.assign(
+        async () =>
+          Response.json({
+            usage: {
+              input_tokens: 900_000,
+              cache_read_input_tokens: 9_999,
+              cache_creation_input_tokens: 1,
+            },
+          }),
+        { preconnect: fetch.preconnect },
+      ),
+    },
+    { ttl: 'long', keep_warm: 'auto' },
+  )
+  expect(f.track().tracked).toBe(true)
+  f.manager.recordAcceptedUsage('ses_planned', f.input.bodyText, {
+    input_tokens: 123_456,
+    cache_read_input_tokens: 1_000,
+    cache_creation_input_tokens: 100,
+  })
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(f.target.policyState).toMatchObject({
+    prefixTokens: 1_100,
+    inputTokens: 124_556,
+    warmCostSoFar: 220,
+  })
+})
+
+test('restoring an unresolved dispatch accounts for a successful warm before its coalesced flush', async () => {
+  let reserved: import('../cachekeep.ts').CacheKeepTarget | undefined
+  const f = plannedFixture(
+    {
+      reserveWarm: async (target) => {
+        reserved = structuredClone(target)
+        return true
+      },
+    },
+    { ttl: 'long', keep_warm: 'auto' },
+  )
+  expect(f.track().tracked).toBe(true)
+  f.manager.recordAcceptedUsage('ses_planned', f.input.bodyText, {
+    cache_read_input_tokens: 1_000,
+  })
+  f.target.policyState!.warmCostSoFar = 7_600
+  f.target.policyState!.warmsSinceLastRealRequest = 38
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(1)
+  expect(reserved).toBeDefined()
+  const restored = plannedFixture({}, { ttl: 'long', keep_warm: 'auto' })
+  restored.advance(f.now - restored.now)
+  expect(reserved!.policyState).toMatchObject({
+    warmCostSoFar: 7_600,
+    pendingWarmCost: 200,
+  })
+  expect(
+    restored.track({ retained: { ...reserved!, nextPrewarmAt: restored.now } })
+      .tracked,
+  ).toBe(false)
+  await restored.manager.tick()
+  expect(restored.sends).toBe(0)
+})
+
+test.each(['short', 'long'] as const)(
+  'ttl-only %s source preserves its captured lifetime without an active touch',
+  async (ttl) => {
+    const f = plannedFixture({}, { ttl })
+    f.input.storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    f.input.storage.cacheKeep = { enabled: true, always: true }
+    const acceptedAt = f.now - 10_000
+    expect(
+      f.track({
+        sourceWarm: true,
+        ttlMs: undefined,
+        acceptedAt,
+        cacheMode: 'hybrid',
+      }).tracked,
+    ).toBe(true)
+    expect(f.target.ttlMs).toBe(ttl === 'short' ? 300_000 : 3_600_000)
+    expect(f.target.cacheExpiresAt).toBe(
+      acceptedAt + (ttl === 'short' ? 300_000 : 3_600_000),
+    )
+    f.advance(3_300_000)
+    await f.manager.tick()
+    expect(f.sends).toBe(ttl === 'short' ? 0 : 1)
+  },
+)
+
+test('a known failed warm clears its unresolved admitted cost durably without spending it', async () => {
+  let settled: import('../cachekeep.ts').CacheKeepPolicyState | undefined
+  const f = plannedFixture(
+    {
+      fetchImpl: Object.assign(async () => Response.json({}, { status: 503 }), {
+        preconnect: fetch.preconnect,
+      }),
+      settleWarm: async (target) => {
+        settled = structuredClone(target.policyState)
+        return true
+      },
+    },
+    { ttl: 'long', keep_warm: 'auto' },
+  )
+  f.track()
+  f.manager.recordAcceptedUsage('ses_planned', f.input.bodyText, {
+    cache_read_input_tokens: 1_000,
+  })
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(settled).toMatchObject({
+    warmCostSoFar: 0,
+    warmsSinceLastRealRequest: 1,
+  })
+  expect(settled?.pendingWarmCost).toBeUndefined()
+})
+
+test('accepted JSON body and known usage persist together while duplicate observations stay quiet', () => {
+  const states: Array<{ prefixTokens?: number; inputTokens?: number }> = []
+  const f = plannedFixture(
+    {
+      onTargetChanged: (target) => {
+        states.push({
+          prefixTokens: target.policyState?.prefixTokens,
+          inputTokens: target.policyState?.inputTokens,
+        })
+      },
+    },
+    { ttl: 'long', keep_warm: 'auto' },
+  )
+  const usage = {
+    cache_read_input_tokens: 1_000,
+    cache_creation_input_tokens: 100,
+    input_tokens: 90_000,
+  }
+  expect(f.track({ acceptedUsage: usage }).tracked).toBe(true)
+  expect(states).toEqual([{ prefixTokens: 1_100, inputTokens: 91_100 }])
+  f.manager.recordAcceptedUsage('ses_planned', f.input.bodyText, usage)
+  expect(states).toHaveLength(1)
+  f.manager.recordAcceptedUsage('ses_planned', f.input.bodyText, {
+    ...usage,
+    cache_creation_input_tokens: 101,
+  })
+  expect(states).toEqual([
+    { prefixTokens: 1_100, inputTokens: 91_100 },
+    { prefixTokens: 1_101, inputTokens: 91_101 },
+  ])
 })

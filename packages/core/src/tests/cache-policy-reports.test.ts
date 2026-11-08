@@ -188,7 +188,12 @@ test.each([
     expect(f.reports[1]).toEqual({
       kind: 'cache_warm_stopped',
       at: f.now,
-      reason: reason === 'off' || reason === 'none' ? 'unsupported' : reason,
+      reason:
+        reason === 'off' || reason === 'none'
+          ? 'unsupported'
+          : reason === 'expired'
+            ? 'cost-cap'
+            : reason,
     })
     f.manager.untrack('ses_report')
     await detached()
@@ -506,3 +511,66 @@ test.each([
     })
   },
 )
+
+test('planned final-margin retirement reports cost-cap instead of expired', async () => {
+  const f = fixture()
+  await f.warm()
+  f.advance(3_596_000)
+  await f.manager.tick()
+  await detached()
+  expect(f.reports.at(-1)).toEqual({
+    kind: 'cache_warm_stopped',
+    at: f.now,
+    reason: 'cost-cap',
+  })
+})
+
+test('a real warm stop survives failed host handoff and a later background warm still reports', async () => {
+  const f = fixture()
+  await f.warm()
+  let background!: () => void
+  let completed!: Promise<void>
+  const failed = withSessionCacheReportHandoff(async () => {
+    f.manager.untrack('ses_report')
+    const context = new Promise<void>((resolve) => {
+      background = resolve
+    })
+    completed = context.then(async () => {
+      f.manager.track(f.input)
+      await f.warm()
+    })
+    throw new Error('host failed')
+  })
+  await expect(failed()).rejects.toThrow('host failed')
+  await detached()
+  expect(
+    f.reports.filter((value) => value.kind === 'cache_warm_stopped'),
+  ).toEqual([
+    { kind: 'cache_warm_stopped', at: f.now, reason: 'session-ended' },
+  ])
+  background()
+  await completed
+  await detached()
+  expect(
+    f.reports.filter((value) => value.kind === 'cache_touch'),
+  ).toHaveLength(2)
+})
+
+test('background warms report even when their async context came from a failed handoff', async () => {
+  const f = fixture()
+  let release!: () => void
+  let completed!: Promise<void>
+  const host = withSessionCacheReportHandoff(async () => {
+    const pending = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    completed = pending.then(() => f.warm())
+    throw new Error('host failed')
+  })
+  await expect(host()).rejects.toThrow('host failed')
+  release()
+  await completed
+  expect(f.reports).toEqual([
+    { kind: 'cache_touch', at: f.now, ttl_ms: 3_600_000, source: 'warm' },
+  ])
+})

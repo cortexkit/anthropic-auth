@@ -462,6 +462,8 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
    */
   readonly requestGzipLatch?: RequestGzipLatch
   readonly fetch?: typeof fetch
+  /** Receipt clock; production uses epoch milliseconds from Date.now. */
+  readonly now?: () => number
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
@@ -1441,7 +1443,9 @@ export function createNativeAnthropicAdapter<Q, P>(
               observeFinalWire(request, createBody)
               const received = await (deps.fetch ?? globalThis.fetch)(url, init)
               if (received.ok && fromUpstream(received.headers, data))
-                physicalAcceptances.set(data, { at: Date.now() })
+                physicalAcceptances.set(data, {
+                  at: deps.now?.() ?? Date.now(),
+                })
               return received
             } catch (error) {
               request.signal.throwIfAborted()
@@ -1954,7 +1958,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const data = attempt.data
       if (!data || !fromUpstream(headers, data)) return undefined
       if (data.route === 'oauth' && status >= 200 && status < 300)
-        physicalAcceptances.set(data, { at: Date.now() })
+        physicalAcceptances.set(data, { at: deps.now?.() ?? Date.now() })
       return source.quotaFromHeaders?.(headers, {
         ...contextOf(attempt, data),
         status,

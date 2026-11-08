@@ -59,6 +59,7 @@ import {
   type OAuthAccount,
   type OAuthQuotaSnapshot,
   orderClaudeCodeBody,
+  PROMPT_CACHE_DEFAULT_TTL_MS,
   type ProviderAccountUuid,
   type ProviderErrorResponseScope,
   parseSseFrame,
@@ -73,6 +74,7 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  readSessionCachePolicy,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
   resolveNativePoolPaths,
@@ -822,7 +824,7 @@ async function sendAnthropicRequest(
   const oneHourCache =
     isCache1hPersistentlyEnabled(storage) ||
     options.streamOptions?.cacheRetention === 'long'
-  const { body, bodyText, toolNames } = options.prime
+  const { body, bodyText, toolNames, cacheTtlMs } = options.prime
     ? buildPiPrimeBody(identity)
     : await buildAnthropicRequest(
         options.model.id,
@@ -880,8 +882,12 @@ async function sendAnthropicRequest(
     cacheAccepted.add(attempt)
     const at = Date.now()
     const appliedTtl = requestCacheLifetimeMs(sentBody)
+    const localTtl =
+      readSessionCachePolicy(relayAffinity, true)?.ttl !== undefined
+        ? appliedTtl
+        : cacheTtlMs || PROMPT_CACHE_DEFAULT_TTL_MS
     if (relayAffinity) {
-      sessionCacheActivity.record(relayAffinity, routeId, appliedTtl)
+      sessionCacheActivity.record(relayAffinity, routeId, localTtl)
       reportSessionCacheTouch(relayAffinity, {
         at,
         ttlMs: appliedTtl,
@@ -895,7 +901,7 @@ async function sendAnthropicRequest(
       bodyText,
       storage,
       cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
-      ttlMs: appliedTtl,
+      ttlMs: localTtl,
       oauthAccountId: routeId,
       oauthAccountIdentity: verifiedUuid,
       accountStoragePath: options.storagePath,

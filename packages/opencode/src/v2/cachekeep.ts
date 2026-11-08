@@ -116,8 +116,24 @@ interface CacheKeepLease {
  * plugin file changes, so the tracked sessions must outlive any one instance.
  */
 interface SharedCacheKeep {
-  readonly manager: Omit<CacheKeepManager, 'registrySessions'> &
-    Partial<Pick<CacheKeepManager, 'registrySessions'>>
+  readonly manager: Omit<
+    CacheKeepManager,
+    | 'registrySessions'
+    | 'reserveWarmDispatch'
+    | 'isCurrentTarget'
+    | 'recordAcceptedUsage'
+    | 'hasPlannedTarget'
+  > &
+    Partial<
+      Pick<
+        CacheKeepManager,
+        | 'registrySessions'
+        | 'reserveWarmDispatch'
+        | 'isCurrentTarget'
+        | 'recordAcceptedUsage'
+        | 'hasPlannedTarget'
+      >
+    >
   readonly registry: CacheKeepSessionRegistry
   persistence: CacheKeepStore
   readonly persistenceFollowsOwner?: true
@@ -140,28 +156,60 @@ interface SharedCacheKeep {
   readonly retain: () => void
   /** Called when a lease is taken; resumes warming any retained sessions. */
   readonly adopt: () => Promise<void>
+  hybridDisabled?: boolean
+  localCleanup?: Promise<void>
+  plannedUnsupportedLogged?: boolean
 }
 
-async function discardLocalTargets(shared: SharedCacheKeep, now: number) {
+function discardLocalTargets(
+  shared: SharedCacheKeep,
+  now: number,
+  disabled: boolean,
+) {
+  if (!disabled) {
+    shared.hybridDisabled = false
+    return
+  }
   const controlled = (id: string) =>
     readSessionCachePolicy(id, true)?.keep_warm !== undefined
   let hasRunnerTargets = false
   for (const session of shared.manager.trackedSessions()) {
-    if (controlled(session.id)) hasRunnerTargets = true
+    if (controlled(session.id) || shared.manager.hasPlannedTarget?.(session.id))
+      hasRunnerTargets = true
     else shared.manager.untrack(session.id, 'disabled')
   }
+  if (shared.hybridDisabled) return
+  shared.hybridDisabled = true
+  const persistence = shared.persistence
   // Inspect saved as well as live targets before a whole-store clear: a saved
   // session with explicit keep_warm may not have been restored into memory yet.
-  await shared.persistence.drain()
-  await shared.persistence.load(now, (entry) => {
-    if (controlled(entry.policyState?.ownerSessionId ?? entry.id)) {
-      hasRunnerTargets = true
-      return undefined
-    }
-    shared.persistence.removed(entry.id)
-    return 'invalid'
-  })
-  if (!hasRunnerTargets) shared.persistence.clear()
+  shared.localCleanup = (shared.localCleanup ?? Promise.resolve())
+    .then(async () => {
+      await persistence.drain()
+      await persistence.load(now, (entry) => {
+        if (!shared.hybridDisabled) return undefined
+        if (
+          entry.policyState?.planned ||
+          controlled(entry.policyState?.ownerSessionId ?? entry.id)
+        ) {
+          hasRunnerTargets = true
+          return undefined
+        }
+        persistence.removed(entry.id)
+        return 'invalid'
+      })
+      // A response may admit a runner target while the disk sweep awaits I/O.
+      const liveRunner = shared.manager
+        .trackedSessions()
+        .some(
+          (session) =>
+            controlled(session.id) ||
+            shared.manager.hasPlannedTarget?.(session.id),
+        )
+      if (!hasRunnerTargets && !liveRunner && shared.hybridDisabled)
+        persistence.clear()
+    })
+    .catch(() => logger.warn('cachekeep', 'local restart cleanup failed'))
 }
 
 // Kept on globalThis rather than in a module variable, so a plugin reload that
@@ -202,8 +250,12 @@ function createSharedCacheKeep(
     loadStorage: async () => {
       const lease = newestLease()
       const storage = lease ? await lease.loadStorage() : null
-      if (lease && !isCacheKeepHybridActive(storage))
-        await discardLocalTargets(shared, options.now?.() ?? Date.now())
+      if (lease)
+        discardLocalTargets(
+          shared,
+          options.now?.() ?? Date.now(),
+          !isCacheKeepHybridActive(storage),
+        )
       return storage
     },
     now: options.now,
@@ -221,6 +273,7 @@ function createSharedCacheKeep(
     setTimeoutImpl: options.setTimeoutImpl,
     clearTimeoutImpl: options.clearTimeoutImpl,
     reserveWarm: (target) => shared.persistence.reserveWarm(target),
+    settleWarm: (target) => shared.persistence.reserveWarm(target),
     deferWarmReservation: true,
     responseTtlMs: (response) => warmResponseLifetimes.get(response),
     onTargetChanged: (target) => shared.persistence.changed(target),
@@ -344,10 +397,10 @@ function createSharedCacheKeep(
             return 'account-gone'
           if (
             entry.isSubagent &&
-            !readSessionCachePolicy(
+            readSessionCachePolicy(
               entry.policyState?.ownerSessionId ?? entry.id,
               true,
-            ) &&
+            )?.keep_warm === undefined &&
             !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
           )
             return 'invalid'
@@ -469,6 +522,23 @@ export function createNativeCacheKeep(
     if (signal.aborted)
       throw new CacheKeepPrewarmError('authorization', signal.reason)
     const warmBodyText = await warm.text()
+    if (
+      !manager.reserveWarmDispatch &&
+      (target.policyState?.planned ||
+        readSessionCachePolicy(
+          target.policyState?.ownerSessionId ?? target.id,
+          true,
+        )?.keep_warm !== undefined)
+    ) {
+      if (!owner.plannedUnsupportedLogged) {
+        owner.plannedUnsupportedLogged = true
+        logger.debug(
+          'cachekeep',
+          'planned warming requires a server restart after an older owner reload',
+        )
+      }
+      throw new CacheKeepWarmRefusal('unsupported')
+    }
     const body = JSON.parse(warmBodyText) as { model: string }
     const scope: RequestScope = {
       providerID: 'anthropic',
@@ -512,10 +582,10 @@ export function createNativeCacheKeep(
           if (
             !target.policyState?.planned &&
             ((target.isSubagent &&
-              !readSessionCachePolicy(
+              readSessionCachePolicy(
                 target.policyState?.ownerSessionId ?? target.id,
                 true,
-              ) &&
+              )?.keep_warm === undefined &&
               !isCacheKeepSubagentsEnabled(snapshot.policyStorage)) ||
               !isCacheKeepHybridActive(snapshot.policyStorage) ||
               !isCacheKeepActiveNow(
@@ -558,10 +628,10 @@ export function createNativeCacheKeep(
           if (
             !target.policyState?.planned &&
             ((target.isSubagent &&
-              !readSessionCachePolicy(
+              readSessionCachePolicy(
                 target.policyState?.ownerSessionId ?? target.id,
                 true,
-              ) &&
+              )?.keep_warm === undefined &&
               !isCacheKeepSubagentsEnabled(snapshot.policyStorage)) ||
               !isCacheKeepHybridActive(snapshot.policyStorage) ||
               !isCacheKeepActiveNow(
@@ -614,7 +684,7 @@ export function createNativeCacheKeep(
         transport: 'http',
         data: authorized.attempt,
       }
-      let request = await native.adapter.rewriteRequest?.({
+      const request = await native.adapter.rewriteRequest?.({
         ...scope,
         accountId,
         attempt,
@@ -626,14 +696,8 @@ export function createNativeCacheKeep(
         }),
       })
       if (!request) throw new Error('CacheKeep rewrite refused')
-      // Authorization must not reshape a captured planned prefix using
-      // today's host defaults. The manager has already prepared the replay.
-      if (target.policyState?.planned) {
-        request = new Request(request, { body: warmBodyText })
-        actualWarmTtl = requestCacheLifetimeMs(warmBodyText)
-      }
       signal.throwIfAborted()
-      await manager.reserveWarmDispatch(target)
+      await manager.reserveWarmDispatch?.(target)
       signal.throwIfAborted()
       stage = 'send'
       const physical = await (options.fetch ?? fetch)(request)
@@ -665,7 +729,7 @@ export function createNativeCacheKeep(
         response.ok &&
         !signal.aborted &&
         !target.sourceWarm &&
-        manager.isCurrentTarget(target)
+        (manager.isCurrentTarget?.(target) ?? true)
       )
         sessionCacheActivity.recordPrewarm(
           target.id,
@@ -746,8 +810,22 @@ export function createNativeCacheKeep(
       const snapshot = await runtime.read()
       if (lease.stopped) return skipped('lease-stopped')
       const policy = readSessionCachePolicy(input.sessionID, true)
+      if (policy?.keep_warm !== undefined && !manager.reserveWarmDispatch) {
+        if (!owner.plannedUnsupportedLogged) {
+          owner.plannedUnsupportedLogged = true
+          logger.debug(
+            'cachekeep',
+            'planned warming requires a server restart after an older owner reload',
+          )
+        }
+        return skipped('planned-owner-requires-restart')
+      }
+      discardLocalTargets(
+        owner,
+        options.now?.() ?? Date.now(),
+        !isCacheKeepHybridActive(snapshot.policyStorage),
+      )
       if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
-        await discardLocalTargets(owner, options.now?.() ?? Date.now())
         if (policy?.keep_warm === undefined) return skipped('hybrid-inactive')
       }
       let isSubagent = false
@@ -759,7 +837,7 @@ export function createNativeCacheKeep(
       }
       if (lease.stopped) return skipped('lease-stopped')
       if (
-        !policy &&
+        policy?.keep_warm === undefined &&
         isSubagent &&
         !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
       )
@@ -803,6 +881,7 @@ export function createNativeCacheKeep(
       status: number
       acceptedAt?: number
       ttlMs?: number
+      acceptedUsage?: Parameters<CacheKeepManager['recordAcceptedUsage']>[2]
     }) {
       const target = discardAttempt(input.attemptId)
       if (
@@ -813,6 +892,7 @@ export function createNativeCacheKeep(
       ) {
         const result = manager.track({
           ...target,
+          acceptedUsage: input.acceptedUsage,
           ...(input.acceptedAt !== undefined && {
             acceptedAt: input.acceptedAt,
           }),
@@ -835,7 +915,7 @@ export function createNativeCacheKeep(
       bodyText: string,
       usage: Parameters<CacheKeepManager['recordAcceptedUsage']>[2],
     ) {
-      manager.recordAcceptedUsage(sessionID, bodyText, usage)
+      manager.recordAcceptedUsage?.(sessionID, bodyText, usage)
     },
     forgetSession(sessionID: string) {
       manager.untrack(sessionID)

@@ -398,3 +398,33 @@ test('planned child warms override local off and preserve the 24-count across Pi
   await resumed.tick()
   expect(f.sends).toHaveLength(24)
 })
+
+test('ttl-only policy cannot restore a Pi child after the local subagent opt-out', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  globals[key] = () => ({ cache: () => ({ ttl: 'long' }) })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  const f = await fixture()
+  f.snapshot.policyStorage.cacheKeep = {
+    enabled: true,
+    always: true,
+    subagents: true,
+  }
+  const first = f.create()
+  await first.process.trackAccepted(
+    { ...f.input('ttl-child'), isSubagent: true },
+    f.snapshot,
+  )
+  await first.process.stop()
+  f.snapshot.policyStorage.cacheKeep.subagents = false
+  const resumed = f.create()
+  await resumed.process.startSession('pi-storage', 'ttl-child')
+  f.advance(3_300_000)
+  await resumed.tick()
+  expect(f.sends).toEqual([])
+  expect(resumed.process.manager.trackedSessions()).toEqual([])
+})

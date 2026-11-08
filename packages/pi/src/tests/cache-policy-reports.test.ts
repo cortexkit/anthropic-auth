@@ -2,7 +2,10 @@ import { afterEach, expect, mock, spyOn, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CacheKeepManager } from '@cortexkit/anthropic-auth-core'
+import {
+  CacheKeepManager,
+  sessionCacheActivity,
+} from '@cortexkit/anthropic-auth-core'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import {
   sendPiPrimeRequest,
@@ -59,7 +62,7 @@ function accepted() {
     },
   )
 }
-async function fixture(api = false) {
+async function fixture(api = false, keepWarm = false) {
   const directory = await mkdtemp(join(tmpdir(), 'pi-cache-reports-'))
   const storagePath = join(directory, 'anthropic-auth.json')
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -124,7 +127,7 @@ async function fixture(api = false) {
         mainQuotaCheckedAt: checkedAt,
       },
       claudeCache: { enabled: true, mode: 'hybrid' },
-      cacheKeep: { enabled: false },
+      cacheKeep: { enabled: keepWarm, always: true },
     },
     storagePath,
   )
@@ -275,4 +278,60 @@ test('Pi Prime is stateless and emits no session cache report', async () => {
   await response.text()
   await detached()
   expect(reports).toEqual([])
+})
+
+test('Pi unmarked no-policy response retains its legacy hold and keeper lifetime while reporting zero', async () => {
+  await fixture(false, true)
+  const reports: unknown[] = []
+  globals[routingKey] = () => ({
+    report: (payload: Record<string, unknown>) => {
+      if (payload.kind === 'cache_touch') reports.push(payload)
+    },
+  })
+  globalThis.fetch = mock(async (input: any) =>
+    String(input).includes('/api/claude_cli/bootstrap')
+      ? Response.json({
+          oauth_account: { account_uuid: fixtureAccountIdentity('main') },
+        })
+      : accepted(),
+  ) as unknown as typeof fetch
+  const originalTrack = CacheKeepManager.prototype.track
+  let kept: ReturnType<CacheKeepManager['trackedRequest']>
+  const track = spyOn(CacheKeepManager.prototype, 'track').mockImplementation(
+    function (this: CacheKeepManager, input) {
+      const result = originalTrack.call(this, input)
+      if (input.sessionId === 'ses_pi_reports')
+        kept = this.trackedRequest(input.sessionId)
+      return result
+    },
+  )
+  cleanups.push(() => track.mockRestore())
+  const before = Date.now()
+  const result = await streamCortexKitAnthropic(model, context(), {
+    apiKey: 'sk-ant-oat01-main-access',
+    sessionId: 'ses_pi_reports',
+    onPayload: (payload) => {
+      const strip = (value: any) => {
+        if (!value || typeof value !== 'object') return
+        delete value.cache_control
+        delete value.cacheControl
+        for (const child of Object.values(value)) strip(child)
+      }
+      strip(payload)
+    },
+  }).result()
+  expect(result.errorMessage).toBeUndefined()
+  await detached()
+  expect(reports).toEqual([
+    {
+      kind: 'cache_touch',
+      at: expect.any(Number),
+      ttl_ms: 0,
+      source: 'response',
+    },
+  ])
+  expect(
+    sessionCacheActivity.holdUntil('ses_pi_reports', 'main', before, 'max'),
+  ).toBeGreaterThanOrEqual(before + 300_000)
+  expect(kept?.cacheExpiresAt).toBeGreaterThanOrEqual(before + 300_000)
 })

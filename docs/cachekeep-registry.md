@@ -62,7 +62,11 @@ the latest body, at most once per five seconds per session, and drain on clean
 shutdown. Stopping warming deletes the record. Warm-attempt reservations are an
 exception to coalescing: with persistence enabled they are written immediately
 and owner-only before dispatch, preventing a crash from resuming an older low
-count. Failed attempts retain the reservation; only successful warms add cost.
+count. A refused write rolls back the unsent in-memory reservation. Dispatched
+attempts retain the reservation; only successful warms add their admitted cost.
+The same write stores an unresolved dispatch's cost. Restore conservatively
+counts that cost as spent unless a failure was saved, so a crash
+before the success flush cannot create another `auto` warm.
 Saved bounds include the last real/warm times, reserved count, successful cost,
 prefix usage and whether the target has actually warmed. An older record without
 these facts cannot resume planned or local `always` warming until a real request.
