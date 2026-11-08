@@ -4,11 +4,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Thalamus can choose each OAuth session's cache lifetime and keep-warm mode, and receives a report whenever a session's cache is refreshed or its keep-warm stops. “Keep cache warm always” now stops after 24 warm attempts without a real request, also outside Thalamus and for Opus 4.8 source warms.
 - On OpenCode 1, sessions using the HTTP relay now keep their cache warm even when the upstream response has no request id.
-- Immediate cache warms work again for tracked sessions, and Pi keeps tracking accepted HTTP-relay sessions for keep-warm and restart recovery.
-- Thalamus can choose each OAuth session's cache lifetime and keep-warm mode and receive cache touch/stop reports. “Keep cache warm always” now stops after 24 warm attempts without a real request, including outside Thalamus and for Opus 4.8 source warms.
-- Five-minute source caches now refresh on time instead of expiring between background checks.
-- On OpenCode 2, delayed session-parent lookups no longer stop a newer allowed cache warm, and explicit Thalamus keep-warm modes do not wait for those lookups.
+
 ## 2.6.0
 
 - Message threads now continue across a routine login refresh on OpenCode 2 and Pi, and in local mode on OpenCode 1, instead of resending the whole conversation. Debug logs now explain why a conversation starts a new thread without logging its contents or credentials.
