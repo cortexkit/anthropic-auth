@@ -390,10 +390,12 @@ export type CacheKeepPolicyState = {
   warmsSinceLastRealRequest: number
   /** Micro-USD: per-million-token catalogue rate multiplied by prefix tokens. */
   warmCostSoFar: number
+  /** Admitted cost durably reserved for dispatches whose result is not saved yet. */
+  pendingWarmCost?: number
   prefixTokens?: number
   inputTokens?: number
   hasWarmed: boolean
-  /** A legacy local-hours restore cannot establish a real-request baseline. */
+  /** A restored local hours-window record lacks the accepted real-request baseline. */
   needsRealRequest?: boolean
 }
 
@@ -420,6 +422,38 @@ export type CacheKeepTarget = {
    */
   sourceWarm?: boolean
 } & Pick<CacheKeepTrackedSession, 'ttlMs' | 'lastTouchAt' | 'lastTouchKind'>
+
+type AcceptedCacheUsage = {
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+  input_tokens?: number
+}
+
+function updateAcceptedUsage(
+  target: CacheKeepTarget,
+  bodyText: string,
+  usage: AcceptedCacheUsage,
+): boolean {
+  const state = target.policyState
+  if (
+    !state ||
+    target.bodyText !== bodyText ||
+    (usage.cache_read_input_tokens === undefined &&
+      usage.cache_creation_input_tokens === undefined)
+  )
+    return false
+  const read = usage.cache_read_input_tokens ?? 0
+  const write = usage.cache_creation_input_tokens ?? 0
+  const uncached = usage.input_tokens ?? 0
+  if (![read, write, uncached].every((n) => Number.isFinite(n) && n >= 0))
+    return false
+  const prefix = read + write
+  const input = prefix + uncached
+  if (state.prefixTokens === prefix && state.inputTokens === input) return false
+  state.prefixTokens = prefix
+  state.inputTokens = input
+  return true
+}
 
 function sessionMetadata(target: CacheKeepTarget): CacheKeepTrackedSession {
   return {
@@ -665,6 +699,10 @@ export class CacheKeepManager {
   private tickPromise: Promise<void> | null = null
   private nextPrewarmAttemptId = 0
   private readonly reportedStops = new WeakSet<CacheKeepPolicyState>()
+  private readonly admittedWarmCosts = new WeakMap<
+    Readonly<CacheKeepTarget>,
+    number
+  >()
 
   constructor(
     private readonly options: {
@@ -698,6 +736,8 @@ export class CacheKeepManager {
       onTargetRemoved?: (id: string) => void
       /** Persistent hosts must commit the reservation before any physical send. */
       reserveWarm?: (target: Readonly<CacheKeepTarget>) => Promise<boolean>
+      /** Persist a known failed dispatch so restore need not charge its cost. */
+      settleWarm?: (target: Readonly<CacheKeepTarget>) => Promise<boolean>
       /** Native hosts authorize asynchronously inside fetchImpl and reserve there. */
       deferWarmReservation?: boolean
       /** A native host may rewrite the final physical warm after fetchImpl starts. */
@@ -865,31 +905,14 @@ export class CacheKeepManager {
     return current !== undefined && current.policyState === target.policyState
   }
 
+  hasPlannedTarget(id: string): boolean {
+    return this.targets.get(id)?.policyState?.planned === true
+  }
+
   /** An old response cannot price or reset a newer captured request. */
-  recordAcceptedUsage(
-    id: string,
-    bodyText: string,
-    usage: {
-      cache_read_input_tokens?: number
-      cache_creation_input_tokens?: number
-      input_tokens?: number
-    },
-  ) {
+  recordAcceptedUsage(id: string, bodyText: string, usage: AcceptedCacheUsage) {
     const target = this.targets.get(id)
-    const state = target?.policyState
-    if (!target || !state || target.bodyText !== bodyText) return
-    if (
-      usage.cache_read_input_tokens === undefined &&
-      usage.cache_creation_input_tokens === undefined
-    )
-      return
-    const read = usage.cache_read_input_tokens ?? 0
-    const write = usage.cache_creation_input_tokens ?? 0
-    const uncached = usage.input_tokens ?? 0
-    if (![read, write, uncached].every((n) => Number.isFinite(n) && n >= 0))
-      return
-    state.prefixTokens = read + write
-    state.inputTokens = read + write + uncached
+    if (!target || !updateAcceptedUsage(target, bodyText, usage)) return
     this.options.onTargetChanged?.(target)
     this.scheduleDueTimer()
   }
@@ -1014,7 +1037,12 @@ export class CacheKeepManager {
     if (decision?.action === 'stop')
       throw new CacheKeepWarmRefusal(decision.reason)
     if (decision?.action === 'wait') throw new CacheKeepWarmRefusal('stopped')
-    if (state) state.warmsSinceLastRealRequest++
+    const admittedCost = this.costs(current)?.nextWarmCost ?? 0
+    const pendingCost = state?.pendingWarmCost
+    if (state) {
+      state.warmsSinceLastRealRequest++
+      state.pendingWarmCost = (pendingCost ?? 0) + admittedCost
+    }
     // Process-only keepers have no restart replay. Persistent hosts must prove
     // the new count is stored before sending; a failed attempt keeps its slot.
     if (this.options.reserveWarm) {
@@ -1022,9 +1050,15 @@ export class CacheKeepManager {
       try {
         committed = await this.options.reserveWarm(current)
       } catch {}
-      if (!committed && (state?.planned || isCacheKeepAlways(storage)))
+      if (!committed && (state?.planned || isCacheKeepAlways(storage))) {
+        if (state) {
+          state.warmsSinceLastRealRequest--
+          state.pendingWarmCost = pendingCost
+        }
         throw new CacheKeepPrewarmError('authorization', undefined)
+      }
     }
+    this.admittedWarmCosts.set(target, admittedCost)
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
     const fresh = this.policyDecision(
       current,
@@ -1139,11 +1173,13 @@ export class CacheKeepManager {
     // active session cache. The shared report has no target-attribution field.
     if (target.sourceWarm || !state?.hasWarmed || this.reportedStops.has(state))
       return
-    this.reportedStops.add(state)
-    reportSessionCacheWarmStopped(state.ownerSessionId, {
-      at,
-      reason: reportStopReason(reason),
-    })
+    if (
+      reportSessionCacheWarmStopped(state.ownerSessionId, {
+        at,
+        reason: reportStopReason(reason),
+      })
+    )
+      this.reportedStops.add(state)
   }
 
   private evictOldestTarget(now: number, reason: 'budget' | 'count') {
@@ -1168,7 +1204,11 @@ export class CacheKeepManager {
         continue
       }
       if (now >= target.cacheExpiresAt) {
-        this.reportStop(target, 'expired', now)
+        this.reportStop(
+          target,
+          target.policyState?.planned ? 'cost-cap' : 'expired',
+          now,
+        )
         this.targets.delete(id)
         this.options.onTargetRemoved?.(id)
       }
@@ -1197,6 +1237,7 @@ export class CacheKeepManager {
     /** Source targets use a synthetic id but belong to a real host session. */
     ownerSessionId?: string
     acceptedAt?: number
+    acceptedUsage?: AcceptedCacheUsage
     ttlMs?: number
     /** Restore only the remaining lifetime, never grant a restarted cache a new hour. */
     retained?: Pick<
@@ -1299,6 +1340,7 @@ export class CacheKeepManager {
     }
     const window = getCacheKeepWindow(input.storage)
     const appliedTtlMs = requestCacheLifetimeMs(input.bodyText)
+    const replayTtlMs = input.sourceWarm ? appliedTtlMs : input.ttlMs
     if (planned && appliedTtlMs === 0) return retire('unsupported')
     if (!planned && !isCacheKeepActiveNow(input.storage, new Date(now))) {
       return refuse('outside configured schedule', 'outside-schedule')
@@ -1345,7 +1387,7 @@ export class CacheKeepManager {
             lastTouchKind: input.retained.lastTouchKind,
           }
         : input.sourceWarm
-          ? {}
+          ? { ttlMs: replayTtlMs }
           : {
               ttlMs: input.ttlMs ?? CACHE_KEEP_TTL_MS,
               lastTouchAt: acceptedAt,
@@ -1353,13 +1395,13 @@ export class CacheKeepManager {
             }),
       cacheExpiresAt:
         input.retained?.cacheExpiresAt ??
-        acceptedAt + (input.ttlMs ?? CACHE_KEEP_TTL_MS),
+        acceptedAt + (replayTtlMs ?? CACHE_KEEP_TTL_MS),
       nextPrewarmAt:
         input.retained?.nextPrewarmAt ??
         acceptedAt +
           (policy?.ttl
             ? CACHE_KEEP_TTL_MS
-            : (input.ttlMs ?? CACHE_KEEP_TTL_MS)) -
+            : (replayTtlMs ?? CACHE_KEEP_TTL_MS)) -
           CACHE_KEEP_PREWARM_LEAD_MS,
       consecutiveFailures: 0,
       dayKey: today,
@@ -1368,7 +1410,13 @@ export class CacheKeepManager {
       accountStoragePath: input.accountStoragePath,
       isSubagent: input.isSubagent ?? false,
       policyState: input.retained?.policyState
-        ? { ...input.retained.policyState }
+        ? {
+            ...input.retained.policyState,
+            warmCostSoFar:
+              input.retained.policyState.warmCostSoFar +
+              (input.retained.policyState.pendingWarmCost ?? 0),
+            pendingWarmCost: undefined,
+          }
         : {
             ownerSessionId,
             planned,
@@ -1385,6 +1433,8 @@ export class CacheKeepManager {
     const target = this.targets.get(input.sessionId)
     if (!target)
       return { tracked: false, reason: 'evicted by cachekeep limits' }
+    if (input.acceptedUsage)
+      updateAcceptedUsage(target, input.bodyText, input.acceptedUsage)
     if (planned) {
       target.ttlMs = appliedTtlMs
       if (!input.retained) target.cacheExpiresAt = acceptedAt + appliedTtlMs
@@ -1491,7 +1541,11 @@ export class CacheKeepManager {
       }
       if (target.nextPrewarmAt > attemptAt) continue
       if (attemptAt > this.lastPrewarmStart(target)) {
-        this.removeTarget(target, 'retry-window-ended', attemptAt)
+        this.removeTarget(
+          target,
+          target.policyState?.planned ? 'cost-cap' : 'retry-window-ended',
+          attemptAt,
+        )
         continue
       }
       try {
@@ -1526,7 +1580,11 @@ export class CacheKeepManager {
     const now = this.options.now?.() ?? Date.now()
     const deadline = this.lastPrewarmStart(target)
     if (now >= deadline) {
-      this.removeTarget(target, 'retry-window-ended', now)
+      this.removeTarget(
+        target,
+        target.policyState?.planned ? 'cost-cap' : 'retry-window-ended',
+        now,
+      )
       return
     }
     target.consecutiveFailures += 1
@@ -1649,6 +1707,14 @@ export class CacheKeepManager {
             body: prewarm.bodyText,
             signal: attempt.signal,
           })
+          if (!sent.ok && target.policyState) {
+            const cost = this.admittedWarmCosts.get(target) ?? 0
+            target.policyState.pendingWarmCost =
+              Math.max(0, (target.policyState.pendingWarmCost ?? 0) - cost) ||
+              undefined
+            this.admittedWarmCosts.delete(target)
+            await this.options.settleWarm?.(target)
+          }
           return scope.redactResponse(sent)
         } catch (error) {
           if (nativeAccountRefusal(error)) {
@@ -1834,13 +1900,15 @@ export class CacheKeepManager {
 
     if (this.targets.get(target.id) !== target) return
     acceptedAt ??= this.options.now?.() ?? Date.now()
-    if (result.usage)
-      this.recordAcceptedUsage(target.id, target.bodyText, result.usage)
     const state = target.policyState
     if (state) {
       state.hasWarmed = true
       state.lastWarmAt = acceptedAt
-      state.warmCostSoFar += this.costs(target)?.nextWarmCost ?? 0
+      const cost = this.admittedWarmCosts.get(target) ?? 0
+      state.warmCostSoFar += cost
+      state.pendingWarmCost =
+        Math.max(0, (state.pendingWarmCost ?? 0) - cost) || undefined
+      this.admittedWarmCosts.delete(target)
       this.reportedStops.delete(state)
       if (!target.sourceWarm)
         reportSessionCacheTouch(state.ownerSessionId, {
@@ -1849,7 +1917,8 @@ export class CacheKeepManager {
           source: 'warm',
         })
     }
-    target.ttlMs = state?.planned ? target.ttlMs : CACHE_KEEP_TTL_MS
+    target.ttlMs =
+      state?.planned || target.sourceWarm ? target.ttlMs : CACHE_KEEP_TTL_MS
     target.lastTouchAt = acceptedAt
     target.lastTouchKind = 'warm'
     target.cacheExpiresAt = acceptedAt + (target.ttlMs ?? CACHE_KEEP_TTL_MS)

@@ -19,6 +19,7 @@ import {
   CACHE_KEEP_TTL_MS,
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  type CacheKeepTarget,
   createNativeAccountRuntime,
   createNativePoolStore,
   decideStickyQuotaFailure,
@@ -27,6 +28,7 @@ import {
   logger,
   NativeCustodyError,
   type NativeLockEvent,
+  RequestGzipLatch,
   resolveNativePoolPaths,
   runNativeMigration,
   sessionCacheActivity,
@@ -41,6 +43,7 @@ import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import * as wireTransform from '../transform'
+import * as nativeAdapters from '../v2/adapter'
 import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
@@ -1376,18 +1379,37 @@ test.each([false, true])(
     expect(JSON.parse((await saved()).bodyText).messages).toEqual(
       first.messages,
     )
-    const changed = spyOn(newStore, 'changed')
+    const notifications: Array<Readonly<CacheKeepTarget>> = []
+    const persist = newStore.changed.bind(newStore)
+    const changed = spyOn(newStore, 'changed').mockImplementation((target) => {
+      notifications.push({
+        ...target,
+        policyState: target.policyState && { ...target.policyState },
+      })
+      persist(target)
+    })
     cleanups.push(() => changed.mockRestore())
     const latest = (await (
       await next.live(undefined, {
         messages: [{ role: 'user', content: 'A request after plugin reload' }],
       })
     ).json()) as Record<string, any>
-    expect(changed).toHaveBeenCalledTimes(1)
+    // Capture finishes before hand-off; usage arrives when the response drains.
+    expect(changed).toHaveBeenCalledTimes(2)
+    expect(notifications[0]!.policyState?.prefixTokens).toBeUndefined()
+    expect(notifications[0]!.policyState?.inputTokens).toBeUndefined()
+    expect(notifications[1]).toEqual({
+      ...notifications[0]!,
+      policyState: {
+        ...notifications[0]!.policyState!,
+        prefixTokens: 1,
+        inputTokens: 1,
+      },
+    })
     if (legacy) {
       // Emulate an older manager's callback, which captured the first store.
       oldStore.changed(changed.mock.calls[0]![0])
-      expect(changed).toHaveBeenCalledTimes(2)
+      expect(changed).toHaveBeenCalledTimes(3)
     }
     await newStore.drain()
     expect(JSON.parse((await saved()).bodyText).messages).toEqual(
@@ -1858,7 +1880,7 @@ test('OC2 accepted OAuth reports the final no-cache body even with warming refus
   try {
     const draft = await f.prepare()
     expect(await draft.request.clone().text()).not.toContain('cache_control')
-    const before = Date.now()
+    const before = f.now()
     const response = await f.respond(
       draft,
       Response.json({ usage: { cache_read_input_tokens: 12 } }),
@@ -1928,7 +1950,7 @@ test('OC2 recovered 400 to 200 reports exactly once with the recovered applied l
     expect(JSON.parse(await draft.request.clone().text()).thread).toEqual({
       type: 'create',
     })
-    const before = Date.now()
+    const before = f.now()
     const response = await f.respond(
       draft,
       Response.json(
@@ -2049,4 +2071,263 @@ test('OC2 ordinary acceptance captures the byte-identical pre-thread snapshot be
     rewrite.mockRestore()
     track.mockRestore()
   }
+})
+
+function runnerPolicyForReview(policy: unknown, reports: unknown[] = []) {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  globals[key] = () => ({
+    cache: () => policy,
+    report: (payload: unknown) => reports.push(payload),
+  })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+}
+
+test('hybrid-disabled request dispatch never waits on a held restart write', async () => {
+  const f = await fixture()
+  await f.live()
+  const owner = (globalThis as any)[
+    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ].get(f.paths.storageId)
+  await owner.persistence.drain()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: false },
+  }))
+  let release!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const drain = spyOn(owner.persistence, 'drain').mockImplementation(() => held)
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  const preparing = f.prepare()
+  try {
+    const outcome = await Promise.race([
+      preparing.then(() => 'dispatched'),
+      new Promise<string>((resolve) => {
+        timeout = setTimeout(() => resolve('blocked by bookkeeping'), 2_000)
+      }),
+    ])
+    expect(outcome).toBe('dispatched')
+    await f.prepare()
+    await owner.manager.tick()
+    expect(drain).toHaveBeenCalledTimes(1)
+    runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+    await f.live()
+    release()
+    await owner.localCleanup
+    drain.mockRestore()
+    await owner.persistence.drain()
+    const retained: string[] = []
+    await owner.persistence.load(f.now(), (entry: { id: string }) => {
+      retained.push(entry.id)
+      return undefined
+    })
+    expect(retained).toEqual(['ses_oc2_keep'])
+  } finally {
+    clearTimeout(timeout)
+    release()
+    await preparing
+    drain.mockRestore()
+  }
+})
+
+test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted usage safe', async () => {
+  const f = await fixture()
+  await f.live()
+  const owner = (globalThis as any)[
+    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ].get(f.paths.storageId)
+  const original = owner.manager
+  owner.manager = new Proxy(original, {
+    get(target, name) {
+      if (
+        [
+          'reserveWarmDispatch',
+          'isCurrentTarget',
+          'recordAcceptedUsage',
+        ].includes(String(name))
+      )
+        return undefined
+      const value = Reflect.get(target, name)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  const reports: unknown[] = []
+  runnerPolicyForReview(null, reports)
+  const next = await f.start()
+  await next.live()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(
+    reports.filter((value: any) => value.kind === 'cache_touch'),
+  ).toHaveLength(1)
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  const debug = spyOn(logger, 'debug')
+  cleanups.push(() => debug.mockRestore())
+  runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+  await next.live()
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  expect(
+    debug.mock.calls.filter((call) =>
+      String(call[1]).includes('planned warming requires a server restart'),
+    ),
+  ).toHaveLength(1)
+  owner.manager = original
+})
+
+test.each(['http-relay', 'gzip'] as const)(
+  'planned %s warm preserves physical transport framing',
+  async (transport) => {
+    const f = await fixture()
+    await f.live(undefined, {
+      system: 'Large stable cache prefix. '.repeat(10_000),
+    })
+    const owner = (globalThis as any)[
+      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    ].get(f.paths.storageId)
+    const captured = owner.manager.trackedRequest('ses_oc2_keep')
+    expect(captured).toBeDefined()
+    runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+    expect(
+      owner.manager.track({
+        ...captured,
+        sessionId: 'ses_oc2_keep',
+        headers: new Headers(),
+        storage: { version: 1, accounts: [], cacheKeep: { enabled: false } },
+        cacheMode: 'hybrid',
+        ttlMs: 3_600_000,
+      }).tracked,
+    ).toBe(true)
+    const original = nativeAdapters.createNativeAnthropicAdapter
+    {
+      const intercepted = ((deps: Parameters<typeof original>[0]) =>
+        original({
+          ...deps,
+          requestGzipLatch: new RequestGzipLatch(),
+          source:
+            transport === 'gzip'
+              ? deps.source
+              : {
+                  ...deps.source,
+                  async authorizeAccount(
+                    ...args: Parameters<
+                      NonNullable<typeof deps.source.authorizeAccount>
+                    >
+                  ) {
+                    const authorization = await deps.source.authorizeAccount?.(
+                      ...args,
+                    )
+                    return authorization?.route === 'oauth'
+                      ? {
+                          ...authorization,
+                          dispatch: {
+                            kind: 'http-relay',
+                            url: 'https://relay.example/v1/messages',
+                            token: 'synthetic-relay',
+                          },
+                        }
+                      : authorization
+                  },
+                },
+        })) as typeof original
+      const spy = spyOn(
+        nativeAdapters,
+        'createNativeAnthropicAdapter',
+      ).mockImplementation(intercepted)
+      cleanups.push(() => spy.mockRestore())
+    }
+    f.advance(3_580_000)
+    await f.timers.fireTimeouts()
+    expect(f.sent).toHaveLength(1)
+    const sent = f.sent[0]!
+    if (transport === 'http-relay') {
+      expect(sent.url).toBe('https://relay.example/v1/messages')
+      const envelope = (await sent.clone().json()) as { body: string }
+      expect(envelope).toMatchObject({
+        protocol: 1,
+        type: 'request',
+        mode: 'full_sync',
+        upstream: {
+          url: 'https://api.anthropic.com/v1/messages?beta=true',
+          method: 'POST',
+        },
+      })
+      expect(JSON.parse(envelope.body).max_tokens).toBe(0)
+    } else {
+      expect(sent.headers.get('content-encoding')).toBe('gzip')
+      const body = JSON.parse(
+        gunzipSync(Buffer.from(await sent.clone().arrayBuffer())).toString(),
+      )
+      expect(body.max_tokens).toBe(0)
+      expect(JSON.stringify(body)).toContain('Large stable cache prefix.')
+    }
+  },
+)
+
+test('ttl-only policy keeps the live OC2 subagent opt-out', async () => {
+  runnerPolicyForReview({ ttl: 'long' })
+  const f = await fixture(true)
+  await f.live()
+  expect(await f.registry.list()).toEqual([])
+  expect(f.timers.callbacks.size).toBe(0)
+})
+
+test('ttl-only policy keeps the restored OC2 subagent opt-out', async () => {
+  runnerPolicyForReview({ ttl: 'long' })
+  const f = await fixture(true)
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, always: true, subagents: true },
+  }))
+  await f.live()
+  const owner = (globalThis as any)[
+    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ].get(f.paths.storageId)
+  const captured = owner.manager.trackedRequest('ses_oc2_keep')
+  expect(
+    owner.manager.track({
+      ...captured,
+      sessionId: 'ses_oc2_keep',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        system: [
+          {
+            type: 'text',
+            text: 'Live child prefix',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+      storage: {
+        version: 1,
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true, subagents: true },
+      },
+      cacheMode: 'hybrid',
+      isSubagent: true,
+      ttlMs: 3_600_000,
+    }).tracked,
+  ).toBe(true)
+  await f.dispose()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, always: true, subagents: false },
+  }))
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(0)
+  expect(await readdir(f.disk)).toEqual([])
 })

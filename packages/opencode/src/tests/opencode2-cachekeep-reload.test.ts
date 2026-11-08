@@ -166,6 +166,7 @@ test.each([false, true])(
       kind: 'primary',
     } as Parameters<typeof keep.track>[0])
     expect(manager.trackedSessions()).toEqual([])
+    await Reflect.get(owner, 'localCleanup')
     await owner.persistence.drain()
     expect(await readdir(owner.persistence.directory)).toEqual([])
   },
@@ -250,13 +251,16 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
   ).toHaveLength(2)
   policy.cacheKeep = { enabled: false }
   await keep.track({ ...input, attemptId: 'disabled' })
+  await shared.localCleanup
   await shared.persistence.drain()
   expect(
     shared.manager.trackedSessions().map(({ id }: { id: string }) => id),
   ).toEqual(['ses_runner'])
   const retained: string[] = []
+  let saved: any
   await shared.persistence.load(now, (entry: { id: string }) => {
     retained.push(entry.id)
+    saved = entry
     return undefined
   })
   expect(retained).toEqual(['ses_runner'])
@@ -265,4 +269,29 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
       name.endsWith('.json.gz'),
     ),
   ).toHaveLength(1)
+  const reports: unknown[] = []
+  shared.manager.track({
+    sessionId: 'ses_runner',
+    url: input.url,
+    bodyText: input.bodyText,
+    headers: new Headers(),
+    storage: policy,
+    cacheMode: 'hybrid',
+    oauthAccountId: 'first',
+    oauthAccountIdentity: '11111111-2222-4333-8444-555555555555',
+    retained: {
+      ...saved,
+      policyState: { ...saved.policyState, hasWarmed: true },
+    },
+  })
+  globals[routingKey] = () => ({
+    cache: () => null,
+    report: (payload: unknown) => reports.push(payload),
+  })
+  await keep.track({ ...input, attemptId: 'vanished-plan' })
+  await shared.manager.tick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(reports).toEqual([
+    { kind: 'cache_warm_stopped', at: now, reason: 'session-ended' },
+  ])
 })

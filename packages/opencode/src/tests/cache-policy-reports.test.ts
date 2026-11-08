@@ -3,6 +3,7 @@ import {
   CacheKeepManager,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
+  sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type OpenCode2HookContext,
@@ -10,6 +11,7 @@ import {
 } from '@cortexkit/common-auth/opencode2'
 import type { Registration } from '@opencode/plugin/promise/registration'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
+import * as wireTransform from '../transform'
 import type { NativeAnthropicSource } from '../v2/adapter'
 import { installNativeAnthropic } from '../v2/install'
 import { preparedAnthropicCredential } from '../v2/ownership'
@@ -357,6 +359,109 @@ describe('OC1 final response cache reports', () => {
               output_tokens: 1,
             },
           )
+      },
+    )
+    oc1Test.each(['unmarked', 'ttl-child'] as const)(
+      'legacy local admission for %s',
+      async (scenario) => {
+        await useTempAccountFile(
+          ctx,
+          createFallbackStorage({
+            accounts: [],
+            quota: { enabled: false },
+            refresh: { enabled: false },
+            claudeCache: { enabled: true, mode: 'hybrid' },
+            cacheKeep: { enabled: true, always: true, subagents: false },
+          }),
+        )
+        const reports: Record<string, unknown>[] = []
+        globals[routingKey] = () => ({
+          cache: () => (scenario === 'ttl-child' ? { ttl: 'long' } : null),
+          report: (payload: Record<string, unknown>) => {
+            if (payload.kind === 'cache_touch') reports.push(payload)
+          },
+        })
+        if (scenario === 'unmarked') {
+          const original = wireTransform.rewriteRequestBody
+          const rewrite = spyOn(
+            wireTransform,
+            'rewriteRequestBody',
+          ).mockImplementation(async (...args) => {
+            const body = JSON.parse((await original(...args))!)
+            const strip = (value: any) => {
+              if (!value || typeof value !== 'object') return
+              delete value.cache_control
+              delete value.cacheControl
+              for (const child of Object.values(value)) strip(child)
+            }
+            strip(body)
+            return JSON.stringify(body)
+          })
+          cleanups.push(() => rewrite.mockRestore())
+        }
+        globalThis.fetch = mock(
+          withNativeAdmission(ctx, async () =>
+            Response.json({ content: [], usage: {} }),
+          ),
+        ) as unknown as typeof fetch
+        const originalTrack = CacheKeepManager.prototype.track
+        let kept: ReturnType<CacheKeepManager['trackedRequest']>
+        let tracked = false
+        const track = spyOn(
+          CacheKeepManager.prototype,
+          'track',
+        ).mockImplementation(function (this: CacheKeepManager, input) {
+          const result = originalTrack.call(this, input)
+          if (input.sessionId === 'ses_oc1_legacy_review') {
+            tracked = result.tracked
+            kept = this.trackedRequest(input.sessionId)
+          }
+          return result
+        })
+        cleanups.push(() => track.mockRestore())
+        const plugin = await getPlugin(ctx)
+        const loader = await plugin.auth.loader(
+          () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+          { models: {} },
+        )
+        const before = Date.now()
+        const response = await loader.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: {
+            'x-session-affinity': 'ses_oc1_legacy_review',
+            ...(scenario === 'ttl-child' && {
+              'x-parent-session-id': 'ses_parent',
+            }),
+          },
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            messages: [{ role: 'user', content: 'Hello' }],
+          }),
+        })
+        await response.text()
+        await detached()
+        if (scenario === 'unmarked') {
+          expect(reports).toEqual([
+            {
+              kind: 'cache_touch',
+              at: expect.any(Number),
+              ttl_ms: 0,
+              source: 'response',
+            },
+          ])
+          expect(
+            sessionCacheActivity.holdUntil(
+              'ses_oc1_legacy_review',
+              'main',
+              before,
+              'max',
+            ),
+          ).toBeGreaterThanOrEqual(before + 3_600_000)
+          expect(tracked).toBe(true)
+          expect(kept?.cacheExpiresAt).toBeGreaterThanOrEqual(
+            before + 3_600_000,
+          )
+        } else expect(tracked).toBe(false)
       },
     )
   })

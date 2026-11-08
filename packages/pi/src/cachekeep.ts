@@ -4,6 +4,7 @@ import {
   CacheKeepManager,
   CacheKeepStore,
   type CacheKeepStoreOptions,
+  type CacheKeepTarget,
   type HolderLiveness,
   isCacheKeepSubagentsEnabled,
   logger,
@@ -66,6 +67,14 @@ export class PiCacheKeep {
     const schedule = managerOptions.setIntervalImpl ?? setInterval
     this.schedule = schedule
     this.cancel = managerOptions.clearIntervalImpl ?? clearInterval
+    const persistWarm = async (target: Readonly<CacheKeepTarget>) => {
+      const session = this.sessions.get(target.id)
+      if (this.stopping || !session?.identity) return false
+      return session.store.reserveWarm({
+        ...target,
+        oauthAccountIdentity: session.identity,
+      })
+    }
     this.manager = new CacheKeepManager({
       ...managerOptions,
       setIntervalImpl: ((_callback: unknown, ms?: number) =>
@@ -84,14 +93,8 @@ export class PiCacheKeep {
           })
         managerOptions.onTargetChanged?.(target)
       },
-      reserveWarm: async (target) => {
-        const session = this.sessions.get(target.id)
-        if (this.stopping || !session?.identity) return false
-        return session.store.reserveWarm({
-          ...target,
-          oauthAccountIdentity: session.identity,
-        })
-      },
+      reserveWarm: persistWarm,
+      settleWarm: persistWarm,
       onTargetRemoved: (id) => {
         this.restored.delete(id)
         if (!this.stopping) this.sessions.get(id)?.store.removed(id)
@@ -264,10 +267,10 @@ export class PiCacheKeep {
             return 'account-gone'
           if (
             entry.isSubagent &&
-            !readSessionCachePolicy(
+            readSessionCachePolicy(
               entry.policyState?.ownerSessionId ?? entry.id,
               true,
-            ) &&
+            )?.keep_warm === undefined &&
             !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
           )
             return 'invalid'

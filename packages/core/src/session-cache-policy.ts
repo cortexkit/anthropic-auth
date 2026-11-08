@@ -30,14 +30,34 @@ export function readSessionCachePolicy(
 const reportHandoffs = new AsyncLocalStorage<{
   released: boolean
   failed: boolean
-  pending: Array<() => void>
+  pending: Array<{ send: () => void; responseTouch: boolean }>
 }>()
 
-function detachReport(send: () => void) {
+function scheduleReport(send: () => void) {
+  reportHandoffs.exit(() =>
+    setTimeout(() => {
+      try {
+        send()
+      } catch {}
+    }, 0).unref?.(),
+  )
+}
+
+function detachReport(
+  send: () => void,
+  responseTouch = false,
+  background = false,
+): boolean {
+  if (background) {
+    scheduleReport(send)
+    return true
+  }
   const handoff = reportHandoffs.getStore()
-  if (handoff?.failed) return
-  if (handoff && !handoff.released) handoff.pending.push(send)
-  else setTimeout(send, 0).unref?.()
+  if (handoff?.failed && responseTouch) return false
+  if (handoff && !handoff.released)
+    handoff.pending.push({ send, responseTouch })
+  else scheduleReport(send)
+  return true
 }
 
 /**
@@ -52,7 +72,7 @@ export function withSessionCacheReportHandoff<Args extends unknown[], T>(
     const handoff = {
       released: false,
       failed: false,
-      pending: [] as Array<() => void>,
+      pending: [] as Array<{ send: () => void; responseTouch: boolean }>,
     }
     return reportHandoffs.run(handoff, async () => {
       try {
@@ -63,8 +83,8 @@ export function withSessionCacheReportHandoff<Args extends unknown[], T>(
       } finally {
         handoff.released = true
         const pending = handoff.pending.splice(0)
-        if (!handoff.failed)
-          for (const send of pending) setTimeout(send, 0).unref?.()
+        for (const { send, responseTouch } of pending)
+          if (!handoff.failed || !responseTouch) scheduleReport(send)
       }
     })
   }
@@ -78,15 +98,19 @@ export function reportSessionCacheTouch(
   sessionId: string,
   input: CacheTouchInput,
 ): void {
-  detachReport(() => reportCacheTouch(sessionId, input))
+  detachReport(
+    () => reportCacheTouch(sessionId, input),
+    input.source === 'response',
+    input.source === 'warm',
+  )
 }
 
 /** Stops describe actual warming, not a refusal to start warming. */
 export function reportSessionCacheWarmStopped(
   sessionId: string,
   input: CacheWarmStoppedInput,
-): void {
-  detachReport(() => reportCacheWarmStopped(sessionId, input))
+): boolean {
+  return detachReport(() => reportCacheWarmStopped(sessionId, input))
 }
 
 function record(value: unknown): value is Record<string, unknown> {

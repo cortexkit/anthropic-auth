@@ -4049,6 +4049,7 @@ const anthropicAuthPlugin = async (
       url: kept.url,
       headers: new Headers(kept.headers),
       bodyText: kept.bodyText,
+      ttlMs: requestCacheLifetimeMs(kept.bodyText),
       storage,
       cacheMode: 'hybrid',
       oauthAccountId: kept.oauthAccountId,
@@ -7727,7 +7728,10 @@ const anthropicAuthPlugin = async (
               const headerBodyParseStart = nowMs()
               try {
                 const finalBody = JSON.parse(body) as Record<string, unknown>
-                acceptedCacheTtlMs = requestCacheLifetimeMs(finalBody)
+                if (
+                  readSessionCachePolicy(relayAffinity, true)?.ttl !== undefined
+                )
+                  acceptedCacheTtlMs = requestCacheLifetimeMs(finalBody)
                 setOAuthHeaders(requestHeaders, accessToken, {
                   body: finalBody,
                   identity,
@@ -7805,15 +7809,19 @@ const anthropicAuthPlugin = async (
               if (init?.signal?.aborted) return
               if (acceptedCacheAttempts.has(attempt)) return
               acceptedCacheAttempts.add(attempt)
-              acceptedCacheTtlMs =
+              const wireTtlMs =
                 typeof sentBody === 'string'
                   ? requestCacheLifetimeMs(sentBody)
                   : acceptedCacheTtlMs
+              if (
+                readSessionCachePolicy(relayAffinity, true)?.ttl !== undefined
+              )
+                acceptedCacheTtlMs = wireTtlMs
               if (relayAffinity && trace) {
                 const touch = {
                   sessionId: relayAffinity,
                   at: Date.now(),
-                  ttlMs: acceptedCacheTtlMs,
+                  ttlMs: wireTtlMs,
                   signal: init?.signal,
                 }
                 const delivery = cacheReportDelivery(trace)
@@ -7836,7 +7844,8 @@ const anthropicAuthPlugin = async (
             if (typeof body === 'string') {
               const storage = await getRequestStorage()
               if (
-                readSessionCachePolicy(relayAffinity, true) ||
+                readSessionCachePolicy(relayAffinity, true)?.keep_warm !==
+                  undefined ||
                 (isCache1hEnabled() &&
                   getCache1hMode() === 'hybrid' &&
                   (!subagentRequest || isCacheKeepSubagentsEnabled(storage)))

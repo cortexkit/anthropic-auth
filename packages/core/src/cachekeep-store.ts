@@ -113,6 +113,7 @@ function record(
         lastWarmAt: target.policyState.lastWarmAt,
         warmsSinceLastRealRequest: target.policyState.warmsSinceLastRealRequest,
         warmCostSoFar: target.policyState.warmCostSoFar,
+        pendingWarmCost: target.policyState.pendingWarmCost,
         prefixTokens: target.policyState.prefixTokens,
         inputTokens: target.policyState.inputTokens,
         hasWarmed: target.policyState.hasWarmed,
@@ -186,6 +187,9 @@ function invalidReason(
       state.warmsSinceLastRealRequest < 0 ||
       !Number.isFinite(state.warmCostSoFar) ||
       state.warmCostSoFar < 0 ||
+      (state.pendingWarmCost !== undefined &&
+        (!Number.isFinite(state.pendingWarmCost) ||
+          state.pendingWarmCost < 0)) ||
       [state.prefixTokens, state.inputTokens].some(
         (tokens) =>
           tokens !== undefined && (!Number.isFinite(tokens) || tokens < 0),
@@ -483,7 +487,8 @@ export class CacheKeepStore {
 
   /**
    * Bypass coalescing before a persisted replay can dispatch. An initially
-   * unsafe folder disables both writes and restores for this process, so its
+   * unsafe folder (a symlink, foreign owner, or non-private permissions; see
+   * directoryReady) disables both writes and restores for this process, so its
    * targets use memory-only bounds. A write failure in an enabled store must
    * pause that warm and retry: an older low-count record could still resume.
    */
