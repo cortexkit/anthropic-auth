@@ -73,6 +73,8 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  reportSessionCacheTouch,
+  requestCacheLifetimeMs,
   resolveNativePoolPaths,
   runWithRequestSignal,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
@@ -476,19 +478,21 @@ const piCacheKeep = new PiCacheKeep(
       })
       return rotatedHeaders
     },
-    onResponse: async ({ target, attempt, status, receivedAt }) => {
+    onResponse: async ({ target, attempt, status, receivedAt, bodyText }) => {
       const entry = nativePrewarmAttempts.get(attempt.id)
       if (
         entry &&
         status >= 200 &&
         status < 300 &&
         !attempt.signal?.aborted &&
-        !target.sourceWarm
+        !target.sourceWarm &&
+        cacheKeepManager.isCurrentTarget(target)
       )
         sessionCacheActivity.recordPrewarm(
           target.id,
           target.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID,
           receivedAt,
+          requestCacheLifetimeMs(bodyText),
         )
       if (entry && status === 401 && !entry.reported)
         await entry.runtime.report(entry.served, status, 'direct').catch(() => {
@@ -756,6 +760,9 @@ async function sendAnthropicRequest(
     effortTransitions?: readonly MidConversationEffortTransition[]
     onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
     onThreadPrepared?: (fail: () => void) => void
+    onCacheUsageRecorder?: (
+      record: (usage?: Record<string, number>) => void,
+    ) => void
     prime?: {
       beforeSend: () => Promise<void>
       onServed: (attempt: PiNativeAttempt) => void
@@ -767,6 +774,7 @@ async function sendAnthropicRequest(
     native?: PiNativeRuntime
   } = {},
 ): Promise<Response> {
+  options.onCacheUsageRecorder?.(() => {})
   assertHostAuthorityStable()
   const fetchImpl = deps.fetch ?? globalThis.fetch
   const keep = deps.cacheKeep ?? cacheKeepManager
@@ -814,7 +822,7 @@ async function sendAnthropicRequest(
   const oneHourCache =
     isCache1hPersistentlyEnabled(storage) ||
     options.streamOptions?.cacheRetention === 'long'
-  const { body, bodyText, toolNames, cacheTtlMs } = options.prime
+  const { body, bodyText, toolNames } = options.prime
     ? buildPiPrimeBody(identity)
     : await buildAnthropicRequest(
         options.model.id,
@@ -862,10 +870,24 @@ async function sendAnthropicRequest(
     signal: options.streamOptions?.signal,
     ...(!options.apiAccount && { redirect: 'error' as const }),
   }
-  const trackAcceptedRequest = () => {
+  const cacheAccepted = new Set<PiNativeAttempt>()
+  const trackAcceptedRequest = (
+    attempt: PiNativeAttempt,
+    sentBody = wireBodyText,
+  ) => {
     if (options.prime || options.apiAccount || init.signal?.aborted) return
-    if (relayAffinity)
-      sessionCacheActivity.record(relayAffinity, routeId, cacheTtlMs)
+    if (cacheAccepted.has(attempt)) return
+    cacheAccepted.add(attempt)
+    const at = Date.now()
+    const appliedTtl = requestCacheLifetimeMs(sentBody)
+    if (relayAffinity) {
+      sessionCacheActivity.record(relayAffinity, routeId, appliedTtl)
+      reportSessionCacheTouch(relayAffinity, {
+        at,
+        ttlMs: appliedTtl,
+        source: 'response',
+      })
+    }
     const target: Parameters<CacheKeepManager['track']>[0] = {
       sessionId: relayAffinity,
       url: input.toString(),
@@ -873,13 +895,23 @@ async function sendAnthropicRequest(
       bodyText,
       storage,
       cacheMode: isCacheKeepHybridActive(storage) ? 'hybrid' : 'disabled',
-      ttlMs: cacheTtlMs,
+      ttlMs: appliedTtl,
       oauthAccountId: routeId,
       oauthAccountIdentity: verifiedUuid,
       accountStoragePath: options.storagePath,
     }
-    if (deps.cacheKeep) keep.track(target)
-    else void piCacheKeep.trackAccepted(target, snapshot)
+    const tracked = deps.cacheKeep
+      ? Promise.resolve(keep.track(target))
+      : piCacheKeep.trackAccepted(target, snapshot)
+    let latestUsage: Record<string, number> = {}
+    options.onCacheUsageRecorder?.((usage) => {
+      if (!usage || init.signal?.aborted || !relayAffinity) return
+      const merged = { ...latestUsage, ...usage }
+      latestUsage = merged
+      void tracked.then(() =>
+        keep.recordAcceptedUsage(relayAffinity, bodyText, merged),
+      )
+    })
   }
 
   const reported = new Set<PiNativeAttempt>()
@@ -1102,7 +1134,7 @@ async function sendAnthropicRequest(
       )
     }
     if (attempt && response.ok) {
-      trackAcceptedRequest()
+      trackAcceptedRequest(attempt)
       markServed(attempt)
     }
     return response
@@ -1132,12 +1164,15 @@ async function sendAnthropicRequest(
         relayAttempt = attempt
         lastTransport = 'relay'
         const authorizedHeaders = new Headers(headers)
+        const sentBody = wireBodyText
         const access = piAttemptAccessToken(attempt)
         authorizedHeaders.set('authorization', `Bearer ${access}`)
         return {
           headers: authorizedHeaders,
           errorSecrets: [access],
           onUpstreamStatus: (status) => {
+            if (status >= 200 && status < 300)
+              trackAcceptedRequest(attempt, sentBody)
             if (status === 401) {
               relay401Attempt = attempt
               // The relay can report an upstream 401 after returning the streaming response.
@@ -1194,7 +1229,6 @@ async function sendAnthropicRequest(
       void response.body?.cancel().catch(() => {})
       throw new Error('Pi Prime relay response has no upstream provenance')
     }
-    trackAcceptedRequest()
     markServed(relayAttempt)
   }
   return response
@@ -2086,6 +2120,9 @@ export function streamCortexKitAnthropic(
       buildPiOAuthMessagesUrl(model.baseUrl)
       const storagePath = getPiAccountStoragePath()
       let toolNames: ReadonlyMap<string, string> = new Map()
+      let recordCacheUsage:
+        | ((usage?: Record<string, number>) => void)
+        | undefined
       const request = {
         model,
         context,
@@ -2094,6 +2131,11 @@ export function streamCortexKitAnthropic(
         storagePath,
         onThreadPrepared: (fail: () => void) => {
           failThread = fail
+        },
+        onCacheUsageRecorder: (
+          record: (usage?: Record<string, number>) => void,
+        ) => {
+          recordCacheUsage = record
         },
         effortTransitions,
         onResolvedToolNames: (names: ReadonlyMap<string, string>) => {
@@ -2175,6 +2217,7 @@ export function streamCortexKitAnthropic(
       const blocks = output.content as Block[]
       for await (const event of parseSse(response)) {
         if (event.type === 'message_start') {
+          recordCacheUsage?.(event.message?.usage)
           updateUsage(model, output, event.message?.usage)
         } else if (event.type === 'content_block_start') {
           const block = event.content_block
@@ -2311,6 +2354,7 @@ export function streamCortexKitAnthropic(
             })
           }
         } else if (event.type === 'message_delta') {
+          recordCacheUsage?.(event.usage)
           output.stopReason = mapStopReason(
             String(event.delta?.stop_reason ?? ''),
           )

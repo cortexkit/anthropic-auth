@@ -59,7 +59,18 @@ Both use the same owner-only protections, including Windows ACLs, and the same
 versioned gzip format. Records whitelist replay fields, never transport headers
 or credentials. Only an accepted response updates the saved body; writes keep
 the latest body, at most once per five seconds per session, and drain on clean
-shutdown. Stopping warming deletes the record.
+shutdown. Stopping warming deletes the record. Warm-attempt reservations are an
+exception to coalescing: with persistence enabled they are written immediately
+and owner-only before dispatch, preventing a crash from resuming an older low
+count. Failed attempts retain the reservation; only successful warms add cost.
+Saved bounds include the last real/warm times, reserved count, successful cost,
+prefix usage and whether the target has actually warmed. An older record without
+these facts cannot resume planned or local `always` warming until a real request.
+
+If the restart store is disabled for the process because its folder is unsafe,
+it neither writes nor restores there; memory-only warming still enforces all
+bounds. A transient reservation failure in an enabled store instead skips that
+warm rather than risking an older on-disk count. See [cache policy](cache.md#per-session-runner-policy).
 
 OpenCode 2 restores all eligible sessions in its storage. Pi restores only the
 session named by `session_start` (or the first `turn_start` on a host that

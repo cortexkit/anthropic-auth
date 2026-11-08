@@ -34,6 +34,8 @@ import {
 import { stripServerFallbackUsageMarkers } from './server-fallback-usage.ts'
 import {
   readSessionCachePolicy,
+  reportSessionCacheTouch,
+  reportSessionCacheWarmStopped,
   requestCacheLifetimeMs,
 } from './session-cache-policy.ts'
 
@@ -452,6 +454,39 @@ function stopReason(reason: string): CacheKeepStopReason {
   }
 }
 
+function reportStopReason(reason: string): CacheWarmStopReason {
+  switch (reason) {
+    case 'cost-cap':
+    case 'count-cap':
+    case 'outside-hours':
+    case 'session-ended':
+    case 'unsupported':
+    case 'evicted':
+    case 'stopped':
+    case 'account-changed':
+    case 'expired':
+    case 'idle':
+      return reason
+    case 'budget':
+    case 'count':
+      return 'evicted'
+    case 'schedule':
+    case 'schedule-period-ended':
+      return 'outside-hours'
+    case 'session-forgotten':
+      return 'session-ended'
+    case 'retry-window-ended':
+      return 'expired'
+    case 'source-warm-idle-cap':
+      return 'cost-cap'
+    case 'credential-changed':
+    case 'account-unavailable':
+      return 'account-changed'
+    default:
+      return 'unsupported'
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -579,6 +614,7 @@ export type CacheKeepPrewarmResult =
   | {
       ok: true
       refused?: false
+      ttlMs?: number
       usage?: {
         input_tokens?: number
         cache_creation_input_tokens?: number
@@ -628,6 +664,7 @@ export class CacheKeepManager {
   private dueTimer: ReturnType<typeof setTimeout> | null = null
   private tickPromise: Promise<void> | null = null
   private nextPrewarmAttemptId = 0
+  private readonly reportedStops = new WeakSet<CacheKeepPolicyState>()
 
   constructor(
     private readonly options: {
@@ -663,6 +700,8 @@ export class CacheKeepManager {
       reserveWarm?: (target: Readonly<CacheKeepTarget>) => Promise<boolean>
       /** Native hosts authorize asynchronously inside fetchImpl and reserve there. */
       deferWarmReservation?: boolean
+      /** A native host may rewrite the final physical warm after fetchImpl starts. */
+      responseTtlMs?: (response: Response) => number | undefined
       prepareBody?: (
         bodyText: string,
         target: CacheKeepTarget,
@@ -708,6 +747,9 @@ export class CacheKeepManager {
   }
 
   stop() {
+    const now = this.options.now?.() ?? Date.now()
+    for (const target of this.targets.values())
+      this.reportStop(target, 'stopped', now)
     if (this.dueTimer) {
       ;(this.options.clearTimeoutImpl ?? clearTimeout)(this.dueTimer)
       this.dueTimer = null
@@ -806,6 +848,7 @@ export class CacheKeepManager {
   ): boolean {
     const target = this.targets.get(id)
     if (!target) return false
+    this.reportStop(target, reason, this.options.now?.() ?? Date.now())
     this.retainStopped(target, reason, this.options.now?.() ?? Date.now())
     this.targets.delete(id)
     this.options.onTargetRemoved?.(id)
@@ -1055,6 +1098,7 @@ export class CacheKeepManager {
     details: Record<string, unknown> = {},
   ) {
     if (this.targets.get(target.id) !== target) return
+    this.reportStop(target, reason, now)
     if (now < target.cacheExpiresAt)
       logger[reason === 'count-cap' ? 'debug' : 'warn'](
         'cachekeep',
@@ -1089,6 +1133,19 @@ export class CacheKeepManager {
     })
   }
 
+  private reportStop(target: CacheKeepTarget, reason: string, at: number) {
+    const state = target.policyState
+    // Source warms are a different model's prefix, not evidence about the
+    // active session cache. The shared report has no target-attribution field.
+    if (target.sourceWarm || !state?.hasWarmed || this.reportedStops.has(state))
+      return
+    this.reportedStops.add(state)
+    reportSessionCacheWarmStopped(state.ownerSessionId, {
+      at,
+      reason: reportStopReason(reason),
+    })
+  }
+
   private evictOldestTarget(now: number, reason: 'budget' | 'count') {
     const oldest = this.targets.values().next().value
     if (!oldest) return
@@ -1111,6 +1168,7 @@ export class CacheKeepManager {
         continue
       }
       if (now >= target.cacheExpiresAt) {
+        this.reportStop(target, 'expired', now)
         this.targets.delete(id)
         this.options.onTargetRemoved?.(id)
       }
@@ -1692,7 +1750,13 @@ export class CacheKeepManager {
           }
         | undefined
       onAccepted?.(receivedAt)
-      return { ok: true, ...(usage && { usage }) }
+      return {
+        ok: true,
+        ttlMs:
+          this.options.responseTtlMs?.(response) ??
+          requestCacheLifetimeMs(prewarm.bodyText),
+        ...(usage && { usage }),
+      }
     } catch (error) {
       if (error instanceof CacheKeepWarmRefusal)
         return { ok: false, refused: true, reason: error.reason }
@@ -1777,6 +1841,13 @@ export class CacheKeepManager {
       state.hasWarmed = true
       state.lastWarmAt = acceptedAt
       state.warmCostSoFar += this.costs(target)?.nextWarmCost ?? 0
+      this.reportedStops.delete(state)
+      if (!target.sourceWarm)
+        reportSessionCacheTouch(state.ownerSessionId, {
+          at: acceptedAt,
+          ttlMs: result.ttlMs ?? requestCacheLifetimeMs(target.bodyText),
+          source: 'warm',
+        })
     }
     target.ttlMs = state?.planned ? target.ttlMs : CACHE_KEEP_TTL_MS
     target.lastTouchAt = acceptedAt

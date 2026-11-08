@@ -372,14 +372,22 @@ export async function setupAnthropicAuth(
         logger.warn('cachekeep', 'live request tracking failed')
       }
     },
-    onResponseHeaders: (input) => {
+    onCacheResponse: (input) => {
       try {
-        cacheKeep?.onResponseHeaders(input)
+        cacheKeep?.onResponseHeaders({
+          ...input,
+          status: input.acceptedAt === undefined ? 0 : 200,
+        })
       } catch {
         logger.warn('cachekeep', 'live request tracking failed')
       }
     },
-    onAttemptEnd: (input) => cacheKeep?.discardAttempt(input.attemptId),
+    onAttemptEnd: (input, outcome) => {
+      if (outcome.status === undefined)
+        cacheKeep?.discardAttempt(input.attemptId)
+    },
+    onCacheUsage: (sessionID, bodyText, usage) =>
+      cacheKeep?.recordAcceptedUsage(sessionID, bodyText, usage),
     resolveModelId: async (scope) => models.modelId(scope.modelID),
     onOwnedRequest: () => {
       lifecycle ??= startNativeAnthropicLifecycle(runtime, options.fetch)

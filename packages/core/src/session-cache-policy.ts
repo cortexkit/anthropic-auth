@@ -1,4 +1,9 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
+  type CacheTouchInput,
+  type CacheWarmStoppedInput,
+  reportCacheTouch,
+  reportCacheWarmStopped,
   type SessionCachePolicy,
   type SessionCacheTtl,
   sessionCachePolicy,
@@ -20,6 +25,68 @@ export function readSessionCachePolicy(
   isOAuth: boolean,
 ): SessionCachePolicy | null {
   return isOAuth && sessionId ? sessionCachePolicy(sessionId) : null
+}
+
+const reportHandoffs = new AsyncLocalStorage<{
+  released: boolean
+  failed: boolean
+  pending: Array<() => void>
+}>()
+
+function detachReport(send: () => void) {
+  const handoff = reportHandoffs.getStore()
+  if (handoff?.failed) return
+  if (handoff && !handoff.released) handoff.pending.push(send)
+  else setTimeout(send, 0).unref?.()
+}
+
+/**
+ * Admitting a real response can retire an older warmed target before body
+ * inspection finishes. Buffer both report kinds until the outer host callback
+ * settles; later background callbacks still send without awaiting the bridge.
+ */
+export function withSessionCacheReportHandoff<Args extends unknown[], T>(
+  work: (...args: Args) => Promise<T>,
+): (...args: Args) => Promise<T> {
+  return (...args) => {
+    const handoff = {
+      released: false,
+      failed: false,
+      pending: [] as Array<() => void>,
+    }
+    return reportHandoffs.run(handoff, async () => {
+      try {
+        return await work(...args)
+      } catch (error) {
+        handoff.failed = true
+        throw error
+      } finally {
+        handoff.released = true
+        const pending = handoff.pending.splice(0)
+        if (!handoff.failed)
+          for (const send of pending) setTimeout(send, 0).unref?.()
+      }
+    })
+  }
+}
+
+/**
+ * Queue at host hand-off or after a completed background warm. Thalamus's
+ * routing report bridge, not auth, resends its newest failed touch.
+ */
+export function reportSessionCacheTouch(
+  sessionId: string,
+  input: CacheTouchInput,
+): void {
+  detachReport(() => reportCacheTouch(sessionId, input))
+}
+
+/** Stops describe actual warming, not a refusal to start warming. */
+export function reportSessionCacheWarmStopped(
+  sessionId: string,
+  input: CacheWarmStoppedInput,
+): void {
+  detachReport(() => reportCacheWarmStopped(sessionId, input))
 }
 
 function record(value: unknown): value is Record<string, unknown> {

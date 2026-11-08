@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -166,5 +166,103 @@ test.each([false, true])(
       kind: 'primary',
     } as Parameters<typeof keep.track>[0])
     expect(manager.trackedSessions()).toEqual([])
+    await owner.persistence.drain()
+    expect(await readdir(owner.persistence.directory)).toEqual([])
   },
 )
+
+test('OpenCode 2 hybrid disable removes local records but preserves a mixed store runner target', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-mixed-'))
+  cleanups.push(() => rm(directory, { recursive: true, force: true }))
+  const storageId = randomUUID()
+  const now = Date.now()
+  const policy: Awaited<
+    ReturnType<NativeAccountRuntime['read']>
+  >['policyStorage'] = {
+    version: 1,
+    accounts: [],
+    claudeCache: { enabled: true, mode: 'hybrid' },
+    cacheKeep: { enabled: true, always: true },
+  }
+  const binding = { storageId, rowId: 'first', credentialEpoch: 0 }
+  const runtime = {
+    read: async () => ({
+      policyStorage: policy,
+      accounts: [
+        {
+          id: 'first',
+          accountIdentity: '11111111-2222-4333-8444-555555555555',
+          binding,
+        },
+      ],
+    }),
+  } as unknown as NativeAccountRuntime
+  const routingKey = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const originalRouting = globals[routingKey]
+  globals[routingKey] = (sessionId: string) =>
+    sessionId === 'ses_runner'
+      ? { cache: () => ({ ttl: 'long', keep_warm: 'always' }) }
+      : undefined
+  cleanups.push(() => {
+    if (originalRouting === undefined) delete globals[routingKey]
+    else globals[routingKey] = originalRouting
+  })
+  const keep = createNativeCacheKeep({
+    storageId,
+    runtime,
+    source: {} as NativeSource,
+    persistence: { root: directory },
+    now: () => now,
+    setIntervalImpl: (() => ({ unref() {} })) as unknown as typeof setInterval,
+    clearIntervalImpl: (() => {}) as typeof clearInterval,
+    setTimeoutImpl: (() => ({ unref() {} })) as unknown as typeof setTimeout,
+    clearTimeoutImpl: (() => {}) as typeof clearTimeout,
+  })
+  cleanups.push(() => keep.dispose())
+  await keep.ready
+  const shared = (globalThis as any)[
+    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ].get(storageId)
+  const input = {
+    attemptId: 'local',
+    sessionID: 'ses_local',
+    route: 'oauth',
+    agent: 'build',
+    kind: 'primary',
+    accountId: 'first',
+    url: 'https://api.anthropic.com/v1/messages',
+    bodyText:
+      '{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"Kept prefix","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":"Hello"}]}',
+    provenance: { kind: 'local', subject: { binding } },
+  } as Parameters<typeof keep.track>[0]
+  for (const id of ['local', 'runner']) {
+    await keep.track({ ...input, attemptId: id, sessionID: `ses_${id}` })
+    expect(
+      keep.onResponseHeaders({ attemptId: id, status: 200 })?.tracked,
+    ).toBe(true)
+  }
+  await shared.persistence.drain()
+  expect(
+    (await readdir(shared.persistence.directory)).filter((name) =>
+      name.endsWith('.json.gz'),
+    ),
+  ).toHaveLength(2)
+  policy.cacheKeep = { enabled: false }
+  await keep.track({ ...input, attemptId: 'disabled' })
+  await shared.persistence.drain()
+  expect(
+    shared.manager.trackedSessions().map(({ id }: { id: string }) => id),
+  ).toEqual(['ses_runner'])
+  const retained: string[] = []
+  await shared.persistence.load(now, (entry: { id: string }) => {
+    retained.push(entry.id)
+    return undefined
+  })
+  expect(retained).toEqual(['ses_runner'])
+  expect(
+    (await readdir(shared.persistence.directory)).filter((name) =>
+      name.endsWith('.json.gz'),
+    ),
+  ).toHaveLength(1)
+})
