@@ -2,10 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.7.1
 
 - Addresses #673: in vault mode, Insula's quota readings stay fresh between background checks, so the plugin no longer polls Anthropic's usage endpoint itself when Insula already has the reading.
 - The log now records once per process when the plugin uses Thalamus's vault relay.
+
 ## 2.7.0
 
 - Thalamus can choose each OAuth session's cache lifetime and keep-warm mode, and receives a report whenever a session's cache is refreshed or its keep-warm stops. “Keep cache warm always” now stops after 24 warm attempts without a real request, also outside Thalamus and for Opus 4.8 source warms.
