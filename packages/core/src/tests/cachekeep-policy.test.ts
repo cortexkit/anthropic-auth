@@ -734,3 +734,78 @@ test.each([
     expect(f.sends).toBe(1)
   },
 )
+
+test.each([0, 17_000, 59_000])(
+  'registered timers warm a short source twice from interval phase %s',
+  async (phase) => {
+    let now = Date.parse('2026-05-18T10:00:00Z')
+    const scheduled = new Map<
+      object,
+      { at: number; every?: number; callback: () => unknown }
+    >()
+    const arm = (callback: () => unknown, ms: number, every?: number) => {
+      const id = { unref() {} }
+      scheduled.set(id, { at: now + ms, every, callback })
+      return id
+    }
+    const clear = (id: object) => {
+      scheduled.delete(id)
+    }
+    const f = plannedFixture(
+      {
+        now: () => now,
+        setIntervalImpl: ((callback: () => unknown, ms: number) =>
+          arm(callback, ms, ms)) as unknown as typeof setInterval,
+        clearIntervalImpl: clear as unknown as typeof clearInterval,
+        setTimeoutImpl: ((callback: () => unknown, ms: number) =>
+          arm(callback, ms)) as unknown as typeof setTimeout,
+        clearTimeoutImpl: clear as unknown as typeof clearTimeout,
+      },
+      { ttl: 'short' },
+    )
+    f.setPolicy(null)
+    f.input.storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    f.input.storage.cacheKeep = { enabled: true, always: true }
+    const tick = spyOn(f.manager, 'tick')
+    const advanceTo = async (end: number) => {
+      for (;;) {
+        const next = [...scheduled]
+          .filter(([, timer]) => timer.at <= end)
+          .sort((a, b) => a[1].at - b[1].at)[0]
+        if (!next) break
+        const [id, timer] = next
+        now = timer.at
+        if (timer.every) timer.at += timer.every
+        else scheduled.delete(id)
+        await timer.callback()
+        // Intervals deliberately return void; join the pass they actually started.
+        await tick.mock.results.at(-1)?.value
+      }
+      now = end
+    }
+    try {
+      f.manager.start()
+      await advanceTo(now + phase)
+      const admittedAt = now
+      expect(
+        f.track({ sourceWarm: true, cacheMode: 'hybrid', acceptedAt: now })
+          .tracked,
+      ).toBe(true)
+      expect(f.sends).toBe(0)
+      await advanceTo(admittedAt + 269_999)
+      expect(f.sends).toBe(0)
+      await advanceTo(admittedAt + 270_000)
+      expect(f.sends).toBe(1)
+      expect(f.target.cacheExpiresAt).toBe(admittedAt + 570_000)
+      await advanceTo(admittedAt + 539_999)
+      expect(f.sends).toBe(1)
+      await advanceTo(admittedAt + 540_000)
+      expect(f.sends).toBe(2)
+      expect(f.target.cacheExpiresAt).toBe(admittedAt + 840_000)
+      await advanceTo(admittedAt + 600_000)
+      expect(f.sends).toBe(2)
+    } finally {
+      tick.mockRestore()
+    }
+  },
+)

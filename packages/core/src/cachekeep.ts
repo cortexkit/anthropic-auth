@@ -912,6 +912,11 @@ export class CacheKeepManager {
     return current !== undefined && current.policyState === target.policyState
   }
 
+  /** A capture's state identity survives warm updates, not a new real request. */
+  trackedPolicyState(id: string): Readonly<CacheKeepPolicyState> | undefined {
+    return this.targets.get(id)?.policyState
+  }
+
   hasPlannedTarget(id: string): boolean {
     return this.targets.get(id)?.policyState?.planned === true
   }
@@ -1089,8 +1094,14 @@ export class CacheKeepManager {
       (this.options.clearTimeoutImpl ?? clearTimeout)(this.dueTimer)
     this.dueTimer = null
     let due = Infinity
+    // A short cache can become due and expire between 60-second interval ticks.
     for (const target of this.targets.values())
-      if (target.policyState?.planned) due = Math.min(due, target.nextPrewarmAt)
+      if (
+        target.policyState?.planned ||
+        target.sourceWarm ||
+        (target.ttlMs ?? CACHE_KEEP_TTL_MS) < CACHE_KEEP_TTL_MS
+      )
+        due = Math.min(due, target.nextPrewarmAt)
     if (!Number.isFinite(due)) return
     this.dueTimer = (this.options.setTimeoutImpl ?? setTimeout)(
       () => {

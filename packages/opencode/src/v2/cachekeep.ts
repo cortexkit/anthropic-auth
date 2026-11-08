@@ -129,6 +129,7 @@ interface SharedCacheKeep {
     | 'recordAcceptedUsage'
     | 'hasPlannedTarget'
     | 'updateSubagent'
+    | 'trackedPolicyState'
   > &
     Partial<
       Pick<
@@ -139,6 +140,7 @@ interface SharedCacheKeep {
         | 'recordAcceptedUsage'
         | 'hasPlannedTarget'
         | 'updateSubagent'
+        | 'trackedPolicyState'
       >
     >
   readonly registry: CacheKeepSessionRegistry
@@ -505,17 +507,34 @@ export function createNativeCacheKeep(
   owner.persistence = persistence
   shareds.set(options.storageId, owner)
   const { manager, registry } = owner
-  const acceptedStorage = new Map<string, CacheKeepPolicyStorage>()
-  const resolvedParent = (sessionID: string, isSubagent: boolean) => {
-    const storage = acceptedStorage.get(sessionID)
+  const acceptedStates = new Map<
+    string,
+    NonNullable<CacheKeepTarget['policyState']>
+  >()
+  const resolvedParent = async (sessionID: string, isSubagent: boolean) => {
+    const state = acceptedStates.get(sessionID)
+    const current = () =>
+      !lease.stopped &&
+      state !== undefined &&
+      manager.trackedPolicyState?.(sessionID) === state
+    if (!current()) return
+    if (!isSubagent) {
+      manager.updateSubagent?.(sessionID, false)
+      return
+    }
+    const latestLease = () => [...owner.leases.values()].at(-1)
+    const active = latestLease()
+    const storage = await active?.loadStorage()
+    // Parent facts may outlive a capture, a settings change, or their sender.
+    // Only the same capture under the newest live lease can be retired here.
+    if (!current() || !active || latestLease() !== active) return
     if (
-      isSubagent &&
       storage &&
       readSessionCachePolicy(sessionID, true)?.keep_warm === undefined &&
       !isCacheKeepSubagentsEnabled(storage)
     ) {
       manager.untrack(sessionID, 'policy-refused')
-      acceptedStorage.delete(sessionID)
+      acceptedStates.delete(sessionID)
     } else manager.updateSubagent?.(sessionID, isSubagent)
   }
   // Unanswered attempts are not warm targets: replacing a target or reserving
@@ -726,14 +745,12 @@ export function createNativeCacheKeep(
       if (!request) throw new Error('CacheKeep rewrite refused')
       signal.throwIfAborted()
       const ownerSession = target.policyState?.ownerSessionId ?? target.id
-      const parent = options.subagent?.(ownerSession)
-      if (options.subagent && parent === undefined)
+      const explicit =
+        readSessionCachePolicy(ownerSession, true)?.keep_warm !== undefined
+      const parent = explicit ? undefined : options.subagent?.(ownerSession)
+      if (!explicit && options.subagent && parent === undefined)
         throw new CacheKeepPrewarmError('authorization', undefined)
-      if (
-        parent &&
-        readSessionCachePolicy(ownerSession, true)?.keep_warm === undefined &&
-        !isCacheKeepSubagentsEnabled(dispatchStorage)
-      )
+      if (parent && !isCacheKeepSubagentsEnabled(dispatchStorage))
         throw new CacheKeepWarmRefusal('subagents-disabled')
       await manager.reserveWarmDispatch?.(target)
       signal.throwIfAborted()
@@ -960,11 +977,12 @@ export function createNativeCacheKeep(
           // Prime every live lease's parent facts without waiting for lookup.
           for (const current of owner.leases.values())
             current.subagent?.(sessionID)
-          acceptedStorage.delete(sessionID)
-          if (target.storage) acceptedStorage.set(sessionID, target.storage)
-          if (acceptedStorage.size > 4096) {
-            const oldest = acceptedStorage.keys().next().value
-            if (oldest !== undefined) acceptedStorage.delete(oldest)
+          acceptedStates.delete(sessionID)
+          const state = manager.trackedPolicyState?.(sessionID)
+          if (state) acceptedStates.set(sessionID, state)
+          if (acceptedStates.size > 4096) {
+            const oldest = acceptedStates.keys().next().value
+            if (oldest !== undefined) acceptedStates.delete(oldest)
           }
         }
         if (result.tracked)
@@ -988,7 +1006,7 @@ export function createNativeCacheKeep(
     },
     resolvedParent,
     forgetSession(sessionID: string) {
-      acceptedStorage.delete(sessionID)
+      acceptedStates.delete(sessionID)
       manager.untrack(sessionID)
       for (const [attemptId, entry] of pending)
         if (entry.sessionID === sessionID) discardAttempt(attemptId)
