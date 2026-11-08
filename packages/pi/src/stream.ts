@@ -1235,6 +1235,10 @@ async function sendAnthropicRequest(
       void response.body?.cancel().catch(() => {})
       throw new Error('Pi Prime relay response has no upstream provenance')
     }
+    // HTTP relays forward the accepted status even without a request-id.
+    // Optimistic WebSocket responses must wait for their real upstream status.
+    if (response.headers.get('x-cortexkit-relay-optimistic') !== 'true')
+      trackAcceptedRequest(relayAttempt)
     markServed(relayAttempt)
   }
   return response

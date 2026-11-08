@@ -699,6 +699,9 @@ export class CacheKeepWarmRefusal extends Error {
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
+  // Standalone warms are not retained targets. Their object identity fences
+  // callbacks when a real request, newer warm or explicit stop supersedes them.
+  private readonly immediateTargets = new Map<string, CacheKeepTarget>()
   // Only the body-free public projection survives when warming stops.
   private readonly stoppedSessions = new Map<string, CacheKeepTrackedSession>()
   private timer: ReturnType<typeof setInterval> | null = null
@@ -794,6 +797,7 @@ export class CacheKeepManager {
   }
 
   stop() {
+    this.immediateTargets.clear()
     const now = this.options.now?.() ?? Date.now()
     for (const target of this.targets.values())
       this.reportStop(target, 'stopped', now)
@@ -893,6 +897,7 @@ export class CacheKeepManager {
     id: string,
     reason: CacheKeepStopReason = 'session-forgotten',
   ): boolean {
+    this.immediateTargets.delete(id)
     const target = this.targets.get(id)
     if (!target) return false
     this.reportStop(target, reason, this.options.now?.() ?? Date.now())
@@ -909,7 +914,9 @@ export class CacheKeepManager {
 
   isCurrentTarget(target: Readonly<CacheKeepTarget>): boolean {
     const current = this.targets.get(target.id)
-    return current !== undefined && current.policyState === target.policyState
+    return current
+      ? current.policyState === target.policyState
+      : this.immediateTargets.get(target.id) === target
   }
 
   /**
@@ -1311,6 +1318,7 @@ export class CacheKeepManager {
       return { tracked: false as const, reason }
     }
     if (!input.sessionId) return refuse('missing session id', 'missing-session')
+    this.immediateTargets.delete(input.sessionId)
     let previous = this.targets.get(input.sessionId)
     if (
       previous &&
@@ -1494,6 +1502,15 @@ export class CacheKeepManager {
     accountStoragePath?: string
     isSubagent?: boolean
   }): Promise<CacheKeepPrewarmResult> {
+    const current = this.targets.get(input.sessionId)
+    if (
+      current &&
+      (current.bodyText !== input.bodyText ||
+        current.url !== input.url ||
+        current.oauthAccountId !== input.oauthAccountId ||
+        current.oauthAccountIdentity !== input.oauthAccountIdentity)
+    )
+      return { ok: false, refused: true, reason: 'stopped' }
     const headers: Record<string, string> = {}
     input.headers.forEach((value, key) => {
       headers[key] = value
@@ -1501,7 +1518,6 @@ export class CacheKeepManager {
     const target: CacheKeepTarget = {
       id: input.sessionId,
       url: input.url,
-      headers,
       bodyText: input.bodyText,
       bodyBytes: Buffer.byteLength(input.bodyText, 'utf8'),
       cacheExpiresAt: this.options.now?.() ?? Date.now(),
@@ -1512,8 +1528,28 @@ export class CacheKeepManager {
       oauthAccountIdentity: input.oauthAccountIdentity,
       accountStoragePath: input.accountStoragePath,
       isSubagent: input.isSubagent ?? false,
+      // Share the tracked request's warm count, admitted cost and state object.
+      // Replacing that state for a later request invalidates this replay.
+      ...current,
+      headers,
     }
-    return this.sendPrewarm(target)
+    if (!current) this.immediateTargets.set(target.id, target)
+    try {
+      let acceptedAt: number | undefined
+      const result = await this.sendPrewarm(target, (receivedAt) => {
+        acceptedAt = receivedAt
+      })
+      if (result.ok && current && this.isCurrentTarget(target))
+        this.acceptWarm(
+          current,
+          result,
+          acceptedAt ?? this.options.now?.() ?? Date.now(),
+        )
+      return result
+    } finally {
+      if (this.immediateTargets.get(target.id) === target)
+        this.immediateTargets.delete(target.id)
+    }
   }
 
   tick(): Promise<void> {
@@ -1724,6 +1760,8 @@ export class CacheKeepManager {
       // diagnostics. The scope retires when the error body is read or cancelled;
       // a successful body is passed through untouched.
       const send = async (attemptHeaders: Headers): Promise<Response> => {
+        if (!this.isCurrentTarget(target))
+          throw new CacheKeepWarmRefusal('stopped')
         if (this.targets.has(target.id) || target.policyState) {
           if (!this.options.deferWarmReservation)
             await this.reserveWarmDispatch(target)
@@ -1934,6 +1972,14 @@ export class CacheKeepManager {
 
     if (this.targets.get(target.id) !== target) return
     acceptedAt ??= this.options.now?.() ?? Date.now()
+    this.acceptWarm(target, result, acceptedAt)
+  }
+
+  private acceptWarm(
+    target: CacheKeepTarget,
+    result: Extract<CacheKeepPrewarmResult, { ok: true }>,
+    acceptedAt: number,
+  ) {
     const state = target.policyState
     if (state) {
       state.hasWarmed = true

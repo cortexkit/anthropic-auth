@@ -2172,7 +2172,12 @@ test('hybrid-disabled request dispatch never waits on a held restart write', asy
 
 test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted usage safe', async () => {
   const f = await fixture()
+  const reports: unknown[] = []
+  runnerPolicyForReview(null, reports)
   await f.live()
+  // Drain the initial response's detached report before counting reload reports.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  reports.length = 0
   const owner = (globalThis as any)[
     Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
   ].get(f.paths.storageId)
@@ -2192,8 +2197,6 @@ test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted u
       return typeof value === 'function' ? value.bind(target) : value
     },
   })
-  const reports: unknown[] = []
-  runnerPolicyForReview(null, reports)
   const next = await f.start()
   await next.live()
   await new Promise((resolve) => setTimeout(resolve, 0))

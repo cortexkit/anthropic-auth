@@ -475,6 +475,7 @@ describe('CacheKeepManager', () => {
 
     expect(result).toEqual({
       ok: true,
+      ttlMs: 3_600_000,
       usage: { cache_read_input_tokens: 123 },
     })
     expect(fetchImpl).toHaveBeenCalledTimes(1)

@@ -8230,6 +8230,7 @@ const anthropicAuthPlugin = async (
             // that, a relayed upstream 401 is only recorded: the dispatch may
             // still replay on a newer version, which makes this one obsolete.
             let relayReturned = false
+            let relayCacheAcceptance: object | undefined
             let routingHeaders: Headers | undefined
             const reportScoped401 = reportVault401
             // The relay scrubs each physical relay attempt's responses and
@@ -8266,6 +8267,7 @@ const anthropicAuthPlugin = async (
                     `Bearer ${nextAuthorization.accessToken}`,
                   )
                   const cacheAcceptance = {}
+                  relayCacheAcceptance = cacheAcceptance
                   const acceptedBody = body
                   return {
                     headers: relayHeaders,
@@ -8487,6 +8489,15 @@ const anthropicAuthPlugin = async (
               if (response.status === 401)
                 await endIfCancelled(response, init?.signal)
               if (response.ok) {
+                // HTTP relay success is accepted even without a request-id;
+                // an optimistic WebSocket 200 still needs its upstream status.
+                if (
+                  !usedDirectFetch &&
+                  relayCacheAcceptance &&
+                  response.headers.get('x-cortexkit-relay-optimistic') !==
+                    'true'
+                )
+                  trackAcceptedRequest(relayCacheAcceptance)
                 usagePublications.publish(async (signal) => {
                   if (served.scopedAttempt)
                     await nativeAccounts.vault.publish(

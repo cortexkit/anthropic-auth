@@ -10,6 +10,7 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   type NativeCustodyClient as ClaustrumScopedClient,
+  cacheKeepStoreDirectory,
   createNativeAccountRuntime,
   getClaudeCodeIdentityForVerifiedAccount,
   getLogLevel,
@@ -60,6 +61,8 @@ import {
 import {
   __prewarmPiCacheKeepForTest,
   __sendPiAnthropicRequestForTest,
+  startPiCacheKeepSession,
+  stopPiCacheKeep,
   streamCortexKitAnthropic,
 } from '../stream.ts'
 import {
@@ -1786,9 +1789,10 @@ registerTest.each([200, 401])(
       Date.now(),
       'max',
     )
-    if (finalStatus === 200)
-      expect(expiry).toBeGreaterThan(Date.now() + 55 * 60_000)
-    else expect(expiry).toBe(acceptedAt + 3_600_000)
+    if (finalStatus === 200) {
+      expect(expiry).toBeGreaterThan(Date.now() + 4 * 60_000)
+      expect(expiry).toBeLessThanOrEqual(Date.now() + 5 * 60_000)
+    } else expect(expiry).toBe(acceptedAt + 3_600_000)
     expect(sent).toEqual(['Bearer pi-cachekeep-v1', 'Bearer pi-cachekeep-v2'])
     expect(f.reports.map((report) => report.recordVersion)).toEqual(
       finalStatus === 401 ? [1, 2] : [1],
@@ -2711,6 +2715,8 @@ for (const [transport, credentialSource] of [
       clearIntervalImpl: (() => {}) as typeof clearInterval,
     })
     deferCleanup(() => keep.stop())
+    const tracking = spyOn(keep, 'track')
+    deferCleanup(() => tracking.mockRestore())
     const sent: Array<{ text: string; headers: Headers }> = []
     let rejection: string | undefined
     let relayBody = ''
@@ -2906,6 +2912,8 @@ for (const [transport, credentialSource] of [
     ).toBeLessThanOrEqual(4)
     const stored = keep.trackedRequest(primarySession)
     expect(stored).toBeDefined()
+    expect(tracking).toHaveBeenCalledTimes(2)
+    expect(stored?.cacheExpiresAt).toBeGreaterThan(Date.now() + 55 * 60_000)
     const warm = await buildCacheKeepPrewarmBody(stored?.bodyText ?? '{}')
     expect(warm.ok).toBe(true)
     const prewarm = JSON.parse(warm.ok ? warm.bodyText : '{}')
@@ -2994,3 +3002,178 @@ for (const [transport, credentialSource] of [
     }
   })
 }
+
+test('Pi persists an ordinary no-policy HTTP relay target without request-id provenance', async () => {
+  const f = await fixture('main-first', true)
+  const previousDataHome = process.env.XDG_DATA_HOME
+  const dataHome = join(dirname(f.path), 'cache-data')
+  process.env.XDG_DATA_HOME = dataHome
+  deferCleanup(async () => {
+    await stopPiCacheKeep()
+    if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+    else process.env.XDG_DATA_HOME = previousDataHome
+  })
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: false },
+    claudeCache: { enabled: true, mode: 'hybrid' },
+    cacheKeep: { enabled: true, always: true },
+  }))
+  const sessionId = 'pi-http-no-policy-persist'
+  deferCleanup(() => sessionCacheActivity.forget(sessionId))
+  await startPiCacheKeepSession(f.path, sessionId)
+  const acceptedAt = Date.now()
+  const fetchImpl = (async (input) => {
+    expect(String(input)).toStartWith('https://relay.invalid')
+    return success()
+  }) as typeof fetch
+  globalThis.fetch = fetchImpl
+  const response = await __sendPiAnthropicRequestForTest(
+    {
+      model,
+      context: { ...context, systemPrompt: 'persist accepted HTTP prefix' },
+      storagePath: f.path,
+      streamOptions: { sessionId },
+    },
+    {
+      native: f.native,
+      fetch: fetchImpl,
+    },
+  )
+  expect(response.headers.get('request-id')).toBeNull()
+  await response.text()
+  // Shutdown joins detached admission and drains the real singleton's store.
+  await stopPiCacheKeep()
+  const { storageId } = await resolveNativePoolPaths(f.path)
+  const sessionHash = createHash('sha256').update(sessionId).digest('hex')
+  const saved = JSON.parse(
+    gunzipSync(
+      await readFile(
+        join(
+          cacheKeepStoreDirectory(storageId, dataHome, 'pi'),
+          `${sessionHash}.json.gz`,
+        ),
+      ),
+    ).toString(),
+  )
+  expect(saved.id).toBe(sessionId)
+  expect(saved.bodyText).toContain('persist accepted HTTP prefix')
+  expect(saved.ttlMs).toBe(3_600_000)
+  expect(saved.cacheExpiresAt).toBeGreaterThanOrEqual(acceptedAt + 3_600_000)
+  expect(saved.cacheExpiresAt).toBeLessThanOrEqual(Date.now() + 3_600_000)
+  expect(saved.policyState.planned).toBe(false)
+  expect(saved.policyState.warmsSinceLastRealRequest).toBe(0)
+})
+
+test('Pi WebSocket relay tracks exactly once only after the real upstream 200', async () => {
+  const f = await fixture()
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: false },
+    claudeCache: { enabled: true, mode: 'hybrid' },
+    cacheKeep: { enabled: true, always: true },
+  }))
+  const keep = new CacheKeepManager({
+    loadStorage: async () => (await runtime.read()).policyStorage,
+    setIntervalImpl: (() => ({ unref() {} })) as unknown as typeof setInterval,
+    clearIntervalImpl: (() => {}) as typeof clearInterval,
+  })
+  deferCleanup(() => keep.stop())
+  const tracking = spyOn(keep, 'track')
+  deferCleanup(() => tracking.mockRestore())
+  const accepted = lifetimes.gate()
+  const upstream = lifetimes.gate()
+  const sse = await success().text()
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch: (request, server) =>
+      server.upgrade(request)
+        ? undefined
+        : new Response('unexpected HTTP', { status: 500 }),
+    websocket: {
+      open: (socket) => {
+        socket.send(JSON.stringify({ type: 'ready', protocol: 2, state: null }))
+      },
+      message: async (socket, data) => {
+        const payload = JSON.parse(String(data))
+        socket.send(
+          JSON.stringify({
+            type: 'accepted',
+            protocol: 2,
+            id: payload.id,
+            hash: payload.next_hash,
+            revision: payload.revision,
+          }),
+        )
+        accepted.open()
+        await upstream.wait
+        const start = JSON.stringify({
+          type: 'response_start',
+          id: payload.id,
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+        socket.send(start)
+        socket.send(start)
+        socket.send(
+          JSON.stringify({
+            type: 'chunk',
+            id: payload.id,
+            base64: Buffer.from(sse).toString('base64'),
+          }),
+        )
+        socket.send(JSON.stringify({ type: 'done', id: payload.id }))
+      },
+    },
+  })
+  const abort = new AbortController()
+  const deadline = setTimeout(() => abort.abort(), 4_000)
+  deferCleanup(() => {
+    clearTimeout(deadline)
+    abort.abort()
+    server.stop(true)
+  })
+  await runtime.updateRelay({
+    enabled: true,
+    url: server.url.href,
+    token: 'synthetic-ws-cache-token',
+    transport: 'websocket',
+    fallbackToDirect: false,
+  })
+  const sessionId = 'pi-ws-real-acceptance'
+  deferCleanup(() => sessionCacheActivity.forget(sessionId))
+  let returned = false
+  const sending = __sendPiAnthropicRequestForTest(
+    {
+      model,
+      context,
+      storagePath: f.path,
+      streamOptions: { sessionId, signal: abort.signal },
+    },
+    { native: f.native, cacheKeep: keep },
+  )
+  const finished = sending.then(async (response) => {
+    returned = true
+    expect(response.headers.get('x-cortexkit-relay-optimistic')).toBeNull()
+    return response.text()
+  })
+  lifetimes.trackDetached(finished)
+  await accepted.wait
+  try {
+    // Relay acceptance is not upstream acceptance; Pi waits for response_start.
+    expect(returned).toBe(false)
+    expect(keep.trackedCount()).toBe(0)
+    expect(tracking).toHaveBeenCalledTimes(0)
+    upstream.open()
+    expect(await finished).toContain('message_stop')
+    expect(tracking).toHaveBeenCalledTimes(1)
+    expect(keep.trackedCount()).toBe(1)
+    expect(keep.trackedRequest(sessionId)?.bodyText).toContain('Hello')
+  } finally {
+    upstream.open()
+    await finished
+  }
+})

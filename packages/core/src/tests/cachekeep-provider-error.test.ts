@@ -500,7 +500,7 @@ suite.test(
     const result = await fixture.run()
     const dumps = await fixture.dumpText()
 
-    expect(result).toEqual({ ok: true, usage: payload.usage })
+    expect(result).toEqual({ ok: true, ttlMs: 3_600_000, usage: payload.usage })
     expect(fixture.calls).toHaveLength(1)
     expect(fixture.observations).toEqual([{ status: 200, data: payload }])
     expect(dumps.text).toContain('"cache_read_input_tokens": 4096')

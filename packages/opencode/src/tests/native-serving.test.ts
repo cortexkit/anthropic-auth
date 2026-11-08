@@ -2910,6 +2910,73 @@ const cacheKeepPrewarmBody = JSON.stringify({
   ],
 })
 
+for (const provenance of [true, false]) {
+  test(`OpenCode 1 HTTP relay accepts cache activity exactly once ${provenance ? 'with' : 'without'} request-id provenance`, async () => {
+    const fixture = await migrateServingFixture('claustrum')
+    const runtime = createNativeAccountRuntime({
+      paths: fixture.paths,
+      host: 'opencode',
+    })
+    const relayUrl = 'https://synthetic-accepted-relay.invalid'
+    try {
+      await runtime.updateSettings((settings) => ({
+        ...settings,
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+      }))
+      await runtime.updateRelay({
+        enabled: true,
+        url: relayUrl,
+        token: 'synthetic-relay-token',
+        transport: 'http',
+        fallbackToDirect: false,
+      })
+    } finally {
+      runtime.close()
+    }
+    network.mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : input.toString()
+      if (!url.startsWith(relayUrl)) return fixture.fetchProvider(input, init)
+      return Response.json(
+        { content: [], usage: {} },
+        { headers: provenance ? { 'request-id': 'req_cache_accepted' } : {} },
+      )
+    })
+    const plugin = await createPlugin({
+      claustrumScopedConnect: async () => fixture.scopedClient,
+      setInterval: (() => ({ unref() {} })) as unknown as typeof setInterval,
+      clearInterval: (() => {}) as typeof clearInterval,
+    })
+    const send = requestFetch(
+      await load(plugin, async () => custodyTombstoneOAuth('anthropic')),
+    )
+    const keep = getPluginTestHandles(plugin).cacheKeepManager
+    if (!(keep instanceof CacheKeepManager)) throw new Error('missing keeper')
+    const tracking = spyOn(keep, 'track')
+    lifetimes.deferCleanup(() => tracking.mockRestore())
+    const sessionId = `oc1-http-accepted-${provenance}`
+    lifetimes.deferCleanup(() => sessionCacheActivity.forget(sessionId))
+    await (
+      await send('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-session-affinity': sessionId },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 8,
+          messages: [{ role: 'user', content: 'accepted through HTTP relay' }],
+        }),
+      })
+    ).text()
+    expect(tracking).toHaveBeenCalledTimes(1)
+    expect(keep.trackedRequest(sessionId)?.bodyText).toContain(
+      'accepted through HTTP relay',
+    )
+    expect(
+      sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
+    ).toBeGreaterThan(Date.now() + 55 * 60_000)
+  })
+}
+
 for (const cacheKeepEnabled of [true, false]) {
   test(`OpenCode 1 records only accepted cache activity with CacheKeep ${cacheKeepEnabled ? 'on' : 'off'}`, async () => {
     const fixture = await migrateServingFixture('claustrum')
@@ -3175,9 +3242,10 @@ for (const scenario of final401Cases) {
       Date.now(),
       'max',
     )
-    if (scenario.outcome === 'replay succeeds')
-      expect(expiry).toBeGreaterThan(Date.now() + 55 * 60_000)
-    else expect(expiry).toBe(acceptedAt + 3_600_000)
+    if (scenario.outcome === 'replay succeeds') {
+      expect(expiry).toBeGreaterThan(Date.now() + 4 * 60_000)
+      expect(expiry).toBeLessThanOrEqual(Date.now() + 5 * 60_000)
+    } else expect(expiry).toBe(acceptedAt + 3_600_000)
     sessionCacheActivity.forget(target.sessionId)
     expectFinal401Record(
       fixture,

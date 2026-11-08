@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import type { AccountStorage } from '../accounts.ts'
 import { CacheKeepManager } from '../cachekeep.ts'
 
 const bodyText = JSON.stringify({
@@ -13,6 +14,124 @@ const bodyText = JSON.stringify({
   ],
   messages: [{ role: 'user', content: 'warm' }],
 })
+
+const target = {
+  sessionId: 'immediate-test',
+  url: 'https://api.anthropic.com/v1/messages',
+  headers: new Headers(),
+  bodyText,
+}
+
+const storage: AccountStorage = {
+  version: 1,
+  accounts: [],
+  claudeCache: { enabled: true, mode: 'hybrid' },
+  cacheKeep: { enabled: true, always: true },
+}
+
+test('CacheKeep immediate replay binds the tracked generation and reserves its count', async () => {
+  let sends = 0
+  const current: boolean[] = []
+  const manager = new CacheKeepManager({
+    loadStorage: async () => storage,
+    fetchImpl: (async () => {
+      sends++
+      return Response.json({})
+    }) as unknown as typeof fetch,
+    onResponse: ({ target }) => {
+      current.push(manager.isCurrentTarget(target))
+    },
+  })
+  try {
+    expect(manager.track({ ...target, storage, cacheMode: 'hybrid' })).toEqual({
+      tracked: true,
+    })
+    const state = manager.trackedPolicyState(target.sessionId)
+    expect(await manager.prewarmNow(target)).toEqual({
+      ok: true,
+      ttlMs: 300_000,
+    })
+    expect(manager.trackedPolicyState(target.sessionId)).toBe(state)
+    expect(state?.warmsSinceLastRealRequest).toBe(1)
+    expect(state?.hasWarmed).toBe(true)
+    expect(sends).toBe(1)
+    expect(current).toEqual([true])
+  } finally {
+    manager.stop()
+  }
+})
+
+test('CacheKeep standalone immediate responses update only their own generation', async () => {
+  const responses = [
+    Promise.withResolvers<Response>(),
+    Promise.withResolvers<Response>(),
+  ]
+  const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
+  let sends = 0
+  const current: boolean[] = []
+  const manager = new CacheKeepManager({
+    loadStorage: async () => null,
+    fetchImpl: (async () => {
+      const index = sends++
+      started[index]!.resolve()
+      return responses[index]!.promise
+    }) as unknown as typeof fetch,
+    onResponse: ({ target }) => {
+      current.push(manager.isCurrentTarget(target))
+    },
+  })
+  const first = manager.prewarmNow(target)
+  await started[0]!.promise
+  const second = manager.prewarmNow(target)
+  await started[1]!.promise
+  try {
+    responses[1]!.resolve(Response.json({}))
+    expect(await second).toEqual({ ok: true, ttlMs: 300_000 })
+    responses[0]!.resolve(Response.json({}))
+    expect(await first).toEqual({ ok: true, ttlMs: 300_000 })
+    expect(current).toEqual([true, false])
+  } finally {
+    responses.forEach((response) => {
+      response.resolve(Response.json({}))
+    })
+    await Promise.all([first, second])
+    manager.stop()
+  }
+})
+
+test.each(['request', 'untrack', 'stop'] as const)(
+  'CacheKeep %s invalidates an in-flight standalone immediate generation',
+  async (change) => {
+    const response = Promise.withResolvers<Response>()
+    const started = Promise.withResolvers<void>()
+    const current: boolean[] = []
+    const manager = new CacheKeepManager({
+      loadStorage: async () => storage,
+      fetchImpl: (async () => {
+        started.resolve()
+        return response.promise
+      }) as unknown as typeof fetch,
+      onResponse: ({ target }) => {
+        current.push(manager.isCurrentTarget(target))
+      },
+    })
+    const warm = manager.prewarmNow(target)
+    await started.promise
+    try {
+      if (change === 'request')
+        manager.track({ ...target, storage, cacheMode: 'hybrid' })
+      else if (change === 'untrack') manager.untrack(target.sessionId)
+      else manager.stop()
+      response.resolve(Response.json({}))
+      expect(await warm).toEqual({ ok: true, ttlMs: 300_000 })
+      expect(current).toEqual([false])
+    } finally {
+      response.resolve(Response.json({}))
+      await warm
+      manager.stop()
+    }
+  },
+)
 
 test('CacheKeep retries an in-flight 401 once with a new scoped receipt before reporting', async () => {
   const sent: string[] = []

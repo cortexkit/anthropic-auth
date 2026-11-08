@@ -233,7 +233,12 @@ describe('OC1 shared routing relay', () => {
     })
     await (await f.send()).text()
     expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-fallback-access')
-    expect(reports).toEqual([
+    const routingReports = (): unknown[] =>
+      reports.filter(
+        (report) =>
+          typeof report === 'object' && report !== null && 'outcome' in report,
+      )
+    expect(routingReports()).toEqual([
       {
         account_id: syntheticFallbackAccountUuid(0),
         outcome: 'served',
@@ -243,7 +248,7 @@ describe('OC1 shared routing relay', () => {
     answer = null
     await (await f.send()).text()
     expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-fallback-access')
-    expect(reports).toHaveLength(2)
+    expect(routingReports()).toHaveLength(2)
   })
 
   for (const mode of ['null', 'unknown', 'floor', 'reserve']) {
