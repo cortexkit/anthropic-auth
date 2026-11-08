@@ -517,7 +517,8 @@ test('ttl only keeps local always cadence and its 24 reservation cap', async () 
     cacheKeep: { enabled: true, always: true },
   })
   expect(f.track({ cacheMode: 'hybrid' }).tracked).toBe(true)
-  expect(f.timerMs).toBeUndefined()
+  // Local one-hour targets now get a precise timer at the unchanged 55-minute due time.
+  expect(f.timerMs).toBe(3_300_000)
   expect(f.target.nextPrewarmAt).toBe(f.now + 3_300_000)
   for (let n = 0; n < 25; n++) {
     f.advance(3_300_000)

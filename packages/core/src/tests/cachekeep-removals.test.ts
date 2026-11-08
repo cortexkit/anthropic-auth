@@ -243,6 +243,83 @@ test('a due attempt cannot start when less than its timeout and safety margin re
   expect(manager.trackedCount()).toBe(0)
 })
 
+test('a later-inserted due target with an earlier last-start deadline warms first', async () => {
+  const sent: string[] = []
+  const { manager } = fixture({
+    prepareHeaders: (headers, target) => {
+      sent.push(target.id)
+      return headers
+    },
+    fetchImpl: Object.assign(
+      async () => {
+        now += 9000
+        return Response.json({})
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  const startedAt = now
+  for (const [id, remaining] of [
+    ['later-deadline', 90_000],
+    ['earlier-deadline', 40_000],
+  ] as const) {
+    expect(
+      manager.track({
+        sessionId: id,
+        bodyText: body,
+        url: 'https://api.anthropic.com/v1/messages',
+        headers: new Headers(),
+        storage,
+        cacheMode: 'hybrid',
+        retained: {
+          cacheExpiresAt: startedAt + remaining,
+          nextPrewarmAt: startedAt,
+          policyState: {
+            ownerSessionId: id,
+            planned: false,
+            lastRealRequestAt: startedAt - CACHE_KEEP_TTL_MS + remaining,
+            warmsSinceLastRealRequest: 0,
+            warmCostSoFar: 0,
+            hasWarmed: false,
+          },
+        },
+      }).tracked,
+    ).toBe(true)
+  }
+  await manager.tick()
+  expect(sent).toEqual(['earlier-deadline', 'later-deadline'])
+  expect(manager.trackedCount()).toBe(2)
+})
+
+test('an immediate tracked warm re-arms its next due timer', async () => {
+  const timers = new Map<object, number>()
+  const { manager, track } = fixture({
+    setTimeoutImpl: ((_callback: () => unknown, ms: number) => {
+      const id = { unref() {} }
+      timers.set(id, now + ms)
+      return id
+    }) as unknown as typeof setTimeout,
+    clearTimeoutImpl: ((id: object) => {
+      timers.delete(id)
+    }) as unknown as typeof clearTimeout,
+  })
+  track('ses_immediate')
+  const firstDue = now + CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS
+  expect([...timers.values()]).toEqual([firstDue])
+  now += 1000
+  expect(
+    (
+      await manager.prewarmNow({
+        sessionId: 'ses_immediate',
+        bodyText: body,
+        url: 'https://api.anthropic.com/v1/messages',
+        headers: new Headers(),
+      })
+    ).ok,
+  ).toBe(true)
+  expect([...timers.values()]).toEqual([firstDue + 1000])
+})
+
 test('retry scheduling uses completion time rather than the tick start', async () => {
   const { manager, track } = fixture({
     fetchImpl: Object.assign(

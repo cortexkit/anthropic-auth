@@ -794,6 +794,7 @@ export class CacheKeepManager {
       CACHE_KEEP_TICK_MS,
     )
     if ('unref' in this.timer) this.timer.unref()
+    this.scheduleDueTimer()
   }
 
   stop() {
@@ -1104,14 +1105,9 @@ export class CacheKeepManager {
       (this.options.clearTimeoutImpl ?? clearTimeout)(this.dueTimer)
     this.dueTimer = null
     let due = Infinity
-    // A short cache can become due and expire between 60-second interval ticks.
+    // Restored or near-expiry caches may not survive the next interval tick.
     for (const target of this.targets.values())
-      if (
-        target.policyState?.planned ||
-        target.sourceWarm ||
-        (target.ttlMs ?? CACHE_KEEP_TTL_MS) < CACHE_KEEP_TTL_MS
-      )
-        due = Math.min(due, target.nextPrewarmAt)
+      due = Math.min(due, target.nextPrewarmAt)
     if (!Number.isFinite(due)) return
     this.dueTimer = (this.options.setTimeoutImpl ?? setTimeout)(
       () => {
@@ -1539,12 +1535,14 @@ export class CacheKeepManager {
       const result = await this.sendPrewarm(target, (receivedAt) => {
         acceptedAt = receivedAt
       })
-      if (result.ok && current && this.isCurrentTarget(target))
+      if (result.ok && current && this.isCurrentTarget(target)) {
         this.acceptWarm(
           current,
           result,
           acceptedAt ?? this.options.now?.() ?? Date.now(),
         )
+        this.scheduleDueTimer()
+      }
       return result
     } finally {
       if (this.immediateTargets.get(target.id) === target)
@@ -1580,7 +1578,11 @@ export class CacheKeepManager {
     }
 
     logger.debug('cachekeep', 'fired', { targets: this.targets.size })
-    for (const target of this.targets.values()) {
+    // Prewarms are sequential, so serve the least remaining retry window first.
+    const targets = [...this.targets.values()].sort(
+      (a, b) => this.lastPrewarmStart(a) - this.lastPrewarmStart(b),
+    )
+    for (const target of targets) {
       const attemptAt = this.options.now?.() ?? Date.now()
       const decision = this.policyDecision(target, attemptAt)
       if (decision?.action === 'stop') {

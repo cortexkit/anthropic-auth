@@ -147,6 +147,7 @@ class Timers {
     private readonly afterTick: () => Promise<unknown>,
   ) {}
   readonly callbacks = new Map<object, () => unknown>()
+  readonly intervals = new Map<object, { at: number; every: number }>()
   readonly timeouts = new Map<object, { callback: () => unknown; at: number }>()
   readonly setTimeout: typeof globalThis.setTimeout = ((
     callback: () => unknown,
@@ -169,14 +170,39 @@ class Timers {
   }
   readonly setInterval: typeof globalThis.setInterval = ((
     callback: () => unknown,
+    ms: number,
   ) => {
     const id = { unref() {} }
     this.callbacks.set(id, callback)
+    this.intervals.set(id, { at: this.now() + ms, every: ms })
     return id
   }) as unknown as typeof globalThis.setInterval
   readonly clearInterval: typeof globalThis.clearInterval = ((id: object) => {
     this.callbacks.delete(id)
+    this.intervals.delete(id)
   }) as unknown as typeof globalThis.clearInterval
+  async advanceTo(end: number, advance: (ms: number) => void) {
+    for (;;) {
+      const next = [
+        ...[...this.timeouts].map(([id, timer]) => ({ id, ...timer })),
+        ...[...this.intervals].map(([id, timer]) => ({
+          id,
+          ...timer,
+          callback: this.callbacks.get(id)!,
+        })),
+      ]
+        .filter((timer) => timer.at <= Math.max(end, this.now()))
+        .sort((a, b) => a.at - b.at)[0]
+      if (!next) break
+      advance(Math.max(0, next.at - this.now()))
+      const interval = this.intervals.get(next.id)
+      if (interval) interval.at += interval.every
+      else this.timeouts.delete(next.id)
+      await next.callback()
+      await this.afterTick()
+    }
+    advance(Math.max(0, end - this.now()))
+  }
   async fire() {
     await Promise.all(
       [...this.callbacks.values()].map((callback) => callback()),
@@ -1527,6 +1553,7 @@ test('OpenCode 2 throttles later tool steps for five seconds but disposal drains
       ],
     })
   ).json()) as Record<string, any>
+  const secondAcceptedAt = f.now()
   f.advance(4999)
   await f.timers.fireTimeouts()
   const [name] = await readdir(f.disk)
@@ -1534,7 +1561,15 @@ test('OpenCode 2 throttles later tool steps for five seconds but disposal drains
     gunzipSync(await readFile(join(f.disk, name!))).toString(),
   )
   expect(JSON.parse(saved.bodyText).messages).toEqual(first.messages)
-  expect(f.timers.timeouts.size).toBe(1)
+  // The pending five-second store flush now coexists with the precise 55-minute warm timer.
+  expect(
+    [...f.timers.timeouts.values()]
+      .map((timer) => timer.at)
+      .sort((a, b) => a - b),
+  ).toEqual([
+    secondAcceptedAt + 5000,
+    secondAcceptedAt + CACHE_KEEP_TTL_MS - CACHE_KEEP_PREWARM_LEAD_MS,
+  ])
   await f.dispose()
   expect(f.timers.timeouts.size).toBe(0)
   forgetCacheKeepProcess(f.paths.storageId)
@@ -1706,6 +1741,54 @@ test('OpenCode 2 does not restore sessions outside the configured schedule', asy
   await f.timers.fire()
   expect(next.sent).toHaveLength(0)
   expect(await readdir(f.disk)).toEqual([])
+})
+
+test('OpenCode 2 timers warm three overdue restored sessions before their retry windows end', async () => {
+  const f = await fixture()
+  for (const id of ['ses_one', 'ses_two', 'ses_three'])
+    await f.live(undefined, {}, id)
+  await f.dispose()
+  const restoredAt = f.now()
+  // The first-restored session can still start at the minute backstop. The
+  // other two have about a minute of cache left and cannot wait that long.
+  const names = (await readdir(f.disk)).sort()
+  for (const name of names) {
+    const path = join(f.disk, name)
+    const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+    saved.cacheExpiresAt = restoredAt + (name === names[0] ? 96_000 : 65_000)
+    saved.nextPrewarmAt = restoredAt - 1000
+    await writeFile(path, gzipSync(JSON.stringify(saved)))
+  }
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  const starts: number[] = []
+  const clock = spyOn(Date, 'now').mockImplementation(f.now)
+  cleanups.push(() => clock.mockRestore())
+  next.setSend(async () => {
+    starts.push(f.now() - restoredAt)
+    f.advance(9000)
+    return Response.json({ usage: { cache_read_input_tokens: 1 } })
+  })
+  await f.timers.advanceTo(restoredAt + 60_000, f.advance)
+  expect(next.sent).toHaveLength(3)
+  expect(starts).toEqual([1, 9002, 18002])
+  const sessions = await f.registry.list()
+  expect(sessions).toHaveLength(3)
+  expect(sessions.every((session) => session.lastTouchKind === 'warm')).toBe(
+    true,
+  )
+  expect(sessions.every((session) => !session.warmStopped)).toBe(true)
+})
+
+test('OpenCode 2 adoption re-arms the due timer for targets retained in memory', async () => {
+  const f = await fixture()
+  await f.live()
+  await f.dispose()
+  f.due()
+  const adoptedAt = f.now()
+  const next = await f.start()
+  await f.timers.advanceTo(adoptedAt + 1, f.advance)
+  expect(next.sent).toHaveLength(1)
 })
 
 test('OpenCode 2 staggers overdue restored prewarms instead of sending a burst', async () => {
