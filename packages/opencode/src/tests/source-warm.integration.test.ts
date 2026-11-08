@@ -178,7 +178,15 @@ async function setupRound(
       }),
     { models: {} },
   )
-  return { plugin, result, sent, warms }
+  return {
+    plugin,
+    result,
+    sent,
+    warms,
+    refuseNextSource: () => {
+      refusalsLeft = 1
+    },
+  }
 }
 
 function targetId(sessionId: string) {
@@ -454,11 +462,13 @@ describe('source-warm', () => {
     }
   })
 
-  test('the idle cap stops warms at the derived count and a user turn resets it', async () => {
+  test('local always keeps its 24-warm cap when a fallback user turn resets the source idle counter', async () => {
     const realDateNow = Date.now
     try {
-      // The idle stretch runs about forty hours; keep the credential valid.
-      const round = await setupRound(200 * 60 * 60_000)
+      // The idle stretch runs about twenty-four hours; keep the credential valid.
+      const storage = hybridStorage()
+      expect(storage.cacheKeep?.always).toBe(true)
+      const round = await setupRound(200 * 60 * 60_000, storage)
       const sessionId = 'ses_warm_idle'
       const firstTurn = await userTurnHeaders(round.plugin, sessionId, 'msg_u1')
       await startRound(sessionId, round, firstTurn)
@@ -491,20 +501,21 @@ describe('source-warm', () => {
         fallbackManager.sourceWarmFor(recoveryKey(sessionId)),
       ).toMatchObject({ warmsSinceUserTurn: 0 })
 
-      // Only the kept source prefix has an idle cap. Stop warming the live
-      // Opus 4.8 prefix so the long idle stretch sends no unrelated prewarms.
+      // Stop warming the live Opus 4.8 prefix so the idle stretch sends only
+      // source replays, each governed by local always's separate count cap.
       expect(cacheKeep.untrack(sessionId)).toBe(true)
 
-      // Opus 5.5 pricing derives a cap of 39 warms per idle stretch. Step
-      // just under a lifetime so every tick finds a due (not expired) warm.
-      for (let index = 0; index < 39; index++) {
+      // The fallback user turn resets the source's legacy idle counter, but
+      // has not made a real source request. Its first warm still counts
+      // toward local always's 24-warm cap, which precedes the 39-read cost cap.
+      for (let index = 0; index < 23; index++) {
         elapsed += 55 * 60_000
         await cacheKeep.tick()
       }
-      expect(sourceWarms(round)).toHaveLength(1 + 39)
+      expect(sourceWarms(round)).toHaveLength(24)
       expect(
         fallbackManager.sourceWarmFor(recoveryKey(sessionId)),
-      ).toMatchObject({ warmsSinceUserTurn: 39 })
+      ).toMatchObject({ warmsSinceUserTurn: 23 })
       expect(
         cacheKeep.trackedSessions().some((s) => s.id === targetId(sessionId)),
       ).toBe(true)
@@ -513,7 +524,7 @@ describe('source-warm', () => {
       // Step under a lifetime so the validator (not expiry pruning) decides.
       elapsed += 55 * 60_000
       await cacheKeep.tick()
-      expect(sourceWarms(round)).toHaveLength(1 + 39)
+      expect(sourceWarms(round)).toHaveLength(24)
       expect(
         cacheKeep.trackedSessions().some((s) => s.id === targetId(sessionId)),
       ).toBe(false)
@@ -524,10 +535,86 @@ describe('source-warm', () => {
       // Past the cap nothing more is sent.
       elapsed += 60 * 60_000
       await cacheKeep.tick()
-      expect(sourceWarms(round)).toHaveLength(1 + 39)
+      expect(sourceWarms(round)).toHaveLength(24)
     } finally {
       Date.now = realDateNow
     }
+  })
+
+  test.each([
+    'disabled',
+    'schedule',
+    'policy-refused',
+    'evicted',
+    'session-forgotten',
+    'retries-exhausted',
+    'cost-cap',
+  ] as const)(
+    'terminal %s retires the kept source and a later fallback turn cannot resurrect it',
+    async (reason) => {
+      const round = await setupRound()
+      const sessionId = `ses_terminal_${reason}`
+      await startRound(sessionId, round)
+      const { cacheKeepManager: cacheKeep, fableFallbackManager: fallback } =
+        getPluginTestHandles(round.plugin)
+      expect(fallback.sourceWarmFor(recoveryKey(sessionId))).toBeDefined()
+      expect(cacheKeep.untrack(targetId(sessionId), reason)).toBe(true)
+      expect(fallback.sourceWarmFor(recoveryKey(sessionId))).toBeUndefined()
+      const headers = await userTurnHeaders(
+        round.plugin,
+        sessionId,
+        'msg_after_stop',
+      )
+      await (
+        await round.result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': sessionId, ...headers },
+          body: requestBody(),
+        })
+      ).text()
+      expect(round.sent.at(-1)?.model).toBe('claude-opus-4-8')
+      expect(fallback.sourceWarmFor(recoveryKey(sessionId))).toBeUndefined()
+      expect(
+        cacheKeep
+          .trackedSessions()
+          .some((target) => target.id === targetId(sessionId)),
+      ).toBe(false)
+      expect(sourceWarms(round)).toEqual([])
+    },
+  )
+
+  test('a stopped source stays retired until a new real source request starts another recovery round', async () => {
+    const round = await setupRound()
+    const sessionId = 'ses_terminal_new_round'
+    await startRound(sessionId, round)
+    const { cacheKeepManager: cacheKeep, fableFallbackManager: fallback } =
+      getPluginTestHandles(round.plugin)
+    expect(cacheKeep.untrack(targetId(sessionId), 'cost-cap')).toBe(true)
+    const request = {
+      method: 'POST',
+      headers: { 'x-session-affinity': sessionId },
+      body: requestBody(),
+    }
+    for (let turn = 0; turn < 10; turn++) {
+      await (await round.result.fetch(MESSAGES_URL, request)).text()
+      expect(fallback.sourceWarmFor(recoveryKey(sessionId))).toBeUndefined()
+      expect(
+        cacheKeep
+          .trackedSessions()
+          .some((target) => target.id === targetId(sessionId)),
+      ).toBe(false)
+    }
+    expect(round.sent.at(-1)?.model).toBe(SOURCE_MODEL)
+    round.refuseNextSource()
+    await startRound(sessionId, round)
+    expect(fallback.sourceWarmFor(recoveryKey(sessionId))?.model).toBe(
+      SOURCE_MODEL,
+    )
+    expect(
+      cacheKeep
+        .trackedSessions()
+        .some((target) => target.id === targetId(sessionId)),
+    ).toBe(true)
   })
 
   test('without CacheKeep nothing is kept or warmed', async () => {

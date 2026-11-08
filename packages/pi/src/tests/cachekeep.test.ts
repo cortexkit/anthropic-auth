@@ -4,6 +4,7 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  type CacheKeepManager,
   cacheKeepStoreDirectory,
   createEmptyStorage,
   type HolderLiveness,
@@ -47,7 +48,10 @@ async function fixture() {
   }
   const sends: Array<{ session: string; body: Record<string, unknown> }> = []
   const delays: number[] = []
-  const create = (liveness?: HolderLiveness) => {
+  const create = (
+    liveness?: HolderLiveness,
+    send?: () => Promise<Response>,
+  ) => {
     const timers = new Map<object, () => unknown>()
     const process = new PiCacheKeep(
       {
@@ -71,6 +75,7 @@ async function fixture() {
             session: new Headers(init?.headers).get('x-session')!,
             body: JSON.parse(String(init?.body)),
           })
+          if (send) return send()
           return new Response('{"usage":{"cache_read_input_tokens":100}}', {
             status: 200,
           })
@@ -428,3 +433,53 @@ test('ttl-only policy cannot restore a Pi child after the local subagent opt-out
   expect(f.sends).toEqual([])
   expect(resumed.process.manager.trackedSessions()).toEqual([])
 })
+
+test.each(['replaced', 'retired'] as const)(
+  'an old Pi 503 settlement cannot persist a %s generation',
+  async (change) => {
+    const f = await fixture()
+    let entered!: () => void
+    let finish!: (response: Response) => void
+    const started = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const held = new Promise<Response>((resolve) => {
+      finish = resolve
+    })
+    const first = f.create(undefined, () => {
+      entered()
+      return held
+    })
+    await first.process.startSession('pi-storage', 'ses_settle')
+    await first.process.trackAccepted(f.input('ses_settle'), f.snapshot)
+    f.advance(55 * 60_000)
+    const warming = first.tick()
+    await started
+    if (change === 'replaced')
+      await first.process.trackAccepted(
+        f.input('ses_settle', 'Newest Pi prefix'),
+        f.snapshot,
+      )
+    else
+      (
+        first.process as unknown as { manager: CacheKeepManager }
+      ).manager.untrack('ses_settle', 'session-forgotten')
+    finish(Response.json({}, { status: 503 }))
+    await warming
+    await first.process.stop()
+    const second = f.create()
+    await second.process.startSession('pi-storage', 'ses_settle')
+    const restored = (
+      second.process as unknown as { manager: CacheKeepManager }
+    ).manager.trackedRequest('ses_settle')
+    if (change === 'replaced')
+      expect(restored?.bodyText).toContain('Newest Pi prefix')
+    else expect(restored).toBeUndefined()
+    f.sends.length = 0
+    f.advance(55 * 60_000)
+    await second.tick()
+    expect(f.sends).toHaveLength(change === 'replaced' ? 1 : 0)
+    if (change === 'replaced')
+      expect(JSON.stringify(f.sends[0]!.body)).toContain('Newest Pi prefix')
+  },
+)

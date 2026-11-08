@@ -354,14 +354,48 @@ export async function setupAnthropicAuth(
   let lifecycle: ReturnType<typeof startNativeAnthropicLifecycle> | undefined
   let prime: ReturnType<typeof createNativePrime> | undefined
   let cacheKeep: ReturnType<typeof createNativeCacheKeep> | undefined
+  const parents = new Map<string, { value?: boolean }>()
+  const subagent = (sessionID: string): boolean | undefined => {
+    const cached = parents.get(sessionID)
+    if (cached) return cached.value
+    const entry: { value?: boolean } = {}
+    parents.set(sessionID, entry)
+    if (parents.size > 4096) {
+      const oldest = parents.keys().next().value
+      if (oldest !== undefined) parents.delete(oldest)
+    }
+    // Parent lookup is advisory at capture time, but must resolve before a
+    // warm may spend. A failure is forgotten so the next warm can retry it.
+    void Promise.resolve()
+      .then(() =>
+        ctx.session.get({
+          sessionID: sessionID as Parameters<
+            Plugin.Context['session']['get']
+          >[0]['sessionID'],
+        }),
+      )
+      .then((session) => {
+        if (!active || parents.get(sessionID) !== entry) return
+        entry.value = Boolean(session.parentID)
+        cacheKeep?.resolvedParent(sessionID, entry.value)
+      })
+      .catch(() => {
+        if (parents.get(sessionID) === entry) parents.delete(sessionID)
+      })
+    return undefined
+  }
   const source: NativeSource = createNativeAnthropicSource({
     runtime,
     paths,
     fetch: options.fetch,
-    requestOptions: wire.requestOptions,
+    requestOptions: (input, snapshot) => {
+      subagent(input.sessionID)
+      return wire.requestOptions(input, snapshot)
+    },
     responseOptions: wire.responseOptions,
     onRequestId: wire.onRequestId,
     onForgetSession: (sessionID) => {
+      parents.delete(sessionID)
       wire.forgetSession(sessionID)
       cacheKeep?.forgetSession(sessionID)
     },
@@ -405,16 +439,7 @@ export async function setupAnthropicAuth(
     source,
     storageId: paths.storageId,
     fetch: options.fetch,
-    isSubagent: async (sessionID) =>
-      Boolean(
-        (
-          await ctx.session.get({
-            sessionID: sessionID as Parameters<
-              Plugin.Context['session']['get']
-            >[0]['sessionID'],
-          })
-        ).parentID,
-      ),
+    subagent,
   })
   await cacheKeep.ready
   const capabilities = createNativeMenuCapabilities({
@@ -451,6 +476,7 @@ export async function setupAnthropicAuth(
   const dispose = () => {
     if (cleanup) return cleanup
     active = false
+    parents.clear()
     requests.retire()
     holderRegistration?.close()
     capabilities.close()
