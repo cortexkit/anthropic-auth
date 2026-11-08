@@ -28,7 +28,11 @@ import {
   type NativeAnthropicAttemptData,
 } from './adapter'
 import { CacheKeepStore, type CacheKeepStoreOptions } from './cachekeep-store'
-import type { NativeSource, NativeSourceProvenance } from './source'
+import type {
+  NativeCacheRequestPrepared,
+  NativeSource,
+  NativeSourceProvenance,
+} from './source'
 
 const warmResponseLifetimes = new WeakMap<Response, number>()
 
@@ -107,6 +111,7 @@ interface CacheKeepLease {
   /** Sends this lease started; its disposal waits for them to settle. */
   readonly inflight: Set<Promise<unknown>>
   readonly read: NativeAccountRuntime['read']
+  readonly subagent?: (sessionID: string) => boolean | undefined
 }
 
 /**
@@ -123,6 +128,7 @@ interface SharedCacheKeep {
     | 'isCurrentTarget'
     | 'recordAcceptedUsage'
     | 'hasPlannedTarget'
+    | 'updateSubagent'
   > &
     Partial<
       Pick<
@@ -132,6 +138,7 @@ interface SharedCacheKeep {
         | 'isCurrentTarget'
         | 'recordAcceptedUsage'
         | 'hasPlannedTarget'
+        | 'updateSubagent'
       >
     >
   readonly registry: CacheKeepSessionRegistry
@@ -273,7 +280,10 @@ function createSharedCacheKeep(
     setTimeoutImpl: options.setTimeoutImpl,
     clearTimeoutImpl: options.clearTimeoutImpl,
     reserveWarm: (target) => shared.persistence.reserveWarm(target),
-    settleWarm: (target) => shared.persistence.reserveWarm(target),
+    settleWarm: (target) =>
+      manager.isCurrentTarget(target)
+        ? shared.persistence.reserveWarm(target)
+        : Promise.resolve(false),
     deferWarmReservation: true,
     responseTtlMs: (response) => warmResponseLifetimes.get(response),
     onTargetChanged: (target) => shared.persistence.changed(target),
@@ -465,6 +475,7 @@ export function createNativeCacheKeep(
     storageId: string
     fetch?: typeof fetch
     isSubagent?: (sessionID: string) => Promise<boolean>
+    subagent?: (sessionID: string) => boolean | undefined
   },
 ) {
   const { runtime, source } = options
@@ -494,6 +505,19 @@ export function createNativeCacheKeep(
   owner.persistence = persistence
   shareds.set(options.storageId, owner)
   const { manager, registry } = owner
+  const acceptedStorage = new Map<string, CacheKeepPolicyStorage>()
+  const resolvedParent = (sessionID: string, isSubagent: boolean) => {
+    const storage = acceptedStorage.get(sessionID)
+    if (
+      isSubagent &&
+      storage &&
+      readSessionCachePolicy(sessionID, true)?.keep_warm === undefined &&
+      !isCacheKeepSubagentsEnabled(storage)
+    ) {
+      manager.untrack(sessionID, 'policy-refused')
+      acceptedStorage.delete(sessionID)
+    } else manager.updateSubagent?.(sessionID, isSubagent)
+  }
   // Unanswered attempts are not warm targets: replacing a target or reserving
   // budget before Anthropic accepts the request would evict useful prefixes.
   const pending = new Map<
@@ -522,6 +546,7 @@ export function createNativeCacheKeep(
     if (signal.aborted)
       throw new CacheKeepPrewarmError('authorization', signal.reason)
     const warmBodyText = await warm.text()
+    let dispatchStorage: CacheKeepPolicyStorage | undefined
     if (
       !manager.reserveWarmDispatch &&
       (target.policyState?.planned ||
@@ -573,6 +598,7 @@ export function createNativeCacheKeep(
         },
         async authorizeAccount(input, accountId) {
           const snapshot = await runtime.read()
+          dispatchStorage = snapshot.policyStorage
           signal.throwIfAborted()
           const account = snapshot.accounts.find((row) => row.id === accountId)
           if (account?.type !== 'oauth' || !nativeAccountCanServe(account))
@@ -618,6 +644,7 @@ export function createNativeCacheKeep(
         async admitRequest(input) {
           await source.admitRequest?.(input, refuse)
           const snapshot = await runtime.read()
+          dispatchStorage = snapshot.policyStorage
           const account = snapshot.accounts.find(
             (row) => row.id === input.accountId,
           )
@@ -653,6 +680,7 @@ export function createNativeCacheKeep(
     signal.addEventListener('abort', cancel, { once: true })
     try {
       const snapshot = await runtime.read()
+      dispatchStorage = snapshot.policyStorage
       const accountId = snapshot.accounts.find(
         (account) => accountKey(account) === target.oauthAccountIdentity,
       )?.id
@@ -697,6 +725,16 @@ export function createNativeCacheKeep(
       })
       if (!request) throw new Error('CacheKeep rewrite refused')
       signal.throwIfAborted()
+      const ownerSession = target.policyState?.ownerSessionId ?? target.id
+      const parent = options.subagent?.(ownerSession)
+      if (options.subagent && parent === undefined)
+        throw new CacheKeepPrewarmError('authorization', undefined)
+      if (
+        parent &&
+        readSessionCachePolicy(ownerSession, true)?.keep_warm === undefined &&
+        !isCacheKeepSubagentsEnabled(dispatchStorage)
+      )
+        throw new CacheKeepWarmRefusal('subagents-disabled')
       await manager.reserveWarmDispatch?.(target)
       signal.throwIfAborted()
       stage = 'send'
@@ -773,16 +811,21 @@ export function createNativeCacheKeep(
     send,
     inflight: new Set(),
     read: () => runtime.read(),
+    subagent: options.subagent,
   }
   const adopting = owner.leases.size === 0
   owner.leases.set(lease.generation, lease)
-  const ready = adopting ? owner.adopt() : (owner.loading ?? Promise.resolve())
+  const ready = (
+    adopting ? owner.adopt() : (owner.loading ?? Promise.resolve())
+  ).then(() => {
+    if (!lease.stopped)
+      for (const session of manager.trackedSessions())
+        options.subagent?.(session.id)
+  })
   let cleanup: Promise<void> | undefined
   return {
     ready,
-    async track(
-      input: Parameters<NonNullable<NativeSource['onRequestPrepared']>>[0],
-    ) {
+    async track(input: NativeCacheRequestPrepared) {
       // These skips are normal (API-key routes, prewarms, subagents, policy
       // off) and keep any existing target, so they stay at debug and do no
       // per-request work beyond the log call.
@@ -807,7 +850,7 @@ export function createNativeCacheKeep(
       }
       pending.set(input.attemptId, entry)
       input.signal?.addEventListener('abort', entry.onAbort, { once: true })
-      const snapshot = await runtime.read()
+      const snapshot = input.admission?.snapshot ?? (await runtime.read())
       if (lease.stopped) return skipped('lease-stopped')
       const policy = readSessionCachePolicy(input.sessionID, true)
       if (policy?.keep_warm !== undefined && !manager.reserveWarmDispatch) {
@@ -830,7 +873,9 @@ export function createNativeCacheKeep(
       }
       let isSubagent = false
       try {
-        isSubagent = (await options.isSubagent?.(input.sessionID)) ?? false
+        isSubagent = options.subagent
+          ? (options.subagent(input.sessionID) ?? false)
+          : ((await options.isSubagent?.(input.sessionID)) ?? false)
       } catch {
         // A missing host session record cannot justify background spending.
         return skipped('session-lookup-failed')
@@ -842,9 +887,9 @@ export function createNativeCacheKeep(
         !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
       )
         return skipped('subagents-disabled')
-      const account = snapshot.accounts.find(
-        (row) => row.id === input.accountId,
-      )
+      const account =
+        input.admission?.account ??
+        snapshot.accounts.find((row) => row.id === input.accountId)
       if (!account?.accountIdentity) return skipped('account-identity-missing')
       if (
         input.provenance.kind === 'local' &&
@@ -890,6 +935,18 @@ export function createNativeCacheKeep(
         input.status < 300 &&
         target
       ) {
+        const sessionID = target.sessionId
+        if (!sessionID) return
+        const parent = options.subagent?.(sessionID)
+        if (parent !== undefined) target.isSubagent = parent
+        if (
+          target.isSubagent &&
+          readSessionCachePolicy(sessionID, true)?.keep_warm === undefined &&
+          !isCacheKeepSubagentsEnabled(target.storage)
+        ) {
+          manager.untrack(sessionID, 'policy-refused')
+          return
+        }
         const result = manager.track({
           ...target,
           acceptedUsage: input.acceptedUsage,
@@ -898,6 +955,18 @@ export function createNativeCacheKeep(
           }),
           ...(input.ttlMs !== undefined && { ttlMs: input.ttlMs }),
         })
+        if (result.tracked) {
+          // A predecessor may become the sender after this lease is disposed.
+          // Prime every live lease's parent facts without waiting for lookup.
+          for (const current of owner.leases.values())
+            current.subagent?.(sessionID)
+          acceptedStorage.delete(sessionID)
+          if (target.storage) acceptedStorage.set(sessionID, target.storage)
+          if (acceptedStorage.size > 4096) {
+            const oldest = acceptedStorage.keys().next().value
+            if (oldest !== undefined) acceptedStorage.delete(oldest)
+          }
+        }
         if (result.tracked)
           registry
             .publish(manager.registrySessions?.() ?? manager.trackedSessions())
@@ -917,7 +986,9 @@ export function createNativeCacheKeep(
     ) {
       manager.recordAcceptedUsage?.(sessionID, bodyText, usage)
     },
+    resolvedParent,
     forgetSession(sessionID: string) {
+      acceptedStorage.delete(sessionID)
       manager.untrack(sessionID)
       for (const [attemptId, entry] of pending)
         if (entry.sessionID === sessionID) discardAttempt(attemptId)

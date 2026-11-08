@@ -42,6 +42,13 @@ import {
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
 export const CACHE_KEEP_TTL_MS = 60 * 60_000
 export const CACHE_KEEP_PREWARM_LEAD_MS = 5 * 60_000
+
+function replayPrewarmLeadMs(ttlMs: number, planned: boolean): number {
+  if (!planned && ttlMs === CACHE_KEEP_TTL_MS) return CACHE_KEEP_PREWARM_LEAD_MS
+  // Match decideCacheKeep's lead for short replays: the legacy five-minute
+  // lead would otherwise make a five-minute source due at capture.
+  return Math.min(30_000, ttlMs / 2)
+}
 export const CACHE_KEEP_TICK_MS = 60_000
 export const CACHE_KEEP_EXTENDED_TTL_BETA = 'extended-cache-ttl-2025-04-11'
 export const CACHE_KEEP_MAX_TARGETS = 32
@@ -700,7 +707,7 @@ export class CacheKeepManager {
   private nextPrewarmAttemptId = 0
   private readonly reportedStops = new WeakSet<CacheKeepPolicyState>()
   private readonly admittedWarmCosts = new WeakMap<
-    Readonly<CacheKeepTarget>,
+    CacheKeepPolicyState,
     number
   >()
 
@@ -909,6 +916,14 @@ export class CacheKeepManager {
     return this.targets.get(id)?.policyState?.planned === true
   }
 
+  updateSubagent(id: string, isSubagent: boolean): void {
+    const target = this.targets.get(id)
+    if (!target || target.isSubagent === isSubagent) return
+    target.isSubagent = isSubagent
+    this.options.onTargetChanged?.(target)
+    this.scheduleDueTimer()
+  }
+
   /** An old response cannot price or reset a newer captured request. */
   recordAcceptedUsage(id: string, bodyText: string, usage: AcceptedCacheUsage) {
     const target = this.targets.get(id)
@@ -1058,7 +1073,7 @@ export class CacheKeepManager {
         throw new CacheKeepPrewarmError('authorization', undefined)
       }
     }
-    this.admittedWarmCosts.set(target, admittedCost)
+    if (state) this.admittedWarmCosts.set(state, admittedCost)
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
     const fresh = this.policyDecision(
       current,
@@ -1340,7 +1355,7 @@ export class CacheKeepManager {
     }
     const window = getCacheKeepWindow(input.storage)
     const appliedTtlMs = requestCacheLifetimeMs(input.bodyText)
-    const replayTtlMs = input.sourceWarm ? appliedTtlMs : input.ttlMs
+    const replayTtlMs = planned || input.sourceWarm ? appliedTtlMs : input.ttlMs
     if (planned && appliedTtlMs === 0) return retire('unsupported')
     if (!planned && !isCacheKeepActiveNow(input.storage, new Date(now))) {
       return refuse('outside configured schedule', 'outside-schedule')
@@ -1398,11 +1413,15 @@ export class CacheKeepManager {
         acceptedAt + (replayTtlMs ?? CACHE_KEEP_TTL_MS),
       nextPrewarmAt:
         input.retained?.nextPrewarmAt ??
-        acceptedAt +
-          (policy?.ttl
-            ? CACHE_KEEP_TTL_MS
-            : (replayTtlMs ?? CACHE_KEEP_TTL_MS)) -
-          CACHE_KEEP_PREWARM_LEAD_MS,
+        (planned || input.sourceWarm
+          ? acceptedAt +
+            (replayTtlMs ?? CACHE_KEEP_TTL_MS) -
+            replayPrewarmLeadMs(replayTtlMs ?? CACHE_KEEP_TTL_MS, planned)
+          : acceptedAt +
+            (policy?.ttl
+              ? CACHE_KEEP_TTL_MS
+              : (replayTtlMs ?? CACHE_KEEP_TTL_MS)) -
+            CACHE_KEEP_PREWARM_LEAD_MS),
       consecutiveFailures: 0,
       dayKey: today,
       oauthAccountId: input.oauthAccountId,
@@ -1569,7 +1588,7 @@ export class CacheKeepManager {
   private lastPrewarmStart(target: CacheKeepTarget) {
     return (
       target.cacheExpiresAt -
-      (target.policyState?.planned
+      (target.policyState?.planned || target.sourceWarm
         ? 0
         : (this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS)) -
       CACHE_KEEP_EXPIRY_SAFETY_MS
@@ -1609,7 +1628,7 @@ export class CacheKeepManager {
       CACHE_KEEP_EXPIRY_SAFETY_MS
     const timeout = Math.min(
       this.options.prewarmTimeoutMs ?? CACHE_KEEP_PREWARM_TIMEOUT_MS,
-      target.policyState?.planned ? remaining : Infinity,
+      target.policyState?.planned || target.sourceWarm ? remaining : Infinity,
     )
     if (timeout <= 0) return { ok: false, refused: true, reason: 'cost-cap' }
     const attempt = {
@@ -1707,12 +1726,13 @@ export class CacheKeepManager {
             body: prewarm.bodyText,
             signal: attempt.signal,
           })
-          if (!sent.ok && target.policyState) {
-            const cost = this.admittedWarmCosts.get(target) ?? 0
+          if (!sent.ok && this.isCurrentTarget(target) && target.policyState) {
+            const state = target.policyState
+            const cost = this.admittedWarmCosts.get(state) ?? 0
             target.policyState.pendingWarmCost =
               Math.max(0, (target.policyState.pendingWarmCost ?? 0) - cost) ||
               undefined
-            this.admittedWarmCosts.delete(target)
+            this.admittedWarmCosts.delete(state)
             await this.options.settleWarm?.(target)
           }
           return scope.redactResponse(sent)
@@ -1904,11 +1924,11 @@ export class CacheKeepManager {
     if (state) {
       state.hasWarmed = true
       state.lastWarmAt = acceptedAt
-      const cost = this.admittedWarmCosts.get(target) ?? 0
+      const cost = this.admittedWarmCosts.get(state) ?? 0
       state.warmCostSoFar += cost
       state.pendingWarmCost =
         Math.max(0, (state.pendingWarmCost ?? 0) - cost) || undefined
-      this.admittedWarmCosts.delete(target)
+      this.admittedWarmCosts.delete(state)
       this.reportedStops.delete(state)
       if (!target.sourceWarm)
         reportSessionCacheTouch(state.ownerSessionId, {
@@ -1922,11 +1942,16 @@ export class CacheKeepManager {
     target.lastTouchAt = acceptedAt
     target.lastTouchKind = 'warm'
     target.cacheExpiresAt = acceptedAt + (target.ttlMs ?? CACHE_KEEP_TTL_MS)
-    target.nextPrewarmAt = state?.planned
-      ? target.cacheExpiresAt - 30_000
-      : (readSessionCachePolicy(state?.ownerSessionId ?? target.id, true)?.ttl
-          ? acceptedAt + CACHE_KEEP_TTL_MS
-          : target.cacheExpiresAt) - CACHE_KEEP_PREWARM_LEAD_MS
+    target.nextPrewarmAt =
+      state?.planned || target.sourceWarm
+        ? target.cacheExpiresAt -
+          replayPrewarmLeadMs(
+            target.ttlMs ?? CACHE_KEEP_TTL_MS,
+            state?.planned === true,
+          )
+        : (readSessionCachePolicy(state?.ownerSessionId ?? target.id, true)?.ttl
+            ? acceptedAt + CACHE_KEEP_TTL_MS
+            : target.cacheExpiresAt) - CACHE_KEEP_PREWARM_LEAD_MS
     target.consecutiveFailures = 0
     logger.debug('cachekeep', 'prewarm succeeded', {
       session: target.id,

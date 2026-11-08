@@ -705,3 +705,32 @@ test('accepted JSON body and known usage persist together while duplicate observ
     { prefixTokens: 1_101, inputTokens: 91_101 },
   ])
 })
+
+test.each([
+  ['short', 300_000, 30_000],
+  ['long', 3_600_000, 300_000],
+] as const)(
+  'no-policy %s source schedules each warm from expiry, never admission',
+  async (ttl, lifetime, lead) => {
+    const f = plannedFixture({}, { ttl })
+    f.setPolicy(null)
+    f.input.storage.claudeCache = { enabled: true, mode: 'hybrid' }
+    f.input.storage.cacheKeep = { enabled: true, always: true }
+    expect(
+      f.track({ sourceWarm: true, ttlMs: undefined, cacheMode: 'hybrid' })
+        .tracked,
+    ).toBe(true)
+    expect(f.target.nextPrewarmAt).toBe(f.now + lifetime - lead)
+    await f.manager.tick()
+    expect(f.sends).toBe(0)
+    f.advance(lifetime - lead - 1)
+    await f.manager.tick()
+    expect(f.sends).toBe(0)
+    f.advance(1)
+    await f.manager.tick()
+    expect(f.sends).toBe(1)
+    expect(f.target.nextPrewarmAt).toBe(f.now + lifetime - lead)
+    await f.manager.tick()
+    expect(f.sends).toBe(1)
+  },
+)

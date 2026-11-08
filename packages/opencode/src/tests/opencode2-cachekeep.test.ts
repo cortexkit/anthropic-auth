@@ -56,6 +56,7 @@ import {
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
 import type { NativeSource } from '../v2/source'
+import * as sourceFactory from '../v2/source'
 
 const cleanups: Array<() => void | Promise<void>> = []
 let reportFailure: (() => void) | undefined
@@ -191,6 +192,7 @@ async function fixture(
   unsafePersistence = false,
   trace?: ReturnType<typeof cacheKeepFailureTrace>,
   identity = '11111111-2222-4333-8444-555555555555',
+  getSession?: () => Promise<{ parentID?: string }>,
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -287,7 +289,9 @@ async function fixture(
     const registration = { dispose: async () => {} }
     const ctx = {
       session: {
-        get: async () => ({ parentID: child ? 'ses_parent' : undefined }),
+        get:
+          getSession ??
+          (async () => ({ parentID: child ? 'ses_parent' : undefined })),
         hook: async (name: string, callback: (draft: any) => unknown) => {
           hooks.set(name, [...(hooks.get(name) ?? []), callback])
           return registration
@@ -423,6 +427,7 @@ async function fixture(
       return draft.request
     }
     return {
+      ctx,
       live,
       prepare,
       respond,
@@ -2331,3 +2336,310 @@ test('ttl-only policy keeps the restored OC2 subagent opt-out', async () => {
   expect(next.sent).toHaveLength(0)
   expect(await readdir(f.disk)).toEqual([])
 })
+
+test('OC2 priced auto charges every physical warm and stops at the equality boundary', async () => {
+  const f = await fixture()
+  runnerPolicyForReview({ ttl: 'long', keep_warm: 'auto' })
+  const draft = await f.prepare(undefined, { model: 'claude-opus-5-5' })
+  await f.respond(
+    draft,
+    Response.json({ usage: { cache_read_input_tokens: 1_000 } }),
+  )
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const initial = (globalThis as any)[key].get(f.paths.storageId)
+  const retained = initial.manager.targets.get(
+    'ses_oc2_keep',
+  ) as CacheKeepTarget
+  expect(retained.policyState).toBeDefined()
+  Object.assign(retained.policyState!, {
+    warmCostSoFar: 7_400,
+    warmsSinceLastRealRequest: 37,
+    hasWarmed: true,
+    lastWarmAt: f.now(),
+  })
+  expect(await initial.persistence.reserveWarm(retained)).toBe(true)
+  await f.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  let state: CacheKeepTarget['policyState']
+  expect(
+    JSON.parse(owner.manager.trackedRequest('ses_oc2_keep').bodyText).model,
+  ).toBe('claude-opus-5-5')
+  const persist = owner.persistence.reserveWarm.bind(owner.persistence)
+  const reservation = spyOn(
+    owner.persistence,
+    'reserveWarm',
+  ).mockImplementation(async (target: Readonly<CacheKeepTarget>) => {
+    state ??= target.policyState
+    return persist(target)
+  })
+  cleanups.push(() => reservation.mockRestore())
+  // For this 1,000-token Opus 5.5 prefix, rewriting the one-hour cache costs
+  // 8,000 micro-USD; each read costs 200. The 40th warm reaches equality.
+  // Restore the first 37 reads durably, then charge two successful warms
+  // through OC2 request preparation, dispatch, and Core cost settlement.
+  expect(
+    owner.manager.targets.get('ses_oc2_keep')?.policyState?.warmCostSoFar,
+  ).toBe(7_400)
+  for (const [warm, expectedCost] of [
+    [1, 7_600],
+    [2, 7_800],
+  ] as const) {
+    f.advance(3_570_000)
+    await f.timers.fireTimeouts()
+    await owner.manager.tick()
+    expect(next.sent).toHaveLength(warm)
+    expect(state).toBeDefined()
+    expect(state!.warmCostSoFar).toBe(expectedCost)
+    expect(state!.pendingWarmCost).toBeUndefined()
+    expect(state!.prefixTokens).toBe(1_000)
+  }
+  f.advance(3_570_000)
+  await f.timers.fireTimeouts()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(2)
+  expect(owner.manager.trackedSessions()).toEqual([])
+})
+
+test.each(['replaced', 'retired'] as const)(
+  'an old OC2 503 settlement cannot overwrite a %s target on restart',
+  async (change) => {
+    const f = await fixture()
+    runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+    await f.live()
+    let entered!: () => void
+    let finish!: (response: Response) => void
+    const enteredSend = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const held = new Promise<Response>((resolve) => {
+      finish = resolve
+    })
+    f.setSend(async () => {
+      entered()
+      return held
+    })
+    f.advance(3_570_000)
+    const warming = f.timers.fireTimeouts()
+    await enteredSend
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    let latest: string | undefined
+    if (change === 'replaced') {
+      await f.live(undefined, {
+        messages: [{ role: 'user', content: 'The newest accepted prefix' }],
+      })
+      latest = owner.manager.trackedRequest('ses_oc2_keep').bodyText
+    } else owner.manager.untrack('ses_oc2_keep', 'session-forgotten')
+    finish(Response.json({ error: { type: 'api_error' } }, { status: 503 }))
+    await warming
+    await f.dispose()
+    forgetCacheKeepProcess(f.paths.storageId)
+    const next = await f.start()
+    const restored = (globalThis as any)[key]
+      .get(f.paths.storageId)
+      .manager.trackedRequest('ses_oc2_keep')
+    if (change === 'replaced') expect(restored?.bodyText).toBe(latest)
+    else expect(restored).toBeUndefined()
+    f.advance(3_570_000)
+    await f.timers.fireTimeouts()
+    if (change === 'replaced') {
+      expect(next.sent).toHaveLength(1)
+      expect(await next.sent[0]!.clone().text()).toContain(
+        'The newest accepted prefix',
+      )
+    } else expect(next.sent).toEqual([])
+  },
+)
+
+test('OC2 dispatch and accepted capture do not await tracking readView or an unknown parent', async () => {
+  let release!: () => void
+  let admitted!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const admittedRequest = new Promise<void>((resolve) => {
+    admitted = resolve
+  })
+  let armed = false
+  let tracking = false
+  let trackingReads = 0
+  let lookups = 0
+  const create = sourceFactory.createNativeAnthropicSource
+  const source = spyOn(
+    sourceFactory,
+    'createNativeAnthropicSource',
+  ).mockImplementation((options) => {
+    const read = options.runtime.read.bind(options.runtime)
+    const reading = spyOn(options.runtime, 'read').mockImplementation(
+      async () => {
+        if (tracking) {
+          trackingReads++
+          await held
+        }
+        return read()
+      },
+    )
+    cleanups.push(() => reading.mockRestore())
+    const native = create(options)
+    return {
+      ...native,
+      admitRequest: async (
+        ...args: Parameters<NonNullable<typeof native.admitRequest>>
+      ) => {
+        await native.admitRequest?.(...args)
+        if (armed) admitted()
+      },
+      onRequestPrepared: async (
+        ...args: Parameters<NonNullable<typeof native.onRequestPrepared>>
+      ) => {
+        tracking = armed
+        try {
+          await native.onRequestPrepared?.(...args)
+        } finally {
+          tracking = false
+        }
+      },
+    }
+  })
+  cleanups.push(() => source.mockRestore())
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    undefined,
+    async () => {
+      lookups++
+      await held
+      return { parentID: undefined }
+    },
+  )
+  armed = true
+  const preparing = f.prepare()
+  let cancelTimeout = () => {}
+  try {
+    await Promise.race([
+      admittedRequest,
+      preparing.then(() => {
+        throw new Error('admission observer did not run before dispatch')
+      }),
+    ])
+    const draft = await Promise.race([
+      preparing,
+      new Promise<undefined>((resolve) => {
+        const timer = setTimeout(resolve, 1000)
+        cancelTimeout = () => clearTimeout(timer)
+      }),
+    ])
+    expect(draft).toBeDefined()
+    expect(trackingReads).toBe(0)
+    expect(lookups).toBe(1)
+    await f.respond(draft!)
+    const owner = (globalThis as any)[
+      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    ].get(f.paths.storageId)
+    expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+      'Hello',
+    )
+  } finally {
+    cancelTimeout()
+    release()
+    await preparing
+  }
+  f.due()
+  await f.timers.fireTimeouts()
+  const owner = (globalThis as any)[
+    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ].get(f.paths.storageId)
+  await owner.manager.tick()
+  expect(f.sent).toHaveLength(1)
+})
+
+test('an unknown-parent OC2 child is captured then retired as soon as lookup resolves', async () => {
+  let resolve!: (session: { parentID?: string }) => void
+  const held = new Promise<{ parentID?: string }>((done) => {
+    resolve = done
+  })
+  let lookups = 0
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    undefined,
+    () => {
+      lookups++
+      return held
+    },
+  )
+  await f.live()
+  const owner = (globalThis as any)[
+    Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  ].get(f.paths.storageId)
+  expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+    'Hello',
+  )
+  expect(lookups).toBe(1)
+  resolve({ parentID: 'ses_parent' })
+  await held
+  // Join the detached lookup's continuation, not any storage work.
+  await new Promise((done) => setTimeout(done, 0))
+  expect(owner.manager.trackedRequest('ses_oc2_keep')).toBeUndefined()
+  await owner.persistence.drain()
+  f.due()
+  await f.timers.fireTimeouts()
+  expect(f.sent).toEqual([])
+})
+
+test.each(['pending', 'failed'] as const)(
+  'a %s OC2 parent lookup cannot dispatch a warm, and a resolved main later can',
+  async (status) => {
+    let resolve!: (session: { parentID?: string }) => void
+    const held = new Promise<{ parentID?: string }>((done) => {
+      resolve = done
+    })
+    let healthy = false
+    const f = await fixture(
+      false,
+      false,
+      undefined,
+      false,
+      false,
+      undefined,
+      undefined,
+      async () => {
+        if (healthy) return { parentID: undefined }
+        if (status === 'failed')
+          throw new Error('synthetic host lookup unavailable')
+        return held
+      },
+    )
+    await f.live()
+    const owner = (globalThis as any)[
+      Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    ].get(f.paths.storageId)
+    f.due()
+    await f.timers.fireTimeouts()
+    await owner.manager.tick()
+    expect(f.sent).toEqual([])
+    healthy = true
+    resolve({ parentID: undefined })
+    await held
+    await new Promise((done) => setTimeout(done, 0))
+    f.advance(60_000)
+    await f.timers.fireTimeouts()
+    await owner.manager.tick()
+    if (status === 'failed') {
+      f.advance(60_000)
+      await f.timers.fireTimeouts()
+      await owner.manager.tick()
+    }
+    expect(f.sent).toHaveLength(1)
+  },
+)

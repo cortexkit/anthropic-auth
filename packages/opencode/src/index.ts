@@ -270,6 +270,7 @@ import {
 import {
   FableFallbackManager,
   type FableFallbackPlan,
+  type FableSourceWarmKeep,
   type FableStandbyCacheAnchor,
   isRecoverableRefusalModel,
   parseSourceWarmTargetId,
@@ -3726,12 +3727,31 @@ const anthropicAuthPlugin = async (
     CacheKeepManager['trackedSessions']
   > = []
   const cacheKeepScopedAttempts = new Map<number, NativeOAuthAuthorization>()
+  const cacheKeepSourceCopies = new Map<string, FableSourceWarmKeep>()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
     fetchImpl: fetchOAuth,
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
+    onTargetChanged: (target) => {
+      if (!target.sourceWarm) return
+      const kept = fableFallbackManager.sourceWarmForTarget(target.id)
+      if (
+        kept &&
+        kept.bodyText === target.bodyText &&
+        kept.sentAt === target.policyState?.lastRealRequestAt
+      )
+        cacheKeepSourceCopies.set(target.id, kept)
+    },
+    onTargetRemoved: (id) => {
+      const kept = cacheKeepSourceCopies.get(id)
+      cacheKeepSourceCopies.delete(id)
+      // A terminal stop must retire both copies. Do not let an old target's
+      // removal discard a newer recovery round already using the same id.
+      if (kept && fableFallbackManager.sourceWarmForTarget(id) === kept)
+        fableFallbackManager.dropSourceWarmForTarget(id)
+    },
     onTrackedSessionsChanged: async (sessions) => {
       await cacheKeepRegistry.publish(sessions)
       aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)

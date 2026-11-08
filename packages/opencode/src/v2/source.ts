@@ -93,6 +93,7 @@ type State = {
   readonly scope: RequestScope
   readonly active: AbortController
   readonly account: NativeAccountView
+  readonly snapshot?: NativeAccountSnapshot
   readonly receipt?: NativeCustodyReceipt
   readonly access?: string
   readonly retry: boolean
@@ -200,6 +201,15 @@ function stickyHold(
   }
 }
 
+export type NativeCacheRequestPrepared = Parameters<
+  NonNullable<NativeSource['onRequestPrepared']>
+>[0] & {
+  readonly admission?: {
+    readonly snapshot: NativeAccountSnapshot
+    readonly account: NativeAccountView
+  }
+}
+
 export interface NativeSourceOptions {
   readonly runtime: NativeAccountRuntime
   readonly paths: NativePoolPaths
@@ -216,7 +226,9 @@ export interface NativeSourceOptions {
   ) => void
   readonly onForgetSession?: (sessionID: string) => void
   readonly onOwnedRequest?: () => void
-  readonly onRequestPrepared?: NativeSource['onRequestPrepared']
+  readonly onRequestPrepared?: (
+    input: NativeCacheRequestPrepared,
+  ) => Promise<void> | void
   readonly onResponseHeaders?: (
     input: NativeAnthropicResponseContext<NativeSourceProvenance>,
   ) => void
@@ -463,13 +475,16 @@ export function createNativeAnthropicSource(
       const main = current.accounts.find(
         (row) => row.id === 'main' && row.type === 'oauth',
       )
-      return (
-        !!main &&
-        stickyQuotaSnapshotIsFresh(main.quota, current.policyStorage) &&
-        quotaSnapshotIsExhausted(main.quota)
+      if (
+        !(
+          !!main &&
+          stickyQuotaSnapshotIsFresh(main.quota, current.policyStorage) &&
+          quotaSnapshotIsExhausted(main.quota)
+        )
       )
+        return false
     }
-    return true
+    return { snapshot: current, account }
   }
 
   const assertTransport = (snapshot: NativeAccountSnapshot) => {
@@ -1123,21 +1138,23 @@ export function createNativeAnthropicSource(
     },
     async admitRequest(input, onRefusal) {
       const state = states.get(input.provenance)
-      if (
-        !state ||
-        !(await admitted(
+      const admission =
+        state &&
+        (await admitted(
           input.accountId,
           input.modelID,
           input.route,
           state.active,
           onRefusal,
         ))
-      )
+      if (!state || !admission)
         throw new Error(
           'request refused: native account policy changed before dispatch',
         )
       states.set(input.provenance, {
         ...state,
+        snapshot: admission.snapshot,
+        account: admission.account,
         scope: { ...state.scope, modelID: input.modelID },
       })
     },
@@ -1164,7 +1181,13 @@ export function createNativeAnthropicSource(
           if (oldest !== undefined) cacheAttempts.delete(oldest)
         }
       }
-      return options.onRequestPrepared?.(input)
+      const state = states.get(input.provenance)
+      return options.onRequestPrepared?.({
+        ...input,
+        ...(state?.snapshot && {
+          admission: { snapshot: state.snapshot, account: state.account },
+        }),
+      })
     },
     onFinalRequestPrepared(input) {
       const cached = cacheAttempts.get(input.attemptId)

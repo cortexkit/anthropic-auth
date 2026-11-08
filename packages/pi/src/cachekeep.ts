@@ -94,7 +94,10 @@ export class PiCacheKeep {
         managerOptions.onTargetChanged?.(target)
       },
       reserveWarm: persistWarm,
-      settleWarm: persistWarm,
+      settleWarm: (target) =>
+        this.manager.isCurrentTarget(target)
+          ? persistWarm(target)
+          : Promise.resolve(false),
       onTargetRemoved: (id) => {
         this.restored.delete(id)
         if (!this.stopping) this.sessions.get(id)?.store.removed(id)
