@@ -2,6 +2,7 @@ import {
   applyClaudeCodeMetadata,
   applyMidConversationOutputConfig,
   applyRunnerTurnNotes,
+  applySessionCacheTtl,
   applyThinkingBindingControls,
   applyTurnEndNotes,
   assertNoMeaningfulTrailingAssistant,
@@ -27,8 +28,8 @@ import {
   isOpenAIReasoningSignature,
   type MidConversationEffortTransition,
   orderClaudeCodeBody,
-  PROMPT_CACHE_1H_TTL_MS,
-  PROMPT_CACHE_DEFAULT_TTL_MS,
+  readSessionCachePolicy,
+  requestCacheLifetimeMs,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
   type ThinkingPrefixMismatchBehavior,
@@ -812,7 +813,12 @@ export async function buildAnthropicRequest(
     isOAuth: !!identity,
   })
   addEphemeralCacheControl(body)
-  applyCacheMode(body, cache.enabled, cache.mode)
+  const cachePolicy = readSessionCachePolicy(options?.sessionId, !!identity)
+  applyCacheMode(
+    body,
+    cachePolicy?.ttl !== undefined ? cachePolicy.ttl !== 'none' : cache.enabled,
+    cache.mode,
+  )
   if (identity) {
     applyThinkingBindingControls(
       body,
@@ -826,6 +832,7 @@ export async function buildAnthropicRequest(
     : undefined
   if (replaced !== undefined)
     body = { ...(replaced as AnthropicRequestBody), stream: true }
+  applySessionCacheTtl(body, cachePolicy?.ttl)
   // As in Pi's native adapter, replacements must still request SSE. Hooks own
   // the validity of their other edits and must not add a fifth cache breakpoint:
   // the provider's existing layout may already use Anthropic's four slots.
@@ -852,10 +859,6 @@ export async function buildAnthropicRequest(
   // Sticky routing uses the longest TTL actually sent to bound how long a
   // session waits on its account. Include hook edits, not the account setting;
   // a cache_control key inside tool data is not a cache breakpoint.
-  let cacheTtlMs = PROMPT_CACHE_DEFAULT_TTL_MS
-  walkCacheControlHolders(sentBody, (holder) => {
-    if ((holder.cache_control as Record<string, unknown>).ttl === '1h')
-      cacheTtlMs = PROMPT_CACHE_1H_TTL_MS
-  })
+  const cacheTtlMs = requestCacheLifetimeMs(sentBody)
   return { body, bodyText, toolNames, cacheTtlMs }
 }

@@ -3,6 +3,7 @@ import {
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyRunnerTurnNotes,
+  applySessionCacheTtl,
   applyThinkingBindingControls,
   applyTurnEndNotes,
   assertNotCustodyTombstone,
@@ -37,6 +38,7 @@ import {
   PARAGRAPH_REMOVAL_ANCHORS,
   parseSseFrame,
   REQUIRED_BETAS,
+  readSessionCachePolicy,
   remapRequestBodyModel,
   resolveClaudeModelCapabilities,
   SseFrameTooLargeError,
@@ -1711,14 +1713,23 @@ export async function rewriteRequestBody(
     }
 
     const cacheStart = rewriteNowMs()
+    const cachePolicy = readSessionCachePolicy(
+      options.sessionId,
+      options.isOAuth === true,
+    )
+    const cacheEnabled =
+      cachePolicy?.ttl !== undefined
+        ? cachePolicy.ttl !== 'none'
+        : (options.cache1hEnabled ?? false)
     const cachePlacement = applyCache1hStrategy(parsed, {
-      enabled: options.cache1hEnabled ?? false,
+      enabled: cacheEnabled,
       mode: options.cache1hMode ?? 'explicit',
       hybridStandbyAnchor: options.hybridStandbyAnchor,
     })
+    applySessionCacheTtl(parsed, cachePolicy?.ttl)
     options.perf?.('cache_strategy', {
       ms: rewriteRoundMs(rewriteNowMs() - cacheStart),
-      enabled: options.cache1hEnabled ?? false,
+      enabled: cacheEnabled,
       mode: options.cache1hMode ?? 'explicit',
       ...cachePlacement,
     })

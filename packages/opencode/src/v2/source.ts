@@ -30,13 +30,12 @@ import {
   nativePollQuotaGenerallyExhausted,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
-  PROMPT_CACHE_1H_TTL_MS,
-  PROMPT_CACHE_DEFAULT_TTL_MS,
   type ProviderAccountUuid,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   readNativeAccountsForRequest,
   remapModelId,
+  requestCacheLifetimeMs,
   requestSignal,
   StickyQuotaRetryCounter,
   StickySessionRouter,
@@ -99,7 +98,6 @@ type State = {
   quota?: OAuthQuotaSnapshot
   responseHeaders?: Headers
   exhaustionReported?: boolean
-  cacheTtlMs?: number
 }
 type Retry = {
   readonly scope: RequestScope
@@ -295,7 +293,12 @@ export function createNativeAnthropicSource(
   const states = new WeakMap<NativeSourceProvenance, State>()
   const cacheAttempts = new Map<
     string,
-    { sessionID: string; accountId: string; signal?: AbortSignal }
+    {
+      sessionID: string
+      accountId: string
+      signal?: AbortSignal
+      cacheTtlMs: number
+    }
   >()
   const retries = new Map<string, Retry>()
   const refusalHeaders = new Map<
@@ -1086,9 +1089,6 @@ export function createNativeAnthropicSource(
         states.set(input.provenance, {
           ...state,
           scope: { ...state.scope, modelID: input.modelID },
-          cacheTtlMs: bodyOptions.cache1hEnabled
-            ? PROMPT_CACHE_1H_TTL_MS
-            : PROMPT_CACHE_DEFAULT_TTL_MS,
         })
       return bodyOptions
     },
@@ -1119,6 +1119,7 @@ export function createNativeAnthropicSource(
           sessionID: input.sessionID,
           accountId: input.accountId,
           signal: input.signal,
+          cacheTtlMs: requestCacheLifetimeMs(input.bodyText),
         })
         if (cacheAttempts.size > 4096) {
           const oldest = cacheAttempts.keys().next().value
@@ -1151,7 +1152,7 @@ export function createNativeAnthropicSource(
           sessionCacheActivity.record(
             input.sessionID,
             input.accountId,
-            state.cacheTtlMs,
+            cacheAttempt.cacheTtlMs,
           )
         const refusalKey = key(
           { ...input, modelID: state.scope.modelID },

@@ -9,6 +9,7 @@ import {
   setCache1hEnabled,
   setCache1hMode,
 } from '@cortexkit/anthropic-auth-core'
+import { rewriteRequestBody } from '../transform.ts'
 
 function parseEnabled(summary: string) {
   const enabledMatch = summary.match(/- Enabled: (enabled|disabled)/)
@@ -26,6 +27,72 @@ function parseMode(summary: string) {
 
 beforeEach(() => {
   resetCache1hState()
+})
+
+test('session lifetimes override enable but preserve every selected placement mode', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const previous = globals[key]
+  try {
+    for (const mode of ['explicit', 'automatic', 'hybrid'] as const) {
+      for (const ttl of ['none', 'short', 'long'] as const) {
+        globals[key] = () => ({ cache: () => ({ ttl, keep_warm: 'off' }) })
+        const sent = await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-sonnet-5',
+            max_tokens: 10,
+            system: [
+              {
+                type: 'text',
+                text: 'Stable',
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+              },
+            ],
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Hello',
+                    cache_control: { type: 'ephemeral', ttl: '1h' },
+                  },
+                ],
+              },
+            ],
+          }),
+          {
+            sessionId: 'ses_oc_cache_policy',
+            isOAuth: true,
+            cache1hEnabled: false,
+            cache1hMode: mode,
+          },
+        )
+        const markers: unknown[] = []
+        const body = JSON.parse(sent, (key, value: unknown) => {
+          if (key === 'cache_control' || key === 'cacheControl')
+            markers.push(value)
+          return value
+        })
+        if (ttl === 'none') expect(markers).toEqual([])
+        else {
+          expect(markers.length).toBeGreaterThan(0)
+          expect(markers.length).toBeLessThanOrEqual(4)
+          for (const marker of markers)
+            expect(marker).toEqual(
+              ttl === 'long'
+                ? { type: 'ephemeral', ttl: '1h' }
+                : { type: 'ephemeral' },
+            )
+          if (mode === 'automatic') expect(body.cache_control).toBeDefined()
+          else expect(body.cache_control).toBeUndefined()
+        }
+      }
+    }
+  } finally {
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  }
 })
 
 describe('claude-cache command state', () => {

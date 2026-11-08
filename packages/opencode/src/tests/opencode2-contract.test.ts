@@ -521,6 +521,97 @@ describe('OpenCode 2 published installation contract', () => {
     expect(isPlaceholderCredential(marker, 'anthropic')).toBe(true)
     expect(marker.access).toBe(placeholderSecret('anthropic'))
   })
+  test('OC2 primary request honors ttl none by stripping host cache markers', async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const previous = globals[key]
+    globals[key] = (id: string) => ({
+      cache: () => ({
+        ttl: id === 'ses_cache_none' ? 'none' : 'long',
+        keep_warm: 'off',
+      }),
+    })
+    const hooks = new Hooks()
+    const native = await installNativeAnthropic(
+      { session: hooks },
+      { source: source({ requestOptions: () => ({ cache1hEnabled: false }) }) },
+      { credential: preparedAnthropicCredential },
+    )
+    try {
+      for (const id of ['ses_cache_none', 'ses_cache_long']) {
+        const current = { ...scope, sessionID: id as typeof sessionID }
+        const modelRequest = {
+          ...current,
+          headers: {} as Record<string, string>,
+        }
+        await hooks.run('model.request', modelRequest)
+        const marker = { type: 'ephemeral' }
+        const draft = {
+          ...current,
+          request: new Request('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              ...Object.fromEntries(request().headers),
+              ...modelRequest.headers,
+            },
+            body: JSON.stringify({
+              model: 'claude-sonnet-5',
+              max_tokens: 128,
+              cache_control: marker,
+              tools: [
+                {
+                  name: 'lookup',
+                  input_schema: {
+                    type: 'object',
+                    properties: { cache_control: { type: 'string' } },
+                  },
+                  cacheControl: marker,
+                },
+              ],
+              system: [
+                { type: 'text', text: 'Stable context', cache_control: marker },
+              ],
+              messages: [
+                {
+                  role: 'user',
+                  content: [
+                    { type: 'text', text: 'Hello', cache_control: marker },
+                  ],
+                },
+              ],
+            }),
+          }),
+        }
+        await hooks.run('http.request', draft)
+        const body = JSON.parse(await draft.request.clone().text())
+        const holders = [
+          body,
+          ...body.tools,
+          ...body.system,
+          ...body.messages.flatMap((message: { content: unknown[] }) => [
+            message,
+            ...message.content,
+          ]),
+        ]
+        const markers = holders.flatMap((holder) =>
+          [holder.cache_control, holder.cacheControl].filter(Boolean),
+        )
+        if (id === 'ses_cache_none') expect(markers).toEqual([])
+        else {
+          expect(markers.length).toBeGreaterThan(0)
+          expect(markers.every((control) => control.ttl === '1h')).toBe(true)
+        }
+        expect(body.tools[0].input_schema.properties.cache_control).toEqual({
+          type: 'string',
+        })
+      }
+    } finally {
+      await native.dispose()
+      if (previous === undefined) delete globals[key]
+      else globals[key] = previous
+    }
+  })
+
   test('real recipe overrides host credentials and removes its attempt header on physical HTTP request', async () => {
     const hooks = new Hooks()
     const native = await installNativeAnthropic(
