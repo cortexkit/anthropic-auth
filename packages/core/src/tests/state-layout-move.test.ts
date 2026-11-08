@@ -1029,30 +1029,31 @@ for (const step of MOVE_STEPS) {
   })
 }
 
-test('a crash after a rename landed but before its folder was flushed, at every flush of the move, recovers to exactly one usable copy', async () => {
+/**
+ * Every folder flush of an undisturbed move, in order. The list is written
+ * out from the design rather than counted from the code, so a flush that
+ * goes missing fails here instead of shrinking the matrix.
+ */
+const MOVE_FLUSH_SITES: [string, (m: Machine) => string][] = [
+  // The new subfolder's entry in each parent it was created in.
+  [
+    'opencode directory entry',
+    (m) => join(m.root, 'state', 'cortexkit', 'anthropic-auth'),
+  ],
+  ['anthropic-auth directory entry', (m) => join(m.root, 'state', 'cortexkit')],
+  ['cortexkit directory entry', (m) => join(m.root, 'state')],
+  ['state directory entry', (m) => m.root],
+  ['config-dir.json and holder file', (m) => m.sub],
+  ['preparing record', (m) => m.sub],
+  ['copies', (m) => m.sub],
+  ['barriers', (m) => m.configDir],
+  ['commit', (m) => m.sub],
+  ['removal of old copies', (m) => m.configDir],
+  ['record of removal', (m) => m.sub],
+]
+
+test('an undisturbed move flushes exactly the written-out folders in order', async () => {
   const base = defaultStateLayoutFs()
-  /**
-   * Every folder flush of an undisturbed move, in order. The list is written
-   * out from the design rather than counted from the code, so a flush that
-   * goes missing fails here instead of shrinking the matrix.
-   */
-  const flushSites = (m: Machine) => {
-    const anthropic = join(m.root, 'state', 'cortexkit', 'anthropic-auth')
-    return [
-      // The new subfolder's entry in each parent it was created in.
-      anthropic,
-      join(m.root, 'state', 'cortexkit'),
-      join(m.root, 'state'),
-      m.root,
-      m.sub, // config-dir.json and the holder file
-      m.sub, // the preparing record
-      m.sub, // the copies
-      m.configDir, // the barriers
-      m.sub, // the commit
-      m.configDir, // the removal of the old copies
-      m.sub, // the record of that removal
-    ]
-  }
   const probe = await machine()
   const flushed: string[] = []
   const recording: StateLayoutFs = {
@@ -1063,9 +1064,17 @@ test('a crash after a rename landed but before its folder was flushed, at every 
     },
   }
   expect((await decide(probe, { fs: recording })).kind).toBe('state-home')
-  expect(flushed).toEqual(flushSites(probe))
-  const total = flushSites(probe).length
-  for (let flush = 1; flush <= total; flush++) {
+  expect(flushed).toEqual(
+    MOVE_FLUSH_SITES.map(([, directory]) => directory(probe)),
+  )
+})
+
+// Each recovery builds a full machine and does durable I/O, so give every
+// flush its own test rather than accumulating the whole matrix in one deadline.
+for (const [index, [name]] of MOVE_FLUSH_SITES.entries()) {
+  const flush = index + 1
+  test(`a crash after a rename landed but before move flush ${flush} (${name}) recovers to exactly one usable copy`, async () => {
+    const base = defaultStateLayoutFs()
     const m = await machine()
     let calls = 0
     let last: StateLayoutStep = 'old-holders-locking'
@@ -1107,8 +1116,8 @@ test('a crash after a rename landed but before its folder was flushed, at every 
     })
     expect(await servedPoolState(m)).toBe(m.original.localPoolState as string)
     expect((await readStateLayoutRecord(m.sub))?.cleanup).toBe('done')
-  }
-})
+  })
+}
 
 // One test per crash point: each case builds a full machine, so a single
 // test looping over every step ran close to Bun's 5 s per-test limit.
