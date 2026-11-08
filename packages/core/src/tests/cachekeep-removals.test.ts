@@ -486,7 +486,18 @@ test('restoring a target preserves its remaining lifetime and uses the usual mem
       headers: new Headers(),
       storage,
       cacheMode: 'hybrid',
-      retained: { cacheExpiresAt, nextPrewarmAt },
+      retained: {
+        cacheExpiresAt,
+        nextPrewarmAt,
+        policyState: {
+          ownerSessionId: 'restored',
+          planned: false,
+          lastRealRequestAt: now - CACHE_KEEP_TTL_MS + 60_000,
+          warmsSinceLastRealRequest: 0,
+          warmCostSoFar: 0,
+          hasWarmed: false,
+        },
+      },
     }).tracked,
   ).toBe(true)
   expect(removed).toEqual(['old'])

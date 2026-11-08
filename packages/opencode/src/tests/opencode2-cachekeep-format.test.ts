@@ -45,7 +45,19 @@ test('OC2 v2.5.5 reads current records and the current reader reads v2.5.5 recor
   const current = new CacheKeepStore(options)
   const released = new ReleasedStore(options)
   expect(current.directory).toBe(released.directory)
-  current.changed(target)
+  current.changed({
+    ...target,
+    policyState: {
+      ownerSessionId: target.id,
+      planned: true,
+      lastRealRequestAt: now,
+      warmsSinceLastRealRequest: 23,
+      warmCostSoFar: 100,
+      prefixTokens: 1000,
+      inputTokens: 1100,
+      hasWarmed: true,
+    },
+  })
   await current.drain()
   const oldRead: string[] = []
   await released.load(now, (entry) => {

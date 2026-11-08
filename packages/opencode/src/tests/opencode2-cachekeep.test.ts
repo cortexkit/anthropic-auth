@@ -158,6 +158,7 @@ class Timers {
       this.timeouts.delete(id)
       await timeout.callback()
     }
+    await this.afterTick()
   }
   readonly setInterval: typeof globalThis.setInterval = ((
     callback: () => unknown,
@@ -338,6 +339,8 @@ async function fixture(
         now: () => now,
         setIntervalImpl: timers.setInterval,
         clearIntervalImpl: timers.clearInterval,
+        setTimeoutImpl: timers.setTimeout,
+        clearTimeoutImpl: timers.clearTimeout,
         registryDirectory,
         persistence: {
           root: directory,
@@ -1598,6 +1601,11 @@ test.skipIf(process.platform === 'win32')(
     f.due()
     await f.timers.fire()
     expect(f.sent).toHaveLength(1)
+    for (let n = 1; n < 25; n++) {
+      f.due()
+      await f.timers.fire()
+    }
+    expect(f.sent).toHaveLength(24)
     await f.dispose()
     expect(await readdir(f.disk)).toEqual([])
     expect(logs.filter((line) => line.includes(' WARN '))).toHaveLength(1)
@@ -1781,3 +1789,49 @@ for (const stillAdmitted of [true, false]) {
     )
   })
 }
+
+test('planned short warms override local off and child opt-out while preserving the captured prefix', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  globals[key] = (session: string) => ({
+    cache: () =>
+      session === 'ses_oc2_keep' ? { ttl: 'short', keep_warm: 'always' } : null,
+  })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  const f = await fixture(true)
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    claudeCache: { enabled: false, mode: 'hybrid' },
+    cacheKeep: { enabled: false, subagents: false },
+  }))
+  const live = await f.live()
+  const accepted = JSON.parse(await live.clone().text())
+  expect(JSON.stringify(accepted)).not.toContain('"ttl":"1h"')
+  expect(JSON.stringify(accepted)).toContain(
+    '"cache_control":{"type":"ephemeral"}',
+  )
+  expect(
+    [...f.timers.timeouts.values()].some(
+      (timer) => timer.at === f.now() + 270_000,
+    ),
+  ).toBe(true)
+  f.advance(270_000)
+  await f.timers.fireTimeouts()
+  expect(f.sent).toHaveLength(1)
+  const warm = JSON.parse(await f.sent[0]!.clone().text())
+  // The first system entry is x-anthropic-billing-header: warms remove its
+  // prompt IDs and re-sign it. Every other system entry and message stays intact.
+  expect(warm.system.slice(1)).toEqual(accepted.system.slice(1))
+  expect(warm.messages).toEqual(accepted.messages)
+  expect(warm.max_tokens).toBe(0)
+  expect(JSON.stringify(warm)).not.toContain('"ttl":"1h"')
+  expect((await f.registry.list())[0]).toMatchObject({
+    id: 'ses_oc2_keep',
+    ttlMs: 300_000,
+    lastTouchKind: 'warm',
+  })
+})

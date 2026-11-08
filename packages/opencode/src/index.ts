@@ -199,6 +199,7 @@ import {
   readNativeEnrollmentMode,
   readNativeHostAuthKind,
   readNativeMigrationJournal,
+  readSessionCachePolicy,
   refreshBackoffActive,
   remapRequestBodyModel,
   requestCacheLifetimeMs,
@@ -3725,18 +3726,26 @@ const anthropicAuthPlugin = async (
         !target.sourceWarm &&
         status >= 200 &&
         status < 300 &&
-        !attempt.signal?.aborted
+        !attempt.signal?.aborted &&
+        cacheKeepManager.isCurrentTarget(target)
       )
         sessionCacheActivity.recordPrewarm(
           target.id,
           target.oauthAccountId ?? 'main',
           receivedAt,
+          requestCacheLifetimeMs(bodyText),
         )
       if (status === 401 && authorization?.scopedAttempt) {
         await reportVault401(authorization.scopedAttempt, 'direct')
       }
       // A successful source warm counts toward the round's idle cap.
-      if (target.sourceWarm && status >= 200 && status < 300) {
+      if (
+        target.sourceWarm &&
+        status >= 200 &&
+        status < 300 &&
+        !attempt.signal?.aborted &&
+        cacheKeepManager.isCurrentTarget(target)
+      ) {
         fableFallbackManager.noteSourceWarmSentForTarget(target.id)
       }
       const prepared = cacheKeepDiagnosticsRequests.get(target.id)
@@ -3978,6 +3987,8 @@ const anthropicAuthPlugin = async (
     }
     const tracked = cacheKeepManager.track({
       sessionId: targetId,
+      ownerSessionId: plan.sessionId,
+      acceptedAt: kept.sentAt,
       url: kept.url,
       headers: new Headers(kept.headers),
       bodyText: kept.bodyText,
@@ -7745,9 +7756,10 @@ const anthropicAuthPlugin = async (
             if (typeof body === 'string') {
               const storage = await getRequestStorage()
               if (
-                isCache1hEnabled() &&
-                getCache1hMode() === 'hybrid' &&
-                (!subagentRequest || isCacheKeepSubagentsEnabled(storage))
+                readSessionCachePolicy(relayAffinity, true) ||
+                (isCache1hEnabled() &&
+                  getCache1hMode() === 'hybrid' &&
+                  (!subagentRequest || isCacheKeepSubagentsEnabled(storage)))
               ) {
                 const bodyText = body
                 trackCacheKeepRequest = () => {

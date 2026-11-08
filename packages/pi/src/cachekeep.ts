@@ -1,18 +1,16 @@
 import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
-  CACHE_KEEP_PREWARM_LEAD_MS,
-  CACHE_KEEP_TTL_MS,
   CacheKeepManager,
   CacheKeepStore,
   type CacheKeepStoreOptions,
   type HolderLiveness,
-  isCacheKeepHybridActive,
   isCacheKeepSubagentsEnabled,
   logger,
   type NativeAccountSnapshot,
   type NativeAccountView,
   nativeAccountCanServe,
+  readSessionCachePolicy,
 } from '@cortexkit/anthropic-auth-core'
 import { version as pluginVersion } from '../package.json'
 import { PiCacheKeepClaim } from './cachekeep-claim.ts'
@@ -85,6 +83,14 @@ export class PiCacheKeep {
             oauthAccountIdentity: session.identity,
           })
         managerOptions.onTargetChanged?.(target)
+      },
+      reserveWarm: async (target) => {
+        const session = this.sessions.get(target.id)
+        if (this.stopping || !session?.identity) return false
+        return session.store.reserveWarm({
+          ...target,
+          oauthAccountIdentity: session.identity,
+        })
       },
       onTargetRemoved: (id) => {
         this.restored.delete(id)
@@ -249,8 +255,7 @@ export class PiCacheKeep {
             this.manager.trackedRequest(entry.id)
           )
             return undefined
-          if (!snapshot || !isCacheKeepHybridActive(snapshot.policyStorage))
-            return 'invalid'
+          if (!snapshot) return 'invalid'
           const account = snapshot.accounts.find(
             (row) => accountKey(row) === entry.oauthAccountIdentity,
           )
@@ -259,6 +264,10 @@ export class PiCacheKeep {
             return 'account-gone'
           if (
             entry.isSubagent &&
+            !readSessionCachePolicy(
+              entry.policyState?.ownerSessionId ?? entry.id,
+              true,
+            ) &&
             !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
           )
             return 'invalid'
@@ -322,16 +331,9 @@ export class PiCacheKeep {
       session.identity = accountKey(account)
       // Claim I/O may finish after the response, or even during shutdown. Keep
       // that accepted body, but never grant the cache the time spent waiting.
-      const ttlMs = input.ttlMs ?? CACHE_KEEP_TTL_MS
       const result = this.manager.track({
         ...input,
-        retained: input.retained ?? {
-          cacheExpiresAt: acceptedAt + ttlMs,
-          nextPrewarmAt: acceptedAt + ttlMs - CACHE_KEEP_PREWARM_LEAD_MS,
-          ttlMs,
-          lastTouchAt: acceptedAt,
-          lastTouchKind: 'response',
-        },
+        acceptedAt,
       })
       if (result.tracked) this.restored.delete(sessionId)
       if (this.stopping) this.manager.stop()

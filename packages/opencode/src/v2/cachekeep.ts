@@ -6,6 +6,7 @@ import {
   CacheKeepPrewarmError,
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
+  CacheKeepWarmRefusal,
   getCacheKeepRegistryDirectories,
   isCacheKeepActiveNow,
   isCacheKeepHybridActive,
@@ -17,6 +18,8 @@ import {
   type NativeAccountView,
   nativeAccountCanServe,
   nativeAccountRefusal,
+  readSessionCachePolicy,
+  requestCacheLifetimeMs,
   sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import type { Attempt, RequestScope } from '@cortexkit/common-auth/opencode2'
@@ -31,6 +34,8 @@ export interface NativeCacheKeepOptions {
   readonly now?: () => number
   readonly setIntervalImpl?: typeof globalThis.setInterval
   readonly clearIntervalImpl?: typeof globalThis.clearInterval
+  readonly setTimeoutImpl?: typeof globalThis.setTimeout
+  readonly clearTimeoutImpl?: typeof globalThis.clearTimeout
   readonly registryDirectory?: string
   /** Filesystem seam for tests; this is not a user setting. */
   readonly persistence?: Omit<CacheKeepStoreOptions, 'storageId'>
@@ -173,11 +178,6 @@ function createSharedCacheKeep(
     loadStorage: async () => {
       const lease = newestLease()
       const storage = lease ? await lease.loadStorage() : null
-      if (lease && !isCacheKeepHybridActive(storage)) {
-        for (const session of manager.trackedSessions())
-          manager.untrack(session.id, 'disabled')
-        shared.persistence.clear()
-      }
       return storage
     },
     now: options.now,
@@ -192,6 +192,10 @@ function createSharedCacheKeep(
         return shared.ticking
       }, ms)) as typeof globalThis.setInterval,
     clearIntervalImpl: options.clearIntervalImpl,
+    setTimeoutImpl: options.setTimeoutImpl,
+    clearTimeoutImpl: options.clearTimeoutImpl,
+    reserveWarm: (target) => shared.persistence.reserveWarm(target),
+    deferWarmReservation: true,
     onTargetChanged: (target) => shared.persistence.changed(target),
     onTargetRemoved: (id) => {
       restored.delete(id)
@@ -288,10 +292,6 @@ function createSharedCacheKeep(
         const lease = newestLease()
         if (!lease) return
         const snapshot = await lease.read()
-        if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
-          shared.persistence.clear()
-          return
-        }
         const now = options.now?.() ?? Date.now()
         let overdue = 0
         await shared.persistence.load(now, (entry) => {
@@ -309,6 +309,10 @@ function createSharedCacheKeep(
             return 'account-gone'
           if (
             entry.isSubagent &&
+            !readSessionCachePolicy(
+              entry.policyState?.ownerSessionId ?? entry.id,
+              true,
+            ) &&
             !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
           )
             return 'invalid'
@@ -332,6 +336,7 @@ function createSharedCacheKeep(
               ttlMs: entry.ttlMs,
               lastTouchAt: entry.lastTouchAt,
               lastTouchKind: entry.lastTouchKind,
+              policyState: entry.policyState,
             },
           })
           if (result.tracked) restored.add(entry.id)
@@ -428,7 +433,8 @@ export function createNativeCacheKeep(
       : abort.signal
     if (signal.aborted)
       throw new CacheKeepPrewarmError('authorization', signal.reason)
-    const body = JSON.parse(await warm.text()) as { model: string }
+    const warmBodyText = await warm.text()
+    const body = JSON.parse(warmBodyText) as { model: string }
     const scope: RequestScope = {
       providerID: 'anthropic',
       modelID: body.model,
@@ -465,13 +471,18 @@ export function createNativeCacheKeep(
           if (accountKey(account) !== target.oauthAccountIdentity)
             throw new NativeAccountRefusal('credential-changed')
           if (
-            (target.isSubagent &&
+            !target.policyState?.planned &&
+            ((target.isSubagent &&
+              !readSessionCachePolicy(
+                target.policyState?.ownerSessionId ?? target.id,
+                true,
+              ) &&
               !isCacheKeepSubagentsEnabled(snapshot.policyStorage)) ||
-            !isCacheKeepHybridActive(snapshot.policyStorage) ||
-            !isCacheKeepActiveNow(
-              snapshot.policyStorage,
-              new Date(options.now?.() ?? Date.now()),
-            )
+              !isCacheKeepHybridActive(snapshot.policyStorage) ||
+              !isCacheKeepActiveNow(
+                snapshot.policyStorage,
+                new Date(options.now?.() ?? Date.now()),
+              ))
           )
             return undefined
           const authorized = await source.authorizeAccount(
@@ -506,13 +517,18 @@ export function createNativeCacheKeep(
           if (accountKey(account) !== target.oauthAccountIdentity)
             throw new NativeAccountRefusal('credential-changed')
           if (
-            (target.isSubagent &&
+            !target.policyState?.planned &&
+            ((target.isSubagent &&
+              !readSessionCachePolicy(
+                target.policyState?.ownerSessionId ?? target.id,
+                true,
+              ) &&
               !isCacheKeepSubagentsEnabled(snapshot.policyStorage)) ||
-            !isCacheKeepHybridActive(snapshot.policyStorage) ||
-            !isCacheKeepActiveNow(
-              snapshot.policyStorage,
-              new Date(options.now?.() ?? Date.now()),
-            )
+              !isCacheKeepHybridActive(snapshot.policyStorage) ||
+              !isCacheKeepActiveNow(
+                snapshot.policyStorage,
+                new Date(options.now?.() ?? Date.now()),
+              ))
           )
             throw new Error('CacheKeep policy changed before dispatch')
         },
@@ -559,7 +575,7 @@ export function createNativeCacheKeep(
         transport: 'http',
         data: authorized.attempt,
       }
-      const request = await native.adapter.rewriteRequest?.({
+      let request = await native.adapter.rewriteRequest?.({
         ...scope,
         accountId,
         attempt,
@@ -571,6 +587,12 @@ export function createNativeCacheKeep(
         }),
       })
       if (!request) throw new Error('CacheKeep rewrite refused')
+      // Authorization must not reshape a captured planned prefix using
+      // today's host defaults. The manager has already prepared the replay.
+      if (target.policyState?.planned)
+        request = new Request(request, { body: warmBodyText })
+      signal.throwIfAborted()
+      await manager.reserveWarmDispatch(target)
       signal.throwIfAborted()
       stage = 'send'
       const physical = await (options.fetch ?? fetch)(request)
@@ -598,15 +620,22 @@ export function createNativeCacheKeep(
           attempt,
         })
       const bytes = await response.arrayBuffer()
-      if (response.ok && !signal.aborted && !target.sourceWarm)
+      if (
+        response.ok &&
+        !signal.aborted &&
+        !target.sourceWarm &&
+        manager.isCurrentTarget(target)
+      )
         sessionCacheActivity.recordPrewarm(
           target.id,
           accountId,
           options.now?.() ?? Date.now(),
+          requestCacheLifetimeMs(warmBodyText),
         )
       complete = true
       return new Response(bytes, { status, headers: response.headers })
     } catch (error) {
+      if (error instanceof CacheKeepWarmRefusal) throw error
       const refusal = nativeAccountRefusal(error)
       if (refusal) throw refusal
       // The native credentials are unavailable to the manager's error scrubber;
@@ -670,12 +699,7 @@ export function createNativeCacheKeep(
       input.signal?.addEventListener('abort', entry.onAbort, { once: true })
       const snapshot = await runtime.read()
       if (lease.stopped) return skipped('lease-stopped')
-      if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
-        for (const session of manager.trackedSessions())
-          manager.untrack(session.id, 'disabled')
-        owner.persistence.clear()
-        return skipped('hybrid-inactive')
-      }
+      const policy = readSessionCachePolicy(input.sessionID, true)
       let isSubagent = false
       try {
         isSubagent = (await options.isSubagent?.(input.sessionID)) ?? false
@@ -684,7 +708,11 @@ export function createNativeCacheKeep(
         return skipped('session-lookup-failed')
       }
       if (lease.stopped) return skipped('lease-stopped')
-      if (isSubagent && !isCacheKeepSubagentsEnabled(snapshot.policyStorage))
+      if (
+        !policy &&
+        isSubagent &&
+        !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
+      )
         return skipped('subagents-disabled')
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
@@ -713,6 +741,7 @@ export function createNativeCacheKeep(
         oauthAccountId: input.accountId,
         oauthAccountIdentity: accountKey(account),
         isSubagent,
+        ttlMs: requestCacheLifetimeMs(input.bodyText),
       }
     },
     onResponseHeaders(input: { attemptId: string; status: number }) {
