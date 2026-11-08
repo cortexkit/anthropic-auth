@@ -14,6 +14,7 @@ import {
   __resetEnrollmentModeLogForTests,
   readNativeEnrollmentMode,
 } from '../native-enrollment-authority.ts'
+import { resetVaultHostAuthorityForTests } from '../native-vault-host.ts'
 
 function capture() {
   const records: LogTestRecord[] = []
@@ -28,6 +29,60 @@ function capture() {
     },
   }
 }
+
+test('hosted custody logs exactly once per host across two resolutions and never outside hosted mode', async () => {
+  __resetEnrollmentModeLogForTests()
+  resetVaultHostAuthorityForTests()
+  const previousHost = process.env.CORTEXKIT_VAULT_HOST
+  const root = await mkdtemp(join(tmpdir(), 'hosted-mode-log-'))
+  const captureLogs = capture()
+  setLogLevel('info')
+  try {
+    delete process.env.CORTEXKIT_VAULT_HOST
+    const hosts = ['opencode', 'pi'] as const
+    for (const host of hosts) {
+      const env = {
+        [`${host.toUpperCase()}_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`]:
+          join(root, `${host}.json`),
+      }
+      expect(await readNativeEnrollmentMode(host, env)).toBe('local')
+      expect(await readNativeEnrollmentMode(host, env)).toBe('local')
+    }
+    expect(
+      captureLogs.records.filter((record) => record.payload?.mode === 'hosted'),
+    ).toEqual([])
+    captureLogs.records.length = 0
+
+    // Reset the cached vault-host authority after changing CORTEXKIT_VAULT_HOST
+    // to simulate a process restart.
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    resetVaultHostAuthorityForTests()
+    for (const host of hosts) {
+      for (const suffix of ['first', 'second']) {
+        const env = {
+          [`${host.toUpperCase()}_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE`]:
+            join(root, `${host}-${suffix}.json`),
+        }
+        expect(await readNativeEnrollmentMode(host, env)).toBe('claustrum')
+      }
+    }
+    expect(captureLogs.records).toEqual(
+      hosts.map((host) => ({
+        level: 'info',
+        channel: 'enrollment',
+        message: 'Native enrollment mode',
+        payload: { host, mode: 'hosted', source: 'thalamus' },
+      })),
+    )
+  } finally {
+    captureLogs.restore()
+    if (previousHost === undefined) delete process.env.CORTEXKIT_VAULT_HOST
+    else process.env.CORTEXKIT_VAULT_HOST = previousHost
+    resetVaultHostAuthorityForTests()
+    __resetEnrollmentModeLogForTests()
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test('enrollment mode logs once per token path and again on a mode change without token bytes', async () => {
   __resetEnrollmentModeLogForTests()

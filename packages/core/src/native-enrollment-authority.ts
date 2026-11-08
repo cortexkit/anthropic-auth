@@ -56,9 +56,9 @@ const privateFilesUnavailableReasons = new Set([
   'native-addon-unavailable',
 ])
 
-// Enrollment mode INFO records already emitted this process. The key covers
-// the host, the resolved token file and the resolved mode, so a repeat read
-// stays silent and a mode change logs again without tracking anything else.
+// Enrollment mode INFO records already emitted this process. Native keys cover
+// the host, token file and mode; hosted keys cover only the host and mode because
+// Thalamus custody does not use enrollment files.
 const loggedEnrollmentModes = new Set<string>()
 
 /** Test-only reset for the once-per-process enrollment mode log. */
@@ -200,7 +200,18 @@ export async function readNativeEnrollmentMode(
     `anthropic-auth-${host}`,
   )
   assertHostAuthorityStable()
-  if (authority === 'host') return 'claustrum'
+  if (authority === 'host') {
+    const key = `${host}${'\0'}hosted`
+    if (!loggedEnrollmentModes.has(key)) {
+      loggedEnrollmentModes.add(key)
+      logger.info('enrollment', 'Native enrollment mode', {
+        host,
+        mode: 'hosted',
+        source: 'thalamus',
+      })
+    }
+    return 'claustrum'
+  }
   if (authority !== 'vault')
     closeNativeVaultAuthority(
       getHostClaustrumEnrollmentPaths(host, env).tokenPath,
