@@ -201,6 +201,7 @@ import {
   readNativeMigrationJournal,
   refreshBackoffActive,
   remapRequestBodyModel,
+  requestCacheLifetimeMs,
   resetClaustrumEnrollmentState,
   resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
@@ -7658,6 +7659,7 @@ const anthropicAuthPlugin = async (
               const headerBodyParseStart = nowMs()
               try {
                 const finalBody = JSON.parse(body) as Record<string, unknown>
+                acceptedCacheTtlMs = requestCacheLifetimeMs(finalBody)
                 setOAuthHeaders(requestHeaders, accessToken, {
                   body: finalBody,
                   identity,

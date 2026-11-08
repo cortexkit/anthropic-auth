@@ -21,6 +21,10 @@ export class SessionCacheActivity {
     ttlMs: number | undefined,
     lastAcceptedAt = Date.now(),
   ) {
+    if (ttlMs === 0) {
+      this.forget(sessionId)
+      return
+    }
     this.entries.delete(sessionId)
     this.entries.set(sessionId, {
       accountId,
@@ -52,10 +56,15 @@ export class SessionCacheActivity {
   }
 
   /** A late keep-warm send must not replace a newer turn on a different account. */
-  recordPrewarm(sessionId: string, accountId: string, acceptedAt = Date.now()) {
+  recordPrewarm(
+    sessionId: string,
+    accountId: string,
+    acceptedAt = Date.now(),
+    ttlMs = PROMPT_CACHE_1H_TTL_MS,
+  ) {
     const activity = this.entries.get(sessionId)
     if (activity && activity.accountId !== accountId) return
-    this.record(sessionId, accountId, PROMPT_CACHE_1H_TTL_MS, acceptedAt)
+    this.record(sessionId, accountId, ttlMs, acceptedAt)
   }
 
   forget(sessionId: string) {
