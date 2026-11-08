@@ -36,7 +36,7 @@ docs/           public user and contributor documentation
   - Routing: `routing.ts` and `sticky-routing.ts`.
   - Quota policy: `killswitch.ts`, `quota-refusal.ts` and `session-cache-activity.ts`.
   - Quota readings: `quota-manager.ts`, `quota-headers.ts`, `quota-header-feed.ts`, `insula-quota.ts` and `quotas.ts`.
-- **Cache:** `cache1h.ts`, `cachekeep.ts`, `cachekeep-store.ts` (restart store), `cachekeep-registry.ts` (session list) and `prime.ts`.
+- **Cache:** `cache1h.ts`, `session-cache-policy.ts` (per-session policy from Thalamus), `cachekeep.ts`, `cachekeep-store.ts` (restart store), `cachekeep-registry.ts` (session list) and `prime.ts`.
 - **State layout:** `state-layout-*.ts`, `holder-registry.ts`, `layout-fence.ts`, `relocation-guard.ts` and `state-home-serving-guard.ts`.
 - **Shared plumbing:** `logger.ts`, `logging.ts`, `dump.ts`, `json.ts` (redacting JSON parse), `sse.ts`, `owner-only.ts`, `publication-rename.ts`, `network-errors.ts` and `provider-error.ts`.
 - `tests/`: Core unit tests. `test-lifetime.ts` holds the body-owned cleanup helper.
