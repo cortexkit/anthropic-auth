@@ -1583,6 +1583,9 @@ export class CacheKeepManager {
       (a, b) => this.lastPrewarmStart(a) - this.lastPrewarmStart(b),
     )
     for (const target of targets) {
+      // An earlier prewarm's await can let a real request replace or retire
+      // this target; only the current one is decided and sent.
+      if (this.targets.get(target.id) !== target) continue
       const attemptAt = this.options.now?.() ?? Date.now()
       const decision = this.policyDecision(target, attemptAt)
       if (decision?.action === 'stop') {
