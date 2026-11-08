@@ -21,6 +21,11 @@ import {
 export interface NativeInsulaUsageTransport {
   connectionFile: string
   getUsage(): Promise<unknown>
+  /** Hold usage.watch open; older/custom transports can omit push support. */
+  watchUsage?(onNotice: (body: Uint8Array) => void): {
+    stop(): void
+    readonly closed: Promise<void>
+  }
 }
 
 /** Claustrum IPC operations for listing accounts, reading tokens, reporting rejection, and closing the connection. */
@@ -89,8 +94,8 @@ export interface NativeCustodyClient {
   ): NativeScopedWatchHandle
   /**
    * How to read insula's background quota cache on the same daemon. Present
-   * when the connection was made with connectClaustrumScopedClient; reading
-   * it opens a separate short-lived socket and never uses this connection.
+   * when the connection was made with connectClaustrumScopedClient; reads and
+   * watches use separate sockets and never use this connection.
    */
   insula?: NativeInsulaUsageTransport
 }

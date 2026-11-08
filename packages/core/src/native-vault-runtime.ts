@@ -122,8 +122,8 @@ export interface NativeVaultRuntimeOptions {
   now?: () => number
   onLockEvent?: (event: NativeLockEvent) => void
   /**
-   * Timer functions for the vault custody's outage probe and roster watch
-   * retries. Defaults to the global ones; tests pass their own.
+   * Timer functions for custody probes, watch retries and Insula's minute
+   * watchdog. Defaults to the global ones; tests pass their own.
    */
   setTimeout?: typeof globalThis.setTimeout
   clearTimeout?: typeof globalThis.clearTimeout
@@ -521,15 +521,14 @@ export function createNativeVaultRuntime(
   // the same connection file as native custody but must never reuse its source.
   const hostedInsulaCacheKey = `${tokenPath}.host-anthropic-auth`
   const clock = options.now ?? Date.now
-  let insula:
-    | {
-        source: InsulaQuotaSource
-        release(): void
-        owner: NativeCustody
-        generation: number
-        transportEpoch: number
-      }
-    | undefined
+  type HeldInsula = {
+    source: InsulaQuotaSource
+    release(): void
+    owner: NativeCustody
+    generation: number
+    transportEpoch: number
+  }
+  let insula: HeldInsula | undefined
   const unwatchAuthority = watchNativeVaultAuthority({
     roster: paths.roster,
     tokenPath,
@@ -551,6 +550,8 @@ export function createNativeVaultRuntime(
       const generation = owner.generation ?? 0
       const transportEpoch = insulaTransportEpoch
       const assertTransport = () => {
+        if (closing || shutdown.signal.aborted)
+          throw new NativeCustodyError('closed')
         assertCustodyOwner(owner, generation)
         if (transportEpoch !== insulaTransportEpoch)
           throw new NativeCustodyError('route-unavailable')
@@ -574,18 +575,76 @@ export function createNativeVaultRuntime(
           transport,
           hosted ? hostedInsulaCacheKey : tokenPath,
         )
+        let held: HeldInsula | undefined
         try {
           assertTransport()
-          if (!insula)
-            insula = { ...acquired, owner, generation, transportEpoch }
-          else acquired.release()
+          if (!insula) {
+            let released = false
+            let timer: ReturnType<typeof setTimeout> | undefined
+            let unwatch = () => {}
+            held = {
+              source: acquired.source,
+              owner,
+              generation,
+              transportEpoch,
+              release() {
+                if (released) return
+                released = true
+                if (timer !== undefined)
+                  (options.clearTimeout ?? clearTimeout)(timer)
+                timer = undefined
+                try {
+                  unwatch()
+                } finally {
+                  acquired.release()
+                }
+              },
+            }
+            insula = held
+            const current = held
+            unwatch = held.source.watch({
+              provider: 'claude',
+              setTimeoutImpl: options.setTimeout,
+              clearTimeoutImpl: options.clearTimeout,
+            })
+            // watch() has no mode callback. Keep a cheap watchdog so a pending,
+            // refused or ended stream resumes polling without waiting for the
+            // five-minute roster sweep. An accepted watch needs no reads.
+            const schedule = () => {
+              if (released || closing || shutdown.signal.aborted) return
+              timer = (options.setTimeout ?? setTimeout)(
+                () =>
+                  withDetachedNativeLocks(async () => {
+                    timer = undefined
+                    if (released || insula !== current) return
+                    try {
+                      assertTransport()
+                    } catch {
+                      current.release()
+                      if (insula === current) insula = undefined
+                      return
+                    }
+                    if (current.source.watchMode() !== 'watching')
+                      await refreshInsula()
+                  })
+                    .finally(schedule)
+                    .catch(() => {}),
+                60_000,
+              )
+              timer.unref?.()
+            }
+            schedule()
+          } else acquired.release()
         } catch (error) {
-          acquired.release()
+          if (held) {
+            held.release()
+            if (insula === held) insula = undefined
+          } else acquired.release()
           throw error
         }
       }
       assertTransport()
-      await insula.source.refresh(clock())
+      await insula?.source.refresh(clock())
     } catch {
       // Insula is optional: without it every account keeps its own poll.
     }
@@ -602,7 +661,8 @@ export function createNativeVaultRuntime(
     if (
       insula &&
       (insula.owner !== custody ||
-        insula.generation !== (custody.generation ?? 0))
+        insula.generation !== (custody.generation ?? 0) ||
+        insula.transportEpoch !== insulaTransportEpoch)
     ) {
       insula.release()
       insula = undefined
@@ -1415,6 +1475,8 @@ export function createNativeVaultRuntime(
     },
     close() {
       if (closing) return closing
+      insula?.release()
+      insula = undefined
       watchers.clear()
       closeRosterWatch()
       schedulePoll()

@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Addresses #673: in vault mode, Insula's quota readings stay fresh between background checks, so the plugin no longer polls Anthropic's usage endpoint itself when Insula already has the reading.
 - The log now records once per process when the plugin uses Thalamus's vault relay.
 ## 2.7.0
 

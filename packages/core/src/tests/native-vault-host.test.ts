@@ -35,6 +35,7 @@ import { nativeVaultPaths } from '../native-vault-paths.ts'
 import { createNativeVaultRuntime } from '../native-vault-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { StickySessionRouter } from '../sticky-routing.ts'
+import { insulaBackground } from './insula-watch-fixture.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 
 const symbol = Symbol.for('cortexkit.vault')
@@ -227,6 +228,99 @@ async function fixture(timers?: {
       clock += ms
     },
   }
+}
+
+for (const refused of [false, true]) {
+  test(`hosted Insula ${refused ? 'refusal polling' : 'held-open watch'} keeps admission fresh and closes on authority change`, async () => {
+    const background = insulaBackground(refused)
+    const f = await fixture(background)
+    let readingAt = now - 30_000
+    const transport = f.relay.insula!
+    transport.watchUsage = background.watchUsage
+    transport.getUsage = mock(async () => ({
+      completeProviders: ['claude'],
+      result: [
+        {
+          provider: 'claude',
+          account: accountId,
+          fetchedAt: new Date(readingAt).toISOString(),
+          source: 'vault',
+          usage: {
+            primary: {
+              usedPercent: 40,
+              windowKind: 'five_hour',
+              windowMinutes: 300,
+            },
+            secondary: {
+              usedPercent: 55,
+              windowKind: 'weekly',
+              windowMinutes: 10_080,
+            },
+          },
+        },
+      ],
+    }))
+    await f.markHost()
+    await f.runtime.vault.refresh()
+    const direct = Object.assign(
+      mock(async () =>
+        Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 20 },
+        }),
+      ),
+      { preconnect: fetch.preconnect },
+    )
+    await f.runtime.vault.fetchQuota(
+      'main',
+      direct,
+      undefined,
+      undefined,
+      'background',
+    )
+    const lease = claustrum.acquireInsulaQuotaSource(
+      transport,
+      `${getHostClaustrumEnrollmentPaths('opencode', f.env).tokenPath}.host-anthropic-auth`,
+    )
+    cleanup.push(lease.release)
+    if (refused) {
+      for (let minute = 1; minute <= 4; minute++) {
+        f.advance(60_000)
+        readingAt = now + minute * 60_000 - 30_000
+        await background.tick()
+      }
+      f.advance(30_000)
+      expect(transport.getUsage).toHaveBeenCalledTimes(5)
+    } else {
+      f.advance(180_000)
+      readingAt = now + 150_000
+      background.notice()
+      expect(lease.source.watchMode()).toBe('watching')
+      await lease.source.refresh(now + 180_000)
+      f.advance(60_000)
+      const reads = (transport.getUsage as ReturnType<typeof mock>).mock.calls
+        .length
+      await background.tick()
+      expect(transport.getUsage).toHaveBeenCalledTimes(reads)
+      f.advance(30_000)
+    }
+    const quota = await f.runtime.vault.fetchQuota(
+      'main',
+      direct,
+      undefined,
+      undefined,
+      'admission',
+    )
+    expect(quota.five_hour?.checkedAt).toBe(readingAt)
+    expect(direct).not.toHaveBeenCalled()
+    expect(f.connect).not.toHaveBeenCalled()
+    expect(f.readToken).not.toHaveBeenCalled()
+    expect(background.counts.opens).toBe(1)
+    delete process.env.CORTEXKIT_VAULT_HOST
+    expect(() => isVaultHosted()).toThrow()
+    expect(background.timers.size).toBe(0)
+    if (!refused) expect(background.counts.stops).toBe(1)
+  })
 }
 
 test('unmarked accessor is never called and native custody keeps reading enrollment', async () => {

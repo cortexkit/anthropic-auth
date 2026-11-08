@@ -6,6 +6,7 @@ import {
   acquireInsulaQuotaSource,
   type InsulaQuotaLookup,
   type InsulaUsageEntry,
+  type InsulaUsageTransport,
   projectVaultRoster,
 } from '@cortexkit/common-auth/claustrum'
 import {
@@ -31,11 +32,16 @@ import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import type { NativeCustodyClient } from '../native-custody.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { readNativeRuntime } from '../native-runtime.ts'
+import { disconnectNativeVaultForHost } from '../native-vault-connection.ts'
 import { nativeVaultPaths } from '../native-vault-paths.ts'
-import { createNativeVaultRuntime } from '../native-vault-runtime.ts'
+import {
+  createNativeVaultRuntime,
+  type NativeVaultRuntimeOptions,
+} from '../native-vault-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { QuotaManager, QuotaRefreshDeferred } from '../quota-manager.ts'
+import { insulaBackground } from './insula-watch-fixture.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
@@ -114,6 +120,9 @@ const usageBody = {
 async function fixture(
   entries: () => unknown[],
   completeProviders = ['claude'],
+  background: Pick<NativeVaultRuntimeOptions, 'setTimeout' | 'clearTimeout'> & {
+    watchUsage?: InsulaUsageTransport['watchUsage']
+  } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-vault-insula-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
@@ -192,6 +201,7 @@ async function fixture(
         counts.insula++
         return { result: entries(), completeProviders }
       },
+      watchUsage: background.watchUsage,
     },
   }
   const usage: typeof fetch = Object.assign(
@@ -211,6 +221,8 @@ async function fixture(
       now: () => clock.now,
       connect: async () => client,
       readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
+      setTimeout: background.setTimeout,
+      clearTimeout: background.clearTimeout,
     })
     deferCleanup(async () => {
       await runtime.drainQuotaPublications()
@@ -235,7 +247,201 @@ async function fixture(
     deferCleanup(() => lease.release())
     return lease.source
   }
-  return { runtime, make, counts, usage, vaultPaths, routeOf, clock, source }
+  return {
+    runtime,
+    make,
+    counts,
+    usage,
+    vaultPaths,
+    routeOf,
+    clock,
+    source,
+    env,
+  }
+}
+
+test('watch notices keep admission on Insula 4.5 minutes after the last sweep', async () => {
+  const background = insulaBackground()
+  let readingAt = fetchedAt
+  const f = await fixture(
+    () => [entry(uuid2, { fetchedAt: new Date(readingAt).toISOString() })],
+    ['claude'],
+    background,
+  )
+  await f.runtime.fetchQuota(
+    f.routeOf(uuid2),
+    f.usage,
+    undefined,
+    undefined,
+    'background',
+  )
+  f.clock.now = now + 180_000
+  readingAt = f.clock.now - 30_000
+  background.notice()
+  // Join only a watch-driven read already in flight, never warm an unwatched source.
+  if (f.source().watchMode() === 'watching')
+    await f.source().refresh(f.clock.now)
+  const reads = f.counts.insula
+  f.clock.now = now + 270_000
+  const quota = await f.runtime.fetchQuota(
+    f.routeOf(uuid2),
+    f.usage,
+    undefined,
+    undefined,
+    'admission',
+  )
+  expect(f.counts.usage).toEqual([])
+  expect(quota.five_hour?.checkedAt).toBe(readingAt)
+  expect(f.counts.insula).toBe(reads)
+  expect(background.counts.opens).toBe(1)
+})
+
+test('shared Insula watches stay open until the last runtime releases its source', async () => {
+  const background = insulaBackground()
+  const f = await fixture(() => [entry(uuid2)], ['claude'], background)
+  const second = f.make()
+  for (const runtime of [f.runtime, second]) {
+    await runtime.fetchQuota(
+      f.routeOf(uuid2),
+      f.usage,
+      undefined,
+      undefined,
+      'background',
+    )
+    await runtime.drainQuotaPublications()
+  }
+  expect(background.counts.opens).toBe(1)
+  expect(
+    [...background.timers].filter((timer) => timer.ms === 60_000),
+  ).toHaveLength(2)
+  await f.runtime.close()
+  expect(background.counts.stops).toBe(0)
+  expect(
+    [...background.timers].filter((timer) => timer.ms === 60_000),
+  ).toHaveLength(1)
+  await second.fetchQuota(
+    f.routeOf(uuid2),
+    f.usage,
+    undefined,
+    undefined,
+    'admission',
+  )
+  expect(f.counts.usage).toEqual([])
+  await second.close()
+  expect(background.counts.stops).toBe(1)
+  expect(background.timers.size).toBe(0)
+})
+
+for (const refused of [false, true]) {
+  test(`${refused ? 'refused' : 'not-yet-open'} watch keeps admission on Insula with its own minute timer`, async () => {
+    const background = insulaBackground(refused)
+    let readingAt = fetchedAt
+    const f = await fixture(
+      () => [entry(uuid2, { fetchedAt: new Date(readingAt).toISOString() })],
+      ['claude'],
+      background,
+    )
+    await f.runtime.fetchQuota(
+      f.routeOf(uuid2),
+      f.usage,
+      undefined,
+      undefined,
+      'background',
+    )
+    for (let minute = 1; minute <= 4; minute++) {
+      f.clock.now = now + minute * 60_000
+      readingAt = f.clock.now - 30_000
+      await background.tick()
+    }
+    f.clock.now = now + 270_000
+    const quota = await f.runtime.fetchQuota(
+      f.routeOf(uuid2),
+      f.usage,
+      undefined,
+      undefined,
+      'admission',
+    )
+    expect(f.counts.usage).toEqual([])
+    expect(quota.five_hour?.checkedAt).toBe(now + 210_000)
+    expect(f.counts.insula).toBe(5)
+    expect([...background.timers].every((timer) => timer.unrefed)).toBe(true)
+  })
+}
+
+test('the minute watchdog makes no reads while watching and resumes when the stream ends', async () => {
+  const background = insulaBackground()
+  let readingAt = now
+  const f = await fixture(
+    () => [entry(uuid2, { fetchedAt: new Date(readingAt).toISOString() })],
+    ['claude'],
+    background,
+  )
+  await f.runtime.fetchQuota(
+    f.routeOf(uuid2),
+    f.usage,
+    undefined,
+    undefined,
+    'background',
+  )
+  background.notice()
+  await f.source().refresh(f.clock.now)
+  expect(f.source().watchMode()).toBe('watching')
+  const reads = f.counts.insula
+  for (let minute = 1; minute <= 3; minute++) {
+    f.clock.now = now + minute * 60_000
+    await background.tick()
+    expect(f.counts.insula).toBe(reads)
+    await f.runtime.fetchQuota(
+      f.routeOf(uuid2),
+      f.usage,
+      undefined,
+      undefined,
+      'admission',
+    )
+  }
+  expect(f.counts.usage).toEqual([])
+  background.end()
+  await Promise.resolve()
+  f.clock.now += 60_000
+  readingAt = f.clock.now
+  await background.tick()
+  expect(f.counts.insula).toBe(reads + 1)
+  await f.runtime.close()
+  expect(background.timers.size).toBe(0)
+})
+
+for (const refused of [false, true]) {
+  for (const stop of ['close', 'custody-change'] as const) {
+    test(`${stop} releases the ${refused ? 'refused' : 'open'} Insula watch and minute timer`, async () => {
+      const background = insulaBackground(refused)
+      const f = await fixture(() => [entry(uuid2)], ['claude'], background)
+      await f.runtime.fetchQuota(
+        f.routeOf(uuid2),
+        f.usage,
+        undefined,
+        undefined,
+        'background',
+      )
+      if (!refused) {
+        background.notice()
+        await f.source().refresh(f.clock.now)
+      }
+      await f.runtime.drainQuotaPublications()
+      expect(background.counts.opens).toBe(1)
+      expect([...background.timers].some((timer) => timer.ms === 60_000)).toBe(
+        true,
+      )
+      if (stop === 'close') await f.runtime.close()
+      else await disconnectNativeVaultForHost({ host: 'opencode', env: f.env })
+      expect(background.timers.size).toBe(0)
+      if (!refused) expect(background.counts.stops).toBe(1)
+      const reads = f.counts.insula
+      background.notice()
+      await background.tick()
+      expect(f.counts.insula).toBe(reads)
+      expect(f.counts.usage).toEqual([])
+    })
+  }
 }
 
 const bearer = (credentialId: string) =>
