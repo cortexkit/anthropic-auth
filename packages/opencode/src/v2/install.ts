@@ -1,4 +1,7 @@
-import { runWithRequestSignal } from '@cortexkit/anthropic-auth-core'
+import {
+  runWithRequestSignal,
+  withSessionCacheReportHandoff,
+} from '@cortexkit/anthropic-auth-core'
 import {
   type InstallOpenCode2AuthOptions,
   installOpenCode2Auth,
@@ -61,6 +64,33 @@ export async function installNativeAnthropic<Q, P>(
     const registration = await ctx.session.hook(
       name,
       async (draft) => {
+        if (name === 'http.response') {
+          return withSessionCacheReportHandoff(async () => {
+            let accepted = false
+            try {
+              const result = await callback(draft)
+              accepted = true
+              return result
+            } finally {
+              if ('request' in draft && draft.request instanceof Request) {
+                try {
+                  const response =
+                    'response' in draft && draft.response instanceof Response
+                      ? draft.response
+                      : undefined
+                  deps.source.onResponseHandedToHost?.(
+                    draft.request,
+                    accepted && response
+                      ? native.acceptedResponse(response)
+                      : undefined,
+                  )
+                } catch {
+                  /* Reporting never changes the host response. */
+                }
+              }
+            }
+          })()
+        }
         if (name !== 'http.request') return callback(draft)
         // Account choice runs inside http.request, before the host can send it.
         // Keep the signal request-local even when a session has concurrent turns.

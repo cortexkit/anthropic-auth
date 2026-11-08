@@ -37,6 +37,7 @@ import {
   type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
+  requestCacheLifetimeMs,
   requestSignal,
   runWithRequestSignal,
   sendWithRequestGzip,
@@ -371,6 +372,16 @@ export interface NativeAnthropicSource<Q, P> {
       readonly signal?: AbortSignal
     },
   ) => Promise<void> | void
+  readonly onFinalRequestPrepared?: (input: {
+    attemptId: string
+    requestId: string | undefined
+    bodyText: string
+    ttlMs: number
+  }) => void
+  readonly onResponseHandedToHost?: (
+    request: Request,
+    accepted: { at: number } | undefined,
+  ) => void
   /** Response observers for an OAuth response. */
   readonly responseOptions?: (
     input: NativeAnthropicResponseContext<P>,
@@ -454,6 +465,8 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
+  /** Receipt time of this adapter's final verified upstream OAuth 2xx response. */
+  acceptedResponse(response: Response): { at: number } | undefined
   readonly adapter: OpenCode2AuthAdapter<
     Q,
     NativeAnthropicAttemptData<P>,
@@ -965,8 +978,15 @@ export function createNativeAnthropicAdapter<Q, P>(
   // bounded even after that scope has ended. A copy of the headers, or any
   // other response, is not recognized and is scrubbed as raw text.
   const rewrittenFailures = new WeakMap<Headers, Data>()
+  const physicalAcceptances = new WeakMap<Data, { at: number }>()
+  const finalAcceptances = new WeakMap<Response, { at: number }>()
   const rewrittenFailure = (data: Data | undefined, response: Response) => {
     if (data && !response.ok) rewrittenFailures.set(response.headers, data)
+    const accepted =
+      data?.route === 'oauth' && response.ok
+        ? physicalAcceptances.get(data)
+        : undefined
+    if (accepted) finalAcceptances.set(response, accepted)
     return response
   }
 
@@ -1418,7 +1438,11 @@ export function createNativeAnthropicAdapter<Q, P>(
           const resendFetch = async (url: string, init: RequestInit) => {
             try {
               assertHostAuthorityStable()
-              return await (deps.fetch ?? globalThis.fetch)(url, init)
+              observeFinalWire(request, createBody)
+              const received = await (deps.fetch ?? globalThis.fetch)(url, init)
+              if (received.ok && fromUpstream(received.headers, data))
+                physicalAcceptances.set(data, { at: Date.now() })
+              return received
             } catch (error) {
               request.signal.throwIfAborted()
               if (!isRecoveryTransportFailure(error)) throw error
@@ -1563,16 +1587,22 @@ export function createNativeAnthropicAdapter<Q, P>(
         dropDumpContext(data)
       }
       assertHostAuthorityStable()
-      return new Request(send.dispatch.url, {
+      const clientRequestId = headers.get('x-client-request-id')
+      const relayRequest = new Request(send.dispatch.url, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           'x-relay-token': send.dispatch.token,
+          ...(clientRequestId
+            ? { 'x-client-request-id': clientRequestId }
+            : {}),
         },
         redirect: 'error',
         signal: request.signal,
         body: JSON.stringify(envelope),
       })
+      observeFinalWire(relayRequest, body)
+      return relayRequest
     }
     let wireBody: string | Uint8Array | undefined = body
     if (data.route === 'oauth' && messages && body !== undefined) {
@@ -1610,7 +1640,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       dropDumpContext(data)
     }
     assertHostAuthorityStable()
-    return new Request(url, {
+    const finalRequest = new Request(url, {
       method: request.method,
       headers,
       // An OAuth bearer must not follow a redirect to another host.
@@ -1618,6 +1648,22 @@ export function createNativeAnthropicAdapter<Q, P>(
       signal: request.signal,
       ...(wireBody !== undefined ? { body: wireBody } : {}),
     })
+    observeFinalWire(finalRequest, body)
+    return finalRequest
+
+    function observeFinalWire(prepared: Request, bodyText: string | undefined) {
+      if (data?.route !== 'oauth' || !messages || bodyText === undefined) return
+      try {
+        source.onFinalRequestPrepared?.({
+          attemptId: attempt.attemptId,
+          requestId: prepared.headers.get('x-client-request-id') ?? undefined,
+          bodyText,
+          ttlMs: requestCacheLifetimeMs(bodyText),
+        })
+      } catch {
+        /* Optional cache observation cannot fail a physical send. */
+      }
+    }
   }
 
   const adapter: NativeAnthropicAdapter<Q, P>['adapter'] = {
@@ -1907,6 +1953,8 @@ export function createNativeAnthropicAdapter<Q, P>(
     quotaFromHeaders(headers, status, attempt) {
       const data = attempt.data
       if (!data || !fromUpstream(headers, data)) return undefined
+      if (data.route === 'oauth' && status >= 200 && status < 300)
+        physicalAcceptances.set(data, { at: Date.now() })
       return source.quotaFromHeaders?.(headers, {
         ...contextOf(attempt, data),
         status,
@@ -2097,6 +2145,7 @@ export function createNativeAnthropicAdapter<Q, P>(
 
   return {
     adapter,
+    acceptedResponse: (response) => finalAcceptances.get(response),
     dispose() {
       disposed = true
       for (const [sessionID, operations] of inProgress) {

@@ -202,6 +202,7 @@ import {
   readSessionCachePolicy,
   refreshBackoffActive,
   remapRequestBodyModel,
+  reportSessionCacheTouch,
   requestCacheLifetimeMs,
   resetClaustrumEnrollmentState,
   resolveClaudeModelCapabilities,
@@ -228,6 +229,7 @@ import {
   VAULT_HOST_CONNECT_REFUSAL,
   VAULT_HOST_STATUS,
   withAbortableFetch,
+  withSessionCacheReportHandoff,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
 import type { Model as ProviderModelV2 } from '@opencode-ai/sdk/v2'
@@ -3392,11 +3394,40 @@ const anthropicAuthPlugin = async (
     // Response inspection copies this metadata when it replaces the Response.
     toolNameMap?: ToolNameMap
     failThread?: () => void
+    cacheKeepBodyText?: string
+    cacheKeepSignal?: AbortSignal | null
   }
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
     CacheDiagnosticsResponse
   >()
+  const cacheReportDeliveries = new WeakMap<
+    PerfTrace,
+    {
+      handedOff: boolean
+      touches: Array<{
+        sessionId: string
+        at: number
+        ttlMs: number
+        signal?: AbortSignal | null
+      }>
+    }
+  >()
+  function cacheReportDelivery(trace: PerfTrace) {
+    let state = cacheReportDeliveries.get(trace)
+    if (!state) {
+      state = { handedOff: false, touches: [] }
+      cacheReportDeliveries.set(trace, state)
+    }
+    return state
+  }
+  function deliverCacheReports(trace: PerfTrace) {
+    const state = cacheReportDelivery(trace)
+    state.handedOff = true
+    for (const { sessionId, signal, ...touch } of state.touches.splice(0))
+      if (!signal?.aborted)
+        reportSessionCacheTouch(sessionId, { ...touch, source: 'response' })
+  }
   const cacheKeepDiagnosticsRequests = new Map<
     string,
     CacheDiagnosticsRequestContext & {
@@ -3495,6 +3526,7 @@ const anthropicAuthPlugin = async (
   ) {
     const context = cacheDiagnosticsResponses.get(response)
     if (!context) return
+    recordCacheKeepUsage(context, message)
     if (
       message &&
       typeof message === 'object' &&
@@ -3537,6 +3569,7 @@ const anthropicAuthPlugin = async (
       ...(delta.usage ? { usage: { ...startUsage, ...delta.usage } } : {}),
       ...(delta.stopReason ? { stop_reason: delta.stopReason } : {}),
     }
+    recordCacheKeepUsage(context, message)
     context.dumpWrite = context.dumpWrite
       .then(() =>
         dumpResponseArtifact(context.dump, {
@@ -3546,6 +3579,30 @@ const anthropicAuthPlugin = async (
         }),
       )
       .catch(() => {})
+  }
+
+  function recordCacheKeepUsage(
+    context: CacheDiagnosticsResponse,
+    message: unknown,
+  ) {
+    if (
+      context.status < 200 ||
+      context.status >= 300 ||
+      context.synthetic ||
+      context.cacheKeepSignal?.aborted ||
+      !context.trackSessionId ||
+      !context.cacheKeepBodyText ||
+      !message ||
+      typeof message !== 'object'
+    )
+      return
+    const usage = (message as { usage?: Record<string, number> }).usage
+    if (usage)
+      cacheKeepManager.recordAcceptedUsage(
+        context.trackSessionId,
+        context.cacheKeepBodyText,
+        usage,
+      )
   }
 
   function attachCacheDiagnosticsResponse(
@@ -7743,8 +7800,31 @@ const anthropicAuthPlugin = async (
             if (fableRequest) fableRequest.oauthAccountId = oauthAccountId
             if (fableRequest) fableRequest.subagent = subagentRequest
             let trackCacheKeepRequest: (() => void) | undefined
-            const trackAcceptedRequest = () => {
+            const acceptedCacheAttempts = new WeakSet<object>()
+            const trackAcceptedRequest = (attempt: object, sentBody = body) => {
               if (init?.signal?.aborted) return
+              if (acceptedCacheAttempts.has(attempt)) return
+              acceptedCacheAttempts.add(attempt)
+              acceptedCacheTtlMs =
+                typeof sentBody === 'string'
+                  ? requestCacheLifetimeMs(sentBody)
+                  : acceptedCacheTtlMs
+              if (relayAffinity && trace) {
+                const touch = {
+                  sessionId: relayAffinity,
+                  at: Date.now(),
+                  ttlMs: acceptedCacheTtlMs,
+                  signal: init?.signal,
+                }
+                const delivery = cacheReportDelivery(trace)
+                if (delivery.handedOff)
+                  reportSessionCacheTouch(relayAffinity, {
+                    at: touch.at,
+                    ttlMs: touch.ttlMs,
+                    source: 'response',
+                  })
+                else delivery.touches.push(touch)
+              }
               if (relayAffinity)
                 sessionCacheActivity.record(
                   relayAffinity,
@@ -8007,7 +8087,7 @@ const anthropicAuthPlugin = async (
                     : await physicalSend(body, requestHeaders),
                 )
                 if (response.ok && !init?.signal?.aborted)
-                  trackAcceptedRequest?.()
+                  trackAcceptedRequest(response)
                 if (typeof body === 'string') {
                   directDump = await dumpDirectRequest({
                     affinity: relayAffinity,
@@ -8156,6 +8236,8 @@ const anthropicAuthPlugin = async (
                     'authorization',
                     `Bearer ${nextAuthorization.accessToken}`,
                   )
+                  const cacheAcceptance = {}
+                  const acceptedBody = body
                   return {
                     headers: relayHeaders,
                     errorSecrets: [nextAuthorization.accessToken],
@@ -8165,7 +8247,7 @@ const anthropicAuthPlugin = async (
                         status < 300 &&
                         !init?.signal?.aborted
                       )
-                        trackAcceptedRequest?.()
+                        trackAcceptedRequest(cacheAcceptance, acceptedBody)
                       if (status !== 401 || !nextAttempt) return
                       relay401Attempt = nextAttempt
                       // A WebSocket can deliver a real upstream 401 after its
@@ -8353,6 +8435,8 @@ const anthropicAuthPlugin = async (
                 failThread: threadRequest?.fail,
                 accountId: oauthAccountId,
                 synthetic: laneStartRequest,
+                cacheKeepBodyText: typeof body === 'string' ? body : undefined,
+                cacheKeepSignal: init?.signal,
                 ...cacheDiagnosticsBetas,
                 requestedModel: parseRequestModel(body),
                 request: cacheDiagnosticsRequest,
@@ -9153,7 +9237,7 @@ const anthropicAuthPlugin = async (
             )
           }
 
-          return withAbortableFetch({
+          const authTransport = withAbortableFetch({
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
               if (input instanceof Request && init?.signal === undefined)
@@ -9216,7 +9300,7 @@ const anthropicAuthPlugin = async (
               const wrapResponse = (response: Response) => {
                 const diagnosticsContext =
                   cacheDiagnosticsResponses.get(response)
-                return createStrippedStream(response, {
+                const wrapped = createStrippedStream(response, {
                   toolNameMap: diagnosticsContext?.toolNameMap,
                   onResponseFailure: diagnosticsContext?.failThread,
                   perf: (stage, data) => trace.mark(stage, data),
@@ -9478,6 +9562,8 @@ const anthropicAuthPlugin = async (
                       }
                     : {}),
                 })
+                deliverCacheReports(trace)
+                return wrapped
               }
               const authStart = nowMs()
               const credentialModelId =
@@ -9512,7 +9598,9 @@ const anthropicAuthPlugin = async (
                   body: passthroughBody,
                   headers: passthroughHeaders,
                 })
-                trace.done('non_oauth_passthrough', { status: response.status })
+                trace.done('non_oauth_passthrough', {
+                  status: response.status,
+                })
                 return response
               }
               const storage = await loadAccounts()
@@ -10881,7 +10969,9 @@ const anthropicAuthPlugin = async (
                   storage,
                 })
                 const message = formatKillswitchBlockMessage({
-                  ...(scoped.isScopedDriven && { modelName: scoped.modelName }),
+                  ...(scoped.isScopedDriven && {
+                    modelName: scoped.modelName,
+                  }),
                 })
                 return quotaRefusal(
                   message,
@@ -10982,6 +11072,10 @@ const anthropicAuthPlugin = async (
               return wrapResponse(response)
             },
           })
+          return {
+            ...authTransport,
+            fetch: withSessionCacheReportHandoff(authTransport.fetch),
+          }
         }
 
         return {}

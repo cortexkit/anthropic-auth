@@ -30,6 +30,8 @@ import {
 import { CacheKeepStore, type CacheKeepStoreOptions } from './cachekeep-store'
 import type { NativeSource, NativeSourceProvenance } from './source'
 
+const warmResponseLifetimes = new WeakMap<Response, number>()
+
 export interface NativeCacheKeepOptions {
   readonly now?: () => number
   readonly setIntervalImpl?: typeof globalThis.setInterval
@@ -140,6 +142,28 @@ interface SharedCacheKeep {
   readonly adopt: () => Promise<void>
 }
 
+async function discardLocalTargets(shared: SharedCacheKeep, now: number) {
+  const controlled = (id: string) =>
+    readSessionCachePolicy(id, true)?.keep_warm !== undefined
+  let hasRunnerTargets = false
+  for (const session of shared.manager.trackedSessions()) {
+    if (controlled(session.id)) hasRunnerTargets = true
+    else shared.manager.untrack(session.id, 'disabled')
+  }
+  // Inspect saved as well as live targets before a whole-store clear: a saved
+  // session with explicit keep_warm may not have been restored into memory yet.
+  await shared.persistence.drain()
+  await shared.persistence.load(now, (entry) => {
+    if (controlled(entry.policyState?.ownerSessionId ?? entry.id)) {
+      hasRunnerTargets = true
+      return undefined
+    }
+    shared.persistence.removed(entry.id)
+    return 'invalid'
+  })
+  if (!hasRunnerTargets) shared.persistence.clear()
+}
+
 // Kept on globalThis rather than in a module variable, so a plugin reload that
 // imports this module again still finds the sessions the previous copy
 // tracked. The version suffix keeps a future, differently shaped entry apart.
@@ -178,6 +202,8 @@ function createSharedCacheKeep(
     loadStorage: async () => {
       const lease = newestLease()
       const storage = lease ? await lease.loadStorage() : null
+      if (lease && !isCacheKeepHybridActive(storage))
+        await discardLocalTargets(shared, options.now?.() ?? Date.now())
       return storage
     },
     now: options.now,
@@ -196,6 +222,7 @@ function createSharedCacheKeep(
     clearTimeoutImpl: options.clearTimeoutImpl,
     reserveWarm: (target) => shared.persistence.reserveWarm(target),
     deferWarmReservation: true,
+    responseTtlMs: (response) => warmResponseLifetimes.get(response),
     onTargetChanged: (target) => shared.persistence.changed(target),
     onTargetRemoved: (id) => {
       restored.delete(id)
@@ -297,6 +324,14 @@ function createSharedCacheKeep(
         await shared.persistence.load(now, (entry) => {
           // Disposal may race startup. Leave the file for the next live lease.
           if (!leases.size || manager.trackedRequest(entry.id)) return undefined
+          if (
+            !isCacheKeepHybridActive(snapshot.policyStorage) &&
+            readSessionCachePolicy(
+              entry.policyState?.ownerSessionId ?? entry.id,
+              true,
+            )?.keep_warm === undefined
+          )
+            return 'invalid'
           const account = snapshot.accounts.find(
             (row) => accountKey(row) === entry.oauthAccountIdentity,
           )
@@ -445,6 +480,7 @@ export function createNativeCacheKeep(
     const refuse = (reason: NativeAccountRefusalReason) => {
       throw new NativeAccountRefusal(reason)
     }
+    let actualWarmTtl = requestCacheLifetimeMs(warmBodyText)
     const native = createNativeAnthropicAdapter({
       source: {
         ...source,
@@ -452,6 +488,9 @@ export function createNativeCacheKeep(
         // chain or replace its live CacheKeep target. Successful prewarms only
         // update the target session's last cache refresh time below.
         onRequestPrepared: undefined,
+        onFinalRequestPrepared: ({ ttlMs }) => {
+          actualWarmTtl = ttlMs
+        },
         responseOptions: undefined,
         async requestOptions(input) {
           const policy = await source.requestOptions?.(input, refuse)
@@ -589,8 +628,10 @@ export function createNativeCacheKeep(
       if (!request) throw new Error('CacheKeep rewrite refused')
       // Authorization must not reshape a captured planned prefix using
       // today's host defaults. The manager has already prepared the replay.
-      if (target.policyState?.planned)
+      if (target.policyState?.planned) {
         request = new Request(request, { body: warmBodyText })
+        actualWarmTtl = requestCacheLifetimeMs(warmBodyText)
+      }
       signal.throwIfAborted()
       await manager.reserveWarmDispatch(target)
       signal.throwIfAborted()
@@ -630,10 +671,15 @@ export function createNativeCacheKeep(
           target.id,
           accountId,
           options.now?.() ?? Date.now(),
-          requestCacheLifetimeMs(warmBodyText),
+          actualWarmTtl,
         )
       complete = true
-      return new Response(bytes, { status, headers: response.headers })
+      const completed = new Response(bytes, {
+        status,
+        headers: response.headers,
+      })
+      warmResponseLifetimes.set(completed, actualWarmTtl)
+      return completed
     } catch (error) {
       if (error instanceof CacheKeepWarmRefusal) throw error
       const refusal = nativeAccountRefusal(error)
@@ -700,6 +746,10 @@ export function createNativeCacheKeep(
       const snapshot = await runtime.read()
       if (lease.stopped) return skipped('lease-stopped')
       const policy = readSessionCachePolicy(input.sessionID, true)
+      if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
+        await discardLocalTargets(owner, options.now?.() ?? Date.now())
+        if (policy?.keep_warm === undefined) return skipped('hybrid-inactive')
+      }
       let isSubagent = false
       try {
         isSubagent = (await options.isSubagent?.(input.sessionID)) ?? false
@@ -741,10 +791,19 @@ export function createNativeCacheKeep(
         oauthAccountId: input.accountId,
         oauthAccountIdentity: accountKey(account),
         isSubagent,
-        ttlMs: requestCacheLifetimeMs(input.bodyText),
+        ttlMs:
+          requestCacheLifetimeMs(input.bodyText) ||
+          (readSessionCachePolicy(input.sessionID, true)?.ttl !== undefined
+            ? 0
+            : undefined),
       }
     },
-    onResponseHeaders(input: { attemptId: string; status: number }) {
+    onResponseHeaders(input: {
+      attemptId: string
+      status: number
+      acceptedAt?: number
+      ttlMs?: number
+    }) {
       const target = discardAttempt(input.attemptId)
       if (
         !lease.stopped &&
@@ -752,7 +811,13 @@ export function createNativeCacheKeep(
         input.status < 300 &&
         target
       ) {
-        const result = manager.track(target)
+        const result = manager.track({
+          ...target,
+          ...(input.acceptedAt !== undefined && {
+            acceptedAt: input.acceptedAt,
+          }),
+          ...(input.ttlMs !== undefined && { ttlMs: input.ttlMs }),
+        })
         if (result.tracked)
           registry
             .publish(manager.registrySessions?.() ?? manager.trackedSessions())
@@ -764,6 +829,13 @@ export function createNativeCacheKeep(
     },
     discardAttempt(attemptId: string) {
       discardAttempt(attemptId)
+    },
+    recordAcceptedUsage(
+      sessionID: string,
+      bodyText: string,
+      usage: Parameters<CacheKeepManager['recordAcceptedUsage']>[2],
+    ) {
+      manager.recordAcceptedUsage(sessionID, bodyText, usage)
     },
     forgetSession(sessionID: string) {
       manager.untrack(sessionID)

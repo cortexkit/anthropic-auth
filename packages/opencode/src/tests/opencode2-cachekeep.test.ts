@@ -17,6 +17,7 @@ import {
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   CACHE_KEEP_PREWARM_LEAD_MS,
   CACHE_KEEP_TTL_MS,
+  CacheKeepManager,
   CacheKeepSessionRegistry,
   createNativeAccountRuntime,
   createNativePoolStore,
@@ -39,6 +40,7 @@ import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import * as wireTransform from '../transform'
 import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptData,
@@ -185,6 +187,7 @@ async function fixture(
   vaultMode = false,
   unsafePersistence = false,
   trace?: ReturnType<typeof cacheKeepFailureTrace>,
+  identity = '11111111-2222-4333-8444-555555555555',
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -215,7 +218,6 @@ async function fixture(
     quota: nativeQuotaCodec,
     ...(trace && { onLockEvent: trace.lock }),
   })
-  const identity = '11111111-2222-4333-8444-555555555555'
   for (const id of ['first', 'second']) {
     await store.add({
       id,
@@ -1834,4 +1836,217 @@ test('planned short warms override local off and child opt-out while preserving 
     ttlMs: 300_000,
     lastTouchKind: 'warm',
   })
+})
+
+test('OC2 accepted OAuth reports the final no-cache body even with warming refused', async () => {
+  const f = await fixture()
+  const usage = spyOn(CacheKeepManager.prototype, 'recordAcceptedUsage')
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  const reports: Array<Record<string, unknown>> = []
+  globals[key] = () => ({
+    cache: () => ({ ttl: 'none', keep_warm: 'off' }),
+    report: (payload: Record<string, unknown>) => {
+      if (
+        payload.kind === 'cache_touch' ||
+        payload.kind === 'cache_warm_stopped'
+      )
+        reports.push(payload)
+    },
+  })
+  try {
+    const draft = await f.prepare()
+    expect(await draft.request.clone().text()).not.toContain('cache_control')
+    const before = Date.now()
+    const response = await f.respond(
+      draft,
+      Response.json({ usage: { cache_read_input_tokens: 12 } }),
+      false,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports).toEqual([
+      {
+        kind: 'cache_touch',
+        at: expect.any(Number),
+        ttl_ms: 0,
+        source: 'response',
+      },
+    ])
+    expect(reports[0]!.at as number).toBeGreaterThanOrEqual(before)
+    expect(reports[0]!.at as number).toBeLessThanOrEqual(Date.now())
+    expect(f.sent).toEqual([])
+    await response.text()
+    expect(usage).toHaveBeenCalledWith('ses_oc2_keep', expect.any(String), {
+      cache_read_input_tokens: 12,
+    })
+  } finally {
+    usage.mockRestore()
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  }
+})
+
+test('OC2 recovered 400 to 200 reports exactly once with the recovered applied lifetime', async () => {
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    '11111111-2222-4333-8444-555555555551',
+  )
+  const routingKey = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const originalRouting = globals[routingKey]
+  const originalFetch = globalThis.fetch
+  const reports: Record<string, unknown>[] = []
+  const resent: Request[] = []
+  globals[routingKey] = () => ({
+    cache: () => ({ ttl: 'short', keep_warm: 'always' }),
+    report: (payload: Record<string, unknown>) => {
+      if (
+        payload.kind === 'cache_touch' ||
+        payload.kind === 'cache_warm_stopped'
+      )
+        reports.push(payload)
+    },
+  })
+  globalThis.fetch = (async (
+    url: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    resent.push(new Request(url as Request, init))
+    return Response.json(
+      { content: [], usage: { cache_read_input_tokens: 12 } },
+      { headers: { 'request-id': 'req_recovered_cache' } },
+    )
+  }) as unknown as typeof fetch
+  try {
+    const draft = await f.prepare()
+    expect(JSON.parse(await draft.request.clone().text()).thread).toEqual({
+      type: 'create',
+    })
+    const before = Date.now()
+    const response = await f.respond(
+      draft,
+      Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            details: { error_code: 'thread_unsupported_request' },
+          },
+        },
+        { status: 400 },
+      ),
+    )
+    expect(response.status).toBe(200)
+    expect(resent).toHaveLength(1)
+    expect(await resent[0]!.clone().text()).toContain(
+      '"cache_control":{"type":"ephemeral"}',
+    )
+    expect(await resent[0]!.clone().text()).not.toContain('"ttl":"1h"')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports).toEqual([
+      {
+        kind: 'cache_touch',
+        at: expect.any(Number),
+        ttl_ms: 300_000,
+        source: 'response',
+      },
+    ])
+    expect(reports[0]!.at as number).toBeGreaterThanOrEqual(before)
+  } finally {
+    globalThis.fetch = originalFetch
+    if (originalRouting === undefined) delete globals[routingKey]
+    else globals[routingKey] = originalRouting
+  }
+})
+
+test('OC2 aborted recovery reports nothing', async () => {
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    '11111111-2222-4333-8444-555555555552',
+  )
+  const routingKey = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const originalRouting = globals[routingKey]
+  const originalFetch = globalThis.fetch
+  const reports: unknown[] = []
+  const abort = new AbortController()
+  let sends = 0
+  globals[routingKey] = () => ({
+    cache: () => ({ ttl: 'short', keep_warm: 'always' }),
+    report: (payload: Record<string, unknown>) => {
+      if (
+        payload.kind === 'cache_touch' ||
+        payload.kind === 'cache_warm_stopped'
+      )
+        reports.push(payload)
+    },
+  })
+  globalThis.fetch = (async () => {
+    sends++
+    abort.abort()
+    return Response.json({
+      content: [],
+      usage: { cache_read_input_tokens: 12 },
+    })
+  }) as unknown as typeof fetch
+  try {
+    const draft = await f.prepare(undefined, {}, 'ses_oc2_keep', abort.signal)
+    await f
+      .respond(
+        draft,
+        Response.json(
+          {
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              details: { error_code: 'thread_unsupported_request' },
+            },
+          },
+          { status: 400 },
+        ),
+      )
+      .catch((error) => expect(error.name).toBe('AbortError'))
+    expect(sends).toBe(1)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports).toEqual([])
+  } finally {
+    globalThis.fetch = originalFetch
+    if (originalRouting === undefined) delete globals[routingKey]
+    else globals[routingKey] = originalRouting
+  }
+})
+
+test('OC2 ordinary acceptance captures the byte-identical pre-thread snapshot before returning', async () => {
+  const f = await fixture()
+  const originalRewrite = wireTransform.rewriteRequestBody
+  let captured: string | undefined
+  const rewrite = spyOn(wireTransform, 'rewriteRequestBody').mockImplementation(
+    async (...args) => {
+      captured = await originalRewrite(...args)
+      return captured
+    },
+  )
+  const track = spyOn(CacheKeepManager.prototype, 'track')
+  try {
+    const draft = await f.prepare()
+    expect(captured).toBeDefined()
+    expect(JSON.parse(captured!).thread).toBeUndefined()
+    await f.respond(draft, Response.json({ content: [], usage: {} }), false)
+    expect(track).toHaveBeenCalledTimes(1)
+    expect(track.mock.calls[0]![0].bodyText).toBe(captured!)
+  } finally {
+    rewrite.mockRestore()
+    track.mockRestore()
+  }
 })

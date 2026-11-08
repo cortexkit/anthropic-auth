@@ -34,7 +34,9 @@ import {
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   readNativeAccountsForRequest,
+  readSessionCachePolicy,
   remapModelId,
+  reportSessionCacheTouch,
   requestCacheLifetimeMs,
   requestSignal,
   StickyQuotaRetryCounter,
@@ -219,6 +221,20 @@ export interface NativeSourceOptions {
     input: NativeAnthropicResponseContext<NativeSourceProvenance>,
   ) => void
   readonly onAttemptEnd?: NativeSource['onAttemptEnd']
+  readonly onCacheUsage?: (
+    sessionID: string,
+    bodyText: string,
+    usage: {
+      input_tokens?: number
+      cache_creation_input_tokens?: number
+      cache_read_input_tokens?: number
+    },
+  ) => void
+  readonly onCacheResponse?: (input: {
+    attemptId: string
+    acceptedAt?: number
+    ttlMs?: number
+  }) => void
   readonly fetch?: typeof fetch
   /** Resolve a host model alias to the upstream ID before request-local policy. */
   readonly resolveModelId?: (scope: RequestScope) => Promise<string>
@@ -298,7 +314,19 @@ export function createNativeAnthropicSource(
       accountId: string
       signal?: AbortSignal
       cacheTtlMs: number
+      ttlOverridden: boolean
+      bodyText: string
+      accepted?: boolean
+      finalWire?: { ttlMs: number }
+      usage?: Record<string, number>
+      sessionSignal?: AbortSignal
+      ended?: boolean
+      handedOff?: boolean
     }
+  >()
+  const wireRequests = new Map<
+    string,
+    { attemptId: string; sessionID: string }
   >()
   const retries = new Map<string, Retry>()
   const refusalHeaders = new Map<
@@ -1114,12 +1142,21 @@ export function createNativeAnthropicSource(
     },
     isDumpEnabled: () => readDumpEnabled(),
     onRequestPrepared: (input) => {
-      if (input.route === 'oauth' && !input.signal?.aborted) {
+      if (
+        input.route === 'oauth' &&
+        input.agent !== 'prime' &&
+        input.agent !== 'cachekeep' &&
+        !input.signal?.aborted
+      ) {
         cacheAttempts.set(input.attemptId, {
           sessionID: input.sessionID,
           accountId: input.accountId,
           signal: input.signal,
           cacheTtlMs: requestCacheLifetimeMs(input.bodyText),
+          ttlOverridden:
+            readSessionCachePolicy(input.sessionID, true)?.ttl !== undefined,
+          bodyText: input.bodyText,
+          sessionSignal: states.get(input.provenance)?.active.signal,
         })
         if (cacheAttempts.size > 4096) {
           const oldest = cacheAttempts.keys().next().value
@@ -1128,17 +1165,115 @@ export function createNativeAnthropicSource(
       }
       return options.onRequestPrepared?.(input)
     },
+    onFinalRequestPrepared(input) {
+      const cached = cacheAttempts.get(input.attemptId)
+      if (!cached) return
+      if (input.requestId) {
+        wireRequests.set(input.requestId, {
+          attemptId: input.attemptId,
+          sessionID: cached.sessionID,
+        })
+        if (wireRequests.size > 4096) {
+          const oldest = wireRequests.keys().next().value
+          if (oldest !== undefined) wireRequests.delete(oldest)
+        }
+      }
+      cached.finalWire = { ttlMs: input.ttlMs }
+    },
+    onResponseHandedToHost(request, accepted) {
+      const requestId = request.headers.get('x-client-request-id')
+      if (!requestId) return
+      const wire = wireRequests.get(requestId)
+      if (!wire) return
+      const { attemptId } = wire
+      wireRequests.delete(requestId)
+      const cached = cacheAttempts.get(attemptId)
+      if (!cached) return
+      cached.handedOff = true
+      cached.accepted = Boolean(
+        accepted &&
+          cached.finalWire &&
+          !cached.signal?.aborted &&
+          !cached.sessionSignal?.aborted,
+      )
+      options.onCacheResponse?.({
+        attemptId,
+        ...(cached.accepted && accepted && { acceptedAt: accepted.at }),
+        ttlMs:
+          cached.finalWire?.ttlMs === 0 && !cached.ttlOverridden
+            ? undefined
+            : cached.finalWire?.ttlMs,
+      })
+      if (cached.accepted && accepted && cached.finalWire) {
+        sessionCacheActivity.record(
+          cached.sessionID,
+          cached.accountId,
+          cached.finalWire.ttlMs === 0 && !cached.ttlOverridden
+            ? undefined
+            : cached.finalWire.ttlMs,
+          accepted.at,
+        )
+        if (cached.usage)
+          options.onCacheUsage?.(
+            cached.sessionID,
+            cached.bodyText,
+            cached.usage,
+          )
+        reportSessionCacheTouch(cached.sessionID, {
+          at: accepted.at,
+          ttlMs: cached.finalWire.ttlMs,
+          source: 'response',
+        })
+      }
+      if (cached.ended) cacheAttempts.delete(attemptId)
+    },
     responseOptions(input) {
-      return options.responseOptions?.({
+      const cached = cacheAttempts.get(input.attemptId)
+      const active = states.get(input.provenance)?.active.signal
+      if (cached && active) cached.sessionSignal = active
+      const configured = options.responseOptions?.({
         ...input,
         modelID: states.get(input.provenance)?.scope.modelID ?? input.modelID,
       })
+      const usage = (message: unknown) => {
+        if (
+          !cached ||
+          cached.signal?.aborted ||
+          cached.sessionSignal?.aborted ||
+          !message ||
+          typeof message !== 'object'
+        )
+          return
+        const value = (message as { usage?: unknown }).usage
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return
+        cached.usage = { ...cached.usage, ...value }
+        if (cached.accepted)
+          options.onCacheUsage?.(
+            cached.sessionID,
+            cached.bodyText,
+            cached.usage,
+          )
+      }
+      return {
+        ...configured,
+        onMessageStart: (message) => {
+          configured?.onMessageStart?.(message)
+          usage(message)
+        },
+        onMessageResponse: (message) => {
+          configured?.onMessageResponse?.(message)
+          usage(message)
+        },
+        onMessageDelta: (delta) => {
+          configured?.onMessageDelta?.(delta)
+          usage(delta)
+        },
+      }
     },
     quotaFromHeaders(headers, input) {
       options.onResponseHeaders?.(input)
       const state = states.get(input.provenance)
       const cacheAttempt = cacheAttempts.get(input.attemptId)
-      cacheAttempts.delete(input.attemptId)
       if (state) {
         if (
           input.route === 'oauth' &&
@@ -1149,10 +1284,16 @@ export function createNativeAnthropicSource(
           cacheAttempt.accountId === input.accountId &&
           !cacheAttempt.signal?.aborted
         )
+          // Without a TTL override, unmarked local requests keep their legacy
+          // five-minute sticky-account hold before quota routing may switch the
+          // session to another account. Runner reports use the actual wire TTL.
           sessionCacheActivity.record(
             input.sessionID,
             input.accountId,
-            cacheAttempt.cacheTtlMs,
+            (cacheAttempt.finalWire?.ttlMs ?? cacheAttempt.cacheTtlMs) === 0 &&
+              !cacheAttempt.ttlOverridden
+              ? undefined
+              : (cacheAttempt.finalWire?.ttlMs ?? cacheAttempt.cacheTtlMs),
           )
         const refusalKey = key(
           { ...input, modelID: state.scope.modelID },
@@ -1380,7 +1521,10 @@ export function createNativeAnthropicSource(
       return undefined
     },
     async onAttemptEnd(input, outcome) {
-      cacheAttempts.delete(input.attemptId)
+      const cached = cacheAttempts.get(input.attemptId)
+      if (cached) cached.ended = true
+      if (cached?.handedOff || outcome.status === undefined)
+        cacheAttempts.delete(input.attemptId)
       await options.onAttemptEnd?.(input, outcome)
       const state = states.get(input.provenance)
       if (!state) return
@@ -1410,6 +1554,8 @@ export function createNativeAnthropicSource(
       turnIds.delete(sessionID)
     },
     forgetSession(sessionID) {
+      for (const [requestId, wire] of wireRequests)
+        if (wire.sessionID === sessionID) wireRequests.delete(requestId)
       source.forgetTurn?.(sessionID)
       for (const [attemptId, attempt] of cacheAttempts)
         if (attempt.sessionID === sessionID) cacheAttempts.delete(attemptId)
@@ -1457,6 +1603,8 @@ export function createNativeAnthropicSource(
         ...[...routers.values()].map((router) => router.drain()),
       ]).then(() => {}),
     close() {
+      wireRequests.clear()
+      cacheAttempts.clear()
       closed = true
       for (const active of sessions.values()) active.abort()
       sessions.clear()
