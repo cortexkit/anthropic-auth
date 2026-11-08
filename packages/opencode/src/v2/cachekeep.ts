@@ -525,8 +525,9 @@ export function createNativeCacheKeep(
     const latestLease = () => [...owner.leases.values()].at(-1)
     const active = latestLease()
     const storage = await active?.loadStorage()
-    // Parent facts may outlive a capture, a settings change, or their sender.
-    // Only the same capture under the newest live lease can be retired here.
+    // A session-parent lookup can finish after the tracked policy state, the
+    // settings or the lease have changed. Retire the target only if that same
+    // policy state is still current under the newest live lease.
     if (!current() || !active || latestLease() !== active) return
     if (
       storage &&

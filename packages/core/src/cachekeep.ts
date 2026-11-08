@@ -912,7 +912,10 @@ export class CacheKeepManager {
     return current !== undefined && current.policyState === target.policyState
   }
 
-  /** A capture's state identity survives warm updates, not a new real request. */
+  /**
+   * The tracked policy state keeps the same object identity across warm
+   * updates; each newly accepted real request gets a new one.
+   */
   trackedPolicyState(id: string): Readonly<CacheKeepPolicyState> | undefined {
     return this.targets.get(id)?.policyState
   }
