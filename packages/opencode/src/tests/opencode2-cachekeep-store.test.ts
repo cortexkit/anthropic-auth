@@ -268,3 +268,102 @@ test('a nonempty data store wins over old temp restart records', async () => {
   expect(ids).toEqual([f.target.id])
   expect(await readdir(legacy)).toEqual(['unreadable.json.gz'])
 })
+
+test('warm reservations bypass coalescing and cannot be overwritten by an older queued count', async () => {
+  const f = await fixture()
+  f.target.policyState = {
+    ownerSessionId: f.target.id,
+    planned: true,
+    lastRealRequestAt: Date.now(),
+    warmsSinceLastRealRequest: 22,
+    warmCostSoFar: 0.01,
+    prefixTokens: 1000,
+    inputTokens: 1100,
+    hasWarmed: true,
+  }
+  f.store.changed(f.target)
+  f.target.policyState.warmsSinceLastRealRequest = 23
+  expect(await f.store.reserveWarm(f.target)).toBe(true)
+  expect((await f.saved()).policyState.warmsSinceLastRealRequest).toBe(23)
+  await f.store.drain()
+  expect((await f.saved()).policyState).toMatchObject({
+    warmsSinceLastRealRequest: 23,
+    prefixTokens: 1000,
+    hasWarmed: true,
+  })
+  const replacement = new CacheKeepStore(
+    { storageId: 'store', root: f.root },
+    f.store,
+  )
+  const counts: number[] = []
+  await replacement.load(Date.now(), (entry) => {
+    counts.push(entry.policyState!.warmsSinceLastRealRequest)
+    return true
+  })
+  expect(counts).toEqual([23])
+})
+
+test.each([
+  'warmsSinceLastRealRequest',
+  'warmCostSoFar',
+  'lastRealRequestAt',
+] as const)(
+  'invalid restart policy state %s is not replayed',
+  async (field) => {
+    const f = await fixture()
+    f.target.policyState = {
+      ownerSessionId: f.target.id,
+      planned: true,
+      lastRealRequestAt: Date.now(),
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      hasWarmed: false,
+    }
+    f.target.policyState[field] =
+      field === 'lastRealRequestAt' ? Date.now() + 60_000 : -1
+    f.store.changed(f.target)
+    await f.store.drain()
+    let restored = 0
+    await f.store.load(Date.now(), () => {
+      restored++
+      return true
+    })
+    expect(restored).toBe(0)
+    expect(await readdir(f.store.directory)).toEqual([])
+  },
+)
+
+test('a transient private reservation write failure does not turn enabled persistence into memory-only mode', async () => {
+  let failWrites = false
+  const privateFiles = {
+    verifySafeParent: async () => ({ ok: true }),
+    verifyOwnerOnly: async () => ({ ok: true }),
+    readPrivateFile: readFile,
+    createPrivateDirectory: async (path: string) => {
+      await mkdir(path, { mode: 0o700 })
+    },
+    createPrivateFile: async (path: string, bytes: Uint8Array) => {
+      if (failWrites) throw new Error('synthetic write failure')
+      await writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
+    },
+  } as unknown as OwnerOnlyOptions['privateFiles']
+  const f = await fixture({ platform: 'win32', privateFiles })
+  f.target.policyState = {
+    ownerSessionId: f.target.id,
+    planned: true,
+    lastRealRequestAt: Date.now(),
+    warmsSinceLastRealRequest: 0,
+    warmCostSoFar: 0,
+    hasWarmed: false,
+  }
+  f.store.changed(f.target)
+  await f.store.drain()
+  failWrites = true
+  f.target.policyState.warmsSinceLastRealRequest = 1
+  expect(await f.store.reserveWarm(f.target)).toBe(false)
+  expect((await f.saved()).policyState.warmsSinceLastRealRequest).toBe(0)
+  failWrites = false
+  f.target.policyState.warmsSinceLastRealRequest = 2
+  expect(await f.store.reserveWarm(f.target)).toBe(true)
+  expect((await f.saved()).policyState.warmsSinceLastRealRequest).toBe(2)
+})

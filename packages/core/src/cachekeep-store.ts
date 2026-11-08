@@ -66,6 +66,7 @@ export type SavedCacheKeepTarget = Pick<
   | 'ttlMs'
   | 'lastTouchAt'
   | 'lastTouchKind'
+  | 'policyState'
 > & { v: typeof RECORD_FORMAT_VERSION; pluginVersion: string }
 
 type DropReason =
@@ -104,6 +105,20 @@ function record(
     ttlMs: target.ttlMs,
     lastTouchAt: target.lastTouchAt,
     lastTouchKind: target.lastTouchKind,
+    ...(target.policyState && {
+      policyState: {
+        ownerSessionId: target.policyState.ownerSessionId,
+        planned: target.policyState.planned,
+        lastRealRequestAt: target.policyState.lastRealRequestAt,
+        lastWarmAt: target.policyState.lastWarmAt,
+        warmsSinceLastRealRequest: target.policyState.warmsSinceLastRealRequest,
+        warmCostSoFar: target.policyState.warmCostSoFar,
+        prefixTokens: target.policyState.prefixTokens,
+        inputTokens: target.policyState.inputTokens,
+        hasWarmed: target.policyState.hasWarmed,
+        needsRealRequest: target.policyState.needsRealRequest,
+      },
+    }),
   }
 }
 
@@ -151,6 +166,32 @@ function invalidReason(
   )
     return 'invalid'
   if (value.cacheExpiresAt <= now) return 'expired'
+  const state = value.policyState
+  if (
+    state !== undefined &&
+    (!state ||
+      typeof state !== 'object' ||
+      Array.isArray(state) ||
+      typeof state.ownerSessionId !== 'string' ||
+      !state.ownerSessionId ||
+      typeof state.planned !== 'boolean' ||
+      typeof state.hasWarmed !== 'boolean' ||
+      (state.needsRealRequest !== undefined &&
+        typeof state.needsRealRequest !== 'boolean') ||
+      !Number.isFinite(state.lastRealRequestAt) ||
+      state.lastRealRequestAt > now ||
+      (state.lastWarmAt !== undefined &&
+        (!Number.isFinite(state.lastWarmAt) || state.lastWarmAt > now)) ||
+      !Number.isSafeInteger(state.warmsSinceLastRealRequest) ||
+      state.warmsSinceLastRealRequest < 0 ||
+      !Number.isFinite(state.warmCostSoFar) ||
+      state.warmCostSoFar < 0 ||
+      [state.prefixTokens, state.inputTokens].some(
+        (tokens) =>
+          tokens !== undefined && (!Number.isFinite(tokens) || tokens < 0),
+      ))
+  )
+    return 'invalid'
   // Malformed bodies and credential-bearing records are not replayable.
   if (sanitizedBody(value.bodyText) !== value.bodyText) return 'invalid'
 }
@@ -174,6 +215,9 @@ export interface CacheKeepStoreOptions {
 export class CacheKeepStore {
   readonly directory: string
   private disabled = false
+  private memoryOnly = false
+  private persistenceEnabled = false
+  private writeWarning = false
   private legacyLoadAttempted = false
   private chain: Promise<void> = Promise.resolve()
   private readonly pending = new Map<string, SavedCacheKeepTarget>()
@@ -195,9 +239,10 @@ export class CacheKeepStore {
     this.chain = previous?.drain() ?? Promise.resolve()
   }
 
-  private refuse() {
+  private refuse(memoryOnly = false) {
     if (this.disabled) return
     this.disabled = true
+    this.memoryOnly = memoryOnly
     for (const timer of this.timers.values())
       (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
     this.timers.clear()
@@ -207,6 +252,15 @@ export class CacheKeepStore {
     logger.warn(
       'cachekeep',
       'restart storage unavailable; retaining sessions in memory only',
+    )
+  }
+
+  private writeFailed() {
+    if (this.writeWarning) return
+    this.writeWarning = true
+    logger.warn(
+      'cachekeep',
+      'restart write failed; persistent warm awaits a durable reservation',
     )
   }
 
@@ -237,9 +291,11 @@ export class CacheKeepStore {
         ))
       )
         throw new Error('Unsafe restart directory')
+      this.persistenceEnabled = true
       return true
     } catch {
-      this.refuse()
+      if (!this.persistenceEnabled) this.refuse(true)
+      else this.writeFailed()
       return false
     }
   }
@@ -249,7 +305,7 @@ export class CacheKeepStore {
       .then(async () => {
         if (await this.directoryReady()) await action()
       })
-      .catch(() => this.refuse())
+      .catch(() => this.writeFailed())
   }
 
   // An undefined acceptance leaves the record untouched without counting a
@@ -388,6 +444,8 @@ export class CacheKeepStore {
       previous.ttlMs === entry.ttlMs &&
       previous.lastTouchAt === entry.lastTouchAt &&
       previous.lastTouchKind === entry.lastTouchKind &&
+      JSON.stringify(previous.policyState) ===
+        JSON.stringify(entry.policyState) &&
       previous.isSubagent === entry.isSubagent
     )
       return
@@ -421,6 +479,33 @@ export class CacheKeepStore {
     this.lastWrite.set(id, this.options.now?.() ?? Date.now())
     this.enqueue(() => this.writeEntry(entry))
     return this.chain
+  }
+
+  /**
+   * Bypass coalescing before a persisted replay can dispatch. An initially
+   * unsafe folder disables both writes and restores for this process, so its
+   * targets use memory-only bounds. A write failure in an enabled store must
+   * pause that warm and retry: an older low-count record could still resume.
+   */
+  async reserveWarm(target: Readonly<CacheKeepTarget>): Promise<boolean> {
+    if (this.disabled) return this.memoryOnly
+    const entry = record(target, this.options.pluginVersion)
+    const timer = this.timers.get(entry.id)
+    if (timer) (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
+    this.timers.delete(entry.id)
+    this.pending.delete(entry.id)
+    this.latest.set(entry.id, entry)
+    this.lastWrite.set(entry.id, this.options.now?.() ?? Date.now())
+    let committed = false
+    this.chain = this.chain
+      .then(async () => {
+        if (!(await this.directoryReady())) return
+        await this.writeEntry(entry)
+        committed = true
+      })
+      .catch(() => this.writeFailed())
+    await this.chain
+    return committed || this.memoryOnly
   }
 
   private async writeEntry(entry: SavedCacheKeepTarget) {
