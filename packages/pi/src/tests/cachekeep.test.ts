@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   type CacheKeepManager,
   cacheKeepStoreDirectory,
@@ -157,6 +158,73 @@ test('a fresh Pi process restores its idle session and warms without a request',
   expect(f.delays).toHaveLength(1)
   expect(f.delays[0]).toBeGreaterThanOrEqual(1000)
   expect(f.delays[0]).toBeLessThan(3000)
+})
+
+test('Pi restores a 2.6 record without policyState and durably caps its new count', async () => {
+  const f = await fixture()
+  const first = f.create()
+  await first.process.trackAccepted(f.input('legacy-pi'), f.snapshot)
+  await first.process.stop()
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const [name] = (await readdir(directory)).filter((name) =>
+    name.endsWith('.gz'),
+  )
+  const path = join(directory, name!)
+  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+  expect(saved.policyState).toBeDefined()
+  saved.pluginVersion = '2.6.0'
+  delete saved.policyState
+  await writeFile(path, gzipSync(JSON.stringify(saved)))
+  f.advance(60_000)
+  const reserved: number[] = []
+  const resumed = f.create(undefined, async () => {
+    const persisted = JSON.parse(gunzipSync(await readFile(path)).toString())
+    reserved.push(persisted.policyState.warmsSinceLastRealRequest)
+    return Response.json({})
+  })
+  await resumed.process.startSession('pi-storage', 'legacy-pi')
+  expect(resumed.process.manager.trackedPolicyState('legacy-pi')).toMatchObject(
+    {
+      planned: false,
+      lastRealRequestAt: saved.lastTouchAt,
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      hasWarmed: false,
+    },
+  )
+  for (let count = 1; count <= 25; count++) {
+    f.advance(55 * 60_000)
+    await resumed.tick()
+    expect(f.sends).toHaveLength(Math.min(count, 24))
+  }
+  expect(reserved).toEqual(Array.from({ length: 24 }, (_, i) => i + 1))
+  expect(f.sends[0]?.body.system).toEqual(JSON.parse(saved.bodyText).system)
+  expect(resumed.process.manager.trackedCount()).toBe(0)
+})
+
+test('Pi still drops a restart record requiring a real request', async () => {
+  const f = await fixture()
+  const first = f.create()
+  await first.process.trackAccepted(f.input('stopped-pi'), f.snapshot)
+  await first.process.stop()
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const [name] = (await readdir(directory)).filter((name) =>
+    name.endsWith('.gz'),
+  )
+  const path = join(directory, name!)
+  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+  saved.policyState.needsRealRequest = true
+  saved.policyState.warmsSinceLastRealRequest = 24
+  await writeFile(path, gzipSync(JSON.stringify(saved)))
+  const resumed = f.create()
+  await resumed.process.startSession('pi-storage', 'stopped-pi')
+  expect(resumed.process.manager.trackedCount()).toBe(0)
+  expect(
+    (await readdir(directory)).filter((name) => name.endsWith('.gz')),
+  ).toEqual([])
+  f.advance(55 * 60_000)
+  await resumed.tick()
+  expect(f.sends).toEqual([])
 })
 
 test('two live Pi processes cannot restore or track the same session', async () => {

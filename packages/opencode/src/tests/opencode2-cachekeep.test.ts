@@ -1417,6 +1417,80 @@ test('OpenCode 2 restores and prewarms a live format-1 record from another plugi
   expect(warm.max_tokens).toBe(0)
 })
 
+test('OpenCode 2 restores a 2.6 record without policyState and durably caps its new count', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture(false, false, 'debug')
+  const live = (await (await f.live()).json()) as Record<string, any>
+  await f.dispose()
+  const [name] = await readdir(f.disk)
+  const path = join(f.disk, name!)
+  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+  expect(saved.policyState).toBeDefined()
+  saved.pluginVersion = '2.6.0'
+  delete saved.policyState
+  await writeFile(path, gzipSync(JSON.stringify(saved)))
+  forgetCacheKeepProcess(f.paths.storageId)
+  f.advance(60_000)
+  lines.length = 0
+  const next = await f.start()
+  expect(
+    lines.find((line) => line.includes('restart records loaded')),
+  ).toContain('"restored":1,"dropped":0')
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  expect(owner.manager.trackedPolicyState('ses_oc2_keep')).toMatchObject({
+    planned: false,
+    lastRealRequestAt: saved.lastTouchAt,
+    warmsSinceLastRealRequest: 0,
+    warmCostSoFar: 0,
+    hasWarmed: false,
+  })
+  await owner.persistence.drain()
+  expect(
+    JSON.parse(gunzipSync(await readFile(path)).toString()).policyState
+      .warmsSinceLastRealRequest,
+  ).toBe(0)
+  const reserved: number[] = []
+  next.setSend(async () => {
+    const persisted = JSON.parse(gunzipSync(await readFile(path)).toString())
+    reserved.push(persisted.policyState.warmsSinceLastRealRequest)
+    return Response.json({})
+  })
+  for (let count = 1; count <= 25; count++) {
+    f.due()
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(Math.min(count, 24))
+  }
+  expect(reserved).toEqual(Array.from({ length: 24 }, (_, i) => i + 1))
+  const warm = (await next.sent[0]!.json()) as Record<string, any>
+  expect(warm.messages).toEqual(live.messages)
+  expect(warm.system.slice(1)).toEqual(live.system.slice(1))
+  expect(owner.manager.trackedCount()).toBe(0)
+})
+
+test('OpenCode 2 still drops a restart record requiring a real request', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture(false, false, 'debug')
+  await f.live()
+  await f.dispose()
+  const [name] = await readdir(f.disk)
+  const path = join(f.disk, name!)
+  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+  saved.policyState.needsRealRequest = true
+  saved.policyState.warmsSinceLastRealRequest = 24
+  await writeFile(path, gzipSync(JSON.stringify(saved)))
+  forgetCacheKeepProcess(f.paths.storageId)
+  lines.length = 0
+  const next = await f.start()
+  expect(lines.some((line) => line.includes('"reason":"unsupported"'))).toBe(
+    true,
+  )
+  expect(await readdir(f.disk)).toEqual([])
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toEqual([])
+})
+
 test.each([false, true])(
   'an OpenCode 2 adopted entry writes through the newer store (legacy callbacks: %s)',
   async (legacy) => {

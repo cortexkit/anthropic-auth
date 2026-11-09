@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Addresses #677: on the first OpenCode 2 or Pi start after upgrading to 2.7, keep-warm sessions saved by earlier versions are kept warm instead of dropped; the limit of 24 warms without a real request counts from the restart.
 - A server-fallback boundary is now restored even after a context manager clears its thinking text, instead of being sent to Anthropic as an invalid thinking block.
 ## 2.7.1
 

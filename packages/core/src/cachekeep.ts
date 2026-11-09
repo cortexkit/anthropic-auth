@@ -1283,7 +1283,7 @@ export class CacheKeepManager {
     >
   }): { tracked: true } | { tracked: false; reason: string } {
     const now = this.options.now?.() ?? Date.now()
-    const acceptedAt = input.acceptedAt ?? now
+    const acceptedAt = input.acceptedAt ?? input.retained?.lastTouchAt ?? now
     if (input.retained && input.retained.cacheExpiresAt <= now)
       return { tracked: false, reason: 'cache expired' }
     // Measured only once the policy checks pass: track() runs on every live
@@ -1337,8 +1337,7 @@ export class CacheKeepManager {
     if (
       input.retained &&
       (planned || isCacheKeepAlways(input.storage)) &&
-      (!input.retained.policyState ||
-        input.retained.policyState.needsRealRequest)
+      input.retained.policyState?.needsRealRequest
     )
       return retire('unsupported')
     if (
@@ -1446,6 +1445,9 @@ export class CacheKeepManager {
       oauthAccountIdentity: input.oauthAccountIdentity,
       accountStoragePath: input.accountStoragePath,
       isSubagent: input.isSubagent ?? false,
+      // Every 2.7 writer saves policyState for tracked targets. Its absence means
+      // an older record: start its count here using the same state as a new target.
+      // onTargetChanged and reserveWarm persist that state before the first send.
       policyState: input.retained?.policyState
         ? {
             ...input.retained.policyState,
@@ -1460,8 +1462,9 @@ export class CacheKeepManager {
             lastRealRequestAt: acceptedAt,
             warmsSinceLastRealRequest: 0,
             warmCostSoFar: 0,
-            hasWarmed: previous?.policyState?.hasWarmed ?? false,
-            ...(input.retained && { needsRealRequest: true }),
+            hasWarmed: input.retained
+              ? false
+              : (previous?.policyState?.hasWarmed ?? false),
           },
       ...(input.sourceWarm === true && { sourceWarm: true }),
     })

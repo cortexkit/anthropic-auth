@@ -385,14 +385,26 @@ test.each([
   },
 )
 
-test('old restart metadata cannot reset a planned or local always count', () => {
+test('restart metadata requiring a real request cannot reset a planned or local always count', () => {
   const f = plannedFixture()
   const retained = {
     cacheExpiresAt: f.now + 300_000,
     nextPrewarmAt: f.now + 270_000,
     ttlMs: 300_000,
+    policyState: {
+      ownerSessionId: f.input.sessionId,
+      planned: false,
+      lastRealRequestAt: f.now - 60_000,
+      warmsSinceLastRealRequest: 24,
+      warmCostSoFar: 0,
+      hasWarmed: true,
+      needsRealRequest: true,
+    },
   }
-  expect(f.track({ retained }).tracked).toBe(false)
+  expect(f.track({ retained })).toEqual({
+    tracked: false,
+    reason: 'unsupported',
+  })
   f.setPolicy(null)
   expect(
     f.track({
@@ -403,8 +415,78 @@ test('old restart metadata cannot reset a planned or local always count', () => 
         claudeCache: { enabled: true, mode: 'hybrid' },
         cacheKeep: { enabled: true, always: true },
       },
-    }).tracked,
-  ).toBe(false)
+    }),
+  ).toEqual({ tracked: false, reason: 'unsupported' })
+})
+
+test.each([false, true])(
+  'legacy restore starts a fresh 24-warm count using its last touch (planned=%s)',
+  async (planned) => {
+    const f = plannedFixture({}, { ttl: 'long', keep_warm: 'always' })
+    if (!planned) {
+      f.setPolicy(null)
+      Object.assign(f.input.storage, {
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+      })
+    }
+    const lastTouchAt = f.now - 60_000
+    const interval = planned ? 3_570_000 : 3_300_000
+    expect(
+      f.track({
+        cacheMode: 'hybrid',
+        retained: {
+          cacheExpiresAt: lastTouchAt + 3_600_000,
+          nextPrewarmAt: lastTouchAt + interval,
+          ttlMs: 3_600_000,
+          lastTouchAt,
+          lastTouchKind: 'warm',
+        },
+      }),
+    ).toEqual({ tracked: true })
+    expect(f.target.policyState).toEqual({
+      ownerSessionId: f.input.sessionId,
+      planned,
+      lastRealRequestAt: lastTouchAt,
+      warmsSinceLastRealRequest: 0,
+      warmCostSoFar: 0,
+      hasWarmed: false,
+    })
+    for (let count = 1; count <= 24; count++) {
+      f.advance(count === 1 ? interval - 60_000 : interval)
+      await f.manager.tick()
+      expect(f.sends).toBe(count)
+    }
+    f.advance(interval)
+    await f.manager.tick()
+    expect(f.sends).toBe(24)
+    expect(f.manager.trackedCount()).toBe(0)
+  },
+)
+
+test('legacy planned auto starts with zero admitted cost', async () => {
+  const f = plannedFixture({}, { ttl: 'short', keep_warm: 'auto' })
+  expect(
+    f.track({
+      retained: {
+        cacheExpiresAt: f.now + 240_000,
+        nextPrewarmAt: f.now + 210_000,
+        ttlMs: 300_000,
+        lastTouchAt: f.now - 60_000,
+        lastTouchKind: 'response',
+      },
+    }),
+  ).toEqual({ tracked: true })
+  expect(f.target.policyState?.warmCostSoFar).toBe(0)
+  f.advance(210_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(1)
+  expect(f.target.policyState).toMatchObject({
+    planned: true,
+    warmCostSoFar: 0,
+    warmsSinceLastRealRequest: 1,
+    hasWarmed: true,
+  })
 })
 
 test('source synchronization does not reset a per-target reserved count or lifetime', async () => {
@@ -478,7 +560,7 @@ test('planned timeout is clipped to expiry minus safety and authorization cannot
   }
 })
 
-test('a restored legacy hours target cannot acquire a planned baseline without a real request', async () => {
+test('a restored hours target requiring a real request cannot acquire a planned baseline', async () => {
   const f = plannedFixture()
   f.setPolicy(null)
   const hour = new Date(f.now).getHours()
@@ -492,6 +574,15 @@ test('a restored legacy hours target cannot acquire a planned baseline without a
     cacheExpiresAt: f.now + 300_000,
     nextPrewarmAt: f.now + 270_000,
     ttlMs: 300_000,
+    policyState: {
+      ownerSessionId: f.input.sessionId,
+      planned: false,
+      lastRealRequestAt: f.now - 60_000,
+      warmsSinceLastRealRequest: 24,
+      warmCostSoFar: 0,
+      hasWarmed: true,
+      needsRealRequest: true,
+    },
   }
   expect(f.track({ retained, storage, cacheMode: 'hybrid' }).tracked).toBe(true)
   f.setPolicy({ ttl: 'short', keep_warm: 'always' })
