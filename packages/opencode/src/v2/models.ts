@@ -83,9 +83,11 @@ export function createNativeClaudeModelRules() {
         (model) => !provider.models.has(String(model.id)),
       )
       if (!additions.length) return
-      // Catalogue metadata does not take over requests: stock credentials still
-      // use OpenCode's transport. Only common-auth-placeholder.anthropic
-      // credentials let request hooks select an account from the plugin's pool.
+      // Adding a catalogue row does not take over requests: a stock API key or
+      // OpenCode's own Anthropic login still sends through OpenCode's
+      // transport. Only the plugin's placeholder login (the non-secret
+      // connection the plugin's sign-in methods write) routes requests to this
+      // plugin's accounts.
       editor.models.set('anthropic', [
         ...provider.models.values(),
         ...additions,
