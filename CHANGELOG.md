@@ -2,9 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## 2.8.0
+## Unreleased
 
 - After a plugin reload, the OpenCode TUI's `/claude` menu no longer briefly gets an "unauthorized" error or a dropped connection from the previous plugin instance.
+## 2.8.0
+
 - On OpenCode 2, Claude models the plugin supports but OpenCode's own model list doesn't have yet (such as Fable 5.2 on launch day) now appear in the model picker, as on OpenCode 1.
 - Adds Claude Fable 5.2 (`claude-fable-5-2`) on OpenCode 1, OpenCode 2 and Pi, sent the way Claude Code sends it: adaptive thinking, medium default effort, per-message effort and Anthropic's safety fallback. Fast mode stays off for Fable 5.2 until Anthropic enables it for subscription accounts.
 - Claude subscription requests no longer carry a `service_tier` field a host adds, keeping them in the shape Claude Code sends; API-key requests keep it.
