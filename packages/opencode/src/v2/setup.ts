@@ -502,6 +502,7 @@ export async function setupAnthropicAuth(
   }
   try {
     registrations.push(await wire.install(ctx))
+    registrations.push(await models.installProviderModels(ctx))
     registrations.push(await models.install(ctx))
     registrations.push(
       await registerOpenCode2AuthMethods(

@@ -47,6 +47,7 @@ async function fixture() {
       hook: async () => registration,
     },
     model: { transform: async () => registration },
+    provider: { transform: async () => registration },
     integration: { transform: async () => registration },
     rpc: {
       register: async () => ({

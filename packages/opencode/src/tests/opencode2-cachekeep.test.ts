@@ -325,6 +325,7 @@ async function fixture(
         },
       },
       model: { transform: async () => registration },
+      provider: { transform: async () => registration },
       integration: {
         transform: async () => {
           logger.debug('startup-test', 'registering integration')
