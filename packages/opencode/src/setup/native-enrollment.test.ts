@@ -432,3 +432,39 @@ for (const host of ['opencode', 'pi'] as const) {
     })
   }
 }
+
+for (const [host, name, displayName] of [
+  ['opencode', 'anthropic-auth-opencode', 'Claude sign-in for OpenCode'],
+  ['pi', 'anthropic-auth-pi', 'Claude sign-in for Pi'],
+] as const) {
+  test(`${host} enrollment proposes its fixed person-facing display name`, async () => {
+    await fixture(async (root) => {
+      const proposals: { name: string; displayName?: string }[] = []
+      await enrollNativeVaultForHost(host, {
+        paths: {
+          tokenPath: join(root, 'enrollment.json'),
+          statePath: join(root, 'enrollment-state.json'),
+        },
+        env: {},
+        runner: { run: async () => ({ exitCode: 0, stdout: '', stderr: '' }) },
+        processFence: async () => {},
+        grantPermissions: false,
+        client: {
+          enrollPropose: async (input) => {
+            proposals.push(input)
+            return { requestId: 'named-request' }
+          },
+          enrollPoll: async () => ({
+            status: 'approved',
+            name,
+            token: 'a'.repeat(64),
+            tokenGeneration: 1,
+          }),
+        },
+      })
+      expect(proposals).toHaveLength(1)
+      expect(proposals).toMatchObject([{ name, displayName }])
+      expect(displayName.length).toBeLessThanOrEqual(40)
+    })
+  })
+}

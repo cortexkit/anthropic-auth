@@ -28,6 +28,29 @@ afterEach(async () => {
 })
 
 describe('fake Claustrum daemon', () => {
+  it('accepts a person-facing display_name on an enrollment proposal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-claustrum-'))
+    roots.push(root)
+    const daemon = await startFakeClaustrumDaemon({ directory: root, scopedCredentials: {} })
+    daemons.push(daemon)
+    const client = await SubcClient.connect({
+      connectionFile: daemon.connectionFile,
+      identity: { project_root: root, harness: 'e2e', session: 'fixture-enrollment' },
+    })
+    clients.push(client)
+    const response = await client.call('claustrum', 'auth.enroll_propose', {
+      proposed_name: 'anthropic-auth-opencode',
+      display_name: 'Claude sign-in for OpenCode',
+      request_secret_hash: 'ab'.repeat(32),
+    })
+    expect(response).toEqual({ result: { request_id: 'fake-enrollment-request' } })
+    expect(daemon.enrollmentProposals).toEqual([{
+      proposed_name: 'anthropic-auth-opencode',
+      display_name: 'Claude sign-in for OpenCode',
+      request_secret_hash: 'ab'.repeat(32),
+    }])
+  })
+
   it('serves a credential payload through the Subc wire protocol', async () => {
     const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-claustrum-'))
     roots.push(root)

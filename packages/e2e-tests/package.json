@@ -7,7 +7,7 @@
     "typecheck": "tsc"
   },
   "dependencies": {
-    "@cortexkit/subc-client": "^0.22.10",
+    "@cortexkit/subc-client": "^0.24",
     "@opencode-ai/sdk": "1.19.5"
   }
 }

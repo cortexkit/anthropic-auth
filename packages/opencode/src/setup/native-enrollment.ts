@@ -2,23 +2,26 @@ import { dirname } from 'node:path'
 import {
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
   CLAUSTRUM_PI_ENROLLMENT_NAME,
-  getHostClaustrumEnrollmentPaths,
-  resolveClaustrumConnectionPath,
-} from '@cortexkit/anthropic-auth-core'
-import { writeEnrollmentTokenFile } from '@cortexkit/claustrum-client'
-import {
   type ClaustrumEnrollmentClient,
   ClaustrumEnrollmentManager,
   type ClaustrumEnrollmentPaths,
   connectClaustrumEnrollmentClient,
+  getHostClaustrumEnrollmentPaths,
   readClaustrumEnrollmentStatus,
-} from '@cortexkit/common-auth/claustrum'
+  resolveClaustrumConnectionPath,
+} from '@cortexkit/anthropic-auth-core'
+import { writeEnrollmentTokenFile } from '@cortexkit/claustrum-client'
 
 import type { CommandRunner, HarnessKind } from './types.ts'
 
 export const NATIVE_VAULT_HOST_NAMES = {
   opencode: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
   pi: CLAUSTRUM_PI_ENROLLMENT_NAME,
+} as const
+
+const NATIVE_VAULT_HOST_DISPLAY_NAMES = {
+  opencode: 'Claude sign-in for OpenCode',
+  pi: 'Claude sign-in for Pi',
 } as const
 
 /** Convert the token file resolved by getHostClaustrumEnrollmentPaths into runSetup's path inputs; the runner derives the matching state file itself. */
@@ -115,6 +118,7 @@ export async function enrollNativeVaultForHost(
       const manager = new ClaustrumEnrollmentManager({
         paths,
         proposedName: name,
+        displayName: NATIVE_VAULT_HOST_DISPLAY_NAMES[host],
         client: {
           enrollPropose: async (input) => {
             await processFence()

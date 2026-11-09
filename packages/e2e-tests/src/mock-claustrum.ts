@@ -29,6 +29,7 @@ export type FakeClaustrumCredential = {
 
 export type FakeClaustrumEnrollmentProposal = {
   proposed_name?: string
+  display_name?: string
   request_secret_hash?: string
 }
 
@@ -166,6 +167,10 @@ export async function startFakeClaustrumDaemon(input: {
             proposed_name:
               typeof request.params?.proposed_name === 'string'
                 ? request.params.proposed_name
+                : undefined,
+            display_name:
+              typeof request.params?.display_name === 'string'
+                ? request.params.display_name
                 : undefined,
             request_secret_hash:
               typeof request.params?.request_secret_hash === 'string'
