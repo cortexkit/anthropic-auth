@@ -2,9 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## 2.7.2
+## Unreleased
 
 - Vault setup now names the plugin when it asks for access ("Claude sign-in for OpenCode" or "for Pi"), so the vault's approval prompt and the apps' Permissions page show a readable name. Older vaults that don't know the field are retried without it.
+
+## 2.7.2
+
 - Addresses #677: on the first OpenCode 2 or Pi start after upgrading to 2.7, keep-warm sessions saved by earlier versions are kept warm instead of dropped; the limit of 24 warms without a real request counts from the restart.
 - A server-fallback boundary is now restored even after a context manager clears its thinking text, instead of being sent to Anthropic as an invalid thinking block.
 

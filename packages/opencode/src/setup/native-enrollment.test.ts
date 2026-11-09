@@ -9,10 +9,12 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 
 import {
   enrollNativeVaultForHost,
   grantNativeVaultForHost,
+  type NativeVaultEnrollmentOptions,
 } from './native-enrollment.ts'
 import type { CommandRunner } from './types.ts'
 
@@ -468,3 +470,184 @@ for (const [host, name, displayName] of [
     })
   })
 }
+
+type EnrollmentProposal = Parameters<
+  NonNullable<NativeVaultEnrollmentOptions['client']>['enrollPropose']
+>[0] & { displayName?: string }
+
+function adapterOptions(root: string): NativeVaultEnrollmentOptions {
+  return {
+    paths: {
+      tokenPath: join(root, 'enrollment.json'),
+      statePath: join(root, 'enrollment-state.json'),
+    },
+    env: {},
+    runner: { run: async () => ({ exitCode: 0, stdout: '', stderr: '' }) },
+    processFence: async () => {},
+    grantPermissions: false,
+  }
+}
+
+test('named invalid_params retries once without the display name, fencing both sends and using retry success', async () => {
+  await fixture(async (root) => {
+    const proposals: EnrollmentProposal[] = []
+    const events: string[] = []
+    const polled: string[] = []
+    await enrollNativeVaultForHost('opencode', {
+      ...adapterOptions(root),
+      processFence: async () => {
+        events.push('fence')
+      },
+      client: {
+        enrollPropose: async (input) => {
+          proposals.push(input)
+          events.push('send')
+          if (proposals.length === 1)
+            throw new ClaustrumCredentialError(
+              'invalid_params',
+              'permanent',
+              'gone',
+            )
+          return { requestId: 'legacy-request' }
+        },
+        enrollPoll: async ({ requestId }) => {
+          polled.push(requestId)
+          return {
+            status: 'approved',
+            name: 'anthropic-auth-opencode',
+            token: 'a'.repeat(64),
+            tokenGeneration: 3,
+          }
+        },
+      },
+    })
+    expect(proposals).toHaveLength(2)
+    expect(proposals[0]).toMatchObject({
+      name: 'anthropic-auth-opencode',
+      displayName: 'Claude sign-in for OpenCode',
+    })
+    expect(proposals[0]!.requestSecretHash).toMatch(/^[0-9a-f]{64}$/)
+    expect(proposals[1]).toEqual({
+      name: 'anthropic-auth-opencode',
+      requestSecretHash: proposals[0]!.requestSecretHash,
+    })
+    for (const [index, event] of events.entries())
+      if (event === 'send') expect(events[index - 1]).toBe('fence')
+    expect(polled).toEqual(['legacy-request'])
+    expect(
+      JSON.parse(await readFile(join(root, 'enrollment.json'), 'utf8')),
+    ).toEqual({
+      token: 'a'.repeat(64),
+      token_generation: 3,
+    })
+  })
+})
+
+for (const [code, expectedCalls] of [
+  ['invalid_params', 2],
+  ['pending_exists', 1],
+] as const) {
+  test(`${code} reaches common-auth's terminal classification after ${expectedCalls} proposal sends`, async () => {
+    await fixture(async (root) => {
+      const proposals: EnrollmentProposal[] = []
+      await expect(
+        enrollNativeVaultForHost('pi', {
+          ...adapterOptions(root),
+          client: {
+            enrollPropose: async (input) => {
+              proposals.push(input)
+              throw new ClaustrumCredentialError(code, 'permanent', 'gone')
+            },
+            enrollPoll: async () => {
+              throw new Error('a refused proposal must not be polled')
+            },
+          },
+        }),
+      ).rejects.toMatchObject({ code: 'enrollment-refused' })
+      expect(proposals).toHaveLength(expectedCalls)
+      expect(proposals[0]!.displayName).toBe('Claude sign-in for Pi')
+      if (expectedCalls === 2)
+        expect(proposals[1]).not.toHaveProperty('displayName')
+      const persisted = JSON.parse(
+        await readFile(join(root, 'enrollment-state.json'), 'utf8'),
+      )
+      expect(persisted).toMatchObject({ phase: 'blocked', errorCode: code })
+      expect(persisted).not.toHaveProperty('requestSecret')
+    })
+  })
+}
+
+test('a crash-resume re-proposes the same display name and secret hash without persisting the label', async () => {
+  await fixture(async (root) => {
+    const options = adapterOptions(root)
+    const proposals: EnrollmentProposal[] = []
+    await expect(
+      enrollNativeVaultForHost('pi', {
+        ...options,
+        client: {
+          enrollPropose: async (input) => {
+            proposals.push(input)
+            throw new Error('connection reset after server commit')
+          },
+          enrollPoll: async () => ({ status: 'pending' }),
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'enrollment-refused' })
+    const pending = JSON.parse(
+      await readFile(join(root, 'enrollment-state.json'), 'utf8'),
+    )
+    expect(pending).toMatchObject({
+      phase: 'pending',
+      proposedName: 'anthropic-auth-pi',
+    })
+    expect(pending).not.toHaveProperty('requestId')
+    expect(JSON.stringify(pending)).not.toContain('displayName')
+    expect(JSON.stringify(pending)).not.toContain('display_name')
+    expect(JSON.stringify(pending)).not.toContain('Claude sign-in')
+    await enrollNativeVaultForHost('pi', {
+      ...options,
+      client: {
+        enrollPropose: async (input) => {
+          proposals.push(input)
+          return { requestId: 'resumed-request' }
+        },
+        enrollPoll: async () => ({
+          status: 'approved',
+          name: 'anthropic-auth-pi',
+          token: 'a'.repeat(64),
+          tokenGeneration: 1,
+        }),
+      },
+    })
+    expect(proposals).toHaveLength(2)
+    expect(proposals[0]).toMatchObject({
+      name: 'anthropic-auth-pi',
+      displayName: 'Claude sign-in for Pi',
+    })
+    expect(proposals[1]).toEqual(proposals[0]!)
+  })
+})
+
+test('unsupported enrollment keeps common-auth cleanup of leftover pending state', async () => {
+  await fixture(async (root) => {
+    let proposals = 0
+    await expect(
+      enrollNativeVaultForHost('opencode', {
+        ...adapterOptions(root),
+        client: {
+          enrollPropose: async () => {
+            proposals += 1
+            throw new ClaustrumCredentialError(
+              'unknown_method',
+              'permanent',
+              'gone',
+            )
+          },
+          enrollPoll: async () => ({ status: 'pending' }),
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'enrollment-refused' })
+    expect(proposals).toBe(1)
+    expect(await readdir(root)).toEqual([])
+  })
+})

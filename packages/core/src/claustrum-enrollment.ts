@@ -58,7 +58,6 @@ const TERMINAL_ENROLLMENT_CODES = new Set([
 export interface ClaustrumEnrollmentClient {
   enrollPropose(input: {
     name: string
-    displayName?: string
     requestSecretHash: string
   }): Promise<{ requestId: string }>
   enrollPoll(input: {
@@ -499,7 +498,6 @@ export class ClaustrumEnrollmentManager {
   readonly #client: ClaustrumEnrollmentClient
   readonly #paths: ClaustrumEnrollmentPaths
   readonly #proposedName: string
-  readonly #displayName: string | undefined
   readonly #now: () => number
   readonly #mintSecret: () => string
   readonly #writeTokenFile: typeof writeEnrollmentTokenFile
@@ -508,7 +506,6 @@ export class ClaustrumEnrollmentManager {
     client: ClaustrumEnrollmentClient
     paths: ClaustrumEnrollmentPaths
     proposedName: string
-    displayName?: string
     now?: () => number
     mintSecret?: () => string
     writeTokenFile?: typeof writeEnrollmentTokenFile
@@ -516,7 +513,6 @@ export class ClaustrumEnrollmentManager {
     this.#client = options.client
     this.#paths = options.paths
     this.#proposedName = options.proposedName
-    this.#displayName = options.displayName
     this.#now = options.now ?? Date.now
     this.#mintSecret =
       options.mintSecret ?? (() => randomBytes(32).toString('hex'))
@@ -615,29 +611,10 @@ export class ClaustrumEnrollmentManager {
           const requestSecretHash = createHash('sha256')
             .update(Buffer.from(state.requestSecret, 'hex'))
             .digest('hex')
-          const proposal = {
+          const proposed = await this.#client.enrollPropose({
             name: state.proposedName,
             requestSecretHash,
-          }
-          let proposed: { requestId: string }
-          try {
-            proposed = await this.#client.enrollPropose({
-              ...proposal,
-              ...(this.#displayName !== undefined && {
-                displayName: this.#displayName,
-              }),
-            })
-          } catch (error) {
-            // Older vaults reject the unknown display-name field before storing
-            // a request. Retry only that refusal, with the same name and secret.
-            if (
-              this.#displayName === undefined ||
-              !(error instanceof ClaustrumCredentialError) ||
-              error.code !== 'invalid_params'
-            )
-              throw error
-            proposed = await this.#client.enrollPropose(proposal)
-          }
+          })
           state = {
             ...state,
             requestId: proposed.requestId,

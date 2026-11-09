@@ -144,20 +144,17 @@ describe('ClaustrumEnrollmentManager', () => {
     expect((await stat(paths.statePath)).mode & 0o777).toBe(0o600)
   })
 
-  test('re-proposes with the same display name and persisted secret after a crash before the request id is saved', async () => {
+  test('re-proposes with the same persisted secret after a crash before the request id is saved', async () => {
     const paths = await fixture()
     const hashes: string[] = []
-    const displayNames: (string | undefined)[] = []
     const first = manager(
       paths,
       client({
-        enrollPropose: async ({ requestSecretHash, displayName }) => {
+        enrollPropose: async ({ requestSecretHash }) => {
           hashes.push(requestSecretHash)
-          displayNames.push(displayName)
           throw new Error('connection reset after server commit')
         },
       }),
-      { displayName: 'Claude sign-in for OpenCode' },
     )
     await expect(first.reconcile()).rejects.toThrow(
       'connection reset after server commit',
@@ -166,13 +163,11 @@ describe('ClaustrumEnrollmentManager', () => {
     const second = manager(
       paths,
       client({
-        enrollPropose: async ({ requestSecretHash, displayName }) => {
+        enrollPropose: async ({ requestSecretHash }) => {
           hashes.push(requestSecretHash)
-          displayNames.push(displayName)
           return { requestId: 'same-server-request' }
         },
       }),
-      { displayName: 'Claude sign-in for OpenCode' },
     )
     await expect(second.reconcile()).resolves.toEqual({
       state: 'pending',
@@ -181,101 +176,10 @@ describe('ClaustrumEnrollmentManager', () => {
     })
     expect(hashes).toHaveLength(2)
     expect(hashes[0]).toBe(hashes[1])
-    expect(displayNames).toEqual([
-      'Claude sign-in for OpenCode',
-      'Claude sign-in for OpenCode',
-    ])
     const persisted = JSON.parse(await readFile(paths.statePath, 'utf8'))
     expect(persisted.requestSecret).toBe(secret)
     expect(persisted.requestId).toBe('same-server-request')
-    expect(persisted).not.toHaveProperty('displayName')
-    expect(persisted).not.toHaveProperty('display_name')
-    expect(JSON.stringify(persisted)).not.toContain('Claude sign-in')
   })
-
-  test('retries a named invalid_params proposal once without the display name and uses its success', async () => {
-    const paths = await fixture()
-    const proposals: Parameters<
-      ClaustrumEnrollmentClient['enrollPropose']
-    >[0][] = []
-    const instance = manager(
-      paths,
-      client({
-        enrollPropose: async (input) => {
-          proposals.push(input)
-          if (proposals.length === 1)
-            throw new ClaustrumCredentialError(
-              'invalid_params',
-              'permanent',
-              'gone',
-            )
-          return { requestId: 'legacy-request' }
-        },
-        enrollPoll: async ({ requestId }) => {
-          expect(requestId).toBe('legacy-request')
-          return {
-            status: 'approved',
-            name: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
-            token: 'ab'.repeat(32),
-            tokenGeneration: 1,
-          }
-        },
-      }),
-      { displayName: 'Claude sign-in for OpenCode' },
-    )
-    await expect(instance.reconcile()).resolves.toMatchObject({
-      state: 'approved',
-      tokenGeneration: 1,
-    })
-    expect(proposals).toHaveLength(2)
-    expect(proposals[0]).toEqual({
-      name: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
-      displayName: 'Claude sign-in for OpenCode',
-      requestSecretHash: createHash('sha256')
-        .update(Buffer.from(secret, 'hex'))
-        .digest('hex'),
-    })
-    expect(proposals[1]).toEqual({
-      name: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
-      requestSecretHash: proposals[0]!.requestSecretHash,
-    })
-    expect((await readClaustrumEnrollmentToken(paths.tokenPath)).token).toBe(
-      'ab'.repeat(32),
-    )
-  })
-
-  test.each([
-    ['unnamed invalid_params', undefined, 'invalid_params', 1],
-    [
-      'repeated named invalid_params',
-      'Claude sign-in for OpenCode',
-      'invalid_params',
-      2,
-    ],
-    ['other named refusal', 'Claude sign-in for OpenCode', 'pending_exists', 1],
-  ] as const)(
-    'does not retry beyond the compatibility fallback: %s',
-    async (_label, displayName, code, expectedCalls) => {
-      const paths = await fixture()
-      let calls = 0
-      const instance = manager(
-        paths,
-        client({
-          enrollPropose: async () => {
-            calls += 1
-            throw new ClaustrumCredentialError(code, 'permanent', 'gone')
-          },
-        }),
-        { displayName },
-      )
-      await expect(instance.reconcile()).resolves.toEqual({
-        state: 'blocked',
-        proposedName: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
-        code,
-      })
-      expect(calls).toBe(expectedCalls)
-    },
-  )
 
   test('keeps the secret and reports retryable queue saturation without inventing a request id', async () => {
     const paths = await fixture()
