@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/pi-anthropic-auth",
-  "version": "2.7.1",
+  "version": "2.7.2",
   "type": "module",
   "repository": {
     "type": "git",
@@ -36,7 +36,7 @@
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
-    "@cortexkit/anthropic-auth-core": "2.7.1"
+    "@cortexkit/anthropic-auth-core": "2.7.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.86.1 <2",
