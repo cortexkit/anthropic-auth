@@ -92,6 +92,7 @@ async function driveDirect(options: {
   laneStart?: boolean
   upstreamStatus?: number
   upstreamBody?: unknown
+  upstreamSse?: string
   payload?: unknown
 }) {
   const source = makeSource({ enabled: options.enabled })
@@ -142,10 +143,17 @@ async function driveDirect(options: {
       model: 'claude-sonnet-5',
       usage: { input_tokens: 3, output_tokens: 1 },
     }
-    const physical = new Response(JSON.stringify(upstreamBody), {
-      status: options.upstreamStatus ?? 200,
-      headers: { 'content-type': 'application/json' },
-    })
+    const physical = new Response(
+      options.upstreamSse ?? JSON.stringify(upstreamBody),
+      {
+        status: options.upstreamStatus ?? 200,
+        headers: {
+          'content-type': options.upstreamSse
+            ? 'text/event-stream'
+            : 'application/json',
+        },
+      },
+    )
     const rewrittenResponse = (await native.adapter.rewriteResponse?.({
       ...attempt,
       request: wire,
@@ -263,6 +271,67 @@ async function allDumpText() {
 }
 
 describe('opencode2 request dumps', () => {
+  test('streamed response dumps record reply text edges without text', async () => {
+    const events = [
+      { type: 'message_start', message: { id: 'msg_edges', content: [] } },
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '\n' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: '\nHello ' },
+      },
+      { type: 'content_block_stop', index: 0 },
+      {
+        type: 'content_block_start',
+        index: 1,
+        content_block: {
+          type: 'tool_use',
+          id: 'tool_edges',
+          name: 'Read',
+          input: {},
+        },
+      },
+      { type: 'content_block_stop', index: 1 },
+      {
+        type: 'content_block_start',
+        index: 2,
+        content_block: { type: 'text', text: '' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 2,
+        delta: { type: 'text_delta', text: 'World\n' },
+      },
+      { type: 'content_block_stop', index: 2 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      { type: 'message_stop' },
+    ]
+    await driveDirect({
+      enabled: true,
+      payload: { model: 'claude-sonnet-5', stream: true, messages: [] },
+      upstreamSse: events
+        .map(
+          (event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+        )
+        .join(''),
+    })
+    const { files } = await allDumpText()
+    const text = await readFile(
+      join(dumpDir, files.find((name) => name.endsWith('.response.json'))!),
+      'utf8',
+    )
+    expect(JSON.parse(text).reply_text_edges).toEqual([
+      { index: 0, leading: 2, trailing: 1, chars: 8 },
+      { index: 2, leading: 0, trailing: 1, chars: 6 },
+    ])
+    expect(text).not.toContain('Hello')
+    expect(text).not.toContain('World')
+  })
+
   test('direct send writes OpenCode 1-shaped dumps without tokens', async () => {
     await driveDirect({ enabled: true })
     const { files, texts } = await allDumpText()
@@ -294,6 +363,7 @@ describe('opencode2 request dumps', () => {
     expect(responseRecord.status).toBe(200)
     expect(responseRecord.message_id).toBe('msg_dump_01')
     expect(responseRecord.usage).toEqual({ input_tokens: 3, output_tokens: 1 })
+    expect(responseRecord).not.toHaveProperty('reply_text_edges')
     for (const text of texts) {
       expect(text).not.toContain(TOKEN)
       expect(text).not.toContain('relay-token-do-not-log')
@@ -329,6 +399,10 @@ describe('opencode2 request dumps', () => {
     const metaPath = files.find((name) => name.endsWith('.meta.json'))!
     const meta = JSON.parse(await readFile(join(dumpDir, metaPath), 'utf8'))
     expect(meta.status).toBe(401)
+    const responsePath = files.find((name) => name.endsWith('.response.json'))!
+    expect(
+      JSON.parse(await readFile(join(dumpDir, responsePath), 'utf8')),
+    ).not.toHaveProperty('reply_text_edges')
   })
 
   test('relay send writes a relay dump with the start tag', async () => {

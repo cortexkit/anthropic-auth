@@ -510,7 +510,7 @@ describe('auth.loader', () => {
     }
   })
 
-  test('dumps final streamed usage while retaining opening counters', async () => {
+  test('dumps final streamed usage and reply text edges while retaining opening counters', async () => {
     const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
     const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-stream-dump-test-'))
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
@@ -546,10 +546,49 @@ describe('auth.loader', () => {
         delta: { stop_reason: 'end_turn' },
         usage: { output_tokens: 1749 },
       })}\n\n`
+      const content = [
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: '\n' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: '\nHello ' },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'content_block_start',
+          index: 1,
+          content_block: {
+            type: 'tool_use',
+            id: 'tool_edges',
+            name: 'Read',
+            input: {},
+          },
+        },
+        { type: 'content_block_stop', index: 1 },
+        {
+          type: 'content_block_start',
+          index: 2,
+          content_block: { type: 'text', text: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 2,
+          delta: { type: 'text_delta', text: 'World\n' },
+        },
+        { type: 'content_block_stop', index: 2 },
+      ]
+        .map(
+          (event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+        )
+        .join('')
       globalThis.fetch = mock(
         withNativeAdmission(() =>
           Promise.resolve(
-            new Response(`${start}${delta}`, {
+            new Response(`${start}${content}${delta}`, {
               status: 200,
               headers: { 'content-type': 'text/event-stream' },
             }),
@@ -575,10 +614,11 @@ describe('auth.loader', () => {
         body: JSON.stringify({
           model: 'claude-opus-4-7',
           stream: true,
+          tools: [{ name: 'Read', input_schema: { type: 'object' } }],
           messages: [{ role: 'user', content: 'hello' }],
         }),
       })
-      expect(await response.text()).toBe(`${start}${delta}`)
+      expect(await response.text()).toBe(`${start}${content}${delta}`)
 
       const files = await readdir(dumpDir)
       const responsePath = files.find((file) => file.endsWith('.response.json'))
@@ -602,7 +642,14 @@ describe('auth.loader', () => {
         diagnostics: null,
         stop_reason: 'end_turn',
         stream_complete: true,
+        reply_text_edges: [
+          { index: 0, leading: 2, trailing: 1, chars: 8 },
+          { index: 2, leading: 0, trailing: 1, chars: 6 },
+        ],
       })
+      const summary = await readFile(join(dumpDir, responsePath!), 'utf8')
+      expect(summary).not.toContain('Hello')
+      expect(summary).not.toContain('World')
     } finally {
       if (originalDumpDir === undefined) {
         delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR

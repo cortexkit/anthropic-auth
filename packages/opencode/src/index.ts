@@ -44,6 +44,7 @@ import {
   cacheWarmCacheablePrefixFingerprint,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
+  createDumpResponseObserver,
   createEmptyStorage,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
@@ -9340,8 +9341,15 @@ const anthropicAuthPlugin = async (
               const wrapResponse = (response: Response) => {
                 const diagnosticsContext =
                   cacheDiagnosticsResponses.get(response)
+                const dumpObserver = diagnosticsContext?.streaming
+                  ? createDumpResponseObserver(
+                      diagnosticsContext.dump,
+                      diagnosticsContext.status,
+                    )
+                  : undefined
                 const wrapped = createStrippedStream(response, {
                   toolNameMap: diagnosticsContext?.toolNameMap,
+                  onSseEvent: dumpObserver?.observe,
                   onResponseFailure: diagnosticsContext?.failThread,
                   perf: (stage, data) => trace.mark(stage, data),
                   laneStart: laneStartRequest,
@@ -9358,7 +9366,10 @@ const anthropicAuthPlugin = async (
                             ),
                           onMessageDelta: (delta) =>
                             observeCacheDiagnosticsDelta(response, delta),
-                          onStreamEnd: () => diagnosticsContext.dumpWrite,
+                          onStreamEnd: async () => {
+                            await diagnosticsContext.dumpWrite
+                            await dumpObserver?.finish()
+                          },
                         }
                       : {
                           onMessageResponse: (message) =>

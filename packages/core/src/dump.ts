@@ -785,6 +785,107 @@ export async function dumpRelayRequest(input: {
   })
 }
 
+export type ReplyTextEdge = {
+  index: number
+  leading: number
+  trailing: number
+  chars: number
+}
+
+/** Summarize parsed provider events without retaining any reply text. */
+export function createDumpResponseObserver(
+  handle: DumpHandle | null,
+  status: number,
+) {
+  const edges = new Map<number, ReplyTextEdge>()
+  let message: Record<string, unknown> | undefined
+  let complete = false
+  let failed = false
+  const append = (edge: ReplyTextEdge, text: unknown) => {
+    if (typeof text !== 'string') return
+    let leading = 0
+    // ECMAScript \s has the same whitespace definition as trimStart/trimEnd.
+    while (leading < text.length && /\s/u.test(text.charAt(leading))) leading++
+    if (edge.leading === edge.chars) edge.leading += leading
+    let trailing = 0
+    while (
+      trailing < text.length &&
+      /\s/u.test(text.charAt(text.length - trailing - 1))
+    )
+      trailing++
+    edge.trailing =
+      trailing === text.length ? edge.trailing + trailing : trailing
+    edge.chars += text.length
+  }
+  const start = (index: unknown, block: unknown) => {
+    if (
+      typeof index !== 'number' ||
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      !block ||
+      typeof block !== 'object' ||
+      (block as Record<string, unknown>).type !== 'text' ||
+      edges.has(index)
+    )
+      return
+    const edge = { index, leading: 0, trailing: 0, chars: 0 }
+    edges.set(index, edge)
+    append(edge, (block as Record<string, unknown>).text)
+  }
+  return {
+    observe(event: Record<string, unknown>) {
+      if (!handle) return
+      if (event.type === 'message_start') {
+        const opening = event.message as Record<string, unknown> | undefined
+        if (!opening || typeof opening !== 'object') return
+        message = {}
+        for (const key of [
+          'id',
+          'model',
+          'usage',
+          'diagnostics',
+          'stop_reason',
+        ]) {
+          if (Object.hasOwn(opening, key)) message[key] = opening[key]
+        }
+        if (Array.isArray(opening.content)) {
+          for (const [index, block] of opening.content.entries())
+            start(index, block)
+        }
+      } else if (event.type === 'content_block_start') {
+        start(event.index, event.content_block)
+      } else if (event.type === 'content_block_delta') {
+        const delta = event.delta as Record<string, unknown> | undefined
+        const edge =
+          typeof event.index === 'number' ? edges.get(event.index) : undefined
+        if (edge && delta?.type === 'text_delta') append(edge, delta.text)
+      } else if (event.type === 'message_delta' && message) {
+        if (event.usage && typeof event.usage === 'object')
+          message.usage = { ...(message.usage as object), ...event.usage }
+        const delta = event.delta as Record<string, unknown> | undefined
+        if (typeof delta?.stop_reason === 'string')
+          message.stop_reason = delta.stop_reason
+        complete = true
+      } else if (event.type === 'message_stop') {
+        complete = true
+      } else if (event.type === 'error') {
+        failed = true
+      }
+    },
+    async finish() {
+      if (!message) return
+      await dumpResponseArtifact(handle, {
+        status,
+        message,
+        complete: complete && !failed,
+        ...(!failed && status >= 200 && status < 300
+          ? { reply_text_edges: [...edges.values()] }
+          : {}),
+      })
+    },
+  }
+}
+
 export async function dumpResponseArtifact(
   handle: DumpHandle | null,
   input: {
@@ -792,6 +893,7 @@ export async function dumpResponseArtifact(
     message: unknown
     complete?: boolean
     provider_error?: ProviderErrorSummary['provider_error']
+    reply_text_edges?: readonly ReplyTextEdge[]
   },
 ): Promise<void> {
   if (!handle) return
@@ -815,6 +917,20 @@ export async function dumpResponseArtifact(
   if (typeof message.stop_reason === 'string' && message.stop_reason.length > 0)
     artifact.stop_reason = message.stop_reason
   if (input.provider_error) artifact.provider_error = input.provider_error
+  if (
+    input.reply_text_edges &&
+    input.status >= 200 &&
+    input.status < 300 &&
+    !input.provider_error
+  )
+    artifact.reply_text_edges = input.reply_text_edges.map(
+      ({ index, leading, trailing, chars }) => ({
+        index,
+        leading,
+        trailing,
+        chars,
+      }),
+    )
   try {
     await writeDumpFile(
       handle.responsePath,
