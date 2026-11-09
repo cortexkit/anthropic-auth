@@ -2,9 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## 2.7.3
+## Unreleased
 
 - Claude subscription requests no longer carry a `service_tier` field a host adds, keeping them in the shape Claude Code sends; API-key requests keep it.
+## 2.7.3
+
 - Vault setup now names the plugin when it asks for access ("Claude sign-in for OpenCode" or "for Pi"), so the vault's approval prompt and the apps' Permissions page show a readable name. Older vaults that don't know the field are retried without it.
 
 ## 2.7.2
