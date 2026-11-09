@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { NativeMenuDispatchRequest } from '@cortexkit/anthropic-auth-core'
@@ -25,6 +26,71 @@ afterEach(async () => {
 })
 
 describe('rpc-server', () => {
+  test('stop drains an in-flight menu reply and closes its connection before same-port reuse', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'aa-rpc-stop-'))
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let entered!: () => void
+    const applying = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const server = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      applyMenu: async () => {
+        entered()
+        await gate
+        return {
+          command: 'claude',
+          ok: true,
+          text: 'applied',
+          menu: { command: 'claude', title: 'Claude', sections: [] },
+        }
+      },
+    })
+    stop = server.stop
+    const successor = createServer((_req, res) => {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ successor: true }))
+    })
+    try {
+      const url = `http://127.0.0.1:${server.port}/rpc/apply-menu`
+      const pending = fetch(url, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${server.token}` },
+        body: JSON.stringify({
+          command: 'claude',
+          sectionId: 'Diagnostics',
+          actionId: 'logging-level',
+          values: { level: 'warn' },
+          sessionId: 'stopping',
+        }),
+      })
+      await applying
+      const stopping = server.stop()
+      release()
+      const response = await pending
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({ ok: true, text: 'applied' })
+      await stopping
+      await new Promise<void>((resolve) =>
+        successor.listen(server.port, '127.0.0.1', resolve),
+      )
+
+      // Without closing the old active connection after its reply, Bun can
+      // send this POST to the disposed RPC server instead of the successor.
+      const next = await fetch(url, { method: 'POST', body: '{}' })
+      expect(await next.json()).toEqual({ successor: true })
+      expect(response.headers.get('connection')).toBe('close')
+    } finally {
+      release()
+      await server.stop()
+      await new Promise<void>((resolve) => successor.close(() => resolve()))
+    }
+  })
+
   test('native menu client/server dispatch preserves structured limits and opaque IDs', async () => {
     dir = await mkdtemp(join(tmpdir(), 'aa-native-rpc-'))
     const calls: NativeMenuDispatchRequest[] = []

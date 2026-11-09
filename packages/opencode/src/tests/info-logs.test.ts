@@ -241,6 +241,9 @@ async function migratedClaude() {
         `http://127.0.0.1:${entry.port}/rpc/apply-menu`,
         {
           method: 'POST',
+          // Each test owns a short-lived RPC listener. Do not borrow a pooled
+          // socket from an earlier fixture if the OS reuses its ephemeral port.
+          keepalive: false,
           headers: {
             'content-type': 'application/json',
             authorization: `Bearer ${entry.token}`,

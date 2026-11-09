@@ -5,6 +5,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http'
+import type { Socket } from 'node:net'
 import { join } from 'node:path'
 import {
   type CommandApplyRequest,
@@ -59,13 +60,43 @@ export async function startRpcServer(
   options: RpcServerOptions,
 ): Promise<RpcServerHandle> {
   const token = randomBytes(32).toString('hex')
+  const connections = new Set<Socket>()
+  let stopping = false
+  let closing: Promise<void> | undefined
   const server = createServer((req, res) => {
     void dispatch(req, res)
   })
+  server.on('connection', (socket) => {
+    connections.add(socket)
+    socket.once('close', () => connections.delete(socket))
+  })
+
+  function closeServer(): Promise<void> {
+    closing ??= (async () => {
+      stopping = true
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      // Bun closes connections that were idle when close() ran, but a request
+      // active at that point can leave its keep-alive socket open after replying.
+      // Wait for the replies first, then close every remaining owned socket.
+      await Promise.all(
+        [...connections].map(
+          (socket) =>
+            new Promise<void>((resolve) => {
+              socket.once('close', () => resolve())
+              socket.destroy()
+            }),
+        ),
+      )
+    })()
+    return closing
+  }
 
   async function dispatch(req: IncomingMessage, res: ServerResponse) {
     const json = (status: number, value: unknown) => {
-      res.writeHead(status, { 'content-type': 'application/json' })
+      res.writeHead(status, {
+        'content-type': 'application/json',
+        ...(stopping && { connection: 'close' }),
+      })
       res.end(JSON.stringify(value))
     }
     try {
@@ -129,7 +160,7 @@ export async function startRpcServer(
   try {
     await writePortFile(options.dir, { port, token, pid: process.pid })
   } catch (error) {
-    await new Promise<void>((resolve) => server.close(() => resolve()))
+    await closeServer()
     throw error
   }
 
@@ -137,7 +168,7 @@ export async function startRpcServer(
     port,
     token,
     async stop() {
-      await new Promise<void>((resolve) => server.close(() => resolve()))
+      await closeServer()
       try {
         const portFile = join(options.dir, `port-${process.pid}.json`)
         const current = JSON.parse(await readFile(portFile, 'utf8')) as {

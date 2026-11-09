@@ -99,6 +99,9 @@ export function createGuardedFetch(
         const replayableRequest = request.clone()
         const response = await Reflect.apply(nativeFetchImpl, globalThis, [
           request,
+          // Bun's connection-pool opt-out is a fetch option, not a Request
+          // property. Preserve it when rebuilding requests, including redirects.
+          { keepalive: init?.keepalive },
         ])
         if (!REDIRECT_STATUSES.has(response.status)) return response
         const location = response.headers.get('location')

@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -58,6 +59,101 @@ describe('test network guard', () => {
         assertLoopback(new URL(`http://${host}/health`)),
       ).not.toThrow()
     }
+  })
+
+  test('preserves the connection-pool opt-out when an ephemeral port is reused', async () => {
+    const sockets = new Set<Socket>()
+    let oldRequests = 0
+    let newRequests = 0
+    function onCompletePost(socket: Socket, handle: () => void) {
+      let request = ''
+      socket.on('data', (chunk) => {
+        request += chunk.toString()
+        if (!request.endsWith('\r\n\r\n{}')) return
+        request = ''
+        handle()
+      })
+    }
+    const previous = createServer((socket) => {
+      sockets.add(socket)
+      onCompletePost(socket, () => {
+        oldRequests++
+        if (oldRequests === 1) {
+          socket.write(
+            'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\nold',
+          )
+        } else {
+          // Hold the old connection until the next POST to force the race
+          // between server-side closure and the client's pooled socket reuse.
+          socket.resetAndDestroy()
+        }
+      })
+    })
+    const successor = createServer((socket) => {
+      sockets.add(socket)
+      onCompletePost(socket, () => {
+        newRequests++
+        socket.end(
+          'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnew',
+        )
+      })
+    })
+    let previousClosed: Promise<void> | undefined
+    try {
+      await new Promise<void>((resolve) =>
+        previous.listen(0, '127.0.0.1', resolve),
+      )
+      const address = previous.address()
+      if (!address || typeof address === 'string') throw new Error('no port')
+      const url = `http://127.0.0.1:${address.port}/rpc/apply-menu`
+      expect(
+        await (await guardedFetch(url, { method: 'POST', body: '{}' })).text(),
+      ).toBe('old')
+      // Stop accepting connections but deliberately delay the old socket's
+      // closure. The successor must only see fresh connections to this port.
+      previousClosed = new Promise<void>((resolve) =>
+        previous.close(() => resolve()),
+      )
+      await new Promise<void>((resolve) =>
+        successor.listen(address.port, '127.0.0.1', resolve),
+      )
+
+      const response = await guardedFetch(url, {
+        method: 'POST',
+        body: '{}',
+        keepalive: false,
+      })
+      expect(await response.text()).toBe('new')
+      expect(oldRequests).toBe(1)
+      expect(newRequests).toBe(1)
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await (previousClosed ??
+        new Promise<void>((resolve) => previous.close(() => resolve())))
+      await new Promise<void>((resolve) => successor.close(() => resolve()))
+    }
+  })
+
+  test('preserves the connection-pool opt-out across redirects', async () => {
+    const options: unknown[] = []
+    const nativeFetch = Object.assign(
+      async (_request: Request, init?: Parameters<typeof fetch>[1]) => {
+        options.push(init?.keepalive)
+        return options.length === 1
+          ? new Response(null, {
+              status: 307,
+              headers: { location: 'http://127.0.0.1/final' },
+            })
+          : new Response('ok')
+      },
+      { preconnect: () => {} },
+    ) as unknown as typeof fetch
+    const response = await createGuardedFetch(nativeFetch)(
+      'http://127.0.0.1/first',
+      { keepalive: false },
+    )
+    expect(await response.text()).toBe('ok')
+    expect(options).toEqual([false, false])
   })
 
   test('rejects near-miss IPv4 addresses and loopback-looking hostnames', async () => {
