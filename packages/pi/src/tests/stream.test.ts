@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
@@ -8,6 +8,7 @@ import {
   createNativePoolStore,
   type LogTestRecord,
   resetBillingHeaderCCH,
+  resetDumpState,
   resolveNativePoolPaths,
   sessionCacheActivity,
   signRequestBody,
@@ -55,6 +56,106 @@ const anthropicContext = {
   messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
   tools: [],
 } as any
+
+test.each([false, true])(
+  'streamed reply dumps keep only text edge counts (error: %s)',
+  async (error) => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-dump-edges-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    const dumpDir = join(tempDir, 'dumps')
+    const originalDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    try {
+      await saveNativePiFixture(
+        {
+          version: 1,
+          main: { type: 'opencode', provider: 'anthropic' },
+          accounts: [],
+          dump: { enabled: true },
+          quota: { enabled: false },
+        },
+        storagePath,
+      )
+      const events = [
+        { type: 'message_start', message: { id: 'msg_pi_edges', content: [] } },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: '\n\nHello ' },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'content_block_start',
+          index: 1,
+          content_block: {
+            type: 'tool_use',
+            id: 'tool_edges',
+            name: 'Read',
+            input: {},
+          },
+        },
+        { type: 'content_block_stop', index: 1 },
+        {
+          type: 'content_block_start',
+          index: 2,
+          content_block: { type: 'text', text: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 2,
+          delta: { type: 'text_delta', text: 'World\n' },
+        },
+        { type: 'content_block_stop', index: 2 },
+        ...(error
+          ? [{ type: 'error', error: { type: 'api_error', message: 'failed' } }]
+          : [
+              { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+              { type: 'message_stop' },
+            ]),
+      ]
+      globalThis.fetch = mock(async (input: string | URL | Request) => {
+        if (input.toString().includes('/api/claude_cli/bootstrap'))
+          return new Response(
+            JSON.stringify({ oauth_account: { account_uuid: 'pi-dump-uuid' } }),
+          )
+        return new Response(
+          events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      }) as unknown as typeof fetch
+      const stream = streamCortexKitAnthropic(
+        anthropicModel,
+        anthropicContext,
+        { apiKey: 'sk-ant-oat-pi-dump', sessionId: 'ses_pi_dump_edges' },
+      )
+      const result = await stream.result()
+      expect(result.stopReason).toBe(error ? 'error' : 'stop')
+      const files = await readdir(dumpDir)
+      const path = files.find((name) => name.endsWith('.response.json'))
+      expect(path).toBeString()
+      const text = await readFile(join(dumpDir, path!), 'utf8')
+      if (error) expect(JSON.parse(text)).not.toHaveProperty('reply_text_edges')
+      else
+        expect(JSON.parse(text).reply_text_edges).toEqual([
+          { index: 0, leading: 2, trailing: 1, chars: 8 },
+          { index: 2, leading: 0, trailing: 1, chars: 6 },
+        ])
+      expect(text).not.toContain('Hello')
+      expect(text).not.toContain('World')
+    } finally {
+      resetDumpState()
+      if (originalDumpDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = originalDumpDir
+    }
+  },
+)
 
 afterEach(async () => {
   __setLogTestSink(null)

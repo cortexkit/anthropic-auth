@@ -14,6 +14,7 @@ import {
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
   classifyGzipRejection,
+  createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
   type DumpHandle,
@@ -1859,6 +1860,10 @@ export function createNativeAnthropicAdapter<Q, P>(
       // stop reason instead of only the status.
       const handleForStream = dumpHandle
       const statusForStream = response.status
+      const dumpObserver = createDumpResponseObserver(
+        handleForStream,
+        statusForStream,
+      )
       const appendDumpWrite = (write: () => Promise<unknown>) => {
         const previous = dumpWrites.get(data) ?? Promise.resolve()
         const next: Promise<void> = previous
@@ -1883,6 +1888,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         data,
         createStrippedStream(safe, {
           ...baseStreamOptions,
+          onSseEvent: dumpObserver.observe,
           onMessageStart: (message: Record<string, unknown>) => {
             try {
               originalStart?.(message)
@@ -1949,6 +1955,7 @@ export function createNativeAnthropicAdapter<Q, P>(
             } catch {}
             try {
               await (dumpWrites.get(data) ?? Promise.resolve())
+              await dumpObserver.finish()
             } catch {}
           },
         }),

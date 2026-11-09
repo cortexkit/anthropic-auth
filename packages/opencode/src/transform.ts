@@ -1877,7 +1877,10 @@ function numberField(record: Record<string, unknown> | undefined, key: string) {
   return typeof value === 'number' ? value : undefined
 }
 
-function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
+function summarizeSseEvent(
+  rawEvent: string,
+  onParsedEvent?: (event: Record<string, unknown>) => void,
+): SseEventSummary | null {
   if (!rawEvent.trim()) return null
 
   let eventName: string | undefined
@@ -1914,6 +1917,11 @@ function summarizeSseEvent(rawEvent: string): SseEventSummary | null {
   }
 
   const data = asDiagnosticRecord(parsed)
+  if (data && onParsedEvent) {
+    try {
+      onParsedEvent(data)
+    } catch {}
+  }
   const delta = asDiagnosticRecord(data?.delta)
   const contentBlock = asDiagnosticRecord(data?.content_block)
   const message = asDiagnosticRecord(data?.message)
@@ -1973,6 +1981,7 @@ function updateSseDiagnostics(
   text: string,
   maxPendingBytes: number,
   onEvent?: (summary: SseEventSummary) => void,
+  onParsedEvent?: (event: Record<string, unknown>) => void,
 ) {
   if (!text || state.disabled) return
   state.pending += text
@@ -1983,7 +1992,7 @@ function updateSseDiagnostics(
 
     const rawEvent = state.pending.slice(0, boundary.index)
     state.pending = state.pending.slice(boundary.index + boundary.length)
-    const summary = summarizeSseEvent(rawEvent)
+    const summary = summarizeSseEvent(rawEvent, onParsedEvent)
     if (!summary) continue
 
     state.events++
@@ -2351,6 +2360,7 @@ export function createStrippedStream(
       stopReason?: string
     }) => void
     onMessageResponse?: (message: Record<string, unknown>) => void
+    onSseEvent?: (event: Record<string, unknown>) => void
     onRelayUpstreamError?: (status: RelayUpstreamStatus) => void
     onStreamEnd?: () => void | Promise<void>
     responseMode?: 'json'
@@ -2377,7 +2387,10 @@ export function createStrippedStream(
   let lastProgressAt = rewriteNowMs()
   const streamStart = rewriteNowMs()
   const sseDiagnostics =
-    options.perf || options.onMessageStart || options.onMessageDelta
+    options.perf ||
+    options.onMessageStart ||
+    options.onMessageDelta ||
+    options.onSseEvent
       ? createSseDiagnosticState()
       : undefined
   let responseText = ''
@@ -2520,6 +2533,7 @@ export function createStrippedStream(
                       }),
                     )
                 },
+                options.onSseEvent,
               )
             if (jsonMode) {
               const finalBytes = encoder.encode(finalDecoded).byteLength
@@ -2634,6 +2648,7 @@ export function createStrippedStream(
                     }),
                   )
               },
+              options.onSseEvent,
             )
           const rewriteStart = rewriteNowMs()
           const serverRewritten = serverSideFallback

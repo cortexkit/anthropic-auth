@@ -13,14 +13,17 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
+  createDumpResponseObserver,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
   createQuotaRefusalResponse,
   createSseFramer,
   createStickyNoRouteResponse,
+  type DumpHandle,
   decideStickyQuotaFailure,
   decodeSseFrame,
   dumpDirectRequest,
+  dumpResponseArtifact,
   effectiveRelayTransport,
   FAST_MODE_BETA,
   getCache1hPersistentMode,
@@ -129,6 +132,10 @@ import {
 } from './transport.ts'
 
 const messageThreads = new MessageThreadTracker()
+const dumpResponseObservers = new WeakMap<
+  Response,
+  ReturnType<typeof createDumpResponseObserver>
+>()
 // Each session owns its lease; storage identifies which host may end it.
 const primaryTurns = new Map<string, string>()
 
@@ -665,6 +672,7 @@ export async function* parseSse(
   response: Response,
 ): AsyncGenerator<AnthropicEvent> {
   if (!response.body) return
+  const dumpObserver = dumpResponseObservers.get(response)
   const reader = response.body.getReader()
   // Core's byte framer ends frames at blank lines with CRLF, LF or CR line
   // endings and keeps a multibyte character split across reads in one frame,
@@ -683,13 +691,16 @@ export async function* parseSse(
         const data = parseSseFrame(decodeSseFrame(frame, { streamStart })).data
         streamStart = false
         if (!data || data === '[DONE]') continue
-        yield JSON.parse(data) as AnthropicEvent
+        const event = JSON.parse(data) as AnthropicEvent
+        dumpObserver?.observe(event)
+        yield event
       }
     }
   } finally {
     // Only the lock is released when the consumer stops early: cancelling the
     // body on abandonment is the consumer's decision, not the parser's.
     reader.releaseLock()
+    await dumpObserver?.finish()
   }
 }
 
@@ -781,6 +792,7 @@ async function sendAnthropicRequest(
   const fetchImpl = deps.fetch ?? globalThis.fetch
   const keep = deps.cacheKeep ?? cacheKeepManager
   const native = deps.native ?? getPiNativeRuntime(options.storagePath)
+  let dumpHandle: DumpHandle | null = null
   // Capture the serving service while authorization is open. Shutdown rejects
   // new serving work immediately but drains writes for already-served attempts.
   const servingRuntime = await native.service()
@@ -1098,7 +1110,7 @@ async function sendAnthropicRequest(
       // for a newer credential), end it as cancelled here.
       if (attempt && response.status === 401)
         await endIfCancelled(response, init.signal)
-      await dumpDirectRequest({
+      dumpHandle = await dumpDirectRequest({
         affinity: relayAffinity,
         route:
           options.route ??
@@ -1143,6 +1155,17 @@ async function sendAnthropicRequest(
       trackAcceptedRequest(attempt)
       markServed(attempt)
     }
+    if (options.apiAccount && dumpHandle) {
+      await dumpResponseArtifact(dumpHandle, {
+        status: response.status,
+        message: null,
+        complete: false,
+      })
+      dumpResponseObservers.set(
+        response,
+        createDumpResponseObserver(dumpHandle, response.status),
+      )
+    }
     return response
   }
   if (options.apiAccount) return directFetch()
@@ -1162,6 +1185,9 @@ async function sendAnthropicRequest(
       body: wireBodyText,
       fallback: directFetch,
       affinity: relayAffinity,
+      onDumpCreated: (handle) => {
+        dumpHandle = handle
+      },
       authorizeAttempt: async () => {
         const attempt = await takeAttempt()
         await options.prime?.beforeSend()
@@ -1240,6 +1266,17 @@ async function sendAnthropicRequest(
     if (response.headers.get('x-cortexkit-relay-optimistic') !== 'true')
       trackAcceptedRequest(relayAttempt)
     markServed(relayAttempt)
+  }
+  if (dumpHandle) {
+    await dumpResponseArtifact(dumpHandle, {
+      status: response.status,
+      message: null,
+      complete: false,
+    })
+    dumpResponseObservers.set(
+      response,
+      createDumpResponseObserver(dumpHandle, response.status),
+    )
   }
   return response
 }
@@ -1385,6 +1422,8 @@ export async function firstStreamingError(
     return { response: replay(false), preflight: 'rate_limit_error' }
   }
   const inspected = replay(true)
+  const dumpObserver = dumpResponseObservers.get(response)
+  if (dumpObserver) dumpResponseObservers.set(inspected, dumpObserver)
   return { response: inspected, preflight: inspected }
 }
 

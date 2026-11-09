@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  createDumpResponseObserver,
   dumpDirectRequest,
   dumpRelayRequest,
   dumpResponseArtifact,
@@ -308,6 +309,7 @@ test('response artifacts sanitize message fields and preserve diagnostics presen
       usage: { input_tokens: 1 },
       diagnostics: null,
       content: [{ text: 'secret' }],
+      reply_text_edges: [{ text: 'secret' }],
     },
     complete: true,
   })
@@ -322,6 +324,145 @@ test('response artifacts sanitize message fields and preserve diagnostics presen
   })
   expect(JSON.stringify(artifact)).not.toContain('secret')
 })
+
+test('streamed response artifacts count text edges across deltas without content', async () => {
+  const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-dump-edges-'))
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({
+    affinity: 'ses-edges',
+    bodyText: '{}',
+  })
+  const observer = createDumpResponseObserver(handle, 200)
+  const events = [
+    { type: 'message_start', message: { id: 'msg_edges', content: [] } },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '\n' },
+    },
+    ...['\n', 'Hel', 'lo ', ''].map((text) => ({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text },
+    })),
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'content_block_start',
+      index: 1,
+      content_block: { type: 'tool_use', name: 'Read', input: {} },
+    },
+    {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'input_json_delta', partial_json: '{"text":"secret"}' },
+    },
+    { type: 'content_block_stop', index: 1 },
+    {
+      type: 'content_block_start',
+      index: 2,
+      content_block: { type: 'text', text: '' },
+    },
+    ...['Wor', 'ld', '\n'].map((text) => ({
+      type: 'content_block_delta',
+      index: 2,
+      delta: { type: 'text_delta', text },
+    })),
+    { type: 'content_block_stop', index: 2 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+    { type: 'message_stop' },
+  ]
+  for (const event of events) observer.observe(event)
+  await observer.finish()
+  const text = await readFile(handle!.responsePath, 'utf8')
+  expect(JSON.parse(text).reply_text_edges).toEqual([
+    { index: 0, leading: 2, trailing: 1, chars: 8 },
+    { index: 2, leading: 0, trailing: 1, chars: 6 },
+  ])
+  for (const secret of ['Hello', 'World', 'secret'])
+    expect(text).not.toContain(secret)
+})
+
+test('reply edge counts use trim whitespace and preserve empty and whitespace-only blocks', async () => {
+  const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-dump-whitespace-'))
+  dumpDirs.push(dumpDir)
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+  setDumpEnabled(true)
+  const handle = await dumpDirectRequest({
+    affinity: 'ses-whitespace',
+    bodyText: '{}',
+  })
+  const observer = createDumpResponseObserver(handle, 200)
+  observer.observe({
+    type: 'message_start',
+    message: { content: [{ type: 'text', text: '' }] },
+  })
+  observer.observe({
+    type: 'content_block_start',
+    index: 4,
+    content_block: {
+      type: 'text',
+      text: '\t\v\f\r\n \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff',
+    },
+  })
+  observer.observe({
+    type: 'content_block_delta',
+    index: 4,
+    delta: { type: 'text_delta', text: '\n' },
+  })
+  observer.observe({
+    type: 'content_block_start',
+    index: 2,
+    content_block: { type: 'text', text: '\ufeff\u200b \n' },
+  })
+  observer.observe({
+    type: 'content_block_delta',
+    index: 2,
+    delta: { type: 'text_delta', text: 'X' },
+  })
+  observer.observe({
+    type: 'content_block_delta',
+    index: 2,
+    delta: { type: 'text_delta', text: '\u3000' },
+  })
+  observer.observe({ type: 'message_stop' })
+  await observer.finish()
+  expect(
+    JSON.parse(await readFile(handle!.responsePath, 'utf8')).reply_text_edges,
+  ).toEqual([
+    { index: 0, leading: 0, trailing: 0, chars: 0 },
+    { index: 4, leading: 26, trailing: 26, chars: 26 },
+    { index: 2, leading: 1, trailing: 1, chars: 6 },
+  ])
+})
+
+test.each([200, 500])(
+  'error response artifacts omit reply edges (HTTP %i)',
+  async (status) => {
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-dump-error-'))
+    dumpDirs.push(dumpDir)
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    setDumpEnabled(true)
+    const handle = await dumpDirectRequest({
+      affinity: 'ses-error',
+      bodyText: '{}',
+    })
+    const observer = createDumpResponseObserver(handle, status)
+    observer.observe({ type: 'message_start', message: { content: [] } })
+    observer.observe({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: 'secret ' },
+    })
+    if (status === 200)
+      observer.observe({ type: 'error', error: { type: 'api_error' } })
+    await observer.finish()
+    const text = await readFile(handle!.responsePath, 'utf8')
+    expect(JSON.parse(text)).not.toHaveProperty('reply_text_edges')
+    expect(text).not.toContain('secret')
+  },
+)
 
 test('response artifacts preserve opening usage while recording terminal usage and reason', async () => {
   const dumpDir = await mkdtemp(
