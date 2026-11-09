@@ -153,6 +153,7 @@ export type ClaudeModelCatalogue = {
 export type ClaudeRefusalRecoveryFamily =
   | 'fable-5'
   | 'fable-5-1'
+  | 'fable-5-2'
   | 'opus-5'
   | 'opus-5-5'
 
@@ -246,6 +247,20 @@ const FABLE_MYTHOS_5_1_CATALOGUE: ClaudeModelCatalogue = {
   },
 }
 
+const FABLE_5_2_CATALOGUE: ClaudeModelCatalogue = {
+  releaseDate: '2026-11-09',
+  contextWindow: 1_000_000,
+  maxOutputTokens: 128_000,
+  pricing: {
+    input: 8,
+    output: 40,
+    // Anthropic's Claude Fable 5.2 model page lists cache reads at $0.20/M.
+    cacheRead: 0.2,
+    cacheWrite5m: 10,
+    cacheWrite1h: 16,
+  },
+}
+
 export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
   {
     id: 'claude-fable-5',
@@ -317,6 +332,26 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
     serverSideFallback: false,
     scopedQuota: 'mythos',
+    fastMode: false,
+  },
+  {
+    id: 'claude-fable-5-2',
+    name: 'Claude Fable 5.2',
+    family: 'fable',
+    idSuffixes: 'any',
+    catalogue: FABLE_5_2_CATALOGUE,
+    thinkingModes: ['adaptive'],
+    rejectsForcedToolChoice: true,
+    efforts: { variants: ALL_ADAPTIVE_EFFORTS, default: 'medium' },
+    effortMarkers: 'always',
+    turnEndNote: true,
+    thinkingBindingControls: true,
+    claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
+    serverSideFallback: true,
+    refusalRecoveryFamily: 'fable-5-2',
+    scopedQuota: 'fable',
+    // Claude Code's runtime capability list for 5.2 lacks fast_mode today, so
+    // we don't send speed: fast until a real request proves subscription accounts accept it.
     fastMode: false,
   },
   {

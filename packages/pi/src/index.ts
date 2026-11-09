@@ -136,7 +136,7 @@ export default async function cortexKitPiAnthropicAuth(
       }
     }
     // This hook collects effort history for the per-message effort markers
-    // that core adds to Fable 5.1, Opus 5.5 and Sonnet 5.5 requests. A host
+    // that core adds to Fable 5.1/5.2, Opus 5.5 and Sonnet 5.5 requests. A host
     // whose session entries do not match what this reads must cost the
     // session its transitions and nothing else: the handler runs before every
     // turn, and an exception here surfaced as a per-turn extension error while

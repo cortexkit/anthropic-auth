@@ -33,6 +33,7 @@ export function parseSourceWarmTargetId(
   if (
     family !== 'fable-5' &&
     family !== 'fable-5-1' &&
+    family !== 'fable-5-2' &&
     family !== 'opus-5' &&
     family !== 'opus-5-5'
   ) {
@@ -112,7 +113,7 @@ type FableFallbackState = {
 /**
  * Models whose content-filter refusal we recover from by downgrading to Opus 4.8
  * for a bounded window: capability rows with a `refusalRecoveryFamily` (Fable 5,
- * Fable 5.1, Opus 5 and Opus 5.5). Each has a separate source family because
+ * Fable 5.1, Fable 5.2, Opus 5 and Opus 5.5). Each has a separate source family because
  * recovery state must not cross-contaminate distinct requested models. All use
  * Anthropic's `claude-opus-4-8` fallback for the same classifier refusal shape
  * and recovery period. Mythos has no classifiers and Sonnet 5 is not flagged —

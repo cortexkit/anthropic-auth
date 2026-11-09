@@ -54,7 +54,7 @@ export function usesPerTurnControl(model: unknown): boolean {
 
 /**
  * Models whose OAuth requests carry `PER_TURN_CONTROL_BETA`: those whose
- * Claude Code main beta list includes it (Opus 5.5, Sonnet 5.5, Fable 5.1 and
+ * Claude Code main beta list includes it (Opus 5.5, Sonnet 5.5, Fable 5.1/5.2 and
  * Haiku 5.5 in Claude Code 2.1.302). Sending the beta does not by itself make
  * a model eligible for effort markers; `supportsPerMessageEffort` decides that.
  */
@@ -69,7 +69,7 @@ export function sendsPerTurnControlBeta(model: unknown): boolean {
 /**
  * Whether a request may move effort changes into empty system messages.
  *
- * Models with `effortMarkers: "always"` (Fable 5.1) are always eligible,
+ * Models with `effortMarkers: "always"` (Fable 5.1/5.2) are always eligible,
  * whatever the thinking field says. Models with `"with-adaptive-thinking"`
  * (Opus 5.5, Sonnet 5.5) qualify only with adaptive thinking: Anthropic
  * rejects a differing per-message effort with HTTP 400 on Sonnet 5.5
@@ -135,7 +135,7 @@ export function applyMidConversationOutputConfig(
   }
 
   const compacted = compactTransitions(transitions)
-  // Models with `effortMarkers: "always"` (Fable 5.1) always pin top-level
+  // Models with `effortMarkers: "always"` (Fable 5.1/5.2) always pin top-level
   // effort. The other models leave a request without an effort change exactly
   // as the host built it.
   const pinsEveryRequest = pinsEffortOnEveryRequest(body.model)

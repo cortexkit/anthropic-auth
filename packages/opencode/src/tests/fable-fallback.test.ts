@@ -5,6 +5,7 @@ import {
   FableFallbackManager,
   type FableSourceWarmInit,
   parseSourceWarmTargetId,
+  recoverableRefusalFamily,
   sourceWarmTargetId,
 } from '../fable-fallback'
 import { createStrippedStream } from '../transform'
@@ -534,6 +535,38 @@ describe('FableFallbackManager — Opus 5 recovery parity', () => {
       downgraded: false,
     })
   })
+})
+
+test('tracks Fable 5.2 recovery independently from Fable 5.1 in the same session', () => {
+  expect(recoverableRefusalFamily('claude-fable-5-2')).toBe('fable-5-2')
+  expect(parseSourceWarmTargetId('source-warm:session-a:fable-5-2')).toEqual({
+    sessionId: 'session-a',
+    family: 'fable-5-2',
+  })
+  const manager = new FableFallbackManager()
+  manager.activate(
+    manager.plan('session-a', body('claude-fable-5-1'))!,
+    '5.1-account',
+  )
+  const healthy52 = manager.plan('session-a', body('claude-fable-5-2'))!
+  expect(healthy52).toMatchObject({
+    effectiveModel: 'claude-fable-5-2',
+    downgraded: false,
+  })
+  manager.activate(healthy52, '5.2-account')
+  const recovered51 = manager.plan('session-a', body('claude-fable-5-1'))!
+  const recovered52 = manager.plan('session-a', body('claude-fable-5-2'))!
+  expect(recovered51).toMatchObject({
+    effectiveModel: FABLE_FALLBACK_MODEL_ID,
+    cacheAccountId: '5.1-account',
+    downgraded: true,
+  })
+  expect(recovered52).toMatchObject({
+    effectiveModel: FABLE_FALLBACK_MODEL_ID,
+    cacheAccountId: '5.2-account',
+    downgraded: true,
+  })
+  expect(recovered51.cycle).not.toBe(recovered52.cycle)
 })
 
 test('tracks Opus 5.5 recovery independently from Opus 5 in the same session', () => {

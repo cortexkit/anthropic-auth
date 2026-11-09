@@ -451,6 +451,63 @@ describe('mergeBetaHeaders', () => {
 })
 
 describe('setOAuthHeaders', () => {
+  test('Fable 5.2 OAuth uses medium adaptive thinking, 5.1 betas and safety fallback but never speed', async () => {
+    const request = (model: string) => {
+      const plan = markOpenCodeEffortTransitions([
+        {
+          info: {
+            id: 'u1',
+            sessionID: 'ses_fable52',
+            role: 'user',
+            model: { providerID: 'anthropic', modelID: model },
+          },
+          parts: [{ type: 'text', text: 'Hello' }],
+        },
+      ])!
+      if (model === 'claude-fable-5-2') expect(plan?.baseline).toBe('medium')
+      return rewriteRequestBody(
+        JSON.stringify({
+          model,
+          max_tokens: 128_000,
+          messages: [{ role: 'user', content: 'Hello' }],
+          thinking: { type: 'disabled' },
+          tool_choice: { type: 'any' },
+          speed: 'fast',
+        }),
+        {
+          isOAuth: true,
+          fastModeEnabled: true,
+          serverSideFallbackEnabled: true,
+          midConversationEffortEnabled: true,
+          midConversationEffortPlan: encodeOpenCodeEffortPlan(plan),
+        },
+      )
+    }
+    const body = JSON.parse(await request('claude-fable-5-2'))
+    const previous = JSON.parse(await request('claude-fable-5-1'))
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'medium' })
+    expect(body.fallbacks).toBe('default')
+    expect(body.speed).toBeUndefined()
+    expect(body.tool_choice).toBeUndefined()
+    const headers = new Headers()
+    const previousHeaders = new Headers()
+    setOAuthHeaders(headers, 'token', { body })
+    setOAuthHeaders(previousHeaders, 'token', { body: previous })
+    expect(headers.get('anthropic-beta')).toBe(
+      previousHeaders.get('anthropic-beta'),
+    )
+    expect(headers.get('anthropic-beta')?.split(',')).toContain(
+      PER_TURN_CONTROL_BETA,
+    )
+    expect(headers.get('anthropic-beta')?.split(',')).toContain(
+      SERVER_SIDE_FALLBACK_BETA,
+    )
+    expect(headers.get('anthropic-beta')?.split(',')).not.toContain(
+      FAST_MODE_BETA,
+    )
+  })
+
   test('sets authorization bearer token', () => {
     const headers = new Headers()
     setOAuthHeaders(headers, 'my-token')

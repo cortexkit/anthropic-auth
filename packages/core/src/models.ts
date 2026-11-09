@@ -14,6 +14,7 @@ export { normalizeAnthropicModelId }
 export const CLAUDE_FABLE_5_MODEL_ID = 'claude-fable-5'
 export const CLAUDE_MYTHOS_5_MODEL_ID = 'claude-mythos-5'
 export const CLAUDE_FABLE_5_1_MODEL_ID = 'claude-fable-5-1'
+export const CLAUDE_FABLE_5_2_MODEL_ID = 'claude-fable-5-2'
 export const CLAUDE_MYTHOS_5_1_MODEL_ID = 'claude-mythos-5-1'
 
 /**
@@ -43,6 +44,7 @@ export const CLAUDE_FABLE_MYTHOS_5_MODEL_IDS = [
   CLAUDE_FABLE_5_MODEL_ID,
   CLAUDE_MYTHOS_5_MODEL_ID,
   ...CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS,
+  CLAUDE_FABLE_5_2_MODEL_ID,
 ] as const
 
 export type ClaudeFableMythos5ModelId =
@@ -55,9 +57,12 @@ export const CLAUDE_FABLE_MYTHOS_5_SUMMARIZED_THINKING = {
 
 const FABLE_5_CATALOGUE = getClaudeModelCatalogue(CLAUDE_FABLE_5_MODEL_ID)
 const FABLE_5_1_CATALOGUE = getClaudeModelCatalogue(CLAUDE_FABLE_5_1_MODEL_ID)
+const FABLE_5_2_CATALOGUE = getClaudeModelCatalogue(CLAUDE_FABLE_5_2_MODEL_ID)
 
 export const CLAUDE_FABLE_MYTHOS_5_PRICING = FABLE_5_CATALOGUE.pricing
 export const CLAUDE_FABLE_MYTHOS_5_1_PRICING = FABLE_5_1_CATALOGUE.pricing
+export const CLAUDE_FABLE_5_2_PRICING = FABLE_5_2_CATALOGUE.pricing
+export const CLAUDE_FABLE_5_2_RELEASE_DATE = FABLE_5_2_CATALOGUE.releaseDate
 
 export const CLAUDE_FABLE_MYTHOS_5_CONTEXT_WINDOW =
   FABLE_5_CATALOGUE.contextWindow
@@ -118,9 +123,11 @@ export function isClaudeFable51Model(model: unknown) {
 }
 
 export function getClaudeFableMythos5ReleaseDate(model: unknown) {
-  return isClaudeFableOrMythos51Model(model)
-    ? CLAUDE_FABLE_MYTHOS_5_1_RELEASE_DATE
-    : CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE
+  const row = resolveClaudeModelCapabilities(model)
+  return (
+    (isFableOrMythosRow(row) && row?.catalogue?.releaseDate) ||
+    CLAUDE_FABLE_MYTHOS_5_RELEASE_DATE
+  )
 }
 
 export const CLAUDE_SONNET_5_MODEL_ID = 'claude-sonnet-5'

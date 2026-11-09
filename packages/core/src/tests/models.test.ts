@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test'
+import * as models from '../models'
+
 import {
   CLAUDE_FABLE_5_1_MODEL_ID,
   CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS,
@@ -30,6 +32,26 @@ import {
   isClaudeSonnet55Model,
   normalizeAnthropicModelId,
 } from '../models'
+
+test('Fable 5.2 has independent pricing, registration and release date aliases', () => {
+  expect(models.CLAUDE_FABLE_5_2_MODEL_ID).toBe('claude-fable-5-2')
+  expect(models.CLAUDE_FABLE_5_2_PRICING).toEqual({
+    input: 8,
+    output: 40,
+    cacheRead: 0.2,
+    cacheWrite5m: 10,
+    cacheWrite1h: 16,
+  })
+  expect(models.CLAUDE_FABLE_5_2_PRICING).not.toBe(
+    models.CLAUDE_FABLE_MYTHOS_5_1_PRICING,
+  )
+  expect(models.CLAUDE_FABLE_5_2_RELEASE_DATE).toBe('2026-11-09')
+  expect(models.CLAUDE_FABLE_MYTHOS_5_MODEL_IDS).toContain('claude-fable-5-2')
+  expect(
+    models.getClaudeFableMythos5ReleaseDate('claude-fable-5-2-20261109[1m]'),
+  ).toBe('2026-11-09')
+  expect(models.isClaudeFable51Model('claude-fable-5-2')).toBe(false)
+})
 
 describe('Claude Fable/Mythos 5.1 models', () => {
   test('exposes both 5.1 model ids and complete specs', () => {

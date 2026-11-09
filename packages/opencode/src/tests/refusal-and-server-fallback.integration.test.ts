@@ -156,7 +156,8 @@ describe('auth.loader', () => {
     expect(responseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
   })
 
-  test('uses Anthropic server-side fallback for Fable 5.1 and reports transitions', async () => {
+  const assertServerFallbackTransitions = async (modelId: string) => {
+    const label = modelId === 'claude-fable-5-2' ? 'Fable 5.2' : 'Fable 5.1'
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE
     await useTempAccountFile(
       createFallbackStorage({
@@ -179,7 +180,7 @@ describe('auth.loader', () => {
         index: 0,
         content_block: {
           type: 'fallback',
-          from: { model: 'claude-fable-5-1' },
+          from: { model: modelId },
           to: { model: 'claude-opus-5' },
         },
       }),
@@ -203,7 +204,7 @@ describe('auth.loader', () => {
           iterations: [
             {
               type: 'message',
-              model: 'claude-fable-5-1',
+              model: modelId,
               input_tokens: 100,
               output_tokens: 0,
             },
@@ -221,7 +222,7 @@ describe('auth.loader', () => {
     const restoredSse = [
       frame('message_start', {
         type: 'message_start',
-        message: { id: 'msg_restored', model: 'claude-fable-5-1' },
+        message: { id: 'msg_restored', model: modelId },
       }),
       frame('content_block_start', {
         type: 'content_block_start',
@@ -242,7 +243,7 @@ describe('auth.loader', () => {
           iterations: [
             {
               type: 'message',
-              model: 'claude-fable-5-1',
+              model: modelId,
               input_tokens: 100,
               output_tokens: 2,
             },
@@ -282,7 +283,7 @@ describe('auth.loader', () => {
           agent: 'Alfonso - CTO',
           model: {
             providerID: 'anthropic',
-            modelID: 'claude-fable-5-1',
+            modelID: modelId,
             variant: 'xhigh',
           },
         },
@@ -293,7 +294,7 @@ describe('auth.loader', () => {
           role: 'assistant',
           agent: 'Alfonso - CTO',
           providerID: 'anthropic',
-          modelID: 'claude-fable-5-1',
+          modelID: modelId,
           variant: 'xhigh',
         },
       },
@@ -313,7 +314,7 @@ describe('auth.loader', () => {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses_server_fallback' },
       body: JSON.stringify({
-        model: 'claude-fable-5-1',
+        model: modelId,
         stream: true,
         messages: [{ role: 'user', content: 'hello' }],
       }),
@@ -337,7 +338,7 @@ describe('auth.loader', () => {
       ),
     )
     expect(switched.fableRecoveries?.[0]).toMatchObject({
-      requestedModelId: 'claude-fable-5-1',
+      requestedModelId: modelId,
       targetModelId: 'claude-opus-5',
       remaining: 0,
     })
@@ -398,7 +399,9 @@ describe('auth.loader', () => {
           noReply: true,
           parts: [
             expect.objectContaining({
-              text: expect.stringContaining('Anthropic safety fallback'),
+              text: expect.stringContaining(
+                `Anthropic safety fallback active: ${label} → Opus 5`,
+              ),
             }),
           ],
         }),
@@ -474,9 +477,7 @@ describe('auth.loader', () => {
         ),
       ),
     )
-    expect(restored.fableRecoveries?.[0]?.requestedModelId).toBe(
-      'claude-fable-5-1',
-    )
+    expect(restored.fableRecoveries?.[0]?.requestedModelId).toBe(modelId)
     await plugin.event?.({
       event: {
         type: 'session.idle',
@@ -495,7 +496,7 @@ describe('auth.loader', () => {
         body: expect.objectContaining({
           parts: [
             expect.objectContaining({
-              text: expect.stringContaining('Returning to Fable 5.1'),
+              text: expect.stringContaining(`Returning to ${label}`),
             }),
           ],
         }),
@@ -593,7 +594,7 @@ describe('auth.loader', () => {
         body: expect.objectContaining({
           parts: [
             expect.objectContaining({
-              text: expect.stringContaining('Returning to Fable 5.1'),
+              text: expect.stringContaining(`Returning to ${label}`),
             }),
           ],
         }),
@@ -628,7 +629,11 @@ describe('auth.loader', () => {
     })
     await waitForMockCall(mockClient.session.promptAsync)
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
-  })
+  }
+  test.each(['claude-fable-5-1', 'claude-fable-5-2'])(
+    'uses Anthropic server-side fallback for %s and reports transitions',
+    assertServerFallbackTransitions,
+  )
 
   test('downgrades a filtered Fable session for ten completed Opus responses without source warms', async () => {
     await useTempAccountFile(

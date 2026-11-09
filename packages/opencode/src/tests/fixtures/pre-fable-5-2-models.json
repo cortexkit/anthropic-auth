@@ -1,0 +1,1460 @@
+{
+  "claude-fable-5": {
+    "capabilities": {
+      "id": "claude-fable-5",
+      "name": "Claude Fable 5",
+      "family": "fable",
+      "idSuffixes": "any",
+      "catalogue": {
+        "releaseDate": "2026-06-09",
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "pricing": {
+          "input": 10,
+          "output": 50,
+          "cacheRead": 1,
+          "cacheWrite5m": 12.5,
+          "cacheWrite1h": 20
+        }
+      },
+      "thinkingModes": ["adaptive"],
+      "rejectsForcedToolChoice": false,
+      "efforts": {
+        "default": "high"
+      },
+      "effortMarkers": "none",
+      "turnEndNote": false,
+      "thinkingBindingControls": false,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05"
+        ]
+      },
+      "serverSideFallback": true,
+      "refusalRecoveryFamily": "fable-5",
+      "scopedQuota": "fable",
+      "fastMode": false
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-fable-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=26e9c;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-fable-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=26e9c;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-fable-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=26e9c;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      }
+    }
+  },
+  "claude-mythos-5": {
+    "capabilities": {
+      "id": "claude-mythos-5",
+      "name": "Claude Mythos 5",
+      "family": "mythos",
+      "idSuffixes": "any",
+      "limited": true,
+      "catalogue": {
+        "releaseDate": "2026-06-09",
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "pricing": {
+          "input": 10,
+          "output": 50,
+          "cacheRead": 1,
+          "cacheWrite5m": 12.5,
+          "cacheWrite1h": 20
+        }
+      },
+      "thinkingModes": ["adaptive"],
+      "rejectsForcedToolChoice": false,
+      "efforts": {
+        "default": "high"
+      },
+      "effortMarkers": "none",
+      "turnEndNote": false,
+      "thinkingBindingControls": false,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05"
+        ]
+      },
+      "serverSideFallback": false,
+      "scopedQuota": "mythos",
+      "fastMode": false
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-mythos-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=752b6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-mythos-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=752b6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-mythos-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=752b6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      }
+    }
+  },
+  "claude-fable-5-1": {
+    "capabilities": {
+      "id": "claude-fable-5-1",
+      "name": "Claude Fable 5.1",
+      "family": "fable",
+      "idSuffixes": "any",
+      "catalogue": {
+        "releaseDate": "2026-09-01",
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "pricing": {
+          "input": 10,
+          "output": 50,
+          "cacheRead": 0.25,
+          "cacheWrite5m": 12.5,
+          "cacheWrite1h": 20
+        }
+      },
+      "thinkingModes": ["adaptive"],
+      "rejectsForcedToolChoice": true,
+      "efforts": {
+        "variants": ["low", "medium", "high", "xhigh", "max"],
+        "default": "high"
+      },
+      "effortMarkers": "always",
+      "turnEndNote": true,
+      "thinkingBindingControls": true,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01"
+        ]
+      },
+      "serverSideFallback": true,
+      "refusalRecoveryFamily": "fable-5-1",
+      "scopedQuota": "fable",
+      "fastMode": false
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-fable-5-1",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=8c24e;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-fable-5-1",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=8c24e;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-fable-5-1",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=8c24e;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      }
+    }
+  },
+  "claude-mythos-5-1": {
+    "capabilities": {
+      "id": "claude-mythos-5-1",
+      "name": "Claude Mythos 5.1",
+      "family": "mythos",
+      "idSuffixes": "any",
+      "limited": true,
+      "catalogue": {
+        "releaseDate": "2026-09-01",
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "pricing": {
+          "input": 10,
+          "output": 50,
+          "cacheRead": 0.25,
+          "cacheWrite5m": 12.5,
+          "cacheWrite1h": 20
+        }
+      },
+      "thinkingModes": ["adaptive"],
+      "rejectsForcedToolChoice": true,
+      "efforts": {
+        "default": "high"
+      },
+      "effortMarkers": "none",
+      "turnEndNote": false,
+      "thinkingBindingControls": false,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05"
+        ]
+      },
+      "serverSideFallback": false,
+      "scopedQuota": "mythos",
+      "fastMode": false
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-mythos-5-1",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=dbbd0;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-mythos-5-1",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=dbbd0;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-mythos-5-1",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=dbbd0;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      }
+    }
+  },
+  "claude-opus-5": {
+    "capabilities": {
+      "id": "claude-opus-5",
+      "name": "Claude Opus 5",
+      "family": "opus",
+      "idSuffixes": "any",
+      "thinkingModes": ["adaptive", "disabled"],
+      "rejectsForcedToolChoice": false,
+      "efforts": {
+        "variants": ["low", "medium", "high", "xhigh", "max"],
+        "default": "high"
+      },
+      "effortMarkers": "none",
+      "turnEndNote": false,
+      "thinkingBindingControls": false,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05"
+        ]
+      },
+      "serverSideFallback": true,
+      "refusalRecoveryFamily": "opus-5",
+      "fastMode": true
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-opus-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=a4525;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "speed": "fast",
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07,fast-mode-2026-02-01"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-opus-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=a4525;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "speed": "fast",
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07,fast-mode-2026-02-01"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-opus-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=1acd6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "disabled"
+          },
+          "speed": "fast",
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07,fast-mode-2026-02-01"
+      }
+    }
+  },
+  "claude-opus-5-5": {
+    "capabilities": {
+      "id": "claude-opus-5-5",
+      "name": "Claude Opus 5.5",
+      "family": "opus",
+      "idSuffixes": "any",
+      "catalogue": {
+        "releaseDate": "2026-09-18",
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "pricing": {
+          "input": 4,
+          "output": 20,
+          "cacheRead": 0.2,
+          "cacheWrite5m": 5,
+          "cacheWrite1h": 8
+        }
+      },
+      "thinkingModes": ["adaptive"],
+      "rejectsForcedToolChoice": true,
+      "efforts": {
+        "variants": ["low", "medium", "high", "xhigh", "max"],
+        "default": "medium"
+      },
+      "effortMarkers": "with-adaptive-thinking",
+      "turnEndNote": true,
+      "thinkingBindingControls": true,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01"
+        ]
+      },
+      "serverSideFallback": true,
+      "refusalRecoveryFamily": "opus-5-5",
+      "fastMode": true
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-opus-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=1e52e;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "speed": "fast",
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07,fast-mode-2026-02-01"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-opus-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=1e52e;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "speed": "fast",
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07,fast-mode-2026-02-01"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-opus-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=1e52e;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          },
+          "speed": "fast",
+          "fallbacks": "default"
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,server-side-fallback-2026-07-01",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07,fast-mode-2026-02-01"
+      }
+    }
+  },
+  "claude-sonnet-5": {
+    "capabilities": {
+      "id": "claude-sonnet-5",
+      "name": "Claude Sonnet 5",
+      "family": "sonnet",
+      "idSuffixes": "any",
+      "thinkingModes": ["adaptive", "disabled"],
+      "rejectsForcedToolChoice": false,
+      "efforts": {
+        "default": "high"
+      },
+      "effortMarkers": "none",
+      "turnEndNote": false,
+      "thinkingBindingControls": false,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05"
+        ]
+      },
+      "serverSideFallback": false,
+      "fastMode": false
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-sonnet-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=752b6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-sonnet-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=752b6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-sonnet-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=81454;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      }
+    }
+  },
+  "claude-sonnet-5-5": {
+    "capabilities": {
+      "id": "claude-sonnet-5-5",
+      "name": "Claude Sonnet 5.5",
+      "family": "sonnet",
+      "idSuffixes": "any",
+      "catalogue": {
+        "releaseDate": "2026-09-28",
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "pricing": {
+          "input": 2,
+          "output": 10,
+          "cacheRead": 0.2,
+          "cacheWrite5m": 2.5,
+          "cacheWrite1h": 4
+        }
+      },
+      "thinkingModes": ["adaptive", "between_tools"],
+      "rejectsForcedToolChoice": true,
+      "efforts": {
+        "variants": ["low", "medium", "high", "xhigh", "max"],
+        "default": "high"
+      },
+      "effortMarkers": "with-adaptive-thinking",
+      "turnEndNote": true,
+      "thinkingBindingControls": true,
+      "claudeCodeBetas": {
+        "main": [
+          "claude-code-20250219",
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01"
+        ]
+      },
+      "serverSideFallback": false,
+      "fastMode": false
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-sonnet-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=dbbd0;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-sonnet-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=dbbd0;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-sonnet-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=32910;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "between_tools"
+          }
+        },
+        "betas": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      }
+    }
+  },
+  "claude-haiku-5-5": {
+    "capabilities": {
+      "id": "claude-haiku-5-5",
+      "name": "Claude Haiku 5.5",
+      "family": "haiku",
+      "idSuffixes": "dated",
+      "catalogue": {
+        "releaseDate": "2026-10-07",
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "pricing": {
+          "input": 0.1,
+          "output": 0.5,
+          "cacheRead": 0.01,
+          "cacheWrite5m": 0.125,
+          "cacheWrite1h": 0.2
+        },
+        "longContext": {
+          "inputTokensAbove": 100000,
+          "pricing": {
+            "input": 0.5,
+            "output": 2.5,
+            "cacheRead": 0.05,
+            "cacheWrite5m": 0.625,
+            "cacheWrite1h": 1
+          }
+        }
+      },
+      "thinkingModes": ["adaptive", "disabled"],
+      "rejectsForcedToolChoice": false,
+      "efforts": {
+        "variants": ["low", "medium", "high", "xhigh", "max"],
+        "default": "medium"
+      },
+      "effortMarkers": "none",
+      "turnEndNote": true,
+      "thinkingBindingControls": true,
+      "claudeCodeBetas": {
+        "main": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "claude-code-20250219",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "advanced-tool-use-2025-11-20",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "thinking-binding-controls-2026-08-01",
+          "thinking-display-updates-2026-08-18",
+          "extended-cache-ttl-2025-04-11",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "title": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01",
+          "mid-conversation-tool-changes-2026-07-01",
+          "mid-conversation-system-clear-at-2026-08-21",
+          "effort-2025-11-24",
+          "cache-diagnosis-2026-04-07"
+        ],
+        "quota": [
+          "oauth-2025-04-20",
+          "interleaved-thinking-2025-05-14",
+          "redact-thinking-2026-02-12",
+          "thinking-token-count-2026-05-13",
+          "context-management-2025-06-27",
+          "prompt-caching-scope-2026-01-05",
+          "per-turn-control-2026-07-01"
+        ]
+      },
+      "serverSideFallback": false,
+      "fastMode": false
+    },
+    "requests": {
+      "absent": {
+        "body": {
+          "model": "claude-haiku-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=752b6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "adaptive": {
+        "body": {
+          "model": "claude-haiku-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=752b6;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "betas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      },
+      "disabled": {
+        "body": {
+          "model": "claude-haiku-5-5",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.302.804; cc_entrypoint=cli; cch=81454;"
+            },
+            {
+              "type": "text",
+              "text": "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+          ],
+          "tool_choice": {
+            "type": "any"
+          },
+          "max_tokens": 32000,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "betas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "auxiliaryBetas": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07"
+      }
+    }
+  }
+}

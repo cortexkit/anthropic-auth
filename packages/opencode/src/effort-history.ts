@@ -113,14 +113,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * Group a model id into the per-message-effort family whose user turns share
- * one effort timeline. Every model that takes effort markers (Fable 5.1,
+ * one effort timeline. Every model that takes effort markers (Fable 5.1/5.2,
  * Opus 5.5 and Sonnet 5.5) is its own family, and turns sent to a different
  * family in the same session are left out: an Opus 5.5 timeline never counts
- * Sonnet 5.5 or Fable 5.1 turns, and the reverse.
+ * Sonnet 5.5 or Fable 5.1/5.2 turns, and the reverse.
  */
 function perMessageEffortFamily(model: unknown): string | undefined {
   // Models whose capability row allows effort markers; the family is the
-  // row's id without its `claude-` prefix, such as `fable-5-1`.
+  // row's id without its `claude-` prefix, such as `fable-5-2`.
   const capabilities = resolveClaudeModelCapabilities(model)
   if (!capabilities || capabilities.effortMarkers === 'none') return undefined
   return capabilities.id.replace(/^claude-/, '')
@@ -899,7 +899,7 @@ export function applyOpenCodeEffortMarkers(
         'Per-message effort marker request plan mismatch',
       )
     }
-    // Only models with `effortMarkers: "always"` (Fable 5.1) pin top-level
+    // Only models with `effortMarkers: "always"` (Fable 5.1/5.2) pin top-level
     // effort on a request without surviving markers; the other models keep
     // the host's request unchanged here.
     if (enabled && pinsEffortOnEveryRequest(body.model)) {
@@ -1097,7 +1097,7 @@ export function applyOpenCodeEffortMarkers(
     rewritten.push(message.value)
   }
   body.messages = rewritten
-  // Models with `effortMarkers: "always"` (Fable 5.1) always pin the earliest
+  // Models with `effortMarkers: "always"` (Fable 5.1/5.2) always pin the earliest
   // effort. The other models change top-level effort only when a marker
   // carries the later effort.
   if (applyConfig && (inserted > 0 || pinsEffortOnEveryRequest(body.model))) {

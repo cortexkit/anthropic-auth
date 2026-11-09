@@ -1,6 +1,15 @@
 {
   "catalogue": {
     "CLAUDE_FABLE_5_1_MODEL_ID": "claude-fable-5-1",
+    "CLAUDE_FABLE_5_2_MODEL_ID": "claude-fable-5-2",
+    "CLAUDE_FABLE_5_2_PRICING": {
+      "input": 8,
+      "output": 40,
+      "cacheRead": 0.2,
+      "cacheWrite5m": 10,
+      "cacheWrite1h": 16
+    },
+    "CLAUDE_FABLE_5_2_RELEASE_DATE": "2026-11-09",
     "CLAUDE_FABLE_5_MODEL_ID": "claude-fable-5",
     "CLAUDE_FABLE_MYTHOS_5_1_MODEL_IDS": [
       "claude-fable-5-1",
@@ -31,7 +40,8 @@
       "claude-fable-5",
       "claude-mythos-5",
       "claude-fable-5-1",
-      "claude-mythos-5-1"
+      "claude-mythos-5-1",
+      "claude-fable-5-2"
     ],
     "CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS": {
       "claude-fable-5": {
@@ -51,6 +61,10 @@
         "id": "claude-mythos-5-1",
         "name": "Claude Mythos 5.1",
         "limited": true
+      },
+      "claude-fable-5-2": {
+        "id": "claude-fable-5-2",
+        "name": "Claude Fable 5.2"
       }
     },
     "CLAUDE_FABLE_MYTHOS_5_PRICING": {
@@ -1102,6 +1116,628 @@
           "thinking": {
             "type": "adaptive",
             "display": "summarized"
+          }
+        },
+        "drop_block/disabled": {
+          "applied": false,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "drop_block/between_tools": {
+          "applied": false,
+          "thinking": {
+            "type": "between_tools"
+          }
+        },
+        "drop_block/absent": {
+          "applied": false,
+          "thinking": null
+        },
+        "withoutReplayableThinking": false
+      }
+    },
+    "claude-fable-5-2": {
+      "normalized": "claude-fable-5-2",
+      "predicates": {
+        "isClaudeFable51Model": false,
+        "isClaudeFableOrMythos51Model": false,
+        "isClaudeFableOrMythos5Model": true,
+        "isClaudeHaiku55Model": false,
+        "isClaudeOpus55Model": false,
+        "isClaudeOpus5FamilyModel": false,
+        "isClaudeOpus5Model": false,
+        "isClaudeSonnet55Model": false,
+        "isClaudeSonnet5Model": false,
+        "isOpenAIReasoningSignature": false
+      },
+      "fableMythosReleaseDate": "2026-11-09",
+      "fastMode": false,
+      "stickyRouteFamily": "fable",
+      "nativeQuotaScope": "fable",
+      "betas": {
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
+      },
+      "effort": {
+        "sendsPerTurnControlBeta": true,
+        "usesPerTurnControl": false,
+        "defaultAdaptiveEffort": "medium",
+        "supportsPerMessageEffort": {
+          "adaptive": true,
+          "disabled": true,
+          "between_tools": true,
+          "absent": true
+        },
+        "midConversation": {
+          "adaptive/none/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "medium"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/none/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "xhigh"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/single/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/single/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/change/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          },
+          "adaptive/change/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          },
+          "absent/none/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "medium"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/none/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "xhigh"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/single/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/single/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/change/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          },
+          "absent/change/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          }
+        }
+      },
+      "turnEndNote": {
+        "supportsTurnEndNote": true,
+        "inserted": 1,
+        "messages": [
+          "user",
+          "assistant",
+          "user",
+          {
+            "role": "system",
+            "clear_at": "next_user_message",
+            "output_config": null,
+            "text": true
+          },
+          "assistant",
+          "user"
+        ]
+      },
+      "thinkingBinding": {
+        "account-default/adaptive": {
+          "applied": false,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "account-default/disabled": {
+          "applied": false,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "account-default/between_tools": {
+          "applied": false,
+          "thinking": {
+            "type": "between_tools"
+          }
+        },
+        "account-default/absent": {
+          "applied": false,
+          "thinking": null
+        },
+        "error/adaptive": {
+          "applied": true,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "error"
+            }
+          }
+        },
+        "error/disabled": {
+          "applied": false,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "error/between_tools": {
+          "applied": false,
+          "thinking": {
+            "type": "between_tools"
+          }
+        },
+        "error/absent": {
+          "applied": false,
+          "thinking": null
+        },
+        "drop_block/adaptive": {
+          "applied": true,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          }
+        },
+        "drop_block/disabled": {
+          "applied": false,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "drop_block/between_tools": {
+          "applied": false,
+          "thinking": {
+            "type": "between_tools"
+          }
+        },
+        "drop_block/absent": {
+          "applied": false,
+          "thinking": null
+        },
+        "withoutReplayableThinking": false
+      }
+    },
+    "claude-fable-5-2-20261109[1m]": {
+      "normalized": "claude-fable-5-2-20261109",
+      "predicates": {
+        "isClaudeFable51Model": false,
+        "isClaudeFableOrMythos51Model": false,
+        "isClaudeFableOrMythos5Model": true,
+        "isClaudeHaiku55Model": false,
+        "isClaudeOpus55Model": false,
+        "isClaudeOpus5FamilyModel": false,
+        "isClaudeOpus5Model": false,
+        "isClaudeSonnet55Model": false,
+        "isClaudeSonnet5Model": false,
+        "isOpenAIReasoningSignature": false
+      },
+      "fableMythosReleaseDate": "2026-11-09",
+      "fastMode": false,
+      "stickyRouteFamily": "fable",
+      "nativeQuotaScope": "fable",
+      "betas": {
+        "main": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07",
+        "mainWithNoteStructuredFastAndExtra": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07,fast-mode-2026-02-01,extra-beta-2026-01-01",
+        "title": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,cache-diagnosis-2026-04-07",
+        "titleStructured": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,structured-outputs-2025-12-15,cache-diagnosis-2026-04-07",
+        "quota": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01",
+        "quotaWithNote": "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-system-clear-at-2026-08-21"
+      },
+      "effort": {
+        "sendsPerTurnControlBeta": true,
+        "usesPerTurnControl": false,
+        "defaultAdaptiveEffort": "medium",
+        "supportsPerMessageEffort": {
+          "adaptive": true,
+          "disabled": true,
+          "between_tools": true,
+          "absent": true
+        },
+        "midConversation": {
+          "adaptive/none/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "medium"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/none/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "xhigh"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/single/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/single/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "adaptive/change/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          },
+          "adaptive/change/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          },
+          "absent/none/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "medium"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/none/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "xhigh"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/single/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/single/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 0
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": ["user", "assistant", "user", "assistant", "user"]
+          },
+          "absent/change/noConfig": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          },
+          "absent/change/xhigh": {
+            "result": {
+              "applied": true,
+              "inserted": 1
+            },
+            "output_config": {
+              "effort": "low"
+            },
+            "messages": [
+              "user",
+              "assistant",
+              "user",
+              "assistant",
+              {
+                "role": "system",
+                "clear_at": null,
+                "output_config": {
+                  "effort": "max"
+                },
+                "text": false
+              },
+              "user"
+            ]
+          }
+        }
+      },
+      "turnEndNote": {
+        "supportsTurnEndNote": true,
+        "inserted": 1,
+        "messages": [
+          "user",
+          "assistant",
+          "user",
+          {
+            "role": "system",
+            "clear_at": "next_user_message",
+            "output_config": null,
+            "text": true
+          },
+          "assistant",
+          "user"
+        ]
+      },
+      "thinkingBinding": {
+        "account-default/adaptive": {
+          "applied": false,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized"
+          }
+        },
+        "account-default/disabled": {
+          "applied": false,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "account-default/between_tools": {
+          "applied": false,
+          "thinking": {
+            "type": "between_tools"
+          }
+        },
+        "account-default/absent": {
+          "applied": false,
+          "thinking": null
+        },
+        "error/adaptive": {
+          "applied": true,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "error"
+            }
+          }
+        },
+        "error/disabled": {
+          "applied": false,
+          "thinking": {
+            "type": "disabled"
+          }
+        },
+        "error/between_tools": {
+          "applied": false,
+          "thinking": {
+            "type": "between_tools"
+          }
+        },
+        "error/absent": {
+          "applied": false,
+          "thinking": null
+        },
+        "drop_block/adaptive": {
+          "applied": true,
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
           }
         },
         "drop_block/disabled": {

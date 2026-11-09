@@ -21,6 +21,40 @@ const snapshot = JSON.parse(
 ) as { models: Record<string, unknown> }
 
 describe('model capability table', () => {
+  test('Fable 5.2 resolves ahead of the Fable 5 prefix, including suffixed ids', () => {
+    for (const id of ['claude-fable-5-2', 'claude-fable-5-2-20261109[1m]']) {
+      expect(resolveClaudeModelCapabilities(id)).toMatchObject({
+        id: 'claude-fable-5-2',
+        name: 'Claude Fable 5.2',
+        thinkingModes: ['adaptive'],
+        rejectsForcedToolChoice: true,
+        efforts: {
+          variants: ['low', 'medium', 'high', 'xhigh', 'max'],
+          default: 'medium',
+        },
+        effortMarkers: 'always',
+        turnEndNote: true,
+        thinkingBindingControls: true,
+        serverSideFallback: true,
+        refusalRecoveryFamily: 'fable-5-2',
+        scopedQuota: 'fable',
+        fastMode: false,
+        catalogue: {
+          releaseDate: '2026-11-09',
+          contextWindow: 1_000_000,
+          maxOutputTokens: 128_000,
+          pricing: {
+            input: 8,
+            output: 40,
+            cacheRead: 0.2,
+            cacheWrite5m: 10,
+            cacheWrite1h: 16,
+          },
+        },
+      })
+    }
+  })
+
   test('ids are unique', () => {
     const ids = CLAUDE_MODEL_CAPABILITIES.map((row) => row.id)
     expect(new Set(ids).size).toBe(ids.length)

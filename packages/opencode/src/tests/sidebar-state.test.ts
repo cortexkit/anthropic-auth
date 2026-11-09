@@ -389,6 +389,12 @@ describe('getFableRecoverySummary', () => {
 })
 
 describe('formatFallbackModelLabel', () => {
+  test('formats Fable 5.2 ahead of the generic Fable 5 prefix', () => {
+    expect(formatFallbackModelLabel('claude-fable-5-2')).toBe('Fable 5.2')
+    expect(formatFallbackModelLabel('claude-fable-5-2-20261109')).toBe(
+      'Fable 5.2',
+    )
+  })
   test('formats Fable 5 ids', () => {
     expect(formatFallbackModelLabel('claude-fable-5')).toBe('Fable 5')
     expect(formatFallbackModelLabel('claude-fable-5-20260608')).toBe('Fable 5')

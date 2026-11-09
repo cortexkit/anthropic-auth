@@ -190,6 +190,23 @@ describe('cortexKitPiAnthropicAuth provider registration', () => {
     })
   })
 
+  test('exposes Claude Fable 5.2 with its own price and limits in Pi', async () => {
+    const { pi, providers } = mockPi()
+    await cortexKitPiAnthropicAuth(pi)
+    expect(providers.get('anthropic')?.models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'claude-fable-5-2',
+          name: 'Claude Fable 5.2',
+          reasoning: true,
+          cost: { input: 8, output: 40, cacheRead: 0.2, cacheWrite: 10 },
+          contextWindow: 1_000_000,
+          maxTokens: 128_000,
+        }),
+      ]),
+    )
+  })
+
   test('exposes Claude Fable and Mythos 5.1 in the Pi Anthropic catalog', async () => {
     const { pi, providers } = mockPi()
 

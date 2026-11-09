@@ -629,6 +629,39 @@ describe('auth.methods', () => {
 })
 
 describe('provider.models', () => {
+  test('registers Fable 5.2 on OC1 with its own price, limits and release date', async () => {
+    const plugin = await getPlugin()
+    const result = await plugin.provider?.models?.(
+      {
+        models: {
+          'claude-opus-4-8': {
+            id: 'claude-opus-4-8',
+            api: {
+              id: 'claude-opus-4-8',
+              type: 'aisdk',
+              package: '@ai-sdk/anthropic',
+            },
+          },
+        },
+      } as never,
+      { auth: { type: 'api' } } as never,
+    )
+    expect(result?.['claude-fable-5-2']).toMatchObject({
+      name: 'Claude Fable 5.2',
+      api: { id: 'claude-fable-5-2' },
+      cost: { input: 8, output: 40, cache: { read: 0.2, write: 10 } },
+      limit: { context: 1_000_000, output: 128_000 },
+      release_date: '2026-11-09',
+    })
+    expect(Object.keys(result?.['claude-fable-5-2']?.variants ?? {})).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+  })
+
   beforeEach(async () => {
     await useTempAccountFile(createFallbackStorage({ accounts: [] }))
   })

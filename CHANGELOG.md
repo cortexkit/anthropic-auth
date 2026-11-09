@@ -4,6 +4,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Adds Claude Fable 5.2 (`claude-fable-5-2`) on OpenCode 1, OpenCode 2 and Pi, sent the way Claude Code sends it: adaptive thinking, medium default effort, per-message effort and Anthropic's safety fallback. Fast mode stays off for Fable 5.2 until Anthropic enables it for subscription accounts.
+
 - Claude subscription requests no longer carry a `service_tier` field a host adds, keeping them in the shape Claude Code sends; API-key requests keep it.
 ## 2.7.3
 

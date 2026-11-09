@@ -375,7 +375,7 @@ function getPiCacheKeepRegistry() {
  * betas this body needs. Model requests and CacheKeep prewarms both call it:
  * a prewarm replays a model request's body, and Anthropic needs the same
  * betas to accept it (for example, the effort beta for the empty
- * `role: "system"` effort markers in a Fable 5.1 body). `leadingBetas` appends
+ * `role: "system"` effort markers in a Fable 5.1/5.2 body). `leadingBetas` appends
  * adapter-requested feature betas without changing Core's model-beta selection.
  */
 function applyPiOAuthRequestHeaders(

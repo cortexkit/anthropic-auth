@@ -28,7 +28,11 @@ import type {
   RequestScope,
 } from '@cortexkit/common-auth/opencode2'
 import { BILLING_LINEAGE_REQUEST_HEADER } from '../billing-lineage'
-import { EFFORT_PLAN_REQUEST_HEADER } from '../effort-history'
+import {
+  EFFORT_PLAN_REQUEST_HEADER,
+  encodeOpenCodeEffortPlan,
+  markOpenCodeEffortTransitions,
+} from '../effort-history'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
 import {
   SERVER_FALLBACK_MARKER_TEXT,
@@ -748,6 +752,38 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
     expect(await signRequestBody(text)).toBe(text)
     const tampered = text.replace('List the repo files.', 'List all files.')
     expect(await signRequestBody(tampered)).not.toBe(tampered)
+  })
+
+  test('Fable 5.2 uses adaptive thinking and default medium effort on OC2', async () => {
+    const plan = markOpenCodeEffortTransitions([
+      {
+        info: {
+          id: 'u1',
+          sessionID: 'ses_fable52',
+          role: 'user',
+          model: { providerID: 'anthropic', modelID: 'claude-fable-5-2' },
+        },
+        parts: [{ type: 'text', text: 'Hello' }],
+      },
+    ])!
+    expect(plan?.baseline).toBe('medium')
+    const { source } = makeSource({
+      options: {
+        midConversationEffortEnabled: true,
+        midConversationEffortPlan: encodeOpenCodeEffortPlan(plan),
+        fastModeEnabled: true,
+      },
+    })
+    const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+    const { final } = await host.run(
+      scopeOf({ modelID: 'claude-fable-5-2' }),
+      hostRequest({ ...opus55Payload(), model: 'claude-fable-5-2' }),
+    )
+    const body = await bodyOf(final)
+    expect(body.tool_choice).toBeUndefined()
+    expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(body.output_config).toEqual({ effort: 'medium' })
+    expect(body.speed).toBeUndefined()
   })
 
   test('Opus 5.5 drops the forced tool choice and keeps adaptive thinking', async () => {
