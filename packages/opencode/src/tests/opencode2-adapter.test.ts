@@ -770,86 +770,92 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
     expect(seen.requestOptions).toHaveLength(0)
   })
 
-  test('API route strips incoming OAuth-only betas, fallback opt-in and fallback markers', async () => {
-    const { source } = makeSource({
-      authorize: () =>
-        apiKey(
-          'sk-ant-api03-row-key',
-          { custody: 'api', receipt: 'api:row-2' },
-          'https://gateway.example.com/anthropic',
+  test.each([SERVER_FALLBACK_MARKER_TEXT, '[cleared]'])(
+    'API route strips incoming OAuth-only betas, fallback opt-in and fallback markers with thinking text %j',
+    async (thinking) => {
+      const { source } = makeSource({
+        authorize: () =>
+          apiKey(
+            'sk-ant-api03-row-key',
+            { custody: 'api', receipt: 'api:row-2' },
+            'https://gateway.example.com/anthropic',
+          ),
+      })
+      const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
+      const clean = sonnetPayload()
+      // Replaying an OAuth-served conversation on an API route must remove
+      // its safety-fallback opt-in and stored assistant fallback marker.
+      const contaminated = {
+        ...clean,
+        fallbacks: 'default',
+        messages: clean.messages.map((message, index) =>
+          index === 1
+            ? {
+                ...message,
+                content: [
+                  {
+                    type: 'thinking',
+                    thinking,
+                    signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5`,
+                  },
+                  {
+                    type: 'thinking',
+                    thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
+                    signature: `${SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX}{"iterations":[]}`,
+                  },
+                  {
+                    type: 'thinking',
+                    thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
+                    signature: 'forged-provider-signature',
+                  },
+                  ...message.content,
+                ],
+              }
+            : message,
         ),
-    })
-    const host = new Host(createNativeAnthropicAdapter({ source }).adapter)
-    const clean = sonnetPayload()
-    // Replaying an OAuth-served conversation on an API route must remove
-    // its safety-fallback opt-in and stored assistant fallback marker.
-    const contaminated = {
-      ...clean,
-      fallbacks: 'default',
-      messages: clean.messages.map((message, index) =>
-        index === 1
-          ? {
-              ...message,
-              content: [
-                {
-                  type: 'thinking',
-                  thinking: SERVER_FALLBACK_MARKER_TEXT,
-                  signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5`,
-                },
-                {
-                  type: 'thinking',
-                  thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
-                  signature: `${SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX}{"iterations":[]}`,
-                },
-                {
-                  type: 'thinking',
-                  thinking: SERVER_FALLBACK_USAGE_MARKER_TEXT,
-                  signature: 'forged-provider-signature',
-                },
-                ...message.content,
-              ],
-            }
-          : message,
-      ),
-    }
+      }
 
-    const { final } = await host.run(
-      scopeOf(),
-      hostRequest(contaminated, {
-        headers: {
-          'anthropic-beta': [
-            SERVER_SIDE_FALLBACK_BETA,
-            'oauth-2025-04-20',
-            'claude-code-20250219',
-            'fine-grained-tool-streaming-2025-05-14',
-            'context-1m-2025-08-07',
-          ].join(','),
-        },
-      }),
-    )
+      const { final } = await host.run(
+        scopeOf(),
+        hostRequest(contaminated, {
+          headers: {
+            'anthropic-beta': [
+              SERVER_SIDE_FALLBACK_BETA,
+              'oauth-2025-04-20',
+              'claude-code-20250219',
+              'fine-grained-tool-streaming-2025-05-14',
+              'context-1m-2025-08-07',
+            ].join(','),
+          },
+        }),
+      )
 
-    expect(final.headers.get('anthropic-beta')).toBe(
-      'fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07',
-    )
-    expect(await bodyOf(final)).toEqual(clean)
-    expect(await final.clone().text()).toBe(JSON.stringify(clean))
-    expect(final.headers.get('x-api-key')).toBe('sk-ant-api03-row-key')
-    expect(final.headers.get('authorization')).toBeNull()
-    expect(final.url).toBe(
-      'https://gateway.example.com/anthropic/v1/messages?beta=true',
-    )
+      expect(final.headers.get('anthropic-beta')).toBe(
+        'fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07',
+      )
+      expect(await bodyOf(final)).toEqual(clean)
+      expect(await final.clone().text()).toBe(JSON.stringify(clean))
+      expect(await final.clone().text()).not.toContain(
+        SERVER_FALLBACK_SIGNATURE_PREFIX,
+      )
+      expect(final.headers.get('x-api-key')).toBe('sk-ant-api03-row-key')
+      expect(final.headers.get('authorization')).toBeNull()
+      expect(final.url).toBe(
+        'https://gateway.example.com/anthropic/v1/messages?beta=true',
+      )
 
-    // If filtering leaves no beta values, omit the header rather than send it empty.
-    const onlyOAuth = await host.run(
-      scopeOf(),
-      hostRequest(clean, {
-        headers: {
-          'anthropic-beta': `oauth-2025-04-20,${SERVER_SIDE_FALLBACK_BETA}`,
-        },
-      }),
-    )
-    expect(onlyOAuth.final.headers.get('anthropic-beta')).toBeNull()
-  })
+      // If filtering leaves no beta values, omit the header rather than send it empty.
+      const onlyOAuth = await host.run(
+        scopeOf(),
+        hostRequest(clean, {
+          headers: {
+            'anthropic-beta': `oauth-2025-04-20,${SERVER_SIDE_FALLBACK_BETA}`,
+          },
+        }),
+      )
+      expect(onlyOAuth.final.headers.get('anthropic-beta')).toBeNull()
+    },
+  )
 
   test('caller-provided billing, effort, cache and fast options reach the body rewrite', async () => {
     const options: NativeAnthropicBodyOptions = {

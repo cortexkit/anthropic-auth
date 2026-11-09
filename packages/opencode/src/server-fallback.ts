@@ -156,8 +156,6 @@ function rewriteStoredMarkers(body: Record<string, unknown>, enabled: boolean) {
       const block = asRecord(rawBlock)
       const isInternalMarker =
         block?.type === 'thinking' &&
-        (block.thinking === SERVER_FALLBACK_MARKER_TEXT ||
-          block.thinking === '') &&
         typeof block.signature === 'string' &&
         block.signature.startsWith(SERVER_FALLBACK_SIGNATURE_PREFIX)
       if (!isInternalMarker) {

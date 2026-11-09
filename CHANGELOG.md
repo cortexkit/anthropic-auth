@@ -4,6 +4,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- A server-fallback boundary is now restored even after a context manager clears its thinking text, instead of being sent to Anthropic as an invalid thinking block.
+
 ## 2.7.1
 
 - Addresses #673: in vault mode, Insula's quota readings stay fresh between background checks, so the plugin no longer polls Anthropic's usage endpoint itself when Insula already has the reading.

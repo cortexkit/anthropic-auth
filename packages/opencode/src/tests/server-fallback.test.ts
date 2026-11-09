@@ -268,6 +268,59 @@ describe('applyServerSideFallbackToBody', () => {
     })
   })
 
+  test.each([true, false])(
+    'handles cleared boundary markers with server fallback enabled: %s',
+    (enabled) => {
+      const body = {
+        model: 'claude-fable-5',
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'partial source output' },
+              {
+                type: 'thinking',
+                thinking: '[cleared]',
+                signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5`,
+              },
+              { type: 'text', text: 'continued fallback output' },
+            ] as Array<Record<string, unknown>>,
+          },
+          { role: 'user', content: [{ type: 'text', text: 'continue' }] },
+        ],
+      }
+
+      expect(applyServerSideFallbackToBody(body, enabled)).toEqual({
+        enabled,
+        restoredMarkers: enabled ? 1 : 0,
+        droppedMarkers: enabled ? 0 : 1,
+      })
+      expect(body.messages[0]?.content).toEqual([
+        { type: 'text', text: 'partial source output' },
+        ...(enabled
+          ? [
+              {
+                type: 'fallback',
+                from: { model: 'claude-fable-5' },
+                to: { model: 'claude-opus-5' },
+              },
+            ]
+          : []),
+        { type: 'text', text: 'continued fallback output' },
+      ])
+      expect(
+        body.messages
+          .flatMap((message) => message.content)
+          .some(
+            (block) =>
+              block.type === 'thinking' &&
+              typeof block.signature === 'string' &&
+              block.signature.startsWith(SERVER_FALLBACK_SIGNATURE_PREFIX),
+          ),
+      ).toBe(false)
+    },
+  )
+
   test('preserves ordinary thinking, restores chained fallbacks, and drops malformed internal markers', () => {
     const body = {
       model: 'claude-fable-5',

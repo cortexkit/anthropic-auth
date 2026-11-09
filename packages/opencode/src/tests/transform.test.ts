@@ -2990,37 +2990,43 @@ describe('rewriteRequestBody', () => {
     }
   })
 
-  test('restores hidden fallback boundaries before signing replay requests', async () => {
-    const result = JSON.parse(
-      await rewriteRequestBody(
-        JSON.stringify({
-          model: 'claude-fable-5',
-          messages: [
-            {
-              role: 'assistant',
-              content: [
-                { type: 'text', text: 'partial' },
-                {
-                  type: 'thinking',
-                  thinking: SERVER_FALLBACK_MARKER_TEXT,
-                  signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5`,
-                },
-                { type: 'text', text: 'continued' },
-              ],
-            },
-            { role: 'user', content: 'continue' },
-          ],
-        }),
-        { serverSideFallbackEnabled: true },
-      ),
-    )
+  test.each([SERVER_FALLBACK_MARKER_TEXT, '[cleared]'])(
+    'restores hidden fallback boundaries before signing replay requests with thinking text %j',
+    async (thinking) => {
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-fable-5',
+            messages: [
+              {
+                role: 'assistant',
+                content: [
+                  { type: 'text', text: 'partial' },
+                  {
+                    type: 'thinking',
+                    thinking,
+                    signature: `${SERVER_FALLBACK_SIGNATURE_PREFIX}claude-fable-5|claude-opus-5`,
+                  },
+                  { type: 'text', text: 'continued' },
+                ],
+              },
+              { role: 'user', content: 'continue' },
+            ],
+          }),
+          { serverSideFallbackEnabled: true },
+        ),
+      )
 
-    expect(result.messages[0].content[1]).toEqual({
-      type: 'fallback',
-      from: { model: 'claude-fable-5' },
-      to: { model: 'claude-opus-5' },
-    })
-  })
+      expect(result.messages[0].content[1]).toEqual({
+        type: 'fallback',
+        from: { model: 'claude-fable-5' },
+        to: { model: 'claude-opus-5' },
+      })
+      expect(JSON.stringify(result)).not.toContain(
+        SERVER_FALLBACK_SIGNATURE_PREFIX,
+      )
+    },
+  )
 
   test('requests summarized adaptive thinking for Opus 5 without thinking', async () => {
     const body = JSON.stringify({
