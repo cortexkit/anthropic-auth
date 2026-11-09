@@ -2497,6 +2497,15 @@ describe('Pi onPayload hook', () => {
     return sent
   }
 
+  test('Pi OAuth strips service_tier added by the payload hook before signing', async () => {
+    const sent = await capture((payload) => ({
+      ...(payload as Record<string, unknown>),
+      service_tier: 'auto',
+    }))
+    expect(JSON.parse(sent)).not.toHaveProperty('service_tier')
+    expect(await signRequestBody(resetBillingHeaderCCH(sent))).toBe(sent)
+  })
+
   test('sends the payload the hook returns, signed after the hook', async () => {
     const seen: Array<{ payload: Record<string, any>; model: unknown }> = []
     const sent = await capture((payload, model) => {

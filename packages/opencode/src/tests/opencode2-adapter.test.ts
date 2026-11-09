@@ -13,6 +13,7 @@ import {
   RELOCATED_MESSAGE,
   RelocatedError,
   RequestGzipLatch,
+  resetBillingHeaderCCH,
   signRequestBody,
   TRAILING_ASSISTANT_HISTORY_MESSAGE,
   USER_AGENT,
@@ -476,6 +477,39 @@ const bodyOf = async (request: Request) =>
   JSON.parse(await request.clone().text()) as InspectedBody
 
 describe('OpenCode 2 native Anthropic adapter: request shape', () => {
+  test.each(['oauth', 'api'] as const)(
+    'service_tier follows the OpenCode 2 %s route',
+    async (route) => {
+      const { source } = makeSource({
+        ...(route === 'api'
+          ? {
+              authorize: () =>
+                apiKey('synthetic-key', { custody: 'api', receipt: 'api' }),
+            }
+          : {}),
+      })
+      const native = createNativeAnthropicAdapter({ source })
+      try {
+        const host = new Host(native.adapter)
+        const payload = {
+          ...sonnetPayload(),
+          service_tier: route === 'oauth' ? 'auto' : 'standard_only',
+        }
+        const { final } = await host.run(scopeOf(), hostRequest(payload))
+        const sent = await final.text()
+        if (route === 'oauth') {
+          expect(JSON.parse(sent)).not.toHaveProperty('service_tier')
+          expect(await signRequestBody(resetBillingHeaderCCH(sent))).toBe(sent)
+        } else {
+          expect(JSON.parse(sent).service_tier).toBe('standard_only')
+          expect(sent).toBe(JSON.stringify(payload))
+        }
+      } finally {
+        native.dispose()
+      }
+    },
+  )
+
   test('OC2 runner notes use the adapter session on OAuth and report API skips without changing bytes', async () => {
     const reports: unknown[] = []
     const hostModelId = 'claude-opus-5-5[1m]'

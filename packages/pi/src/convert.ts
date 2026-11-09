@@ -844,7 +844,9 @@ export async function buildAnthropicRequest(
     throw new Error(
       `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
     )
-  const unsigned = JSON.stringify(orderClaudeCodeBody(body))
+  const unsigned = JSON.stringify(
+    orderClaudeCodeBody(body, { isOAuth: !!identity }),
+  )
   const bodyText = controls.deferSigning
     ? unsigned
     : await signRequestBody(unsigned)

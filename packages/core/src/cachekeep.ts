@@ -384,7 +384,7 @@ export async function buildCacheKeepPrewarmBody(
   }
 
   const signedBodyText = await signRequestBody(
-    JSON.stringify(orderClaudeCodeBody(warm)),
+    JSON.stringify(orderClaudeCodeBody(warm, { isOAuth: true })),
   )
   return { ok: true, bodyText: signedBodyText }
 }

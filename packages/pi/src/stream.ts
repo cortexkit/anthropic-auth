@@ -727,7 +727,7 @@ function buildPiPrimeBody(identity?: ClaudeCodeIdentity) {
   if (identity) applyClaudeCodeMetadata(body, identity)
   return {
     body,
-    bodyText: JSON.stringify(orderClaudeCodeBody(body)),
+    bodyText: JSON.stringify(orderClaudeCodeBody(body, { isOAuth: true })),
     toolNames: new Map<string, string>(),
     cacheTtlMs: 0,
   }

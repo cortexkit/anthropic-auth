@@ -69,6 +69,110 @@ function readAccountStorage(): Promise<AccountStorage | null> {
   return readAccountStorageWithCtx(testContext)
 }
 
+describe('OpenCode 1 service_tier shaping', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test.each(['oauth', 'api fallback'] as const)(
+    'service_tier follows the OpenCode 1 %s route',
+    async (route) => {
+      await useTempAccountFile(
+        createFallbackStorage({
+          fallbackOn: [429],
+          refresh: {
+            enabled: false,
+            intervalMinutes: 10,
+            refreshBeforeExpiryMinutes: 30,
+          },
+          quota: {
+            enabled: false,
+            checkIntervalMinutes: 5,
+            minimumRemaining: {},
+            failClosedOnUnknownQuota: false,
+          },
+          accounts: [
+            {
+              id: 'service-tier-api',
+              type: 'api',
+              apiKey: 'synthetic-service-tier-key',
+              baseURL: 'https://paid.invalid',
+              authHeader: 'x-api-key',
+            },
+          ],
+        }),
+      )
+      const sent: Array<{ headers: Headers; body: Record<string, unknown> }> =
+        []
+      globalThis.fetch = mock(
+        withNativeAdmission(
+          (input: string | URL | Request, init?: RequestInit) => {
+            const url = extractUrl(input)
+            if (url.includes('/claude_cli/bootstrap'))
+              return Promise.resolve(
+                Response.json({
+                  oauth_account: { account_uuid: 'service-tier-account' },
+                }),
+              )
+            if (url.includes('/api/oauth/usage'))
+              return Promise.resolve(
+                Response.json({
+                  five_hour: { utilization: 100 },
+                  seven_day: { utilization: 50 },
+                }),
+              )
+            if (url.includes('/v1/messages')) {
+              const headers = new Headers(init?.headers)
+              sent.push({ headers, body: JSON.parse(String(init?.body)) })
+              return Promise.resolve(
+                new Response('{}', {
+                  status:
+                    route === 'api fallback' && headers.has('authorization')
+                      ? 429
+                      : 200,
+                }),
+              )
+            }
+            throw new Error(`Unexpected service-tier fixture request: ${url}`)
+          },
+        ),
+      ) as unknown as typeof fetch
+      const plugin = await getPlugin()
+      try {
+        const auth = await plugin.auth.loader(
+          () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+          { models: {} },
+        )
+        const response = await auth.fetch(MESSAGES_URL, {
+          method: 'POST',
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            max_tokens: 64,
+            service_tier: route === 'oauth' ? 'auto' : 'standard_only',
+            messages: [{ role: 'user', content: 'Hello' }],
+          }),
+        })
+        expect(response.status).toBe(200)
+        expect(sent).toHaveLength(route === 'oauth' ? 1 : 2)
+        expect(sent[0]?.headers.get('authorization')).toBe(
+          'Bearer sk-ant-oat01-main-access',
+        )
+        expect(sent[0]?.body).not.toHaveProperty('service_tier')
+        if (route === 'api fallback') {
+          expect(sent[1]?.headers.get('x-api-key')).toBe(
+            'synthetic-service-tier-key',
+          )
+          expect(sent[1]?.body.service_tier).toBe('standard_only')
+        }
+      } finally {
+        await plugin.dispose?.()
+      }
+    },
+  )
+})
+
 describe('Fable 5.1 request-scoped effort history', () => {
   const originalFetch = globalThis.fetch
 

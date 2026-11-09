@@ -188,12 +188,19 @@ test('Pi API-key requests never use message threads', async () => {
           },
           apiAccount,
           storagePath,
-          streamOptions: { sessionId: 'pi-api-thread' },
+          streamOptions: {
+            sessionId: 'pi-api-thread',
+            onPayload: (payload) => ({
+              ...(payload as Record<string, unknown>),
+              service_tier: 'standard_only',
+            }),
+          },
         },
         { fetch: fetchImpl },
       )
     ).text()
     expect(JSON.parse(String(sent?.body)).thread).toBeUndefined()
+    expect(JSON.parse(String(sent?.body)).service_tier).toBe('standard_only')
     expect(new Headers(sent?.headers).get('anthropic-beta')).not.toContain(
       'message-threads-',
     )

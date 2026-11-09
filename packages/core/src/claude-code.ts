@@ -557,12 +557,15 @@ const BODY_FIELD_ORDER = [
 
 export function orderClaudeCodeBody<T extends Record<string, unknown>>(
   body: T,
+  options: { isOAuth?: boolean } = {},
 ): T {
   const ordered: Record<string, unknown> = {}
   for (const key of BODY_FIELD_ORDER) {
     if (Object.hasOwn(body, key)) ordered[key] = body[key]
   }
   for (const [key, value] of Object.entries(body)) {
+    // Claude Code does not select a service tier on subscription requests.
+    if (options.isOAuth && key === 'service_tier') continue
     if (!Object.hasOwn(ordered, key)) ordered[key] = value
   }
   return ordered as T

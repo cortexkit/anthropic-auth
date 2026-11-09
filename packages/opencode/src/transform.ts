@@ -288,7 +288,10 @@ export function setOAuthHeaders(
  * Add TOOL_PREFIX to tool names in the request body.
  * Prefixes both tool definitions and tool_use blocks in messages.
  */
-export function prefixToolNames(parsed: Record<string, unknown>): string {
+export function prefixToolNames(
+  parsed: Record<string, unknown>,
+  options: { isOAuth?: boolean } = {},
+): string {
   if (parsed.tools && Array.isArray(parsed.tools)) {
     parsed.tools = parsed.tools.map(
       (tool: { name?: string; [k: string]: unknown }) => ({
@@ -330,7 +333,7 @@ export function prefixToolNames(parsed: Record<string, unknown>): string {
     )
   }
 
-  return JSON.stringify(orderClaudeCodeBody(parsed))
+  return JSON.stringify(orderClaudeCodeBody(parsed, options))
 }
 
 /**
@@ -1760,7 +1763,7 @@ export async function rewriteRequestBody(
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const toolNameMap = responseToolNames(parsed.tools)
-    const prefixed = prefixToolNames(parsed)
+    const prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),
       outputBytesBeforeSign: prefixed.length,
