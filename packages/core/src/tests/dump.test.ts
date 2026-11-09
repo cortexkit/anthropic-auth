@@ -426,6 +426,10 @@ test('reply edge counts use trim whitespace and preserve empty and whitespace-on
     index: 2,
     delta: { type: 'text_delta', text: '\u3000' },
   })
+  observer.observe({
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn' },
+  })
   observer.observe({ type: 'message_stop' })
   await observer.finish()
   expect(
@@ -436,6 +440,40 @@ test('reply edge counts use trim whitespace and preserve empty and whitespace-on
     { index: 2, leading: 1, trailing: 1, chars: 6 },
   ])
 })
+
+test.each(['bare delta', 'read failure'])(
+  'incomplete response artifacts omit reply edges after %s',
+  async (scenario) => {
+    const dumpDir = await mkdtemp(join(tmpdir(), 'anthropic-dump-incomplete-'))
+    dumpDirs.push(dumpDir)
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    setDumpEnabled(true)
+    const handle = await dumpDirectRequest({
+      affinity: 'ses-incomplete',
+      bodyText: '{}',
+    })
+    const observer = createDumpResponseObserver(handle, 200)
+    observer.observe({
+      type: 'message_start',
+      message: { id: 'msg_incomplete', content: [] },
+    })
+    observer.observe({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: 'secret ' },
+    })
+    observer.observe({
+      type: 'message_delta',
+      delta: scenario === 'bare delta' ? {} : { stop_reason: 'end_turn' },
+    })
+    if (scenario === 'read failure') observer.fail()
+    observer.observe({ type: 'message_stop' })
+    await observer.finish()
+    const summary = JSON.parse(await readFile(handle!.responsePath, 'utf8'))
+    expect(summary.stream_complete).toBe(false)
+    expect(summary).not.toHaveProperty('reply_text_edges')
+  },
+)
 
 test.each([200, 500])(
   'error response artifacts omit reply edges (HTTP %i)',

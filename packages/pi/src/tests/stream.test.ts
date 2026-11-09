@@ -57,9 +57,10 @@ const anthropicContext = {
   tools: [],
 } as any
 
-test.each([false, true])(
-  'streamed reply dumps keep only text edge counts (error: %s)',
-  async (error) => {
+test.each(['success', 'provider error', 'malformed'])(
+  'streamed reply dumps keep only text edge counts (%s)',
+  async (outcome) => {
+    const error = outcome !== 'success'
     tempDir = await mkdtemp(join(tmpdir(), 'pi-dump-edges-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
     const dumpDir = join(tempDir, 'dumps')
@@ -112,7 +113,7 @@ test.each([false, true])(
           delta: { type: 'text_delta', text: 'World\n' },
         },
         { type: 'content_block_stop', index: 2 },
-        ...(error
+        ...(outcome === 'provider error'
           ? [{ type: 'error', error: { type: 'api_error', message: 'failed' } }]
           : [
               { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
@@ -125,7 +126,8 @@ test.each([false, true])(
             JSON.stringify({ oauth_account: { account_uuid: 'pi-dump-uuid' } }),
           )
         return new Response(
-          events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+          events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') +
+            (outcome === 'malformed' ? 'data: malformed\n\n' : ''),
           { headers: { 'content-type': 'text/event-stream' } },
         )
       }) as unknown as typeof fetch
@@ -140,6 +142,7 @@ test.each([false, true])(
       const path = files.find((name) => name.endsWith('.response.json'))
       expect(path).toBeString()
       const text = await readFile(join(dumpDir, path!), 'utf8')
+      expect(JSON.parse(text).stream_complete).toBe(!error)
       if (error) expect(JSON.parse(text)).not.toHaveProperty('reply_text_edges')
       else
         expect(JSON.parse(text).reply_text_edges).toEqual([

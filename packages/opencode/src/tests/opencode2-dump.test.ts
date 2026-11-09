@@ -271,6 +271,40 @@ async function allDumpText() {
 }
 
 describe('opencode2 request dumps', () => {
+  test('malformed stream after message_delta preserves an incomplete summary', async () => {
+    const events = [
+      {
+        type: 'message_start',
+        message: { id: 'msg_malformed_edges', content: [] },
+      },
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: '\nHello ' },
+      },
+      { type: 'message_delta', delta: {} },
+    ]
+    await driveDirect({
+      enabled: true,
+      payload: { model: 'claude-sonnet-5', stream: true, messages: [] },
+      upstreamSse:
+        events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') +
+        'data: malformed\n\n',
+    })
+    const { files } = await allDumpText()
+    const responsePath = files.find((name) => name.endsWith('.response.json'))!
+    const summary = JSON.parse(
+      await readFile(join(dumpDir, responsePath), 'utf8'),
+    )
+    expect(summary.stream_complete).toBe(false)
+    expect(summary).not.toHaveProperty('reply_text_edges')
+  })
+
   test('streamed response dumps record reply text edges without text', async () => {
     const events = [
       { type: 'message_start', message: { id: 'msg_edges', content: [] } },

@@ -801,6 +801,14 @@ export function createDumpResponseObserver(
   let message: Record<string, unknown> | undefined
   let complete = false
   let failed = false
+  const record = (value: unknown): Record<string, unknown> | undefined =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined
+  const replyTextEdges = () =>
+    message && !failed && status >= 200 && status < 300
+      ? [...edges.values()]
+      : undefined
   const append = (edge: ReplyTextEdge, text: unknown) => {
     if (typeof text !== 'string') return
     let leading = 0
@@ -860,17 +868,27 @@ export function createDumpResponseObserver(
           typeof event.index === 'number' ? edges.get(event.index) : undefined
         if (edge && delta?.type === 'text_delta') append(edge, delta.text)
       } else if (event.type === 'message_delta' && message) {
-        if (event.usage && typeof event.usage === 'object')
-          message.usage = { ...(message.usage as object), ...event.usage }
-        const delta = event.delta as Record<string, unknown> | undefined
-        if (typeof delta?.stop_reason === 'string')
-          message.stop_reason = delta.stop_reason
-        complete = true
-      } else if (event.type === 'message_stop') {
-        complete = true
+        const nested = record(event.message)
+        const usage = record(event.usage) ?? record(nested?.usage)
+        const delta = record(event.delta)
+        const stopReason = [
+          delta?.stop_reason,
+          event.stop_reason,
+          ...(usage ? [nested?.stop_reason] : []),
+        ].find((value) => typeof value === 'string')
+        // Only a delta carrying usage or a stop reason completes the response summary.
+        if (usage || stopReason) {
+          if (usage) message.usage = { ...(message.usage as object), ...usage }
+          if (stopReason) message.stop_reason = stopReason
+          complete = true
+        }
       } else if (event.type === 'error') {
         failed = true
       }
+    },
+    replyTextEdges,
+    fail() {
+      failed = true
     },
     async finish() {
       if (!message) return
@@ -878,9 +896,7 @@ export function createDumpResponseObserver(
         status,
         message,
         complete: complete && !failed,
-        ...(!failed && status >= 200 && status < 300
-          ? { reply_text_edges: [...edges.values()] }
-          : {}),
+        ...(complete ? { reply_text_edges: replyTextEdges() } : {}),
       })
     },
   }
@@ -919,6 +935,7 @@ export async function dumpResponseArtifact(
   if (input.provider_error) artifact.provider_error = input.provider_error
   if (
     input.reply_text_edges &&
+    input.complete !== false &&
     input.status >= 200 &&
     input.status < 300 &&
     !input.provider_error

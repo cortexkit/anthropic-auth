@@ -3392,6 +3392,7 @@ const anthropicAuthPlugin = async (
     status: number
     streaming: boolean
     dumpWrite: Promise<void>
+    dumpObserver?: ReturnType<typeof createDumpResponseObserver>
     messageStart?: Record<string, unknown>
     // Response inspection copies this metadata when it replaces the Response.
     toolNameMap?: ToolNameMap
@@ -3543,6 +3544,9 @@ const anthropicAuthPlugin = async (
           status: context.status,
           message,
           complete,
+          reply_text_edges: complete
+            ? context.dumpObserver?.replyTextEdges()
+            : undefined,
         }),
       )
       .catch(() => {})
@@ -3578,6 +3582,7 @@ const anthropicAuthPlugin = async (
           status: context.status,
           message,
           complete: true,
+          reply_text_edges: context.dumpObserver?.replyTextEdges(),
         }),
       )
       .catch(() => {})
@@ -9341,12 +9346,15 @@ const anthropicAuthPlugin = async (
               const wrapResponse = (response: Response) => {
                 const diagnosticsContext =
                   cacheDiagnosticsResponses.get(response)
-                const dumpObserver = diagnosticsContext?.streaming
-                  ? createDumpResponseObserver(
-                      diagnosticsContext.dump,
-                      diagnosticsContext.status,
-                    )
-                  : undefined
+                if (
+                  diagnosticsContext?.streaming &&
+                  !diagnosticsContext.dumpObserver
+                )
+                  diagnosticsContext.dumpObserver = createDumpResponseObserver(
+                    diagnosticsContext.dump,
+                    diagnosticsContext.status,
+                  )
+                const dumpObserver = diagnosticsContext?.dumpObserver
                 const wrapped = createStrippedStream(response, {
                   toolNameMap: diagnosticsContext?.toolNameMap,
                   onSseEvent: dumpObserver?.observe,
@@ -9366,10 +9374,7 @@ const anthropicAuthPlugin = async (
                             ),
                           onMessageDelta: (delta) =>
                             observeCacheDiagnosticsDelta(response, delta),
-                          onStreamEnd: async () => {
-                            await diagnosticsContext.dumpWrite
-                            await dumpObserver?.finish()
-                          },
+                          onStreamEnd: () => diagnosticsContext.dumpWrite,
                         }
                       : {
                           onMessageResponse: (message) =>

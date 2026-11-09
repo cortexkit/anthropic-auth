@@ -696,6 +696,9 @@ export async function* parseSse(
         yield event
       }
     }
+  } catch (error) {
+    dumpObserver?.fail()
+    throw error
   } finally {
     // Only the lock is released when the consumer stops early: cancelling the
     // body on abandonment is the consumer's decision, not the parser's.

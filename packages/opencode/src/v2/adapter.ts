@@ -1931,6 +1931,7 @@ export function createNativeAnthropicAdapter<Q, P>(
                   status: statusForStream,
                   message: merged,
                   complete: true,
+                  reply_text_edges: dumpObserver.replyTextEdges(),
                 }),
               )
             } catch {}
@@ -1955,7 +1956,6 @@ export function createNativeAnthropicAdapter<Q, P>(
             } catch {}
             try {
               await (dumpWrites.get(data) ?? Promise.resolve())
-              await dumpObserver.finish()
             } catch {}
           },
         }),
