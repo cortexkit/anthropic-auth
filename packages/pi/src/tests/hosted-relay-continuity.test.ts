@@ -180,20 +180,18 @@ for (const operation of ['authorize', 'retry'] as const) {
     expect(
       await f.runtime.vault.publish(attempt.receipt, { lastUsed: Date.now() }),
     ).toBe(true)
-    await f.runtime.vault.reportFailure(attempt.receipt, 401, 'direct')
     expect(f.reports).toEqual([])
+    await f.runtime.vault.reportFailure(attempt.receipt, 401, 'direct')
+    expect(f.reports).toEqual([
+      { connection: 1, recordVersion: attempt.receipt.recordVersion },
+    ])
     if (operation === 'authorize') {
-      const retry = await f.native.retry(f.route, attempt)
-      if (retry?.source !== 'vault')
-        throw new Error('Pi refused its reconnect retry')
-      expect(retry.receipt.accessToken).toBe('synthetic-relay-1')
-      await f.runtime.vault.reportFailure(retry.receipt, 401, 'direct')
-      expect(f.reports).toEqual([
-        { connection: 1, recordVersion: retry.receipt.recordVersion },
-      ])
-      expect(await f.native.retry(f.route, retry)).toBeUndefined()
+      // Reconnecting to the same vault does not rotate the served credential.
+      expect(await f.native.retry(f.route, attempt)).toBeUndefined()
+      expect(f.gets).toEqual([0, 1])
     } else {
       expect(await f.native.retry(f.route, attempt)).toBeUndefined()
+      expect(f.gets).toEqual([0, 0])
     }
   })
 }

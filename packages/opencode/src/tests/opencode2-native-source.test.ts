@@ -4160,6 +4160,7 @@ async function hostedVault(versions = [7, 7]) {
   const closed = Promise.withResolvers<void>()
   let outage = false,
     connections = 0
+  const reportConnections: number[] = []
   type Timer = {
     callback(): void
     delay: number
@@ -4209,6 +4210,14 @@ async function hostedVault(versions = [7, 7]) {
               check()
               return client.getScoped(...args)
             },
+            reportAuthFailureScoped: async (
+              ...args: Parameters<
+                NativeCustodyClient['reportAuthFailureScoped']
+              >
+            ) => {
+              reportConnections.push(connection)
+              return client.reportAuthFailureScoped(...args)
+            },
             close: () => {
               if (connection === 0) closed.resolve()
             },
@@ -4219,6 +4228,7 @@ async function hostedVault(versions = [7, 7]) {
   )
   return {
     ...f,
+    reportConnections,
     swap: async () => {
       outage = true
       await f.runtime.vault.authorize('main')
@@ -4231,7 +4241,7 @@ async function hostedVault(versions = [7, 7]) {
   }
 }
 
-test('OC2 admitted-then-send preserves its pre-swap receipt and retries its first 401 on current custody', async () => {
+test('OC2 admitted-then-send reports its pre-swap receipt on the new connection without a same-version retry', async () => {
   const f = await hostedVault()
   const native = source(f.runtime, f.paths)
   const managed = createNativeAnthropicAdapter({ source: native })
@@ -4284,8 +4294,9 @@ test('OC2 admitted-then-send preserves its pre-swap receipt and retries its firs
     body: async () => '{}',
     attempt,
   })
-  expect(limit).toBeDefined()
-  expect(f.reports).toEqual([])
+  expect(limit).toBeUndefined()
+  expect(f.reports.map((report) => report.recordVersion)).toEqual([7])
+  expect(f.reportConnections).toEqual([1])
   expect(f.gets).toHaveLength(2)
 })
 
@@ -4334,6 +4345,7 @@ test('OC2 queued authorization survives a relay swap during its receipt-held adm
     status: 401,
     outputStarted: false,
   })
-  expect(f.reports.map((report) => report.recordVersion)).toEqual([7])
+  expect(f.reports.map((report) => report.recordVersion)).toEqual([7, 8])
+  expect(f.reportConnections).toEqual([0, 1])
   expect(f.gets).toHaveLength(2)
 })
