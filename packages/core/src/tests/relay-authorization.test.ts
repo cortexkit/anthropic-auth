@@ -1,6 +1,27 @@
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { type RelayConfig, sendViaRelay } from '../relay.ts'
+
+const routingKey = Symbol.for('cortexkit.routing')
+const globals = globalThis as Record<symbol, unknown>
+const previousRouting = globals[routingKey]
+afterEach(() => {
+  if (previousRouting === undefined) delete globals[routingKey]
+  else globals[routingKey] = previousRouting
+})
+function captureBilling() {
+  const reports: Record<string, unknown>[] = []
+  globals[routingKey] = () => ({
+    report: (payload: Record<string, unknown>) => reports.push(payload),
+  })
+  return reports
+}
+const billing = (attempt: number) => ({
+  sessionId: 'session',
+  credentialId: `credential-${attempt}`,
+  model: 'test-model',
+  requestKind: 'primary' as const,
+})
 
 const body = (suffix: string) =>
   JSON.stringify({
@@ -26,6 +47,7 @@ const config = (
 })
 
 test('HTTP patch recovery reauthorizes and binds status to the final upstream attempt', async () => {
+  const billingReports = captureBilling()
   const sent: Array<{
     mode: string
     upstream: { headers: Record<string, string> }
@@ -66,6 +88,7 @@ test('HTTP patch recovery reauthorizes and binds status to the final upstream at
         const attempt = ++authorizations
         return {
           headers: new Headers({ authorization: `Bearer test-${attempt}` }),
+          billing: billing(attempt),
           onUpstreamStatus: (status) => {
             observed.push([attempt, status])
           },
@@ -92,6 +115,17 @@ test('HTTP patch recovery reauthorizes and binds status to the final upstream at
       [3, 401],
     ])
     expect(fallbacks).toBe(0)
+    await Bun.sleep(10)
+    expect(billingReports).toHaveLength(2)
+    expect(billingReports[0]).toMatchObject({
+      credential_id: 'credential-1',
+      status: 200,
+    })
+    expect(billingReports[1]).toMatchObject({
+      credential_id: 'credential-3',
+      status: 401,
+      outcome: 'failed',
+    })
   } finally {
     await server.stop(true)
   }
@@ -138,6 +172,7 @@ test('revocation before a retry cannot fall through to HTTP or direct dispatch',
 })
 
 test('a relay transport 401 without upstream provenance falls back direct without blaming OAuth', async () => {
+  const billingReports = captureBilling()
   let observed = 0
   let direct = 0
   const server = Bun.serve({
@@ -159,6 +194,7 @@ test('a relay transport 401 without upstream provenance falls back direct withou
       },
       authorizeAttempt: async () => ({
         headers: new Headers({ authorization: 'Bearer test-access' }),
+        billing: billing(1),
         onUpstreamStatus: () => {
           observed++
         },
@@ -168,6 +204,8 @@ test('a relay transport 401 without upstream provenance falls back direct withou
     expect(await response.text()).toBe('direct-ok')
     expect(direct).toBe(1)
     expect(observed).toBe(0)
+    await Bun.sleep(10)
+    expect(billingReports).toEqual([])
   } finally {
     await server.stop(true)
   }
@@ -276,6 +314,7 @@ test('a relay that fails before any direct fallback still falls back direct once
 })
 
 test('optimistic WebSocket reconnect uses a fresh receipt without reporting its synthetic 200', async () => {
+  const billingReports = captureBilling()
   const sent: Array<{
     id: string
     upstream: { headers: Record<string, string> }
@@ -333,6 +372,7 @@ test('optimistic WebSocket reconnect uses a fresh receipt without reporting its 
         const attempt = ++gets
         return {
           headers: new Headers({ authorization: `Bearer test-${attempt}` }),
+          billing: billing(attempt),
           onUpstreamStatus: (status) => {
             observed.push([attempt, status])
           },
@@ -348,9 +388,108 @@ test('optimistic WebSocket reconnect uses a fresh receipt without reporting its 
     ])
     expect(observed).toEqual([[2, 401]])
     expect(fallbacks).toBe(0)
+    await Bun.sleep(10)
+    expect(billingReports).toHaveLength(1)
+    expect(billingReports[0]).toMatchObject({
+      credential_id: 'credential-2',
+      outcome: 'failed',
+      status: 401,
+    })
   } finally {
     // Bun closes the upgraded socket but its stop() promise remains pending
     // for an idle persistent relay session; don't hold the test on that waiter.
+    server.stop(true)
+  }
+})
+
+test('WebSocket billing observes real upstream usage and response identity', async () => {
+  const reports = captureBilling()
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch: (request, server) =>
+      server.upgrade(request) ? undefined : new Response('', { status: 500 }),
+    websocket: {
+      open: (socket) => {
+        socket.send(JSON.stringify({ type: 'ready', protocol: 2, state: null }))
+      },
+      message: (socket, data) => {
+        const payload = JSON.parse(String(data)) as { id: string }
+        socket.send(
+          JSON.stringify({
+            type: 'response_start',
+            id: payload.id,
+            status: 200,
+            headers: {
+              'content-type': 'text/event-stream',
+              'request-id': 'req_ws',
+            },
+          }),
+        )
+        const text = [
+          {
+            type: 'message_start',
+            message: {
+              id: 'msg_ws',
+              usage: { input_tokens: 3, output_tokens: 0 },
+            },
+          },
+          {
+            type: 'message_delta',
+            usage: {
+              output_tokens: 7,
+              output_tokens_details: { thinking_tokens: 2 },
+            },
+          },
+          { type: 'message_stop' },
+        ]
+          .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+          .join('')
+        socket.send(
+          JSON.stringify({
+            type: 'chunk',
+            id: payload.id,
+            base64: Buffer.from(text).toString('base64'),
+          }),
+        )
+        socket.send(JSON.stringify({ type: 'done', id: payload.id }))
+      },
+    },
+  })
+  try {
+    const response = await sendViaRelay({
+      config: config(server.url.href, 'websocket'),
+      input: 'https://api.anthropic.com/v1/messages',
+      init: { method: 'POST' },
+      headers: new Headers(),
+      body: streamingBody('usage'),
+      affinity: randomUUID(),
+      optimisticResponse: true,
+      fallback: async () => {
+        throw new Error('Unexpected direct fallback')
+      },
+      authorizeAttempt: async () => ({
+        headers: new Headers(),
+        billing: billing(1),
+      }),
+    })
+    await response.text()
+    await Bun.sleep(10)
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      credential_id: 'credential-1',
+      outcome: 'completed',
+      status: 200,
+      provider_request_id: 'req_ws',
+      provider_response_id: 'msg_ws',
+      usage: {
+        input: 3,
+        output: 7,
+        reasoning: 2,
+        reasoning_included_in_output: true,
+      },
+    })
+  } finally {
     server.stop(true)
   }
 })

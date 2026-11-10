@@ -938,6 +938,9 @@ test('an OpenCode 2 prewarm preserves thinking block binding and carries its bet
 })
 
 test('a due OpenCode 2 prewarm sends once with the original account and no billing lineage', async () => {
+  const reports: unknown[] = []
+  const reportSessions: string[] = []
+  runnerPolicyForReview(undefined, reports, reportSessions)
   const f = await fixture()
   expect(await (await f.live()).text()).toContain('prompt_id')
   await f.store.rotate('first', {
@@ -965,6 +968,42 @@ test('a due OpenCode 2 prewarm sends once with the original account and no billi
   ).toBe(true)
   await f.timers.fire()
   expect(f.sent).toHaveLength(1)
+  await Bun.sleep(10)
+  const billingIndex = reports.findIndex((value) => {
+    const report = value as { kind?: string; request_kind?: string }
+    return report.kind === 'billing' && report.request_kind === 'keep_warm'
+  })
+  expect(billingIndex).toBeGreaterThanOrEqual(0)
+  expect(reportSessions[billingIndex]).toBe('ses_oc2_keep')
+  expect(reports[billingIndex]).toMatchObject({
+    account_id: '11111111-2222-4333-8444-555555555555',
+    model: body.model,
+    outcome: 'completed',
+    usage: { cache_read: 1 },
+    cache: { ttl_ms: 3_600_000, warming: { on: true } },
+  })
+})
+
+test('OpenCode 2 refuses a reserved warm before dispatch without billing it', async () => {
+  const reports: unknown[] = []
+  runnerPolicyForReview(undefined, reports)
+  const f = await fixture()
+  await (await f.live()).text()
+  await Bun.sleep(10)
+  reports.length = 0
+  const reserve = spyOn(
+    CacheKeepManager.prototype,
+    'reserveWarmDispatch',
+  ).mockRejectedValue(new Error('reservation refused'))
+  cleanups.push(() => reserve.mockRestore())
+  f.due()
+  await f.timers.fire()
+  await Bun.sleep(10)
+  expect(reserve).toHaveBeenCalledTimes(1)
+  expect(f.sent).toHaveLength(0)
+  expect(
+    reports.filter((value) => (value as { kind?: string }).kind === 'billing'),
+  ).toEqual([])
 })
 
 test('a killswitch-refused OpenCode 2 target warns once, stops, and tracks the next live account', async () => {
@@ -2412,13 +2451,20 @@ test('OC2 ordinary acceptance captures the byte-identical pre-thread snapshot be
   }
 })
 
-function runnerPolicyForReview(policy: unknown, reports: unknown[] = []) {
+function runnerPolicyForReview(
+  policy: unknown,
+  reports: unknown[] = [],
+  reportSessions?: string[],
+) {
   const key = Symbol.for('cortexkit.routing')
   const globals = globalThis as Record<symbol, unknown>
   const original = globals[key]
-  globals[key] = () => ({
+  globals[key] = (sessionId: string) => ({
     cache: () => policy,
-    report: (payload: unknown) => reports.push(payload),
+    report: (payload: unknown) => {
+      reportSessions?.push(sessionId)
+      reports.push(payload)
+    },
   })
   cleanups.push(() => {
     if (original === undefined) delete globals[key]

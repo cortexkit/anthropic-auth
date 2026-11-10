@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## 2.9.1
 
 - Pi and OpenCode now retry Claude streams that disconnect before completion instead of silently ending the turn, with content-free connection diagnostics for troubleshooting.
+- OpenCode and Pi hosted by Thalamus now report each Claude model request's paying login and token usage, including retries and keep-warm requests, for accurate spend tracking.
 - Updated the shared auth library.
 
 ## 2.9.0

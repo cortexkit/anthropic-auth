@@ -75,6 +75,25 @@ import { trackPiTestBody } from './setup.ts'
 const originalFetch = globalThis.fetch
 const lifetimes = createTestLifetimeSuite()
 const { deferCleanup } = lifetimes
+function captureBilling() {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const previous = globals[key]
+  const reports: Record<string, unknown>[] = []
+  const sessions: string[] = []
+  globals[key] = (sessionId: string) => ({
+    report: (payload: Record<string, unknown>) => {
+      if (payload.kind !== 'billing') return
+      sessions.push(sessionId)
+      reports.push(payload)
+    },
+  })
+  deferCleanup(() => {
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  })
+  return { reports, sessions }
+}
 const wrapBody = <Args extends unknown[]>(body: (...args: Args) => unknown) =>
   lifetimes.wrapBody((...args: Args) =>
     trackPiTestBody(Promise.resolve().then(() => body(...args))),
@@ -103,6 +122,7 @@ const context: Context = {
 
 test('Pi Prime authorizes vault custody for a stateless signed physical send', async () => {
   const f = await fixture()
+  const billing = captureBilling()
   const runtime = await f.native.service()
   await runtime.updateSettings((settings) => ({
     ...settings,
@@ -159,10 +179,13 @@ test('Pi Prime authorizes vault custody for a stateless signed physical send', a
     (await runtime.read()).accounts.find((account) => account.id === 'main')
       ?.prime,
   ).toMatchObject({ count: 1, inputTokens: 11, outputTokens: 1 })
+  await Bun.sleep(10)
+  expect(billing.reports).toEqual([])
 })
 const success = () =>
   new Response(
     'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+    { headers: { 'content-type': 'text/event-stream' } },
   )
 const row = (id: string, accountId: string): ScopedInventoryRow => ({
   id,
@@ -1799,6 +1822,79 @@ registerTest.each([200, 401])(
     )
   }),
 )
+
+test('Pi bills each failed and retried physical send with its actual vault payer', async () => {
+  const f = await fixture()
+  const billing = captureBilling()
+  let sends = 0
+  const fetchImpl = Object.assign(
+    async () =>
+      ++sends === 1
+        ? Response.json({ type: 'error' }, { status: 401 })
+        : Response.json({
+            id: 'msg_pi',
+            usage: { input_tokens: 6, output_tokens: 4 },
+          }),
+    { preconnect: originalFetch.preconnect },
+  )
+  const response = await __sendPiAnthropicRequestForTest(
+    {
+      model,
+      context,
+      storagePath: f.path,
+      streamOptions: { sessionId: 'pi-billing-retry' },
+    },
+    { native: f.native, fetch: fetchImpl },
+  )
+  await response.text()
+  await Bun.sleep(10)
+  expect(sends).toBe(2)
+  expect(billing.sessions).toEqual(['pi-billing-retry', 'pi-billing-retry'])
+  expect(billing.reports).toHaveLength(2)
+  expect(billing.reports[0]).toMatchObject({
+    credential_id: 'oauth:anthropic',
+    account_id: fixtureAccountIdentity('main'),
+    outcome: 'failed',
+    status: 401,
+  })
+  expect(billing.reports[1]).toMatchObject({
+    credential_id: 'oauth:anthropic',
+    account_id: fixtureAccountIdentity('main'),
+    outcome: 'completed',
+    status: 200,
+    provider_response_id: 'msg_pi',
+    usage: { input: 6, output: 4 },
+  })
+  expect(billing.reports[0]?.attempt_id).not.toBe(
+    billing.reports[1]?.attempt_id,
+  )
+})
+
+test('Pi bills a model response and its keep-warm under the owning real session', async () => {
+  const f = await fixture()
+  const billing = captureBilling()
+  await sendAndPrewarm(f, 'claude-fable-5-1')
+  await Bun.sleep(10)
+  expect(billing.sessions).toEqual([
+    'pi-prewarm-betas-claude-fable-5-1',
+    'pi-prewarm-betas-claude-fable-5-1',
+  ])
+  expect(billing.reports).toHaveLength(2)
+  expect(billing.reports[0]).toMatchObject({
+    credential_id: 'oauth:anthropic',
+    account_id: fixtureAccountIdentity('main'),
+    outcome: 'completed',
+    usage: { input: 1, output: 1 },
+  })
+  expect(billing.reports[1]).toMatchObject({
+    credential_id: 'oauth:anthropic',
+    account_id: fixtureAccountIdentity('main'),
+    request_kind: 'keep_warm',
+    outcome: 'completed',
+    usage: { input: 1 },
+    cache: { ttl_ms: 300_000, warming: { on: true } },
+  })
+})
 
 for (const cacheKeepEnabled of [true, false]) {
   test(`Pi records only accepted cache activity with CacheKeep ${cacheKeepEnabled ? 'on' : 'off'}`, async () => {

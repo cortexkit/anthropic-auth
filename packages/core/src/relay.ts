@@ -1,6 +1,12 @@
 import { Buffer } from 'node:buffer'
 import { createHash, randomBytes } from 'node:crypto'
 import type { AccountStorage } from './accounts.ts'
+import {
+  type AnthropicBillingRequest,
+  createAnthropicBillingObserver,
+  observeAnthropicBillingResponse,
+  reportAnthropicBillingFailure,
+} from './billing.ts'
 import { dumpRelayRequest } from './dump.ts'
 import { parseJsonRedacted } from './json.ts'
 import { relayLog } from './logger.ts'
@@ -155,6 +161,7 @@ type RelaySendResult = {
 
 export type RelayAttemptAuthorization = {
   headers: Headers
+  billing?: AnthropicBillingRequest
   /** Called only for a genuine upstream response, never optimistic/transport status. */
   onUpstreamStatus?: (status: number) => void
   /**
@@ -599,7 +606,13 @@ async function postRelayAttempt(
     throw safe
   }
   try {
-    return { authorization, scope, response: scope.redactResponse(raw) }
+    const upstream =
+      raw.ok || /^req_[A-Za-z0-9_-]+$/.test(raw.headers.get('request-id') ?? '')
+    const observed =
+      authorization?.billing && upstream
+        ? observeAnthropicBillingResponse(authorization.billing, raw)
+        : raw
+    return { authorization, scope, response: scope.redactResponse(observed) }
   } catch (error) {
     // Never hand the unscrubbed response on; the scope accepted nothing.
     scope.dispose()
@@ -810,6 +823,7 @@ function disposeWebSocketAttemptScopes(scopes: WebSocketAttemptScopes) {
 }
 
 type PendingWebSocketRequest = {
+  billingObserver?: ReturnType<typeof createAnthropicBillingObserver>
   abortCleanup?: () => void
   payload: RelayPayload
   bodyText: string
@@ -1341,6 +1355,14 @@ class PersistentRelaySession {
     pending: PendingWebSocketRequest,
     attempt: PhysicalAttempt<WebSocketAttemptScopes>,
   ) {
+    if (
+      !pending.billingObserver &&
+      pending.accepted &&
+      pending.authorization?.billing
+    )
+      reportAnthropicBillingFailure(pending.authorization.billing)
+    pending.billingObserver?.finish()
+    pending.billingObserver = undefined
     pending.scope?.dispose()
     pending.responseScope?.dispose()
     pending.authorization = attempt.authorization
@@ -1355,6 +1377,14 @@ class PersistentRelaySession {
    * the headers it sent. Byte counters and the retry guard are kept.
    */
   private retireAttempt(pending: PendingWebSocketRequest) {
+    if (
+      !pending.billingObserver &&
+      pending.accepted &&
+      pending.authorization?.billing
+    )
+      reportAnthropicBillingFailure(pending.authorization.billing)
+    pending.billingObserver?.finish()
+    pending.billingObserver = undefined
     pending.retired = true
     pending.abortCleanup?.()
     pending.abortCleanup = undefined
@@ -1380,6 +1410,7 @@ class PersistentRelaySession {
     pending: PendingWebSocketRequest,
     chunk: Uint8Array,
   ) {
+    pending.billingObserver?.push(chunk)
     this.deliverResponseHeaders(pending)
     pending.streamChunkCount += 1
     pending.streamByteCount += chunk.byteLength
@@ -1651,6 +1682,15 @@ class PersistentRelaySession {
     }
     if (message.type === 'response_start') {
       if (pending.responseStartedAt != null) return
+      try {
+        if (pending.authorization?.billing)
+          pending.billingObserver = createAnthropicBillingObserver(
+            pending.authorization.billing,
+            message.status,
+            new Headers(message.headers),
+            pending.responseMode === 'event-stream',
+          )
+      } catch {}
       const responseStartedAt = perfNowMs()
       pending.responseStartedAt = responseStartedAt
       try {

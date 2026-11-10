@@ -6,6 +6,10 @@ import {
 import type { CacheWarmStopReason } from '@cortexkit/common-auth/routing-accessor'
 import type { AccountStorage } from './accounts.ts'
 import {
+  type AnthropicBillingRequest,
+  withAnthropicBilling,
+} from './billing.ts'
+import {
   type CacheKeepFailure,
   type CacheKeepFailureStage,
   CacheKeepPrewarmError,
@@ -721,6 +725,10 @@ export class CacheKeepManager {
     private readonly options: {
       loadStorage: () => Promise<AccountStorage | null>
       fetchImpl?: typeof fetch
+      billingRequest?: (
+        target: CacheKeepTarget,
+        attempt: CacheKeepPrewarmAttempt,
+      ) => AnthropicBillingRequest | undefined
       now?: () => number
       prewarmTimeoutMs?: number
       setIntervalImpl?: typeof globalThis.setInterval
@@ -1813,12 +1821,20 @@ export class CacheKeepManager {
           'http',
         )
         try {
-          const sent = await fetchImpl(target.url, {
-            method: 'POST',
-            headers: attemptHeaders,
-            body: prewarm.bodyText,
-            signal: attempt.signal,
-          })
+          const dispatch = () =>
+            fetchImpl(target.url, {
+              method: 'POST',
+              headers: attemptHeaders,
+              body: prewarm.bodyText,
+              signal: attempt.signal,
+            })
+          let billing: AnthropicBillingRequest | undefined
+          try {
+            billing = this.options.billingRequest?.(prewarmTarget, attempt)
+          } catch {}
+          const sent = await (billing
+            ? withAnthropicBilling(billing, dispatch)
+            : dispatch())
           if (!sent.ok && this.isCurrentTarget(target) && target.policyState) {
             const state = target.policyState
             const cost = this.admittedWarmCosts.get(state) ?? 0

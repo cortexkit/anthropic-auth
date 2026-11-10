@@ -482,6 +482,73 @@ function sseResponse(text: string, onCancel?: (reason: unknown) => void) {
   })
 }
 
+test.each(['completed', 'cut', 'failed', 'transport'] as const)(
+  'bills the physical OpenCode 2 attempt: %s',
+  async (outcome) => {
+    const reports: Record<string, unknown>[] = []
+    globals[routingKey] = () => ({
+      report: (payload: Record<string, unknown>) => reports.push(payload),
+    })
+    const { source } = makeSource({
+      billingRequest: (input) => ({
+        sessionId: input.sessionID,
+        credentialId: input.provenance.receipt,
+        accountId: ACCOUNT_UUID,
+        model: input.modelID,
+        requestKind: input.kind,
+      }),
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    try {
+      const host = new Host(native.adapter)
+      const { attempt, final } = await host.run(
+        scopeOf(),
+        hostRequest(sonnetPayload()),
+      )
+      if (outcome !== 'transport') {
+        const upstream =
+          outcome === 'failed'
+            ? Response.json({ type: 'error' }, { status: 503 })
+            : sseResponse(
+                outcome === 'cut'
+                  ? (PREFIXED_STREAM[0] ?? '')
+                  : PREFIXED_STREAM.join(''),
+              )
+        const response = await native.adapter.rewriteResponse?.({
+          ...attempt,
+          request: final,
+          response: upstream,
+          attempt,
+        })
+        await response?.text()
+      }
+      await native.adapter.onAttemptEnd?.(attempt, {
+        outputStarted: outcome === 'completed',
+      })
+      await Bun.sleep(10)
+      expect(reports).toHaveLength(1)
+      expect(reports[0]).toMatchObject({
+        kind: 'billing',
+        attempt_id: attempt.attemptId,
+        credential_id: 'local:acct-local',
+        account_id: ACCOUNT_UUID,
+        outcome: outcome === 'transport' ? 'failed' : outcome,
+      })
+      if (outcome === 'completed')
+        expect(reports[0]).toMatchObject({
+          provider_response_id: 'msg_01',
+          provider_request_id: 'req_011CTestUpstream000000001',
+          usage: { input: 120, output: 18, cache_read: 64 },
+        })
+      if (outcome === 'cut')
+        expect(reports[0]?.usage).not.toHaveProperty('output')
+      if (outcome === 'failed') expect(reports[0]?.status).toBe(503)
+    } finally {
+      native.dispose()
+    }
+  },
+)
+
 type InspectedBody = Record<string, unknown> & {
   tools: Array<{ name: string }>
   messages: Array<{ content: Array<Record<string, unknown>> }>

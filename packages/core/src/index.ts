@@ -36,6 +36,7 @@ export {
 } from '@cortexkit/common-auth/setup'
 export * from './accounts.ts'
 export * from './auth.ts'
+export * from './billing.ts'
 export * from './cache1h.ts'
 export * from './cachekeep.ts'
 export * from './cachekeep-failure.ts'

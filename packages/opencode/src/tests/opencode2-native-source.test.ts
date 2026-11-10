@@ -412,6 +412,17 @@ describe('OC2 shared routing relay', () => {
       'Anthropic-RateLimit-New-Header': 'kept',
       'request-id': 'discarded',
     })
+    expect(native.billingRequest?.(context(auth.provenance))).toMatchObject({
+      sessionId: scope.sessionID,
+      credentialId: 'oauth:anthropic',
+      accountId: identity,
+      model: scope.modelID,
+      requestKind: scope.kind,
+      chargeBasis: 'subscription_included',
+    })
+    expect(
+      native.billingRequest?.({ ...context(auth.provenance), agent: 'prime' }),
+    ).toBeUndefined()
     native.quotaFromHeaders?.(headers, {
       ...context(auth.provenance),
       status: 200,

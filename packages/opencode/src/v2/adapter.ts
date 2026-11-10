@@ -7,6 +7,7 @@
 
 import { createHash } from 'node:crypto'
 import {
+  type AnthropicBillingRequest,
   AnthropicOAuthOriginError,
   applyCustomHeaders,
   applyRunnerTurnNotes,
@@ -32,6 +33,7 @@ import {
   type MessageThreadRequest,
   MessageThreadTracker,
   mergeAnthropicBetas,
+  observeAnthropicBillingResponse,
   type ProviderErrorRedactor,
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
@@ -39,6 +41,7 @@ import {
   type RequestGzipLatch,
   remapModelId,
   remapRequestBodyModel,
+  reportAnthropicBillingFailure,
   requestCacheLifetimeMs,
   requestSignal,
   resolveNativePoolPaths,
@@ -325,6 +328,9 @@ export interface NativeAnthropicAttemptOutcome extends AttemptOutcome {
  * the adapter passes it is rejected at compile time.
  */
 export interface NativeAnthropicSource<Q, P> {
+  readonly billingRequest?: (
+    input: NativeAnthropicAttemptContext<P>,
+  ) => AnthropicBillingRequest | undefined
   /**
    * Picks the account for one request; `undefined` refuses it. In phase
    * `retry` it may instead return a hold, which keeps the refused account and
@@ -471,6 +477,8 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
+  /** Background drivers can refuse a rewritten request before their final dispatch. */
+  discardUnsentBilling(data: NativeAnthropicAttemptData<P>): void
   /** Receipt time of this adapter's final verified upstream OAuth 2xx response. */
   acceptedResponse(response: Response): { at: number } | undefined
   readonly adapter: OpenCode2AuthAdapter<
@@ -796,6 +804,10 @@ export function createNativeAnthropicAdapter<Q, P>(
   const endTimeoutMs =
     deps.attemptEndTimeoutMs ?? DEFAULT_ATTEMPT_END_TIMEOUT_MS
   type Data = NativeAnthropicAttemptData<P>
+  const billingSends = new WeakMap<
+    Data,
+    { input: AnthropicBillingRequest; received: boolean }
+  >()
   let requestGzipLatch = deps.requestGzipLatch
   const gzipLatch = async () => {
     if (requestGzipLatch) return requestGzipLatch
@@ -1448,10 +1460,19 @@ export function createNativeAnthropicAdapter<Q, P>(
             try {
               assertHostAuthorityStable()
               observeFinalWire(request, createBody)
-              const received = await (deps.fetch ?? globalThis.fetch)(url, init)
+              let received = await (deps.fetch ?? globalThis.fetch)(url, init)
               if (request.signal.aborted) {
                 void received.body?.cancel().catch(() => {})
                 request.signal.throwIfAborted()
+              }
+              const billingSend = billingSends.get(data)
+              if (billingSend) {
+                billingSend.received = true
+                if (fromUpstream(received.headers, data))
+                  received = observeAnthropicBillingResponse(
+                    { ...billingSend.input, attemptId: undefined },
+                    received,
+                  )
               }
               if (received.ok && fromUpstream(received.headers, data))
                 physicalAcceptances.set(data, {
@@ -1459,6 +1480,18 @@ export function createNativeAnthropicAdapter<Q, P>(
                 })
               return received
             } catch (error) {
+              const billingSend = billingSends.get(data)
+              if (
+                billingSend &&
+                !billingSend.received &&
+                dispatch?.kind !== 'http-relay'
+              ) {
+                billingSend.received = true
+                reportAnthropicBillingFailure({
+                  ...billingSend.input,
+                  attemptId: undefined,
+                })
+              }
               request.signal.throwIfAborted()
               if (!isRecoveryTransportFailure(error)) throw error
               // Return an HTTP failure instead of rejecting the response hook,
@@ -1667,6 +1700,27 @@ export function createNativeAnthropicAdapter<Q, P>(
     return finalRequest
 
     function observeFinalWire(prepared: Request, bodyText: string | undefined) {
+      if (data && messages && bodyText !== undefined) {
+        try {
+          const metadata = source.billingRequest?.(contextOf(attempt, data))
+          if (metadata) {
+            const payload = parseJson(bodyText)
+            const ttlMs = requestCacheLifetimeMs(bodyText)
+            billingSends.set(data, {
+              input: {
+                ...metadata,
+                attemptId: attempt.attemptId,
+                model:
+                  isRecord(payload) && typeof payload.model === 'string'
+                    ? payload.model
+                    : metadata.model,
+                ...(ttlMs > 0 ? { cache: { ...metadata.cache, ttlMs } } : {}),
+              },
+              received: false,
+            })
+          }
+        } catch {}
+      }
       if (data?.route !== 'oauth' || !messages || bodyText === undefined) return
       try {
         source.onFinalRequestPrepared?.({
@@ -1718,6 +1772,15 @@ export function createNativeAnthropicAdapter<Q, P>(
     },
     async rewriteResponse({ response, attempt }) {
       const data = attempt.data
+      const billingSend = data ? billingSends.get(data) : undefined
+      if (billingSend) {
+        billingSend.received = true
+        if (data && fromUpstream(response.headers, data))
+          response = observeAnthropicBillingResponse(
+            billingSend.input,
+            response,
+          )
+      }
       const threaded = data ? threadRequests.get(data) : undefined
       const failThread = threaded?.thread.fail
       if (data) threadRequests.delete(data)
@@ -2112,6 +2175,15 @@ export function createNativeAnthropicAdapter<Q, P>(
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
       if (!data) return
+      const billingSend = billingSends.get(data)
+      billingSends.delete(data)
+      if (
+        billingSend &&
+        !billingSend.received &&
+        !localRefusals.has(data) &&
+        data.dispatch === 'direct'
+      )
+        reportAnthropicBillingFailure(billingSend.input)
       pending.delete(data)
       // A send that never reached `rewriteResponse` (the host's fetch threw,
       // say) still writes its request dump with a fixed error label, as
@@ -2196,6 +2268,9 @@ export function createNativeAnthropicAdapter<Q, P>(
 
   return {
     adapter,
+    discardUnsentBilling: (data) => {
+      billingSends.delete(data)
+    },
     acceptedResponse: (response) => finalAcceptances.get(response),
     dispose() {
       disposed = true

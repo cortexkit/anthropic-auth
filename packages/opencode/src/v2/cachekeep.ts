@@ -599,6 +599,17 @@ export function createNativeCacheKeep(
     const native = createNativeAnthropicAdapter({
       source: {
         ...source,
+        billingRequest(input) {
+          const billing = source.billingRequest?.(input)
+          return billing
+            ? {
+                ...billing,
+                sessionId: target.policyState?.ownerSessionId ?? target.id,
+                requestKind: 'keep_warm',
+                cache: { warming: { on: true } },
+              }
+            : undefined
+        },
         // Background sends must not extend a user turn's billing or diagnostics
         // chain or replace its live CacheKeep target. Successful prewarms only
         // update the target session's last cache refresh time below.
@@ -819,6 +830,8 @@ export function createNativeCacheKeep(
       throw new CacheKeepPrewarmError(stage, error, status)
     } finally {
       signal.removeEventListener('abort', cancel)
+      if (attempt?.data && stage === 'authorization')
+        native.discardUnsentBilling(attempt.data)
       try {
         if (attempt)
           await native.adapter.onAttemptEnd?.(attempt, {

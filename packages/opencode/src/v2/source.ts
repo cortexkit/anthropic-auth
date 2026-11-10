@@ -606,6 +606,26 @@ export function createNativeAnthropicSource(
   }
 
   const source: NativeSource = {
+    billingRequest(input) {
+      if (input.agent === 'prime') return undefined
+      const state = states.get(input.provenance)
+      if (!state) return undefined
+      const provenance = input.provenance
+      return {
+        sessionId: input.sessionID,
+        credentialId:
+          provenance.kind === 'vault'
+            ? provenance.credentialId
+            : provenance.kind === 'local'
+              ? localMessageThreadCredential(provenance.subject.binding)
+              : provenance.subject.credentialFingerprint,
+        accountId: state.account.accountIdentity,
+        model: state.scope.modelID,
+        requestKind: input.agent === 'cachekeep' ? 'keep_warm' : input.kind,
+        chargeBasis:
+          input.route === 'api' ? 'metered_api' : 'subscription_included',
+      }
+    },
     async chooseAccount(
       input: ChooseAccountInput,
     ): Promise<ChooseAccountResult> {

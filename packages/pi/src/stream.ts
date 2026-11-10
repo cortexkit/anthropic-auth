@@ -1,5 +1,6 @@
 import {
   type AccountStorage,
+  type AnthropicBillingRequest,
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
@@ -97,6 +98,7 @@ import {
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  withAnthropicBilling,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -406,6 +408,16 @@ function applyPiOAuthRequestHeaders(
   return headers
 }
 
+function piBillingPayer(attempt: PiNativeAttempt) {
+  return {
+    credentialId:
+      attempt.source === 'vault'
+        ? attempt.receipt.credentialId
+        : localMessageThreadCredential(attempt.admission.binding),
+    accountId: attempt.accountIdentity,
+  }
+}
+
 const nativePrewarmAttempts = new Map<
   number,
   {
@@ -416,6 +428,21 @@ const nativePrewarmAttempts = new Map<
 >()
 const piCacheKeep = new PiCacheKeep(
   {
+    billingRequest(target, attempt) {
+      const entry = nativePrewarmAttempts.get(attempt.id)
+      if (!entry) return undefined
+      return {
+        ...piBillingPayer(entry.served),
+        sessionId: target.policyState?.ownerSessionId ?? target.id,
+        model: (JSON.parse(target.bodyText) as { model: string }).model,
+        requestKind: 'keep_warm',
+        chargeBasis: 'subscription_included',
+        cache: {
+          ttlMs: requestCacheLifetimeMs(target.bodyText),
+          warming: { on: true },
+        },
+      }
+    },
     fetchImpl: fetchPiOAuth,
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
     onTrackedSessionsChanged: (sessions) =>
@@ -905,6 +932,26 @@ async function sendAnthropicRequest(
         ...(options.prime && { requestClass: 'auxiliary' }),
       })
   const relayAffinity = options.streamOptions?.sessionId ?? null
+  const billingInput = (
+    attempt?: PiNativeAttempt,
+    apiSubject?: NativeApiSubject,
+  ): AnthropicBillingRequest | undefined => {
+    if (options.prime || !relayAffinity || (!attempt && !apiSubject))
+      return undefined
+    const credentialId = attempt
+      ? piBillingPayer(attempt).credentialId
+      : apiSubject?.credentialFingerprint
+    if (!credentialId) return undefined
+    const ttlMs = requestCacheLifetimeMs(wireBodyText)
+    return {
+      ...(attempt ? piBillingPayer(attempt) : { credentialId }),
+      sessionId: relayAffinity,
+      model: typeof body.model === 'string' ? body.model : options.model.id,
+      requestKind: options.requestOrigin === 'direct' ? 'generate' : 'primary',
+      chargeBasis: options.apiAccount ? 'metered_api' : 'subscription_included',
+      ...(ttlMs > 0 ? { cache: { ttlMs } } : {}),
+    }
+  }
   let input = options.apiAccount
     ? new URL('https://api.anthropic.com/v1/messages')
     : buildPiOAuthMessagesUrl(options.model.baseUrl)
@@ -1075,7 +1122,9 @@ async function sendAnthropicRequest(
       // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
       // the signed identity text for dumps and CacheKeep.
       if (options.apiAccount || typeof init.body !== 'string')
-        return scope.redactResponse(await fetchResponse(input, init))
+        return scope.redactResponse(
+          await physicalFetch(() => fetchResponse(input, init)),
+        )
       return scope.redactResponse(
         await sendWithRequestGzip({
           url: input,
@@ -1088,14 +1137,20 @@ async function sendAnthropicRequest(
             await options.prime?.beforeSend()
             init.signal?.throwIfAborted()
             assertHostAuthorityStable()
-            return fetchResponse(input, {
-              ...init,
-              body: wireBody,
-              headers: wireHeaders,
-            })
+            return physicalFetch(() =>
+              fetchResponse(input, {
+                ...init,
+                body: wireBody,
+                headers: wireHeaders,
+              }),
+            )
           },
         }),
       )
+    }
+    const physicalFetch = (send: () => Promise<Response>) => {
+      const billing = billingInput(attempt, apiSubject)
+      return billing ? withAnthropicBilling(billing, send) : send()
     }
     let response: Response
     try {
@@ -1232,6 +1287,7 @@ async function sendAnthropicRequest(
         authorizedHeaders.set('authorization', `Bearer ${access}`)
         return {
           headers: authorizedHeaders,
+          billing: billingInput(attempt),
           errorSecrets: [access],
           onUpstreamStatus: (status) => {
             if (status >= 200 && status < 300)
