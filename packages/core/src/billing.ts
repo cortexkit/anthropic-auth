@@ -4,6 +4,7 @@ import {
   type ReportRoutingInput,
   reportRouting,
 } from '@cortexkit/common-auth/routing-accessor'
+import { copyStreamResponseTiming } from './stream-completion.ts'
 
 type BillingReport = Extract<ReportRoutingInput, { kind: 'billing' }>
 export type AnthropicBillingRequest = Omit<
@@ -195,10 +196,10 @@ export function createAnthropicBillingObserver(
       else overflow = true
       return
     }
-    for (const part of text.split(/(?<=\n)/)) {
+    for (const part of text.split(/(?<=[\r\n])/)) {
       if (pending.length + part.length > maxPending) overflow = true
       if (!overflow) pending += part
-      if (part.endsWith('\n')) {
+      if (/[\r\n]$/.test(part)) {
         if (!overflow && pending.startsWith('data:'))
           parse(pending.slice(5).trim())
         pending = ''
@@ -257,11 +258,14 @@ export function observeAnthropicBillingResponse(
     },
     { highWaterMark: 0 },
   )
-  return new Response(body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  })
+  return copyStreamResponseTiming(
+    response,
+    new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+  )
 }
 
 /** Call only at the physical send boundary, after authorization and local admission. */

@@ -48,6 +48,42 @@ const start = {
   message: { id: 'msg_test', usage: { input_tokens: 12, output_tokens: 0 } },
 }
 
+test.each(['\r', '\r\n'])(
+  'billing accepts SSE framing %j across byte chunks',
+  async (ending) => {
+    const reports = capture()
+    const text = [
+      start,
+      { type: 'message_delta', usage: { output_tokens: 7 } },
+      { type: 'message_stop' },
+    ]
+      .map(frame)
+      .join('')
+      .replaceAll('\n', ending)
+    const bytes = new TextEncoder().encode(text)
+    let offset = 0
+    const upstream = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (offset === bytes.length) controller.close()
+          else controller.enqueue(bytes.subarray(offset, ++offset))
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    expect(
+      await observeAnthropicBillingResponse(request, upstream).text(),
+    ).toBe(text)
+    await Bun.sleep(10)
+    expect(reports).toHaveLength(1)
+    expect(reports[0]).toMatchObject({
+      outcome: 'completed',
+      provider_response_id: 'msg_test',
+      usage: { input: 12, output: 7 },
+    })
+  },
+)
+
 test('billing sums iterations across fallback models, split cache writes and thinking', async () => {
   const reports = capture()
   const upstream = response([

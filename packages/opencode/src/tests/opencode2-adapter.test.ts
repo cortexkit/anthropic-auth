@@ -517,10 +517,29 @@ test.each(['completed', 'cut', 'failed', 'transport'] as const)(
         const response = await native.adapter.rewriteResponse?.({
           ...attempt,
           request: final,
-          response: upstream,
+          response: core.copyStreamResponseTiming(
+            upstream,
+            upstream,
+            performance.now() - 40,
+          ),
           attempt,
         })
-        await response?.text()
+        if (outcome === 'cut') {
+          if (!response) throw new Error('Missing billing response')
+          await expect(response.text()).rejects.toMatchObject({
+            code: 'ECONNRESET',
+            diagnostics: {
+              response_headers: {
+                'request-id': 'req_011CTestUpstream000000001',
+              },
+              response_bytes: Buffer.byteLength(PREFIXED_STREAM[0] ?? ''),
+              sse_events: 1,
+              send_to_headers_ms: expect.any(Number),
+              timing_source: 'physical_fetch',
+              headers_to_eof_ms: expect.any(Number),
+            },
+          })
+        } else await response?.text()
       }
       await native.adapter.onAttemptEnd?.(attempt, {
         outputStarted: outcome === 'completed',

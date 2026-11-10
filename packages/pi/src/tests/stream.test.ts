@@ -173,7 +173,13 @@ afterEach(async () => {
   tempDir = undefined
 })
 
-test.each(['empty', 'bodyless', 'partial', 'unterminated stop'])(
+test.each([
+  'empty',
+  'bodyless',
+  'partial',
+  'unterminated stop',
+  'partial with billing',
+])(
   'Pi incomplete 200 is retryable and never an empty stop: %s',
   async (scenario) => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-incomplete-'))
@@ -184,6 +190,13 @@ test.each(['empty', 'bodyless', 'partial', 'unterminated stop'])(
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
     const records: LogTestRecord[] = []
     __setLogTestSink((record) => records.push(record))
+    const billingReports: Record<string, unknown>[] = []
+    if (scenario === 'partial with billing')
+      globals[routingKey] = () => ({
+        report: (payload: Record<string, unknown>) => {
+          if (payload.kind === 'billing') billingReports.push(payload)
+        },
+      })
     try {
       await saveNativePiFixture(
         {
@@ -195,17 +208,22 @@ test.each(['empty', 'bodyless', 'partial', 'unterminated stop'])(
         },
         storagePath,
       )
-      const frame = (event: unknown) => `data: ${JSON.stringify(event)}\n\n`
-      const body =
-        scenario === 'partial'
-          ? frame({
-              type: 'message_start',
-              message: { id: 'msg_partial', content: [] },
-            }) +
-            frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })
-          : scenario === 'unterminated stop'
-            ? 'data: {"type":"message_stop"}\n'
-            : ''
+      const ending = scenario === 'partial with billing' ? '\r\n' : '\n'
+      const frame = (event: unknown) =>
+        `data: ${JSON.stringify(event)}${ending}${ending}`
+      const body = scenario.startsWith('partial')
+        ? frame({
+            type: 'message_start',
+            message: {
+              id: 'msg_partial',
+              content: [],
+              usage: { input_tokens: 12, output_tokens: 0 },
+            },
+          }) +
+          frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })
+        : scenario === 'unterminated stop'
+          ? 'data: {"type":"message_stop"}\n'
+          : ''
       globalThis.fetch = mock(async (input: string | URL | Request) => {
         if (input.toString().includes('/api/claude_cli/bootstrap'))
           return Response.json({
@@ -251,7 +269,7 @@ test.each(['empty', 'bodyless', 'partial', 'unterminated stop'])(
           'content-length': String(Buffer.byteLength(body)),
         },
         response_bytes: Buffer.byteLength(body),
-        sse_events: scenario === 'partial' ? 2 : 0,
+        sse_events: scenario.startsWith('partial') ? 2 : 0,
         send_to_headers_ms: expect.any(Number),
         timing_source: 'physical_fetch',
         headers_to_eof_ms: expect.any(Number),
@@ -266,6 +284,18 @@ test.each(['empty', 'bodyless', 'partial', 'unterminated stop'])(
       expect(JSON.stringify([summary, warnings])).not.toContain(
         'private prompt',
       )
+      if (scenario === 'partial with billing') {
+        await Bun.sleep(10)
+        expect(billingReports).toHaveLength(1)
+        expect(billingReports[0]).toMatchObject({
+          outcome: 'cut',
+          status: 200,
+          provider_request_id: 'req_incomplete_pi',
+          provider_response_id: 'msg_partial',
+          usage: { input: 12 },
+        })
+        expect(billingReports[0]?.usage).not.toHaveProperty('output')
+      }
     } finally {
       resetDumpState()
       if (previousDumpDir === undefined)
