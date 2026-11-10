@@ -34,7 +34,7 @@
         "xxhash-wasm": "^1.1.0",
       },
       "devDependencies": {
-        "@cortexkit/common-auth": "0.42.0",
+        "@cortexkit/common-auth": "0.43.0",
       },
     },
     "packages/e2e-tests": {
@@ -64,6 +64,7 @@
       },
       "devDependencies": {
         "@ai-sdk/anthropic": "4.0.94",
+        "@cortexkit/opencode-sidebar": "0.1.0",
         "@opencode/plugin": "2.2.5",
       },
       "peerDependencies": {
@@ -252,9 +253,11 @@
 
     "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.17.0", "", { "dependencies": { "@cortexkit/store": "^0.2.3", "@cortexkit/subc-client": "^0.24.0" } }, "sha512-8PF7fI8pnRyZWgLpzO8zeywc3dGaYYDIhU3ztrJtfwDkw+dq9o2UQtCaoHo776d2aHo+JPZXFfN+7E2VaG75vw=="],
 
-    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.42.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0 || ^0.24.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-LAZ67qRdJA+9SmglIyDRtEd2Wz+6X2dDRTC+qXt6HryQzir87LIiY+sWWllWT707agUA9rxOocCCP6e+mwoZyA=="],
+    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.43.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/opencode-sidebar": "~0.1.0", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0 || ^0.24.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/opencode-sidebar", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-J0vA1VHliTdDhBghn/G5oR6oRcm5sA0ScL/6ghwqMEsQjlSZ5K8q40vYVbW15gZcw69hcmVuA6Gbq1/26yKR4A=="],
 
     "@cortexkit/opencode-anthropic-auth": ["@cortexkit/opencode-anthropic-auth@workspace:packages/opencode"],
+
+    "@cortexkit/opencode-sidebar": ["@cortexkit/opencode-sidebar@0.1.0", "", { "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" } }, "sha512-Dqon2Yuz9HBXDwsupm6RhLV9uwTeThQZtfje8Oz+A+lq0ej7dVHoeBS/qHCtBWnvNADTJokiwxiBWqhyQHSEpg=="],
 
     "@cortexkit/pi-anthropic-auth": ["@cortexkit/pi-anthropic-auth@workspace:packages/pi"],
 

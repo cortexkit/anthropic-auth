@@ -89,6 +89,7 @@
   },
   "devDependencies": {
     "@ai-sdk/anthropic": "4.0.94",
+    "@cortexkit/opencode-sidebar": "0.1.0",
     "@opencode/plugin": "2.2.5"
   }
 }
