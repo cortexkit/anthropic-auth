@@ -112,7 +112,8 @@ export function createAnthropicStreamCompletion(response: Response) {
     try {
       const event = JSON.parse(data)
       if (event?.type === 'message_stop') stopped = true
-      // An explicit error is already a terminal failure handled by the host.
+      // An explicit error event already ends the stream as a failure the caller
+      // reports, so finish() must not add an incomplete-stream error on top.
       if (event?.type === 'error') failed = true
     } catch {
       // Invalid data cannot certify a completed Anthropic response.
