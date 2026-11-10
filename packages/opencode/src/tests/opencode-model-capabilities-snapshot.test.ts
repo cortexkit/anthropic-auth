@@ -34,6 +34,8 @@ const PROBE_MODELS = [
   'claude-mythos-5-1',
   'claude-fable-5-2',
   'claude-fable-5-2-20261109[1m]',
+  'claude-mythos-5-2',
+  'claude-mythos-5-2-20261109[1m]',
   'claude-opus-5',
   'claude-opus-5-5',
   'claude-sonnet-5',

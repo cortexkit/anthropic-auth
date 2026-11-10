@@ -914,7 +914,8 @@ function buildRestoredNotice(modelId: string): string {
 
 function fallbackModelLabel(modelId: string): string {
   const row = resolveClaudeModelCapabilities(modelId)
-  if (row?.id === 'claude-fable-5-2') return row.name.replace(/^Claude /, '')
+  if (row?.id === 'claude-fable-5-2' || row?.id === 'claude-mythos-5-2')
+    return row.name.replace(/^Claude /, '')
   if (isClaudeOpus55Model(modelId)) return 'Opus 5.5'
   if (isClaudeOpus5Model(modelId)) return 'Opus 5'
   if (isClaudeFableOrMythos51Model(modelId)) {

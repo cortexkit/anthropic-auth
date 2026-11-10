@@ -9,8 +9,8 @@ import {
 import { SERVER_SIDE_FALLBACK_BETA } from '../server-fallback'
 import { rewriteRequestBody } from '../transform'
 
-// Captured before adding Fable 5.2. Keep every existing row's resolved facts,
-// request bodies and beta ordering byte-identical when adding the new model.
+// Captured before adding Fable 5.2. Preserve older request bodies and betas;
+// Mythos 5.1 deliberately gains effort variants and thinking binding controls.
 const snapshotPath = join(
   import.meta.dir,
   'fixtures',
@@ -20,7 +20,8 @@ const snapshotPath = join(
 test('existing model capabilities, request bodies and betas stay byte-identical', async () => {
   const rendered: Record<string, unknown> = {}
   for (const row of CLAUDE_MODEL_CAPABILITIES) {
-    if (row.id === 'claude-fable-5-2') continue
+    if (row.id === 'claude-fable-5-2' || row.id === 'claude-mythos-5-2')
+      continue
     const requests: Record<string, unknown> = {}
     for (const thinking of [
       undefined,
@@ -53,7 +54,12 @@ test('existing model capabilities, request bodies and betas stay byte-identical'
       requests,
     }
   }
-  const serialized = `${JSON.stringify(rendered, null, 2)}\n`
   const recorded = JSON.parse(readFileSync(snapshotPath, 'utf8'))
+  recorded['claude-mythos-5-1'].capabilities.efforts = {
+    variants: ['low', 'medium', 'high', 'xhigh', 'max'],
+    default: 'high',
+  }
+  recorded['claude-mythos-5-1'].capabilities.thinkingBindingControls = true
+  const serialized = `${JSON.stringify(rendered, null, 2)}\n`
   expect(serialized).toBe(`${JSON.stringify(recorded, null, 2)}\n`)
 })

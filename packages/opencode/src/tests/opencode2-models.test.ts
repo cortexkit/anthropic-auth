@@ -147,7 +147,14 @@ test('OC2 does not replace an already complete host inventory', async () => {
   expect([...models.get('anthropic')!.values()]).toEqual(rows)
 })
 
-test.each(['claude-fable-5-2', 'claude-fable-5-2-20261109'])(
+test.each([
+  'claude-fable-5-2',
+  'claude-fable-5-2-20261109',
+  'claude-mythos-5-1',
+  'claude-mythos-5-1-20260901',
+  'claude-mythos-5-2',
+  'claude-mythos-5-2-20261109',
+])(
   'OC2 adds adaptive effort variants to host catalogue model %s',
   (modelID) => {
     const candidate = {
@@ -182,3 +189,26 @@ test.each(['claude-fable-5-2', 'claude-fable-5-2-20261109'])(
     ])
   },
 )
+
+test('OC2 registers missing Mythos 5.1 and 5.2 rows with adaptive effort variants', async () => {
+  const { models } = await providerCatalogue({ anthropic: [] })
+  for (const id of ['claude-mythos-5-1', 'claude-mythos-5-2']) {
+    const row = models.get('anthropic')?.get(id)
+    expect<unknown>(row?.variants).toEqual(
+      ['low', 'medium', 'high', 'xhigh', 'max'].map((effort) => ({
+        id: effort,
+        settings: {
+          effort,
+          thinking: { type: 'adaptive', display: 'summarized' },
+        },
+      })),
+    )
+  }
+  expect(models.get('anthropic')?.get('claude-mythos-5-2')).toMatchObject({
+    name: 'Claude Mythos 5.2',
+    family: 'claude-mythos',
+    limit: { context: 1_000_000, output: 128_000 },
+    cost: [{ input: 8, output: 40, cache: { read: 0.2, write: 10 } }],
+    time: { released: Date.parse('2026-11-09') },
+  })
+})

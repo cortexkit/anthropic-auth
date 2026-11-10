@@ -733,7 +733,23 @@ describe('provider.models', () => {
       thinking: { type: 'adaptive', display: 'summarized' },
       effort: 'xhigh',
     })
-    expect(result?.['claude-mythos-5-1']?.variants).toBeUndefined()
+    for (const id of ['claude-mythos-5-1', 'claude-mythos-5-2']) {
+      expect(result?.[id]?.variants).toEqual(
+        Object.fromEntries(
+          ['low', 'medium', 'high', 'xhigh', 'max'].map((effort) => [
+            effort,
+            { thinking: { type: 'adaptive', display: 'summarized' }, effort },
+          ]),
+        ),
+      )
+    }
+    expect(result?.['claude-mythos-5-2']).toMatchObject({
+      name: 'Claude Mythos 5.2',
+      api: { id: 'claude-mythos-5-2' },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      limit: { context: 1_000_000, output: 128_000 },
+      release_date: '2026-11-09',
+    })
     expect(result?.['claude-mythos-5-1']?.name).toBe('Claude Mythos 5.1')
     expect(result?.['claude-haiku-5-5']?.api?.id).toBe('claude-haiku-5-5')
     expect(result?.['claude-haiku-5-5']?.name).toBe('Claude Haiku 5.5')

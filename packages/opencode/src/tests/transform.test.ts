@@ -634,28 +634,34 @@ describe('setOAuthHeaders', () => {
       },
       { role: 'user', content: 'continue' },
     ]
-    const fableBody = JSON.parse(
-      await rewriteRequestBody(
-        JSON.stringify({
-          model: 'claude-fable-5-1',
-          thinking: { type: 'adaptive' },
-          messages: signedHistory,
-        }),
-        { thinkingPrefixMismatchBehavior: 'drop_block' },
-      ),
-    )
-    expect(fableBody.thinking).toEqual({
-      type: 'adaptive',
-      display: 'summarized',
-      block_binding: { prefix_mismatch_behavior: 'drop_block' },
-    })
-    const fableHeaders = new Headers()
-    setOAuthHeaders(fableHeaders, 'token', { body: fableBody })
-    expect(fableHeaders.get('anthropic-beta')).toContain(
-      'thinking-binding-controls-2026-08-01',
-    )
+    for (const model of [
+      'claude-fable-5-1',
+      'claude-mythos-5-1',
+      'claude-mythos-5-2',
+    ]) {
+      const fableBody = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model,
+            thinking: { type: 'adaptive' },
+            messages: signedHistory,
+          }),
+          { thinkingPrefixMismatchBehavior: 'drop_block' },
+        ),
+      )
+      expect(fableBody.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+        block_binding: { prefix_mismatch_behavior: 'drop_block' },
+      })
+      const fableHeaders = new Headers()
+      setOAuthHeaders(fableHeaders, 'token', { body: fableBody })
+      expect(fableHeaders.get('anthropic-beta')).toContain(
+        'thinking-binding-controls-2026-08-01',
+      )
+    }
 
-    for (const model of ['claude-fable-5', 'claude-mythos-5-1']) {
+    for (const model of ['claude-fable-5', 'claude-mythos-5']) {
       const body = JSON.parse(
         await rewriteRequestBody(
           JSON.stringify({

@@ -389,6 +389,11 @@ describe('getFableRecoverySummary', () => {
 })
 
 describe('formatFallbackModelLabel', () => {
+  test('formats Mythos 5.2 with its own sidebar label', () => {
+    for (const id of ['claude-mythos-5-2', 'claude-mythos-5-2-20261109[1m]']) {
+      expect(formatFallbackModelLabel(id)).toBe('Mythos 5.2')
+    }
+  })
   test('formats Fable 5.2 ahead of the generic Fable 5 prefix', () => {
     expect(formatFallbackModelLabel('claude-fable-5-2')).toBe('Fable 5.2')
     expect(formatFallbackModelLabel('claude-fable-5-2-20261109')).toBe(

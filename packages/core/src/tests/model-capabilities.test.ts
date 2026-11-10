@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { getScopedQuotaWindowForModel } from '../accounts.ts'
 import {
   CLAUDE_MODEL_CAPABILITIES,
   getClaudeModelCapabilities,
@@ -21,6 +22,42 @@ const snapshot = JSON.parse(
 ) as { models: Record<string, unknown> }
 
 describe('model capability table', () => {
+  test('Mythos 5.2 has its own catalogue, effort, binding, quota and recovery row', () => {
+    for (const id of ['claude-mythos-5-2', 'claude-mythos-5-2-20261109[1m]']) {
+      expect(resolveClaudeModelCapabilities(id)).toMatchObject({
+        id: 'claude-mythos-5-2',
+        name: 'Claude Mythos 5.2',
+        family: 'mythos',
+        limited: true,
+        thinkingModes: ['adaptive'],
+        rejectsForcedToolChoice: true,
+        efforts: {
+          variants: ['low', 'medium', 'high', 'xhigh', 'max'],
+          default: 'medium',
+        },
+        effortMarkers: 'always',
+        turnEndNote: true,
+        thinkingBindingControls: true,
+        serverSideFallback: true,
+        refusalRecoveryFamily: 'mythos-5-2',
+        scopedQuota: 'mythos',
+        fastMode: false,
+        catalogue: {
+          releaseDate: '2026-11-09',
+          contextWindow: 1_000_000,
+          maxOutputTokens: 128_000,
+          pricing: {
+            input: 8,
+            output: 40,
+            cacheRead: 0.2,
+            cacheWrite5m: 10,
+            cacheWrite1h: 16,
+          },
+        },
+      })
+    }
+  })
+
   test('Fable 5.2 resolves ahead of the Fable 5 prefix, including suffixed ids', () => {
     for (const id of ['claude-fable-5-2', 'claude-fable-5-2-20261109[1m]']) {
       expect(resolveClaudeModelCapabilities(id)).toMatchObject({
@@ -125,6 +162,29 @@ describe('model capability table', () => {
       expect(row.scopedQuota ?? null).toBe(
         scope === 'fable' || scope === 'mythos' ? scope : null,
       )
+    }
+  })
+
+  test('Mythos 5.2 draws from the Mythos quota window, not Fable', () => {
+    const quota = {
+      scoped: ['Fable', 'Mythos'].map((modelName) => ({
+        id: `weekly-${modelName.toLowerCase()}`,
+        title: `${modelName} only`,
+        modelName,
+        usedPercent: 90,
+        remainingPercent: 10,
+        checkedAt: 1,
+      })),
+    }
+    for (const model of [
+      'claude-mythos-5-1',
+      'claude-mythos-5-2',
+      'claude-mythos-5-2-20261109[1m]',
+    ]) {
+      expect(getScopedQuotaWindowForModel(quota, model)?.id).toBe(
+        'weekly-mythos',
+      )
+      expect(nativeQuotaModelScope(model)).toBe('mythos')
     }
   })
 

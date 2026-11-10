@@ -86,8 +86,8 @@ describe('Fable 5.1 thinking binding controls', () => {
     expect(hasThinkingBindingControls(body)).toBe(true)
   })
 
-  test('does not apply Fable prefix controls to Mythos 5.1 or older models', () => {
-    for (const model of ['claude-mythos-5-1', 'claude-fable-5']) {
+  test('does not apply prefix controls to older models', () => {
+    for (const model of ['claude-mythos-5', 'claude-fable-5']) {
       const body = bodyWith(model, {
         type: 'thinking',
         thinking: 'reasoning',
@@ -95,6 +95,30 @@ describe('Fable 5.1 thinking binding controls', () => {
       })
       expect(applyThinkingBindingControls(body, 'drop_block')).toBe(false)
       expect(hasThinkingBindingControls(body)).toBe(false)
+    }
+  })
+
+  test('Mythos 5.1 and 5.2 binding requires adaptive thinking, signed history and an explicit choice', () => {
+    for (const model of ['claude-mythos-5-1', 'claude-mythos-5-2']) {
+      const signed = { type: 'thinking', thinking: 'plan', signature: 'sig-1' }
+      expect(applyThinkingBindingControls(bodyWith(model), 'drop_block')).toBe(
+        false,
+      )
+      const accountDefault = bodyWith(model, signed)
+      expect(applyThinkingBindingControls(accountDefault)).toBe(false)
+      expect(hasThinkingBindingControls(accountDefault)).toBe(false)
+      for (const behavior of ['drop_block', 'error'] as const) {
+        const body = bodyWith(model, signed)
+        expect(applyThinkingBindingControls(body, behavior)).toBe(true)
+        expect(body.thinking.block_binding).toEqual({
+          prefix_mismatch_behavior: behavior,
+        })
+      }
+      const disabled = {
+        ...bodyWith(model, signed),
+        thinking: { type: 'disabled' },
+      }
+      expect(applyThinkingBindingControls(disabled, 'error')).toBe(false)
     }
   })
 

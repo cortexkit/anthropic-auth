@@ -435,13 +435,16 @@
         "fallbacks": null,
         "notRequestedFallbacks": null
       },
-      "nativeVariants": ["custom"],
+      "nativeVariants": ["custom", "low", "medium", "high", "xhigh", "max"],
       "rewrite": {
         "plain": {
           "model": "claude-mythos-5-1",
           "thinking": {
             "type": "adaptive",
-            "display": "summarized"
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
           },
           "tool_choice": null,
           "output_config": null,
@@ -453,7 +456,10 @@
           "model": "claude-mythos-5-1",
           "thinking": {
             "type": "adaptive",
-            "display": "summarized"
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
           },
           "tool_choice": null,
           "output_config": {
@@ -467,7 +473,10 @@
           "model": "claude-mythos-5-1",
           "thinking": {
             "type": "adaptive",
-            "display": "summarized"
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
           },
           "tool_choice": null,
           "output_config": {
@@ -481,7 +490,10 @@
           "model": "claude-mythos-5-1",
           "thinking": {
             "type": "adaptive",
-            "display": "summarized"
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
           },
           "tool_choice": null,
           "output_config": {
@@ -495,7 +507,10 @@
           "model": "claude-mythos-5-1",
           "thinking": {
             "type": "adaptive",
-            "display": "summarized"
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
           },
           "tool_choice": null,
           "output_config": null,
@@ -859,6 +874,412 @@
         },
         "budget": {
           "model": "claude-fable-5-2-20261109[1m]",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": null,
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        }
+      },
+      "effortMarkers": {
+        "single": {
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
+          "result": {
+            "found": 0,
+            "inserted": 0
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": ["user"]
+        },
+        "single_default": {
+          "plan": {
+            "baseline": "medium",
+            "markerCount": 0
+          },
+          "result": {
+            "found": 0,
+            "inserted": 0
+          },
+          "output_config": {
+            "effort": "medium"
+          },
+          "messages": ["user"]
+        },
+        "change": {
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
+          },
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
+        }
+      }
+    },
+    "claude-mythos-5-2": {
+      "recoverableRefusalFamily": "mythos-5-2",
+      "isRecoverableRefusalModel": true,
+      "serverSideFallback": {
+        "enabled": true,
+        "fallbacks": "default",
+        "notRequestedFallbacks": null
+      },
+      "nativeVariants": ["custom", "low", "medium", "high", "xhigh", "max"],
+      "rewrite": {
+        "plain": {
+          "model": "claude-mythos-5-2",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": null,
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "adaptiveForcedTool": {
+          "model": "claude-mythos-5-2",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": {
+            "effort": "max"
+          },
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "disabledXhigh": {
+          "model": "claude-mythos-5-2",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": {
+            "effort": "xhigh"
+          },
+          "fallbacks": "default",
+          "temperature": 0.5,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "betweenToolsMax": {
+          "model": "claude-mythos-5-2",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": {
+            "effort": "max"
+          },
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "budget": {
+          "model": "claude-mythos-5-2",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": null,
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        }
+      },
+      "effortMarkers": {
+        "single": {
+          "plan": {
+            "baseline": "low",
+            "markerCount": 0
+          },
+          "result": {
+            "found": 0,
+            "inserted": 0
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": ["user"]
+        },
+        "single_default": {
+          "plan": {
+            "baseline": "medium",
+            "markerCount": 0
+          },
+          "result": {
+            "found": 0,
+            "inserted": 0
+          },
+          "output_config": {
+            "effort": "medium"
+          },
+          "messages": ["user"]
+        },
+        "change": {
+          "plan": {
+            "baseline": "low",
+            "markerCount": 1
+          },
+          "result": {
+            "found": 1,
+            "inserted": 1
+          },
+          "output_config": {
+            "effort": "low"
+          },
+          "messages": [
+            "user",
+            "assistant",
+            {
+              "role": "system",
+              "clear_at": null,
+              "output_config": {
+                "effort": "max"
+              }
+            },
+            "user"
+          ]
+        }
+      }
+    },
+    "claude-mythos-5-2-20261109[1m]": {
+      "recoverableRefusalFamily": "mythos-5-2",
+      "isRecoverableRefusalModel": true,
+      "serverSideFallback": {
+        "enabled": true,
+        "fallbacks": "default",
+        "notRequestedFallbacks": null
+      },
+      "nativeVariants": ["custom", "low", "medium", "high", "xhigh", "max"],
+      "rewrite": {
+        "plain": {
+          "model": "claude-mythos-5-2-20261109[1m]",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": null,
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "adaptiveForcedTool": {
+          "model": "claude-mythos-5-2-20261109[1m]",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": {
+            "effort": "max"
+          },
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "disabledXhigh": {
+          "model": "claude-mythos-5-2-20261109[1m]",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": {
+            "effort": "xhigh"
+          },
+          "fallbacks": "default",
+          "temperature": 0.5,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "betweenToolsMax": {
+          "model": "claude-mythos-5-2-20261109[1m]",
+          "thinking": {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {
+              "prefix_mismatch_behavior": "drop_block"
+            }
+          },
+          "tool_choice": null,
+          "output_config": {
+            "effort": "max"
+          },
+          "fallbacks": "default",
+          "temperature": null,
+          "messages": [
+            "user",
+            "assistant",
+            "user",
+            {
+              "role": "system",
+              "clear_at": "next_user_message",
+              "output_config": null
+            },
+            "assistant",
+            "user"
+          ]
+        },
+        "budget": {
+          "model": "claude-mythos-5-2-20261109[1m]",
           "thinking": {
             "type": "adaptive",
             "display": "summarized",

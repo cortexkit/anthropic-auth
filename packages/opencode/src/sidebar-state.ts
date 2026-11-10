@@ -860,13 +860,14 @@ export function resolveActiveAccount(state: SidebarState): {
 }
 
 /**
- * Pretty label for a recoverable-refusal source model (Fable or Opus).
+ * Pretty label for a recoverable-refusal source model (Fable, Mythos or Opus).
  * Falls back to the raw id for unrecognized ids so the sidebar never goes
  * blank on a future model that has not yet been cataloged here.
  */
 export function formatFallbackModelLabel(modelId: string | undefined): string {
   const row = resolveClaudeModelCapabilities(modelId)
-  if (row?.id === 'claude-fable-5-2') return row.name.replace(/^Claude /, '')
+  if (row?.id === 'claude-fable-5-2' || row?.id === 'claude-mythos-5-2')
+    return row.name.replace(/^Claude /, '')
   if (
     modelId === 'claude-mythos-5-1' ||
     modelId?.startsWith('claude-mythos-5-1-')
