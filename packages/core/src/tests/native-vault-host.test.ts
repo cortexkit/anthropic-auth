@@ -944,7 +944,52 @@ test('an outage serves kept receipts and a proven same-authority reconnect prese
   )
   await custody.reportFailure(first, 401, 'direct')
   expect(old.owned.reportAuthFailureScoped).not.toHaveBeenCalled()
-  expect(fresh.reportAuthFailureScoped).not.toHaveBeenCalled()
+  expect(fresh.reportAuthFailureScoped).toHaveBeenCalledTimes(1)
+  expect(fresh.reportAuthFailureScoped).toHaveBeenCalledWith(
+    expect.objectContaining({
+      recordVersion: first.recordVersion,
+      providerStatus: 401,
+    }),
+  )
+  custody.close()
+  expect(accessor.closed).toEqual([0, 1])
+})
+
+test('client replacement keeps the serving receipt until and after the candidate proves a roster read', async () => {
+  const timers = manualTimers()
+  const old = outageClient()
+  const fresh = outageClient()
+  const entered = gate(),
+    release = gate(),
+    swapped = gate()
+  old.owned.close = mock(swapped.open)
+  const list = fresh.owned.listScoped
+  fresh.owned.listScoped = mock(async (...args) => {
+    entered.open()
+    await release.wait
+    return list(...args)
+  })
+  cleanup.push(release.open)
+  const accessor = host((index) => (index === 0 ? old.owned : fresh.owned))
+  const custody = hostCustody(timers)
+  const served = await custody.authorize(identity)
+  old.fail()
+  await custody.authorize(identity)
+  timers.run(0)
+  await entered.wait
+  expect(accessor.closed).toEqual([])
+  const pendingReceipt = await custody.authorize(identity)
+  expect(pendingReceipt.fromKeptReceipt).toBe(true)
+  expect(pendingReceipt.accessToken).toBe(served.accessToken)
+  release.open()
+  await swapped.wait
+  expect(custody.generation).toBe(0)
+  fresh.fail()
+  const kept = await custody.authorize(identity)
+  expect(kept.fromKeptReceipt).toBe(true)
+  expect(kept.accessToken).toBe(served.accessToken)
+  expect((await custody.prepareRetry(kept)).retry).toBe(false)
+  expect(fresh.owned.reportAuthFailureScoped).not.toHaveBeenCalled()
   custody.close()
   expect(accessor.closed).toEqual([0, 1])
 })
@@ -1149,23 +1194,40 @@ async function swappingRuntime() {
   return { ...f, old, fresh, route, swap, accessor }
 }
 
-test('a pre-swap 401 authorizes once on the current primitive and only its retry receipt is reported', async () => {
+test('a pre-swap 401 is reported through the replacement client without a same-version request retry', async () => {
   const f = await swappingRuntime()
   const served = await f.runtime.vault.authorize(f.route)
   await f.swap()
   await f.runtime.vault.reportFailure(served, 401, 'direct')
   expect(f.old.owned.reportAuthFailureScoped).not.toHaveBeenCalled()
-  expect(f.fresh.reportAuthFailureScoped).not.toHaveBeenCalled()
-  const retry = await f.runtime.vault.prepareRetry(served)
-  expect(retry.retry).toBe(true)
-  expect(f.fresh.getScoped).toHaveBeenCalledTimes(1)
-  if (!retry.retry) throw new Error('Reconnect retry refused')
-  expect(retry.receipt.recordVersion).toBe(served.recordVersion)
-  await f.runtime.vault.reportFailure(retry.receipt, 401, 'direct')
+  await f.runtime.vault.reportFailure(served, 401, 'direct')
   expect(f.fresh.reportAuthFailureScoped).toHaveBeenCalledTimes(1)
+  const retry = await f.runtime.vault.prepareRetry(served)
+  expect(retry).toEqual({ retry: false, reason: 'version-not-newer' })
+  expect(f.fresh.getScoped).toHaveBeenCalledTimes(1)
   expect(f.fresh.reportAuthFailureScoped).toHaveBeenCalledWith(
     expect.objectContaining({ recordVersion: 7, providerStatus: 401 }),
   )
+  expect((await f.runtime.vault.prepareRetry(served)).retry).toBe(false)
+})
+
+test('a pre-swap 401 still permits one strict-newer-version retry through the replacement client', async () => {
+  const f = await swappingRuntime()
+  const served = await f.runtime.vault.authorize(f.route)
+  const get = f.fresh.getScoped
+  f.fresh.getScoped = mock(async (...args: Parameters<typeof get>) => ({
+    ...(await get(...args)),
+    recordVersion: 8,
+  }))
+  await f.swap()
+  await f.runtime.vault.reportFailure(served, 401, 'direct')
+  const retry = await f.runtime.vault.prepareRetry(served)
+  expect(retry.retry).toBe(true)
+  if (!retry.retry) throw new Error('Rotated credential retry refused')
+  expect(retry.receipt.recordVersion).toBe(8)
+  await f.runtime.vault.reportFailure(retry.receipt, 401, 'direct')
+  expect(f.old.owned.reportAuthFailureScoped).not.toHaveBeenCalled()
+  expect(f.fresh.reportAuthFailureScoped).toHaveBeenCalledTimes(2)
   expect((await f.runtime.vault.prepareRetry(retry.receipt)).retry).toBe(false)
   expect((await f.runtime.vault.prepareRetry(served)).retry).toBe(false)
 })
@@ -1203,6 +1265,11 @@ test('Core prepareRetry keeps a receipt usable when a relay swap occurs after au
 
 test('Core quota dispatch can send a pre-swap receipt and a later 401 is reauthorized normally', async () => {
   const f = await swappingRuntime()
+  const get = f.fresh.getScoped
+  f.fresh.getScoped = mock(async (...args: Parameters<typeof get>) => ({
+    ...(await get(...args)),
+    recordVersion: 8,
+  }))
   const entered = gate(),
     release = gate()
   let sends = 0
@@ -1280,26 +1347,24 @@ test('a recovered serving relay wins over a pending proven replacement', async (
   )
 })
 
-test('probe promotion reapplies retain changes made while discovery awaited', async () => {
+test('client replacement preserves retain changes made while its roster proof awaited', async () => {
   const timers = manualTimers(),
     old = outageClient(),
-    fresh = client()
+    fresh = outageClient()
   const entered = gate(),
     release = gate(),
     swapped = gate()
   old.owned.close = mock(swapped.open)
-  const list = fresh.listScoped
-  fresh.listScoped = mock(async (...args) => {
+  const list = fresh.owned.listScoped
+  fresh.owned.listScoped = mock(async (...args) => {
     entered.open()
     await release.wait
     return list(...args)
   })
-  const retainSpy = spyOn(claustrum.ClaustrumScopedCustody.prototype, 'retain')
   cleanup.push(() => {
     release.open()
-    retainSpy.mockRestore()
   })
-  host((index) => (index === 0 ? old.owned : fresh))
+  host((index) => (index === 0 ? old.owned : fresh.owned))
   const custody = hostCustody(timers)
   custody.retain([{ ...identity, enabled: true, state: 'active' }])
   await custody.authorize(identity)
@@ -1308,13 +1373,12 @@ test('probe promotion reapplies retain changes made while discovery awaited', as
   timers.run(0)
   await entered.wait
   custody.retain([{ ...identity, enabled: false, state: 'active' }])
-  const before = retainSpy.mock.calls.length
   release.open()
   await swapped.wait
-  expect(retainSpy.mock.calls).toHaveLength(before + 1)
-  expect(retainSpy.mock.calls.at(-1)?.[0]).toEqual([
-    expect.objectContaining({ enabled: false }),
-  ])
+  fresh.fail()
+  await expect(custody.authorize(identity)).rejects.toMatchObject({
+    code: 'unavailable',
+  })
 })
 
 test('an answered probe refusal stops reconnect retries instead of treating it as a transport loss', async () => {
@@ -1494,7 +1558,7 @@ test('setEnabled refuses success when custody closes during its final roster rea
 })
 
 for (const operation of ['authorize', 'discover'] as const) {
-  test(`${operation} reselects the current primitive after its ready await during a proven swap`, async () => {
+  test(`${operation} uses the replacement client after its ready await during a proven swap`, async () => {
     const timers = manualTimers(),
       old = outageClient(),
       fresh = client()
@@ -1513,15 +1577,9 @@ for (const operation of ['authorize', 'discover'] as const) {
     const done = gate()
     let outcome: PromiseSettledResult<unknown> | undefined
     let armed = true
-    const discover = claustrum.ClaustrumScopedCustody.prototype.discover
-    const spy = spyOn(
-      claustrum.ClaustrumScopedCustody.prototype,
-      'discover',
-    ).mockImplementation(function (
-      this: claustrum.ClaustrumScopedCustody,
-      ...args
-    ) {
-      return discover.apply(this, args).then((inventory) => {
+    const list = fresh.listScoped
+    fresh.listScoped = mock((...args) =>
+      list(...args).then((inventory) => {
         if (armed) {
           armed = false
           queueMicrotask(() => {
@@ -1536,9 +1594,8 @@ for (const operation of ['authorize', 'discover'] as const) {
           })
         }
         return inventory
-      })
-    })
-    cleanup.push(() => spy.mockRestore())
+      }),
+    )
     timers.run(0)
     await done.wait
     expect(outcome?.status).toBe('fulfilled')
@@ -1546,6 +1603,7 @@ for (const operation of ['authorize', 'discover'] as const) {
       expect(outcome).toMatchObject({
         value: { accessToken: 'synthetic-current-relay' },
       })
+    else expect(fresh.listScoped).toHaveBeenCalledTimes(2)
   })
 }
 

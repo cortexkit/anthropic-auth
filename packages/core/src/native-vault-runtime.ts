@@ -479,7 +479,6 @@ export function createNativeVaultRuntime(
         : undefined,
       onConnectionChanged: () => {
         insulaTransportEpoch++
-        closeRosterWatch()
         insula?.release()
         insula = undefined
       },
@@ -1150,12 +1149,9 @@ export function createNativeVaultRuntime(
           return [{ retry: false, reason: 'credential-changed' }, next]
         if (next.assertedAccountIdentity !== served.assertedAccountIdentity)
           return [{ retry: false, reason: 'account-changed' }, next]
-        const replacementReceipt =
-          custody.isPreviousConnectionReceipt?.(served) &&
-          !custody.isPreviousConnectionReceipt?.(next)
         if (
           next.fromKeptReceipt ||
-          (!replacementReceipt && !(next.recordVersion > served.recordVersion))
+          !(next.recordVersion > served.recordVersion)
         )
           return [{ retry: false, reason: 'version-not-newer' }, next]
         // Mark the retry-issued receipt too, so handing it back cannot restart

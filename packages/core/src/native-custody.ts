@@ -316,8 +316,6 @@ export type NativeCustodyRetry =
     }
 
 export interface NativeCustody {
-  /** Whether a 401 needs fresh authorization because a previous relay issued the receipt. */
-  isPreviousConnectionReceipt?: (receipt: NativeCustodyReceipt) => boolean
   /** Authority lifetime only; replacing a relay does not retire issued tokens. */
   readonly generation?: number
   discover: (signal?: AbortSignal) => Promise<NativeCustodyInventory>
@@ -369,12 +367,8 @@ export function createNativeCustody(
   const onClose = new Set<() => void>()
   // Weak membership rejects copied or foreign receipts without retaining them.
   // Common-auth keeps the original receipt's send-time enrollment token private.
-  const receipts = new WeakMap<
-    object,
-    { generation: number; owner: ClaustrumScopedCustody }
-  >()
+  const receipts = new WeakMap<object, number>()
   const retryUsed = new WeakSet<object>()
-  const reconnectReports = new WeakSet<object>()
   let generation = 0
 
   function check(signal?: AbortSignal): void {
@@ -498,8 +492,6 @@ export function createNativeCustody(
   let reconnectFailures = 0
   type RelayProbe = {
     client?: NativeCustodyClient
-    primitive?: ClaustrumScopedCustody
-    abort: AbortController
     closed: boolean
     promoted: boolean
   }
@@ -523,10 +515,8 @@ export function createNativeCustody(
   function closeProbe(held: RelayProbe) {
     if (held.closed || held.promoted) return
     held.closed = true
-    held.abort.abort(new NativeCustodyError('closed'))
     try {
-      if (held.primitive) held.primitive.close()
-      else held.client?.close()
+      held.client?.close()
     } catch {
       // Closing an unavailable relay must not replace an admission refusal.
     }
@@ -554,7 +544,6 @@ export function createNativeCustody(
     if (closed || revoked || probe || !primitive) return
     const previous = primitive
     const held: RelayProbe = {
-      abort: new AbortController(),
       closed: false,
       promoted: false,
     }
@@ -569,24 +558,22 @@ export function createNativeCustody(
         return
       }
       check()
-      held.primitive = makePrimitive(held.client)
-      if (retained) held.primitive.retain(retained)
       // A new accessor result is not proof that the relay is back. Keep the
-      // old primitive's expiry-bounded receipts until a real roster read works.
-      // The 0.40.0 host client has no ready(); this read proves it can answer.
-      await held.primitive.discover(held.abort.signal)
+      // serving custody and its receipts until the candidate answers a roster read.
+      await held.client.listScoped()
       check()
       if (held.closed || primitive !== previous) return
       if (previous instanceof HostedCustody && !previous.relayUnavailable)
         return
-      if (retained) held.primitive.retain(retained)
-      primitive = held.primitive
+      const oldClient = client
+      previous.replaceClient(held.client)
+      previous.reachable()
       client = held.client
       connecting = Promise.resolve(held.client)
       held.promoted = true
       reconnectFailures = 0
       try {
-        previous.close()
+        oldClient?.close()
       } finally {
         options.onConnectionChanged?.()
       }
@@ -719,21 +706,14 @@ export function createNativeCustody(
 
   function requireReceipt(receipt: NativeCustodyReceipt): void {
     if (!receipts.has(receipt)) throw new NativeCustodyError('no-receipt')
-    if (receipts.get(receipt)?.generation !== generation)
+    if (receipts.get(receipt) !== generation)
       throw new NativeCustodyError('route-unavailable')
   }
   function currentPrimitive(): ClaustrumScopedCustody {
     if (!primitive) throw new NativeCustodyError('unavailable')
     return primitive
   }
-  function previousConnectionReceipt(receipt: NativeCustodyReceipt): boolean {
-    check()
-    requireReceipt(receipt)
-    return hosted && receipts.get(receipt)?.owner !== primitive
-  }
-
   const custody: NativeCustody = {
-    isPreviousConnectionReceipt: previousConnectionReceipt,
     get generation() {
       return generation
     },
@@ -772,7 +752,7 @@ export function createNativeCustody(
           signal,
         )
         check(signal)
-        receipts.set(receipt, { generation, owner })
+        receipts.set(receipt, generation)
         // Fixed OAuth input narrows common-auth's two-credential-type declaration.
         // Return the original object, preserving its non-enumerable accessToken.
         return receipt as NativeCustodyReceipt
@@ -783,15 +763,6 @@ export function createNativeCustody(
         await ready()
         check()
         requireReceipt(receipt)
-        if (previousConnectionReceipt(receipt)) {
-          if (status === 401 && !reconnectReports.has(receipt)) {
-            reconnectReports.add(receipt)
-            logger?.debug(
-              'Native custody 401 crossed a relay replacement; fresh authorization required',
-            )
-          }
-          return
-        }
         await currentPrimitive().reportFailure(receipt, status, reporterSource)
       }),
     prepareRetry: async (served, signal) => {
@@ -840,12 +811,9 @@ export function createNativeCustody(
       if (current.assertedAccountIdentity !== served.assertedAccountIdentity) {
         return { retry: false, reason: 'account-changed' }
       }
-      // Only a replacement relay's fresh authorization may reuse the version.
-      const replacementReceipt =
-        previousConnectionReceipt(served) && !previousConnectionReceipt(current)
       if (
         current.fromKeptReceipt ||
-        (!replacementReceipt && !(current.recordVersion > served.recordVersion))
+        !(current.recordVersion > served.recordVersion)
       ) {
         return { retry: false, reason: 'version-not-newer' }
       }
