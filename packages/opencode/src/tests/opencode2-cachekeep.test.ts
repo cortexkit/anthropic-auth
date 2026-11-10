@@ -790,6 +790,45 @@ test('OpenCode 2 registry publication failure never rejects the live request', a
   expect(f.timers.callbacks.size).toBe(1)
 })
 
+test('an OpenCode 2 prewarm preserves thinking block binding and carries its beta', async () => {
+  const f = await fixture()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    thinkingBinding: { prefixMismatchBehavior: 'drop_block' },
+  }))
+  const live = await f.live(undefined, {
+    model: 'claude-fable-5-2',
+    thinking: { type: 'adaptive', display: 'summarized' },
+    messages: [
+      { role: 'user', content: 'first' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'reasoning', signature: 'signature' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      { role: 'user', content: 'continue' },
+    ],
+  })
+  const trackedBody = (await live.json()) as Record<string, any>
+  expect(trackedBody.thinking.block_binding).toEqual({
+    prefix_mismatch_behavior: 'drop_block',
+  })
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(1)
+  const warm = f.sent[0]!
+  const body = (await warm.json()) as Record<string, any>
+  expect(body.max_tokens).toBe(0)
+  expect(body.thinking).toEqual(trackedBody.thinking)
+  expect(body.messages).toEqual(trackedBody.messages)
+  expect(warm.headers.get('x-claude-code-request-class')).toBe('auxiliary')
+  expect(warm.headers.get('anthropic-beta')?.split(',')).toContain(
+    'thinking-binding-controls-2026-08-01',
+  )
+})
+
 test('a due OpenCode 2 prewarm sends once with the original account and no billing lineage', async () => {
   const f = await fixture()
   expect(await (await f.live()).text()).toContain('prompt_id')

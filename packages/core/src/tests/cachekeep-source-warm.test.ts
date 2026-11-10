@@ -8,6 +8,7 @@ import {
   cacheWarmCacheablePrefixFingerprint,
   isCacheKeepHybridActive,
 } from '../cachekeep.ts'
+import { selectClaudeCodeBetas } from '../claude-code.ts'
 import { __setLogTestSink } from '../logger.ts'
 
 const hybridStorage = (): AccountStorage => ({
@@ -53,6 +54,27 @@ function sourceBody() {
 }
 
 describe('cachekeep source-warm prewarm body', () => {
+  test('ordinary and source warms preserve thinking block binding with its beta', async () => {
+    const body = JSON.parse(sourceBody())
+    body.thinking = {
+      type: 'adaptive',
+      display: 'summarized',
+      block_binding: { prefix_mismatch_behavior: 'drop_block' },
+    }
+    for (const stripServerFallback of [false, true]) {
+      const result = await buildCacheKeepPrewarmBody(JSON.stringify(body), {
+        stripServerFallback,
+      })
+      expect(result.ok).toBe(true)
+      if (!result.ok) throw new Error(result.reason)
+      const warm = JSON.parse(result.bodyText)
+      expect(warm.thinking).toEqual(body.thinking)
+      expect(selectClaudeCodeBetas(warm, [], 'auxiliary').split(',')).toContain(
+        'thinking-binding-controls-2026-08-01',
+      )
+    }
+  })
+
   test('drops the server-side fallback opt-in for a source warm so it cannot be sticky-routed away', async () => {
     const result = await buildCacheKeepPrewarmBody(sourceBody(), {
       stripServerFallback: true,

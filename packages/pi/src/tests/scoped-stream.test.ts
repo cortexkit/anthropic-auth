@@ -1912,6 +1912,7 @@ async function sendAndPrewarm(
     afterAssistantMessages: number
     effort: 'low' | 'high'
   }>,
+  replayThinking = false,
 ) {
   const sent: Array<{ url: string; headers: Headers; body: string }> = []
   globalThis.fetch = Object.assign(
@@ -1942,7 +1943,18 @@ async function sendAndPrewarm(
         provider: 'anthropic',
         api: 'anthropic-messages',
         model: modelId,
-        content: [{ type: 'text', text: 'first answer' }],
+        content: [
+          ...(replayThinking
+            ? [
+                {
+                  type: 'thinking' as const,
+                  thinking: 'reasoning',
+                  thinkingSignature: 'signature',
+                },
+              ]
+            : []),
+          { type: 'text', text: 'first answer' },
+        ],
         usage: {
           input: 0,
           output: 0,
@@ -2014,6 +2026,28 @@ function expectPrewarmHeadersMatchModelRequest(
     )
   expect(others(warm.headers)).toEqual(others(main.headers))
 }
+
+test('Pi CacheKeep prewarm preserves thinking block binding and carries its beta', async () => {
+  const f = await fixture()
+  await (await f.native.service()).updateSettings((settings) => ({
+    ...settings,
+    thinkingBinding: { prefixMismatchBehavior: 'drop_block' },
+  }))
+  const { main, warm } = await sendAndPrewarm(
+    f,
+    'claude-fable-5-2',
+    undefined,
+    true,
+  )
+  expect(main.json.thinking.block_binding).toEqual({
+    prefix_mismatch_behavior: 'drop_block',
+  })
+  expect(warm.json.max_tokens).toBe(0)
+  expect(warm.json.thinking).toEqual(main.json.thinking)
+  expect(warm.json.messages).toEqual(main.json.messages)
+  expect(warm.betas).toContain('thinking-binding-controls-2026-08-01')
+  expectPrewarmHeadersMatchModelRequest(main, warm)
+})
 
 test('Pi CacheKeep prewarm of a Fable 5.1 body with effort markers sends the per-turn control beta', async () => {
   const f = await fixture()

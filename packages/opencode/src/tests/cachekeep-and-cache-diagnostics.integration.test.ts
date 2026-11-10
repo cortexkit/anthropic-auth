@@ -16,6 +16,7 @@ import {
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import { drainSidebarWrites } from '../sidebar-state'
+import { getPluginTestHandles } from './plugin-test-handles'
 import {
   applyMenuAction as applyMenuActionWithCtx,
   createMockClient,
@@ -889,6 +890,75 @@ describe('cache diagnostics', () => {
       ),
     ).toHaveLength(2)
     setLogLevel('info')
+  })
+
+  test('an OpenCode 1 prewarm preserves thinking block binding and carries its beta', async () => {
+    let now = 1_000
+    Date.now = mock(() => now) as unknown as typeof Date.now
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        quota: { enabled: false },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        cacheKeep: { enabled: true, always: true },
+        thinkingBinding: { prefixMismatchBehavior: 'drop_block' },
+      }),
+    )
+    const sent: Array<{ headers: Headers; body: Record<string, any> }> = []
+    globalThis.fetch = mock(
+      withNativeAdmission((_input: any, init: RequestInit) => {
+        const body = JSON.parse(String(init.body))
+        sent.push({ headers: new Headers(init.headers), body })
+        return Promise.resolve(
+          body.max_tokens === 0
+            ? Response.json(message('provider-thinking-warm'))
+            : sseResponse(message('provider-thinking-live')),
+        )
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(oauthLoader, { models: {} })
+    await (
+      await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': 'ses-thinking-binding-warm' },
+        body: JSON.stringify({
+          model: 'claude-fable-5-2',
+          stream: true,
+          thinking: { type: 'adaptive', display: 'summarized' },
+          messages: [
+            { role: 'user', content: 'first' },
+            {
+              role: 'assistant',
+              content: [
+                {
+                  type: 'thinking',
+                  thinking: 'reasoning',
+                  signature: 'signature',
+                },
+                { type: 'text', text: 'answer' },
+              ],
+            },
+            { role: 'user', content: 'continue' },
+          ],
+        }),
+      })
+    ).text()
+    expect(sent).toHaveLength(1)
+    const live = sent[0]!
+    expect(live.body.thinking.block_binding).toEqual({
+      prefix_mismatch_behavior: 'drop_block',
+    })
+    now += 55 * 60_000
+    await getPluginTestHandles(plugin).cacheKeepManager.tick()
+    expect(sent).toHaveLength(2)
+    const warm = sent[1]!
+    expect(warm.body.max_tokens).toBe(0)
+    expect(warm.body.thinking).toEqual(live.body.thinking)
+    expect(warm.body.messages).toEqual(live.body.messages)
+    expect(warm.headers.get('anthropic-beta')?.split(',')).toContain(
+      'thinking-binding-controls-2026-08-01',
+    )
   })
 
   test('cache diagnostics records cachekeep prewarms and carries their provider id forward', async () => {

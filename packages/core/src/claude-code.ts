@@ -434,6 +434,10 @@ export function selectClaudeCodeBetas(
   )
     selected.push(TURN_END_NOTE_BETA)
 
+  // Auxiliary cache warms can replay the same binding controls as a real turn.
+  if (isRecord(body?.thinking) && 'block_binding' in body.thinking)
+    selected.push('thinking-binding-controls-2026-08-01')
+
   if (body && hasStructuredOutput(body)) {
     const index = selected.indexOf('cache-diagnosis-2026-04-07')
     selected.splice(

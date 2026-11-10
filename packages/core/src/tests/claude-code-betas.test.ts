@@ -95,6 +95,37 @@ test('auxiliary summaries use title betas without requesting structured output',
   ).toBe(TITLE.replace(',structured-outputs-2025-12-15', ''))
 })
 
+test('auxiliary thinking block binding carries its beta without changing ordinary betas', () => {
+  const body = {
+    model: 'claude-fable-5-2',
+    max_tokens: 0,
+    thinking: { type: 'adaptive', display: 'summarized' },
+    messages: [{ role: 'user', content: 'keep warm' }],
+  }
+  const ordinaryBetas = TITLE.replace(',structured-outputs-2025-12-15', '')
+  expect(selectClaudeCodeBetas(body, [], 'auxiliary')).toBe(ordinaryBetas)
+
+  for (const behavior of ['error', 'drop_block']) {
+    const boundBody = {
+      ...body,
+      thinking: {
+        ...body.thinking,
+        block_binding: { prefix_mismatch_behavior: behavior },
+      },
+    }
+    const before = JSON.stringify(boundBody)
+    expect(selectClaudeCodeBetas(boundBody, [], 'auxiliary')).toBe(
+      `${ordinaryBetas},thinking-binding-controls-2026-08-01`,
+    )
+    expect(JSON.stringify(boundBody)).toBe(before)
+    expect(
+      selectClaudeCodeBetas(boundBody)
+        .split(',')
+        .filter((beta) => beta === 'thinking-binding-controls-2026-08-01'),
+    ).toHaveLength(1)
+  }
+})
+
 test('main feature betas retain their positions without changing binding fields', () => {
   const body = {
     model: 'claude-opus-4-8',

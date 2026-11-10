@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.9.1
 
+- OpenCode and Pi keep prompt caches warm when a conversation replays signed thinking, avoiding rejected warm requests and unnecessary cache rewrites. Addresses #696.
 - Pi and OpenCode now retry Claude streams that disconnect before completion instead of silently ending the turn, with content-free connection diagnostics for troubleshooting.
 - Updated the shared auth library.
 
