@@ -647,6 +647,38 @@ test('OC1 incomplete 200 is a retryable connection error instead of an empty rep
   await expect(response.text()).rejects.toMatchObject({ code: 'ECONNRESET' })
 })
 
+test('OC1 preserves an explicit terminal relay error instead of replacing it with EOF failure', async () => {
+  const { owner, client } = await vaultFixture()
+  const body = sse({
+    type: 'error',
+    error: {
+      type: 'relay_upstream_error',
+      status: 401,
+      message: 'Relay upstream returned HTTP 401',
+    },
+  })
+  owner.network.current = async () => eventStream(body)
+  const plugin = await createPlugin(owner, client)
+  const response = await sendNative(owner, plugin, 'oc1-terminal-error')
+  expect(response.status).toBe(200)
+  expect(await response.text()).toBe(body)
+})
+
+test('OC1 rejects an unterminated error frame as incomplete', async () => {
+  const { owner, client } = await vaultFixture()
+  owner.network.current = async () =>
+    eventStream(
+      sse({ type: 'error', error: { type: 'authentication_error' } }).slice(
+        0,
+        -1,
+      ),
+    )
+  const plugin = await createPlugin(owner, client)
+  const response = await sendNative(owner, plugin, 'oc1-unterminated-error')
+  expect(response.status).toBe(200)
+  await expect(response.text()).rejects.toMatchObject({ code: 'ECONNRESET' })
+})
+
 for (const ending of ['LF', 'CRLF'] as const) {
   test(`OC1 vault ${ending} success that quotes the credential stays byte-identical`, async () => {
     const { owner, client } = await vaultFixture()

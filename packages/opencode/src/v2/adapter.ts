@@ -1343,14 +1343,11 @@ export function createNativeAnthropicAdapter<Q, P>(
     // Dispatch begins here; use this send's copied secrets to redact its errors.
     // The request's own stream flag decides how its response is read, never
     // the response's content type.
-    holdRedactor(
-      data,
-      send,
+    const responseMode =
       isRecord(finalPayload) && finalPayload.stream === true
         ? 'event-stream'
-        : 'http',
-      headers,
-    )
+        : 'http'
+    holdRedactor(data, send, responseMode, headers)
     if (data.route === 'oauth' && messages && body !== undefined) {
       await source.onRequestPrepared?.({
         ...contextOf(attempt, data),
@@ -1443,7 +1440,7 @@ export function createNativeAnthropicAdapter<Q, P>(
                 identity: authorized.identity,
               },
             },
-            'event-stream',
+            responseMode,
             retryHeaders,
           )
           const dispatch = authorized.dispatch
@@ -1452,6 +1449,10 @@ export function createNativeAnthropicAdapter<Q, P>(
               assertHostAuthorityStable()
               observeFinalWire(request, createBody)
               const received = await (deps.fetch ?? globalThis.fetch)(url, init)
+              if (request.signal.aborted) {
+                void received.body?.cancel().catch(() => {})
+                request.signal.throwIfAborted()
+              }
               if (received.ok && fromUpstream(received.headers, data))
                 physicalAcceptances.set(data, {
                   at: deps.now?.() ?? Date.now(),

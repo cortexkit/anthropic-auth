@@ -1879,7 +1879,9 @@ describe('auth.loader', () => {
         return Promise.resolve(
           authorization === 'Bearer sk-ant-oat01-fallback-access'
             ? new Response('exhausted', { status: 429 })
-            : new Response('ok', { status: 200 }),
+            : new Response('ok\n\ndata: {"type":"message_stop"}\n\n', {
+                status: 200,
+              }),
         )
       }),
     ) as unknown as typeof fetch
@@ -1906,7 +1908,9 @@ describe('auth.loader', () => {
     })
 
     expect(response.status).toBe(200)
-    expect(await response.text()).toBe('ok')
+    expect(await response.text()).toBe(
+      'ok\n\ndata: {"type":"message_stop"}\n\n',
+    )
     expect(authorizations).toEqual([
       'Bearer sk-ant-oat01-fallback-access',
       'Bearer api-key',
@@ -1978,7 +1982,11 @@ describe('auth.loader', () => {
         authorizations.push(
           new Headers(init?.headers).get('authorization') ?? '',
         )
-        return Promise.resolve(new Response('ok', { status: 200 }))
+        return Promise.resolve(
+          new Response('ok\n\ndata: {"type":"message_stop"}\n\n', {
+            status: 200,
+          }),
+        )
       }),
     ) as unknown as typeof fetch
 

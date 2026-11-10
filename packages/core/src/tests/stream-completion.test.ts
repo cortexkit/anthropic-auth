@@ -30,6 +30,27 @@ test.each(['\n', '\r', '\r\n'])(
   },
 )
 
+test.each(['\n', '\r', '\r\n'])(
+  'a complete error is a terminal failure with byte-split %j framing',
+  (ending) => {
+    const completion = createAnthropicStreamCompletion(new Response(''))
+    const bytes = new TextEncoder().encode(
+      `event: error${ending}data: {"type":"error","error":{"type":"relay_upstream_error","status":401,"message":"Relay upstream returned HTTP 401"}}${ending}${ending}`,
+    )
+    for (const byte of bytes) completion.push(Uint8Array.of(byte))
+    expect(completion.finish()).toBeUndefined()
+  },
+)
+
+test.each([
+  'event: error\ndata: {"type":"error","error":',
+  'event: error\ndata: {"type":"error","error":{"type":"authentication_error"}}\n',
+])('an incomplete error frame is not terminal: %j', (frame) => {
+  const completion = createAnthropicStreamCompletion(new Response(''))
+  completion.push(new TextEncoder().encode(frame))
+  expect(completion.finish()).toMatchObject({ code: 'ECONNRESET' })
+})
+
 test('incomplete diagnostics retain only fixed headers and byte/event counts', () => {
   const records: LogTestRecord[] = []
   __setLogTestSink((record) => records.push(record))

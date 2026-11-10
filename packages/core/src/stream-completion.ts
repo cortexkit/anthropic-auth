@@ -89,7 +89,7 @@ export function safeIncompleteStreamDiagnostics(
   }
 }
 
-/** EOF is transport failure until Anthropic's complete message_stop event arrives. */
+/** EOF requires a complete message_stop or an explicit protocol error. */
 export function createAnthropicStreamCompletion(response: Response) {
   const framer = createSseFramer()
   const timing = timings.get(response)
@@ -101,6 +101,7 @@ export function createAnthropicStreamCompletion(response: Response) {
   let bytes = 0
   let events = 0
   let stopped = false
+  let failed = false
   let streamStart = true
   let eofAt: number | undefined
   const inspect = (frame: Uint8Array) => {
@@ -111,6 +112,8 @@ export function createAnthropicStreamCompletion(response: Response) {
     try {
       const event = JSON.parse(data)
       if (event?.type === 'message_stop') stopped = true
+      // An explicit error is already a terminal failure handled by the host.
+      if (event?.type === 'error') failed = true
     } catch {
       // Invalid data cannot certify a completed Anthropic response.
     }
@@ -132,7 +135,7 @@ export function createAnthropicStreamCompletion(response: Response) {
       | (Error & { code: string; diagnostics: IncompleteStreamDiagnostics })
       | undefined {
       end()
-      if (stopped) return undefined
+      if (stopped || failed) return undefined
       const diagnostics: IncompleteStreamDiagnostics = {
         response_headers: headers,
         response_bytes: bytes,

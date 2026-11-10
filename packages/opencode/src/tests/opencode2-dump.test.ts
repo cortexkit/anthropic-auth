@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   CacheKeepManager,
+  RequestGzipLatch,
   resetDumpState,
   setDumpEnabled,
 } from '@cortexkit/anthropic-auth-core'
@@ -500,7 +501,11 @@ describe('opencode2 request dumps', () => {
   test('large gzipped sends dump the signed uncompressed body', async () => {
     const bigText = `payload-${'x'.repeat(5000)}`
     const source = makeSource({ enabled: true })
-    const native = createNativeAnthropicAdapter({ source })
+    const native = createNativeAnthropicAdapter({
+      source,
+      // Rejection fixtures in other suites may have latched the shared default off.
+      requestGzipLatch: new RequestGzipLatch(),
+    })
     try {
       const scope = scopeOf()
       const accountId = (await native.adapter.chooseAccount({

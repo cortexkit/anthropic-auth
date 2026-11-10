@@ -1375,20 +1375,21 @@ describe('OpenCode 2 native Anthropic adapter: responses', () => {
       `mcp_${name[0]!.toUpperCase()}${name.slice(1)}`,
       name,
     ])
-    const upstream = wireNames
-      .map((name, index) =>
-        sse('content_block_start', {
-          type: 'content_block_start',
-          index,
-          content_block: {
-            type: 'tool_use',
-            id: `toolu_${index}`,
-            name,
-            input: {},
-          },
-        }),
-      )
-      .join('')
+    const upstream =
+      wireNames
+        .map((name, index) =>
+          sse('content_block_start', {
+            type: 'content_block_start',
+            index,
+            content_block: {
+              type: 'tool_use',
+              id: `toolu_${index}`,
+              name,
+              input: {},
+            },
+          }),
+        )
+        .join('') + sse('message_stop', { type: 'message_stop' })
     const response = await native.adapter.rewriteResponse?.({
       ...attempt,
       request: host.sent[0] as Request,
@@ -1399,7 +1400,9 @@ describe('OpenCode 2 native Anthropic adapter: responses', () => {
     const restored = text
       .split('\n')
       .filter((line) => line.startsWith('data: '))
-      .map((line) => JSON.parse(line.slice(6)).content_block.name)
+      .map((line) => JSON.parse(line.slice(6)))
+      .filter((event) => event.type !== 'message_stop')
+      .map((event) => event.content_block.name)
     expect(restored).toEqual(names.flatMap((name) => [name, name]))
   })
 
@@ -1429,7 +1432,7 @@ describe('OpenCode 2 native Anthropic adapter: responses', () => {
                 name: 'mcp_Search',
                 input: {},
               },
-            }),
+            }) + sse('message_stop', { type: 'message_stop' }),
           ),
           attempt,
         })
@@ -1524,16 +1527,17 @@ describe('OpenCode 2 native Anthropic adapter: responses', () => {
     const { attempt } = await host.run(scopeOf(), hostRequest(sonnetPayload()))
     // An API request's tools were never renamed, so a tool genuinely called
     // `search` must come back as `search`.
-    const stream = sse('content_block_start', {
-      type: 'content_block_start',
-      index: 0,
-      content_block: {
-        type: 'tool_use',
-        id: 'toolu_03',
-        name: 'search',
-        input: {},
-      },
-    })
+    const stream =
+      sse('content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: 'toolu_03',
+          name: 'search',
+          input: {},
+        },
+      }) + sse('message_stop', { type: 'message_stop' })
     const upstream = sseResponse(stream)
 
     const response =
@@ -3353,6 +3357,30 @@ test('audit primary gates: OC2 title kind cannot replace a primary reply', async
   }
 })
 
+test('OC2 checks completion for a streaming request even when the response claims JSON', async () => {
+  const { source } = makeSource()
+  const native = createNativeAnthropicAdapter({ source })
+  try {
+    const host = new Host(native.adapter)
+    const { attempt, final } = await host.run(
+      scopeOf(),
+      hostRequest({ ...sonnetPayload(), stream: true }),
+    )
+    const response = await native.adapter.rewriteResponse?.({
+      ...attempt,
+      attempt,
+      request: final,
+      response: new Response('', {
+        headers: { 'content-type': 'application/json' },
+      }),
+    } as never)
+    if (!response) throw new Error('Missing response')
+    await expect(response.text()).rejects.toMatchObject({ code: 'ECONNRESET' })
+  } finally {
+    native.dispose()
+  }
+})
+
 test('audit downstream refusal: OC2 revokes an anchor after raw EOF validation fails', async () => {
   const { source } = makeSource()
   const native = createNativeAnthropicAdapter({ source })
@@ -3360,7 +3388,8 @@ test('audit downstream refusal: OC2 revokes an anchor after raw EOF validation f
     const host = new Host(native.adapter)
     const payload = {
       model: 'claude-sonnet-5',
-      stream: true,
+      // A JSON request must reject the SSE-shaped body at EOF rather than parse a valid stream.
+      stream: false,
       tools: ['search', 'mcp_Search'].map((name) => ({
         name,
         input_schema: { type: 'object' },

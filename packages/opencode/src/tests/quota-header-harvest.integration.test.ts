@@ -592,7 +592,9 @@ describe('auth.loader', () => {
             )
             this.dispatchEvent(
               new MessageEvent('message', {
-                data: Buffer.from('event: message_stop\n\n'),
+                data: Buffer.from(
+                  'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+                ),
               }),
             )
             this.dispatchEvent(

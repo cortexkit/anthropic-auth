@@ -363,10 +363,13 @@ describe('auth.loader', () => {
           })
           const reply =
             replies.shift() ??
-            new Response('event: message_stop\ndata: {}\n\n', {
-              status: 200,
-              headers: { 'request-id': 'req_011CGzipOk00000000000001' },
-            })
+            new Response(
+              'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+              {
+                status: 200,
+                headers: { 'request-id': 'req_011CGzipOk00000000000001' },
+              },
+            )
           attempt.replyStatus = reply.status
           return reply
         } catch (error) {
@@ -546,6 +549,7 @@ describe('auth.loader', () => {
         delta: { stop_reason: 'end_turn' },
         usage: { output_tokens: 1749 },
       })}\n\n`
+      const stop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
       const content = [
         {
           type: 'content_block_start',
@@ -588,7 +592,7 @@ describe('auth.loader', () => {
       globalThis.fetch = mock(
         withNativeAdmission(() =>
           Promise.resolve(
-            new Response(`${start}${content}${delta}`, {
+            new Response(`${start}${content}${delta}${stop}`, {
               status: 200,
               headers: { 'content-type': 'text/event-stream' },
             }),
@@ -618,7 +622,7 @@ describe('auth.loader', () => {
           messages: [{ role: 'user', content: 'hello' }],
         }),
       })
-      expect(await response.text()).toBe(`${start}${content}${delta}`)
+      expect(await response.text()).toBe(`${start}${content}${delta}${stop}`)
 
       const files = await readdir(dumpDir)
       const responsePath = files.find((file) => file.endsWith('.response.json'))

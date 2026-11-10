@@ -1260,7 +1260,7 @@ describe('auth.loader', () => {
       start(controller) {
         controller.enqueue(
           encoder.encode(
-            'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
+            'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash"}}\n\ndata: {"type":"message_stop"}\n\n',
           ),
         )
         controller.close()

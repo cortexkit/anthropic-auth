@@ -2216,8 +2216,8 @@ test('OC2 aborted recovery reports nothing', async () => {
   }) as unknown as typeof fetch
   try {
     const draft = await f.prepare(undefined, {}, 'ses_oc2_keep', abort.signal)
-    await f
-      .respond(
+    await expect(
+      f.respond(
         draft,
         Response.json(
           {
@@ -2229,8 +2229,8 @@ test('OC2 aborted recovery reports nothing', async () => {
           },
           { status: 400 },
         ),
-      )
-      .catch((error) => expect(error.name).toBe('AbortError'))
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' })
     expect(sends).toBe(1)
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(reports).toEqual([])
