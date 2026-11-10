@@ -1,9 +1,11 @@
 import { mkdir, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { vaultAuthority } from '@cortexkit/common-auth/claustrum'
 import { LockContentionError } from '@cortexkit/common-auth/fs'
 
 import { getOpenCodeConfigDir } from './accounts.ts'
+import { getHostClaustrumEnrollmentPaths } from './claustrum-enrollment.ts'
 import {
   anthropicAuthRelease,
   buildHolderEntry,
@@ -28,7 +30,6 @@ import {
   statePathOverrides,
 } from './layout-fence.ts'
 import { logger } from './logger.ts'
-import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import type { NativeLockEvent } from './native-lock-observer.ts'
 import { nativeVaultPaths } from './native-vault-paths.ts'
 import { ensureWindowsOwnerOnlyDirectory } from './owner-only.ts'
@@ -313,13 +314,27 @@ async function readRecord(sub: string) {
   }
 }
 
+// Read authority directly so preflight neither creates plugin logs nor closes
+// active vault state as readNativeEnrollmentMode does. Unreadable results skip
+// preflight; normal admission uses that reader for its usual refusal and logs.
+async function readPreflightCustodyAuthority(
+  host: 'opencode' | 'pi',
+  env: NodeJS.ProcessEnv,
+): Promise<'vault' | 'local' | 'unreadable'> {
+  const authority = await vaultAuthority(
+    getHostClaustrumEnrollmentPaths(host, env),
+    `anthropic-auth-${host}`,
+  )
+  return authority === 'host' ? 'vault' : authority
+}
+
 /** Require a completed local migration journal without creating a holder file. */
 async function preflightExistingAuthority(
   paths: NativePoolPaths,
   host: 'opencode' | 'pi',
   env: NodeJS.ProcessEnv,
 ): Promise<void> {
-  if ((await readNativeEnrollmentMode(host, env)) !== 'local') return
+  if ((await readPreflightCustodyAuthority(host, env)) !== 'local') return
   // Leave relocation and managed-folder refusals to normal admission. A missing
   // legacy journal in those folders does not mean offline setup never ran.
   const vault = nativeVaultPaths(paths, LEGACY_STATE_LAYOUT)
@@ -336,7 +351,7 @@ async function preflightOpenCodeAuthority(
   env: NodeJS.ProcessEnv,
   home: string,
 ): Promise<void> {
-  if ((await readNativeEnrollmentMode('opencode', env)) !== 'local') return
+  if ((await readPreflightCustodyAuthority('opencode', env)) !== 'local') return
   if (!isExplicit(env)) {
     const identity = configIdentity(configDir)
     if (identity !== undefined) {
