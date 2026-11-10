@@ -1272,9 +1272,6 @@ const anthropicAuthPlugin = async (
   const profileFetch = globalThis.fetch
   const accountStoragePath = getAccountStoragePath()
   const messageThreads = new MessageThreadTracker()
-  const requestGzipLatch = getRequestGzipLatch(
-    getRequestGzipLatchPath(accountStoragePath),
-  )
 
   // -- OAuth add-flow pending state (Add account modal) --------------------
   interface OAuthPendingEntry {
@@ -1347,6 +1344,9 @@ const anthropicAuthPlugin = async (
     accountStoragePath,
     undefined,
     stateLayout.layout,
+  )
+  const requestGzipLatch = getRequestGzipLatch(
+    getRequestGzipLatchPath(accountStoragePath, stateLayout.layout),
   )
   const holderRegistration =
     stateLayout.kind === 'state-home' ? undefined : stateLayout.registration

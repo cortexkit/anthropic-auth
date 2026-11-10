@@ -1,5 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
@@ -431,6 +438,64 @@ describe('a rejected gzipped body', () => {
 })
 
 describe('the persisted latch', () => {
+  for (const moved of [false, true]) {
+    test(`a gzip rejection writes only to the ${moved ? 'state-home' : 'legacy config'} folder`, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'request-gzip-layout-'))
+      const config = join(root, 'config')
+      const stateHome = join(root, 'state')
+      try {
+        await mkdir(config)
+        await mkdir(stateHome)
+        const path = getRequestGzipLatchPath(
+          join(config, 'anthropic-auth.json'),
+          moved ? { kind: 'state-home', dir: stateHome } : { kind: 'legacy' },
+        )
+        const now = 1_800_000_000_000
+        reset([{ status: 415, body: 'Unsupported Media Type' }, OK])
+        await send(await signedBody(20_000), {
+          latch: new RequestGzipLatch(path, () => now),
+        })
+        expect(captured).toHaveLength(2)
+        expect(captured[0]?.headers.get('content-encoding')).toBe('gzip')
+        expect(captured[1]?.headers.get('content-encoding')).toBeNull()
+        const name = 'anthropic-auth-request-gzip.json'
+        expect(
+          JSON.parse(
+            await readFile(join(moved ? stateHome : config, name), 'utf8'),
+          ),
+        ).toEqual({ latchedAt: now, status: 415 })
+        expect(await readdir(moved ? config : stateHome)).toEqual([])
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  }
+
+  test('a moved gzip latch starts empty without copying or changing the old latch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'request-gzip-empty-'))
+    try {
+      const now = 1_800_000_000_000
+      const old = join(root, 'anthropic-auth-request-gzip.json')
+      const bytes = JSON.stringify({ latchedAt: now, status: 415 })
+      await writeFile(old, bytes)
+      const stateHome = join(root, 'state')
+      await mkdir(stateHome)
+      const path = getRequestGzipLatchPath(join(root, 'anthropic-auth.json'), {
+        kind: 'state-home',
+        dir: stateHome,
+      })
+      reset()
+      await send(await signedBody(20_000), {
+        latch: new RequestGzipLatch(path, () => now),
+      })
+      expect(captured[0]?.headers.get('content-encoding')).toBe('gzip')
+      expect(await readFile(old, 'utf8')).toBe(bytes)
+      expect(await readdir(stateHome)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('keeps gzip off for seven days, then clears itself', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'request-gzip-latch-'))
     try {

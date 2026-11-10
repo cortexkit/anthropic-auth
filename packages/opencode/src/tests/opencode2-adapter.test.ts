@@ -1,4 +1,15 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import * as core from '@cortexkit/anthropic-auth-core'
 import {
@@ -2217,6 +2228,54 @@ describe('OpenCode 2 native Anthropic adapter: request-body gzip', () => {
     const text = new TextDecoder().decode(identity.body)
     expect(extractBillingHeaderCCH(text)).not.toBe('00000')
     expect(await signRequestBody(text)).toBe(text)
+  })
+
+  test('the default gzip latch follows the decided state-home layout on first use', async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'oc2-gzip-layout-')),
+    )
+    const keys = [
+      'OPENCODE_CONFIG_DIR',
+      'OPENCODE_ANTHROPIC_AUTH_FILE',
+      'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
+    ]
+    const saved = keys.map((key) => [key, process.env[key]] as const)
+    const config = join(root, 'config')
+    const state = join(root, 'state')
+    const { source } = makeSource()
+    let native: NativeAnthropicAdapter<Quota, Provenance> | undefined
+    try {
+      for (const key of keys) delete process.env[key]
+      process.env.OPENCODE_CONFIG_DIR = config
+      await mkdir(config)
+      await mkdir(state)
+      native = createNativeAnthropicAdapter({ source })
+      const paths = await core.resolveNativePoolPaths(
+        undefined,
+        undefined,
+        core.LEGACY_STATE_LAYOUT,
+      )
+      core.recordProcessStateLayout(paths.legacyConfig, {
+        kind: 'state-home',
+        dir: state,
+      })
+      const latch = join(state, 'anthropic-auth-request-gzip.json')
+      const bytes = JSON.stringify({ latchedAt: Date.now(), status: 415 })
+      await writeFile(latch, bytes)
+      const host = new Host(native.adapter)
+      const { final } = await host.run(scopeOf(), hostRequest(largePayload()))
+      expect(final.headers.get('content-encoding')).toBeNull()
+      expect(await readFile(latch, 'utf8')).toBe(bytes)
+      expect(await readdir(config)).toEqual([])
+    } finally {
+      native?.dispose()
+      core.resetProcessStateLayoutsForTests()
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   test('an ordinary API 400 does not latch gzip off', async () => {

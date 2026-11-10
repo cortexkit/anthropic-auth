@@ -24,7 +24,6 @@ import {
   dumpRelayRequest,
   dumpResponseArtifact,
   encodeGzipRequestBody,
-  getAccountStoragePath,
   getRequestGzipLatch,
   getRequestGzipLatchPath,
   isDumpEnabled as isDumpEnabledCore,
@@ -40,10 +39,12 @@ import {
   remapRequestBodyModel,
   requestCacheLifetimeMs,
   requestSignal,
+  resolveNativePoolPaths,
   runWithRequestSignal,
   sendWithRequestGzip,
   setDumpEnabled as setDumpEnabledCore,
   signRequestBody,
+  stateLayoutOfPaths,
   stateRefusalCause,
   stateRefusalPublicMessage,
   stripEmptyTrailingAssistantMessages,
@@ -458,8 +459,8 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
    */
   readonly attemptEndTimeoutMs?: number
   /**
-   * Remembers a rejected gzipped body. Defaults to the latch next to the
-   * OpenCode account storage file.
+   * Remembers a rejected gzipped body. Defaults to the latch in the state
+   * layout OpenCode chose at host startup.
    */
   readonly requestGzipLatch?: RequestGzipLatch
   readonly fetch?: typeof fetch
@@ -793,9 +794,15 @@ export function createNativeAnthropicAdapter<Q, P>(
   const endTimeoutMs =
     deps.attemptEndTimeoutMs ?? DEFAULT_ATTEMPT_END_TIMEOUT_MS
   type Data = NativeAnthropicAttemptData<P>
-  const requestGzipLatch =
-    deps.requestGzipLatch ??
-    getRequestGzipLatch(getRequestGzipLatchPath(getAccountStoragePath()))
+  let requestGzipLatch = deps.requestGzipLatch
+  const gzipLatch = async () => {
+    if (requestGzipLatch) return requestGzipLatch
+    const paths = await resolveNativePoolPaths()
+    requestGzipLatch ??= getRequestGzipLatch(
+      getRequestGzipLatchPath(paths.legacyConfig, stateLayoutOfPaths(paths)),
+    )
+    return requestGzipLatch
+  }
   // Direct sends whose body this adapter gzipped. The host performs the fetch
   // and its limit and output detection see the response before
   // rewriteResponse does, so a rejected gzipped body cannot be resent here
@@ -1520,7 +1527,7 @@ export function createNativeAnthropicAdapter<Q, P>(
               url,
               body: createBody,
               headers: retryHeaders,
-              latch: requestGzipLatch,
+              latch: await gzipLatch(),
               send: (wireBody, wireHeaders) => {
                 assertHostAuthorityStable()
                 return resendFetch(url, {
@@ -1614,7 +1621,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const decision = await decideRequestGzip({
         url,
         body,
-        latch: requestGzipLatch,
+        latch: await gzipLatch(),
       })
       ensureLive()
       if (decision.gzip) {
@@ -1748,9 +1755,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         gzippedSends.delete(data)
         // Classify before the body is scrubbed or read; a clone is read.
         void classifyGzipRejection(response).then(
-          (kind) => {
+          async (kind) => {
             if (!kind) return
-            requestGzipLatch.latchProcess()
+            const latch = await gzipLatch()
+            latch.latchProcess()
             log?.warn(
               'gzipped request body rejected; later requests go uncompressed',
               { kind, status: response.status },

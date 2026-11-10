@@ -24,6 +24,11 @@ import {
   CLAUDE_CODE_GZIP_MIN_BODY_CHARS,
   CLAUDE_CODE_GZIPS_REQUEST_BODIES,
 } from './constants.ts'
+import {
+  LEGACY_STATE_LAYOUT,
+  type StateLayout,
+  stateHomeFilePaths,
+} from './state-layout-paths.ts'
 
 const gzipAsync = promisify(gzip)
 
@@ -241,8 +246,13 @@ export function getRequestGzipLatch(path?: string): RequestGzipLatch {
   return latch
 }
 
-/** The latch file path: `<stem>-request-gzip.json` beside the account storage file. */
-export function getRequestGzipLatchPath(accountStoragePath: string): string {
+/** The advisory latch starts empty in state-home; legacy and Pi keep their account-file sibling. */
+export function getRequestGzipLatchPath(
+  accountStoragePath: string,
+  layout: StateLayout = LEGACY_STATE_LAYOUT,
+): string {
+  if (layout.kind === 'state-home')
+    return stateHomeFilePaths(layout.dir).requestGzip
   const name = basename(accountStoragePath)
   const stem = name.endsWith('.json') ? name.slice(0, -5) : name
   return join(dirname(accountStoragePath), `${stem}-request-gzip.json`)
