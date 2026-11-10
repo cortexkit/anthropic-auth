@@ -50,8 +50,8 @@ export function sourceWarmRecoveryKey(
 }
 
 /**
- * The source request a recovery round keeps alive: the exact signed bytes
- * the plugin sent to the source model (normally the refused request), bound
+ * The source request a recovery round keeps alive: the full request template
+ * accepted at its last cache boundary with positive cache usage, bound
  * to the OAuth account that sent it. In memory only; a restart drops it
  * along with the process-local round state.
  */
@@ -92,6 +92,7 @@ export type FableFallbackPlan = {
   cycle?: number
   cacheAccountId?: string
   standbyCacheAnchor?: FableStandbyCacheAnchor
+  sourceRecovery?: FableSourceWarmKeep
   requestSequence?: number
   completed?: boolean
 }
@@ -216,6 +217,7 @@ export class FableFallbackManager {
         downgraded: false,
         cycle: state?.cycle,
         standbyCacheAnchor: state?.standbyCacheAnchor,
+        sourceRecovery: state?.sourceWarm,
       }
     }
 

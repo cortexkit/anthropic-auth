@@ -104,9 +104,25 @@ const refusalSse = () =>
     ],
   ])
 
-const successSse = () =>
+const successSse = (cacheUsage = true, threaded = false) =>
   sse([
-    ['message_start', { type: 'message_start', message: { id: 'msg_ok' } }],
+    [
+      'message_start',
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_ok',
+          ...(threaded && { content: [{ type: 'text', text: 'Answer' }] }),
+          usage: cacheUsage
+            ? {
+                input_tokens: 0,
+                cache_creation_input_tokens: 1000,
+                cache_read_input_tokens: 0,
+              }
+            : {},
+        },
+      },
+    ],
     [
       'message_delta',
       {
@@ -129,6 +145,8 @@ function hybridStorage(): AccountStorage {
 async function setupRound(
   mainExpiresInMs = 8 * 60 * 60_000,
   storage: AccountStorage = hybridStorage(),
+  cacheUsage = true,
+  threaded = false,
 ) {
   await useTempAccountFile(storage, {
     ...syntheticMainHostAuth(),
@@ -136,7 +154,7 @@ async function setupRound(
   })
   const sent: SentRequest[] = []
   const warms: SentRequest[] = []
-  let refusalsLeft = 1
+  let refusalsLeft = 0
   globalThis.fetch = mock(
     withNativeAdmission((input: any, init: any) => {
       const url = extractUrl(input)
@@ -163,7 +181,9 @@ async function setupRound(
         refusalsLeft--
         return Promise.resolve(new Response(refusalSse(), { status: 200 }))
       }
-      return Promise.resolve(new Response(successSse(), { status: 200 }))
+      return Promise.resolve(
+        new Response(successSse(cacheUsage, threaded), { status: 200 }),
+      )
     }),
   ) as unknown as typeof fetch
 
@@ -211,7 +231,7 @@ async function waitForSourceWarmTarget(plugin: TestPlugin, sessionId: string) {
   throw new Error('source warm target was never tracked')
 }
 
-/** Drive a refusal, then one successful Opus turn so the live target is 4.8. */
+/** Cache a source success, then refuse its follow-up and start recovery. */
 async function startRound(
   sessionId: string,
   round: Awaited<ReturnType<typeof setupRound>>,
@@ -223,6 +243,13 @@ async function startRound(
     headers: { 'x-session-affinity': sessionId, ...extraHeaders },
     body: requestBody(),
   }
+  await (await round.result.fetch(MESSAGES_URL, request)).text()
+  round.refuseNextSource()
+  request.body = requestBody(SOURCE_MODEL, [
+    { role: 'user', content: 'same session input' },
+    { role: 'assistant', content: 'accepted source response' },
+    { role: 'user', content: 'refused follow-up' },
+  ])
   const filtered = await round.result.fetch(MESSAGES_URL, request)
   await expect(filtered.text()).rejects.toThrow()
   if (expectWarmTarget) await waitForSourceWarmTarget(round.plugin, sessionId)
@@ -259,6 +286,127 @@ async function userTurnHeaders(
 describe('source-warm', () => {
   installLoaderSetup(testContext)
 
+  test('a refused HTTP 200 alone cannot establish a source cache entry', async () => {
+    const round = await setupRound()
+    round.refuseNextSource()
+    const response = await round.result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': 'ses_only_refusal' },
+      body: requestBody(),
+    })
+    await expect(response.text()).rejects.toThrow()
+    expect(
+      getPluginTestHandles(round.plugin).fableFallbackManager.sourceWarmFor(
+        recoveryKey('ses_only_refusal'),
+      ),
+    ).toBeUndefined()
+  })
+
+  test('a source completion without cache usage is not retained for recovery', async () => {
+    const round = await setupRound(undefined, undefined, false)
+    const sessionId = 'ses_no_cache_usage'
+    await startRound(sessionId, round, {}, false)
+    expect(
+      getPluginTestHandles(round.plugin).fableFallbackManager.sourceWarmFor(
+        recoveryKey(sessionId),
+      ),
+    ).toBeUndefined()
+  })
+
+  test('only the first successful source return restores the accepted tail, not the refused tail', async () => {
+    const round = await setupRound()
+    const sessionId = 'ses_return_anchor'
+    const messages = [
+      { role: 'user', content: 'stable first user' },
+      { role: 'assistant', content: 'source history' },
+      { role: 'user', content: 'accepted source tail' },
+    ]
+    const send = () =>
+      round.result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': sessionId },
+        body: requestBody(SOURCE_MODEL, messages),
+      })
+    await (await send()).text()
+    messages.push(
+      { role: 'assistant', content: 'source answer' },
+      { role: 'user', content: 'refused source tail' },
+    )
+    round.refuseNextSource()
+    await expect((await send()).text()).rejects.toThrow()
+    await waitForSourceWarmTarget(round.plugin, sessionId)
+    for (let i = 0; i < 10; i++) {
+      await (await send()).text()
+      messages.push(
+        { role: 'assistant', content: `Opus answer ${i}` },
+        { role: 'user', content: `Opus follow-up ${i}` },
+      )
+    }
+    await (await send()).text()
+    const returning = round.sent.at(-1)!.parsed as any
+    expect(returning.model).toBe(SOURCE_MODEL)
+    expect(returning.messages[2].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(returning.messages[4].content[0].cache_control).toBeUndefined()
+    expect(returning.messages.at(-1).content[0].cache_control).toBeDefined()
+    messages.push(
+      { role: 'assistant', content: 'source is back' },
+      { role: 'user', content: 'next source turn' },
+    )
+    await (await send()).text()
+    const second = round.sent.at(-1)!.parsed as any
+    expect(second.messages[2].content[0].cache_control).toBeUndefined()
+  })
+
+  test('a successful source continuation keeps the full logical prefix for the return', async () => {
+    const round = await setupRound(undefined, undefined, true, true)
+    const sessionId = 'ses_thread_source_return'
+    const messages = [{ role: 'user', content: 'first threaded question' }]
+    const send = () =>
+      round.result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: { 'x-session-affinity': sessionId },
+        body: requestBody(SOURCE_MODEL, messages),
+      })
+    await (await send()).text()
+    messages.push(
+      { role: 'assistant', content: 'Answer' },
+      { role: 'user', content: 'accepted continued question' },
+    )
+    await (await send()).text()
+    expect(round.sent[1]!.parsed.thread).toEqual({
+      type: 'continue',
+      previous_message_id: 'msg_ok',
+    })
+    expect(round.sent[1]!.parsed.messages).toHaveLength(1)
+    messages.push(
+      { role: 'assistant', content: 'Answer' },
+      { role: 'user', content: 'refused continued question' },
+    )
+    round.refuseNextSource()
+    await expect((await send()).text()).rejects.toThrow()
+    await waitForSourceWarmTarget(round.plugin, sessionId)
+    const kept = getPluginTestHandles(
+      round.plugin,
+    ).fableFallbackManager.sourceWarmFor(recoveryKey(sessionId))!
+    expect(JSON.parse(kept.bodyText).messages).toHaveLength(3)
+    for (let i = 0; i < 10; i++) {
+      await (await send()).text()
+      messages.push(
+        { role: 'assistant', content: 'Answer' },
+        { role: 'user', content: `Opus continued question ${i}` },
+      )
+    }
+    await (await send()).text()
+    const returning = round.sent.at(-1)!.parsed as any
+    expect(returning.messages[2].content[0].cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+  })
+
   test('a round longer than the source cache lifetime sends exactly one source warm near expiry', async () => {
     const realDateNow = Date.now
     try {
@@ -266,11 +414,13 @@ describe('source-warm', () => {
       const sessionId = 'ses_warm_long'
       await startRound(sessionId, round)
       const firstSend = round.sent[0]
-      if (!firstSend) throw new Error('refused source request was not sent')
+      if (!firstSend) throw new Error('accepted source request was not sent')
       const sourceAuth = firstSend.auth
       expect(sourceAuth).toContain('Bearer ')
-      const refusedMessages = firstSend.parsed.messages as unknown[] | undefined
-      expect(refusedMessages?.length).toBeGreaterThan(0)
+      const acceptedMessages = firstSend.parsed.messages as
+        | unknown[]
+        | undefined
+      expect(acceptedMessages?.length).toBeGreaterThan(0)
 
       const baseNow = realDateNow()
       Date.now = () => baseNow + 30 * 60_000
@@ -293,7 +443,8 @@ describe('source-warm', () => {
       // The warm goes to the same account that sent the source request.
       expect(warm.auth).toBe(sourceAuth)
       // The warm carries the source's exact prefix, not a 4.8 rebuild.
-      expect(warm.parsed.messages).toEqual(refusedMessages)
+      expect(warm.parsed.messages).toEqual(acceptedMessages)
+      expect(warm.parsed.messages).not.toEqual(round.sent[1]?.parsed.messages)
       expect(
         (warm.parsed.system as Array<{ text?: string }>).some((block) =>
           block.text?.includes('x-anthropic-billing-header:'),
@@ -605,7 +756,6 @@ describe('source-warm', () => {
       ).toBe(false)
     }
     expect(round.sent.at(-1)?.model).toBe(SOURCE_MODEL)
-    round.refuseNextSource()
     await startRound(sessionId, round)
     expect(fallback.sourceWarmFor(recoveryKey(sessionId))?.model).toBe(
       SOURCE_MODEL,

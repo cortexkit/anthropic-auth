@@ -35,6 +35,7 @@ import {
   isFastModeSupportedModel,
   isOpenAIReasoningSignature,
   mergeAnthropicBetas,
+  messageThreadCachePrefix,
   OPENCODE_IDENTITY_PREFIX,
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
@@ -945,6 +946,125 @@ function removeAllCacheControls(parsed: Record<string, unknown>) {
   walkCacheControlTargets(parsed, removeCacheControl)
 }
 
+function lastSourceCacheAnchor(source: Record<string, unknown>) {
+  if (!Array.isArray(source?.messages)) return undefined
+  let anchor:
+    | {
+        messageIndex: number
+        blockIndex: number
+        control: Record<string, unknown>
+      }
+    | undefined
+  source.messages.forEach((message, messageIndex) => {
+    if (!isRecord(message)) return
+    normalizeContentToArray(message.content)?.forEach((block, blockIndex) => {
+      if (!isRecord(block)) return
+      const control = getCacheControl(block)
+      if (control?.type === 'ephemeral')
+        anchor = { messageIndex, blockIndex, control }
+    })
+  })
+  return anchor
+}
+
+/** Match a continuation's last cache marker to the full body kept for warming. */
+export function sourceCacheAnchorMatchesWire(
+  templateBody: string,
+  wireBody: string,
+) {
+  try {
+    const template = JSON.parse(templateBody)
+    const wire = JSON.parse(wireBody)
+    const kept = lastSourceCacheAnchor(template)
+    const sent = lastSourceCacheAnchor(wire)
+    if (!kept || !sent) return false
+    const offset =
+      wire.thread?.type === 'continue'
+        ? template.messages.length - wire.messages.length
+        : 0
+    if (
+      offset < 0 ||
+      kept.messageIndex !== offset + sent.messageIndex ||
+      kept.blockIndex !== sent.blockIndex
+    )
+      return false
+    if (kept.control.ttl !== sent.control.ttl) return false
+    const prefix = messageThreadCachePrefix(
+      wire,
+      sent.messageIndex,
+      sent.blockIndex,
+    )
+    return Boolean(
+      prefix &&
+        prefix ===
+          messageThreadCachePrefix(
+            { ...template, messages: template.messages.slice(offset) },
+            sent.messageIndex,
+            sent.blockIndex,
+          ),
+    )
+  } catch {
+    return false
+  }
+}
+
+function restoreSourceCacheAnchor(
+  parsed: Record<string, unknown>,
+  sourceBody: string,
+) {
+  let source: Record<string, unknown>
+  try {
+    source = JSON.parse(sourceBody)
+  } catch {
+    return
+  }
+  if (!Array.isArray(parsed.messages)) return
+  const anchor = lastSourceCacheAnchor(source)
+  if (!anchor) return
+  const { messageIndex, blockIndex, control } = anchor
+  // A cache-policy change can make the old lifetime incompatible with the new
+  // tail: Anthropic requires every 1h marker to precede every 5m marker.
+  let ttlMismatch = false
+  walkCacheControlTargets(parsed, (target) => {
+    if (!isRecord(target)) return
+    const current = getCacheControl(target)
+    if (
+      current?.type === 'ephemeral' &&
+      (current.ttl ?? '5m') !== (control.ttl ?? '5m')
+    )
+      ttlMismatch = true
+  })
+  if (ttlMismatch) return
+  const prefix = messageThreadCachePrefix(source, messageIndex, blockIndex)
+  if (
+    !prefix ||
+    prefix !== messageThreadCachePrefix(parsed, messageIndex, blockIndex)
+  )
+    return
+  const message = parsed.messages[messageIndex]
+  if (!isRecord(message)) return
+  const content = normalizeContentToArray(message.content)
+  const block = content?.[blockIndex]
+  if (!isRecord(block)) return
+  message.content = content
+  block.cache_control = { ...control }
+  delete block.cacheControl
+
+  // The restored entry already covers the earliest anchors. Spend their slots
+  // first, preserving both the old cache boundary and the new tail write.
+  const marked: Record<string, unknown>[] = []
+  walkCacheControlTargets(parsed, (target) => {
+    if (isRecord(target) && getCacheControl(target)) marked.push(target)
+  })
+  let excess = marked.length - 4
+  for (const target of marked) {
+    if (excess <= 0) break
+    if (target === block || target === marked.at(-1)) continue
+    removeCacheControl(target)
+    excess--
+  }
+}
+
 function applyAutomaticCache1h(parsed: Record<string, unknown>) {
   removeAllCacheControls(parsed)
   parsed.cache_control = { ...CACHE_1H_CONTROL }
@@ -1577,6 +1697,7 @@ export async function rewriteRequestBody(
     turnEndNote?: { tools: string[] }
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
+    sourceRecoveryBody?: string
     serverSideFallbackEnabled?: boolean
     modelRemapEnabled?: boolean
     laneStart?: boolean
@@ -1765,7 +1886,17 @@ export async function rewriteRequestBody(
     const prefixStart = rewriteNowMs()
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const toolNameMap = responseToolNames(parsed.tools)
-    const prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
+    let prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
+    if (
+      options.sourceRecoveryBody &&
+      cacheEnabled &&
+      options.cache1hMode === 'hybrid'
+    ) {
+      restoreSourceCacheAnchor(parsed, options.sourceRecoveryBody)
+      prefixed = JSON.stringify(
+        orderClaudeCodeBody(parsed, { isOAuth: options.isOAuth }),
+      )
+    }
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),
       outputBytesBeforeSign: prefixed.length,

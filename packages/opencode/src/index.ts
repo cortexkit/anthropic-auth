@@ -273,6 +273,7 @@ import {
 import {
   FableFallbackManager,
   type FableFallbackPlan,
+  type FableSourceWarmInit,
   type FableSourceWarmKeep,
   type FableStandbyCacheAnchor,
   isRecoverableRefusalModel,
@@ -354,6 +355,7 @@ import {
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
+  sourceCacheAnchorMatchesWire,
   type ToolNameMap,
 } from './transform.ts'
 
@@ -853,6 +855,8 @@ type FableRequestContext = {
   opusCacheAnchor?: FableStandbyCacheAnchor
   standbyBridgeLogged?: boolean
   subagent?: boolean
+  sourceCandidate?: FableSourceWarmInit
+  sourceCacheUsed?: FableSourceWarmInit
 }
 
 type StickyOAuthRoute = {
@@ -1928,15 +1932,10 @@ const anthropicAuthPlugin = async (
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
   const fableFallbackManager = new FableFallbackManager()
-  // Send-time metadata per recovery round, keyed by recovery key. The kept
-  // source body itself is never copied here: when a refusal starts the
-  // round, the keep takes the full request template from CacheKeep's live
-  // target for the session and signs it when warming. If that target is absent
-  // (CacheKeep off, not hybrid), there is nothing to warm.
-  const pendingSourceMeta = new Map<
-    string,
-    { accountIdentity?: string; sentAt: number }
-  >()
+  // A refused HTTP 200 replaces CacheKeep's live template before its stop
+  // reason is known. Retain only a completed source send with cache usage so
+  // recovery warms and returns can target an entry known to exist.
+  const acceptedSourceRequests = new Map<string, FableSourceWarmInit>()
   // Stop every source warm in a session for good and drop the CacheKeep
   // targets with it. The manager already forgot the kept prefixes (session
   // clear, model change); this mirrors that into CacheKeep's machinery.
@@ -1951,8 +1950,8 @@ const anthropicAuthPlugin = async (
       if (parsed && parsed.sessionId === sessionId)
         cacheKeepManager.untrack(target.id)
     }
-    for (const key of [...pendingSourceMeta.keys()]) {
-      if (key.startsWith(`${sessionId}\0`)) pendingSourceMeta.delete(key)
+    for (const key of [...acceptedSourceRequests.keys()]) {
+      if (key.startsWith(`${sessionId}\0`)) acceptedSourceRequests.delete(key)
     }
   }
   const laneStartTracker = new LaneStartTracker()
@@ -3404,6 +3403,8 @@ const anthropicAuthPlugin = async (
     failThread?: () => void
     cacheKeepBodyText?: string
     cacheKeepSignal?: AbortSignal | null
+    fableRequest?: FableRequestContext
+    sourceCandidate?: FableSourceWarmInit
   }
   const cacheDiagnosticsResponses = new WeakMap<
     Response,
@@ -3609,6 +3610,26 @@ const anthropicAuthPlugin = async (
     )
       return
     const usage = (message as { usage?: Record<string, number> }).usage
+    if (
+      context.fableRequest &&
+      context.sourceCandidate &&
+      context.fableRequest.sourceCandidate === context.sourceCandidate &&
+      context.sourceCandidate.oauthAccountId === context.accountId &&
+      context.fableRequest.sourceCacheUsed !== context.sourceCandidate &&
+      usage &&
+      [usage.cache_read_input_tokens, usage.cache_creation_input_tokens].some(
+        (tokens) =>
+          typeof tokens === 'number' && Number.isFinite(tokens) && tokens > 0,
+      ) &&
+      sourceCacheAnchorMatchesWire(
+        context.sourceCandidate.bodyText,
+        context.cacheKeepBodyText,
+      )
+    ) {
+      // Keep the full logical template: a threaded wire body may be only a
+      // delta. Warming signs the template again before sending it.
+      context.fableRequest.sourceCacheUsed = context.sourceCandidate
+    }
     if (usage)
       cacheKeepManager.recordAcceptedUsage(
         context.trackSessionId,
@@ -7724,6 +7745,11 @@ const anthropicAuthPlugin = async (
                   midConversationEffortResolvedPlan: resolvedEffortPlan,
                   midConversationEffortPlanVersions: effortPlanVersions,
                   hybridStandbyAnchor: standbyCacheAnchor,
+                  sourceRecoveryBody:
+                    fableRequest?.plan.sourceRecovery?.oauthAccountId ===
+                    oauthAccountId
+                      ? fableRequest.plan.sourceRecovery.bodyText
+                      : undefined,
                   serverSideFallbackEnabled: fallbackMode === 'server',
                   laneStart: laneStartRequest,
                   billingLineage: activeBillingLineage,
@@ -7915,26 +7941,28 @@ const anthropicAuthPlugin = async (
                     reason: tracked.tracked ? undefined : tracked.reason,
                     bodyBytes: bodyText.length,
                   })
-                  // Remember the source-model send's account identity and
-                  // time for content-filter recovery. CacheKeep already owns
-                  // the full request template, so only this small metadata is
-                  // stored per round; warming applies its own signature.
+                  // Promote this candidate only after source completion and
+                  // positive cache usage, not merely HTTP acceptance.
                   if (
                     relayAffinity &&
                     fableRequest &&
                     !fableRequest.plan.downgraded &&
                     tracked.tracked
                   ) {
-                    pendingSourceMeta.set(fableRequest.plan.recoveryKey, {
+                    fableRequest.sourceCandidate = {
+                      bodyText,
+                      oauthAccountId,
                       ...(nativeAuthorization.accountIdentity !== undefined && {
                         accountIdentity: nativeAuthorization.accountIdentity,
                       }),
                       sentAt: Date.now(),
-                    })
-                    while (pendingSourceMeta.size > 128) {
-                      const oldest = pendingSourceMeta.keys().next().value
-                      if (oldest === undefined) break
-                      pendingSourceMeta.delete(oldest)
+                      model: fableRequest.plan.requestedModel,
+                      firstAnchorFingerprint:
+                        hybridUserMessageCacheAnchorFingerprints(bodyText)[0],
+                      url:
+                        rewritten.url?.toString() ?? rewritten.input.toString(),
+                      headers: Object.fromEntries(requestHeaders),
+                      ...(subagentRequest && { subagent: true }),
                     }
                   }
                 }
@@ -8490,6 +8518,8 @@ const anthropicAuthPlugin = async (
                 synthetic: laneStartRequest,
                 cacheKeepBodyText: typeof body === 'string' ? body : undefined,
                 cacheKeepSignal: init?.signal,
+                fableRequest,
+                sourceCandidate: fableRequest?.sourceCandidate,
                 ...cacheDiagnosticsBetas,
                 requestedModel: parseRequestModel(body),
                 request: cacheDiagnosticsRequest,
@@ -9429,65 +9459,16 @@ const anthropicAuthPlugin = async (
                             )
                             return false
                           }
-                          // Keep the source prefix from CacheKeep's live
-                          // target for the session: the original full request
-                          // template (normally the refused request itself),
-                          // never rebuilt from a 4.8 request. Warming signs it.
-                          // The live target
-                          // is required to be this round's source-model send
-                          // for this session and account; anything else (a
-                          // 4.8 request, another round's probe) cannot become
-                          // a warm. Without a live target (CacheKeep off or
-                          // not hybrid) there is nothing to warm.
-                          const pending = pendingSourceMeta.get(
+                          // HTTP success alone does not prove a refused
+                          // request populated its tail cache entry.
+                          const accepted = acceptedSourceRequests.get(
                             fablePlan.recoveryKey,
                           )
-                          pendingSourceMeta.delete(fablePlan.recoveryKey)
-                          const live = cacheKeepManager.trackedRequest(
-                            fablePlan.sessionId,
-                          )
-                          let liveModel: string | undefined
-                          if (live) {
-                            try {
-                              const parsed = JSON.parse(live.bodyText) as {
-                                model?: unknown
-                              }
-                              if (typeof parsed.model === 'string')
-                                liveModel = parsed.model
-                            } catch {}
-                          }
-                          const liveFamily = liveModel
-                            ? recoverableRefusalFamily(liveModel)
-                            : null
-                          const requestedFamily = recoverableRefusalFamily(
-                            fablePlan.requestedModel,
-                          )
-                          const liveAccountId = live?.oauthAccountId
+                          acceptedSourceRequests.delete(fablePlan.recoveryKey)
                           const keep =
-                            pending &&
-                            live &&
-                            liveAccountId !== undefined &&
-                            liveFamily !== null &&
-                            liveFamily === requestedFamily &&
-                            liveAccountId === fableRequest.oauthAccountId
-                              ? {
-                                  bodyText: live.bodyText,
-                                  oauthAccountId: liveAccountId,
-                                  ...(pending.accountIdentity !== undefined && {
-                                    accountIdentity: pending.accountIdentity,
-                                  }),
-                                  sentAt: pending.sentAt,
-                                  model: fablePlan.requestedModel,
-                                  firstAnchorFingerprint:
-                                    hybridUserMessageCacheAnchorFingerprints(
-                                      live.bodyText,
-                                    )[0],
-                                  url: live.url,
-                                  headers: live.headers,
-                                  ...(fableRequest.subagent && {
-                                    subagent: true,
-                                  }),
-                                }
+                            accepted?.oauthAccountId ===
+                            fableRequest.oauthAccountId
+                              ? accepted
                               : undefined
                           const remaining = fableFallbackManager.activate(
                             fablePlan,
@@ -9550,6 +9531,27 @@ const anthropicAuthPlugin = async (
                     ? {
                         onComplete: (finishReason: string) => {
                           if (!fablePlan.downgraded) {
+                            if (
+                              fableRequest.sourceCandidate &&
+                              fableRequest.sourceCacheUsed ===
+                                fableRequest.sourceCandidate &&
+                              !fableRequest.serverFallback
+                            ) {
+                              acceptedSourceRequests.delete(
+                                fablePlan.recoveryKey,
+                              )
+                              acceptedSourceRequests.set(
+                                fablePlan.recoveryKey,
+                                fableRequest.sourceCandidate,
+                              )
+                              while (acceptedSourceRequests.size > 128) {
+                                const oldest = acceptedSourceRequests
+                                  .keys()
+                                  .next().value
+                                if (oldest === undefined) break
+                                acceptedSourceRequests.delete(oldest)
+                              }
+                            }
                             const ended = fableFallbackManager.completeSource(
                               fablePlan,
                               !fableRequest.serverFallback,

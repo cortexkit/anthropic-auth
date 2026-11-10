@@ -20,6 +20,7 @@ import {
   encodeOpenCodeEffortPlan,
   markOpenCodeEffortTransitions,
 } from '../effort-history'
+import { FableFallbackManager } from '../fable-fallback'
 import {
   createServerSideFallbackStreamRewriter,
   SERVER_FALLBACK_MARKER_TEXT,
@@ -45,6 +46,7 @@ import {
   rewriteUrl,
   sanitizeSystemText,
   setOAuthHeaders,
+  sourceCacheAnchorMatchesWire,
   stripToolPrefix,
   type ToolNameMap,
 } from '../transform'
@@ -4351,6 +4353,369 @@ describe('rewriteRequestBody', () => {
     expect(result.messages.at(-1).content[0].cache_control).toEqual({
       type: 'ephemeral',
       ttl: '1h',
+    })
+  })
+
+  describe('source cache recovery return', () => {
+    const options = { cache1hEnabled: true, cache1hMode: 'hybrid' as const }
+    function sourceRequest() {
+      return {
+        model: 'claude-fable-5-2',
+        system: 'Stable system block',
+        tools: [{ name: 'read', input_schema: { type: 'object' } }],
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'permanent history' },
+              { type: 'text', text: 'volatile history' },
+            ],
+          },
+          {
+            role: 'assistant',
+            content: Array.from({ length: 707 }, (_, i) => ({
+              type: 'text',
+              text: `history ${i}`,
+            })),
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'source tail first block' },
+              { type: 'text', text: 'source tail second block' },
+              { type: 'text', text: 'source cached boundary' },
+            ],
+          },
+        ],
+      }
+    }
+    function returnRequest() {
+      const body = sourceRequest()
+      // Ten recovery responses add forty blocks beyond the 712-block source.
+      for (let i = 0; i < 10; i++) {
+        body.messages.push(
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: `Opus response ${i}` },
+              { type: 'text', text: 'detail' },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: `Opus follow-up ${i}` },
+              { type: 'text', text: 'continue' },
+            ],
+          },
+        )
+      }
+      return body
+    }
+    function markers(body: any) {
+      return [
+        ...(body.system ?? []),
+        ...body.messages.flatMap((message: any) =>
+          Array.isArray(message.content) ? message.content : [],
+        ),
+      ].filter((block: any) => block.cache_control)
+    }
+
+    test.each(['1h', '5m'] as const)(
+      'restores the source old-tail breakpoint beyond lookback with %s TTL for one accepted return',
+      async (ttl) => {
+        const key = Symbol.for('cortexkit.routing')
+        const globals = globalThis as Record<symbol, unknown>
+        const previous = globals[key]
+        globals[key] = () => ({
+          cache: () => ({ ttl: ttl === '5m' ? 'short' : 'long' }),
+        })
+        const ttlOptions = {
+          ...options,
+          sessionId: 'ses_return',
+          isOAuth: true,
+        }
+        try {
+          const sourceBody = await rewriteRequestBody(
+            JSON.stringify(sourceRequest()),
+            ttlOptions,
+          )
+          const manager = new FableFallbackManager()
+          const initial = manager.plan(
+            'ses_return',
+            JSON.stringify(sourceRequest()),
+          )!
+          manager.activate(initial, 'main', {
+            bodyText: sourceBody,
+            oauthAccountId: 'main',
+            sentAt: 0,
+            model: initial.requestedModel,
+            url: 'https://api.anthropic.com/v1/messages',
+            headers: {},
+          })
+          for (let i = 0; i < 10; i++)
+            manager.complete(
+              manager.plan('ses_return', JSON.stringify(returnRequest()))!,
+            )
+          const returning = manager.plan(
+            'ses_return',
+            JSON.stringify(returnRequest()),
+          )!
+          const result = JSON.parse(
+            await rewriteRequestBody(returning.bodyText, {
+              ...ttlOptions,
+              sourceRecoveryBody: returning.sourceRecovery?.bodyText,
+            }),
+          )
+          expect(result.messages[2].content[2].cache_control).toEqual(
+            ttl === '1h'
+              ? { type: 'ephemeral', ttl: '1h' }
+              : { type: 'ephemeral' },
+          )
+          expect(result.messages[2].content[0].cache_control).toBeUndefined()
+          expect(markers(result)).toHaveLength(4)
+          expect(
+            result.system.every((block: any) => !block.cache_control),
+          ).toBe(true)
+          expect(
+            result.messages.at(-1).content.at(-1).cache_control,
+          ).toBeDefined()
+          expect(
+            markers(result).every(
+              (block: any) =>
+                block.cache_control.ttl === (ttl === '1h' ? '1h' : undefined),
+            ),
+          ).toBe(true)
+          manager.completeSource(returning)
+          const next = manager.plan(
+            'ses_return',
+            JSON.stringify(returnRequest()),
+          )!
+          expect(next.sourceRecovery).toBeUndefined()
+          const second = await rewriteRequestBody(next.bodyText, {
+            ...ttlOptions,
+            sourceRecoveryBody: next.sourceRecovery?.bodyText,
+          })
+          expect(second).toBe(
+            await rewriteRequestBody(next.bodyText, ttlOptions),
+          )
+          expect(
+            JSON.parse(second).messages[2].content[2].cache_control,
+          ).toBeUndefined()
+        } finally {
+          if (previous === undefined) delete globals[key]
+          else globals[key] = previous
+        }
+      },
+    )
+
+    test.each(['rewrite', 'compaction', 'tools', 'system'] as const)(
+      'skips the restored anchor after %s',
+      async (change) => {
+        const sourceBody = await rewriteRequestBody(
+          JSON.stringify(sourceRequest()),
+          options,
+        )
+        const body = returnRequest()
+        if (change === 'rewrite')
+          body.messages[1]!.content[400]!.text = 'edited history'
+        if (change === 'compaction') body.messages.splice(1, 1)
+        if (change === 'tools') body.tools[0]!.input_schema.type = 'string'
+        if (change === 'system') body.system = 'Replaced system'
+        const input = JSON.stringify(body)
+        expect(
+          await rewriteRequestBody(input, {
+            ...options,
+            sourceRecoveryBody: sourceBody,
+          }),
+        ).toBe(await rewriteRequestBody(input, options))
+      },
+    )
+
+    test.each(['short', 'long'] as const)(
+      'skips the restored anchor when the source %s TTL changes during recovery',
+      async (sourceTtl) => {
+        const key = Symbol.for('cortexkit.routing')
+        const globals = globalThis as Record<symbol, unknown>
+        const previous = globals[key]
+        let ttl: 'short' | 'long' = sourceTtl
+        globals[key] = () => ({ cache: () => ({ ttl }) })
+        const policyOptions = {
+          ...options,
+          sessionId: 'ses_changed_ttl',
+          isOAuth: true,
+        }
+        try {
+          const sourceBody = await rewriteRequestBody(
+            JSON.stringify(sourceRequest()),
+            policyOptions,
+          )
+          ttl = sourceTtl === 'short' ? 'long' : 'short'
+          const input = JSON.stringify(returnRequest())
+          const result = await rewriteRequestBody(input, {
+            ...policyOptions,
+            sourceRecoveryBody: sourceBody,
+          })
+          expect(result).toBe(await rewriteRequestBody(input, policyOptions))
+          expect(
+            JSON.parse(result).messages[2].content[2].cache_control,
+          ).toBeUndefined()
+          expect(markers(JSON.parse(result)).at(-1).cache_control).toEqual(
+            ttl === 'long'
+              ? { type: 'ephemeral', ttl: '1h' }
+              : { type: 'ephemeral' },
+          )
+        } finally {
+          if (previous === undefined) delete globals[key]
+          else globals[key] = previous
+        }
+      },
+    )
+
+    test('matches canonical history through the exact old block, not later content', async () => {
+      const sourceBody = await rewriteRequestBody(
+        JSON.stringify(sourceRequest()),
+        options,
+      )
+      const reorderedSource = JSON.stringify(
+        JSON.parse(sourceBody),
+        (_key, value) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value))
+            return value
+          return Object.fromEntries(Object.entries(value).reverse())
+        },
+      )
+      const body = returnRequest()
+      body.messages[2]!.content.push({
+        type: 'text',
+        text: 'content added after the cached block',
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(JSON.stringify(body), {
+          ...options,
+          sourceRecoveryBody: reorderedSource,
+        }),
+      )
+      expect(result.messages[2].content[2].cache_control).toEqual({
+        type: 'ephemeral',
+        ttl: '1h',
+      })
+      expect(result.messages[2].content[3].cache_control).toBeUndefined()
+      expect(markers(result)).toHaveLength(4)
+    })
+
+    test('an accepted thread continuation retains its full source template and anchors the mapped tail', async () => {
+      const template = await rewriteRequestBody(
+        JSON.stringify(sourceRequest()),
+        options,
+      )
+      const wire = JSON.parse(template)
+      wire.thread = { type: 'continue', previous_message_id: 'msg_source' }
+      wire.messages = wire.messages.slice(2)
+      expect(sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))).toBe(
+        true,
+      )
+      const kept = sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))
+        ? template
+        : undefined
+      const result = JSON.parse(
+        await rewriteRequestBody(JSON.stringify(returnRequest()), {
+          ...options,
+          sourceRecoveryBody: kept,
+        }),
+      )
+      expect(result.messages[2].content[2].cache_control).toEqual({
+        type: 'ephemeral',
+        ttl: '1h',
+      })
+    })
+
+    test('keeps the restored block even when it precedes every normal message anchor', async () => {
+      const base = {
+        model: 'claude-fable-5-2',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: '<memory-mural>stable</memory-mural>' },
+            ],
+          },
+        ],
+      }
+      const template = await rewriteRequestBody(JSON.stringify(base), options)
+      const input = JSON.stringify({
+        ...base,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              ...base.messages[0]!.content,
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: 'image/png',
+                  data: 'AA==',
+                },
+              },
+              { type: 'text', text: 'appended merged history' },
+            ],
+          },
+          { role: 'assistant', content: 'answer' },
+          { role: 'user', content: 'normal bridge boundary' },
+          {
+            role: 'assistant',
+            content: Array.from({ length: 24 }, (_, i) => ({
+              type: 'text',
+              text: `block ${i}`,
+            })),
+          },
+          { role: 'user', content: 'new tail' },
+        ],
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(input, {
+          ...options,
+          sourceRecoveryBody: template,
+        }),
+      )
+      expect(result.messages[0].content[0].cache_control).toBeDefined()
+      expect(result.messages.at(-1).content[0].cache_control).toBeDefined()
+      expect(markers(result)).toHaveLength(4)
+    })
+
+    test('an unmappable thread continuation tail cannot establish a return anchor', async () => {
+      const template = await rewriteRequestBody(
+        JSON.stringify(sourceRequest()),
+        options,
+      )
+      const wire = JSON.parse(template)
+      wire.thread = { type: 'continue', previous_message_id: 'msg_source' }
+      wire.messages = wire.messages.slice(2)
+      delete wire.messages[0].content[2].cache_control
+      wire.messages.push({
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: 'prefill',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+      })
+      expect(sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))).toBe(
+        false,
+      )
+      const kept = sourceCacheAnchorMatchesWire(template, JSON.stringify(wire))
+        ? template
+        : undefined
+      const input = JSON.stringify(returnRequest())
+      expect(
+        await rewriteRequestBody(input, {
+          ...options,
+          sourceRecoveryBody: kept,
+        }),
+      ).toBe(await rewriteRequestBody(input, options))
     })
   })
 

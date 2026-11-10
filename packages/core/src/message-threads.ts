@@ -521,6 +521,52 @@ function fixedThreadFingerprint(input: MessageThreadInput): string {
   )
 }
 
+/** Canonical cacheable prefix through one content block, using thread history rules. */
+export function messageThreadCachePrefix(
+  body: Body,
+  messageIndex: number,
+  blockIndex: number,
+): string | undefined {
+  if (!Array.isArray(body.messages)) return undefined
+  const message = body.messages[messageIndex]
+  if (!isBody(message)) return undefined
+  const content =
+    typeof message.content === 'string'
+      ? [{ type: 'text', text: message.content }]
+      : message.content
+  if (!Array.isArray(content) || !content[blockIndex]) return undefined
+  const messages = body.messages.slice(0, messageIndex).concat({
+    ...message,
+    content: content.slice(0, blockIndex + 1),
+  })
+  const system = Array.isArray(body.system)
+    ? body.system
+        .filter(
+          (block) =>
+            !(
+              typeof block?.text === 'string' &&
+              block.text.startsWith('x-anthropic-billing-header:')
+            ),
+        )
+        .map(withoutOwnCache)
+    : body.system
+  return hash(
+    canonicalValue({
+      model: body.model,
+      thinking: body.thinking,
+      output_config: body.output_config,
+      tool_choice: body.tool_choice,
+      context_management: body.context_management,
+      fallbacks: body.fallbacks,
+      tools: Array.isArray(body.tools)
+        ? body.tools.map(withoutOwnCache)
+        : body.tools,
+      system,
+      messages: messages.map(withoutMessageCache),
+    }),
+  )
+}
+
 export function messageThreadSnapshot(
   input: MessageThreadInput,
   identity = hash([input.account, input.credential]),
