@@ -5,10 +5,7 @@ import {
   getHostClaustrumEnrollmentPaths,
   resolveClaustrumConnectionPath,
 } from '@cortexkit/anthropic-auth-core'
-import {
-  ClaustrumCredentialError,
-  writeEnrollmentTokenFile,
-} from '@cortexkit/claustrum-client'
+import { writeEnrollmentTokenFile } from '@cortexkit/claustrum-client'
 import {
   type ClaustrumEnrollmentClient,
   ClaustrumEnrollmentManager,
@@ -24,7 +21,7 @@ export const NATIVE_VAULT_HOST_NAMES = {
   pi: CLAUSTRUM_PI_ENROLLMENT_NAME,
 } as const
 
-const NATIVE_VAULT_HOST_DISPLAY_NAMES = {
+export const NATIVE_VAULT_HOST_DISPLAY_NAMES = {
   opencode: 'Claude sign-in for OpenCode',
   pi: 'Claude sign-in for Pi',
 } as const
@@ -123,26 +120,11 @@ export async function enrollNativeVaultForHost(
       const manager = new ClaustrumEnrollmentManager({
         paths,
         proposedName: name,
+        displayName: NATIVE_VAULT_HOST_DISPLAY_NAMES[host],
         client: {
           enrollPropose: async (input) => {
             await processFence()
-            const proposal = {
-              ...input,
-              displayName: NATIVE_VAULT_HOST_DISPLAY_NAMES[host],
-            }
-            try {
-              return await connected.enrollPropose(proposal)
-            } catch (error) {
-              // Older vaults reject the unknown display-name field before
-              // storing a request. Retry once with the same name and secret.
-              if (
-                !(error instanceof ClaustrumCredentialError) ||
-                error.code !== 'invalid_params'
-              )
-                throw error
-              await processFence()
-              return connected.enrollPropose(input)
-            }
+            return connected.enrollPropose(input)
           },
           enrollPoll: async (input) => {
             await processFence()

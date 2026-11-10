@@ -2883,6 +2883,66 @@ lifetimes.test(
 )
 
 lifetimes.test(
+  'shared setup passes host display names and delegates the legacy-vault retry to common-auth',
+  async () => {
+    const f = await callbackFixture({
+      opencode: true,
+      pi: true,
+      claustrum: true,
+    })
+    const proposals: {
+      name: string
+      displayName?: string
+      requestSecretHash: string
+    }[] = []
+    expect(
+      await runSetupCommand(['--yes', '--enroll-only', '--opencode=2'], {
+        ...f.io,
+        connect: async () => {
+          let name = ''
+          return {
+            close() {},
+            enrollPropose: async (input) => {
+              proposals.push(input)
+              name = input.name
+              if (input.displayName !== undefined)
+                throw new ClaustrumCredentialError(
+                  'invalid_params',
+                  'permanent',
+                  'gone',
+                )
+              return { requestId: name }
+            },
+            enrollPoll: async () => ({
+              status: 'approved',
+              name,
+              token: 'c'.repeat(64),
+              tokenGeneration: 1,
+            }),
+          }
+        },
+      }),
+    ).toBe(0)
+    expect(proposals).toHaveLength(4)
+    for (const [index, host, displayName] of [
+      [0, 'opencode', 'Claude sign-in for OpenCode'],
+      [2, 'pi', 'Claude sign-in for Pi'],
+    ] as const) {
+      expect(proposals[index]).toMatchObject({
+        name: `anthropic-auth-${host}`,
+        displayName,
+      })
+      expect(proposals[index]!.requestSecretHash).toMatch(/^[0-9a-f]{64}$/)
+      expect(proposals[index + 1]).toEqual({
+        name: `anthropic-auth-${host}`,
+        requestSecretHash: proposals[index]!.requestSecretHash,
+      })
+      expect(await readNativeEnrollmentMode(host, f.env)).toBe('claustrum')
+    }
+  },
+)
+
+lifetimes.test(
   'shared vault ceremony enrolls once per host between preflight and activation, without local classification',
   async () => {
     const f = await callbackFixture({

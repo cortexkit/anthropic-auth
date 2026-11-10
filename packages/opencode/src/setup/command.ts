@@ -35,6 +35,7 @@ import {
   preflightNativeVaultForHost,
 } from './native-activation.ts'
 import {
+  NATIVE_VAULT_HOST_DISPLAY_NAMES,
   NATIVE_VAULT_HOST_NAMES,
   nativeVaultConnectionFile,
   nativeVaultHostPaths,
@@ -267,10 +268,12 @@ export async function runSetupCommand(
       hosts: {
         opencode: {
           name: NATIVE_VAULT_HOST_NAMES.opencode,
+          displayName: NATIVE_VAULT_HOST_DISPLAY_NAMES.opencode,
           paths: nativeVaultHostPaths('opencode', env),
         },
         pi: {
           name: NATIVE_VAULT_HOST_NAMES.pi,
+          displayName: NATIVE_VAULT_HOST_DISPLAY_NAMES.pi,
           paths: nativeVaultHostPaths('pi', env),
         },
       },
