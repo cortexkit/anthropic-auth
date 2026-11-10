@@ -936,8 +936,8 @@ async function sendAnthropicRequest(
     attempt?: PiNativeAttempt,
     apiSubject?: NativeApiSubject,
   ): AnthropicBillingRequest | undefined => {
-    // Thalamus matches billing to session transcripts; Prime has no session
-    // and intentionally never emits a billing report.
+    // The session runner matches billing reports to session transcripts, and
+    // Prime is account-wide with no session, so it sends no billing report.
     if (options.prime || !relayAffinity || (!attempt && !apiSubject))
       return undefined
     const credentialId = attempt
