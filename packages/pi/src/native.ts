@@ -234,6 +234,8 @@ export class PiNativeRuntime {
       const decision = await decidePiStateLayout({
         paths,
         role: 'pi',
+        env,
+        requireExistingAuthority: true,
         onLockEvent: options.local?.onLockEvent,
       })
       return decision.registration

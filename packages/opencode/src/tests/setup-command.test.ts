@@ -9,6 +9,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   rm,
   stat,
   writeFile,
@@ -448,6 +449,7 @@ lifetimes.test(
       XDG_CONFIG_HOME: join(root, '.config'),
       XDG_DATA_HOME: join(root, '.local', 'share'),
       PI_CODING_AGENT_DIR: join(root, 'absent-pi'),
+      XDG_STATE_HOME: join(root, '.local', 'state'),
       OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE: join(
         root,
         'absent-connection',
@@ -506,8 +508,32 @@ lifetimes.test(
     // reported completion. The offline migration itself sent no token anywhere,
     // so the old unidentified login was never presented for lookup.
     expect(identityLookups).toEqual([FRESH_ACCESS])
+    // Setup decided the layout after the initial import probe. A reader opened
+    // after setup must use that decision, not the probe's legacy paths.
+    const completed = await resolveNativeSetupPaths('opencode', env)
+    expect(completed.paths.storageId).toBe(plan.paths.storageId)
+    expect(dirname(completed.paths.journal)).not.toBe(
+      dirname(plan.paths.journal),
+    )
+    const target = core.resolveStateHomeTarget({ env })
+    expect(target).toBeDefined()
+    expect(dirname(completed.paths.journal)).toBe(await realpath(target!.dir))
+    const marker = await core.readStateLayoutMarker(target!.dir)
+    expect(marker?.phase).toBe('committed')
+    expect(existsSync(plan.paths.journal)).toBe(false)
+    const legacyPointer = await core.readRelocationPointer(plan.paths.runtime)
+    expect(legacyPointer).toMatchObject({
+      relocatedTo: await realpath(target!.dir),
+      stateRoot: marker!.stateRoot,
+      identity: marker!.identity,
+      attempt: marker!.attempt,
+    })
+    expect(JSON.parse(await readFile(plan.paths.runtime, 'utf8'))).toEqual({
+      version: 0,
+      ...legacyPointer,
+    })
     const runtime = createNativeAccountRuntime({
-      paths: plan.paths,
+      paths: completed.paths,
       host: 'opencode',
       local: {
         refreshToken: async () => {
@@ -529,7 +555,7 @@ lifetimes.test(
         snapshot.accounts.find((account) => account.id === 'main')
           ?.accountIdentity,
       ).toBe(FRESH_UUID)
-      expect((await readNativeMigrationJournal(plan.paths))?.phase).toBe(
+      expect((await readNativeMigrationJournal(completed.paths))?.phase).toBe(
         'retired',
       )
       const authorized = await runtime.authorizeLocal('main')

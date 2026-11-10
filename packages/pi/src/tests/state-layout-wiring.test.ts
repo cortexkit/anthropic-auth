@@ -21,6 +21,7 @@ import {
   setRelocationMoveEnabledForTests,
 } from '@cortexkit/anthropic-auth-core'
 import { PiNativeRuntime } from '../native.ts'
+import { initializeNativePiFixture } from './native-fixture.ts'
 
 const cleanups: Array<() => unknown> = []
 
@@ -62,6 +63,9 @@ for (const moveEnabled of [false, true]) {
     await mkdir(dirname(routing), { recursive: true })
     await writeFile(routing, '{}\n', { flag: 'wx' })
     cleanups.push(() => rm(routing, { force: true }))
+    // The runtime registers only after a completed migration admits pool I/O.
+    // Keep this a serving case rather than an unmigrated refusal.
+    await initializeNativePiFixture(paths)
     const runtime = new PiNativeRuntime(join(agent, 'anthropic-auth.json'), {
       vaultPoll: { intervalMs: 0 },
     })

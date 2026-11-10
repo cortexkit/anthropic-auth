@@ -232,6 +232,44 @@ async function decide(
   })
 }
 
+test('an authority preflight refuses an unmigrated local dataset without locks or writes', async () => {
+  const m = await machine({ journal: false })
+  const before = await oldTree(m)
+  const names = (await readdir(m.configDir)).sort()
+  const locks: unknown[] = []
+  await expect(
+    decide(m, {
+      role: 'cli',
+      requireExistingAuthority: true,
+      onLockEvent: (event) => {
+        locks.push(event)
+      },
+    }),
+  ).rejects.toMatchObject({ code: 'migration-required' })
+  expect(locks).toEqual([])
+  expect(await oldTree(m)).toEqual(before)
+  expect((await readdir(m.configDir)).sort()).toEqual(names)
+  expect(await exists(m.sub)).toBe(false)
+})
+
+test('an authority preflight admits a migrated dataset whose journal has moved', async () => {
+  const m = await machine()
+  expect((await decide(m)).kind).toBe('state-home')
+  expect(await readNativeMigrationJournal(m.oldPaths)).toBeUndefined()
+  const admitted = await decide(m, {
+    role: 'cli',
+    requireExistingAuthority: true,
+  })
+  expect(admitted.kind).toBe('state-home')
+  if (admitted.kind !== 'state-home')
+    throw new Error('moved dataset was not admitted')
+  expect(admitted.moved).toBe(false)
+  expect(admitted.layout).toEqual({ kind: 'state-home', dir: m.sub })
+  expect((await readNativeMigrationJournal(m.newPaths))?.phase).toBe(
+    'committed',
+  )
+})
+
 function crashAt(step: StateLayoutStep) {
   return async (current: StateLayoutStep) => {
     if (current === step) throw new StateLayoutCrash(step)

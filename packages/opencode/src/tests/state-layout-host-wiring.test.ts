@@ -17,9 +17,11 @@ import {
   HOLDER_FILE_NAME,
   HOLDER_REGISTRATION_ERROR_MESSAGES,
   LEGACY_STATE_LAYOUT,
+  publishNativeEmptyInit,
   resetNativeHolderRegistryForTests,
   resetProcessStateLayoutsForTests,
   resetStateLayoutDecisionsForTests,
+  resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   resolveStateHomeTarget,
   setRelocationMoveEnabledForTests,
@@ -93,6 +95,24 @@ async function machine(moveEnabled: boolean) {
 
 type Machine = Awaited<ReturnType<typeof machine>>
 
+async function initializeAuthority() {
+  const paths = await resolveNativePoolPaths(
+    undefined,
+    undefined,
+    LEGACY_STATE_LAYOUT,
+  )
+  await publishNativeEmptyInit({
+    paths,
+    routingDestinationPath: resolveLocalRoutingDestination(
+      'opencode',
+      paths,
+      process.env,
+    ),
+    env: { ...process.env },
+    processFence: async () => {},
+  })
+}
+
 /** The state-home subfolder this config folder has, if any. */
 async function subfolder(m: Machine) {
   const parent = join(m.stateRoot, 'cortexkit', 'anthropic-auth')
@@ -163,12 +183,17 @@ for (const moveEnabled of [false, true]) {
 
   test(`the CLI decides the layout before its first pool read with moving ${label}`, async () => {
     const m = await machine(moveEnabled)
+    // A refused unmigrated command does no pool I/O and must not write a holder.
+    // Seed a completed migration journal so this case reaches its pool-read check.
+    await initializeAuthority()
     // The command stops at its first prompt, after it has opened the pool.
-    await relaySetup({
-      prompt: async () => {
-        throw new Error('stop here')
-      },
-    }).catch(() => {})
+    await expect(
+      relaySetup({
+        prompt: async () => {
+          throw new Error('stop here')
+        },
+      }),
+    ).rejects.toThrow('stop here')
     await expectDecided(m, 'cli', moveEnabled)
   })
 
@@ -194,6 +219,22 @@ for (const moveEnabled of [false, true]) {
     await expectDecided(m, 'setup', moveEnabled)
   })
 }
+
+test('the CLI authority preflight reads an already-moved dataset from state-home', async () => {
+  const m = await machine(true)
+  await initializeAuthority()
+  const setupDecision = await decideOpenCodeStateLayout({ role: 'setup' })
+  expect(setupDecision.kind).toBe('state-home')
+  resetDecisions()
+  await expect(
+    relaySetup({
+      prompt: async () => {
+        throw new Error('moved pool reached')
+      },
+    }),
+  ).rejects.toThrow('moved pool reached')
+  await expectDecided(m, 'cli', true)
+})
 
 test('OpenCode 2 refuses at setup with the fixed text of a layout refusal, naming no folder', async () => {
   const m = await machine(false)
@@ -259,12 +300,15 @@ function captured() {
 
 test('setup --restore-legacy refuses while a host runs, and otherwise dispatches to the restore and prints where the state went', async () => {
   const m = await machine(true)
-  // Move the empty dataset first, as a start with moving on does.
-  await relaySetup({
-    prompt: async () => {
-      throw new Error('stop here')
-    },
-  }).catch(() => {})
+  // Move a migrated empty dataset before testing restore.
+  await initializeAuthority()
+  await expect(
+    relaySetup({
+      prompt: async () => {
+        throw new Error('stop here')
+      },
+    }),
+  ).rejects.toThrow('stop here')
   const sub = await subfolder(m)
   if (!sub) throw new Error('the dataset was not moved')
   const running = captured()

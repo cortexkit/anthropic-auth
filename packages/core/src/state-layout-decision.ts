@@ -28,8 +28,11 @@ import {
   statePathOverrides,
 } from './layout-fence.ts'
 import { logger } from './logger.ts'
+import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import type { NativeLockEvent } from './native-lock-observer.ts'
+import { nativeVaultPaths } from './native-vault-paths.ts'
 import { ensureWindowsOwnerOnlyDirectory } from './owner-only.ts'
+import { requireNativePoolAuthority } from './pool-authority.ts'
 import {
   canonicalPath,
   type NativePoolPaths,
@@ -80,6 +83,7 @@ import {
   LEGACY_STATE_LAYOUT,
   readConfigDirMarker,
   readRelocationPointer,
+  readStateLayoutMarker,
   recordProcessStateLayout,
   type StateHomeTarget,
   type StateLayout,
@@ -154,6 +158,8 @@ export interface DecideStateLayoutOptions {
   role: HolderRole
   env?: NodeJS.ProcessEnv
   home?: string
+  /** Read-only local migration check before registration; offline setup omits it. */
+  requireExistingAuthority?: boolean
   /** Filesystem seam; `node:fs` for this platform otherwise. */
   fs?: StateLayoutFs
   liveness?: HolderLiveness
@@ -305,6 +311,65 @@ async function readRecord(sub: string) {
   } catch (error) {
     markerUnreadable(sub, error)
   }
+}
+
+/** Require a completed local migration journal without creating a holder file. */
+async function preflightExistingAuthority(
+  paths: NativePoolPaths,
+  host: 'opencode' | 'pi',
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  if ((await readNativeEnrollmentMode(host, env)) !== 'local') return
+  // Leave relocation and managed-folder refusals to normal admission. A missing
+  // legacy journal in those folders does not mean offline setup never ran.
+  const vault = nativeVaultPaths(paths, LEGACY_STATE_LAYOUT)
+  for (const runtime of [paths.runtime, vault.runtime])
+    if (await readRelocationPointer(runtime)) return
+  for (const dir of new Set(nativeHolderDatasetFiles(paths).map(dirname)))
+    if ((await readConfigDirMarker(dir)) || (await readStateLayoutMarker(dir)))
+      return
+  await requireNativePoolAuthority(paths)
+}
+
+async function preflightOpenCodeAuthority(
+  configDir: string,
+  env: NodeJS.ProcessEnv,
+  home: string,
+): Promise<void> {
+  if ((await readNativeEnrollmentMode('opencode', env)) !== 'local') return
+  if (!isExplicit(env)) {
+    const identity = configIdentity(configDir)
+    if (identity !== undefined) {
+      const target = stateHomeTargetFor(identity, { env, home })
+      // A move or restore can have removed the old journal. Let the layout
+      // decision validate/recover the record and select the authoritative copy.
+      const record = await readRecord(target.dir)
+      if (record?.phase === 'committed') {
+        const dataset = await resolveRelocationDataset({
+          configDir,
+          identity,
+          stateRoot: target.stateRoot,
+          sub: await canonicalPath(target.dir),
+        })
+        requireRecordMatches(record, dataset)
+        await requireNativePoolAuthority(dataset.newPaths)
+        return
+      }
+      if (!noMoveRecord(record)) return
+    }
+  }
+  const config =
+    env.OPENCODE_ANTHROPIC_AUTH_FILE?.trim() || join(configDir, ACCOUNT_FILE)
+  const state =
+    env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE?.trim() ||
+    (config.endsWith(ACCOUNT_FILE)
+      ? join(dirname(config), ACCOUNT_STATE_FILE)
+      : `${config}.state.json`)
+  await preflightExistingAuthority(
+    await resolveNativePoolPaths(config, state, LEGACY_STATE_LAYOUT),
+    'opencode',
+    env,
+  )
 }
 
 /** Register this process's use of `paths` while the caller holds `holderFile`'s lock. */
@@ -741,6 +806,8 @@ function stateFolderUnreadable(dir: string, cause: unknown): never {
  * neither copy may be served safely; the process must then do no pool I/O
  * for the dataset. `RelocatedError` is never thrown here: a dataset moved by
  * a newer version of the same layout rules is served from its new folder.
+ * With `requireExistingAuthority`, an unmigrated local dataset refuses with
+ * `NativeAuthorityError` before locks, registration or relocation writes.
  */
 export async function decideOpenCodeStateLayout(
   options: DecideStateLayoutOptions,
@@ -749,6 +816,8 @@ export async function decideOpenCodeStateLayout(
   const home = options.home ?? homedir()
   const fs = options.fs ?? defaultStateLayoutFs()
   const configDir = getOpenCodeConfigDir(env, home)
+  if (options.requireExistingAuthority)
+    await preflightOpenCodeAuthority(configDir, env, home)
   const newContext = (): StateLayoutTransitionContext => ({
     fs,
     stack: new StateLayoutLockStack(options.onLockEvent),
@@ -1293,7 +1362,19 @@ export function decideOpenCodeStateLayoutOnce(
 ): Promise<StateLayoutDecision> {
   const key = decisionKey(options)
   const known = processDecisions.get(key)
-  if (known) return known
+  if (known) {
+    if (!options.requireExistingAuthority) return known
+    return known.then(async (decision) => {
+      const env = options.env ?? process.env
+      const home = options.home ?? homedir()
+      await preflightOpenCodeAuthority(
+        getOpenCodeConfigDir(env, home),
+        env,
+        home,
+      )
+      return decision
+    })
+  }
   const decision = decideOpenCodeStateLayout(options)
   processDecisions.set(key, decision)
   decision.catch(() => {
@@ -1317,6 +1398,9 @@ export function resetStateLayoutDecisionsForTests(): void {
 export async function decidePiStateLayout(options: {
   paths: NativePoolPaths
   role: HolderRole
+  env?: NodeJS.ProcessEnv
+  /** Read-only local migration check before registration; offline setup omits it. */
+  requireExistingAuthority?: boolean
   onLockEvent?: (event: NativeLockEvent) => void
   liveness?: HolderLiveness
   lockTimeoutMs?: number
@@ -1329,6 +1413,12 @@ export async function decidePiStateLayout(options: {
   readonly layout: StateLayout
   readonly registration: NativeHolderRegistration
 }> {
+  if (options.requireExistingAuthority)
+    await preflightExistingAuthority(
+      options.paths,
+      'pi',
+      options.env ?? process.env,
+    )
   const registration = await registerNativePoolHolder({
     paths: options.paths,
     role: options.role,

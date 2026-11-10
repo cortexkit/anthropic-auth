@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, readFile, realpath } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { assertFreshOpenCode1Journal, sha256, snapshot } from './harness.mjs'
 
@@ -34,9 +34,57 @@ export async function verifySetupReaders({
   result,
   fixtureToken,
 }) {
-  const paths = await core.resolveNativePoolPaths(
-    join(env.OPENCODE_CONFIG_DIR, 'anthropic-auth.json'),
-    join(env.OPENCODE_CONFIG_DIR, 'anthropic-auth-state.json'),
+  // Read setup's committed layout without making a second process decide or
+  // change it. Core owns both the custom-config folder naming and the marker.
+  const target = core.resolveStateHomeTarget({ env, home: profile })
+  assert(target, 'Setup must leave an identifiable config folder')
+  const marker = await core.readStateLayoutMarker(target.dir)
+  assert(marker, 'Setup must publish its state-home layout marker')
+  assert.equal(marker.phase, 'committed')
+  assert.equal(marker.identity, target.identity)
+  assert.equal(marker.stateRoot, await realpath(target.stateRoot))
+  assert.equal(marker.sub, await realpath(target.dir))
+  const config = join(env.OPENCODE_CONFIG_DIR, 'anthropic-auth.json')
+  const state = join(env.OPENCODE_CONFIG_DIR, 'anthropic-auth-state.json')
+  const paths = await core.resolveNativePoolPaths(config, state, {
+    kind: 'state-home',
+    dir: marker.sub,
+  })
+  assert.equal(paths.storageId, marker.storageIds.local)
+  const legacy = await core.resolveNativePoolPaths(config, state, {
+    kind: 'legacy',
+  })
+  for (const key of ['journal', 'runtime']) {
+    assert.equal(dirname(paths[key]), marker.sub)
+  }
+  await assert.rejects(
+    lstat(legacy.journal),
+    { code: 'ENOENT' },
+    'Setup must not leave its journal in the config folder',
+  )
+  // Older readers must see the relocation tombstone, never a second account
+  // runtime.
+  const pointer = await core.readRelocationPointer(legacy.runtime)
+  assert(
+    pointer,
+    'Only a relocation tombstone may remain at the legacy runtime',
+  )
+  assert.equal(pointer.relocatedTo, marker.sub)
+  assert.equal(pointer.stateRoot, marker.stateRoot)
+  assert.equal(pointer.identity, marker.identity)
+  assert.equal(pointer.attempt, marker.attempt)
+  const pointerBytes = await api.readPrivateFile(legacy.runtime)
+  assert.deepEqual(JSON.parse(pointerBytes.toString('utf8')), {
+    version: 0,
+    ...pointer,
+  })
+  result.dacls['setup-runtime-pointer'] = await api.verifyOwnerOnly(
+    legacy.runtime,
+  )
+  assert.equal(result.dacls['setup-runtime-pointer'].ok, true)
+  result.files['setup-runtime-pointer'] = sha256(pointerBytes)
+  result.files['setup-layout'] = sha256(
+    await readFile(join(marker.sub, 'layout.json')),
   )
   const journal = await core.readNativeMigrationJournal(paths)
   assertFreshOpenCode1Journal(journal)
@@ -75,6 +123,14 @@ export async function verifySetupReaders({
   )
   result.files.profile = await snapshot(profile)
   return {
+    layout: {
+      phase: marker.phase,
+      location: 'state-home',
+      files: [basename(paths.journal), basename(paths.runtime)],
+      journalAbsentFromConfig: true,
+      legacyRuntime: 'matching relocation tombstone only; no account payload',
+      marker: 'layout.json',
+    },
     journal: 'setup-written v4 retired migration',
     runtime: 'setup-written empty runtime; private-files verified bytes',
     hostAuth: 'synthetic absent',

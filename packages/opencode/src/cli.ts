@@ -30,7 +30,10 @@ async function withNativeAccounts<T>(
   // decision also records that this command uses those files, so a later
   // version never moves them while it runs. It is made once per process.
   // A refusal reaches the failure handler, which prints its fixed text.
-  const decision = await decideOpenCodeStateLayoutOnce({ role: 'cli' })
+  const decision = await decideOpenCodeStateLayoutOnce({
+    role: 'cli',
+    requireExistingAuthority: true,
+  })
   const paths = await resolveNativePoolPaths(
     undefined,
     undefined,
