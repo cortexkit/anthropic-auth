@@ -2,11 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.9.0
 
 - Setup's offline recovery sign-in follows OpenCode's relocated state files, and commands that refuse an unmigrated install leave its files unchanged. Addresses #477.
 - **Update every OpenCode and Pi installation on the machine first, then restart the running hosts (including Thalamus-hosted servers).** Once no process is using the old files, OpenCode moves its machine-written account, vault, usage and session state out of the config folder into `~/.local/state/cortexkit/anthropic-auth/opencode/` (`%USERPROFILE%\.local\state\cortexkit\anthropic-auth\opencode\` on Windows); `XDG_STATE_HOME` replaces `~/.local/state` when set, and a custom config folder (including `OPENCODE_CONFIG_DIR`) uses `opencode-<16 hex sha256 of the config folder's real path>/`. Pi's files do not move. Before downgrading, quit every OpenCode and Pi and run `npx @cortexkit/opencode-anthropic-auth setup --restore-legacy` to put OpenCode's files back. The config folder keeps your settings (`anthropic-auth-pool.json`, `anthropic-auth-vault-settings.json`, `tui-preferences.jsonc`), legacy sign-in inputs (`anthropic-auth.json`, `anthropic-auth-state.json`) and local routing (`anthropic-auth-pool-routing-state.json`). The prompt-cache keep-warm session registry and restart records stay in the CortexKit data folder. Addresses #477.
 - After a plugin reload, the OpenCode TUI's `/claude` menu no longer briefly gets an "unauthorized" error or a dropped connection from the previous plugin instance.
+
 ## 2.8.0
 
 - On OpenCode 2, Claude models the plugin supports but OpenCode's own model list doesn't have yet (such as Fable 5.2 on launch day) now appear in the model picker, as on OpenCode 1.
