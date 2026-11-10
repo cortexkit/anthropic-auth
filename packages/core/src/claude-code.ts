@@ -14,6 +14,7 @@ import {
   resolveClaudeModelCapabilities,
   TURN_END_NOTE_BETA,
 } from './model-capabilities.ts'
+import { THINKING_BINDING_CONTROLS_BETA } from './thinking-binding.ts'
 
 export type ProviderAccountUuid = string & {
   readonly __providerAccountUuid: unique symbol
@@ -436,7 +437,7 @@ export function selectClaudeCodeBetas(
 
   // Auxiliary cache warms can replay the same binding controls as a real turn.
   if (isRecord(body?.thinking) && 'block_binding' in body.thinking)
-    selected.push('thinking-binding-controls-2026-08-01')
+    selected.push(THINKING_BINDING_CONTROLS_BETA)
 
   if (body && hasStructuredOutput(body)) {
     const index = selected.indexOf('cache-diagnosis-2026-04-07')
