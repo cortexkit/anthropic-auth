@@ -638,6 +638,15 @@ test('OC1 vault streamed error omits the send credential', async () => {
   expect(logged).not.toContain('exact=')
 })
 
+test('OC1 incomplete 200 is a retryable connection error instead of an empty reply', async () => {
+  const { owner, client } = await vaultFixture()
+  owner.network.current = async () => eventStream('')
+  const plugin = await createPlugin(owner, client)
+  const response = await sendNative(owner, plugin, 'oc1-incomplete')
+  expect(response.status).toBe(200)
+  await expect(response.text()).rejects.toMatchObject({ code: 'ECONNRESET' })
+})
+
 for (const ending of ['LF', 'CRLF'] as const) {
   test(`OC1 vault ${ending} success that quotes the credential stays byte-identical`, async () => {
     const { owner, client } = await vaultFixture()
@@ -740,7 +749,9 @@ for (const relay of [false, true]) {
           }),
         )
         .join('')
-      const bytes = new TextEncoder().encode(events)
+      const bytes = new TextEncoder().encode(
+        events + sse({ type: 'message_stop' }),
+      )
       return new Response(
         new ReadableStream<Uint8Array>({
           start(controller) {
@@ -774,7 +785,9 @@ for (const relay of [false, true]) {
         return text
           .split('\n')
           .filter((line) => line.startsWith('data: '))
-          .map((line) => JSON.parse(line.slice(6)).content_block.name)
+          .map((line) => JSON.parse(line.slice(6)))
+          .filter((event) => event.type === 'content_block_start')
+          .map((event) => event.content_block.name)
       }),
     )
     expect(names).toEqual([

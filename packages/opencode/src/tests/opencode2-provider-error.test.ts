@@ -370,6 +370,31 @@ test('OC2 stream error verdicts and classifier inputs omit the send credential',
   ])
 })
 
+for (const body of [
+  '',
+  sse({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }),
+]) {
+  test(`OC2 incomplete 200 reaches the host as a retryable connection error: ${JSON.stringify(body)}`, async () => {
+    const { source } = makeSource(oauthFor(ACCESS_A))
+    const native = own(createNativeAnthropicAdapter({ source }))
+    const attempt = await send(native.adapter, 'ses-incomplete')
+    const response = await respond(
+      native.adapter,
+      attempt,
+      new Response(body, {
+        headers: {
+          'content-type': 'text/event-stream',
+          'request-id': 'req_incomplete_oc2',
+        },
+      }),
+    )
+    await expect(response.text()).rejects.toMatchObject({
+      code: 'ECONNRESET',
+      diagnostics: { timing_source: 'credential_scope' },
+    })
+  })
+}
+
 test('OC2 streamed error frames reach the host scrubbed and success frames stay byte-identical', async () => {
   const { source } = makeSource(oauthFor(ACCESS_A))
   const native = own(createNativeAnthropicAdapter({ source }))
@@ -403,6 +428,18 @@ test('OC2 streamed error frames reach the host scrubbed and success frames stay 
   const visible = await visibleText(response)
   expectScrubbed(visible, [ACCESS_A])
   expect(visible).toContain('overloaded_error')
+})
+
+test('OC2 API incomplete 200 is retryable without rewriting complete success bytes', async () => {
+  const { source } = makeSource(() => ({
+    route: 'api',
+    headers: { 'x-api-key': API_KEY },
+    provenance: { receipt: 'api' },
+  }))
+  const native = own(createNativeAnthropicAdapter({ source }))
+  const attempt = await send(native.adapter, 'ses-api-incomplete')
+  const response = await respond(native.adapter, attempt, new Response(null))
+  await expect(response.text()).rejects.toMatchObject({ code: 'ECONNRESET' })
 })
 
 test('OC2 API-key route errors omit the paid key and its success bytes pass unchanged', async () => {

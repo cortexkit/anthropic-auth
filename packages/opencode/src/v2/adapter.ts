@@ -26,6 +26,8 @@ import {
   encodeGzipRequestBody,
   getRequestGzipLatch,
   getRequestGzipLatchPath,
+  guardAnthropicStreamResponse,
+  type IncompleteStreamDiagnostics,
   isDumpEnabled as isDumpEnabledCore,
   type MessageThreadRequest,
   MessageThreadTracker,
@@ -1833,18 +1835,46 @@ export function createNativeAnthropicAdapter<Q, P>(
       // Remove this send's secrets from provider errors before any other
       // reader; successful bytes pass through unchanged.
       const safe = scrubResponse(data, response)
+      let incompleteObserver:
+        | ReturnType<typeof createDumpResponseObserver>
+        | undefined
+      const onIncompleteStream = async (
+        diagnostics: IncompleteStreamDiagnostics,
+      ) => {
+        if (data) await dumpWrites.get(data)
+        if (incompleteObserver) {
+          incompleteObserver.fail(diagnostics)
+          await incompleteObserver.finish()
+          return
+        }
+        await dumpResponseArtifact(dumpHandle ?? null, {
+          status: response.status,
+          message: null,
+          complete: false,
+          incomplete_stream: diagnostics,
+        })
+      }
       // Only the OAuth route prefixes tool names, so only its responses are
       // mapped back. An API response reaches the host byte for byte.
       if (data?.route !== 'oauth' || !safe.body) {
-        return rewrittenFailure(data, safe)
+        return rewrittenFailure(
+          data,
+          data && modes.get(data) === 'event-stream'
+            ? guardAnthropicStreamResponse(safe, onIncompleteStream)
+            : safe,
+        )
       }
       const context = { ...contextOf(attempt, data), status: response.status }
       const options = source.responseOptions?.(context) ?? {}
-      const json = (response.headers.get('content-type') ?? '').includes(
-        'application/json',
-      )
+      const json = data
+        ? modes.get(data) === 'http'
+        : (response.headers.get('content-type') ?? '').includes(
+            'application/json',
+          )
       const baseStreamOptions = {
         ...options,
+        requireMessageStop: true,
+        onIncompleteStream,
         toolNameMap: data ? responseToolNameMaps.get(data) : undefined,
         onResponseFailure: failThread,
         // Unsafe response names depend on this request's tool declarations,
@@ -1872,6 +1902,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         handleForStream,
         statusForStream,
       )
+      incompleteObserver = dumpObserver
       const appendDumpWrite = (write: () => Promise<unknown>) => {
         const previous = dumpWrites.get(data) ?? Promise.resolve()
         const next: Promise<void> = previous

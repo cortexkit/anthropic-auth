@@ -1,3 +1,5 @@
+import { copyStreamResponseTiming } from './stream-completion.ts'
+
 /**
  * Where a Claude OAuth access token may be sent.
  *
@@ -109,7 +111,9 @@ export function createAnthropicOAuthFetch(
             : undefined
       signal?.throwIfAborted()
       requireAnthropicOAuthOrigin(fetchInputUrl(input), current())
-      return fetch(input, { ...init, redirect: 'error' })
+      const sentAt = performance.now()
+      const response = await fetch(input, { ...init, redirect: 'error' })
+      return copyStreamResponseTiming(response, response, sentAt)
     },
     {
       preconnect: (...args: Parameters<typeof fetch.preconnect>) => {

@@ -22,8 +22,10 @@ import {
   type ClaudeCodeIdentity,
   type ClaudeCodeRequestClass,
   countUserPrompts,
+  createAnthropicStreamCompletion,
   createSseFramer,
   FAST_MODE_BETA,
+  type IncompleteStreamDiagnostics,
   isClaudeFableOrMythos5Model,
   isClaudeHaiku55Model,
   isClaudeOpus5Model,
@@ -2367,13 +2369,29 @@ export function createStrippedStream(
     onRelayUpstreamError?: (status: RelayUpstreamStatus) => void
     onStreamEnd?: () => void | Promise<void>
     responseMode?: 'json'
+    /** Whole Anthropic responses must terminate with message_stop; fragment rewriting need not. */
+    requireMessageStop?: boolean
+    onIncompleteStream?: (
+      diagnostics: IncompleteStreamDiagnostics,
+    ) => void | Promise<void>
     laneStart?: boolean
     laneStartOAuthServed?: boolean
   } = {},
 ): Response {
-  if (!response.body) return response
+  const completion =
+    options.requireMessageStop && response.ok && options.responseMode !== 'json'
+      ? createAnthropicStreamCompletion(response)
+      : undefined
+  if (!response.body && !completion) return response
 
-  const reader = response.body.getReader()
+  const reader = (
+    response.body ??
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close()
+      },
+    })
+  ).getReader()
   const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
   const encoder = new TextEncoder()
   const jsonMode = options.responseMode === 'json'
@@ -2512,7 +2530,13 @@ export function createStrippedStream(
         try {
           const { done, value } = await reader.read()
           const readMs = rewriteRoundMs(rewriteNowMs() - readStart)
+          if (!done && value) completion?.push(value)
           if (done) {
+            const incomplete = completion?.finish()
+            if (incomplete) {
+              await options.onIncompleteStream?.(incomplete.diagnostics)
+              throw incomplete
+            }
             const finalDecoded = decoder.decode()
             if (sseDiagnostics && !jsonMode)
               updateSseDiagnostics(

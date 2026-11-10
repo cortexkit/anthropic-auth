@@ -31,6 +31,7 @@ import {
   type SseEvent,
   SseFrameTooLargeError,
 } from './sse.ts'
+import { copyStreamResponseTiming } from './stream-completion.ts'
 
 export interface ProviderErrorRedactor {
   /** Scrub credentials from error text. */
@@ -2181,6 +2182,7 @@ export function createProviderErrorResponseScope(
   secrets: readonly string[],
   mode: ProviderResponseMode,
 ): ProviderErrorResponseScope {
+  const sentAt = performance.now()
   if (mode !== 'event-stream' && mode !== 'http')
     throw new TypeError(
       "Provider error response scope mode must be 'event-stream' or 'http'",
@@ -2228,7 +2230,12 @@ export function createProviderErrorResponseScope(
       if (state.wrappedBodies === 0) retire('untouched')
       if (!(result instanceof Response))
         throw new TypeError('Provider error redactor expects a Response')
-      return result
+      return copyStreamResponseTiming(
+        response,
+        result,
+        sentAt,
+        'credential_scope',
+      )
     },
     redactError(error: unknown): unknown {
       return redactErrorWith(error, state)

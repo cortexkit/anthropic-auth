@@ -66,6 +66,55 @@ async function toolMapFor(...names: string[]): Promise<ToolNameMap> {
 const sse = (event: string, data: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 
+test.each([
+  '',
+  null,
+  sse('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn' },
+  }),
+  'data: {"type":"message_stop"}\n',
+])(
+  'OpenCode whole-response transform rejects incomplete 200: %j',
+  async (body) => {
+    const diagnostics: unknown[] = []
+    const failures: unknown[] = []
+    const response = createStrippedStream(new Response(body), {
+      requireMessageStop: true,
+      onIncompleteStream: (value) => {
+        diagnostics.push(value)
+      },
+      onResponseFailure: () => {
+        failures.push(true)
+      },
+    })
+    await expect(response.text()).rejects.toMatchObject({
+      code: 'ECONNRESET',
+      syscall: 'anthropic-sse',
+    })
+    expect(failures).toHaveLength(1)
+    expect(diagnostics).toHaveLength(1)
+    expect(diagnostics[0]).toMatchObject({
+      response_bytes: Buffer.byteLength(body ?? ''),
+    })
+  },
+)
+
+test('OpenCode whole-response transform accepts a completed empty reply and JSON mode', async () => {
+  const body = sse('message_stop', { type: 'message_stop' })
+  expect(
+    await createStrippedStream(new Response(body), {
+      requireMessageStop: true,
+    }).text(),
+  ).toBe(body)
+  expect(
+    await createStrippedStream(Response.json({ content: [] }), {
+      requireMessageStop: true,
+      responseMode: 'json',
+    }).json(),
+  ).toEqual({ content: [] })
+})
+
 describe('mergeHeaders', () => {
   test('copies headers from a Request object', () => {
     const request = new Request('https://example.com', {

@@ -13,6 +13,8 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
+  copyStreamResponseTiming,
+  createAnthropicStreamCompletion,
   createDumpResponseObserver,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
@@ -670,8 +672,12 @@ export function configureApiRouteHeaders(
 
 export async function* parseSse(
   response: Response,
+  completion?: ReturnType<typeof createAnthropicStreamCompletion>,
 ): AsyncGenerator<AnthropicEvent> {
-  if (!response.body) return
+  if (!response.body) {
+    completion?.end()
+    return
+  }
   const dumpObserver = dumpResponseObservers.get(response)
   const reader = response.body.getReader()
   // Core's byte framer ends frames at blank lines with CRLF, LF or CR line
@@ -686,7 +692,11 @@ export async function* parseSse(
   try {
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        completion?.end()
+        break
+      }
+      completion?.push(value)
       for (const frame of framer.push(value)) {
         const data = parseSseFrame(decodeSseFrame(frame, { streamStart })).data
         streamStart = false
@@ -793,6 +803,14 @@ async function sendAnthropicRequest(
   options.onCacheUsageRecorder?.(() => {})
   assertHostAuthorityStable()
   const fetchImpl = deps.fetch ?? globalThis.fetch
+  const fetchResponse = async (
+    input: Parameters<typeof fetch>[0],
+    init: Parameters<typeof fetch>[1],
+  ) => {
+    const sentAt = performance.now()
+    const response = await fetchImpl(input, init)
+    return copyStreamResponseTiming(response, response, sentAt)
+  }
   const keep = deps.cacheKeep ?? cacheKeepManager
   const native = deps.native ?? getPiNativeRuntime(options.storagePath)
   let dumpHandle: DumpHandle | null = null
@@ -1047,7 +1065,7 @@ async function sendAnthropicRequest(
       // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
       // the signed identity text for dumps and CacheKeep.
       if (options.apiAccount || typeof init.body !== 'string')
-        return scope.redactResponse(await fetchImpl(input, init))
+        return scope.redactResponse(await fetchResponse(input, init))
       return scope.redactResponse(
         await sendWithRequestGzip({
           url: input,
@@ -1060,7 +1078,7 @@ async function sendAnthropicRequest(
             await options.prime?.beforeSend()
             init.signal?.throwIfAborted()
             assertHostAuthorityStable()
-            return fetchImpl(input, {
+            return fetchResponse(input, {
               ...init,
               body: wireBody,
               headers: wireHeaders,
@@ -1424,7 +1442,7 @@ export async function firstStreamingError(
     release()
     return { response: replay(false), preflight: 'rate_limit_error' }
   }
-  const inspected = replay(true)
+  const inspected = copyStreamResponseTiming(response, replay(true))
   const dumpObserver = dumpResponseObservers.get(response)
   if (dumpObserver) dumpResponseObservers.set(inspected, dumpObserver)
   return { response: inspected, preflight: inspected }
@@ -2267,7 +2285,8 @@ export function streamCortexKitAnthropic(
       }
 
       const blocks = output.content as Block[]
-      for await (const event of parseSse(response)) {
+      const completion = createAnthropicStreamCompletion(response)
+      for await (const event of parseSse(response, completion)) {
         if (event.type === 'message_start') {
           recordCacheUsage?.(event.message?.usage)
           updateUsage(model, output, event.message?.usage)
@@ -2447,6 +2466,13 @@ export function streamCortexKitAnthropic(
       }
 
       if (options?.signal?.aborted) throw new Error('Request was aborted')
+      const incomplete = completion.finish()
+      if (incomplete) {
+        const observer = dumpResponseObservers.get(response)
+        observer?.fail(incomplete.diagnostics)
+        await observer?.finish()
+        throw incomplete
+      }
       if (output.errorMessage) throw new Error(output.errorMessage)
       for (const block of output.content as Block[]) delete block.index
       stream.push({

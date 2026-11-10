@@ -378,5 +378,11 @@ export * from './state-layout-errors.ts'
 export * from './state-layout-paths.ts'
 export * from './state-layout-restore.ts'
 export * from './sticky-routing.ts'
+export type { IncompleteStreamDiagnostics } from './stream-completion.ts'
+export {
+  copyStreamResponseTiming,
+  createAnthropicStreamCompletion,
+  guardAnthropicStreamResponse,
+} from './stream-completion.ts'
 export * from './thinking-binding.ts'
 export * from './turn-end-note.ts'

@@ -14,6 +14,10 @@ import { extractBillingHeaderCCH } from './cch.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
 import type { ProviderErrorSummary } from './provider-error.ts'
+import {
+  type IncompleteStreamDiagnostics,
+  safeIncompleteStreamDiagnostics,
+} from './stream-completion.ts'
 
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
 
@@ -801,6 +805,7 @@ export function createDumpResponseObserver(
   let message: Record<string, unknown> | undefined
   let complete = false
   let failed = false
+  let incomplete: IncompleteStreamDiagnostics | undefined
   const record = (value: unknown): Record<string, unknown> | undefined =>
     value && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>)
@@ -887,15 +892,17 @@ export function createDumpResponseObserver(
       }
     },
     replyTextEdges,
-    fail() {
+    fail(diagnostics?: IncompleteStreamDiagnostics) {
       failed = true
+      incomplete = diagnostics
     },
     async finish() {
-      if (!message) return
+      if (!message && !incomplete) return
       await dumpResponseArtifact(handle, {
         status,
         message,
         complete: complete && !failed,
+        incomplete_stream: incomplete,
         ...(complete ? { reply_text_edges: replyTextEdges() } : {}),
       })
     },
@@ -910,6 +917,7 @@ export async function dumpResponseArtifact(
     complete?: boolean
     provider_error?: ProviderErrorSummary['provider_error']
     reply_text_edges?: readonly ReplyTextEdge[]
+    incomplete_stream?: IncompleteStreamDiagnostics
   },
 ): Promise<void> {
   if (!handle) return
@@ -933,6 +941,10 @@ export async function dumpResponseArtifact(
   if (typeof message.stop_reason === 'string' && message.stop_reason.length > 0)
     artifact.stop_reason = message.stop_reason
   if (input.provider_error) artifact.provider_error = input.provider_error
+  if (input.incomplete_stream)
+    artifact.incomplete_stream = safeIncompleteStreamDiagnostics(
+      input.incomplete_stream,
+    )
   if (
     input.reply_text_edges &&
     input.complete !== false &&

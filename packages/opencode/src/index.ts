@@ -9358,6 +9358,24 @@ const anthropicAuthPlugin = async (
                   )
                 const dumpObserver = diagnosticsContext?.dumpObserver
                 const wrapped = createStrippedStream(response, {
+                  requireMessageStop: true,
+                  onIncompleteStream: async (diagnostics) => {
+                    await diagnosticsContext?.dumpWrite
+                    if (dumpObserver) {
+                      dumpObserver.fail(diagnostics)
+                      await dumpObserver.finish()
+                      return
+                    }
+                    await dumpResponseArtifact(
+                      diagnosticsContext?.dump ?? null,
+                      {
+                        status: response.status,
+                        message: null,
+                        complete: false,
+                        incomplete_stream: diagnostics,
+                      },
+                    )
+                  },
                   toolNameMap: diagnosticsContext?.toolNameMap,
                   onSseEvent: dumpObserver?.observe,
                   onResponseFailure: diagnosticsContext?.failThread,

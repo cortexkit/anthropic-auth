@@ -4,6 +4,7 @@ import { logger } from './logger.ts'
 import type { NativeLocalPoolBinding } from './pool-binding.ts'
 import { isServerFallbackUsageMarker } from './server-fallback-usage.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
+import { copyStreamResponseTiming } from './stream-completion.ts'
 
 export const MESSAGE_THREADS_BETA = 'message-threads-2026-08-12'
 const MAX_AGE_MS = 5 * 60_000
@@ -878,48 +879,51 @@ export function observeMessageThreadResponse(
       facts.rewritten = true
     }
   }
-  return new Response(
-    new ReadableStream<Uint8Array>(
-      {
-        async pull(controller) {
-          try {
-            const chunk = await reader.read()
-            if (chunk.done) {
-              // An unterminated EOF tail is not a completed SSE event.
-              if (inspecting && framer.finish()) facts.rewritten = true
+  return copyStreamResponseTiming(
+    response,
+    new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            try {
+              const chunk = await reader.read()
+              if (chunk.done) {
+                // An unterminated EOF tail is not a completed SSE event.
+                if (inspecting && framer.finish()) facts.rewritten = true
+                if (inspecting) {
+                  facts.replyFingerprint = reply.digest()
+                  prepared.complete(facts)
+                }
+                controller.close()
+                return
+              }
               if (inspecting) {
-                facts.replyFingerprint = reply.digest()
-                prepared.complete(facts)
+                try {
+                  for (const frame of framer.push(chunk.value)) parse(frame)
+                } catch {
+                  inspecting = false
+                  prepared.fail('response_rewritten')
+                }
               }
-              controller.close()
-              return
+              controller.enqueue(chunk.value)
+            } catch (error) {
+              prepared.fail('stream_error')
+              controller.error(error)
             }
-            if (inspecting) {
-              try {
-                for (const frame of framer.push(chunk.value)) parse(frame)
-              } catch {
-                inspecting = false
-                prepared.fail('response_rewritten')
-              }
-            }
-            controller.enqueue(chunk.value)
-          } catch (error) {
-            prepared.fail('stream_error')
-            controller.error(error)
-          }
+          },
+          cancel(reason) {
+            prepared.fail('stream_cancelled')
+            return reader.cancel(reason)
+          },
         },
-        cancel(reason) {
-          prepared.fail('stream_cancelled')
-          return reader.cancel(reason)
-        },
+        { highWaterMark: 0 },
+      ),
+      {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
       },
-      { highWaterMark: 0 },
     ),
-    {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    },
   )
 }
 

@@ -271,6 +271,43 @@ async function allDumpText() {
 }
 
 describe('opencode2 request dumps', () => {
+  test('incomplete 200 diagnostics preserve partial message identity and usage', async () => {
+    const events = [
+      {
+        type: 'message_start',
+        message: {
+          id: 'msg_incomplete',
+          content: [],
+          usage: { input_tokens: 3 },
+        },
+      },
+      {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { output_tokens: 2 },
+      },
+    ]
+    await driveDirect({
+      enabled: true,
+      payload: { model: 'claude-sonnet-5', stream: true, messages: [] },
+      upstreamSse: events
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(''),
+    })
+    const { files } = await allDumpText()
+    const responsePath = files.find((name) => name.endsWith('.response.json'))!
+    const summary = JSON.parse(
+      await readFile(join(dumpDir, responsePath), 'utf8'),
+    )
+    expect(summary).toMatchObject({
+      stream_complete: false,
+      message_id: 'msg_incomplete',
+      usage: { input_tokens: 3, output_tokens: 2 },
+      incomplete_stream: { sse_events: 2, timing_source: 'credential_scope' },
+    })
+    expect(summary).not.toHaveProperty('reply_text_edges')
+  })
+
   test('malformed stream after message_delta preserves an incomplete summary', async () => {
     const events = [
       {

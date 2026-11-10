@@ -13,6 +13,7 @@ import {
   sessionCacheActivity,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
+import { isRetryableAssistantError } from '@earendil-works/pi-ai/compat'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { getPiNativeRuntime } from '../native.ts'
 import {
@@ -171,6 +172,108 @@ afterEach(async () => {
   if (tempDir) await rm(tempDir, { recursive: true, force: true })
   tempDir = undefined
 })
+
+test.each(['empty', 'bodyless', 'partial', 'unterminated stop'])(
+  'Pi incomplete 200 is retryable and never an empty stop: %s',
+  async (scenario) => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-incomplete-'))
+    const storagePath = join(tempDir, 'accounts.json')
+    const dumpDir = join(tempDir, 'dumps')
+    const previousDumpDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumpDir
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    try {
+      await saveNativePiFixture(
+        {
+          version: 1,
+          main: { type: 'opencode', provider: 'anthropic' },
+          accounts: [],
+          dump: { enabled: true },
+          quota: { enabled: false },
+        },
+        storagePath,
+      )
+      const frame = (event: unknown) => `data: ${JSON.stringify(event)}\n\n`
+      const body =
+        scenario === 'partial'
+          ? frame({
+              type: 'message_start',
+              message: { id: 'msg_partial', content: [] },
+            }) +
+            frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })
+          : scenario === 'unterminated stop'
+            ? 'data: {"type":"message_stop"}\n'
+            : ''
+      globalThis.fetch = mock(async (input: string | URL | Request) => {
+        if (input.toString().includes('/api/claude_cli/bootstrap'))
+          return Response.json({
+            oauth_account: { account_uuid: 'pi-incomplete' },
+          })
+        return new Response(scenario === 'bodyless' ? null : body, {
+          headers: {
+            'request-id': 'req_incomplete_pi',
+            'cf-ray': '1234567890abcdef-LHR',
+            'content-type': 'text/event-stream',
+            'content-encoding': 'identity',
+            'content-length': String(Buffer.byteLength(body)),
+            'x-private': 'private prompt must not be retained',
+          },
+        })
+      }) as unknown as typeof fetch
+      const stream = streamCortexKitAnthropic(
+        anthropicModel,
+        anthropicContext,
+        {
+          sessionId: `ses_incomplete_${scenario}`,
+          apiKey: 'sk-ant-oat-incomplete',
+        },
+      )
+      const emitted = []
+      for await (const event of stream) emitted.push(event)
+      const result = await stream.result()
+      expect(result.stopReason).toBe('error')
+      expect(result.errorMessage).toContain('ECONNRESET')
+      expect(isRetryableAssistantError(result)).toBe(true)
+      expect(emitted.some((event) => event.type === 'done')).toBe(false)
+      const file = (await readdir(dumpDir)).find((name) =>
+        name.endsWith('.response.json'),
+      )!
+      const summary = JSON.parse(await readFile(join(dumpDir, file), 'utf8'))
+      expect(summary.stream_complete).toBe(false)
+      expect(summary.incomplete_stream).toEqual({
+        response_headers: {
+          'request-id': 'req_incomplete_pi',
+          'cf-ray': '1234567890abcdef-LHR',
+          'content-type': 'text/event-stream',
+          'content-encoding': 'identity',
+          'content-length': String(Buffer.byteLength(body)),
+        },
+        response_bytes: Buffer.byteLength(body),
+        sse_events: scenario === 'partial' ? 2 : 0,
+        send_to_headers_ms: expect.any(Number),
+        timing_source: 'physical_fetch',
+        headers_to_eof_ms: expect.any(Number),
+      })
+      const warnings = records.filter(
+        (record) =>
+          record.level === 'warn' &&
+          record.message === 'Anthropic connection closed before message_stop',
+      )
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]?.payload).toEqual(summary.incomplete_stream)
+      expect(JSON.stringify([summary, warnings])).not.toContain(
+        'private prompt',
+      )
+    } finally {
+      resetDumpState()
+      if (previousDumpDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDumpDir
+    }
+  },
+)
 
 describe('Pi stream stop reasons', () => {
   const refusal = 'Claude refused this request (stop_reason: refusal).'
