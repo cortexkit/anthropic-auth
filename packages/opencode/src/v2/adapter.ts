@@ -5,7 +5,7 @@
 // including HTTP relay responses. Only a rejected message-thread continuation
 // is resent here, once as a full create, before the host reads any bytes.
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   type AnthropicBillingRequest,
   AnthropicOAuthOriginError,
@@ -1709,7 +1709,10 @@ export function createNativeAnthropicAdapter<Q, P>(
             billingSends.set(data, {
               input: {
                 ...metadata,
-                attemptId: attempt.attemptId,
+                // The host's attempt id is a counter that restarts with each
+                // plugin load, so it repeats across server restarts. A billing
+                // report's id must be unique per provider attempt for good.
+                attemptId: randomUUID(),
                 model:
                   isRecord(payload) && typeof payload.model === 'string'
                     ? payload.model

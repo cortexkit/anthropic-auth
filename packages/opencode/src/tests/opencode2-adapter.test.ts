@@ -548,7 +548,9 @@ test.each(['completed', 'cut', 'failed', 'transport'] as const)(
       expect(reports).toHaveLength(1)
       expect(reports[0]).toMatchObject({
         kind: 'billing',
-        attempt_id: attempt.attemptId,
+        attempt_id: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        ),
         credential_id: 'local:acct-local',
         account_id: ACCOUNT_UUID,
         outcome: outcome === 'transport' ? 'failed' : outcome,
@@ -567,6 +569,50 @@ test.each(['completed', 'cut', 'failed', 'transport'] as const)(
     }
   },
 )
+
+test('billing attempt ids never repeat across plugin loads', async () => {
+  const reports: Record<string, unknown>[] = []
+  globals[routingKey] = () => ({
+    report: (payload: Record<string, unknown>) => reports.push(payload),
+  })
+  const hostAttemptIds: string[] = []
+  // Two plugin loads stand in for a server restart: each host numbers its
+  // attempts from 1 again, so their host attempt ids are equal.
+  for (let load = 0; load < 2; load++) {
+    const { source } = makeSource({
+      billingRequest: (input) => ({
+        sessionId: input.sessionID,
+        credentialId: input.provenance.receipt,
+        accountId: ACCOUNT_UUID,
+        model: input.modelID,
+        requestKind: input.kind,
+      }),
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    try {
+      const host = new Host(native.adapter)
+      const { attempt, final } = await host.run(
+        scopeOf(),
+        hostRequest(sonnetPayload()),
+      )
+      hostAttemptIds.push(attempt.attemptId)
+      const response = await native.adapter.rewriteResponse?.({
+        ...attempt,
+        request: final,
+        response: sseResponse(PREFIXED_STREAM.join('')),
+        attempt,
+      })
+      await response?.text()
+      await native.adapter.onAttemptEnd?.(attempt, { outputStarted: true })
+      await Bun.sleep(10)
+    } finally {
+      native.dispose()
+    }
+  }
+  expect(hostAttemptIds[0]).toBe(hostAttemptIds[1])
+  expect(reports).toHaveLength(2)
+  expect(reports[0]?.attempt_id).not.toBe(reports[1]?.attempt_id)
+})
 
 type InspectedBody = Record<string, unknown> & {
   tools: Array<{ name: string }>
