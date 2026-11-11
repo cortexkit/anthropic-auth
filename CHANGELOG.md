@@ -4,10 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- OpenCode 2 hosted by Thalamus now gives each billing report its own unique id. Reports after a server restart reused earlier ids, so Thalamus dropped them as repeats.
 - Pi hosted by Thalamus now reports confirmed Claude account limits and successful requests to shared routing, so capped accounts are avoided after failover.
 - OpenCode no longer reports an unconfirmed rate limit to shared routing as a weekly limit.
 - OpenCode 2 and Pi hosted by Thalamus now say with each completed Claude model request whether keep-warm is on for the session, or why it stopped.
-- OpenCode 2 hosted by Thalamus now gives each billing report its own unique id. Reports after a server restart reused earlier ids, so Thalamus dropped them as repeats.
 ## 2.10.0
 
 - Approving the plugin in the vault now also grants access to its Claude accounts, so vault setup no longer needs a separate grant step on vaults that support it.
