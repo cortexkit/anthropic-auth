@@ -252,6 +252,8 @@ test.each([
       for await (const event of stream) emitted.push(event)
       const result = await stream.result()
       expect(result.stopReason).toBe('error')
+      if (scenario.startsWith('partial'))
+        expect(result.responseId).toBe('msg_partial')
       expect(result.errorMessage).toContain('ECONNRESET')
       expect(isRetryableAssistantError(result)).toBe(true)
       expect(emitted.some((event) => event.type === 'done')).toBe(false)

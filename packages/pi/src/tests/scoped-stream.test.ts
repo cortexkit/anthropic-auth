@@ -61,6 +61,7 @@ import {
 import {
   __prewarmPiCacheKeepForTest,
   __sendPiAnthropicRequestForTest,
+  forgetPiMessageThread,
   startPiCacheKeepSession,
   stopPiCacheKeep,
   streamCortexKitAnthropic,
@@ -1823,6 +1824,60 @@ registerTest.each([200, 401])(
   }),
 )
 
+test('Pi streamed responseId matches its billing report', async () => {
+  await fixture()
+  const billing = captureBilling()
+  globalThis.fetch = Object.assign(
+    async () =>
+      new Response(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_stream_billing","usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+        { headers: { 'content-type': 'text/event-stream' } },
+      ),
+    { preconnect: originalFetch.preconnect },
+  )
+  const result = await streamCortexKitAnthropic(model, context, {
+    sessionId: 'pi-stream-response-id',
+  }).result()
+  await Bun.sleep(10)
+  expect(result.stopReason).toBe('stop')
+  expect(billing.reports).toHaveLength(1)
+  expect(billing.reports[0]?.provider_response_id).toBe('msg_stream_billing')
+  expect(result.responseId).toBe('msg_stream_billing')
+  expect(billing.reports[0]?.provider_response_id).toBe(result.responseId)
+})
+
+test('Pi retains responseId when a stream is aborted after message_start', async () => {
+  await fixture()
+  const controller = new AbortController()
+  globalThis.fetch = Object.assign(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(body) {
+            body.enqueue(
+              new TextEncoder().encode(
+                'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_aborted"}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+              ),
+            )
+            controller.signal.addEventListener('abort', () => body.close())
+          },
+        }),
+        { headers: { 'content-type': 'text/event-stream' } },
+      ),
+    { preconnect: originalFetch.preconnect },
+  )
+  const stream = streamCortexKitAnthropic(model, context, {
+    sessionId: 'pi-stream-response-id-aborted',
+    signal: controller.signal,
+  })
+  for await (const event of stream) {
+    if (event.type === 'text_start') controller.abort()
+  }
+  const result = await stream.result()
+  expect(result.stopReason).toBe('aborted')
+  expect(result.responseId).toBe('msg_aborted')
+})
+
 test('Pi bills each failed and retried physical send with its actual vault payer', async () => {
   const f = await fixture()
   const billing = captureBilling()
@@ -3053,6 +3108,19 @@ for (const [transport, credentialSource] of [
       (message) => message.role === 'assistant',
     )
     if (!replay) throw new Error('Missing assistant fixture')
+    forgetPiMessageThread(primarySession)
+    await (await send(threadContext)).text()
+    const withResponseId: Context = {
+      ...history,
+      messages: history.messages.map((message) =>
+        message.role === 'assistant'
+          ? { ...message, responseId: 'msg_pi_thread' }
+          : message,
+      ),
+    }
+    await (await send(withResponseId)).text()
+    expect(sent.at(-1)?.text).toBe(sent[1]?.text)
+    expect(JSON.parse(sent.at(-1)?.text ?? '{}').thread.type).toBe('continue')
     for (const code of [
       'thread_not_found',
       'thread_fingerprint_mismatch',

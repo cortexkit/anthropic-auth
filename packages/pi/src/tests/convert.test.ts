@@ -79,6 +79,35 @@ async function buildMessages(
   return body.messages
 }
 
+test('assistant responseId does not change serialized request bytes', async () => {
+  const messages = [
+    userMsg('Hello'),
+    assistantMsg('I will use a tool.'),
+    userMsg('Please continue.'),
+    toolCallMsg('tool-1', 'read', { path: 'notes.txt' }),
+    toolResultMsg('tool-1', 'Contents'),
+    assistantMsg('Here is the result.'),
+    userMsg('Thanks'),
+  ]
+  const build = async (history: Message[]) =>
+    (
+      await buildAnthropicRequest(
+        TEST_MODEL_ID,
+        { messages: history, tools: [] } as Context,
+        undefined,
+        defaultCache,
+      )
+    ).bodyText
+  const withResponseIds = messages.map((message, index) =>
+    message.role === 'assistant'
+      ? { ...message, responseId: `msg_history_${index}` }
+      : message,
+  )
+  const original = await build(messages)
+  expect(original).toContain('Here is the result.')
+  expect(await build(withResponseIds)).toBe(original)
+})
+
 describe('fast mode model eligibility', () => {
   test.each([
     ['claude-opus-4-6', false],

@@ -638,7 +638,7 @@ type AnthropicEvent = {
   content_block?: Record<string, unknown>
   delta?: Record<string, unknown>
   error?: Record<string, unknown>
-  message?: { usage?: Record<string, number> }
+  message?: { id?: string; usage?: Record<string, number> }
   usage?: Record<string, number>
 }
 
@@ -2411,6 +2411,7 @@ export function streamCortexKitAnthropic(
       const completion = createAnthropicStreamCompletion(response)
       for await (const event of parseSse(response, completion)) {
         if (event.type === 'message_start') {
+          output.responseId = event.message?.id
           recordCacheUsage?.(event.message?.usage)
           updateUsage(model, output, event.message?.usage)
         } else if (event.type === 'content_block_start') {
