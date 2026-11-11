@@ -81,8 +81,8 @@
     "@cortexkit/claustrum-client": "0.18.0",
     "@cortexkit/private-files": "0.2.2",
     "@cortexkit/subc-client": "^0.24",
-    "@opentui/core": "0.8.1",
-    "@opentui/solid": "0.8.1",
+    "@opentui/core": "0.8.3",
+    "@opentui/solid": "0.8.3",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.18",
     "xxhash-wasm": "^1.1.0"
@@ -90,6 +90,6 @@
   "devDependencies": {
     "@ai-sdk/anthropic": "4.0.94",
     "@cortexkit/opencode-sidebar": "0.1.0",
-    "@opencode/plugin": "2.2.5"
+    "@opencode/plugin": "2.2.6"
   }
 }
