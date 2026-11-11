@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  type AnthropicBillingWarming,
   type CacheKeepFailureStage,
   CacheKeepManager,
   type CacheKeepPrewarmAttempt,
@@ -1037,7 +1038,10 @@ export function createNativeCacheKeep(
      * API-key routes are never warmed; an older shared manager without the
      * reader leaves the state undecided.
      */
-    warming(input: { sessionID: string; route: string }) {
+    warming(input: {
+      sessionID: string
+      route: string
+    }): AnthropicBillingWarming | undefined {
       if (input.route !== 'oauth') return { on: false as const }
       return manager.warming?.(input.sessionID)
     },
