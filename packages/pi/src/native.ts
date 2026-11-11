@@ -172,6 +172,7 @@ export interface PiVaultPollOptions {
 }
 
 export class PiNativeRuntime {
+  private publishedRuntime?: NativeAccountRuntime
   private readonly pendingReports = new Set<Promise<void>>()
 
   /** Join started failure reports, never model sends waiting for headers. */
@@ -285,6 +286,7 @@ export class PiNativeRuntime {
         // the next poll or a request's bounded refresh retries it.
         void this.vaultWatch.ready.catch(() => {})
       }
+      this.publishedRuntime = runtime
       return runtime
     })
     // Initialization is lazy from the host's perspective; a path failure is
@@ -298,6 +300,11 @@ export class PiNativeRuntime {
     const runtime = await this.initialization
     if (this.closed) throw new Error('Pi native authentication is closed')
     return runtime
+  }
+
+  /** Inspect only a completed runtime read; initialization is never awaited. */
+  peek(): NativeAccountSnapshot | undefined {
+    return this.closed ? undefined : this.publishedRuntime?.peek?.()
   }
 
   async routingPath(): Promise<string> {
@@ -570,6 +577,16 @@ export class PiNativeRuntime {
     })()
     return this.closing
   }
+}
+
+/** Inspect an existing context without creating a runtime or starting its I/O. */
+export function peekPiNativeSnapshot(
+  storagePath = getPiAccountStoragePath(),
+): NativeAccountSnapshot | undefined {
+  const contextKey = runtimeCacheKey(storagePath)
+  return [...runtimes.values()]
+    .find((entry) => entry.contextKey === contextKey)
+    ?.runtime.peek()
 }
 
 export function getPiNativeRuntime(

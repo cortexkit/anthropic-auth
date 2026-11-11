@@ -178,6 +178,7 @@ import {
   parsePrimeCommandAction,
   parseRoutingCommandAction,
   parseSseFrame,
+  peekRoutingAccount,
   prepareMessageThreadRequest,
   QUOTA_HEADER_FEED_SCHEMA_VERSION,
   type QuotaAccountSummary,
@@ -202,6 +203,7 @@ import {
   readNativeMigrationJournal,
   readSessionCachePolicy,
   refreshBackoffActive,
+  remapModelId,
   remapRequestBodyModel,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
@@ -3739,6 +3741,17 @@ const anthropicAuthPlugin = async (
   const cacheKeepSourceCopies = new Map<string, FableSourceWarmKeep>()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    peekRoutingAccount: (_target, { sessionId, modelId }) => {
+      const snapshot = nativeAccounts.peek?.()
+      return peekRoutingAccount({
+        snapshot,
+        router: snapshot?.routingPath
+          ? stickySessionRouters.get(snapshot.routingPath)
+          : undefined,
+        sessionId,
+        modelId: modelId ? remapModelId(modelId) : undefined,
+      })
+    },
     // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
     fetchImpl: fetchOAuth,
     setIntervalImpl: runtimeTimers.setInterval,

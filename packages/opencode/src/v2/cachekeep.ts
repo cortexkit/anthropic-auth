@@ -701,6 +701,16 @@ export function createNativeCacheKeep(
     try {
       const snapshot = await runtime.read()
       dispatchStorage = snapshot.policyStorage
+      const sessionId = target.policyState?.ownerSessionId ?? target.id
+      const sessionBody = manager.trackedRequest(sessionId)?.bodyText
+      const modelId = sessionBody
+        ? (JSON.parse(sessionBody) as { model?: string }).model
+        : body.model
+      const routed = manager.trackedRequest(target.id)
+        ? source.peekAccount?.(sessionId, modelId, snapshot)
+        : undefined
+      if (routed !== undefined && routed !== (target.oauthAccountId ?? 'main'))
+        throw new CacheKeepWarmRefusal('routing-moved')
       const accountId = snapshot.accounts.find(
         (account) => accountKey(account) === target.oauthAccountIdentity,
       )?.id

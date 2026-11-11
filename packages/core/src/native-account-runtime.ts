@@ -190,6 +190,8 @@ export interface NativeAccountRuntime {
   getRelayConfig(): Promise<RelayConfig | null>
   updateRelay(patch: NativeRelayUpdate): Promise<void>
   read(): Promise<NativeAccountSnapshot>
+  /** Last completed read, without disk I/O or credential/quota work. */
+  peek?(): NativeAccountSnapshot | undefined
   authorizeLocal(
     routeId: string,
     options?: NativeLocalAuthorizeOptions,
@@ -337,6 +339,7 @@ export function acquireNativeAccountRuntime(
     getSettingsPath: () => use().getSettingsPath(),
     updateRelay: (patch) => use().updateRelay(patch),
     read: () => use().read(),
+    peek: () => use().peek?.(),
     authorizeLocal: (id, request) => use().authorizeLocal(id, request),
     authorizeApi: (id, signal) => use().authorizeApi(id, signal),
     authorizeVault: (id, signal) => use().authorizeVault(id, signal),
@@ -915,6 +918,7 @@ export function createNativeAccountRuntime(
       runtime: NativeRuntimeState | undefined
     }
   >()
+  let lastSnapshot: NativeAccountSnapshot | undefined
   function awaitsTornWrite(snapshot: NativeAccountSnapshot, routeId: string) {
     const source = projectedFrom.get(snapshot)
     return (
@@ -1079,8 +1083,10 @@ export function createNativeAccountRuntime(
     async read() {
       const view = await readView()
       projectedFrom.set(view.snapshot, view)
+      lastSnapshot = view.snapshot
       return view.snapshot
     },
+    peek: () => lastSnapshot,
     async authorizeLocal(routeId, request = {}) {
       await authority(request.signal)
       let snapshot = await runtime.read()

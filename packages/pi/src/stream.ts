@@ -118,6 +118,7 @@ import {
   getPiNativeRuntime,
   type PiNativeAttempt,
   type PiNativeRuntime,
+  peekPiNativeSnapshot,
   piAttemptAccessToken,
 } from './native.ts'
 import { getPiAccountStoragePath } from './paths.ts'
@@ -527,6 +528,15 @@ const piCacheKeep = new PiCacheKeep(
         )
       ).storageId,
     read: (storagePath) => getPiNativeRuntime(storagePath).view(),
+    routing: (storagePath) => {
+      const snapshot = peekPiNativeSnapshot(storagePath)
+      return {
+        snapshot,
+        router: snapshot?.routingPath
+          ? stickyRouters.get(snapshot.routingPath)
+          : undefined,
+      }
+    },
   },
 )
 const cacheKeepManager = piCacheKeep.manager

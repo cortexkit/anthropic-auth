@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, mock } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   __setLogTestSink,
   type AccountStorage,
+  CacheKeepManager,
   type CommandApplyRequest,
   type CommandApplyResult,
   getDumpDirectory,
@@ -28,6 +29,7 @@ import {
   createFallbackStorage,
   getPlugin as getPluginWithCtx,
   syntheticMainHostAuth,
+  updatePoolSettings,
   useTempAccountFile as useTempAccountFileWithCtx,
   withNativeAdmission as withNativeAdmissionWithCtx,
 } from './support/opencode1-pool-fixture.ts'
@@ -82,6 +84,84 @@ function applyMenuAction(
 
 describe('auth.loader', () => {
   installLoaderSetup(testContext)
+
+  test('OC1 routing-moved stops an old-account warm before the next real turn', async () => {
+    let now = Date.now()
+    Date.now = mock(() => now)
+    const intervals: Array<() => unknown> = []
+    testContext.pluginRuntimeOverrides = {
+      setInterval: ((callback: () => unknown) => {
+        intervals.push(callback)
+        return { unref() {} } as ReturnType<typeof setInterval>
+      }) as typeof setInterval,
+      clearInterval: (() => {}) as typeof clearInterval,
+    }
+    const window = { remainingPercent: 80, usedPercent: 20, checkedAt: now }
+    await useTempAccountFile(
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          refresh: { enabled: false },
+          quota: {
+            enabled: false,
+            mainQuota: { five_hour: window, seven_day: window },
+          },
+          claudeCache: { enabled: true, mode: 'hybrid' },
+          cacheKeep: { enabled: true, always: true },
+        }),
+      ),
+    )
+    const requests: Headers[] = []
+    const records: LogTestRecord[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission((_input: any, init: RequestInit) => {
+        requests.push(new Headers(init.headers))
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ usage: { cache_read_input_tokens: 1 } }),
+            { status: 200 },
+          ),
+        )
+      }),
+    ) as unknown as typeof fetch
+    __setLogTestSink((record) => records.push(record))
+    const ticking = spyOn(CacheKeepManager.prototype, 'tick')
+    try {
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () => Promise.resolve({ ...syntheticMainHostAuth(), type: 'oauth' }),
+        { models: {} },
+      )
+      await (
+        await result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': 'ses-routing-moved' },
+          body: JSON.stringify({
+            model: 'claude-opus-4-8',
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        })
+      ).text()
+      expect(requests[0]?.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-fallback-access',
+      )
+      await updatePoolSettings(testContext, (settings) => ({
+        ...settings,
+        routing: { mode: 'main-first' },
+      }))
+      now += 55 * 60_000
+      intervals.at(-1)?.()
+      await ticking.mock.results.at(-1)?.value
+      expect(requests).toHaveLength(1)
+      const stopped = records.filter(
+        (record) => record.message === 'stopped warming session',
+      )
+      expect(stopped).toHaveLength(1)
+      expect(stopped[0]?.payload).toMatchObject({ reason: 'routing-moved' })
+    } finally {
+      ticking.mockRestore()
+    }
+  })
 
   test('cachekeep lists tracked sessions across OpenCode plugin instances', async () => {
     const nowHour = new Date().getHours()

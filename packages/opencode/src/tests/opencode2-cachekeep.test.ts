@@ -31,6 +31,8 @@ import {
   RequestGzipLatch,
   resolveNativePoolPaths,
   runNativeMigration,
+  StickyQuotaRetryCounter,
+  StickySessionRouter,
   sessionCacheActivity,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
@@ -40,7 +42,10 @@ import {
 } from '@cortexkit/common-auth/opencode2'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
-import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
+import {
+  nativeQuotaCodec,
+  toNativeQuotaMap,
+} from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
 import * as wireTransform from '../transform'
 import * as nativeAdapters from '../v2/adapter'
@@ -469,6 +474,27 @@ async function fixture(
   }
   return {
     ...(await start()),
+    setQuota: (id: string, remainingPercent = 80) => {
+      const window = {
+        remainingPercent,
+        usedPercent: 100 - remainingPercent,
+        checkedAt: now,
+      }
+      return store.recordQuota(
+        id,
+        {
+          credentialEpoch: 1,
+          identity:
+            id === 'first' ? identity : '99999999-2222-4333-8444-555555555555',
+        },
+        toNativeQuotaMap({
+          five_hour: window,
+          seven_day: window,
+          accountIdentity:
+            id === 'first' ? identity : '99999999-2222-4333-8444-555555555555',
+        }),
+      )
+    },
     /** Another plugin instance for the same account storage and clock. */
     start,
     paths,
@@ -608,6 +634,88 @@ test('OpenCode 2 hybrid requests publish a CacheKeep lease and dispose removes i
   expect(f.timers.callbacks.size).toBe(0)
   expect(await f.registry.list()).toEqual([])
 })
+
+test.each([false, true])(
+  'OC2 routing-moved stops an old-account warm (restored=%s)',
+  async (restored) => {
+    const lines = captureStartupLogs()
+    const f = await fixture()
+    await f.setQuota('first')
+    await f.setQuota('second')
+    await f.store.close()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      routing: { mode: 'fallback-first' },
+    }))
+    expect((await f.live()).headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-second',
+    )
+    if (restored) {
+      await f.dispose()
+      forgetCacheKeepProcess(f.paths.storageId)
+    }
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      routing: { mode: 'main-first' },
+    }))
+    const active = restored ? await f.start() : f
+    expect((await f.registry.list())[0]?.warmStopped).toBeUndefined()
+    f.due()
+    await f.timers.fire()
+    expect(active.sent).toHaveLength(0)
+    const stopped = lines.filter((line) =>
+      line.includes('stopped warming session'),
+    )
+    expect(stopped).toHaveLength(1)
+    expect(stopped[0]).toContain('WARN')
+    expect(stopped[0]).toContain('"reason":"routing-moved"')
+    expect((await f.registry.list())[0]?.warmStopped?.reason).toBe(
+      'routing-moved',
+    )
+  },
+)
+
+test.each(['unchanged', 'sticky-pin', 'unknown-reading'] as const)(
+  'OC2 routing peek keeps warming on A: %s',
+  async (control) => {
+    const f = await fixture()
+    await f.setQuota('second')
+    if (control !== 'unknown-reading') await f.setQuota('first')
+    await f.store.close()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      routing: {
+        mode: control === 'sticky-pin' ? 'sticky-balanced' : 'fallback-first',
+      },
+    }))
+    if (control === 'sticky-pin') await f.store.disable('first', 'user')
+    expect((await f.live()).headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-second',
+    )
+    if (control === 'sticky-pin') await f.store.enable('first')
+    if (control === 'unknown-reading')
+      await f.store.updateSettings((settings) => ({
+        ...settings,
+        routing: { mode: 'main-first' },
+      }))
+    const resolve = spyOn(StickySessionRouter.prototype, 'resolve')
+    const retain = spyOn(StickyQuotaRetryCounter.prototype, 'retain')
+    try {
+      f.due()
+      await f.timers.fire()
+      expect(f.sent).toHaveLength(1)
+      expect(f.sent[0]!.headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-second',
+      )
+      expect((await f.registry.list())[0]?.warmStopped).toBeUndefined()
+      expect(resolve).not.toHaveBeenCalled()
+      expect(retain).not.toHaveBeenCalled()
+    } finally {
+      resolve.mockRestore()
+      retain.mockRestore()
+    }
+  },
+)
 
 test('OpenCode 2 publishes response and warm cache facts with the actual touch times', async () => {
   const f = await fixture()

@@ -31,6 +31,7 @@ import {
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
+  peekRoutingAccount,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   readNativeAccountsForRequest,
@@ -274,6 +275,11 @@ export interface NativeSource
   readonly resetRouting: (sessionID: string) => Promise<void>
   /** The account that served the session's latest authorization, if any. */
   readonly servedAccount: (sessionID: string) => string | undefined
+  readonly peekAccount?: (
+    sessionId: string,
+    modelId: string | undefined,
+    snapshot: NativeAccountSnapshot,
+  ) => string | undefined
   readonly recordPrime: (
     provenance: NativeSourceProvenance,
     usage: { inputTokens?: number; outputTokens?: number },
@@ -1600,6 +1606,15 @@ export function createNativeAnthropicSource(
         if (queue[0]?.scope.sessionID === sessionID) recoveries.delete(queueKey)
       options.onForgetSession?.(sessionID)
     },
+    peekAccount: (sessionId, modelId, snapshot) =>
+      peekRoutingAccount({
+        snapshot,
+        router: snapshot.routingPath
+          ? routers.get(snapshot.routingPath)
+          : undefined,
+        sessionId,
+        modelId: modelId ? remapModelId(modelId) : undefined,
+      }),
     servedAccount: (sessionID) => servedBy.get(sessionID),
     resetRouting: async (sessionID) => {
       source.forgetTurn?.(sessionID)

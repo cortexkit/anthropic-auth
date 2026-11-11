@@ -11,7 +11,10 @@ import {
   type NativeAccountSnapshot,
   type NativeAccountView,
   nativeAccountCanServe,
+  peekRoutingAccount,
   readSessionCachePolicy,
+  remapModelId,
+  type StickySessionRouter,
 } from '@cortexkit/anthropic-auth-core'
 import { version as pluginVersion } from '../package.json'
 import { PiCacheKeepClaim } from './cachekeep-claim.ts'
@@ -58,6 +61,10 @@ export class PiCacheKeep {
     private readonly options: {
       storageId: (storagePath: string) => Promise<string>
       read: (storagePath: string) => Promise<NativeAccountSnapshot>
+      routing?: (storagePath: string) => {
+        snapshot: NativeAccountSnapshot | undefined
+        router?: StickySessionRouter
+      }
       persistence?: Partial<Pick<CacheKeepStoreOptions, 'root' | 'ownerOnly'>>
       liveness?: HolderLiveness
       restoreDelay?: (ms: number, signal?: AbortSignal) => Promise<void>
@@ -77,6 +84,19 @@ export class PiCacheKeep {
     }
     this.manager = new CacheKeepManager({
       ...managerOptions,
+      peekRoutingAccount: (target, route) => {
+        const session = this.sessions.get(route.sessionId)
+        const routing = this.options.routing?.(
+          session?.storagePath ?? target.accountStoragePath ?? '',
+        )
+        return routing
+          ? peekRoutingAccount({
+              ...routing,
+              ...route,
+              modelId: route.modelId ? remapModelId(route.modelId) : undefined,
+            })
+          : managerOptions.peekRoutingAccount?.(target, route)
+      },
       setIntervalImpl: ((_callback: unknown, ms?: number) =>
         schedule(() => {
           this.ticking = this.manager

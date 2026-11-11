@@ -1162,6 +1162,19 @@ export class StickySessionRouter {
       )[0]?.candidate
   }
 
+  /** Read a published pin without loading, touching, pruning or publishing it. */
+  peekAssignment(sessionId: string, affinityModelId?: string) {
+    const assignment = this.state.assignments[sessionKey(sessionId)]
+    if (
+      !assignment ||
+      !this.assignmentIsActive(assignment) ||
+      (affinityModelId !== undefined &&
+        assignment.affinityModelId !== affinityModelId)
+    )
+      return undefined
+    return { ...assignment, accountId: this.logicalAccountId(assignment) }
+  }
+
   async resolve(input: {
     sessionId: string
     family: StickyRouteFamily

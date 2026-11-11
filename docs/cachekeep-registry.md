@@ -131,7 +131,8 @@ the transition release, as defined above.
 - `warmStopped` (optional): warming has stopped, but the known cache lifetime
   has not necessarily ended. `at` is the stop timestamp and `reason` is one of
   `cost-cap`, `schedule`, `evicted`, `policy-refused`, `retries-exhausted`,
-  `session-forgotten`, `disabled`.
+  `session-forgotten`, `disabled`, `routing-moved` (the next turn would use a
+  different account).
 - `writer` may also be present as an internal process-protocol stamp. Readers
   do not need it to interpret cache lifetime.
 

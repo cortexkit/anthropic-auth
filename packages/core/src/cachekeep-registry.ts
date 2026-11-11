@@ -35,6 +35,7 @@ export const CACHE_KEEP_STOP_REASONS = [
   'schedule',
   'evicted',
   'policy-refused',
+  'routing-moved',
   'retries-exhausted',
   'session-forgotten',
   'disabled',

@@ -84,6 +84,7 @@ async function fixture() {
       },
       {
         read: async () => snapshot,
+        routing: () => ({ snapshot }),
         storageId: async () => 'shared-storage',
         persistence: { root },
         liveness,
@@ -135,6 +136,65 @@ async function fixture() {
     },
   }
 }
+
+test.each([false, true])(
+  'Pi routing-moved stops an old-account warm (restored=%s)',
+  async (restored) => {
+    const f = await fixture()
+    const window = { remainingPercent: 80, usedPercent: 20, checkedAt: f.now() }
+    const quota = { five_hour: window, seven_day: window }
+    f.snapshot.accounts[0]!.quota = quota
+    f.snapshot.accounts.push({
+      id: 'main',
+      type: 'oauth',
+      source: 'local',
+      enabled: true,
+      quota,
+    })
+    f.snapshot.policyStorage.routing = { mode: 'fallback-first' }
+    const first = f.create()
+    await first.process.startSession('pi-storage', 'session-S')
+    await first.process.trackAccepted(f.input('session-S'), f.snapshot)
+    if (restored) await first.process.stop()
+    f.snapshot.policyStorage.routing.mode = 'main-first'
+    const active = restored ? f.create() : first
+    if (restored) await active.process.startSession('pi-storage', 'session-S')
+    f.advance(55 * 60_000 + 30_000)
+    await active.tick()
+    expect(f.sends).toHaveLength(0)
+    expect(
+      active.process.manager.registrySessions()[0]?.warmStopped?.reason,
+    ).toBe('routing-moved')
+  },
+)
+
+test.each(['unchanged', 'unknown-reading'] as const)(
+  'Pi routing peek keeps warming on A: %s',
+  async (control) => {
+    const f = await fixture()
+    const window = { remainingPercent: 80, usedPercent: 20, checkedAt: f.now() }
+    f.snapshot.accounts[0]!.quota = { five_hour: window, seven_day: window }
+    f.snapshot.accounts.push({
+      id: 'main',
+      type: 'oauth',
+      source: 'local',
+      enabled: true,
+    })
+    f.snapshot.policyStorage.routing = {
+      mode: control === 'unchanged' ? 'fallback-first' : 'main-first',
+    }
+    const active = f.create()
+    await active.process.startSession('pi-storage', 'session-S')
+    await active.process.trackAccepted(f.input('session-S'), f.snapshot)
+    f.advance(55 * 60_000)
+    await active.tick()
+    expect(f.sends).toHaveLength(1)
+    expect(f.sends[0]?.session).toBe('session-S')
+    expect(
+      active.process.manager.registrySessions()[0]?.warmStopped,
+    ).toBeUndefined()
+  },
+)
 
 test('a fresh Pi process restores its idle session and warms without a request', async () => {
   const f = await fixture()

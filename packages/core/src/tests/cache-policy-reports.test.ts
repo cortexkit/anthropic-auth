@@ -1,6 +1,12 @@
 import { afterEach, expect, test } from 'bun:test'
 import type { AccountStorage } from '../accounts.ts'
 import { CacheKeepManager } from '../cachekeep.ts'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
+} from '../logger.ts'
 import { NativeAccountRefusal } from '../native-account-refusal.ts'
 import {
   reportSessionCacheTouch,
@@ -84,6 +90,12 @@ function fixture({
   let now = Date.parse('2026-05-18T10:00:00Z')
   let policy = { ttl: 'long', keep_warm: 'always' } as Record<string, unknown>
   const reports: Record<string, unknown>[] = []
+  let routedAccount: string | undefined = 'main'
+  const peeks: Array<{
+    targetId: string
+    sessionId: string
+    modelId?: string
+  }> = []
   globals[key] = () => ({
     cache: () => policy,
     report: (payload: Record<string, unknown>) => {
@@ -98,6 +110,10 @@ function fixture({
   const manager = new CacheKeepManager({
     now: () => now,
     loadStorage: async () => storage,
+    peekRoutingAccount: (target, route) => {
+      peeks.push({ targetId: target.id, ...route })
+      return routedAccount
+    },
     fetchImpl: Object.assign(
       async () =>
         send ? send() : Response.json({}, { status: fail ? 500 : 200 }),
@@ -132,6 +148,10 @@ function fixture({
     manager,
     reports,
     input,
+    peeks,
+    setRoutedAccount(value: string | undefined) {
+      routedAccount = value
+    },
     get now() {
       return now
     },
@@ -148,6 +168,82 @@ function fixture({
     },
   }
 }
+
+test('routing-moved refuses before send and reports one WARN, lifecycle reason and registry stop', async () => {
+  let sends = 0
+  const f = fixture({
+    send: async () => {
+      sends++
+      return Response.json({})
+    },
+  })
+  await f.warm()
+  expect(sends).toBe(1)
+  const lines: LogTestRecord[] = []
+  const level = getLogLevel()
+  setLogLevel('warn')
+  __setLogTestSink((line) => lines.push(line))
+  try {
+    f.setRoutedAccount('B')
+    await f.warm()
+    await f.manager.tick()
+    expect(sends).toBe(1)
+    const stopped = lines.filter(
+      (line) => line.message === 'stopped warming session',
+    )
+    expect(stopped).toHaveLength(1)
+    expect(stopped[0]?.level).toBe('warn')
+    expect(stopped[0]?.payload).toMatchObject({
+      reason: 'routing-moved',
+      session: 'ses_report',
+    })
+    expect(f.manager.registrySessions()[0]?.warmStopped?.reason).toBe(
+      'routing-moved',
+    )
+    expect(
+      f.reports.filter((row) => row.kind === 'cache_warm_stopped'),
+    ).toEqual([
+      { kind: 'cache_warm_stopped', at: f.now, reason: 'routing-moved' },
+    ])
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(level)
+  }
+})
+
+test('source-model warms peek the owner session and its current model before sending', async () => {
+  let sends = 0
+  const f = fixture({
+    send: async () => {
+      sends++
+      return Response.json({})
+    },
+  })
+  expect(
+    f.manager.track({
+      ...f.input,
+      sessionId: 'source-copy',
+      ownerSessionId: 'ses_report',
+      sourceWarm: true,
+      bodyText: f.input.bodyText.replace('claude-opus-5-5', 'claude-fable-5'),
+    }).tracked,
+  ).toBe(true)
+  await f.warm()
+  expect(sends).toBe(2)
+  expect(f.peeks).toContainEqual({
+    targetId: 'source-copy',
+    sessionId: 'ses_report',
+    modelId: 'claude-opus-5-5',
+  })
+  f.setRoutedAccount('B')
+  await f.warm()
+  expect(sends).toBe(2)
+  expect(
+    f.manager
+      .registrySessions()
+      .every((row) => row.warmStopped?.reason === 'routing-moved'),
+  ).toBe(true)
+})
 
 test.each([
   'off',

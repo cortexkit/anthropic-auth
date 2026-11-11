@@ -490,6 +490,8 @@ function stopReason(reason: string): CacheKeepStopReason {
       return 'disabled'
     case 'source-warm-idle-cap':
       return 'cost-cap'
+    case 'routing-moved':
+      return 'routing-moved'
     default:
       return 'policy-refused'
   }
@@ -505,6 +507,7 @@ function reportStopReason(reason: string): CacheWarmStopReason {
     case 'evicted':
     case 'stopped':
     case 'account-changed':
+    case 'routing-moved':
     case 'expired':
     case 'idle':
       return reason
@@ -729,6 +732,11 @@ export class CacheKeepManager {
         target: CacheKeepTarget,
         attempt: CacheKeepPrewarmAttempt,
       ) => Promise<Headers | undefined> | Headers | undefined
+      /** Pure in-memory route lookup; an unknown answer keeps the target. */
+      peekRoutingAccount?: (
+        target: Readonly<CacheKeepTarget>,
+        route: { sessionId: string; modelId?: string },
+      ) => string | undefined
       /** Optionally reauthorize a replayable prewarm after a genuine 401.
        * Return headers only for a verified newer version of the same account;
        * onResponse observes only the final physical attempt. */
@@ -1695,7 +1703,31 @@ export class CacheKeepManager {
     }
     let stage: CacheKeepFailureStage = 'authorization'
     let responseStatus: number | undefined
+    const checkRouting = () => {
+      // One-off diagnostic probes are not idle sessions following a real turn.
+      if (!this.targets.has(target.id)) return
+      const sessionId = target.policyState?.ownerSessionId ?? target.id
+      if (
+        target.sourceWarm &&
+        this.stoppedSessions.get(sessionId)?.warmStopped?.reason ===
+          'routing-moved'
+      )
+        throw new CacheKeepWarmRefusal('routing-moved')
+      const body = this.targets.get(sessionId)?.bodyText ?? target.bodyText
+      let modelId: string | undefined
+      try {
+        const parsed = JSON.parse(body)
+        if (typeof parsed.model === 'string') modelId = parsed.model
+      } catch {}
+      const routed = this.options.peekRoutingAccount?.(target, {
+        sessionId,
+        modelId,
+      })
+      if (routed !== undefined && routed !== (target.oauthAccountId ?? 'main'))
+        throw new CacheKeepWarmRefusal('routing-moved')
+    }
     try {
+      checkRouting()
       let bodyText = target.bodyText
       if (this.options.prepareBody) {
         try {
@@ -1770,6 +1802,7 @@ export class CacheKeepManager {
       const send = async (attemptHeaders: Headers): Promise<Response> => {
         if (!this.isCurrentTarget(target))
           throw new CacheKeepWarmRefusal('stopped')
+        checkRouting()
         if (this.targets.has(target.id) || target.policyState) {
           if (!this.options.deferWarmReservation)
             await this.reserveWarmDispatch(target)
@@ -1797,7 +1830,10 @@ export class CacheKeepManager {
           }
           return scope.redactResponse(sent)
         } catch (error) {
-          if (nativeAccountRefusal(error)) {
+          if (
+            error instanceof CacheKeepWarmRefusal ||
+            nativeAccountRefusal(error)
+          ) {
             scope.dispose()
             throw error
           }
