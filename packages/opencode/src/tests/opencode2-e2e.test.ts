@@ -206,8 +206,18 @@ async function installPackedHosts() {
     join(packedProject, 'package.json'),
     JSON.stringify({ private: true, type: 'module' }),
   )
+  // The shared download cache is keyed on host versions only, so its saved
+  // registry metadata can predate a dependency the plugin was just bumped to.
+  // Prefer-offline would then refuse that version; resolve it online instead.
   await requireCommand(
-    ['npm', 'install', '--no-audit', '--no-fund', ...archives],
+    [
+      'npm',
+      'install',
+      '--no-audit',
+      '--no-fund',
+      '--prefer-online',
+      ...archives,
+    ],
     packedProject,
     env,
     { clock: installation, name: 'packed.install' },
