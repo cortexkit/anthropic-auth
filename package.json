@@ -28,7 +28,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@babel/parser": "8.0.10",
+    "@babel/parser": "8.1.0",
     "@biomejs/biome": "2.6.4",
     "@earendil-works/pi-agent-core": "1.4.0",
     "@earendil-works/pi-ai": "1.4.0",
