@@ -8,7 +8,7 @@ import {
   signRequestBody,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
-import { type Context, type Message, Type } from '@earendil-works/pi-ai'
+import type { Context, Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
 import { normalizeContext } from '../transcript.ts'
 
@@ -1727,7 +1727,7 @@ describe('Pi normalized transcripts', () => {
         {
           name: 'preserve_tool',
           description: 'Keep this tool',
-          parameters: Type.Object({}),
+          parameters: { type: 'object', properties: {} },
         },
       ],
       messages: [userMsg('Hello')],
@@ -1765,7 +1765,7 @@ describe('Pi normalized transcripts', () => {
             {
               name: 'old_tool',
               description: 'Old',
-              parameters: Type.Object({}),
+              parameters: { type: 'object', properties: {} },
             },
           ],
           timestamp: 0,
@@ -1780,7 +1780,7 @@ describe('Pi normalized transcripts', () => {
             {
               name: 'new_tool',
               description: 'New',
-              parameters: Type.Object({}),
+              parameters: { type: 'object', properties: {} },
             },
           ],
           timestamp: 1,
@@ -1955,7 +1955,11 @@ test('snapshots response aliases from serialized declarations after the hook', a
     {
       messages: [userMsg('inspect')],
       tools: [
-        { name: 'bash', description: 'bash', parameters: Type.Object({}) },
+        {
+          name: 'bash',
+          description: 'bash',
+          parameters: { type: 'object', properties: {} },
+        },
       ],
     } as Context,
     undefined,

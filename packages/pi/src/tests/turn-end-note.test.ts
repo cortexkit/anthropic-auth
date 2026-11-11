@@ -5,7 +5,7 @@ import {
   type ProviderAccountUuid,
   signRequestBody,
 } from '@cortexkit/anthropic-auth-core'
-import { type Context, type Message, Type } from '@earendil-works/pi-ai'
+import type { Context, Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert'
 
 const routingKey = Symbol.for('cortexkit.routing')
@@ -72,7 +72,7 @@ async function build(
       tools: names.map((name) => ({
         name,
         description: name,
-        parameters: Type.Object({}),
+        parameters: { type: 'object', properties: {} },
       })),
     } as Context,
     undefined,
