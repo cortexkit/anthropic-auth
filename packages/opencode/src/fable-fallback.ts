@@ -34,7 +34,6 @@ export function parseSourceWarmTargetId(
     family !== 'fable-5' &&
     family !== 'fable-5-1' &&
     family !== 'fable-5-2' &&
-    family !== 'mythos-5-2' &&
     family !== 'opus-5' &&
     family !== 'opus-5-5'
   ) {

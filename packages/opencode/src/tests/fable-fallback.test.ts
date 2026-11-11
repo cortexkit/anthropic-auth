@@ -569,25 +569,16 @@ test('tracks Fable 5.2 recovery independently from Fable 5.1 in the same session
   expect(recovered51.cycle).not.toBe(recovered52.cycle)
 })
 
-test('Mythos 5.2 refusal recovery is isolated from Fable 5.2', () => {
-  expect(recoverableRefusalFamily('claude-mythos-5-2')).toBe('mythos-5-2')
-  expect(parseSourceWarmTargetId('source-warm:session-a:mythos-5-2')).toEqual({
-    sessionId: 'session-a',
-    family: 'mythos-5-2',
-  })
+test('Mythos 5.2 does not opt into unverified refusal recovery', () => {
+  expect(parseSourceWarmTargetId('source-warm:session-a:mythos-5-2')).toBeNull()
   const manager = new FableFallbackManager()
-  manager.activate(
-    manager.plan('session-a', body('claude-mythos-5-2'))!,
-    'mythos-account',
-  )
+  for (const id of ['claude-mythos-5-2', 'claude-mythos-5-2-20261109[1m]']) {
+    expect(recoverableRefusalFamily(id)).toBeNull()
+    expect(manager.plan('session-a', body(id))).toBeNull()
+  }
   expect(manager.plan('session-a', body('claude-fable-5-2'))).toMatchObject({
     effectiveModel: 'claude-fable-5-2',
     downgraded: false,
-  })
-  expect(manager.plan('session-a', body('claude-mythos-5-2'))).toMatchObject({
-    effectiveModel: FABLE_FALLBACK_MODEL_ID,
-    cacheAccountId: 'mythos-account',
-    downgraded: true,
   })
 })
 

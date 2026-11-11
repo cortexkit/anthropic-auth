@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getScopedQuotaWindowForModel } from '../accounts.ts'
 import {
+  CLAUDE_CODE_DEFAULT_BETAS,
   CLAUDE_MODEL_CAPABILITIES,
   getClaudeModelCapabilities,
   resolveClaudeModelCapabilities,
@@ -22,7 +23,7 @@ const snapshot = JSON.parse(
 ) as { models: Record<string, unknown> }
 
 describe('model capability table', () => {
-  test('Mythos 5.2 has its own catalogue, effort, binding, quota and recovery row', () => {
+  test('Mythos 5.2 has its own catalogue with conservative Mythos request defaults', () => {
     for (const id of ['claude-mythos-5-2', 'claude-mythos-5-2-20261109[1m]']) {
       expect(resolveClaudeModelCapabilities(id)).toMatchObject({
         id: 'claude-mythos-5-2',
@@ -33,13 +34,13 @@ describe('model capability table', () => {
         rejectsForcedToolChoice: true,
         efforts: {
           variants: ['low', 'medium', 'high', 'xhigh', 'max'],
-          default: 'medium',
+          default: 'high',
         },
-        effortMarkers: 'always',
-        turnEndNote: true,
+        effortMarkers: 'none',
+        turnEndNote: false,
         thinkingBindingControls: true,
-        serverSideFallback: true,
-        refusalRecoveryFamily: 'mythos-5-2',
+        claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
+        serverSideFallback: false,
         scopedQuota: 'mythos',
         fastMode: false,
         catalogue: {
@@ -55,6 +56,9 @@ describe('model capability table', () => {
           },
         },
       })
+      expect(resolveClaudeModelCapabilities(id)).not.toHaveProperty(
+        'refusalRecoveryFamily',
+      )
     }
   })
 

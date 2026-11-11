@@ -154,7 +154,6 @@ export type ClaudeRefusalRecoveryFamily =
   | 'fable-5'
   | 'fable-5-1'
   | 'fable-5-2'
-  | 'mythos-5-2'
   | 'opus-5'
   | 'opus-5-5'
 
@@ -366,16 +365,16 @@ export const CLAUDE_MODEL_CAPABILITIES: readonly ClaudeModelCapabilities[] = [
     catalogue: FABLE_MYTHOS_5_2_CATALOGUE,
     thinkingModes: ['adaptive'],
     rejectsForcedToolChoice: true,
-    // Match Claude Code's Fable 5.2 medium default. The overview's "Default
-    // effort" row is the API default (high for both models), not the CLI default:
-    // https://platform.claude.com/docs/en/models/mythos-5-2/overview#how-it-compares
-    efforts: { variants: ALL_ADAPTIVE_EFFORTS, default: 'medium' },
-    effortMarkers: 'always',
-    turnEndNote: true,
+    // The overview's Capabilities table lists default effort as high:
+    // https://platform.claude.com/docs/en/models/mythos-5-2/overview
+    efforts: { variants: ALL_ADAPTIVE_EFFORTS, default: 'high' },
+    // Request-shape flags follow Mythos 5.1: no evidence shows Mythos 5.2
+    // accepts Fable 5.2's extra controls or betas.
+    effortMarkers: 'none',
+    turnEndNote: false,
     thinkingBindingControls: true,
-    claudeCodeBetas: claudeCodeBetaLists({ perTurnControl: true }),
-    serverSideFallback: true,
-    refusalRecoveryFamily: 'mythos-5-2',
+    claudeCodeBetas: CLAUDE_CODE_DEFAULT_BETAS,
+    serverSideFallback: false,
     scopedQuota: 'mythos',
     fastMode: false,
   },

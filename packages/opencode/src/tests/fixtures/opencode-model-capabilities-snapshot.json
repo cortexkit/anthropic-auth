@@ -956,11 +956,11 @@
       }
     },
     "claude-mythos-5-2": {
-      "recoverableRefusalFamily": "mythos-5-2",
-      "isRecoverableRefusalModel": true,
+      "recoverableRefusalFamily": null,
+      "isRecoverableRefusalModel": false,
       "serverSideFallback": {
-        "enabled": true,
-        "fallbacks": "default",
+        "enabled": false,
+        "fallbacks": null,
         "notRequestedFallbacks": null
       },
       "nativeVariants": ["custom", "low", "medium", "high", "xhigh", "max"],
@@ -976,20 +976,9 @@
           },
           "tool_choice": null,
           "output_config": null,
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "adaptiveForcedTool": {
           "model": "claude-mythos-5-2",
@@ -1004,20 +993,9 @@
           "output_config": {
             "effort": "max"
           },
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "disabledXhigh": {
           "model": "claude-mythos-5-2",
@@ -1032,20 +1010,9 @@
           "output_config": {
             "effort": "xhigh"
           },
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": 0.5,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "betweenToolsMax": {
           "model": "claude-mythos-5-2",
@@ -1060,20 +1027,9 @@
           "output_config": {
             "effort": "max"
           },
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "budget": {
           "model": "claude-mythos-5-2",
@@ -1086,84 +1042,47 @@
           },
           "tool_choice": null,
           "output_config": null,
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         }
       },
       "effortMarkers": {
         "single": {
-          "plan": {
-            "baseline": "low",
-            "markerCount": 0
-          },
+          "plan": null,
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": {
-            "effort": "low"
-          },
+          "output_config": null,
           "messages": ["user"]
         },
         "single_default": {
-          "plan": {
-            "baseline": "medium",
-            "markerCount": 0
-          },
+          "plan": null,
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": {
-            "effort": "medium"
-          },
+          "output_config": null,
           "messages": ["user"]
         },
         "change": {
-          "plan": {
-            "baseline": "low",
-            "markerCount": 1
-          },
+          "plan": null,
           "result": {
-            "found": 1,
-            "inserted": 1
+            "found": 0,
+            "inserted": 0
           },
-          "output_config": {
-            "effort": "low"
-          },
-          "messages": [
-            "user",
-            "assistant",
-            {
-              "role": "system",
-              "clear_at": null,
-              "output_config": {
-                "effort": "max"
-              }
-            },
-            "user"
-          ]
+          "output_config": null,
+          "messages": ["user", "assistant", "user"]
         }
       }
     },
     "claude-mythos-5-2-20261109[1m]": {
-      "recoverableRefusalFamily": "mythos-5-2",
-      "isRecoverableRefusalModel": true,
+      "recoverableRefusalFamily": null,
+      "isRecoverableRefusalModel": false,
       "serverSideFallback": {
-        "enabled": true,
-        "fallbacks": "default",
+        "enabled": false,
+        "fallbacks": null,
         "notRequestedFallbacks": null
       },
       "nativeVariants": ["custom", "low", "medium", "high", "xhigh", "max"],
@@ -1179,20 +1098,9 @@
           },
           "tool_choice": null,
           "output_config": null,
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "adaptiveForcedTool": {
           "model": "claude-mythos-5-2-20261109[1m]",
@@ -1207,20 +1115,9 @@
           "output_config": {
             "effort": "max"
           },
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "disabledXhigh": {
           "model": "claude-mythos-5-2-20261109[1m]",
@@ -1235,20 +1132,9 @@
           "output_config": {
             "effort": "xhigh"
           },
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": 0.5,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "betweenToolsMax": {
           "model": "claude-mythos-5-2-20261109[1m]",
@@ -1263,20 +1149,9 @@
           "output_config": {
             "effort": "max"
           },
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         },
         "budget": {
           "model": "claude-mythos-5-2-20261109[1m]",
@@ -1289,75 +1164,38 @@
           },
           "tool_choice": null,
           "output_config": null,
-          "fallbacks": "default",
+          "fallbacks": null,
           "temperature": null,
-          "messages": [
-            "user",
-            "assistant",
-            "user",
-            {
-              "role": "system",
-              "clear_at": "next_user_message",
-              "output_config": null
-            },
-            "assistant",
-            "user"
-          ]
+          "messages": ["user", "assistant", "user", "assistant", "user"]
         }
       },
       "effortMarkers": {
         "single": {
-          "plan": {
-            "baseline": "low",
-            "markerCount": 0
-          },
+          "plan": null,
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": {
-            "effort": "low"
-          },
+          "output_config": null,
           "messages": ["user"]
         },
         "single_default": {
-          "plan": {
-            "baseline": "medium",
-            "markerCount": 0
-          },
+          "plan": null,
           "result": {
             "found": 0,
             "inserted": 0
           },
-          "output_config": {
-            "effort": "medium"
-          },
+          "output_config": null,
           "messages": ["user"]
         },
         "change": {
-          "plan": {
-            "baseline": "low",
-            "markerCount": 1
-          },
+          "plan": null,
           "result": {
-            "found": 1,
-            "inserted": 1
+            "found": 0,
+            "inserted": 0
           },
-          "output_config": {
-            "effort": "low"
-          },
-          "messages": [
-            "user",
-            "assistant",
-            {
-              "role": "system",
-              "clear_at": null,
-              "output_config": {
-                "effort": "max"
-              }
-            },
-            "user"
-          ]
+          "output_config": null,
+          "messages": ["user", "assistant", "user"]
         }
       }
     },
