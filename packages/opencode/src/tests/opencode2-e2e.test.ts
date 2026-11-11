@@ -208,7 +208,11 @@ async function installPackedHosts() {
   )
   // The shared download cache is keyed on host versions only, so its saved
   // registry metadata can predate a dependency the plugin was just bumped to.
-  // Prefer-offline would then refuse that version; resolve it online instead.
+  // Prefer-offline would then refuse that version, and npm lets it win over
+  // --prefer-online, so this install drops it and revalidates metadata.
+  const onlineEnv = Object.fromEntries(
+    Object.entries(env).filter(([key]) => key !== 'npm_config_prefer_offline'),
+  )
   await requireCommand(
     [
       'npm',
@@ -219,7 +223,7 @@ async function installPackedHosts() {
       ...archives,
     ],
     packedProject,
-    env,
+    onlineEnv,
     { clock: installation, name: 'packed.install' },
   )
 }
