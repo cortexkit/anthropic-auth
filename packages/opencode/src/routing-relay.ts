@@ -1,12 +1,9 @@
 import {
   type AccountStorage,
   askRouting,
-  getScopedQuotaWindowForModel,
   logger,
   type OAuthQuotaSnapshot,
-  quotaExhaustionFromHeaders,
-  type ReportRoutingInput,
-  reportRouting,
+  reportRoutingResponse,
   type StickyRouteCandidate,
   stickyRouteFamilyForModel,
   stickyRouteKnownFableExhausted,
@@ -43,9 +40,6 @@ export function routingReserveAllows(
   )
   return !depleted.length || depleted.some((row) => row.accountId === accountId)
 }
-
-// Shared routing's pool-name alphabet; it drops a report whose pool falls outside it.
-const ROUTING_POOL_NAME = /^[a-z0-9._-]{1,64}$/
 
 export function createRoutingRelay(
   quotaFor?: (
@@ -115,82 +109,15 @@ export function createRoutingRelay(
       modelId?: string,
       served = status < 400,
     ) {
-      if (!subject.accountIdentity) return
-      const identity = {
+      reportRoutingResponse(
         sessionId,
-        accountId: subject.accountIdentity,
-        ...(subject.credentialId ? { credentialId: subject.credentialId } : {}),
-      }
-      const reports: ReportRoutingInput[] = []
-      if (served && status < 400) {
-        const rateHeaders: Record<string, string> = {}
-        headers.forEach((value, name) => {
-          if (name.toLowerCase().startsWith('anthropic-ratelimit-'))
-            rateHeaders[name.toLowerCase()] = value
-        })
-        reports.push({ ...identity, outcome: 'served', headers: rateHeaders })
-      }
-      const quota =
-        status === 429
-          ? quotaExhaustionFromHeaders(headers, modelId)
-          : undefined
-      if (quota) {
-        // Display percentages round near-full windows to 100. Only the refused
-        // response's raw headers can confirm exhaustion, never saved quota.
-        for (const [window, reading] of [
-          ['5h', quota.five_hour],
-          ['7d', quota.seven_day],
-        ] as const) {
-          if (reading)
-            reports.push({
-              ...identity,
-              outcome: 'exhausted',
-              window,
-              ...(reading.resetsAt
-                ? { resetsAt: Date.parse(reading.resetsAt) }
-                : {}),
-            })
-        }
-        if (!reports.length && !quota.scoped?.length)
-          reports.push({ ...identity, outcome: 'exhausted', window: '7d' })
-      }
-      // Neither synchronous bridge errors nor rejected report promises can fail a send.
-      void Promise.resolve()
-        .then(async () => {
-          for (const report of reports) reportRouting(report)
-          if (quota?.scoped?.length) {
-            const stored = await quotaFor?.(subject)
-            // Stored usage-poll rows use this id prefix and keep the provider's
-            // model identity; header-only rows cannot name a pool. Routing names
-            // the pool by that identity in lowercase and ignores any other
-            // spelling, so a name outside its alphabet sends no report: a report
-            // without a valid pool would block the whole account for the week.
-            const scoped = getScopedQuotaWindowForModel(
-              {
-                scoped: stored?.scoped?.filter((row) =>
-                  row.id.startsWith('claude-weekly-scoped-'),
-                ),
-              },
-              modelId,
-            )
-            const pool = (scoped?.modelId ?? scoped?.modelName)
-              ?.trim()
-              .toLowerCase()
-            if (!pool || !ROUTING_POOL_NAME.test(pool)) return
-            for (const reading of quota.scoped) {
-              reportRouting({
-                ...identity,
-                outcome: 'exhausted',
-                window: '7d',
-                pool,
-                ...(reading.resetsAt
-                  ? { resetsAt: Date.parse(reading.resetsAt) }
-                  : {}),
-              })
-            }
-          }
-        })
-        .catch(() => {})
+        subject,
+        headers,
+        status,
+        modelId,
+        served,
+        quotaFor ? () => quotaFor(subject) : undefined,
+      )
     },
   }
 }

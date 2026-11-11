@@ -108,14 +108,7 @@ describe('shared routing relay', () => {
     relay.report('session', subject, new Headers(), 429)
     relay.report('session', subject, new Headers(), 401)
     await Promise.resolve()
-    expect(reports.slice(1)).toEqual([
-      {
-        account_id: 'account',
-        credential_id: 'credential',
-        outcome: 'exhausted',
-        window: '7d',
-      },
-    ])
+    expect(reports.slice(1)).toEqual([])
   })
 
   test.each(['throw', 'reject', 'pending'])(
@@ -271,7 +264,7 @@ describe('shared routing relay', () => {
     },
   )
 
-  test('an unconfirmed 429 ignores rounded utilization and binding claims and falls back to 7d', async () => {
+  test('an unconfirmed 429 ignores rounded utilization and binding claims and sends no report', async () => {
     const reports: unknown[] = []
     globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
     createRoutingRelay().report(
@@ -284,9 +277,7 @@ describe('shared routing relay', () => {
       429,
     )
     await Promise.resolve()
-    expect(reports).toEqual([
-      { account_id: 'account', outcome: 'exhausted', window: '7d' },
-    ])
+    expect(reports).toEqual([])
   })
 
   test('reports each exhausted window from the same 429 once', async () => {

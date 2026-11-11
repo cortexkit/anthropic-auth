@@ -1529,6 +1529,14 @@ describe('Pi API fallback routing helpers', () => {
   const checkStickyQuotaReread = async (
     confirmed: boolean,
     retryBudget = false,
+    reporting?:
+      | 'windows'
+      | 'scoped'
+      | 'unconfirmed'
+      | 'no-accessor'
+      | 'throw'
+      | 'reject'
+      | 'pending',
   ) => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-weekly-'))
     const storagePath = join(tempDir, 'anthropic-auth.json')
@@ -1569,7 +1577,21 @@ describe('Pi API fallback routing helpers', () => {
             access: 'sk-ant-oat01-full-access',
             refresh: 'full-refresh',
             expires: checkedAt + 8 * 60 * 60_000,
-            quota: quota(100),
+            quota: {
+              ...quota(100),
+              ...(reporting === 'scoped' && {
+                scoped: [
+                  {
+                    id: 'claude-weekly-scoped-fable',
+                    title: 'Fable only',
+                    modelName: 'Fable',
+                    usedPercent: 20,
+                    remainingPercent: 80,
+                    checkedAt,
+                  },
+                ],
+              }),
+            },
           },
           {
             id: 'room',
@@ -1585,6 +1607,24 @@ describe('Pi API fallback routing helpers', () => {
     )
     const authorizations: string[] = []
     const usageRequests: string[] = []
+    const reports: Record<string, unknown>[] = []
+    const sessions: string[] = []
+    if (reporting) {
+      delete globals[routingKey]
+      if (reporting !== 'no-accessor')
+        globals[routingKey] = (sessionId: string) => {
+          sessions.push(sessionId)
+          if (reporting === 'throw') throw new Error('routing unavailable')
+          return {
+            report: (payload: Record<string, unknown>) => {
+              if (reporting === 'reject')
+                return Promise.reject(new Error('routing unavailable'))
+              if (reporting === 'pending') return new Promise(() => {})
+              reports.push(payload)
+            },
+          }
+        }
+    }
     globalThis.fetch = mock(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = input instanceof Request ? input.url : input.toString()
@@ -1604,15 +1644,35 @@ describe('Pi API fallback routing helpers', () => {
             { error: { type: 'rate_limit_error' } },
             {
               status: 429,
-              headers: {
-                'retry-after': '432000',
-                'anthropic-ratelimit-unified-7d-utilization': confirmed
-                  ? '1.0'
-                  : '',
-                'anthropic-ratelimit-unified-7d-reset': String(
-                  Math.floor(Date.now() / 1000) + 432000,
-                ),
-              },
+              headers:
+                reporting && reporting !== 'unconfirmed'
+                  ? {
+                      'retry-after': '432000',
+                      ...(reporting === 'scoped'
+                        ? {
+                            'anthropic-ratelimit-unified-7d_fable-status':
+                              'rejected',
+                            'anthropic-ratelimit-unified-7d_fable-reset':
+                              '2000000000',
+                          }
+                        : {
+                            'anthropic-ratelimit-unified-5h-status': 'rejected',
+                            'anthropic-ratelimit-unified-5h-reset':
+                              '2000000000',
+                            'anthropic-ratelimit-unified-7d-utilization': '1',
+                            'anthropic-ratelimit-unified-7d-reset':
+                              '2000000100',
+                          }),
+                    }
+                  : {
+                      'retry-after': '432000',
+                      'anthropic-ratelimit-unified-7d-utilization': confirmed
+                        ? '1.0'
+                        : '',
+                      'anthropic-ratelimit-unified-7d-reset': String(
+                        Math.floor(Date.now() / 1000) + 432000,
+                      ),
+                    },
             },
           )
         return new Response(
@@ -1621,6 +1681,13 @@ describe('Pi API fallback routing helpers', () => {
             'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
             'event: message_stop\ndata: {"type":"message_stop"}\n\n',
           ].join(''),
+          {
+            headers: {
+              'Anthropic-RateLimit-Unified-5h-Utilization': '0.2',
+              'anthropic-ratelimit-future-field': 'raw',
+              'x-private': 'never reported',
+            },
+          },
         )
       },
     ) as unknown as typeof fetch
@@ -1695,7 +1762,83 @@ describe('Pi API fallback routing helpers', () => {
       expect(authorizations).toEqual(['Bearer sk-ant-oat01-full-access'])
     }
     expect(usageRequests).toHaveLength(confirmed ? 0 : 1)
+    if (reporting) {
+      await Bun.sleep(10)
+      return { reports, sessions }
+    }
   }
+
+  test('Pi routing reports both confirmed 429 windows with resets and successful raw headers', async () => {
+    const result = (await checkStickyQuotaReread(true, false, 'windows'))!
+    const reports = result.reports.filter(
+      (row) => row.outcome === 'served' || row.outcome === 'exhausted',
+    )
+    const credential = result.reports.find(
+      (row) => row.kind === 'billing' && row.outcome === 'failed',
+    )?.credential_id
+    expect(credential).toEqual(expect.any(String))
+    expect(
+      result.sessions.every((session) => session === 'pi-weekly-headers'),
+    ).toBe(true)
+    expect(reports).toEqual([
+      {
+        account_id: fixtureAccountIdentity('full'),
+        credential_id: credential,
+        outcome: 'exhausted',
+        window: '5h',
+        resets_at: 2_000_000_000_000,
+      },
+      {
+        account_id: fixtureAccountIdentity('full'),
+        credential_id: credential,
+        outcome: 'exhausted',
+        window: '7d',
+        resets_at: 2_000_000_100_000,
+      },
+      {
+        account_id: fixtureAccountIdentity('room'),
+        credential_id: expect.any(String),
+        outcome: 'served',
+        headers: {
+          'anthropic-ratelimit-unified-5h-utilization': '0.2',
+          'anthropic-ratelimit-future-field': 'raw',
+        },
+      },
+    ])
+  })
+
+  test('Pi routing reports a scoped Fable 429 with the stored poll pool', async () => {
+    const result = (await checkStickyQuotaReread(true, false, 'scoped'))!
+    expect(result.reports.filter((row) => row.outcome === 'exhausted')).toEqual(
+      [
+        {
+          account_id: fixtureAccountIdentity('full'),
+          credential_id: expect.any(String),
+          outcome: 'exhausted',
+          window: '7d',
+          pool: 'fable',
+          resets_at: 2_000_000_000_000,
+        },
+      ],
+    )
+  })
+
+  test('Pi routing sends no limit report for a 429 without confirming headers', async () => {
+    const result = (await checkStickyQuotaReread(false, false, 'unconfirmed'))!
+    expect(
+      result.reports.filter(
+        (row) => row.outcome === 'served' || row.outcome === 'exhausted',
+      ),
+    ).toEqual([])
+  })
+
+  test.each(['no-accessor', 'throw', 'reject', 'pending'] as const)(
+    'Pi routing %s cannot affect confirmed 429 failover',
+    async (mode) => {
+      const result = (await checkStickyQuotaReread(true, false, mode))!
+      expect(result.reports).toEqual([])
+    },
+  )
 
   test('sticky-balanced Pi weekly 429 headers skip the usage endpoint and still migrate', async () => {
     await checkStickyQuotaReread(true)

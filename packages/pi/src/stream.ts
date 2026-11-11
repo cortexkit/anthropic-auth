@@ -81,6 +81,7 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   readSessionCachePolicy,
+  reportRoutingResponse,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
   resolveNativePoolPaths,
@@ -932,6 +933,26 @@ async function sendAnthropicRequest(
         ...(options.prime && { requestClass: 'auxiliary' }),
       })
   const relayAffinity = options.streamOptions?.sessionId ?? null
+  const reportRoutingHeaders = (
+    attempt: PiNativeAttempt,
+    responseHeaders: Headers,
+    status: number,
+  ) => {
+    if (options.prime || !relayAffinity) return
+    const payer = piBillingPayer(attempt)
+    reportRoutingResponse(
+      relayAffinity,
+      { accountIdentity: payer.accountId, credentialId: payer.credentialId },
+      responseHeaders,
+      status,
+      typeof body.model === 'string' ? body.model : options.model.id,
+      status < 400,
+      async () =>
+        selected?.accountIdentity === payer.accountId
+          ? selected.quota
+          : undefined,
+    )
+  }
   const billingInput = (
     attempt?: PiNativeAttempt,
     apiSubject?: NativeApiSubject,
@@ -1166,9 +1187,14 @@ async function sendAnthropicRequest(
         }),
       )
     }
-    const physicalFetch = (send: () => Promise<Response>) => {
+    const physicalFetch = async (send: () => Promise<Response>) => {
       const billing = billingInput(attempt, apiSubject)
-      return billing ? withAnthropicBilling(billing, send) : send()
+      const response = await (billing
+        ? withAnthropicBilling(billing, send)
+        : send())
+      if (attempt)
+        reportRoutingHeaders(attempt, response.headers, response.status)
+      return response
     }
     let response: Response
     try {
@@ -1280,8 +1306,9 @@ async function sendAnthropicRequest(
   // The relay scrubs each physical relay attempt's responses and errors with
   // that attempt's own credentials and the relay token; a direct fallback is
   // scrubbed by directFetch.
-  const sendRelayAttempt = async () =>
-    sendViaRelay({
+  const sendRelayAttempt = async () => {
+    let upstream: { attempt: PiNativeAttempt; status: number } | undefined
+    return sendViaRelay({
       config: relayConfig,
       input,
       init,
@@ -1289,6 +1316,16 @@ async function sendAnthropicRequest(
       body: wireBodyText,
       fallback: directFetch,
       affinity: relayAffinity,
+      // Some relay streams start before the provider answers. Report the
+      // provider's actual status and headers, not that early placeholder.
+      onResponseHeaders: (responseHeaders) => {
+        if (upstream)
+          reportRoutingHeaders(
+            upstream.attempt,
+            responseHeaders,
+            upstream.status,
+          )
+      },
       onDumpCreated: (handle) => {
         dumpHandle = handle
       },
@@ -1308,6 +1345,7 @@ async function sendAnthropicRequest(
           billing: billingInput(attempt),
           errorSecrets: [access],
           onUpstreamStatus: (status) => {
+            upstream = { attempt, status }
             if (status >= 200 && status < 300)
               trackAcceptedRequest(attempt, sentBody)
             if (status === 401) {
@@ -1319,6 +1357,7 @@ async function sendAnthropicRequest(
         }
       },
     })
+  }
   let response = await sendRelayAttempt()
   await Promise.all(relayReports)
   if (
