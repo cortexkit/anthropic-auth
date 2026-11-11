@@ -69,6 +69,7 @@ import {
   EffortMarkerCorrelationError,
   type OpenCodeEffortMarkerPlan,
 } from './effort-history'
+import { stripRecoveryRoundThinking } from './recovery-thinking'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
   applyServerSideFallbackToBody,
@@ -1698,6 +1699,12 @@ export async function rewriteRequestBody(
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     sourceRecoveryBody?: string
+    /**
+     * Digests of thinking blocks written by the fallback model in this
+     * session's refusal-recovery rounds. Set only on requests to the source
+     * model; see recovery-thinking.ts.
+     */
+    recoveryRoundThinking?: ReadonlySet<string>
     serverSideFallbackEnabled?: boolean
     modelRemapEnabled?: boolean
     laneStart?: boolean
@@ -1737,6 +1744,9 @@ export async function rewriteRequestBody(
 
     const modelNormalizeStart = rewriteNowMs()
     const removedNonAnthropicThinking = stripNonAnthropicThinkingBlocks(parsed)
+    const removedRecoveryRoundThinking = options.recoveryRoundThinking
+      ? stripRecoveryRoundThinking(parsed, options.recoveryRoundThinking)
+      : 0
     const serverSideFallback = applyServerSideFallbackToBody(
       parsed,
       options.serverSideFallbackEnabled === true,
@@ -1760,6 +1770,9 @@ export async function rewriteRequestBody(
       haiku55ThinkingDisplay: haiku55Thinking?.display,
       replacedHaiku55Thinking: haiku55Thinking?.replacedExisting ?? false,
       removedNonAnthropicThinking,
+      ...(removedRecoveryRoundThinking > 0
+        ? { removedRecoveryRoundThinking }
+        : {}),
       serverSideFallbackEnabled: serverSideFallback.enabled,
       serverFallbackMarkersRestored: serverSideFallback.restoredMarkers,
       serverFallbackMarkersDropped: serverSideFallback.droppedMarkers,

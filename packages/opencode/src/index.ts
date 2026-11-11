@@ -297,6 +297,10 @@ import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import { logFallbackQuotaPreflightWarning } from './quota-preflight.ts'
 import {
+  createRecoveryThinkingObserver,
+  RecoveryThinkingStore,
+} from './recovery-thinking.ts'
+import {
   isAuxiliaryAgent,
   REQUEST_CLASS_REQUEST_HEADER,
   takeRequestClassHeader,
@@ -1932,6 +1936,9 @@ const anthropicAuthPlugin = async (
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
   const fableFallbackManager = new FableFallbackManager()
+  // Which thinking blocks the fallback model wrote during recovery rounds, so
+  // requests back to the source model can leave them out (recovery-thinking.ts).
+  const recoveryThinking = new RecoveryThinkingStore()
   // A refused HTTP 200 replaces CacheKeep's live template before its stop
   // reason is known. Retain only a completed source send with cache usage so
   // recovery warms and returns can target an entry known to exist.
@@ -6573,6 +6580,7 @@ const anthropicAuthPlugin = async (
         sessionCacheActivity.forget(sessionId)
         messageThreads.forget(sessionId)
         fableFallbackManager.clearSession(sessionId)
+        recoveryThinking.forgetSession(sessionId)
         dropSessionSourceWarms(sessionId)
         nativeCommands.delete(sessionId)
         oauthPending.delete(sessionId)
@@ -7720,6 +7728,17 @@ const anthropicAuthPlugin = async (
                   oauthAccountId
                   ? fableRequest.plan.standbyCacheAnchor
                   : undefined
+              const recoveryFamily =
+                fableRequest && !fableRequest.plan.downgraded
+                  ? recoverableRefusalFamily(fableRequest.plan.requestedModel)
+                  : null
+              const recoveryRoundThinking =
+                fableRequest && recoveryFamily
+                  ? await recoveryThinking.digests(
+                      fableRequest.plan.sessionId,
+                      recoveryFamily,
+                    )
+                  : undefined
               try {
                 body = await rewriteRequestBody(body, {
                   deferSigning: true,
@@ -7750,6 +7769,9 @@ const anthropicAuthPlugin = async (
                     oauthAccountId
                       ? fableRequest.plan.sourceRecovery.bodyText
                       : undefined,
+                  recoveryRoundThinking: recoveryRoundThinking?.size
+                    ? recoveryRoundThinking
+                    : undefined,
                   serverSideFallbackEnabled: fallbackMode === 'server',
                   laneStart: laneStartRequest,
                   billingLineage: activeBillingLineage,
@@ -9401,6 +9423,29 @@ const anthropicAuthPlugin = async (
                     diagnosticsContext.status,
                   )
                 const dumpObserver = diagnosticsContext?.dumpObserver
+                // During a recovery round, remember which thinking blocks the
+                // fallback model wrote so the source model never sees them
+                // mixed into one of its own turns.
+                const recoveryRoundFamily = fablePlan?.downgraded
+                  ? recoverableRefusalFamily(fablePlan.requestedModel)
+                  : null
+                const observeRecoveryThinking =
+                  fablePlan && recoveryRoundFamily
+                    ? createRecoveryThinkingObserver((digest) =>
+                        recoveryThinking.record(
+                          fablePlan.sessionId,
+                          recoveryRoundFamily,
+                          digest,
+                        ),
+                      )
+                    : undefined
+                const onSseEvent =
+                  observeRecoveryThinking && dumpObserver
+                    ? (event: Record<string, unknown>) => {
+                        dumpObserver.observe(event)
+                        observeRecoveryThinking(event)
+                      }
+                    : (observeRecoveryThinking ?? dumpObserver?.observe)
                 const wrapped = createStrippedStream(response, {
                   requireMessageStop: true,
                   onIncompleteStream: async (diagnostics) => {
@@ -9421,7 +9466,7 @@ const anthropicAuthPlugin = async (
                     )
                   },
                   toolNameMap: diagnosticsContext?.toolNameMap,
-                  onSseEvent: dumpObserver?.observe,
+                  onSseEvent,
                   onResponseFailure: diagnosticsContext?.failThread,
                   perf: (stage, data) => trace.mark(stage, data),
                   laneStart: laneStartRequest,
