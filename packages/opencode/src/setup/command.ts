@@ -269,11 +269,17 @@ export async function runSetupCommand(
         opencode: {
           name: NATIVE_VAULT_HOST_NAMES.opencode,
           displayName: NATIVE_VAULT_HOST_DISPLAY_NAMES.opencode,
+          requestedGrants: [
+            { selector: { category: 'anthropic-native' }, operation: 'read' },
+          ],
           paths: nativeVaultHostPaths('opencode', env),
         },
         pi: {
           name: NATIVE_VAULT_HOST_NAMES.pi,
           displayName: NATIVE_VAULT_HOST_DISPLAY_NAMES.pi,
+          requestedGrants: [
+            { selector: { category: 'anthropic-native' }, operation: 'read' },
+          ],
           paths: nativeVaultHostPaths('pi', env),
         },
       },

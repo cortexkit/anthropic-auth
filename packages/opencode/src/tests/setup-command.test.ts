@@ -24,6 +24,7 @@ import {
   custodyTombstoneOAuth,
   getHostClaustrumEnrollmentPaths,
   inspectNativeHostAuthEntry,
+  type NativeCustodyInventory,
   NativeMigrationError,
   nativePiAuthSlotPaths,
   type ProviderAccountUuid,
@@ -34,7 +35,12 @@ import {
   runNativeMigration,
   type SetupIO,
 } from '@cortexkit/anthropic-auth-core'
+import type { ScopedInventoryRow } from '@cortexkit/claustrum-client'
 import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
+import {
+  ClaustrumEnrollmentManager,
+  readClaustrumEnrollmentStatus,
+} from '@cortexkit/common-auth/claustrum'
 import { lockPathFor, withLock } from '@cortexkit/common-auth/fs'
 import type {
   AccountHeadersResult,
@@ -1525,12 +1531,15 @@ lifetimes.test(
       }),
     ).toBe(1)
     const lines = f.screen().trimEnd().split('\n')
-    expect(lines.slice(lines.indexOf(OPENCODE_CONNECTED))).toEqual([
-      OPENCODE_CONNECTED,
+    const connected = `${OPENCODE_CONNECTED} — Approved, but access could not be confirmed; check ck auth status or run:`
+    expect(lines.slice(lines.indexOf(connected))).toEqual([
+      connected,
+      '  ck auth grant --principal enrolled:anthropic-auth-opencode --selector-kind category --selector anthropic-native --operation read',
       'Pi: not connected',
       'The vault has no verified default Claude account. Sign in through the vault and rerun setup.',
       STAYS_CONNECTED,
     ])
+    expect(occurrences(f.screen(), OPENCODE_CONNECTED)).toBe(1)
     expect(f.screen()).not.toContain('Pi stays connected')
     await expectNoDiagnostics(f)
   },
@@ -2943,7 +2952,7 @@ lifetimes.test(
 )
 
 lifetimes.test(
-  'shared vault ceremony enrolls once per host between preflight and activation, without local classification',
+  'shared legacy-vault ceremony enrolls once per host between preflight and fallback activation, without local classification',
   async () => {
     const f = await callbackFixture({
       opencode: true,
@@ -2980,6 +2989,13 @@ lifetimes.test(
           return {
             close() {},
             enrollPropose: async (input) => {
+              // This vault cannot apply proposal grants, so activation must grant access.
+              if ('requestedGrants' in input)
+                throw new ClaustrumCredentialError(
+                  'invalid_params',
+                  'permanent',
+                  'gone',
+                )
               name = input.name
               events.push(`enroll:${name}`)
               return { requestId: name }
@@ -3108,7 +3124,7 @@ lifetimes.test(
 )
 
 lifetimes.test(
-  'vault generation 2 never opens OC1 data and grant failure prevents activation',
+  'vault generation 2 never opens OC1 data and fallback grant failure prevents activation',
   async () => {
     const f = await callbackFixture({
       opencode: true,
@@ -3126,6 +3142,21 @@ lifetimes.test(
       expect(
         await runSetupCommand(['--yes', '--claustrum', '--opencode=2'], {
           ...f.io,
+          connect: async (options) => {
+            const client = await f.io.connect!(options)
+            return {
+              ...client,
+              enrollPropose: async (input) => {
+                if ('requestedGrants' in input)
+                  throw new ClaustrumCredentialError(
+                    'invalid_params',
+                    'permanent',
+                    'gone',
+                  )
+                return client.enrollPropose(input)
+              },
+            }
+          },
           runner: {
             run: async (_file, args) => ({
               exitCode: args.includes('grant') ? 1 : 0,
@@ -3886,6 +3917,294 @@ lifetimes.test(
     ).toBe(false)
   },
 )
+
+type GrantSetupClient = Awaited<ReturnType<NonNullable<SetupIO['connect']>>>
+type GrantSetupProposal = Parameters<GrantSetupClient['enrollPropose']>[0]
+const NATIVE_READ_GRANTS = [
+  { selector: { category: 'anthropic-native' }, operation: 'read' as const },
+]
+const GRANT_SETUP_ROW: ScopedInventoryRow = {
+  id: 'oauth:anthropic',
+  accountId: SETUP_UUID,
+  credentialType: 'oauth',
+  categories: ['anthropic-native'],
+  refreshAdapter: 'anthropic',
+  serves: ['anthropic'],
+  providerIds: [],
+  state: 'active',
+  operations: ['read'],
+  recordVersion: 1,
+  createdAtMs: null,
+}
+
+async function grantSetupFixture(
+  host: 'opencode' | 'pi',
+  mode: 'sent' | 'dropped' | 'legacy' | 'resumed' = 'sent',
+) {
+  const f = await callbackFixture({
+    opencode: host === 'opencode',
+    pi: host === 'pi',
+    claustrum: true,
+  })
+  const paths = getHostClaustrumEnrollmentPaths(host, f.env)
+  const name = `anthropic-auth-${host}`
+  const proposals: GrantSetupProposal[] = []
+  const events: string[] = []
+  const state = {
+    rows: [GRANT_SETUP_ROW] as readonly ScopedInventoryRow[],
+    listFailure: false,
+    approved: mode !== 'resumed',
+    grants: 0,
+    screenAtGrant: '',
+    inventory: verifiedSetupInventory() as NativeCustodyInventory,
+  }
+  const client: GrantSetupClient = {
+    close() {},
+    enrollPropose: async (input) => {
+      proposals.push(input)
+      if (mode === 'dropped' && proposals.length === 1)
+        throw new ClaustrumCredentialError(
+          'invalid_params',
+          'permanent',
+          'gone',
+        )
+      return { requestId: 'grant-setup-request' }
+    },
+    enrollPoll: async () =>
+      state.approved
+        ? {
+            status: 'approved',
+            name,
+            token: 'c'.repeat(64),
+            tokenGeneration: 1,
+          }
+        : { status: 'pending' },
+    listScoped: async (token) => {
+      expect(token).toBe('c'.repeat(64))
+      events.push('confirmation')
+      if (state.listFailure) throw new Error(ECHO_SK)
+      return {
+        view: 'grant-setup',
+        rows: state.rows,
+        grants: undefined,
+        grantTuples: undefined,
+      }
+    },
+  }
+  if (mode === 'legacy' || mode === 'resumed') {
+    const manager = new ClaustrumEnrollmentManager({
+      paths,
+      proposedName: name,
+      ...(mode === 'resumed' && { requestedGrants: NATIVE_READ_GRANTS }),
+      client,
+    })
+    await manager.reconcile()
+    state.approved = true
+  }
+  const run = () =>
+    runSetupCommand(
+      [
+        '--yes',
+        '--claustrum',
+        ...(host === 'opencode' ? ['--opencode=2'] : []),
+      ],
+      {
+        ...f.io,
+        connect: async () => client,
+        runner: {
+          run: async (_file, args) => {
+            if (args.includes('grant')) {
+              state.grants++
+              state.screenAtGrant = f.screen()
+              events.push('fallback')
+            }
+            return { exitCode: 0, stdout: '', stderr: '' }
+          },
+        },
+        vaultActivate: (selected, options, preflight) =>
+          completeNativeVaultActivation(
+            selected,
+            {
+              ...options,
+              discover: async () => {
+                events.push('default-account')
+                if (mode === 'dropped' || mode === 'legacy')
+                  expect(state.grants).toBe(1)
+                return state.inventory
+              },
+            },
+            preflight,
+          ),
+      },
+    )
+  return { ...f, run, state, paths, name, proposals, events }
+}
+
+describe('approval-time native read grants', () => {
+  for (const host of ['opencode', 'pi'] as const) {
+    lifetimes.test(
+      `${host} proposes account read access and confirms approval before activation without another grant`,
+      async () => {
+        const f = await grantSetupFixture(host)
+        expect(await f.run()).toBe(0)
+        expect(f.proposals).toMatchObject([
+          {
+            name: f.name,
+            displayName:
+              host === 'opencode'
+                ? 'Claude sign-in for OpenCode'
+                : 'Claude sign-in for Pi',
+            requestedGrants: NATIVE_READ_GRANTS,
+          },
+        ])
+        expect(f.state.grants).toBe(0)
+        expect(f.events).toEqual(['confirmation', 'default-account'])
+        expect(f.screen()).toContain(
+          'Confirmed read access to the vault\'s "anthropic-native" accounts (1 reachable login).',
+        )
+        expect(f.screen()).not.toContain('Approved, but')
+        expect(
+          await readClaustrumEnrollmentStatus(f.paths, f.name),
+        ).toMatchObject({
+          state: 'approved',
+          requestedGrantsStatus: 'sent',
+        })
+      },
+    )
+  }
+
+  lifetimes.test(
+    'a sent proposal with zero reachable logins refuses activation without overriding the approval decision',
+    async () => {
+      const f = await grantSetupFixture('opencode')
+      f.state.rows = []
+      f.state.inventory = { view: 'empty', skipped: [], credentials: [] }
+      expect(await f.run()).toBe(1)
+      expect(f.state.grants).toBe(0)
+      expect(f.events).toEqual(['confirmation', 'default-account'])
+      expect(f.screen()).toContain(
+        'Approved, but no logins are reachable yet; run:',
+      )
+      expect(f.screen()).toContain(UNVERIFIED_TEXT)
+      expect(f.screen()).not.toContain('Configured CortexKit')
+    },
+  )
+
+  lifetimes.test(
+    'a partial inventory counts only category read matches and still requires an account identity',
+    async () => {
+      const f = await grantSetupFixture('opencode')
+      f.state.rows = [
+        GRANT_SETUP_ROW,
+        { ...GRANT_SETUP_ROW, id: 'list-only', operations: ['list'] },
+        { ...GRANT_SETUP_ROW, id: 'other-category', categories: ['other'] },
+      ]
+      f.state.inventory = {
+        view: 'unverified',
+        skipped: [],
+        credentials: [
+          {
+            credentialId: 'oauth:anthropic',
+            credentialType: 'oauth',
+            state: 'active',
+          },
+        ],
+      }
+      expect(await f.run()).toBe(1)
+      expect(f.state.grants).toBe(0)
+      expect(f.screen()).toContain('(1 reachable login).')
+      expect(f.screen()).toContain(UNVERIFIED_TEXT)
+    },
+  )
+
+  lifetimes.test(
+    'a listScoped failure reports unconfirmed access without leaking its error or issuing a grant',
+    async () => {
+      const f = await grantSetupFixture('opencode')
+      f.state.listFailure = true
+      expect(await f.run()).toBe(0)
+      expect(f.state.grants).toBe(0)
+      expect(f.events).toEqual(['confirmation', 'default-account'])
+      expect(f.screen()).toContain(
+        'Approved, but access could not be confirmed;',
+      )
+      expect(f.screen()).not.toContain(ECHO_SK)
+    },
+  )
+
+  lifetimes.test(
+    'old-vault invalid_params retries once without name metadata or grants and falls back after approval',
+    async () => {
+      const f = await grantSetupFixture('opencode', 'dropped')
+      expect(await f.run()).toBe(0)
+      expect(f.proposals).toHaveLength(2)
+      expect(f.proposals[0]).toMatchObject({
+        displayName: 'Claude sign-in for OpenCode',
+        requestedGrants: NATIVE_READ_GRANTS,
+      })
+      expect(f.proposals[1]).toEqual({
+        name: f.name,
+        requestSecretHash: f.proposals[0]!.requestSecretHash,
+      })
+      expect(f.events).toEqual(['fallback', 'default-account'])
+      expect(f.state.grants).toBe(1)
+      // common-auth 0.44 prints the remedy before our fallback; 0.45 will let us defer it.
+      expect(f.state.screenAtGrant).toContain(
+        'Approved. This vault is too old to grant access with the approval; run:',
+      )
+      expect(f.screen()).not.toContain(
+        'Approved, but no logins are reachable yet',
+      )
+      expect(f.screen()).toContain('Configured CortexKit Anthropic Auth')
+      expect(
+        await readClaustrumEnrollmentStatus(f.paths, f.name),
+      ).toMatchObject({
+        state: 'approved',
+        requestedGrantsStatus: 'dropped',
+      })
+    },
+  )
+
+  lifetimes.test(
+    'a resumed grant proposal confirms approval without proposing again or issuing a separate grant',
+    async () => {
+      const f = await grantSetupFixture('pi', 'resumed')
+      expect(f.proposals).toHaveLength(1)
+      expect(await f.run()).toBe(0)
+      expect(f.proposals).toHaveLength(1)
+      expect(f.proposals[0]).toMatchObject({
+        requestedGrants: NATIVE_READ_GRANTS,
+      })
+      expect(f.state.grants).toBe(0)
+      expect(f.events).toEqual(['confirmation', 'default-account'])
+      expect(f.screen()).toContain('(1 reachable login).')
+    },
+  )
+
+  lifetimes.test(
+    'an existing 0.43 enrollment keeps its grant fallback after the shared access report',
+    async () => {
+      const f = await grantSetupFixture('opencode', 'legacy')
+      f.state.rows = []
+      const before = await readFile(f.paths.tokenPath, 'utf8')
+      expect(await f.run()).toBe(0)
+      expect(f.proposals).toHaveLength(1)
+      expect(f.proposals[0]).not.toHaveProperty('requestedGrants')
+      expect(f.state.grants).toBe(1)
+      expect(f.events).toEqual(['confirmation', 'fallback', 'default-account'])
+      // With no recorded proposal, 0.44 also reports before fallback; deferred output awaits 0.45.
+      expect(f.state.screenAtGrant).toContain(
+        'Approved, but no logins are reachable yet; run:',
+      )
+      expect(f.screen()).toContain(`Already connected as ${f.name}.`)
+      expect(f.screen()).toContain('Configured CortexKit Anthropic Auth')
+      expect(await readFile(f.paths.tokenPath, 'utf8')).toBe(before)
+      expect(
+        await readClaustrumEnrollmentStatus(f.paths, f.name),
+      ).not.toHaveProperty('requestedGrantsStatus')
+    },
+  )
+})
 
 // An empty vault listing is explained by the grants it reports: none at all
 // needs a grant, a grant that reaches nothing needs the logins categorized,

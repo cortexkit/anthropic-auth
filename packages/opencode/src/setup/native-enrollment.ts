@@ -209,7 +209,7 @@ export function nativeVaultGrantArgs(
   ]
 }
 
-/** Grant this OpenCode or Pi principal read access to the vault's anthropic-native category; enrollment alone grants no provider access. */
+/** Grant this host read access only when enrollment could not propose permissions. */
 export async function grantNativeVaultForHost(
   host: HarnessKind,
   options: Pick<
@@ -229,6 +229,10 @@ export async function grantNativeVaultForHost(
       throw new NativeVaultEnrollmentError('permission-refused')
     const approvedName =
       status.state === 'approved' ? status.approvedName : undefined
+    // A sent proposal lets the operator approve without granting access. Do not
+    // override that decision; activation still checks the default account.
+    if (status.state === 'approved' && status.requestedGrantsStatus === 'sent')
+      return approvedName
     const args = nativeVaultGrantArgs(host, approvedName)
     const grant = await options.runner.run(options.ckBinary ?? 'ck', args, {
       env: options.env,

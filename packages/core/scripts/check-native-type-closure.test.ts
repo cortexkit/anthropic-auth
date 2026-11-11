@@ -125,8 +125,9 @@ test.each([
   '0.41.0',
   '0.41.1',
   '0.42.0',
-  '^0.43.0',
-  '~0.43.0',
+  '0.43.0',
+  '^0.44.0',
+  '~0.44.0',
 ])(
   'rejects unsupported published producer version %s before copying declarations',
   async (version) => {
@@ -151,7 +152,7 @@ test.each([
     )
 
     await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-      `Expected published common-auth 0.43.0, got ${version}`,
+      `Expected published common-auth 0.44.0, got ${version}`,
     )
     expect(await readdir(dist)).not.toContain('internal-types')
   },
@@ -165,7 +166,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.43.0',
+      version: '0.44.0',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
@@ -301,8 +302,8 @@ test('packed Core types and Node runtime work in a fresh consumer without common
   const manifest = JSON.parse(
     await readFile(join(core, 'package.json'), 'utf8'),
   )
-  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.43.0')
-  expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.17.0')
+  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.44.0')
+  expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.18.0')
   expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.24')
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')
   expect(manifest.dependencies['@cortexkit/private-files']).toBe('0.2.2')
@@ -363,7 +364,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
       'utf8',
     ),
   )
-  expect(claustrumManifest.version).toBe('0.17.0')
+  expect(claustrumManifest.version).toBe('0.18.0')
   const subcManifests = allInstalled.filter((path) =>
     /(?:^|\/)@cortexkit\/subc-client\/package\.json$/.test(path),
   )
