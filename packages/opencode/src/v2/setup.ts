@@ -423,6 +423,7 @@ export async function setupAnthropicAuth(
     },
     onCacheUsage: (sessionID, bodyText, usage) =>
       cacheKeep?.recordAcceptedUsage(sessionID, bodyText, usage),
+    billingWarming: (input) => cacheKeep?.warming(input),
     resolveModelId: async (scope) => models.modelId(scope.modelID),
     onOwnedRequest: () => {
       lifecycle ??= startNativeAnthropicLifecycle(runtime, options.fetch)

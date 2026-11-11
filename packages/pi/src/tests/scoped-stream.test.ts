@@ -3307,3 +3307,94 @@ test('Pi WebSocket relay tracks exactly once only after the real upstream 200', 
     await finished
   }
 })
+
+test('Pi model-request billing carries the keep-warm state each accepted step leaves', async () => {
+  const f = await fixture()
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: false },
+    claudeCache: { enabled: true, mode: 'hybrid' },
+    cacheKeep: { enabled: true, always: true },
+  }))
+  const keep = new CacheKeepManager({
+    loadStorage: async () => (await runtime.read()).policyStorage,
+    setIntervalImpl: (() => ({ unref() {} })) as unknown as typeof setInterval,
+    clearIntervalImpl: (() => {}) as typeof clearInterval,
+    setTimeoutImpl: (() => ({ unref() {} })) as unknown as typeof setTimeout,
+    clearTimeoutImpl: (() => {}) as typeof clearTimeout,
+  })
+  deferCleanup(() => keep.stop())
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const previous = globals[key]
+  const policies = new Map<string, unknown>()
+  const reports: Record<string, unknown>[] = []
+  globals[key] = (sessionId: string) => ({
+    cache: () => policies.get(sessionId) ?? null,
+    report: (payload: Record<string, unknown>) => {
+      if (payload.kind === 'billing') reports.push(payload)
+    },
+  })
+  deferCleanup(() => {
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  })
+  let status = 200
+  const fetchImpl = (async () =>
+    status === 200
+      ? Response.json({ id: 'msg_pi', usage: { input_tokens: 6 } })
+      : Response.json({ type: 'error' }, { status })) as unknown as typeof fetch
+  const step = async (sessionId: string) => {
+    deferCleanup(() => sessionCacheActivity.forget(sessionId))
+    await (
+      await __sendPiAnthropicRequestForTest(
+        {
+          model,
+          context,
+          storagePath: f.path,
+          streamOptions: { sessionId },
+        },
+        { fetch: fetchImpl, cacheKeep: keep },
+      )
+    ).text()
+    await Bun.sleep(10)
+    return reports.splice(0)
+  }
+  const warming = (report: Record<string, unknown> | undefined) =>
+    (report?.cache as Record<string, unknown> | undefined)?.warming
+
+  const [on] = await step('pi-warming-on')
+  expect(on).toMatchObject({ outcome: 'completed' })
+  expect(warming(on)).toEqual({ on: true })
+
+  // A failed attempt still carries no cache facts, warming included.
+  status = 500
+  const [failed] = await step('pi-warming-on')
+  status = 200
+  expect(failed).toMatchObject({ outcome: 'failed', status: 500 })
+  expect(failed?.cache).toBeUndefined()
+
+  const hhmm = (at: number) => new Date(at).toISOString().slice(11, 16)
+  const away = Date.now() + 6 * 3_600_000
+  policies.set('pi-warming-on', {
+    keep_warm: 'hours',
+    hours: { from: hhmm(away), to: hhmm(away + 10 * 60_000), tz: 'UTC' },
+  })
+  const [stopped] = await step('pi-warming-on')
+  expect(stopped).toMatchObject({ outcome: 'completed' })
+  expect(warming(stopped)).toEqual({ on: false, stop_reason: 'outside-hours' })
+
+  policies.set('pi-warming-plan-off', { keep_warm: 'off' })
+  const [planOff] = await step('pi-warming-plan-off')
+  expect(planOff).toMatchObject({ outcome: 'completed' })
+  expect(warming(planOff)).toEqual({ on: false })
+
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: false },
+  }))
+  const [localOff] = await step('pi-warming-local-off')
+  expect(localOff).toMatchObject({ outcome: 'completed' })
+  expect(warming(localOff)).toEqual({ on: false })
+})

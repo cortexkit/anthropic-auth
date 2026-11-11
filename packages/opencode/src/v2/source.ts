@@ -1,4 +1,5 @@
 import {
+  type AnthropicBillingWarming,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   decideStickyQuotaFailure,
@@ -249,6 +250,14 @@ export interface NativeSourceOptions {
     ttlMs?: number
     acceptedUsage?: Record<string, number>
   }) => void
+  /**
+   * Keep-warm state for a model request's billing report, read from memory
+   * once its response finishes; `undefined` leaves the state out.
+   */
+  readonly billingWarming?: (input: {
+    sessionID: string
+    route: string
+  }) => AnthropicBillingWarming | undefined
   readonly fetch?: typeof fetch
   /** Resolve a host model alias to the upstream ID before request-local policy. */
   readonly resolveModelId?: (scope: RequestScope) => Promise<string>
@@ -624,6 +633,14 @@ export function createNativeAnthropicSource(
         requestKind: input.agent === 'cachekeep' ? 'keep_warm' : input.kind,
         chargeBasis:
           input.route === 'api' ? 'metered_api' : 'subscription_included',
+        ...(input.agent !== 'cachekeep' &&
+          options.billingWarming && {
+            cacheWarming: () =>
+              options.billingWarming?.({
+                sessionID: input.sessionID,
+                route: input.route,
+              }),
+          }),
       }
     },
     async chooseAccount(

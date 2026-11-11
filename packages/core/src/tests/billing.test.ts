@@ -451,3 +451,118 @@ test('oversized non-usage stream lines cannot hide a later usage frame', async (
     usage: { input: 12, output: 8 },
   })
 })
+
+test('model-request billing reads keep-warm state only once a response completes', async () => {
+  const reports = capture()
+  let reads = 0
+  const tracked: AnthropicBillingRequest = {
+    ...request,
+    cache: { ttlMs: 300_000 },
+    cacheWarming: () => {
+      reads++
+      return { on: false, stopReason: 'count-cap' }
+    },
+  }
+  await (
+    await withAnthropicBilling(tracked, async () =>
+      Response.json({ id: 'msg_done', usage: { output_tokens: 1 } }),
+    )
+  ).text()
+  await (
+    await withAnthropicBilling(tracked, async () => response([start]))
+  ).text()
+  await (
+    await withAnthropicBilling(tracked, async () =>
+      Response.json({ type: 'error' }, { status: 500 }),
+    )
+  ).text()
+  await Bun.sleep(10)
+  expect(reads).toBe(1)
+  expect(reports.map((report) => [report.outcome, report.cache])).toEqual([
+    [
+      'completed',
+      { ttl_ms: 300_000, warming: { on: false, stop_reason: 'count-cap' } },
+    ],
+    ['cut', { ttl_ms: 300_000 }],
+    ['failed', undefined],
+  ])
+})
+
+test('CacheKeep warming state follows tracked, stopped and switched-off sessions', () => {
+  const policies = new Map<string, unknown>()
+  globals[key] = (session: string) => ({
+    cache: () => policies.get(session) ?? null,
+    report: () => {},
+  })
+  const now = Date.now()
+  const manager = new CacheKeepManager({
+    loadStorage: async () => null,
+    now: () => now,
+    setIntervalImpl: (() => ({
+      unref() {},
+    })) as unknown as typeof setInterval,
+    clearIntervalImpl: (() => {}) as typeof clearInterval,
+    setTimeoutImpl: (() => ({ unref() {} })) as unknown as typeof setTimeout,
+    clearTimeoutImpl: (() => {}) as typeof clearTimeout,
+  })
+  const track = (
+    sessionId: string,
+    extra: Partial<Parameters<CacheKeepManager['track']>[0]> = {},
+  ) =>
+    manager.track({
+      sessionId,
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: new Headers(),
+      bodyText: JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: [
+          { type: 'text', text: 'p', cache_control: { type: 'ephemeral' } },
+        ],
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      storage: null,
+      cacheMode: 'hybrid',
+      ...extra,
+    })
+  try {
+    expect(manager.warming('unseen')).toBeUndefined()
+    policies.set('warm', { keep_warm: 'always' })
+    expect(track('warm').tracked).toBe(true)
+    expect(manager.warming('warm')).toEqual({ on: true })
+    manager.untrack('warm', 'routing-moved')
+    // Billing reports accept only some stop reasons; other stops carry none.
+    expect(manager.warming('warm')).toEqual({ on: false })
+
+    policies.set('capped', { keep_warm: 'always' })
+    expect(
+      track('capped', {
+        retained: {
+          cacheExpiresAt: now + 300_000,
+          nextPrewarmAt: now + 270_000,
+          ttlMs: 300_000,
+          policyState: {
+            ownerSessionId: 'capped',
+            planned: true,
+            lastRealRequestAt: now,
+            warmsSinceLastRealRequest: 24,
+            warmCostSoFar: 0,
+            hasWarmed: true,
+          },
+        },
+      }).tracked,
+    ).toBe(false)
+    expect(manager.warming('capped')).toEqual({
+      on: false,
+      stopReason: 'count-cap',
+    })
+
+    policies.set('planned-off', { keep_warm: 'off' })
+    expect(track('planned-off').tracked).toBe(false)
+    expect(manager.warming('planned-off')).toEqual({ on: false })
+    // No plan and local keep-warm disabled (no saved settings).
+    expect(track('local-off').tracked).toBe(false)
+    expect(manager.warming('local-off')).toEqual({ on: false })
+  } finally {
+    manager.stop()
+  }
+})

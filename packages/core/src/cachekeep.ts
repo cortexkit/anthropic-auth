@@ -3,10 +3,14 @@ import {
   type CacheKeepDecision,
   decideCacheKeep,
 } from '@cortexkit/common-auth/cachekeep'
-import type { CacheWarmStopReason } from '@cortexkit/common-auth/routing-accessor'
+import {
+  type CacheWarmStopReason,
+  isCacheWarmStopReason,
+} from '@cortexkit/common-auth/routing-accessor'
 import type { AccountStorage } from './accounts.ts'
 import {
   type AnthropicBillingRequest,
+  type AnthropicBillingWarming,
   withAnthropicBilling,
 } from './billing.ts'
 import {
@@ -697,6 +701,8 @@ export type CacheKeepPrewarmValidation =
 // common-auth/cachekeep's default maxIdleWarmMs and maxSubagentIdleMs.
 const PLANNED_UNPRICED_MAIN_IDLE_MS = 60 * 60_000
 const PLANNED_UNPRICED_SUBAGENT_IDLE_MS = 30 * 60_000
+/** Bounds the per-session warming records kept for billing reports. */
+const WARMING_RECORD_LIMIT = 4096
 
 export class CacheKeepWarmRefusal extends Error {
   constructor(readonly reason: CacheWarmStopReason) {
@@ -711,6 +717,13 @@ export class CacheKeepManager {
   private readonly immediateTargets = new Map<string, CacheKeepTarget>()
   // Only the body-free public projection survives when warming stops.
   private readonly stoppedSessions = new Map<string, CacheKeepTrackedSession>()
+  // Why a session has no live target, for billing reports: the reason its
+  // warming last stopped, or `undefined` when its settings kept warming off.
+  // Latest event wins; a newly tracked target clears the record.
+  private readonly warmingRecords = new Map<
+    string,
+    { stopReason?: CacheWarmStopReason }
+  >()
   private timer: ReturnType<typeof setInterval> | null = null
   private dueTimer: ReturnType<typeof setTimeout> | null = null
   private tickPromise: Promise<void> | null = null
@@ -946,6 +959,46 @@ export class CacheKeepManager {
 
   hasPlannedTarget(id: string): boolean {
     return this.targets.get(id)?.policyState?.planned === true
+  }
+
+  /**
+   * Whether keep-warm tracks a session, read from memory only (no lock, no
+   * storage). `on: true` means a live target holds the session's cache. A stop
+   * carries its reason only when billing reports accept that reason
+   * (`isCacheWarmStopReason`); other stops report `on: false` alone.
+   * `undefined` means this manager has seen nothing that decides it.
+   */
+  warming(id: string): AnthropicBillingWarming | undefined {
+    const target = this.targets.get(id)
+    if (target && (this.options.now?.() ?? Date.now()) < target.cacheExpiresAt)
+      return { on: true }
+    const record = this.warmingRecords.get(id)
+    if (!record) return undefined
+    return isCacheWarmStopReason(record.stopReason)
+      ? { on: false, stopReason: record.stopReason }
+      : { on: false }
+  }
+
+  /**
+   * Record that a session's policy or settings keep warming off, for a host
+   * that refuses to track before reaching this manager (an API-key route,
+   * local keep-warm disabled, or a subagent without subagent warming).
+   */
+  recordWarmingOff(id: string): void {
+    this.setWarmingRecord(id, {})
+  }
+
+  private setWarmingRecord(
+    id: string,
+    record: { stopReason?: CacheWarmStopReason },
+  ) {
+    this.warmingRecords.delete(id)
+    this.warmingRecords.set(id, record)
+    while (this.warmingRecords.size > WARMING_RECORD_LIMIT) {
+      const oldest = this.warmingRecords.keys().next()
+      if (oldest.done) break
+      this.warmingRecords.delete(oldest.value)
+    }
   }
 
   updateSubagent(id: string, isSubagent: boolean): void {
@@ -1217,6 +1270,9 @@ export class CacheKeepManager {
 
   private reportStop(target: CacheKeepTarget, reason: string, at: number) {
     const state = target.policyState
+    // Source warms use a synthetic id, not the session's own.
+    if (!target.sourceWarm)
+      this.setWarmingRecord(target.id, { stopReason: reportStopReason(reason) })
     // Source warms are a different model's prefix, not evidence about the
     // active session cache. The shared report has no target-attribution field.
     if (target.sourceWarm || !state?.hasWarmed || this.reportedStops.has(state))
@@ -1361,12 +1417,22 @@ export class CacheKeepManager {
       (input.retained?.policyState?.planned || previous?.policyState?.planned)
     )
       return retire('session-ended')
-    if (policy?.ttl === 'none' || policy?.keep_warm === 'off')
+    // A plan or setting that keeps warming off is recorded for billing, unless
+    // this call stops a live target: then that stop is the session's record.
+    const sessionId = input.sessionId
+    const keptOff = () => {
+      if (!previous && !input.sourceWarm) this.recordWarmingOff(sessionId)
+    }
+    if (policy?.ttl === 'none' || policy?.keep_warm === 'off') {
+      if (policy.keep_warm === 'off') keptOff()
       return retire('unsupported')
+    }
     if (!planned && !isCacheKeepPersistentlyEnabled(input.storage)) {
+      keptOff()
       return refuse('cachekeep disabled', 'disabled')
     }
     if (!planned && input.cacheMode !== 'hybrid') {
+      keptOff()
       return refuse('cache mode is not hybrid', 'not-hybrid')
     }
     bodyBytes = Buffer.byteLength(input.bodyText, 'utf8')
@@ -1415,6 +1481,7 @@ export class CacheKeepManager {
     this.pruneTargets(now, today)
     if (this.targets.has(input.sessionId)) this.targets.delete(input.sessionId)
     this.stoppedSessions.delete(input.sessionId)
+    this.warmingRecords.delete(input.sessionId)
 
     const headers: Record<string, string> = {}
     input.headers.forEach((value, key) => {

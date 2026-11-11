@@ -130,6 +130,8 @@ interface SharedCacheKeep {
     | 'hasPlannedTarget'
     | 'updateSubagent'
     | 'trackedPolicyState'
+    | 'warming'
+    | 'recordWarmingOff'
   > &
     Partial<
       Pick<
@@ -141,6 +143,8 @@ interface SharedCacheKeep {
         | 'hasPlannedTarget'
         | 'updateSubagent'
         | 'trackedPolicyState'
+        | 'warming'
+        | 'recordWarmingOff'
       >
     >
   readonly registry: CacheKeepSessionRegistry
@@ -904,13 +908,17 @@ export function createNativeCacheKeep(
         }
         return skipped('planned-owner-requires-restart')
       }
-      discardLocalTargets(
-        owner,
-        options.now?.() ?? Date.now(),
-        !isCacheKeepHybridActive(snapshot.policyStorage),
-      )
-      if (!isCacheKeepHybridActive(snapshot.policyStorage)) {
-        if (policy?.keep_warm === undefined) return skipped('hybrid-inactive')
+      const hybridActive = isCacheKeepHybridActive(snapshot.policyStorage)
+      // A target this call stops keeps its stop as the session's warming record.
+      const hadTarget =
+        !hybridActive &&
+        manager.trackedSessions().some(({ id }) => id === input.sessionID)
+      discardLocalTargets(owner, options.now?.() ?? Date.now(), !hybridActive)
+      if (!hybridActive) {
+        if (policy?.keep_warm === undefined) {
+          if (!hadTarget) manager.recordWarmingOff?.(input.sessionID)
+          return skipped('hybrid-inactive')
+        }
       }
       let isSubagent = false
       try {
@@ -926,8 +934,10 @@ export function createNativeCacheKeep(
         policy?.keep_warm === undefined &&
         isSubagent &&
         !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
-      )
+      ) {
+        manager.recordWarmingOff?.(input.sessionID)
         return skipped('subagents-disabled')
+      }
       const account =
         input.admission?.account ??
         snapshot.accounts.find((row) => row.id === input.accountId)
@@ -985,7 +995,8 @@ export function createNativeCacheKeep(
           readSessionCachePolicy(sessionID, true)?.keep_warm === undefined &&
           !isCacheKeepSubagentsEnabled(target.storage)
         ) {
-          manager.untrack(sessionID, 'policy-refused')
+          if (!manager.untrack(sessionID, 'policy-refused'))
+            manager.recordWarmingOff?.(sessionID)
           return
         }
         const result = manager.track({
@@ -1020,6 +1031,15 @@ export function createNativeCacheKeep(
     },
     discardAttempt(attemptId: string) {
       discardAttempt(attemptId)
+    },
+    /**
+     * Keep-warm state for a model request's billing report, from memory only.
+     * API-key routes are never warmed; an older shared manager without the
+     * reader leaves the state undecided.
+     */
+    warming(input: { sessionID: string; route: string }) {
+      if (input.route !== 'oauth') return { on: false as const }
+      return manager.warming?.(input.sessionID)
     },
     recordAcceptedUsage(
       sessionID: string,

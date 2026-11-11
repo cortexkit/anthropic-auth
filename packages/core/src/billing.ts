@@ -7,6 +7,9 @@ import {
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
 type BillingReport = Extract<ReportRoutingInput, { kind: 'billing' }>
+export type AnthropicBillingWarming = NonNullable<
+  NonNullable<BillingReport['cache']>['warming']
+>
 export type AnthropicBillingRequest = Omit<
   BillingReport,
   | 'kind'
@@ -18,7 +21,15 @@ export type AnthropicBillingRequest = Omit<
   | 'providerResponseId'
   | 'usage'
   | 'usageByModel'
-> & { attemptId?: string }
+> & {
+  attemptId?: string
+  /**
+   * Read once a completed response finishes, after the host has let CacheKeep
+   * track or refuse it, so the report carries the keep-warm state that request
+   * produced. Must not wait or do I/O; `undefined` leaves `cache.warming` out.
+   */
+  cacheWarming?: () => AnthropicBillingWarming | undefined
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   if (value && typeof value === 'object' && !Array.isArray(value))
@@ -122,7 +133,7 @@ function detachReport(report: BillingReport) {
   }, 0).unref?.()
 }
 
-function identity(input: AnthropicBillingRequest) {
+function identity({ cacheWarming: _, ...input }: AnthropicBillingRequest) {
   return {
     ...input,
     kind: 'billing' as const,
@@ -158,11 +169,20 @@ export function createAnthropicBillingObserver(
     const measured = anthropicBillingUsage(rawUsage)
     // message_start's zero output is not a measurement of a cut-off answer.
     if (!finalUsage) delete measured.usage.output
+    const outcome = failed ? 'failed' : !finalUsage ? 'cut' : 'completed'
+    let cache = failed ? undefined : base.cache
+    if (outcome === 'completed' && !cache?.warming && input.cacheWarming) {
+      let warming: AnthropicBillingWarming | undefined
+      try {
+        warming = input.cacheWarming()
+      } catch {}
+      if (warming) cache = { ...cache, warming }
+    }
     detachReport({
       ...base,
-      cache: failed ? undefined : base.cache,
+      cache,
       providerResponseId,
-      outcome: failed ? 'failed' : !finalUsage ? 'cut' : 'completed',
+      outcome,
       ...measured,
     })
   }

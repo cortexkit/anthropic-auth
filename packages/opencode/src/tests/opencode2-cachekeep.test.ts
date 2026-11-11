@@ -3197,3 +3197,93 @@ test('OC2 priced auto settles a same-generation known failure and charges the ne
   })
   expect((await saved()).pendingWarmCost).toBeUndefined()
 })
+
+function runnerPolicies(reports: Array<Record<string, unknown>>) {
+  const policies = new Map<string, unknown>()
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  globals[key] = (sessionId: string) => ({
+    cache: () => policies.get(sessionId) ?? null,
+    report: (payload: Record<string, unknown>) => reports.push(payload),
+  })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  return policies
+}
+
+/** A runner hours window six hours from now, so no warm can fall inside it. */
+function hoursAway() {
+  const hhmm = (at: number) => new Date(at).toISOString().slice(11, 16)
+  const from = Date.now() + 6 * 3_600_000
+  return { from: hhmm(from), to: hhmm(from + 10 * 60_000), tz: 'UTC' }
+}
+
+async function modelBilling(reports: Array<Record<string, unknown>>) {
+  await Bun.sleep(10)
+  const billed = reports.filter(
+    (report) =>
+      report.kind === 'billing' && report.request_kind !== 'keep_warm',
+  )
+  reports.length = 0
+  return billed
+}
+
+const warmingOf = (report: Record<string, unknown> | undefined) =>
+  (report?.cache as Record<string, unknown> | undefined)?.warming
+
+test('OC2 model-request billing carries the keep-warm state each step leaves', async () => {
+  const reports: Array<Record<string, unknown>> = []
+  const policies = runnerPolicies(reports)
+  const f = await fixture()
+  await f.live()
+  const [warm] = await modelBilling(reports)
+  expect(warm).toMatchObject({
+    outcome: 'completed',
+    cache: { ttl_ms: 3_600_000, warming: { on: true } },
+  })
+
+  // A failed attempt still carries no cache facts, warming included.
+  const failed = await f.prepare()
+  await f
+    .respond(failed, Response.json({ type: 'error' }, { status: 500 }))
+    .catch(() => {})
+  const [refused] = await modelBilling(reports)
+  expect(refused).toMatchObject({ outcome: 'failed' })
+  expect(refused?.cache).toBeUndefined()
+
+  policies.set('ses_oc2_keep', { keep_warm: 'hours', hours: hoursAway() })
+  await f.live()
+  const [stopped] = await modelBilling(reports)
+  expect(stopped).toMatchObject({ outcome: 'completed' })
+  expect(warmingOf(stopped)).toEqual({
+    on: false,
+    stop_reason: 'outside-hours',
+  })
+})
+
+test('OC2 model-request billing reports keep-warm off when a plan or setting never starts it', async () => {
+  const reports: Array<Record<string, unknown>> = []
+  const policies = runnerPolicies(reports)
+  const f = await fixture()
+  policies.set('ses_oc2_plan_off', { keep_warm: 'off' })
+  await f.live(undefined, {}, 'ses_oc2_plan_off')
+  const [planOff] = await modelBilling(reports)
+  expect(planOff).toMatchObject({ outcome: 'completed' })
+  expect(warmingOf(planOff)).toEqual({
+    on: false,
+  })
+
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: false },
+  }))
+  await f.live(undefined, {}, 'ses_oc2_local_off')
+  const [localOff] = await modelBilling(reports)
+  expect(localOff).toMatchObject({ outcome: 'completed' })
+  expect(warmingOf(localOff)).toEqual({
+    on: false,
+  })
+})

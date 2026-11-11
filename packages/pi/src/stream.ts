@@ -945,13 +945,23 @@ async function sendAnthropicRequest(
       : apiSubject?.credentialFingerprint
     if (!credentialId) return undefined
     const ttlMs = requestCacheLifetimeMs(wireBodyText)
+    const sessionId = relayAffinity
     return {
       ...(attempt ? piBillingPayer(attempt) : { credentialId }),
-      sessionId: relayAffinity,
+      sessionId,
       model: typeof body.model === 'string' ? body.model : options.model.id,
       requestKind: options.requestOrigin === 'direct' ? 'generate' : 'primary',
       chargeBasis: options.apiAccount ? 'metered_api' : 'subscription_included',
       ...(ttlMs > 0 ? { cache: { ttlMs } } : {}),
+      // Read when the response finishes. API-key routes are never warmed. An
+      // OAuth answer waits for nothing: until this attempt's CacheKeep
+      // tracking has settled, the state is left out.
+      cacheWarming: () => {
+        if (options.apiAccount) return { on: false }
+        if (!attempt || cacheTracking.get(attempt) !== 'settled')
+          return undefined
+        return keep.warming(sessionId)
+      },
     }
   }
   let input = options.apiAccount
@@ -965,6 +975,7 @@ async function sendAnthropicRequest(
     ...(!options.apiAccount && { redirect: 'error' as const }),
   }
   const cacheAccepted = new Set<PiNativeAttempt>()
+  const cacheTracking = new Map<PiNativeAttempt, 'pending' | 'settled'>()
   const trackAcceptedRequest = (
     attempt: PiNativeAttempt,
     sentBody = wireBodyText,
@@ -1001,6 +1012,11 @@ async function sendAnthropicRequest(
     const tracked = deps.cacheKeep
       ? Promise.resolve(keep.track(target))
       : piCacheKeep.trackAccepted(target, snapshot)
+    cacheTracking.set(attempt, 'pending')
+    void tracked.then(
+      () => cacheTracking.set(attempt, 'settled'),
+      () => {},
+    )
     let latestUsage: Record<string, number> = {}
     options.onCacheUsageRecorder?.((usage) => {
       if (!usage || init.signal?.aborted || !relayAffinity) return
