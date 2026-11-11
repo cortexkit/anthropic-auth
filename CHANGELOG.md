@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.10.0
 
 - Approving the plugin in the vault now also grants access to its Claude accounts, so vault setup no longer needs a separate grant step on vaults that support it.
 - OpenCode version 1 reuses the original model's kept prompt cache when returning from Opus recovery, avoiding a large prompt rewrite after a refusal.
@@ -10,6 +10,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Keep-warm stops spending on an idle session's old account when routing would send its next turn elsewhere, including after a restart. Addresses #698.
 - Adds Claude Mythos 5.2 to the model picker with adaptive thinking and effort choices, restores Mythos 5.1 effort choices on OpenCode 1 and 2, and supports preserved-thinking binding controls for both. Addresses #697.
 - OpenCode and Pi keep prompt caches warm when a conversation replays signed thinking, avoiding rejected warm requests and unnecessary cache rewrites. Addresses #696.
+
 ## 2.9.1
 
 - Pi and OpenCode now retry Claude streams that disconnect before completion instead of silently ending the turn, with content-free connection diagnostics for troubleshooting.
