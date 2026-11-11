@@ -341,6 +341,17 @@ function writeConfigs(env: IsolatedEnv, options: SpawnOptions) {
         $schema: 'https://opencode.ai/config.json',
         plugin: [`file://${PLUGIN_ENTRY}`],
         autoupdate: false,
+        // The live host catalog can deprecate models independently of the pinned
+        // OpenCode binary. The mock still serves the harness's default model.
+        provider: {
+          anthropic: {
+            models: {
+              'claude-sonnet-4-5': {
+                status: 'active',
+              },
+            },
+          },
+        },
         compaction: { auto: false, prune: false },
         permission: { read: 'allow', bash: 'allow', edit: 'allow' },
       },

@@ -137,6 +137,19 @@ function offlineOnly() {
 
 describe('native process fixture preparation', () => {
   it(
+    'keeps the default mock model active when the live OpenCode catalog deprecates it',
+    lifetimes.wrapBody(async () => {
+      const run = await prepareWithoutHost({})
+      const config = JSON.parse(
+        await readFile(join(run.env.configDir, 'opencode.json'), 'utf8'),
+      )
+      expect(config.provider?.anthropic?.models?.['claude-sonnet-4-5']).toEqual({
+        status: 'active',
+      })
+    }),
+  )
+
+  it(
     'migrates a local login before the host starts and leaves it servable without network',
     lifetimes.wrapBody(async () => {
       const run = await prepareWithoutHost({
