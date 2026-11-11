@@ -220,8 +220,8 @@ const IDLE_TTL_MS = 30 * 24 * 60 * 60_000
 const STALE_TEMP_MS = 10 * 60_000
 const WRITE_DELAY_MS = 1_000
 /**
- * Shutdown waits at most this long for pending writes, matching the grace
- * other account bookkeeping gets at shutdown, then gives up.
+ * Shutdown waits at most this long for pending writes, then gives up. It is
+ * the same one-second grace the quota and last-used saves get at shutdown.
  */
 const SHUTDOWN_GRACE_MS = 1_000
 const MAX_FILE_BYTES = 2 * 1024 * 1024
