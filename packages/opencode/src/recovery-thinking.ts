@@ -209,10 +209,21 @@ const MAX_DIGESTS_PER_FAMILY = 4096
 const MAX_SESSIONS_IN_MEMORY = 128
 /**
  * A record outlives its round: the trimmed turn stays in the session's
- * history. Records untouched this long are deleted on the first load.
+ * history. Records untouched this long are deleted by a sweep that runs once
+ * per process, in the background, from the store's first use.
  */
 const IDLE_TTL_MS = 30 * 24 * 60 * 60_000
+/**
+ * A temporary file this young may belong to a write still running in another
+ * OpenCode process that shares the folder, so the sweep leaves it alone.
+ */
+const STALE_TEMP_MS = 10 * 60_000
 const WRITE_DELAY_MS = 1_000
+/**
+ * Shutdown waits at most this long for pending writes, matching the grace
+ * other account bookkeeping gets at shutdown, then gives up.
+ */
+const SHUTDOWN_GRACE_MS = 1_000
 const MAX_FILE_BYTES = 2 * 1024 * 1024
 
 type SessionRecord = {
@@ -297,12 +308,33 @@ export class RecoveryThinkingStore {
       .catch(() => this.warn('delete'))
   }
 
-  /** Write every pending change now. Tests and shutdown use this. */
+  /** Write every pending change now. Tests use this; shutdown uses close. */
   async flush() {
     if (this.timer) clearTimeout(this.timer)
     this.timer = undefined
     this.enqueueWrites()
     await this.chain
+  }
+
+  /**
+   * Write pending changes at shutdown, waiting at most SHUTDOWN_GRACE_MS. A
+   * round that ends just before a restart would otherwise lose its record.
+   */
+  async close() {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const written = await Promise.race([
+      this.flush().then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), SHUTDOWN_GRACE_MS)
+        timer.unref?.()
+      }),
+    ])
+    clearTimeout(timer)
+    if (!written)
+      logger.warn(
+        'fable-fallback',
+        'recovery thinking record not fully written before shutdown',
+      )
   }
 
   private session(sessionId: string): SessionRecord {
@@ -321,6 +353,7 @@ export class RecoveryThinkingStore {
     }
     record.loading = this.load(sessionId, record)
     this.sessions.set(sessionId, record)
+    this.startSweep()
     while (this.sessions.size > MAX_SESSIONS_IN_MEMORY) {
       const oldest = this.sessions.keys().next().value
       if (oldest === undefined) break
@@ -337,7 +370,6 @@ export class RecoveryThinkingStore {
 
   private async load(sessionId: string, record: SessionRecord) {
     try {
-      await this.sweep()
       const path = join(this.directory, sessionFileName(sessionId))
       const stat = await lstat(path)
       if (
@@ -375,24 +407,48 @@ export class RecoveryThinkingStore {
     }
   }
 
-  /** Delete idle records and stale temporaries, once per process. */
-  private async sweep() {
+  /**
+   * Queue the sweep once per process, behind any queued write or delete, so it
+   * never removes a temporary file this process is still writing. Requests
+   * never wait for it.
+   */
+  private startSweep() {
     if (this.swept) return
     this.swept = true
+    this.chain = this.chain.then(() => this.sweep()).catch(() => {})
+  }
+
+  /** Whether a record file belongs to a session this process is using. */
+  private inUse(name: string) {
+    for (const records of [this.sessions, this.unwritten]) {
+      for (const sessionId of records.keys()) {
+        if (sessionFileName(sessionId) === name) return true
+      }
+    }
+    return false
+  }
+
+  /** Delete idle records and stale temporaries. */
+  private async sweep() {
     let names: string[]
     try {
       names = await readdir(this.directory)
     } catch {
       return
     }
-    const cutoff = this.now() - IDLE_TTL_MS
+    const now = this.now()
     for (const name of names) {
-      if (!FILE.test(name) && !TEMP.test(name)) continue
+      const temp = TEMP.test(name)
+      if (!temp && !FILE.test(name)) continue
       const path = join(this.directory, name)
       try {
         const stat = await lstat(path)
-        if (TEMP.test(name) || stat.mtimeMs < cutoff)
-          await rm(path, { force: true })
+        const expired = temp
+          ? stat.mtimeMs < now - STALE_TEMP_MS
+          : stat.mtimeMs < now - IDLE_TTL_MS
+        // Checked right before removal: a session loaded since readdir keeps
+        // its file.
+        if (expired && !this.inUse(name)) await rm(path, { force: true })
       } catch {}
     }
   }

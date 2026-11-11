@@ -2,6 +2,10 @@ import { describe, expect, mock } from 'bun:test'
 import { gunzipSync } from 'node:zlib'
 import type { AccountStorage } from '@cortexkit/anthropic-auth-core'
 import { FABLE_FALLBACK_TURNS } from '../fable-fallback'
+import {
+  RecoveryThinkingStore,
+  recoveryThinkingDigest,
+} from '../recovery-thinking'
 import { installLoaderSetup } from './support/opencode1-loader-setup.ts'
 import {
   createFallbackStorage,
@@ -335,5 +339,17 @@ describe('refusal recovery round thinking', () => {
       ...fallbackResponses.slice(0, -1).map((response) => response.toolUseId),
     ])
     expect(JSON.stringify(returnRequest.messages)).toContain('"text":"done"')
+
+    // The record survives a restart: shutdown writes it, and a fresh store on
+    // the same folder reads every block the round wrote.
+    await plugin.dispose?.()
+    const restarted = new RecoveryThinkingStore()
+    expect(await restarted.digests(SESSION, 'fable-5-2')).toEqual(
+      new Set(
+        fallbackResponses.map((response) =>
+          recoveryThinkingDigest('thinking', response.signature),
+        ),
+      ),
+    )
   })
 })

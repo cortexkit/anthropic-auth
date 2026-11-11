@@ -317,17 +317,37 @@ describe('RecoveryThinkingStore', () => {
     expect((await restarted.digests('ses_a', 'fable-5-2')).size).toBe(0)
   })
 
-  test('drops records left idle past their lifetime on first load', async () => {
+  test('close writes a pending change before shutdown, without waiting for the write timer', async () => {
+    const dir = await directory()
+    const store = new RecoveryThinkingStore({
+      directory: dir,
+      writeDelayMs: 60 * 60_000,
+    })
+    store.record('ses_a', 'fable-5-2', digest('fb-1'))
+    await store.close()
+    const restarted = new RecoveryThinkingStore({ directory: dir })
+    expect(await restarted.digests('ses_a', 'fable-5-2')).toEqual(
+      new Set([digest('fb-1')]),
+    )
+  })
+
+  test('drops records left idle past their lifetime in a background sweep', async () => {
     const dir = await directory()
     const store = new RecoveryThinkingStore({ directory: dir })
     store.record('ses_old', 'fable-5-2', digest('fb-1'))
+    store.record('ses_kept', 'fable-5-2', digest('fb-2'))
     await store.flush()
-    const [file] = await readdir(dir)
     const old = new Date(Date.now() - 31 * 24 * 60 * 60_000)
-    await utimes(join(dir, file!), old, old)
+    for (const file of await readdir(dir))
+      await utimes(join(dir, file), old, old)
 
     const restarted = new RecoveryThinkingStore({ directory: dir })
+    // A session in use keeps its file even when it looks idle on disk.
+    expect(await restarted.digests('ses_kept', 'fable-5-2')).toEqual(
+      new Set([digest('fb-2')]),
+    )
+    await restarted.flush()
+    expect(await readdir(dir)).toHaveLength(1)
     expect((await restarted.digests('ses_old', 'fable-5-2')).size).toBe(0)
-    expect(await readdir(dir)).toEqual([])
   })
 })

@@ -4586,6 +4586,11 @@ const anthropicAuthPlugin = async (
         error: error instanceof Error ? error.message : String(error),
       })
     }
+    // Bounded: waits at most about a second for the recovery record's
+    // pending write, so a restart right after a round keeps the record.
+    try {
+      await recoveryThinking.close()
+    } catch {}
     try {
       primeManagerAdoption.release()
     } catch (error) {
