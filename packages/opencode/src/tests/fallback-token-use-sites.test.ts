@@ -428,6 +428,7 @@ async function createFixture(
     primeMainDue?: boolean
     cachekeep?: boolean
     recovery?: boolean
+    refuseFirst?: boolean
     profile?: boolean
     captureIntervals?: boolean
     mainFirst?: boolean
@@ -457,7 +458,7 @@ async function createFixture(
   const intervals: IntervalRecord[] = []
   const records: OutboundRecord[] = []
   const credentialGets: Array<{ credentialId: string; isMain: boolean }> = []
-  let refusalPending = options.recovery === true
+  let refusalPending = options.refuseFirst ?? options.recovery === true
 
   const storage: AccountStorage = {
     version: 1,
@@ -827,7 +828,14 @@ async function createFixture(
             'message_start',
             {
               type: 'message_start',
-              message: { id: 'msg_tool', model, usage: {} },
+              message: {
+                id: 'msg_tool',
+                model,
+                usage:
+                  model === 'claude-opus-5-5'
+                    ? { cache_creation_input_tokens: 1000 }
+                    : {},
+              },
             },
           ],
           [
@@ -1202,6 +1210,7 @@ describe('vault-served fallback outbound token census', () => {
             quotaEnabled: true,
             quotaSnapshot: quota(now, 98),
             recovery: true,
+            refuseFirst: false,
             fallbackMode,
             recoveryToolUse: true,
             captureIntervals: true,
@@ -1250,6 +1259,9 @@ describe('vault-served fallback outbound token census', () => {
                 ),
             ).toBe(true)
           }
+          // Recovery keeps a source prefix only after a completed request has
+          // reported cache usage, before the refused request starts the round.
+          await send('claude-opus-5-5')
           for (const responses of [10]) {
             await send('claude-opus-5-5', true)
             for (let index = 0; index < responses; index++) {
