@@ -4,13 +4,13 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- OpenCode and Pi hosted by Thalamus now report each Claude model request's paying login and token usage, including retries and keep-warm requests, for accurate spend tracking.
 - Keep-warm stops spending on an idle session's old account when routing would send its next turn elsewhere, including after a restart. Addresses #698.
 - Adds Claude Mythos 5.2 to the model picker with adaptive thinking and effort choices, restores Mythos 5.1 effort choices on OpenCode 1 and 2, and supports preserved-thinking binding controls for both. Addresses #697.
 - OpenCode and Pi keep prompt caches warm when a conversation replays signed thinking, avoiding rejected warm requests and unnecessary cache rewrites. Addresses #696.
 ## 2.9.1
 
 - Pi and OpenCode now retry Claude streams that disconnect before completion instead of silently ending the turn, with content-free connection diagnostics for troubleshooting.
-- OpenCode and Pi hosted by Thalamus now report each Claude model request's paying login and token usage, including retries and keep-warm requests, for accurate spend tracking.
 - Updated the shared auth library.
 
 ## 2.9.0
