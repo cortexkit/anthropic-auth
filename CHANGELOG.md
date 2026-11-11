@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Approving the plugin in the vault now also grants access to its Claude accounts, so vault setup no longer needs a separate grant step on vaults that support it.
 - OpenCode version 1 reuses the original model's kept prompt cache when returning from Opus recovery, avoiding a large prompt rewrite after a refusal.
 - OpenCode and Pi hosted by Thalamus now report each Claude model request's paying login and token usage, including retries and keep-warm requests, for accurate spend tracking.
 - Keep-warm stops spending on an idle session's old account when routing would send its next turn elsewhere, including after a restart. Addresses #698.
