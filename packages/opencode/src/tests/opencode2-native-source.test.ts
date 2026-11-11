@@ -610,15 +610,21 @@ describe('OC2 shared routing relay', () => {
         input,
       )
       await Promise.resolve()
-      expect(reports).toEqual([
-        {
-          account_id: identity,
-          credential_id: 'oauth:anthropic',
-          outcome: 'exhausted',
-          window: confirmed ? '5h' : '7d',
-          ...(confirmed ? { resets_at: 2_000_000_000_000 } : {}),
-        },
-      ])
+      // Only a window the refused response's own headers confirm is reported;
+      // an unconfirmed limit sends nothing rather than a guessed weekly wall.
+      expect(reports).toEqual(
+        confirmed
+          ? [
+              {
+                account_id: identity,
+                credential_id: 'oauth:anthropic',
+                outcome: 'exhausted',
+                window: '5h',
+                resets_at: 2_000_000_000_000,
+              },
+            ]
+          : [],
+      )
     },
   )
 
