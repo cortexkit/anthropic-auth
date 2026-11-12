@@ -63,7 +63,7 @@ export async function fetchPiStreamResponse(
     }
     observer?.disconnect()
   }
-  // Observers have private queues, so concurrent warms cannot consume each
+  // Observers have private queues, so concurrent fetches cannot consume each
   // other's timing. Leave the runtime's bounded global timeline untouched.
   const observer = process.versions.bun
     ? undefined

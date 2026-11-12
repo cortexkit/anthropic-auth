@@ -87,13 +87,15 @@ test('Pi OAuth sends the Claude Code accept-encoding on the wire', async () => {
     },
     storagePath,
   )
-  let wireEncoding: string | null = null
-  let explicitEncoding: string | null = null
+  const encoding: { wire: string | null; explicit: string | null } = {
+    wire: null,
+    explicit: null,
+  }
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
     fetch(request) {
-      wireEncoding = request.headers.get('accept-encoding')
+      encoding.wire = request.headers.get('accept-encoding')
       return new Response('data: {"type":"message_stop"}\n\n', {
         headers: { 'content-type': 'text/event-stream' },
       })
@@ -104,7 +106,7 @@ test('Pi OAuth sends the Claude Code accept-encoding on the wire', async () => {
       return Response.json({
         oauth_account: { account_uuid: 'pi-wire-encoding' },
       })
-    explicitEncoding = new Headers(init?.headers).get('accept-encoding')
+    encoding.explicit = new Headers(init?.headers).get('accept-encoding')
     return originalFetch(`${server.url}v1/messages`, init)
   }) as typeof fetch
   try {
@@ -113,8 +115,8 @@ test('Pi OAuth sends the Claude Code accept-encoding on the wire', async () => {
       apiKey: 'sk-ant-oat-wire-encoding',
     })
     expect((await stream.result()).stopReason).toBe('stop')
-    expect(explicitEncoding).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
-    expect(wireEncoding).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
+    expect(encoding.explicit).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
+    expect(encoding.wire).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
   } finally {
     await server.stop(true)
   }

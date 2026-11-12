@@ -875,12 +875,13 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
         Response.json({ encoding: request.headers.get('accept-encoding') }),
     })
     try {
-      const wire = await fetch(
-        new Request(`${server.url}v1/messages`, final.clone()),
-      )
-      expect((await wire.json()).encoding).toBe(
-        core.CLAUDE_CODE_ACCEPT_ENCODING,
-      )
+      const wire = await fetch(`${server.url}v1/messages`, {
+        method: final.method,
+        headers: final.headers,
+        body: await final.clone().arrayBuffer(),
+      })
+      const received = (await wire.json()) as { encoding: string | null }
+      expect(received.encoding).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
     } finally {
       await server.stop(true)
     }

@@ -129,11 +129,16 @@ try {
         sse_events: 0,
       },
     })
-    expect(results[1].diagnostics).toMatchObject({
-      encoded_body_bytes: 0,
-      decoded_body_bytes: 0,
-      response_bytes: 0,
-      sse_events: 0,
+    expect(results[1]).toMatchObject({
+      code: 'ECONNRESET',
+      message:
+        'Anthropic connection reset: stream ended before message_stop (ECONNRESET)',
+      diagnostics: {
+        encoded_body_bytes: 0,
+        decoded_body_bytes: 0,
+        response_bytes: 0,
+        sse_events: 0,
+      },
     })
     expect(results[2]).toBeNull()
     expect(unknown).not.toHaveProperty('encoded_body_bytes')
