@@ -1272,7 +1272,9 @@ const anthropicAuthPlugin = async (
   ctx: Parameters<Plugin>[0],
   runtimeOverrides: PluginRuntimeOverrides = {},
 ) => {
-  const runtimeNow = runtimeOverrides.now ?? Date.now
+  // Read Date.now at each call, not once here, so the default tracks the
+  // process clock exactly as the direct Date.now() reads it replaces did.
+  const runtimeNow = runtimeOverrides.now ?? (() => Date.now())
   const runtimeTimers = {
     setTimeout: globalThis.setTimeout,
     clearTimeout: globalThis.clearTimeout,
