@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Pi now records compressed and decoded byte counts for cut Claude streams when available, and sends Claude Code's response-compression preferences on Claude sign-in requests.
 - OpenCode version 1 no longer gets stuck on a "thinking blocks cannot be modified" error when it returns to the original model after an Opus recovery round that began mid-turn, including after OpenCode restarts.
 - OpenCode 2 hosted by Thalamus now gives each billing report its own unique id. Reports after a server restart reused earlier ids, so Thalamus dropped them as repeats.
 - Pi hosted by Thalamus now reports confirmed Claude account limits and successful requests to shared routing, so capped accounts are avoided after failover.
