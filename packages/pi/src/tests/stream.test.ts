@@ -177,7 +177,8 @@ test.each(['success', 'provider error', 'malformed'])(
 )
 
 afterEach(async () => {
-  // Retire vault polls and drain publications before replacing fetch or deleting fixtures.
+  // Close each fixture's native runtime before replacing fetch or deleting
+  // fixtures. A runtime left open keeps polling the vault into later test files.
   await Promise.all([...nativeStoragePaths].map(closePiNativeRuntime))
   nativeStoragePaths.clear()
   __setLogTestSink(null)
