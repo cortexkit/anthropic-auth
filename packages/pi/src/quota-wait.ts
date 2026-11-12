@@ -43,7 +43,7 @@ async function waitForReset(
   })
   try {
     options.setWorkingMessage?.(
-      `Checking account availability in ${delayMs / 60_000} minutes (reset at ${time} UTC) · Esc to cancel`,
+      `Checking account availability in ${Math.max(1, Math.ceil(delayMs / 60_000))} min (reset at ${time} UTC) · Esc to cancel`,
     )
     await new Promise<void>((resolve, reject) => {
       const abort = () => {

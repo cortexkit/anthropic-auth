@@ -8,6 +8,12 @@ const details = new WeakMap<
 
 export const quotaRefusalDetails = (response: Response) => details.get(response)
 
+// Whole minutes only: a capped wait can be a few seconds short of a minute boundary.
+function retryMinutes(seconds: number) {
+  const minutes = Math.max(1, Math.ceil(seconds / 60))
+  return minutes === 1 ? '1 minute' : `${minutes} minutes`
+}
+
 export function createQuotaRefusalResponse(
   reason: string,
   timing: ReturnType<typeof quotaRefusalTiming>,
@@ -54,7 +60,7 @@ export function createQuotaRefusalResponse(
       : `${Math.ceil(remaining / 60_000)} min`
   const message =
     timing.limitName && resetTime
-      ? `All Claude accounts are at a usage limit (${timing.limitName} limit). The earliest reset is ${resetTime} UTC (in ${duration}). ${seconds === undefined || options.retry === 'manual' ? 'Send the message again after that.' : `Retrying every ${seconds / 60} minutes.`} ${reason}`
+      ? `No Claude account has room for this request (${timing.limitName} limit or your quota floor). The earliest reset is ${resetTime} UTC (in ${duration}). ${seconds === undefined || options.retry === 'manual' ? 'Send the message again after that.' : `Retrying every ${retryMinutes(seconds)}.`} ${reason}`
       : `${reason}${retry} ${reset}`
   const response = new Response(
     JSON.stringify({

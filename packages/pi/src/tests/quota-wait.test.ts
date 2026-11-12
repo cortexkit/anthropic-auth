@@ -65,7 +65,7 @@ test('Pi waits inside the stream and resumes the same account after showing and 
   expect(sends).toBe(0)
   expect(clock.delay).toBe(120_000)
   expect(clock.messages[0]).toMatch(
-    /^Checking account availability in 2 minutes \(reset at \d\d:\d\d UTC\) · Esc to cancel$/,
+    /^Checking account availability in 2 min \(reset at \d\d:\d\d UTC\) · Esc to cancel$/,
   )
   clock.callback?.()
   expect(await (await result).text()).toBe('served')
