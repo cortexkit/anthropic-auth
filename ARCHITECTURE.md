@@ -130,7 +130,7 @@ Modes are `main-first` (default), `fallback-first` and `sticky-balanced` (`routi
 
 ## Prompt cache
 
-- **Strategy:** set per account (`cache1h.ts`): explicit breakpoints, automatic, or hybrid. Hybrid keeps a stable system anchor, and switches to a bridge anchor when the last two user boundaries are more than 20 content blocks apart.
+- **Strategy:** set per account (`cache1h.ts`): explicit breakpoints, automatic, or hybrid. Hybrid keeps a stable system anchor, and switches to a bridge anchor when the last two user boundaries are more than 20 content blocks apart. A full request after accepted thread continuations may use that slot for the previous full request's cache boundary, as described below. Markers that reconnect caches when a session switches between Fable and Opus take priority.
 - **Keep-warm:** `CacheKeepManager` (`cachekeep.ts`) tracks up to 32 sessions, within a 64 MiB body budget, once Anthropic has accepted their request.
   - **Timing:** it sends the prewarm 5 minutes before expiry, on the account that served the session. Transient failures retry at about 20, 40 and 60 seconds until the cache would expire. A refusal a retry cannot fix (killswitch floor, account disabled or signed out, changed login, vault refusal) stops warming that session with one warning.
   - **Restarts:** OpenCode 2 and Pi save the latest accepted body per session, gzipped and owner-only, under `cortexkit/anthropic-auth/cachekeep-restore/` in the data folder. A restarted host warms again from there.
@@ -148,13 +148,17 @@ Modes are `main-first` (default), `fallback-first` and `sticky-balanced` (`routi
 `message-threads.ts` is shared by all three hosts and runs on the final wire body. A request continues the thread only when all of these hold:
 
 - it has an anchor from the previous accepted response, on the same account and credential, less than 5 minutes old. The credential is the stable row, not the token: the vault credential id, or the local account row and its login epoch, so a routine token refresh keeps the thread;
-- every fixed field is identical: model, thinking, effort, tool choice, context management, fallbacks, betas, system and tools;
-- every earlier message is unchanged by canonical hash (only `cache_control` is ignored);
+- every fixed field is identical: model, thinking, effort, tool choice, context management, fallbacks, betas, system and tools. On supported cache layouts, Core first restores the accepted create's system/tool cache annotations, preserving wire key order; normal per-request billing fields are excluded from the comparison;
+- every earlier message matches its canonical thread-history hash, ignoring protocol `cache_control` annotations;
 - exactly one new assistant reply matches the reply fingerprint the stream recorded.
 
 Anything else sends a full `create` request. Title, summary, compaction, keep-warm, Prime and WebSocket relay requests stay stateless. Each full request inside a session logs one debug line with a fixed reason code (for example `reply_changed` or `identity_changed`) and no content.
 
-**Recovery:** if Anthropic rejects a continue, the plugin resends once with the full conversation as a new thread. If that create is rejected for using threads, it resends once more statelessly and turns threads off for that account until restart. A thread problem never reaches the user as an error when a stateless send would work.
+**Full-after-thread cache boundary:** after at least one continuation has been accepted since the last full request, a new full request may reuse that full request's last message marker, including one nested inside a tool result. Core retains only the marker's position, lifetime, accepted time and hashes of its prefix and account/credential identity. The prefix, beta list and speed must still match, and the entry must not have expired. The marker replaces OpenCode's ordinary system/lookback marker or Pi's system marker, never exceeding four markers. It cannot replace an Opus standby bridge (anchoring the cache kept ready for an Opus recovery turn) or a Fable return marker (anchoring the Fable prefix when returning from Opus). If no slot is offered, Core skips the prefix hash and body clone. Every failed condition leaves the ordinary full body untouched and logs one content-free tail reason such as `prefix_changed`, `slot_taken` or `layout_unrecordable`. A create directly after a create, and a session that has only sent stateless requests, never gets this extra boundary.
+
+**Wire safety:** 1-hour markers must precede every 5-minute marker. Core checks the final continuation after restoring fixed fields and budgeting message markers; invalid order falls back to the untouched full request rather than repairing the accepted fixed fields. Every accepted create records the fingerprint and last message marker from the body actually sent. Fixed annotation layouts must be recordable before a tail marker can replace another marker.
+
+**Recovery:** if Anthropic rejects a continue, the plugin resends once with the full conversation as a new thread. If that create is rejected for using threads, it resends once more statelessly and turns threads off for that account until restart. Removing the thread beta for that last retry changes the cache-prefix identity, so the retry keeps the ordinary full body's cache markers. A thread problem never reaches the user as an error when a stateless send would work.
 
 ## Content-filter fallback
 

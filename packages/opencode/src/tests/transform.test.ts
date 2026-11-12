@@ -1,10 +1,19 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test'
 import {
   CLAUDE_CODE_FULL_AGENT_BETAS,
   CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
   FAST_MODE_BETA,
+  logger,
   MessageThreadTracker,
   OPENCODE_IDENTITY_PREFIX,
   PER_TURN_CONTROL_BETA,
@@ -216,9 +225,23 @@ describe('hybrid full-after-thread slot', () => {
           message('user', 'middle'),
         ],
       }
-      const standbyAnchor = extractLatestHybridMessageCacheAnchor(
-        await rewriteRequestBody(JSON.stringify(middle), options),
+      const middleText = await rewriteRequestBody(
+        JSON.stringify(middle),
+        options,
       )
+      const continuation = tracker.prepare({
+        ...input,
+        body: JSON.parse(middleText),
+        cacheSlot: slot,
+      })
+      expect(continuation.decision.type).toBe('continue')
+      continuation.complete({
+        messageId: 'msg_middle',
+        stopped: true,
+        stopReason: 'end_turn',
+        reply: message('assistant', 'reply'),
+      })
+      const standbyAnchor = extractLatestHybridMessageCacheAnchor(middleText)
       const final = {
         ...middle,
         messages: [
@@ -233,8 +256,14 @@ describe('hybrid full-after-thread slot', () => {
       })
       const body = JSON.parse(text)
       now = 301_000
+      const log = spyOn(logger, 'debug')
       const prepared = tracker.prepare({ ...input, body, cacheSlot: slot })
+      const tailReason = log.mock.calls
+        .filter((call) => call[1] === 'message_thread_tail_marker')
+        .at(-1)?.[2]
+      log.mockRestore()
       if (kind === 'standby') {
+        expect(tailReason).toMatchObject({ reason: 'slot_taken' })
         expect(JSON.stringify(prepared.body)).toBe(
           JSON.stringify({ ...body, thread: { type: 'create' } }),
         )
@@ -4619,6 +4648,99 @@ describe('rewriteRequestBody', () => {
         ),
       ].filter((block: any) => block.cache_control)
     }
+
+    test('Fable return reserves the slot and its accepted wire continues unchanged', async () => {
+      const rewrite = (payload: unknown) =>
+        rewriteRequestBody(JSON.stringify(payload), {
+          ...options,
+          deferSigning: true,
+        })
+      const history = returnRequest()
+      const source = await rewrite(sourceRequest())
+      const first = JSON.parse(
+        await rewrite({ ...history, messages: history.messages.slice(0, 5) }),
+      )
+      const tracker = new MessageThreadTracker(10, () => 0)
+      const input = {
+        body: first,
+        betas: [],
+        account: 'account',
+        credential: 'credential',
+        session: 'reserved-return',
+        cacheSlot: () => undefined,
+      }
+      tracker.prepare(input).complete({
+        messageId: 'msg_source',
+        stopped: true,
+        stopReason: 'end_turn',
+        reply: history.messages[5],
+      })
+      const middle = JSON.parse(
+        await rewrite({ ...history, messages: history.messages.slice(0, 7) }),
+      )
+      const continuation = tracker.prepare({ ...input, body: middle })
+      expect(continuation.decision.type).toBe('continue')
+      continuation.complete({
+        messageId: 'msg_middle',
+        stopped: true,
+        stopReason: 'end_turn',
+        reply: history.messages[7],
+      })
+      let slot: Parameters<MessageThreadTracker['prepare']>[0]['cacheSlot']
+      const returned = JSON.parse(
+        await rewriteRequestBody(JSON.stringify(history), {
+          ...options,
+          deferSigning: true,
+          sourceRecoveryBody: source,
+          onThreadCacheSlot: (value) => {
+            slot = value
+          },
+        }),
+      )
+      const log = spyOn(logger, 'debug')
+      const full = tracker.prepare({
+        ...input,
+        body: returned,
+        cacheSlot: slot,
+      })
+      const reason = log.mock.calls
+        .filter((call) => call[1] === 'message_thread_tail_marker')
+        .at(-1)?.[2]
+      log.mockRestore()
+      expect(reason).toMatchObject({ reason: 'slot_taken' })
+      expect(full.tailMarkerAdded).toBe(false)
+      expect(JSON.stringify(full.body)).toBe(
+        JSON.stringify({ ...returned, thread: { type: 'create' } }),
+      )
+      const reply = {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'source answer' }],
+      }
+      full.complete({
+        messageId: 'msg_return',
+        stopped: true,
+        stopReason: 'end_turn',
+        reply,
+      })
+      const following = JSON.parse(
+        await rewrite({
+          ...history,
+          messages: [
+            ...history.messages,
+            reply,
+            { role: 'user', content: [{ type: 'text', text: 'next' }] },
+          ],
+        }),
+      )
+      const next = tracker.prepare({ ...input, body: following })
+      expect(next.decision.type).toBe('continue')
+      expect(JSON.stringify(next.body.system)).toBe(
+        JSON.stringify(full.body.system),
+      )
+      expect(JSON.stringify(next.body.tools)).toBe(
+        JSON.stringify(full.body.tools),
+      )
+    })
 
     test.each(['1h', '5m'] as const)(
       'restores the source old-tail breakpoint beyond lookback with %s TTL for one accepted return',

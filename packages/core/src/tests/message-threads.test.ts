@@ -86,6 +86,21 @@ function tailMarkerInput(): MessageThreadInput {
 }
 
 describe('full request tail marker', () => {
+  function anchorWithContinuation(
+    tracker: MessageThreadTracker,
+    request: MessageThreadInput,
+  ) {
+    anchor(tracker, request)
+    const continued = tracker.prepare(advance(request))
+    expect(continued.decision.type).toBe('continue')
+    continued.complete({
+      messageId: 'msg_continue',
+      stopped: true,
+      stopReason: 'end_turn',
+      reply: assistant,
+    })
+    return request
+  }
   function replay(first: MessageThreadInput): MessageThreadInput {
     const request = advance(first)
     request.body = structuredClone(request.body)
@@ -120,7 +135,14 @@ describe('full request tail marker', () => {
       )
     expect(blocks(first.body)).toBe(438)
     const continued = advance(first)
-    expect(tracker.prepare(continued).decision.type).toBe('continue')
+    const continuation = tracker.prepare(continued)
+    expect(continuation.decision.type).toBe('continue')
+    continuation.complete({
+      messageId: 'msg_continue',
+      stopped: true,
+      stopReason: 'end_turn',
+      reply: assistant,
+    })
     // A long replay needs its old full tail even when it is beyond Anthropic's
     // 20-block lookback. These tails are 284 content blocks apart, at messages
     // 350 and 528, with 438 and 722 blocks in the respective full requests.
@@ -194,7 +216,7 @@ describe('full request tail marker', () => {
     let now = 0
     const tracker = new MessageThreadTracker(10, () => now)
     const first = tailMarkerInput()
-    if (reason !== 'no_prior_thread') anchor(tracker, first)
+    if (reason !== 'no_prior_thread') anchorWithContinuation(tracker, first)
     const request = replay(first)
     request.stateless = true
     now = 301_000
@@ -217,7 +239,7 @@ describe('full request tail marker', () => {
         content: Record<string, unknown>[]
       }[]
       messages[350]!.content[0]!.cache_control = { type: 'ephemeral' }
-      anchor(tracker, short)
+      anchorWithContinuation(tracker, short)
       now = 1
     }
     const before = JSON.stringify(request.body)
@@ -257,7 +279,7 @@ describe('full request tail marker', () => {
         content: Record<string, unknown>[]
       }[]
       messages[350]!.content[0]!.cache_control = { type: 'ephemeral' }
-      anchor(tracker, first)
+      anchorWithContinuation(tracker, first)
       const request = replay(first)
       request.stateless = true
       ;(request.body.messages as { content: Record<string, unknown>[] }[])[352]!
@@ -275,7 +297,7 @@ describe('full request tail marker', () => {
 
   test('materializes a historical user string only when its canonical full tail matches', () => {
     const tracker = new MessageThreadTracker(10, () => 0)
-    const first = anchor(tracker, tailMarkerInput())
+    const first = anchorWithContinuation(tracker, tailMarkerInput())
     const request = replay(first)
     const messages = request.body.messages as { content: unknown }[]
     messages[350]!.content = 'message 350'
@@ -344,7 +366,7 @@ describe('full request tail marker', () => {
         cache_control: { type: 'ephemeral', ttl: '1h' },
       },
     ]
-    anchor(tracker, first)
+    anchorWithContinuation(tracker, first)
     const request = replay(first)
     request.stateless = true
     const result = (
@@ -395,14 +417,27 @@ describe('full request tail marker', () => {
     },
   )
 
-  test('full recovery and stateless fallback add the marker before signing', async () => {
+  test('recovery create adds the tail before signing and beta-changed stateless fallback stays byte-identical', async () => {
     const tracker = new MessageThreadTracker(10, () => 0)
-    const first = anchor(tracker, {
+    const first = anchorWithContinuation(tracker, {
       ...tailMarkerInput(),
       account: 'tail-recovery-account',
+      betas: [MESSAGE_THREADS_BETA],
     })
-    const request = replay(first)
-    const prepared = await prepareMessageThreadRequest(tracker, {
+    const request = advance(replay(first))
+    delete (
+      request.body.messages as { content: Record<string, unknown>[] }[]
+    )[352]!.content[0]!.cache_control
+    ;(request.body.messages as { content: unknown }[])[354]!.content = [
+      {
+        type: 'text',
+        text: 'two',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ]
+    const mismatchTracker = new MessageThreadTracker(10, () => 0)
+    anchorWithContinuation(mismatchTracker, first)
+    const prepared = await prepareMessageThreadRequest(mismatchTracker, {
       ...request,
       account: 'other-tail-recovery-account',
       headers: new Headers(),
@@ -412,33 +447,62 @@ describe('full request tail marker', () => {
     expect(
       JSON.parse(prepared.bodyText).messages[350].content[0].cache_control,
     ).toBeUndefined()
+    const headers = new Headers()
     const sameAccount = await prepareMessageThreadRequest(tracker, {
       ...request,
-      headers: new Headers(),
+      headers,
       bodyText: JSON.stringify(request.body),
     })
+    expect(JSON.parse(sameAccount.bodyText).thread.type).toBe('continue')
     let sends = 0
-    await sameAccount.recover(
-      new Response(
-        JSON.stringify({
-          error: {
-            type: 'invalid_request_error',
-            message: 'thread is not supported',
-          },
-        }),
-        { status: 400 },
-      ),
-      async (body) => {
-        sends++
-        expect(JSON.parse(body).messages[350].content[0].cache_control).toEqual(
-          { type: 'ephemeral', ttl: '1h' },
-        )
-        expect(body).toBe(await signRequestBody(body))
-        expect(JSON.parse(body).thread).toBeUndefined()
-        return new Response('ok')
-      },
-    )
-    expect(sends).toBe(1)
+    const log = spyOn(logger, 'debug')
+    try {
+      await sameAccount.recover(
+        new Response(
+          JSON.stringify({
+            error: {
+              type: 'not_found_error',
+              details: { error_code: 'thread_not_found' },
+            },
+          }),
+          { status: 404 },
+        ),
+        async (body) => {
+          sends++
+          expect(body).toBe(await signRequestBody(body))
+          if (sends === 1) {
+            expect(JSON.parse(body).thread.type).toBe('create')
+            expect(
+              JSON.parse(body).messages[350].content[0].cache_control,
+            ).toEqual({ type: 'ephemeral', ttl: '1h' })
+            return new Response(
+              JSON.stringify({
+                error: {
+                  type: 'invalid_request_error',
+                  message: 'thread is not supported',
+                },
+              }),
+              { status: 400 },
+            )
+          }
+          expect(
+            JSON.parse(body).messages[350].content[0].cache_control,
+          ).toBeUndefined()
+          expect(body).toBe(JSON.stringify(request.body))
+          expect(JSON.parse(body).thread).toBeUndefined()
+          return new Response('ok')
+        },
+      )
+      expect(
+        log.mock.calls
+          .filter((call) => call[1] === 'message_thread_tail_marker')
+          .map((call) => (call[2] as { reason: string }).reason),
+      ).toEqual(['tail_marker_added', 'prefix_changed'])
+    } finally {
+      log.mockRestore()
+    }
+    expect(sends).toBe(2)
+    expect(headers.get('anthropic-beta')).toBeNull()
   })
 })
 

@@ -1442,16 +1442,14 @@ describe('message threads wire', () => {
       ]
       await send(continuedHistory, tailSession)
       expect(sent.at(-1)?.body.thread.type).toBe('continue')
-      await send(
-        [
-          ...continuedHistory,
-          answer,
-          { role: 'user', content: 'Third' },
-          answer,
-          { role: 'user', content: 'Fourth' },
-        ],
-        tailSession,
-      )
+      const tailReplay = [
+        ...continuedHistory,
+        answer,
+        { role: 'user', content: 'Third' },
+        answer,
+        { role: 'user', content: 'Fourth' },
+      ]
+      await send(tailReplay, tailSession)
       const fullTail = sent.at(-1)!
       expect(fullTail.body.thread.type).toBe('create')
       expect(fullTail.body.messages[2].content.at(-1).cache_control).toEqual({
@@ -1463,6 +1461,19 @@ describe('message threads wire', () => {
       ).toBe(true)
       expect(fullTail.text.match(/"cache_control"/g)).toHaveLength(4)
       expect(fullTail.text).toBe(await Core.signRequestBody(fullTail.text))
+      await send(
+        [...tailReplay, answer, { role: 'user', content: 'After full replay' }],
+        tailSession,
+      )
+      const afterTail = sent.at(-1)!
+      expect(afterTail.body.thread.type).toBe('continue')
+      expect(JSON.stringify(afterTail.body.system.slice(1))).toBe(
+        JSON.stringify(fullTail.body.system.slice(1)),
+      )
+      expect(JSON.stringify(afterTail.body.tools)).toBe(
+        JSON.stringify(fullTail.body.tools),
+      )
+      expect(afterTail.text).toBe(await Core.signRequestBody(afterTail.text))
       for (const code of [
         'thread_not_found',
         'thread_fingerprint_mismatch',

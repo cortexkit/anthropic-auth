@@ -110,6 +110,14 @@ test('Pi full-after-thread trades only its system slot for the accepted full tai
   expect(JSON.stringify(normal.body)).toBe(
     JSON.stringify({ ...body, thread: { type: 'create' } }),
   )
+  const continuation = tracker.prepare({ ...input, body })
+  expect(continuation.decision.type).toBe('continue')
+  continuation.complete({
+    messageId: 'msg_pi_continue',
+    stopped: true,
+    stopReason: 'end_turn',
+    reply: { role: 'assistant', content: 'answer' },
+  })
   const prepared = tracker.prepare({ ...input, body, stateless: true })
   const result = prepared.body as typeof body
   expect(

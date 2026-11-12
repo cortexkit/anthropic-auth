@@ -57,6 +57,8 @@ export type MessageThreadCreateReason =
   | 'reply_changed'
   | 'fixed_changed'
   | 'prefix_changed'
+  | 'ttl_order'
+  | 'stateless'
 
 export type MessageThreadDisposition =
   | 'never_seen'
@@ -529,19 +531,20 @@ function fixedThreadFingerprint(input: MessageThreadInput): string {
 export function messageThreadCachePrefix(
   body: Body,
   messageIndex: number,
-  blockIndex: number,
+  blockIndex: number | readonly number[],
+  betas?: readonly string[],
 ): string | undefined {
   if (!Array.isArray(body.messages)) return undefined
   const message = body.messages[messageIndex]
   if (!isBody(message)) return undefined
-  const content =
-    typeof message.content === 'string'
-      ? [{ type: 'text', text: message.content }]
-      : message.content
-  if (!Array.isArray(content) || !content[blockIndex]) return undefined
+  const content = cachePrefixContent(
+    message.content,
+    typeof blockIndex === 'number' ? [blockIndex] : blockIndex,
+  )
+  if (!content) return undefined
   const messages = body.messages.slice(0, messageIndex).concat({
     ...message,
-    content: content.slice(0, blockIndex + 1),
+    content,
   })
   const system = Array.isArray(body.system)
     ? body.system
@@ -557,6 +560,8 @@ export function messageThreadCachePrefix(
   return hash(
     canonicalValue({
       model: body.model,
+      speed: body.speed,
+      betas,
       thinking: body.thinking,
       output_config: body.output_config,
       tool_choice: body.tool_choice,
@@ -569,6 +574,31 @@ export function messageThreadCachePrefix(
       messages: messages.map(withoutMessageCache),
     }),
   )
+}
+
+function cachePrefixContent(
+  content: unknown,
+  path: readonly number[],
+): unknown[] | undefined {
+  const blocks =
+    typeof content === 'string' ? [{ type: 'text', text: content }] : content
+  const index = path[0]
+  if (
+    !Array.isArray(blocks) ||
+    index === undefined ||
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= blocks.length
+  )
+    return undefined
+  let block = blocks[index]
+  if (path.length > 1) {
+    if (!isBody(block) || block.type !== 'tool_result') return undefined
+    const nested = cachePrefixContent(block.content, path.slice(1))
+    if (!nested) return undefined
+    block = { ...block, content: nested }
+  }
+  return [...blocks.slice(0, index), block]
 }
 
 export function messageThreadSnapshot(
@@ -653,11 +683,16 @@ export interface MessageThreadCompletion {
 interface FullCacheTail {
   identity: string
   messageIndex: number
-  blockIndex: number
+  blockPath: number[]
   prefix: string
   control: { type: 'ephemeral'; ttl?: '1h' | '5m' }
   acceptedAt: number
+}
+
+interface FullTailHistory {
   hadThread: boolean
+  continued: boolean
+  tail?: FullCacheTail
 }
 
 interface FixedCacheLayout {
@@ -697,10 +732,7 @@ function fixedCacheLayout(body: Body): FixedCacheLayout | undefined {
             valid = false
             return []
           }
-          const kept: FullCacheTail['control'] = {
-            type: 'ephemeral',
-            ...(control.ttl ? { ttl: control.ttl } : {}),
-          }
+          const kept = { ...control } as FullCacheTail['control']
           return [{ index, control: kept }]
         })
       : []
@@ -718,10 +750,14 @@ function withFixedCacheLayout(body: Body, layout: FixedCacheLayout): Body {
     if (!Array.isArray(body[field])) continue
     copy[field] = body[field].map((item, index) => {
       if (!isBody(item)) return item
-      const block = { ...item }
-      delete block.cache_control
       const marker = layout[field].find((marker) => marker.index === index)
+      if (
+        JSON.stringify(item.cache_control) === JSON.stringify(marker?.control)
+      )
+        return item
+      const block = { ...item }
       if (marker) block.cache_control = { ...marker.control }
+      else delete block.cache_control
       return block
     })
   }
@@ -731,42 +767,77 @@ function withFixedCacheLayout(body: Body, layout: FixedCacheLayout): Body {
 function fullCacheTail(
   input: MessageThreadInput,
   acceptedAt: number,
-  hadThread: boolean,
 ): FullCacheTail | undefined {
-  let tail: Omit<FullCacheTail, 'prefix'> | undefined
-  if (!Array.isArray(input.body.messages)) return undefined
-  input.body.messages.forEach((message, messageIndex) => {
-    if (!isBody(message) || !Array.isArray(message.content)) return
-    message.content.forEach((block, blockIndex) => {
-      if (!isBody(block) || !isBody(block.cache_control)) return
-      const control = block.cache_control
-      if (
-        control.type !== 'ephemeral' ||
-        (control.ttl !== undefined &&
-          control.ttl !== '1h' &&
-          control.ttl !== '5m')
-      )
-        return
-      tail = {
+  const tail = messageCacheBoundaries(input.body).at(-1)
+  if (!tail) return undefined
+  const control = tail.holder.cache_control
+  if (
+    !isBody(control) ||
+    control.type !== 'ephemeral' ||
+    (control.ttl !== undefined && control.ttl !== '1h' && control.ttl !== '5m')
+  )
+    return undefined
+  const prefix = messageThreadCachePrefix(
+    input.body,
+    tail.messageIndex,
+    tail.blockPath,
+    input.betas,
+  )
+  return prefix
+    ? {
         identity: hash([input.account, input.credential]),
-        messageIndex,
-        blockIndex,
+        messageIndex: tail.messageIndex,
+        blockPath: tail.blockPath,
+        prefix,
         control: {
           type: 'ephemeral',
           ...(control.ttl ? { ttl: control.ttl } : {}),
         },
         acceptedAt,
-        hadThread,
       }
+    : undefined
+}
+
+function messageCacheBoundaries(
+  body: Body,
+): Array<{ messageIndex: number; blockPath: number[]; holder: Body }> {
+  const markers: Array<{
+    messageIndex: number
+    blockPath: number[]
+    holder: Body
+  }> = []
+  const visit = (content: unknown, messageIndex: number, parent: number[]) => {
+    if (!Array.isArray(content)) return
+    content.forEach((block, index) => {
+      if (!isBody(block)) return
+      const blockPath = [...parent, index]
+      // A tool-result boundary follows its nested content in cache order.
+      if (block.type === 'tool_result')
+        visit(block.content, messageIndex, blockPath)
+      if (block.cache_control)
+        markers.push({ messageIndex, blockPath, holder: block })
     })
-  })
-  if (!tail) return undefined
-  const prefix = messageThreadCachePrefix(
-    input.body,
-    tail.messageIndex,
-    tail.blockIndex,
-  )
-  return prefix ? { ...tail, prefix } : undefined
+  }
+  if (Array.isArray(body.messages))
+    body.messages.forEach((message, index) => {
+      if (isBody(message)) visit(message.content, index, [])
+    })
+  return markers
+}
+
+function cacheBoundaryBlock(body: Body, tail: FullCacheTail): Body | undefined {
+  const message = Array.isArray(body.messages)
+    ? body.messages[tail.messageIndex]
+    : undefined
+  let content: unknown = isBody(message) ? message.content : undefined
+  let block: unknown
+  for (const index of tail.blockPath) {
+    if (!Array.isArray(content)) return undefined
+    block = content[index]
+    if (!isBody(block)) return undefined
+    content = block.type === 'tool_result' ? block.content : undefined
+  }
+  return isBody(block) ? block : undefined
 }
 
 function tailCacheHolders(body: Body): Body[] {
@@ -777,30 +848,19 @@ function tailCacheHolders(body: Body): Body[] {
         )
       : [],
   )
-  const messages: Body[] = []
-  const visit = (content: unknown) => {
-    if (!Array.isArray(content)) return
-    for (const block of content) {
-      if (!isBody(block)) continue
-      // A tool-result boundary follows its nested content in cache order.
-      if (block.type === 'tool_result') visit(block.content)
-      if (block.cache_control) messages.push(block)
-    }
-  }
-  if (Array.isArray(body.messages)) {
-    for (const message of body.messages)
-      if (isBody(message)) visit(message.content)
-  }
+  const messages = messageCacheBoundaries(body).map((marker) => marker.holder)
   return [...fixed, ...messages, ...(body.cache_control ? [body] : [])]
 }
 
 function restoreFullCacheTail(
   input: MessageThreadInput,
-  tail: FullCacheTail | null | undefined,
+  history: FullTailHistory | undefined,
   now: number,
 ): { body?: Body; reason: string } {
-  if (tail === null) return { reason: 'no_full_tail' }
-  if (!tail?.hadThread) return { reason: 'no_prior_thread' }
+  if (!history?.hadThread) return { reason: 'no_prior_thread' }
+  if (!history.continued) return { reason: 'no_continuation' }
+  const tail = history.tail
+  if (!tail) return { reason: 'no_full_tail' }
   if (tail.identity !== hash([input.account, input.credential]))
     return { reason: 'account_changed' }
   if (
@@ -808,39 +868,51 @@ function restoreFullCacheTail(
     now >= tail.acceptedAt + (tail.control.ttl === '1h' ? 3_600_000 : 300_000)
   )
     return { reason: 'expired' }
+  if (input.body.cache_control) return { reason: 'slot_taken' }
+  const slot = input.cacheSlot?.(input.body)
+  if (!slot) return { reason: 'slot_taken' }
+  const holders = tailCacheHolders(input.body)
+  const slotIndex = holders.indexOf(slot)
+  if (slotIndex < 0 || holders.length > 4) return { reason: 'slot_taken' }
   if (
     tail.prefix !==
-    messageThreadCachePrefix(input.body, tail.messageIndex, tail.blockIndex)
+    messageThreadCachePrefix(
+      input.body,
+      tail.messageIndex,
+      tail.blockPath,
+      input.betas,
+    )
   )
     return { reason: 'prefix_changed' }
   const body = structuredClone(input.body)
   const message = (body.messages as Body[])[tail.messageIndex]
-  if (typeof message?.content === 'string' && tail.blockIndex === 0)
-    message.content = [{ type: 'text', text: message.content }]
-  const block = Array.isArray(message?.content)
-    ? message.content[tail.blockIndex]
-    : undefined
-  if (!isBody(block)) return { reason: 'prefix_changed' }
-  if (block.cache_control) return { reason: 'already_marked' }
-  const slot = input.cacheSlot?.(body)
-  const holders = tailCacheHolders(body)
   if (
-    !slot ||
-    !holders.includes(slot) ||
-    holders.length > 4 ||
-    body.cache_control
+    typeof message?.content === 'string' &&
+    tail.blockPath.length === 1 &&
+    tail.blockPath[0] === 0
   )
-    return { reason: 'slot_taken' }
-  delete slot.cache_control
+    message.content = [{ type: 'text', text: message.content }]
+  const block = cacheBoundaryBlock(body, tail)
+  if (!block) return { reason: 'prefix_changed' }
+  if (block.cache_control) return { reason: 'already_marked' }
+  const clonedSlot = tailCacheHolders(body)[slotIndex]
+  if (!clonedSlot) return { reason: 'slot_taken' }
+  delete clonedSlot.cache_control
   block.cache_control = { ...tail.control }
+  if (!cacheLifetimeOrderValid(body)) return { reason: 'ttl_order' }
+  if (!fixedCacheLayout(body)) return { reason: 'layout_unrecordable' }
+  return { body, reason: 'tail_marker_added' }
+}
+
+function cacheLifetimeOrderValid(body: Body): boolean {
   let shortSeen = false
   for (const holder of tailCacheHolders(body)) {
     const control = holder.cache_control as Body
     if (control.ttl === '1h') {
-      if (shortSeen) return { reason: 'ttl_order' }
+      if (shortSeen) return false
     } else shortSeen = true
   }
-  return { body, reason: 'tail_marker_added' }
+  return true
 }
 
 export class MessageThreadTracker {
@@ -853,7 +925,7 @@ export class MessageThreadTracker {
   private readonly dispositions = new Map<string, MessageThreadDisposition>()
   private readonly instance = randomUUID()
   // One hash-only full-render boundary per session, independent of continue age.
-  private readonly fullTails = new Map<string, FullCacheTail | null>()
+  private readonly fullTails = new Map<string, FullTailHistory>()
 
   constructor(
     private readonly capacity = MAX_SESSIONS,
@@ -941,18 +1013,6 @@ export class MessageThreadTracker {
     const previous = this.sessions.get(input.session)
     const anchor = previous?.anchor
     const now = this.now()
-    // Hybrid placement may remove the system marker. Continuations must reuse
-    // the successfully completed full request's fixed markers, unless the
-    // cache lifetime changed and a new full request is required.
-    const threadInput =
-      input.cacheSlot &&
-      anchor?.fixedCacheLayout &&
-      anchor.fixedCacheLayout.lifetime === cacheLifetimeSignature(input.body)
-        ? {
-            ...input,
-            body: withFixedCacheLayout(input.body, anchor.fixedCacheLayout),
-          }
-        : input
     // Check session metadata and history shape before hashing request content.
     const identity =
       anchor &&
@@ -961,17 +1021,56 @@ export class MessageThreadTracker {
         ? hash([input.account, input.credential])
         : undefined
     let snapshot: MessageThreadSnapshot | undefined
-    let reason = continuationBlocker(anchor, input, identity, now)
+    let threadInput = input
+    let reason: MessageThreadCreateReason | undefined = input.stateless
+      ? 'stateless'
+      : continuationBlocker(anchor, input, identity, now)
     if (!reason && anchor) {
+      // Restore only annotations from the accepted wire. The ordinary fixed
+      // fingerprint must still match, including block and control key order.
+      if (
+        input.cacheSlot &&
+        anchor.fixedCacheLayout &&
+        anchor.fixedCacheLayout.lifetime === cacheLifetimeSignature(input.body)
+      )
+        threadInput = {
+          ...input,
+          body: withFixedCacheLayout(input.body, anchor.fixedCacheLayout),
+        }
       const fingerprint = fixedThreadFingerprint(threadInput)
       if (fingerprint === anchor.fingerprint)
         snapshot = messageThreadSnapshot(threadInput, identity, fingerprint)
       else reason = 'fixed_changed'
     }
-    const decision: MessageThreadDecision =
+    let decision: MessageThreadDecision =
       snapshot && !input.stateless
         ? decideMessageThread(anchor, input, snapshot, now)
         : { type: 'create' }
+    let continueBody: Body | undefined
+    let invalidContinue = false
+    if (decision.type === 'continue') {
+      continueBody = {
+        ...threadInput.body,
+        thread: {
+          type: 'continue',
+          previous_message_id: decision.previousMessageId,
+        },
+        messages: decision.deltaMessages,
+        diagnostics: {
+          ...(isBody(threadInput.body.diagnostics)
+            ? threadInput.body.diagnostics
+            : {}),
+          previous_message_id: decision.previousMessageId,
+        },
+      }
+      placeContinueCache(continueBody, threadInput.body)
+      if (!cacheLifetimeOrderValid(continueBody)) {
+        decision = { type: 'create' }
+        reason = 'ttl_order'
+        invalidContinue = true
+        continueBody = undefined
+      }
+    }
     if (decision.type === 'create')
       this.logCreate(
         input.session,
@@ -981,11 +1080,13 @@ export class MessageThreadTracker {
         now,
       )
     const oldTail = this.fullTails.get(input.session)
-    const tailResult =
+    const tailResult: { body?: Body; reason: string } | undefined =
       decision.type === 'create'
-        ? restoreFullCacheTail(input, oldTail, now)
+        ? invalidContinue
+          ? { reason: 'ttl_order' }
+          : restoreFullCacheTail(input, oldTail, now)
         : undefined
-    if (tailResult && (oldTail?.hadThread || oldTail === null || anchor))
+    if (tailResult && (oldTail?.hadThread || anchor))
       logger.debug('message-threads', 'message_thread_tail_marker', {
         event: 'message_thread_tail_marker',
         session: input.session,
@@ -1001,32 +1102,14 @@ export class MessageThreadTracker {
     let accepted = false
     let body: Body | undefined
     const outgoingBody = (): Body => {
+      if (continueBody) return continueBody
       if (body) return body
-      const full =
-        decision.type === 'continue'
-          ? threadInput.body
-          : (tailResult?.body ?? input.body)
+      const full = tailResult?.body ?? input.body
       body = {
         ...full,
-        thread:
-          decision.type === 'create'
-            ? { type: 'create' }
-            : {
-                type: 'continue',
-                previous_message_id: decision.previousMessageId,
-              },
+        thread: { type: 'create' },
       }
       if (input.stateless) delete body.thread
-      if (decision.type === 'continue') {
-        Object.assign(body, { messages: decision.deltaMessages })
-        placeContinueCache(body, full)
-        Object.assign(body, {
-          diagnostics: {
-            ...(isBody(body.diagnostics) ? body.diagnostics : {}),
-            previous_message_id: decision.previousMessageId,
-          },
-        })
-      }
       return body
     }
     return {
@@ -1074,38 +1157,34 @@ export class MessageThreadTracker {
         }
         const completedAt = this.now()
         accepted = true
+        const sentInput = { ...input, body: tailResult?.body ?? input.body }
+        this.fullTails.delete(input.session)
         if (decision.type === 'create') {
-          const tail = fullCacheTail(
-            input,
-            completedAt,
-            !input.stateless || !!oldTail?.hadThread || oldTail === null,
-          )
-          this.fullTails.delete(input.session)
-          if (tail) this.fullTails.set(input.session, tail)
-          else if (!input.stateless || oldTail !== undefined)
-            this.fullTails.set(input.session, null)
-          while (this.fullTails.size > this.capacity) {
-            const oldest = this.fullTails.keys().next().value
-            if (oldest === undefined) break
-            this.fullTails.delete(oldest)
-          }
+          if (!input.stateless || oldTail?.hadThread)
+            this.fullTails.set(input.session, {
+              hadThread: true,
+              continued: false,
+              tail: fullCacheTail(sentInput, completedAt),
+            })
+        } else
+          this.fullTails.set(input.session, {
+            hadThread: true,
+            continued: true,
+            tail: oldTail?.tail,
+          })
+        while (this.fullTails.size > this.capacity) {
+          const oldest = this.fullTails.keys().next().value
+          if (oldest === undefined) break
+          this.fullTails.delete(oldest)
         }
         if (input.stateless) return
         // Compute a create request's history fingerprint after response completion.
-        const completedSnapshot = snapshot
-          ? tailResult?.body
-            ? {
-                ...snapshot,
-                fingerprint: fixedThreadFingerprint({
-                  ...input,
-                  body: tailResult.body,
-                }),
-              }
-            : snapshot
-          : messageThreadSnapshot(
-              { ...input, body: tailResult?.body ?? input.body },
-              identity,
-            )
+        const completedSnapshot =
+          decision.type === 'create'
+            ? snapshot
+              ? { ...snapshot, fingerprint: fixedThreadFingerprint(sentInput) }
+              : messageThreadSnapshot(sentInput, identity)
+            : (snapshot ?? messageThreadSnapshot(threadInput, identity))
         this.messageHashes += completedSnapshot.messages.length
         this.sessions.set(input.session, {
           token,
@@ -1283,11 +1362,17 @@ function placeContinueCache(body: Body, full: Body): void {
   }
 }
 
-export function messageThreadBetas(headers: Headers): string[] {
-  const betas = (headers.get('anthropic-beta') ?? '')
+function requestHeaderBetas(headers: Headers): string[] {
+  return (headers.get('anthropic-beta') ?? '')
     .split(',')
     .map((beta) => beta.trim())
-    .filter((beta) => beta && beta !== MESSAGE_THREADS_BETA)
+    .filter(Boolean)
+}
+
+export function messageThreadBetas(headers: Headers): string[] {
+  const betas = requestHeaderBetas(headers).filter(
+    (beta) => beta !== MESSAGE_THREADS_BETA,
+  )
   betas.push(MESSAGE_THREADS_BETA)
   headers.set('anthropic-beta', betas.join(','))
   return betas
@@ -1422,7 +1507,7 @@ export async function prepareMessageThreadRequest(
   const fullBody = () => (full ??= JSON.parse(fullText) as Body)
   const accountKey = input.account
   let threading = !disabledThreadAccounts.has(accountKey)
-  const betas = threading ? messageThreadBetas(input.headers) : []
+  if (threading) messageThreadBetas(input.headers)
   const prepareForSession = (credential: string) =>
     tracker.prepare({
       account: input.account,
@@ -1430,7 +1515,7 @@ export async function prepareMessageThreadRequest(
       session: input.session ?? '',
       request:
         input.request ?? input.headers.get('x-client-request-id') ?? undefined,
-      betas,
+      betas: requestHeaderBetas(input.headers),
       replyToolNames: input.replyToolNames,
       cacheSlot: input.cacheSlot,
       stateless: !threading,

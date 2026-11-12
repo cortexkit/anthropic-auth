@@ -3133,21 +3133,17 @@ for (const [transport, credentialSource] of [
     }
     await (await send(longer, tailSession)).text()
     expect(JSON.parse(sent.at(-1)?.text ?? '{}').thread.type).toBe('continue')
-    await (
-      await send(
-        {
-          ...longer,
-          messages: [
-            ...longer.messages,
-            replay,
-            { role: 'user', content: 'Third', timestamp: 5 },
-            replay,
-            { role: 'user', content: 'Fourth', timestamp: 6 },
-          ],
-        },
-        tailSession,
-      )
-    ).text()
+    const tailReplay: Context = {
+      ...longer,
+      messages: [
+        ...longer.messages,
+        replay,
+        { role: 'user', content: 'Third', timestamp: 5 },
+        replay,
+        { role: 'user', content: 'Fourth', timestamp: 6 },
+      ],
+    }
+    await (await send(tailReplay, tailSession)).text()
     const fullTailText = sent.at(-1)?.text ?? '{}'
     const fullTail = JSON.parse(fullTailText)
     expect(fullTail.thread.type).toBe('create')
@@ -3159,6 +3155,27 @@ for (const [transport, credentialSource] of [
     )
     expect(fullTailText.match(/"cache_control"/g)).toHaveLength(4)
     expect(fullTailText).toBe(await signRequestBody(fullTailText))
+    await (
+      await send(
+        {
+          ...tailReplay,
+          messages: [
+            ...tailReplay.messages,
+            replay,
+            { role: 'user', content: 'After full replay', timestamp: 7 },
+          ],
+        },
+        tailSession,
+      )
+    ).text()
+    const afterTailText = sent.at(-1)?.text ?? '{}'
+    const afterTail = JSON.parse(afterTailText)
+    expect(afterTail.thread.type).toBe('continue')
+    expect(JSON.stringify(afterTail.system.slice(1))).toBe(
+      JSON.stringify(fullTail.system.slice(1)),
+    )
+    expect(JSON.stringify(afterTail.tools)).toBe(JSON.stringify(fullTail.tools))
+    expect(afterTailText).toBe(await signRequestBody(afterTailText))
     for (const code of [
       'thread_not_found',
       'thread_fingerprint_mismatch',

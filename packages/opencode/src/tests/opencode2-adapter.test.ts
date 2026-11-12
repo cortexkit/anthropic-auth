@@ -3021,20 +3021,18 @@ describe.each(['direct', 'http'] as const)(
             .type,
         ).toBe('continue')
         await complete(second, 'msg_continue_tail')
-        const third = await host.run(
-          scopeOf(),
-          hostRequest({
-            ...payload,
-            messages: [
-              ...secondPayload.messages,
-              reply,
-              { role: 'user', content: [text('Third')] },
-              reply,
-              { role: 'user', content: [text('Fourth')] },
-            ],
-          }),
-        )
-        const wire = upstreamText(await third.final.text())
+        const thirdPayload = {
+          ...payload,
+          messages: [
+            ...secondPayload.messages,
+            reply,
+            { role: 'user', content: [text('Third')] },
+            reply,
+            { role: 'user', content: [text('Fourth')] },
+          ],
+        }
+        const third = await host.run(scopeOf(), hostRequest(thirdPayload))
+        const wire = upstreamText(await third.final.clone().text())
         const body = JSON.parse(wire)
         expect(body.thread.type).toBe('create')
         expect(body.messages[2].content[1].cache_control).toEqual({
@@ -3050,6 +3048,29 @@ describe.each(['direct', 'http'] as const)(
         )
         expect(wire.match(/"cache_control"/g)).toHaveLength(4)
         expect(wire).toBe(await signRequestBody(wire))
+        await complete(third, 'msg_tail_replay')
+        const fourth = await host.run(
+          scopeOf(),
+          hostRequest({
+            ...thirdPayload,
+            messages: [
+              ...thirdPayload.messages,
+              reply,
+              { role: 'user', content: [text('After full replay')] },
+            ],
+          }),
+        )
+        const afterTailText = upstreamText(await fourth.final.text())
+        const afterTail = JSON.parse(afterTailText)
+        expect(afterTail.thread).toEqual({
+          type: 'continue',
+          previous_message_id: 'msg_tail_replay',
+        })
+        expect(JSON.stringify(afterTail.system.slice(1))).toBe(
+          JSON.stringify(body.system.slice(1)),
+        )
+        expect(JSON.stringify(afterTail.tools)).toBe(JSON.stringify(body.tools))
+        expect(afterTailText).toBe(await signRequestBody(afterTailText))
       } finally {
         native.dispose()
       }
