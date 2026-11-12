@@ -2196,11 +2196,14 @@ describe('auth.loader', () => {
         expect((await result.fetch(MESSAGES_URL, request)).status).toBe(500)
         const held = await result.fetch(MESSAGES_URL, request)
         expect(held.status).toBe(429)
+        // The session still holds for a reset 30 minutes out under `max`, but a
+        // host is never told to wait longer than 15 minutes; it re-asks then.
+        const hostRetrySeconds = Math.min(holdMinutes * 60, 15 * 60)
         expect(Number(held.headers.get('retry-after'))).toBeGreaterThanOrEqual(
-          holdMinutes * 60,
+          hostRetrySeconds,
         )
         expect(Number(held.headers.get('retry-after'))).toBeLessThanOrEqual(
-          holdMinutes * 60 + 20,
+          Math.min(holdMinutes * 60 + 20, 15 * 60),
         )
         expect(await held.text()).toContain(
           'Sticky OAuth account quota resets shortly; retaining session affinity.',

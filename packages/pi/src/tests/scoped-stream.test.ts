@@ -496,7 +496,7 @@ for (const outcome of [
     await scheduled.promise
     expect(sends).toBe(pool ? 0 : 1)
     expect(messages[0]).toMatch(
-      /^Waiting for the account to reset at \d\d:\d\d · Esc to cancel$/,
+      /^Checking account availability in \d+ min \(reset at \d\d:\d\d UTC\) · Esc to cancel$/,
     )
     if (outcome.endsWith('abort')) abort.abort()
     else {
