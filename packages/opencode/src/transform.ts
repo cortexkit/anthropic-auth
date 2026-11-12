@@ -1365,7 +1365,13 @@ function applyHybridCache1h(
   }
 }
 
-/** Replace the system or ordinary lookback marker, never a model-recovery marker. */
+/**
+ * The marker a full request after a thread may give up for the previous full
+ * request's cache boundary: the system marker, or the lookback bridge's marker
+ * on the previous user or tool-result message. Returns nothing when the bridge
+ * is the Opus standby bridge, which must keep reaching the cache an Opus
+ * recovery turn will read.
+ */
 export function hybridThreadCacheSlot(
   body: Record<string, unknown>,
   standbyAnchor?: HybridMessageCacheAnchor,
