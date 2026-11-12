@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import * as core from '@cortexkit/anthropic-auth-core'
 import {
   CCH_POSITIONS,
   computeCCH,
@@ -635,6 +636,11 @@ describe('shared Claude OAuth wire vectors', () => {
     for (const testCase of vectors.cases) {
       test(testCase.id, async () => {
         const actual = await rebuildRequest(testCase)
+        expect(
+          actual.headers_wire_order.find(
+            ([name]) => name.toLowerCase() === 'accept-encoding',
+          )?.[1],
+        ).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
         const mismatch = firstOutputDifference(
           testCase.id,
           testCase.output,

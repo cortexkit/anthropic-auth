@@ -18,6 +18,48 @@ test('physical Content-Length survives wrappers that remove the body length head
   })
 })
 
+test('resource body sizes survive response wrappers, warning and dump sanitization', () => {
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => records.push(record))
+  const response = new Response('')
+  copyStreamResponseTiming(
+    response,
+    response,
+    performance.now(),
+    'physical_fetch',
+    () => ({
+      encoded_body_bytes: 10,
+      decoded_body_bytes: 0,
+    }),
+  )
+  const wrapped = copyStreamResponseTiming(response, new Response(''))
+  const error = createAnthropicStreamCompletion(wrapped).finish()!
+  expect(error.diagnostics).toMatchObject({
+    encoded_body_bytes: 10,
+    decoded_body_bytes: 0,
+  })
+  expect(records[0]?.payload).toEqual({ ...error.diagnostics })
+  expect(safeIncompleteStreamDiagnostics(error.diagnostics)).toEqual(
+    error.diagnostics,
+  )
+  for (const sizes of [
+    {},
+    { encoded_body_bytes: 0 },
+    { encoded_body_bytes: -1, decoded_body_bytes: 0 },
+    { encoded_body_bytes: 10, decoded_body_bytes: NaN },
+    { encoded_body_bytes: Infinity, decoded_body_bytes: 0 },
+  ]) {
+    const safe = safeIncompleteStreamDiagnostics({
+      ...error.diagnostics,
+      encoded_body_bytes: undefined,
+      decoded_body_bytes: undefined,
+      ...sizes,
+    })
+    expect(safe).not.toHaveProperty('encoded_body_bytes')
+    expect(safe).not.toHaveProperty('decoded_body_bytes')
+  }
+})
+
 test.each(['\n', '\r', '\r\n'])(
   'a complete message_stop survives byte-split %j framing',
   (ending) => {

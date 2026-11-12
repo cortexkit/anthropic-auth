@@ -868,6 +868,22 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
     expect(final.headers.get('x-api-key')).toBeNull()
     expect(final.headers.get('user-agent')).toBe(USER_AGENT)
     expect(final.headers.get('x-app')).toBe('cli')
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: (request) =>
+        Response.json({ encoding: request.headers.get('accept-encoding') }),
+    })
+    try {
+      const wire = await fetch(
+        new Request(`${server.url}v1/messages`, final.clone()),
+      )
+      expect((await wire.json()).encoding).toBe(
+        core.CLAUDE_CODE_ACCEPT_ENCODING,
+      )
+    } finally {
+      await server.stop(true)
+    }
     expect(final.headers.get('x-claude-code-session-id')).toBe(
       IDENTITY.sessionId,
     )

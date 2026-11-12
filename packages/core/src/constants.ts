@@ -76,6 +76,7 @@ export const CCH_SALT = '59cf53e54c78'
 export const CCH_POSITIONS = [4, 7, 20]
 export const CLAUDE_CODE_VERSION = '2.1.302'
 export const CLAUDE_CODE_ENTRYPOINT = 'cli'
+export const CLAUDE_CODE_ACCEPT_ENCODING = 'gzip, deflate, br, zstd'
 export const CLAUDE_CODE_STAINLESS_PACKAGE_VERSION = '0.128.0'
 export const CLAUDE_CODE_STAINLESS_RUNTIME_VERSION = 'v26.3.0'
 

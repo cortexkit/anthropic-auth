@@ -11,6 +11,7 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   type CacheKeepManager,
   CacheKeepSessionRegistry,
+  CLAUDE_CODE_ACCEPT_ENCODING,
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
@@ -134,6 +135,7 @@ import {
 import {
   buildPiOAuthMessagesUrl,
   fetchPiOAuth,
+  fetchPiStreamResponse,
   requirePiOAuthOrigin,
 } from './transport.ts'
 
@@ -401,6 +403,8 @@ function applyPiOAuthRequestHeaders(
     extraBetas: options.leadingBetas,
     requestClass: options.requestClass,
   })
+  // Pi runs on undici, whose default encoding order differs from Claude Code's.
+  headers.set('accept-encoding', CLAUDE_CODE_ACCEPT_ENCODING)
   if (body.speed === 'fast')
     headers.set(
       'anthropic-beta',
@@ -845,9 +849,7 @@ async function sendAnthropicRequest(
     input: Parameters<typeof fetch>[0],
     init: Parameters<typeof fetch>[1],
   ) => {
-    const sentAt = performance.now()
-    const response = await fetchImpl(input, init)
-    return copyStreamResponseTiming(response, response, sentAt)
+    return fetchPiStreamResponse(input, init, fetchImpl)
   }
   const keep = deps.cacheKeep ?? cacheKeepManager
   const native = deps.native ?? getPiNativeRuntime(options.storagePath)

@@ -3,6 +3,7 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
+import * as core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
   createNativePoolStore,
@@ -72,6 +73,52 @@ const anthropicContext = {
   messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
   tools: [],
 } as any
+
+test('Pi OAuth sends the Claude Code accept-encoding on the wire', async () => {
+  tempDir = await mkdtemp(join(tmpdir(), 'pi-wire-encoding-'))
+  const storagePath = join(tempDir, 'accounts.json')
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture(
+    {
+      version: 1,
+      main: { type: 'opencode', provider: 'anthropic' },
+      accounts: [],
+      quota: { enabled: false },
+    },
+    storagePath,
+  )
+  let wireEncoding: string | null = null
+  let explicitEncoding: string | null = null
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch(request) {
+      wireEncoding = request.headers.get('accept-encoding')
+      return new Response('data: {"type":"message_stop"}\n\n', {
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    },
+  })
+  globalThis.fetch = (async (input, init) => {
+    if (String(input).includes('/api/claude_cli/bootstrap'))
+      return Response.json({
+        oauth_account: { account_uuid: 'pi-wire-encoding' },
+      })
+    explicitEncoding = new Headers(init?.headers).get('accept-encoding')
+    return originalFetch(`${server.url}v1/messages`, init)
+  }) as typeof fetch
+  try {
+    const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
+      sessionId: 'ses_pi_wire_encoding',
+      apiKey: 'sk-ant-oat-wire-encoding',
+    })
+    expect((await stream.result()).stopReason).toBe('stop')
+    expect(explicitEncoding).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
+    expect(wireEncoding).toBe(core.CLAUDE_CODE_ACCEPT_ENCODING)
+  } finally {
+    await server.stop(true)
+  }
+})
 
 test.each(['success', 'provider error', 'malformed'])(
   'streamed reply dumps keep only text edge counts (%s)',

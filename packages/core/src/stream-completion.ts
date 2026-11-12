@@ -9,6 +9,8 @@ import {
 export interface IncompleteStreamDiagnostics {
   response_headers: Record<string, string>
   response_bytes: number
+  encoded_body_bytes?: number
+  decoded_body_bytes?: number
   sse_events: number
   send_to_headers_ms?: number
   /**
@@ -26,6 +28,12 @@ const timings = new WeakMap<
     headers: number
     contentLength?: string
     source: 'physical_fetch' | 'credential_scope'
+    bodySizes?: () =>
+      | Pick<
+          IncompleteStreamDiagnostics,
+          'encoded_body_bytes' | 'decoded_body_bytes'
+        >
+      | undefined
   }
 >()
 
@@ -35,6 +43,12 @@ export function copyStreamResponseTiming(
   target: Response,
   sent?: number,
   timingSource: 'physical_fetch' | 'credential_scope' = 'physical_fetch',
+  bodySizes?: () =>
+    | Pick<
+        IncompleteStreamDiagnostics,
+        'encoded_body_bytes' | 'decoded_body_bytes'
+      >
+    | undefined,
 ) {
   const timing = timings.get(source)
   if (timing) timings.set(target, timing)
@@ -44,6 +58,7 @@ export function copyStreamResponseTiming(
       headers: performance.now(),
       contentLength: responseHeaders(target.headers)['content-length'],
       source: timingSource,
+      bodySizes,
     })
   return target
 }
@@ -67,6 +82,21 @@ function responseHeaders(
   return result
 }
 
+function bodyByteCounts(input?: {
+  encoded_body_bytes?: number
+  decoded_body_bytes?: number
+}) {
+  const { encoded_body_bytes, decoded_body_bytes } = input ?? {}
+  return typeof encoded_body_bytes === 'number' &&
+    Number.isSafeInteger(encoded_body_bytes) &&
+    encoded_body_bytes >= 0 &&
+    typeof decoded_body_bytes === 'number' &&
+    Number.isSafeInteger(decoded_body_bytes) &&
+    decoded_body_bytes >= 0
+    ? { encoded_body_bytes, decoded_body_bytes }
+    : {}
+}
+
 export function safeIncompleteStreamDiagnostics(
   input: IncompleteStreamDiagnostics,
 ): IncompleteStreamDiagnostics {
@@ -77,6 +107,7 @@ export function safeIncompleteStreamDiagnostics(
       get: (name) => input.response_headers[name] ?? null,
     }),
     response_bytes: count(input.response_bytes),
+    ...bodyByteCounts(input),
     sse_events: count(input.sse_events),
     ...(input.send_to_headers_ms !== undefined
       ? { send_to_headers_ms: count(input.send_to_headers_ms) }
@@ -140,6 +171,7 @@ export function createAnthropicStreamCompletion(response: Response) {
       const diagnostics: IncompleteStreamDiagnostics = {
         response_headers: headers,
         response_bytes: bytes,
+        ...bodyByteCounts(timing?.bodySizes?.()),
         sse_events: events,
         ...(timing
           ? {
