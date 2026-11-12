@@ -1245,6 +1245,8 @@ function isOpenCodeDesktop(): boolean {
 
 type PluginRuntimeOverrides = Partial<{
   authorize: typeof authorize
+  /** Domain clock for recovery, cache lifetimes and quota, never filesystem leases. */
+  now: () => number
   setTimeout: typeof globalThis.setTimeout
   clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval
@@ -1270,6 +1272,7 @@ const anthropicAuthPlugin = async (
   ctx: Parameters<Plugin>[0],
   runtimeOverrides: PluginRuntimeOverrides = {},
 ) => {
+  const runtimeNow = runtimeOverrides.now ?? Date.now
   const runtimeTimers = {
     setTimeout: globalThis.setTimeout,
     clearTimeout: globalThis.clearTimeout,
@@ -1935,7 +1938,7 @@ const anthropicAuthPlugin = async (
   const fallbackMode = resolveContentFilterFallbackMode(
     process.env.OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE,
   )
-  const fableFallbackManager = new FableFallbackManager()
+  const fableFallbackManager = new FableFallbackManager(runtimeNow)
   // Which thinking blocks the fallback model wrote during recovery rounds, so
   // requests back to the source model can leave them out (recovery-thinking.ts).
   const recoveryThinking = new RecoveryThinkingStore()
@@ -2035,6 +2038,7 @@ const anthropicAuthPlugin = async (
   // rejected refresh token became usable, so it must not clear refresh errors.
   const quotaManager = new QuotaManager({
     storage: initialStorage,
+    now: runtimeNow,
     pauseBetweenQuotaCalls: runtimeOverrides.quotaCallPause,
     fetchQuotaSnapshot: (request, dispatch) => {
       assertNativeEnvironment()
@@ -3769,6 +3773,7 @@ const anthropicAuthPlugin = async (
   const cacheKeepSourceCopies = new Map<string, FableSourceWarmKeep>()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    now: runtimeNow,
     peekRoutingAccount: (_target, { sessionId, modelId }) => {
       const snapshot = nativeAccounts.peek?.()
       return peekRoutingAccount({
@@ -7915,7 +7920,7 @@ const anthropicAuthPlugin = async (
               if (relayAffinity && trace) {
                 const touch = {
                   sessionId: relayAffinity,
-                  at: Date.now(),
+                  at: runtimeNow(),
                   ttlMs: wireTtlMs,
                   signal: init?.signal,
                 }
@@ -7982,7 +7987,7 @@ const anthropicAuthPlugin = async (
                       ...(nativeAuthorization.accountIdentity !== undefined && {
                         accountIdentity: nativeAuthorization.accountIdentity,
                       }),
-                      sentAt: Date.now(),
+                      sentAt: runtimeNow(),
                       model: fableRequest.plan.requestedModel,
                       firstAnchorFingerprint:
                         hybridUserMessageCacheAnchorFingerprints(bodyText)[0],
@@ -8039,7 +8044,7 @@ const anthropicAuthPlugin = async (
                       // The CacheKeep track for a new keep lands just after the
                       // refusal is observed; a keep younger than that track
                       // flight may not be tracked yet.
-                      Date.now() - warm.sentAt > 30_000
+                      runtimeNow() - warm.sentAt > 30_000
                     ) {
                       // The target expired or was evicted without a warm ever
                       // firing: the kept prefix outlived its cache entry.
@@ -8793,7 +8798,7 @@ const anthropicAuthPlugin = async (
               !stickyQuotaSnapshotIsFresh(
                 mainEntry?.quota,
                 input.storage,
-                Date.now(),
+                runtimeNow(),
                 input.requestedModelId,
               )
             ) {
@@ -8862,7 +8867,7 @@ const anthropicAuthPlugin = async (
                     !stickyQuotaSnapshotIsFresh(
                       accountQuota,
                       latestStorage,
-                      Date.now(),
+                      runtimeNow(),
                       input.requestedModelId,
                     )
                   ) {

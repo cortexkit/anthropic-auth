@@ -17,6 +17,7 @@ import {
   resetClaudeCodeIdentityCachesForTest,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
+import { updateNativeRuntime } from '../../../core/src/native-runtime.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
@@ -159,7 +160,7 @@ afterAll(() => {
 
 /**
  * Everything one census body replaces or starts: the process-global fetch,
- * clock and fixture environment, and the plugins it creates.
+ * fixture environment, and the plugins it creates.
  *
  * Bun does not cancel a body that outlives its timeout, and once one
  * afterEach hook times out it skips every later afterEach hook for that test,
@@ -177,7 +178,6 @@ class CensusScope {
   bodySettled = false
   private readonly plugins = new Set<PluginHooks>()
   private readonly savedFetch = globalThis.fetch
-  private readonly savedNow = Date.now
   private readonly savedEnv = new Map(
     fixtureEnvKeys.map((key) => [key, process.env[key]]),
   )
@@ -202,7 +202,7 @@ class CensusScope {
       ),
   }
 
-  /** Call before replacing fetch, Date.now or a fixture env key, and between polls. */
+  /** Call before replacing fetch or a fixture env key, and between polls. */
   assertOpen(): void {
     if (this.closing)
       throw new Error(
@@ -223,11 +223,9 @@ class CensusScope {
 
   close(): Promise<void> {
     if (!this.closing) {
-      this.trace.record('restore fetch, clock and environment started')
+      this.trace.record('restore fetch and environment started')
       this.restoreGlobals()
-      this.trace.record(
-        'restore fetch, clock and environment settled (synchronous)',
-      )
+      this.trace.record('restore fetch and environment settled (synchronous)')
       this.closing = this.disposeOwned()
     }
     return this.closing
@@ -235,7 +233,6 @@ class CensusScope {
 
   private restoreGlobals(): void {
     globalThis.fetch = this.savedFetch
-    Date.now = this.savedNow
     for (const key of fixtureEnvKeys) {
       const value = this.savedEnv.get(key)
       if (value === undefined) delete process.env[key]
@@ -442,6 +439,8 @@ async function createFixture(
   } = {},
 ) {
   const now = options.now ?? Date.now()
+  let clock = now
+  const fixtureNow = options.now === undefined ? Date.now : () => clock
   const canary = custodyTombstoneOAuth('anthropic').refresh
   const vault = vaultToken(site)
   const mainVault = mainVaultToken(site)
@@ -720,12 +719,10 @@ async function createFixture(
     migrated.close()
   }
 
-  // Freeze the clock only after migration, so the migration journal and
-  // locks see real time and only the plugin observes the test clock.
+  // Only the plugin's domain decisions observe the fixture clock. Filesystem
+  // leases and migration continue to use wall time throughout the test.
   scope.assertOpen()
   if (options.now !== undefined) {
-    let clock = now
-    Date.now = mock(() => clock) as unknown as typeof Date.now
     Object.defineProperty(intervals, 'clock', {
       value: (next: number) => {
         clock = next
@@ -921,6 +918,7 @@ async function createFixture(
           false,
         ),
       nativeLocal: { onLockEvent: scope.trace.locks.observe },
+      now: fixtureNow,
       setInterval,
       clearInterval,
       ...(options.recovery ? { quotaCallPause } : {}),
@@ -1030,6 +1028,38 @@ test.serial(
 )
 
 describe('vault-served fallback outbound token census', () => {
+  test.serial(
+    'an advanced plugin clock leaves native-runtime leases on wall time',
+    async () => {
+      const wallNow = Date.now
+      const fixture = await createFixture('request', {
+        now: wallNow() + 55 * 60_000,
+      })
+      const { storageId } = JSON.parse(
+        await readFile(fixture.paths.runtime, 'utf8'),
+      )
+      const leasePath = `${fixture.paths.runtime}.native-runtime.lock`
+      const started = wallNow()
+      let expiresAt = 0
+      await updateNativeRuntime(
+        fixture.paths.runtime,
+        storageId,
+        (state) => state,
+        {
+          beforeRename: async () => {
+            expiresAt = JSON.parse(await readFile(leasePath, 'utf8')).expiresAt
+          },
+        },
+      )
+      expect(expiresAt).toBeGreaterThanOrEqual(started + 10_000)
+      expect(expiresAt).toBeLessThanOrEqual(wallNow() + 10_000)
+      expect(Date.now).toBe(wallNow)
+      await expect(readFile(leasePath, 'utf8')).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
+    },
+  )
+
   test.serial('request and lane-start sends', async () => {
     const fixture = await createFixture('request')
     fixture.records.length = 0
