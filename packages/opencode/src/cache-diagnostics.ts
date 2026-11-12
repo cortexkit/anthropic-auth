@@ -1,4 +1,5 @@
 import {
+  hostRetryHeaders,
   setBounded,
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
@@ -114,9 +115,10 @@ export async function withStickyRetryAfter(
       'retry-after',
       String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
     )
+  const boundedHeaders = hostRetryHeaders(headers)
   if (streamingRateLimit) {
     await response.body?.cancel().catch(() => {})
-    headers.set('content-type', 'application/json')
+    boundedHeaders.set('content-type', 'application/json')
     return new Response(
       JSON.stringify({
         type: 'error',
@@ -127,13 +129,13 @@ export async function withStickyRetryAfter(
             : 'Sticky OAuth account quota resets shortly; retaining session affinity.',
         },
       }),
-      { status: 429, headers },
+      { status: 429, headers: boundedHeaders },
     )
   }
   const retriedResponse = new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
-    headers,
+    headers: boundedHeaders,
   })
   copyCacheDiagnosticsContext(contexts, response, retriedResponse)
   return retriedResponse

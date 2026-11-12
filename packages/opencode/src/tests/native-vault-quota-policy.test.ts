@@ -9,6 +9,7 @@ import {
   type NativeCustodyClient,
   NativeVaultQuotaPolicyError,
   nativeAccountPolicy,
+  sessionCacheActivity,
 } from '@cortexkit/anthropic-auth-core'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
@@ -122,7 +123,7 @@ async function vaultFixture() {
     routing: { mode: 'sticky-balanced' },
   }))
   const receipt = await runtime.authorizeVault('main')
-  async function quota(remaining: number) {
+  async function quota(remaining: number, resetsAt?: string) {
     const checkedAt = Date.now()
     await runtime.vault.publish(receipt, {
       quota: {
@@ -133,6 +134,7 @@ async function vaultFixture() {
           usedPercent: 100 - remaining,
           remainingPercent: remaining,
           checkedAt,
+          resetsAt,
         },
       },
     })
@@ -228,6 +230,30 @@ test('vault quota floors refuse new OpenCode 2 sessions without asking for sign-
     /429|500|502|503|504|524|retry|rate.?limit/i,
   )
   expect(networkCalls()).toBe(0)
+})
+
+test('host retry cap gives OpenCode 2 a named 26-hour pool reset without dispatch on re-ask', async () => {
+  const { store, quota, choose, networkCalls } = await vaultFixture()
+  const resetAt = new Date(Date.now() + 26 * 3_600_000).toISOString()
+  await store.updateSettings((settings) => ({
+    ...settings,
+    routing: { mode: 'sticky-balanced', maxSameAccountWait: 'max' },
+  }))
+  const sessionID = 'long-reset-pool'
+  sessionCacheActivity.record(sessionID, 'main', 26 * 3_600_000, Date.now())
+  cleanups.push(() => sessionCacheActivity.forget(sessionID))
+  await quota(0, resetAt)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const refusal = (await choose(sessionID).catch(
+      (error: unknown) => error,
+    )) as NativeVaultQuotaPolicyError
+    expect(refusal).toBeInstanceOf(NativeVaultQuotaPolicyError)
+    expect(refusal.headers.get('retry-after')).toBe('900')
+    expect(refusal.message).toContain('weekly limit')
+    expect(refusal.message).toContain('UTC (in 26 h)')
+    expect(refusal.message).toContain('Retrying every 15 minutes.')
+    expect(networkCalls()).toBe(0)
+  }
 })
 
 test('OpenCode 2 vault accounts needing sign-in retain the existing refusal', async () => {

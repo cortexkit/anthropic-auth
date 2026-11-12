@@ -3630,6 +3630,7 @@ async function stickyVaultRejectedFirstSend(
     firstRefusal?: (headers: Record<string, string>) => Response
     fallback?: boolean
     acceptFirst?: boolean
+    repeatRefusal?: boolean
   } = {},
 ) {
   const fixture = await migrateServingFixture(
@@ -3699,7 +3700,10 @@ async function stickyVaultRejectedFirstSend(
       // An Anthropic request id is what lets a relayed status count as upstream.
       const headers = { 'request-id': `req_synthetic_sticky_${served.length}` }
       const refusalNumber = options.acceptFirst ? 2 : 1
-      if (served.length === refusalNumber && options.firstRefusal)
+      if (
+        (served.length === refusalNumber || options.repeatRefusal) &&
+        options.firstRefusal
+      )
         return options.firstRefusal(headers)
       if (served.length === refusalNumber)
         return Response.json(
@@ -3753,6 +3757,7 @@ async function weeklyStickyRefusal(
     headers?: Record<string, string>
     fallback?: boolean
     acceptFirst?: boolean
+    repeatRefusal?: boolean
   } = {},
 ) {
   const resetSeconds = options.resetSeconds ?? 5 * 24 * 60 * 60
@@ -3767,6 +3772,7 @@ async function weeklyStickyRefusal(
     {
       fallback: options.fallback,
       acceptFirst: options.acceptFirst,
+      repeatRefusal: options.repeatRefusal,
       firstRefusal: (headers) =>
         Response.json(
           {
@@ -3968,6 +3974,72 @@ test('vault sticky weekly 429 on the last eligible account still returns a quota
   })
   expect(served).toEqual(['oauth:anthropic'])
 })
+
+test('host retry cap bounds unconfirmed OpenCode 1 93151s responses after the short-retain budget', async () => {
+  const { plugin, sessionId } = await weeklyStickyRefusal({
+    fallback: false,
+    repeatRefusal: true,
+    resetSeconds: 93_151,
+    headers: {
+      'retry-after-ms': '93151000',
+      'anthropic-ratelimit-unified-7d-utilization': '',
+    },
+  })
+  const probe = spyOn(
+    getPluginTestHandles(plugin).quotaManager,
+    'refreshMain',
+  ).mockRejectedValue(new Error('Synthetic quota probe unavailable'))
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+      expect(response.status).toBe(429)
+      expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(
+        900,
+      )
+      expect(
+        Number(response.headers.get('retry-after-ms')),
+      ).toBeLessThanOrEqual(900_000)
+      await response.text()
+    }
+  } finally {
+    probe.mockRestore()
+  }
+})
+
+for (const rejectedStatus of [false, true]) {
+  test(`host retry cap replaces the last sticky 93151s refusal and re-asks an exhausted pool without a model send (rejected status=${rejectedStatus})`, async () => {
+    const { plugin, served, sessionId } = await weeklyStickyRefusal({
+      fallback: false,
+      resetSeconds: 93_151,
+      headers: {
+        'retry-after-ms': '93151000',
+        ...(rejectedStatus
+          ? {
+              'anthropic-ratelimit-unified-7d-utilization': '',
+              'anthropic-ratelimit-unified-7d-status': 'rejected',
+            }
+          : {}),
+      },
+    })
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+      expect(response.status).toBe(429)
+      expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(
+        900,
+      )
+      if (response.headers.has('retry-after-ms'))
+        expect(
+          Number(response.headers.get('retry-after-ms')),
+        ).toBeLessThanOrEqual(900_000)
+      const body = (await response.json()) as { error: { message: string } }
+      expect(body.error.message).toContain('weekly limit')
+      expect(body.error.message).toContain('UTC (in 26 h)')
+      expect(body.error.message).toContain('Retrying every 15 minutes.')
+      expect(body.error.message).not.toContain('Synthetic weekly limit')
+      expect(served).toEqual(['oauth:anthropic'])
+    }
+  })
+}
 
 const reportedRecords = (fixture: ServingFixture) =>
   fixture.scopedReports.map((report) => [

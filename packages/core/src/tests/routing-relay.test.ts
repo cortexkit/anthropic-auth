@@ -71,3 +71,29 @@ test('rejected routing admission sends no served or exhausted report', async () 
   await Promise.resolve()
   expect(reports).toEqual([])
 })
+
+test('host retry cap bounds routing refusals and hosted holds to fifteen minutes', async () => {
+  for (const refusal of [
+    { code: 'account_limit_exhausted' as const, retryAfterSecs: 93_151 },
+    {
+      code: 'account_limit_exhausted' as const,
+      resetsAtMs: Date.now() + 26 * 3_600_000,
+    },
+  ]) {
+    const error = new RoutingRefusalError(refusal)
+    expect(error.retryAfterSecs).toBe(900)
+    expect(error.response().headers.get('retry-after')).toBe('900')
+  }
+  globals[key] = () => ({
+    accountFor: async () => ({
+      account_id: 'account',
+      credential_id: 'credential',
+      hold: { retry_after_ms: 93_151_000 },
+    }),
+  })
+  expect(
+    await createRoutingRelay().accountFor('session', 'model', [
+      { accountIdentity: 'account', credentialId: 'credential' },
+    ]),
+  ).toMatchObject({ hold: { retry_after_ms: 900_000 } })
+})

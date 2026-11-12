@@ -65,7 +65,7 @@ test('Pi waits inside the stream and resumes the same account after showing and 
   expect(sends).toBe(0)
   expect(clock.delay).toBe(120_000)
   expect(clock.messages[0]).toMatch(
-    /^Waiting for the account to reset at \d\d:\d\d · Esc to cancel$/,
+    /^Checking account availability in 2 minutes \(reset at \d\d:\d\d UTC\) · Esc to cancel$/,
   )
   clock.callback?.()
   expect(await (await result).text()).toBe('served')
@@ -220,3 +220,84 @@ for (const evidence of ['unknown', 'stale'] as const) {
     ).toBe(false)
   })
 }
+
+test('host retry cap bounds Pi unconfirmed sticky retain upstream 93151s headers without a blind wait', async () => {
+  const response = await withPiQuotaWait({
+    run: async () =>
+      new Response('provider limit', {
+        status: 429,
+        headers: { 'retry-after': '93151', 'retry-after-ms': '93151000' },
+      }),
+    resume: async () => {
+      throw new Error('unexpected upstream retry')
+    },
+  })
+  expect(response.headers.get('retry-after')).toBe('900')
+  expect(response.headers.get('retry-after-ms')).toBe('900000')
+})
+
+test('host retry cap keeps Pi to one bounded wait and one recheck for a 26-hour pool reset', async () => {
+  const clock = new Clock()
+  let rechecks = 0
+  const refusal = () =>
+    createQuotaRefusalResponse(
+      'No eligible route.',
+      {
+        resetAt: clock.now + 26 * 3_600_000,
+        retryAfterSeconds: 26 * 3600,
+        limitName: 'weekly',
+      },
+      clock.now,
+    )
+  const result = withPiQuotaWait({
+    run: async () => refusal(),
+    resume: async () => {
+      rechecks++
+      return refusal()
+    },
+    wait: clock.options,
+  })
+  await clock.scheduled.promise
+  expect(clock.delay).toBe(900_000)
+  expect(rechecks).toBe(0)
+  clock.callback?.()
+  const final = await result
+  expect(rechecks).toBe(1)
+  expect(final.status).toBe(412)
+  expect(final.headers.has('retry-after')).toBe(false)
+  const message = await final.text()
+  expect(message).toContain('weekly limit')
+  expect(message).toContain('12:00 UTC (in 26 h)')
+  expect(message).toContain('Send the message again after that.')
+  expect(message).not.toContain('Retrying')
+  expect(
+    isRetryableAssistantError({
+      stopReason: 'error',
+      errorMessage: `HTTP 412 ${message}`,
+    } as AssistantMessage),
+  ).toBe(false)
+})
+
+test('host retry cap bounds Pi marked holds independently of the response producer', async () => {
+  const clock = new Clock()
+  const result = withPiQuotaWait({
+    run: async () =>
+      markPiAccountHold(
+        new Response(null, {
+          status: 429,
+          headers: { 'retry-after': '93151', 'retry-after-ms': '93151000' },
+        }),
+        {
+          accountId: 'main',
+          accountIdentity: 'current',
+          resetAt: clock.now + 93_151_000,
+        },
+      ),
+    resume: async () => new Response('available'),
+    wait: clock.options,
+  })
+  await clock.scheduled.promise
+  expect(clock.delay).toBe(900_000)
+  clock.callback?.()
+  expect(await (await result).text()).toBe('available')
+})

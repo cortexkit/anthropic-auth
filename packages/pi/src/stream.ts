@@ -42,6 +42,8 @@ import {
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
+  hostRetryHeaders,
+  hostRetryResponse,
   isCache1hPersistentlyEnabled,
   isCacheKeepHybridActive,
   isDumpPersistentlyEnabled,
@@ -103,6 +105,7 @@ import {
   signRequestBody,
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
+  stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
   withAnthropicBilling,
 } from '@cortexkit/anthropic-auth-core'
@@ -2025,7 +2028,7 @@ async function executeWithFallback(options: {
       })
       throw error
     }
-    if (!resolution) {
+    const noRouteResponse = async () => {
       if (snapshot.mode === 'claustrum')
         return createNativeVaultNoRouteResponse({
           snapshot: await native.view(),
@@ -2050,6 +2053,7 @@ async function executeWithFallback(options: {
         modelId: options.model.id,
       })
     }
+    if (!resolution) return noRouteResponse()
     let route = routes.allRoutes.find(
       (candidate) => candidate.id === resolution?.accountId,
     )
@@ -2068,7 +2072,7 @@ async function executeWithFallback(options: {
         _selected: PiStickyRoute,
         response: Response,
         _markUsed = true,
-      ) => response
+      ) => hostRetryResponse(response)
       const heldAccountId = route.id
       const heldAccountIdentity = accountView(route.id)?.accountIdentity
       const holdResponse = (
@@ -2096,7 +2100,7 @@ async function executeWithFallback(options: {
                   'Sticky OAuth account quota resets shortly; retaining session affinity.',
               },
             }),
-            { status: 429, headers },
+            { status: 429, headers: hostRetryHeaders(headers) },
           ),
           {
             accountId: heldAccountId,
@@ -2256,7 +2260,29 @@ async function executeWithFallback(options: {
             clearPiStickyQuotaRetries(options.storagePath, sessionId)
             return apiFallback
           }
+          routes = await buildStickyRoutes(options.model.id)
         }
+      }
+      if (
+        primaryResponseAllowsApiFallback(preflight) &&
+        routes.candidates.every(
+          (candidate) =>
+            stickyRouteCandidateWeight({
+              candidate,
+              family: stickyRouteFamilyForModel(options.model.id),
+              modelId: options.model.id,
+              storage,
+            }) === 0,
+        ) &&
+        routes.allRoutes.length > 0 &&
+        routes.allRoutes.every((candidate) =>
+          quotaObservationIsFresh(candidate.quota, options.model.id),
+        )
+      ) {
+        void response.body?.cancel().catch(() => {})
+        if (preflight instanceof Response)
+          void preflight.body?.cancel().catch(() => {})
+        return noRouteResponse()
       }
       return completeRoute(
         route,

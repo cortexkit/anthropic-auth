@@ -12,6 +12,7 @@ import {
   isQuotaBearingHeaderFrame,
   localMessageThreadCredential,
   logger,
+  MAX_HOST_RETRY_MS,
   mergeHeaderQuotaForPersistence,
   type NativeAccountPolicy,
   type NativeAccountRefusalReason,
@@ -192,7 +193,7 @@ function stickyHold(
     hold: {
       // OpenCode 2 caps each wait; under "max", retries recheck the original cache expiry.
       delayMs: Math.min(
-        15 * 60_000,
+        MAX_HOST_RETRY_MS,
         stickyRetryAfterWithJitter(
           input.sessionID,
           decision.retryAfterSeconds,

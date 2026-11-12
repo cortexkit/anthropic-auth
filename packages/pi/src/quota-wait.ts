@@ -1,5 +1,7 @@
 import {
+  clampHostRetryMs,
   createQuotaRefusalResponse,
+  hostRetryResponse,
   quotaRefusalDetails,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -33,14 +35,15 @@ async function waitForReset(
   const set = options.setTimeout ?? globalThis.setTimeout
   const clear = options.clearTimeout ?? globalThis.clearTimeout
   const when = resetAt ?? (options.now?.() ?? Date.now()) + delayMs
-  const time = new Date(when).toLocaleTimeString(undefined, {
+  const time = new Date(when).toLocaleTimeString('en-GB', {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
+    timeZone: 'UTC',
   })
   try {
     options.setWorkingMessage?.(
-      `Waiting for the account to reset at ${time} · Esc to cancel`,
+      `Checking account availability in ${delayMs / 60_000} minutes (reset at ${time} UTC) · Esc to cancel`,
     )
     await new Promise<void>((resolve, reject) => {
       const abort = () => {
@@ -66,9 +69,13 @@ export async function withPiQuotaWait(input: {
   signal?: AbortSignal
   wait?: PiQuotaWaitOptions
 }) {
-  const response = await input.run()
-  const hold = holds.get(response)
-  const refusal = quotaRefusalDetails(response)
+  const original = await input.run()
+  const hold = holds.get(original)
+  const refusal = quotaRefusalDetails(original)
+  const response = hostRetryResponse(
+    original,
+    input.wait?.now?.() ?? Date.now(),
+  )
   const delay = Number(response.headers.get('retry-after')) * 1000
   if (
     (!hold && !refusal) ||
@@ -87,7 +94,7 @@ export async function withPiQuotaWait(input: {
       retryAfterSeconds: undefined,
     })
   await waitForReset(
-    delay,
+    clampHostRetryMs(delay),
     hold?.resetAt ?? refusal?.timing.resetAt,
     input.signal,
     options,
@@ -96,7 +103,8 @@ export async function withPiQuotaWait(input: {
   let next: Response | undefined
   try {
     next = await input.resume(hold)
-    if (next.ok || next.status === 401) return next
+    if (next.ok || next.status === 401)
+      return hostRetryResponse(next, options.now?.() ?? Date.now())
   } catch (error) {
     if (input.signal?.aborted) throw error
   }
@@ -110,8 +118,10 @@ export async function withPiQuotaWait(input: {
     {
       resetAt:
         latest?.timing.resetAt ?? refusal?.timing.resetAt ?? hold?.resetAt,
+      limitName: latest?.timing.limitName ?? refusal?.timing.limitName,
       retryAfterSeconds: undefined,
     },
     options.now?.() ?? Date.now(),
+    { retry: 'manual' },
   )
 }

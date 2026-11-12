@@ -123,5 +123,5 @@ test('vault model-scoped refusal names the model limit and uses its reset retry 
   const body = (await response.json()) as { error: { message: string } }
   expect(body.error.message).toContain('Opus scoped limit')
   expect(body.error.message).toContain('/claude → Killswitch / Quota')
-  expect(body.error.message).toContain('Retry in ')
+  expect(body.error.message).toContain('Retrying every 2 minutes.')
 })

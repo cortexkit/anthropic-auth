@@ -1949,6 +1949,7 @@ async function retryHost(native: ReturnType<typeof source>) {
       }
       await run('http.response', draft)
       await draft.response.text()
+      return draft.response
     },
     /** Answers with a 200 event stream whose events the host reads to the end. */
     async streamed(request: Request, events: string, input = scope) {
@@ -2012,18 +2013,54 @@ async function retryHost(native: ReturnType<typeof source>) {
         type: 'unknown',
         message: 'provider refused the attempt',
       },
+      delay = 1234,
     ) {
       const draft: SessionHooks['retry'] = {
         ...hostScope(input),
         attempt: 1,
         error,
-        decision: retry ? { retry: true, delay: 1234 } : { retry: false },
+        decision: retry ? { retry: true, delay } : { retry: false },
       }
       await run('retry', draft)
       return draft.decision
     },
   }
 }
+
+test('host retry cap bounds OpenCode 2 upstream 93151s headers and installer delays', async () => {
+  for (const confirmed of [false, true]) {
+    const fixture = await vaultWithFallback()
+    const native = source(fixture.runtime, fixture.paths)
+    const host = await retryHost(native)
+    const first = await host.send()
+    const response = await host.response(first, 429, scope, {
+      'retry-after': '93151',
+      'retry-after-ms': '93151000',
+      ...(confirmed
+        ? {
+            'anthropic-ratelimit-unified-7d-status': 'rejected',
+            'anthropic-ratelimit-unified-7d-reset': String(
+              Math.floor(Date.now() / 1000) + 93_151,
+            ),
+          }
+        : {}),
+    })
+    expect(response.headers.get('retry-after')).toBe('900')
+    expect(response.headers.get('retry-after-ms')).toBe('900000')
+  }
+  const fixture = await vaultWithFallback()
+  const host = await retryHost(source(fixture.runtime, fixture.paths))
+  const first = await host.send()
+  await host.response(first, 200)
+  expect(
+    await host.retry(
+      true,
+      scope,
+      { type: 'unknown', message: 'retryable transport error' },
+      93_151_000,
+    ),
+  ).toEqual({ retry: true, delay: 900_000 })
+})
 
 describe('OC2 interrupted-read continuation (requires common-auth 0.36.0)', () => {
   test('a sticky session continues on the same account after visible output and a failed body read', async () => {

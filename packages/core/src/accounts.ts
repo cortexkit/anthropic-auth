@@ -12,6 +12,7 @@ import {
   CLAUDE_CODE_VERSION,
   DEFAULT_CACHE_1H_MODE,
 } from './constants.ts'
+import { clampHostRetryMs } from './host-retry.ts'
 import type { LogLevel } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
@@ -1503,7 +1504,11 @@ export function quotaRefusalTiming(input: {
   modelId?: string
   sessionTtlMs?: number
   now?: number
-}) {
+}): {
+  resetAt: number | undefined
+  retryAfterSeconds: number | undefined
+  limitName?: string
+} {
   const now = input.now ?? Date.now()
   const maxAge = getQuotaCheckIntervalMs(input.storage ?? null)
   const fresh = (window: AccountQuotaWindow | undefined) =>
@@ -1513,7 +1518,7 @@ export function quotaRefusalTiming(input: {
         window.checkedAt <= now &&
         now - window.checkedAt < maxAge,
     )
-  const resetTimes: number[] = []
+  const resetTimes: { resetAt: number; limitName: string }[] = []
   const storage = input.storage ?? null
   const modelId = input.modelId ?? input.scopedModelId
   const floors = quotaEnabled(storage)
@@ -1536,7 +1541,7 @@ export function quotaRefusalTiming(input: {
       (modelId && killswitch.scoped > 0 && quota.scoped === undefined)
     )
       continue
-    const blockers: AccountQuotaWindow[] = []
+    const blockers: { window: AccountQuotaWindow; name: string }[] = []
     let unknown = false
     for (const key of ['five_hour', 'seven_day'] as const) {
       if (key === 'five_hour' && quotaSnapshotOmitsFiveHour(quota)) continue
@@ -1549,26 +1554,38 @@ export function quotaRefusalTiming(input: {
         window.remainingPercent <= 0 ||
         window.remainingPercent < Math.max(floors[key], killswitch[key])
       )
-        blockers.push(window)
+        blockers.push({
+          window,
+          name: key === 'five_hour' ? '5-hour' : 'weekly',
+        })
     }
     if (scoped) {
       if (!Number.isFinite(scoped.remainingPercent)) unknown = true
       else if (scoped.remainingPercent <= killswitch.scoped)
-        blockers.push(scoped)
+        blockers.push({
+          window: scoped,
+          name: `${scoped.modelName ?? 'Model'} weekly`,
+        })
     }
     // An account can serve again only after every window blocking this request resets.
     let usableAt: number | undefined
-    for (const window of blockers) {
+    let limitName = ''
+    for (const { window, name } of blockers) {
       const resetAt = Date.parse(window?.resetsAt ?? '')
       if (!Number.isFinite(resetAt) || resetAt <= now) {
         unknown = true
         break
       }
-      usableAt = Math.max(usableAt ?? resetAt, resetAt)
+      if (usableAt === undefined || resetAt >= usableAt) {
+        usableAt = resetAt
+        limitName = name
+      }
     }
-    if (!unknown && usableAt !== undefined) resetTimes.push(usableAt)
+    if (!unknown && usableAt !== undefined)
+      resetTimes.push({ resetAt: usableAt, limitName })
   }
-  const resetAt = resetTimes.length ? Math.min(...resetTimes) : undefined
+  const earliest = resetTimes.sort((a, b) => a.resetAt - b.resetAt)[0]
+  const resetAt = earliest?.resetAt
   const wait = getMaxSameAccountWait(input.storage ?? null)
   const ttlMs =
     input.sessionTtlMs &&
@@ -1576,9 +1593,10 @@ export function quotaRefusalTiming(input: {
     Number.isFinite(input.sessionTtlMs)
       ? input.sessionTtlMs
       : 300_000
-  const capMs = wait === 'max' ? ttlMs : Number(wait) * 60_000
+  const capMs = clampHostRetryMs(wait === 'max' ? ttlMs : Number(wait) * 60_000)
   return {
     resetAt,
+    ...(earliest ? { limitName: earliest.limitName } : {}),
     retryAfterSeconds:
       wait === '0'
         ? undefined

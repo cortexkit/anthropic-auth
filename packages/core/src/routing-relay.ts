@@ -3,6 +3,7 @@ import {
   type RoutingRefusal,
 } from '@cortexkit/common-auth/routing-accessor'
 import type { OAuthQuotaSnapshot } from './accounts.ts'
+import { clampHostRetryMs, MAX_HOST_RETRY_MS } from './host-retry.ts'
 import { logger } from './logger.ts'
 import {
   type NativeAccountSnapshot,
@@ -14,7 +15,7 @@ import {
 } from './native-account-view.ts'
 import { reportRoutingResponse } from './routing-reports.ts'
 
-export const ROUTING_HOLD_LIMIT_MS = 15 * 60_000 + 20_000
+export const ROUTING_HOLD_LIMIT_MS = MAX_HOST_RETRY_MS
 export type RoutingChoice = {
   account_id: string
   credential_id: string
@@ -61,6 +62,8 @@ export class RoutingRefusalError extends Error {
             ? undefined
             : Math.max(0, Math.ceil((refusal.resetsAtMs - now) / 1000))))
         : undefined
+    if (this.retryAfterSecs !== undefined)
+      this.retryAfterSecs = clampHostRetryMs(this.retryAfterSecs * 1000) / 1000
   }
 
   response() {

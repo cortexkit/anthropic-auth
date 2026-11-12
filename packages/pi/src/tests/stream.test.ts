@@ -290,7 +290,7 @@ describe('Pi shared routing relay', () => {
       clearTimeout: (() => {}) as unknown as typeof clearTimeout,
     })
     expect((await stream.result()).stopReason).toBe('stop')
-    expect(delay).toBe(920_000)
+    expect(delay).toBe(900_000)
     expect(asks).toBe(1)
     expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
   })
@@ -2015,7 +2015,7 @@ describe('Pi API fallback routing helpers', () => {
               headers:
                 reporting && reporting !== 'unconfirmed'
                   ? {
-                      'retry-after': '432000',
+                      'retry-after': retryBudget ? '93151' : '432000',
                       ...(reporting === 'scoped'
                         ? {
                             'anthropic-ratelimit-unified-7d_fable-status':
@@ -2033,7 +2033,7 @@ describe('Pi API fallback routing helpers', () => {
                           }),
                     }
                   : {
-                      'retry-after': '432000',
+                      'retry-after': retryBudget ? '93151' : '432000',
                       'anthropic-ratelimit-unified-7d-utilization': confirmed
                         ? '1.0'
                         : '',
@@ -2588,6 +2588,117 @@ describe('Pi API fallback routing helpers', () => {
       'Bearer sk-ant-oat01-abundant-access',
     ])
   })
+
+  for (const knownBeforeSend of [true, false]) {
+    test(`host retry cap rechecks a 26-hour Pi pool once without another model request (known before send=${knownBeforeSend})`, async () => {
+      tempDir = await mkdtemp(join(tmpdir(), 'pi-long-pool-reset-'))
+      const storagePath = join(tempDir, 'anthropic-auth.json')
+      process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+      process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = join(
+        tempDir,
+        'sticky-routes.json',
+      )
+      const checkedAt = Date.now()
+      const resetsAt = new Date(checkedAt + 26 * 3_600_000).toISOString()
+      const quota = {
+        checkedAt,
+        five_hour: { remainingPercent: 100, usedPercent: 0, checkedAt },
+        seven_day: {
+          remainingPercent: knownBeforeSend ? 0 : 90,
+          usedPercent: knownBeforeSend ? 100 : 10,
+          checkedAt,
+          resetsAt,
+        },
+      }
+      await saveNativePiFixture(
+        {
+          version: 1,
+          mainAccountId: 'main-account',
+          main: { type: 'opencode', provider: 'anthropic' },
+          quota: {
+            enabled: true,
+            checkIntervalMinutes: 5,
+            minimumRemaining: { five_hour: 1, seven_day: 1 },
+            mainQuota: { ...quota, accountIdentity: 'main-account' },
+            mainQuotaCheckedAt: checkedAt,
+          },
+          routing: { mode: 'sticky-balanced', maxSameAccountWait: 'max' },
+          accounts: [],
+        },
+        storagePath,
+      )
+      let messageRequests = 0
+      globalThis.fetch = mock((input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : String(input)
+        if (url.includes('/v1/messages')) {
+          messageRequests++
+          return Promise.resolve(
+            Response.json(
+              {
+                error: {
+                  type: 'rate_limit_error',
+                  message: 'Synthetic upstream text must not be shown',
+                },
+              },
+              {
+                status: 429,
+                headers: {
+                  'retry-after': '93151',
+                  'retry-after-ms': '93151000',
+                  'anthropic-ratelimit-unified-7d-utilization': '1',
+                  'anthropic-ratelimit-unified-7d-reset': String(
+                    Date.parse(resetsAt) / 1000,
+                  ),
+                },
+              },
+            ),
+          )
+        }
+        return Promise.resolve(
+          Response.json({
+            five_hour: { utilization: 0 },
+            seven_day: { utilization: 100, resets_at: resetsAt },
+          }),
+        )
+      }) as unknown as typeof fetch
+      const sessionId = 'pi-26-hour-pool'
+      sessionCacheActivity.record(sessionId, 'main', 26 * 3_600_000, checkedAt)
+      const delays: number[] = []
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const stream = streamCortexKitAnthropic(
+            anthropicModel,
+            anthropicContext,
+            { apiKey: 'sk-ant-oat01-main-access', sessionId },
+            undefined,
+            {
+              setTimeout: ((callback: () => void, delay: number) => {
+                delays.push(delay)
+                queueMicrotask(callback)
+                return 1
+              }) as unknown as typeof setTimeout,
+              clearTimeout: (() => {}) as unknown as typeof clearTimeout,
+            },
+          )
+          for await (const _event of stream) {
+            /* Drain the local refusal. */
+          }
+          const result = await stream.result()
+          expect(result.errorMessage).toContain('weekly limit')
+          expect(result.errorMessage).toContain('UTC (in 26 h)')
+          expect(result.errorMessage).toContain(
+            'Send the message again after that.',
+          )
+          expect(isRetryableAssistantError(result)).toBe(false)
+          expect(messageRequests).toBe(knownBeforeSend ? 0 : 1)
+          expect(result.errorMessage).not.toContain('Synthetic upstream text')
+        }
+        expect(delays).toEqual([900_000, 900_000])
+      } finally {
+        sessionCacheActivity.forget(sessionId)
+      }
+    })
+  }
 
   test('sticky-balanced reports main re-login when no fallback can serve the requested model', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-no-route-'))

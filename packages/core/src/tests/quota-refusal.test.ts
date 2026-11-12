@@ -50,7 +50,7 @@ test('only fresh current-identity scope-covered resets feed the terminal scan', 
       readings: [{ quota: quota(), accountIdentity: 'current' }],
       now,
     }),
-  ).toEqual({ resetAt, retryAfterSeconds: 900 })
+  ).toMatchObject({ resetAt, retryAfterSeconds: 900 })
   const earlier = quota()
   earlier.five_hour!.resetsAt = new Date(now + 600_000).toISOString()
   earlier.seven_day!.resetsAt = new Date(now + 600_000).toISOString()
@@ -62,7 +62,7 @@ test('only fresh current-identity scope-covered resets feed the terminal scan', 
       ],
       now,
     }),
-  ).toEqual({ resetAt: now + 600_000, retryAfterSeconds: 600 })
+  ).toMatchObject({ resetAt: now + 600_000, retryAfterSeconds: 600 })
 })
 
 test('refusal caps follow zero, fifteen and max without hiding the true reset', async () => {
@@ -70,7 +70,7 @@ test('refusal caps follow zero, fifteen and max without hiding the true reset', 
     ['0', undefined, undefined],
     ['15', undefined, 900],
     ['max', undefined, 300],
-    ['max', 3_600_000, 3600],
+    ['max', 3_600_000, 900],
   ] as const) {
     const timing = quotaRefusalTiming({
       readings: [{ quota: quota(), accountIdentity: 'current' }],
@@ -78,7 +78,7 @@ test('refusal caps follow zero, fifteen and max without hiding the true reset', 
       sessionTtlMs: ttl,
       now,
     })
-    expect(timing).toEqual({ resetAt, retryAfterSeconds: expected })
+    expect(timing).toMatchObject({ resetAt, retryAfterSeconds: expected })
     const response = createQuotaRefusalResponse(
       'No OAuth account currently satisfies sticky-balanced quota policy.',
       timing,
@@ -91,23 +91,16 @@ test('refusal caps follow zero, fifteen and max without hiding the true reset', 
     const body = (await response.json()) as {
       error: { type: string; message: string }
     }
-    expect(body.error.message).toContain('Reset at ')
-    expect(body.error.message).toContain(
-      new Intl.DateTimeFormat('en-US', {
-        month: 'long',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        timeZoneName: 'short',
-      }).format(resetAt),
-    )
+    expect(body.error.message).toContain('The earliest reset is 12:00 UTC')
     if (wait === '0') {
       expect(body.error.type).toBe('FAILED_PRECONDITION')
       expect(body.error.message).not.toMatch(
         /429|500|502|503|504|524|retry|rate.?limit|overloaded|timeout/i,
       )
     } else
-      expect(body.error.message).toContain(`Retry in ${expected / 60}m 0s.`)
+      expect(body.error.message).toContain(
+        `Retrying every ${expected / 60} minutes.`,
+      )
   }
 })
 
@@ -173,7 +166,7 @@ test('an exhausted weekly window determines usable time despite an earlier five-
       readings: [{ quota: q, accountIdentity: 'current' }],
       now,
     }),
-  ).toEqual({
+  ).toMatchObject({
     resetAt: now + 4 * 24 * 3_600_000,
     retryAfterSeconds: 900,
   })
@@ -193,7 +186,7 @@ test('the earlier usable account wins only after all its blockers reset', () => 
       ],
       now,
     }),
-  ).toEqual({ resetAt: now + 600_000, retryAfterSeconds: 600 })
+  ).toMatchObject({ resetAt: now + 600_000, retryAfterSeconds: 600 })
   fast.seven_day!.resetsAt = undefined
   expect(
     quotaRefusalTiming({
@@ -276,4 +269,61 @@ test('zero wait does not change re-login precedence', () => {
       now,
     }).status,
   ).toBe(401)
+})
+
+test('host retry cap names the limiting window and the real 26-hour reset for a complete pool', async () => {
+  const actualReset = now + 26 * 3_600_000
+  for (const limit of ['5-hour', 'weekly', 'Fable weekly']) {
+    const q = quota()
+    q.accountIdentity = 'private-account@example.com'
+    q.five_hour!.remainingPercent = 90
+    q.seven_day!.remainingPercent = 90
+    const blocked =
+      limit === '5-hour'
+        ? q.five_hour!
+        : limit === 'weekly'
+          ? q.seven_day!
+          : {
+              id: 'fable',
+              title: 'Fable',
+              modelName: 'Fable',
+              checkedAt: now,
+              usedPercent: 100,
+              remainingPercent: 0,
+            }
+    blocked.remainingPercent = 0
+    Object.assign(blocked, { resetsAt: new Date(actualReset).toISOString() })
+    if (limit === 'Fable weekly')
+      q.scoped = [blocked as NonNullable<OAuthQuotaSnapshot['scoped']>[number]]
+    const response = createStickyNoRouteResponse({
+      routeQuotas: [q, q],
+      routeIdentities: [
+        'private-account@example.com',
+        'private-account@example.com',
+      ],
+      storage: storage('max'),
+      sessionId: 'long-reset',
+      modelId: 'claude-fable-5',
+      now,
+    })
+    expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(900)
+    const { error } = (await response.json()) as { error: { message: string } }
+    expect(error.message).toContain(`${limit} limit`)
+    expect(error.message).toContain('12:00 UTC (in 26 h)')
+    expect(error.message).toContain('Retrying every ')
+    expect(error.message).not.toContain('private-account@example.com')
+  }
+  const timing = quotaRefusalTiming({
+    readings: [{ quota: quota(), accountIdentity: 'current' }],
+    storage: storage('max'),
+    sessionTtlMs: 26 * 3_600_000,
+    now,
+  })
+  expect(timing.retryAfterSeconds).toBe(900)
+  const defensive = createQuotaRefusalResponse(
+    'No route.',
+    { resetAt: actualReset, retryAfterSeconds: 93_151, limitName: 'weekly' },
+    now,
+  )
+  expect(defensive.headers.get('retry-after')).toBe('900')
 })

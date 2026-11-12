@@ -42,6 +42,7 @@ import {
   type CustodyStatusState,
   cacheKeepSourceWarmIdleCap,
   cacheWarmCacheablePrefixFingerprint,
+  clampHostRetryMs,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   createDumpResponseObserver,
@@ -100,6 +101,7 @@ import {
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
+  hostRetryResponse,
   type IdentityState,
   inspectNativeHostAuthEntry,
   isApiKeyAccount,
@@ -225,6 +227,7 @@ import {
   snapshotHasServableLocalOAuth,
   stateRefusalPublicMessage,
   stickyQuotaSnapshotIsFresh,
+  stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
   TrailingAssistantHistoryError,
   tokenFingerprint,
@@ -2090,6 +2093,7 @@ const anthropicAuthPlugin = async (
       error.nextRetryAt > now
     ) {
       return {
+        exhausted: false,
         message: formatQuotaBackoffMessage(error, now),
         retryAfter: Math.max(1, Math.ceil((error.nextRetryAt - now) / 1000)),
       }
@@ -2118,6 +2122,7 @@ const anthropicAuthPlugin = async (
         : []
     })
     return {
+      exhausted: true,
       message: 'Claude OAuth quota is exhausted for this account.',
       retryAfter: Math.max(
         1,
@@ -2939,15 +2944,24 @@ const anthropicAuthPlugin = async (
   function harvestQuotaHeaders(
     headers: Headers,
     served: ServedQuotaHeaders,
+    modelId?: string,
   ): void {
     try {
-      if (!isQuotaBearingHeaderFrame(headers)) {
+      const confirmed = quotaExhaustionFromHeaders(headers, modelId)
+      if (
+        !isQuotaBearingHeaderFrame(headers) &&
+        Object.keys(confirmed).length === 0
+      ) {
         logger.trace('quota', 'skipped non-quota response headers', {
           account: served.accountId,
         })
         return
       }
       const incoming = normalizeQuotaHeaders(headers)
+      Object.assign(incoming, confirmed)
+      for (const key of ['five_hour', 'seven_day', 'scoped'] as const)
+        if (confirmed[key])
+          incoming.fieldSources = { ...incoming.fieldSources, [key]: 'headers' }
       const mainQuotaIdentity =
         served.accountId === 'main' ? served.mainQuotaIdentity : undefined
       if (served.accountId === 'main') {
@@ -2985,20 +2999,8 @@ const anthropicAuthPlugin = async (
                 checkedAt,
                 refreshAfter: checkedAt,
               },
-              generalExhausted: (['five_hour', 'seven_day'] as const).some(
-                (key) => {
-                  const raw = headers.get(
-                    key === 'five_hour'
-                      ? 'anthropic-ratelimit-unified-5h-utilization'
-                      : 'anthropic-ratelimit-unified-7d-utilization',
-                  )
-                  return (
-                    incoming[key] !== undefined &&
-                    raw !== null &&
-                    Number.isFinite(Number(raw)) &&
-                    Number(raw) >= 1
-                  )
-                },
+              generalExhausted: Boolean(
+                confirmed.five_hour || confirmed.seven_day,
               ),
             }
           : undefined
@@ -8383,7 +8385,7 @@ const anthropicAuthPlugin = async (
                 },
                 onResponseHeaders: (headers) => {
                   routingHeaders = headers
-                  harvestQuotaHeaders(headers, served)
+                  harvestQuotaHeaders(headers, served, modelForIdentity)
                   billingLineageTracker.commit(
                     activeBillingLineage,
                     extractAnthropicRequestId(headers),
@@ -8509,7 +8511,7 @@ const anthropicAuthPlugin = async (
               })
 
               if (usedDirectFetch) {
-                harvestQuotaHeaders(response.headers, served)
+                harvestQuotaHeaders(response.headers, served, modelForIdentity)
                 billingLineageTracker.commit(
                   activeBillingLineage,
                   extractAnthropicRequestId(response.headers),
@@ -8801,7 +8803,10 @@ const anthropicAuthPlugin = async (
             mainQuotaIdentity?: MainQuotaIdentityBinding
           }) {
             const mainQuotaIdentity = input.mainQuotaIdentity?.quotaKey
-            const mainEntry = quotaManager.getMain(mainQuotaIdentity)
+            const mainEntry = routingMainQuotaEntry(
+              input.mainQuotaIdentity,
+              input.storage,
+            )
             let mainQuota = mainEntry?.quota
             if (
               !stickyQuotaSnapshotIsFresh(
@@ -9719,7 +9724,7 @@ const anthropicAuthPlugin = async (
                     : {}),
                 })
                 deliverCacheReports(trace)
-                return wrapped
+                return hostRetryResponse(wrapped)
               }
               const authStart = nowMs()
               const credentialModelId =
@@ -9757,7 +9762,7 @@ const anthropicAuthPlugin = async (
                 trace.done('non_oauth_passthrough', {
                   status: response.status,
                 })
-                return response
+                return hostRetryResponse(response)
               }
               const storage = await loadAccounts()
               const requestMainProviderUuid: ProviderAccountUuid | undefined =
@@ -9892,6 +9897,10 @@ const anthropicAuthPlugin = async (
                   },
                 )
                 if (response) return wrapResponse(response)
+                if (providerRestriction.exhausted)
+                  return quotaRefusal(
+                    'No OAuth account currently satisfies quota policy.',
+                  )
                 return new Response(
                   JSON.stringify({
                     type: 'error',
@@ -9904,15 +9913,19 @@ const anthropicAuthPlugin = async (
                     status: 429,
                     headers: {
                       'content-type': 'application/json',
-                      'retry-after': String(providerRestriction.retryAfter),
+                      'retry-after': String(
+                        clampHostRetryMs(
+                          providerRestriction.retryAfter * 1000,
+                        ) / 1000,
+                      ),
                     },
                   },
                 )
               }
-              const quotaRefusal = async (
+              async function quotaRefusal(
                 reason: string,
                 scopedModelId?: string,
-              ) => {
+              ) {
                 const current = await nativeAccounts.read()
                 return createQuotaRefusalResponse(
                   reason,
@@ -10149,15 +10162,29 @@ const anthropicAuthPlugin = async (
                       'Sticky-balanced routing is waiting for current OAuth quota snapshots',
                     )
                   }
-                  if (!resolution) {
+                  const noRouteResponse = async () => {
                     if (auth.modelDenied) return modelDeniedResponse()
-                    if (isScopedCustodyActive(storage))
+                    if (isScopedCustodyActive(storage)) {
+                      const current = await nativeAccounts.read()
                       return createNativeVaultNoRouteResponse({
-                        snapshot: await nativeAccounts.read(),
+                        snapshot: {
+                          ...current,
+                          // Use the refusal's quota before its background write reaches account storage.
+                          accounts: current.accounts.map((account) => {
+                            const quota = stickyRoutes.allRoutes.find(
+                              (route) => route.id === account.id,
+                            )?.quota
+                            return quota?.accountIdentity ===
+                              account.accountIdentity
+                              ? { ...account, quota }
+                              : account
+                          }),
+                        },
                         modelId: routingModelId,
                         sticky: true,
                         sessionId,
                       })
+                    }
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
                         stickyRoutes.storage?.refresh?.mainLastRefreshError,
@@ -10186,6 +10213,7 @@ const anthropicAuthPlugin = async (
                     })
                     return response
                   }
+                  if (!resolution) return noRouteResponse()
                   let route = stickyRoutes.allRoutes.find(
                     (candidate) => candidate.id === resolution?.accountId,
                   )
@@ -10559,6 +10587,32 @@ const anthropicAuthPlugin = async (
                           }
                         }
                       }
+                    }
+                    if (
+                      inspected.response.status === 429 &&
+                      stickyRoutes.candidates.every(
+                        (candidate) =>
+                          stickyRouteCandidateWeight({
+                            candidate,
+                            family,
+                            modelId: routingModelId,
+                            storage: stickyRoutes.storage,
+                          }) === 0,
+                      ) &&
+                      stickyRoutes.allRoutes.length > 0 &&
+                      stickyRoutes.allRoutes.every(
+                        (candidate) =>
+                          candidate.quota &&
+                          stickyQuotaSnapshotIsFresh(
+                            candidate.quota,
+                            stickyRoutes.storage,
+                            Date.now(),
+                            routingModelId,
+                          ),
+                      )
+                    ) {
+                      await inspected.response.body?.cancel().catch(() => {})
+                      return completeRoute(route, await noRouteResponse())
                     }
                     return completeRoute(route, inspected.response)
                   }
@@ -10990,14 +11044,16 @@ const anthropicAuthPlugin = async (
                     headers: {
                       'content-type': 'application/json',
                       'retry-after': String(
-                        lastError?.nextRetryAt
-                          ? Math.max(
-                              1,
-                              Math.ceil(
-                                (lastError.nextRetryAt - Date.now()) / 1000,
-                              ),
-                            )
-                          : 60,
+                        clampHostRetryMs(
+                          (lastError?.nextRetryAt
+                            ? Math.max(
+                                1,
+                                Math.ceil(
+                                  (lastError.nextRetryAt - Date.now()) / 1000,
+                                ),
+                              )
+                            : 60) * 1000,
+                        ) / 1000,
                       ),
                     },
                   },

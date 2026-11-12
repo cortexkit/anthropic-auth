@@ -1,4 +1,6 @@
 import {
+  clampHostRetryMs,
+  hostRetryResponse,
   runWithRequestSignal,
   withSessionCacheReportHandoff,
 } from '@cortexkit/anthropic-auth-core'
@@ -88,8 +90,16 @@ export async function installNativeAnthropic<Q, P>(
                   /* Reporting never changes the host response. */
                 }
               }
+              if ('response' in draft && draft.response instanceof Response)
+                draft.response = hostRetryResponse(draft.response)
             }
           })()
+        }
+        if (name === 'retry') {
+          const result = await callback(draft)
+          if ('decision' in draft && draft.decision.retry)
+            draft.decision.delay = clampHostRetryMs(draft.decision.delay)
+          return result
         }
         if (name !== 'http.request') return callback(draft)
         // Account choice runs inside http.request, before the host can send it.
