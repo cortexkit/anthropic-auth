@@ -21,6 +21,7 @@ import {
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
   createQuotaRefusalResponse,
+  createRoutingRelay,
   createSseFramer,
   createStickyNoRouteResponse,
   type DumpHandle,
@@ -81,11 +82,14 @@ import {
   quotaSnapshotModelScopeIsExhausted,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  type RoutingChoice,
   readSessionCachePolicy,
   reportRoutingResponse,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
   resolveNativePoolPaths,
+  routingCandidates,
+  routingChoiceMatches,
   runWithRequestSignal,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   StickyQuotaRetryCounter,
@@ -823,6 +827,8 @@ async function sendAnthropicRequest(
     apiAccount?: NativeAccountView
     storagePath: string
     oauthAccountId?: string
+    routingChoice?: RoutingChoice
+    routingRelay?: ReturnType<typeof createRoutingRelay>
     expectedAccountIdentity?: string
     route?: string
     effortTransitions?: readonly MidConversationEffortTransition[]
@@ -878,6 +884,8 @@ async function sendAnthropicRequest(
         routeId,
         options.streamOptions?.signal,
         options.model.id,
+        'serve',
+        options.routingChoice,
       )
     ).accountIdentity
   }
@@ -941,6 +949,11 @@ async function sendAnthropicRequest(
     status: number,
   ) => {
     if (options.prime || !relayAffinity) return
+    if (
+      options.routingRelay &&
+      !options.routingRelay.shouldReport(relayAffinity)
+    )
+      return
     const payer = piBillingPayer(attempt)
     reportRoutingResponse(
       relayAffinity,
@@ -1081,6 +1094,8 @@ async function sendAnthropicRequest(
         routeId,
         init.signal ?? undefined,
         options.model.id,
+        'serve',
+        options.routingChoice,
       ))
     nextAttempt = undefined
     if (attempt.accountIdentity !== verifiedUuid)
@@ -1212,6 +1227,7 @@ async function sendAnthropicRequest(
                   attempt,
                   init.signal ?? undefined,
                   options.model.id,
+                  options.routingChoice,
                 )
                 .catch(() => undefined)
             : undefined
@@ -1374,6 +1390,7 @@ async function sendAnthropicRequest(
         relay401Attempt,
         init.signal ?? undefined,
         options.model.id,
+        options.routingChoice,
       )
       .catch(() => undefined)
     if (rotated) {
@@ -1582,7 +1599,17 @@ async function executeWithFallback(options: {
   effortTransitions?: readonly MidConversationEffortTransition[]
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
   onThreadPrepared?: (fail: () => void) => void
+  routingRelay?: ReturnType<typeof createRoutingRelay>
+  routingState?: {
+    relay: ReturnType<typeof createRoutingRelay>
+    advice?: Promise<RoutingChoice | null>
+  }
 }): Promise<Response> {
+  const routingState = options.routingState ?? {
+    relay: createRoutingRelay(),
+    advice: undefined,
+  }
+  options = { ...options, routingRelay: routingState.relay }
   const native = getPiNativeRuntime(options.storagePath)
   let snapshot = await native.requestView(options.streamOptions?.signal)
   let storage = snapshot.policyStorage
@@ -1917,7 +1944,28 @@ async function executeWithFallback(options: {
   }
 
   const routingMode = getRoutingMode(storage)
-  if (routingMode === 'sticky-balanced' && options.streamOptions?.sessionId) {
+  const routingRelay = routingState.relay
+  const routingSessionId = options.streamOptions?.sessionId
+  if (routingSessionId && !routingState.advice) {
+    routingState.advice = routingRelay.accountFor(
+      routingSessionId,
+      options.model.id,
+      routingCandidates(snapshot.accounts),
+    )
+  }
+  const advice = await routingState.advice
+  let advisedAccountId = advice
+    ? snapshot.accounts.find(
+        (account) =>
+          routingChoiceMatches(advice, account) && nativeReady(account.id),
+      )?.id
+    : undefined
+  if (advice && !advisedAccountId)
+    routingRelay.override(routingSessionId ?? '', 'account unavailable')
+  if (
+    (routingMode === 'sticky-balanced' || advisedAccountId) &&
+    options.streamOptions?.sessionId
+  ) {
     const sessionId = options.streamOptions.sessionId
     const router = await getPiStickyRouter(options.storagePath)
     const initialInputBytes = Math.max(
@@ -1925,6 +1973,13 @@ async function executeWithFallback(options: {
       Buffer.byteLength(JSON.stringify(options.context)),
     )
     let routes = await buildStickyRoutes(options.model.id)
+    if (
+      advisedAccountId &&
+      !routes.allRoutes.some((route) => route.id === advisedAccountId)
+    ) {
+      routingRelay.override(sessionId, 'account unavailable')
+      advisedAccountId = undefined
+    }
     const mainPermanentlyUnavailable = !primaryAvailable()
     const incompleteQuotaPool =
       (routes.allRoutes.length === 0 && !mainPermanentlyUnavailable) ||
@@ -1939,8 +1994,21 @@ async function executeWithFallback(options: {
       affinityModelId: options.model.id,
       // Keep an existing route after a temporary quota poll failure, but do not
       // choose a new balanced route until the account pool has current quota data.
-      candidates: incompleteQuotaPool ? [] : routes.candidates,
-      retainAccountIds: routes.retainAccountIds,
+      candidates: advisedAccountId
+        ? routes.allRoutes
+            .filter((route) => route.id === advisedAccountId)
+            .map((route) => ({
+              accountId: route.id,
+              order: route.order,
+              quota: route.quota ?? { kind: 'unknown' as const },
+            }))
+        : incompleteQuotaPool
+          ? []
+          : routes.candidates,
+      retainAccountIds: advisedAccountId
+        ? new Set([advisedAccountId])
+        : routes.retainAccountIds,
+      ...(advisedAccountId && { routingAccountId: advisedAccountId }),
       accountIdentities: vaultAccountIdentities(),
       storage,
       inputBytes: initialInputBytes,
@@ -1990,6 +2058,10 @@ async function executeWithFallback(options: {
         sendAnthropicRequest({
           ...options,
           oauthAccountId: selected.id,
+          routingChoice:
+            selected.id === advisedAccountId
+              ? (advice ?? undefined)
+              : undefined,
           route: `sticky:${selected.id}`,
         })
       const completeRoute = async (
@@ -1999,12 +2071,20 @@ async function executeWithFallback(options: {
       ) => response
       const heldAccountId = route.id
       const heldAccountIdentity = accountView(route.id)?.accountIdentity
-      const holdResponse = (retryAfterSeconds: number, upstream?: Headers) => {
+      const holdResponse = (
+        retryAfterSeconds: number,
+        upstream?: Headers,
+        routingHold = false,
+      ) => {
         const headers = new Headers(upstream)
         headers.set('content-type', 'application/json')
         headers.set(
           'retry-after',
-          String(stickyRetryAfterWithJitter(sessionId, retryAfterSeconds)),
+          String(
+            routingHold
+              ? retryAfterSeconds
+              : stickyRetryAfterWithJitter(sessionId, retryAfterSeconds),
+          ),
         )
         return markPiAccountHold(
           new Response(
@@ -2025,24 +2105,32 @@ async function executeWithFallback(options: {
           },
         )
       }
-      const proactiveQuotaDecision = stickyQuotaSnapshotIsFresh(
-        route.quota,
-        storage,
-        Date.now(),
-        options.model.id,
-      )
-        ? decideStickyQuotaFailure({
-            quota: route.quota,
-            modelId: options.model.id,
-            sessionId,
-            holdUntil: sessionCacheActivity.holdUntil(
+      if (advisedAccountId && advice?.hold)
+        return holdResponse(
+          Math.ceil(advice.hold.retry_after_ms / 1000),
+          undefined,
+          true,
+        )
+      const proactiveQuotaDecision =
+        !advisedAccountId &&
+        stickyQuotaSnapshotIsFresh(
+          route.quota,
+          storage,
+          Date.now(),
+          options.model.id,
+        )
+          ? decideStickyQuotaFailure({
+              quota: route.quota,
+              modelId: options.model.id,
               sessionId,
-              route.id,
-              Date.now(),
-              getMaxSameAccountWait(storage),
-            ),
-          })
-        : undefined
+              holdUntil: sessionCacheActivity.holdUntil(
+                sessionId,
+                route.id,
+                Date.now(),
+                getMaxSameAccountWait(storage),
+              ),
+            })
+          : undefined
       if (proactiveQuotaDecision?.action === 'hold')
         return holdResponse(proactiveQuotaDecision.retryAfterSeconds)
 
@@ -2151,6 +2239,7 @@ async function executeWithFallback(options: {
           }
         }
         if (
+          !(advice && !advisedAccountId) &&
           primaryResponseAllowsApiFallback(preflight) &&
           (await primaryQuotaRefreshConfirmsExhausted())
         ) {
@@ -2337,6 +2426,11 @@ export function streamCortexKitAnthropic(
           toolNames = names
         },
       }
+      const routingState: {
+        relay: ReturnType<typeof createRoutingRelay>
+        advice?: Promise<RoutingChoice | null>
+      } = { relay: createRoutingRelay() }
+      Object.assign(request, { routingState })
       const response = await runWithRequestSignal(options?.signal, () =>
         withPiQuotaWait({
           signal: options?.signal,
@@ -2374,6 +2468,10 @@ export function streamCortexKitAnthropic(
                 )
                 if (
                   hold &&
+                  !routingState.relay.admitted(
+                    options?.sessionId ?? '',
+                    account,
+                  ) &&
                   decideStickyQuotaFailure({ quota, modelId: model.id })
                     .action === 'migrate'
                 )
@@ -2393,6 +2491,8 @@ export function streamCortexKitAnthropic(
                 ...request,
                 oauthAccountId: hold.accountId,
                 expectedAccountIdentity: hold.accountIdentity,
+                routingRelay: routingState.relay,
+                routingChoice: (await routingState.advice) ?? undefined,
               }),
             )
             if (inspected.preflight instanceof Response)

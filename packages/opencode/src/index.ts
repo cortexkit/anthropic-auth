@@ -148,7 +148,6 @@ import {
   type NativeUiOptions,
   NativeVaultNoAccountError,
   nativeAccountCanServe,
-  nativeAccountPolicy,
   nativeAccountRefusal,
   nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
@@ -311,8 +310,9 @@ import {
 } from './request-policy.ts'
 import {
   createRoutingRelay,
+  RoutingRefusalError,
+  routingCandidates,
   routingChoiceMatches,
-  routingReserveAllows,
 } from './routing-relay.ts'
 import {
   drainNotifications,
@@ -1746,6 +1746,7 @@ const anthropicAuthPlugin = async (
     modelId?: string,
     intent: 'serve' | 'refresh' | 'last-main' | 'cachekeep' = 'serve',
     accountSnapshot?: NativeAccountSnapshot,
+    routingSessionId?: string,
   ): Promise<NativeOAuthAuthorization> {
     assertNativeEnvironment()
     signal?.throwIfAborted()
@@ -1770,6 +1771,8 @@ const anthropicAuthPlugin = async (
       storage: AccountStorage,
       receipt?: NativeCustodyReceipt,
     ) => {
+      if (routingSessionId && routingRelay.admitted(routingSessionId, view))
+        return
       const quota = routingAccountQuota(view, storage, receipt)
       // Ordered routing can try main after eligible fallbacks are exhausted.
       // A cached scoped limit must not remove that final provider attempt;
@@ -7693,6 +7696,8 @@ const anthropicAuthPlugin = async (
               undefined,
               modelForIdentity,
               oauthAccountId === 'main' ? 'last-main' : 'serve',
+              undefined,
+              relayAffinity ?? undefined,
             )
             accessToken = nativeAuthorization.accessToken
             if (
@@ -8113,6 +8118,8 @@ const anthropicAuthPlugin = async (
                 rejectedAccessToken,
                 modelForIdentity,
                 oauthAccountId === 'main' ? 'last-main' : 'serve',
+                undefined,
+                relayAffinity ?? undefined,
               )
               await requireCurrentNativeActivation(separateLocalLogin)
               init?.signal?.throwIfAborted()
@@ -10022,15 +10029,7 @@ const anthropicAuthPlugin = async (
                   const advice = await routingRelay.accountFor(
                     sessionId,
                     routingModelId ?? '',
-                    snapshot.accounts.filter(
-                      (row) =>
-                        nativeAccountCanServe(row) &&
-                        nativeAccountPolicy(row, snapshot, routingModelId)
-                          .status === 'allowed' &&
-                        stickyRoutes.candidates.some(
-                          (candidate) => candidate.accountId === row.id,
-                        ),
-                    ),
+                    routingCandidates(snapshot.accounts),
                   )
                   let advisedAccountId: string | undefined
                   if (advice) {
@@ -10041,23 +10040,15 @@ const anthropicAuthPlugin = async (
                     if (
                       account &&
                       nativeAccountCanServe(account) &&
-                      nativeAccountPolicy(account, snapshot, routingModelId)
-                        .status === 'allowed' &&
-                      stickyRoutes.candidates.some(
-                        (row) => row.accountId === account.id,
-                      ) &&
-                      routingReserveAllows(
-                        account.id,
-                        stickyRoutes.candidates,
-                        stickyRoutes.storage,
-                        routingModelId ?? '',
+                      stickyRoutes.allRoutes.some(
+                        (row) => row.id === account.id,
                       )
                     ) {
                       advisedAccountId = account.id
                     } else {
                       routingRelay.override(
                         sessionId,
-                        'unknown account, credential, account policy or Fable reserve',
+                        'unknown account, credential or account policy',
                       )
                     }
                   }
@@ -10074,9 +10065,13 @@ const anthropicAuthPlugin = async (
                       modelId: routingModelId,
                       affinityModelId: requestModel,
                       candidates: advised
-                        ? stickyRoutes.candidates.filter(
-                            (row) => row.accountId === advised,
-                          )
+                        ? stickyRoutes.allRoutes
+                            .filter((row) => row.id === advised)
+                            .map((row) => ({
+                              accountId: row.id,
+                              order: 0,
+                              quota: row.quota ?? { kind: 'unknown' as const },
+                            }))
                         : stickyRoutes.candidates,
                       retainAccountIds: advised
                         ? new Set([advised])
@@ -10088,7 +10083,10 @@ const anthropicAuthPlugin = async (
                           : 1,
                       preferredAccountId,
                       excludeAccountIds,
-                      ...(advised && { preserveOnNoCandidate: true }),
+                      ...(advised && {
+                        preserveOnNoCandidate: true,
+                        routingAccountId: advised,
+                      }),
                       ...(routing.accountIdentities && {
                         accountIdentities: routing.accountIdentities,
                       }),
@@ -10223,6 +10221,9 @@ const anthropicAuthPlugin = async (
                           init?.signal ?? undefined,
                           undefined,
                           routingModelId,
+                          'serve',
+                          undefined,
+                          sessionId,
                         )
                         const scopedAttempt = credential.scopedAttempt
                         if (!scopedAttempt)
@@ -10302,24 +10303,26 @@ const anthropicAuthPlugin = async (
                       }
                     }
 
-                    const proactiveQuotaDecision = stickyQuotaSnapshotIsFresh(
-                      route.quota,
-                      stickyRoutes.storage,
-                      Date.now(),
-                      routingModelId,
-                    )
-                      ? decideStickyQuotaFailure({
-                          quota: route.quota,
-                          modelId: routingModelId,
-                          sessionId,
-                          holdUntil: sessionCacheActivity.holdUntil(
+                    const proactiveQuotaDecision =
+                      !advisedAccountId &&
+                      stickyQuotaSnapshotIsFresh(
+                        route.quota,
+                        stickyRoutes.storage,
+                        Date.now(),
+                        routingModelId,
+                      )
+                        ? decideStickyQuotaFailure({
+                            quota: route.quota,
+                            modelId: routingModelId,
                             sessionId,
-                            route.id,
-                            Date.now(),
-                            getMaxSameAccountWait(stickyRoutes.storage),
-                          ),
-                        })
-                      : undefined
+                            holdUntil: sessionCacheActivity.holdUntil(
+                              sessionId,
+                              route.id,
+                              Date.now(),
+                              getMaxSameAccountWait(stickyRoutes.storage),
+                            ),
+                          })
+                        : undefined
                     if (proactiveQuotaDecision?.action === 'hold') {
                       return completeRoute(
                         route,
@@ -10510,6 +10513,7 @@ const anthropicAuthPlugin = async (
                           return completeRoute(route, await sendRoute(route))
                         }
                       } else if (
+                        !(advice && !advisedAccountId) &&
                         (inspected.response.status === 429 ||
                           inspected.streamingRateLimit) &&
                         mainQuotaEntryIsFreshExhausted(
@@ -10563,6 +10567,8 @@ const anthropicAuthPlugin = async (
                     error:
                       error instanceof Error ? error.message : String(error),
                   })
+                  if (error instanceof RoutingRefusalError)
+                    return error.response()
                   if (
                     stickyRouteSelected ||
                     isNativeTransientAccountError(error)

@@ -4,6 +4,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Under Thalamus, routing refusals now stop sends instead of silently choosing another account, and a chosen account is no longer rejected by the plugin's minimum remaining-quota settings.
+- Pi now asks Thalamus for its account at turn start, keeps that choice when retrying the request, and honours routing's holds and refusals.
+
 - A refresh-lock release interrupted by another process now finishes cleaning up its lock instead of leaving it to block the next request for up to its timeout.
 ## 2.10.1
 

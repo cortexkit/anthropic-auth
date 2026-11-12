@@ -86,26 +86,51 @@ describe('OC1 shared routing relay', () => {
               access: 'sk-ant-oat01-fallback-access',
               refresh: 'fallback-refresh',
               expires: now + 3600_000,
-              quota: quota(mode === 'floor' || mode === 'blocked' ? 10 : 80),
+              quota:
+                mode === 'unknown quota'
+                  ? undefined
+                  : quota(mode === 'floor' || mode === 'blocked' ? 10 : 80),
+              ...(mode === 'signed out'
+                ? {
+                    lastRefreshError: {
+                      message: 'sign in required',
+                      checkedAt: now,
+                      permanent: true,
+                    },
+                  }
+                : {}),
             },
           ],
         }),
       ),
     )
     const sends: string[] = []
+    const bodies: string[] = []
     globalThis.fetch = mock(
       withNativeAdmission(ctx, (input: any, init: any) => {
         if (extractUrl(input).includes('/api/oauth/usage'))
           return Promise.resolve(
             new Response(
-              JSON.stringify({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
+              JSON.stringify(
+                mode === 'unknown quota' &&
+                  new Headers(init?.headers)
+                    .get('authorization')
+                    ?.includes('fallback')
+                  ? {}
+                  : {
+                      five_hour: { utilization: 0 },
+                      seven_day: { utilization: 0 },
+                    },
+              ),
             ),
           )
         if (extractUrl(input).includes('/v1/messages')) {
           sends.push(new Headers(init?.headers).get('authorization') ?? '')
+          bodies.push(
+            new Headers(init?.headers).get('content-encoding') === 'gzip'
+              ? gunzipSync(init.body).toString()
+              : String(init.body),
+          )
           if (responseFor) return Promise.resolve(responseFor())
         }
         return Promise.resolve(
@@ -144,7 +169,7 @@ describe('OC1 shared routing relay', () => {
           },
         ),
       }) as Promise<Response>
-    return { sends, send }
+    return { sends, send, bodies }
   }
 
   test('OC1 OAuth sends runner notes from its session handle in the final signed body', async () => {
@@ -251,7 +276,7 @@ describe('OC1 shared routing relay', () => {
     expect(routingReports()).toHaveLength(2)
   })
 
-  for (const mode of ['null', 'unknown', 'floor', 'reserve']) {
+  for (const mode of ['null', 'unknown']) {
     test(`${mode} advice falls back to our own account choice`, async () => {
       const f = await fixture(mode)
       globals[key] = () => ({
@@ -271,6 +296,92 @@ describe('OC1 shared routing relay', () => {
       expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-main-access')
     })
   }
+
+  test.each([
+    'account_limit_exhausted',
+    'account_selection_refused',
+    'account_selection_final',
+  ])('routing refusal %s stops OC1 before any Anthropic send', async (code) => {
+    const f = await fixture()
+    let asks = 0
+    globals[key] = () => ({
+      accountFor: async () => {
+        asks++
+        return {
+          refused: {
+            code,
+            retry_after_secs: 17,
+            routing_code: 'private-router-text',
+          },
+        }
+      },
+    })
+    const response = await f.send()
+    expect(response.status).toBe(code === 'account_selection_final' ? 403 : 429)
+    expect(response.headers.get('retry-after')).toBe(
+      code === 'account_selection_final' ? null : '17',
+    )
+    expect(await response.json()).toEqual({
+      type: 'error',
+      error: {
+        type:
+          code === 'account_selection_final'
+            ? 'permission_error'
+            : 'rate_limit_error',
+        code,
+        message:
+          code === 'account_selection_final'
+            ? 'Shared routing refused an account for this request.'
+            : 'Shared routing has no account for this request right now.',
+      },
+    })
+    expect(asks).toBe(1)
+    expect(f.sends).toEqual([])
+  })
+
+  test.each(['floor', 'reserve', 'unknown quota'])(
+    'routing quota trust serves OC1 advice despite %s',
+    async (mode) => {
+      const f = await fixture(mode)
+      globals[key] = () => ({
+        accountFor: async () => ({
+          account_id: syntheticFallbackAccountUuid(0),
+          credential_id: 'local',
+        }),
+      })
+      expect((await f.send()).status).toBe(200)
+      expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+    },
+  )
+
+  test('a signed-out routing pick is replaced by our own OC1 subscription', async () => {
+    const f = await fixture('signed out')
+    const reports: any[] = []
+    globals[key] = () => ({
+      accountFor: async () => ({
+        account_id: syntheticFallbackAccountUuid(0),
+        credential_id: 'local',
+      }),
+      report: (value: unknown) => reports.push(value),
+    })
+    expect((await f.send()).status).toBe(200)
+    expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+    expect(
+      reports.some((report) => report.outcome === 'credential_refused'),
+    ).toBe(false)
+  })
+
+  test('no accessor and undefined advice leave OC1 request bytes and choice unchanged', async () => {
+    const f = await fixture()
+    expect((await f.send()).status).toBe(200)
+    globals[key] = () => ({ accountFor: async () => undefined })
+    expect((await f.send()).status).toBe(200)
+    expect(f.sends).toEqual([
+      'Bearer sk-ant-oat01-main-access',
+      'Bearer sk-ant-oat01-main-access',
+    ])
+    expect(f.bodies[1]).toBe(f.bodies[0])
+  })
 
   test('an eligible hold returns 429 and capped Retry-After without sending', async () => {
     const f = await fixture()

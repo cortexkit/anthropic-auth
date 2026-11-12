@@ -16,7 +16,11 @@ describe('shared routing relay', () => {
     globals[key] = (session: string) => ({
       accountFor: async (input: unknown, options: unknown) => {
         expect(session).toBe('session')
-        expect(input).toEqual({ provider: 'anthropic', modelId: 'model' })
+        expect(input).toEqual({
+          provider: 'anthropic',
+          modelId: 'model',
+          refusals: true,
+        })
         expect(options).toEqual({ deadlineMs: 2000 })
         return { account_id: 'account', credential_id: 'credential' }
       },

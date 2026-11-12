@@ -74,6 +74,258 @@ const anthropicContext = {
   tools: [],
 } as any
 
+describe('Pi shared routing relay', () => {
+  async function fixture(mode = 'normal', retry401 = false) {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-routing-relay-'))
+    const storagePath = join(tempDir, 'accounts.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    const now = Date.now()
+    const quota = (remaining: number) => ({
+      checkedAt: now,
+      five_hour: {
+        usedPercent: 100 - remaining,
+        remainingPercent: remaining,
+        checkedAt: now,
+      },
+      seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+    })
+    await saveNativePiFixture(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 20, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: quota(100),
+        },
+        killswitch: { enabled: true, main: { five_hour: 20 } },
+        accounts: [
+          {
+            id: 'fallback',
+            type: 'oauth',
+            access: 'sk-ant-oat01-fallback-access',
+            refresh: 'fallback-refresh',
+            expires: now + 3_600_000,
+            quota:
+              mode === 'unknown quota'
+                ? undefined
+                : quota(mode === 'floor' ? 10 : 80),
+          },
+        ],
+      },
+      storagePath,
+    )
+    if (mode === 'signed out') {
+      const runtime = await getPiNativeRuntime(storagePath).service()
+      const read = runtime.read.bind(runtime)
+      // The vault keeps the route in its roster while its credential needs sign-in.
+      runtime.read = async () => {
+        const snapshot = await read()
+        return {
+          ...snapshot,
+          accounts: snapshot.accounts.map((account) =>
+            account.id === 'fallback'
+              ? {
+                  ...account,
+                  source: 'vault' as const,
+                  credentialId: 'fallback-vault',
+                  state: 'needs_reauth',
+                }
+              : account,
+          ),
+        }
+      }
+      expect(
+        (await runtime.read()).accounts.find(
+          (account) => account.id === 'fallback',
+        ),
+      ).toMatchObject({ source: 'vault', state: 'needs_reauth' })
+      expect(
+        core
+          .routingCandidates((await runtime.read()).accounts)
+          .map((account) => account.id),
+      ).toEqual(['main'])
+    }
+    const sends: string[] = []
+    const bodies: string[] = []
+    globalThis.fetch = mock(async (input: any, init: any) => {
+      const url = input instanceof Request ? input.url : String(input)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (url.includes('/api/claude_cli/bootstrap'))
+        return Response.json({
+          oauth_account: {
+            account_uuid: fixtureAccountIdentity(
+              authorization.includes('fallback') ? 'fallback' : 'main',
+            ),
+          },
+        })
+      if (url.includes('/oauth/token'))
+        return Response.json({
+          access_token: 'sk-ant-oat01-fallback-renewed',
+          refresh_token: 'fallback-renewed',
+          expires_in: 3600,
+        })
+      if (url.includes('/api/oauth/usage')) return Response.json({})
+      if (!url.includes('/v1/messages'))
+        throw new Error(`Unexpected URL ${url}`)
+      sends.push(authorization)
+      bodies.push(
+        new Headers(init?.headers).get('content-encoding') === 'gzip'
+          ? gunzipSync(init.body).toString()
+          : String(init.body),
+      )
+      if (retry401 && sends.length === 1)
+        return new Response('{}', { status: 401 })
+      return new Response(
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    }) as unknown as typeof fetch
+    const send = (wait?: Parameters<typeof streamCortexKitAnthropic>[4]) =>
+      streamCortexKitAnthropic(
+        anthropicModel,
+        anthropicContext,
+        {
+          sessionId: 'ses_pi_routing_relay',
+          apiKey: 'sk-ant-oat01-main-access',
+        },
+        undefined,
+        wait,
+      )
+    return { send, sends, bodies }
+  }
+
+  test.each([
+    'account_limit_exhausted',
+    'account_selection_refused',
+    'account_selection_final',
+  ])('routing refusal %s stops Pi without host auto-retry', async (code) => {
+    const f = await fixture()
+    let asks = 0
+    globals[routingKey] = () => ({
+      accountFor: async () => {
+        asks++
+        return { refused: { code, retry_after_secs: 17 } }
+      },
+    })
+    const result = await f.send().result()
+    expect(result.stopReason).toBe('error')
+    expect(result.errorMessage).toBe(
+      code === 'account_selection_final'
+        ? 'Shared routing refused an account for this request.'
+        : 'Shared routing has no account for this request right now.',
+    )
+    expect(isRetryableAssistantError(result)).toBe(false)
+    expect(asks).toBe(1)
+    expect(f.sends).toEqual([])
+  })
+
+  test.each(['floor', 'unknown quota'])(
+    'routing quota trust serves Pi advice despite %s',
+    async (mode) => {
+      const f = await fixture(mode)
+      let asks = 0
+      globals[routingKey] = () => ({
+        accountFor: async () => {
+          asks++
+          return {
+            account_id: fixtureAccountIdentity('fallback'),
+            credential_id: 'local',
+          }
+        },
+      })
+      expect((await f.send().result()).stopReason).toBe('stop')
+      expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+      expect(asks).toBe(1)
+    },
+  )
+
+  test('Pi asks once per turn, not on its physical credential retry', async () => {
+    const f = await fixture('normal', true)
+    let asks = 0
+    globals[routingKey] = () => ({
+      accountFor: async () => {
+        asks++
+        return {
+          account_id: fixtureAccountIdentity('fallback'),
+          credential_id: 'local',
+        }
+      },
+    })
+    expect((await f.send().result()).stopReason).toBe('stop')
+    expect(asks).toBe(1)
+    expect(f.sends).toEqual([
+      'Bearer sk-ant-oat01-fallback-access',
+      'Bearer sk-ant-oat01-fallback-renewed',
+    ])
+    expect((await f.send().result()).stopReason).toBe('stop')
+    expect(asks).toBe(2)
+  })
+
+  test('Pi honours a capped routing hold without asking again after its wait', async () => {
+    const f = await fixture('floor')
+    let asks = 0
+    let delay = 0
+    globals[routingKey] = () => ({
+      accountFor: async () => {
+        asks++
+        return {
+          account_id: fixtureAccountIdentity('fallback'),
+          credential_id: 'local',
+          hold: { retry_after_ms: 9_000_000 },
+        }
+      },
+    })
+    const stream = f.send({
+      setTimeout: ((callback: () => void, ms: number) => {
+        delay = ms
+        expect(f.sends).toEqual([])
+        queueMicrotask(callback)
+        return 1
+      }) as unknown as typeof setTimeout,
+      clearTimeout: (() => {}) as unknown as typeof clearTimeout,
+    })
+    expect((await stream.result()).stopReason).toBe('stop')
+    expect(delay).toBe(920_000)
+    expect(asks).toBe(1)
+    expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+  })
+
+  test('a signed-out routing pick is replaced by our own Pi subscription', async () => {
+    const f = await fixture('signed out')
+    const reports: any[] = []
+    globals[routingKey] = () => ({
+      accountFor: async () => ({
+        account_id: fixtureAccountIdentity('fallback'),
+        credential_id: 'local',
+      }),
+      report: (report: unknown) => reports.push(report),
+    })
+    expect((await f.send().result()).stopReason).toBe('stop')
+    expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+    expect(
+      reports.some((report) => report.outcome === 'credential_refused'),
+    ).toBe(false)
+  })
+
+  test('no accessor and undefined advice leave Pi request bytes and choice unchanged', async () => {
+    const f = await fixture()
+    delete globals[routingKey]
+    expect((await f.send().result()).stopReason).toBe('stop')
+    globals[routingKey] = () => ({ accountFor: async () => undefined })
+    expect((await f.send().result()).stopReason).toBe('stop')
+    expect(f.sends).toEqual([
+      'Bearer sk-ant-oat01-main-access',
+      'Bearer sk-ant-oat01-main-access',
+    ])
+    expect(f.bodies[1]).toBe(f.bodies[0])
+  })
+})
+
 test('Pi OAuth sends the Claude Code accept-encoding on the wire', async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'pi-wire-encoding-'))
   const storagePath = join(tempDir, 'accounts.json')

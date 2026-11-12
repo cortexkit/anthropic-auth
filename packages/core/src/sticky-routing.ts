@@ -1190,6 +1190,8 @@ export class StickySessionRouter {
     excludeAccountIds?: ReadonlySet<string>
     /** Leave the current pin intact when selection cannot offer an account. */
     preserveOnNoCandidate?: boolean
+    /** Routing already applied the quota reserve; select its admitted candidate without local quota weighting. */
+    routingAccountId?: string
   }): Promise<StickyRouteResolution | null> {
     requestSignal()?.throwIfAborted()
     if (!input.sessionId) return null
@@ -1290,8 +1292,9 @@ export class StickySessionRouter {
               }) > 0,
           )
         : undefined
-    const selected =
-      preferred ?? this.selectCandidate({ ...input, candidates, state })
+    const selected = input.routingAccountId
+      ? candidates.find((row) => row.accountId === input.routingAccountId)
+      : (preferred ?? this.selectCandidate({ ...input, candidates, state }))
     if (!selected) {
       if (current && !input.preserveOnNoCandidate) {
         delete state.assignments[key]

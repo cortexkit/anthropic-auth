@@ -25,7 +25,6 @@ import {
   type NativeQuotaObservation,
   NativeVaultQuotaPolicyError,
   nativeAccountCanServe,
-  nativeAccountPolicy,
   nativeLocalAccountRefusal,
   nativeLocalQuotaLineage,
   nativePollQuotaGenerallyExhausted,
@@ -61,8 +60,8 @@ import type {
 import { extractAnthropicRequestId } from '../billing-lineage'
 import {
   createRoutingRelay,
+  routingCandidates,
   routingChoiceMatches,
-  routingReserveAllows,
 } from '../routing-relay'
 import {
   type NativeAnthropicAttemptContext,
@@ -440,11 +439,12 @@ export function createNativeAnthropicSource(
     account: NativeAccountView,
     snapshot: NativeAccountSnapshot,
     modelID: string,
+    sessionID = '',
   ) =>
     nativeAccountCanServe(account) &&
     (account.type === 'api' ||
-      nativeAccountPolicy(account, snapshot, remapModelId(modelID)).status ===
-        'allowed')
+      routingRelay.policy(sessionID, account, snapshot, remapModelId(modelID))
+        .status === 'allowed')
   const sameAccount = (
     account: NativeAccountView,
     expected: NativeAccountView,
@@ -468,6 +468,7 @@ export function createNativeAnthropicSource(
     route: 'oauth' | 'api',
     active: AbortController,
     onRefusal?: (reason: NativeAccountRefusalReason) => void,
+    sessionID = '',
   ) => {
     const current = await runtime.read()
     syncDumpEnabled(current)
@@ -477,7 +478,7 @@ export function createNativeAnthropicSource(
     if (
       !account ||
       account.type !== route ||
-      !eligible(account, current, modelID)
+      !eligible(account, current, modelID, sessionID)
     ) {
       onRefusal?.(
         !account || !nativeAccountCanServe(account)
@@ -710,12 +711,7 @@ export function createNativeAnthropicSource(
       const advice = await routingRelay.accountFor(
         input.sessionID,
         modelID,
-        snapshot.accounts.filter(
-          (row) =>
-            row.type === 'oauth' &&
-            nativeAccountCanServe(row) &&
-            nativeAccountPolicy(row, snapshot, modelID).status === 'allowed',
-        ),
+        routingCandidates(snapshot.accounts),
       )
       active.signal.throwIfAborted()
       if (advice) {
@@ -727,7 +723,12 @@ export function createNativeAnthropicSource(
       const policies = new Map<string, NativeAccountPolicy>()
       for (const account of snapshot.accounts) {
         if (account.type !== 'oauth') continue
-        const policy = nativeAccountPolicy(account, snapshot, modelID)
+        const policy = routingRelay.policy(
+          input.sessionID,
+          account,
+          snapshot,
+          modelID,
+        )
         policies.set(account.id, policy)
         if (policy.status !== 'allowed') continue
         if (account.source === 'local') {
@@ -736,7 +737,8 @@ export function createNativeAnthropicSource(
           // obtains a fresh credential itself.
           const admission = await runtime.authorizeLocal(account.id, {
             signal: active.signal,
-            policy: (row, view) => nativeAccountPolicy(row, view, modelID),
+            policy: (row, view) =>
+              routingRelay.policy(input.sessionID, row, view, modelID),
           })
           active.signal.throwIfAborted()
           if (admission.status !== 'usable') continue
@@ -757,13 +759,7 @@ export function createNativeAnthropicSource(
         if (
           account &&
           supportedHold &&
-          (advice.hold || account.id !== input.rerouteFrom?.accountId) &&
-          routingReserveAllows(
-            account.id,
-            candidates,
-            snapshot.policyStorage,
-            modelID,
-          )
+          (advice.hold || account.id !== input.rerouteFrom?.accountId)
         ) {
           const selected = await routerFor(snapshot).resolve({
             sessionId: input.sessionID,
@@ -782,6 +778,7 @@ export function createNativeAnthropicSource(
             storage: snapshot.policyStorage,
             inputBytes: 1,
             preserveOnNoCandidate: true,
+            routingAccountId: account.id,
           })
           active.signal.throwIfAborted()
           if (selected?.migrated) stickyQuotaRetries.clear(input.sessionID)
@@ -790,12 +787,22 @@ export function createNativeAnthropicSource(
               ? { hold: { delayMs: advice.hold.retry_after_ms } }
               : selected.accountId
         }
-        // Unlike OpenCode 1's 429, the host hold can only retain a refused retry account.
+        // OpenCode 2 can hold only when retrying the same refused account.
         routingRelay.override(
           input.sessionID,
           !supportedHold
             ? 'hold requires the same refused retry account'
-            : 'unknown account, credential, account policy or Fable reserve',
+            : 'unknown account, credential or account policy',
+        )
+        // Discard quota exemptions before making our own subscription choice.
+        oauth.splice(
+          0,
+          oauth.length,
+          ...oauth.filter(
+            (account) =>
+              routingRelay.policy(input.sessionID, account, snapshot, modelID)
+                .status === 'allowed',
+          ),
         )
       }
       const hold = stickyHold(
@@ -887,6 +894,7 @@ export function createNativeAnthropicSource(
               getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
           }),
         )
+      if (advice) return undefined
       // Fall back to a pay-per-token API key account only when the primary
       // Claude subscription account ('main') has run out: a recent usage
       // reading for main's current account and credential version must show
@@ -937,7 +945,7 @@ export function createNativeAnthropicSource(
         )
         return account &&
           sameAccount(account, served.account) &&
-          eligible(account, snapshot, modelID)
+          eligible(account, snapshot, modelID, input.sessionID)
           ? { accountId: input.accountId }
           : undefined
       }
@@ -965,7 +973,7 @@ export function createNativeAnthropicSource(
       if (
         !account ||
         !sameAccount(account, retry.account) ||
-        !eligible(account, snapshot, modelID)
+        !eligible(account, snapshot, modelID, input.sessionID)
       )
         return undefined
       const queueKey = key(input, input.accountId)
@@ -994,7 +1002,7 @@ export function createNativeAnthropicSource(
       )
       active.signal.throwIfAborted()
       const account = snapshot.accounts.find((row) => row.id === accountId)
-      if (!account || !eligible(account, snapshot, modelID)) {
+      if (!account || !eligible(account, snapshot, modelID, scope.sessionID)) {
         onRefusal?.(
           !account || !nativeAccountCanServe(account)
             ? 'account-unavailable'
@@ -1020,6 +1028,7 @@ export function createNativeAnthropicSource(
             choice.auth.route,
             active,
             onRefusal,
+            scope.sessionID,
           ))
         )
           return undefined
@@ -1061,7 +1070,16 @@ export function createNativeAnthropicSource(
           return undefined
         const material = await runtime.authorizeApi(accountId, active.signal)
         active.signal.throwIfAborted()
-        if (!(await admitted(accountId, modelID, 'api', active)))
+        if (
+          !(await admitted(
+            accountId,
+            modelID,
+            'api',
+            active,
+            undefined,
+            scope.sessionID,
+          ))
+        )
           return undefined
         const provenance: NativeSourceProvenance = {
           kind: 'api',
@@ -1090,7 +1108,16 @@ export function createNativeAnthropicSource(
             receipt.assertedAccountIdentity !== choice.account.accountIdentity)
         )
           return undefined
-        if (!(await admitted(accountId, modelID, 'oauth', active, onRefusal)))
+        if (
+          !(await admitted(
+            accountId,
+            modelID,
+            'oauth',
+            active,
+            onRefusal,
+            scope.sessionID,
+          ))
+        )
           return undefined
         const provenance: NativeSourceProvenance = {
           kind: 'vault',
@@ -1118,7 +1145,8 @@ export function createNativeAnthropicSource(
       }
       const material = await runtime.authorizeLocal(accountId, {
         signal: active.signal,
-        policy: (row, view) => nativeAccountPolicy(row, view, modelID),
+        policy: (row, view) =>
+          routingRelay.policy(scope.sessionID, row, view, modelID),
       })
       active.signal.throwIfAborted()
       if (material.status !== 'usable') {
@@ -1126,7 +1154,16 @@ export function createNativeAnthropicSource(
         if (refusal) onRefusal?.(refusal.reason)
         return undefined
       }
-      if (!(await admitted(accountId, modelID, 'oauth', active, onRefusal)))
+      if (
+        !(await admitted(
+          accountId,
+          modelID,
+          'oauth',
+          active,
+          onRefusal,
+          scope.sessionID,
+        ))
+      )
         return undefined
       const provenance: NativeSourceProvenance = {
         kind: 'local',
@@ -1155,7 +1192,10 @@ export function createNativeAnthropicSource(
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
       )
-      if (!account || !eligible(account, snapshot, input.modelID)) {
+      if (
+        !account ||
+        !eligible(account, snapshot, input.modelID, input.sessionID)
+      ) {
         onRefusal?.(
           !account || !nativeAccountCanServe(account)
             ? 'account-unavailable'
@@ -1189,6 +1229,7 @@ export function createNativeAnthropicSource(
           input.route,
           state.active,
           onRefusal,
+          input.sessionID,
         ))
       if (!state || !admission)
         throw new Error(
@@ -1501,7 +1542,12 @@ export function createNativeAnthropicSource(
           rejectedAccessToken: state.access,
           signal: active.signal,
           policy: (account, snapshot) =>
-            nativeAccountPolicy(account, snapshot, state.scope.modelID),
+            routingRelay.policy(
+              input.sessionID,
+              account,
+              snapshot,
+              state.scope.modelID,
+            ),
         })
         active.signal.throwIfAborted()
         if (result.status !== 'usable' || result.access === state.access)

@@ -31,11 +31,13 @@ import {
   quotaSnapshotHasStandardWindows,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
+  type RoutingChoice,
   readNativeAccountsForRequest,
   readNativeMigrationJournal,
   resolveClaustrumConnectionPath,
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
+  routingChoiceMatches,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -68,7 +70,11 @@ export function piAttemptAccessToken(attempt: PiNativeAttempt): string {
     : attempt.admission.access
 }
 
-function requestPolicy(routeId: string, modelId?: string) {
+function requestPolicy(
+  routeId: string,
+  modelId?: string,
+  routingChoice?: RoutingChoice,
+) {
   return (
     account: NativeAccountSnapshot['accounts'][number],
     current: NativeAccountSnapshot,
@@ -77,6 +83,8 @@ function requestPolicy(routeId: string, modelId?: string) {
       return { status: 'blocked', reason: 'account-disabled' }
     if (account.source === 'local' && current.mode !== 'local')
       return { status: 'blocked', reason: 'local-mode-unavailable' }
+    if (routingChoice && routingChoiceMatches(routingChoice, account))
+      return { status: 'allowed' }
     const storage = current.policyStorage
     const needsQuotaPolicy =
       quotaSnapshotHasStandardWindows(account.quota) &&
@@ -370,6 +378,7 @@ export class PiNativeRuntime {
     signal?: AbortSignal,
     modelId?: string,
     intent: 'serve' | 'cachekeep' = 'serve',
+    routingChoice?: RoutingChoice,
   ): Promise<PiNativeAttempt> {
     const background = intent === 'cachekeep'
     const runtime = await this.service()
@@ -381,7 +390,7 @@ export class PiNativeRuntime {
       throw background
         ? new NativeAccountRefusal('account-unavailable')
         : new Error('Pi native OAuth route is unavailable')
-    const policy = requestPolicy(routeId, modelId)
+    const policy = requestPolicy(routeId, modelId, routingChoice)
     if (policy(account, snapshot).status === 'blocked')
       throw background
         ? new NativeAccountRefusal('account-policy')
@@ -407,7 +416,7 @@ export class PiNativeRuntime {
         !admitted ||
         current.mode !== 'claustrum' ||
         admitted.accountIdentity !== receipt.assertedAccountIdentity ||
-        requestPolicy(routeId, modelId)(admitted, current).status === 'blocked'
+        policy(admitted, current).status === 'blocked'
       )
         throw background
           ? new NativeAccountRefusal(
@@ -446,6 +455,7 @@ export class PiNativeRuntime {
     served: PiNativeAttempt,
     signal?: AbortSignal,
     modelId?: string,
+    routingChoice?: RoutingChoice,
   ): Promise<PiNativeAttempt | undefined> {
     const runtime = await this.service()
     if (served.source === 'vault') {
@@ -456,7 +466,8 @@ export class PiNativeRuntime {
       if (
         !account ||
         current.mode !== 'claustrum' ||
-        requestPolicy(routeId, modelId)(account, current).status === 'blocked'
+        requestPolicy(routeId, modelId, routingChoice)(account, current)
+          .status === 'blocked'
       )
         return undefined
       const decision = await runtime.vault.prepareRetry(served.receipt, signal)
@@ -479,7 +490,8 @@ export class PiNativeRuntime {
         !admitted ||
         after.mode !== 'claustrum' ||
         admitted.accountIdentity !== decision.receipt.assertedAccountIdentity ||
-        requestPolicy(routeId, modelId)(admitted, after).status === 'blocked'
+        requestPolicy(routeId, modelId, routingChoice)(admitted, after)
+          .status === 'blocked'
       )
         return undefined
       return {
@@ -492,7 +504,7 @@ export class PiNativeRuntime {
       intent: 'refresh',
       rejectedAccessToken: served.admission.access,
       signal,
-      policy: requestPolicy(routeId, modelId),
+      policy: requestPolicy(routeId, modelId, routingChoice),
     })
     if (
       admission.status !== 'usable' ||

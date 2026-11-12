@@ -271,6 +271,113 @@ afterEach(async () => {
 })
 
 describe('OC2 shared routing relay', () => {
+  test.each(['different account', 'different credential', 'unsupported hold'])(
+    'routing quota exemption never leaks to %s',
+    async (mode) => {
+      const f = await vaultWithFallback()
+      const read = f.runtime.read.bind(f.runtime)
+      let hold = false
+      let rotated = false
+      const now = Date.now()
+      const runtime: NativeAccountRuntime = {
+        ...f.runtime,
+        read: async () => {
+          const snapshot = await read()
+          return {
+            ...snapshot,
+            policyStorage: {
+              ...snapshot.policyStorage,
+              quota: {
+                ...snapshot.policyStorage.quota,
+                enabled: true,
+                minimumRemaining: { five_hour: 20, seven_day: 20 },
+              },
+            },
+            accounts: snapshot.accounts.map((account) => {
+              const remaining =
+                mode === 'unsupported hold' && account.id === 'main' ? 100 : 10
+              return {
+                ...account,
+                ...(rotated && account.id !== 'main'
+                  ? { credentialId: 'replacement-credential' }
+                  : {}),
+                quota: {
+                  checkedAt: now,
+                  five_hour: {
+                    usedPercent: 100 - remaining,
+                    remainingPercent: remaining,
+                    checkedAt: now,
+                  },
+                  seven_day: {
+                    usedPercent: 0,
+                    remainingPercent: 100,
+                    checkedAt: now,
+                  },
+                },
+              }
+            }),
+          }
+        },
+      }
+      const native = source(runtime, f.paths)
+      bridge(() => ({
+        account_id: fallbackIdentity,
+        credential_id: 'oauth:anthropic:work',
+        ...(hold ? { hold: { retry_after_ms: 100 } } : {}),
+      }))
+      const fallbackId = (await read()).accounts.find(
+        (account) => account.accountIdentity === fallbackIdentity,
+      )!.id
+      expect(await native.chooseAccount(scope)).toBe(fallbackId)
+      if (mode === 'unsupported hold') {
+        hold = true
+        expect(await native.chooseAccount(scope)).toBe('main')
+      } else {
+        rotated = mode === 'different credential'
+        const refusals: string[] = []
+        expect(
+          await native.authorizeAccount(
+            scope,
+            rotated ? fallbackId : 'main',
+            (reason) => refusals.push(reason),
+          ),
+        ).toBeUndefined()
+        expect(refusals).toEqual(['account-policy'])
+      }
+    },
+  )
+  test.each([
+    'account_limit_exhausted',
+    'account_selection_refused',
+    'account_selection_final',
+  ])(
+    'routing refusal %s stops OC2 before authorization and host retry',
+    async (code) => {
+      const f = await vaultWithFallback()
+      const native = source(f.runtime, f.paths)
+      const authorize = spyOn(native, 'authorizeAccount')
+      const host = await retryHost(native)
+      let asks = 0
+      bridge(() => {
+        asks++
+        return { refused: { code, retry_after_secs: 17 } }
+      })
+      const message =
+        code === 'account_selection_final'
+          ? 'Shared routing refused an account for this request.'
+          : 'Shared routing has no account for this request right now.'
+      await expect(host.send()).rejects.toMatchObject({
+        message,
+        code,
+        retryAfterSecs: code === 'account_selection_final' ? undefined : 17,
+      })
+      expect(
+        await host.retry(false, scope, { type: 'unknown', message }),
+      ).toEqual({ retry: false })
+      expect(asks).toBe(1)
+      expect(authorize).not.toHaveBeenCalled()
+    },
+  )
   function bridge(
     accountFor: () => unknown,
     report: (value: unknown) => unknown = () => {},
@@ -628,8 +735,15 @@ describe('OC2 shared routing relay', () => {
     },
   )
 
-  test.each(['floor', 'reserve', 'disabled', 'model scope'])(
-    'overrides advice refused by %s',
+  test.each([
+    'floor',
+    'reserve',
+    'disabled',
+    'model scope',
+    'unknown quota',
+    'signed out',
+  ])(
+    'routing quota trust keeps OC2 advice unless credentials are unavailable (%s)',
     async (mode) => {
       const f = await vaultWithFallback()
       const originalRead = f.runtime.read
@@ -661,6 +775,16 @@ describe('OC2 shared routing relay', () => {
             ...snapshot,
             policyStorage: {
               ...snapshot.policyStorage,
+              ...(mode === 'unknown quota'
+                ? {
+                    quota: {
+                      ...snapshot.policyStorage.quota,
+                      enabled: true,
+                      failClosedOnUnknownQuota: true,
+                      minimumRemaining: { five_hour: 20, seven_day: 20 },
+                    },
+                  }
+                : {}),
               ...(mode === 'floor'
                 ? { killswitch: { enabled: true, main: { five_hour: 20 } } }
                 : {}),
@@ -670,13 +794,18 @@ describe('OC2 shared routing relay', () => {
               ...(mode === 'disabled' && row.id !== 'main'
                 ? { enabled: false }
                 : {}),
+              ...(mode === 'signed out' && row.id !== 'main'
+                ? { state: 'needs_reauth' as const }
+                : {}),
               quota:
                 row.id === 'main'
                   ? quota(100, mode === 'reserve' ? 0 : 100)
-                  : quota(
-                      mode === 'floor' ? 10 : 100,
-                      mode === 'model scope' ? 0 : 100,
-                    ),
+                  : mode === 'unknown quota'
+                    ? undefined
+                    : quota(
+                        mode === 'floor' ? 10 : 100,
+                        mode === 'model scope' ? 0 : 100,
+                      ),
             })),
           }
         },
@@ -685,7 +814,6 @@ describe('OC2 shared routing relay', () => {
       bridge(() => ({
         account_id: fallbackIdentity,
         credential_id: 'oauth:anthropic:work',
-        ...(mode === 'floor' ? { hold: { retry_after_ms: 100 } } : {}),
       }))
       expect(
         await native.chooseAccount({
@@ -697,9 +825,45 @@ describe('OC2 shared routing relay', () => {
                 ? 'claude-fable-5'
                 : scope.modelID,
         }),
-      ).toBe('main')
+      ).toBe(
+        mode === 'disabled' || mode === 'signed out'
+          ? 'main'
+          : (await f.runtime.read()).accounts.find(
+              (row) => row.accountIdentity === fallbackIdentity,
+            )!.id,
+      )
+      const host = await retryHost(native)
+      const request = await host.send({
+        ...scope,
+        modelID:
+          mode === 'reserve'
+            ? 'claude-opus-4-8'
+            : mode === 'model scope'
+              ? 'claude-fable-5'
+              : scope.modelID,
+      })
+      expect(request.headers.get('authorization')).toBe(
+        mode === 'disabled' || mode === 'signed out'
+          ? 'Bearer sk-ant-oat01-oauth:anthropic'
+          : 'Bearer sk-ant-oat01-oauth:anthropic:work',
+      )
     },
   )
+
+  test('no accessor and undefined advice leave OC2 request bytes and choice unchanged', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const host = await retryHost(native)
+    const baseline = await host.send()
+    const baselineBytes = await baseline.clone().text()
+    await host.response(baseline, 200)
+    bridge(() => undefined)
+    const unchanged = await host.send()
+    expect(unchanged.headers.get('authorization')).toBe(
+      baseline.headers.get('authorization'),
+    )
+    expect(await unchanged.text()).toBe(baselineBytes)
+  })
 
   test('a slow relay falls back to our account choice', async () => {
     const f = await vaultWithFallback()
