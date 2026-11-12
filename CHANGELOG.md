@@ -2,11 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.11.0
 
 - Under Thalamus, when shared routing refuses an account for a request, the plugin now sends nothing and reports the refusal, instead of quietly picking another account. An account that routing chose is no longer refused by the plugin's own quota floors, since routing keeps the same reserve. Sign-in state and disabled accounts still apply.
 - Pi under Thalamus now asks shared routing for its account at the start of each turn, keeps that choice when it retries the request, and honours routing's holds and refusals. Its limit reports now reach routing.
 - A refresh-lock release interrupted by another process now finishes cleaning up its lock instead of leaving it to block the next request for up to its timeout.
+
 ## 2.10.1
 
 - Pi hosted by Thalamus now sends confirmed Claude account limits and successful requests to Thalamus's routing relay. Routing acts on them once Pi also asks routing which account to use; until then they have no effect.
