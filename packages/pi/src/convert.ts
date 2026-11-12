@@ -626,6 +626,16 @@ function applyCacheMode(
   })
 }
 
+/** Replace only the system cache marker, preserving the tool and message markers. */
+export function piThreadCacheSlot(
+  body: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (body.cache_control || !Array.isArray(body.system)) return undefined
+  return body.system.findLast(
+    (block) => block && typeof block === 'object' && block.cache_control,
+  )
+}
+
 export async function buildAnthropicRequest(
   modelId: string,
   context: Context,

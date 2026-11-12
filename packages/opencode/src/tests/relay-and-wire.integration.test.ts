@@ -1421,6 +1421,48 @@ describe('message threads wire', () => {
       const warm = await Core.buildCacheKeepPrewarmBody(retained ?? '{}')
       expect(warm.ok).toBe(true)
       if (warm.ok) expect(JSON.parse(warm.bodyText).thread).toBeUndefined()
+      const tailSession = `full-tail-${transport}`
+      const answer = { role: 'assistant', content: 'Answer' }
+      const tailHistory = [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Stable prefix' },
+            { type: 'text', text: 'Stable history' },
+          ],
+        },
+        answer,
+        { role: 'user', content: 'Old full tail' },
+      ]
+      await send(tailHistory, tailSession)
+      const continuedHistory = [
+        ...tailHistory,
+        answer,
+        { role: 'user', content: 'Next tail turn' },
+      ]
+      await send(continuedHistory, tailSession)
+      expect(sent.at(-1)?.body.thread.type).toBe('continue')
+      await send(
+        [
+          ...continuedHistory,
+          answer,
+          { role: 'user', content: 'Third' },
+          answer,
+          { role: 'user', content: 'Fourth' },
+        ],
+        tailSession,
+      )
+      const fullTail = sent.at(-1)!
+      expect(fullTail.body.thread.type).toBe('create')
+      expect(fullTail.body.messages[2].content.at(-1).cache_control).toEqual({
+        type: 'ephemeral',
+        ttl: '1h',
+      })
+      expect(
+        fullTail.body.system.every((block: any) => !block.cache_control),
+      ).toBe(true)
+      expect(fullTail.text.match(/"cache_control"/g)).toHaveLength(4)
+      expect(fullTail.text).toBe(await Core.signRequestBody(fullTail.text))
       for (const code of [
         'thread_not_found',
         'thread_fingerprint_mismatch',

@@ -124,7 +124,11 @@ import {
   type ToolCall,
 } from '@earendil-works/pi-ai'
 import { PiCacheKeep } from './cachekeep.ts'
-import { buildAnthropicRequest, fromClaudeCodeToolName } from './convert.ts'
+import {
+  buildAnthropicRequest,
+  fromClaudeCodeToolName,
+  piThreadCacheSlot,
+} from './convert.ts'
 import {
   getPiNativeRuntime,
   type PiNativeAttempt,
@@ -1131,6 +1135,7 @@ async function sendAnthropicRequest(
           : localMessageThreadCredential(nextAttempt.admission.binding),
       bodyText,
       replyToolNames: toolNames,
+      cacheSlot: piThreadCacheSlot,
       headers,
       signal: init.signal ?? undefined,
     })

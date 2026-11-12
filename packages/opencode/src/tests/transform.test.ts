@@ -65,6 +65,205 @@ async function toolMapFor(...names: string[]): Promise<ToolNameMap> {
   return map
 }
 
+describe('hybrid full-after-thread slot', () => {
+  test.each(['lookback', 'standby'] as const)(
+    'a %s bridged create continues with exactly its accepted fixed wire fields',
+    async (kind) => {
+      const text = (value: string) => ({ type: 'text', text: value })
+      const reply = { role: 'assistant', content: [text('answer')] }
+      const initial = {
+        model: 'claude-opus-4-8',
+        system: [{ type: 'text', text: 'instructions' }],
+        tools: [{ name: 'read', input_schema: { type: 'object' } }],
+        messages: [
+          { role: 'user', content: [text('prefix'), text('history')] },
+          reply,
+          { role: 'user', content: [text('previous user')] },
+          reply,
+          {
+            role: 'user',
+            content: Array.from({ length: 25 }, (_, index) =>
+              text(`tool result ${index}`),
+            ),
+          },
+        ],
+      }
+      type Slot = Parameters<MessageThreadTracker['prepare']>[0]['cacheSlot']
+      let slot: Slot
+      const options = {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid' as const,
+        deferSigning: true,
+        onThreadCacheSlot: (value: Slot) => {
+          slot = value
+        },
+      }
+      const standby = extractLatestHybridMessageCacheAnchor(
+        await rewriteRequestBody(
+          JSON.stringify({
+            ...initial,
+            messages: initial.messages.slice(0, 3),
+          }),
+          options,
+        ),
+      )
+      const first = JSON.parse(
+        await rewriteRequestBody(JSON.stringify(initial), {
+          ...options,
+          ...(kind === 'standby' ? { hybridStandbyAnchor: standby } : {}),
+        }),
+      )
+      expect(first.system.every((block: any) => !block.cache_control)).toBe(
+        true,
+      )
+      const tracker = new MessageThreadTracker()
+      const input = {
+        body: first,
+        betas: [],
+        session: 'bridge-continue',
+        account: 'account',
+        credential: 'credential',
+        cacheSlot: slot,
+      }
+      tracker.prepare(input).complete({
+        messageId: 'msg_bridge',
+        stopped: true,
+        stopReason: 'end_turn',
+        reply,
+      })
+      const next = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            ...initial,
+            messages: [
+              ...initial.messages,
+              reply,
+              { role: 'user', content: [text('next')] },
+            ],
+          }),
+          options,
+        ),
+      )
+      expect(next.system.some((block: any) => block.cache_control)).toBe(true)
+      const prepared = tracker.prepare({
+        ...input,
+        body: next,
+        cacheSlot: slot,
+      })
+      expect(prepared.decision.type).toBe('continue')
+      expect(JSON.stringify(prepared.body.system)).toBe(
+        JSON.stringify(first.system),
+      )
+      expect(JSON.stringify(prepared.body.tools)).toBe(
+        JSON.stringify(first.tools),
+      )
+    },
+  )
+
+  test.each(['system', 'lookback', 'standby'] as const)(
+    'uses the %s slot only when unreserved',
+    async (kind) => {
+      const message = (role: string, text: string, blocks = 1) => ({
+        role,
+        content: Array.from({ length: blocks }, (_, index) => ({
+          type: 'text',
+          text: `${text}/${index}`,
+        })),
+      })
+      const initial = {
+        model: 'claude-opus-4-8',
+        system: [{ type: 'text', text: 'instructions' }],
+        messages: [
+          message('user', 'prefix', 2),
+          message('assistant', 'reply'),
+          message('user', 'old full', 2),
+        ],
+      }
+      type Slot = Parameters<MessageThreadTracker['prepare']>[0]['cacheSlot']
+      let slot: Slot
+      const options = {
+        cache1hEnabled: true,
+        cache1hMode: 'hybrid' as const,
+        deferSigning: true,
+        onThreadCacheSlot: (value: Slot) => {
+          slot = value
+        },
+      }
+      const first = JSON.parse(
+        await rewriteRequestBody(JSON.stringify(initial), options),
+      )
+      let now = 0
+      const tracker = new MessageThreadTracker(10, () => now)
+      const input = {
+        body: first,
+        betas: [],
+        session: 'hybrid-tail',
+        account: 'account',
+        credential: 'credential',
+        cacheSlot: slot,
+      }
+      tracker.prepare(input).complete({
+        messageId: 'msg_full',
+        stopped: true,
+        stopReason: 'end_turn',
+        reply: message('assistant', 'reply'),
+      })
+      const middle = {
+        ...initial,
+        messages: [
+          ...initial.messages,
+          message('assistant', 'reply'),
+          message('user', 'middle'),
+        ],
+      }
+      const standbyAnchor = extractLatestHybridMessageCacheAnchor(
+        await rewriteRequestBody(JSON.stringify(middle), options),
+      )
+      const final = {
+        ...middle,
+        messages: [
+          ...middle.messages,
+          message('assistant', 'reply'),
+          message('user', 'latest', kind === 'system' ? 1 : 25),
+        ],
+      }
+      const text = await rewriteRequestBody(JSON.stringify(final), {
+        ...options,
+        ...(kind === 'standby' ? { hybridStandbyAnchor: standbyAnchor } : {}),
+      })
+      const body = JSON.parse(text)
+      now = 301_000
+      const prepared = tracker.prepare({ ...input, body, cacheSlot: slot })
+      if (kind === 'standby') {
+        expect(JSON.stringify(prepared.body)).toBe(
+          JSON.stringify({ ...body, thread: { type: 'create' } }),
+        )
+      } else {
+        const result = prepared.body as typeof body
+        expect(result.messages[2].content[1].cache_control).toEqual({
+          type: 'ephemeral',
+          ttl: '1h',
+        })
+        if (kind === 'lookback')
+          expect(result.messages[4].content[0].cache_control).toBeUndefined()
+        else
+          expect(
+            result.system.every((block: any) => !block.cache_control),
+          ).toBe(true)
+        expect(JSON.stringify(result).match(/"cache_control"/g)).toHaveLength(4)
+      }
+      const normal = new MessageThreadTracker().prepare({
+        ...input,
+        body,
+        cacheSlot: slot,
+      })
+      expect(JSON.stringify(normal.body)).toBe(
+        JSON.stringify({ ...body, thread: { type: 'create' } }),
+      )
+    },
+  )
+})
+
 const sse = (event: string, data: unknown) =>
   `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 
@@ -4461,12 +4660,19 @@ describe('rewriteRequestBody', () => {
             'ses_return',
             JSON.stringify(returnRequest()),
           )!
+          let threadSlot: Parameters<
+            MessageThreadTracker['prepare']
+          >[0]['cacheSlot']
           const result = JSON.parse(
             await rewriteRequestBody(returning.bodyText, {
               ...ttlOptions,
               sourceRecoveryBody: returning.sourceRecovery?.bodyText,
+              onThreadCacheSlot: (slot) => {
+                threadSlot = slot
+              },
             }),
           )
+          expect(threadSlot?.(result)).toBeUndefined()
           expect(result.messages[2].content[2].cache_control).toEqual(
             ttl === '1h'
               ? { type: 'ephemeral', ttl: '1h' }

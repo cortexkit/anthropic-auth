@@ -4,12 +4,13 @@ import {
   CLAUDE_CODE_IDENTITY,
   CLAUDE_CODE_VERSION,
   computeCcVersionSuffix,
+  MessageThreadTracker,
   type ProviderAccountUuid,
   signRequestBody,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
 import type { Context, Message } from '@earendil-works/pi-ai'
-import { buildAnthropicRequest } from '../convert'
+import { buildAnthropicRequest, piThreadCacheSlot } from '../convert'
 import { normalizeContext } from '../transcript.ts'
 
 function userMsg(text: string): Message {
@@ -55,6 +56,73 @@ const PI_PROMPT = [
   'KEEP TWO: available tools.',
   'Pi documentation (read only when the user asks about pi itself):\n- MOVE THIS',
 ].join('\n\n')
+
+test('Pi full-after-thread trades only its system slot for the accepted full tail', async () => {
+  const messages = [
+    userMsg('first'),
+    assistantMsg('prior'),
+    userMsg('old full tail'),
+  ]
+  const build = async (
+    history: Message[],
+    mode: 'hybrid' | 'automatic' = 'hybrid',
+  ) =>
+    (
+      await buildAnthropicRequest(
+        TEST_MODEL_ID,
+        {
+          messages: history,
+          systemPrompt: PI_PROMPT,
+          tools: [
+            {
+              name: 'read',
+              description: 'Read',
+              parameters: { properties: {}, required: [] },
+            },
+          ],
+        },
+        undefined,
+        { enabled: true, mode },
+      )
+    ).body
+  const first = await build(messages)
+  const tracker = new MessageThreadTracker(10, () => 0)
+  const input = {
+    body: first,
+    betas: [],
+    account: 'pi-account',
+    credential: 'pi-row',
+    session: 'pi-tail',
+    cacheSlot: piThreadCacheSlot,
+  }
+  tracker.prepare(input).complete({
+    messageId: 'msg_pi_full',
+    stopped: true,
+    stopReason: 'end_turn',
+    reply: { role: 'assistant', content: 'answer' },
+  })
+  const body = await build([
+    ...messages,
+    assistantMsg('answer'),
+    userMsg('new tail'),
+  ])
+  const normal = new MessageThreadTracker().prepare({ ...input, body })
+  expect(JSON.stringify(normal.body)).toBe(
+    JSON.stringify({ ...body, thread: { type: 'create' } }),
+  )
+  const prepared = tracker.prepare({ ...input, body, stateless: true })
+  const result = prepared.body as typeof body
+  expect(
+    (result.messages[2]!.content as Record<string, unknown>[])[0]
+      ?.cache_control,
+  ).toEqual({ type: 'ephemeral', ttl: '1h' })
+  expect(result.system?.every((block) => !block.cache_control)).toBe(true)
+  expect(result.tools).toEqual(body.tools)
+  expect(result.messages[0]).toEqual(body.messages[0])
+  expect(result.messages.at(-1)).toEqual(body.messages.at(-1))
+  expect(JSON.stringify(result).match(/"cache_control"/g)).toHaveLength(4)
+  expect(piThreadCacheSlot(await build(messages, 'automatic'))).toBeUndefined()
+})
 
 // systemPrompt is opt-in. buildAnthropicRequest splits a non-empty prompt between
 // system[] and the first user message, so tests that assert raw conversion output

@@ -3121,6 +3121,44 @@ for (const [transport, credentialSource] of [
     await (await send(withResponseId)).text()
     expect(sent.at(-1)?.text).toBe(sent[1]?.text)
     expect(JSON.parse(sent.at(-1)?.text ?? '{}').thread.type).toBe('continue')
+    const tailSession = `pi-full-tail-${credentialSource}-${transport}`
+    await (await send(history, tailSession)).text()
+    const longer: Context = {
+      ...history,
+      messages: [
+        ...history.messages,
+        replay,
+        { role: 'user', content: 'More', timestamp: 4 },
+      ],
+    }
+    await (await send(longer, tailSession)).text()
+    expect(JSON.parse(sent.at(-1)?.text ?? '{}').thread.type).toBe('continue')
+    await (
+      await send(
+        {
+          ...longer,
+          messages: [
+            ...longer.messages,
+            replay,
+            { role: 'user', content: 'Third', timestamp: 5 },
+            replay,
+            { role: 'user', content: 'Fourth', timestamp: 6 },
+          ],
+        },
+        tailSession,
+      )
+    ).text()
+    const fullTailText = sent.at(-1)?.text ?? '{}'
+    const fullTail = JSON.parse(fullTailText)
+    expect(fullTail.thread.type).toBe('create')
+    expect(fullTail.messages[2].content.at(-1).cache_control).toEqual(
+      oneHourControl,
+    )
+    expect(fullTail.system.every((block: any) => !block.cache_control)).toBe(
+      true,
+    )
+    expect(fullTailText.match(/"cache_control"/g)).toHaveLength(4)
+    expect(fullTailText).toBe(await signRequestBody(fullTailText))
     for (const code of [
       'thread_not_found',
       'thread_fingerprint_mismatch',

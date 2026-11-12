@@ -1240,6 +1240,9 @@ export function createNativeAnthropicAdapter<Q, P>(
     applyCustomHeaders(headers)
     const correlation = takeInternalHeaders(headers)
     let body = request.body === null ? undefined : await request.text()
+    let threadCacheSlot: Parameters<
+      typeof prepareMessageThreadRequest
+    >[1]['cacheSlot']
     // A session forgotten while the body was read never reaches the source's
     // options or the body rewrite.
     ensureLive()
@@ -1291,6 +1294,9 @@ export function createNativeAnthropicAdapter<Q, P>(
             body = await rewriteRequestBody(body, {
               ...options,
               deferSigning: true,
+              onThreadCacheSlot: (slot) => {
+                threadCacheSlot = slot
+              },
               ...(identity ? { identity } : {}),
               sessionId: input.sessionID,
               modelId: input.modelID,
@@ -1388,6 +1394,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         credential: send.oauth.credentialId,
         bodyText: body,
         replyToolNames: responseToolNameMaps.get(data),
+        cacheSlot: threadCacheSlot,
         headers,
         signal: request.signal,
       })

@@ -1064,6 +1064,7 @@ function restoreSourceCacheAnchor(
     removeCacheControl(target)
     excess--
   }
+  return true
 }
 
 function applyAutomaticCache1h(parsed: Record<string, unknown>) {
@@ -1362,6 +1363,31 @@ function applyHybridCache1h(
       ? { standbyBridgeMessageIndex: bridge.index }
       : {}),
   }
+}
+
+/** Replace the system or ordinary lookback marker, never a model-recovery marker. */
+export function hybridThreadCacheSlot(
+  body: Record<string, unknown>,
+  standbyAnchor?: HybridMessageCacheAnchor,
+): Record<string, unknown> | undefined {
+  if (!Array.isArray(body.messages)) return undefined
+  const { bridge, standbyBridgeApplied } = selectHybridMessageAnchors(
+    body.messages,
+    standbyAnchor,
+  )
+  if (standbyBridgeApplied) return undefined
+  if (bridge) {
+    const message = body.messages[bridge.index]
+    if (!isRecord(message) || !Array.isArray(message.content)) return undefined
+    return message.content.findLast(
+      (block) => isRecord(block) && getCacheControl(block),
+    )
+  }
+  return Array.isArray(body.system)
+    ? body.system.findLast((block) => isRecord(block) && getCacheControl(block))
+    : isRecord(body.system) && getCacheControl(body.system)
+      ? body.system
+      : undefined
 }
 
 function stripNonAnthropicThinkingBlocks(parsed: Record<string, unknown>) {
@@ -1682,6 +1708,13 @@ export async function rewriteRequestBody(
     fastModeEnabled?: boolean
     /** Leave the billing signature placeholder for the transport to finalize. */
     deferSigning?: boolean
+    onThreadCacheSlot?: (
+      slot:
+        | ((
+            body: Record<string, unknown>,
+          ) => Record<string, unknown> | undefined)
+        | undefined,
+    ) => void
     identity?: ClaudeCodeIdentity
     sessionId?: string
     /** Raw model id supplied by the host, not the wire body model. */
@@ -1900,16 +1933,26 @@ export async function rewriteRequestBody(
     if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const toolNameMap = responseToolNames(parsed.tools)
     let prefixed = prefixToolNames(parsed, { isOAuth: options.isOAuth })
+    let sourceAnchorRestored = false
     if (
       options.sourceRecoveryBody &&
       cacheEnabled &&
       options.cache1hMode === 'hybrid'
     ) {
-      restoreSourceCacheAnchor(parsed, options.sourceRecoveryBody)
+      sourceAnchorRestored =
+        restoreSourceCacheAnchor(parsed, options.sourceRecoveryBody) === true
       prefixed = JSON.stringify(
         orderClaudeCodeBody(parsed, { isOAuth: options.isOAuth }),
       )
     }
+    const standbyAnchor = options.hybridStandbyAnchor
+    options.onThreadCacheSlot?.(
+      cacheEnabled && options.cache1hMode === 'hybrid'
+        ? sourceAnchorRestored
+          ? () => undefined
+          : (body) => hybridThreadCacheSlot(body, standbyAnchor)
+        : undefined,
+    )
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),
       outputBytesBeforeSign: prefixed.length,

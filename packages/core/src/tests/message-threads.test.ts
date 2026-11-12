@@ -60,6 +60,388 @@ function advance(request: MessageThreadInput): MessageThreadInput {
   }
 }
 
+function tailMarkerInput(): MessageThreadInput {
+  const cc = { type: 'ephemeral', ttl: '1h' }
+  return {
+    ...input(),
+    cacheSlot: (body) => (body.system as Record<string, unknown>[])[0],
+    body: {
+      ...input().body,
+      system: [{ type: 'text', text: 'instructions', cache_control: cc }],
+      messages: Array.from({ length: 351 }, (_, index) => ({
+        role: index % 2 ? 'assistant' : 'user',
+        content: Array.from(
+          { length: index === 0 ? 3 : index % 2 && index < 171 ? 2 : 1 },
+          (_, block) => ({
+            type: 'text',
+            text: `message ${index}${block ? `/${block}` : ''}`,
+            ...((index === 0 && block > 0) || index === 350
+              ? { cache_control: cc }
+              : {}),
+          }),
+        ),
+      })),
+    },
+  }
+}
+
+describe('full request tail marker', () => {
+  function replay(first: MessageThreadInput): MessageThreadInput {
+    const request = advance(first)
+    request.body = structuredClone(request.body)
+    const messages = request.body.messages as { content: unknown }[]
+    delete (
+      (messages[350]!.content as Record<string, unknown>[])[0] as Record<
+        string,
+        unknown
+      >
+    ).cache_control
+    messages[352] = {
+      ...next,
+      content: [
+        {
+          type: 'text',
+          text: 'two',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ],
+    }
+    return request
+  }
+
+  test('restores the accepted full tail beyond lookback after a thread', () => {
+    let now = 0
+    const tracker = new MessageThreadTracker(10, () => now)
+    const first = anchor(tracker, tailMarkerInput())
+    const blocks = (body: Record<string, unknown>) =>
+      (body.messages as { content: unknown[] }[]).reduce(
+        (sum, message) => sum + message.content.length,
+        0,
+      )
+    expect(blocks(first.body)).toBe(438)
+    const continued = advance(first)
+    expect(tracker.prepare(continued).decision.type).toBe('continue')
+    // A long replay needs its old full tail even when it is beyond Anthropic's
+    // 20-block lookback. These tails are 284 content blocks apart, at messages
+    // 350 and 528, with 438 and 722 blocks in the respective full requests.
+    const replay = advance(first)
+    replay.body.messages = [
+      ...structuredClone(
+        first.body.messages as { content: Record<string, unknown>[] }[],
+      ).map((message, index) => {
+        if (index === 350) delete message.content[0]?.cache_control
+        return message
+      }),
+      ...Array.from({ length: 178 }, (_, index) => ({
+        role: index % 2 ? 'user' : 'assistant',
+        content: Array.from({ length: index < 106 ? 2 : 1 }, (_, block) => ({
+          type: 'text',
+          text: `new ${index}/${block}`,
+          ...(index === 177
+            ? { cache_control: { type: 'ephemeral', ttl: '1h' } }
+            : {}),
+        })),
+      })),
+    ]
+    now = 301_000
+    expect(blocks(replay.body)).toBe(722)
+    const prepared = tracker.prepare(replay)
+    expect(prepared.decision.type).toBe('create')
+    const body = prepared.body as typeof first.body & {
+      messages: { content: Record<string, unknown>[] }[]
+    }
+    expect(body.messages[350]?.content[0]?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(body.messages[528]?.content[0]?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
+    expect(
+      (body.system as Record<string, unknown>[])[0]?.cache_control,
+    ).toBeUndefined()
+    expect(
+      JSON.stringify(body).match(/"cache_control"/g)?.length,
+    ).toBeLessThanOrEqual(4)
+    prepared.complete({
+      messageId: 'msg_replay',
+      stopped: true,
+      stopReason: 'end_turn',
+      reply: assistant,
+    })
+    const nextThread = tracker.prepare(advance(replay))
+    expect(nextThread.decision.type).toBe('continue')
+    expect(JSON.stringify(nextThread.body.system)).toBe(
+      JSON.stringify(prepared.body.system),
+    )
+    expect(JSON.stringify(nextThread.body.tools)).toBe(
+      JSON.stringify(prepared.body.tools),
+    )
+  })
+
+  test.each([
+    'no_prior_thread',
+    'prefix_changed',
+    'expired',
+    'account_changed',
+    'credential_changed',
+    'slot_taken',
+    'ttl_order',
+    'later_ttl_order',
+    'clock_rollback',
+  ])('%s leaves the full request byte-identical', (reason) => {
+    let now = 0
+    const tracker = new MessageThreadTracker(10, () => now)
+    const first = tailMarkerInput()
+    if (reason !== 'no_prior_thread') anchor(tracker, first)
+    const request = replay(first)
+    request.stateless = true
+    now = 301_000
+    if (reason === 'prefix_changed')
+      (request.body.messages as { content: unknown }[])[20]!.content =
+        'edited earlier message'
+    if (reason === 'expired') now = 3_600_000
+    if (reason === 'account_changed') request.account = 'other account'
+    if (reason === 'credential_changed')
+      request.credential = 'replacement login'
+    if (reason === 'slot_taken') request.cacheSlot = () => undefined
+    if (reason === 'clock_rollback') now = -1
+    if (reason === 'ttl_order')
+      (request.body.messages as { content: Record<string, unknown>[] }[])[0]!
+        .content[1]!.cache_control = { type: 'ephemeral' }
+    if (reason === 'later_ttl_order') {
+      now = 0
+      const short = tailMarkerInput()
+      const messages = short.body.messages as {
+        content: Record<string, unknown>[]
+      }[]
+      messages[350]!.content[0]!.cache_control = { type: 'ephemeral' }
+      anchor(tracker, short)
+      now = 1
+    }
+    const before = JSON.stringify(request.body)
+    const log = spyOn(logger, 'debug')
+    try {
+      expect(JSON.stringify(tracker.prepare(request).body)).toBe(before)
+      const tailLogs = log.mock.calls.filter(
+        (call) => call[1] === 'message_thread_tail_marker',
+      )
+      if (reason === 'no_prior_thread') expect(tailLogs).toHaveLength(0)
+      else {
+        expect(tailLogs).toHaveLength(1)
+        expect(tailLogs[0]?.[2]).toMatchObject({
+          reason:
+            reason === 'credential_changed'
+              ? 'account_changed'
+              : reason === 'later_ttl_order'
+                ? 'ttl_order'
+                : reason === 'clock_rollback'
+                  ? 'expired'
+                  : reason,
+        })
+      }
+    } finally {
+      log.mockRestore()
+    }
+    expect(JSON.stringify(request.body)).toBe(before)
+  })
+
+  test('preserves the accepted marker default 5-minute lifetime and expires at its boundary', () => {
+    let now = 0
+    for (const age of [299_999, 300_000]) {
+      now = 0
+      const tracker = new MessageThreadTracker(10, () => now)
+      const first = tailMarkerInput()
+      const messages = first.body.messages as {
+        content: Record<string, unknown>[]
+      }[]
+      messages[350]!.content[0]!.cache_control = { type: 'ephemeral' }
+      anchor(tracker, first)
+      const request = replay(first)
+      request.stateless = true
+      ;(request.body.messages as { content: Record<string, unknown>[] }[])[352]!
+        .content[0]!.cache_control = { type: 'ephemeral' }
+      now = age
+      const prepared = tracker.prepare(request)
+      expect(prepared.tailMarkerAdded).toBe(age < 300_000)
+      expect(
+        (
+          prepared.body.messages as { content: Record<string, unknown>[] }[]
+        )[350]!.content[0]!.cache_control,
+      ).toEqual(age < 300_000 ? { type: 'ephemeral' } : undefined)
+    }
+  })
+
+  test('materializes a historical user string only when its canonical full tail matches', () => {
+    const tracker = new MessageThreadTracker(10, () => 0)
+    const first = anchor(tracker, tailMarkerInput())
+    const request = replay(first)
+    const messages = request.body.messages as { content: unknown }[]
+    messages[350]!.content = 'message 350'
+    request.stateless = true
+    const prepared = tracker.prepare(request)
+    expect(prepared.tailMarkerAdded).toBe(true)
+    expect(
+      (prepared.body.messages as { content: unknown }[])[350]!.content,
+    ).toEqual([
+      {
+        type: 'text',
+        text: 'message 350',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ])
+    expect(messages[350]!.content).toBe('message 350')
+  })
+
+  test('a changed continuation prefix beyond the old full tail still anchors the actual new create', () => {
+    const tracker = new MessageThreadTracker(10, () => 0)
+    const first = anchor(tracker, tailMarkerInput())
+    const second = replay(first)
+    const continued = tracker.prepare(second)
+    expect(continued.decision.type).toBe('continue')
+    continued.complete({
+      messageId: 'msg_second',
+      stopped: true,
+      stopReason: 'end_turn',
+      reply: assistant,
+    })
+    const third = advance(second)
+    third.body = structuredClone(third.body)
+    const messages = third.body.messages as { content: unknown }[]
+    messages[352]!.content = 'edited after the old full tail'
+    messages[354]!.content = [
+      {
+        type: 'text',
+        text: 'newest',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ]
+    const full = tracker.prepare(third)
+    expect(full.decision.type).toBe('create')
+    expect(full.tailMarkerAdded).toBe(true)
+    full.complete({
+      messageId: 'msg_third',
+      stopped: true,
+      stopReason: 'end_turn',
+      reply: assistant,
+    })
+    const next = tracker.prepare(advance(third))
+    expect(next.decision.type).toBe('continue')
+    expect(JSON.stringify(next.body.system)).toBe(
+      JSON.stringify(full.body.system),
+    )
+  })
+
+  test('a nested 5-minute marker precedes its enclosing full-tail boundary', () => {
+    const tracker = new MessageThreadTracker(10, () => 0)
+    const first = tailMarkerInput()
+    ;(first.body.messages as { content: unknown }[])[350]!.content = [
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool',
+        content: [{ type: 'text', text: 'result' }],
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ]
+    anchor(tracker, first)
+    const request = replay(first)
+    request.stateless = true
+    const result = (
+      (request.body.messages as { content: Record<string, unknown>[] }[])[350]!
+        .content[0]!.content as Record<string, unknown>[]
+    )[0]!
+    result.cache_control = { type: 'ephemeral' }
+    ;(request.body.messages as { content: Record<string, unknown>[] }[])[352]!
+      .content[0]!.cache_control = { type: 'ephemeral' }
+    delete (
+      request.body.messages as { content: Record<string, unknown>[] }[]
+    )[0]!.content[1]!.cache_control
+    const before = JSON.stringify(request.body)
+    const prepared = tracker.prepare(request)
+    expect(prepared.tailMarkerAdded).toBe(false)
+    expect(JSON.stringify(prepared.body)).toBe(before)
+    expect(JSON.stringify(request.body)).toBe(before)
+  })
+
+  test.each(['system', 'tools', 'ttl'] as const)(
+    'fixed layout reuse does not hide a %s change',
+    (change) => {
+      const tracker = new MessageThreadTracker(10, () => 0)
+      const first = anchor(tracker, tailMarkerInput())
+      const request = replay(first)
+      if (change === 'system')
+        (request.body.system as Record<string, unknown>[])[0]!.text =
+          'changed instructions'
+      if (change === 'tools') request.body.tools = [{ name: 'different' }]
+      if (change === 'ttl') {
+        ;(
+          (request.body.system as Record<string, unknown>[])[0]!
+            .cache_control as Record<string, unknown>
+        ).ttl = '5m'
+        for (const block of (
+          request.body.messages as { content: Record<string, unknown>[] }[]
+        )[0]!.content) {
+          if (block.cache_control)
+            (block.cache_control as Record<string, unknown>).ttl = '5m'
+        }
+        ;(
+          (
+            request.body.messages as { content: Record<string, unknown>[] }[]
+          )[352]!.content[0]!.cache_control as Record<string, unknown>
+        ).ttl = '5m'
+      }
+      expect(tracker.prepare(request).decision.type).toBe('create')
+    },
+  )
+
+  test('full recovery and stateless fallback add the marker before signing', async () => {
+    const tracker = new MessageThreadTracker(10, () => 0)
+    const first = anchor(tracker, {
+      ...tailMarkerInput(),
+      account: 'tail-recovery-account',
+    })
+    const request = replay(first)
+    const prepared = await prepareMessageThreadRequest(tracker, {
+      ...request,
+      account: 'other-tail-recovery-account',
+      headers: new Headers(),
+      bodyText: JSON.stringify(request.body),
+    })
+    // A distinct account cannot reuse another account's full-render cache entry.
+    expect(
+      JSON.parse(prepared.bodyText).messages[350].content[0].cache_control,
+    ).toBeUndefined()
+    const sameAccount = await prepareMessageThreadRequest(tracker, {
+      ...request,
+      headers: new Headers(),
+      bodyText: JSON.stringify(request.body),
+    })
+    let sends = 0
+    await sameAccount.recover(
+      new Response(
+        JSON.stringify({
+          error: {
+            type: 'invalid_request_error',
+            message: 'thread is not supported',
+          },
+        }),
+        { status: 400 },
+      ),
+      async (body) => {
+        sends++
+        expect(JSON.parse(body).messages[350].content[0].cache_control).toEqual(
+          { type: 'ephemeral', ttl: '1h' },
+        )
+        expect(body).toBe(await signRequestBody(body))
+        expect(JSON.parse(body).thread).toBeUndefined()
+        return new Response('ok')
+      },
+    )
+    expect(sends).toBe(1)
+  })
+})
+
 describe('message threads', () => {
   test('local row identity survives refresh but separates replacement logins and stores', () => {
     const binding = {

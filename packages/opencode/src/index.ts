@@ -7677,6 +7677,9 @@ const anthropicAuthPlugin = async (
             let directDump: DumpHandle | null = null
             let relayDump: DumpHandle | null = null
             let toolNameMap: ToolNameMap | undefined
+            let threadCacheSlot: Parameters<
+              typeof prepareMessageThreadRequest
+            >[1]['cacheSlot']
             let modelForIdentity: string | undefined
             if (body && typeof body === 'string') {
               const modelParseStart = nowMs()
@@ -7761,6 +7764,9 @@ const anthropicAuthPlugin = async (
               try {
                 body = await rewriteRequestBody(body, {
                   deferSigning: true,
+                  onThreadCacheSlot: (slot) => {
+                    threadCacheSlot = slot
+                  },
                   onToolNameMap: (map) => {
                     toolNameMap = map
                   },
@@ -8282,6 +8288,7 @@ const anthropicAuthPlugin = async (
                   credential: nativeAuthorization.credentialId,
                   bodyText: body,
                   replyToolNames: toolNameMap,
+                  cacheSlot: threadCacheSlot,
                   headers: requestHeaders,
                   signal: init?.signal ?? undefined,
                 },

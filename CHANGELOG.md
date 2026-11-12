@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## 2.11.1
 
+- OpenCode 1, OpenCode 2 and Pi now preserve a still-live cache boundary from the previous full request when a message thread ends, avoiding large cache rewrites when continuation entries cannot be reused.
 - Claude retries on OpenCode 1, OpenCode 2 and Pi now wait at most 15 minutes, even when a usage limit resets much later; exhausted pools explain the limiting window and real reset without sending another model request.
 
 ## 2.11.0

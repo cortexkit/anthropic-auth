@@ -2953,6 +2953,108 @@ describe.each(['direct', 'http'] as const)(
       native.dispose()
     })
 
+    test('full replay after a thread restores the full-render tail on the signed final body', async () => {
+      const { source } = makeSource({
+        authorize,
+        options: { cache1hEnabled: true, cache1hMode: 'hybrid' },
+      })
+      const native = createNativeAnthropicAdapter({ source })
+      try {
+        const host = new Host(native.adapter)
+        const text = (value: string) => ({ type: 'text', text: value })
+        const reply = { role: 'assistant', content: [text('Answer')] }
+        const payload = {
+          ...sonnetPayload(),
+          messages: [
+            {
+              role: 'user',
+              content: [text('stable prefix'), text('stable history')],
+            },
+            reply,
+            {
+              role: 'user',
+              content: [text('old full tail'), text('old tail block')],
+            },
+          ],
+        }
+        const complete = async (
+          run: Awaited<ReturnType<Host['run']>>,
+          id: string,
+        ) => {
+          const response = await native.adapter.rewriteResponse?.({
+            ...run.attempt,
+            request: run.final,
+            attempt: run.attempt,
+            response: new Response(
+              sse('message_start', {
+                type: 'message_start',
+                message: { id, content: reply.content },
+              }) +
+                sse('message_delta', {
+                  type: 'message_delta',
+                  delta: { stop_reason: 'end_turn' },
+                }) +
+                sse('message_stop', { type: 'message_stop' }),
+              {
+                headers: {
+                  'content-type': 'text/event-stream',
+                  'request-id': 'req_thread_tail_success',
+                },
+              },
+            ),
+          } as never)
+          await response?.text()
+        }
+        const first = await host.run(scopeOf(), hostRequest(payload))
+        await complete(first, 'msg_full_tail')
+        const secondPayload = {
+          ...payload,
+          messages: [
+            ...payload.messages,
+            reply,
+            { role: 'user', content: [text('Next')] },
+          ],
+        }
+        const second = await host.run(scopeOf(), hostRequest(secondPayload))
+        expect(
+          JSON.parse(upstreamText(await second.final.clone().text())).thread
+            .type,
+        ).toBe('continue')
+        await complete(second, 'msg_continue_tail')
+        const third = await host.run(
+          scopeOf(),
+          hostRequest({
+            ...payload,
+            messages: [
+              ...secondPayload.messages,
+              reply,
+              { role: 'user', content: [text('Third')] },
+              reply,
+              { role: 'user', content: [text('Fourth')] },
+            ],
+          }),
+        )
+        const wire = upstreamText(await third.final.text())
+        const body = JSON.parse(wire)
+        expect(body.thread.type).toBe('create')
+        expect(body.messages[2].content[1].cache_control).toEqual({
+          type: 'ephemeral',
+          ttl: '1h',
+        })
+        expect(body.messages.at(-1).content.at(-1).cache_control).toEqual({
+          type: 'ephemeral',
+          ttl: '1h',
+        })
+        expect(body.system.every((block: any) => !block.cache_control)).toBe(
+          true,
+        )
+        expect(wire.match(/"cache_control"/g)).toHaveLength(4)
+        expect(wire).toBe(await signRequestBody(wire))
+      } finally {
+        native.dispose()
+      }
+    })
+
     test.each([
       'thread_not_found',
       'thread_fingerprint_mismatch',
