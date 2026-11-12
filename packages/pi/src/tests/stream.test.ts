@@ -15,7 +15,12 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { isRetryableAssistantError } from '@earendil-works/pi-ai/compat'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
-import { getPiNativeRuntime } from '../native.ts'
+import {
+  closePiNativeRuntime,
+  getPiNativeRuntime,
+  type PiNativeRuntime,
+} from '../native.ts'
+import { getPiAccountStoragePath } from '../paths.ts'
 import {
   beginPiPrimaryTurn,
   buildExplicitBaseMessagesUrl,
@@ -31,10 +36,20 @@ import { normalizeContext } from '../transcript.ts'
 import {
   fixtureAccountIdentity,
   readNativePiFixture,
-  saveNativePiFixture,
+  saveNativePiFixture as saveNativePiStorage,
 } from './native-fixture.ts'
 
 let tempDir: string | undefined
+const nativeStoragePaths = new Set<string>()
+
+async function saveNativePiFixture(
+  ...args: Parameters<typeof saveNativePiStorage>
+) {
+  // Some cases create several stores or restore their environment before teardown.
+  nativeStoragePaths.add(args[1] ?? getPiAccountStoragePath())
+  await saveNativePiStorage(...args)
+}
+
 const originalFetch = globalThis.fetch
 const originalNow = Date.now
 const routingKey = Symbol.for('cortexkit.routing')
@@ -162,6 +177,9 @@ test.each(['success', 'provider error', 'malformed'])(
 )
 
 afterEach(async () => {
+  // Retire vault polls and drain publications before replacing fetch or deleting fixtures.
+  await Promise.all([...nativeStoragePaths].map(closePiNativeRuntime))
+  nativeStoragePaths.clear()
   __setLogTestSink(null)
   globalThis.fetch = originalFetch
   if (originalRouting === undefined) delete globals[routingKey]
@@ -171,6 +189,52 @@ afterEach(async () => {
   delete process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE
   if (tempDir) await rm(tempDir, { recursive: true, force: true })
   tempDir = undefined
+})
+
+describe('stream fixture native runtime lifetime', () => {
+  const polls = new Map<ReturnType<typeof setInterval>, () => void>()
+  const retired: PiNativeRuntime[] = []
+  const schedule = ((callback: () => void) => {
+    const timer = { unref() {} } as ReturnType<typeof setInterval>
+    polls.set(timer, callback)
+    return timer
+  }) as typeof setInterval
+  const cancel = ((timer: ReturnType<typeof setInterval>) => {
+    polls.delete(timer)
+  }) as typeof clearInterval
+
+  test('stream fixture owns every store even after the selected path changes', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-stream-lifetime-'))
+    for (const name of ['first', 'second']) {
+      const storagePath = join(tempDir, name, 'anthropic-auth.json')
+      process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+      await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
+      const native = getPiNativeRuntime(storagePath, {
+        vaultPoll: {
+          intervalMs: 2000,
+          setInterval: schedule,
+          clearInterval: cancel,
+        },
+      })
+      retired.push(native)
+      await native.service()
+    }
+    expect(polls.size).toBe(2)
+  })
+
+  // A separate body observes the real afterEach boundary, with every poll held rather than timed.
+  test('stream fixture teardown cancels held vault polls before the next body', async () => {
+    try {
+      expect(retired).toHaveLength(2)
+      expect(polls.size).toBe(0)
+      for (const native of retired)
+        await expect(native.service()).rejects.toThrow(
+          'Pi native authentication is closed',
+        )
+    } finally {
+      await Promise.all(retired.map((native) => native.close()))
+    }
+  })
 })
 
 test.each([
