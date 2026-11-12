@@ -2,9 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## 2.10.1
+## Unreleased
 
 - A refresh-lock release interrupted by another process now finishes cleaning up its lock instead of leaving it to block the next request for up to its timeout.
+## 2.10.1
+
 - Pi hosted by Thalamus now sends confirmed Claude account limits and successful requests to Thalamus's routing relay. Routing acts on them once Pi also asks routing which account to use; until then they have no effect.
 - Pi hosted by Thalamus now records Anthropic's response id on each answer, so Thalamus can match Pi's billing reports to their transcript rows.
 - Pi now records compressed and decoded byte counts for cut Claude streams when available, and sends Claude Code's response-compression preferences on Claude sign-in requests.
