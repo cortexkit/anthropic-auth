@@ -321,6 +321,192 @@ async function seedLegacyRequest(f: Awaited<ReturnType<typeof fixture>>) {
   await put(f.target, { quota_enabled: 'on', claude_fast_enabled: false })
 }
 
+function captureAuthorityTimers() {
+  const ticks: (() => Promise<void>)[] = []
+  const acquire = core.acquireNativeAccountRuntime
+  const acquisition = spyOn(
+    core,
+    'acquireNativeAccountRuntime',
+  ).mockImplementation((options) =>
+    acquire({
+      ...options,
+      settingsAuthority: {
+        ...options.settingsAuthority,
+        schedule: (callback) => {
+          ticks.push(callback)
+          return () => {}
+        },
+      },
+    }),
+  )
+  cleanups.push(() => acquisition.mockRestore())
+  return ticks
+}
+
+test('OC2 legacy startup with a failed service open joins a later move on the authority timer without moving again', async () => {
+  const f = await fixture()
+  await seedLegacyRequest(f)
+  await fs.rm(f.target)
+  const run = core.runSettingsMoveAtStartup
+  let moves = 0
+  const move = spyOn(core, 'runSettingsMoveAtStartup').mockImplementation(
+    (options) => {
+      moves++
+      return run({ ...options, fence: { registration: undefined } })
+    },
+  )
+  let unavailable = true
+  let opens = 0
+  const opening = spyOn(core, 'openSettingsService').mockImplementation(
+    (options) => {
+      if (options.host !== 'opencode') return f.openSettings(options)
+      opens++
+      if (unavailable)
+        return Promise.reject(new Error('synthetic legacy open failure'))
+      return f.openService(options)
+    },
+  )
+  cleanups.push(() => {
+    move.mockRestore()
+    opening.mockRestore()
+  })
+  const ticks = captureAuthorityTimers()
+  const instance = await f.start()
+  expect(f.starts[0]?.mode).toBe('legacy')
+  expect(f.starts[0]?.reopen).toBeDefined()
+  expect(f.opened).toHaveLength(0)
+  expect(ticks).toHaveLength(1)
+  const beforeRequest = opens
+  expect((await instance.live()).headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-settings-legacy',
+  )
+  expect(opens).toBe(beforeRequest)
+  await put(f.target, { quota_enabled: 'off', claude_fast_enabled: false })
+  await core.writeSettingsMoveMarker(f.target, { env: f.env })
+  unavailable = false
+  await ticks[0]!()
+  expect(instance.runtime.getSettingsStatus?.()).toBeDefined()
+  expect(
+    (await instance.source.requestOptions!({ ...request(), accountId: 'main' }))
+      .fastModeEnabled,
+  ).toBe(false)
+  expect((await instance.live()).headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-settings-legacy',
+  )
+  const menu = createNativeMenuCapabilities({
+    runtime: instance.runtime,
+    source: instance.source,
+    start: async () => {},
+  })
+  cleanups.push(() => menu.close())
+  await menu.readStatus('dump')
+  expect(moves).toBe(1)
+  await instance.dispose()
+  expect(f.watchCloses()).toBe(1)
+})
+
+test('OC2 import-refused serves legacy settings without reopening or moving until a new instance starts', async () => {
+  const f = await fixture()
+  await seedLegacyRequest(f)
+  const legacy = core.createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    local: { resolveIdentity: legacyIdentity },
+    vault: { env: f.env },
+  })
+  cleanups.push(() => legacy.close())
+  const credential = await legacy.authorizeLocal('main')
+  if (credential.status !== 'usable')
+    throw new Error('Legacy credential unavailable')
+  const window = { remainingPercent: 95, usedPercent: 5, checkedAt: Date.now() }
+  await legacy.publishLocal(credential.subject, {
+    quota: {
+      five_hour: window,
+      seven_day: window,
+      accountIdentity: '11111111-2222-4333-8444-555555555555',
+    },
+  })
+  await legacy.close()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    killswitch: {
+      enabled: true,
+      main: { five_hour: 80, seven_day: 0, scoped: 0 },
+    },
+  }))
+  const run = core.runSettingsMoveAtStartup
+  const outcomes: string[] = []
+  const move = spyOn(core, 'runSettingsMoveAtStartup').mockImplementation(
+    async (options) => {
+      const result = await run(options)
+      outcomes.push(result.outcome)
+      return result
+    },
+  )
+  cleanups.push(() => move.mockRestore())
+  const records: core.LogTestRecord[] = []
+  core.setLogLevel('info')
+  core.__setLogTestSink((record) => records.push(record))
+  const ticks = captureAuthorityTimers()
+  const instance = await f.start()
+  expect(outcomes).toEqual(['import-refused'])
+  expect(f.starts[0]?.mode).toBe('legacy')
+  expect(f.starts[0]?.service).toBeUndefined()
+  expect(f.starts[0]?.fallback).toBeUndefined()
+  expect(f.starts[0]?.reopen).toBeUndefined()
+  expect(f.opened).toHaveLength(0)
+  expect(ticks).toHaveLength(0)
+  await expect(fs.stat(`${f.target}.moved.opencode`)).rejects.toMatchObject({
+    code: 'ENOENT',
+  })
+  expect(
+    (await instance.source.requestOptions!({ ...request(), accountId: 'main' }))
+      .fastModeEnabled,
+  ).toBe(true)
+  expect((await instance.live()).headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-settings-legacy',
+  )
+  expect(
+    records.filter((record) =>
+      record.message.includes('Settings startup failed'),
+    ),
+  ).toHaveLength(0)
+  await put(f.target, {
+    quota_enabled: 'off',
+    claude_fast_enabled: false,
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 80,
+  })
+  const file = await fs.readFile(f.target, 'utf8')
+  const menu = createNativeMenuCapabilities({
+    runtime: instance.runtime,
+    source: instance.source,
+    start: async () => {},
+  })
+  cleanups.push(() => menu.close())
+  await menu.readStatus('dump')
+  await menu.dispatch({ action: 'dump-on', values: {} }, {})
+  expect(outcomes).toEqual(['import-refused'])
+  expect(
+    (await instance.runtime.read()).policyStorage.claudeFast?.enabled,
+  ).toBe(true)
+  expect(await fs.readFile(f.target, 'utf8')).toBe(file)
+  await instance.dispose()
+  const restarted = await f.start()
+  expect(outcomes).toHaveLength(2)
+  expect(outcomes.at(-1)).not.toBe('import-refused')
+  expect(f.starts.at(-1)?.mode).toBe('user-file')
+  expect(
+    (
+      await restarted.source.requestOptions!({
+        ...request(),
+        accountId: 'main',
+      })
+    ).fastModeEnabled,
+  ).toBe(false)
+  expect(await fs.stat(`${f.target}.moved.opencode`)).toBeDefined()
+})
+
 for (const stage of ['move', 'service open'] as const) {
   test(`OC2 settings ${stage} failure still installs and serves a legacy-store request`, async () => {
     const f = await fixture()
