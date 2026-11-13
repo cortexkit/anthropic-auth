@@ -5,8 +5,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Updated the shared authentication dependency to common-auth 0.49.2.
-- OpenCode 1, OpenCode 2 and Pi now share one settings file, `anthropic-auth.jsonc`, that you can edit by hand, with per-host and per-model overrides. Existing settings move into it once, automatically. Only your own user file is read, never a project file. See [the settings file](docs/settings-file.md).
-- Moving settings never weakens protection: quota floors and the killswitch keep each host's stricter values.
+- OpenCode 1, OpenCode 2 and Pi now share one settings file, `anthropic-auth.jsonc`, that you can edit by hand, with per-host and per-model overrides. Existing settings move into it once, automatically, after every running copy is updated and can be checked. With a custom `XDG_CONFIG_HOME` or an explicit settings file path (`ANTHROPIC_AUTH_SETTINGS_FILE`), each host moves only its own settings. Only your own user file is read, never a project file. See [the settings file](docs/settings-file.md).
+- Moving settings never weakens protection: each host keeps at least its own effective killswitch, quota-floor, unknown-quota and same-account wait protection, including defaults. The same checks cover adopting the file while running, setup and recreating a missing file. If protection cannot be read, the host keeps its old settings or refuses the write.
 - Rolling back to the previous release keeps working, but it uses your settings from before the move, not later changes.
 - With the shared file in use, OpenCode 2 and Pi `/claude` Status show the killswitch's default floors (5-hour 5, weekly 10, scoped 0) rather than an empty value. The killswitch stays off and nothing else changes.
 - Storage paths no longer resolve incorrectly on Linux while another process is saving.

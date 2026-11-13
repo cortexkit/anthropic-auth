@@ -471,7 +471,7 @@ test('OC2 status names a missing file and its recreation by a menu write', async
   const missing = await f.menu.readStatus('routing')
   expect(missing).toContain(`Settings file: ${f.file}`)
   expect(missing).toContain(
-    'Settings file is missing; a menu write will recreate it.',
+    "Settings file is missing; a menu change recreates it when both hosts' protection can be read.",
   )
   expect(await f.apply('dump-on')).toEqual({
     ok: true,

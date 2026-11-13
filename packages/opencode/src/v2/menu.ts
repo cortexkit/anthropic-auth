@@ -131,7 +131,9 @@ export function createNativeMenuCapabilities(options: {
       summary,
       `Settings file: ${file.file}`,
       ...(file.missing
-        ? ['Settings file is missing; a menu write will recreate it.']
+        ? [
+            "Settings file is missing; a menu change recreates it when both hosts' protection can be read.",
+          ]
         : [`Settings file state: ${file.state}`]),
       ...(file.recreated
         ? ['Settings file was recreated by a menu write.']

@@ -63,10 +63,11 @@ good window stays in effect. The error is logged and shown in Status.
 
 ### What `"default"` means
 
-`claude_cache_enabled` and `quota_enabled` accept `"default"`, `"on"` and
-`"off"`, not booleans. `"on"` and `"off"` are explicit choices on every host.
+`claude_cache_enabled`, `quota_enabled` and
+`quota_fail_closed_on_unknown_quota` accept `"default"`, `"on"` and `"off"`,
+not booleans. `"on"` and `"off"` are explicit choices on every host.
 `"default"` (also the value when unset) preserves each reader's existing
-unset behavior; it does **not** unify the hosts:
+unset behavior; it does **not** unify the hosts. For cache and quota enablement:
 
 | Setting | OpenCode 1 | OpenCode 2 | Pi |
 | --- | --- | --- | --- |
@@ -111,7 +112,7 @@ accept model keys:
 
 Within a setting, precedence is **model key → host key → override `default`
 → declared default**. The object member named `default` is the fallback value;
-the string value `"default"` for the two three-way settings instead means the
+the string value `"default"` for the three settings named above instead means the
 per-reader behavior described above. A model key must name a row id from
 [`model-capabilities.ts`](../packages/core/src/model-capabilities.ts). Requests
 drop the `[1m]` qualifier and use the table's longest matching model id/suffix.
@@ -151,34 +152,44 @@ validation problems. Fix the reported file rather than editing an old store.
 ## The move and the files that stay
 
 At host startup, the one-time move runs only when the target and its marker are
-absent and no older plugin process is still running against the old stores.
-Update and restart every OpenCode and Pi installation to let it run. Until then,
-the host keeps its legacy settings reads and writes. Stopped-host `setup` does
-not run the move.
+absent. It waits until every running copy is on this version and can be checked.
+Update and restart every OpenCode and Pi installation to let it run. If a running
+copy cannot be checked, the move waits rather than guessing. Until then, the host
+keeps reading and writing its old settings. Stopped-host `setup` does not run the
+move.
 
 For the default target, the move reads both hosts' default-location stores,
 using each host's current custody mode: `anthropic-auth-pool.json` in local
 mode, `anthropic-auth-vault-settings.json` in vault mode. For an absolute
 `ANTHROPIC_AUTH_SETTINGS_FILE`, or a private absolute `XDG_CONFIG_HOME` whose
 real path differs from the home directory's `.config`, it reads **only the
-running host's own resolved stores**. A missing or unseeded source is skipped;
-an existing source that cannot be read or parsed stops the move for that start.
+running host's own resolved stores**. A missing source is skipped. If a vault
+peer has a local store but has not yet created its vault settings, the move waits
+until that peer has run once. An existing source that cannot be read or parsed
+stops the move for that start.
 
-Only explicitly stored settings move. A value set on just one host becomes a
-top-level value inherited by **both** hosts. Different explicit values become
-`default` (OpenCode's value) plus `pi`; per-account floors carry host tags.
+Ordinary settings move only when explicitly stored. A value set on just one host
+becomes a top-level value inherited by **both** hosts. Different explicit values
+become `default` (OpenCode's value) plus `pi`; per-account floors carry host tags.
+Protection settings keep at least each host's own effective protection, including
+defaults it did not store explicitly. Sharing a lower value from one host does
+not lower the other host's protection. These checks cover the move, adopting the
+file while running, setup and recreating a missing file.
+
 A host whose settings were not imported takes ordinary settings from the file
 or its defaults, not from its old preferences. Before adopting the file, it also
-makes a one-time protection check: legacy protection values stricter than what
-the host resolves from the file are filled into that host's own override only
-where the file does not already set that key at the host's level. This includes
-the killswitch, quota floors, unknown-quota policy and same-account wait.
+makes a one-time protection check, at startup or while running: effective legacy
+protection values, including defaults, that are stricter than what the host
+resolves from the file are filled into that host's own override only where the
+file does not already set that key at the host's level. This includes the
+killswitch, quota floors, unknown-quota policy and same-account wait.
 Missing per-account floors are added with that host's tag
 when they exceed the file's default floors; existing account entries are not
 replaced. A `<target path>.moved.<host>` record (`opencode` or `pi`) records this
-check. Ordinary legacy preferences are never merged. If the protection import
-fails or is refused, the host keeps serving from its old settings and retries at
-its next start. Startup logs also name legacy values that differ from the file.
+check. Ordinary legacy preferences are never merged. If its legacy protection
+cannot be read, or the protection import cannot be written, the host keeps using
+its old settings. It retries at a later settings check or the next start. Startup
+logs also name legacy values that differ from the file.
 
 The move leaves source files byte-identical and writes a
 `<source file name>.MOVED_READPLEASE` note naming the target beside each existing
@@ -195,6 +206,17 @@ A successful move (even with no sources), or finding a hand-made file that
 parses, writes the owner-only `<target path>.moved` marker. The
 `MOVED_READPLEASE` notes are informational; the plugin never uses them to decide
 authority. Do not delete the marker to try to restore settings from stale stores.
+
+### Setup
+
+Setup adds missing values without overwriting what you set. An ordinary setting
+is added only when the file has no value at the default or acting host's level.
+Stricter protection from that host's old settings, including defaults, is kept at
+the host's level only where you have not already set a value for that host.
+Existing per-account floors are kept; missing ones are added with the host's tag.
+If setup recreates a missing file, it preserves both hosts' protection under the
+same rules as a menu write below, and refuses while either host's protection
+cannot be read.
 
 ### Missing or invalid file
 
@@ -215,13 +237,14 @@ last-applied protection set per host and no credentials. It is updated from
 usable user-file values only. It is a recovery copy, not another settings file
 to edit.
 
-A menu write that recreates a missing file carries the writer's currently
+A menu write that recreates a missing file preserves the writer's currently
 applied protection values and the other host's recoverable protection set, then
-the requested change. If they differ, host overrides and host-tagged account
-floors preserve each host's own values. **The writer's values apply to both hosts
-only when the other host has no protection set of its own.** Recreation is
-refused when either host's protection cannot be read; edit the settings file to
-set it explicitly instead. Status reports that the file was recreated.
+applies the requested change. If they differ, host overrides and host-tagged
+account floors preserve each host's own values. **The writer's values apply to
+both hosts only when the other host never ran and has no protection set of its
+own.** Recreation is refused while either host's protection cannot be read;
+edit the settings file to set it explicitly instead. Status reports that the
+file was recreated.
 
 ## Separate installs
 
