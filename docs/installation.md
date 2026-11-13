@@ -61,6 +61,6 @@ For a one-run extension load, use `pi -e npm:@cortexkit/pi-anthropic-auth`. Neit
 
 ## Configuration ownership
 
-Change supported settings through the [single `/claude` menu](commands.md#the-claude-menu), not by editing credentials or the journal. Local pool settings, private credential state and vault settings are separate; the [custody file map](custody-state-machine.md#storage) describes them. `OPENCODE_ANTHROPIC_AUTH_FILE` and `PI_ANTHROPIC_AUTH_FILE` select legacy sidecar locations; native pool, runtime and journal files are placed beside those sources. The sidecars are not live legacy credential stores.
+Change settings in the shared [`anthropic-auth.jsonc` settings file](settings-file.md) or through the [single `/claude` menu](commands.md#the-claude-menu), never by editing credentials or the journal. Credentials and private runtime state stay in their own files; the [custody file map](custody-state-machine.md#storage) describes them. `OPENCODE_ANTHROPIC_AUTH_FILE` and `PI_ANTHROPIC_AUTH_FILE` select legacy sidecar locations; native pool, runtime and journal files are placed beside those sources. The sidecars are not live legacy credential stores.
 
 The setup runner is bundled through `@cortexkit/anthropic-auth-core`, the shared authentication library. The OpenCode CLI does not add a runtime dependency on common-auth; [dependency ownership](opencode-2.md#dependency-ownership) explains the boundary.

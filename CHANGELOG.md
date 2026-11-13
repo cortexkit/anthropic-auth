@@ -4,11 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- OpenCode 1, OpenCode 2 and Pi now share a hand-editable, user-only `anthropic-auth.jsonc` settings file, with host and selected model overrides; no project settings file is read. See [locations, editing and migration](docs/settings-file.md). Sidebar preferences and relay settings stay in their existing files.
-- The one-time settings move makes a value set on only one host a shared value inherited by the other. A later host whose settings were not imported takes ordinary settings from the file, but first preserves stricter legacy protection where it has no explicit host value; a failed protection import keeps it on its old settings until the next start.
-- A menu write recreating a missing settings file preserves each host's known protection values through host overrides and account tags. The writer's values apply to both hosts only when the other host has no protection set; unreadable protection refuses recreation.
-- Rolling back to the last published release (2.11.4 at the time of writing) loses settings changed after the move: the old release uses the preserved legacy settings, not the shared file.
-- Once the shared settings file is in use, OpenCode 2 and Pi `/claude` Status show the disabled killswitch's default floors (5-hour 5, weekly 10, scoped 0) instead of an empty value; effective protection is unchanged.
+- OpenCode 1, OpenCode 2 and Pi now share one settings file, `anthropic-auth.jsonc`, that you can edit by hand, with per-host and per-model overrides. Existing settings move into it once, automatically. Only your own user file is read, never a project file. See [the settings file](docs/settings-file.md).
+- Moving settings never weakens protection: quota floors and the killswitch keep each host's stricter values.
+- Rolling back to the previous release keeps working, but it uses your settings from before the move, not later changes.
+- With the shared file in use, OpenCode 2 and Pi `/claude` Status show the killswitch's default floors (5-hour 5, weekly 10, scoped 0) rather than an empty value. The killswitch stays off and nothing else changes.
 - Storage paths no longer resolve incorrectly on Linux while another process is saving.
 - Changing effort no longer drops the thread tail cache marker on a full request after continuations.
 - Updated the shared authentication dependency to common-auth 0.49.1.
