@@ -580,3 +580,42 @@ for (const mode of ['user-file', 'legacy', 'separate'] as const) {
     )
   })
 }
+
+test('a runtime that fails to construct releases the settings service it retained', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'native-runtime-leak-'))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const file = join(root, 'settings.jsonc')
+  await writeFile(file, '{}')
+  let opens = 0
+  const open = () =>
+    openSettingsService({
+      file,
+      dependencies: {
+        open: (options) => {
+          opens++
+          return {
+            ...openSettings(settingsDefinition, options),
+            watch: () => () => {},
+          }
+        },
+      },
+    })
+  const service = await open()
+  if (!service) throw new Error('Settings service did not open')
+  expect(() =>
+    createNativeAccountRuntime({
+      // Paths without their files make construction throw after the
+      // settings reader has retained the service.
+      paths: {} as never,
+      host: 'opencode',
+      settingsService: service,
+      settingsMode: () => 'user-file',
+    }),
+  ).toThrow()
+  await service.dispose()
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  // With no reference left, the shared file handle was closed: a new lease opens a new one.
+  const again = await open()
+  cleanup.push(() => again?.dispose())
+  expect(opens).toBe(2)
+})

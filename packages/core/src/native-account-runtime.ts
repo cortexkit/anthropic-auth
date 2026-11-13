@@ -456,14 +456,30 @@ export function nativeAccountPolicy(
 export function createNativeAccountRuntime(
   options: NativeAccountRuntimeOptions,
 ): NativeAccountRuntime {
+  const env = { ...(options.vault?.env ?? process.env) }
+  const runtimeSettings = createNativeRuntimeSettings({ ...options, env })
+  try {
+    return buildNativeAccountRuntime(options, env, runtimeSettings)
+  } catch (error) {
+    // The settings reader already retained the shared settings service, its
+    // file watch and the timer that rechecks which settings source is in
+    // charge; a failed construction must release them.
+    void runtimeSettings.close().catch(() => {})
+    throw error
+  }
+}
+
+function buildNativeAccountRuntime(
+  options: NativeAccountRuntimeOptions,
+  env: NodeJS.ProcessEnv,
+  runtimeSettings: ReturnType<typeof createNativeRuntimeSettings>,
+): NativeAccountRuntime {
   const paths = Object.freeze({ ...options.paths })
   const onLockEvent = nativeLockObserver(
     options.local?.onLockEvent ?? options.vault?.onLockEvent,
   )
   const withLock = observeNativeLocks(() => acquireLock, onLockEvent)
   const now = options.local?.now ?? options.vault?.now ?? Date.now
-  const env = { ...(options.vault?.env ?? process.env) }
-  const runtimeSettings = createNativeRuntimeSettings({ ...options, env })
   const vaultPaths = nativeVaultPaths(paths)
   const relocation = nativeRelocationGuard(paths)
   // A state-home process stops serving once its dataset is in conflict; a
