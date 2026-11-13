@@ -495,7 +495,7 @@ describe('OpenCode 1 settings service reads', () => {
   }
 
   for (const custody of ['local', 'claustrum'] as const) {
-    test(`a ${custody} user-file projection never reaches a legacy write, including later account updates`, async () => {
+    test(`a ${custody} user-file projection never reaches a legacy write, including account-order writes`, async () => {
       if (custody === 'claustrum') {
         const vault = mainOnlyVault()
         await useVaultAccountFile(
@@ -521,7 +521,12 @@ describe('OpenCode 1 settings service reads', () => {
       expect(
         (await instance.runtime.read()).policyStorage.claudeCache?.enabled,
       ).toBe('on')
-      await instance.runtime.setEnabled('main', false)
+      const order = ['settings-test-account']
+      const ordered = await instance.runtime.updateSettings((settings) => ({
+        ...settings,
+        nativeAccountOrder: order,
+      }))
+      expect(ordered.outcome).toBe('saved')
       const result = await applyMenuAction(
         ctx,
         instance.plugin,
@@ -533,6 +538,7 @@ describe('OpenCode 1 settings service reads', () => {
       )
       expect(result.ok).toBe(true)
       const stored = await readNativeSettings(ctx)
+      expect(stored.nativeAccountOrder).toEqual(order)
       expect(stored.claudeCache).toEqual(before.claudeCache)
       expect(stored.quota).toEqual(before.quota)
       expect(JSON.stringify(stored)).not.toMatch(/"(?:default|on|off)"/)
