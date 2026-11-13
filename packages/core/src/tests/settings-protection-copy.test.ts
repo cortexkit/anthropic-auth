@@ -375,6 +375,65 @@ test('a failed copy write is retried off the request path and logged once', asyn
   ).toHaveLength(1)
 })
 
+test('a failed copy of a stricter reading is retried after the file turns corrupt, and a restart recovers it', async () => {
+  const f = await fixture()
+  const retries: (() => void)[] = []
+  let failing = false
+  let attempts = 0
+  let settled = 0
+  const service = await f.open('pi', {
+    dependencies: {
+      schedule: (callback, delayMs) => {
+        if (delayMs === 60_000) retries.push(callback)
+        return () => {}
+      },
+      writeAppliedCopy: async (...args) => {
+        attempts++
+        try {
+          if (failing) throw new Error('transient copy failure')
+          await writeSettingsProtectionCopy(...args)
+        } finally {
+          settled++
+        }
+      },
+    },
+  })
+  // Wait until the given number of copy writes have finished, then let the
+  // failure handler run.
+  const settle = async (count: number) => {
+    for (let i = 0; i < 400 && settled < count; i++)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  await settle(1)
+  expect(
+    (await readSettingsProtectionCopy(f.file, 'pi'))
+      ?.killswitch_default_five_hour,
+  ).toBe(21)
+  // The stricter reading's copy write fails.
+  failing = true
+  await writeFile(
+    f.file,
+    JSON.stringify({ ...complete, killswitch_default_five_hour: 61 }),
+  )
+  await service.refresh()
+  await settle(2)
+  expect(retries).toHaveLength(1)
+  // The file then turns corrupt before the retry runs.
+  await writeFile(f.file, '{broken')
+  await service.refresh()
+  expect(service.snapshot().protection.pi.rung).toBe(1)
+  expect(service.resolve('pi').killswitch_default_five_hour).toBe(61)
+  failing = false
+  retries[0]!()
+  await settle(3)
+  expect(attempts).toBe(3)
+  await service.dispose()
+  const restart = await f.open()
+  expect(restart.snapshot().protection.pi.rung).toBe(1)
+  expect(restart.resolve('pi').killswitch_default_five_hour).toBe(61)
+})
+
 for (const order of ['opencode-first', 'pi-first', 'concurrent'] as const) {
   test(`both hosts preserve distinct whole sets across processes: ${order}`, async () => {
     const f = await fixture({

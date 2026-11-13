@@ -1144,6 +1144,19 @@ class SettingsProtectionLease {
   private readonly copies = new Set<Promise<void>>()
   /** The last submitted copy write: its values and reading time. */
   private copied: string | undefined
+  /**
+   * The newest usable reading of this host's set whose copy is not known to
+   * be saved. A retry writes exactly this reading, even after the file has
+   * become unusable, until it is saved or a newer usable reading replaces it.
+   */
+  private unsaved:
+    | {
+        file: string
+        readAt: number
+        values: SettingsProtectionValues
+        identity: string
+      }
+    | undefined
   private cancelRetry: (() => void) | undefined
   private closed = false
 
@@ -1170,6 +1183,19 @@ class SettingsProtectionLease {
     // whichever reading is newest, across processes.
     const identity = JSON.stringify([generation.readAt, set.values])
     if (identity === this.copied) return
+    this.unsaved = {
+      file: generation.file,
+      readAt: generation.readAt,
+      values: set.values,
+      identity,
+    }
+    this.write(this.unsaved)
+  }
+
+  private write(entry: NonNullable<SettingsProtectionLease['unsaved']>) {
+    const host = this.options?.host
+    if (!host || this.closed) return
+    const { identity } = entry
     this.copied = identity
     this.cancelRetry?.()
     this.cancelRetry = undefined
@@ -1179,19 +1205,22 @@ class SettingsProtectionLease {
     const task = Promise.resolve()
       .then(() =>
         write(
-          generation.file,
+          entry.file,
           host,
-          { readAt: generation.readAt, values: set.values },
+          { readAt: entry.readAt, values: entry.values },
           this.options?.lockTimeoutMs,
         ),
       )
+      .then(() => {
+        if (this.unsaved === entry) this.unsaved = undefined
+      })
       .catch(() => {
-        const key = `copy:${generation.file}:${host}`
+        const key = `copy:${entry.file}:${host}`
         if (!logged.has(key)) {
           logged.add(key)
           logger.warn(
             'settings',
-            `Could not save applied protection settings for ${host} at "${generation.file}.applied.json"; the previous copy is unchanged until a retry succeeds.`,
+            `Could not save applied protection settings for ${host} at "${entry.file}.applied.json"; the previous copy is unchanged until a retry succeeds.`,
           )
         }
         // Not done: the next generation or a retry within a minute submits again.
@@ -1204,7 +1233,7 @@ class SettingsProtectionLease {
     this.copies.add(task)
   }
 
-  /** Retry a failed copy write off the request path, with the newest applied generation. */
+  /** Retry a failed copy write off the request path, with the newest unsaved usable reading. */
   private scheduleRetry() {
     if (this.closed || this.cancelRetry) return
     const schedule =
@@ -1216,7 +1245,9 @@ class SettingsProtectionLease {
       })
     this.cancelRetry = schedule(() => {
       this.cancelRetry = undefined
-      if (this.current) this.persist(this.current)
+      // Not `this.current`: the file may have become corrupt or missing since,
+      // and the reading that failed to save is still the newest usable one.
+      if (this.unsaved) this.write(this.unsaved)
     }, 60_000)
   }
 
