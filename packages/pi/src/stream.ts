@@ -351,6 +351,9 @@ function getPiRoutingServices(
   return { quotaManager, getUsableFallbackAccounts }
 }
 
+/** Exercise fallback eligibility without authorizing or sending a request. */
+export const __getPiRoutingServicesForTest = getPiRoutingServices
+
 async function getPiStickyRouter(storagePath: string) {
   const { path, vaultSeed } =
     await getPiNativeRuntime(storagePath).routingStorage()

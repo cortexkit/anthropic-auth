@@ -109,6 +109,9 @@ function requestPolicy(
   }
 }
 
+/** Exercise request admission against an isolated policy snapshot in tests. */
+export const __piRequestPolicyForTest = requestPolicy
+
 const runtimes = new Map<
   string,
   { contextKey: string; storagePath: string; runtime: PiNativeRuntime }
