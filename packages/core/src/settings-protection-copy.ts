@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import { readFile, rename, rm } from 'node:fs/promises'
+import { readFile, rm } from 'node:fs/promises'
 import { withLock } from '@cortexkit/common-auth/fs'
-
+import {
+  capturePublicationOptions,
+  type PublicationOptions,
+  renameWithWindowsSharingRetry,
+} from './publication-rename.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import {
   SETTINGS_PROTECTION_KEYS,
@@ -81,11 +85,16 @@ function validEntry(value: unknown): value is SettingsProtectionCopyEntry {
 }
 
 async function readCopy(file: string): Promise<Record<string, unknown>> {
-  const copy: unknown = JSON.parse(
-    await readFile(`${file}.applied.json`, 'utf8'),
-  )
-  if (!record(copy)) throw new Error('Invalid protection copy')
-  return copy
+  const text = await readFile(`${file}.applied.json`, 'utf8')
+  let copy: unknown
+  try {
+    copy = JSON.parse(text)
+  } catch {
+    // Malformed JSON cannot preserve either host's saved values, so let the
+    // writer recreate the copy. Filesystem read errors still propagate.
+    return {}
+  }
+  return record(copy) ? copy : {}
 }
 
 /** Missing or invalid host entries return no values, never a partial protection set. */
@@ -107,8 +116,10 @@ export async function writeSettingsProtectionCopy(
   host: SettingsHost,
   entry: SettingsProtectionCopyEntry,
   lockTimeoutMs = 5_000,
+  publicationOptions: PublicationOptions = {},
 ): Promise<void> {
   if (!validEntry(entry)) throw new Error('Invalid protection copy entry')
+  const publication = capturePublicationOptions(publicationOptions)
   const path = `${file}.applied.json`
   await withLock(
     path,
@@ -143,7 +154,15 @@ export async function writeSettingsProtectionCopy(
           process.platform,
         )
         await lease.assertOwned()
-        await rename(temp, path)
+        await renameWithWindowsSharingRetry(
+          temp,
+          path,
+          publication,
+          async () => {
+            await lease.assertOwned()
+            return 'publish'
+          },
+        )
       } finally {
         await rm(temp, { force: true })
       }

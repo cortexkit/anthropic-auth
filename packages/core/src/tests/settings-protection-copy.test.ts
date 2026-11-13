@@ -428,6 +428,142 @@ for (const missing of [false, true]) {
   }
 }
 
+for (const contents of ['{bad-copy', 'null', '[]', '"invalid"', '17']) {
+  for (const host of ['opencode', 'pi'] as const) {
+    test(`${host} repairs a corrupt copy ${contents} without inventing the other host's set`, async () => {
+      const f = await fixture()
+      await writeFile(`${f.file}.applied.json`, contents)
+      expect(await readSettingsProtectionCopy(f.file, host)).toBeUndefined()
+      await writeSettingsProtectionCopy(f.file, host, {
+        readAt: 1,
+        values: complete,
+      })
+      expect(await readSettingsProtectionCopy(f.file, host)).toEqual(complete)
+      const other = host === 'pi' ? 'opencode' : 'pi'
+      expect(await readSettingsProtectionCopy(f.file, other)).toBeUndefined()
+      expect(
+        Object.keys(
+          JSON.parse(await readFile(`${f.file}.applied.json`, 'utf8')),
+        ),
+      ).toEqual([host])
+    })
+  }
+}
+
+test('copy publication retries a transient Windows sharing violation before replacing the old set', async () => {
+  const f = await fixture()
+  await writeSettingsProtectionCopy(f.file, 'pi', {
+    readAt: 1,
+    values: complete,
+  })
+  const before = await readFile(`${f.file}.applied.json`, 'utf8')
+  const next = { ...complete, killswitch_default_five_hour: 91 }
+  let attempts = 0
+  let now = 0
+  const sleeps: number[] = []
+  await writeSettingsProtectionCopy(
+    f.file,
+    'pi',
+    { readAt: 2, values: next },
+    undefined,
+    {
+      platform: 'win32',
+      now: () => now,
+      sleep: async (ms) => {
+        expect(await readFile(`${f.file}.applied.json`, 'utf8')).toBe(before)
+        sleeps.push(ms)
+        now += ms
+      },
+      rename: async (from, to) => {
+        if (++attempts === 1)
+          throw Object.assign(new Error('file is open'), { code: 'EPERM' })
+        await fs.rename(from, to)
+      },
+    },
+  )
+  expect(attempts).toBe(2)
+  expect(sleeps).toEqual([10])
+  expect(await readSettingsProtectionCopy(f.file, 'pi')).toEqual(next)
+})
+
+test('copy publication keeps the old set when Windows sharing violations exhaust retries', async () => {
+  const f = await fixture()
+  await writeSettingsProtectionCopy(f.file, 'pi', {
+    readAt: 1,
+    values: complete,
+  })
+  const before = await readFile(`${f.file}.applied.json`, 'utf8')
+  const failure = Object.assign(new Error('file remains open'), {
+    code: 'EPERM',
+  })
+  let attempts = 0
+  let now = 0
+  await expect(
+    writeSettingsProtectionCopy(
+      f.file,
+      'pi',
+      { readAt: 2, values: complete },
+      undefined,
+      {
+        platform: 'win32',
+        now: () => now,
+        sleep: async (ms) => {
+          now += ms
+        },
+        rename: async () => {
+          attempts++
+          throw failure
+        },
+      },
+    ),
+  ).rejects.toBe(failure)
+  expect(attempts).toBe(6)
+  expect(await readFile(`${f.file}.applied.json`, 'utf8')).toBe(before)
+})
+
+test('a Windows retry rechecks copy lock ownership before attempting replacement again', async () => {
+  const f = await fixture()
+  await writeSettingsProtectionCopy(f.file, 'pi', {
+    readAt: 1,
+    values: complete,
+  })
+  const before = await readFile(`${f.file}.applied.json`, 'utf8')
+  const failure = Object.assign(new Error('file is open'), { code: 'EPERM' })
+  let attempts = 0
+  let now = 0
+  const result = await writeSettingsProtectionCopy(
+    f.file,
+    'pi',
+    { readAt: 2, values: complete },
+    undefined,
+    {
+      platform: 'win32',
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms
+      },
+      rename: async () => {
+        attempts++
+        const path = `${f.file}.applied.json.protection.lock`
+        const lock = JSON.parse(await readFile(path, 'utf8'))
+        await writeFile(
+          path,
+          JSON.stringify({ ...lock, ownerId: 'successor-owner' }),
+        )
+        throw failure
+      },
+    },
+  ).then(
+    () => ({ ok: true as const }),
+    (error) => ({ ok: false as const, error }),
+  )
+  expect(result.ok).toBe(false)
+  if (!result.ok) expect(result.error).not.toBe(failure)
+  expect(attempts).toBe(1)
+  expect(now).toBe(10)
+  expect(await readFile(`${f.file}.applied.json`, 'utf8')).toBe(before)
+})
+
 test('whole-set copy validation rejects missing fields, bad scalars, bad entries and overlaps', async () => {
   const f = await fixture('{broken')
   const incomplete = { ...complete } as Partial<SettingsProtectionValues>
@@ -481,6 +617,10 @@ test('whole-set copy validation rejects missing fields, bad scalars, bad entries
   await rm(`${f.file}.applied.json`)
   await mkdir(`${f.file}.applied.json`)
   expect(await readSettingsProtectionCopy(f.file, 'pi')).toBeUndefined()
+  await expect(
+    writeSettingsProtectionCopy(f.file, 'pi', { readAt: 1, values: complete }),
+  ).rejects.toBeInstanceOf(Error)
+  expect((await stat(`${f.file}.applied.json`)).isDirectory()).toBe(true)
 })
 
 test('a writer preserves even an invalid other-host entry without reading it as its own', async () => {
