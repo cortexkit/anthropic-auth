@@ -279,28 +279,40 @@ export class PiNativeRuntime {
           identity,
         },
       }
-      const settings = await openPiSettings(
-        runtimeOptions,
-        env,
-        home,
-        registration,
-        options.settings,
-      )
-      this.settings = settings.service
+      let warned = false
+      const warnSettings = () => {
+        if (warned) return
+        warned = true
+        logger.warn(
+          'settings',
+          'Pi settings initialization failed; continuing with available settings.',
+        )
+      }
+      let settings: Awaited<ReturnType<typeof openPiSettings>> | undefined
+      try {
+        settings = await openPiSettings(
+          runtimeOptions,
+          env,
+          home,
+          registration,
+          options.settings,
+        )
+      } catch {
+        warnSettings()
+      }
+      this.settings = settings?.service
       const runtime = acquireNativeAccountRuntime({
         ...runtimeOptions,
-        settingsFile: settings.file,
-        settingsService: settings.service,
-        settingsMode: () => settings.mode,
+        settingsFile: settings?.file,
+        settingsService: settings?.service,
+        settingsMode: () => settings?.mode ?? 'legacy',
         settingsAuthority: options.settings?.authority,
       })
       try {
         await runtime.prepareSettingsAction?.()
-      } catch (error) {
-        await runtime.close()
-        await this.settings?.dispose()
-        this.settings = undefined
-        throw error
+      } catch {
+        // A failed settings check must not stop authentication requests.
+        warnSettings()
       }
       // Apply local or vault preferences before the watcher can log. Match
       // OpenCode's startup precedence without blocking migration refusals.

@@ -170,6 +170,84 @@ test('service awaits the move and first resolve; requests make no settings files
   }
 })
 
+for (const failure of ['move', 'service open'] as const) {
+  test(`Pi keeps serving legacy settings when the settings ${failure} throws`, async () => {
+    await saveNativePiFixture(
+      {
+        version: 1,
+        accounts: [],
+        prime: { enabled: false },
+        routing: { mode: 'fallback-first' },
+        claudeCache: { enabled: false },
+        quota: { enabled: false },
+      },
+      storagePath,
+    )
+    const options = settingsOptions()
+    const fail = () => {
+      throw new Error(`private settings failure at ${file}`)
+    }
+    if (failure === 'move') options.startup = { dependencies: { move: fail } }
+    else options.service = { dependencies: { open: fail } }
+    const native = runtime(options)
+    const service = await native.service()
+    const first = await native.requestView()
+    const second = await native.requestView()
+    expect(first.policyStorage.routing?.mode).toBe('fallback-first')
+    expect(first.policyStorage.claudeCache?.enabled).toBe(false)
+    expect(second.policyStorage.quota?.enabled).toBe(false)
+    expect(await service.getSettingsPath()).not.toBe(file)
+    const warnings = records.filter(
+      (record) =>
+        record.message ===
+        'Pi settings initialization failed; continuing with available settings.',
+    )
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatchObject({ level: 'warn', channel: 'settings' })
+    expect(warnings[0]?.payload).toBeUndefined()
+    expect(warnings[0]?.message).not.toContain(file)
+    expect(warnings[0]?.message).not.toContain('private settings failure')
+  })
+}
+
+test('Pi keeps serving when the first settings action preparation throws', async () => {
+  await write({ routing_mode: 'fallback-first' })
+  const acquire = core.acquireNativeAccountRuntime
+  let closes = 0
+  const spy = spyOn(core, 'acquireNativeAccountRuntime').mockImplementation(
+    (options) => {
+      const service = acquire(options)
+      return {
+        ...service,
+        prepareSettingsAction: async () => {
+          throw new Error('private authority failure')
+        },
+        close: () => {
+          closes++
+          return service.close()
+        },
+      }
+    },
+  )
+  try {
+    const native = runtime()
+    await native.service()
+    expect((await native.requestView()).policyStorage.routing?.mode).toBe(
+      'fallback-first',
+    )
+    expect(closes).toBe(0)
+    const warnings = records.filter(
+      (record) =>
+        record.message ===
+        'Pi settings initialization failed; continuing with available settings.',
+    )
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]?.level).toBe('warn')
+  } finally {
+    spy.mockRestore()
+  }
+})
+
 test('five model settings resolve per request row, while unknown models use no-model values', async () => {
   await write({
     claude_cache_enabled: {
