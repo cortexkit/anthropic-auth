@@ -5,6 +5,7 @@ import {
   moveSettingsOnce,
 } from '@cortexkit/common-auth/settings'
 
+import { HOLDER_LOCK_NAME } from './holder-registry.ts'
 import { logger } from './logger.ts'
 import {
   differingLegacySettings,
@@ -22,6 +23,7 @@ import {
 import {
   checkSettingsMoveFence,
   type SettingsMoveFenceOptions,
+  settingsMoveHolderFiles,
 } from './settings-move-fence.ts'
 import { mapSettingsMoveSources } from './settings-move-map.ts'
 import { readSettingsMoveSource } from './settings-move-source.ts'
@@ -158,11 +160,41 @@ export async function runSettingsMoveAtStartup(
       )
     return result('legacy', 'source-unavailable')
   }
+  // Hold every holder file's `holders` lock, in sorted path order, ahead of
+  // the source locks and through publication, so no process can register
+  // between the fence's last check (made by the mover under these locks)
+  // and the published file. This cannot deadlock: a registrant holds one
+  // `holders` lock at a time and takes no other lock while holding it, and
+  // the state-layout mover takes `holders` locks in the same sorted order
+  // before any data lock, as this move does.
+  let holderFiles: string[]
+  try {
+    holderFiles = await settingsMoveHolderFiles({
+      ...options,
+      ...options.fence,
+      stores,
+    })
+  } catch {
+    return result('legacy', 'fence-closed')
+  }
+  const [first, ...rest] = prepared.sources
+  const sources = first
+    ? [
+        {
+          ...first,
+          locks: [
+            ...holderFiles.map((path) => ({ path, name: HOLDER_LOCK_NAME })),
+            ...first.locks,
+          ],
+        },
+        ...rest,
+      ]
+    : []
   const move = await (options.dependencies?.move ?? moveSettingsOnce)({
     definition: settingsDefinition,
     target: paths.target,
     separateInstall: false,
-    sources: prepared.sources,
+    sources,
     map: mapSettingsMoveSources,
     fence: async () =>
       !(await hasSettingsMoveMarker(paths.target, authority)) &&

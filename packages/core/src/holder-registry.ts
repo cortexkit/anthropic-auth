@@ -484,6 +484,10 @@ export async function assertUnmanagedInjectedPaths(
 }
 
 const instance = randomUUID()
+/** This copy of the code's `instance`, as its holder entries record it. */
+export function holderInstance(): string {
+  return instance
+}
 let ownIncarnation: Promise<string | null> | undefined
 /**
  * Registrations this copy of the code has published, by holder file, kind,

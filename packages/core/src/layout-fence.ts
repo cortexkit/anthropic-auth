@@ -260,7 +260,19 @@ export async function preNArtifactBlockers(
   locations: PreNArtifactLocations,
   pidAlive: (pid: number) => boolean = defaultLiveness.pidAlive,
   clock: Pick<HolderLiveness, 'now' | 'uptime'> = {},
+  /**
+   * When set, a stamped artifact counts as older too unless this accepts its
+   * `writer.release`: its writer may be a release below a later fence's
+   * floor whose holder registration is still pending.
+   */
+  acceptsRelease?: (release: unknown) => boolean,
 ): Promise<FenceBlocker[]> {
+  const exempt = (value: unknown) =>
+    stamped(value) &&
+    (!acceptsRelease ||
+      acceptsRelease(
+        (value as { writer: { release?: unknown } }).writer.release,
+      ))
   const blockers: FenceBlocker[] = []
   const portDirs = [...locations.rpcDirs]
   for (const root of locations.rpcRoots)
@@ -271,7 +283,7 @@ export async function preNArtifactBlockers(
       if (!/^port-\d+\.json$/.test(name)) continue
       const path = join(dir, name)
       const record = await readArtifact(path, blockers)
-      if (record === undefined || stamped(record.value)) continue
+      if (record === undefined || exempt(record.value)) continue
       const { value, startedAt } = record
       const pid = (value as { pid?: unknown }).pid
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
@@ -288,7 +300,7 @@ export async function preNArtifactBlockers(
       if (!match) continue
       const path = join(dir, name)
       const record = await readArtifact(path, blockers)
-      if (record === undefined || stamped(record.value)) continue
+      if (record === undefined || exempt(record.value)) continue
       const pid = Number(match[1])
       if (!recordPredatesBoot(record.startedAt, clock) && pidAlive(pid))
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })

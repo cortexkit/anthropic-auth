@@ -119,9 +119,13 @@ test('an injected prerelease floor compares numeric and lexical prerelease ident
   }
 })
 
-test('only the same pid and process start are excluded, even across code copies', async () => {
+test('only this code copy is excluded; another copy in the same process is judged by its release', async () => {
   const options = await fixture()
-  for (const release of ['2.11.2', 'unknown']) {
+  for (const [release, open] of [
+    ['2.11.2', false],
+    ['unknown', false],
+    [FLOOR, true],
+  ] as const) {
     expect(
       (
         await checkSettingsMoveFence({
@@ -131,8 +135,23 @@ test('only the same pid and process start are excluded, even across code copies'
           }),
         })
       ).open,
-    ).toBe(true)
+      release,
+    ).toBe(open)
   }
+  // This copy's own entry never closes the fence, whatever it records.
+  expect(
+    (
+      await checkSettingsMoveFence({
+        ...options,
+        self: { ...self, instance: 'own-copy' },
+        readHolders: async () => ({
+          entries: [
+            holder({ ...self, release: 'unknown', instance: 'own-copy' }),
+          ],
+        }),
+      })
+    ).open,
+  ).toBe(true)
   const result = await checkSettingsMoveFence({
     ...options,
     // The peer has the same recorded start but another pid; it is not self.
@@ -450,7 +469,7 @@ test('failed or pending registration closes only the move without refusing start
 })
 
 for (const host of ['opencode', 'pi'] as const) {
-  test(`unstamped ${host} RPC and CacheKeep artifacts close the settings fence`, async () => {
+  test(`unstamped ${host} RPC and CacheKeep artifacts, and those stamped below the floor, close the settings fence`, async () => {
     const options = await fixture()
     const rpcRoot = join(options.home, 'rpc')
     const rpcDir = join(rpcRoot, host)
@@ -462,13 +481,21 @@ for (const host of ['opencode', 'pi'] as const) {
         kind === 'rpc'
           ? join(rpcDir, 'port-200.json')
           : join(cacheDir, '200-record.json')
-      for (const stamped of [false, true]) {
+      // A stamped writer may still be waiting to register as a holder, so
+      // its own release decides: only one at or above the floor passes.
+      for (const [writer, open] of [
+        [undefined, false],
+        [{ protocol: 1 }, false],
+        [{ protocol: 1, release: '2.11.2' }, false],
+        [{ protocol: 1, release: 'unknown' }, false],
+        [{ protocol: 1, release: FLOOR }, true],
+      ] as const) {
         await writeFile(
           file,
           JSON.stringify({
             pid: 200,
             startedAt: NOW,
-            ...(stamped ? { writer: { protocol: 1 } } : {}),
+            ...(writer ? { writer } : {}),
           }),
         )
         const result = await checkSettingsMoveFence({
@@ -480,9 +507,9 @@ for (const host of ['opencode', 'pi'] as const) {
             cacheKeepDirs: [cacheDir],
           },
         })
-        expect(result.open).toBe(stamped)
+        expect(result.open, JSON.stringify(writer)).toBe(open)
         expect(result.blockers).toEqual(
-          stamped ? [] : [{ kind: 'pre-n-artifact', artifact: file, pid: 200 }],
+          open ? [] : [{ kind: 'pre-n-artifact', artifact: file, pid: 200 }],
         )
       }
       await rm(file)

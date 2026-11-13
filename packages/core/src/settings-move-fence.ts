@@ -6,6 +6,7 @@ import {
   type HolderLiveness,
   holderEntryIsLive,
   holderEntryLiveness,
+  holderInstance,
   type NativeHolderRegistration,
   processIncarnation,
   readHolderFile,
@@ -51,7 +52,13 @@ export interface SettingsMoveFenceOptions extends PathResolutionOptions {
   /** A failed or still-pending registration prevents only this settings move. */
   registration: Pick<NativeHolderRegistration, 'status'> | undefined
   floor?: string
-  self?: Pick<HolderEntry, 'pid' | 'incarnation'>
+  /**
+   * This code copy's own holder entry, the only one the fence ignores.
+   * `instance` defaults to this copy's; another copy of the code loaded in
+   * the same process is judged by its release like any other holder.
+   */
+  self?: Pick<HolderEntry, 'pid' | 'incarnation'> &
+    Partial<Pick<HolderEntry, 'instance'>>
   liveness?: HolderLiveness
   artifacts?: PreNArtifactLocations
   /** Tests inject holder sets without consulting the installed package release. */
@@ -118,9 +125,12 @@ export async function checkSettingsMoveFence(
   if (!floor)
     return { open: false, blockers: [{ kind: 'floor', release: floorText }] }
   const context = resolvePathOptions(options)
-  const self = options.self ?? {
-    pid: process.pid,
-    incarnation: await processIncarnation(process.pid),
+  const self = {
+    ...(options.self ?? {
+      pid: process.pid,
+      incarnation: await processIncarnation(process.pid),
+    }),
+    instance: options.self?.instance ?? holderInstance(),
   }
   let holderFiles: string[]
   try {
@@ -161,7 +171,11 @@ export async function checkSettingsMoveFence(
         })
         continue
       }
-      if (life.pid === self.pid && life.incarnation === self.incarnation)
+      if (
+        life.pid === self.pid &&
+        life.incarnation === self.incarnation &&
+        (value as { instance?: unknown }).instance === self.instance
+      )
         continue
       if (!(await holderEntryIsLive(life, options.liveness))) continue
       const releaseText = (value as { release?: unknown }).release
@@ -183,6 +197,11 @@ export async function checkSettingsMoveFence(
       defaultPreNArtifactLocations(context.env, context.home),
     options.liveness?.pidAlive,
     options.liveness,
+    (release) => {
+      const parsed =
+        typeof release === 'string' ? parseRelease(release) : undefined
+      return !!parsed && compareRelease(parsed, floor) >= 0
+    },
   )
   for (const blocker of artifactBlockers) {
     if (blocker.kind === 'pre-n-artifact' || blocker.kind === 'artifact-scan')

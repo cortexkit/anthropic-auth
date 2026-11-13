@@ -5,7 +5,7 @@ import { dirname, join, win32 } from 'node:path'
 import { withLock } from '@cortexkit/common-auth/fs'
 import { parse } from 'jsonc-parser'
 
-import type { HolderEntry } from '../holder-registry.ts'
+import { HOLDER_FILE_NAME, type HolderEntry } from '../holder-registry.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
@@ -121,7 +121,7 @@ async function fixture(host: SettingsHost = 'opencode') {
     fence: {
       registration: { status: 'registered' },
       floor: '2.12.0',
-      self: { pid: 100, incarnation: 'self' },
+      self: { pid: 100, incarnation: 'self', instance: 'own-copy' },
       liveness: { pidAlive: () => true, incarnation: async () => 'peer' },
       artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
       readHolders: async () => undefined,
@@ -352,6 +352,73 @@ for (const release of [
   })
 }
 
+async function heldHolderLock(
+  holderFile: string,
+  work: () => Promise<void>,
+): Promise<void> {
+  await withLock(
+    holderFile,
+    { name: 'holders', ttlMs: 10_000, timeoutMs: 20_000, renew: true },
+    work,
+  )
+}
+
+test('an older holder registering while the move waits for its holder lock keeps the move from publishing', async () => {
+  const f = await fixture()
+  f.options.fence.readHolders = undefined
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { killswitch: { enabled: true } })
+  const holderFile = join(
+    dirname(f.paths.defaults.pi.account),
+    HOLDER_FILE_NAME,
+  )
+  let started: ReturnType<typeof f.start> | undefined
+  await heldHolderLock(holderFile, async () => {
+    started = f.start()
+    // The move passes its first, unlocked check and then waits for this lock.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    await fs.writeFile(
+      holderFile,
+      JSON.stringify({ version: 1, entries: [holder('2.11.2')] }),
+    )
+  })
+  expect((await started)?.outcome).toBe('fence-closed')
+  expect(await absent(f.paths.target)).toBe(true)
+  expect(await absent(f.paths.marker)).toBe(true)
+})
+
+test("an older holder can't register between the move's last fence check and publication", async () => {
+  const f = await fixture()
+  f.options.fence.readHolders = undefined
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { killswitch: { enabled: true } })
+  const holderFile = join(
+    dirname(f.paths.defaults.pi.account),
+    HOLDER_FILE_NAME,
+  )
+  let registration: Promise<void> | undefined
+  let registered = false
+  let registeredBeforePublish: boolean | undefined
+  setSettingsMoveStepHookForTest(async (step: string) => {
+    // 'locked' runs right after the mover's fence check under its locks.
+    if (step === 'locked') {
+      registration = heldHolderLock(holderFile, async () => {
+        await fs.writeFile(
+          holderFile,
+          JSON.stringify({ version: 1, entries: [holder('2.11.2')] }),
+        )
+        registered = true
+      })
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    }
+    if (step === 'before-publish') registeredBeforePublish = registered
+  })
+  expect((await f.start()).outcome).toBe('moved')
+  expect(registeredBeforePublish).toBe(false)
+  await registration
+  expect(registered).toBe(true)
+})
+
 test('the own lower-release holder is excluded and a separate install never moves or opens the service', async () => {
   const f = await fixture()
   f.options.fence.readHolders = async () => ({
@@ -517,7 +584,7 @@ test('simulated Windows default targets each move and publish their own marker',
     },
     fence: {
       registration: { status: 'registered' },
-      self: { pid: 100, incarnation: 'self' },
+      self: { pid: 100, incarnation: 'self', instance: 'own-copy' },
       artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
       readHolders: async (path) => {
         record(path)
