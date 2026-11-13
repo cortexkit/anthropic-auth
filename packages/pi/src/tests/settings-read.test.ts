@@ -25,6 +25,7 @@ import {
   closePiNativeRuntime,
   getPiNativeRuntime,
   PiNativeRuntime,
+  resolvePiSettingsFromMemory,
 } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
 import { getPiConfigDir } from '../paths.ts'
@@ -48,6 +49,8 @@ beforeEach(async () => {
   original = { ...process.env }
   home = await fs.mkdtemp(join(tmpdir(), 'pi-settings-read-'))
   process.env.HOME = home
+  process.env.USERPROFILE = home
+  process.env.XDG_CONFIG_HOME = join(home, '.config')
   process.env.XDG_STATE_HOME = join(home, 'state')
   delete process.env.OPENCODE_CONFIG_DIR
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
@@ -144,6 +147,68 @@ test('Pi config resolution accepts a sandbox env and home without process global
       home,
     ),
   ).toBe('coding')
+})
+
+test('keep-warm settings resolution never starts I/O for a missing runtime', () => {
+  const stored: core.AccountStorage = {
+    version: 1,
+    accounts: [],
+    dump: { enabled: true },
+  }
+  const path = join(home, 'not-migrated', 'anthropic-auth.json')
+  const realpath = spyOn(fs, 'realpath')
+  const readFile = spyOn(fs, 'readFile')
+  const stat = spyOn(fs, 'stat')
+  try {
+    expect(resolvePiSettingsFromMemory(stored, 'claude-opus-5-5', path)).toBe(
+      stored,
+    )
+    expect(realpath).not.toHaveBeenCalled()
+    expect(readFile).not.toHaveBeenCalled()
+    expect(stat).not.toHaveBeenCalled()
+  } finally {
+    realpath.mockRestore()
+    readFile.mockRestore()
+    stat.mockRestore()
+  }
+})
+
+test('keep-warm settings resolution uses model values from the live cached runtime without I/O', async () => {
+  await write({
+    claude_fast_enabled: { default: false, 'claude-opus-5-5': true },
+  })
+  const native = getPiNativeRuntime(storagePath, {
+    settings: settingsOptions(),
+    vaultPoll: { intervalMs: 0 },
+  })
+  await native.service()
+  const stored: core.AccountStorage = { version: 1, accounts: [] }
+  const realpath = spyOn(fs, 'realpath')
+  const readFile = spyOn(fs, 'readFile')
+  const stat = spyOn(fs, 'stat')
+  try {
+    expect(
+      core.isFastModePersistentlyEnabled(
+        resolvePiSettingsFromMemory(stored, 'claude-opus-5-5', storagePath),
+      ),
+    ).toBe(true)
+    expect(
+      core.isFastModePersistentlyEnabled(
+        resolvePiSettingsFromMemory(stored, 'claude-haiku-4-5', storagePath),
+      ),
+    ).toBe(false)
+    expect(realpath).not.toHaveBeenCalled()
+    expect(readFile).not.toHaveBeenCalled()
+    expect(stat).not.toHaveBeenCalled()
+  } finally {
+    realpath.mockRestore()
+    readFile.mockRestore()
+    stat.mockRestore()
+  }
+  await native.close()
+  expect(
+    resolvePiSettingsFromMemory(stored, 'claude-opus-5-5', storagePath),
+  ).toBe(stored)
 })
 
 test('service awaits the move and first resolve; requests make no settings filesystem calls', async () => {
@@ -893,7 +958,7 @@ for (const mode of ['local', 'claustrum'] as const)
   for (const peer of ['absent', 'same'] as const) {
     test(`every moved setting preserves reader and wire outputs in ${mode} custody with OpenCode ${peer}`, async () => {
       delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
-      file = getSettingsFilePath({ env: process.env, home })
+      file = join(home, '.config', 'cortexkit', 'anthropic-auth.jsonc')
       const stored: core.AccountStorage = {
         version: 1,
         accounts: [],

@@ -7,6 +7,7 @@ delete process.env.CORTEXKIT_VAULT_HOST
 
 let testDir: string | undefined
 let originalXdgStateHome: string | undefined
+let originalHomePaths: [string, string | undefined][] = []
 const activeBodies = new Set<Promise<unknown>>()
 
 /** Bun deadlines do not cancel async bodies; keep their fixture alive until they settle. */
@@ -37,6 +38,15 @@ beforeEach(async () => {
   const source = await import('../../../core/src/native-vault-host.ts')
   source.resetVaultHostAuthorityForTests?.()
   testDir = await mkdtemp(join(tmpdir(), 'anthropic-auth-pi-test-'))
+  originalHomePaths = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME'].map((key) => [
+    key,
+    process.env[key],
+  ])
+  // Settings paths honor inherited home variables before a caller's home argument.
+  // Keep every test's default settings target inside its disposable sandbox.
+  process.env.HOME = testDir
+  process.env.USERPROFILE = testDir
+  process.env.XDG_CONFIG_HOME = join(testDir, '.config')
   originalXdgStateHome = process.env.XDG_STATE_HOME
   for (const key of HOST_PATH_ENV_VARS) delete process.env[key]
   process.env.OPENCODE_CONFIG_DIR = join(testDir, 'opencode')
@@ -57,6 +67,11 @@ afterEach(async () => {
   const retiredBodies = [...activeBodies]
   testDir = undefined
   await Promise.allSettled(retiredBodies)
+  for (const [key, value] of originalHomePaths) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  originalHomePaths = []
   if (originalXdgStateHome === undefined) {
     delete process.env.XDG_STATE_HOME
   } else {

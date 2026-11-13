@@ -138,6 +138,7 @@ import {
   type PiNativeRuntime,
   peekPiNativeSnapshot,
   piAttemptAccessToken,
+  resolvePiSettingsFromMemory,
 } from './native.ts'
 import { getPiAccountStoragePath } from './paths.ts'
 import { type PiPrimeSendOptions, registerPiPrimeSender } from './prime.ts'
@@ -467,8 +468,7 @@ const piCacheKeep = new PiCacheKeep(
     },
     fetchImpl: fetchPiOAuth,
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
-    resolveSettings: (storage, model) =>
-      getPiNativeRuntime().resolveSettings(storage, model),
+    resolveSettings: resolvePiSettingsFromMemory,
     onTrackedSessionsChanged: (sessions) =>
       getPiCacheKeepRegistry().publish(sessions),
     prepareHeaders: async (headers, target, attempt) => {

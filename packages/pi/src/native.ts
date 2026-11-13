@@ -651,14 +651,29 @@ export class PiNativeRuntime {
   }
 }
 
+function cachedPiNativeRuntime(
+  storagePath: string,
+): PiNativeRuntime | undefined {
+  const contextKey = runtimeCacheKey(storagePath)
+  return [...runtimes.values()].find((entry) => entry.contextKey === contextKey)
+    ?.runtime
+}
+
 /** Inspect an existing context without creating a runtime or starting its I/O. */
 export function peekPiNativeSnapshot(
   storagePath = getPiAccountStoragePath(),
 ): NativeAccountSnapshot | undefined {
-  const contextKey = runtimeCacheKey(storagePath)
-  return [...runtimes.values()]
-    .find((entry) => entry.contextKey === contextKey)
-    ?.runtime.peek()
+  return cachedPiNativeRuntime(storagePath)?.peek()
+}
+
+/** When no live runtime exists, resolving settings must not start account I/O. */
+export function resolvePiSettingsFromMemory(
+  stored: AccountStorage,
+  model?: string,
+  storagePath = getPiAccountStoragePath(),
+): AccountStorage {
+  const runtime = cachedPiNativeRuntime(storagePath)
+  return runtime?.peek() ? runtime.resolveSettings(stored, model) : stored
 }
 
 export function getPiNativeRuntime(
