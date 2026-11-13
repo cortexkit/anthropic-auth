@@ -1057,11 +1057,18 @@ usageTests.test(
     })
     usageTests.trackDetached(end)
     try {
-      await new Promise((resolve) => setTimeout(resolve, 200))
+      await end
       expect(ended).toBe(true)
-      expect(
-        (await fixture.runtime.read()).accounts[0]?.lastUsed,
-      ).toBeGreaterThanOrEqual(start)
+      // The pool lock stays held throughout: if lastUsed waited on it, this
+      // never resolves and the test fails at its deadline. A fixed sleep here
+      // failed on loaded CI runners although the write was not blocked.
+      let lastUsed: number | undefined
+      while (lastUsed === undefined) {
+        lastUsed = (await fixture.runtime.read()).accounts[0]?.lastUsed
+        if (lastUsed === undefined)
+          await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(lastUsed).toBeGreaterThanOrEqual(start)
       await lease.assertOwned()
     } finally {
       await lease.release()
