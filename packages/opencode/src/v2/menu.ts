@@ -20,7 +20,9 @@ import {
   type NativeAccountRuntime,
   type NativeAccountSnapshot,
   type NativeMenuDispatch,
+  type NativeSettingsWriteResult,
   nativeAccountCanServe,
+  nativeCacheKeepAlways,
   parseLogLevel,
   resetClaustrumEnrollmentState,
   setDumpEnabled,
@@ -110,12 +112,46 @@ export function createNativeMenuCapabilities(options: {
   >()
   let closed = false
   const write = async (field: string, patch: Record<string, unknown>) => {
-    await runtime.updateSettings((settings) => ({
+    return runtime.updateSettings((settings) => ({
       ...settings,
       [field]: { ...record(settings[field]), ...patch },
     }))
   }
   const done = () => ({ ok: true, text: 'Native Claude settings updated.' })
+  const written = (result: NativeSettingsWriteResult) =>
+    result.outcome === 'refused' || result.outcome === 'failed'
+      ? { ok: false, text: result.reason }
+      : done()
+  const settingsStatus = (summary: string) => {
+    const status = runtime.getSettingsStatus?.()
+    if (!status)
+      return `${summary}\nSettings file: ${runtime.getSettingsPath()}`
+    const { file } = status
+    return [
+      summary,
+      `Settings file: ${file.file}`,
+      ...(file.missing
+        ? ['Settings file is missing; a menu write will recreate it.']
+        : [`Settings file state: ${file.state}`]),
+      ...(file.recreated
+        ? ['Settings file was recreated by a menu write.']
+        : []),
+      ...file.invalidKeys.map((key) => `Invalid setting: ${key}`),
+      ...file.ignoredModelKeys.map(
+        ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
+      ),
+      ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
+      'Settings (no model):',
+      ...Object.entries(status.values).map(
+        ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,
+      ),
+      ...Object.entries(status.modelOverrides).flatMap(([key, rows]) =>
+        (rows ?? []).map(
+          ({ model, value }) => `  ${key} [${model}]: ${JSON.stringify(value)}`,
+        ),
+      ),
+    ].join('\n')
+  }
   const dispatch: NativeMenuDispatch = async (request, options) => {
     if (
       isVaultHosted() &&
@@ -267,21 +303,22 @@ export function createNativeMenuCapabilities(options: {
         await source.resetRouting(request.sessionId)
         return done()
       case 'routing-mode':
-        await write('routing', { mode: request.values.mode })
-        return done()
+        return written(await write('routing', { mode: request.values.mode }))
       case 'routing-max-same-account-wait':
-        await write('routing', {
-          maxSameAccountWait: request.values.maxSameAccountWait,
-        })
-        return done()
+        return written(
+          await write('routing', {
+            maxSameAccountWait: request.values.maxSameAccountWait,
+          }),
+        )
       case 'killswitch-on':
       case 'killswitch-off':
-        await write('killswitch', {
-          enabled: request.action === 'killswitch-on',
-        })
-        return done()
+        return written(
+          await write('killswitch', {
+            enabled: request.action === 'killswitch-on',
+          }),
+        )
       case 'killswitch-set': {
-        await runtime.updateSettings((settings) => {
+        const result = await runtime.updateSettings((settings) => {
           const existing = record(settings.killswitch)
           const accounts = { ...record(existing.accounts) }
           let main = existing.main
@@ -300,36 +337,43 @@ export function createNativeMenuCapabilities(options: {
           }
           return { ...settings, killswitch: { ...existing, main, accounts } }
         })
-        return done()
+        return written(result)
       }
       case 'cache-on':
       case 'cache-off':
-        await write('claudeCache', { enabled: request.action === 'cache-on' })
-        return done()
+        return written(
+          await write('claudeCache', {
+            enabled: request.action === 'cache-on',
+          }),
+        )
       case 'cache-mode':
-        await write('claudeCache', { mode: request.values.mode })
-        return done()
+        return written(
+          await write('claudeCache', { mode: request.values.mode }),
+        )
       case 'cachekeep-always':
-        await write('cacheKeep', { enabled: true, always: true })
-        return done()
+        return written(await runtime.updateSettings(nativeCacheKeepAlways))
       case 'cachekeep-off':
-        await write('cacheKeep', { enabled: false })
-        return done()
+        return written(await write('cacheKeep', { enabled: false }))
       case 'cachekeep-window':
-        await write('cacheKeep', {
-          enabled: true,
-          always: false,
-          startHour: request.values.startHour,
-          endHour: request.values.endHour,
-        })
-        return done()
+        return written(
+          await write('cacheKeep', {
+            enabled: true,
+            always: false,
+            startHour: request.values.startHour,
+            endHour: request.values.endHour,
+          }),
+        )
       case 'cachekeep-subagents':
-        await write('cacheKeep', { subagents: request.values.enabled === 'on' })
-        return done()
+        return written(
+          await write('cacheKeep', {
+            subagents: request.values.enabled === 'on',
+          }),
+        )
       case 'dump-on':
       case 'dump-off': {
         const enabled = request.action === 'dump-on'
-        await write('dump', { enabled })
+        const result = written(await write('dump', { enabled }))
+        if (!result.ok) return result
         // Mirror the persisted switch into this process's Core dump flag, as
         // OpenCode 1 does after its own dump command. The adapter still reads
         // the persisted switch per send; this keeps background Core dumps
@@ -337,22 +381,23 @@ export function createNativeMenuCapabilities(options: {
         try {
           setDumpEnabled(enabled)
         } catch {}
-        return done()
+        return result
       }
       case 'logging-level': {
         const level = parseLogLevel(request.values.level)
         if (!level) throw new Error('Invalid log level')
-        await runtime.setLoggingLevel(level)
-        return done()
+        return written(await runtime.setLoggingLevel(level))
       }
       case 'fast-on':
       case 'fast-off':
-        await write('claudeFast', { enabled: request.action === 'fast-on' })
-        return done()
+        return written(
+          await write('claudeFast', { enabled: request.action === 'fast-on' }),
+        )
       case 'prime-on':
       case 'prime-off':
-        await write('prime', { enabled: request.action === 'prime-on' })
-        return done()
+        return written(
+          await write('prime', { enabled: request.action === 'prime-on' }),
+        )
       case 'start-fire':
         await optionsStart(request.sessionId)
         return { ok: true, text: 'Claude lane start queued in this session.' }
@@ -406,43 +451,49 @@ export function createNativeMenuCapabilities(options: {
           : accounts
       }
       if (command === 'quota')
-        return buildClaudeQuotaSummary({
-          accounts: snapshot.accounts
-            .filter((account) => account.type === 'oauth')
-            .map((account) => ({
-              name: account.label ?? account.id,
-              role:
-                account.id === 'main'
-                  ? ('main' as const)
-                  : ('fallback' as const),
-              enabled: account.enabled,
-              quota: account.quota,
-              tierLabel: formatOAuthAccountTier(account.profile),
-              lastRefreshedAt: account.lastRefreshedAt,
-              error: account.lastQuotaRefreshError?.message,
-            })),
-        }).replace(
-          /Usage:[^\n]*/,
-          'Use /claude to refresh native quota readings.',
+        return settingsStatus(
+          buildClaudeQuotaSummary({
+            accounts: snapshot.accounts
+              .filter((account) => account.type === 'oauth')
+              .map((account) => ({
+                name: account.label ?? account.id,
+                role:
+                  account.id === 'main'
+                    ? ('main' as const)
+                    : ('fallback' as const),
+                enabled: account.enabled,
+                quota: account.quota,
+                tierLabel: formatOAuthAccountTier(account.profile),
+                lastRefreshedAt: account.lastRefreshedAt,
+                error: account.lastQuotaRefreshError?.message,
+              })),
+          }).replace(
+            /Usage:[^\n]*/,
+            'Use /claude to refresh native quota readings.',
+          ),
         )
       if (command === 'prime')
-        return buildPrimeStatusSummary({
-          enabled: snapshot.policyStorage.prime?.enabled === true,
-          accounts: buildPrimeAccountStatuses(snapshot.policyStorage),
-        }).replace(/Usage:[^\n]*/, 'Use /claude to change Prime settings.')
+        return settingsStatus(
+          buildPrimeStatusSummary({
+            enabled: snapshot.policyStorage.prime?.enabled === true,
+            accounts: buildPrimeAccountStatuses(snapshot.policyStorage),
+          }).replace(/Usage:[^\n]*/, 'Use /claude to change Prime settings.'),
+        )
       if (command === 'cachekeep') {
         const sessions = (await options.cacheKeepRegistry?.list()) ?? []
-        return buildCacheKeepStatusSummary({
-          enabled: isCacheKeepPersistentlyEnabled(snapshot.policyStorage),
-          always: isCacheKeepAlways(snapshot.policyStorage),
-          hybridActive: isCacheKeepHybridActive(snapshot.policyStorage),
-          trackedSessionDetails: sessions,
-          window: getCacheKeepWindow(snapshot.policyStorage),
-          trackedSessions: sessions.length,
-          nextPrewarmAt: sessions.length
-            ? Math.min(...sessions.map((session) => session.nextPrewarmAt))
-            : undefined,
-        })
+        return settingsStatus(
+          buildCacheKeepStatusSummary({
+            enabled: isCacheKeepPersistentlyEnabled(snapshot.policyStorage),
+            always: isCacheKeepAlways(snapshot.policyStorage),
+            hybridActive: isCacheKeepHybridActive(snapshot.policyStorage),
+            trackedSessionDetails: sessions,
+            window: getCacheKeepWindow(snapshot.policyStorage),
+            trackedSessions: sessions.length,
+            nextPrewarmAt: sessions.length
+              ? Math.min(...sessions.map((session) => session.nextPrewarmAt))
+              : undefined,
+          }),
+        )
       }
       const fields = {
         routing: 'routing',
@@ -454,7 +505,9 @@ export function createNativeMenuCapabilities(options: {
         fast: 'claudeFast',
         prime: 'prime',
       } as const
-      return JSON.stringify(snapshot.settings[fields[command]] ?? {})
+      return settingsStatus(
+        JSON.stringify(snapshot.settings[fields[command]] ?? {}),
+      )
     },
     async readSidebar(sessionID) {
       const [snapshot, sessions] = await Promise.all([
