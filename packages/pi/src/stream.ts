@@ -467,6 +467,8 @@ const piCacheKeep = new PiCacheKeep(
     },
     fetchImpl: fetchPiOAuth,
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
+    resolveSettings: (storage, model) =>
+      getPiNativeRuntime().resolveSettings(storage, model),
     onTrackedSessionsChanged: (sessions) =>
       getPiCacheKeepRegistry().publish(sessions),
     prepareHeaders: async (headers, target, attempt) => {
@@ -876,7 +878,10 @@ async function sendAnthropicRequest(
   // Capture the serving service while authorization is open. Shutdown rejects
   // new serving work immediately but drains writes for already-served attempts.
   const servingRuntime = await native.service()
-  const snapshot = await native.view()
+  const snapshot = await native.view(
+    options.streamOptions?.signal,
+    options.model.id,
+  )
   const storage = snapshot.policyStorage
   setDumpEnabled(isDumpPersistentlyEnabled(storage))
   const routeId = options.oauthAccountId ?? STICKY_ROUTING_MAIN_ACCOUNT_ID
@@ -1625,7 +1630,10 @@ async function executeWithFallback(options: {
   }
   options = { ...options, routingRelay: routingState.relay }
   const native = getPiNativeRuntime(options.storagePath)
-  let snapshot = await native.requestView(options.streamOptions?.signal)
+  let snapshot = await native.requestView(
+    options.streamOptions?.signal,
+    options.model.id,
+  )
   let storage = snapshot.policyStorage
   const accountView = (id: string) =>
     snapshot.accounts.find((account) => account.id === id)
@@ -1693,7 +1701,10 @@ async function executeWithFallback(options: {
   }
 
   async function refreshRoutingSnapshot() {
-    snapshot = await native.view()
+    snapshot = await native.view(
+      options.streamOptions?.signal,
+      options.model.id,
+    )
     storage = snapshot.policyStorage
     mainAccountId = accountView(STICKY_ROUTING_MAIN_ACCOUNT_ID)?.accountIdentity
     ;({ quotaManager, getUsableFallbackAccounts } = getPiRoutingServices(
@@ -2047,7 +2058,10 @@ async function executeWithFallback(options: {
     const noRouteResponse = async () => {
       if (snapshot.mode === 'claustrum')
         return createNativeVaultNoRouteResponse({
-          snapshot: await native.view(),
+          snapshot: await native.view(
+            options.streamOptions?.signal,
+            options.model.id,
+          ),
           modelId: options.model.id,
           sticky: true,
           sessionId,
@@ -2349,7 +2363,10 @@ async function executeWithFallback(options: {
     }
     if (snapshot.mode === 'claustrum')
       return createNativeVaultNoRouteResponse({
-        snapshot: await native.view(),
+        snapshot: await native.view(
+          options.streamOptions?.signal,
+          options.model.id,
+        ),
         modelId: options.model.id,
         sessionId: options.streamOptions?.sessionId,
       })
@@ -2390,7 +2407,10 @@ async function executeWithFallback(options: {
         const fallback = await tryFallbackAccounts()
         if (fallback) return fallback
       }
-      const current = await native.view()
+      const current = await native.view(
+        options.streamOptions?.signal,
+        options.model.id,
+      )
       return createQuotaRefusalResponse(
         'Killswitch blocked all OAuth routes',
         quotaRefusalTiming({
@@ -2505,7 +2525,7 @@ export function streamCortexKitAnthropic(
           run: () => executeWithFallback(request),
           resume: async (hold) => {
             const native = getPiNativeRuntime(storagePath)
-            const before = await native.requestView(options?.signal)
+            const before = await native.requestView(options?.signal, model.id)
             if (
               hold &&
               (!hold.accountIdentity ||

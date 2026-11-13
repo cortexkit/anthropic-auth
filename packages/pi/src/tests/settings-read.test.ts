@@ -1,0 +1,793 @@
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import * as fs from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import * as core from '@cortexkit/anthropic-auth-core'
+import {
+  __setLogTestSink,
+  getLogLevel,
+  getSettingsFilePath,
+  type LogTestRecord,
+  nativePoolStoreLocks,
+  prepareSettingsMoveSources,
+  resolveNativePoolPaths,
+  setLogLevel,
+  settingsDefinition,
+} from '@cortexkit/anthropic-auth-core'
+import { withLock } from '@cortexkit/common-auth/fs'
+import { openSettings } from '@cortexkit/common-auth/settings'
+import { nativeAccountSettings } from '../../../core/src/native-account-view.ts'
+import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
+import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import { buildAnthropicRequest } from '../convert.ts'
+import {
+  closePiNativeRuntime,
+  getPiNativeRuntime,
+  PiNativeRuntime,
+} from '../native.ts'
+import { createPiNativeCommands } from '../native-commands.ts'
+import { getPiConfigDir } from '../paths.ts'
+import type { PiSettingsOptions } from '../settings.ts'
+import { __sendPiAnthropicRequestForTest } from '../stream.ts'
+import { saveNativePiFixture } from './native-fixture.ts'
+
+let home: string
+let storagePath: string
+let file: string
+let original: NodeJS.ProcessEnv
+const runtimes: PiNativeRuntime[] = []
+let callbacks: (() => void)[]
+let watches: number
+let stops: number
+let settingsReads: number
+let records: LogTestRecord[]
+const level = getLogLevel()
+
+beforeEach(async () => {
+  original = { ...process.env }
+  home = await fs.mkdtemp(join(tmpdir(), 'pi-settings-read-'))
+  process.env.HOME = home
+  process.env.XDG_STATE_HOME = join(home, 'state')
+  delete process.env.OPENCODE_CONFIG_DIR
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+  storagePath = join(home, '.pi', 'agent', 'anthropic-auth.json')
+  file = join(home, 'settings.jsonc')
+  process.env.PI_CODING_AGENT_DIR = getPiConfigDir({}, home)
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  process.env.ANTHROPIC_AUTH_SETTINGS_FILE = file
+  delete process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL
+  callbacks = []
+  watches = 0
+  stops = 0
+  settingsReads = 0
+  records = []
+  __setLogTestSink((record) => records.push(record))
+  await saveNativePiFixture(
+    { version: 1, accounts: [], prime: { enabled: false } },
+    storagePath,
+  )
+})
+afterEach(async () => {
+  await Promise.all(runtimes.splice(0).map((runtime) => runtime.close()))
+  await closePiNativeRuntime(storagePath)
+  __setLogTestSink(null)
+  setLogLevel(level)
+  for (const key of Object.keys(process.env))
+    if (!(key in original)) delete process.env[key]
+  Object.assign(process.env, original)
+  await fs.rm(home, { recursive: true, force: true })
+})
+
+function settingsOptions(): PiSettingsOptions {
+  return {
+    home,
+    service: {
+      dependencies: {
+        writeAppliedCopy: async () => {},
+        readFile: async (path) => {
+          settingsReads++
+          return fs.readFile(path)
+        },
+        open: (options) => {
+          const handle = openSettings<typeof settingsDefinition.settings>(
+            settingsDefinition,
+            options,
+          )
+          return {
+            ...handle,
+            read: async (...args) => {
+              settingsReads++
+              return handle.read(...args)
+            },
+            watch: (callback) => {
+              callbacks.push(callback)
+              watches++
+              return () => {
+                stops++
+              }
+            },
+          }
+        },
+      },
+    },
+  }
+}
+function runtime(settings = settingsOptions()) {
+  const native = new PiNativeRuntime(storagePath, {
+    settings,
+    vaultPoll: { intervalMs: 0 },
+  })
+  runtimes.push(native)
+  return native
+}
+async function write(value: Record<string, unknown>) {
+  await fs.writeFile(
+    file,
+    JSON.stringify({ schema_version: 1, prime_enabled: false, ...value }),
+  )
+}
+async function changed(native: PiNativeRuntime, predicate: () => boolean) {
+  for (const callback of callbacks) callback()
+  const deadline = Date.now() + 2000
+  while (!predicate() && Date.now() < deadline) await Bun.sleep(5)
+  expect(predicate()).toBe(true)
+  return native.requestView()
+}
+
+test('Pi config resolution accepts a sandbox env and home without process globals', () => {
+  expect(getPiConfigDir({}, home)).toBe(join(home, '.pi', 'agent'))
+  expect(getPiConfigDir({ PI_AGENT_DIR: ' agent ' }, home)).toBe('agent')
+  expect(
+    getPiConfigDir(
+      { PI_CODING_AGENT_DIR: ' coding ', PI_AGENT_DIR: 'agent' },
+      home,
+    ),
+  ).toBe('coding')
+})
+
+test('service awaits the move and first resolve; requests make no settings filesystem calls', async () => {
+  const native = runtime()
+  const service = await native.service()
+  expect(await service.getSettingsPath()).toBe(file)
+  expect(JSON.parse(await fs.readFile(`${file}.moved`, 'utf8')).target).toBe(
+    file,
+  )
+  expect((await native.requestView()).policyStorage.quota?.enabled).toBe(
+    'default',
+  )
+  expect(watches).toBe(1)
+  const before = settingsReads
+  const readFile = spyOn(fs, 'readFile')
+  try {
+    await native.requestView(undefined, 'claude-opus-5-5[1m]')
+    expect(settingsReads).toBe(before)
+    expect(
+      readFile.mock.calls.filter(([path]) => String(path).startsWith(file)),
+    ).toEqual([])
+  } finally {
+    readFile.mockRestore()
+  }
+})
+
+test('five model settings resolve per request row, while unknown models use no-model values', async () => {
+  await write({
+    claude_cache_enabled: {
+      default: 'off',
+      'claude-opus-5': 'on',
+      'claude-opus-5-5': 'off',
+    },
+    claude_cache_mode: {
+      default: 'explicit',
+      'claude-opus-5': 'automatic',
+      'claude-opus-5-5': 'hybrid',
+    },
+    claude_fast_enabled: { default: false, 'claude-opus-5': true },
+    cache_keep_enabled: { default: false, 'claude-opus-5': true },
+    thinking_binding_prefix_mismatch_behavior: {
+      default: 'account-default',
+      'claude-opus-5': 'drop_block',
+    },
+    routing_mode: { default: 'main-first', pi: 'sticky-balanced' },
+  })
+  const native = runtime()
+  const broad = (
+    await native.requestView(undefined, 'claude-opus-5-preview[1m]')
+  ).policyStorage
+  expect(broad.claudeCache).toMatchObject({ enabled: 'on', mode: 'automatic' })
+  expect(broad.claudeFast?.enabled).toBe(true)
+  expect(broad.cacheKeep?.enabled).toBe(true)
+  expect(broad.thinkingBinding?.prefixMismatchBehavior).toBe('drop_block')
+  expect(broad.routing?.mode).toBe('sticky-balanced')
+  const longest = (
+    await native.requestView(undefined, 'claude-opus-5-5-preview[1m]')
+  ).policyStorage
+  expect(longest.claudeCache).toMatchObject({ enabled: 'off', mode: 'hybrid' })
+  const unknown = (await native.requestView(undefined, 'unknown-model'))
+    .policyStorage
+  expect(unknown.claudeCache).toMatchObject({
+    enabled: 'off',
+    mode: 'explicit',
+  })
+  expect(unknown.claudeFast?.enabled).toBe(false)
+  expect(unknown.cacheKeep?.enabled).toBe(false)
+  expect(unknown.thinkingBinding?.prefixMismatchBehavior).toBeUndefined()
+})
+
+test('a watch edit updates the next snapshot and changes the live log level once', async () => {
+  await write({ dump_enabled: false, log_level: 'info' })
+  const native = runtime()
+  const service = await native.service()
+  expect(getLogLevel()).toBe('info')
+  records.length = 0
+  await write({
+    dump_enabled: true,
+    log_level: 'debug',
+    claude_fast_enabled: true,
+  })
+  const snapshot = await changed(
+    native,
+    () => service.getSettingsStatus?.()?.values.dump_enabled === true,
+  )
+  expect(snapshot.policyStorage.dump?.enabled).toBe(true)
+  expect(snapshot.policyStorage.claudeFast?.enabled).toBe(true)
+  expect(getLogLevel()).toBe('debug')
+  expect(
+    records.filter((record) => record.message === 'log level changed'),
+  ).toHaveLength(1)
+})
+
+test('startup leaves the live log level alone when the environment selects it', async () => {
+  process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL = 'error'
+  setLogLevel('error')
+  await write({ log_level: 'debug' })
+  await runtime().service()
+  expect(getLogLevel()).toBe('error')
+  expect(
+    records.filter((record) => record.message === 'log level changed'),
+  ).toHaveLength(0)
+})
+
+test('each runtime owns a lease; the shared user-file watch stops only after the last closes', async () => {
+  await write({})
+  const first = runtime()
+  await first.service()
+  const second = runtime()
+  await second.service()
+  expect(watches).toBe(1)
+  await first.close()
+  expect(stops).toBe(0)
+  await second.close()
+  expect(stops).toBe(1)
+})
+
+test('different settings targets never reuse a Pi runtime or service', async () => {
+  await write({ claude_fast_enabled: true })
+  const first = getPiNativeRuntime(storagePath, {
+    settings: settingsOptions(),
+    vaultPoll: { intervalMs: 0 },
+  })
+  await first.service()
+  process.env.ANTHROPIC_AUTH_SETTINGS_FILE = join(home, 'other.jsonc')
+  await fs.writeFile(
+    process.env.ANTHROPIC_AUTH_SETTINGS_FILE,
+    '{"schema_version":1,"prime_enabled":false,"claude_fast_enabled":false}',
+  )
+  const second = getPiNativeRuntime(storagePath, {
+    settings: settingsOptions(),
+    vaultPoll: { intervalMs: 0 },
+  })
+  expect(second).not.toBe(first)
+  expect((await first.requestView()).policyStorage.claudeFast?.enabled).toBe(
+    true,
+  )
+  expect((await second.requestView()).policyStorage.claudeFast?.enabled).toBe(
+    false,
+  )
+})
+
+test('a source-lock timeout bounds startup and preserves legacy mode', async () => {
+  const paths = await resolveNativePoolPaths(storagePath)
+  const lock = nativePoolStoreLocks(paths)[0]
+  const options = settingsOptions()
+  options.startup = {
+    dependencies: {
+      prepareSources: async (input) => {
+        const prepared = await prepareSettingsMoveSources(input)
+        if (prepared.status === 'ready')
+          for (const source of prepared.sources)
+            source.locks = source.locks.map((spec) => ({
+              ...spec,
+              timeoutMs: 30,
+            }))
+        return prepared
+      },
+    },
+  }
+  await withLock(
+    lock.path,
+    { name: lock.name, ttlMs: 10000, timeoutMs: 100 },
+    async () => {
+      const started = Date.now()
+      const native = runtime(options)
+      await native.service()
+      expect(Date.now() - started).toBeLessThan(2000)
+      expect(
+        (await native.requestView()).policyStorage.quota?.enabled,
+      ).toBeUndefined()
+      expect(
+        await fs.stat(`${file}.moved`).catch(() => undefined),
+      ).toBeUndefined()
+      expect(await fs.stat(file).catch(() => undefined)).toBeUndefined()
+    },
+  )
+})
+
+for (const variable of [
+  'PI_ANTHROPIC_AUTH_FILE',
+  'PI_CODING_AGENT_DIR',
+  'PI_AGENT_DIR',
+] as const) {
+  test(`separate ${variable} install neither reads nor watches the default user file nor gets schema defaults`, async () => {
+    delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+    delete process.env.PI_CODING_AGENT_DIR
+    delete process.env.PI_AGENT_DIR
+    delete process.env.PI_ANTHROPIC_AUTH_FILE
+    if (variable === 'PI_ANTHROPIC_AUTH_FILE')
+      process.env[variable] = storagePath = join(
+        home,
+        'private',
+        'anthropic-auth.json',
+      )
+    else {
+      process.env[variable] = join(home, 'private-agent')
+      storagePath = join(process.env[variable], 'anthropic-auth.json')
+    }
+    await saveNativePiFixture(
+      {
+        version: 1,
+        accounts: [],
+        prime: { enabled: false },
+        routing: { mode: 'sticky-balanced' },
+      },
+      storagePath,
+    )
+    if (variable !== 'PI_CODING_AGENT_DIR')
+      delete process.env.PI_CODING_AGENT_DIR
+    const target = getSettingsFilePath({ env: process.env, home })
+    await fs.mkdir(join(target, '..'), { recursive: true })
+    await fs.writeFile(
+      target,
+      '{"schema_version":1,"routing_mode":"main-first"}',
+    )
+    const readFile = spyOn(fs, 'readFile')
+    try {
+      const native = runtime()
+      const service = await native.service()
+      const storage = (await native.requestView()).policyStorage
+      expect(storage.routing?.mode).toBe('sticky-balanced')
+      expect(storage.quota?.enabled).toBeUndefined()
+      await service.updateSettings((stored) => ({
+        ...stored,
+        dump: { enabled: true },
+      }))
+      expect((await native.requestView()).policyStorage.dump?.enabled).toBe(
+        true,
+      )
+      expect(
+        readFile.mock.calls.filter(([path]) => String(path).startsWith(target)),
+      ).toEqual([])
+      expect(watches).toBe(0)
+      expect(settingsReads).toBe(0)
+    } finally {
+      readFile.mockRestore()
+    }
+  })
+}
+
+test('every claude action rechecks a peer marker without a request-path authority read', async () => {
+  const options = settingsOptions()
+  options.startup = { fence: { registration: undefined } }
+  // An unregistered start cannot move, but it must retain the service's watch.
+  const native = getPiNativeRuntime(storagePath, {
+    settings: options,
+    vaultPoll: { intervalMs: 0 },
+  })
+  await native.service()
+  expect((await native.requestView()).policyStorage.dump).toBeUndefined()
+  await write({ dump_enabled: true })
+  await fs.writeFile(
+    `${file}.moved`,
+    JSON.stringify({ version: 1, target: file, at: Date.now() }),
+  )
+  const commands = createPiNativeCommands(storagePath)
+  expect(await commands.readStatus('dump', {})).toContain('enabled')
+  expect((await native.requestView()).policyStorage.dump?.enabled).toBe(true)
+})
+
+for (const mode of ['local', 'claustrum'] as const)
+  test(`projected three-way strings never reach a ${mode} legacy store write after moving`, async () => {
+    const stored: core.AccountStorage = {
+      version: 1,
+      accounts: [],
+      prime: { enabled: false },
+      claudeCache: { enabled: false },
+      quota: { enabled: false, failClosedOnUnknownQuota: false },
+    }
+    await saveNativePiFixture(stored, storagePath)
+    const paths = await resolveNativePoolPaths(storagePath)
+    if (mode === 'claustrum') await seedVaultSettings(paths, stored)
+    const selected = mode === 'claustrum' ? nativeVaultPaths(paths) : paths
+    const before = await fs.readFile(selected.config, 'utf8')
+    const commits: Record<string, unknown>[] = []
+    const native = new PiNativeRuntime(storagePath, {
+      settings: settingsOptions(),
+      vaultPoll: { intervalMs: 0 },
+      local: {
+        onLockEvent: (event) => {
+          if (
+            event.type === 'released' &&
+            event.name === 'pool-config' &&
+            event.path === selected.config
+          )
+            commits.push(JSON.parse(readFileSync(event.path, 'utf8')))
+        },
+      },
+    })
+    runtimes.push(native)
+    const service = await native.service()
+    expect((await native.view()).policyStorage.quota?.enabled).toBe('off')
+    expect(
+      (
+        await service.updateSettings((stored) => ({
+          ...stored,
+          nativeAccountOrder: ['main'],
+        }))
+      ).outcome,
+    ).toBe('saved')
+    if (mode === 'local') await service.setEnabled('main', false)
+    const after = await fs.readFile(selected.config, 'utf8')
+    const oldSettings = JSON.parse(before)
+    const settings = JSON.parse(after)
+    expect(oldSettings.claudeCache).toEqual({ enabled: false })
+    expect(oldSettings.quota).toMatchObject({
+      enabled: false,
+      failClosedOnUnknownQuota: false,
+    })
+    expect(settings.claudeCache).toEqual(oldSettings.claudeCache)
+    expect(settings.quota).toEqual(oldSettings.quota)
+    expect(JSON.stringify([settings.claudeCache, settings.quota])).not.toMatch(
+      /"(?:default|on|off)"/,
+    )
+    expect(commits.length).toBeGreaterThan(0)
+    for (const committed of commits) {
+      expect(committed.claudeCache).toEqual(oldSettings.claudeCache)
+      expect(committed.quota).toEqual(oldSettings.quota)
+    }
+  })
+
+async function seedVaultSettings(
+  paths: core.NativePoolPaths,
+  stored: core.AccountStorage,
+) {
+  process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+    home,
+    'enrollment.json',
+  )
+  const enrollment = core.getHostClaustrumEnrollmentPaths('pi')
+  await fs.writeFile(
+    enrollment.tokenPath,
+    JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+    { mode: 0o600 },
+  )
+  await fs.writeFile(
+    enrollment.statePath,
+    JSON.stringify({
+      version: 1,
+      phase: 'approved',
+      proposedName: 'anthropic-auth-pi',
+      tokenGeneration: 1,
+      updatedAt: 1,
+    }),
+    { mode: 0o600 },
+  )
+  const store = core.createNativePoolStore({
+    paths: nativeVaultPaths(paths),
+    quota: nativeQuotaCodec,
+  })
+  await store.initialize()
+  await store.updateSettings(() => nativeAccountSettings(stored))
+  await store.close()
+}
+
+function readerOutputs(storage: core.AccountStorage) {
+  const main = core.getKillswitchThresholdsForAccount(storage)
+  const minimum = core.getQuotaMinimumRemainingThresholds(storage)
+  const noteBody = {
+    model: 'claude-opus-5-5',
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'x'.repeat(20000) },
+          { type: 'tool_use', id: 'one', name: 'custom', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'one', content: 'ok' }],
+      },
+      { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+    ],
+  }
+  core.applyTurnEndNotes(noteBody, storage.turnEndNote)
+  const outputs = {
+    routing_mode: core.getRoutingMode(storage),
+    max_same_account_wait: core.getMaxSameAccountWait(storage),
+    fallback_on: [401, 403, 418, 429, 503].map((status) =>
+      core.shouldFallbackStatus(status, storage),
+    ),
+    refresh_enabled: storage.refresh?.enabled !== false,
+    refresh_interval_minutes: core.getRefreshIntervalMs(storage),
+    refresh_refresh_before_expiry_minutes:
+      core.getRefreshBeforeExpiryMs(storage),
+    quota_enabled: core.quotaEnabled(storage),
+    quota_check_interval_minutes: core.getQuotaCheckIntervalMs(storage),
+    quota_refresh_every_n_requests: core.getQuotaRefreshEveryNRequests(storage),
+    quota_minimum_remaining_five_hour: minimum.five_hour,
+    quota_minimum_remaining_seven_day: minimum.seven_day,
+    quota_minimum_remaining_scoped: core.normalizeKillswitchThresholds(
+      storage.quota?.minimumRemaining,
+    ).scoped,
+    quota_fail_closed_on_unknown_quota: core.failClosedOnUnknownQuota(storage),
+    quota_show_toasts: storage.quota?.showToasts === true,
+    quota_header_feed_enabled: storage.quotaHeaderFeed?.enabled === true,
+    killswitch_enabled: core.isKillswitchEnabled(storage),
+    killswitch_default_five_hour: main.five_hour,
+    killswitch_default_seven_day: main.seven_day,
+    killswitch_default_scoped: main.scoped,
+    killswitch_account_floors: core.getKillswitchConfig(storage).accounts,
+    claude_cache_enabled: core.isCache1hPersistentlyEnabled(storage),
+    claude_cache_mode: core.getCache1hPersistentMode(storage),
+    cache_keep_enabled: core.isCacheKeepPersistentlyEnabled(storage),
+    cache_keep_always: core.isCacheKeepAlways(storage),
+    cache_keep_window: core.getCacheKeepWindow(storage),
+    cache_keep_subagents: core.isCacheKeepSubagentsEnabled(storage),
+    dump_enabled: core.isDumpPersistentlyEnabled(storage),
+    prime_enabled: core.isPrimePersistentlyEnabled(storage),
+    claude_fast_enabled: core.isFastModePersistentlyEnabled(storage),
+    cost_zeroing_enabled: core.isCostZeroingEnabled(storage),
+    log_level: core.getPersistedLogLevel(storage),
+    thinking_binding_prefix_mismatch_behavior:
+      core.getThinkingPrefixMismatchBehavior(storage),
+    turn_end_note_tools: noteBody,
+  }
+  expect(Object.keys(outputs).sort()).toEqual(
+    Object.keys(core.SETTINGS_DEFAULT_READERS).sort(),
+  )
+  return JSON.stringify(outputs)
+}
+
+for (const mode of ['local', 'claustrum'] as const)
+  for (const peer of ['absent', 'same'] as const) {
+    test(`every moved setting preserves reader and wire outputs in ${mode} custody with OpenCode ${peer}`, async () => {
+      delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+      file = getSettingsFilePath({ env: process.env, home })
+      const stored: core.AccountStorage = {
+        version: 1,
+        accounts: [],
+        routing: { mode: 'fallback-first', maxSameAccountWait: 'max' },
+        fallbackOn: [418, 503],
+        refresh: {
+          enabled: false,
+          intervalMinutes: 3,
+          refreshBeforeExpiryMinutes: 99,
+        },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 7,
+          refreshEveryNRequests: 8,
+          minimumRemaining: { five_hour: 17, seven_day: 19, scoped: 4 },
+          failClosedOnUnknownQuota: false,
+          showToasts: true,
+        },
+        quotaHeaderFeed: { enabled: true },
+        killswitch: {
+          enabled: true,
+          main: { five_hour: 9, seven_day: 21, scoped: 3 },
+          accounts: {
+            'vault:sample': { five_hour: 7, seven_day: 18, scoped: 2 },
+          },
+        },
+        claudeCache: { enabled: true, mode: 'automatic' },
+        cacheKeep: {
+          enabled: true,
+          always: true,
+          startHour: 5,
+          endHour: 9,
+          subagents: true,
+        },
+        dump: { enabled: true },
+        prime: { enabled: true },
+        claudeFast: { enabled: true },
+        costZeroing: { enabled: false },
+        logging: { level: 'debug' },
+        thinkingBinding: { prefixMismatchBehavior: 'drop_block' },
+        turnEndNote: { tools: ['custom'] },
+      }
+      await saveNativePiFixture(stored, storagePath)
+      const paths = await resolveNativePoolPaths(storagePath)
+      const localStore = core.createNativePoolStore({
+        paths,
+        quota: nativeQuotaCodec,
+      })
+      await localStore.updateSettings((current) => ({
+        ...current,
+        ...nativeAccountSettings(stored),
+      }))
+      await localStore.close()
+      if (mode === 'claustrum') await seedVaultSettings(paths, stored)
+      if (peer === 'same') {
+        const peerPaths = await resolveNativePoolPaths(
+          join(home, '.config', 'opencode', 'anthropic-auth.json'),
+          join(home, '.config', 'opencode', 'anthropic-auth-state.json'),
+        )
+        const store = core.createNativePoolStore({
+          paths: peerPaths,
+          quota: nativeQuotaCodec,
+        })
+        await store.initialize()
+        await store.updateSettings(() => nativeAccountSettings(stored))
+        await store.close()
+      }
+      const legacy = core.createNativeAccountRuntime({ paths, host: 'pi' })
+      const before = (await legacy.read()).policyStorage
+      await legacy.close()
+      const settings = settingsOptions()
+      settings.startup = {
+        readMode: async (host) => (host === 'pi' ? mode : 'local'),
+      }
+      const readFile = spyOn(fs, 'readFile')
+      let after: core.AccountStorage
+      try {
+        const native = runtime(settings)
+        after = (await native.view()).policyStorage
+        expect(await (await native.service()).getSettingsPath()).toBe(file)
+        expect(await fs.stat(`${file}.moved`)).toBeDefined()
+        // Holder and lock code reads these kernel files to identify processes;
+        // they contain no user data. Every user-data read stays in the sandbox.
+        const kernelIdentity =
+          /^\/proc\/(?:sys\/kernel\/random\/boot_id|\d+\/stat)$/
+        expect(
+          readFile.mock.calls
+            .map(([path]) => String(path))
+            .filter(
+              (path) =>
+                !path.startsWith(`${home}/`) && !kernelIdentity.test(path),
+            ),
+        ).toEqual([])
+      } finally {
+        readFile.mockRestore()
+      }
+      expect(readerOutputs(after)).toBe(readerOutputs(before))
+      const wire = (storage: core.AccountStorage) =>
+        buildAnthropicRequest(
+          'claude-opus-5-5',
+          { messages: [{ role: 'user', content: 'hello', timestamp: 0 }] },
+          undefined,
+          {
+            enabled: core.isCache1hPersistentlyEnabled(storage),
+            mode: core.getCache1hPersistentMode(storage),
+          },
+          core.isFastModePersistentlyEnabled(storage),
+          undefined,
+          {
+            turnEndNote: storage.turnEndNote,
+            thinkingPrefixMismatchBehavior:
+              core.getThinkingPrefixMismatchBehavior(storage),
+          },
+        )
+      expect((await wire(after)).bodyText).toBe((await wire(before)).bodyText)
+    })
+  }
+
+test('runtime eviction releases its settings lease and closes the last user-file watch', async () => {
+  const entries: PiNativeRuntime[] = []
+  for (let index = 0; index < 17; index++) {
+    process.env.ANTHROPIC_AUTH_SETTINGS_FILE = join(
+      home,
+      `eviction-${index}.jsonc`,
+    )
+    await fs.writeFile(
+      process.env.ANTHROPIC_AUTH_SETTINGS_FILE,
+      '{"schema_version":1,"prime_enabled":false}',
+    )
+    const native = getPiNativeRuntime(storagePath, {
+      settings: settingsOptions(),
+      vaultPoll: { intervalMs: 0 },
+    })
+    entries.push(native)
+    await native.service()
+  }
+  await entries[0]?.close()
+  expect(watches).toBe(17)
+  expect(stops).toBe(1)
+  await expect(entries[0]?.service()).rejects.toThrow('closed')
+})
+
+test('the stream applies model settings and mirrors dump_enabled from every snapshot', async () => {
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = join(home, 'dumps')
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [
+        {
+          id: 'paid',
+          type: 'api',
+          apiKey: 'synthetic-settings-key',
+          baseURL: 'https://api.anthropic.com',
+        },
+      ],
+      prime: { enabled: false },
+    },
+    storagePath,
+  )
+  await write({
+    dump_enabled: true,
+    claude_fast_enabled: { default: false, 'claude-opus-5-5': true },
+  })
+  const native = runtime()
+  const service = await native.service()
+  const apiAccount = (await native.view()).accounts.find(
+    (account) => account.type === 'api',
+  )
+  const bodies: Record<string, unknown>[] = []
+  const send = () =>
+    __sendPiAnthropicRequestForTest(
+      {
+        storagePath,
+        apiAccount,
+        model: {
+          id: 'claude-opus-5-5',
+          name: 'Opus',
+          provider: 'anthropic',
+          api: 'cortexkit-anthropic-messages',
+          baseUrl: 'https://api.anthropic.com',
+          reasoning: true,
+          input: ['text'],
+          cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+          contextWindow: 1000000,
+          maxTokens: 128000,
+        },
+        context: {
+          messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
+        },
+      },
+      {
+        native,
+        fetch: Object.assign(
+          async (
+            _input: Parameters<typeof fetch>[0],
+            init?: Parameters<typeof fetch>[1],
+          ) => {
+            bodies.push(JSON.parse(String(init?.body)))
+            return new Response('{}')
+          },
+          { preconnect: fetch.preconnect },
+        ),
+      },
+    )
+  core.setDumpEnabled(false)
+  await send()
+  expect(core.isDumpEnabled()).toBe(true)
+  expect(bodies[0]?.speed).toBe('fast')
+  await write({ dump_enabled: false, claude_fast_enabled: false })
+  await changed(
+    native,
+    () => service.getSettingsStatus?.()?.values.dump_enabled === false,
+  )
+  core.setDumpEnabled(true)
+  await send()
+  expect(core.isDumpEnabled()).toBe(false)
+  expect(bodies[1]?.speed).toBeUndefined()
+})

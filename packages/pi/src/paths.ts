@@ -10,11 +10,14 @@ import {
   primeStorageFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 
-export function getPiConfigDir(): string {
+export function getPiConfigDir(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string {
   return (
-    process.env.PI_CODING_AGENT_DIR?.trim() ||
-    process.env.PI_AGENT_DIR?.trim() ||
-    join(homedir(), '.pi', 'agent')
+    env.PI_CODING_AGENT_DIR?.trim() ||
+    env.PI_AGENT_DIR?.trim() ||
+    join(home, '.pi', 'agent')
   )
 }
 

@@ -1,11 +1,14 @@
+import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import {
+  type AccountStorage,
   acquireNativeAccountRuntime,
   createNativeUsagePublisher,
   decidePiStateLayout,
   getAccountStatePath,
   getHostClaustrumEnrollmentPaths,
   getPersistedLogLevel,
+  getSettingsFilePath,
   isKillswitchEnabled,
   isVaultHosted,
   killswitchPassesPolicy,
@@ -38,6 +41,7 @@ import {
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   routingChoiceMatches,
+  type SettingsService,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -51,6 +55,7 @@ import {
   type PiPrimeLease,
   type PiPrimeOptions,
 } from './prime.ts'
+import { openPiSettings, type PiSettingsOptions } from './settings.ts'
 
 export type PiNativeAttempt =
   | {
@@ -137,12 +142,13 @@ function closeRuntime(entry: {
   )
 }
 
-function runtimeCacheKey(storagePath: string) {
+function runtimeCacheKey(storagePath: string, home = homedir()) {
   const enrollment = getHostClaustrumEnrollmentPaths('pi')
   return JSON.stringify([
     resolve(storagePath),
     resolve(getAccountStatePath(storagePath)),
-    resolve(getPiConfigDir()),
+    resolve(getPiConfigDir(process.env, home)),
+    resolve(getSettingsFilePath({ env: process.env, home })),
     enrollment.tokenPath,
     enrollment.statePath,
     getPiClaustrumConnectionOptions(storagePath).identity,
@@ -197,6 +203,7 @@ export class PiNativeRuntime {
   private readonly initialization: Promise<NativeAccountRuntime>
   private readonly env: NodeJS.ProcessEnv
   private vaultWatch: NativeVaultWatch | undefined
+  private settings: SettingsService | undefined
   private closed = false
   private closing: Promise<void> | undefined
   prime: PiPrimeLease | undefined
@@ -224,9 +231,14 @@ export class PiNativeRuntime {
       local?: NativeAccountRuntimeOptions['local']
       vaultPoll?: PiVaultPollOptions
       prime?: PiPrimeOptions
+      settings?: PiSettingsOptions
     } = {},
   ) {
-    const env = { ...process.env }
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PI_ANTHROPIC_AUTH_FILE: storagePath,
+    }
+    const home = options.settings?.home ?? homedir()
     this.env = env
     const poll = options.vaultPoll ?? { intervalMs: PI_VAULT_POLL_INTERVAL_MS }
     const identity = getPiClaustrumConnectionOptions(storagePath).identity
@@ -253,9 +265,9 @@ export class PiNativeRuntime {
       return decision.registration
     })
     void this.holderRegistration.catch(() => {})
-    this.initialization = this.holderRegistration.then(async () => {
+    this.initialization = this.holderRegistration.then(async (registration) => {
       const paths = await this.paths
-      const runtime = acquireNativeAccountRuntime({
+      const runtimeOptions: NativeAccountRuntimeOptions = {
         paths,
         host: 'pi',
         local: options.local,
@@ -266,7 +278,30 @@ export class PiNativeRuntime {
           env,
           identity,
         },
+      }
+      const settings = await openPiSettings(
+        runtimeOptions,
+        env,
+        home,
+        registration,
+        options.settings,
+      )
+      this.settings = settings.service
+      const runtime = acquireNativeAccountRuntime({
+        ...runtimeOptions,
+        settingsFile: settings.file,
+        settingsService: settings.service,
+        settingsMode: () => settings.mode,
+        settingsAuthority: options.settings?.authority,
       })
+      try {
+        await runtime.prepareSettingsAction?.()
+      } catch (error) {
+        await runtime.close()
+        await this.settings?.dispose()
+        this.settings = undefined
+        throw error
+      }
       // Apply local or vault preferences before the watcher can log. Match
       // OpenCode's startup precedence without blocking migration refusals.
       try {
@@ -274,6 +309,8 @@ export class PiNativeRuntime {
         if (!env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL)
           setLogLevel(getPersistedLogLevel(initial.policyStorage) ?? 'info')
       } catch {}
+      runtime.applySettingsEffects?.()
+      this.publishedRuntime = runtime
       if (this.closed) runtime.close()
       // Refresh returns at once while this host uses local accounts, so the
       // poll costs one enrollment read per tick outside vault custody.
@@ -297,7 +334,6 @@ export class PiNativeRuntime {
         // the next poll or a request's bounded refresh retries it.
         void this.vaultWatch.ready.catch(() => {})
       }
-      this.publishedRuntime = runtime
       return runtime
     })
     // Initialization is lazy from the host's perspective; a path failure is
@@ -316,6 +352,11 @@ export class PiNativeRuntime {
   /** Inspect only a completed runtime read; initialization is never awaited. */
   peek(): NativeAccountSnapshot | undefined {
     return this.closed ? undefined : this.publishedRuntime?.peek?.()
+  }
+
+  /** Resolve target settings from the initialized service without request I/O. */
+  resolveSettings(stored: AccountStorage, model?: string): AccountStorage {
+    return this.publishedRuntime?.resolveSettings?.(stored, model) ?? stored
   }
 
   async routingPath(): Promise<string> {
@@ -364,16 +405,28 @@ export class PiNativeRuntime {
   }
 
   /** Read the published inventory even when no account can serve, so /claude can show its sign-in remedy. */
-  async view(signal?: AbortSignal): Promise<NativeAccountSnapshot> {
+  async view(
+    signal?: AbortSignal,
+    model?: string,
+  ): Promise<NativeAccountSnapshot> {
     const runtime = await this.service()
     signal?.throwIfAborted()
-    return runtime.read()
+    return runtime.read(model)
   }
 
   /** Admit a model request without rediscovering a healthy roster. */
-  async requestView(signal?: AbortSignal): Promise<NativeAccountSnapshot> {
+  async requestView(
+    signal?: AbortSignal,
+    model?: string,
+  ): Promise<NativeAccountSnapshot> {
     const runtime = await this.service()
-    return readNativeAccountsForRequest(runtime, signal)
+    const snapshot = await readNativeAccountsForRequest(runtime, signal)
+    return {
+      ...snapshot,
+      policyStorage:
+        runtime.resolveSettings?.(snapshot.policyStorage, model) ??
+        snapshot.policyStorage,
+    }
   }
 
   async authorize(
@@ -589,6 +642,7 @@ export class PiNativeRuntime {
         },
         () => {},
       )
+      await this.settings?.dispose()
     })()
     return this.closing
   }
@@ -611,9 +665,10 @@ export function getPiNativeRuntime(
     local?: NativeAccountRuntimeOptions['local']
     vaultPoll?: PiVaultPollOptions
     prime?: PiPrimeOptions
+    settings?: PiSettingsOptions
   } = {},
 ): PiNativeRuntime {
-  const contextKey = runtimeCacheKey(storagePath)
+  const contextKey = runtimeCacheKey(storagePath, options.settings?.home)
   const key = JSON.stringify([
     contextKey,
     nativeRuntimeOptionIdentity(options.connect),

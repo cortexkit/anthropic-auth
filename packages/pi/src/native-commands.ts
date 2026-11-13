@@ -83,6 +83,8 @@ export function createPiNativeCommands(
     })
   }
   const dispatch: NativeMenuDispatch = async (request, options) => {
+    const runtime = await native.service()
+    await runtime.prepareSettingsAction?.()
     if (
       isVaultHosted() &&
       [
@@ -93,7 +95,6 @@ export function createPiNativeCommands(
       ].includes(request.action)
     )
       return { ok: false, text: VAULT_HOST_CONNECT_REFUSAL }
-    const runtime = await native.service()
     switch (request.action) {
       case 'enable':
       case 'disable':
@@ -330,10 +331,15 @@ export function createPiNativeCommands(
     }
   }
   return {
-    readAccounts: async () => (await native.service()).read(),
+    readAccounts: async () => {
+      const runtime = await native.service()
+      await runtime.prepareSettingsAction?.()
+      return runtime.read()
+    },
     dispatch,
     async readStatus(command) {
       const runtime = await native.service()
+      await runtime.prepareSettingsAction?.()
       const snapshot = await runtime.read()
       if (snapshot.mode === 'claustrum' && !(await runtime.vault.read()))
         return 'Claustrum roster is unavailable; no verified account view has been discovered.'
