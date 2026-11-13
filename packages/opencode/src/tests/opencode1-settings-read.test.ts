@@ -25,6 +25,7 @@ import {
   syntheticMainHostAuth,
   updatePoolSettings,
   useTempAccountFile,
+  useUnmigratedAccountFile,
   useVaultAccountFile,
   withNativeAdmission,
 } from './support/opencode1-pool-fixture'
@@ -262,6 +263,64 @@ async function fixture(
 
 describe('OpenCode 1 settings service reads', () => {
   installLoaderSetup(ctx)
+
+  test('unmigrated model enumeration preserves the original refusal and host-only artifacts', async () => {
+    await useUnmigratedAccountFile(
+      ctx,
+      createFallbackStorage({
+        accounts: [],
+        claustrum: { mode: 'claustrum' },
+      }),
+    )
+    const root = ctx.tempConfigDir!
+    const before = await fs.readdir(root)
+    const contents = await Promise.all(
+      before.map((name) => fs.readFile(join(root, name), 'utf8')),
+    )
+    const saved = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+    process.env.ANTHROPIC_AUTH_SETTINGS_FILE = join(root, 'settings.jsonc')
+    cleanups.push(() => {
+      if (saved === undefined) delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+      else process.env.ANTHROPIC_AUTH_SETTINGS_FILE = saved
+    })
+    const network = mock(() => {
+      throw new Error('A refused install must not use the network')
+    })
+    globalThis.fetch = network as unknown as typeof fetch
+    const plugin = await getPlugin(ctx)
+    expect(
+      await plugin.provider!.models!(
+        { models: {} },
+        { auth: { type: 'oauth' } },
+      ),
+    ).toEqual({})
+    const loader = await plugin.auth.loader(
+      async () => core.custodyTombstoneOAuth('anthropic'),
+      { models: {} },
+    )
+    await expect(
+      loader.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-opus-5-5', messages: [] }),
+      }),
+    ).rejects.toThrow(
+      'Anthropic account migration is required. Stop OpenCode, LiteCode and Pi, then run npx @cortexkit/opencode-anthropic-auth setup',
+    )
+    await Promise.all(ctx.fallbackRefreshes)
+    expect(network).not.toHaveBeenCalled()
+    await plugin.dispose!()
+    ctx.livePlugins.delete(plugin)
+    // Refused hosts retain their ordinary holder/sidebar lifecycle. Settings
+    // startup must not add files beyond the holder and sidebar files below.
+    expect((await fs.readdir(root)).sort()).toEqual(
+      [...before, 'anthropic-auth-holders.json', 'sidebar-state.json'].sort(),
+    )
+    expect(
+      await Promise.all(
+        before.map((name) => fs.readFile(join(root, name), 'utf8')),
+      ),
+    ).toEqual(contents)
+  })
 
   test('move and first resolve finish at startup; a request does no settings filesystem work', async () => {
     const f = await fixture()

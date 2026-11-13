@@ -1,4 +1,5 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
+import * as fs from 'node:fs/promises'
 import {
   lstat,
   mkdir,
@@ -10,8 +11,10 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { createNativeRuntimeSettings } from '../native-runtime-settings.ts'
+import { beginNativeEmptyInit } from '../pool-authority.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsImportRecordPath } from '../settings-mode.ts'
 import { resolveSettingsPaths, type SettingsPaths } from '../settings-paths.ts'
@@ -44,6 +47,12 @@ async function fixture(file: 'present' | 'absent' = 'present') {
   const root = await mkdtemp(join(tmpdir(), 'settings-start-'))
   cleanup.push(() => rm(root, { recursive: true, force: true }))
   const target = join(root, 'settings.jsonc')
+  const ownPoolPaths = await resolveNativePoolPaths(
+    join(root, 'anthropic-auth.json'),
+    join(root, 'anthropic-auth-state.json'),
+    { kind: 'legacy' },
+  )
+  await beginNativeEmptyInit(ownPoolPaths)
   if (file === 'present')
     await writeFile(target, '{"killswitch_enabled":false}')
   const paths = {
@@ -57,8 +66,18 @@ async function fixture(file: 'present' | 'absent' = 'present') {
   const options: StartSettingsOptions = {
     host: 'opencode',
     home: root,
-    env: {},
+    env: {
+      OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+        root,
+        'oc-enrollment.json',
+      ),
+      PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+        root,
+        'pi-enrollment.json',
+      ),
+    },
     paths,
+    ownPoolPaths,
     initializeVaultSettings: async () => {},
     fence: { registration: undefined },
     protection: {
@@ -80,6 +99,95 @@ async function fixture(file: 'present' | 'absent' = 'present') {
     },
   }
   return { root, target, paths, options, opens: () => opens }
+}
+
+for (const host of ['opencode', 'pi'] as const) {
+  for (const refusal of [
+    'enrollment',
+    'missing-journal',
+    'corrupt-journal',
+  ] as const) {
+    test(`${host} settings startup with ${refusal} refusal performs only native preflight reads`, async () => {
+      const f = await fixture()
+      const options = { ...f.options, host }
+      const enrollment = getHostClaustrumEnrollmentPaths(host, options.env)
+      const journal = options.ownPoolPaths!.journal
+      if (refusal === 'enrollment')
+        await writeFile(enrollment.tokenPath, '{bad enrollment', {
+          mode: 0o600,
+        })
+      else if (refusal === 'missing-journal') await rm(journal)
+      else await writeFile(journal, '{bad journal', { mode: 0o600 })
+
+      __setLogTestSink(() => {})
+      const calls: { operation: string; path: string }[] = []
+      const operations = [
+        'access',
+        'lstat',
+        'open',
+        'readFile',
+        'realpath',
+        'stat',
+        'mkdir',
+        'rename',
+        'writeFile',
+        'unlink',
+        'rm',
+        'chmod',
+        'appendFile',
+        'readdir',
+      ] as const
+      const spies = operations.map((operation) => {
+        // biome-ignore lint/performance/noDynamicNamespaceImportAccess: Enumerating filesystem calls lets the test reject writes and non-preflight reads.
+        const original = fs[operation] as (...args: any[]) => any
+        return spyOn(
+          fs as unknown as Record<string, (...args: any[]) => any>,
+          operation,
+        ).mockImplementation((...args: any[]) => {
+          calls.push({ operation, path: String(args[0]) })
+          return original(...args)
+        })
+      })
+      let started: Awaited<ReturnType<typeof startSettings>>
+      try {
+        started = await startSettings(options)
+        expect(started).toEqual({ mode: 'legacy', file: '' })
+        const schedule = spyOn(globalThis, 'setTimeout')
+        try {
+          const reader = createNativeRuntimeSettings({
+            host,
+            settingsMode: () => started.mode,
+            settingsService: started.service,
+            settingsFallback: started.fallback,
+            settingsReopen: started.reopen,
+          })
+          await reader.prepareAction()
+          await reader.close()
+          expect(schedule).not.toHaveBeenCalled()
+        } finally {
+          schedule.mockRestore()
+        }
+      } finally {
+        for (const spy of spies) spy.mockRestore()
+      }
+      expect(f.opens()).toBe(0)
+      expect(calls.length).toBeGreaterThan(0)
+      const allowed = new Set([...Object.values(enrollment), journal])
+      const reads = new Set([
+        'access',
+        'lstat',
+        'open',
+        'readFile',
+        'realpath',
+        'stat',
+      ])
+      expect(
+        calls.filter(
+          ({ operation, path }) => !reads.has(operation) || !allowed.has(path),
+        ),
+      ).toEqual([])
+    })
+  }
 }
 
 test('a service open that throws after a move applies the stricter applied copy, never the legacy store', async () => {
@@ -393,6 +501,9 @@ test('startSettings runs the real move: the legacy store is published and the se
   }
   const paths = await resolveSettingsPaths('opencode', options)
   const store = await resolveNativePoolPaths(paths.own.account, paths.own.state)
+  await mkdir(dirname(store.journal), { recursive: true })
+  await beginNativeEmptyInit(store)
+  options.ownPoolPaths = store
   await mkdir(dirname(store.config), { recursive: true })
   await writeFile(
     store.config,

@@ -1,10 +1,17 @@
 import { logger } from './logger.ts'
+import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
+import { requireNativePoolAuthority } from './pool-authority.ts'
+import { resolveNativePoolPaths } from './pool-paths.ts'
 import { resolveSettingsMode, type SettingsMode } from './settings-mode.ts'
 import {
   runSettingsMoveAtStartup,
   type SettingsMoveStartupOptions,
 } from './settings-move-run.ts'
-import { getSettingsFilePath, resolveSettingsPaths } from './settings-paths.ts'
+import {
+  getSettingsFilePath,
+  getSettingsStorePaths,
+  resolveSettingsPaths,
+} from './settings-paths.ts'
 import {
   openSettingsService,
   recoverSettingsProtection,
@@ -50,7 +57,7 @@ export interface SettingsProtectionFallback {
 
 export interface StartedSettings {
   mode: SettingsMode
-  /** The settings file; empty only when even its path could not be resolved. */
+  /** The settings file; empty when native authority refused or its path could not be resolved. */
   file: string
   /** Open in user-file mode, and in legacy mode to notice another host's move. */
   service?: SettingsService
@@ -80,6 +87,26 @@ export function __resetSettingsStartWarningForTest(): void {
 export async function startSettings(
   options: StartSettingsOptions,
 ): Promise<StartedSettings> {
+  // Refused native enrollment or unfinished credential migration must not start
+  // settings I/O. The host's existing credential checks report the refusal on
+  // requests. After setup commits enrollment or migration, the next host start
+  // can initialize settings.
+  try {
+    const mode = await (options.readMode ?? readNativeEnrollmentMode)(
+      options.host,
+      options.env,
+    )
+    if (mode === 'local') {
+      const stores =
+        options.paths?.own ?? getSettingsStorePaths(options.host, options)
+      const paths =
+        options.ownPoolPaths ??
+        (await resolveNativePoolPaths(stores.account, stores.state))
+      await requireNativePoolAuthority(paths)
+    }
+  } catch {
+    return { mode: 'legacy', file: '' }
+  }
   const move = options.start?.move ?? runSettingsMoveAtStartup
   const open = options.start?.open ?? openSettingsService
   const serviceOptions = (file: string): SettingsServiceOptions => ({

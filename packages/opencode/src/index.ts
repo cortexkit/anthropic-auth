@@ -6751,7 +6751,10 @@ const anthropicAuthPlugin = async (
         )
         // Zero OAuth model costs by default (quota-based, not per-token billed).
         // Opt out via persisted config costZeroing.enabled=false to show real costs.
-        const storage = await loadAccounts()
+        const storage =
+          nativeAccounts.resolveSettings?.(
+            initialStorage ?? createEmptyStorage(),
+          ) ?? initialStorage
         if (
           context.auth?.type !== 'oauth' ||
           !isCostZeroingEnabled(storage ?? {})
