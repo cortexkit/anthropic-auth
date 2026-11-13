@@ -21,7 +21,6 @@ import {
 } from './settings-paths.ts'
 import { writeSettingsProtectionCopy } from './settings-protection-copy.ts'
 import {
-  mostRestrictiveSettingsProtection,
   openSettingsService,
   recoverSettingsProtection,
   type SettingsProtectionRecovery,
@@ -84,11 +83,25 @@ export interface StartedSettings {
   /** Set instead of `service` when the file is in charge but could not open. */
   fallback?: SettingsProtectionFallback
   /**
-   * Set in legacy mode when the service could not open: open it again off
-   * the request path, so a move another host publishes later is noticed.
+   * Set in legacy mode when the service could not open, or the enrollment or
+   * migration preflight refused: open it again off the request path, so a
+   * move another host publishes later is noticed.
    */
-  reopen?: () => Promise<SettingsService | undefined>
+  reopen?: SettingsReopen
 }
+
+/**
+ * Opens the settings service again off the request path; undefined while it
+ * still cannot. `retryDelaysMs` asks the runtime to try sooner than its
+ * normal interval, one delay per attempt, before falling back to it.
+ */
+export interface SettingsReopen {
+  (): Promise<SettingsService | undefined>
+  readonly retryDelaysMs?: readonly number[]
+}
+
+/** A repaired enrollment or migration is usually noticed within seconds. */
+const PREFLIGHT_RETRY_DELAYS_MS = [2_000, 5_000, 15_000] as const
 
 let warned = false
 
@@ -102,7 +115,8 @@ export function __resetSettingsStartWarningForTest(): void {
  * move, then opens the service. When either fails, a file that is (or may
  * be) in charge gets the protection fallback, never plain legacy values,
  * which may predate protection the user tightened in the file. Only a check
- * that proves no move happened (no file, no marker) returns legacy mode.
+ * that proves no move happened (no file, no marker) returns legacy mode, or
+ * a refused enrollment or migration preflight, while requests are refused.
  *
  * Every service it opens carries the import check (see
  * `setSettingsAdoptionCheck`): a runtime that starts in legacy mode adopts
@@ -116,8 +130,8 @@ export async function startSettings(
 ): Promise<StartedSettings> {
   // Refused native enrollment or unfinished credential migration must not start
   // settings I/O. The host's existing credential checks report the refusal on
-  // requests. The runtime repeats this check off the request path and starts
-  // using the settings once it passes.
+  // requests. The runtime repeats this check off the request path and opens
+  // the settings service once it passes.
   const preflight = async () => {
     const mode = await (options.readMode ?? readNativeEnrollmentMode)(
       options.host,
@@ -270,31 +284,30 @@ export async function startSettings(
     return undefined
   }
   if (refused) {
-    // No settings I/O until the preflight passes, so which source is in
-    // charge is unknown: the strictest set applies, and the runtime asks again
-    // off the request path. A pure path keeps the shared-runtime key real.
+    // Requests are refused by the host's credential checks while the
+    // preflight refuses, so plain legacy mode with no settings I/O is enough.
+    // Once it passes, requests must be served at once: legacy values apply
+    // until the runtime's check, off the request path, opens the service and
+    // adopts a file in charge through the import check. A pure path keeps
+    // the shared-runtime key real.
     try {
       file = options.paths?.target ?? getSettingsFilePath(options)
     } catch {
       // Without a path the runtime key uses an explicit "no settings file".
     }
-    return {
-      mode: 'user-file',
-      file,
-      fallback: {
-        get file() {
-          return file
-        },
-        rung: 3,
-        values: mostRestrictiveSettingsProtection(),
-        reopen: reopenOnFile,
-        reopenLegacy,
-        resolveAuthority: async () => {
+    const reopenAfterPreflight: SettingsReopen = Object.assign(
+      async () => {
+        try {
           await passPreflight()
-          return probe()
-        },
+          file = (await resolvePaths()).target
+        } catch {
+          return undefined
+        }
+        return openService()
       },
-    }
+      { retryDelaysMs: PREFLIGHT_RETRY_DELAYS_MS },
+    )
+    return { mode: 'legacy', file, reopen: reopenAfterPreflight }
   }
   let mode: SettingsMode = 'user-file'
   let unknown = false

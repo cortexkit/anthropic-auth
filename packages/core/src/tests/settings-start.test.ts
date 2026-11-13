@@ -156,17 +156,13 @@ for (const host of ['opencode', 'pi'] as const) {
       let started: Awaited<ReturnType<typeof startSettings>>
       try {
         started = await startSettings(options)
-        // No settings I/O while the preflight refuses: which source is in
-        // charge is unknown, so the strictest set applies under the file's
-        // real path, never plain legacy values under an empty path.
-        expect(started).toMatchObject({ mode: 'user-file', file: f.target })
+        // No settings I/O while the preflight refuses: plain legacy values
+        // (requests are refused by credential checks meanwhile) under the
+        // file's real path, never an empty one.
+        expect(started).toMatchObject({ mode: 'legacy', file: f.target })
         expect(started.service).toBeUndefined()
-        expect(started.fallback).toMatchObject({
-          file: f.target,
-          rung: 3,
-          values: mostRestrictiveSettingsProtection(),
-        })
-        expect(started.fallback?.resolveAuthority).toBeDefined()
+        expect(started.fallback).toBeUndefined()
+        expect(started.reopen?.retryDelaysMs?.[0]).toBeLessThan(10_000)
         const schedule = spyOn(globalThis, 'setTimeout')
         try {
           const reader = createNativeRuntimeSettings({
@@ -177,10 +173,13 @@ for (const host of ['opencode', 'pi'] as const) {
             settingsReopen: started.reopen,
           })
           await reader.prepareAction()
-          expect(reader.fallbackFile()).toBe(f.target)
+          expect(reader.file()).toBeUndefined()
           await reader.close()
-          // A check off the request path retries the preflight later.
-          expect(schedule).toHaveBeenCalled()
+          // A quick check off the request path retries the preflight.
+          expect(schedule).toHaveBeenCalledWith(
+            expect.any(Function),
+            started.reopen!.retryDelaysMs![0],
+          )
         } finally {
           schedule.mockRestore()
         }
@@ -540,11 +539,14 @@ test('startSettings runs the real move: the legacy store is published and the se
 
 function timer() {
   const ticks: (() => Promise<void>)[] = []
+  const delays: number[] = []
   return {
     ticks,
+    delays,
     tick: () => ticks.at(-1)!(),
-    schedule: (callback: () => Promise<void>) => {
+    schedule: (callback: () => Promise<void>, delayMs: number) => {
       ticks.push(callback)
+      delays.push(delayMs)
       return () => {}
     },
   }
@@ -567,7 +569,7 @@ async function appliedCopy(file: string, ready: (values: unknown) => boolean) {
 
 for (const outcome of ['passes', 'still refused'] as const) {
   for (const file of ['present', 'absent'] as const) {
-    test(`a refused preflight that later ${outcome} with the file ${file} ${outcome === 'passes' ? 'settles authority off the request path' : 'keeps the strictest set'}`, async () => {
+    test(`a refused preflight that later ${outcome} with the file ${file} ${outcome === 'passes' ? 'opens the service off the request path' : 'keeps serving legacy values'}`, async () => {
       const f = await fixture(file)
       const journal = f.options.ownPoolPaths!.journal
       await rm(journal)
@@ -576,43 +578,50 @@ for (const outcome of ['passes', 'still refused'] as const) {
         ...f.options,
         start: { open: openSettingsService },
       })
-      expect(started.fallback).toMatchObject({ rung: 3, file: f.target })
+      expect(started).toMatchObject({ mode: 'legacy', file: f.target })
       const clock = timer()
       const reader = createNativeRuntimeSettings({
         host: 'opencode',
         settingsMode: () => started.mode,
-        settingsFallback: started.fallback,
+        settingsReopen: started.reopen,
         settingsAuthority: { schedule: clock.schedule },
         env: {},
       })
       cleanup.push(reader.close)
+      // Requests resolve the legacy store from memory: nothing blocks them,
+      // and no protection fallback is overlaid.
       const stored = { dump: { enabled: true } }
+      const served = () => reader.resolve(stored) as Resolved
+      expect(served()).toEqual(stored)
       await clock.tick()
-      expect(reader.fallbackFile()).toBe(f.target)
+      expect(reader.file()).toBeUndefined()
+      expect(served()).toEqual(stored)
+      // Quick retries first, then the normal interval.
+      expect(clock.delays).toEqual([2_000, 5_000])
       if (outcome === 'still refused') {
-        expect((reader.resolve(stored) as Resolved).killswitch?.enabled).toBe(
-          true,
-        )
+        await clock.tick()
+        await clock.tick()
+        expect(clock.delays).toEqual([2_000, 5_000, 15_000, 60_000])
+        expect(served()).toEqual(stored)
         return
       }
+      // The repaired preflight serves legacy values at once, before any check.
       await beginNativeEmptyInit(f.options.ownPoolPaths!)
+      expect(served()).toEqual(stored)
       await clock.tick()
-      expect(reader.fallbackFile()).toBeUndefined()
       if (file === 'present') {
         // The file is in charge and this host's (empty) store owes it nothing.
         expect(reader.file()).toBe(f.target)
-        expect((reader.resolve(stored) as Resolved).killswitch?.enabled).toBe(
-          false,
-        )
+        expect(served().killswitch?.enabled).toBe(false)
         await lstat(settingsImportRecordPath(f.target, 'opencode'))
       } else {
         // No move happened: legacy values apply, and a later file is noticed.
         expect(reader.file()).toBeUndefined()
-        expect((reader.resolve(stored) as Resolved).dump?.enabled).toBe(true)
+        expect(served()).toEqual(stored)
         await writeFile(f.target, '{"dump_enabled":false}')
         await clock.tick()
         expect(reader.file()).toBe(f.target)
-        expect((reader.resolve(stored) as Resolved).dump?.enabled).toBe(false)
+        expect(served().dump?.enabled).toBe(false)
       }
     })
   }

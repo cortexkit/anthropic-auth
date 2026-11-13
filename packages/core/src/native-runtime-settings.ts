@@ -29,7 +29,10 @@ import type {
   SettingsUpdate,
   SettingsValues,
 } from './settings-service.ts'
-import type { SettingsProtectionFallback } from './settings-start.ts'
+import type {
+  SettingsProtectionFallback,
+  SettingsReopen,
+} from './settings-start.ts'
 
 export interface NativeRuntimeSettingsOptions {
   settingsService?: SettingsService
@@ -52,7 +55,7 @@ export interface NativeRuntimeSettingsOptions {
    * authority timer and menu actions open it again off the request path, so a
    * move another host publishes later is still noticed.
    */
-  settingsReopen?: () => Promise<SettingsService | undefined>
+  settingsReopen?: SettingsReopen
 }
 
 export interface NativeRuntimeSettingsStatus {
@@ -80,6 +83,7 @@ export function createNativeRuntimeSettings(
   let service = options.settingsService?.retain()
   let fallback = service ? undefined : options.settingsFallback
   let reopenLegacy = service || fallback ? undefined : options.settingsReopen
+  const quickRetries = [...(reopenLegacy?.retryDelaysMs ?? [])]
   // Set when a fallback started with unknown authority later learns the true
   // mode; it then replaces the host's cached mode for this runtime.
   let probedMode: SettingsMode | undefined
@@ -229,6 +233,9 @@ export function createNativeRuntimeSettings(
         timer.unref?.()
         return () => clearTimeout(timer)
       })
+    // A reopen may ask for quicker first retries (a repaired preflight), used
+    // only while the service has not opened yet.
+    const delayMs = (!service && quickRetries.shift()) || 60_000
     cancelCheck = schedule(async () => {
       cancelCheck = undefined
       try {
@@ -240,7 +247,7 @@ export function createNativeRuntimeSettings(
       } finally {
         scheduleCheck()
       }
-    }, 60_000)
+    }, delayMs)
   }
   let unwatch: (() => void) | undefined
   let unonFileEvent: (() => void) | undefined
