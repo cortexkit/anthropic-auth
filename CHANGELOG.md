@@ -4,7 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- Updated the shared authentication dependency to common-auth 0.49.0.
+- Updated the shared authentication dependency to common-auth 0.49.1.
 - Vault enrollment now refuses unsafe token folders even during token replacement or when folder safety checks fail.
 ## 2.11.4
 
