@@ -804,10 +804,10 @@ export function createNativeAnthropicAdapter<Q, P>(
   const endTimeoutMs =
     deps.attemptEndTimeoutMs ?? DEFAULT_ATTEMPT_END_TIMEOUT_MS
   type Data = NativeAnthropicAttemptData<P>
-  const billingSends = new WeakMap<
-    Data,
-    { input: AnthropicBillingRequest; received: boolean }
-  >()
+  type BillingSend = { input: AnthropicBillingRequest; received: boolean }
+  // Only host-owned sends belong here. Recovery fetches own their billing
+  // state so ending the original host attempt cannot retire an in-flight resend.
+  const billingSends = new WeakMap<Data, BillingSend>()
   let requestGzipLatch = deps.requestGzipLatch
   const gzipLatch = async () => {
     if (requestGzipLatch) return requestGzipLatch
@@ -1464,20 +1464,20 @@ export function createNativeAnthropicAdapter<Q, P>(
           )
           const dispatch = authorized.dispatch
           const resendFetch = async (url: string, init: RequestInit) => {
+            let billingSend: BillingSend | undefined
             try {
               assertHostAuthorityStable()
-              observeFinalWire(request, createBody)
+              billingSend = observeFinalWire(request, createBody)
               let received = await (deps.fetch ?? globalThis.fetch)(url, init)
               if (request.signal.aborted) {
                 void received.body?.cancel().catch(() => {})
                 request.signal.throwIfAborted()
               }
-              const billingSend = billingSends.get(data)
               if (billingSend) {
                 billingSend.received = true
                 if (fromUpstream(received.headers, data))
                   received = observeAnthropicBillingResponse(
-                    { ...billingSend.input, attemptId: undefined },
+                    billingSend.input,
                     received,
                   )
               }
@@ -1487,17 +1487,13 @@ export function createNativeAnthropicAdapter<Q, P>(
                 })
               return received
             } catch (error) {
-              const billingSend = billingSends.get(data)
               if (
                 billingSend &&
                 !billingSend.received &&
                 dispatch?.kind !== 'http-relay'
               ) {
                 billingSend.received = true
-                reportAnthropicBillingFailure({
-                  ...billingSend.input,
-                  attemptId: undefined,
-                })
+                reportAnthropicBillingFailure(billingSend.input)
               }
               request.signal.throwIfAborted()
               if (!isRecoveryTransportFailure(error)) throw error
@@ -1656,7 +1652,8 @@ export function createNativeAnthropicAdapter<Q, P>(
         signal: request.signal,
         body: JSON.stringify(envelope),
       })
-      observeFinalWire(relayRequest, body)
+      const billingSend = observeFinalWire(relayRequest, body)
+      if (billingSend) billingSends.set(data, billingSend)
       return relayRequest
     }
     let wireBody: string | Uint8Array | undefined = body
@@ -1703,17 +1700,19 @@ export function createNativeAnthropicAdapter<Q, P>(
       signal: request.signal,
       ...(wireBody !== undefined ? { body: wireBody } : {}),
     })
-    observeFinalWire(finalRequest, body)
+    const billingSend = observeFinalWire(finalRequest, body)
+    if (billingSend) billingSends.set(data, billingSend)
     return finalRequest
 
     function observeFinalWire(prepared: Request, bodyText: string | undefined) {
+      let billingSend: BillingSend | undefined
       if (data && messages && bodyText !== undefined) {
         try {
           const metadata = source.billingRequest?.(contextOf(attempt, data))
           if (metadata) {
             const payload = parseJson(bodyText)
             const ttlMs = requestCacheLifetimeMs(bodyText)
-            billingSends.set(data, {
+            billingSend = {
               input: {
                 ...metadata,
                 // The host's attempt id is a counter that restarts with each
@@ -1727,11 +1726,12 @@ export function createNativeAnthropicAdapter<Q, P>(
                 ...(ttlMs > 0 ? { cache: { ...metadata.cache, ttlMs } } : {}),
               },
               received: false,
-            })
+            }
           }
         } catch {}
       }
-      if (data?.route !== 'oauth' || !messages || bodyText === undefined) return
+      if (data?.route !== 'oauth' || !messages || bodyText === undefined)
+        return billingSend
       try {
         source.onFinalRequestPrepared?.({
           attemptId: attempt.attemptId,
@@ -1742,6 +1742,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       } catch {
         /* Optional cache observation cannot fail a physical send. */
       }
+      return billingSend
     }
   }
 

@@ -61,6 +61,8 @@ import {
 import {
   __prewarmPiCacheKeepForTest,
   __sendPiAnthropicRequestForTest,
+  beginPiPrimaryTurn,
+  endPiPrimaryTurn,
   forgetPiMessageThread,
   startPiCacheKeepSession,
   stopPiCacheKeep,
@@ -1924,6 +1926,145 @@ test('Pi bills each failed and retried physical send with its actual vault payer
     billing.reports[1]?.attempt_id,
   )
 })
+
+for (const rejectGzip of [false, true]) {
+  test(`Pi bills thread recovery and gzip recovery sends independently (gzip rejection: ${rejectGzip})`, async () => {
+    const f = await fixture()
+    const billing = captureBilling()
+    const sent: Array<{ thread?: { type: string }; gzip: boolean }> = []
+    const fetchImpl = Object.assign(
+      async (_input: unknown, init?: RequestInit) => {
+        const gzip =
+          new Headers(init?.headers).get('content-encoding') === 'gzip'
+        const body = JSON.parse(
+          init?.body instanceof Uint8Array
+            ? gunzipSync(init.body).toString()
+            : String(init?.body),
+        )
+        sent.push({ thread: body.thread, gzip })
+        if (body.thread?.type === 'continue')
+          return Response.json(
+            {
+              type: 'error',
+              error: {
+                type: 'not_found_error',
+                details: { error_code: 'thread_not_found' },
+              },
+            },
+            { status: 404 },
+          )
+        if (sent.length > 1 && rejectGzip && gzip)
+          return new Response('Unsupported content-encoding: gzip', {
+            status: 415,
+          })
+        return new Response(
+          `event: message_start\ndata: ${JSON.stringify({
+            type: 'message_start',
+            message: {
+              id: `msg_pi_recovery_${sent.length}`,
+              content: [{ type: 'text', text: 'Answer' }],
+              usage: {
+                input_tokens: 2,
+                output_tokens: 0,
+                cache_read_input_tokens: 509281,
+                cache_creation_input_tokens: 4531,
+              },
+            },
+          })}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":391}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+    const sessionId = `pi-billing-thread-recovery-${rejectGzip}`
+    beginPiPrimaryTurn(f.path, sessionId)
+    deferCleanup(() => {
+      endPiPrimaryTurn(f.path, sessionId)
+      forgetPiMessageThread(sessionId)
+    })
+    const initial: Context = {
+      ...context,
+      messages: [{ role: 'user', content: 'x'.repeat(9000), timestamp: 1 }],
+    }
+    const send = async (current: Context) => {
+      const response = await __sendPiAnthropicRequestForTest(
+        {
+          model,
+          context: current,
+          storagePath: f.path,
+          requestOrigin: 'agent-loop',
+          streamOptions: {
+            sessionId,
+            onPayload: (payload) => payload,
+            onResponse: () => {},
+            onProviderStreamEvent: () => {},
+          },
+        },
+        { native: f.native, fetch: fetchImpl },
+      )
+      await response.text()
+    }
+    await send(initial)
+    await send({
+      ...initial,
+      messages: [
+        ...initial.messages,
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Answer' }],
+          api: 'anthropic-messages',
+          provider: 'anthropic',
+          model: model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+          stopReason: 'stop',
+          timestamp: 2,
+        },
+        { role: 'user', content: 'Next', timestamp: 3 },
+      ],
+    })
+    await Bun.sleep(10)
+    expect(sent.map((send) => send.thread?.type)).toEqual(
+      rejectGzip
+        ? ['create', 'continue', 'create', 'create']
+        : ['create', 'continue', 'create'],
+    )
+    if (rejectGzip) {
+      expect(sent[2]?.gzip).toBe(true)
+      expect(sent[3]?.gzip).toBe(false)
+    }
+    expect(billing.reports).toHaveLength(sent.length)
+    expect(billing.sessions).toEqual(Array(sent.length).fill(sessionId))
+    expect(
+      new Set(billing.reports.map((report) => report.attempt_id)).size,
+    ).toBe(sent.length)
+    expect(
+      billing.reports.slice(1, -1).map((report) => report.outcome),
+    ).toEqual(rejectGzip ? ['failed', 'failed'] : ['failed'])
+    for (const report of billing.reports.slice(1, -1)) {
+      expect(report).not.toHaveProperty('usage')
+      expect(report).not.toHaveProperty('provider_response_id')
+    }
+    expect(billing.reports.at(-1)).toMatchObject({
+      outcome: 'completed',
+      credential_id: 'oauth:anthropic',
+      provider_response_id: `msg_pi_recovery_${sent.length}`,
+      usage: { input: 2, output: 391, cache_read: 509281, cache_write: 4531 },
+    })
+  })
+}
 
 test('Pi bills a model response and its keep-warm under the owning real session', async () => {
   const f = await fixture()

@@ -471,48 +471,66 @@ async function hostBootstrapReport(env: Record<string, string>) {
 
 const frame = (type: string, data: unknown) =>
   `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`
-function reply(model: string, text = 'OC2_SYNTHETIC_OK') {
-  return new Response(
-    [
-      frame('message_start', {
-        type: 'message_start',
-        message: {
-          id: 'msg_oc2_synthetic',
-          type: 'message',
-          role: 'assistant',
-          model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 20, output_tokens: 0 },
-        },
-      }),
-      frame('content_block_start', {
-        type: 'content_block_start',
-        index: 0,
-        content_block: { type: 'text', text: '' },
-      }),
-      frame('content_block_delta', {
-        type: 'content_block_delta',
-        index: 0,
-        delta: { type: 'text_delta', text },
-      }),
-      frame('content_block_stop', { type: 'content_block_stop', index: 0 }),
-      frame('message_delta', {
-        type: 'message_delta',
-        delta: { stop_reason: 'end_turn', stop_sequence: null },
-        usage: { output_tokens: 3 },
-      }),
-      frame('message_stop', { type: 'message_stop' }),
-    ].join(''),
-    {
-      headers: {
-        'content-type': 'text/event-stream',
-        'request-id': 'req_oc2_synthetic',
-        'anthropic-ratelimit-unified-5h-utilization': '0.42',
+function reply(model: string, text = 'OC2_SYNTHETIC_OK', billing = false) {
+  const events = [
+    frame('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_oc2_synthetic',
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: billing
+          ? {
+              input_tokens: 4,
+              output_tokens: 0,
+              cache_read_input_tokens: 415032,
+              cache_creation_input_tokens: 885,
+            }
+          : { input_tokens: 20, output_tokens: 0 },
       },
+    }),
+    frame('content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    }),
+    frame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text },
+    }),
+    frame('content_block_stop', { type: 'content_block_stop', index: 0 }),
+    frame('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: billing ? 172 : 3 },
+    }),
+    frame('message_stop', { type: 'message_stop' }),
+  ]
+  let next = 0
+  // Separate terminal frames so the host cannot receive message_stop merely
+  // because it shares a buffered response chunk with the final usage.
+  const body = billing
+    ? new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await Bun.sleep(20)
+          const event = events[next++]
+          if (event) controller.enqueue(new TextEncoder().encode(event))
+          else controller.close()
+        },
+      })
+    : events.join('')
+  return new Response(body, {
+    headers: {
+      'content-type': 'text/event-stream',
+      'request-id': 'req_oc2_synthetic',
+      'anthropic-ratelimit-unified-5h-utilization': '0.42',
     },
-  )
+  })
 }
 function toolReply(
   model: string,
@@ -585,13 +603,14 @@ type ScenarioArgs = [
   transport: 'direct' | 'http' | 'websocket',
   host?: 'oc1' | 'oc2',
   entry?: 'package' | 'main',
-  mode?: 'tool' | 'structured',
+  mode?: 'tool' | 'structured' | 'billing' | 'billing-recovery',
 ]
 async function scenario(
   args: ScenarioArgs,
   clock: ReturnType<typeof phaseClock>,
 ) {
   const [transport, host = 'oc2', entry = 'package', mode] = args
+  const billing = mode === 'billing' || mode === 'billing-recovery'
   clock.mark('fixture.start')
   const root = await mkdtemp(join(scratch, 'scenario-'))
   // Remove everything this scenario seeds even if setup fails before it
@@ -629,8 +648,19 @@ async function scenario(
           url: request.url,
         })
         const payload = JSON.parse(body)
+        if (mode === 'billing-recovery' && payload.thread?.type === 'continue')
+          return Response.json(
+            {
+              type: 'error',
+              error: {
+                type: 'not_found_error',
+                details: { error_code: 'thread_not_found' },
+              },
+            },
+            { status: 404 },
+          )
         if (
-          mode === 'tool' &&
+          (mode === 'tool' || billing) &&
           payload.tool_choice?.type === 'tool' &&
           !usedTool
         ) {
@@ -650,6 +680,7 @@ async function scenario(
           mode === 'structured'
             ? '{"answer":"OC2_SYNTHETIC_OK"}'
             : 'OC2_SYNTHETIC_OK',
+          billing,
         )
         clock.mark('upstream.first_response')
         return response
@@ -727,10 +758,15 @@ async function scenario(
       }),
     )
     plugin = join(pluginDirectory, 'server.js')
+    // Billing loops keep tool_choice stable across both sends; changing it
+    // would require a new thread rather than exercise continuation recovery.
+    const routingSetup = billing
+      ? `globalThis[Symbol.for('cortexkit.routing')]=sessionId=>({report:payload=>appendFileSync(${JSON.stringify(join(project, 'billing.jsonl'))},JSON.stringify({sessionId,...payload})+'\\n')});`
+      : ''
     await writeFile(
       plugin,
       `import native from '${PACKAGE}/server'; import {appendFileSync} from 'node:fs';
-export default {id:'cortexkit-anthropic-auth',async setup(ctx){appendFileSync('${join(project, 'hook-audit.jsonl')}',JSON.stringify({setup:true})+'\\n');let forced=false;const hook=await ctx.session.hook('http.request',async draft=>{appendFileSync('${join(project, 'hook-audit.jsonl')}',JSON.stringify({kind:draft.kind,model:draft.model})+'\\n');if(draft.kind!=='primary')return;const body=await draft.request.json();${mode === 'structured' ? `body.output_config={...body.output_config,format:{type:'json_schema',schema:{type:'object',properties:{answer:{type:'string'}},required:['answer'],additionalProperties:false}}};` : `if(!forced){const tool=body.tools.find(tool=>/read/i.test(tool.name));if(!tool)throw new Error('Native read tool is missing');body.tool_choice={type:'tool',name:tool.name};forced=true;}`}draft.request=new Request(draft.request,{body:JSON.stringify(body)});},{providerID:'anthropic'});const cleanup=await native.setup(ctx);return async()=>{await cleanup();await hook.dispose()}}};`,
+export default {id:'cortexkit-anthropic-auth',async setup(ctx){${routingSetup}appendFileSync('${join(project, 'hook-audit.jsonl')}',JSON.stringify({setup:true})+'\\n');let forced=false;const hook=await ctx.session.hook('http.request',async draft=>{appendFileSync('${join(project, 'hook-audit.jsonl')}',JSON.stringify({kind:draft.kind,model:draft.model})+'\\n');if(draft.kind!=='primary')return;const body=await draft.request.json();${mode === 'structured' ? `body.output_config={...body.output_config,format:{type:'json_schema',schema:{type:'object',properties:{answer:{type:'string'}},required:['answer'],additionalProperties:false}}};` : `if(!forced||${billing}){const tool=body.tools.find(tool=>/read/i.test(tool.name));if(!tool)throw new Error('Native read tool is missing');body.tool_choice={type:'tool',name:tool.name};forced=true;}`}draft.request=new Request(draft.request,{body:JSON.stringify(body)});},{providerID:'anthropic'});const cleanup=await native.setup(ctx);return async()=>{await cleanup();await hook.dispose()}}};`,
     )
     plugin = pathToFileURL(pluginDirectory).href
   }
@@ -906,6 +942,64 @@ console.log(JSON.stringify({ server: entry.server ?? null, setup: typeof mod?.de
       )
     })
   }, 60_000)
+  for (const recovery of [false, true]) {
+    test(`real OC2 reports each physical send after host stream consumption (recovery: ${recovery})`, async () => {
+      await withScenario(
+        ['direct', 'oc2', 'package', recovery ? 'billing-recovery' : 'billing'],
+        async (run) => {
+          expect(run.result.exit).toBe(0)
+          expect(run.result.stdout).toContain('OC2_SYNTHETIC_OK')
+          const captured = (
+            await readFile(join(run.root, 'project/billing.jsonl'), 'utf8')
+          )
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line))
+          const reports = captured.filter(
+            (report) =>
+              report.kind === 'billing' && report.request_kind === 'primary',
+          )
+          const threaded = run.wire
+            .map((send) => JSON.parse(send.body))
+            .filter((body) => body.thread)
+          expect(threaded.map((body) => body.thread.type)).toEqual(
+            recovery
+              ? ['create', 'continue', 'create']
+              : ['create', 'continue'],
+          )
+          expect(reports.map((report) => report.outcome)).toEqual(
+            recovery
+              ? ['completed', 'failed', 'completed']
+              : ['completed', 'completed'],
+          )
+          expect(reports).toHaveLength(threaded.length)
+          expect(new Set(reports.map((report) => report.attempt_id)).size).toBe(
+            reports.length,
+          )
+          expect(new Set(reports.map((report) => report.sessionId)).size).toBe(
+            1,
+          )
+          expect(reports.every((report) => report.attempt === undefined)).toBe(
+            true,
+          )
+          expect(reports.at(-1)).toMatchObject({
+            outcome: 'completed',
+            provider_response_id: 'msg_oc2_synthetic',
+            usage: {
+              input: 4,
+              output: 172,
+              cache_read: 415032,
+              cache_write: 885,
+            },
+          })
+          if (recovery) {
+            expect(reports[1]).not.toHaveProperty('usage')
+            expect(reports[1]).not.toHaveProperty('provider_response_id')
+          }
+        },
+      )
+    }, 60_000)
+  }
   test('real OC2 HTTP relay delivers the exact signed native body and upstream headers', async () => {
     await withScenario(['http'], async (run) => {
       expect(run.result.exit).toBe(0)

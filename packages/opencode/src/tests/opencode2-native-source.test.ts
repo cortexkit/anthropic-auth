@@ -45,6 +45,7 @@ import {
 import { ClaustrumUnreachableError } from '@cortexkit/common-auth/claustrum'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
+  type AccountHeadersResult,
   type LimitSignal,
   type OpenCode2HookContext,
   placeholderSecret,
@@ -82,6 +83,7 @@ import {
 import {
   createNativeAnthropicAdapter,
   type NativeAnthropicAttemptContext,
+  type NativeAnthropicAttemptData,
   NativeAnthropicTransportRefusal,
 } from '../v2/adapter'
 import { installNativeAnthropic } from '../v2/install'
@@ -4807,4 +4809,175 @@ test('OC2 queued authorization survives a relay swap during its receipt-held adm
   expect(f.reports.map((report) => report.recordVersion)).toEqual([7, 8])
   expect(f.reportConnections).toEqual([0, 1])
   expect(f.gets).toHaveLength(2)
+})
+
+test('real OC2 vault source bills recovery sends even when the host ends the original attempt during resend', async () => {
+  const f = await vault([7, 8, 9, 10, 11])
+  const native = source(f.runtime, f.paths)
+  const billingInputs = spyOn(native, 'billingRequest')
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const previous = globals[key]
+  const reports: Record<string, unknown>[] = []
+  const sessions: string[] = []
+  globals[key] = (sessionId: string) => ({
+    report: (report: Record<string, unknown>) => {
+      if (report.kind === 'billing') {
+        reports.push(report)
+        sessions.push(sessionId)
+      }
+    },
+  })
+  cleanups.push(() => {
+    billingInputs.mockRestore()
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  })
+  let rejectCreate = false
+  let endOriginalAttempt: (() => Promise<void>) | undefined
+  const sent: Record<string, any>[] = []
+  const upstream = Object.assign(
+    async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      sent.push(body)
+      if (body.thread?.type === 'create' && endOriginalAttempt) {
+        // The host may finish its rejected continue while the plugin's
+        // separately owned recovery fetch is still awaiting a response.
+        const end = endOriginalAttempt
+        endOriginalAttempt = undefined
+        await end()
+      }
+      if (body.thread?.type === 'continue' || (rejectCreate && body.thread))
+        return Response.json(
+          {
+            type: 'error',
+            error: {
+              type:
+                body.thread.type === 'continue'
+                  ? 'not_found_error'
+                  : 'invalid_request_error',
+              message: 'thread is not supported',
+              details: { error_code: 'thread_not_found' },
+            },
+          },
+          { status: body.thread.type === 'continue' ? 404 : 400 },
+        )
+      const id = `msg_vault_${sent.length}`
+      return new Response(
+        `event: message_start\ndata: ${JSON.stringify({
+          type: 'message_start',
+          message: {
+            id,
+            content: [{ type: 'text', text: 'answer' }],
+            usage: {
+              input_tokens: 4,
+              output_tokens: 0,
+              cache_read_input_tokens: 415032,
+              cache_creation_input_tokens: 885,
+            },
+          },
+        })}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":172}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  ) as typeof fetch
+  const managed = createNativeAnthropicAdapter({
+    source: native,
+    fetch: upstream,
+  })
+  cleanups.push(() => managed.dispose())
+  const adapter = managed.adapter
+  const requestScope = { ...scope, modelID: 'claude-opus-5-5' }
+  const messages = [{ role: 'user', content: 'first' }]
+  for (let turn = 0; turn < 3; turn++) {
+    rejectCreate = turn === 2
+    const accountId = await adapter.chooseAccount(requestScope)
+    if (typeof accountId !== 'string') throw new Error('No account')
+    const authorization = (await adapter.accountHeaders({
+      ...requestScope,
+      accountId,
+    })) as AccountHeadersResult<
+      NativeAnthropicAttemptData<NativeSourceProvenance>
+    >
+    const attempt = {
+      ...requestScope,
+      accountId,
+      attemptId: `host-${turn}`,
+      transport: 'http' as const,
+      data: authorization.attempt,
+    }
+    if (turn > 0)
+      endOriginalAttempt = async () => {
+        await adapter.onAttemptEnd?.(attempt, {
+          status: 404,
+          outputStarted: false,
+        })
+      }
+    const request = new Request('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: requestScope.modelID,
+        stream: true,
+        messages,
+      }),
+    })
+    const final = await adapter.rewriteRequest?.({
+      ...attempt,
+      request,
+      attempt,
+    })
+    if (!final) throw new Error('No rewritten request')
+    const response = await adapter.rewriteResponse?.({
+      ...attempt,
+      attempt,
+      request: final,
+      response: await upstream(final.url, { body: await final.text() }),
+    })
+    expect(await response?.text()).toContain(`msg_vault_${sent.length}`)
+    await adapter.onAttemptEnd?.(attempt, { status: 200, outputStarted: true })
+    messages.push(
+      { role: 'assistant', content: 'answer' },
+      { role: 'user', content: `next ${turn}` },
+    )
+  }
+  await Bun.sleep(10)
+  expect(sent.map((body) => body.thread?.type)).toEqual([
+    'create',
+    'continue',
+    'create',
+    'continue',
+    'create',
+    undefined,
+  ])
+  expect(reports.map((report) => report.outcome)).toEqual([
+    'completed',
+    'failed',
+    'completed',
+    'failed',
+    'failed',
+    'completed',
+  ])
+  expect(reports).toHaveLength(sent.length)
+  expect(sessions).toEqual(Array(sent.length).fill(scope.sessionID))
+  expect(new Set(reports.map((report) => report.attempt_id)).size).toBe(
+    sent.length,
+  )
+  for (const index of [0, 2, 5])
+    expect(reports[index]).toMatchObject({
+      credential_id: 'oauth:anthropic',
+      account_id: identity,
+      provider_response_id: `msg_vault_${index + 1}`,
+      usage: { input: 4, output: 172, cache_read: 415032, cache_write: 885 },
+    })
+  for (const index of [1, 3, 4]) {
+    expect(reports[index]).not.toHaveProperty('usage')
+    expect(reports[index]).not.toHaveProperty('provider_response_id')
+  }
+  expect([reports[1]?.status, reports[3]?.status, reports[4]?.status]).toEqual([
+    404, 404, 400,
+  ])
+  expect(billingInputs.mock.results).toHaveLength(sent.length)
+  expect(billingInputs.mock.results.every((result) => result.value)).toBe(true)
 })
