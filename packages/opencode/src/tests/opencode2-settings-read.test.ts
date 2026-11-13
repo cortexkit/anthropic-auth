@@ -321,6 +321,36 @@ async function seedLegacyRequest(f: Awaited<ReturnType<typeof fixture>>) {
   await put(f.target, { quota_enabled: 'on', claude_fast_enabled: false })
 }
 
+async function seedStrictLegacyRequest(f: Awaited<ReturnType<typeof fixture>>) {
+  await seedLegacyRequest(f)
+  const legacy = core.createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    local: { resolveIdentity: legacyIdentity },
+    vault: { env: f.env },
+  })
+  cleanups.push(() => legacy.close())
+  const credential = await legacy.authorizeLocal('main')
+  if (credential.status !== 'usable')
+    throw new Error('Legacy credential unavailable')
+  const window = { remainingPercent: 95, usedPercent: 5, checkedAt: Date.now() }
+  await legacy.publishLocal(credential.subject, {
+    quota: {
+      five_hour: window,
+      seven_day: window,
+      accountIdentity: '11111111-2222-4333-8444-555555555555',
+    },
+  })
+  await legacy.close()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    killswitch: {
+      enabled: true,
+      main: { five_hour: 80, seven_day: 0, scoped: 0 },
+    },
+  }))
+}
+
 function captureAuthorityTimers() {
   const ticks: (() => Promise<void>)[] = []
   const acquire = core.acquireNativeAccountRuntime
@@ -405,35 +435,61 @@ test('OC2 legacy startup with a failed service open joins a later move on the au
   expect(f.watchCloses()).toBe(1)
 })
 
-test('OC2 import-refused serves legacy settings without reopening or moving until a new instance starts', async () => {
+test('OC2 imports stricter legacy protection at its own level and adopts the file in the same start', async () => {
   const f = await fixture()
-  await seedLegacyRequest(f)
-  const legacy = core.createNativeAccountRuntime({
-    paths: f.paths,
-    host: 'opencode',
-    local: { resolveIdentity: legacyIdentity },
-    vault: { env: f.env },
+  await seedStrictLegacyRequest(f)
+  const instance = await f.start()
+  expect(f.starts[0]?.mode).toBe('user-file')
+  expect(f.starts[0]?.service).toBeDefined()
+  expect(f.opened).toHaveLength(1)
+  expect(JSON.parse(await fs.readFile(f.target, 'utf8'))).toMatchObject({
+    quota_enabled: 'on',
+    claude_fast_enabled: false,
+    killswitch_enabled: { opencode: true },
+    killswitch_default_five_hour: { opencode: 80 },
   })
-  cleanups.push(() => legacy.close())
-  const credential = await legacy.authorizeLocal('main')
-  if (credential.status !== 'usable')
-    throw new Error('Legacy credential unavailable')
-  const window = { remainingPercent: 95, usedPercent: 5, checkedAt: Date.now() }
-  await legacy.publishLocal(credential.subject, {
-    quota: {
-      five_hour: window,
-      seven_day: window,
-      accountIdentity: '11111111-2222-4333-8444-555555555555',
+  expect(
+    JSON.parse(await fs.readFile(`${f.target}.moved.opencode`, 'utf8')),
+  ).toMatchObject({ version: 1, host: 'opencode' })
+  const service = f.opened[0]
+  if (!service) throw new Error('Adopted settings service unavailable')
+  expect(service.resolve('opencode')).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 80,
+  })
+  expect(service.resolve('pi')).toMatchObject({
+    killswitch_enabled: false,
+    killswitch_default_five_hour: 5,
+  })
+  expect(
+    (await instance.source.requestOptions!({ ...request(), accountId: 'main' }))
+      .fastModeEnabled,
+  ).toBe(false)
+})
+
+test('OC2 import-refused after a failed write serves legacy settings without reopening or retrying until a new instance starts', async () => {
+  const f = await fixture()
+  await seedStrictLegacyRequest(f)
+  let attempts = 0
+  const failing = await f.openSettings({
+    file: f.target,
+    dependencies: {
+      open: (options) => {
+        const handle = openSettings<typeof core.settingsDefinition.settings>(
+          core.settingsDefinition,
+          options,
+        )
+        return {
+          ...handle,
+          update: async () => {
+            attempts++
+            throw new Error('synthetic settings write failure')
+          },
+        }
+      },
     },
   })
-  await legacy.close()
-  await f.store.updateSettings((settings) => ({
-    ...settings,
-    killswitch: {
-      enabled: true,
-      main: { five_hour: 80, seven_day: 0, scoped: 0 },
-    },
-  }))
+  cleanups.push(() => failing?.dispose())
   const run = core.runSettingsMoveAtStartup
   const outcomes: string[] = []
   const move = spyOn(core, 'runSettingsMoveAtStartup').mockImplementation(
@@ -450,6 +506,8 @@ test('OC2 import-refused serves legacy settings without reopening or moving unti
   const ticks = captureAuthorityTimers()
   const instance = await f.start()
   expect(outcomes).toEqual(['import-refused'])
+  expect(attempts).toBe(1)
+  await failing?.dispose()
   expect(f.starts[0]?.mode).toBe('legacy')
   expect(f.starts[0]?.service).toBeUndefined()
   expect(f.starts[0]?.fallback).toBeUndefined()
@@ -491,6 +549,12 @@ test('OC2 import-refused serves legacy settings without reopening or moving unti
     (await instance.runtime.read()).policyStorage.claudeFast?.enabled,
   ).toBe(true)
   expect(await fs.readFile(f.target, 'utf8')).toBe(file)
+  expect(attempts).toBe(1)
+  expect(f.opened).toHaveLength(0)
+  expect(ticks).toHaveLength(0)
+  await expect(fs.stat(`${f.target}.moved.opencode`)).rejects.toMatchObject({
+    code: 'ENOENT',
+  })
   await instance.dispose()
   const restarted = await f.start()
   expect(outcomes).toHaveLength(2)
