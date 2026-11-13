@@ -41,6 +41,19 @@ export type SettingsProtectionValues = Pick<
   (typeof SETTINGS_PROTECTION_KEYS)[number]
 >
 
+export type SettingsProtectionRung = 0 | 1 | 2 | 3
+
+export interface SettingsProtectionRecovery {
+  /** Return only this host's complete set; missing or corrupt copies return undefined or throw. */
+  readAppliedCopy?: (
+    host: SettingsHost,
+  ) => Promise<SettingsProtectionValues | undefined>
+  /** Read this runtime's local or vault settings store, as selected by its current enrollment mode. */
+  readLegacyProtection?: (
+    host: SettingsHost,
+  ) => Promise<SettingsProtectionValues | undefined>
+}
+
 export interface SettingsContextValues {
   readonly noModel: SettingsValues
   readonly models: Readonly<Record<string, SettingsValues>>
@@ -69,7 +82,11 @@ export interface SettingsGeneration {
   readonly protection: Readonly<
     Record<
       SettingsHost,
-      { readonly usable: boolean; readonly values: SettingsProtectionValues }
+      {
+        readonly usable: boolean
+        readonly values: SettingsProtectionValues
+        readonly rung: SettingsProtectionRung
+      }
     >
   >
 }
@@ -101,6 +118,7 @@ export interface SettingsServiceOptions {
   separateInstall?: boolean
   createMissing?: boolean
   lockTimeoutMs?: number
+  protection?: SettingsProtectionRecovery
   /** Dependency seams for deterministic file-race and no-I/O tests. */
   dependencies?: {
     open?: (options: OpenSettingsOptions) => CoreSettingsHandle
@@ -139,6 +157,16 @@ function protection(values: SettingsValues): SettingsProtectionValues {
   return Object.fromEntries(
     SETTINGS_PROTECTION_KEYS.map((key) => [key, values[key]]),
   ) as SettingsProtectionValues
+}
+
+export function mostRestrictiveSettingsProtection(): SettingsProtectionValues {
+  return {
+    ...protection(defaults()),
+    killswitch_enabled: true,
+    killswitch_account_floors: [],
+    quota_fail_closed_on_unknown_quota: 'on',
+    max_same_account_wait: 'off',
+  }
 }
 
 function reportText(entry: ReportEntry): string {
@@ -236,6 +264,7 @@ class SharedSettingsService {
   private closed = false
   private cancelMissingRead: (() => void) | undefined
   private missingConfirmed = false
+  private readonly lastGood = new Map<SettingsHost, SettingsProtectionValues>()
 
   constructor(
     readonly file: string,
@@ -263,6 +292,10 @@ class SharedSettingsService {
   snapshot(): SettingsGeneration {
     if (!this.current) throw new Error('Settings startup has not finished')
     return this.current
+  }
+
+  lastGoodProtection(host: SettingsHost) {
+    return this.lastGood.get(host)
   }
 
   watch(listener: SettingsChangeListener) {
@@ -450,9 +483,6 @@ class SharedSettingsService {
               ? fallback
               : []
         }
-        if (after.status === 'missing' && lastGood) {
-          Object.assign(values, protection(lastGood))
-        }
       }
     }
     const status =
@@ -468,10 +498,9 @@ class SharedSettingsService {
       !report.some((entry) =>
         SETTINGS_PROTECTION_KEYS.some((key) => key === entry.keyPath[0]),
       )
-    const sets = {} as Record<
-      SettingsHost,
-      { usable: boolean; values: SettingsProtectionValues }
-    >
+    const sets = {} as {
+      [H in SettingsHost]: SettingsGeneration['protection'][H]
+    }
     for (const host of hosts) {
       const values = protection(contexts[host].noModel)
       const seen = new Set<string>()
@@ -484,7 +513,7 @@ class SharedSettingsService {
         }
       }
       if (overlaps) addReport(['killswitch_account_floors'], 'invalid-value')
-      sets[host] = { usable: usable && !overlaps, values }
+      sets[host] = { usable: usable && !overlaps, values, rung: 0 }
     }
     return {
       before,
@@ -529,6 +558,7 @@ class SharedSettingsService {
           {
             usable: false,
             values: protection(contexts[host].noModel),
+            rung: 0,
           },
         ]),
       ) as SettingsGeneration['protection'],
@@ -629,6 +659,10 @@ class SharedSettingsService {
         id: (prior?.id ?? 0) + 1,
       })
       this.current = generation
+      for (const host of hosts) {
+        if (generation.protection[host].usable)
+          this.lastGood.set(host, generation.protection[host].values)
+      }
       logReports(generation.report)
       if (
         generation.status === 'missing' &&
@@ -677,6 +711,72 @@ class SharedSettingsService {
   }
 }
 
+/** File resolution is shared; recovery belongs to the runtime holding each lease. */
+class SettingsProtectionLease {
+  private current: SettingsGeneration | undefined
+  private pending = Promise.resolve()
+
+  constructor(
+    private readonly shared: SharedSettingsService,
+    private readonly recovery: SettingsProtectionRecovery = {},
+  ) {}
+
+  snapshot(): SettingsGeneration {
+    if (!this.current) throw new Error('Settings startup has not finished')
+    return this.current
+  }
+
+  publish(generation: SettingsGeneration): Promise<void> {
+    this.pending = this.pending.then(() => this.apply(generation))
+    return this.pending
+  }
+
+  private async recover(host: SettingsHost) {
+    const good = this.shared.lastGoodProtection(host)
+    if (good) return { values: good, rung: 1 as const }
+    const previous = this.current?.protection[host]
+    if (previous) return previous
+    for (const [rung, read] of [
+      [1, this.recovery.readAppliedCopy],
+      [2, this.recovery.readLegacyProtection],
+    ] as const) {
+      try {
+        const values = await read?.(host)
+        if (values) return { values, rung }
+      } catch {
+        // Unreadable recovery sources leave the whole rung, never individual keys.
+      }
+    }
+    return { values: mostRestrictiveSettingsProtection(), rung: 3 as const }
+  }
+
+  private async apply(generation: SettingsGeneration) {
+    if (hosts.every((host) => generation.protection[host].usable)) {
+      this.current = generation
+      return
+    }
+    const contexts = { ...generation.contexts }
+    const sets = { ...generation.protection }
+    for (const host of hosts) {
+      if (sets[host].usable) continue
+      const recovered = await this.recover(host)
+      const values = structuredClone(recovered.values)
+      sets[host] = { usable: false, values, rung: recovered.rung }
+      const context = contexts[host]
+      contexts[host] = {
+        noModel: { ...context.noModel, ...values },
+        models: Object.fromEntries(
+          Object.entries(context.models).map(([model, modelValues]) => [
+            model,
+            { ...modelValues, ...values },
+          ]),
+        ),
+      }
+    }
+    this.current = freeze({ ...generation, contexts, protection: sets })
+  }
+}
+
 /** One lease per plugin instance; no handle, reads or watch for a separate install. */
 export async function openSettingsService(
   options: SettingsServiceOptions,
@@ -693,6 +793,10 @@ export async function openSettingsService(
   let closed = false
   let closing: Promise<void> | undefined
   const subscriptions = new Set<() => void>()
+  const lease = new SettingsProtectionLease(owned, options.protection)
+  const unsubscribeLease = owned.watch((generation) =>
+    lease.publish(generation),
+  )
   const use = () => {
     if (closed) throw new Error('Settings service lease is disposed')
     return owned
@@ -700,6 +804,7 @@ export async function openSettingsService(
   const dispose = (): Promise<void> => {
     if (closed) return closing ?? Promise.resolve()
     closed = true
+    unsubscribeLease()
     for (const unsubscribe of subscriptions) unsubscribe()
     subscriptions.clear()
     if (--owned.users === 0) {
@@ -710,6 +815,7 @@ export async function openSettingsService(
   }
   try {
     await owned.ready
+    await lease.publish(owned.snapshot())
   } catch (error) {
     await dispose()
     throw error
@@ -717,14 +823,21 @@ export async function openSettingsService(
   return {
     file,
     resolve(host, model) {
-      const context = use().snapshot().contexts[host]
+      use()
+      const context = lease.snapshot().contexts[host]
       const row = resolveClaudeModelCapabilities(model)
       return (row ? context.models[row.id] : undefined) ?? context.noModel
     },
-    snapshot: () => use().snapshot(),
-    status: () => use().snapshot().fileStatus,
+    snapshot: () => {
+      use()
+      return lease.snapshot()
+    },
+    status: () => {
+      use()
+      return lease.snapshot().fileStatus
+    },
     watch(listener) {
-      const unsubscribe = use().watch((generation) => listener(generation))
+      const unsubscribe = use().watch(() => listener(lease.snapshot()))
       const stop = () => {
         unsubscribe()
         subscriptions.delete(stop)

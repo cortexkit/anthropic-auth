@@ -19,7 +19,9 @@ import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsDefinition } from '../settings-definition.ts'
 import {
   openSettingsService,
+  SETTINGS_PROTECTION_KEYS,
   type SettingsGeneration,
+  type SettingsProtectionValues,
   type SettingsServiceOptions,
 } from '../settings-service.ts'
 
@@ -707,7 +709,11 @@ test('a file still missing after 2 s publishes defaults once without waiting on 
     if (record.channel === 'settings') records.push(record)
   })
   const f = await fixture(
-    '{"dump_enabled":true,"refresh_interval_minutes":20,"killswitch_enabled":true}',
+    JSON.stringify({
+      ...distinctProtection,
+      dump_enabled: true,
+      refresh_interval_minutes: 20,
+    }),
   )
   const timer = manualTimer()
   const service = await f.open({
@@ -724,6 +730,7 @@ test('a file still missing after 2 s publishes defaults once without waiting on 
     expect(service.resolve(host).dump_enabled).toBe(false)
     expect(service.resolve(host).refresh_interval_minutes).toBe(10)
     expect(service.resolve(host).killswitch_enabled).toBe(true)
+    expect(protectionOf(service.resolve(host))).toEqual(distinctProtection)
     expect(service.snapshot().protection[host].usable).toBe(false)
   }
   expect(service.status().missing).toBe(true)
@@ -799,6 +806,294 @@ test('an invalid protection entry or overlapping account floors invalidates the 
     keyPath: ['killswitch_account_floors'],
     reason: 'invalid-value',
   })
+})
+
+function protectionOf(values: SettingsGeneration['contexts']['pi']['noModel']) {
+  return Object.fromEntries(
+    SETTINGS_PROTECTION_KEYS.map((key) => [key, values[key]]),
+  ) as SettingsProtectionValues
+}
+
+const distinctProtection: SettingsProtectionValues = {
+  killswitch_enabled: true,
+  killswitch_default_five_hour: 31,
+  killswitch_default_seven_day: 42,
+  killswitch_default_scoped: 13,
+  killswitch_account_floors: [
+    {
+      account: 'local-row',
+      host: 'pi',
+      five_hour: 51,
+      seven_day: 62,
+      scoped: 23,
+    },
+  ],
+  quota_minimum_remaining_five_hour: 14,
+  quota_minimum_remaining_seven_day: 25,
+  quota_minimum_remaining_scoped: 36,
+  quota_fail_closed_on_unknown_quota: 'off',
+  max_same_account_wait: 'cache',
+}
+
+for (const bad of [
+  { killswitch_default_five_hour: 101 },
+  {
+    killswitch_account_floors: [
+      { account: 'bad', host: 'pi', '5h': 3, seven_day: 4, scoped: 0 },
+    ],
+  },
+  {
+    killswitch_account_floors: [
+      { account: 'bad', host: 'pi', five_hour: 3, seven_day: 4 },
+    ],
+  },
+] as const) {
+  test(`one invalid protection entry retains the entire last applied set: ${JSON.stringify(bad)}`, async () => {
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => {
+      if (record.channel === 'settings') records.push(record)
+    })
+    const f = await fixture(JSON.stringify(distinctProtection))
+    const service = await f.open()
+    await writeFile(
+      f.file,
+      JSON.stringify({ killswitch_enabled: false, dump_enabled: true, ...bad }),
+    )
+    await service.refresh()
+    await service.refresh()
+    for (const host of ['opencode', 'pi'] as const) {
+      expect(protectionOf(service.resolve(host))).toEqual(distinctProtection)
+      expect(protectionOf(service.resolve(host, 'claude-opus-5-5'))).toEqual(
+        distinctProtection,
+      )
+      expect(service.snapshot().protection[host].rung).toBe(1)
+      expect(service.resolve(host).dump_enabled).toBe(true)
+    }
+    expect(
+      service
+        .status()
+        .invalidKeys.some((key) => key.startsWith(Object.keys(bad)[0]!)),
+    ).toBe(true)
+    expect(records).toHaveLength(service.snapshot().report.length)
+    expect(records.length).toBeGreaterThan(0)
+    await writeFile(f.file, '{broken')
+    await service.refresh()
+    expect(protectionOf(service.resolve('pi'))).toEqual(distinctProtection)
+  })
+}
+
+for (const tags of [
+  ['both', 'pi'],
+  ['pi', 'both'],
+  ['pi', 'pi'],
+] as const) {
+  test(`overlapping ${tags.join('/')} floors invalidate both hosts at start and while running`, async () => {
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => {
+      if (record.channel === 'settings') records.push(record)
+    })
+    const floors = tags.map((host) => ({
+      account: 'same',
+      host,
+      five_hour: 1,
+      seven_day: 2,
+      scoped: 3,
+    }))
+    const invalid = JSON.stringify({
+      killswitch_account_floors: floors,
+      dump_enabled: true,
+    })
+    const f = await fixture(invalid)
+    const service = await f.open({
+      protection: { readLegacyProtection: async () => distinctProtection },
+    })
+    for (const host of ['opencode', 'pi'] as const) {
+      expect(service.snapshot().protection[host].rung).toBe(2)
+      expect(protectionOf(service.resolve(host))).toEqual(distinctProtection)
+    }
+    await writeFile(
+      f.file,
+      JSON.stringify({ killswitch_default_five_hour: 77 }),
+    )
+    await service.refresh()
+    const good = protectionOf(service.resolve('pi'))
+    await writeFile(f.file, invalid)
+    await service.refresh()
+    for (const host of ['opencode', 'pi'] as const) {
+      expect(service.snapshot().protection[host].rung).toBe(1)
+      expect(protectionOf(service.resolve(host))).toEqual(good)
+      expect(service.snapshot().protection[host].usable).toBe(false)
+    }
+    expect(service.status().invalidKeys).toEqual(['killswitch_account_floors'])
+    expect(records.map((record) => record.message)).toEqual([
+      `Settings invalid-value in "${f.file}" (killswitch_account_floors).`,
+    ])
+  })
+}
+
+test('a single scalar protection setting is usable and all other protection defaults apply on rung 0', async () => {
+  const f = await fixture('{"killswitch_default_five_hour":37}')
+  const service = await f.open()
+  expect(service.snapshot().protection.pi.rung).toBe(0)
+  expect(service.snapshot().protection.pi.usable).toBe(true)
+  for (const key of SETTINGS_PROTECTION_KEYS) {
+    expect<unknown>(service.resolve('pi')[key]).toEqual(
+      key === 'killswitch_default_five_hour'
+        ? 37
+        : settingsDefinition.settings[key].default,
+    )
+  }
+})
+
+for (const reason of [
+  'duplicate-key',
+  'unknown-key',
+  'override-not-allowed',
+] as const) {
+  test(`any protection report reason leaves rung 0, including ${reason}`, async () => {
+    const f = await fixture('{"killswitch_enabled":false}')
+    const open = f.options.dependencies!.open!
+    const service = await f.open({
+      dependencies: {
+        ...f.options.dependencies,
+        open: (options) => {
+          const handle = open(options)
+          return {
+            ...handle,
+            report: () => [
+              {
+                file: { kind: 'user', path: f.file },
+                keyPath: ['killswitch_enabled', 'pi'],
+                reason,
+              },
+            ],
+          }
+        },
+      },
+    })
+    expect(service.snapshot().protection.pi.rung).toBe(3)
+    expect(service.resolve('pi').killswitch_enabled).toBe(true)
+    expect(service.snapshot().report[0]?.reason).toBe(reason)
+  })
+}
+
+for (const missing of [false, true]) {
+  for (const copy of [
+    'valid',
+    'missing',
+    'corrupt',
+    'other-host-only',
+  ] as const) {
+    test(`${missing ? 'missing' : 'unparseable'} startup uses the first whole recovery rung with a ${copy} copy`, async () => {
+      const f = await fixture('{broken')
+      if (missing) await rm(f.file)
+      const legacy = {
+        ...distinctProtection,
+        killswitch_enabled: false,
+        max_same_account_wait: 'off' as const,
+      }
+      const reads: string[] = []
+      const service = await f.open({
+        protection: {
+          readAppliedCopy: async (host) => {
+            reads.push(`copy:${host}`)
+            if (copy === 'corrupt') throw new Error('bad copy')
+            if (
+              copy === 'valid' ||
+              (copy === 'other-host-only' && host === 'pi')
+            )
+              return distinctProtection
+          },
+          readLegacyProtection: async (host) => {
+            reads.push(`legacy:${host}`)
+            return legacy
+          },
+        },
+      })
+      for (const host of ['opencode', 'pi'] as const) {
+        const hasCopy =
+          copy === 'valid' || (copy === 'other-host-only' && host === 'pi')
+        expect(protectionOf(service.resolve(host))).toEqual(
+          hasCopy ? distinctProtection : legacy,
+        )
+        expect(service.snapshot().protection[host].rung).toBe(hasCopy ? 1 : 2)
+        expect(reads.includes(`legacy:${host}`)).toBe(!hasCopy)
+        expect(service.resolve(host).dump_enabled).toBe(false)
+      }
+    })
+  }
+}
+
+test('unavailable recovery sources use exactly the most restrictive set', async () => {
+  const f = await fixture('{broken')
+  const service = await f.open({
+    protection: {
+      readLegacyProtection: async () => {
+        throw new Error('unreadable store')
+      },
+    },
+  })
+  const expected: SettingsProtectionValues = {
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 5,
+    killswitch_default_seven_day: 10,
+    killswitch_default_scoped: 0,
+    killswitch_account_floors: [],
+    quota_minimum_remaining_five_hour: 0,
+    quota_minimum_remaining_seven_day: 0,
+    quota_minimum_remaining_scoped: 0,
+    quota_fail_closed_on_unknown_quota: 'on',
+    max_same_account_wait: 'off',
+  }
+  expect(protectionOf(service.resolve('pi'))).toEqual(expected)
+  expect(service.snapshot().protection.pi.rung).toBe(3)
+})
+
+test("two runtime leases sharing an unusable target recover their own stores, never the first opener's", async () => {
+  const f = await fixture('{broken')
+  const other = {
+    ...distinctProtection,
+    killswitch_default_five_hour: 87,
+    killswitch_account_floors: [],
+  }
+  const [a, b] = await Promise.all([
+    f.open({
+      protection: { readLegacyProtection: async () => distinctProtection },
+    }),
+    f.open({ protection: { readLegacyProtection: async () => other } }),
+  ])
+  expect(f.counts.opens).toBe(1)
+  expect(protectionOf(a.resolve('pi'))).toEqual(distinctProtection)
+  expect(protectionOf(b.resolve('pi'))).toEqual(other)
+  await writeFile(f.file, '{still-broken')
+  await b.refresh()
+  expect(protectionOf(a.resolve('pi'))).toEqual(distinctProtection)
+  expect(protectionOf(b.resolve('pi'))).toEqual(other)
+})
+
+test('process memory outranks an older copy, including a new lease on a shared handle', async () => {
+  const f = await fixture(JSON.stringify(distinctProtection))
+  let recoveryReads = 0
+  const protection = {
+    readAppliedCopy: async () => {
+      recoveryReads++
+      return { ...distinctProtection, killswitch_enabled: false }
+    },
+    readLegacyProtection: async () => {
+      recoveryReads++
+      return undefined
+    },
+  }
+  const first = await f.open({ protection })
+  expect(recoveryReads).toBe(0)
+  await writeFile(f.file, '{broken')
+  await first.refresh()
+  const second = await f.open({ protection })
+  for (const service of [first, second]) {
+    expect(protectionOf(service.resolve('pi'))).toEqual(distinctProtection)
+    expect(service.snapshot().protection.pi.rung).toBe(1)
+  }
+  expect(recoveryReads).toBe(0)
 })
 
 test('updates use the acting host without a model and resolve before returning', async () => {
