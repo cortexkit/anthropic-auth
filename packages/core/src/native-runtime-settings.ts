@@ -1,3 +1,4 @@
+import type { SettingsEdit } from '@cortexkit/common-auth/settings'
 import type { AccountStorage } from './accounts.ts'
 import { setDumpEnabled } from './dump.ts'
 import { parseLogLevel, setLogLevel } from './logger.ts'
@@ -7,7 +8,7 @@ import {
   type NativeSettingsEffectFields,
 } from './native-command-effects.ts'
 import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
-import type { SettingsMode } from './settings-mode.ts'
+import { resolveSettingsMode, type SettingsMode } from './settings-mode.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import { resolveSettingsRecord } from './settings-record.ts'
 import type {
@@ -45,8 +46,11 @@ export function createNativeRuntimeSettings(
   const env = options.env ?? process.env
   const service = options.settingsService?.retain()
   let effects: NativeSettingsEffectFields | undefined
+  let menuAuthority = false
+  let writes = 0
   const generation = () =>
-    service && (options.settingsMode?.() ?? 'user-file') === 'user-file'
+    service &&
+    (menuAuthority || (options.settingsMode?.() ?? 'user-file') === 'user-file')
       ? service.snapshot()
       : undefined
 
@@ -101,15 +105,73 @@ export function createNativeRuntimeSettings(
     }
   }
 
-  const unwatch = service?.watch(() => applyEffects())
+  const unwatch = service?.watch(() => {
+    if (!writes) applyEffects()
+  })
   return {
     resolve,
     status,
     applyEffects,
     file: () => generation()?.file,
+    /** Recheck authority on the menu path before choosing a write target. */
+    async prepareWrite() {
+      if (!service || options.settingsMode?.() === 'separate') return undefined
+      if (!generation()) {
+        if (
+          (await resolveSettingsMode({
+            target: service.file,
+            separate: false,
+          })) !== 'user-file'
+        )
+          return undefined
+        menuAuthority = true
+        await service.refresh()
+      }
+      return service
+    },
+    async update(
+      edits: readonly SettingsEdit[],
+      before: Record<string, unknown>,
+    ) {
+      if (!service) throw new Error('Settings service is not available')
+      // Menu commits emit effects once, even when a service watch fires during the edit.
+      writes++
+      let changed = false
+      try {
+        changed =
+          (await service.update(edits, options.host)).outcome === 'updated'
+      } finally {
+        writes--
+      }
+      const next = resolve(before)
+      const withLevel = (settings: Record<string, unknown>) => ({
+        ...settings,
+        logging: {
+          level:
+            parseLogLevel(sectionLevel(settings)) ??
+            parseLogLevel(env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL) ??
+            'info',
+        },
+      })
+      const committed = withLevel(next)
+      if (changed)
+        applyCommittedNativeSettingsEffects(
+          captureNativeSettingsEffectFields(withLevel(before)),
+          committed,
+        )
+      effects = captureNativeSettingsEffectFields(committed)
+      setDumpEnabled(
+        (next.dump as { enabled?: boolean } | undefined)?.enabled === true,
+      )
+    },
     close: () => {
       unwatch?.()
       return service?.dispose()
     },
   }
+}
+
+function sectionLevel(settings: Record<string, unknown>) {
+  const level = (settings.logging as { level?: unknown } | undefined)?.level
+  return typeof level === 'string' ? level : undefined
 }

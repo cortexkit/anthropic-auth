@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { withLock as acquireLock } from '@cortexkit/common-auth/fs'
+import { SettingsRefusal } from '@cortexkit/common-auth/settings'
 import {
   fingerprintOf,
   POOL_LOCK_DEFAULTS,
@@ -87,6 +88,11 @@ import {
   type NativeRuntimeSettingsStatus,
 } from './native-runtime-settings.ts'
 import {
+  applyNativeStoreSettingsChanges,
+  legacyNativeSettings,
+  planNativeSettingsWrite,
+} from './native-settings-write.ts'
+import {
   joinNativePoolWrite,
   NativeTransientAccountError,
 } from './native-transient-account.ts'
@@ -126,6 +132,7 @@ import {
   nativeRelocationGuard,
   type RelocationGuard,
 } from './relocation-guard.ts'
+import { SETTINGS_WRITE_FAILURES } from './settings-definition.ts'
 import { getSettingsFilePath } from './settings-paths.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
@@ -183,6 +190,13 @@ export interface NativeApiSubject {
 export type NativeRelayUpdate = Partial<Omit<RelayConfig, 'token'>> & {
   token?: string | null
 }
+
+export type NativeSettingsWriteResult = {
+  settings: Record<string, unknown>
+} & (
+  | { outcome: 'saved' | 'updated' | 'unchanged' }
+  | { outcome: 'refused' | 'failed'; reason: string }
+)
 
 export interface NativeAccountRuntime {
   readonly onLockEvent?: (event: NativeLockEvent) => void
@@ -250,16 +264,13 @@ export interface NativeAccountRuntime {
       | Record<string, unknown>
       | undefined
       | Promise<Record<string, unknown> | undefined>,
-  ): Promise<{
-    settings: Record<string, unknown>
-    outcome: 'updated' | 'unchanged'
-  }>
+  ): Promise<NativeSettingsWriteResult>
   /**
    * Store `level` as the logging level, then make it this process's live
    * logger level if it is not already, even when the stored value was
    * unchanged. Nothing is applied when the write fails.
    */
-  setLoggingLevel(level: LogLevel): Promise<void>
+  setLoggingLevel(level: LogLevel): Promise<NativeSettingsWriteResult>
   setEnabled(routeId: string, enabled: boolean): Promise<void>
   remove(routeId: string): Promise<void>
   /**
@@ -1468,23 +1479,20 @@ export function createNativeAccountRuntime(
       }),
     async updateSettings(mutator) {
       const selected = await selectedStorage()
-      // Filled from the copy the committed attempt started from; effects run
-      // only after the write has been committed and changed the settings.
-      const captured: { before?: NativeSettingsEffectFields } = {}
-      const result = await selected.store.updateSettings(async (settings) => {
-        function activation(value: Record<string, unknown>) {
-          const custody = value.claustrum as Record<string, unknown> | undefined
-          return [
-            value.mainAccountId,
-            custody?.mode,
-            custody?.primaryAccount,
-            custody?.scopedRoster,
-            custody?.rosterView,
-            value.relay,
-          ]
-        }
+      const service = await runtimeSettings.prepareWrite()
+      function activation(value: Record<string, unknown>) {
+        const custody = value.claustrum as Record<string, unknown> | undefined
+        return [
+          value.mainAccountId,
+          custody?.mode,
+          custody?.primaryAccount,
+          custody?.scopedRoster,
+          custody?.rosterView,
+          value.relay,
+        ]
+      }
+      async function mutate(settings: Record<string, unknown>) {
         const before = JSON.stringify(activation(settings))
-        captured.before = captureNativeSettingsEffectFields(settings)
         const result = await mutator(settings)
         const next = captureNativePlainData(result ?? settings) as Record<
           string,
@@ -1493,6 +1501,60 @@ export function createNativeAccountRuntime(
         if (JSON.stringify(activation(next)) !== before)
           throw new NativeCustodyError('route-unavailable')
         return next
+      }
+      if (service) {
+        const stored = await selected.store.readSettings()
+        if (stored.status !== 'ready')
+          throw new NativeCustodyError('route-unavailable')
+        const before = runtimeSettings.resolve(stored.settings)
+        const next = await mutate(structuredClone(before))
+        const plan = planNativeSettingsWrite(before, next)
+        try {
+          if (plan.edits.length)
+            await runtimeSettings.update(plan.edits, before)
+        } catch (error) {
+          const failure =
+            error instanceof SettingsRefusal
+              ? SETTINGS_WRITE_FAILURES[error.code]
+              : SETTINGS_WRITE_FAILURES['settings-unavailable']
+          return {
+            settings: runtimeSettings.resolve(stored.settings),
+            outcome: failure.outcome,
+            reason: failure.text(service.file),
+          }
+        }
+        // Never persist the effective record: it contains defaults and three-way enums.
+        let committed = stored.settings
+        try {
+          if (plan.storeChanges.length) {
+            committed = (
+              await selected.store.updateSettings((settings) =>
+                legacyNativeSettings(
+                  applyNativeStoreSettingsChanges(settings, plan.storeChanges),
+                ),
+              )
+            ).settings
+          }
+        } catch {
+          return {
+            settings: runtimeSettings.resolve(stored.settings),
+            outcome: 'failed',
+            reason: SETTINGS_WRITE_FAILURES['settings-unavailable'].text(
+              service.file,
+            ),
+          }
+        }
+        return {
+          settings: runtimeSettings.resolve(committed),
+          outcome: 'saved',
+        }
+      }
+      // Capture pre-change settings in the write callback; effects run only
+      // after the legacy store commits a change.
+      const captured: { before?: NativeSettingsEffectFields } = {}
+      const result = await selected.store.updateSettings(async (settings) => {
+        captured.before = captureNativeSettingsEffectFields(settings)
+        return legacyNativeSettings(await mutate(settings))
       })
       if (result.outcome === 'updated' && captured.before)
         applyCommittedNativeSettingsEffects(captured.before, result.settings)
@@ -1501,7 +1563,7 @@ export function createNativeAccountRuntime(
     async setLoggingLevel(level) {
       // A changed stored level is applied and logged by updateSettings; an
       // unchanged one still brings a different live level in line with it.
-      await runtime.updateSettings((settings) => ({
+      const result = await runtime.updateSettings((settings) => ({
         ...settings,
         logging: {
           ...(settings.logging &&
@@ -1512,7 +1574,9 @@ export function createNativeAccountRuntime(
           level,
         },
       }))
-      applyNativeLogLevel(level)
+      if (result.outcome !== 'refused' && result.outcome !== 'failed')
+        applyNativeLogLevel(level)
+      return result
     },
     async setEnabled(routeId, enabled) {
       // The earlier read only chooses the vault or the pool and supplies the

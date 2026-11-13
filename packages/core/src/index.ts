@@ -90,6 +90,7 @@ export type {
   NativeLocalAuthorizeOptions,
   NativeQuotaPolicyLimit,
   NativeRelayUpdate,
+  NativeSettingsWriteResult,
 } from './native-account-runtime.ts'
 export {
   acquireNativeAccountRuntime,
