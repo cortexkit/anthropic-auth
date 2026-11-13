@@ -16,7 +16,11 @@ import {
   CLAUDE_MODEL_CAPABILITIES,
   resolveClaudeModelCapabilities,
 } from './model-capabilities.ts'
-import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
+import {
+  refusedSettingsRecreationText,
+  type SettingsKey,
+  settingsDefinition,
+} from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import {
   readSettingsProtectionCopy,
@@ -46,6 +50,18 @@ export type SettingsProtectionValues = Pick<
 >
 
 export type SettingsProtectionRung = 0 | 1 | 2 | 3
+
+export class SettingsRecreationRefusal extends Error {
+  constructor(file: string) {
+    super(refusedSettingsRecreationText(file))
+    this.name = 'SettingsRecreationRefusal'
+  }
+}
+
+export interface SettingsUpdateOptions {
+  /** Only menu writes and setup with a <target>.moved marker and no user file may create it. */
+  createMissing?: boolean
+}
 
 export interface SettingsProtectionRecovery {
   /** Return only this host's complete set; missing or corrupt copies return undefined or throw. */
@@ -118,6 +134,7 @@ export interface SettingsService {
   update(
     edits: readonly SettingsEdit[],
     host: SettingsHost,
+    options?: SettingsUpdateOptions,
   ): Promise<UpdateResult>
   dispose(): Promise<void>
 }
@@ -132,7 +149,6 @@ export interface SettingsServiceOptions {
   /** Acting host: enables persistence and startup recovery of only its own copy set. */
   host?: SettingsHost
   separateInstall?: boolean
-  createMissing?: boolean
   lockTimeoutMs?: number
   protection?: SettingsProtectionRecovery
   /** Dependency seams for deterministic file-race and no-I/O tests. */
@@ -211,6 +227,22 @@ function protection(values: SettingsValues): SettingsProtectionValues {
   return Object.fromEntries(
     SETTINGS_PROTECTION_KEYS.map((key) => [key, values[key]]),
   ) as SettingsProtectionValues
+}
+
+/** Carry only the writer's account floors; vault routes apply to both hosts after recreation. */
+export function settingsProtectionForRecreation(
+  values: SettingsProtectionValues,
+  host: SettingsHost,
+): SettingsProtectionValues {
+  return {
+    ...values,
+    killswitch_account_floors: values.killswitch_account_floors
+      .filter((entry) => entry.host === host || entry.host === 'both')
+      .map((entry) => ({
+        ...entry,
+        host: entry.account.startsWith('vault:') ? 'both' : host,
+      })),
+  }
 }
 
 export function mostRestrictiveSettingsProtection(): SettingsProtectionValues {
@@ -338,11 +370,11 @@ class SharedSettingsService {
     this.ready = this.refresh()
   }
 
-  private openOptions(): OpenSettingsOptions {
+  private openOptions(createMissing = false): OpenSettingsOptions {
     return {
       file: this.file,
       separateInstall: false,
-      createMissing: this.options.createMissing ?? true,
+      createMissing,
       lockTimeoutMs: this.options.lockTimeoutMs,
       log: silentLogger,
     }
@@ -763,10 +795,44 @@ class SharedSettingsService {
     }
   }
 
-  async update(edits: readonly SettingsEdit[], host: SettingsHost) {
+  async update(
+    edits: readonly SettingsEdit[],
+    host: SettingsHost,
+    options: SettingsUpdateOptions,
+    applied: SettingsGeneration['protection'][SettingsHost],
+  ): Promise<UpdateResult> {
+    if (!edits.length) return { outcome: 'unchanged' }
     const missing = (await this.bytes()).status === 'missing'
-    const result = await this.handle.update(edits, { host })
-    if (missing && result.outcome === 'updated') recreatedFiles.add(this.file)
+    let carried: SettingsProtectionValues | undefined
+    if (missing && options.createMissing) {
+      if (applied.rung === 3) throw new SettingsRecreationRefusal(this.file)
+      const values = settingsProtectionForRecreation(applied.values, host)
+      carried = values
+      edits = [
+        ...SETTINGS_PROTECTION_KEYS.map((setting) => ({
+          setting,
+          value: values[setting],
+        })),
+        ...edits,
+      ]
+    }
+    // The shared read/watch handle cannot create files. Only the menu's transient writer can.
+    const handle = options.createMissing
+      ? (this.options.dependencies?.open?.(this.openOptions(true)) ??
+        openSettings(settingsDefinition, this.openOptions(true)))
+      : this.handle
+    const result = await handle.update(edits, { host })
+    if (carried && result.outcome === 'updated') {
+      recreatedFiles.add(this.file)
+      const identity = `recreated:${this.file}`
+      if (!logged.has(identity)) {
+        logged.add(identity)
+        logger.info(
+          'settings',
+          `Settings file was recreated at "${this.file}" carrying protection settings: ${JSON.stringify(carried)}.`,
+        )
+      }
+    }
     await this.refresh()
     return result
   }
@@ -920,7 +986,7 @@ function referenceCountedSettingsService(
       snapshot: () => use().snapshot(),
       status: () => use().status(),
       refresh: () => use().refresh(),
-      update: (edits, host) => use().update(edits, host),
+      update: (edits, host, options) => use().update(edits, host, options),
       watch(listener) {
         const unsubscribe = use().watch(listener)
         const stop = () => {
@@ -1013,7 +1079,8 @@ export async function openSettingsService(
       return stop
     },
     refresh: () => use().refresh(),
-    update: (edits, host) => use().update(edits, host),
+    update: (edits, host, options = {}) =>
+      use().update(edits, host, options, lease.snapshot().protection[host]),
     dispose,
   })
 }

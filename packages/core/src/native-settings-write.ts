@@ -9,7 +9,11 @@ import {
   type SettingsKey,
 } from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
-import type { SettingsGeneration, SettingsValues } from './settings-service.ts'
+import {
+  type SettingsGeneration,
+  type SettingsValues,
+  settingsProtectionForRecreation,
+} from './settings-service.ts'
 
 type Settings = Record<string, unknown>
 
@@ -255,7 +259,13 @@ export function planNativeSettingsWrite(
         )
       : {}
   let floors = structuredClone(
-    (raw[key] ?? []) as SettingsValues['killswitch_account_floors'],
+    (present
+      ? (raw[key] ?? [])
+      : settingsProtectionForRecreation(
+          generation.protection[host].values,
+          host,
+        )
+          .killswitch_account_floors) as SettingsValues['killswitch_account_floors'],
   )
   const original = structuredClone(floors)
   for (const account of accounts) {

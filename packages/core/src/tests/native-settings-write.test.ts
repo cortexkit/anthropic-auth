@@ -21,11 +21,16 @@ import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import {
   invalidSettingsWriteText,
+  refusedSettingsRecreationText,
   refusedSettingsWriteText,
   SETTINGS_WRITE_FAILURES,
   settingsDefinition,
 } from '../settings-definition.ts'
-import type { SettingsMode } from '../settings-mode.ts'
+import { resolveSettingsMode, type SettingsMode } from '../settings-mode.ts'
+import {
+  readSettingsProtectionCopy,
+  writeSettingsProtectionCopy,
+} from '../settings-protection-copy.ts'
 import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import { openSettingsService } from '../settings-service.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
@@ -45,6 +50,8 @@ async function fixture(
     refusal?: SettingsRefusalCode
     legacy?: Record<string, unknown>
     windowDefault?: { start_hour: number; end_hour: number }[]
+    unavailableProtection?: boolean
+    failCopy?: boolean
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
@@ -62,11 +69,20 @@ async function fixture(
       ...options.legacy,
     }))
   const calls: unknown[] = []
+  const openModes: boolean[] = []
   const service = await openSettingsService({
     file,
     host: options.host ?? 'opencode',
     dependencies: {
+      ...(options.failCopy
+        ? {
+            writeAppliedCopy: async () => {
+              throw new Error('synthetic copy failure')
+            },
+          }
+        : {}),
       open: (config) => {
+        openModes.push(config.createMissing === true)
         const handle = openSettings(
           {
             ...settingsDefinition,
@@ -99,10 +115,12 @@ async function fixture(
     },
     protection: {
       readLegacyProtection: async () =>
-        legacySettingsProtection(
-          options.legacy ?? {},
-          options.host ?? 'opencode',
-        ),
+        options.unavailableProtection
+          ? undefined
+          : legacySettingsProtection(
+              options.legacy ?? {},
+              options.host ?? 'opencode',
+            ),
     },
   })
   if (!service) throw new Error('Settings service unavailable')
@@ -140,6 +158,7 @@ async function fixture(
     runtime,
     store,
     calls,
+    openModes,
     service,
     text: () => readFile(file, 'utf8'),
     saved: async () => {
@@ -565,6 +584,325 @@ test('the mutator gets applied ladder protection and returning it unchanged crea
     main: { five_hour: 5, seven_day: 10, scoped: 7 },
   })
   expect(f.calls).toHaveLength(0)
+  await expect(f.text()).rejects.toThrow()
+})
+
+for (const host of ['opencode', 'pi'] as const) {
+  test(`${host} rung-2 menu recreation carries canonical complete protection before the unrelated edit`, async () => {
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    const f = await fixture(null, {
+      host,
+      legacy: {
+        killswitch: {
+          enabled: true,
+          main: { '5h': 18, '1w': 28 },
+          accounts: {
+            local: { '5h': 31 },
+            'vault:credential~0123456789': { '1w': 42 },
+          },
+        },
+        quota: {
+          minimumRemaining: { '5h': 12 },
+          failClosedOnUnknownQuota: true,
+        },
+        routing: { maxSameAccountWait: '0' },
+      },
+    })
+    expect(f.service.snapshot().protection[host].rung).toBe(2)
+    const legacy = await f.saved()
+    const result = await f.runtime.updateSettings((settings) => {
+      settings.dump = { enabled: true }
+    })
+    expect(result.outcome).toBe('saved')
+    const raw = parse(await f.text())
+    expect(raw).toEqual({
+      schema_version: 1,
+      max_same_account_wait: 'off',
+      quota_minimum_remaining_five_hour: 12,
+      quota_minimum_remaining_seven_day: 0,
+      quota_minimum_remaining_scoped: 0,
+      quota_fail_closed_on_unknown_quota: 'on',
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 18,
+      killswitch_default_seven_day: 28,
+      killswitch_default_scoped: 0,
+      killswitch_account_floors: [
+        { account: 'local', host, five_hour: 31, seven_day: 10, scoped: 0 },
+        {
+          account: 'vault:credential~0123456789',
+          host: 'both',
+          five_hour: 5,
+          seven_day: 42,
+          scoped: 0,
+        },
+      ],
+      dump_enabled: true,
+    })
+    expect(Object.keys(raw).at(-1)).toBe('dump_enabled')
+    expect(result.settings.killswitch).toEqual({
+      enabled: true,
+      main: { five_hour: 18, seven_day: 28, scoped: 0 },
+      accounts: {
+        local: { five_hour: 31, seven_day: 10, scoped: 0 },
+        'vault:credential~0123456789': {
+          five_hour: 5,
+          seven_day: 42,
+          scoped: 0,
+        },
+      },
+    })
+    expect(f.calls).toHaveLength(1)
+    expect(f.openModes).toEqual([false, true])
+    expect(await f.saved()).toEqual(legacy)
+    expect(f.runtime.getSettingsStatus?.()).toMatchObject({
+      file: { missing: false, recreated: true },
+    })
+    await f.service.refresh()
+    const logs = records.filter((record) =>
+      record.message.includes('was recreated'),
+    )
+    expect(logs).toHaveLength(1)
+    expect(logs[0]!.message).toContain('"killswitch_enabled":true')
+    expect(logs[0]!.message).toContain('"killswitch_default_five_hour":18')
+    expect(logs[0]!.message).toContain('"killswitch_account_floors":[')
+  })
+}
+
+test('recreation replaces both hosts differing protection with the writer values, including only its account floors', async () => {
+  const f = await fixture(
+    JSON.stringify({
+      killswitch_enabled: { default: false, pi: true },
+      killswitch_default_five_hour: { default: 15, pi: 45 },
+      quota_minimum_remaining_seven_day: { default: 17, pi: 47 },
+      killswitch_account_floors: [
+        {
+          account: 'local',
+          host: 'opencode',
+          five_hour: 21,
+          seven_day: 22,
+          scoped: 0,
+        },
+        {
+          account: 'local',
+          host: 'pi',
+          five_hour: 51,
+          seven_day: 52,
+          scoped: 0,
+        },
+        {
+          account: 'vault:shared',
+          host: 'opencode',
+          five_hour: 23,
+          seven_day: 24,
+          scoped: 0,
+        },
+        {
+          account: 'vault:shared',
+          host: 'pi',
+          five_hour: 53,
+          seven_day: 54,
+          scoped: 0,
+        },
+      ],
+    }),
+  )
+  const peer = await openSettingsService({ file: f.file, host: 'pi' })
+  if (!peer) throw new Error('Peer service unavailable')
+  cleanup.push(() => peer.dispose())
+  expect(peer.resolve('pi').killswitch_enabled).toBe(true)
+  expect(f.service.resolve('opencode').killswitch_enabled).toBe(false)
+  await rm(f.file)
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result.outcome).toBe('saved')
+  for (const host of ['opencode', 'pi'] as const) {
+    expect(peer.resolve(host)).toMatchObject({
+      killswitch_enabled: false,
+      killswitch_default_five_hour: 15,
+      quota_minimum_remaining_seven_day: 17,
+    })
+  }
+  expect(parse(await f.text()).killswitch_account_floors).toEqual([
+    {
+      account: 'local',
+      host: 'opencode',
+      five_hour: 21,
+      seven_day: 22,
+      scoped: 0,
+    },
+    {
+      account: 'vault:shared',
+      host: 'both',
+      five_hour: 23,
+      seven_day: 24,
+      scoped: 0,
+    },
+  ])
+})
+
+test('rung-3 recreation refuses with the fixed text and commits neither file nor legacy changes', async () => {
+  const f = await fixture(null, { unavailableProtection: true })
+  expect(f.service.snapshot().protection.opencode.rung).toBe(3)
+  const legacy = await f.saved()
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+    settings.nativeAccountOrder = ['b', 'a']
+  })
+  expect(result).toMatchObject({
+    outcome: 'refused',
+    reason: refusedSettingsRecreationText(f.file),
+  })
+  expect(f.calls).toHaveLength(0)
+  expect(f.openModes).toEqual([false])
+  await expect(f.text()).rejects.toThrow()
+  expect(await f.saved()).toEqual(legacy)
+})
+
+test('a failed copy write never replaces the applied protection carried by a recreating menu write', async () => {
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => records.push(record))
+  const f = await fixture(
+    '{"killswitch_enabled":true,"killswitch_default_five_hour":39}',
+    {
+      failCopy: true,
+    },
+  )
+  const old = legacySettingsProtection({}, 'opencode')
+  await writeSettingsProtectionCopy(f.file, 'opencode', {
+    readAt: 1,
+    values: old,
+  })
+  expect(
+    (await readSettingsProtectionCopy(f.file, 'opencode'))?.killswitch_enabled,
+  ).toBe(false)
+  await rm(f.file)
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result.outcome).toBe('saved')
+  expect(parse(await f.text())).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 39,
+    dump_enabled: true,
+  })
+  await f.runtime.close()
+  await f.service.dispose()
+  expect(await readSettingsProtectionCopy(f.file, 'opencode')).toEqual(old)
+  expect(
+    records.filter((record) =>
+      record.message.includes('Could not save applied protection'),
+    ),
+  ).toHaveLength(1)
+})
+
+test('an account-floor menu edit during recreation retains untouched applied accounts', async () => {
+  const f = await fixture(null, {
+    legacy: {
+      killswitch: {
+        enabled: true,
+        accounts: {
+          'vault:changed': { five_hour: 20, seven_day: 30 },
+          untouched: { five_hour: 40, seven_day: 50 },
+        },
+      },
+    },
+  })
+  const result = await f.runtime.updateSettings((settings) => {
+    const killswitch = settings.killswitch as {
+      accounts: Record<string, unknown>
+    }
+    killswitch.accounts['vault:changed'] = { five_hour: 25, seven_day: 35 }
+  })
+  expect(result.outcome).toBe('saved')
+  expect(parse(await f.text()).killswitch_account_floors).toEqual([
+    {
+      account: 'vault:changed',
+      host: 'opencode',
+      five_hour: 25,
+      seven_day: 35,
+      scoped: 0,
+    },
+    {
+      account: 'vault:changed',
+      host: 'pi',
+      five_hour: 20,
+      seven_day: 30,
+      scoped: 0,
+    },
+    {
+      account: 'untouched',
+      host: 'opencode',
+      five_hour: 40,
+      seven_day: 50,
+      scoped: 0,
+    },
+  ])
+})
+
+test('a recreating mixed menu write persists only the legacy record, never its three-way projection', async () => {
+  const f = await fixture(null, {
+    legacy: {
+      claudeCache: { enabled: false },
+      quota: { enabled: false, failClosedOnUnknownQuota: false },
+      nativeAccountOrder: ['a'],
+    },
+  })
+  const legacy = await f.saved()
+  const result = await f.runtime.updateSettings((settings) => {
+    expect(settings.claudeCache).toMatchObject({ enabled: 'default' })
+    expect(settings.quota).toMatchObject({
+      enabled: 'default',
+      failClosedOnUnknownQuota: 'off',
+    })
+    settings.nativeAccountOrder = ['b', 'a']
+    settings.dump = { enabled: true }
+  })
+  expect(result.outcome).toBe('saved')
+  expect(await f.saved()).toEqual({ ...legacy, nativeAccountOrder: ['b', 'a'] })
+  expect(parse(await f.text()).quota_fail_closed_on_unknown_quota).toBe('off')
+})
+
+test('restart after deletion keeps user-file authority, defaults non-protection settings and reports missing once', async () => {
+  const f = await fixture(
+    '{"dump_enabled":true,"refresh_interval_minutes":33,"killswitch_enabled":true}',
+    {
+      legacy: { dump: { enabled: true }, refresh: { intervalMinutes: 33 } },
+    },
+  )
+  await writeFile(`${f.file}.moved`, '{}')
+  await f.runtime.close()
+  await f.service.dispose()
+  await rm(f.file)
+  expect(await resolveSettingsMode({ target: f.file, separate: false })).toBe(
+    'user-file',
+  )
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => records.push(record))
+  const service = await openSettingsService({
+    file: f.file,
+    host: 'opencode',
+    protection: {
+      readLegacyProtection: async () =>
+        legacySettingsProtection({}, 'opencode'),
+    },
+  })
+  if (!service) throw new Error('Restarted service unavailable')
+  cleanup.push(() => service.dispose())
+  expect(service.resolve('opencode')).toMatchObject({
+    dump_enabled: false,
+    refresh_interval_minutes: 10,
+    killswitch_enabled: true,
+  })
+  expect(service.snapshot().protection.opencode.rung).toBe(1)
+  expect(service.status()).toMatchObject({ missing: true, recreated: false })
+  await service.refresh()
+  const missing = records.filter((record) =>
+    record.message.includes('Settings file is missing'),
+  )
+  expect(missing).toHaveLength(1)
+  expect(missing[0]!.message).toContain('A menu write will recreate it.')
   await expect(f.text()).rejects.toThrow()
 })
 

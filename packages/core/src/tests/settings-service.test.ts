@@ -697,17 +697,35 @@ test('a file missing at startup uses schema defaults and a menu write exposes it
   const timer = manualTimer()
   const service = await f.open({
     dependencies: { ...f.options.dependencies, schedule: timer.schedule },
+    protection: { readAppliedCopy: async () => distinctProtection },
   })
   expect(timer.delays).toEqual([])
   expect(service.status().missing).toBe(true)
   expect(service.resolve('pi').dump_enabled).toBe(false)
   expect(service.resolve('pi').refresh_interval_minutes).toBe(10)
-  await service.update([{ setting: 'dump_enabled', value: true }], 'pi')
+  expect(service.snapshot().protection.pi.rung).toBe(1)
+  await service.update([{ setting: 'dump_enabled', value: true }], 'pi', {
+    createMissing: true,
+  })
   expect(service.resolve('pi').dump_enabled).toBe(true)
+  expect(service.resolve('pi').killswitch_default_five_hour).toBe(31)
   expect(service.status().missing).toBe(false)
   expect(service.status().recreated).toBe(true)
   await service.dispose()
   expect((await f.open()).status().recreated).toBe(true)
+})
+
+test('non-menu service updates cannot create a missing user file', async () => {
+  const f = await fixture()
+  await rm(f.file)
+  const service = await f.open({
+    protection: { readLegacyProtection: async () => distinctProtection },
+  })
+  await expect(
+    service.update([{ setting: 'dump_enabled', value: true }], 'pi'),
+  ).rejects.toThrow()
+  await expect(readFile(f.file)).rejects.toThrow()
+  expect(service.status().recreated).toBe(false)
 })
 
 test('a file recreated during the injected 2 s save window is read without publishing missing defaults', async () => {

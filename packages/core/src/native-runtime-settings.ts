@@ -139,7 +139,8 @@ export function createNativeRuntimeSettings(
       let changed = false
       try {
         changed =
-          (await service.update(edits, options.host)).outcome === 'updated'
+          (await service.update(edits, options.host, { createMissing: true }))
+            .outcome === 'updated'
       } finally {
         writes--
       }

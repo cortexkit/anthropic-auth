@@ -134,6 +134,7 @@ import {
 } from './relocation-guard.ts'
 import { SETTINGS_WRITE_FAILURES } from './settings-definition.ts'
 import { getSettingsFilePath } from './settings-paths.ts'
+import { SettingsRecreationRefusal } from './settings-service.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -1521,6 +1522,12 @@ export function createNativeAccountRuntime(
           if (plan.edits.length)
             await runtimeSettings.update(plan.edits, before)
         } catch (error) {
+          if (error instanceof SettingsRecreationRefusal)
+            return {
+              settings: runtimeSettings.resolve(stored.settings),
+              outcome: 'refused',
+              reason: error.message,
+            }
           const failure =
             error instanceof SettingsRefusal
               ? SETTINGS_WRITE_FAILURES[error.code]
