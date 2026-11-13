@@ -11,6 +11,7 @@ import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import { createNativeMenuCapabilities } from '../v2/menu'
+import * as reloadFactory from '../v2/reload'
 import { setupAnthropicAuth } from '../v2/setup'
 import * as sourceFactory from '../v2/source'
 import releaseSnapshots from './fixtures/settings-2.11.2.json'
@@ -1179,4 +1180,44 @@ test('OC2 starts when resolving the settings paths throws, logging only fixed te
   expect(
     records.some((record) => JSON.stringify(record).includes('private path')),
   ).toBe(false)
+})
+
+test('OC2 passes no empty settings path when both path lookups throw; startSettings resolves its own', async () => {
+  const f = await fixture()
+  // Only OpenCode 2's own lookups throw (each is its first call); the
+  // settings startup that follows resolves the path itself.
+  const failures = [
+    spyOn(core, 'resolveSettingsPaths').mockImplementationOnce(async () => {
+      throw new Error('private path')
+    }),
+    spyOn(core, 'getSettingsFilePath').mockImplementationOnce(() => {
+      throw new Error('private path')
+    }),
+  ]
+  const keys: string[] = []
+  const create = reloadFactory.createReloadableRequestHooks
+  const reload = spyOn(
+    reloadFactory,
+    'createReloadableRequestHooks',
+  ).mockImplementation((ctx, key, version) => {
+    keys.push(key)
+    return create(ctx, key, version)
+  })
+  // The fixture already wraps startSettings in a spy.
+  const startup = core.startSettings as unknown as ReturnType<
+    typeof spyOn<typeof core, 'startSettings'>
+  >
+  cleanups.push(() => {
+    for (const failure of failures) failure.mockRestore()
+    reload.mockRestore()
+  })
+  const started = await f.start()
+  for (const failure of failures) expect(failure).toHaveBeenCalled()
+  expect(started.runtime).toBeDefined()
+  // The reload key records no settings path rather than an empty one.
+  expect(keys).toHaveLength(1)
+  expect(JSON.parse(keys[0]!)[1]).toBeNull()
+  // startSettings got no paths, so it resolved the target on its own.
+  expect(startup.mock.calls.at(-1)?.[0].paths).toBeUndefined()
+  expect(f.starts.at(-1)?.file).toBe(f.target)
 })

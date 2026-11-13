@@ -363,18 +363,21 @@ export async function setupAnthropicAuth(
       'Settings file paths could not be resolved; settings startup falls back to the last applied protection settings.',
     )
   }
+  // The reload key only tells plugin instances apart; it is never resolved as
+  // a path. Without any settings path it records null, never an empty string,
+  // which path code would resolve against the working directory.
   let settingsTarget = settingsPaths?.target
   if (settingsTarget === undefined)
     try {
       settingsTarget = getSettingsFilePath({ env: settingsEnv })
     } catch {
-      settingsTarget = ''
+      // Leave it undefined; startSettings resolves the path itself.
     }
   const requests = createReloadableRequestHooks(
     ctx,
     JSON.stringify([
       nativeVaultRuntimeKey({ ...options.vault, paths, host: 'opencode' }),
-      settingsTarget,
+      settingsTarget || null,
     ]),
   )
   ctx = requests.context
