@@ -72,6 +72,15 @@ export interface SettingsProtectionRecovery {
   readLegacyProtection?: (
     host: SettingsHost,
   ) => Promise<SettingsProtectionValues | undefined>
+  /**
+   * Read the other host's own legacy store through that host's current custody
+   * (see `readPeerLegacySettingsProtection`). Recreating a missing file uses it
+   * to learn the other host's protection; without it that host counts as
+   * having the strictest set.
+   */
+  readPeerLegacyProtection?: (
+    host: SettingsHost,
+  ) => Promise<SettingsProtectionValues | undefined>
 }
 
 export interface SettingsContextValues {
@@ -231,20 +240,140 @@ function protection(values: SettingsValues): SettingsProtectionValues {
   ) as SettingsProtectionValues
 }
 
-/** Carry only the writer's account floors; vault routes apply to both hosts after recreation. */
-export function settingsProtectionForRecreation(
+type AccountFloor =
+  SettingsProtectionValues['killswitch_account_floors'][number]
+
+/** The account floors one host applies, in list order, without their host tags. */
+function hostFloors(values: SettingsProtectionValues, host: SettingsHost) {
+  return values.killswitch_account_floors
+    .filter((entry) => entry.host === host || entry.host === 'both')
+    .map(({ account, five_hour, seven_day, scoped }) => ({
+      account,
+      five_hour,
+      seven_day,
+      scoped,
+    }))
+}
+
+function sameJson(a: unknown, b: unknown) {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** One host's whole protection set, as the recreation planner receives it. */
+export interface SettingsRecreationSide {
+  host: SettingsHost
+  values: SettingsProtectionValues
+}
+
+/**
+ * A settings edit that names the override level it writes. common-auth 0.48
+ * has no `level`; 0.49 adds it, and only then can a recreation write a value
+ * for one host. Until then recreation accepts plans whose edits carry none.
+ */
+export type SettingsLevelEdit = SettingsEdit & {
+  level?: 'default' | SettingsHost
+}
+
+/**
+ * The protection edits for a recreated file, as a pure function of both
+ * hosts' whole sets, so each host resolves exactly its own set from the new
+ * file. A key both hosts agree on is one plain value. A key they disagree on
+ * is the writer's value at the default level, then the other host's value at
+ * that host's level. Floors are one list whose entries keep each host's tag;
+ * an entry becomes `both` only for a vault account whose floors are
+ * identical for the two hosts.
+ */
+export function planSettingsRecreation(
+  writer: SettingsRecreationSide,
+  peer: SettingsRecreationSide,
+): {
+  edits: SettingsLevelEdit[]
+  /** True when the other host resolves any protection value differently. */
+  peerDiffers: boolean
+} {
+  let peerDiffers = false
+  const edits: SettingsLevelEdit[] = []
+  for (const setting of SETTINGS_PROTECTION_KEYS) {
+    if (setting === 'killswitch_account_floors') continue
+    const own = writer.values[setting]
+    const other = peer.values[setting]
+    if (sameJson(own, other)) {
+      edits.push({ setting, value: own })
+      continue
+    }
+    peerDiffers = true
+    edits.push(
+      { setting, level: 'default', value: own },
+      { setting, level: peer.host, value: other },
+    )
+  }
+  const ownFloors = hostFloors(writer.values, writer.host)
+  const otherFloors = hostFloors(peer.values, peer.host)
+  const byAccount = (list: typeof ownFloors) =>
+    [...list].sort((a, b) =>
+      a.account < b.account ? -1 : a.account > b.account ? 1 : 0,
+    )
+  if (!sameJson(byAccount(ownFloors), byAccount(otherFloors)))
+    peerDiffers = true
+  const floors: AccountFloor[] = []
+  const shared = new Set<string>()
+  for (const entry of ownFloors) {
+    const identical = otherFloors.some(
+      (other) => other.account === entry.account && sameJson(other, entry),
+    )
+    if (identical && entry.account.startsWith('vault:')) {
+      shared.add(entry.account)
+      floors.push({ ...entry, host: 'both' })
+    } else floors.push({ ...entry, host: writer.host })
+  }
+  for (const entry of otherFloors)
+    if (!shared.has(entry.account)) floors.push({ ...entry, host: peer.host })
+  edits.push({ setting: 'killswitch_account_floors', value: floors })
+  return { edits, peerDiffers }
+}
+
+/**
+ * The floor list a recreation writes when the other host applies the same
+ * floors as `host`, which is the only case recreation accepts today.
+ */
+export function settingsRecreationFloors(
   values: SettingsProtectionValues,
   host: SettingsHost,
-): SettingsProtectionValues {
-  return {
-    ...values,
-    killswitch_account_floors: values.killswitch_account_floors
-      .filter((entry) => entry.host === host || entry.host === 'both')
-      .map((entry) => ({
-        ...entry,
-        host: entry.account.startsWith('vault:') ? 'both' : host,
-      })),
-  }
+): SettingsProtectionValues['killswitch_account_floors'] {
+  const peer = host === 'opencode' ? 'pi' : 'opencode'
+  const { edits } = planSettingsRecreation(
+    { host, values },
+    {
+      host: peer,
+      values: {
+        ...values,
+        killswitch_account_floors: hostFloors(values, host).map((entry) => ({
+          ...entry,
+          host: peer,
+        })),
+      },
+    },
+  )
+  const floors = edits.find(
+    (edit) => edit.setting === 'killswitch_account_floors',
+  )?.value
+  return (floors ?? []) as SettingsProtectionValues['killswitch_account_floors']
+}
+
+/** The state of the user file a menu write found, as common-auth's planned update reports it. */
+export type SettingsWriteState = { status: 'missing' } | { status: 'ready' }
+
+/**
+ * The edits for one menu write, as a pure function of the file it finds:
+ * protection is carried only into a missing file, and an existing file keeps
+ * its own. `carry` throws when recreation must be refused.
+ */
+export function planSettingsMenuWrite(
+  current: SettingsWriteState,
+  edits: readonly SettingsEdit[],
+  carry: () => readonly SettingsEdit[],
+): readonly SettingsEdit[] {
+  return current.status === 'missing' ? [...carry(), ...edits] : edits
 }
 
 export function mostRestrictiveSettingsProtection(): SettingsProtectionValues {
@@ -811,21 +940,31 @@ class SharedSettingsService {
     host: SettingsHost,
     options: SettingsUpdateOptions,
     applied: SettingsGeneration['protection'][SettingsHost],
+    peerProtection: (
+      host: SettingsHost,
+    ) => Promise<SettingsProtectionValues> = async () =>
+      mostRestrictiveSettingsProtection(),
   ): Promise<UpdateResult> {
     if (!edits.length) return { outcome: 'unchanged' }
     const missing = (await this.bytes()).status === 'missing'
-    let carried: SettingsProtectionValues | undefined
+    let carried: Record<string, unknown> | undefined
     if (missing && options.createMissing) {
       if (applied.rung === 3) throw new SettingsRecreationRefusal(this.file)
-      const values = settingsProtectionForRecreation(applied.values, host)
-      carried = values
-      edits = [
-        ...SETTINGS_PROTECTION_KEYS.map((setting) => ({
-          setting,
-          value: values[setting],
-        })),
-        ...edits,
-      ]
+      const peer = host === 'opencode' ? 'pi' : 'opencode'
+      const plan = planSettingsRecreation(
+        { host, values: applied.values },
+        { host: peer, values: await peerProtection(peer) },
+      )
+      // common-auth 0.48 cannot write a value for one host into a new file,
+      // so a plain carry would hand the writer's values to the other host.
+      // Refuse until edits can name their level (common-auth 0.49).
+      if (plan.peerDiffers) throw new SettingsRecreationRefusal(this.file)
+      carried = Object.fromEntries(
+        plan.edits.map((edit) => [edit.setting, edit.value]),
+      )
+      edits = planSettingsMenuWrite({ status: 'missing' }, edits, () =>
+        plan.edits.map(({ setting, value }) => ({ setting, value })),
+      )
     }
     // The shared read/watch handle cannot create files. Only the menu's transient writer can.
     const handle = options.createMissing
@@ -918,6 +1057,30 @@ class SettingsProtectionLease {
   publish(generation: SettingsGeneration): Promise<void> {
     this.pending = this.pending.then(() => this.apply(generation))
     return this.pending
+  }
+
+  /**
+   * The other host's whole set for recreating a missing file: its last-good
+   * set in this process, then its applied copy, then its own legacy store,
+   * then the strictest set.
+   */
+  async peerProtection(host: SettingsHost): Promise<SettingsProtectionValues> {
+    const good = this.shared.lastGoodProtection(host)
+    if (good) return good
+    for (const read of [
+      this.recovery.readAppliedCopy ??
+        ((peer: SettingsHost) =>
+          readSettingsProtectionCopy(this.shared.file, peer)),
+      this.recovery.readPeerLegacyProtection,
+    ]) {
+      try {
+        const values = await read?.(host)
+        if (values) return values
+      } catch {
+        // An unreadable source is skipped whole; keys are never mixed across sources.
+      }
+    }
+    return mostRestrictiveSettingsProtection()
   }
 
   private async recover(host: SettingsHost) {
@@ -1110,7 +1273,13 @@ export async function openSettingsService(
     },
     refresh: () => use().refresh(),
     update: (edits, host, options = {}) =>
-      use().update(edits, host, options, lease.snapshot().protection[host]),
+      use().update(
+        edits,
+        host,
+        options,
+        lease.snapshot().protection[host],
+        (peer) => lease.peerProtection(peer),
+      ),
     dispose,
   })
 }

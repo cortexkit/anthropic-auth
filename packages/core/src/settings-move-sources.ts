@@ -1,4 +1,4 @@
-import { lstat } from 'node:fs/promises'
+import { lstat, readFile } from 'node:fs/promises'
 import type { MoveSource } from '@cortexkit/common-auth/settings'
 
 import { logger } from './logger.ts'
@@ -18,6 +18,8 @@ import {
   type SettingsPathOptions,
   type SettingsPaths,
 } from './settings-paths.ts'
+import { legacySettingsProtection } from './settings-protection-legacy.ts'
+import type { SettingsProtectionValues } from './settings-service.ts'
 import {
   LEGACY_STATE_LAYOUT,
   readStateLayoutMarker,
@@ -54,7 +56,7 @@ const loggedSkips = new Set<string>()
 /** Observe a peer's layout without moving files or registering a process for that host. */
 async function peerLayout(
   host: SettingsHost,
-  options: SettingsMoveSourcesOptions,
+  options: SettingsPathOptions,
 ): Promise<StateLayout> {
   // Pi never relocates its dataset; only OpenCode has a state-home layout.
   if (host === 'pi') return LEGACY_STATE_LAYOUT
@@ -86,6 +88,70 @@ async function peerLayout(
 }
 
 /**
+ * Read the other host's legacy protection for recreating a missing settings
+ * file: its default store, through its current custody and state layout,
+ * without seeding a vault, taking locks or writing anything. A store that
+ * doesn't exist in local custody reads as an empty store, as that host's
+ * legacy release reads it. Anything unreadable, including vault settings
+ * that were never seeded, returns undefined so the caller uses a stricter set.
+ */
+export async function readPeerLegacySettingsProtection(
+  options: SettingsPathOptions & {
+    host: SettingsHost
+    readMode?: typeof readNativeEnrollmentMode
+  },
+): Promise<SettingsProtectionValues | undefined> {
+  try {
+    const paths = await resolveSettingsPaths(options.host, options)
+    if (paths.separate) return undefined
+    const store = paths.defaults[options.host]
+    const mode = await (options.readMode ?? readNativeEnrollmentMode)(
+      options.host,
+      enrollmentEnv(options),
+    )
+    const pool = await resolveNativePoolPaths(
+      store.account,
+      store.state,
+      await peerLayout(options.host, options),
+    )
+    const selected = mode === 'claustrum' ? nativeVaultPaths(pool) : pool
+    let text: string
+    try {
+      text = await readFile(selected.config, 'utf8')
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code === 'ENOENT' &&
+        mode === 'local'
+      )
+        return legacySettingsProtection({}, options.host, mode)
+      return undefined
+    }
+    const stored: unknown = JSON.parse(text)
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored))
+      return undefined
+    return legacySettingsProtection(
+      stored as Record<string, unknown>,
+      options.host,
+      mode,
+    )
+  } catch {
+    return undefined
+  }
+}
+
+function enrollmentEnv(options: SettingsPathOptions) {
+  const context = resolvePathOptions(options)
+  return {
+    ...context.env,
+    // Enrollment's legacy resolver uses os.homedir(); carry the supplied home
+    // through its state-root input instead, so sandboxed callers stay isolated.
+    XDG_STATE_HOME:
+      context.env.XDG_STATE_HOME ||
+      context.paths.join(context.home, '.local', 'state'),
+  }
+}
+
+/**
  * Prepare the common-auth mover's sources, not a startup or authority decision.
  * An unavailable own source must keep this start in legacy mode; the caller logs
  * that result once and must not call the mover or publish a marker.
@@ -96,15 +162,7 @@ export async function prepareSettingsMoveSources(
   const paths =
     options.paths ?? (await resolveSettingsPaths(options.host, options))
   if (paths.separate) return { status: 'separate', sources: [] }
-  const context = resolvePathOptions(options)
-  const env = {
-    ...context.env,
-    // Enrollment's legacy resolver uses os.homedir(); carry the supplied home
-    // through its state-root input instead, so sandboxed callers stay isolated.
-    XDG_STATE_HOME:
-      context.env.XDG_STATE_HOME ||
-      context.paths.join(context.home, '.local', 'state'),
-  }
+  const env = enrollmentEnv(options)
   const warn = (message: string) =>
     options.log ? options.log.warn(message) : logger.warn('settings', message)
   const skip = (host: SettingsHost, path: string, reason: string) => {

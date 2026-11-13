@@ -697,7 +697,17 @@ test('a file missing at startup uses schema defaults and a menu write exposes it
   const timer = manualTimer()
   const service = await f.open({
     dependencies: { ...f.options.dependencies, schedule: timer.schedule },
-    protection: { readAppliedCopy: async () => distinctProtection },
+    // Both hosts' copies hold the same set, so recreation may carry it as plain values.
+    protection: {
+      readAppliedCopy: async (host) => ({
+        ...distinctProtection,
+        killswitch_account_floors:
+          distinctProtection.killswitch_account_floors.map((entry) => ({
+            ...entry,
+            host,
+          })),
+      }),
+    },
   })
   expect(timer.delays).toEqual([])
   expect(service.status().missing).toBe(true)

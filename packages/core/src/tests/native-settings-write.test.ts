@@ -50,6 +50,8 @@ async function fixture(
     mode?: SettingsMode
     refusal?: SettingsRefusalCode
     legacy?: Record<string, unknown>
+    /** The other host's legacy store; null makes it unreadable. */
+    peerLegacy?: Record<string, unknown> | null
     windowDefault?: { start_hour: number; end_hour: number }[]
     unavailableProtection?: boolean
     failCopy?: boolean
@@ -129,6 +131,14 @@ async function fixture(
           : legacySettingsProtection(
               options.legacy ?? {},
               options.host ?? 'opencode',
+            ),
+      // The other host's own store holds the same legacy settings unless a test says otherwise.
+      readPeerLegacyProtection: async (peer) =>
+        options.unavailableProtection || options.peerLegacy === null
+          ? undefined
+          : legacySettingsProtection(
+              options.peerLegacy ?? options.legacy ?? {},
+              peer,
             ),
     },
   })
@@ -649,6 +659,14 @@ for (const host of ['opencode', 'pi'] as const) {
           seven_day: 42,
           scoped: 0,
         },
+        // The other host's own store holds the same local floor, under its own tag.
+        {
+          account: 'local',
+          host: host === 'pi' ? 'opencode' : 'pi',
+          five_hour: 31,
+          seven_day: 10,
+          scoped: 0,
+        },
       ],
       dump_enabled: true,
     })
@@ -682,7 +700,7 @@ for (const host of ['opencode', 'pi'] as const) {
   })
 }
 
-test('recreation replaces both hosts differing protection with the writer values, including only its account floors', async () => {
+test('recreation refuses while the other host applies a different protection set, and that host keeps its own', async () => {
   const f = await fixture(
     JSON.stringify({
       killswitch_enabled: { default: false, pi: true },
@@ -729,15 +747,40 @@ test('recreation replaces both hosts differing protection with the writer values
   const result = await f.runtime.updateSettings((settings) => {
     settings.dump = { enabled: true }
   })
-  expect(result.outcome).toBe('saved')
-  for (const host of ['opencode', 'pi'] as const) {
-    expect(peer.resolve(host)).toMatchObject({
-      killswitch_enabled: false,
-      killswitch_default_five_hour: 15,
-      quota_minimum_remaining_seven_day: 17,
-    })
-  }
-  expect(parse(await f.text()).killswitch_account_floors).toEqual([
+  // The file cannot yet hold a value for Pi alone, so the write is refused
+  // rather than handing Pi OpenCode's weaker protection.
+  expect(result).toMatchObject({
+    outcome: 'refused',
+    reason: refusedSettingsRecreationText(f.file),
+  })
+  expect(f.calls).toHaveLength(0)
+  await expect(f.text()).rejects.toThrow()
+  await peer.refresh()
+  expect(peer.resolve('pi')).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 45,
+    quota_minimum_remaining_seven_day: 47,
+  })
+  expect(
+    peer
+      .resolve('pi')
+      .killswitch_account_floors.filter(
+        (entry) => entry.host === 'pi' || entry.host === 'both',
+      ),
+  ).toEqual([
+    { account: 'local', host: 'pi', five_hour: 51, seven_day: 52, scoped: 0 },
+    {
+      account: 'vault:shared',
+      host: 'pi',
+      five_hour: 53,
+      seven_day: 54,
+      scoped: 0,
+    },
+  ])
+})
+
+test('recreation carries plain values when both hosts apply the same protection set', async () => {
+  const floors = [
     {
       account: 'local',
       host: 'opencode',
@@ -745,6 +788,7 @@ test('recreation replaces both hosts differing protection with the writer values
       seven_day: 22,
       scoped: 0,
     },
+    { account: 'local', host: 'pi', five_hour: 21, seven_day: 22, scoped: 0 },
     {
       account: 'vault:shared',
       host: 'both',
@@ -752,7 +796,39 @@ test('recreation replaces both hosts differing protection with the writer values
       seven_day: 24,
       scoped: 0,
     },
+  ]
+  const f = await fixture(
+    JSON.stringify({
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 45,
+      quota_minimum_remaining_seven_day: 47,
+      killswitch_account_floors: floors,
+    }),
+  )
+  await rm(f.file)
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result.outcome).toBe('saved')
+  const raw = parse(await f.text())
+  expect(raw).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 45,
+    quota_minimum_remaining_seven_day: 47,
+    dump_enabled: true,
+  })
+  expect(raw.killswitch_account_floors).toEqual([
+    floors[0],
+    floors[2],
+    floors[1],
   ])
+  await f.service.refresh()
+  for (const host of ['opencode', 'pi'] as const)
+    expect(f.service.resolve(host)).toMatchObject({
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 45,
+      quota_minimum_remaining_seven_day: 47,
+    })
 })
 
 test('rung-3 recreation refuses with the fixed text and commits neither file nor legacy changes', async () => {
@@ -847,6 +923,14 @@ test('an account-floor menu edit during recreation retains untouched applied acc
     {
       account: 'untouched',
       host: 'opencode',
+      five_hour: 40,
+      seven_day: 50,
+      scoped: 0,
+    },
+    // Pi's own store holds the same floor; recreation keeps it under Pi's tag.
+    {
+      account: 'untouched',
+      host: 'pi',
       five_hour: 40,
       seven_day: 50,
       scoped: 0,

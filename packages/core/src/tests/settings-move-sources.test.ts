@@ -23,6 +23,7 @@ import {
 import { mapSettingsMoveSources } from '../settings-move-map.ts'
 import {
   prepareSettingsMoveSources,
+  readPeerLegacySettingsProtection,
   type SettingsMoveSourcesOptions,
 } from '../settings-move-sources.ts'
 import {
@@ -698,3 +699,29 @@ for (const host of ['opencode', 'pi'] as const) {
     )
   })
 }
+
+test('the peer legacy reader follows the peer custody and never seeds a vault', async () => {
+  const f = await fixture('opencode')
+  const read = () =>
+    readPeerLegacySettingsProtection({
+      ...f.options,
+      host: 'pi',
+      readMode: f.options.readMode,
+    })
+  // A local store that doesn't exist reads as an empty legacy store.
+  expect((await read())?.killswitch_enabled).toBe(false)
+  await put(f.defaults.pi.config, {
+    killswitch: { enabled: true, main: { '5h': 45 } },
+  })
+  expect(await read()).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 45,
+  })
+  // In vault custody the local store no longer counts, and unseeded vault
+  // settings are unknown rather than empty.
+  f.modes.pi = 'claustrum'
+  expect(await read()).toBeUndefined()
+  expect(f.seeds()).toBe(0)
+  await put(f.vaults.pi.config, { killswitch: { enabled: true } })
+  expect(await read()).toMatchObject({ killswitch_enabled: true })
+})
