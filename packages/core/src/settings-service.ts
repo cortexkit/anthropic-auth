@@ -6,6 +6,7 @@ import {
   type ReportEntry,
   type SettingsEdit,
   type SettingsHandle,
+  SettingsRefusal,
   type UpdateResult,
   type ValueOf,
 } from '@cortexkit/common-auth/settings'
@@ -61,6 +62,11 @@ export class SettingsRecreationRefusal extends Error {
 export interface SettingsUpdateOptions {
   /** Only menu writes and setup with a <target>.moved marker and no user file may create it. */
   createMissing?: boolean
+  /**
+   * The file text the edits were planned from (a whole floor list). The write
+   * is refused as busy when the file no longer holds exactly this text.
+   */
+  expectedSource?: string
 }
 
 export interface SettingsProtectionRecovery {
@@ -1009,6 +1015,25 @@ class SharedSettingsService {
       edits = planSettingsMenuWrite({ status: 'missing' }, edits, () =>
         plan.edits.map(({ setting, value }) => ({ setting, value })),
       )
+    }
+    // common-auth 0.48 decides nothing under its write lock, so check right
+    // before the write that the file is still as planned: still missing for
+    // a recreation (or still present for an ordinary menu write), and still
+    // the exact text a floor list was computed from. A change in the short
+    // window after this check is not caught; common-auth 0.49's planned
+    // update runs the planner on the document read under the lock instead.
+    if (options.createMissing || options.expectedSource !== undefined) {
+      const now = await this.bytes()
+      const changed =
+        options.expectedSource !== undefined
+          ? now.status !== 'ready' ||
+            now.bytes.toString('utf8') !== options.expectedSource
+          : (now.status === 'missing') !== missing
+      if (changed)
+        throw new SettingsRefusal(
+          'settings-busy',
+          'Settings changed while the write was planned',
+        )
     }
     // The shared read/watch handle cannot create files. Only the menu's transient writer can.
     const handle = options.createMissing

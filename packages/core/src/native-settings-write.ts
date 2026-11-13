@@ -263,24 +263,50 @@ export function planNativeSettingsWrite(
     return plan
   }
   // The settings service has checked the list; parsing its original text retains other hosts' and custody modes' entries.
-  const raw =
+  const edit = planSettingsAccountFloors(
     present && generation.source
-      ? object(
-          parse(generation.source.replace(/^\uFEFF/, ''), [], {
+      ? {
+          status: 'ready',
+          document: parse(generation.source.replace(/^\uFEFF/, ''), [], {
             allowTrailingComma: true,
           }),
-        )
-      : {}
+        }
+      : { status: 'missing' },
+    new Map(accounts.map((account) => [account, nextAccounts.get(account)])),
+    host,
+    settingsRecreationFloors(generation.protection[host].values, host),
+  )
+  if (edit) edits.push(edit)
+  return plan
+}
+
+/**
+ * The acting host's floor-list edit, as a pure function of the file it
+ * finds: the parsed document, or a missing file, which starts from the list
+ * a recreation carries. Only the acting host's entries for the changed
+ * accounts change; a `both` entry for such an account is split first so the
+ * other host keeps its floor. Returns undefined when the list is unchanged.
+ *
+ * common-auth 0.48 can't run this under its write lock, so the caller plans
+ * from a generation and the service refuses the write if the file changed
+ * since (see `SettingsUpdateOptions.expectedSource`); that leaves a small
+ * window before the lock. common-auth 0.49's planned update will pass this
+ * function the document read under the lock, closing it.
+ */
+export function planSettingsAccountFloors(
+  current: { status: 'missing' } | { status: 'ready'; document: unknown },
+  changes: ReadonlyMap<string, Record<string, unknown> | undefined>,
+  host: SettingsHost,
+  recreation: SettingsValues['killswitch_account_floors'],
+): SettingsEdit | undefined {
+  const key = 'killswitch_account_floors'
   let floors = structuredClone(
-    (present
-      ? (raw[key] ?? [])
-      : settingsRecreationFloors(
-          generation.protection[host].values,
-          host,
-        )) as SettingsValues['killswitch_account_floors'],
+    (current.status === 'ready'
+      ? (object(current.document)[key] ?? [])
+      : recreation) as SettingsValues['killswitch_account_floors'],
   )
   const original = structuredClone(floors)
-  for (const account of accounts) {
+  for (const [account, value] of changes) {
     floors = floors.flatMap((entry) =>
       entry.account === account && entry.host === 'both'
         ? [
@@ -292,7 +318,6 @@ export function planNativeSettingsWrite(
     const index = floors.findIndex(
       (entry) => entry.account === account && entry.host === host,
     )
-    const value = nextAccounts.get(account)
     if (value === undefined) {
       if (index !== -1) floors.splice(index, 1)
     } else {
@@ -301,9 +326,9 @@ export function planNativeSettingsWrite(
       else floors[index] = entry as (typeof floors)[number]
     }
   }
-  if (!isDeepStrictEqual(original, floors))
-    edits.push({ setting: key, value: floors })
-  return plan
+  return isDeepStrictEqual(original, floors)
+    ? undefined
+    : { setting: key, value: floors }
 }
 
 /** Apply only store-held deltas to a fresh legacy record, never the resolved settings projection. */

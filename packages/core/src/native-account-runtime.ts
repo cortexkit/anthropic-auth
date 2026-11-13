@@ -1540,8 +1540,19 @@ function buildNativeAccountRuntime(
         if (plan.refusal)
           return { settings: before, outcome: 'refused', reason: plan.refusal }
         try {
-          if (plan.edits.length)
-            await runtimeSettings.update(plan.edits, before)
+          if (plan.edits.length) {
+            const generation = service.snapshot()
+            await runtimeSettings.update(
+              plan.edits,
+              before,
+              // A whole floor list was computed from this text; refuse if it changed.
+              plan.edits.some(
+                (edit) => edit.setting === 'killswitch_account_floors',
+              ) && generation.status !== 'missing'
+                ? generation.source
+                : undefined,
+            )
+          }
         } catch (error) {
           if (error instanceof SettingsRecreationRefusal)
             return {

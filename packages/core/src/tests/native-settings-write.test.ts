@@ -53,6 +53,8 @@ async function fixture(
     legacy?: Record<string, unknown>
     /** The other host's legacy store; null makes it unreadable. */
     peerLegacy?: Record<string, unknown> | null
+    /** Runs while a recreation reads the other host's protection. */
+    onPeerRead?: (file: string) => Promise<void>
     windowDefault?: { start_hour: number; end_hour: number }[]
     unavailableProtection?: boolean
     failCopy?: boolean
@@ -134,13 +136,15 @@ async function fixture(
               options.host ?? 'opencode',
             ),
       // The other host's own store holds the same legacy settings unless a test says otherwise.
-      readPeerLegacyProtection: async (peer) =>
-        options.unavailableProtection || options.peerLegacy === null
+      readPeerLegacyProtection: async (peer) => {
+        await options.onPeerRead?.(file)
+        return options.unavailableProtection || options.peerLegacy === null
           ? undefined
           : legacySettingsProtection(
               options.peerLegacy ?? options.legacy ?? {},
               peer,
-            ),
+            )
+      },
     },
   })
   if (!service) throw new Error('Settings service unavailable')
@@ -1613,4 +1617,52 @@ test('an unreadable file refuses floor edits and removals instead of planning fr
     refusal: undefined,
     edits: [{ setting: 'dump_enabled', value: true }],
   })
+})
+
+test('a floor edit is refused as busy when the file changed after the list was planned', async () => {
+  const floor = (host: string, five_hour: number) => ({
+    account: 'shared-row',
+    host,
+    five_hour,
+    seven_day: 30,
+    scoped: 0,
+  })
+  const f = await fixture(
+    JSON.stringify({ killswitch_account_floors: [floor('pi', 20)] }),
+  )
+  // Pi commits a stricter floor after OpenCode's generation was read.
+  const piCommitted = JSON.stringify({
+    killswitch_account_floors: [floor('pi', 60)],
+  })
+  const result = await f.runtime.updateSettings(async (settings) => {
+    await writeFile(f.file, piCommitted)
+    const killswitch = settings.killswitch as {
+      accounts: Record<string, unknown>
+    }
+    killswitch.accounts['shared-row'] = { five_hour: 50, seven_day: 30 }
+  })
+  expect(result).toMatchObject({
+    outcome: 'failed',
+    reason: SETTINGS_WRITE_FAILURES['settings-busy'].text(f.file),
+  })
+  expect(await f.text()).toBe(piCommitted)
+  expect(f.calls).toHaveLength(0)
+})
+
+test('a recreation is refused as busy when the file appears while protection is gathered', async () => {
+  const peerText =
+    '{"killswitch_enabled":true,"killswitch_default_five_hour":77}'
+  const f = await fixture(null, {
+    legacy: { killswitch: { enabled: true } },
+    onPeerRead: (file) => writeFile(file, peerText),
+  })
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result).toMatchObject({
+    outcome: 'failed',
+    reason: SETTINGS_WRITE_FAILURES['settings-busy'].text(f.file),
+  })
+  expect(await f.text()).toBe(peerText)
+  expect(f.calls).toHaveLength(0)
 })

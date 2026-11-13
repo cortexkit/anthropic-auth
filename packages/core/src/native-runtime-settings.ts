@@ -251,6 +251,8 @@ export function createNativeRuntimeSettings(
     async update(
       edits: readonly SettingsEdit[],
       before: Record<string, unknown>,
+      /** The file text a floor list was planned from; see SettingsUpdateOptions. */
+      expectedSource?: string,
     ) {
       if (!service) throw new Error('Settings service is not available')
       // Menu commits emit effects once, even when a service watch fires during the edit.
@@ -258,8 +260,12 @@ export function createNativeRuntimeSettings(
       let changed = false
       try {
         changed =
-          (await service.update(edits, options.host, { createMissing: true }))
-            .outcome === 'updated'
+          (
+            await service.update(edits, options.host, {
+              createMissing: true,
+              ...(expectedSource === undefined ? {} : { expectedSource }),
+            })
+          ).outcome === 'updated'
       } finally {
         writes--
       }
