@@ -63,6 +63,7 @@ async function fixture(
     failCopy?: boolean
     settingsAuthority?: NativeRuntimeSettingsOptions['settingsAuthority']
     pauseLegacy?: () => Promise<void>
+    beforeUpdate?: () => Promise<void>
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
@@ -119,6 +120,7 @@ async function fixture(
             }
           },
           update: async (edits, context) => {
+            await options.beforeUpdate?.()
             calls.push({ edits, context })
             if (options.refusal)
               throw new SettingsRefusal(
@@ -1859,7 +1861,7 @@ test('an unreadable file refuses floor edits and removals instead of planning fr
   })
 })
 
-test('a floor edit is refused as busy when the file changed after the list was planned', async () => {
+test('a floor edit retains a peer commit made after the generation was read', async () => {
   const floor = (host: string, five_hour: number) => ({
     account: 'shared-row',
     host,
@@ -1881,12 +1883,48 @@ test('a floor edit is refused as busy when the file changed after the list was p
     }
     killswitch.accounts['shared-row'] = { five_hour: 50, seven_day: 30 }
   })
-  expect(result).toMatchObject({
-    outcome: 'failed',
-    reason: SETTINGS_WRITE_FAILURES['settings-busy'].text(f.file),
+  expect(result.outcome).toBe('saved')
+  expect(parse(await f.text()).killswitch_account_floors).toEqual([
+    floor('pi', 60),
+    { ...floor('opencode', 50), scoped: 0 },
+  ])
+  expect(f.calls).toHaveLength(1)
+})
+
+test('two concurrent account floor menu edits both survive', async () => {
+  let waiting = 0
+  let release!: () => void
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve
   })
-  expect(await f.text()).toBe(piCommitted)
-  expect(f.calls).toHaveLength(0)
+  const f = await fixture('{}', {
+    beforeUpdate: async () => {
+      if (++waiting === 2) release()
+      await barrier
+    },
+  })
+  const results = await Promise.all(
+    ['first', 'second'].map((account) =>
+      f.runtime.updateSettings((settings) => {
+        const killswitch = settings.killswitch as {
+          accounts: Record<string, unknown>
+        }
+        killswitch.accounts[account] = { five_hour: 21, seven_day: 32 }
+      }),
+    ),
+  )
+  expect(results.map((result) => result.outcome)).toEqual(['saved', 'saved'])
+  expect(parse(await f.text()).killswitch_account_floors).toEqual(
+    expect.arrayContaining(
+      ['first', 'second'].map((account) => ({
+        account,
+        host: 'opencode',
+        five_hour: 21,
+        seven_day: 32,
+        scoped: 0,
+      })),
+    ),
+  )
 })
 
 test('a floor edit during the missing-file grace recreates the file instead of failing as busy', async () => {

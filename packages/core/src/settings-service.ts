@@ -63,16 +63,6 @@ export interface SettingsUpdateOptions {
   /** Only menu writes and setup with a <target>.moved marker and no user file may create it. */
   createMissing?: boolean
   /**
-   * The file text the edits were planned from (a whole floor list). The write
-   * is refused as busy when the file no longer holds exactly this text.
-   */
-  expectedSource?: string
-  /**
-   * The edits were planned from a missing file (a floor list started from
-   * the recreation's list). The write is refused as busy if a file exists.
-   */
-  expectMissing?: boolean
-  /**
    * Setup runs while every host is stopped. When the other host then has no
    * recoverable protection set (no applied copy and no legacy store, rather
    * than an unreadable one), recreation carries the writer's set instead of
@@ -162,7 +152,7 @@ export interface SettingsService {
   onFileEvent?(listener: () => void): () => void
   refresh(): Promise<void>
   update(
-    edits: readonly SettingsEdit[],
+    edits: SettingsUpdate,
     host: SettingsHost,
     options?: SettingsUpdateOptions,
   ): Promise<UpdateResult>
@@ -442,7 +432,16 @@ export function planSettingsFileRecreation(
 }
 
 /** The state of the user file a menu write found, as common-auth's planned update reports it. */
-export type SettingsWriteState = { status: 'missing' } | { status: 'ready' }
+export type SettingsWriteState =
+  | { status: 'missing' }
+  | { status: 'ready'; document: unknown }
+
+/** Menu edits run under the writer lock; a missing file also supplies its protection carry. */
+export type SettingsUpdatePlan = (
+  current: SettingsWriteState,
+  carry?: readonly SettingsEdit[],
+) => readonly SettingsEdit[]
+export type SettingsUpdate = readonly SettingsEdit[] | SettingsUpdatePlan
 
 /**
  * The edits for one menu write, as a pure function of the file it finds:
@@ -1053,7 +1052,7 @@ class SharedSettingsService {
   }
 
   async update(
-    edits: readonly SettingsEdit[],
+    edits: SettingsUpdate,
     host: SettingsHost,
     options: SettingsUpdateOptions,
     applied: SettingsGeneration['protection'][SettingsHost],
@@ -1064,30 +1063,16 @@ class SharedSettingsService {
       rung: 3,
     }),
   ): Promise<UpdateResult> {
-    if (!edits.length) return { outcome: 'unchanged' }
+    if (typeof edits !== 'function' && !edits.length)
+      return { outcome: 'unchanged' }
     const missing = (await this.bytes()).status === 'missing'
     let carried: Record<string, unknown> | undefined
+    let carry: readonly SettingsEdit[] | undefined
     if (missing && options.createMissing) {
       if (applied.rung === 3) throw new SettingsRecreationRefusal(this.file)
       const peer = host === 'opencode' ? 'pi' : 'opencode'
-      // A floor edit planned against a missing file starts from the writer's
-      // floors mirrored for the other host. Only its writer-side entries
-      // count: the planner rebuilds the list with the other host's own floors,
-      // which may differ, and the separate floor edit is dropped.
-      const floorEdit = edits.find(
-        (edit) =>
-          edit.setting === 'killswitch_account_floors' && 'value' in edit,
-      )
-      const writerValues =
-        floorEdit && 'value' in floorEdit
-          ? {
-              ...applied.values,
-              killswitch_account_floors:
-                floorEdit.value as SettingsProtectionValues['killswitch_account_floors'],
-            }
-          : applied.values
       const plan = planSettingsFileRecreation(
-        { host, values: writerValues, rung: applied.rung },
+        { host, values: applied.values, rung: applied.rung },
         { host: peer, ...(await peerProtection(peer)) },
         options.hostsStopped,
       )
@@ -1098,31 +1083,13 @@ class SharedSettingsService {
       carried = Object.fromEntries(
         plan.edits.map((edit) => [edit.setting, edit.value]),
       )
-      edits = planSettingsMenuWrite(
-        { status: 'missing' },
-        edits.filter((edit) => edit !== floorEdit),
-        () => plan.edits.map(({ setting, value }) => ({ setting, value })),
-      )
+      carry = plan.edits.map(({ setting, value }) => ({ setting, value }))
     }
-    // common-auth 0.48 decides nothing under its write lock, so check right
-    // before the write that the file is still as planned: still missing for
-    // a recreation (or still present for an ordinary menu write), and still
-    // the exact text a floor list was computed from. A change in the short
-    // window after this check is not caught; common-auth 0.49's planned
-    // update runs the planner on the document read under the lock instead.
-    if (
-      options.createMissing ||
-      options.expectedSource !== undefined ||
-      options.expectMissing
-    ) {
+    // Recreation still gathers protection before writing; refuse if the
+    // file's presence changed while those sets were gathered.
+    if (options.createMissing) {
       const now = await this.bytes()
-      const changed =
-        options.expectedSource !== undefined
-          ? now.status !== 'ready' ||
-            now.bytes.toString('utf8') !== options.expectedSource
-          : options.expectMissing
-            ? now.status !== 'missing'
-            : (now.status === 'missing') !== missing
+      const changed = (now.status === 'missing') !== missing
       if (changed)
         throw new SettingsRefusal(
           'settings-busy',
@@ -1134,7 +1101,13 @@ class SharedSettingsService {
       ? (this.options.dependencies?.open?.(this.openOptions(true)) ??
         openSettings(settingsDefinition, this.openOptions(true)))
       : this.handle
-    const result = await handle.update(edits, { host })
+    const result = await handle.update(
+      (current) => {
+        const menu = typeof edits === 'function' ? edits(current, carry) : edits
+        return carry ? [...carry, ...menu] : menu
+      },
+      { host },
+    )
     if (carried && result.outcome === 'updated') {
       recreatedFiles.add(this.file)
       const identity = `recreated:${this.file}`

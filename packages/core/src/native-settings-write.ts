@@ -1,7 +1,6 @@
 import { existsSync } from 'node:fs'
 import { isDeepStrictEqual } from 'node:util'
 import type { SettingsEdit } from '@cortexkit/common-auth/settings'
-import { parse } from 'jsonc-parser'
 import {
   invalidSettingsWriteText,
   malformedSettingsText,
@@ -12,6 +11,7 @@ import {
 import type { SettingsHost } from './settings-paths.ts'
 import {
   type SettingsGeneration,
+  type SettingsUpdatePlan,
   type SettingsValues,
   settingsRecreationFloors,
 } from './settings-service.ts'
@@ -224,14 +224,7 @@ export function planNativeSettingsWrite(
     edits,
     storeChanges,
     refusal: undefined as string | undefined,
-    /**
-     * What a floor-list edit was planned from: the file text, or a missing
-     * file. The write is refused as busy if the file is no longer that.
-     */
-    floorsFrom: undefined as
-      | { status: 'missing' }
-      | { status: 'ready'; source: string }
-      | undefined,
+    update: undefined as SettingsUpdatePlan | undefined,
   }
   if (!edits.length && !accounts.length && !storeChanges.length) return plan
   // A watch's save grace period can retain old provenance after the user deletes the file.
@@ -274,30 +267,19 @@ export function planNativeSettingsWrite(
     plan.refusal = invalidSettingsWriteText(key, generation.file)
     return plan
   }
-  // The settings service has checked the list; parsing its original text retains other hosts' and custody modes' entries.
-  // During the missing-file grace the generation still holds the deleted
-  // file's text; the list is planned from what is on disk now (no file).
-  // An empty file is planned like a missing one but must stay empty.
-  const floorsFrom =
-    present && generation.source !== undefined
-      ? { status: 'ready' as const, source: generation.source }
-      : { status: 'missing' as const }
-  const edit = planSettingsAccountFloors(
-    floorsFrom.status === 'ready' && floorsFrom.source
-      ? {
-          status: 'ready',
-          document: parse(floorsFrom.source.replace(/^\uFEFF/, ''), [], {
-            allowTrailingComma: true,
-          }),
-        }
-      : { status: 'missing' },
-    new Map(accounts.map((account) => [account, nextAccounts.get(account)])),
-    host,
-    settingsRecreationFloors(generation.protection[host].values, host),
+  const floorChanges = new Map(
+    accounts.map((account) => [account, nextAccounts.get(account)]),
   )
-  if (edit) {
-    edits.push(edit)
-    plan.floorsFrom = floorsFrom
+  plan.update = (current, carry) => {
+    const carried = carry?.find((edit) => edit.setting === key)?.value
+    const edit = planSettingsAccountFloors(
+      current,
+      floorChanges,
+      host,
+      (carried as SettingsValues[typeof key] | undefined) ??
+        settingsRecreationFloors(generation.protection[host].values, host),
+    )
+    return edit ? [...edits, edit] : edits
   }
   return plan
 }
@@ -309,11 +291,8 @@ export function planNativeSettingsWrite(
  * accounts change; a `both` entry for such an account is split first so the
  * other host keeps its floor. Returns undefined when the list is unchanged.
  *
- * common-auth 0.48 can't run this under its write lock, so the caller plans
- * from a generation and the service refuses the write if the file changed
- * since (see `SettingsUpdateOptions.expectedSource`); that leaves a small
- * window before the lock. common-auth 0.49's planned update will pass this
- * function the document read under the lock, closing it.
+ * The caller passes the document read under the settings writer lock, so
+ * concurrent writers retain each other's entries.
  */
 export function planSettingsAccountFloors(
   current: { status: 'missing' } | { status: 'ready'; document: unknown },

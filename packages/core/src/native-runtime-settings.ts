@@ -1,4 +1,3 @@
-import type { SettingsEdit } from '@cortexkit/common-auth/settings'
 import type { AccountStorage } from './accounts.ts'
 import { setDumpEnabled } from './dump.ts'
 import { logger, parseLogLevel, setLogLevel } from './logger.ts'
@@ -26,7 +25,7 @@ import {
 import type {
   SettingsFileStatus,
   SettingsService,
-  SettingsUpdateOptions,
+  SettingsUpdate,
   SettingsValues,
 } from './settings-service.ts'
 import type { SettingsProtectionFallback } from './settings-start.ts'
@@ -317,15 +316,7 @@ export function createNativeRuntimeSettings(
         settingsNotImportedText(source, service.file, differing),
       )
     },
-    async update(
-      edits: readonly SettingsEdit[],
-      before: Record<string, unknown>,
-      /** What a floor list was planned from; see SettingsUpdateOptions. */
-      planned: Pick<
-        SettingsUpdateOptions,
-        'expectedSource' | 'expectMissing'
-      > = {},
-    ) {
+    async update(edits: SettingsUpdate, before: Record<string, unknown>) {
       if (!service) throw new Error('Settings service is not available')
       // Menu commits emit effects once, even when a service watch fires during the edit.
       writes++
@@ -335,7 +326,6 @@ export function createNativeRuntimeSettings(
           (
             await service.update(edits, options.host, {
               createMissing: true,
-              ...planned,
             })
           ).outcome === 'updated'
       } finally {

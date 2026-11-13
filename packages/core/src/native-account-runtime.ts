@@ -1554,18 +1554,8 @@ function buildNativeAccountRuntime(
         if (plan.refusal)
           return { settings: before, outcome: 'refused', reason: plan.refusal }
         try {
-          if (plan.edits.length) {
-            await runtimeSettings.update(
-              plan.edits,
-              before,
-              // A whole floor list was computed from this state of the file
-              // (its text, or no file); refuse if the file is no longer so.
-              plan.floorsFrom?.status === 'ready'
-                ? { expectedSource: plan.floorsFrom.source }
-                : plan.floorsFrom?.status === 'missing'
-                  ? { expectMissing: true }
-                  : {},
-            )
+          if (plan.edits.length || plan.update) {
+            await runtimeSettings.update(plan.update ?? plan.edits, before)
           }
         } catch (error) {
           if (error instanceof SettingsRecreationRefusal)
