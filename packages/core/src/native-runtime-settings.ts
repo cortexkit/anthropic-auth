@@ -12,6 +12,7 @@ import {
 } from './settings-authority.ts'
 import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
 import {
+  getSettingsAdoptionCheck,
   resolveSettingsMode,
   type SettingsMode,
   type SettingsModeOptions,
@@ -74,6 +75,8 @@ export function createNativeRuntimeSettings(
   },
 ) {
   const env = options.env ?? process.env
+  // Read before retaining: the check is attached to the handle startSettings returned.
+  let adoption = getSettingsAdoptionCheck(options.settingsService)
   let service = options.settingsService?.retain()
   let fallback = service ? undefined : options.settingsFallback
   let reopenLegacy = service || fallback ? undefined : options.settingsReopen
@@ -151,17 +154,24 @@ export function createNativeRuntimeSettings(
   function recheck(refresh = true): Promise<void> {
     if (checking) return checking
     if (closed || !service || mode() === 'separate') return Promise.resolve()
+    const current = service
     checking = (async () => {
       if (userAuthority) return
       if (
         (await resolveSettingsMode(
-          { target: service.file, separate: false },
+          { target: current.file, separate: false },
           options.settingsAuthority?.options,
         )) !== 'user-file'
       )
         return
       // Never await a re-entrant refresh from inside a service publication.
-      if (refresh) await service.refresh()
+      if (refresh) await current.refresh()
+      // The file this host did not move may lack protection its legacy store
+      // holds: adopt it only once the import check passes. Until then the
+      // host keeps legacy settings, and the timer, watches and menu actions
+      // check again.
+      if (adoption && !(await adoption(current))) return
+      if (closed || service !== current) return
       userAuthority = true
       cancelCheck?.()
       cancelCheck = undefined
@@ -189,7 +199,8 @@ export function createNativeRuntimeSettings(
         probedMode = found
         userAuthority = false
         fallback = undefined
-        if (found === 'legacy') reopenLegacy = current.reopen
+        if (found === 'legacy')
+          reopenLegacy = current.reopenLegacy ?? current.reopen
       }
     }
     const before = fallback
@@ -202,6 +213,7 @@ export function createNativeRuntimeSettings(
       return
     }
     service = next
+    adoption = getSettingsAdoptionCheck(next)
     fallback = undefined
     reopenLegacy = undefined
     subscribe(next)

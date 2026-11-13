@@ -839,6 +839,34 @@ test('later-host import writes stricter protection at its host level before reco
   expect(await absent(`${f.stores.pi.config}.MOVED_READPLEASE`)).toBe(true)
 })
 
+test('later-host import compares effective values: implicit killswitch floors 5/10 are kept over a weaker file', async () => {
+  const f = await fixture()
+  f.options.env = {
+    ...f.options.env,
+    ANTHROPIC_AUTH_SETTINGS_FILE: join(f.root, 'shared.jsonc'),
+  }
+  await put(f.stores.opencode.config, {
+    killswitch: { enabled: true, main: { five_hour: 1, seven_day: 1 } },
+  })
+  // Pi stores no floors, so its legacy readers used 5/10.
+  await put(f.stores.pi.config, { killswitch: { enabled: true } })
+  const moved = await f.start()
+  expect(moved.outcome).toBe('moved')
+  f.options.host = 'pi'
+  expect(await f.start()).toMatchObject({ mode: 'user-file' })
+  const service = await openSettingsService({ file: moved.paths.target })
+  cleanup.push(() => service?.dispose())
+  expect(service!.resolve('pi')).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 5,
+    killswitch_default_seven_day: 10,
+  })
+  expect(service!.resolve('opencode')).toMatchObject({
+    killswitch_default_five_hour: 1,
+    killswitch_default_seven_day: 1,
+  })
+})
+
 test('later-host import refuses a concurrent protection change without writing or adopting', async () => {
   const f = await fixture()
   f.options.env = {

@@ -2,8 +2,14 @@ import { logger } from './logger.ts'
 import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import { requireNativePoolAuthority } from './pool-authority.ts'
 import { resolveNativePoolPaths } from './pool-paths.ts'
-import { resolveSettingsMode, type SettingsMode } from './settings-mode.ts'
 import {
+  resolveSettingsMode,
+  type SettingsAdoptionCheck,
+  type SettingsMode,
+  setSettingsAdoptionCheck,
+} from './settings-mode.ts'
+import {
+  importSettingsHostStore,
   runSettingsMoveAtStartup,
   type SettingsMoveStartupOptions,
 } from './settings-move-run.ts'
@@ -11,8 +17,11 @@ import {
   getSettingsFilePath,
   getSettingsStorePaths,
   resolveSettingsPaths,
+  type SettingsPaths,
 } from './settings-paths.ts'
+import { writeSettingsProtectionCopy } from './settings-protection-copy.ts'
 import {
+  mostRestrictiveSettingsProtection,
   openSettingsService,
   recoverSettingsProtection,
   type SettingsProtectionRecovery,
@@ -44,8 +53,16 @@ export interface SettingsProtectionFallback {
   readonly file: string
   readonly rung: 1 | 2 | 3
   readonly values: SettingsProtectionValues
-  /** Off the request path: open the service again; undefined while it still fails. */
+  /**
+   * Off the request path: open the service again and run this host's import
+   * check; undefined while either still fails.
+   */
   reopen(): Promise<SettingsService | undefined>
+  /**
+   * Present with `resolveAuthority`: once it finds legacy mode, open the
+   * service only to notice a later move, without adopting the file.
+   */
+  reopenLegacy?(): Promise<SettingsService | undefined>
   /**
    * Present only when startup could not tell which source is in charge and
    * fell back to the file as a precaution. Off the request path, asks again;
@@ -57,7 +74,10 @@ export interface SettingsProtectionFallback {
 
 export interface StartedSettings {
   mode: SettingsMode
-  /** The settings file; empty when native authority refused or its path could not be resolved. */
+  /**
+   * The settings file; empty only when no path could be resolved, which the
+   * shared-runtime key treats as "no settings file".
+   */
   file: string
   /** Open in user-file mode, and in legacy mode to notice another host's move. */
   service?: SettingsService
@@ -83,15 +103,22 @@ export function __resetSettingsStartWarningForTest(): void {
  * be) in charge gets the protection fallback, never plain legacy values,
  * which may predate protection the user tightened in the file. Only a check
  * that proves no move happened (no file, no marker) returns legacy mode.
+ *
+ * Every service it opens carries the import check (see
+ * `setSettingsAdoptionCheck`): a runtime that starts in legacy mode adopts
+ * a file that appears later only after that check passes. Until this host
+ * has adopted the file, its applied protection copy is not written from the
+ * file, so a file whose import is still owed never becomes the copy that
+ * recovery trusts.
  */
 export async function startSettings(
   options: StartSettingsOptions,
 ): Promise<StartedSettings> {
   // Refused native enrollment or unfinished credential migration must not start
   // settings I/O. The host's existing credential checks report the refusal on
-  // requests. After setup commits enrollment or migration, the next host start
-  // can initialize settings.
-  try {
+  // requests. The runtime repeats this check off the request path and starts
+  // using the settings once it passes.
+  const preflight = async () => {
     const mode = await (options.readMode ?? readNativeEnrollmentMode)(
       options.host,
       options.env,
@@ -104,53 +131,170 @@ export async function startSettings(
         (await resolveNativePoolPaths(stores.account, stores.state))
       await requireNativePoolAuthority(paths)
     }
+  }
+  let refused = false
+  try {
+    await preflight()
   } catch {
-    return { mode: 'legacy', file: '' }
+    refused = true
+  }
+  /** Throws while the preflight still refuses. */
+  const passPreflight = async () => {
+    if (!refused) return
+    await preflight()
+    refused = false
   }
   const move = options.start?.move ?? runSettingsMoveAtStartup
   const open = options.start?.open ?? openSettingsService
+
+  // Applied copies wait until this host uses the file. The newest one held
+  // back is written when it adopts the file.
+  let adopted = false
+  let held: Parameters<typeof writeSettingsProtectionCopy> | undefined
+  const writeAppliedCopy: typeof writeSettingsProtectionCopy = (...args) => {
+    if (adopted) return writeSettingsProtectionCopy(...args)
+    held = args
+    return Promise.resolve()
+  }
   const serviceOptions = (file: string): SettingsServiceOptions => ({
     file,
     host: options.host,
     protection: options.protection,
     lockTimeoutMs: options.lockTimeoutMs,
+    // A host's own open seam (used by host tests) spreads its own service
+    // dependencies over these options, so it keeps them and its copy writer.
+    ...(options.start?.open ? {} : { dependencies: { writeAppliedCopy } }),
   })
+
+  let paths: SettingsPaths | undefined
+  const resolvePaths = async () => {
+    paths ??=
+      options.paths ?? (await resolveSettingsPaths(options.host, options))
+    return paths
+  }
+  const logged = new Set<string>()
+  const warnOnce = (message: string) => {
+    if (logged.has(message)) return
+    logged.add(message)
+    if (options.log) options.log.warn(message)
+    else logger.warn('settings', message)
+  }
+  const adopt: SettingsAdoptionCheck = async (service) => {
+    const outcome = await importSettingsHostStore(
+      { ...options, paths: await resolvePaths() },
+      service,
+      warnOnce,
+      'at its next settings check',
+    )
+    if (outcome !== 'adopt') return false
+    adopted = true
+    const copy = held
+    held = undefined
+    // A failure leaves the copy to the next generation this host applies.
+    if (copy) await writeSettingsProtectionCopy(...copy).catch(() => {})
+    return true
+  }
+  const track = (service: SettingsService | undefined) => {
+    if (service) setSettingsAdoptionCheck(service, adopt)
+    return service
+  }
+
   let file = ''
   // A move this start completed keeps the file in charge even if a later
   // authority check could not confirm it: for example, when writing the
   // `<file>.moved` marker failed and the file was then deleted, the check
   // finds neither and would wrongly report that no move happened.
   let moved = false
-  try {
-    const started = await move(options)
-    file = started.paths.target
-    moved = started.mode === 'user-file'
-    if (!started.mayOpenService) return { mode: started.mode, file }
-    const service = await open(serviceOptions(file))
-    if (!service) return { mode: started.mode, file }
-    return { mode: started.mode, file, service }
-  } catch {
-    if (!warned) {
-      warned = true
-      logger.warn(
-        'settings',
-        'Settings startup failed; protection settings use their last applied values until the settings file can be opened.',
-      )
+  if (!refused) {
+    try {
+      const started = await move(options)
+      file = started.paths.target
+      paths = started.paths
+      moved = started.mode === 'user-file'
+      // The startup move already ran the import check before choosing the file.
+      adopted = moved
+      if (!started.mayOpenService) return { mode: started.mode, file }
+      const service = track(await open(serviceOptions(file)))
+      if (!service) return { mode: started.mode, file }
+      return { mode: started.mode, file, service }
+    } catch {
+      if (!warned) {
+        warned = true
+        logger.warn(
+          'settings',
+          'Settings startup failed; protection settings use their last applied values until the settings file can be opened.',
+        )
+      }
     }
   }
-  const reopen = async () => {
+  const openService = async () => {
     if (!file) return undefined
     try {
-      return await open(serviceOptions(file))
+      return track(await open(serviceOptions(file)))
     } catch {
       return undefined
     }
   }
   const probe = async () => {
-    const paths =
-      options.paths ?? (await resolveSettingsPaths(options.host, options))
-    file = paths.target
-    return resolveSettingsMode(paths, { ...options, ...options.authority })
+    const resolved = await resolvePaths()
+    file = resolved.target
+    return resolveSettingsMode(resolved, { ...options, ...options.authority })
+  }
+  /** Off the request path, for a runtime in legacy mode: watch for a move. */
+  const reopenLegacy = async () => {
+    try {
+      await passPreflight()
+    } catch {
+      return undefined
+    }
+    return openService()
+  }
+  /**
+   * Off the request path, replacing the fallback: open the service, and hand
+   * it over only once this host's import check passes.
+   */
+  const reopenOnFile = async () => {
+    try {
+      await passPreflight()
+    } catch {
+      return undefined
+    }
+    const service = await openService()
+    if (!service) return undefined
+    try {
+      if (await adopt(service)) return service
+    } catch {
+      // An unavailable check keeps the fallback until the next try.
+    }
+    await service.dispose()
+    return undefined
+  }
+  if (refused) {
+    // No settings I/O until the preflight passes, so which source is in
+    // charge is unknown: the strictest set applies, and the runtime asks again
+    // off the request path. A pure path keeps the shared-runtime key real.
+    try {
+      file = options.paths?.target ?? getSettingsFilePath(options)
+    } catch {
+      // Without a path the runtime key uses an explicit "no settings file".
+    }
+    return {
+      mode: 'user-file',
+      file,
+      fallback: {
+        get file() {
+          return file
+        },
+        rung: 3,
+        values: mostRestrictiveSettingsProtection(),
+        reopen: reopenOnFile,
+        reopenLegacy,
+        resolveAuthority: async () => {
+          await passPreflight()
+          return probe()
+        },
+      },
+    }
   }
   let mode: SettingsMode = 'user-file'
   let unknown = false
@@ -171,7 +315,7 @@ export async function startSettings(
       }
     }
   }
-  if (mode === 'legacy') return { mode, file, reopen }
+  if (mode === 'legacy') return { mode, file, reopen: reopenLegacy }
   if (mode !== 'user-file') return { mode, file }
   const recovered = await recoverSettingsProtection(
     file,
@@ -189,8 +333,8 @@ export async function startSettings(
       },
       rung: recovered.rung,
       values: recovered.values,
-      reopen,
-      ...(unknown ? { resolveAuthority: probe } : {}),
+      reopen: reopenOnFile,
+      ...(unknown ? { reopenLegacy, resolveAuthority: probe } : {}),
     },
   }
 }

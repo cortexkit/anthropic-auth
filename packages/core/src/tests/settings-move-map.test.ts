@@ -11,11 +11,16 @@ import {
   normalizeKillswitchThresholds,
 } from '../accounts.ts'
 import { settingsDefinition } from '../settings-definition.ts'
+import { settingsProtectionStricter } from '../settings-host-import.ts'
 import { mapSettingsMoveSources } from '../settings-move-map.ts'
 import { createSettingsMoveSource } from '../settings-move-source.ts'
 import type { SettingsHost } from '../settings-paths.ts'
+import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import { resolveSettingsRecord } from '../settings-record.ts'
-import { openSettingsService } from '../settings-service.ts'
+import {
+  openSettingsService,
+  SETTINGS_PROTECTION_KEYS,
+} from '../settings-service.ts'
 
 const cleanup: (() => Promise<void> | void)[] = []
 afterEach(async () => {
@@ -409,6 +414,83 @@ for (const invalidHost of ['opencode', 'pi'] as const) {
     }
     expect(f.messages).toHaveLength(1)
   })
+}
+
+// A host that stores no value for a protection key used its legacy reader's
+// implicit default. The other host's weaker explicit value must not become
+// that host's value through inheritance.
+const implicitCases = [
+  {
+    name: 'killswitch on with no stored floors (5/10) beside floors 1/1',
+    implicit: { killswitch: { enabled: true } },
+    explicit: {
+      killswitch: { enabled: true, main: { five_hour: 1, seven_day: 1 } },
+    },
+    keeps: {
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 5,
+      killswitch_default_seven_day: 10,
+      killswitch_default_scoped: 0,
+    },
+    weaker: {
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 1,
+      killswitch_default_seven_day: 1,
+      killswitch_default_scoped: 0,
+    },
+  },
+  {
+    name: "an unset same-account wait beside maxSameAccountWait 'max'",
+    implicit: { dump: { enabled: true } },
+    explicit: { routing: { maxSameAccountWait: 'max' } },
+    keeps: { max_same_account_wait: '15m' },
+    weaker: { max_same_account_wait: 'cache' },
+  },
+  {
+    name: 'an unset unknown-quota policy beside failClosedOnUnknownQuota false',
+    implicit: { dump: { enabled: true } },
+    explicit: { quota: { failClosedOnUnknownQuota: false } },
+    keeps: { quota_fail_closed_on_unknown_quota: 'default' },
+    weaker: { quota_fail_closed_on_unknown_quota: 'off' },
+  },
+] as const
+
+for (const scenario of implicitCases) {
+  for (const explicitHost of ['opencode', 'pi'] as const) {
+    test(`${scenario.name} stored by ${explicitHost}: each host keeps its own effective protection`, async () => {
+      const implicitHost = explicitHost === 'opencode' ? 'pi' : 'opencode'
+      const settings = {
+        [explicitHost]: scenario.explicit,
+        [implicitHost]: scenario.implicit,
+      }
+      const f = await move(
+        (['opencode', 'pi'] as const).map((host) => ({
+          host,
+          settings: settings[host] as Record<string, unknown>,
+        })),
+      )
+      expect(f.result.outcome).toBe('moved')
+      const { service } = await resolve(f.file)
+      expect(service.resolve(implicitHost)).toMatchObject(scenario.keeps)
+      expect(service.resolve(explicitHost)).toMatchObject(scenario.weaker)
+      // Every protection value of each host is at least what its own legacy
+      // reader gave it before the move.
+      for (const host of ['opencode', 'pi'] as const) {
+        const legacy = legacySettingsProtection(
+          settings[host] as Record<string, unknown>,
+          host,
+        )
+        const resolved = service.resolve(host)
+        for (const key of SETTINGS_PROTECTION_KEYS) {
+          if (key === 'killswitch_account_floors') continue
+          expect({
+            key,
+            weaker: settingsProtectionStricter(key, legacy[key], resolved[key]),
+          }).toEqual({ key, weaker: false })
+        }
+      }
+    })
+  }
 }
 
 test('absent sources and absent account settings do not seed a list, while an explicit empty list is carried', () => {

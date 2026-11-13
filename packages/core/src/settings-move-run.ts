@@ -43,7 +43,6 @@ import { resolveSettingsPaths, type SettingsPaths } from './settings-paths.ts'
 import {
   openSettingsService,
   SETTINGS_PROTECTION_KEYS,
-  type SettingsGeneration,
   type SettingsProtectionValues,
   type SettingsService,
 } from './settings-service.ts'
@@ -71,7 +70,115 @@ export interface SettingsMoveStartupResult {
     | 'source-unavailable'
     /** The file is in charge, but this host's legacy store protects more. */
     | 'import-refused'
+    /**
+     * The file is in charge, but this host's legacy store could not be read
+     * to check it. The host stays legacy, and its runtime checks again.
+     */
+    | 'import-unknown'
   move?: MoveResult
+}
+
+/** What a host's import check decided about using the settings file. */
+export type SettingsHostImportOutcome =
+  /** The file holds this host's legacy protection, or the check is not due yet. */
+  | 'adopt'
+  /** Writing the stricter legacy values failed or raced a protection change. */
+  | 'refused'
+  /** This host's legacy store could not be read, so its protection is unknown. */
+  | 'unknown'
+
+/**
+ * The one check a host passes before it starts using a settings file it did
+ * not move itself, at startup and when a running legacy host notices the
+ * file later. A move under an explicit target imports only the mover's
+ * store, and a hand-made file imports none, so the host's legacy store may
+ * protect more than the file. For each protection key the file sets no value
+ * for this host, a stricter legacy value is written at the host's level
+ * first; then the host's import record is written.
+ *
+ * Never call it on the request path: it reads the legacy store and may write
+ * the file. `retry` ends the warnings and says when the check runs again.
+ */
+export async function importSettingsHostStore(
+  options: SettingsMoveSourcesOptions & {
+    paths: SettingsPaths
+    authority?: SettingsMoveStartupOptions['authority']
+  },
+  service: SettingsService,
+  warn: (message: string) => void,
+  retry: string,
+): Promise<SettingsHostImportOutcome> {
+  const { host, paths } = options
+  const authority = { ...options, ...options.authority }
+  const generation = service.snapshot()
+  // A missing or unusable file already falls back to protection from this
+  // host's applied copy or legacy store; the check runs again at a later start.
+  if (generation.status !== 'ready' || !generation.protection[host].usable)
+    return 'adopt'
+  if (await hasSettingsImportRecord(paths.target, host, authority))
+    return 'adopt'
+  let legacy: SettingsProtectionValues | undefined
+  try {
+    legacy = await readOwnLegacySettingsProtection({ ...options, paths })
+  } catch {
+    // An unreadable store is not an empty one: its protection is unknown, so
+    // the file must not replace it yet.
+    warn(
+      `Settings file ${paths.target} is not used by ${host} yet: its legacy settings could not be read to check them against the file. ${host} keeps its legacy settings and checks again ${retry}.`,
+    )
+    return 'unknown'
+  }
+  const resolved = service.resolve(host)
+  const plan = legacy
+    ? planSettingsHostImport({
+        host,
+        legacy,
+        resolved: Object.fromEntries(
+          SETTINGS_PROTECTION_KEYS.map((key) => [key, resolved[key]]),
+        ) as SettingsProtectionValues,
+        fileLevels: generation.fileLevels,
+      })
+    : { keys: [], edits: [] }
+  // Only a failed write refuses adoption. Resolution belongs to common-auth,
+  // so a changed protection field retries later instead of applying an
+  // import computed from an older validated generation.
+  if (plan.keys.length) {
+    const expected = generation.source?.trim()
+      ? parse(generation.source.replace(/^\uFEFF/, ''), [], {
+          allowTrailingComma: true,
+        })
+      : {}
+    try {
+      await service.update((current) => {
+        if (
+          current.status !== 'ready' ||
+          SETTINGS_PROTECTION_KEYS.some(
+            (key) =>
+              !isDeepStrictEqual(
+                (current.document as Record<string, unknown>)[key],
+                expected[key],
+              ),
+          )
+        )
+          throw new SettingsRefusal(
+            'settings-busy',
+            'Protection changed before import',
+          )
+        return plan.edits
+      }, host)
+    } catch {
+      warn(
+        `Settings file ${paths.target} is not used by ${host}: writing its legacy protection for ${plan.keys.join(', ')} failed. ${host} keeps its legacy settings and will retry the import ${retry}.`,
+      )
+      return 'refused'
+    }
+  }
+  try {
+    await writeSettingsImportRecord(paths.target, host, authority)
+  } catch {
+    // Without the record the same check simply runs again next time.
+  }
+  return 'adopt'
 }
 
 /**
@@ -102,8 +209,9 @@ export async function runSettingsMoveAtStartup(
   ): SettingsMoveStartupResult => ({
     paths,
     mode,
-    // A host that refused the file stays legacy until it restarts: a service
-    // would let the runtime's authority checks adopt the file anyway.
+    // A host that refused the file stays legacy until it restarts. An unknown
+    // legacy store keeps the service open: the runtime's checks run the same
+    // import check before adopting the file, and retry it.
     mayOpenService: mode !== 'separate' && outcome !== 'import-refused',
     outcome,
     ...(move ? { move } : {}),
@@ -131,8 +239,16 @@ export async function runSettingsMoveAtStartup(
           warn(`Could not write settings move marker ${paths.target}.moved.`)
         }
       }
-      const refused = await importOwnStore(service, generation)
-      if (refused) return refused
+      const imported = await importSettingsHostStore(
+        { ...options, paths },
+        service,
+        warn,
+        'at the next start',
+      )
+      if (imported === 'refused') return result('legacy', 'import-refused')
+      // The runtime keeps its service in legacy mode and checks again off the
+      // request path, so a store that becomes readable is imported then.
+      if (imported === 'unknown') return result('legacy', 'import-unknown')
       if (generation.status !== 'missing') {
         const prepared = await prepareSettingsMoveSources({
           ...options,
@@ -172,83 +288,6 @@ export async function runSettingsMoveAtStartup(
       outcome ?? (marked ? 'marker-present' : 'done-already'),
       move,
     )
-  }
-
-  /**
-   * A host whose legacy store the file never imported (a move under an
-   * explicit target imports only the mover's store, and a hand-made file
-   * imports none) must not lose protection by adopting it. Returns the
-   * refusal to adopt, or undefined once the file may be used.
-   */
-  const importOwnStore = async (
-    service: SettingsService,
-    generation: SettingsGeneration,
-  ): Promise<SettingsMoveStartupResult | undefined> => {
-    const host = options.host
-    // A missing or unusable file already falls back to protection from this
-    // host's applied copy or legacy store; check again at a later start.
-    if (generation.status !== 'ready' || !generation.protection[host].usable)
-      return undefined
-    if (await hasSettingsImportRecord(paths.target, host, authority))
-      return undefined
-    let legacy: SettingsProtectionValues | undefined
-    try {
-      legacy = await readOwnLegacySettingsProtection({ ...options, paths })
-    } catch {
-      // An unreadable store proves nothing either way; check again next start.
-      return undefined
-    }
-    const resolved = service.resolve(host)
-    const plan = legacy
-      ? planSettingsHostImport({
-          host,
-          legacy,
-          resolved: Object.fromEntries(
-            SETTINGS_PROTECTION_KEYS.map((key) => [key, resolved[key]]),
-          ) as SettingsProtectionValues,
-          fileLevels: generation.fileLevels,
-        })
-      : { keys: [], edits: [] }
-    // Only a failed write refuses adoption. Resolution belongs to common-auth,
-    // so a changed protection field retries at next start instead of applying
-    // an import computed from an older validated generation.
-    if (plan.keys.length) {
-      const expected = generation.source?.trim()
-        ? parse(generation.source.replace(/^\uFEFF/, ''), [], {
-            allowTrailingComma: true,
-          })
-        : {}
-      try {
-        await service.update((current) => {
-          if (
-            current.status !== 'ready' ||
-            SETTINGS_PROTECTION_KEYS.some(
-              (key) =>
-                !isDeepStrictEqual(
-                  (current.document as Record<string, unknown>)[key],
-                  expected[key],
-                ),
-            )
-          )
-            throw new SettingsRefusal(
-              'settings-busy',
-              'Protection changed before import',
-            )
-          return plan.edits
-        }, host)
-      } catch {
-        warn(
-          `Settings file ${paths.target} is not used by ${host}: writing its legacy protection for ${plan.keys.join(', ')} failed. ${host} keeps its legacy settings and will retry the import at the next start.`,
-        )
-        return result('legacy', 'import-refused')
-      }
-    }
-    try {
-      await writeSettingsImportRecord(paths.target, host, authority)
-    } catch {
-      // Without the record the same check simply runs again next start.
-    }
-    return undefined
   }
 
   if (paths.separate) return result('separate', 'separate-install')
@@ -339,7 +378,8 @@ export async function runSettingsMoveAtStartup(
       warn(`Could not write settings move marker ${paths.target}.moved.`)
     }
     // Every host whose store this move read now has its settings in the
-    // file (a source with no store had none to import).
+    // file, including protection it held only as an implicit default (see
+    // mapSettingsMoveSources); a source with no store had none to import.
     for (const host of new Set(sources.map((source) => source.host))) {
       try {
         await writeSettingsImportRecord(

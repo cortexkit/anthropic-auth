@@ -15,8 +15,17 @@ const ranks: Partial<Record<ProtectionKey, Record<string, number>>> = {
   max_same_account_wait: { cache: 0, '15m': 1, off: 2 },
 }
 
-/** True when `legacy` protects more than `file` for one scalar protection key. */
-function stricter(key: ProtectionKey, legacy: unknown, file: unknown): boolean {
+/**
+ * True when `legacy` protects more than `file` for one scalar protection key.
+ * Both sides are effective values: an unset legacy key counts as the value
+ * its legacy reader returns (the killswitch floors 5/10/0, `default` for the
+ * unknown-quota policy, `15m` for the same-account wait), never as absent.
+ */
+export function settingsProtectionStricter(
+  key: ProtectionKey,
+  legacy: unknown,
+  file: unknown,
+): boolean {
   if (typeof legacy === 'boolean') return legacy && file === false
   if (typeof legacy === 'number')
     return typeof file === 'number' && legacy > file
@@ -50,7 +59,7 @@ export function planSettingsHostImport(input: {
   for (const key of SETTINGS_PROTECTION_KEYS) {
     if (key === 'killswitch_account_floors') continue
     if (input.fileLevels[key]?.includes(host)) continue
-    if (!stricter(key, legacy[key], resolved[key])) continue
+    if (!settingsProtectionStricter(key, legacy[key], resolved[key])) continue
     keys.push(key)
     edits.push({ setting: key, level: host, value: legacy[key] })
   }

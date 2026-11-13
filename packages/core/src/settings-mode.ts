@@ -11,6 +11,7 @@ import {
 } from './path-options.ts'
 import { canonicalPath } from './pool-paths.ts'
 import type { SettingsHost, SettingsPaths } from './settings-paths.ts'
+import type { SettingsService } from './settings-service.ts'
 import { writeOwnerOnlyExclusive } from './state-layout-io.ts'
 
 export type SettingsMode = 'separate' | 'user-file' | 'legacy'
@@ -157,4 +158,33 @@ export async function resolveSettingsMode(
   return (await hasSettingsMoveMarker(paths.target, options))
     ? 'user-file'
     : 'legacy'
+}
+
+/**
+ * Decides, off the request path, whether a running host may start using the
+ * settings file through `service` (its own handle on that file). It runs the
+ * host's import check, and returns false to keep the host's current
+ * authority and ask again at the next check.
+ */
+export type SettingsAdoptionCheck = (
+  service: SettingsService,
+) => Promise<boolean>
+
+// Keyed by the service handle `startSettings` returned, so hosts pass the
+// check to their runtime without carrying another option.
+const adoptionChecks = new WeakMap<object, SettingsAdoptionCheck>()
+
+/** Attach the check a runtime must pass before adopting the file `service` reads. */
+export function setSettingsAdoptionCheck(
+  service: object,
+  check: SettingsAdoptionCheck,
+): void {
+  adoptionChecks.set(service, check)
+}
+
+/** The check attached to `service`, if any; read it before retaining the handle. */
+export function getSettingsAdoptionCheck(
+  service: object | undefined,
+): SettingsAdoptionCheck | undefined {
+  return service ? adoptionChecks.get(service) : undefined
 }

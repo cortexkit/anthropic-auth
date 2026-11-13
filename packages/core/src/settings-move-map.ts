@@ -1,5 +1,10 @@
 import type { LegacySource, MapResult } from '@cortexkit/common-auth/settings'
-import type { SettingsValues } from './settings-service.ts'
+import { settingsProtectionStricter } from './settings-host-import.ts'
+import { legacySettingsProtection } from './settings-protection-legacy.ts'
+import {
+  SETTINGS_PROTECTION_KEYS,
+  type SettingsValues,
+} from './settings-service.ts'
 
 type AccountFloor = SettingsValues['killswitch_account_floors'][number]
 
@@ -37,6 +42,7 @@ export function mapSettingsMoveSources(sources: LegacySource[]): MapResult {
       } else entries.push({ source, setting, value })
     }
   }
+  entries.push(...keepImplicitProtection(sources, entries))
 
   if (accountSource !== undefined) {
     const pi = new Map(floors.pi.map((entry) => [entry.account, entry]))
@@ -66,4 +72,46 @@ export function mapSettingsMoveSources(sources: LegacySource[]): MapResult {
     })
   }
   return { entries, unmapped: [] }
+}
+
+/**
+ * common-auth publishes a value only one source stores as the top-level value
+ * both hosts inherit. A host that stores no value for a protection key still
+ * had one: the implicit default its legacy reader applied (killswitch floors
+ * 5/10/0, fail-closed on unknown quota, a 15-minute same-account wait). When
+ * that default protects more than the value the host would inherit, carry it
+ * as this host's own value, so common-auth keeps it at the host's level (or
+ * as the default, with the other host's value at its level) and no host
+ * leaves the move weaker than its legacy store left it. A source with no
+ * store has no legacy settings and inherits as before.
+ */
+function keepImplicitProtection(
+  sources: LegacySource[],
+  entries: MapResult['entries'],
+): MapResult['entries'] {
+  const added: MapResult['entries'] = []
+  for (const setting of SETTINGS_PROTECTION_KEYS) {
+    if (setting === 'killswitch_account_floors') continue
+    // common-auth makes the lowest-numbered source's value the default.
+    const inherited = entries
+      .filter((entry) => entry.setting === setting)
+      .sort((a, b) => a.source - b.source)[0]
+    if (!inherited) continue
+    for (const [source, legacy] of sources.entries()) {
+      if (!legacy.present) continue
+      if (
+        entries.some(
+          (entry) => entry.source === source && entry.setting === setting,
+        )
+      )
+        continue
+      const implicit = legacySettingsProtection(
+        {},
+        legacy.host as 'opencode' | 'pi',
+      )[setting]
+      if (settingsProtectionStricter(setting, implicit, inherited.value))
+        added.push({ source, setting, value: implicit })
+    }
+  }
+  return added
 }

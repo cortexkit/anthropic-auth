@@ -335,12 +335,15 @@ const sharedAccounts = new NativeRuntimeRegistry<NativeAccountRuntime>()
 export function acquireNativeAccountRuntime(
   options: NativeAccountRuntimeOptions,
 ): NativeAccountRuntime {
+  // An empty settings file means startup could resolve no path. Key it as
+  // "no settings file" rather than resolving '' to the working directory.
+  const settingsFile = options.settingsService?.file ?? options.settingsFile
   const key = JSON.stringify([
-    resolve(
-      options.settingsService?.file ??
-        options.settingsFile ??
-        getSettingsFilePath({ env: options.vault?.env }),
-    ),
+    settingsFile === ''
+      ? null
+      : resolve(
+          settingsFile ?? getSettingsFilePath({ env: options.vault?.env }),
+        ),
     nativeVaultRuntimeKey({
       ...options.vault,
       paths: options.paths,

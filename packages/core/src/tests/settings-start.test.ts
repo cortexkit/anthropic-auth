@@ -4,12 +4,14 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rm,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { parse } from 'jsonc-parser'
 
 import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
@@ -18,7 +20,10 @@ import { beginNativeEmptyInit } from '../pool-authority.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsImportRecordPath } from '../settings-mode.ts'
 import { resolveSettingsPaths, type SettingsPaths } from '../settings-paths.ts'
-import { writeSettingsProtectionCopy } from '../settings-protection-copy.ts'
+import {
+  readSettingsProtectionCopy,
+  writeSettingsProtectionCopy,
+} from '../settings-protection-copy.ts'
 import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import {
   mostRestrictiveSettingsProtection,
@@ -151,7 +156,17 @@ for (const host of ['opencode', 'pi'] as const) {
       let started: Awaited<ReturnType<typeof startSettings>>
       try {
         started = await startSettings(options)
-        expect(started).toEqual({ mode: 'legacy', file: '' })
+        // No settings I/O while the preflight refuses: which source is in
+        // charge is unknown, so the strictest set applies under the file's
+        // real path, never plain legacy values under an empty path.
+        expect(started).toMatchObject({ mode: 'user-file', file: f.target })
+        expect(started.service).toBeUndefined()
+        expect(started.fallback).toMatchObject({
+          file: f.target,
+          rung: 3,
+          values: mostRestrictiveSettingsProtection(),
+        })
+        expect(started.fallback?.resolveAuthority).toBeDefined()
         const schedule = spyOn(globalThis, 'setTimeout')
         try {
           const reader = createNativeRuntimeSettings({
@@ -162,8 +177,10 @@ for (const host of ['opencode', 'pi'] as const) {
             settingsReopen: started.reopen,
           })
           await reader.prepareAction()
+          expect(reader.fallbackFile()).toBe(f.target)
           await reader.close()
-          expect(schedule).not.toHaveBeenCalled()
+          // A check off the request path retries the preflight later.
+          expect(schedule).toHaveBeenCalled()
         } finally {
           schedule.mockRestore()
         }
@@ -519,4 +536,267 @@ test('startSettings runs the real move: the legacy store is published and the se
   })
   await lstat(paths.marker)
   await lstat(settingsImportRecordPath(paths.target, 'opencode'))
+})
+
+function timer() {
+  const ticks: (() => Promise<void>)[] = []
+  return {
+    ticks,
+    tick: () => ticks.at(-1)!(),
+    schedule: (callback: () => Promise<void>) => {
+      ticks.push(callback)
+      return () => {}
+    },
+  }
+}
+
+type Resolved = {
+  killswitch?: { enabled?: boolean; main?: { five_hour?: number } }
+  dump?: { enabled?: boolean }
+}
+
+async function appliedCopy(file: string, ready: (values: unknown) => boolean) {
+  // Copies are written in the background after a generation is applied.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const values = await readSettingsProtectionCopy(file, 'opencode')
+    if (ready(values)) return values
+    await Bun.sleep(20)
+  }
+  return readSettingsProtectionCopy(file, 'opencode')
+}
+
+for (const outcome of ['passes', 'still refused'] as const) {
+  for (const file of ['present', 'absent'] as const) {
+    test(`a refused preflight that later ${outcome} with the file ${file} ${outcome === 'passes' ? 'settles authority off the request path' : 'keeps the strictest set'}`, async () => {
+      const f = await fixture(file)
+      const journal = f.options.ownPoolPaths!.journal
+      await rm(journal)
+      __setLogTestSink(() => {})
+      const started = await startSettings({
+        ...f.options,
+        start: { open: openSettingsService },
+      })
+      expect(started.fallback).toMatchObject({ rung: 3, file: f.target })
+      const clock = timer()
+      const reader = createNativeRuntimeSettings({
+        host: 'opencode',
+        settingsMode: () => started.mode,
+        settingsFallback: started.fallback,
+        settingsAuthority: { schedule: clock.schedule },
+        env: {},
+      })
+      cleanup.push(reader.close)
+      const stored = { dump: { enabled: true } }
+      await clock.tick()
+      expect(reader.fallbackFile()).toBe(f.target)
+      if (outcome === 'still refused') {
+        expect((reader.resolve(stored) as Resolved).killswitch?.enabled).toBe(
+          true,
+        )
+        return
+      }
+      await beginNativeEmptyInit(f.options.ownPoolPaths!)
+      await clock.tick()
+      expect(reader.fallbackFile()).toBeUndefined()
+      if (file === 'present') {
+        // The file is in charge and this host's (empty) store owes it nothing.
+        expect(reader.file()).toBe(f.target)
+        expect((reader.resolve(stored) as Resolved).killswitch?.enabled).toBe(
+          false,
+        )
+        await lstat(settingsImportRecordPath(f.target, 'opencode'))
+      } else {
+        // No move happened: legacy values apply, and a later file is noticed.
+        expect(reader.file()).toBeUndefined()
+        expect((reader.resolve(stored) as Resolved).dump?.enabled).toBe(true)
+        await writeFile(f.target, '{"dump_enabled":false}')
+        await clock.tick()
+        expect(reader.file()).toBe(f.target)
+        expect((reader.resolve(stored) as Resolved).dump?.enabled).toBe(false)
+      }
+    })
+  }
+}
+
+test('a running legacy host adopts a hand-made file only after importing its stricter legacy protection', async () => {
+  const f = await fixture('absent')
+  const stored = {
+    killswitch: { enabled: true, main: { five_hour: 61 } },
+    dump: { enabled: true },
+  }
+  await writeFile(f.options.ownPoolPaths!.config, JSON.stringify(stored))
+  const started = await startSettings({
+    ...f.options,
+    start: {
+      move: async () => ({
+        paths: f.paths,
+        mode: 'legacy',
+        mayOpenService: true,
+        outcome: 'fence-closed',
+      }),
+    },
+  })
+  cleanup.push(() => started.service?.dispose())
+  expect(started).toMatchObject({ mode: 'legacy', file: f.target })
+  const clock = timer()
+  const reader = createNativeRuntimeSettings({
+    host: 'opencode',
+    settingsMode: () => started.mode,
+    settingsService: started.service,
+    settingsAuthority: { schedule: clock.schedule },
+    env: {},
+  })
+  cleanup.push(reader.close)
+  // The user writes a settings file by hand while this host runs.
+  await writeFile(f.target, '{"dump_enabled":false}')
+  await clock.tick()
+  expect(reader.file()).toBe(f.target)
+  const resolved = reader.resolve(stored) as Resolved
+  expect(resolved.killswitch).toMatchObject({
+    enabled: true,
+    main: { five_hour: 61 },
+  })
+  expect(resolved.dump?.enabled).toBe(false)
+  const document = parse(await readFile(f.target, 'utf8'))
+  expect(document.killswitch_enabled).toEqual({ opencode: true })
+  expect(document.killswitch_default_five_hour).toEqual({ opencode: 61 })
+  await lstat(settingsImportRecordPath(f.target, 'opencode'))
+})
+
+test("a running legacy host adopts another host's own-store-only move only after importing its own protection", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'settings-start-')))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const shared = join(root, 'shared.jsonc')
+  const host = async (
+    name: 'opencode' | 'pi',
+    open: boolean,
+    settings: Record<string, unknown>,
+  ) => {
+    const options: StartSettingsOptions = {
+      host: name,
+      home: root,
+      platform: 'linux',
+      env: {
+        HOME: root,
+        XDG_STATE_HOME: join(root, 'state'),
+        // An explicit target moves only the mover's own store.
+        ANTHROPIC_AUTH_SETTINGS_FILE: shared,
+      },
+      readMode: async () => 'local',
+      initializeVaultSettings: async () => {},
+      log: { warn: () => {} },
+      fence: open
+        ? {
+            registration: { status: 'registered' },
+            floor: '2.12.0',
+            liveness: { pidAlive: () => false, incarnation: async () => null },
+            artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
+            readHolders: async () => undefined,
+          }
+        : // No holder registration keeps the move fence closed.
+          { registration: undefined },
+    }
+    const paths = await resolveSettingsPaths(name, options)
+    const store = await resolveNativePoolPaths(
+      paths.own.account,
+      paths.own.state,
+    )
+    await mkdir(dirname(store.journal), { recursive: true })
+    await beginNativeEmptyInit(store)
+    options.ownPoolPaths = store
+    await mkdir(dirname(store.config), { recursive: true })
+    await writeFile(store.config, JSON.stringify(settings))
+    return options
+  }
+  const piStore = { killswitch: { enabled: true, main: { five_hour: 61 } } }
+  // Pi starts while the move fence is closed and keeps its legacy settings.
+  const pi = await startSettings(await host('pi', false, piStore))
+  cleanup.push(() => pi.service?.dispose())
+  expect(pi).toMatchObject({ mode: 'legacy', file: shared })
+  const clock = timer()
+  const reader = createNativeRuntimeSettings({
+    host: 'pi',
+    settingsMode: () => pi.mode,
+    settingsService: pi.service,
+    settingsAuthority: { schedule: clock.schedule },
+    env: {},
+  })
+  cleanup.push(reader.close)
+  // OpenCode then moves only its own, weaker store.
+  const opencode = await startSettings(
+    await host('opencode', true, { dump: { enabled: true } }),
+  )
+  cleanup.push(() => opencode.service?.dispose())
+  expect(opencode).toMatchObject({ mode: 'user-file', file: shared })
+  await clock.tick()
+  expect(reader.file()).toBe(shared)
+  expect((reader.resolve(piStore) as Resolved).killswitch).toMatchObject({
+    enabled: true,
+    main: { five_hour: 61 },
+  })
+  expect((reader.resolve(piStore) as Resolved).dump?.enabled).toBe(true)
+  expect(opencode.service?.resolve('opencode').killswitch_enabled).toBe(false)
+  // Pi's protection sits at its own level; OpenCode's moved values stay.
+  expect(parse(await readFile(shared, 'utf8')).killswitch_enabled).toEqual({
+    pi: true,
+  })
+})
+
+test('an unreadable own store keeps a host legacy, writes no applied copy from the file, and retries at the next check', async () => {
+  const f = await fixture()
+  await writeFile(f.target, '{"dump_enabled":false}')
+  const config = f.options.ownPoolPaths!.config
+  await writeFile(config, '{unreadable')
+  const warnings: string[] = []
+  const started = await startSettings({
+    ...f.options,
+    log: { warn: (message) => warnings.push(message) },
+    // The real move, and the default open with its applied-copy gate.
+    start: {},
+  })
+  cleanup.push(() => started.service?.dispose())
+  // The file is in charge, but this host's protection is unknown.
+  expect(started).toMatchObject({ mode: 'legacy', file: f.target })
+  expect(started.service).toBeDefined()
+  expect(
+    warnings.some((message) => message.includes('could not be read')),
+  ).toBe(true)
+  const clock = timer()
+  const reader = createNativeRuntimeSettings({
+    host: 'opencode',
+    settingsMode: () => started.mode,
+    settingsService: started.service,
+    settingsAuthority: { schedule: clock.schedule },
+    env: {},
+  })
+  cleanup.push(reader.close)
+  const stored = {
+    killswitch: { enabled: true, main: { five_hour: 61 } },
+    dump: { enabled: true },
+  }
+  await clock.tick()
+  expect(reader.file()).toBeUndefined()
+  expect((reader.resolve(stored) as Resolved).dump?.enabled).toBe(true)
+  // The file's looser protection never became this host's applied copy.
+  await Bun.sleep(100)
+  expect(await readSettingsProtectionCopy(f.target, 'opencode')).toBeUndefined()
+  // The store becomes readable; the next check imports it and adopts the file.
+  await writeFile(config, JSON.stringify(stored))
+  await clock.tick()
+  expect(reader.file()).toBe(f.target)
+  expect((reader.resolve(stored) as Resolved).killswitch).toMatchObject({
+    enabled: true,
+    main: { five_hour: 61 },
+  })
+  expect((reader.resolve(stored) as Resolved).dump?.enabled).toBe(false)
+  const copy = await appliedCopy(
+    f.target,
+    (values) =>
+      (values as SettingsProtectionValues | undefined)
+        ?.killswitch_default_five_hour === 61,
+  )
+  expect(copy).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 61,
+  })
 })
