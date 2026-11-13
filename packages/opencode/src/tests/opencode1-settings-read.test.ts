@@ -4,12 +4,13 @@ import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import { parse } from 'jsonc-parser'
+import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
-import {
-  nondefaultSettings,
-  settingsReaderOutputs,
-} from './opencode2-settings-readers'
+import releaseSnapshots from './fixtures/settings-2.11.2.json'
+import { settingsReaderOutputs } from './opencode2-settings-readers'
+import { snapshotSettings } from './settings-snapshot-fixture'
+import { observeSettings } from './settings-snapshot-observe'
 import {
   applyMenuAction,
   createMockClient,
@@ -631,87 +632,101 @@ describe('OpenCode 1 settings service reads', () => {
 
   for (const custody of ['local', 'claustrum'] as const) {
     for (const peer of ['absent', 'same'] as const) {
-      test(`all declared reader outputs survive the move in ${custody} custody with Pi ${peer}`, async () => {
-        if (custody === 'claustrum') {
-          const vault = mainOnlyVault()
-          await useVaultAccountFile(
-            ctx,
-            createFallbackStorage({ accounts: [] }),
-            vault,
+      for (const sample of ['explicit', 'absent'] as const) {
+        test(`release byte snapshots in ${custody} custody with Pi ${peer}, three-way ${sample}`, async () => {
+          if (custody === 'claustrum') {
+            const vault = mainOnlyVault()
+            await useVaultAccountFile(
+              ctx,
+              createFallbackStorage({ accounts: [] }),
+              vault,
+            )
+            ctx.pluginRuntimeOverrides.claustrumScopedConnect = async () =>
+              vault
+          } else {
+            await useTempAccountFile(
+              ctx,
+              bindPoolAccounts(createFallbackStorage({ accounts: [] })),
+            )
+          }
+          const f = await fixture()
+          await fs.rm(f.target)
+          const paths =
+            custody === 'local' ? f.pool.paths : nativeVaultPaths(f.pool.paths)
+          const store = core.createNativePoolStore({
+            paths,
+            quota: nativeQuotaCodec,
+          })
+          await store.initialize()
+          const values = nativeAccountSettings(
+            snapshotSettings(sample === 'absent'),
           )
-          ctx.pluginRuntimeOverrides.claustrumScopedConnect = async () => vault
-        } else {
-          await useTempAccountFile(
-            ctx,
-            bindPoolAccounts(createFallbackStorage({ accounts: [] })),
-          )
-        }
-        const f = await fixture()
-        await fs.rm(f.target)
-        const paths =
-          custody === 'local' ? f.pool.paths : nativeVaultPaths(f.pool.paths)
-        const store = core.createNativePoolStore({
-          paths,
-          quota: nativeQuotaCodec,
-        })
-        await store.initialize()
-        const values = nondefaultSettings(
-          custody === 'local' ? 'local-account' : 'vault:credential',
-        )
-        await store.updateSettings((settings) => ({ ...settings, ...values }))
-        const legacy = core.createNativeAccountRuntime({
-          paths: f.pool.paths,
-          host: 'opencode',
-        })
-        const before = settingsReaderOutputs(
-          (await legacy.read()).policyStorage,
-        )
-        await legacy.close()
-        // Use the default-source rule in a sandbox to include Pi without reading
-        // either host's real default folder.
-        const move = core.runSettingsMoveAtStartup
-        const sandboxEnv: NodeJS.ProcessEnv = {
-          ...process.env,
-          HOME: f.pool.root,
-          XDG_CONFIG_HOME: join(f.pool.root, '.config'),
-        }
-        delete sandboxEnv.ANTHROPIC_AUTH_SETTINGS_FILE
-        const settingsPaths = await core.resolveSettingsPaths('opencode', {
-          env: sandboxEnv,
-        })
-        settingsPaths.defaults.opencode = settingsPaths.own
-        if (peer === 'same') {
-          const pi = settingsPaths.defaults.pi
-          await fs.mkdir(join(pi.account, '..'), { recursive: true })
-          await fs.writeFile(
-            pi.account,
-            JSON.stringify({ version: 1, accounts: [], ...values }),
-          )
-        }
-        const mover = spyOn(
-          core,
-          'runSettingsMoveAtStartup',
-        ).mockImplementation((options) =>
-          move({
-            ...options,
+          await store.updateSettings((settings) => ({ ...settings, ...values }))
+          const sourceBytes = await fs.readFile(paths.config, 'utf8')
+          const legacy = core.createNativeAccountRuntime({
+            paths: f.pool.paths,
+            host: 'opencode',
+          })
+          const before = (await legacy.read()).policyStorage
+          await legacy.close()
+          // Use the default-source rule in a sandbox to include Pi without reading
+          // either host's real default folder.
+          const move = core.runSettingsMoveAtStartup
+          const sandboxEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            HOME: f.pool.root,
+            XDG_CONFIG_HOME: join(f.pool.root, '.config'),
+          }
+          delete sandboxEnv.ANTHROPIC_AUTH_SETTINGS_FILE
+          const settingsPaths = await core.resolveSettingsPaths('opencode', {
             env: sandboxEnv,
-            paths: {
-              ...settingsPaths,
-              target: f.target,
-              own: settingsPaths.own,
-              separate: false,
-            },
-            ownPoolPaths: f.pool.paths,
-          }),
-        )
-        cleanups.push(() => mover.mockRestore())
-        const instance = await f.launch()
-        expect(f.starts[0]?.mode).toBe('user-file')
-        expect(
-          settingsReaderOutputs((await instance.runtime.read()).policyStorage),
-        ).toBe(before)
-        await store.close()
-      })
+          })
+          settingsPaths.defaults.opencode = settingsPaths.own
+          if (peer === 'same') {
+            const pi = settingsPaths.defaults.pi
+            await fs.mkdir(join(pi.account, '..'), { recursive: true })
+            await fs.writeFile(
+              pi.account,
+              JSON.stringify({ version: 1, accounts: [], ...values }),
+            )
+          }
+          const mover = spyOn(
+            core,
+            'runSettingsMoveAtStartup',
+          ).mockImplementation((options) =>
+            move({
+              ...options,
+              env: sandboxEnv,
+              paths: {
+                ...settingsPaths,
+                target: f.target,
+                own: settingsPaths.own,
+                separate: false,
+              },
+              ownPoolPaths: f.pool.paths,
+            }),
+          )
+          cleanups.push(() => mover.mockRestore())
+          const instance = await f.launch()
+          expect(f.starts[0]?.mode).toBe('user-file')
+          const after = (await instance.runtime.read()).policyStorage
+          expect(await fs.readFile(paths.config, 'utf8')).toBe(sourceBytes)
+          for (const [phase, storage] of [
+            ['before', before],
+            ['after', after],
+          ] as const) {
+            settingsReaderOutputs(storage)
+            const observed = await observeSettings(storage, 1)
+            expect(JSON.stringify(observed), phase).toBe(
+              JSON.stringify(releaseSnapshots[`oc1-${sample}`]),
+            )
+            expect(observed.logs.length).toBeGreaterThan(0)
+            expect(observed.track.tracked).toBe(true)
+            expect(observed.warms).toHaveLength(sample === 'explicit' ? 1 : 0)
+          }
+          await store.close()
+        })
+      }
     }
   }
 })

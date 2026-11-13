@@ -7,16 +7,20 @@ const source = await readFile(new URL('../index.ts', import.meta.url), 'utf8')
 
 // These OpenCode 1 predicates are private. Execute their source as the schema
 // default tests do, rather than comparing two copies of a settings converter.
-function predicate(pattern: RegExp, storage: core.AccountStorage) {
+export function predicate(pattern: RegExp, storage: core.AccountStorage) {
   const expression = source.match(pattern)?.[1]
   expect(expression).toBeDefined()
   return new Function(
     'storage',
-    `return (${expression?.replaceAll('initialStorage', 'storage')})`,
-  )(storage)
+    'readThreeWayBoolean',
+    `return (${expression?.replaceAll('initialStorage', 'storage').replaceAll('snapshot.policyStorage', 'storage')})`,
+  )(storage, core.readThreeWayBoolean)
 }
 
-export function settingsReaderOutputs(s: core.AccountStorage) {
+export function settingsReaderOutputs(
+  s: core.AccountStorage,
+  inventory = true,
+) {
   const tools: string[] = []
   core.applyTurnEndNotes(
     { model: 'claude-opus-5-5', messages: [] },
@@ -94,9 +98,10 @@ export function settingsReaderOutputs(s: core.AccountStorage) {
       core.getThinkingPrefixMismatchBehavior(s),
     turn_end_note_tools: tools,
   } satisfies Record<core.SettingsKey, unknown>
-  expect(Object.keys(outputs).sort()).toEqual(
-    Object.keys(core.SETTINGS_DEFAULT_READERS).sort(),
-  )
+  if (inventory)
+    expect(Object.keys(outputs).sort()).toEqual(
+      Object.keys(core.SETTINGS_DEFAULT_READERS).sort(),
+    )
   const wire = createNativeWirePolicy().requestOptions(
     {
       attemptId: 'parity',

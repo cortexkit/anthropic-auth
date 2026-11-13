@@ -6,15 +6,16 @@ import * as core from '@cortexkit/anthropic-auth-core'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import type { Plugin } from '@opencode/plugin'
+import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
 import * as sourceFactory from '../v2/source'
-import {
-  nondefaultSettings,
-  settingsReaderOutputs,
-} from './opencode2-settings-readers'
+import releaseSnapshots from './fixtures/settings-2.11.2.json'
+import { settingsReaderOutputs } from './opencode2-settings-readers'
+import { snapshotSettings } from './settings-snapshot-fixture'
+import { observeSettings } from './settings-snapshot-observe'
 
 const cleanups: (() => unknown | Promise<unknown>)[] = []
 afterEach(async () => {
@@ -1032,57 +1033,72 @@ test.each(['local', 'claustrum'] as const)(
 
 for (const mode of ['local', 'claustrum'] as const) {
   for (const peer of ['absent', 'same'] as const) {
-    test(`OC2 ${mode} move preserves every named reader with Pi ${peer}`, async () => {
-      const f = await fixture(mode)
-      const legacy = nondefaultSettings(
-        mode === 'local' ? 'local-row' : 'vault:credential',
-      )
-      await f.store.updateSettings(() => legacy)
-      if (peer === 'same') {
-        const peerPaths = core.getDefaultSettingsStorePaths('pi', {
-          env: f.env,
-        })
-        const paths = await core.resolveNativePoolPaths(
-          peerPaths.account,
-          peerPaths.state,
-          { kind: 'legacy' },
+    for (const sample of ['explicit', 'absent'] as const) {
+      test(`OC2 release byte snapshots in ${mode} with Pi ${peer}, three-way ${sample}`, async () => {
+        const f = await fixture(mode)
+        const legacy = nativeAccountSettings(
+          snapshotSettings(sample === 'absent'),
         )
-        const store = core.createNativePoolStore({
-          paths: mode === 'local' ? paths : nativeVaultPaths(paths),
-          quota: nativeQuotaCodec,
-        })
-        cleanups.push(() => store.close())
-        await store.initialize()
-        await store.updateSettings(() => legacy)
-        if (mode === 'claustrum')
-          await put(f.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE!, {
-            token: '02'.repeat(32),
-            token_generation: 1,
+        await f.store.updateSettings(() => legacy)
+        if (peer === 'same') {
+          const peerPaths = core.getDefaultSettingsStorePaths('pi', {
+            env: f.env,
           })
-      }
-      const raw = core.createNativeAccountRuntime({
-        paths: f.paths,
-        host: 'opencode',
-        vault: { env: f.env },
-      })
-      const before = settingsReaderOutputs((await raw.read()).policyStorage)
-      await raw.close()
-      const bytes = await fs.readFile(
-        mode === 'local' ? f.paths.config : nativeVaultPaths(f.paths).config,
-        'utf8',
-      )
-      const instance = await f.start()
-      expect(
-        settingsReaderOutputs((await instance.runtime.read()).policyStorage),
-      ).toBe(before)
-      expect(
-        await fs.readFile(
+          const paths = await core.resolveNativePoolPaths(
+            peerPaths.account,
+            peerPaths.state,
+            { kind: 'legacy' },
+          )
+          const store = core.createNativePoolStore({
+            paths: mode === 'local' ? paths : nativeVaultPaths(paths),
+            quota: nativeQuotaCodec,
+          })
+          cleanups.push(() => store.close())
+          await store.initialize()
+          await store.updateSettings(() => legacy)
+          if (mode === 'claustrum')
+            await put(f.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE!, {
+              token: '02'.repeat(32),
+              token_generation: 1,
+            })
+        }
+        const raw = core.createNativeAccountRuntime({
+          paths: f.paths,
+          host: 'opencode',
+          vault: { env: f.env },
+        })
+        const before = (await raw.read()).policyStorage
+        await raw.close()
+        const bytes = await fs.readFile(
           mode === 'local' ? f.paths.config : nativeVaultPaths(f.paths).config,
           'utf8',
-        ),
-      ).toBe(bytes)
-      expect(f.opened[0]!.snapshot().report).toEqual([])
-    })
+        )
+        const instance = await f.start()
+        const after = (await instance.runtime.read()).policyStorage
+        for (const [phase, storage] of [
+          ['before', before],
+          ['after', after],
+        ] as const) {
+          settingsReaderOutputs(storage)
+          const observed = await observeSettings(storage, 2)
+          expect(JSON.stringify(observed), phase).toBe(
+            JSON.stringify(releaseSnapshots[`oc2-${sample}`]),
+          )
+          expect(observed.logs.length).toBeGreaterThan(0)
+          expect(observed.track.tracked).toBe(true)
+          expect(observed.warms).toHaveLength(sample === 'explicit' ? 1 : 0)
+        }
+        expect(
+          await fs.readFile(
+            mode === 'local'
+              ? f.paths.config
+              : nativeVaultPaths(f.paths).config,
+            'utf8',
+          ),
+        ).toBe(bytes)
+        expect(f.opened[0]!.snapshot().report).toEqual([])
+      })
+    }
   }
 }
 
