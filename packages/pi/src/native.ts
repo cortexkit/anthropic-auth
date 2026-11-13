@@ -292,6 +292,7 @@ export class PiNativeRuntime {
         settingsFile: settings.file,
         settingsService: settings.service,
         settingsFallback: settings.fallback,
+        settingsReopen: settings.reopen,
         settingsMode: () => settings.mode,
         settingsAuthority: options.settings?.authority,
       })

@@ -212,6 +212,163 @@ for (const failure of ['move', 'service open'] as const) {
   })
 }
 
+test('Pi reopens a failed legacy settings service on the authority timer without retrying the move', async () => {
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      prime: { enabled: false },
+      dump: { enabled: true },
+    },
+    storagePath,
+  )
+  const options = settingsOptions()
+  let moves = 0
+  options.startup = {
+    dependencies: {
+      move: () => {
+        moves++
+        throw new Error('private move failure')
+      },
+    },
+  }
+  const open = options.service?.dependencies?.open
+  if (!open) throw new Error('Expected the settings open test dependency')
+  let unavailable = true
+  let opens = 0
+  options.service = {
+    ...options.service,
+    dependencies: {
+      ...options.service?.dependencies,
+      open: (settings) => {
+        opens++
+        if (unavailable) throw new Error('private service failure')
+        return open(settings)
+      },
+    },
+  }
+  const ticks: (() => Promise<void>)[] = []
+  options.authority = {
+    schedule: (callback) => {
+      ticks.push(callback)
+      return () => {}
+    },
+  }
+  const native = runtime(options)
+  await native.service()
+  expect(
+    core.isDumpPersistentlyEnabled((await native.requestView()).policyStorage),
+  ).toBe(true)
+  expect(moves).toBe(1)
+  expect(opens).toBe(1)
+  expect(ticks).toHaveLength(1)
+  await write({ dump_enabled: false })
+  await core.writeSettingsMoveMarker(file, { env: process.env, home })
+  await core.writeSettingsImportRecord(file, 'pi', { env: process.env, home })
+  unavailable = false
+  await ticks[0]?.()
+  expect(
+    core.isDumpPersistentlyEnabled((await native.requestView()).policyStorage),
+  ).toBe(false)
+  expect(moves).toBe(1)
+  expect(opens).toBe(2)
+  expect(ticks).toHaveLength(1)
+  await native.close()
+  expect(stops).toBe(1)
+})
+
+test('Pi treats import-refused as a serving legacy result without retrying until restart', async () => {
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      prime: { enabled: false },
+      killswitch: { enabled: true, main: { five_hour: 53 } },
+      routing: { mode: 'fallback-first' },
+    },
+    storagePath,
+  )
+  await write({ killswitch_enabled: false, routing_mode: 'main-first' })
+  await core.writeSettingsMoveMarker(file, { env: process.env, home })
+  await core.writeSettingsImportRecord(file, 'opencode', {
+    env: process.env,
+    home,
+  })
+  const outcomes: string[] = []
+  const begin = core.startSettings
+  const start = spyOn(core, 'startSettings').mockImplementation((options) =>
+    begin({
+      ...options,
+      start: {
+        ...options.start,
+        move: async (moveOptions) => {
+          const result = await core.runSettingsMoveAtStartup(moveOptions)
+          outcomes.push(result.outcome)
+          return result
+        },
+      },
+    }),
+  )
+  const options = settingsOptions()
+  const ticks: (() => Promise<void>)[] = []
+  options.authority = {
+    schedule: (callback) => {
+      ticks.push(callback)
+      return () => {}
+    },
+  }
+  try {
+    const native = getPiNativeRuntime(storagePath, {
+      settings: options,
+      vaultPoll: { intervalMs: 0 },
+    })
+    const service = await native.service()
+    expect(outcomes).toEqual(['import-refused'])
+    expect(await service.getSettingsPath()).not.toBe(file)
+    expect(ticks).toHaveLength(0)
+    expect(watches).toBe(0)
+    await expect(fs.stat(`${file}.moved.pi`)).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+    const commands = createPiNativeCommands(storagePath)
+    const before = await fs.readFile(file, 'utf8')
+    if (!commands.readAccounts)
+      throw new Error('Expected the Pi account reader')
+    await commands.readAccounts()
+    await commands.readStatus('routing', {})
+    expect(await fs.readFile(file, 'utf8')).toBe(before)
+    await write({
+      killswitch_enabled: { default: false, pi: true },
+      killswitch_default_five_hour: 53,
+      routing_mode: 'main-first',
+    })
+    await commands.readStatus('routing', {})
+    for (let request = 0; request < 2; request++) {
+      const stored = (await native.requestView()).policyStorage
+      expect(core.isKillswitchEnabled(stored)).toBe(true)
+      expect(core.getKillswitchThresholdsForAccount(stored).five_hour).toBe(53)
+      expect(core.getRoutingMode(stored)).toBe('fallback-first')
+    }
+    expect(outcomes).toEqual(['import-refused'])
+    expect(ticks).toHaveLength(0)
+    expect(records.filter((record) => record.level === 'error')).toHaveLength(0)
+    await closePiNativeRuntime(storagePath)
+    const restarted = getPiNativeRuntime(storagePath, {
+      settings: options,
+      vaultPoll: { intervalMs: 0 },
+    })
+    expect(
+      core.getRoutingMode((await restarted.requestView()).policyStorage),
+    ).toBe('main-first')
+    expect(outcomes).toEqual(['import-refused', 'marker-present'])
+    expect(
+      JSON.parse(await fs.readFile(`${file}.moved.pi`, 'utf8')),
+    ).toMatchObject({ version: 1, host: 'pi' })
+  } finally {
+    start.mockRestore()
+  }
+})
+
 test('Pi keeps the stricter applied-copy floor after a moved file cannot open and recovers on the authority timer', async () => {
   await saveNativePiFixture(
     {
