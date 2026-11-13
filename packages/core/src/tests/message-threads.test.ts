@@ -202,9 +202,58 @@ describe('full request tail marker', () => {
     )
   })
 
+  test.each(['active', 'expired'] as const)(
+    'an effort change restores the full tail after continuations with an %s thread',
+    (state) => {
+      let now = 0
+      const tracker = new MessageThreadTracker(10, () => now)
+      const first = anchorWithContinuation(tracker, tailMarkerInput())
+      const request = advance(replay(first))
+      request.body.output_config = { effort: 'xhigh' }
+      now = state === 'expired' ? 301_000 : 1
+      const log = spyOn(logger, 'debug')
+      try {
+        const prepared = tracker.prepare(request)
+        expect(prepared.decision.type).toBe('create')
+        expect(
+          log.mock.calls.find(
+            (call) => call[1] === 'message_thread_create',
+          )?.[2],
+        ).toMatchObject({
+          reason: state === 'expired' ? 'expired' : 'fixed_changed',
+        })
+        expect(
+          log.mock.calls.find(
+            (call) => call[1] === 'message_thread_tail_marker',
+          )?.[2],
+        ).toMatchObject({ reason: 'tail_marker_added' })
+        expect(prepared.tailMarkerAdded).toBe(true)
+        expect(
+          (
+            prepared.body.messages as { content: Record<string, unknown>[] }[]
+          )[350]?.content[0]?.cache_control,
+        ).toEqual({ type: 'ephemeral', ttl: '1h' })
+        expect(
+          (prepared.body.system as Record<string, unknown>[])[0]?.cache_control,
+        ).toBeUndefined()
+        expect(prepared.body.output_config).toEqual({ effort: 'xhigh' })
+        expect(first.body.output_config).toEqual({ effort: 'high' })
+      } finally {
+        log.mockRestore()
+      }
+    },
+  )
+
   test.each([
     'no_prior_thread',
     'prefix_changed',
+    'thinking_changed',
+    'system_changed',
+    'tools_changed',
+    'output_format_changed',
+    'nested_effort_changed',
+    'model_changed',
+    'betas_changed',
     'expired',
     'account_changed',
     'credential_changed',
@@ -216,6 +265,8 @@ describe('full request tail marker', () => {
     let now = 0
     const tracker = new MessageThreadTracker(10, () => now)
     const first = tailMarkerInput()
+    if (reason === 'nested_effort_changed')
+      first.body.output_config = { effort: 'high', custom: { effort: 'high' } }
     if (reason !== 'no_prior_thread') anchorWithContinuation(tracker, first)
     const request = replay(first)
     request.stateless = true
@@ -223,6 +274,21 @@ describe('full request tail marker', () => {
     if (reason === 'prefix_changed')
       (request.body.messages as { content: unknown }[])[20]!.content =
         'edited earlier message'
+    if (reason === 'thinking_changed')
+      request.body.thinking = { type: 'adaptive' }
+    if (reason === 'system_changed')
+      (request.body.system as Record<string, unknown>[])[0]!.text =
+        'changed instructions'
+    if (reason === 'tools_changed') request.body.tools = [{ name: 'write' }]
+    if (reason === 'output_format_changed')
+      request.body.output_config = {
+        effort: 'high',
+        format: { type: 'json_schema', schema: { type: 'object' } },
+      }
+    if (reason === 'nested_effort_changed')
+      request.body.output_config = { effort: 'high', custom: { effort: 'low' } }
+    if (reason === 'model_changed') request.body.model = 'different-model'
+    if (reason === 'betas_changed') request.betas = ['base', 'different']
     if (reason === 'expired') now = 3_600_000
     if (reason === 'account_changed') request.account = 'other account'
     if (reason === 'credential_changed')
@@ -260,7 +326,9 @@ describe('full request tail marker', () => {
                 ? 'ttl_order'
                 : reason === 'clock_rollback'
                   ? 'expired'
-                  : reason,
+                  : reason.endsWith('_changed') && reason !== 'account_changed'
+                    ? 'prefix_changed'
+                    : reason,
         })
       }
     } finally {

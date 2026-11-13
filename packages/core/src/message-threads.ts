@@ -546,6 +546,12 @@ export function messageThreadCachePrefix(
     ...message,
     content,
   })
+  // Cache entries written at one effort were observed being read at another.
+  // Exclude only effort here; thread continuation still uses the full config.
+  const outputConfig = isBody(body.output_config)
+    ? { ...body.output_config }
+    : body.output_config
+  if (isBody(outputConfig)) delete outputConfig.effort
   const system = Array.isArray(body.system)
     ? body.system
         .filter(
@@ -563,7 +569,7 @@ export function messageThreadCachePrefix(
       speed: body.speed,
       betas,
       thinking: body.thinking,
-      output_config: body.output_config,
+      output_config: outputConfig,
       tool_choice: body.tool_choice,
       context_management: body.context_management,
       fallbacks: body.fallbacks,
