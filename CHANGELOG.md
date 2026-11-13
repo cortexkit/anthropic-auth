@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Vault enrollment now refuses unsafe token folders even during token replacement or when folder safety checks fail.
-
 ## 2.11.4
 
 - OpenCode 2 now preserves billing reports for thread-recovery resends even when the host finishes the rejected request before its resend returns.
