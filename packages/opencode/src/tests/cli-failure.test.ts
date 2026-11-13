@@ -377,12 +377,15 @@ test('shared runner plain errors retain their exact display messages', async () 
 })
 
 test('shared runner fence errors display only rebuilt host names and PIDs', async () => {
+  // Setup's process check excludes the test runner PID, so use other host PIDs.
+  const opencodePid = process.pid + 1
+  const piPid = process.pid + 2
   const { error, output } = await runnerFailure(['--yes'], {
-    processes: `77 /private/host-canary/opencode --token=${SK}\n78 /usr/bin/pi --secret=${OPAQUE}\n`,
+    processes: `${opencodePid} /private/host-canary/opencode --token=${SK}\n${piPid} /usr/bin/pi --secret=${OPAQUE}\n`,
   })
   const expected =
     'OpenCode or Pi processes are currently running:\n' +
-    '  - PID 77: opencode\n  - PID 78: pi\n\n' +
+    `  - PID ${opencodePid}: opencode\n  - PID ${piPid}: pi\n\n` +
     'Please quit all OpenCode, LiteCode, and Pi processes before running setup.'
   expect(knownFailureMessage(error)).toBe(expected)
   expect(await reportThrownFailure('cli-setup', error, {})).toBe(expected)
