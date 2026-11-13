@@ -1,5 +1,8 @@
 import { isDeepStrictEqual } from 'node:util'
-import type { SettingsEdit } from '@cortexkit/common-auth/settings'
+import {
+  type SettingsEdit,
+  SettingsRefusal,
+} from '@cortexkit/common-auth/settings'
 import { parse } from 'jsonc-parser'
 import { logger } from './logger.ts'
 import {
@@ -138,6 +141,7 @@ export async function writeNativeSetupSettings(
         }) ?? {})
       : {}
     const edits: SettingsEdit[] = []
+    let importFloors: AccountFloor[] | undefined
     const skip = (
       key: SettingsKey,
       legacy: unknown,
@@ -191,27 +195,14 @@ export async function writeNativeSetupSettings(
         )
         continue
       }
-      if (key === 'killswitch_account_floors' && Object.hasOwn(raw, key)) {
+      if (key === 'killswitch_account_floors') {
         if (generation.report.some((entry) => entry.keyPath[0] === key))
           return {
             ...result,
             outcome: 'refused',
             reason: invalidSettingsWriteText(key, paths.target),
           }
-        const floors = structuredClone(raw[key] as SettingsValues[typeof key])
-        const appended = []
-        for (const entry of values[key] ?? []) {
-          const held = floors.find(
-            (existing) =>
-              existing.account === entry.account &&
-              (existing.host === options.host || existing.host === 'both'),
-          )
-          if (held) {
-            skip(key, thresholds(entry), thresholds(held), entry.account)
-          } else appended.push({ ...entry, host: options.host })
-        }
-        if (appended.length)
-          edits.push({ setting: key, value: [...floors, ...appended] })
+        importFloors = values[key] ?? []
         continue
       }
       const levels = generation.fileLevels[key] ?? []
@@ -227,45 +218,50 @@ export async function writeNativeSetupSettings(
             : held,
         )
       } else {
-        // common-auth 0.48 cannot select a Pi-only location for a new key.
-        // Account-floor entries already name their host inside the shared list.
-        const edit: SettingsEdit | undefined =
-          options.host === 'pi' && key !== 'killswitch_account_floors'
-            ? undefined
-            : { setting: key, value }
-        if (edit) edits.push(edit)
-        else {
-          const note =
-            "Pi's value was not imported because the settings file had no Pi entry for it."
-          result.skipped.push(key)
-          result.differing.push({
-            key,
-            legacy: value,
-            file: service.resolve('pi')[key],
-            note,
-          })
-          warn(`Setup skipped setting "${key}" in "${paths.target}": ${note}`)
-        }
+        edits.push({
+          setting: key,
+          value,
+          ...(options.host === 'pi' ? { level: 'pi' as const } : {}),
+        })
       }
     }
     // The service carries the whole applied protection set in this same edit.
     // Imported protection was omitted above so a stale source cannot replace it.
-    if (edits.length)
-      await service.update(edits, options.host, {
-        createMissing: missing,
-        hostsStopped: true,
-      })
-    else if (missing && Object.keys(values).length)
+    if (
+      edits.length ||
+      importFloors?.length ||
+      (missing && Object.keys(values).length)
+    )
       await service.update(
-        [
-          {
-            setting: 'killswitch_enabled',
-            value:
-              generation.protection[options.host].values.killswitch_enabled,
-          },
-        ],
+        (current, carry) => {
+          if (!importFloors?.length) return edits
+          const key = 'killswitch_account_floors'
+          const floors =
+            current.status === 'ready'
+              ? ((current.document as Record<string, unknown>)[key] ?? [])
+              : (carry?.find((edit) => edit.setting === key)?.value ?? [])
+          if (!Array.isArray(floors))
+            throw new SettingsRefusal(
+              'settings-invalid-value',
+              'Account floors are not a list',
+            )
+          const appended: AccountFloor[] = []
+          for (const entry of importFloors) {
+            const held = (floors as AccountFloor[]).find(
+              (existing) =>
+                existing.account === entry.account &&
+                (existing.host === options.host || existing.host === 'both'),
+            )
+            if (held)
+              skip(key, thresholds(entry), thresholds(held), entry.account)
+            else appended.push({ ...entry, host: options.host })
+          }
+          return appended.length
+            ? [...edits, { setting: key, value: [...floors, ...appended] }]
+            : edits
+        },
         options.host,
-        { createMissing: true, hostsStopped: true },
+        { createMissing: missing, hostsStopped: true },
       )
     return result
   } catch (error) {

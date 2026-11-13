@@ -121,13 +121,23 @@ async function fixture(
           },
           update: async (edits, context) => {
             await options.beforeUpdate?.()
-            calls.push({ edits, context })
+            const call = { edits, context }
+            calls.push(call)
             if (options.refusal)
               throw new SettingsRefusal(
                 options.refusal,
                 'dependency-private-file-contents',
               )
-            return handle.update(edits, context)
+            return handle.update(
+              typeof edits === 'function'
+                ? (current) => {
+                    const planned = edits(current)
+                    call.edits = planned
+                    return planned
+                  }
+                : edits,
+              context,
+            )
           },
         }
       },
