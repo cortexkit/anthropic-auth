@@ -2,6 +2,8 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
 ## 2.11.4
 
 - OpenCode 2 now preserves billing reports for thread-recovery resends even when the host finishes the rejected request before its resend returns.
