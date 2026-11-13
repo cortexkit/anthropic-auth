@@ -1,8 +1,11 @@
 import { createHash } from 'node:crypto'
-import { realpath } from 'node:fs/promises'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import { getAccountStatePath, getAccountStoragePath } from './accounts.ts'
+import {
+  type PathResolutionOptions,
+  resolvePathOptions,
+} from './path-options.ts'
 import {
   LEGACY_STATE_LAYOUT,
   processStateLayout,
@@ -55,8 +58,12 @@ export function resolveLocalRoutingDestination(
  * This can follow a leaf symlink, so it does not establish configured-leaf safety.
  * Source capture and recheck must retain the configured path for the lstat guard.
  */
-export async function canonicalPath(path: string): Promise<string> {
-  const absolute = resolve(path)
+export async function canonicalPath(
+  path: string,
+  options: PathResolutionOptions = {},
+): Promise<string> {
+  const { paths, realpath } = resolvePathOptions(options)
+  const absolute = paths.resolve(path)
   try {
     return await realpath(absolute)
   } catch (error) {
@@ -68,9 +75,12 @@ export async function canonicalPath(path: string): Promise<string> {
       throw error
     }
   }
-  const parent = dirname(absolute)
+  const parent = paths.dirname(absolute)
   if (parent === absolute) return absolute
-  return join(await canonicalPath(parent), basename(absolute))
+  return paths.join(
+    await canonicalPath(parent, options),
+    paths.basename(absolute),
+  )
 }
 
 function sibling(

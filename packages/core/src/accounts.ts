@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 
 import { parseRetryAfterHeader } from './auth.ts'
 import type { ProviderAccountUuid } from './claude-code.ts'
@@ -15,6 +15,10 @@ import {
 import { clampHostRetryMs } from './host-retry.ts'
 import type { LogLevel } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
+import {
+  type PathResolutionOptions,
+  resolvePathOptions,
+} from './path-options.ts'
 import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
 import { getMaxSameAccountWait } from './routing.ts'
 import {
@@ -519,25 +523,36 @@ export const FALLBACK_BACKGROUND_TICK_MS = 60_000
 export function getOpenCodeConfigDir(
   env: NodeJS.ProcessEnv = process.env,
   home = homedir(),
+  options: Pick<PathResolutionOptions, 'platform' | 'realpath'> = {},
 ) {
+  const { paths } = resolvePathOptions({ ...options, env, home })
   if (env.OPENCODE_CONFIG_DIR?.trim()) {
     return env.OPENCODE_CONFIG_DIR.trim()
   }
-  return join(env.XDG_CONFIG_HOME || join(home, '.config'), 'opencode')
-}
-
-export function getAccountStoragePath() {
-  return (
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE?.trim() ||
-    join(getOpenCodeConfigDir(), ACCOUNT_FILE_NAME)
+  return paths.join(
+    env.XDG_CONFIG_HOME || paths.join(home, '.config'),
+    'opencode',
   )
 }
 
-export function getAccountStatePath(configPath = getAccountStoragePath()) {
-  const explicit = process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE?.trim()
+export function getAccountStoragePath(options: PathResolutionOptions = {}) {
+  const { env, home, paths } = resolvePathOptions(options)
+  return (
+    env.OPENCODE_ANTHROPIC_AUTH_FILE?.trim() ||
+    paths.join(getOpenCodeConfigDir(env, home, options), ACCOUNT_FILE_NAME)
+  )
+}
+
+export function getAccountStatePath(
+  configPath: string | undefined = undefined,
+  options: PathResolutionOptions = {},
+) {
+  const { env, paths } = resolvePathOptions(options)
+  configPath ??= getAccountStoragePath(options)
+  const explicit = env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE?.trim()
   if (explicit) return explicit
   return configPath.endsWith(ACCOUNT_FILE_NAME)
-    ? join(dirname(configPath), ACCOUNT_STATE_FILE_NAME)
+    ? paths.join(paths.dirname(configPath), ACCOUNT_STATE_FILE_NAME)
     : `${configPath}.state.json`
 }
 

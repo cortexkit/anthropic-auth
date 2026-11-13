@@ -320,6 +320,7 @@ export {
   type OwnerOnlyOptions,
   readWindowsOwnerOnly,
 } from './owner-only.ts'
+export * from './path-options.ts'
 export * from './pkce.ts'
 export type {
   NativeEmptyInitJournal,
@@ -368,6 +369,8 @@ export * from './server-fallback-usage.ts'
 export * from './session-cache-activity.ts'
 export * from './session-cache-policy.ts'
 export * from './settings-definition.ts'
+export * from './settings-mode.ts'
+export * from './settings-paths.ts'
 export * from './settings-three-way.ts'
 export type { SseEvent, SseFramer, SseFramerOptions } from './sse.ts'
 export {
