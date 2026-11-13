@@ -611,7 +611,8 @@ for (const contents of ['{bad-copy', 'null', '[]', '"invalid"', '17']) {
     test(`${host} repairs a corrupt copy ${contents} without inventing the other host's set`, async () => {
       const f = await fixture()
       await writeFile(`${f.file}.applied.json`, contents)
-      expect(await readSettingsProtectionCopy(f.file, host)).toBeUndefined()
+      // A corrupt copy is unknown, not absent: the reader throws.
+      await expect(readSettingsProtectionCopy(f.file, host)).rejects.toThrow()
       await writeSettingsProtectionCopy(f.file, host, {
         readAt: 1,
         values: complete,
@@ -783,18 +784,26 @@ test('whole-set copy validation rejects missing fields, bad scalars, bad entries
       `${f.file}.applied.json`,
       JSON.stringify({ pi: { readAt: 1, values } }),
     )
-    expect(await readSettingsProtectionCopy(f.file, 'pi')).toBeUndefined()
+    await expect(readSettingsProtectionCopy(f.file, 'pi')).rejects.toThrow()
   }
   for (const readAt of [undefined, 'yesterday', -1]) {
     await writeFile(
       `${f.file}.applied.json`,
       JSON.stringify({ pi: { readAt, values: complete } }),
     )
-    expect(await readSettingsProtectionCopy(f.file, 'pi')).toBeUndefined()
+    await expect(readSettingsProtectionCopy(f.file, 'pi')).rejects.toThrow()
   }
-  await rm(`${f.file}.applied.json`)
-  await mkdir(`${f.file}.applied.json`)
+  // Only a copy file that doesn't exist, or has no entry for the host, is absent.
+  await writeFile(
+    `${f.file}.applied.json`,
+    JSON.stringify({ opencode: { readAt: 1, values: complete } }),
+  )
   expect(await readSettingsProtectionCopy(f.file, 'pi')).toBeUndefined()
+  await rm(`${f.file}.applied.json`)
+  expect(await readSettingsProtectionCopy(f.file, 'pi')).toBeUndefined()
+  // A copy path that exists but can't be read is unknown, not absent.
+  await mkdir(`${f.file}.applied.json`)
+  await expect(readSettingsProtectionCopy(f.file, 'pi')).rejects.toThrow()
   await expect(
     writeSettingsProtectionCopy(f.file, 'pi', { readAt: 1, values: complete }),
   ).rejects.toBeInstanceOf(Error)
@@ -812,7 +821,7 @@ test('a writer preserves even an invalid other-host entry without reading it as 
   expect(
     JSON.parse(await readFile(`${f.file}.applied.json`, 'utf8')).opencode,
   ).toEqual(other)
-  expect(await readSettingsProtectionCopy(f.file, 'opencode')).toBeUndefined()
+  await expect(readSettingsProtectionCopy(f.file, 'opencode')).rejects.toThrow()
   expect(await readSettingsProtectionCopy(f.file, 'pi')).toEqual(complete)
 })
 

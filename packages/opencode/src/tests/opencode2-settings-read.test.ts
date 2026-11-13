@@ -6,6 +6,7 @@ import * as core from '@cortexkit/anthropic-auth-core'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import type { Plugin } from '@opencode/plugin'
+import { parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
@@ -1119,3 +1120,62 @@ test.each(['local', 'claustrum'] as const)(
     ).toBe(before)
   },
 )
+
+for (const pi of ['never ran', 'stricter', 'unreadable'] as const) {
+  test(`OC2 recreating a missing settings file when Pi's store is ${pi} ${pi === 'unreadable' ? 'is refused' : 'succeeds'}`, async () => {
+    const f = await fixture()
+    await core.writeSettingsMoveMarker(f.target, { env: f.env })
+    // Pi's own default store under the same home.
+    const store = core.getDefaultSettingsStorePaths('pi', {
+      env: f.env,
+    }).account
+    if (pi === 'stricter')
+      await put(store, {
+        version: 1,
+        accounts: [],
+        killswitch: { enabled: true, main: { five_hour: 55 } },
+      })
+    if (pi === 'unreadable') {
+      await fs.mkdir(dirname(store), { recursive: true })
+      await fs.writeFile(store, '{broken')
+    }
+    const started = await f.start()
+    const result = await started.runtime.updateSettings((settings) => ({
+      ...settings,
+      dump: { enabled: true },
+    }))
+    if (pi === 'unreadable') {
+      expect(result.outcome).toBe('refused')
+      await expect(fs.readFile(f.target)).rejects.toThrow()
+      return
+    }
+    expect(result.outcome).toBe('saved')
+    const file = parse(await fs.readFile(f.target, 'utf8'))
+    expect(file.dump_enabled).toBe(true)
+    if (pi === 'stricter')
+      expect(file.killswitch_default_five_hour).toMatchObject({ pi: 55 })
+  })
+}
+
+test('OC2 starts when resolving the settings paths throws, logging only fixed text', async () => {
+  const f = await fixture()
+  const records: core.LogTestRecord[] = []
+  core.__setLogTestSink((record) => records.push(record))
+  const failure = spyOn(core, 'resolveSettingsPaths').mockImplementation(
+    async () => {
+      throw new Error(`private path ${f.root}`)
+    },
+  )
+  cleanups.push(() => failure.mockRestore())
+  const started = await f.start()
+  expect(failure).toHaveBeenCalled()
+  expect(started.runtime).toBeDefined()
+  expect(await started.source.isDumpEnabled?.()).toBe(false)
+  const warnings = records.filter((record) =>
+    record.message.includes('Settings file paths could not be resolved'),
+  )
+  expect(warnings).toHaveLength(1)
+  expect(
+    records.some((record) => JSON.stringify(record).includes('private path')),
+  ).toBe(false)
+})

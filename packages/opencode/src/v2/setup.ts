@@ -9,6 +9,7 @@ import {
   disconnectNativeVaultForHost,
   exchange,
   getPersistedLogLevel,
+  getSettingsFilePath,
   isDumpPersistentlyEnabled,
   isVaultHosted,
   legacySettingsProtection,
@@ -22,9 +23,11 @@ import {
   nativeVaultRuntimeKey,
   openCodeHolderKind,
   readNativeEnrollmentMode,
+  readPeerLegacySettingsProtection,
   registerNativePoolHolder,
   resolveNativePoolPaths,
   resolveSettingsPaths,
+  type SettingsPaths,
   setDumpEnabled,
   setLogLevel,
   startSettings,
@@ -345,14 +348,33 @@ export async function setupAnthropicAuth(
         OPENCODE_ANTHROPIC_AUTH_STATE_FILE: paths.legacyState,
       }
     : env
-  const settingsPaths = await resolveSettingsPaths('opencode', {
-    env: settingsEnv,
-  })
+  // A failure to resolve the settings paths must not abort this start, which
+  // 2.11.4 completed: startSettings then resolves them itself and falls back
+  // as for any other settings startup failure. Only fixed text is logged,
+  // since the error may name a path.
+  let settingsPaths: SettingsPaths | undefined
+  try {
+    settingsPaths = await resolveSettingsPaths('opencode', {
+      env: settingsEnv,
+    })
+  } catch {
+    logger.warn(
+      'settings',
+      'Settings file paths could not be resolved; settings startup falls back to the last applied protection settings.',
+    )
+  }
+  let settingsTarget = settingsPaths?.target
+  if (settingsTarget === undefined)
+    try {
+      settingsTarget = getSettingsFilePath({ env: settingsEnv })
+    } catch {
+      settingsTarget = ''
+    }
   const requests = createReloadableRequestHooks(
     ctx,
     JSON.stringify([
       nativeVaultRuntimeKey({ ...options.vault, paths, host: 'opencode' }),
-      settingsPaths.target,
+      settingsTarget,
     ]),
   )
   ctx = requests.context
@@ -403,6 +425,9 @@ export async function setupAnthropicAuth(
             snapshot.mode,
           )
         }),
+      // Recreating a missing settings file needs Pi's own protection.
+      readPeerLegacyProtection: (host) =>
+        readPeerLegacySettingsProtection({ host, env: settingsEnv }),
     },
   })
   const settingsService = settingsStartup.service

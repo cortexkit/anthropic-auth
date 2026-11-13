@@ -208,6 +208,7 @@ import {
   readNativeEnrollmentMode,
   readNativeHostAuthKind,
   readNativeMigrationJournal,
+  readPeerLegacySettingsProtection,
   readSessionCachePolicy,
   readThreeWayBoolean,
   refreshBackoffActive,
@@ -1422,6 +1423,10 @@ const anthropicAuthPlugin = async (
             snapshot.mode,
           )
         }),
+      // Recreating a missing settings file needs Pi's own protection, read
+      // with the same process environment this start resolved its paths from.
+      readPeerLegacyProtection: (host) =>
+        readPeerLegacySettingsProtection({ host }),
     },
   })
   const nativeAccounts = acquireNativeAccountRuntime({

@@ -16,6 +16,7 @@ import {
   prepareNativeMigration,
   readNativeEnrollmentMode,
   readNativeMigrationJournal,
+  readPeerLegacySettingsProtection,
   readSettingsMoveSource,
   releaseNativeMigrationPreflight,
   requireNoSupervisedAuthContentSnapshot,
@@ -340,6 +341,14 @@ export async function writeNativeLocalSetupSettings(
             snapshot.mode,
           )
         },
+        // Recreating a missing settings file needs the other host's own
+        // protection, read with the same environment and home as setup.
+        readPeerLegacyProtection: (peer) =>
+          readPeerLegacySettingsProtection({
+            host: peer,
+            env: options.env,
+            home: options.env.HOME,
+          }),
       },
     })
     for (const difference of result.differing)

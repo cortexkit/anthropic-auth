@@ -310,6 +310,25 @@ lifetimeTest(
 )
 
 lifetimeTest(
+  'marked missing file keeps the other host stricter legacy protection at its own level',
+  async () => {
+    const f = await fixture()
+    await f.marker()
+    // Pi's own default store under the same home, never read by OpenCode before.
+    await json(join(f.home, '.pi', 'agent', 'anthropic-auth.json'), {
+      version: 1,
+      accounts: [],
+      killswitch: { enabled: true, main: { five_hour: 55 } },
+    })
+    await f.run()
+    expect(f.phases).toEqual(['committed'])
+    const file = parse(await readFile(f.target, 'utf8'))
+    expect(file.killswitch_default_five_hour).toMatchObject({ pi: 55 })
+    expect(file).toMatchObject({ dump_enabled: true })
+  },
+)
+
+lifetimeTest(
   'setup never persists a settings-service projection to the legacy store',
   async () => {
     const f = await fixture()

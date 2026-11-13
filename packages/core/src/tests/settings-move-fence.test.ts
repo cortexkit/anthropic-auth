@@ -1,8 +1,17 @@
 import { expect } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { bundleCore } from '../../scripts/build.ts'
 
 import {
   HOLDER_FILE_NAME,
@@ -535,3 +544,56 @@ test('unknown process starts remain live, and an invalid injected floor closes t
     blockers: [{ kind: 'floor', release: 'unknown' }],
   })
 })
+
+test('a holder registered by a 2.12.0 build opens the default fence for another 2.12.0 build, while 2.11.x blocks it', async () => {
+  // A published process stamps its holder entry with the version in the
+  // package.json beside its bundle (core's bundle reads `../package.json`
+  // from `dist/index.js`). Bundle Core as its build does, then install one
+  // copy per version inside the package folder so its externals resolve.
+  const coreRoot = fileURLToPath(new URL('../../', import.meta.url))
+  const staging = await mkdtemp(join(coreRoot, '.release-fence-'))
+  deferCleanup(() => rm(staging, { recursive: true, force: true }))
+  const bundle = join(staging, 'bundle.js')
+  await bundleCore({
+    entrypoint: join(coreRoot, 'src', 'index.ts'),
+    outfile: bundle,
+  })
+  const install = async (folder: string, version: string) => {
+    const root = join(staging, folder)
+    await mkdir(join(root, 'dist'), { recursive: true })
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ name: '@cortexkit/anthropic-auth-core', version }),
+    )
+    await copyFile(bundle, join(root, 'dist', 'index.js'))
+    return (await import(
+      pathToFileURL(join(root, 'dist', 'index.js')).href
+    )) as typeof import('../index.ts')
+  }
+  const checker = await install('checker', '2.12.0')
+  expect(checker.anthropicAuthRelease()).toBe('2.12.0')
+  const { floor: _floor, ...options } = await fixture()
+  for (const [version, open] of [
+    ['2.12.0', true],
+    ['2.11.4', false],
+    ['2.11.0', false],
+  ] as const) {
+    const registrant = await install(`holder-${version}`, version)
+    expect(registrant.anthropicAuthRelease()).toBe(version)
+    // The registrant's own entry, as its registration publishes it.
+    const entry = await registrant.buildHolderEntry({
+      role: 'pi',
+      kind: 'pi',
+      identity: null,
+      files: ['/unrelated/store.json'],
+      liveness,
+      now: () => NOW,
+    })
+    expect(entry.release).toBe(version)
+    const result = await checker.checkSettingsMoveFence({
+      ...options,
+      readHolders: async () => ({ entries: [entry] }),
+    })
+    expect(result.open, version).toBe(open)
+  }
+}, 60_000)

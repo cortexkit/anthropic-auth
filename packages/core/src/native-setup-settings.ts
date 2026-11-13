@@ -15,6 +15,7 @@ import {
   SETTINGS_WRITE_FAILURES,
   type SettingsKey,
 } from './settings-definition.ts'
+import { planSettingsHostImport } from './settings-host-import.ts'
 import {
   resolveSettingsMode,
   type SettingsModeOptions,
@@ -27,12 +28,17 @@ import {
   type SettingsPathOptions,
   type SettingsPaths,
 } from './settings-paths.ts'
+import { legacySettingsProtection } from './settings-protection-legacy.ts'
 import {
   openSettingsService,
   SETTINGS_PROTECTION_KEYS,
+  type SettingsGeneration,
   type SettingsProtectionRecovery,
+  type SettingsProtectionValues,
   SettingsRecreationRefusal,
   type SettingsValues,
+  type SettingsWriteState,
+  settingsFileLevels,
 } from './settings-service.ts'
 
 export interface NativeSetupSettingsDifference {
@@ -71,6 +77,216 @@ const thresholds = ({ five_hour, seven_day, scoped }: AccountFloor) => ({
   seven_day,
   scoped,
 })
+
+type ProtectionKey = (typeof SETTINGS_PROTECTION_KEYS)[number]
+const protectionKeys = new Set<string>(SETTINGS_PROTECTION_KEYS)
+
+/** How many times setup re-plans after protection changes under it. */
+const SETUP_WRITE_ATTEMPTS = 3
+
+/**
+ * Thrown from the locked writer plan when the file's protection fields no
+ * longer match the generation the plan compared against; setup refreshes and
+ * plans again.
+ */
+class SetupProtectionChanged extends Error {}
+
+/** A legacy value setup did not write, kept for the report after the write. */
+interface SetupSkip {
+  key: SettingsKey
+  legacy: unknown
+  held: unknown
+  account?: string
+  /** The value came from the protection set carried into a missing file. */
+  carried: boolean
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** The parsed document a generation was resolved from. */
+function documentOf(generation: SettingsGeneration): Record<string, unknown> {
+  const raw = generation.source
+    ? parse(generation.source.replace(/^\uFEFF/, ''), [], {
+        allowTrailingComma: true,
+      })
+    : {}
+  return record(raw) ? raw : {}
+}
+
+/**
+ * What one host resolves from the protection edits a recreation carries:
+ * the plain or default-level values, with that host's own level on top.
+ */
+function carriedProtection(
+  carry: readonly SettingsEdit[],
+  host: SettingsHost,
+): SettingsProtectionValues {
+  const values: Record<string, unknown> = {}
+  for (const edit of carry)
+    if (!edit.level || edit.level === 'default')
+      values[edit.setting] = edit.value
+  for (const edit of carry)
+    if (edit.level === host) values[edit.setting] = edit.value
+  return values as SettingsProtectionValues
+}
+
+/**
+ * Setup's edits for one state of the user file, as a pure function of it.
+ * An ordinary setting is filled only where the file sets no value at the
+ * default or this host's level. A protection setting the file doesn't
+ * mention at all is filled the same way. Otherwise, as at a later host's
+ * first start, the legacy value is written at this host's level only where
+ * it protects more than what the host resolves from the file (or from the
+ * carried set, for a missing file) and the file holds no value of the
+ * host's own. A missing account floor is appended to an existing file; into
+ * a missing file only where it is above the carried default thresholds.
+ *
+ * For an existing file the comparison uses `snapshot`'s resolution, so the
+ * plan throws `SetupProtectionChanged` when the file's protection fields
+ * no longer match it.
+ */
+function planSetupEdits(input: {
+  host: SettingsHost
+  values: Partial<SettingsValues>
+  legacy: SettingsProtectionValues
+  current: SettingsWriteState
+  carry?: readonly SettingsEdit[]
+  snapshot: SettingsGeneration
+}): { edits: SettingsEdit[]; skips: SetupSkip[] } {
+  const { host, values, legacy, current, snapshot } = input
+  const missing = current.status === 'missing'
+  const document =
+    current.status === 'ready' && record(current.document)
+      ? current.document
+      : {}
+  let resolved: SettingsProtectionValues
+  if (missing)
+    // Before the lock there is no carry yet; the writer's applied set is
+    // what it will carry for this host.
+    resolved = input.carry
+      ? carriedProtection(input.carry, host)
+      : snapshot.protection[host].values
+  else {
+    const expected = snapshot.status === 'ready' ? documentOf(snapshot) : {}
+    if (
+      snapshot.status !== 'ready' ||
+      SETTINGS_PROTECTION_KEYS.some(
+        (key) => !isDeepStrictEqual(document[key], expected[key]),
+      )
+    )
+      throw new SetupProtectionChanged()
+    resolved = snapshot.protection[host].values
+  }
+  const levels = missing ? {} : settingsFileLevels(document)
+  const held = (key: SettingsKey) => {
+    const value = document[key]
+    if (!record(value)) return value
+    return value[levels[key]?.includes(host) ? host : 'default']
+  }
+  const fill = (key: SettingsKey, value: unknown): SettingsEdit => ({
+    setting: key,
+    value,
+    ...(host === 'pi' ? { level: 'pi' as const } : {}),
+  })
+  const edits: SettingsEdit[] = []
+  const skips: SetupSkip[] = []
+  const skip = (
+    key: SettingsKey,
+    legacyValue: unknown,
+    heldValue: unknown,
+    account?: string,
+  ) =>
+    skips.push({
+      key,
+      legacy: legacyValue,
+      held: heldValue,
+      ...(account === undefined ? {} : { account }),
+      carried: missing,
+    })
+  const imported = planSettingsHostImport({
+    host,
+    legacy,
+    resolved,
+    fileLevels: levels,
+  })
+  const filled = new Set<SettingsKey>()
+  for (const key of Object.keys(values) as SettingsKey[]) {
+    if (key === 'killswitch_account_floors') continue
+    const value = values[key]
+    const keyLevels = levels[key] ?? []
+    if (!keyLevels.length && !(missing && protectionKeys.has(key))) {
+      filled.add(key)
+      edits.push(fill(key, value))
+    } else if (protectionKeys.has(key)) {
+      // A stricter value is imported below; a weaker one yields to the file.
+      if (!imported.keys.includes(key as ProtectionKey))
+        skip(key, value, missing ? resolved[key as ProtectionKey] : held(key))
+    } else if (keyLevels.includes('default') || keyLevels.includes(host))
+      skip(key, value, held(key))
+    else {
+      filled.add(key)
+      edits.push(fill(key, value))
+    }
+  }
+  for (const edit of imported.edits)
+    if (
+      edit.setting !== 'killswitch_account_floors' &&
+      !filled.has(edit.setting as SettingsKey)
+    )
+      edits.push(edit)
+  const floorsKey = 'killswitch_account_floors'
+  const legacyFloors = values[floorsKey]
+  if (legacyFloors === undefined) return { edits, skips }
+  const own = (entry: AccountFloor) =>
+    entry.host === host || entry.host === 'both'
+  if (missing) {
+    const carriedFloors = resolved.killswitch_account_floors
+    const importedFloors = imported.edits.find(
+      (edit) => edit.setting === floorsKey,
+    )?.value as AccountFloor[] | undefined
+    const appended = new Set(
+      (importedFloors ?? [])
+        .slice(carriedFloors.length)
+        .map((entry) => entry.account),
+    )
+    if (importedFloors)
+      edits.push({ setting: floorsKey, value: importedFloors })
+    if (!legacyFloors.length) skip(floorsKey, [], [])
+    for (const entry of legacyFloors) {
+      if (appended.has(entry.account)) continue
+      const kept = carriedFloors.find(
+        (existing) => existing.account === entry.account && own(existing),
+      )
+      skip(
+        floorsKey,
+        thresholds(entry),
+        kept && thresholds(kept),
+        entry.account,
+      )
+    }
+    return { edits, skips }
+  }
+  const floors = document[floorsKey] ?? []
+  if (!Array.isArray(floors))
+    throw new SettingsRefusal(
+      'settings-invalid-value',
+      'Account floors are not a list',
+    )
+  const appended: AccountFloor[] = []
+  for (const entry of legacyFloors) {
+    const kept = (floors as AccountFloor[]).find(
+      (existing) => existing.account === entry.account && own(existing),
+    )
+    if (kept)
+      skip(floorsKey, thresholds(entry), thresholds(kept), entry.account)
+    else appended.push({ ...entry, host })
+  }
+  if (appended.length)
+    edits.push({ setting: floorsKey, value: [...floors, ...appended] })
+  return { edits, skips }
+}
 
 /**
  * Called only after credential commit, while hosts are stopped. Decide authority
@@ -135,23 +351,11 @@ export async function writeNativeSetupSettings(
       path: options.source,
       log: { warn },
     })
-    const raw: Record<string, unknown> = generation.source
-      ? (parse(generation.source.replace(/^\uFEFF/, ''), [], {
-          allowTrailingComma: true,
-        }) ?? {})
-      : {}
-    const edits: SettingsEdit[] = []
-    let importFloors: AccountFloor[] | undefined
-    const skip = (
-      key: SettingsKey,
-      legacy: unknown,
-      held: unknown,
-      account?: string,
-    ) => {
+    const skip = ({ key, legacy, held, account, carried }: SetupSkip) => {
       if (!result.skipped.includes(key)) {
         result.skipped.push(key)
         warn(
-          `Setup skipped setting "${key}" in "${paths.target}": ${missing ? 'the carried protection set' : 'the user settings file'} already supplies it for ${options.host}.`,
+          `Setup skipped setting "${key}" in "${paths.target}": ${carried ? 'the carried protection set' : 'the user settings file'} already supplies it for ${options.host}.`,
         )
       }
       if (!isDeepStrictEqual(legacy, held))
@@ -162,107 +366,76 @@ export async function writeNativeSetupSettings(
           file: held,
         })
     }
-    for (const key of Object.keys(values) as SettingsKey[]) {
-      const value = values[key]
-      if (
-        missing &&
-        (SETTINGS_PROTECTION_KEYS as readonly string[]).includes(key)
-      ) {
-        if (key === 'killswitch_account_floors') {
-          const floors = generation.protection[options.host].values[key]
-          if (!values[key]?.length) skip(key, [], [])
-          for (const entry of values[key] ?? []) {
-            const held = floors.find(
-              (existing) =>
-                existing.account === entry.account &&
-                (existing.host === options.host || existing.host === 'both'),
-            )
-            skip(
-              key,
-              thresholds(entry),
-              held && thresholds(held),
-              entry.account,
-            )
-          }
-          continue
-        }
-        skip(
-          key,
-          value,
-          generation.protection[options.host].values[
-            key as (typeof SETTINGS_PROTECTION_KEYS)[number]
-          ],
-        )
-        continue
-      }
-      if (key === 'killswitch_account_floors') {
-        if (generation.report.some((entry) => entry.keyPath[0] === key))
-          return {
-            ...result,
-            outcome: 'refused',
-            reason: invalidSettingsWriteText(key, paths.target),
-          }
-        importFloors = values[key] ?? []
-        continue
-      }
-      const levels = generation.fileLevels[key] ?? []
-      if (levels.includes('default') || levels.includes(options.host)) {
-        const held = raw[key]
-        skip(
-          key,
-          value,
-          held && typeof held === 'object' && !Array.isArray(held)
-            ? (held as Record<string, unknown>)[
-                levels.includes(options.host) ? options.host : 'default'
-              ]
-            : held,
-        )
-      } else {
-        edits.push({
-          setting: key,
-          value,
-          ...(options.host === 'pi' ? { level: 'pi' as const } : {}),
-        })
-      }
-    }
-    // The service carries the whole applied protection set in this same edit.
-    // Imported protection was omitted above so a stale source cannot replace it.
+    // Protection is compared by effective value, including implicit defaults
+    // the legacy store never wrote, such as an enabled killswitch's floors.
+    const legacy = legacySettingsProtection(moved, options.host)
     if (
-      edits.length ||
-      importFloors?.length ||
-      (missing && Object.keys(values).length)
-    )
-      await service.update(
-        (current, carry) => {
-          if (!importFloors?.length) return edits
-          const key = 'killswitch_account_floors'
-          const floors =
-            current.status === 'ready'
-              ? ((current.document as Record<string, unknown>)[key] ?? [])
-              : (carry?.find((edit) => edit.setting === key)?.value ?? [])
-          if (!Array.isArray(floors))
-            throw new SettingsRefusal(
-              'settings-invalid-value',
-              'Account floors are not a list',
-            )
-          const appended: AccountFloor[] = []
-          for (const entry of importFloors) {
-            const held = (floors as AccountFloor[]).find(
-              (existing) =>
-                existing.account === entry.account &&
-                (existing.host === options.host || existing.host === 'both'),
-            )
-            if (held)
-              skip(key, thresholds(entry), thresholds(held), entry.account)
-            else appended.push({ ...entry, host: options.host })
-          }
-          return appended.length
-            ? [...edits, { setting: key, value: [...floors, ...appended] }]
-            : edits
-        },
-        options.host,
-        { createMissing: missing, hostsStopped: true },
+      !missing &&
+      values.killswitch_account_floors !== undefined &&
+      generation.report.some(
+        (entry) => entry.keyPath[0] === 'killswitch_account_floors',
       )
+    )
+      return {
+        ...result,
+        outcome: 'refused',
+        reason: invalidSettingsWriteText(
+          'killswitch_account_floors',
+          paths.target,
+        ),
+      }
+    let skips: SetupSkip[] = []
+    try {
+      const initial = planSetupEdits({
+        host: options.host,
+        values,
+        legacy,
+        current: missing
+          ? { status: 'missing' }
+          : { status: 'ready', document: documentOf(generation) },
+        snapshot: generation,
+      })
+      skips = initial.skips
+      // The service carries the whole applied protection set into a missing
+      // file in this same edit.
+      if (initial.edits.length || (missing && Object.keys(values).length)) {
+        for (let attempt = 1; ; attempt++) {
+          const snapshot = service.snapshot()
+          try {
+            await service.update(
+              (current, carry) => {
+                // Decide again from the file as it is under the writer lock,
+                // so a value written since the snapshot is never overwritten.
+                const plan = planSetupEdits({
+                  host: options.host,
+                  values,
+                  legacy,
+                  current,
+                  carry,
+                  snapshot,
+                })
+                skips = plan.skips
+                return plan.edits
+              },
+              options.host,
+              { createMissing: missing },
+            )
+            break
+          } catch (error) {
+            if (!(error instanceof SetupProtectionChanged)) throw error
+            if (attempt >= SETUP_WRITE_ATTEMPTS)
+              throw new SettingsRefusal(
+                'settings-busy',
+                'Protection settings kept changing during setup',
+              )
+            // Resolve the changed file before comparing protection again.
+            await service.refresh()
+          }
+        }
+      }
+    } finally {
+      for (const entry of skips) skip(entry)
+    }
     return result
   } catch (error) {
     if (error instanceof SettingsRecreationRefusal)

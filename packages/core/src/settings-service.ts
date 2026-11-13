@@ -61,18 +61,10 @@ export class SettingsRecreationRefusal extends Error {
 export interface SettingsUpdateOptions {
   /** Only menu writes and setup with a <target>.moved marker and no user file may create it. */
   createMissing?: boolean
-  /**
-   * Setup runs while every host is stopped. When the other host then has no
-   * recoverable protection set (no applied copy and no legacy store, rather
-   * than an unreadable one), recreation carries the writer's set instead of
-   * refusing. Running hosts never pass it: a running peer at the strictest
-   * set would be loosened.
-   */
-  hostsStopped?: boolean
 }
 
 export interface SettingsProtectionRecovery {
-  /** Return only this host's complete set; missing or corrupt copies return undefined or throw. */
+  /** Return only this host's complete set; a missing copy returns undefined, an unreadable or corrupt one throws. */
   readAppliedCopy?: (
     host: SettingsHost,
   ) => Promise<SettingsProtectionValues | undefined>
@@ -83,8 +75,9 @@ export interface SettingsProtectionRecovery {
   /**
    * Read the other host's own legacy store through that host's current custody
    * (see `readPeerLegacySettingsProtection`). Recreating a missing file uses it
-   * to learn the other host's protection; without it that host counts as
-   * having the strictest set.
+   * to learn the other host's protection. Without it, that host's set is
+   * unknown and recreation is refused: an absent reader never means the
+   * other host has nothing to protect.
    */
   readPeerLegacyProtection?: (
     host: SettingsHost,
@@ -216,7 +209,10 @@ function fileObject(source: string | undefined): Record<string, unknown> {
     : {}
 }
 
-function fileLevels(raw: Record<string, unknown>): SettingsFileLevels {
+/** The levels at which a parsed settings document sets each key; values and their validity remain common-auth's responsibility. */
+export function settingsFileLevels(
+  raw: Record<string, unknown>,
+): SettingsFileLevels {
   return Object.fromEntries(
     keys
       .filter((key) => Object.hasOwn(raw, key))
@@ -398,21 +394,22 @@ export interface SettingsRecreationInput {
 export type SettingsRecreationRefusalReason = 'own-unknown' | 'peer-unknown'
 
 /**
- * What a menu write that finds the file missing does, as a pure function of
- * both hosts' sets: the protection edits it carries, or why it is refused.
- * A peer with no set takes the writer's; so does one with no recoverable set
- * when every host is stopped (setup). Otherwise both known sets are carried
- * together, with host levels preserving any differing values.
+ * What a menu write or setup that finds the file missing does, as a pure
+ * function of both hosts' sets: the protection edits it carries, or why it
+ * is refused. Only a peer known to have no set (it never ran) takes the
+ * writer's. A peer whose set is unknown refuses the write, whether or not
+ * the hosts are running, so its protection is never replaced by the
+ * writer's. Otherwise both known sets are carried together, with host levels
+ * preserving any differing values.
  */
 export function planSettingsFileRecreation(
   writer: SettingsRecreationInput,
   peer: SettingsRecreationInput,
-  hostsStopped = false,
 ):
   | { edits: SettingsLevelEdit[] }
   | { refused: SettingsRecreationRefusalReason } {
   if (writer.rung === 3) return { refused: 'own-unknown' }
-  if (peer.none || (hostsStopped && peer.rung === 3 && !peer.unreadable))
+  if (peer.none)
     return { edits: settingsRecreationForWriter(writer.values, writer.host) }
   if (peer.rung === 3) return { refused: 'peer-unknown' }
   return { edits: planSettingsRecreation(writer, peer).edits }
@@ -854,7 +851,7 @@ class SharedSettingsService {
       candidate: {
         file: this.file,
         source,
-        fileLevels: fileLevels(raw),
+        fileLevels: settingsFileLevels(raw),
         status,
         contexts,
         report,
@@ -1075,7 +1072,6 @@ class SharedSettingsService {
                 rung: 3,
               }),
             },
-            options.hostsStopped,
           )
           if ('refused' in plan) throw new SettingsRecreationRefusal(this.file)
           carry = plan.edits
@@ -1291,39 +1287,43 @@ class SettingsProtectionLease {
 
   /**
    * The other host's whole set for recreating a missing file: its last-good
-   * set in this process, then its applied copy, then its own legacy store,
-   * then the strictest set. `none` means both sources were read and hold
-   * nothing (that host never ran); without a legacy reader the set is unknown.
+   * set in this process, then its applied copy, then its own legacy store.
+   * `none` means both sources were read and hold nothing (that host never
+   * ran). Anything else that yields no set is unknown (rung 3): a copy or
+   * store that exists but can't be read, or no legacy reader at all. An
+   * unreadable copy stops here rather than falling back to the legacy store,
+   * because the copy may hold protection tightened in the file since the
+   * legacy store was last written.
    */
   async peerProtection(
     host: SettingsHost,
   ): Promise<Omit<SettingsRecreationInput, 'host'>> {
     const good = this.shared.lastGoodProtection(host)
     if (good) return { values: good, rung: 1 }
-    let unreadable = false
-    for (const [rung, read] of [
-      [
-        1,
-        this.recovery.readAppliedCopy ??
-          ((peer: SettingsHost) =>
-            readSettingsProtectionCopy(this.shared.file, peer)),
-      ],
-      [2, this.recovery.readPeerLegacyProtection],
-    ] as const) {
-      try {
-        const values = await read?.(host)
-        if (values) return { values, rung }
-      } catch {
-        // An unreadable source is skipped whole; keys are never mixed across sources.
-        unreadable = true
-      }
-    }
-    return {
+    const unknown = (unreadable: boolean) => ({
       values: mostRestrictiveSettingsProtection(),
-      rung: 3,
+      rung: 3 as const,
       unreadable,
-      none: !unreadable && this.recovery.readPeerLegacyProtection !== undefined,
+    })
+    const readCopy =
+      this.recovery.readAppliedCopy ??
+      ((peer: SettingsHost) =>
+        readSettingsProtectionCopy(this.shared.file, peer))
+    try {
+      const values = await readCopy(host)
+      if (values) return { values, rung: 1 }
+    } catch {
+      return unknown(true)
     }
+    const readLegacy = this.recovery.readPeerLegacyProtection
+    if (!readLegacy) return unknown(false)
+    try {
+      const values = await readLegacy(host)
+      if (values) return { values, rung: 2 }
+    } catch {
+      return unknown(true)
+    }
+    return { ...unknown(false), none: true }
   }
 
   /**

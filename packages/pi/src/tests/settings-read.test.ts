@@ -17,6 +17,7 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import { withLock } from '@cortexkit/common-auth/fs'
 import { openSettings } from '@cortexkit/common-auth/settings'
+import { parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view.ts'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
@@ -1431,3 +1432,35 @@ test('the stream applies model settings and mirrors dump_enabled from every snap
   expect(core.isDumpEnabled()).toBe(false)
   expect(bodies[1]?.speed).toBeUndefined()
 })
+
+for (const peer of ['never ran', 'stricter'] as const) {
+  test(`Pi recreates a missing settings file when OpenCode's store is ${peer}`, async () => {
+    await core.writeSettingsMoveMarker(file)
+    if (peer === 'stricter') {
+      // OpenCode's own default store under the same home.
+      const store = core.getDefaultSettingsStorePaths('opencode').account
+      await fs.mkdir(join(store, '..'), { recursive: true })
+      await fs.writeFile(
+        store,
+        JSON.stringify({
+          version: 1,
+          accounts: [],
+          killswitch: { enabled: true, main: { five_hour: 55 } },
+        }),
+      )
+    }
+    const native = runtime()
+    const service = await native.service()
+    const result = await service.updateSettings((stored) => ({
+      ...stored,
+      dump: { enabled: true },
+    }))
+    expect(result.outcome).toBe('saved')
+    const written = parse(await fs.readFile(file, 'utf8'))
+    expect(written).toHaveProperty('dump_enabled')
+    if (peer === 'stricter')
+      expect(written.killswitch_default_five_hour).toMatchObject({
+        opencode: 55,
+      })
+  })
+}

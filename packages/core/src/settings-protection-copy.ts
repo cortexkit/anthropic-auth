@@ -97,17 +97,32 @@ async function readCopy(file: string): Promise<Record<string, unknown>> {
   return record(copy) ? copy : {}
 }
 
-/** Missing or invalid host entries return no values, never a partial protection set. */
+/**
+ * This host's complete set from the applied copy. A copy file that doesn't
+ * exist, or one without an entry for this host, returns undefined: there is
+ * no saved set. A copy that exists but can't be read, isn't valid JSON, or
+ * holds an invalid entry for this host throws instead, so callers can tell an
+ * unknown set from an absent one. Never returns a partial protection set.
+ */
 export async function readSettingsProtectionCopy(
   file: string,
   host: SettingsHost,
 ): Promise<SettingsProtectionValues | undefined> {
+  let text: string
   try {
-    const entry = (await readCopy(file))[host]
-    return validEntry(entry) ? entry.values : undefined
-  } catch {
-    return undefined
+    text = await readFile(`${file}.applied.json`, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
   }
+  const copy: unknown = JSON.parse(text)
+  if (!record(copy))
+    throw new Error('The applied protection copy is not a host map')
+  if (!Object.hasOwn(copy, host)) return undefined
+  const entry = copy[host]
+  if (!validEntry(entry))
+    throw new Error('The applied protection copy entry is invalid')
+  return entry.values
 }
 
 /** Merge only the writer's host while holding the copy's cross-process lock. */

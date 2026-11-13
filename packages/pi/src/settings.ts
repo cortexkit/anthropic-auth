@@ -4,6 +4,7 @@ import {
   type NativeAccountRuntimeOptions,
   type NativeHolderRegistration,
   openSettingsService,
+  readPeerLegacySettingsProtection,
   type SettingsMoveStartupOptions,
   type SettingsServiceOptions,
   startSettings,
@@ -64,6 +65,14 @@ export async function openPiSettings(
             await recovery.close()
           }
         },
+        // Recreating a missing settings file needs OpenCode's own protection.
+        readPeerLegacyProtection: (host) =>
+          readPeerLegacySettingsProtection({
+            host,
+            env,
+            home,
+            readMode: options.startup?.readMode,
+          }),
       },
     })
   } finally {

@@ -21,6 +21,7 @@ import {
   refusedSettingsRecreationText,
   settingsDefinition,
 } from '../settings-definition.ts'
+import { readPeerLegacySettingsProtection } from '../settings-move-sources.ts'
 import { resolveSettingsPaths, type SettingsHost } from '../settings-paths.ts'
 import { writeSettingsProtectionCopy } from '../settings-protection-copy.ts'
 import { legacySettingsProtection } from '../settings-protection-legacy.ts'
@@ -102,6 +103,14 @@ async function fixture(
           JSON.parse(await readFile(paths.own.account, 'utf8')),
           host,
         ),
+      // The other host's real default store under this home, as setup wires it.
+      readPeerLegacyProtection: (peer) =>
+        readPeerLegacySettingsProtection({
+          host: peer,
+          home,
+          env: {},
+          platform: 'linux',
+        }),
     },
     log: {
       warn: (message) => {
@@ -280,15 +289,20 @@ for (const host of ['opencode', 'pi'] as const) {
         })
         return
       }
-      // The peer has no applied copy and no legacy store, so with hosts
-      // stopped it takes the acting host's set.
+      // The peer has no applied copy and no legacy store, so it takes the
+      // acting host's set.
       expect(result.outcome).toBe('saved')
       const file = await contents(f.paths.target)
       expect(file.dump_enabled).toEqual(
         host === 'opencode' ? true : { pi: true },
       )
       expect(file.killswitch_enabled).toBe(true)
-      expect(file.max_same_account_wait).toBe('cache')
+      // The legacy wait "0" protects more than the carried "max", so it is
+      // kept at this host's level rather than dropped for the carried set.
+      expect(file.max_same_account_wait).toEqual({
+        default: 'cache',
+        [host]: 'off',
+      })
       expect(file.quota_fail_closed_on_unknown_quota).toBe('on')
       expect(file.killswitch_account_floors).toEqual(
         copy.killswitch_account_floors,
@@ -682,3 +696,106 @@ test('setup floor appends retain a peer write made before the writer lock', asyn
     await service?.dispose()
   }
 })
+
+test('setup keeps stricter legacy protection at its own level over weaker default-level values', async () => {
+  // An enabled killswitch with no stored floors protects at 5/10, and an
+  // unset unknown-quota policy is Core's fail-closed default.
+  const f = await fixture('pi', {
+    killswitch: { enabled: true },
+    routing: { maxSameAccountWait: '0' },
+  })
+  await writeFile(
+    f.paths.target,
+    JSON.stringify({
+      killswitch_enabled: false,
+      killswitch_default_five_hour: 1,
+      // A value of Pi's own is never replaced, even when it is weaker.
+      killswitch_default_seven_day: { default: 1, pi: 2 },
+      max_same_account_wait: 'cache',
+      quota_fail_closed_on_unknown_quota: 'off',
+    }),
+  )
+  const result = await f.write()
+  expect(result.outcome).toBe('saved')
+  expect(await contents(f.paths.target)).toMatchObject({
+    killswitch_enabled: { default: false, pi: true },
+    killswitch_default_five_hour: { default: 1, pi: 5 },
+    killswitch_default_seven_day: { default: 1, pi: 2 },
+    max_same_account_wait: { default: 'cache', pi: 'off' },
+    quota_fail_closed_on_unknown_quota: { default: 'off', pi: 'default' },
+  })
+  expect(f.writes).toEqual([])
+})
+
+test('a hand edit made after setup reads the file but before its writer lock survives', async () => {
+  const f = await fixture('opencode', {
+    quota: { minimumRemaining: { '5h': 10 } },
+    dump: { enabled: true },
+  })
+  await writeFile(f.paths.target, '{}')
+  const edited = { quota_minimum_remaining_five_hour: 50, dump_enabled: false }
+  // Setup shares this service; its edit runs after the file changes.
+  const service = await openSettingsService({
+    file: f.paths.target,
+    dependencies: {
+      open: (config) => {
+        const handle = openSettings(settingsDefinition, config)
+        return {
+          ...handle,
+          update: async (plan, context) => {
+            await writeFile(f.paths.target, JSON.stringify(edited))
+            return handle.update(plan, context)
+          },
+        }
+      },
+    },
+  })
+  try {
+    expect((await f.write()).outcome).toBe('saved')
+    expect(await contents(f.paths.target)).toMatchObject(edited)
+  } finally {
+    await service?.dispose()
+  }
+})
+
+for (const peer of [
+  'stricter',
+  'unreadable store',
+  'unreadable copy',
+] as const) {
+  test(`setup recreating a missing file with a ${peer} Pi ${peer === 'stricter' ? "keeps Pi's own set" : 'refuses'}`, async () => {
+    const f = await fixture('opencode', legacy)
+    await writeFile(f.paths.marker, 'marker')
+    const store = f.paths.defaults.pi.account
+    await mkdir(dirname(store), { recursive: true })
+    if (peer === 'stricter')
+      await writeFile(
+        store,
+        JSON.stringify({
+          killswitch: { enabled: true, main: { '5h': 50, '1w': 60 } },
+        }),
+      )
+    if (peer === 'unreadable store') await writeFile(store, '{broken')
+    // Pi's copy entry exists but is not a valid set, so its set is unknown;
+    // Pi's legacy store would otherwise say it has none.
+    if (peer === 'unreadable copy')
+      await writeFile(
+        `${f.paths.target}.applied.json`,
+        JSON.stringify({ pi: { readAt: 1, values: { broken: true } } }),
+      )
+    const result = await f.write()
+    if (peer !== 'stricter') {
+      expect(result).toMatchObject({
+        outcome: 'refused',
+        reason: refusedSettingsRecreationText(f.paths.target),
+      })
+      await absent(f.paths.target)
+      return
+    }
+    expect(result.outcome).toBe('saved')
+    expect(await contents(f.paths.target)).toMatchObject({
+      killswitch_default_five_hour: { default: 9, pi: 50 },
+      killswitch_default_seven_day: { default: 21, pi: 60 },
+    })
+  })
+}

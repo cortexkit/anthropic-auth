@@ -267,6 +267,39 @@ async function fixture(
 describe('OpenCode 1 settings service reads', () => {
   installLoaderSetup(ctx)
 
+  test('a menu write recreates a missing settings file when Pi never ran', async () => {
+    const f = await fixture()
+    // Point the Pi store lookup at this test's folder, where Pi never ran.
+    const saved = {
+      HOME: process.env.HOME,
+      PI_ANTHROPIC_AUTH_FILE: process.env.PI_ANTHROPIC_AUTH_FILE,
+      PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE:
+        process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
+    }
+    process.env.HOME = f.pool.root
+    delete process.env.PI_ANTHROPIC_AUTH_FILE
+    process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = join(
+      f.pool.root,
+      'pi-enrollment.json',
+    )
+    cleanups.push(() => {
+      for (const [key, value] of Object.entries(saved))
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+    })
+    await fs.rm(f.target)
+    await core.writeSettingsMoveMarker(f.target)
+    const instance = await f.launch(f.pool.root)
+    const result = await instance.runtime.updateSettings((settings) => ({
+      ...settings,
+      dump: { enabled: true },
+    }))
+    expect(result.outcome).toBe('saved')
+    expect(parse(await fs.readFile(f.target, 'utf8'))).toMatchObject({
+      dump_enabled: true,
+    })
+  })
+
   test('unmigrated model enumeration preserves the original refusal and host-only artifacts', async () => {
     await useUnmigratedAccountFile(
       ctx,
