@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import * as fs from 'node:fs/promises'
 import {
   chmod,
   mkdir,
@@ -633,6 +634,101 @@ describe('ClaustrumEnrollmentManager', () => {
 })
 
 describe('scoped enrollment token reads', () => {
+  test.skipIf(process.platform === 'win32')(
+    'refuses a writable ancestor even if realpath would report ENOENT for the token file',
+    async () => {
+      const paths = await fixture()
+      const parent = join(dirname(paths.tokenPath), 'private')
+      await mkdir(parent, { mode: 0o700 })
+      const tokenPath = join(parent, 'enrollment.json')
+      await writeEnrollmentTokenFile(tokenPath, {
+        token: secret,
+        token_generation: 1,
+      })
+      await chmod(dirname(parent), 0o777)
+      const realpath = fs.realpath
+      const resolvePath = spyOn(fs, 'realpath').mockImplementation(
+        new Proxy(realpath, {
+          async apply(target, receiver, args) {
+            if (args[0] === tokenPath) {
+              throw Object.assign(new Error('synthetic missing token'), {
+                code: 'ENOENT',
+              })
+            }
+            return Reflect.apply(target, receiver, args)
+          },
+        }),
+      )
+      try {
+        await expect(readClaustrumEnrollmentToken(tokenPath)).rejects.toThrow(
+          'Claustrum enrollment path has an unsafe writable ancestor',
+        )
+        expect(resolvePath).toHaveBeenCalledWith(parent)
+        expect(resolvePath).not.toHaveBeenCalledWith(tokenPath)
+      } finally {
+        resolvePath.mockRestore()
+      }
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'refuses when realpath reports EACCES for the enrollment path',
+    async () => {
+      const paths = await fixture()
+      await writeEnrollmentTokenFile(paths.tokenPath, {
+        token: secret,
+        token_generation: 1,
+      })
+      const resolvePath = spyOn(fs, 'realpath').mockRejectedValue(
+        Object.assign(new Error('synthetic path access failure'), {
+          code: 'EACCES',
+        }),
+      )
+      try {
+        await expect(
+          readClaustrumEnrollmentToken(paths.tokenPath),
+        ).rejects.toThrow(
+          'Claustrum enrollment path has an unsafe writable ancestor',
+        )
+      } finally {
+        resolvePath.mockRestore()
+      }
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'refuses when stat reports EACCES for an enrollment ancestor',
+    async () => {
+      const paths = await fixture()
+      await writeEnrollmentTokenFile(paths.tokenPath, {
+        token: secret,
+        token_generation: 1,
+      })
+      const metadata = spyOn(fs, 'stat').mockRejectedValue(
+        Object.assign(new Error('synthetic ancestor access failure'), {
+          code: 'EACCES',
+        }),
+      )
+      try {
+        await expect(
+          readClaustrumEnrollmentToken(paths.tokenPath),
+        ).rejects.toThrow(
+          'Claustrum enrollment path has an unsafe writable ancestor',
+        )
+      } finally {
+        metadata.mockRestore()
+      }
+    },
+  )
+
+  test('a missing parent folder still reports enrollment is not configured', async () => {
+    const paths = await fixture()
+    const missing = join(dirname(paths.tokenPath), 'missing', 'enrollment.json')
+    await expect(readClaustrumEnrollmentToken(missing)).rejects.toThrow(
+      'Claustrum enrollment is not configured',
+    )
+  })
+
   test('reads each atomic replacement rather than retaining the previous token', async () => {
     const paths = await fixture()
     await writeEnrollmentTokenFile(paths.tokenPath, {

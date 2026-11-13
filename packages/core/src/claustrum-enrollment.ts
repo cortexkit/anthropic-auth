@@ -322,7 +322,7 @@ export async function refuseWritableAncestor(
   ownership: OwnerOnlyOptions = {},
   metadataAt: (path: string) => Promise<{ mode: number } | undefined> = (
     path,
-  ) => stat(path).catch(() => undefined),
+  ) => stat(path),
 ): Promise<void> {
   const safe = await isSafeWindowsParent(parent, ownership)
   if (safe === true) return
@@ -331,11 +331,21 @@ export async function refuseWritableAncestor(
   let component: string
   try {
     component = await realpath(parent)
-  } catch {
-    return
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw new Error('Claustrum enrollment path has an unsafe writable ancestor')
   }
   for (;;) {
-    const metadata = await metadataAt(component)
+    let metadata: { mode: number } | undefined
+    try {
+      metadata = await metadataAt(component)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new Error(
+          'Claustrum enrollment path has an unsafe writable ancestor',
+        )
+      }
+    }
     if (
       metadata &&
       (metadata.mode & 0o022) !== 0 &&
@@ -460,7 +470,8 @@ export async function readClaustrumEnrollmentStatus(
 export async function readClaustrumEnrollmentToken(
   tokenPath: string,
 ): Promise<EnrollmentTokenFile> {
-  await refuseWritableAncestor(tokenPath)
+  // The token is replaced atomically; only its stable parent needs resolving.
+  await refuseWritableAncestor(dirname(tokenPath))
   const value = await readBoundedJson(tokenPath)
   if (value === undefined)
     throw new Error('Claustrum enrollment is not configured')
