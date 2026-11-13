@@ -1502,6 +1502,20 @@ function buildNativeAccountRuntime(
     async updateSettings(mutator) {
       const selected = await selectedStorage()
       const service = await runtimeSettings.prepareWrite()
+      const fallbackFile = runtimeSettings.fallbackFile()
+      if (!service && fallbackFile !== undefined) {
+        // The settings file is in charge but unavailable; a legacy write would be lost.
+        const stored = await selected.store.readSettings()
+        return {
+          settings:
+            stored.status === 'ready'
+              ? runtimeSettings.resolve(stored.settings)
+              : {},
+          outcome: 'failed',
+          reason:
+            SETTINGS_WRITE_FAILURES['settings-unavailable'].text(fallbackFile),
+        }
+      }
       function activation(value: Record<string, unknown>) {
         const custody = value.claustrum as Record<string, unknown> | undefined
         return [

@@ -1068,6 +1068,38 @@ class SharedSettingsService {
   }
 }
 
+/**
+ * Rungs 1-3 of the protection ladder, which need no open settings handle:
+ * the applied copy (by default read from disk only for the acting host),
+ * then the host's legacy store, then the strictest set. A source that can't
+ * be read is skipped whole; keys are never mixed across sources.
+ */
+export async function recoverSettingsProtection(
+  file: string,
+  host: SettingsHost,
+  recovery: SettingsProtectionRecovery = {},
+  actingHost?: SettingsHost,
+): Promise<{ values: SettingsProtectionValues; rung: 1 | 2 | 3 }> {
+  for (const [rung, read] of [
+    [
+      1,
+      recovery.readAppliedCopy ??
+        (actingHost === host
+          ? () => readSettingsProtectionCopy(file, host)
+          : undefined),
+    ],
+    [2, recovery.readLegacyProtection],
+  ] as const) {
+    try {
+      const values = await read?.(host)
+      if (values) return { values, rung }
+    } catch {
+      // Skip this source whole.
+    }
+  }
+  return { values: mostRestrictiveSettingsProtection(), rung: 3 }
+}
+
 /** File resolution is shared; recovery belongs to the runtime holding each lease. */
 class SettingsProtectionLease {
   private current: SettingsGeneration | undefined
@@ -1200,24 +1232,12 @@ class SettingsProtectionLease {
     if (good) return { values: good, rung: 1 as const }
     const previous = this.current?.protection[host]
     if (previous) return previous
-    for (const [rung, read] of [
-      [
-        1,
-        this.recovery.readAppliedCopy ??
-          (this.options?.host === host
-            ? () => readSettingsProtectionCopy(this.shared.file, host)
-            : undefined),
-      ],
-      [2, this.recovery.readLegacyProtection],
-    ] as const) {
-      try {
-        const values = await read?.(host)
-        if (values) return { values, rung }
-      } catch {
-        // Unreadable recovery sources leave the whole rung, never individual keys.
-      }
-    }
-    return { values: mostRestrictiveSettingsProtection(), rung: 3 as const }
+    return recoverSettingsProtection(
+      this.shared.file,
+      host,
+      this.recovery,
+      this.options?.host,
+    )
   }
 
   private async apply(generation: SettingsGeneration) {

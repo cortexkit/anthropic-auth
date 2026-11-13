@@ -385,6 +385,7 @@ export * from './settings-protection-copy.ts'
 export * from './settings-protection-legacy.ts'
 export * from './settings-record.ts'
 export * from './settings-service.ts'
+export * from './settings-start.ts'
 export * from './settings-three-way.ts'
 export type { SseEvent, SseFramer, SseFramerOptions } from './sse.ts'
 export {

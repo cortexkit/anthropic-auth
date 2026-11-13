@@ -2,7 +2,10 @@ import type { AccountStorage } from './accounts.ts'
 import { resolveClaudeModelCapabilities } from './model-capabilities.ts'
 import type { SettingsKey } from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
-import type { SettingsGeneration } from './settings-service.ts'
+import type {
+  SettingsGeneration,
+  SettingsProtectionValues,
+} from './settings-service.ts'
 
 /** Presence is captured with the resolved generation, never by reading the file on a request. */
 export function settingsFileSets(
@@ -25,6 +28,67 @@ function section(stored: Record<string, unknown>, key: string) {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {}
+}
+
+function legacyWait(value: SettingsProtectionValues['max_same_account_wait']) {
+  return value === 'off' ? '0' : value === '15m' ? '15' : 'max'
+}
+
+function quotaMinimums(values: SettingsProtectionValues) {
+  return {
+    five_hour: values.quota_minimum_remaining_five_hour,
+    seven_day: values.quota_minimum_remaining_seven_day,
+    scoped: values.quota_minimum_remaining_scoped,
+  }
+}
+
+function killswitchRecord(
+  stored: Record<string, unknown>,
+  values: SettingsProtectionValues,
+  host: SettingsHost,
+) {
+  return {
+    ...section(stored, 'killswitch'),
+    enabled: values.killswitch_enabled,
+    main: {
+      five_hour: values.killswitch_default_five_hour,
+      seven_day: values.killswitch_default_seven_day,
+      scoped: values.killswitch_default_scoped,
+    },
+    accounts: Object.fromEntries(
+      values.killswitch_account_floors
+        .filter((entry) => entry.host === host || entry.host === 'both')
+        .map(({ account, five_hour, seven_day, scoped }) => [
+          account,
+          { five_hour, seven_day, scoped },
+        ]),
+    ),
+  }
+}
+
+/**
+ * Overlay only the protection settings onto a legacy record, keeping every
+ * other stored setting: for a host whose settings file is in charge but
+ * whose settings service could not open.
+ */
+export function overlaySettingsProtection(
+  stored: Record<string, unknown>,
+  values: SettingsProtectionValues,
+  host: SettingsHost,
+): Record<string, unknown> {
+  return structuredClone({
+    ...stored,
+    routing: {
+      ...section(stored, 'routing'),
+      maxSameAccountWait: legacyWait(values.max_same_account_wait),
+    },
+    quota: {
+      ...section(stored, 'quota'),
+      minimumRemaining: quotaMinimums(values),
+      failClosedOnUnknownQuota: values.quota_fail_closed_on_unknown_quota,
+    },
+    killswitch: killswitchRecord(stored, values, host),
+  })
 }
 
 export function resolveSettingsRecord(
@@ -85,12 +149,7 @@ export function resolveSettingsRecord(
     routing: {
       ...section(stored, 'routing'),
       mode: values.routing_mode,
-      maxSameAccountWait:
-        values.max_same_account_wait === 'off'
-          ? '0'
-          : values.max_same_account_wait === '15m'
-            ? '15'
-            : 'max',
+      maxSameAccountWait: legacyWait(values.max_same_account_wait),
     },
     fallbackOn: values.fallback_on,
     refresh: {
@@ -104,11 +163,7 @@ export function resolveSettingsRecord(
       enabled: values.quota_enabled,
       checkIntervalMinutes: values.quota_check_interval_minutes,
       refreshEveryNRequests: values.quota_refresh_every_n_requests,
-      minimumRemaining: {
-        five_hour: values.quota_minimum_remaining_five_hour,
-        seven_day: values.quota_minimum_remaining_seven_day,
-        scoped: values.quota_minimum_remaining_scoped,
-      },
+      minimumRemaining: quotaMinimums(values),
       failClosedOnUnknownQuota: values.quota_fail_closed_on_unknown_quota,
       showToasts: values.quota_show_toasts,
     },
@@ -116,23 +171,7 @@ export function resolveSettingsRecord(
       ...section(stored, 'quotaHeaderFeed'),
       enabled: values.quota_header_feed_enabled,
     },
-    killswitch: {
-      ...section(stored, 'killswitch'),
-      enabled: values.killswitch_enabled,
-      main: {
-        five_hour: values.killswitch_default_five_hour,
-        seven_day: values.killswitch_default_seven_day,
-        scoped: values.killswitch_default_scoped,
-      },
-      accounts: Object.fromEntries(
-        values.killswitch_account_floors
-          .filter((entry) => entry.host === host || entry.host === 'both')
-          .map(({ account, five_hour, seven_day, scoped }) => [
-            account,
-            { five_hour, seven_day, scoped },
-          ]),
-      ),
-    },
+    killswitch: killswitchRecord(stored, values, host),
     claudeCache: {
       ...section(stored, 'claudeCache'),
       enabled: values.claude_cache_enabled,

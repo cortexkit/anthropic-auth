@@ -19,12 +19,16 @@ import {
 } from './settings-mode.ts'
 import { readSettingsMoveSource } from './settings-move-source.ts'
 import type { SettingsHost } from './settings-paths.ts'
-import { resolveSettingsRecord } from './settings-record.ts'
+import {
+  overlaySettingsProtection,
+  resolveSettingsRecord,
+} from './settings-record.ts'
 import type {
   SettingsFileStatus,
   SettingsService,
   SettingsValues,
 } from './settings-service.ts'
+import type { SettingsProtectionFallback } from './settings-start.ts'
 
 export interface NativeRuntimeSettingsOptions {
   settingsService?: SettingsService
@@ -35,6 +39,13 @@ export interface NativeRuntimeSettingsOptions {
     /** Schedule a background authority check and return its cancellation function. */
     schedule?: (callback: () => Promise<void>, delayMs: number) => () => void
   }
+  /**
+   * From `startSettings` when the file is in charge but its service could not
+   * open: requests overlay the fallback's protection on the legacy record,
+   * menu writes are refused, and the authority timer and menu actions try to
+   * open the service again until it replaces the fallback.
+   */
+  settingsFallback?: SettingsProtectionFallback
 }
 
 export interface NativeRuntimeSettingsStatus {
@@ -57,7 +68,8 @@ export function createNativeRuntimeSettings(
   },
 ) {
   const env = options.env ?? process.env
-  const service = options.settingsService?.retain()
+  let service = options.settingsService?.retain()
+  let fallback = service ? undefined : options.settingsFallback
   let effects: NativeSettingsEffectFields | undefined
   let userAuthority = (options.settingsMode?.() ?? 'user-file') === 'user-file'
   let closed = false
@@ -79,6 +91,8 @@ export function createNativeRuntimeSettings(
     model?: string,
   ): Record<string, unknown>
   function resolve(stored: Record<string, unknown>, model?: string) {
+    if (fallback && options.settingsMode?.() !== 'separate')
+      return overlaySettingsProtection(stored, fallback.values, options.host)
     return resolveSettingsRecord(stored, generation(), options.host, model)
   }
 
@@ -148,14 +162,24 @@ export function createNativeRuntimeSettings(
     })
     return checking
   }
-  function scheduleCheck() {
-    if (
-      closed ||
-      !service ||
-      userAuthority ||
-      options.settingsMode?.() === 'separate'
-    )
+  /** Off the request path: replace the protection fallback with an opened service. */
+  async function reopen() {
+    const current = fallback
+    if (!current || closed) return
+    const next = await current.reopen()
+    if (!next) return
+    if (closed || fallback !== current) {
+      await next.dispose()
       return
+    }
+    service = next
+    fallback = undefined
+    subscribe(next)
+    if (!writes) applyEffects()
+  }
+  function scheduleCheck() {
+    if (closed || options.settingsMode?.() === 'separate') return
+    if (!fallback && (!service || userAuthority)) return
     const schedule =
       options.settingsAuthority?.schedule ??
       ((callback, delayMs) => {
@@ -166,7 +190,8 @@ export function createNativeRuntimeSettings(
     cancelCheck = schedule(async () => {
       cancelCheck = undefined
       try {
-        await recheck()
+        if (fallback) await reopen()
+        else await recheck()
       } catch {
         // An unavailable authority probe is retried off-request on the next tick.
       } finally {
@@ -174,13 +199,18 @@ export function createNativeRuntimeSettings(
       }
     }, 60_000)
   }
-  const unwatch = service?.watch(() => {
-    void recheck(false).catch(() => {})
-    if (!writes) applyEffects()
-  })
-  const unonFileEvent = service?.onFileEvent?.(() => {
-    void recheck().catch(() => {})
-  })
+  let unwatch: (() => void) | undefined
+  let unonFileEvent: (() => void) | undefined
+  function subscribe(next: SettingsService) {
+    unwatch = next.watch(() => {
+      void recheck(false).catch(() => {})
+      if (!writes) applyEffects()
+    })
+    unonFileEvent = next.onFileEvent?.(() => {
+      void recheck().catch(() => {})
+    })
+  }
+  if (service) subscribe(service)
   scheduleCheck()
   let ready = recheck()
   // A failed startup probe must not fail every later menu action: replace it
@@ -195,8 +225,11 @@ export function createNativeRuntimeSettings(
     file: () => generation()?.file,
     async prepareAction() {
       await ready
+      await reopen().catch(() => {})
       await recheck()
     },
+    /** The settings file while the protection fallback is in use, else undefined. */
+    fallbackFile: () => fallback?.file,
     /**
      * Called under the legacy store's locks by a write that chose the legacy
      * store: true when the user file became authoritative meanwhile (a move
@@ -215,7 +248,9 @@ export function createNativeRuntimeSettings(
     },
     /** Recheck authority on the menu path before choosing a write target. */
     async prepareWrite() {
-      if (!service || options.settingsMode?.() === 'separate') return undefined
+      if (options.settingsMode?.() === 'separate') return undefined
+      await reopen().catch(() => {})
+      if (!service) return undefined
       await ready
       await recheck()
       return generation() ? service : undefined
