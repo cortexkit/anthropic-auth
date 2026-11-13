@@ -47,6 +47,7 @@ import {
   configuredAnthropicOAuthAccountCount,
   createDumpResponseObserver,
   createEmptyStorage,
+  createNativeAccountRuntime,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   createProviderErrorResponseScope,
@@ -129,6 +130,7 @@ import {
   isValidApiBaseURL,
   isVaultHosted,
   killswitchPassesPolicy,
+  legacySettingsProtection,
   localMessageThreadCredential,
   log,
   logger,
@@ -137,6 +139,7 @@ import {
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
   NativeAccountRefusal,
+  type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
   type NativeAccountSnapshot,
   type NativeAccountView,
@@ -226,6 +229,7 @@ import {
   shouldFallbackStatus,
   signRequestBody,
   snapshotHasServableLocalOAuth,
+  startSettings,
   stateRefusalPublicMessage,
   stickyQuotaSnapshotIsFresh,
   stickyRouteCandidateWeight,
@@ -1371,14 +1375,76 @@ const anthropicAuthPlugin = async (
   )
   const holderRegistration =
     stateLayout.kind === 'state-home' ? undefined : stateLayout.registration
-  const nativeAccounts = acquireNativeAccountRuntime({
+  const runtimeOptions = {
     paths: nativePaths,
-    host: 'opencode',
+    host: 'opencode' as const,
     local: runtimeOverrides.nativeLocal,
     vault: runtimeOverrides.claustrumScopedConnect
       ? { connect: runtimeOverrides.claustrumScopedConnect }
       : undefined,
+  }
+  const withLegacy = async <T>(
+    read: (runtime: NativeAccountRuntime) => Promise<T>,
+  ) => {
+    const legacy = createNativeAccountRuntime(runtimeOptions)
+    try {
+      return await read(legacy)
+    } finally {
+      await legacy.close()
+    }
+  }
+  // Finish the move and first resolution before installing any request hooks.
+  // Each project instance owns a lease, even when its account runtime is shared.
+  const settingsStartup = await startSettings({
+    host: 'opencode',
+    ownPoolPaths: nativePaths,
+    initializeVaultSettings: () =>
+      withLegacy(async (legacy) => {
+        await legacy.vault.initializeSettings()
+      }),
+    fence: {
+      registration:
+        holderRegistration ??
+        (stateLayout.kind === 'state-home'
+          ? { status: 'registered' }
+          : undefined),
+    },
+    protection: {
+      readLegacyProtection: () =>
+        withLegacy(async (legacy) => {
+          const snapshot = await legacy.read()
+          return legacySettingsProtection(
+            snapshot.settings,
+            'opencode',
+            snapshot.mode,
+          )
+        }),
+    },
   })
+  const nativeAccounts = acquireNativeAccountRuntime({
+    ...runtimeOptions,
+    settingsService: settingsStartup.service,
+    settingsFile: settingsStartup.file,
+    settingsMode: () => settingsStartup.mode,
+    settingsFallback: settingsStartup.fallback,
+    settingsReopen: settingsStartup.reopen,
+    settingsAuthority: {
+      schedule: (callback, delayMs) => {
+        const timer = runtimeTimers.setTimeout(callback, delayMs)
+        timer.unref?.()
+        return () => runtimeTimers.clearTimeout(timer)
+      },
+    },
+  })
+  try {
+    await nativeAccounts.prepareSettingsAction?.()
+    nativeAccounts.applySettingsEffects?.()
+  } catch {
+    logger.warn(
+      'settings',
+      'Settings authority check failed; continuing with current settings.',
+    )
+  }
   // Header and poll readings share the native account/epoch-fenced overlay.
   const headerRoutingObservations = nativeAccounts.quotaObservations
   let headerRoutingPolicyStorage: AccountStorage | null = null
@@ -1498,10 +1564,11 @@ const anthropicAuthPlugin = async (
   // tokens or API keys; credential material comes only from native authorization.
   async function loadAccounts(
     path = accountStoragePath,
+    model?: string,
   ): Promise<AccountStorage | null> {
     if (path !== accountStoragePath)
       throw new Error('Native account storage mismatch')
-    const snapshot = await nativeAccounts.read()
+    const snapshot = await nativeAccounts.read(model)
     headerRoutingPolicyStorage = snapshot.policyStorage
     if (!mainQuotaCredentialEpoch) {
       const binding = snapshot.accounts.find(
@@ -1539,6 +1606,31 @@ const anthropicAuthPlugin = async (
               }
             : undefined,
       },
+    }
+  }
+  function requestWireSettings(
+    storage: AccountStorage | null | undefined,
+    model?: string,
+  ) {
+    // Legacy commands use process-wide cache and fast-mode settings. User-file
+    // requests use their model context, not another project's settings.
+    if (!nativeAccounts.getSettingsStatus?.())
+      return {
+        cacheEnabled: isCache1hEnabled(),
+        cacheMode: getCache1hMode(),
+        fastModeEnabled: isFastModeEnabled(),
+      }
+    const resolved =
+      nativeAccounts.resolveSettings?.(
+        storage ?? createEmptyStorage(),
+        model,
+      ) ??
+      storage ??
+      null
+    return {
+      cacheEnabled: isCache1hPersistentlyEnabled(resolved),
+      cacheMode: getCache1hPersistentMode(resolved),
+      fastModeEnabled: isFastModePersistentlyEnabled(resolved),
     }
   }
   async function updateNativeSection(
@@ -3782,6 +3874,8 @@ const anthropicAuthPlugin = async (
   const cacheKeepSourceCopies = new Map<string, FableSourceWarmKeep>()
   const cacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
+    resolveSettings: (storage, model) =>
+      nativeAccounts.resolveSettings?.(storage, model) ?? storage,
     now: runtimeNow,
     peekRoutingAccount: (_target, { sessionId, modelId }) => {
       const snapshot = nativeAccounts.peek?.()
@@ -4552,6 +4646,7 @@ const anthropicAuthPlugin = async (
         error: error instanceof Error ? error.message : String(error),
       })
     }
+    await settingsStartup.service?.dispose()
     try {
       quotaManager.close()
     } catch {}
@@ -6029,6 +6124,7 @@ const anthropicAuthPlugin = async (
   }
 
   const dispatchNative: NativeMenuDispatch = async (request, options) => {
+    await nativeAccounts.prepareSettingsAction?.()
     if (options.signal?.aborted)
       throw options.signal.reason ?? new Error('Menu action aborted')
     let text: string
@@ -6237,6 +6333,7 @@ const anthropicAuthPlugin = async (
     command,
     invocation,
   ) => {
+    await nativeAccounts.prepareSettingsAction?.()
     if (command === 'account') {
       const snapshot = await readNativeSnapshotForDisplay(
         AbortSignal.timeout(3_000),
@@ -6440,8 +6537,10 @@ const anthropicAuthPlugin = async (
           dir: rpcDir,
           drain: drainNotifications,
           apply: applyCommand,
-          applyMenu: (request) =>
-            getNativeCommand(request.sessionId ?? '').apply(request),
+          applyMenu: async (request) => {
+            await nativeAccounts.prepareSettingsAction?.()
+            return getNativeCommand(request.sessionId ?? '').apply(request)
+          },
         }),
       )
     } catch {
@@ -6652,10 +6751,10 @@ const anthropicAuthPlugin = async (
         )
         // Zero OAuth model costs by default (quota-based, not per-token billed).
         // Opt out via persisted config costZeroing.enabled=false to show real costs.
-        // initialStorage is nullable (no config file yet) → default to enabled.
+        const storage = await loadAccounts()
         if (
           context.auth?.type !== 'oauth' ||
-          !isCostZeroingEnabled(initialStorage ?? {})
+          !isCostZeroingEnabled(storage ?? {})
         )
           return models
         return zeroModelCosts(models)
@@ -6667,6 +6766,7 @@ const anthropicAuthPlugin = async (
       sessionID: string
     }) => {
       if (input.command !== 'claude') return
+      await nativeAccounts.prepareSettingsAction?.()
       const payload = await getNativeCommand(input.sessionID).open(
         input.sessionID,
       )
@@ -7401,7 +7501,6 @@ const anthropicAuthPlugin = async (
             mainAccessToken?: string,
             mainQuotaIdentity?: MainQuotaIdentityBinding,
           ) {
-            void currentStorage
             if (fableRequest) {
               fableRequest.oauthAccountId = undefined
               fableRequest.opusCacheAnchor = undefined
@@ -7432,6 +7531,10 @@ const anthropicAuthPlugin = async (
             // The API-key route sends no Claude Code headers; drop the marker.
             requestHeaders.delete(REQUEST_CLASS_REQUEST_HEADER)
             let body = await fetchBody(input, init)
+            const wireSettings = requestWireSettings(
+              currentStorage,
+              parseRequestModel(body),
+            )
             let streaming = false
             let dump: DumpHandle | null = null
             let toolNameMap: ToolNameMap | undefined
@@ -7441,7 +7544,7 @@ const anthropicAuthPlugin = async (
             if (body && typeof body === 'string') {
               const rewriteStart = nowMs()
               const fastModeRequested = (() => {
-                if (!isFastModeEnabled()) return false
+                if (!wireSettings.fastModeEnabled) return false
                 try {
                   return isFastModeSupportedModel(JSON.parse(body).model)
                 } catch {
@@ -7453,8 +7556,8 @@ const anthropicAuthPlugin = async (
                   onToolNameMap: (map) => {
                     toolNameMap = map
                   },
-                  cache1hEnabled: !subagentRequest && isCache1hEnabled(),
-                  cache1hMode: getCache1hMode(),
+                  cache1hEnabled: !subagentRequest && wireSettings.cacheEnabled,
+                  cache1hMode: wireSettings.cacheMode,
                   fastModeEnabled: fastModeRequested,
                   sessionId: directAffinity || undefined,
                   modelId:
@@ -7492,8 +7595,8 @@ const anthropicAuthPlugin = async (
                 ms: roundMs(nowMs() - rewriteStart),
                 originalBytes,
                 rewrittenBytes: body.length,
-                cacheEnabled: !subagentRequest && isCache1hEnabled(),
-                cacheMode: getCache1hMode(),
+                cacheEnabled: !subagentRequest && wireSettings.cacheEnabled,
+                cacheMode: wireSettings.cacheMode,
                 fastModeEnabled: fastModeRequested,
                 subagent: subagentRequest,
               })
@@ -7632,7 +7735,10 @@ const anthropicAuthPlugin = async (
             const start = nowMs()
             let requestStorage = currentStorage
             const getRequestStorage = async () => {
-              requestStorage ??= await loadAccounts(accountStoragePath)
+              requestStorage ??= await loadAccounts(
+                accountStoragePath,
+                modelForIdentity,
+              )
               return requestStorage
             }
             const requestHeaders = mergeHeaders(input, init)
@@ -7697,6 +7803,16 @@ const anthropicAuthPlugin = async (
                 bodyBytes: body.length,
               })
             }
+            if (requestStorage)
+              requestStorage =
+                nativeAccounts.resolveSettings?.(
+                  requestStorage,
+                  modelForIdentity,
+                ) ?? requestStorage
+            const wireSettings = requestWireSettings(
+              requestStorage,
+              modelForIdentity,
+            )
             let nativeAuthorization = await authorizeOAuth(
               oauthAccountId,
               init?.signal ?? undefined,
@@ -7734,18 +7850,18 @@ const anthropicAuthPlugin = async (
             if (body && typeof body === 'string') {
               const rewriteStart = nowMs()
               const fastModeRequested = (() => {
-                if (!isFastModeEnabled()) return false
+                if (!wireSettings.fastModeEnabled) return false
                 try {
                   return isFastModeSupportedModel(JSON.parse(body).model)
                 } catch {
                   return false
                 }
               })()
-              const cacheEnabled = !subagentRequest && isCache1hEnabled()
+              const cacheEnabled = !subagentRequest && wireSettings.cacheEnabled
               acceptedCacheTtlMs = cacheEnabled
                 ? PROMPT_CACHE_1H_TTL_MS
                 : PROMPT_CACHE_DEFAULT_TTL_MS
-              const cacheMode = getCache1hMode()
+              const cacheMode = wireSettings.cacheMode
               const standbyCacheAnchor =
                 fableRequest?.plan.downgraded &&
                 fableRequest.plan.standbyCacheAnchor?.oauthAccountId ===
@@ -7909,8 +8025,8 @@ const anthropicAuthPlugin = async (
                 ms: roundMs(nowMs() - rewriteStart),
                 originalBytes,
                 rewrittenBytes: body.length,
-                cacheEnabled: !subagentRequest && isCache1hEnabled(),
-                cacheMode: getCache1hMode(),
+                cacheEnabled: !subagentRequest && wireSettings.cacheEnabled,
+                cacheMode: wireSettings.cacheMode,
                 fastModeEnabled: fastModeRequested,
                 subagent: subagentRequest,
               })
@@ -7963,8 +8079,8 @@ const anthropicAuthPlugin = async (
               if (
                 readSessionCachePolicy(relayAffinity, true)?.keep_warm !==
                   undefined ||
-                (isCache1hEnabled() &&
-                  getCache1hMode() === 'hybrid' &&
+                (wireSettings.cacheEnabled &&
+                  wireSettings.cacheMode === 'hybrid' &&
                   (!subagentRequest || isCacheKeepSubagentsEnabled(storage)))
               ) {
                 const bodyText = body
@@ -8035,8 +8151,8 @@ const anthropicAuthPlugin = async (
                 }
                 if (
                   !isCacheKeepPersistentlyEnabled(storage) ||
-                  !isCache1hEnabled() ||
-                  getCache1hMode() !== 'hybrid'
+                  !wireSettings.cacheEnabled ||
+                  wireSettings.cacheMode !== 'hybrid'
                 ) {
                   dropSessionSourceWarms(relayAffinity)
                 } else {
@@ -9776,7 +9892,10 @@ const anthropicAuthPlugin = async (
                 })
                 return hostRetryResponse(response)
               }
-              const storage = await loadAccounts()
+              const storage = await loadAccounts(
+                accountStoragePath,
+                parseRequestModel(init?.body) ?? credentialModelId,
+              )
               const requestMainProviderUuid: ProviderAccountUuid | undefined =
                 asProviderAccountUuid(auth.nativeAccountIdentity)
               const requestMainScopedAttempt = auth.nativeScopedAttempt
