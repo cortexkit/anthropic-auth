@@ -187,7 +187,7 @@ export const SETTINGS_INFER_MEMBERS = {
   thinking_binding_prefix_mismatch_behavior: 'account-default',
 } as const satisfies Record<(typeof SETTINGS_INFERRED_FIELDS)[number], string>
 
-/** Direct reads and host entry points that delegate to the shared readers. */
+/** Direct policy reads, enum mappings and host entry points that delegate to shared helpers. */
 export const SETTINGS_THREE_WAY_READERS = {
   claude_cache_enabled: [
     {
@@ -287,6 +287,12 @@ export const SETTINGS_THREE_WAY_READERS = {
     },
   ],
   quota_fail_closed_on_unknown_quota: [
+    {
+      path: 'packages/core/src/settings-protection-legacy.ts',
+      reader: 'legacySettingsProtection',
+      kind: 'mapping',
+      absent: 'default',
+    },
     {
       path: 'packages/core/src/accounts.ts',
       reader: 'failClosedOnUnknownQuota',

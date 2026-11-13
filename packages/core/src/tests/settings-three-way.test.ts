@@ -16,9 +16,11 @@ import {
 } from '../accounts.ts'
 import { isCacheKeepHybridActive } from '../cachekeep.ts'
 import { SETTINGS_THREE_WAY_READERS } from '../settings-definition.ts'
+import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import {
   readThreeWayBoolean,
   type ThreeWayBoolean,
+  toThreeWay,
 } from '../settings-three-way.ts'
 
 const inputs = [true, false, undefined, 'on', 'off', 'default'] as const
@@ -44,7 +46,8 @@ type Key = keyof typeof SETTINGS_THREE_WAY_READERS
 type ReaderCase = {
   path: string
   reader: string
-  absent: boolean
+  kind?: 'mapping'
+  absent: boolean | 'default'
   read: (storage: AccountSettingsReaderInput) => unknown
   on: unknown
   off: unknown
@@ -110,6 +113,17 @@ const readers: Record<Key, ReaderCase[]> = {
     },
   ],
   quota_fail_closed_on_unknown_quota: [
+    {
+      path: 'packages/core/src/settings-protection-legacy.ts',
+      reader: 'legacySettingsProtection',
+      kind: 'mapping',
+      absent: 'default',
+      read: (storage) =>
+        legacySettingsProtection({ ...storage }, 'opencode')
+          .quota_fail_closed_on_unknown_quota,
+      on: 'on',
+      off: 'off',
+    },
     {
       path: accountsPath,
       reader: 'failClosedOnUnknownQuota',
@@ -177,13 +191,25 @@ test('readThreeWayBoolean preserves both choices of absence', () => {
   }
 })
 
+test('toThreeWay encodes explicit values and preserves absence as default', () => {
+  expect(inputs.map(toThreeWay)).toEqual([
+    'on',
+    'off',
+    'default',
+    'on',
+    'off',
+    'default',
+  ])
+})
+
 for (const key of Object.keys(readers) as Key[]) {
   test(`${key} six-input tests cover exactly the named Core readers`, () => {
     expect(
-      readers[key].map(({ path, reader, absent }) => ({
+      readers[key].map(({ path, reader, absent, kind }) => ({
         path,
         reader,
         absent,
+        ...(kind ? { kind } : {}),
       })),
     ).toEqual(
       SETTINGS_THREE_WAY_READERS[key].filter(({ path }) =>
@@ -194,7 +220,12 @@ for (const key of Object.keys(readers) as Key[]) {
   for (const reader of readers[key]) {
     test(`${key}: ${reader.reader} preserves legacy inputs and reads on/off/default`, () => {
       const outputs = inputs.map((value) => reader.read(storageFor(key, value)))
-      const absentOutput = reader.absent ? reader.on : reader.off
+      const absentOutput =
+        reader.absent === 'default'
+          ? 'default'
+          : reader.absent
+            ? reader.on
+            : reader.off
       expect(outputs).toEqual([
         reader.on,
         reader.off,
@@ -284,14 +315,21 @@ test('every Core three-way field read is inventoried and uses the shared helper'
       if (!key) return
       const location = `${relative(repoRoot, file)}:${owner ?? '<unnamed>'}`
       found[key].push(location)
+      const entry = SETTINGS_THREE_WAY_READERS[key].find(
+        ({ path, reader }) => `${path}:${reader}` === location,
+      )
+      const helper =
+        entry && 'kind' in entry && entry.kind === 'mapping'
+          ? 'toThreeWay'
+          : 'readThreeWayBoolean'
       expect(
         parent?.type === 'CallExpression' &&
           isNode(parent.callee) &&
           parent.callee.type === 'Identifier' &&
-          parent.callee.name === 'readThreeWayBoolean' &&
+          parent.callee.name === helper &&
           Array.isArray(parent.arguments) &&
           parent.arguments[0] === node,
-        `${location} must read ${key} through readThreeWayBoolean`,
+        `${location} must read ${key} through ${helper}`,
       ).toBe(true)
     }
     function bind(

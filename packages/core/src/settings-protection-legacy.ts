@@ -11,6 +11,7 @@ import type { createNativePoolStore } from './pool-store.ts'
 import { getMaxSameAccountWait } from './routing.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import type { SettingsProtectionValues } from './settings-service.ts'
+import { toThreeWay } from './settings-three-way.ts'
 
 type EnrollmentMode = 'local' | 'claustrum'
 type SettingsStore = Pick<
@@ -44,7 +45,6 @@ export function legacySettingsProtection(
   } as AccountStorage
   const main = getKillswitchThresholdsForAccount(storage)
   const minimum = getQuotaMinimumRemainingThresholds(storage)
-  const failClosed = storage.quota?.failClosedOnUnknownQuota
   return {
     killswitch_enabled: isKillswitchEnabled(storage),
     killswitch_default_five_hour: main.five_hour,
@@ -64,8 +64,9 @@ export function legacySettingsProtection(
     ).scoped,
     // Core's policy defaults to fail-closed; OpenCode 1's direct checks do not.
     // Keep absence as "default" so both retain those readings.
-    quota_fail_closed_on_unknown_quota:
-      failClosed === true ? 'on' : failClosed === false ? 'off' : 'default',
+    quota_fail_closed_on_unknown_quota: toThreeWay(
+      storage.quota?.failClosedOnUnknownQuota,
+    ),
     max_same_account_wait: {
       '0': 'off',
       '15': '15m',

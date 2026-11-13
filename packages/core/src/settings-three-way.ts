@@ -9,3 +9,12 @@ export function readThreeWayBoolean(
   if (value === 'off') return false
   return typeof value === 'boolean' ? value : absent
 }
+
+/** Encode legacy booleans without choosing a reader-specific policy for absence. */
+export function toThreeWay(
+  value: ThreeWayBoolean | undefined,
+): 'default' | 'on' | 'off' {
+  if (value === true || value === 'on') return 'on'
+  if (value === false || value === 'off') return 'off'
+  return 'default'
+}
