@@ -46,6 +46,16 @@ export interface SettingsContextValues {
   readonly models: Readonly<Record<string, SettingsValues>>
 }
 
+export interface SettingsFileStatus {
+  readonly file: string
+  readonly state: 'ready' | 'missing' | 'unparseable' | 'unreadable'
+  readonly missing: boolean
+  readonly recreated: boolean
+  readonly invalidKeys: readonly string[]
+  readonly ignoredModelKeys: readonly { setting: SettingsKey; model: string }[]
+  readonly duplicateKeys: readonly string[]
+}
+
 export interface SettingsGeneration {
   readonly id: number
   readonly file: string
@@ -54,6 +64,7 @@ export interface SettingsGeneration {
   readonly source: string | undefined
   readonly contexts: Readonly<Record<SettingsHost, SettingsContextValues>>
   readonly report: readonly ReportEntry[]
+  readonly fileStatus: SettingsFileStatus
   /** Recover an unusable set as a whole from last-good values or startup recovery, never per key. */
   readonly protection: Readonly<
     Record<
@@ -68,6 +79,8 @@ export interface SettingsService {
   /** Synchronous, memory-only reads; unknown models use the no-model context. */
   resolve(host: SettingsHost, model?: string): SettingsValues
   snapshot(): SettingsGeneration
+  /** Secret-free diagnostics for status displays, with no filesystem work. */
+  status(): SettingsFileStatus
   /** Effects are awaited in publication order; unsubscribe before disposing a host. */
   watch(listener: SettingsChangeListener): () => void
   refresh(): Promise<void>
@@ -92,6 +105,8 @@ export interface SettingsServiceOptions {
   dependencies?: {
     open?: (options: OpenSettingsOptions) => CoreSettingsHandle
     readFile?: (file: string) => Promise<Uint8Array>
+    /** Schedule an off-request re-read; return a cancellation function. */
+    schedule?: (callback: () => void, delayMs: number) => () => void
   }
 }
 
@@ -100,6 +115,7 @@ const hosts = ['opencode', 'pi'] as const
 const modelIds = new Set(CLAUDE_MODEL_CAPABILITIES.map((row) => row.id))
 const services = new Map<string, SharedSettingsService>()
 const logged = new Set<string>()
+const recreatedFiles = new Set<string>()
 const silentLogger = { warn() {}, info() {} }
 
 function freeze<T>(value: T): T {
@@ -146,6 +162,56 @@ function logReports(report: readonly ReportEntry[]) {
   }
 }
 
+function fileStatus(candidate: Candidate): SettingsFileStatus {
+  const ignoredModelKeys: { setting: SettingsKey; model: string }[] = []
+  for (const entry of candidate.report) {
+    const key = entry.keyPath[0] as SettingsKey
+    const declaration = settingsDefinition.settings[key]
+    const model = entry.keyPath[1]
+    if (
+      entry.reason === 'unknown-key' &&
+      declaration &&
+      'overrides' in declaration &&
+      'model' in declaration.overrides &&
+      declaration.overrides.model &&
+      model !== undefined &&
+      !['default', ...hosts].includes(model) &&
+      !modelIds.has(model)
+    )
+      ignoredModelKeys.push({ setting: key, model })
+  }
+  return {
+    file: candidate.file,
+    state: candidate.status,
+    missing: candidate.status === 'missing',
+    recreated: recreatedFiles.has(candidate.file),
+    invalidKeys: [
+      ...new Set(
+        candidate.report
+          .filter(
+            (entry) =>
+              [
+                'invalid-value',
+                'override-not-allowed',
+                'invalid-schema-version',
+                'unknown-key',
+              ].includes(entry.reason) &&
+              !ignoredModelKeys.some(
+                (ignored) =>
+                  ignored.setting === entry.keyPath[0] &&
+                  ignored.model === entry.keyPath[1],
+              ),
+          )
+          .map((entry) => entry.keyPath.join('.')),
+      ),
+    ],
+    ignoredModelKeys,
+    duplicateKeys: candidate.report
+      .filter((entry) => entry.reason === 'duplicate-key')
+      .map((entry) => entry.keyPath.join('.')),
+  }
+}
+
 type FileBytes =
   | { status: 'ready'; bytes: Buffer }
   | { status: 'missing' | 'unreadable' }
@@ -155,7 +221,7 @@ function sameBytes(a: FileBytes, b: FileBytes) {
     : a.status === b.status
 }
 
-type Candidate = Omit<SettingsGeneration, 'id'>
+type Candidate = Omit<SettingsGeneration, 'id' | 'fileStatus'>
 type Pass = { before: FileBytes; after: FileBytes; candidate: Candidate }
 
 class SharedSettingsService {
@@ -168,6 +234,8 @@ class SharedSettingsService {
   private running: Promise<void> | undefined
   private pending = false
   private closed = false
+  private cancelMissingRead: (() => void) | undefined
+  private missingConfirmed = false
 
   constructor(
     readonly file: string,
@@ -275,6 +343,7 @@ class SharedSettingsService {
           reason,
         })
     }
+    if (after.status === 'unreadable') addReport([], 'unreadable')
     // Inspect override names and deciding locations only; common-auth validates and resolves values.
     const raw =
       source === undefined
@@ -297,10 +366,36 @@ class SharedSettingsService {
           if (
             !['default', ...hosts].includes(override) &&
             !modelIds.has(override)
-          )
+          ) {
+            // Unknown model levels never participate, even when their values are invalid.
+            for (let index = report.length - 1; index >= 0; index--) {
+              const entry = report[index]!
+              if (
+                entry.keyPath[0] === key &&
+                entry.keyPath[1] === override &&
+                entry.reason !== 'duplicate-key'
+              )
+                report.splice(index, 1)
+            }
             addReport([key, override], 'unknown-key')
+          }
         }
       }
+    }
+    // The descriptor validates window entries; Core additionally limits each level to one entry.
+    const window = raw?.cache_keep_window
+    const windowLevels =
+      window && typeof window === 'object' && !Array.isArray(window)
+        ? Object.entries(window).filter(([level]) =>
+            ['default', ...hosts].includes(level),
+          )
+        : [[undefined, window] as const]
+    for (const [level, value] of windowLevels) {
+      if (Array.isArray(value) && value.length > 1)
+        addReport(
+          ['cache_keep_window', ...(level === undefined ? [] : [level])],
+          'invalid-value',
+        )
     }
     for (const host of hosts) {
       const previous = this.current?.contexts[host]
@@ -310,50 +405,53 @@ class SharedSettingsService {
       ] as const) {
         const lastGood =
           model === undefined ? previous?.noModel : previous?.models[model]
-        if (lastGood) {
-          for (const entry of report) {
-            const key = entry.keyPath[0] as SettingsKey
-            if (
-              entry.reason !== 'invalid-value' ||
-              !keys.includes(key) ||
-              SETTINGS_PROTECTION_KEYS.some(
-                (protectedKey) => protectedKey === key,
-              )
+        for (const entry of report) {
+          const key = entry.keyPath[0] as SettingsKey
+          if (
+            entry.reason !== 'invalid-value' ||
+            !keys.includes(key) ||
+            SETTINGS_PROTECTION_KEYS.some(
+              (protectedKey) => protectedKey === key,
             )
-              continue
-            const value = raw?.[key]
-            const override =
-              value && typeof value === 'object' && !Array.isArray(value)
-                ? model !== undefined && Object.hasOwn(value, model)
-                  ? model
-                  : Object.hasOwn(value, host)
-                    ? host
-                    : 'default'
-                : undefined
-            if (
-              override !== undefined &&
-              entry.keyPath[1] !== undefined &&
-              entry.keyPath[1] !== override
-            )
-              continue
-            Object.defineProperty(values, key, {
-              value: lastGood[key],
-              enumerable: true,
-              writable: true,
-              configurable: true,
-            })
-          }
+          )
+            continue
+          const value = raw?.[key]
+          const override =
+            value && typeof value === 'object' && !Array.isArray(value)
+              ? model !== undefined && Object.hasOwn(value, model)
+                ? model
+                : Object.hasOwn(value, host)
+                  ? host
+                  : 'default'
+              : undefined
+          if (
+            override !== undefined &&
+            entry.keyPath[1] !== undefined &&
+            entry.keyPath[1] !== override
+          )
+            continue
+          if (lastGood) values[key] = lastGood[key] as never
         }
-        if (values.cache_keep_window.length > 1) {
-          const window = raw?.cache_keep_window
-          const location =
-            window && typeof window === 'object' && !Array.isArray(window)
-              ? [Object.hasOwn(window, host) ? host : 'default']
-              : []
-          addReport(['cache_keep_window', ...location], 'invalid-value')
+        if (!lastGood && values.cache_keep_window.length > 1) {
+          // Drop an invalid host level before considering the remaining default level.
+          const fallback =
+            window && !Array.isArray(window) && typeof window === 'object'
+              ? window.default
+              : undefined
           values.cache_keep_window =
-            (model === undefined ? previous?.noModel : previous?.models[model])
-              ?.cache_keep_window ?? []
+            Array.isArray(fallback) &&
+            fallback.length <= 1 &&
+            !report.some(
+              (entry) =>
+                entry.reason === 'invalid-value' &&
+                entry.keyPath[0] === 'cache_keep_window' &&
+                entry.keyPath[1] === 'default',
+            )
+              ? fallback
+              : []
+        }
+        if (after.status === 'missing' && lastGood) {
+          Object.assign(values, protection(lastGood))
         }
       }
     }
@@ -492,15 +590,56 @@ class SharedSettingsService {
       const candidate = await this.stabilize()
       if (this.closed) return
       const prior = this.current
+      if (candidate.status === 'missing' && prior && !this.missingConfirmed) {
+        if (!this.cancelMissingRead) {
+          const schedule =
+            this.options.dependencies?.schedule ??
+            ((callback, delayMs) => {
+              const timer = setTimeout(callback, delayMs)
+              timer.unref?.()
+              return () => clearTimeout(timer)
+            })
+          this.cancelMissingRead = schedule(() => {
+            this.cancelMissingRead = undefined
+            this.missingConfirmed = true
+            void this.refresh()
+          }, 2_000)
+        }
+        continue
+      }
+      if (candidate.status !== 'missing') {
+        this.cancelMissingRead?.()
+        this.cancelMissingRead = undefined
+        this.missingConfirmed = false
+      } else {
+        this.missingConfirmed = true
+      }
+      if (prior?.status === 'missing' && candidate.status === 'ready')
+        recreatedFiles.add(this.file)
+      const status = fileStatus(candidate)
       if (
         prior &&
         JSON.stringify({ ...prior, id: undefined }) ===
-          JSON.stringify(candidate)
+          JSON.stringify({ ...candidate, fileStatus: status })
       )
         continue
-      const generation = freeze({ ...candidate, id: (prior?.id ?? 0) + 1 })
+      const generation = freeze({
+        ...candidate,
+        fileStatus: status,
+        id: (prior?.id ?? 0) + 1,
+      })
       this.current = generation
       logReports(generation.report)
+      if (
+        generation.status === 'missing' &&
+        !logged.has(`missing:${this.file}`)
+      ) {
+        logged.add(`missing:${this.file}`)
+        logger.warn(
+          'settings',
+          `Settings file is missing at "${this.file}"; non-protection settings use schema defaults. A menu write will recreate it.`,
+        )
+      }
       // Await each listener before another pass can publish, so persistence cannot run out of order.
       for (const listener of this.listeners) {
         if (this.closed) return
@@ -521,13 +660,17 @@ class SharedSettingsService {
   }
 
   async update(edits: readonly SettingsEdit[], host: SettingsHost) {
+    const missing = (await this.bytes()).status === 'missing'
     const result = await this.handle.update(edits, { host })
+    if (missing && result.outcome === 'updated') recreatedFiles.add(this.file)
     await this.refresh()
     return result
   }
 
   async close() {
     this.closed = true
+    this.cancelMissingRead?.()
+    this.cancelMissingRead = undefined
     this.unwatch()
     this.listeners.clear()
     await this.running
@@ -579,6 +722,7 @@ export async function openSettingsService(
       return (row ? context.models[row.id] : undefined) ?? context.noModel
     },
     snapshot: () => use().snapshot(),
+    status: () => use().snapshot().fileStatus,
     watch(listener) {
       const unsubscribe = use().watch((generation) => listener(generation))
       const stop = () => {

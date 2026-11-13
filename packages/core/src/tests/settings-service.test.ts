@@ -458,6 +458,311 @@ test('an oversized default window keeps its last good value without hiding a val
   })
 })
 
+test('invalid non-protection levels fall through at startup and retain only their affected contexts while running', async () => {
+  const f = await fixture(
+    JSON.stringify({
+      dump_enabled: 'invalid',
+      refresh_interval_minutes: { default: 23, pi: -1 },
+      claude_fast_enabled: {
+        default: true,
+        pi: 'invalid',
+        'claude-opus-5-5': 7,
+      },
+    }),
+  )
+  const service = await f.open()
+  expect(service.resolve('opencode').dump_enabled).toBe(false)
+  expect(service.resolve('pi').refresh_interval_minutes).toBe(23)
+  expect(service.resolve('pi').claude_fast_enabled).toBe(true)
+  expect(service.resolve('pi', 'claude-opus-5-5').claude_fast_enabled).toBe(
+    true,
+  )
+  expect(service.status().invalidKeys).toEqual([
+    'dump_enabled',
+    'refresh_interval_minutes.pi',
+    'claude_fast_enabled.pi',
+    'claude_fast_enabled.claude-opus-5-5',
+  ])
+  await writeFile(
+    f.file,
+    JSON.stringify({
+      dump_enabled: true,
+      refresh_interval_minutes: { default: 40, pi: -2 },
+      claude_fast_enabled: {
+        default: false,
+        pi: 'still-invalid',
+        'claude-opus-5-5': 8,
+      },
+    }),
+  )
+  await service.refresh()
+  expect(service.resolve('opencode').dump_enabled).toBe(true)
+  expect(service.resolve('opencode').refresh_interval_minutes).toBe(40)
+  expect(service.resolve('pi').refresh_interval_minutes).toBe(23)
+  expect(service.resolve('opencode').claude_fast_enabled).toBe(false)
+  expect(service.resolve('pi').claude_fast_enabled).toBe(true)
+  expect(
+    service.resolve('opencode', 'claude-opus-5-5').claude_fast_enabled,
+  ).toBe(true)
+  expect(service.resolve('pi', 'claude-opus-5-5').claude_fast_enabled).toBe(
+    true,
+  )
+})
+
+test('oversized windows are rejected at their own level, including levels shadowed by a host', async () => {
+  const window = [{ start_hour: 1, end_hour: 2 }]
+  const oversized = [...window, { start_hour: 3, end_hour: 4 }]
+  const root = await fixture(JSON.stringify({ cache_keep_window: oversized }))
+  expect((await root.open()).resolve('pi').cache_keep_window).toEqual([])
+  const f = await fixture(
+    JSON.stringify({
+      cache_keep_window: { default: window, pi: oversized },
+    }),
+  )
+  const service = await f.open()
+  expect(service.resolve('opencode').cache_keep_window).toEqual(window)
+  expect(service.resolve('pi').cache_keep_window).toEqual(window)
+  expect(service.status().invalidKeys).toEqual(['cache_keep_window.pi'])
+  await writeFile(
+    f.file,
+    JSON.stringify({
+      cache_keep_window: { default: oversized, pi: [] },
+    }),
+  )
+  await service.refresh()
+  expect(service.resolve('opencode').cache_keep_window).toEqual(window)
+  expect(service.resolve('pi').cache_keep_window).toEqual([])
+  expect(service.status().invalidKeys).toEqual(['cache_keep_window.default'])
+  await writeFile(
+    f.file,
+    JSON.stringify({
+      cache_keep_window: { default: [], pi: oversized },
+    }),
+  )
+  await service.refresh()
+  expect(service.resolve('pi').cache_keep_window).toEqual([])
+})
+
+test('status names ignored model keys and duplicate locations while last occurrences still apply', async () => {
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => {
+    if (record.channel === 'settings') records.push(record)
+  })
+  const f = await fixture(`{
+    "dump_enabled": false,
+    "dump_enabled": true,
+    "claude_fast_enabled": {"default": true, "default": false, "not-a-model": 7}
+  }`)
+  const service = await f.open()
+  expect(service.resolve('pi').dump_enabled).toBe(true)
+  expect(service.resolve('pi', 'not-a-model').claude_fast_enabled).toBe(false)
+  expect(service.status()).toEqual({
+    file: f.file,
+    state: 'ready',
+    missing: false,
+    recreated: false,
+    invalidKeys: [],
+    ignoredModelKeys: [
+      { setting: 'claude_fast_enabled', model: 'not-a-model' },
+    ],
+    duplicateKeys: ['dump_enabled', 'claude_fast_enabled.default'],
+  })
+  expect(service.status()).toBe(service.snapshot().fileStatus)
+  expect(Object.isFrozen(service.status().duplicateKeys)).toBe(true)
+  expect(records.map((record) => record.message)).toEqual([
+    `Settings duplicate-key in "${f.file}" (dump_enabled).`,
+    `Settings duplicate-key in "${f.file}" (claude_fast_enabled).`,
+    `Settings unknown-key in "${f.file}" (claude_fast_enabled).`,
+  ])
+  await service.refresh()
+  expect(records).toHaveLength(3)
+})
+
+for (const failure of ['unparseable', 'unreadable'] as const) {
+  test(`${failure} files use schema defaults at startup and last good values while running`, async () => {
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => {
+      if (record.channel === 'settings') records.push(record)
+    })
+    const f = await fixture('{"dump_enabled":true,"prime_enabled":true}')
+    let unreadable = failure === 'unreadable'
+    if (failure === 'unparseable') await writeFile(f.file, '{broken')
+    const service = await f.open({
+      dependencies: {
+        ...f.options.dependencies,
+        readFile: (file) => {
+          if (unreadable)
+            throw Object.assign(new Error('private failure detail'), {
+              code: 'EACCES',
+            })
+          return readFile(file)
+        },
+      },
+    })
+    expect(service.status().state).toBe(failure)
+    expect(service.status().file).toBe(f.file)
+    for (const host of ['opencode', 'pi'] as const) {
+      expect(service.resolve(host).dump_enabled).toBe(false)
+      expect(service.resolve(host).prime_enabled).toBe(false)
+      expect(service.resolve(host).refresh_interval_minutes).toBe(10)
+    }
+    expect(records.map((record) => record.message)).toEqual([
+      `Settings ${failure} in "${f.file}" (<root>).`,
+    ])
+    unreadable = false
+    await writeFile(f.file, '{"dump_enabled":true,"prime_enabled":true}')
+    await service.refresh()
+    expect(service.status().state).toBe('ready')
+    expect(service.resolve('pi').dump_enabled).toBe(true)
+    if (failure === 'unparseable') await writeFile(f.file, '{broken-again')
+    else unreadable = true
+    await service.refresh()
+    expect(service.status().state).toBe(failure)
+    expect(service.resolve('pi').dump_enabled).toBe(true)
+    expect(service.resolve('pi').prime_enabled).toBe(true)
+    await service.refresh()
+    expect(records).toHaveLength(1)
+    expect(JSON.stringify(records)).not.toContain('private failure detail')
+  })
+}
+
+function manualTimer() {
+  let callback: (() => void) | undefined
+  const delays: number[] = []
+  let cancellations = 0
+  return {
+    delays,
+    get cancellations() {
+      return cancellations
+    },
+    schedule(next: () => void, delayMs: number) {
+      expect(callback).toBeUndefined()
+      delays.push(delayMs)
+      callback = next
+      return () => {
+        callback = undefined
+        cancellations++
+      }
+    },
+    fire() {
+      const next = callback
+      expect(next).toBeDefined()
+      callback = undefined
+      next?.()
+    },
+  }
+}
+
+test('a file missing at startup uses schema defaults and a menu write exposes its recreation', async () => {
+  const f = await fixture()
+  await rm(f.file)
+  const timer = manualTimer()
+  const service = await f.open({
+    dependencies: { ...f.options.dependencies, schedule: timer.schedule },
+  })
+  expect(timer.delays).toEqual([])
+  expect(service.status().missing).toBe(true)
+  expect(service.resolve('pi').dump_enabled).toBe(false)
+  expect(service.resolve('pi').refresh_interval_minutes).toBe(10)
+  await service.update([{ setting: 'dump_enabled', value: true }], 'pi')
+  expect(service.resolve('pi').dump_enabled).toBe(true)
+  expect(service.status().missing).toBe(false)
+  expect(service.status().recreated).toBe(true)
+  await service.dispose()
+  expect((await f.open()).status().recreated).toBe(true)
+})
+
+test('a file recreated during the injected 2 s save window is read without publishing missing defaults', async () => {
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => {
+    if (record.channel === 'settings') records.push(record)
+  })
+  const f = await fixture('{"dump_enabled":true}')
+  const timer = manualTimer()
+  const service = await f.open({
+    dependencies: { ...f.options.dependencies, schedule: timer.schedule },
+  })
+  const initial = service.snapshot()
+  await rm(f.file)
+  f.trigger()
+  await service.refresh()
+  expect(timer.delays).toEqual([2_000])
+  expect(service.snapshot()).toBe(initial)
+  const counts = { ...f.counts }
+  expect(service.resolve('pi').dump_enabled).toBe(true)
+  expect(service.status().missing).toBe(false)
+  expect(f.counts).toEqual(counts)
+  await writeFile(f.file, '{"dump_enabled":false,"prime_enabled":true}')
+  timer.fire()
+  await service.refresh()
+  expect(service.resolve('pi').prime_enabled).toBe(true)
+  expect(service.resolve('pi').dump_enabled).toBe(false)
+  expect(service.status().state).toBe('ready')
+  expect(records).toHaveLength(0)
+})
+
+test('a file still missing after 2 s publishes defaults once without waiting on request reads', async () => {
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => {
+    if (record.channel === 'settings') records.push(record)
+  })
+  const f = await fixture(
+    '{"dump_enabled":true,"refresh_interval_minutes":20,"killswitch_enabled":true}',
+  )
+  const timer = manualTimer()
+  const service = await f.open({
+    dependencies: { ...f.options.dependencies, schedule: timer.schedule },
+  })
+  await rm(f.file)
+  f.trigger()
+  await service.refresh()
+  expect(service.resolve('pi').dump_enabled).toBe(true)
+  expect(records).toHaveLength(0)
+  timer.fire()
+  await service.refresh()
+  for (const host of ['opencode', 'pi'] as const) {
+    expect(service.resolve(host).dump_enabled).toBe(false)
+    expect(service.resolve(host).refresh_interval_minutes).toBe(10)
+    expect(service.resolve(host).killswitch_enabled).toBe(true)
+    expect(service.snapshot().protection[host].usable).toBe(false)
+  }
+  expect(service.status().missing).toBe(true)
+  expect(service.status().recreated).toBe(false)
+  expect(records.map((record) => record.message)).toEqual([
+    `Settings file is missing at "${f.file}"; non-protection settings use schema defaults. A menu write will recreate it.`,
+  ])
+  await service.refresh()
+  expect(timer.delays).toEqual([2_000])
+  expect(records).toHaveLength(1)
+  await writeFile(f.file, '{"dump_enabled":true}')
+  f.trigger()
+  await service.refresh()
+  expect(service.status().missing).toBe(false)
+  expect(service.status().recreated).toBe(true)
+  expect(service.resolve('pi').dump_enabled).toBe(true)
+})
+
+test('a reappearance watch or the final lease disposal cancels a pending missing-file timer', async () => {
+  const f = await fixture('{"dump_enabled":true}')
+  const timer = manualTimer()
+  const service = await f.open({
+    dependencies: { ...f.options.dependencies, schedule: timer.schedule },
+  })
+  await rm(f.file)
+  f.trigger()
+  await service.refresh()
+  await writeFile(f.file, '{"dump_enabled":false}')
+  f.trigger()
+  await service.refresh()
+  expect(timer.cancellations).toBe(1)
+  expect(service.resolve('pi').dump_enabled).toBe(false)
+  await rm(f.file)
+  f.trigger()
+  await service.refresh()
+  await service.dispose()
+  expect(timer.cancellations).toBe(2)
+})
+
 test('an invalid protection entry or overlapping account floors invalidates the whole protection set', async () => {
   const f = await fixture(
     '{"dump_enabled":true,"killswitch_default_five_hour":101}',
