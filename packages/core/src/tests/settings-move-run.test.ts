@@ -844,6 +844,27 @@ test('a peer store with unreadable custody keeps the start in legacy, and a late
   expect(service!.resolve('opencode').dump_enabled).toBe(true)
 })
 
+for (const local of ['absent', 'present'] as const) {
+  test(`a peer enrolled in the vault with unseeded settings and ${local === 'absent' ? 'no local store does not block the move' : 'a local store keeps the start in legacy'}`, async () => {
+    const f = await fixture()
+    await put(f.stores.opencode.config, { dump: { enabled: true } })
+    if (local === 'present')
+      await put(f.stores.pi.config, { killswitch: { enabled: true } })
+    f.options.readMode = async (host) => (host === 'pi' ? 'claustrum' : 'local')
+    const started = await f.start()
+    if (local === 'absent') {
+      expect(started).toMatchObject({ mode: 'user-file', outcome: 'moved' })
+      expect(await absent(f.paths.marker)).toBe(false)
+    } else {
+      expect(started).toMatchObject({
+        mode: 'legacy',
+        outcome: 'source-unavailable',
+      })
+      expect(await absent(f.paths.target)).toBe(true)
+    }
+  })
+}
+
 test('a peer with no store is still skipped when its custody is unreadable', async () => {
   const f = await fixture()
   await put(f.stores.opencode.config, { dump: { enabled: true } })

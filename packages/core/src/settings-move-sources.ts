@@ -283,6 +283,9 @@ export async function prepareSettingsMoveSources(
               : 'file is missing',
           )
           if (!own && mode === 'claustrum') {
+            // A peer enrolled in the vault that never ran has neither vault
+            // settings nor a local store to seed them from: nothing to lose.
+            if (await peerStoreAbsent(host, store, options)) continue
             const refused = peerUnavailable(host, 'vault-unseeded', error)
             if (refused) return refused
             continue
