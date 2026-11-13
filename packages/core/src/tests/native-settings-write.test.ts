@@ -51,8 +51,11 @@ async function fixture(
     mode?: SettingsMode
     refusal?: SettingsRefusalCode
     legacy?: Record<string, unknown>
-    /** The other host's legacy store; null makes it unreadable. */
-    peerLegacy?: Record<string, unknown> | null
+    /**
+     * The other host's legacy store: null makes it unreadable, 'absent'
+     * means that host never ran and has no store.
+     */
+    peerLegacy?: Record<string, unknown> | null | 'absent'
     /** Runs while a recreation reads the other host's protection. */
     onPeerRead?: (file: string) => Promise<void>
     windowDefault?: { start_hour: number; end_hour: number }[]
@@ -138,7 +141,9 @@ async function fixture(
       // The other host's own store holds the same legacy settings unless a test says otherwise.
       readPeerLegacyProtection: async (peer) => {
         await options.onPeerRead?.(file)
-        return options.unavailableProtection || options.peerLegacy === null
+        if (options.peerLegacy === null)
+          throw new Error('synthetic unreadable peer store')
+        return options.unavailableProtection || options.peerLegacy === 'absent'
           ? undefined
           : legacySettingsProtection(
               options.peerLegacy ?? options.legacy ?? {},
@@ -836,6 +841,132 @@ test('recreation carries plain values when both hosts apply the same protection 
     })
 })
 
+test('recreation keeps each host its own account floors when only the floors differ', async () => {
+  const legacy = (fiveHour: number) => ({
+    killswitch: {
+      enabled: true,
+      main: { '5h': 18 },
+      accounts: {
+        local: { '5h': fiveHour },
+        'vault:shared': { '5h': fiveHour },
+      },
+    },
+  })
+  const f = await fixture(null, {
+    legacy: legacy(31),
+    peerLegacy: legacy(61),
+  })
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result.outcome).toBe('saved')
+  const raw = parse(await f.text())
+  expect(raw).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 18,
+    dump_enabled: true,
+  })
+  expect(raw.killswitch_account_floors).toEqual([
+    {
+      account: 'local',
+      host: 'opencode',
+      five_hour: 31,
+      seven_day: 10,
+      scoped: 0,
+    },
+    {
+      account: 'vault:shared',
+      host: 'opencode',
+      five_hour: 31,
+      seven_day: 10,
+      scoped: 0,
+    },
+    { account: 'local', host: 'pi', five_hour: 61, seven_day: 10, scoped: 0 },
+    {
+      account: 'vault:shared',
+      host: 'pi',
+      five_hour: 61,
+      seven_day: 10,
+      scoped: 0,
+    },
+  ])
+  await f.service.refresh()
+  const floors = (host: 'opencode' | 'pi') =>
+    f.service
+      .resolve(host)
+      .killswitch_account_floors.filter(
+        (entry) => entry.host === host || entry.host === 'both',
+      )
+      .map((entry) => entry.five_hour)
+  expect(floors('opencode')).toEqual([31, 31])
+  expect(floors('pi')).toEqual([61, 61])
+})
+
+for (const peer of ['differs', 'unreadable'] as const) {
+  test(`recreation refuses when the other host's legacy set ${peer === 'differs' ? 'differs' : 'cannot be read'}`, async () => {
+    const f = await fixture(null, {
+      legacy: { killswitch: { enabled: true, main: { '5h': 18 } } },
+      peerLegacy:
+        peer === 'differs'
+          ? { killswitch: { enabled: true, main: { '5h': 48 } } }
+          : null,
+    })
+    const legacy = await f.saved()
+    const result = await f.runtime.updateSettings((settings) => {
+      settings.dump = { enabled: true }
+    })
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      reason: refusedSettingsRecreationText(f.file),
+    })
+    expect(f.calls).toHaveLength(0)
+    await expect(f.text()).rejects.toThrow()
+    expect(await f.saved()).toEqual(legacy)
+  })
+}
+
+test('a single-host user recreates the missing file with its own set when the other host never ran', async () => {
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => records.push(record))
+  const f = await fixture(null, {
+    legacy: {
+      killswitch: {
+        enabled: true,
+        main: { '5h': 18 },
+        accounts: { local: { '5h': 31 } },
+      },
+    },
+    peerLegacy: 'absent',
+  })
+  expect(
+    records
+      .filter((record) => record.message.includes('Settings file is missing'))
+      .map((record) => record.message),
+  ).toEqual([
+    `Settings file is missing at "${f.file}"; non-protection settings use schema defaults. A menu write will recreate it.`,
+  ])
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result.outcome).toBe('saved')
+  const raw = parse(await f.text())
+  expect(raw).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 18,
+    dump_enabled: true,
+  })
+  // Only the writer's floors: the other host has none to keep.
+  expect(raw.killswitch_account_floors).toEqual([
+    {
+      account: 'local',
+      host: 'opencode',
+      five_hour: 31,
+      seven_day: 10,
+      scoped: 0,
+    },
+  ])
+})
+
 test('rung-3 recreation refuses with the fixed text and commits neither file nor legacy changes', async () => {
   const f = await fixture(null, { unavailableProtection: true })
   expect(f.service.snapshot().protection.opencode.rung).toBe(3)
@@ -891,17 +1022,20 @@ test('a failed copy write never replaces the applied protection carried by a rec
   ).toHaveLength(1)
 })
 
-test('an account-floor menu edit during recreation retains untouched applied accounts', async () => {
-  const f = await fixture(null, {
-    legacy: {
-      killswitch: {
-        enabled: true,
-        accounts: {
-          'vault:changed': { five_hour: 20, seven_day: 30 },
-          untouched: { five_hour: 40, seven_day: 50 },
-        },
+test('an account-floor menu edit during recreation keeps untouched accounts and the other host its own floors', async () => {
+  const legacy = (untouched: { five_hour: number; seven_day: number }) => ({
+    killswitch: {
+      enabled: true,
+      accounts: {
+        'vault:changed': { five_hour: 20, seven_day: 30 },
+        untouched,
       },
     },
+  })
+  const f = await fixture(null, {
+    legacy: legacy({ five_hour: 40, seven_day: 50 }),
+    // Pi's own store holds a stricter floor for the untouched account.
+    peerLegacy: legacy({ five_hour: 70, seven_day: 80 }),
   })
   const result = await f.runtime.updateSettings((settings) => {
     const killswitch = settings.killswitch as {
@@ -919,6 +1053,13 @@ test('an account-floor menu edit during recreation retains untouched applied acc
       scoped: 0,
     },
     {
+      account: 'untouched',
+      host: 'opencode',
+      five_hour: 40,
+      seven_day: 50,
+      scoped: 0,
+    },
+    {
       account: 'vault:changed',
       host: 'pi',
       five_hour: 20,
@@ -927,17 +1068,9 @@ test('an account-floor menu edit during recreation retains untouched applied acc
     },
     {
       account: 'untouched',
-      host: 'opencode',
-      five_hour: 40,
-      seven_day: 50,
-      scoped: 0,
-    },
-    // Pi's own store holds the same floor; recreation keeps it under Pi's tag.
-    {
-      account: 'untouched',
       host: 'pi',
-      five_hour: 40,
-      seven_day: 50,
+      five_hour: 70,
+      seven_day: 80,
       scoped: 0,
     },
   ])
@@ -1004,7 +1137,11 @@ test('restart after deletion keeps user-file authority, defaults non-protection 
     record.message.includes('Settings file is missing'),
   )
   expect(missing).toHaveLength(1)
-  expect(missing[0]!.message).toContain('A menu write will recreate it.')
+  // Pi's protection is unknown here (no reader for its store), so the menu
+  // would refuse; the line says so instead of promising a recreation.
+  expect(missing[0]!.message).toBe(
+    `Settings file is missing at "${f.file}"; non-protection settings use schema defaults. Menu writes that change settings are refused until the file is recreated by hand, because the protection settings of pi are unknown.`,
+  )
   await expect(f.text()).rejects.toThrow()
 })
 
@@ -1755,10 +1892,16 @@ test('a floor edit is refused as busy when the file changed after the list was p
 test('a recreation is refused as busy when the file appears while protection is gathered', async () => {
   const peerText =
     '{"killswitch_enabled":true,"killswitch_default_five_hour":77}'
+  // Opening the service also reads the other host's set (for the missing-file
+  // line); only the menu write's read races with the file appearing.
+  let armed = false
   const f = await fixture(null, {
     legacy: { killswitch: { enabled: true } },
-    onPeerRead: (file) => writeFile(file, peerText),
+    onPeerRead: async (file) => {
+      if (armed) await writeFile(file, peerText)
+    },
   })
+  armed = true
   const result = await f.runtime.updateSettings((settings) => {
     settings.dump = { enabled: true }
   })

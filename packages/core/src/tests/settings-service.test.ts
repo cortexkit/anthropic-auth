@@ -780,7 +780,9 @@ test('a file still missing after 2 s publishes defaults once without waiting on 
     }),
   )
   const timer = manualTimer()
+  // A host's lease logs the missing file, saying what its menu write would do.
   const service = await f.open({
+    host: 'pi',
     dependencies: { ...f.options.dependencies, schedule: timer.schedule },
   })
   await rm(f.file)

@@ -302,7 +302,11 @@ export function planSettingsRecreation(
   peer: SettingsRecreationSide,
 ): {
   edits: SettingsLevelEdit[]
-  /** True when the other host resolves any protection value differently. */
+  /**
+   * True when the other host resolves any protection value other than its
+   * account floors differently. Floors never set it: the one floor list
+   * carries each host's entries under that host's tag.
+   */
   peerDiffers: boolean
 } {
   let peerDiffers = false
@@ -323,12 +327,6 @@ export function planSettingsRecreation(
   }
   const ownFloors = hostFloors(writer.values, writer.host)
   const otherFloors = hostFloors(peer.values, peer.host)
-  const byAccount = (list: typeof ownFloors) =>
-    [...list].sort((a, b) =>
-      a.account < b.account ? -1 : a.account > b.account ? 1 : 0,
-    )
-  if (!sameJson(byAccount(ownFloors), byAccount(otherFloors)))
-    peerDiffers = true
   const floors: AccountFloor[] = []
   const shared = new Set<string>()
   for (const entry of ownFloors) {
@@ -393,6 +391,49 @@ export function settingsRecreationFloors(
     (edit) => edit.setting === 'killswitch_account_floors',
   )?.value
   return (floors ?? []) as SettingsProtectionValues['killswitch_account_floors']
+}
+
+/** One host's protection set and where it came from, for planning a recreation. */
+export interface SettingsRecreationInput {
+  host: SettingsHost
+  values: SettingsProtectionValues
+  rung: SettingsProtectionRung
+  /** A source exists but could not be read, so the set is unknown. */
+  unreadable?: boolean
+  /**
+   * The host has no set at all: no applied copy and no legacy store (it never
+   * ran). Distinct from rung 3 without a reader, which is an unknown set.
+   */
+  none?: boolean
+}
+
+export type SettingsRecreationRefusalReason =
+  | 'own-unknown'
+  | 'peer-unknown'
+  | 'peer-differs'
+
+/**
+ * What a menu write that finds the file missing does, as a pure function of
+ * both hosts' sets: the protection edits it carries, or why it is refused.
+ * A peer with no set takes the writer's; so does one with no recoverable set
+ * when every host is stopped (setup). Otherwise both sets are planned
+ * together, and a peer whose non-floor values differ refuses, since the file
+ * cannot yet hold a value for one host alone (common-auth 0.48 has no level).
+ */
+export function planSettingsFileRecreation(
+  writer: SettingsRecreationInput,
+  peer: SettingsRecreationInput,
+  hostsStopped = false,
+):
+  | { edits: SettingsLevelEdit[] }
+  | { refused: SettingsRecreationRefusalReason } {
+  if (writer.rung === 3) return { refused: 'own-unknown' }
+  if (peer.none || (hostsStopped && peer.rung === 3 && !peer.unreadable))
+    return { edits: settingsRecreationForWriter(writer.values, writer.host) }
+  const plan = planSettingsRecreation(writer, peer)
+  if (plan.peerDiffers)
+    return { refused: peer.rung === 3 ? 'peer-unknown' : 'peer-differs' }
+  return { edits: plan.edits }
 }
 
 /** The state of the user file a menu write found, as common-auth's planned update reports it. */
@@ -985,16 +1026,8 @@ class SharedSettingsService {
           this.lastGood.set(host, generation.protection[host].values)
       }
       logReports(generation.report)
-      if (
-        generation.status === 'missing' &&
-        !logged.has(`missing:${this.file}`)
-      ) {
-        logged.add(`missing:${this.file}`)
-        logger.warn(
-          'settings',
-          `Settings file is missing at "${this.file}"; non-protection settings use schema defaults. A menu write will recreate it.`,
-        )
-      }
+      // The missing-file line is logged by a host's lease, which can tell
+      // whether that host's menu write would recreate the file or be refused.
       // Host effects finish in publication order; detached copy writes order themselves on disk.
       for (const listener of this.listeners) {
         if (this.closed) return
@@ -1019,11 +1052,12 @@ class SharedSettingsService {
     host: SettingsHost,
     options: SettingsUpdateOptions,
     applied: SettingsGeneration['protection'][SettingsHost],
-    peerProtection: (host: SettingsHost) => Promise<{
-      values: SettingsProtectionValues
-      rung: SettingsProtectionRung
-      unreadable?: boolean
-    }> = async () => ({ values: mostRestrictiveSettingsProtection(), rung: 3 }),
+    peerProtection: (
+      host: SettingsHost,
+    ) => Promise<Omit<SettingsRecreationInput, 'host'>> = async () => ({
+      values: mostRestrictiveSettingsProtection(),
+      rung: 3,
+    }),
   ): Promise<UpdateResult> {
     if (!edits.length) return { outcome: 'unchanged' }
     const missing = (await this.bytes()).status === 'missing'
@@ -1031,26 +1065,38 @@ class SharedSettingsService {
     if (missing && options.createMissing) {
       if (applied.rung === 3) throw new SettingsRecreationRefusal(this.file)
       const peer = host === 'opencode' ? 'pi' : 'opencode'
-      const peerSet = await peerProtection(peer)
-      const plan =
-        options.hostsStopped && peerSet.rung === 3 && !peerSet.unreadable
-          ? // With every host stopped, a peer with no applied copy and no
-            // legacy store has no protection to keep; it takes the writer's.
-            { edits: settingsRecreationForWriter(applied.values, host) }
-          : planSettingsRecreation(
-              { host, values: applied.values },
-              { host: peer, values: peerSet.values },
-            )
+      // A floor edit planned against a missing file starts from the writer's
+      // floors mirrored for the other host. Only its writer-side entries
+      // count: the planner rebuilds the list with the other host's own floors,
+      // which may differ, and the separate floor edit is dropped.
+      const floorEdit = edits.find(
+        (edit) =>
+          edit.setting === 'killswitch_account_floors' && 'value' in edit,
+      )
+      const writerValues =
+        floorEdit && 'value' in floorEdit
+          ? {
+              ...applied.values,
+              killswitch_account_floors:
+                floorEdit.value as SettingsProtectionValues['killswitch_account_floors'],
+            }
+          : applied.values
+      const plan = planSettingsFileRecreation(
+        { host, values: writerValues, rung: applied.rung },
+        { host: peer, ...(await peerProtection(peer)) },
+        options.hostsStopped,
+      )
       // common-auth 0.48 cannot write a value for one host into a new file,
       // so a plain carry would hand the writer's values to the other host.
       // Refuse until edits can name their level (common-auth 0.49).
-      if ('peerDiffers' in plan && plan.peerDiffers)
-        throw new SettingsRecreationRefusal(this.file)
+      if ('refused' in plan) throw new SettingsRecreationRefusal(this.file)
       carried = Object.fromEntries(
         plan.edits.map((edit) => [edit.setting, edit.value]),
       )
-      edits = planSettingsMenuWrite({ status: 'missing' }, edits, () =>
-        plan.edits.map(({ setting, value }) => ({ setting, value })),
+      edits = planSettingsMenuWrite(
+        { status: 'missing' },
+        edits.filter((edit) => edit !== floorEdit),
+        () => plan.edits.map(({ setting, value }) => ({ setting, value })),
       )
     }
     // common-auth 0.48 decides nothing under its write lock, so check right
@@ -1274,14 +1320,12 @@ class SettingsProtectionLease {
   /**
    * The other host's whole set for recreating a missing file: its last-good
    * set in this process, then its applied copy, then its own legacy store,
-   * then the strictest set.
+   * then the strictest set. `none` means both sources were read and hold
+   * nothing (that host never ran); without a legacy reader the set is unknown.
    */
-  async peerProtection(host: SettingsHost): Promise<{
-    values: SettingsProtectionValues
-    /** 3 only when no source held a set; `unreadable` when one failed to read. */
-    rung: SettingsProtectionRung
-    unreadable?: boolean
-  }> {
+  async peerProtection(
+    host: SettingsHost,
+  ): Promise<Omit<SettingsRecreationInput, 'host'>> {
     const good = this.shared.lastGoodProtection(host)
     if (good) return { values: good, rung: 1 }
     let unreadable = false
@@ -1302,7 +1346,44 @@ class SettingsProtectionLease {
         unreadable = true
       }
     }
-    return { values: mostRestrictiveSettingsProtection(), rung: 3, unreadable }
+    return {
+      values: mostRestrictiveSettingsProtection(),
+      rung: 3,
+      unreadable,
+      none: !unreadable && this.recovery.readPeerLegacyProtection !== undefined,
+    }
+  }
+
+  /**
+   * Log once per file that it is missing, saying what this host's next menu
+   * write will do: recreate the file, or be refused and why.
+   */
+  private async logMissing(generation: SettingsGeneration) {
+    const host = this.options?.host
+    const key = `missing:${generation.file}`
+    if (!host || logged.has(key)) return
+    const peer = host === 'opencode' ? 'pi' : 'opencode'
+    const own = generation.protection[host]
+    const plan = planSettingsFileRecreation(
+      { host, values: own.values, rung: own.rung },
+      { host: peer, ...(await this.peerProtection(peer)) },
+    )
+    if (logged.has(key) || this.closed) return
+    logged.add(key)
+    const next =
+      'refused' in plan
+        ? `Menu writes that change settings are refused until the file is recreated by hand, because ${
+            {
+              'own-unknown': `${host}'s protection settings could not be recovered`,
+              'peer-unknown': `the protection settings of ${peer} are unknown`,
+              'peer-differs': `${peer} applies different protection settings`,
+            }[plan.refused]
+          }.`
+        : 'A menu write will recreate it.'
+    logger.warn(
+      'settings',
+      `Settings file is missing at "${generation.file}"; non-protection settings use schema defaults. ${next}`,
+    )
   }
 
   private async recover(host: SettingsHost) {
@@ -1344,6 +1425,8 @@ class SettingsProtectionLease {
     }
     this.current = freeze({ ...generation, contexts, protection: sets })
     this.persist(this.current)
+    if (generation.status === 'missing')
+      await this.logMissing(this.current).catch(() => {})
   }
 }
 
