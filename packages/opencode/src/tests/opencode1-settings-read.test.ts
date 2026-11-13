@@ -3,12 +3,13 @@ import * as fs from 'node:fs/promises'
 import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import { openSettings } from '@cortexkit/common-auth/settings'
-import { parse } from 'jsonc-parser'
+import { applyEdits, modify, parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import releaseSnapshots from './fixtures/settings-2.11.2.json'
 import { settingsReaderOutputs } from './opencode2-settings-readers'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { snapshotSettings } from './settings-snapshot-fixture'
 import { observeSettings } from './settings-snapshot-observe'
 import {
@@ -24,6 +25,7 @@ import {
   mainOnlyVault,
   readNativeSettings,
   syntheticMainHostAuth,
+  syntheticMainIdentity,
   updatePoolSettings,
   useTempAccountFile,
   useUnmigratedAccountFile,
@@ -709,8 +711,39 @@ describe('OpenCode 1 settings service reads', () => {
           cleanups.push(() => mover.mockRestore())
           const instance = await f.launch()
           expect(f.starts[0]?.mode).toBe('user-file')
+          // Startup discovery publishes the vault primary pin in the background.
+          // Its ready promise includes that write, so capture only after it settles.
+          if (custody === 'claustrum')
+            await getPluginTestHandles(instance.plugin).fallbackRefreshReady
           const after = (await instance.runtime.read()).policyStorage
-          expect(await fs.readFile(paths.config, 'utf8')).toBe(sourceBytes)
+          const storedBytes = await fs.readFile(paths.config, 'utf8')
+          if (custody === 'claustrum') {
+            const primary = (await instance.runtime.vault.read())?.rows.find(
+              (row) => row.credentialId === 'oauth:anthropic',
+            )
+            expect(primary).toBeDefined()
+            expect(primary?.accountIdentity).toBe(syntheticMainIdentity)
+            const stored = JSON.parse(storedBytes)
+            expect(stored.mainAccountId).toBe(primary!.routeId)
+            expect(stored.claustrum).toEqual({
+              primaryAccount: {
+                credentialId: 'oauth:anthropic',
+                accountId: syntheticMainIdentity,
+              },
+            })
+            // Assert the pin above, then preserve the byte oracle for every other setting.
+            const withoutPrimaryPin = (bytes: string) =>
+              ['mainAccountId', 'claustrum'].reduce(
+                (text, field) =>
+                  applyEdits(text, modify(text, [field], undefined, {})),
+                bytes,
+              )
+            expect(withoutPrimaryPin(storedBytes)).toBe(
+              withoutPrimaryPin(sourceBytes),
+            )
+          } else {
+            expect(storedBytes).toBe(sourceBytes)
+          }
           for (const [phase, storage] of [
             ['before', before],
             ['after', after],
