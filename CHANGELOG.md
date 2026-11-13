@@ -5,7 +5,6 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - OpenCode 2 now preserves billing reports for thread-recovery resends even when the host finishes the rejected request before its resend returns.
-
 ## 2.11.3
 
 - Pi now waits at most 60 seconds before retrying the same account when rate-limit headers do not confirm exhausted quota, as OpenCode does.
