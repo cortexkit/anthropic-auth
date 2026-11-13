@@ -251,7 +251,10 @@ export async function writeNativeSetupSettings(
     // The service carries the whole applied protection set in this same edit.
     // Imported protection was omitted above so a stale source cannot replace it.
     if (edits.length)
-      await service.update(edits, options.host, { createMissing: missing })
+      await service.update(edits, options.host, {
+        createMissing: missing,
+        hostsStopped: true,
+      })
     else if (missing && Object.keys(values).length)
       await service.update(
         [
@@ -262,7 +265,7 @@ export async function writeNativeSetupSettings(
           },
         ],
         options.host,
-        { createMissing: true },
+        { createMissing: true, hostsStopped: true },
       )
     return result
   } catch (error) {

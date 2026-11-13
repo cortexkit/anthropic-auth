@@ -67,6 +67,14 @@ export interface SettingsUpdateOptions {
    * is refused as busy when the file no longer holds exactly this text.
    */
   expectedSource?: string
+  /**
+   * Setup runs while every host is stopped. When the other host then has no
+   * recoverable protection set (no applied copy and no legacy store, rather
+   * than an unreadable one), recreation carries the writer's set instead of
+   * refusing. Running hosts never pass it: a running peer at the strictest
+   * set would be loosened.
+   */
+  hostsStopped?: boolean
 }
 
 export interface SettingsProtectionRecovery {
@@ -336,6 +344,27 @@ export function planSettingsRecreation(
     if (!shared.has(entry.account)) floors.push({ ...entry, host: peer.host })
   edits.push({ setting: 'killswitch_account_floors', value: floors })
   return { edits, peerDiffers }
+}
+
+/**
+ * The protection edits for a recreation whose other host has no set of its
+ * own: the writer's values as plain values, its own account floors tagged
+ * with it, and its vault floors as `both`, since vault routes are shared.
+ */
+export function settingsRecreationForWriter(
+  values: SettingsProtectionValues,
+  host: SettingsHost,
+): SettingsLevelEdit[] {
+  return SETTINGS_PROTECTION_KEYS.map((setting) => ({
+    setting,
+    value:
+      setting === 'killswitch_account_floors'
+        ? hostFloors(values, host).map((entry) => ({
+            ...entry,
+            host: entry.account.startsWith('vault:') ? 'both' : host,
+          }))
+        : values[setting],
+  }))
 }
 
 /**
@@ -990,10 +1019,11 @@ class SharedSettingsService {
     host: SettingsHost,
     options: SettingsUpdateOptions,
     applied: SettingsGeneration['protection'][SettingsHost],
-    peerProtection: (
-      host: SettingsHost,
-    ) => Promise<SettingsProtectionValues> = async () =>
-      mostRestrictiveSettingsProtection(),
+    peerProtection: (host: SettingsHost) => Promise<{
+      values: SettingsProtectionValues
+      rung: SettingsProtectionRung
+      unreadable?: boolean
+    }> = async () => ({ values: mostRestrictiveSettingsProtection(), rung: 3 }),
   ): Promise<UpdateResult> {
     if (!edits.length) return { outcome: 'unchanged' }
     const missing = (await this.bytes()).status === 'missing'
@@ -1001,14 +1031,21 @@ class SharedSettingsService {
     if (missing && options.createMissing) {
       if (applied.rung === 3) throw new SettingsRecreationRefusal(this.file)
       const peer = host === 'opencode' ? 'pi' : 'opencode'
-      const plan = planSettingsRecreation(
-        { host, values: applied.values },
-        { host: peer, values: await peerProtection(peer) },
-      )
+      const peerSet = await peerProtection(peer)
+      const plan =
+        options.hostsStopped && peerSet.rung === 3 && !peerSet.unreadable
+          ? // With every host stopped, a peer with no applied copy and no
+            // legacy store has no protection to keep; it takes the writer's.
+            { edits: settingsRecreationForWriter(applied.values, host) }
+          : planSettingsRecreation(
+              { host, values: applied.values },
+              { host: peer, values: peerSet.values },
+            )
       // common-auth 0.48 cannot write a value for one host into a new file,
       // so a plain carry would hand the writer's values to the other host.
       // Refuse until edits can name their level (common-auth 0.49).
-      if (plan.peerDiffers) throw new SettingsRecreationRefusal(this.file)
+      if ('peerDiffers' in plan && plan.peerDiffers)
+        throw new SettingsRecreationRefusal(this.file)
       carried = Object.fromEntries(
         plan.edits.map((edit) => [edit.setting, edit.value]),
       )
@@ -1208,23 +1245,33 @@ class SettingsProtectionLease {
    * set in this process, then its applied copy, then its own legacy store,
    * then the strictest set.
    */
-  async peerProtection(host: SettingsHost): Promise<SettingsProtectionValues> {
+  async peerProtection(host: SettingsHost): Promise<{
+    values: SettingsProtectionValues
+    /** 3 only when no source held a set; `unreadable` when one failed to read. */
+    rung: SettingsProtectionRung
+    unreadable?: boolean
+  }> {
     const good = this.shared.lastGoodProtection(host)
-    if (good) return good
-    for (const read of [
-      this.recovery.readAppliedCopy ??
-        ((peer: SettingsHost) =>
-          readSettingsProtectionCopy(this.shared.file, peer)),
-      this.recovery.readPeerLegacyProtection,
-    ]) {
+    if (good) return { values: good, rung: 1 }
+    let unreadable = false
+    for (const [rung, read] of [
+      [
+        1,
+        this.recovery.readAppliedCopy ??
+          ((peer: SettingsHost) =>
+            readSettingsProtectionCopy(this.shared.file, peer)),
+      ],
+      [2, this.recovery.readPeerLegacyProtection],
+    ] as const) {
       try {
         const values = await read?.(host)
-        if (values) return values
+        if (values) return { values, rung }
       } catch {
         // An unreadable source is skipped whole; keys are never mixed across sources.
+        unreadable = true
       }
     }
-    return mostRestrictiveSettingsProtection()
+    return { values: mostRestrictiveSettingsProtection(), rung: 3, unreadable }
   }
 
   private async recover(host: SettingsHost) {

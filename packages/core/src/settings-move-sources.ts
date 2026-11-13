@@ -124,10 +124,11 @@ async function peerLayout(
 /**
  * Read the other host's legacy protection for recreating a missing settings
  * file: its default store, through its current custody and state layout,
- * without seeding a vault, taking locks or writing anything. A store that
- * doesn't exist in local custody reads as an empty store, as that host's
- * legacy release reads it. Anything unreadable, including vault settings
- * that were never seeded, returns undefined so the caller uses a stricter set.
+ * without seeding a vault, taking locks or writing anything. A local store
+ * that doesn't exist, or a separate install, returns undefined: that host
+ * has no set to keep. Anything that exists but can't be read, including an
+ * unreadable custody or layout and vault settings that were never seeded,
+ * throws, so the caller can tell an unknown set from a missing one.
  */
 export async function readPeerLegacySettingsProtection(
   options: SettingsPathOptions & {
@@ -135,42 +136,35 @@ export async function readPeerLegacySettingsProtection(
     readMode?: typeof readNativeEnrollmentMode
   },
 ): Promise<SettingsProtectionValues | undefined> {
+  const paths = await resolveSettingsPaths(options.host, options)
+  if (paths.separate) return undefined
+  const store = paths.defaults[options.host]
+  const mode = await (options.readMode ?? readNativeEnrollmentMode)(
+    options.host,
+    enrollmentEnv(options),
+  )
+  const pool = await resolveNativePoolPaths(
+    store.account,
+    store.state,
+    await peerLayout(options.host, options),
+  )
+  const selected = mode === 'claustrum' ? nativeVaultPaths(pool) : pool
+  let text: string
   try {
-    const paths = await resolveSettingsPaths(options.host, options)
-    if (paths.separate) return undefined
-    const store = paths.defaults[options.host]
-    const mode = await (options.readMode ?? readNativeEnrollmentMode)(
-      options.host,
-      enrollmentEnv(options),
-    )
-    const pool = await resolveNativePoolPaths(
-      store.account,
-      store.state,
-      await peerLayout(options.host, options),
-    )
-    const selected = mode === 'claustrum' ? nativeVaultPaths(pool) : pool
-    let text: string
-    try {
-      text = await readFile(selected.config, 'utf8')
-    } catch (error) {
-      if (
-        (error as NodeJS.ErrnoException).code === 'ENOENT' &&
-        mode === 'local'
-      )
-        return legacySettingsProtection({}, options.host, mode)
+    text = await readFile(selected.config, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && mode === 'local')
       return undefined
-    }
-    const stored: unknown = JSON.parse(text)
-    if (!stored || typeof stored !== 'object' || Array.isArray(stored))
-      return undefined
-    return legacySettingsProtection(
-      stored as Record<string, unknown>,
-      options.host,
-      mode,
-    )
-  } catch {
-    return undefined
+    throw error
   }
+  const stored: unknown = JSON.parse(text)
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored))
+    throw new Error('The legacy settings store is not a settings map')
+  return legacySettingsProtection(
+    stored as Record<string, unknown>,
+    options.host,
+    mode,
+  )
 }
 
 function enrollmentEnv(options: SettingsPathOptions) {

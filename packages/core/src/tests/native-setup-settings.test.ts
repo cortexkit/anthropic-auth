@@ -259,7 +259,7 @@ for (const host of ['opencode', 'pi'] as const) {
   })
 
   for (const rung of [1, 2, 3]) {
-    test(`${host}: marker without file recreates on rung ${rung}, carried protection wins`, async () => {
+    test(`${host}: marker without file on rung ${rung} ${rung === 1 ? 'recreates and carried protection wins' : 'refuses and writes nothing'}`, async () => {
       const f = await fixture(host, {
         ...legacy,
         killswitch: { enabled: false },
@@ -274,6 +274,8 @@ for (const host of ['opencode', 'pi'] as const) {
         })
       else {
         // A set belonging only to the peer must not recover the acting host.
+        // It is the peer's own set, though: on rung 2 the acting host's
+        // looser legacy values would replace it, so recreation refuses.
         await writeSettingsProtectionCopy(
           f.paths.target,
           host === 'pi' ? 'opencode' : 'pi',
@@ -283,33 +285,53 @@ for (const host of ['opencode', 'pi'] as const) {
       }
       const result = await f.write()
       expect(f.writes).toEqual([])
-      if (rung === 3) {
+      if (rung !== 1) {
         expect(result).toMatchObject({
           outcome: 'refused',
           reason: refusedSettingsRecreationText(f.paths.target),
         })
         await absent(f.paths.target)
-      } else {
-        expect(result.outcome).toBe('saved')
-        const file = await contents(f.paths.target)
-        expect(file.dump_enabled).toBe(host === 'opencode' ? true : undefined)
-        expect(file.killswitch_enabled).toBe(rung === 1)
-        expect(file.max_same_account_wait).toBe(rung === 1 ? 'cache' : 'off')
-        expect(file.quota_fail_closed_on_unknown_quota).toBe('on')
-        if (rung === 1) {
-          expect(file.killswitch_account_floors).toEqual(
-            copy.killswitch_account_floors,
-          )
-          expect(
-            result.differing.filter(
-              (entry) => entry.key === 'killswitch_enabled',
-            ),
-          ).toEqual([{ key: 'killswitch_enabled', legacy: false, file: true }])
-        }
         expect(await readFile(f.paths.marker, 'utf8')).toBe('marker')
+        return
       }
+      // The peer has no applied copy and no legacy store, so with hosts
+      // stopped it takes the acting host's set.
+      expect(result.outcome).toBe('saved')
+      const file = await contents(f.paths.target)
+      expect(file.dump_enabled).toBe(host === 'opencode' ? true : undefined)
+      expect(file.killswitch_enabled).toBe(true)
+      expect(file.max_same_account_wait).toBe('cache')
+      expect(file.quota_fail_closed_on_unknown_quota).toBe('on')
+      expect(file.killswitch_account_floors).toEqual(
+        copy.killswitch_account_floors,
+      )
+      expect(
+        result.differing.filter((entry) => entry.key === 'killswitch_enabled'),
+      ).toEqual([{ key: 'killswitch_enabled', legacy: false, file: true }])
+      expect(await readFile(f.paths.marker, 'utf8')).toBe('marker')
     })
   }
+
+  test(`${host}: marker without file recreates when the peer's copy holds the same set`, async () => {
+    const f = await fixture(host, legacy)
+    await writeFile(f.paths.marker, 'marker')
+    const peer = host === 'pi' ? 'opencode' : 'pi'
+    const own = legacySettingsProtection(legacy, host)
+    for (const [copyHost, values] of [
+      [host, own],
+      // Same values; its local floors are tagged with the peer itself.
+      [peer, legacySettingsProtection(legacy, peer)],
+    ] as const)
+      await writeSettingsProtectionCopy(f.paths.target, copyHost, {
+        readAt: 1,
+        values,
+      })
+    const result = await f.write()
+    expect(result.outcome).toBe('saved')
+    const file = await contents(f.paths.target)
+    expect(file.killswitch_enabled).toBe(true)
+    expect(file.max_same_account_wait).toBe('cache')
+  })
 }
 
 test('setup writes every explicitly held moved field in schema form without store-held data', async () => {

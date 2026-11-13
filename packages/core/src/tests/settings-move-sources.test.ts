@@ -720,8 +720,8 @@ test('the peer legacy reader follows the peer custody and never seeds a vault', 
       host: 'pi',
       readMode: f.options.readMode,
     })
-  // A local store that doesn't exist reads as an empty legacy store.
-  expect((await read())?.killswitch_enabled).toBe(false)
+  // A local store that doesn't exist holds no set to keep.
+  expect(await read()).toBeUndefined()
   await put(f.defaults.pi.config, {
     killswitch: { enabled: true, main: { '5h': 45 } },
   })
@@ -730,9 +730,9 @@ test('the peer legacy reader follows the peer custody and never seeds a vault', 
     killswitch_default_five_hour: 45,
   })
   // In vault custody the local store no longer counts, and unseeded vault
-  // settings are unknown rather than empty.
+  // settings are unknown rather than absent.
   f.modes.pi = 'claustrum'
-  expect(await read()).toBeUndefined()
+  await expect(read()).rejects.toThrow()
   expect(f.seeds()).toBe(0)
   await put(f.vaults.pi.config, { killswitch: { enabled: true } })
   expect(await read()).toMatchObject({ killswitch_enabled: true })
