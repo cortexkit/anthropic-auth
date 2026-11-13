@@ -1179,6 +1179,17 @@ export class StickySessionRouter {
     return { ...assignment, accountId: this.logicalAccountId(assignment) }
   }
 
+  /** Load the current pin without touching or publishing it. An unreadable pin
+   * omits the advisory hint; normal route resolution still validates its state. */
+  async readAssignment(sessionId: string) {
+    try {
+      await this.refreshStateIfChanged()
+      return this.peekAssignment(sessionId)
+    } catch {
+      return undefined
+    }
+  }
+
   async resolve(input: {
     sessionId: string
     family: StickyRouteFamily

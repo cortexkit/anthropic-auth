@@ -92,6 +92,7 @@ import {
   resolveNativePoolPaths,
   routingCandidates,
   routingChoiceMatches,
+  routingWarmCredential,
   runWithRequestSignal,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
   StickyQuotaRetryCounter,
@@ -1959,11 +1960,16 @@ async function executeWithFallback(options: {
   const routingRelay = routingState.relay
   const routingSessionId = options.streamOptions?.sessionId
   if (routingSessionId && !routingState.advice) {
-    routingState.advice = routingRelay.accountFor(
-      routingSessionId,
-      options.model.id,
-      routingCandidates(snapshot.accounts),
-    )
+    routingState.advice = (async () => {
+      const router = await getPiStickyRouter(options.storagePath)
+      const assignment = await router.readAssignment(routingSessionId)
+      return routingRelay.accountFor(
+        routingSessionId,
+        options.model.id,
+        routingCandidates(snapshot.accounts),
+        routingWarmCredential(snapshot.accounts, assignment),
+      )
+    })()
   }
   const advice = await routingState.advice
   let advisedAccountId = advice

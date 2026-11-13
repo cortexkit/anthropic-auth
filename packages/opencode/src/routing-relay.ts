@@ -5,4 +5,5 @@ export {
   RoutingRefusalError,
   routingCandidates,
   routingChoiceMatches,
+  routingWarmCredential,
 } from '@cortexkit/anthropic-auth-core'

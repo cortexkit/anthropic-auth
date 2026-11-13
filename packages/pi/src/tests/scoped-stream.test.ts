@@ -2629,6 +2629,112 @@ registerTest.each([
   ),
 )
 
+async function vaultWarmHintFixture() {
+  const f = await fixture('sticky-balanced')
+  f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))
+  const runtime = await f.native.service()
+  await runtime.vault.refresh()
+  const bodies: string[] = []
+  globalThis.fetch = Object.assign(
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url.includes('/api/oauth/usage'))
+        return Response.json({
+          five_hour: { utilization: 20 },
+          seven_day: { utilization: 20 },
+        })
+      if (!url.includes('/v1/messages'))
+        throw new Error('Unexpected warm hint fixture request')
+      const body = init?.body
+      if (typeof body !== 'string' && !(body instanceof Uint8Array))
+        throw new Error('Missing model request bytes')
+      bodies.push(
+        new Headers(init?.headers).get('content-encoding') === 'gzip'
+          ? gunzipSync(body).toString()
+          : typeof body === 'string'
+            ? body
+            : Buffer.from(body).toString(),
+      )
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const previous = globals[key]
+  const requests: Record<string, unknown>[] = []
+  let answer: unknown = {
+    account_id: fixtureAccountIdentity('main'),
+    credential_id: 'oauth:anthropic',
+  }
+  globals[key] = () => ({
+    accountFor: async (request: Record<string, unknown>) => {
+      requests.push(request)
+      return answer
+    },
+  })
+  deferCleanup(() => {
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  })
+  const send = () =>
+    streamCortexKitAnthropic(model, context, {
+      sessionId: 'pi-warm-hint',
+    }).result()
+  return {
+    ...f,
+    runtime,
+    bodies,
+    requests,
+    send,
+    noAdvice: () => {
+      answer = null
+    },
+  }
+}
+
+test('Pi sends its pinned vault warm credential on every model request without changing request bytes', async () => {
+  const f = await vaultWarmHintFixture()
+  expect((await f.send()).stopReason).toBe('stop')
+  f.noAdvice()
+  expect((await f.send()).stopReason).toBe('stop')
+  expect((await f.send()).stopReason).toBe('stop')
+  const plain = { provider: 'anthropic', modelId: model.id, refusals: true }
+  expect(f.requests).toEqual([
+    plain,
+    { ...plain, warm_credential: 'oauth:anthropic' },
+    { ...plain, warm_credential: 'oauth:anthropic' },
+  ])
+  expect(f.bodies).toHaveLength(3)
+  expect(f.bodies[1]).toBe(f.bodies[0])
+  expect(f.bodies[2]).toBe(f.bodies[0])
+})
+
+for (const condition of ['disabled', 'signed out', 'unservable']) {
+  test(`Pi omits the warm hint for a pinned account that is ${condition}`, async () => {
+    const f = await vaultWarmHintFixture()
+    expect((await f.send()).stopReason).toBe('stop')
+    f.noAdvice()
+    if (condition === 'disabled')
+      await f.runtime.vault.setEnabled('main', false)
+    else {
+      const primary = f.rows[0]
+      if (!primary) throw new Error('Missing fixture primary')
+      f.rows[0] = {
+        ...primary,
+        state: condition === 'signed out' ? 'needs_reauth' : 'expired',
+      }
+      await f.runtime.vault.refresh()
+    }
+    expect((await f.send()).stopReason).toBe('stop')
+    expect(f.requests).toHaveLength(2)
+    expect(JSON.stringify(f.requests[1])).toBe(JSON.stringify(f.requests[0]))
+  })
+}
+
 test('Pi vault default UUID replacement re-places the old session without inheriting quota or changing an unrelated fallback pin', async () => {
   const f = await fixture('sticky-balanced')
   f.rows.push(row('oauth:anthropic:work', fixtureAccountIdentity('work')))

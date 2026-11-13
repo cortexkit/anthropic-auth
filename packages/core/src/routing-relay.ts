@@ -30,6 +30,21 @@ export function routingCandidates(accounts: readonly NativeAccountView[]) {
   )
 }
 
+/** Hint only the still-servable vault credential behind the session's own pin. */
+export function routingWarmCredential(
+  accounts: readonly NativeAccountView[],
+  assignment: { accountId: string; accountIdentity?: string } | undefined,
+): string | undefined {
+  if (!assignment) return undefined
+  return routingCandidates(accounts).find(
+    (account) =>
+      account.id === assignment.accountId &&
+      account.source === 'vault' &&
+      (!assignment.accountIdentity ||
+        account.accountIdentity === assignment.accountIdentity),
+  )?.credentialId
+}
+
 export function routingChoiceMatches(
   choice: RoutingChoice,
   account: RoutingSubject,
@@ -144,6 +159,7 @@ export function createRoutingRelay(
       sessionId: string,
       modelId: string,
       candidates: readonly RoutingSubject[],
+      warmCredentialId?: string,
     ): Promise<RoutingChoice | null> {
       admissions.delete(sessionId)
       silenced.delete(sessionId)
@@ -153,6 +169,7 @@ export function createRoutingRelay(
         modelId,
         deadlineMs: 2000,
         refusals: true,
+        ...(warmCredentialId ? { warmCredentialId } : {}),
         candidates: candidates.flatMap((row) =>
           row.accountIdentity
             ? [

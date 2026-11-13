@@ -317,6 +317,7 @@ import {
   RoutingRefusalError,
   routingCandidates,
   routingChoiceMatches,
+  routingWarmCredential,
 } from './routing-relay.ts'
 import {
   drainNotifications,
@@ -10050,10 +10051,14 @@ const anthropicAuthPlugin = async (
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
                   const snapshot = await nativeAccounts.read()
+                  const routing = await currentStickyRouting()
+                  const assignment =
+                    await routing.router.readAssignment(sessionId)
                   const advice = await routingRelay.accountFor(
                     sessionId,
                     routingModelId ?? '',
                     routingCandidates(snapshot.accounts),
+                    routingWarmCredential(snapshot.accounts, assignment),
                   )
                   let advisedAccountId: string | undefined
                   if (advice) {

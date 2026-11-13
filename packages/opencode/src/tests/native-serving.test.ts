@@ -13,6 +13,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
@@ -2284,6 +2285,132 @@ test('a replaced default vault account loses its session pins and quota while an
   expect(sent).toHaveLength(2)
   expect(sent[1]).toBe('Bearer sk-ant-oat01-vault-fallback-v1')
 })
+
+async function vaultWarmHintFixture() {
+  const fixture = await migrateServingFixture('claustrum', true)
+  const runtime = createNativeAccountRuntime({
+    paths: fixture.paths,
+    host: 'opencode',
+    vault: { connect: async () => fixture.scopedClient },
+  })
+  lifetimes.deferCleanup(() => runtime.close())
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: true },
+    routing: { mode: 'sticky-balanced' },
+  }))
+  for (const account of (await runtime.read()).accounts) {
+    const receipt = await runtime.authorizeVault(account.id)
+    const now = Date.now()
+    await runtime.vault.publish(receipt, {
+      quota: {
+        accountIdentity: account.accountIdentity,
+        checkedAt: now,
+        five_hour: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+        seven_day: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+      },
+    })
+  }
+  const bodies: string[] = []
+  network.mockImplementation(async (input, init) => {
+    const url = input instanceof Request ? input.url : input.toString()
+    if (url.includes('/v1/messages')) {
+      const body = init?.body
+      if (typeof body !== 'string' && !(body instanceof Uint8Array))
+        throw new Error('Missing model request bytes')
+      bodies.push(
+        new Headers(init?.headers).get('content-encoding') === 'gzip'
+          ? gunzipSync(body).toString()
+          : typeof body === 'string'
+            ? body
+            : Buffer.from(body).toString(),
+      )
+    }
+    return fixture.fetchProvider(input, init)
+  })
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const previous = globals[key]
+  const requests: Record<string, unknown>[] = []
+  let answer: unknown = {
+    account_id: mainIdentity,
+    credential_id: 'oauth:anthropic',
+  }
+  globals[key] = () => ({
+    accountFor: async (request: Record<string, unknown>) => {
+      requests.push(request)
+      return answer
+    },
+  })
+  lifetimes.deferCleanup(() => {
+    if (previous === undefined) delete globals[key]
+    else globals[key] = previous
+  })
+  const plugin = await createPlugin({
+    claustrumScopedConnect: async () => fixture.scopedClient,
+  })
+  return {
+    ...fixture,
+    runtime,
+    plugin,
+    requests,
+    bodies,
+    noAdvice: () => {
+      answer = null
+    },
+  }
+}
+
+test('OC1 sends its pinned vault warm credential without changing model request bytes', async () => {
+  const f = await vaultWarmHintFixture()
+  expect((await sendNative(f.plugin)).status).toBe(200)
+  f.noAdvice()
+  expect((await sendNative(f.plugin)).status).toBe(200)
+  const plain = {
+    provider: 'anthropic',
+    modelId: 'claude-sonnet-4-6',
+    refusals: true,
+  }
+  expect(f.requests).toEqual([
+    plain,
+    { ...plain, warm_credential: 'oauth:anthropic' },
+  ])
+  expect(f.bodies).toHaveLength(2)
+  expect(f.bodies[1]).toBe(f.bodies[0])
+})
+
+for (const condition of ['disabled', 'signed out', 'unservable']) {
+  test(`OC1 omits the warm hint for a pinned account that is ${condition}`, async () => {
+    const f = await vaultWarmHintFixture()
+    expect((await sendNative(f.plugin)).status).toBe(200)
+    f.noAdvice()
+    if (condition === 'disabled')
+      await f.runtime.vault.setEnabled('main', false)
+    else {
+      const list = f.scopedClient.listScoped.bind(f.scopedClient)
+      f.scopedClient.listScoped = async (token) => {
+        const result = await list(token)
+        return {
+          ...result,
+          view: `changed-${condition}`,
+          rows: result.rows.map((row) =>
+            row.id === 'oauth:anthropic'
+              ? {
+                  ...row,
+                  state:
+                    condition === 'signed out' ? 'needs_reauth' : 'expired',
+                }
+              : row,
+          ),
+        }
+      }
+      await f.runtime.vault.refresh()
+    }
+    expect((await sendNative(f.plugin)).status).toBe(200)
+    expect(f.requests).toHaveLength(2)
+    expect(JSON.stringify(f.requests[1])).toBe(JSON.stringify(f.requests[0]))
+  })
+}
 
 test('vault sticky routing keeps session assignments only in the vault routing file', async () => {
   const fixture = await migrateServingFixture('claustrum', true)

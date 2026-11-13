@@ -66,6 +66,7 @@ import {
   createRoutingRelay,
   routingCandidates,
   routingChoiceMatches,
+  routingWarmCredential,
 } from '../routing-relay'
 import {
   type NativeAnthropicAttemptContext,
@@ -728,10 +729,15 @@ export function createNativeAnthropicSource(
       )
         return undefined
       if (input.phase === 'request') servedTurns.delete(input.sessionID)
+      const assignment = await routerFor(snapshot).readAssignment(
+        input.sessionID,
+      )
+      active.signal.throwIfAborted()
       const advice = await routingRelay.accountFor(
         input.sessionID,
         modelID,
         routingCandidates(snapshot.accounts),
+        routingWarmCredential(snapshot.accounts, assignment),
       )
       active.signal.throwIfAborted()
       if (advice) {

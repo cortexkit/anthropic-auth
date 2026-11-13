@@ -439,16 +439,81 @@ describe('OC2 shared routing relay', () => {
     },
   )
   function bridge(
-    accountFor: () => unknown,
+    accountFor: (request: Record<string, unknown>) => unknown,
     report: (value: unknown) => unknown = () => {},
   ) {
     const globals = globalThis as Record<symbol, unknown>
     const key = Symbol.for('cortexkit.routing')
-    globals[key] = () => ({ accountFor: async () => accountFor(), report })
+    globals[key] = () => ({
+      accountFor: async (request: Record<string, unknown>) =>
+        accountFor(request),
+      report,
+    })
     cleanups.push(() => {
       delete globals[key]
     })
   }
+
+  test('OC2 sends a warm vault credential on each pinned ask, including after source restart', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const requests: Record<string, unknown>[] = []
+    bridge((request) => {
+      requests.push(request)
+      return null
+    })
+    expect(await native.chooseAccount(scope)).toBe('main')
+    await native.drainRoutingPublications()
+    expect(await native.chooseAccount(scope)).toBe('main')
+    const restarted = source(f.runtime, f.paths)
+    expect(await restarted.chooseAccount(scope)).toBe('main')
+    const plain = {
+      provider: 'anthropic',
+      modelId: scope.modelID,
+      refusals: true,
+    }
+    expect(requests).toEqual([
+      plain,
+      { ...plain, warm_credential: 'oauth:anthropic' },
+      { ...plain, warm_credential: 'oauth:anthropic' },
+    ])
+    expect(JSON.stringify(requests[0])).toBe(JSON.stringify(plain))
+  })
+
+  test.each(['disabled', 'signed out', 'unservable'])(
+    'OC2 omits the warm hint when the pinned account is %s',
+    async (condition) => {
+      const f = await vaultWithFallback()
+      const native = source(f.runtime, f.paths)
+      const requests: string[] = []
+      bridge((request) => {
+        requests.push(JSON.stringify(request))
+        return null
+      })
+      expect(await native.chooseAccount(scope)).toBe('main')
+      const snapshot = await f.runtime.read()
+      const read = spyOn(f.runtime, 'read').mockResolvedValue({
+        ...snapshot,
+        accounts: snapshot.accounts.map((account) =>
+          account.id !== 'main'
+            ? account
+            : {
+                ...account,
+                ...(condition === 'disabled'
+                  ? { enabled: false }
+                  : {
+                      state:
+                        condition === 'signed out' ? 'needs_reauth' : 'expired',
+                    }),
+              },
+        ),
+      })
+      cleanups.push(() => read.mockRestore())
+      expect(await native.chooseAccount(scope)).not.toBe('main')
+      expect(requests).toHaveLength(2)
+      expect(requests[1]).toBe(requests[0])
+    },
+  )
 
   test('accepts a late-installed answer, moves an existing pin and stays pinned without advice', async () => {
     const f = await vaultWithFallback()
