@@ -239,6 +239,7 @@ export type {
 } from './native-runtime.ts'
 export { NativeRuntimeError } from './native-runtime.ts'
 export { nativeRuntimeOptionIdentity } from './native-runtime-registry.ts'
+export * from './native-runtime-settings.ts'
 export * from './native-settings.ts'
 export {
   isNativeTransientAccountError,

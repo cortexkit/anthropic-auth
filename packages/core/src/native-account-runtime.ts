@@ -8,6 +8,7 @@ import {
   type PoolRow,
 } from '@cortexkit/common-auth/store'
 import {
+  type AccountStorage,
   buildRefreshOperationError,
   fetchOAuthQuotaSnapshot,
   killswitchPassesPolicy,
@@ -81,6 +82,11 @@ import {
   nativeRuntimeOptionIdentity,
 } from './native-runtime-registry.ts'
 import {
+  createNativeRuntimeSettings,
+  type NativeRuntimeSettingsOptions,
+  type NativeRuntimeSettingsStatus,
+} from './native-runtime-settings.ts'
+import {
   joinNativePoolWrite,
   NativeTransientAccountError,
 } from './native-transient-account.ts'
@@ -130,7 +136,8 @@ export type {
   NativeAccountView,
 } from './native-account-view.ts'
 
-export interface NativeAccountRuntimeOptions {
+export interface NativeAccountRuntimeOptions
+  extends NativeRuntimeSettingsOptions {
   paths: NativePoolPaths
   host: 'opencode' | 'pi'
   /** The resolved user settings target, independent of the account store. */
@@ -193,7 +200,13 @@ export interface NativeAccountRuntime {
   /** Fresh private relay authorization for transport only; never include it in a status snapshot. */
   getRelayConfig(): Promise<RelayConfig | null>
   updateRelay(patch: NativeRelayUpdate): Promise<void>
-  read(): Promise<NativeAccountSnapshot>
+  read(model?: string): Promise<NativeAccountSnapshot>
+  /** Memory-only policy settings for a tracked target; never persist the returned record. */
+  resolveSettings?(stored: AccountStorage, model?: string): AccountStorage
+  /** No-model settings and every explicit model override, for /claude status. */
+  getSettingsStatus?(): NativeRuntimeSettingsStatus | undefined
+  /** Hosts call after startup and committed menu writes; watches use the same deduplicated hook. */
+  applySettingsEffects?(): void
   /** Last completed read, without disk I/O or credential/quota work. */
   peek?(): NativeAccountSnapshot | undefined
   authorizeLocal(
@@ -310,7 +323,9 @@ export function acquireNativeAccountRuntime(
 ): NativeAccountRuntime {
   const key = JSON.stringify([
     resolve(
-      options.settingsFile ?? getSettingsFilePath({ env: options.vault?.env }),
+      options.settingsService?.file ??
+        options.settingsFile ??
+        getSettingsFilePath({ env: options.vault?.env }),
     ),
     nativeVaultRuntimeKey({
       ...options.vault,
@@ -319,6 +334,8 @@ export function acquireNativeAccountRuntime(
     }),
     ...[
       options.beforePoolWrite,
+      options.settingsService,
+      options.settingsMode,
       options.local?.refreshToken,
       options.local?.resolveIdentity,
       options.local?.failurePolicy,
@@ -345,7 +362,11 @@ export function acquireNativeAccountRuntime(
     getRelayConfig: () => use().getRelayConfig(),
     getSettingsPath: () => use().getSettingsPath(),
     updateRelay: (patch) => use().updateRelay(patch),
-    read: () => use().read(),
+    read: (model) => use().read(model),
+    resolveSettings: (stored, model) =>
+      use().resolveSettings?.(stored, model) ?? stored,
+    getSettingsStatus: () => use().getSettingsStatus?.(),
+    applySettingsEffects: () => use().applySettingsEffects?.(),
     peek: () => use().peek?.(),
     authorizeLocal: (id, request) => use().authorizeLocal(id, request),
     authorizeApi: (id, signal) => use().authorizeApi(id, signal),
@@ -428,6 +449,7 @@ export function createNativeAccountRuntime(
   const withLock = observeNativeLocks(() => acquireLock, onLockEvent)
   const now = options.local?.now ?? options.vault?.now ?? Date.now
   const env = { ...(options.vault?.env ?? process.env) }
+  const runtimeSettings = createNativeRuntimeSettings({ ...options, env })
   const vaultPaths = nativeVaultPaths(paths)
   const relocation = nativeRelocationGuard(paths)
   // A state-home process stops serving once its dataset is in conflict; a
@@ -804,7 +826,7 @@ export function createNativeAccountRuntime(
    * One read of the selected pool: the account projection, plus the rows and
    * settings it was projected from.
    */
-  async function readView() {
+  async function readView(model?: string) {
     const mode = await authority()
     if (mode === 'claustrum') {
       // Load legacy routing preferences before deciding which account receives
@@ -835,7 +857,7 @@ export function createNativeAccountRuntime(
       paths: { ...paths, ...selectedPaths },
       rows: read.rows,
       settings: {
-        ...settings.settings,
+        ...runtimeSettings.resolve(settings.settings, model),
         claustrum: {
           ...(settings.settings.claustrum as
             | Record<string, unknown>
@@ -1087,8 +1109,11 @@ export function createNativeAccountRuntime(
     async getSettingsPath() {
       return (await selectedStorage()).paths.config
     },
-    async read() {
-      const view = await readView()
+    getSettingsStatus: runtimeSettings.status,
+    resolveSettings: runtimeSettings.resolve,
+    applySettingsEffects: runtimeSettings.applyEffects,
+    async read(model) {
+      const view = await readView(model)
       projectedFrom.set(view.snapshot, view)
       lastSnapshot = view.snapshot
       return view.snapshot
@@ -1888,6 +1913,7 @@ export function createNativeAccountRuntime(
     },
     close() {
       if (closing) return closing
+      runtimeSettings.close()
       const draining = Promise.all([
         quotaPublications.close(),
         metadataPublications.drain(),

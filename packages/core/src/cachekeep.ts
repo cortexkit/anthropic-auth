@@ -742,6 +742,11 @@ export class CacheKeepManager {
   constructor(
     private readonly options: {
       loadStorage: () => Promise<AccountStorage | null>
+      /** Memory-only settings projection; omitted by hosts that still use legacy settings. */
+      resolveSettings?: (
+        storage: AccountStorage,
+        model?: string,
+      ) => AccountStorage
       fetchImpl?: typeof fetch
       billingRequest?: (
         target: CacheKeepTarget,
@@ -1133,7 +1138,14 @@ export class CacheKeepManager {
     if (!current || !this.isCurrentTarget(target))
       throw new CacheKeepWarmRefusal('stopped')
     const state = current.policyState
-    const storage = await this.options.loadStorage()
+    const loaded = await this.options.loadStorage()
+    const storage =
+      loaded && this.options.resolveSettings
+        ? this.targetSettings(
+            this.options.resolveSettings(loaded),
+            target.bodyText,
+          )
+        : loaded
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
     const now = this.options.now?.() ?? Date.now()
     const decision =
@@ -1359,6 +1371,15 @@ export class CacheKeepManager {
       | 'policyState'
     >
   }): { tracked: true } | { tracked: false; reason: string } {
+    if (input.storage && this.options.resolveSettings) {
+      const schedule = this.options.resolveSettings(input.storage)
+      const target = this.targetSettings(schedule, input.bodyText)
+      input = {
+        ...input,
+        storage: target,
+        cacheMode: target.claudeCache?.mode ?? input.cacheMode,
+      }
+    }
     const now = this.options.now?.() ?? Date.now()
     const acceptedAt = input.acceptedAt ?? input.retained?.lastTouchAt ?? now
     if (input.retained && input.retained.cacheExpiresAt <= now)
@@ -1436,7 +1457,12 @@ export class CacheKeepManager {
       keptOff()
       return refuse('cachekeep disabled', 'disabled')
     }
-    if (!planned && input.cacheMode !== 'hybrid') {
+    if (
+      !planned &&
+      (input.cacheMode !== 'hybrid' ||
+        (this.options.resolveSettings &&
+          !isCacheKeepHybridActive(input.storage)))
+    ) {
       keptOff()
       return refuse('cache mode is not hybrid', 'not-hybrid')
     }
@@ -1653,7 +1679,11 @@ export class CacheKeepManager {
   }
 
   private async runTick() {
-    const storage = await this.options.loadStorage()
+    const loaded = await this.options.loadStorage()
+    const storage =
+      loaded && this.options.resolveSettings
+        ? this.options.resolveSettings(loaded)
+        : loaded
     const window = getCacheKeepWindow(storage)
     const now = this.options.now?.() ?? Date.now()
     const today = cacheKeepPeriodKey(storage, window, new Date(now))
@@ -1661,7 +1691,7 @@ export class CacheKeepManager {
       for (const target of this.targets.values()) target.dayKey = 'always'
     }
 
-    this.pruneTargets(now, today)
+    this.pruneTargets(now, this.options.resolveSettings ? undefined : today)
     if (!this.targets.size) {
       this.publishTrackedSessions()
       if (!this.stoppedSessions.size) this.stop()
@@ -1688,15 +1718,27 @@ export class CacheKeepManager {
         continue
       }
       if (!target.policyState?.planned) {
-        if (!isCacheKeepHybridActive(storage)) {
+        const targetStorage = storage
+          ? this.targetSettings(storage, target.bodyText)
+          : storage
+        if (!isCacheKeepHybridActive(targetStorage)) {
           this.removeTarget(target, 'cachekeep-hybrid-inactive', attemptAt)
           continue
         }
-        if (!isCacheKeepActiveNow(storage, new Date(attemptAt))) {
+        const targetToday = cacheKeepPeriodKey(
+          targetStorage,
+          window,
+          new Date(attemptAt),
+        )
+        if (isCacheKeepAlways(targetStorage)) target.dayKey = 'always'
+        if (
+          !isCacheKeepActiveNow(targetStorage, new Date(attemptAt)) ||
+          target.dayKey !== targetToday
+        ) {
           this.removeTarget(target, 'schedule-period-ended', attemptAt)
           continue
         }
-        if (isCacheKeepAlways(storage)) {
+        if (isCacheKeepAlways(targetStorage)) {
           const count = this.countDecision(target)
           if (count?.action === 'stop') {
             this.removeTarget(target, count.reason, attemptAt)
@@ -1729,6 +1771,22 @@ export class CacheKeepManager {
       }
     }
     this.publishTrackedSessions()
+  }
+
+  private targetSettings(storage: AccountStorage, bodyText: string) {
+    if (!this.options.resolveSettings) return storage
+    let model: string | undefined
+    try {
+      const body = JSON.parse(bodyText)
+      if (typeof body.model === 'string') model = body.model
+    } catch {}
+    const resolved = this.options.resolveSettings(storage, model)
+    // Schedule and status values are process-wide; only these target checks take a model.
+    return {
+      ...storage,
+      cacheKeep: { ...storage.cacheKeep, enabled: resolved.cacheKeep?.enabled },
+      claudeCache: resolved.claudeCache,
+    }
   }
 
   private lastPrewarmStart(target: CacheKeepTarget) {
