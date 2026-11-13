@@ -13,9 +13,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Writable } from 'node:stream'
 import {
+  createNativePoolStore,
   decideOpenCodeStateLayout,
   HOLDER_FILE_NAME,
   HOLDER_REGISTRATION_ERROR_MESSAGES,
+  isDumpEnabled,
   LEGACY_STATE_LAYOUT,
   publishNativeEmptyInit,
   resetNativeHolderRegistryForTests,
@@ -24,10 +26,13 @@ import {
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   resolveStateHomeTarget,
+  setDumpEnabled,
   setRelocationMoveEnabledForTests,
   stateLayoutRefusalPublicMessage,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
+import { parse } from 'jsonc-parser'
+import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { relaySetup } from '../cli'
 import { runSetupCommand } from '../setup/command'
 import { setupAnthropicAuth, startFailure } from '../v2/setup'
@@ -38,6 +43,7 @@ import { setupAnthropicAuth, startFailure } from '../v2/setup'
  * own and puts these back afterwards.
  */
 const ENV_KEYS = [
+  'ANTHROPIC_AUTH_SETTINGS_FILE',
   'OPENCODE_CONFIG_DIR',
   'XDG_STATE_HOME',
   'TMPDIR',
@@ -168,6 +174,32 @@ function openCode2Context() {
     event: { subscribe: async function* () {} },
   } as unknown as Plugin.Context
 }
+
+test('OpenCode 2 state-home admission permits the settings move without a per-plugin holder lease', async () => {
+  const m = await machine(true)
+  const dump = isDumpEnabled()
+  cleanups.push(() => setDumpEnabled(dump))
+  const target = join(m.root, 'settings.jsonc')
+  process.env.ANTHROPIC_AUTH_SETTINGS_FILE = target
+  await initializeAuthority()
+  const paths = await resolveNativePoolPaths(
+    undefined,
+    undefined,
+    LEGACY_STATE_LAYOUT,
+  )
+  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  await store.updateSettings(() => ({ dump: { enabled: true } }))
+  await store.close()
+  const dispose = await setupAnthropicAuth(openCode2Context(), {
+    vault: { env: { ...process.env } },
+  })
+  cleanups.push(dispose)
+  await expectDecided(m, 'opencode2', true)
+  expect(parse(await readFile(target, 'utf8')).dump_enabled).toBe(true)
+  expect(JSON.parse(await readFile(`${target}.moved`, 'utf8')).target).toBe(
+    target,
+  )
+})
 
 for (const moveEnabled of [false, true]) {
   const label = moveEnabled ? 'on' : 'off'

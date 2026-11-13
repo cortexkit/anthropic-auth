@@ -401,11 +401,8 @@ export function createNativeAnthropicSource(
     }
   }
 
-  // Mirror the current custody mode's persisted dump switch into this
-  // process's Core dump flag, so Core's manager (CacheKeep prewarms) and the
-  // adapter's settings-gated dumps agree. The switch lives in the snapshot's
-  // policy storage for the current mode, local or vault, exactly where the
-  // OpenCode 2 menu writes it (`write('dump', { enabled })`).
+  // Mirror the resolved switch, whether supplied by the user file or the
+  // current custody store, so Core's prewarms and adapter dumps agree.
   const syncDumpEnabled = (snapshot: NativeAccountSnapshot) => {
     try {
       setDumpEnabled(isDumpPersistentlyEnabled(snapshot.policyStorage))
@@ -491,7 +488,7 @@ export function createNativeAnthropicSource(
     onRefusal?: (reason: NativeAccountRefusalReason) => void,
     sessionID = '',
   ) => {
-    const current = await runtime.read()
+    const current = await runtime.read(modelID)
     syncDumpEnabled(current)
     active.signal.throwIfAborted()
     assertTransport(current)
@@ -673,18 +670,23 @@ export function createNativeAnthropicSource(
       // queue an account choice, or create, move or delete a session pin.
       const active = controller(input)
       options.onOwnedRequest?.()
-      let snapshot = await runtime.read()
+      const modelID = remapModelId(
+        (await options.resolveModelId?.(input)) ?? input.modelID,
+      )
+      let snapshot = await runtime.read(modelID)
       syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
       // Account selection rejects a WebSocket relay before any OAuth token
       // refresh or retrieval starts.
       assertTransport(snapshot)
-      const modelID = remapModelId(
-        (await options.resolveModelId?.(input)) ?? input.modelID,
-      )
-      active.signal.throwIfAborted()
       if (snapshot.mode === 'claustrum') {
         snapshot = await readNativeAccountsForRequest(runtime, active.signal)
+        snapshot = {
+          ...snapshot,
+          policyStorage:
+            runtime.resolveSettings?.(snapshot.policyStorage, modelID) ??
+            snapshot.policyStorage,
+        }
         active.signal.throwIfAborted()
       }
       if (readThreeWayBoolean(snapshot.policyStorage.quota?.enabled, true)) {
@@ -718,7 +720,7 @@ export function createNativeAnthropicSource(
             active.signal.throwIfAborted()
           }
         }
-        if (refreshed) snapshot = await runtime.read()
+        if (refreshed) snapshot = await runtime.read(modelID)
         active.signal.throwIfAborted()
       }
       if (
@@ -741,7 +743,7 @@ export function createNativeAnthropicSource(
       )
       active.signal.throwIfAborted()
       if (advice) {
-        snapshot = await runtime.read()
+        snapshot = await runtime.read(modelID)
         active.signal.throwIfAborted()
         assertTransport(snapshot)
       }
@@ -974,13 +976,12 @@ export function createNativeAnthropicSource(
         const served = servedAccounts.get(key(input, input.accountId))
         if (!served) return undefined
         const active = controller(input)
-        const snapshot = await runtime.read()
-        active.signal.throwIfAborted()
-        assertTransport(snapshot)
         const modelID = remapModelId(
           (await options.resolveModelId?.(input)) ?? input.modelID,
         )
+        const snapshot = await runtime.read(modelID)
         active.signal.throwIfAborted()
+        assertTransport(snapshot)
         const account = snapshot.accounts.find(
           (row) => row.id === input.accountId,
         )
@@ -1001,13 +1002,12 @@ export function createNativeAnthropicSource(
       // on can never be handed to a later request.
       retries.delete(retry.reason)
       const active = controller(input)
-      const snapshot = await runtime.read()
-      active.signal.throwIfAborted()
-      assertTransport(snapshot)
       const modelID = remapModelId(
         (await options.resolveModelId?.(input)) ?? input.modelID,
       )
+      const snapshot = await runtime.read(modelID)
       active.signal.throwIfAborted()
+      assertTransport(snapshot)
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
       )
@@ -1034,14 +1034,13 @@ export function createNativeAnthropicSource(
     },
     async authorizeAccount(scope, accountId, onRefusal) {
       const active = controller(scope)
-      const snapshot = await runtime.read()
-      syncDumpEnabled(snapshot)
-      active.signal.throwIfAborted()
-      assertTransport(snapshot)
       const modelID = remapModelId(
         (await options.resolveModelId?.(scope)) ?? scope.modelID,
       )
+      const snapshot = await runtime.read(modelID)
+      syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
+      assertTransport(snapshot)
       const account = snapshot.accounts.find((row) => row.id === accountId)
       if (!account || !eligible(account, snapshot, modelID, scope.sessionID)) {
         onRefusal?.(
@@ -1227,7 +1226,7 @@ export function createNativeAnthropicSource(
     },
     async requestOptions(input, onRefusal) {
       const active = controller(input)
-      const snapshot = await runtime.read()
+      const snapshot = await runtime.read(input.modelID)
       syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
       const account = snapshot.accounts.find(

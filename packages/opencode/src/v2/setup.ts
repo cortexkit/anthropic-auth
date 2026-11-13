@@ -3,6 +3,7 @@ import {
   assertUnmanagedInjectedPaths,
   authorize,
   connectVaultHost,
+  createNativeAccountRuntime,
   createNativeUi,
   decideOpenCodeStateLayoutOnce,
   disconnectNativeVaultForHost,
@@ -10,6 +11,7 @@ import {
   getPersistedLogLevel,
   isDumpPersistentlyEnabled,
   isVaultHosted,
+  legacySettingsProtection,
   logger,
   type NativeAccountRuntime,
   type NativeAccountRuntimeOptions,
@@ -19,12 +21,17 @@ import {
   type NativeUiOptions,
   nativeVaultRuntimeKey,
   openCodeHolderKind,
+  openSettingsService,
   readNativeEnrollmentMode,
   registerNativePoolHolder,
   resolveNativePoolPaths,
+  resolveSettingsPaths,
+  runSettingsMoveAtStartup,
+  type SettingsService,
   setDumpEnabled,
   setLogLevel,
   stateLayoutIoFailure,
+  stateLayoutOfPaths,
   unmovedRegistrationPolicy,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -324,17 +331,113 @@ export async function setupAnthropicAuth(
   options: AnthropicAuthV2Options = {},
 ): Promise<Plugin.Cleanup> {
   const { paths, holderRegistration } = await decideNativePaths(options)
+  const env = {
+    ...(options.vault?.env ?? process.env),
+    ...(process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL && {
+      OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL:
+        process.env.OPENCODE_ANTHROPIC_AUTH_LOG_LEVEL,
+    }),
+  }
+  // Injected account paths have the same separate-install rules as configured
+  // paths. Never move a test or embedded host's private pool into the user file.
+  const settingsEnv = options.paths
+    ? {
+        ...env,
+        OPENCODE_ANTHROPIC_AUTH_FILE: paths.legacyConfig,
+        OPENCODE_ANTHROPIC_AUTH_STATE_FILE: paths.legacyState,
+      }
+    : env
+  const settingsPaths = await resolveSettingsPaths('opencode', {
+    env: settingsEnv,
+  })
   const requests = createReloadableRequestHooks(
     ctx,
-    nativeVaultRuntimeKey({ ...options.vault, paths, host: 'opencode' }),
+    JSON.stringify([
+      nativeVaultRuntimeKey({ ...options.vault, paths, host: 'opencode' }),
+      settingsPaths.target,
+    ]),
   )
   ctx = requests.context
-  const runtime = acquireNativeAccountRuntime({
+  let settingsService: SettingsService | undefined
+  let startup: Awaited<ReturnType<typeof runSettingsMoveAtStartup>>
+  const runtimeOptions = {
     paths,
-    host: 'opencode',
+    host: 'opencode' as const,
     local: options.local,
-    vault: options.vault,
+    vault: { ...options.vault, env },
+  }
+  const withLegacy = async <T>(
+    read: (runtime: NativeAccountRuntime) => Promise<T>,
+  ) => {
+    const legacy = createNativeAccountRuntime(runtimeOptions)
+    try {
+      return await read(legacy)
+    } finally {
+      await legacy.close()
+    }
+  }
+  try {
+    startup = await runSettingsMoveAtStartup({
+      host: 'opencode',
+      env: settingsEnv,
+      paths: settingsPaths,
+      ownPoolPaths: paths,
+      initializeVaultSettings: () =>
+        withLegacy(async (legacy) => {
+          await legacy.vault.initializeSettings()
+        }),
+      fence: {
+        // Choosing state-home already listed this process in its holder file.
+        // The layout decision owns that registration, not this plugin, so
+        // there is no plugin-owned registration to pass or release here.
+        registration:
+          holderRegistration ??
+          (stateLayoutOfPaths(paths).kind === 'state-home'
+            ? { status: 'registered' }
+            : undefined),
+      },
+    })
+    if (startup.mayOpenService)
+      settingsService = await openSettingsService({
+        file: settingsPaths.target,
+        host: 'opencode',
+        protection: {
+          readLegacyProtection: () =>
+            withLegacy(async (legacy) => {
+              // Recover from the local or vault account store selected by
+              // enrollment, before applying any user-file settings to it.
+              const snapshot = await legacy.read()
+              return legacySettingsProtection(
+                snapshot.settings,
+                'opencode',
+                snapshot.mode,
+              )
+            }),
+        },
+      })
+  } catch (error) {
+    requests.retire()
+    holderRegistration?.close()
+    await settingsService?.dispose()
+    throw error
+  }
+  const runtime = acquireNativeAccountRuntime({
+    ...runtimeOptions,
+    settingsService,
+    settingsFile: settingsPaths.target,
+    settingsMode: () => startup.mode,
+    settingsAuthority: { options: { env: settingsEnv } },
   })
+  try {
+    await runtime.prepareSettingsAction?.()
+    runtime.applySettingsEffects?.()
+  } catch (error) {
+    requests.retire()
+    holderRegistration?.close()
+    await runtime.close()
+    await settingsService?.dispose()
+    throw error
+  }
   // Use the same enrollment files the account runtime reads, so the login
   // methods, the menu and request serving always agree on the mode.
   const enrollment = nativeEnrollmentCallbacks(
@@ -443,7 +546,15 @@ export async function setupAnthropicAuth(
     fetch: options.fetch,
     subagent,
   })
-  await cacheKeep.ready
+  await cacheKeep.ready.catch(async (error: unknown) => {
+    requests.retire()
+    holderRegistration?.close()
+    await cacheKeep?.dispose()
+    await source.close()
+    await runtime.close()
+    await settingsService?.dispose()
+    throw error
+  })
   const capabilities = createNativeMenuCapabilities({
     runtime,
     source,
@@ -472,6 +583,7 @@ export async function setupAnthropicAuth(
     await cacheKeep?.dispose()
     await Promise.all([source.close(), runtime.drainQuotaPublications()])
     await runtime.close()
+    await settingsService?.dispose()
     throw error
   })
   let cleanup: Promise<void> | undefined
@@ -498,6 +610,7 @@ export async function setupAnthropicAuth(
       // the final runtime close may cancel its pending lock acquisitions.
       await Promise.all([source.close(), runtime.drainQuotaPublications()])
       await runtime.close()
+      await settingsService?.dispose()
     })()
     return cleanup
   }
@@ -520,7 +633,10 @@ export async function setupAnthropicAuth(
       host: 'opencode',
       dispatch: capabilities.dispatch,
       readStatus: (command) => capabilities.readStatus(command),
-      readAccounts: () => runtime.read(),
+      readAccounts: async () => {
+        await runtime.prepareSettingsAction?.()
+        return runtime.read()
+      },
       readMode: enrollment.readMode,
       disconnectVault: enrollment.disconnectVault,
       interactive: true,

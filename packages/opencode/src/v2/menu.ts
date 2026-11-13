@@ -129,6 +129,7 @@ export function createNativeMenuCapabilities(options: {
       throw new Error(VAULT_HOST_CONNECT_REFUSAL)
     if (closed) throw new Error('Native menu is closed')
     options.signal?.throwIfAborted()
+    await runtime.prepareSettingsAction?.()
     switch (request.action) {
       case 'enable':
       case 'disable':
@@ -362,6 +363,7 @@ export function createNativeMenuCapabilities(options: {
   return {
     dispatch,
     async readStatus(command) {
+      await runtime.prepareSettingsAction?.()
       let snapshot = await runtime.read()
       if (command === 'account') {
         let empty = 'No native Claude accounts.'
