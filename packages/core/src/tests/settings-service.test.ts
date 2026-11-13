@@ -18,6 +18,10 @@ import { acquireNativeAccountRuntime } from '../native-account-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsDefinition } from '../settings-definition.ts'
 import {
+  readSettingsProtectionCopy,
+  writeSettingsProtectionCopy,
+} from '../settings-protection-copy.ts'
+import {
   openSettingsService,
   SETTINGS_PROTECTION_KEYS,
   type SettingsGeneration,
@@ -229,12 +233,22 @@ test('an unknown model uses the no-model values and unknown override keys are re
 for (const restore of [false, true]) {
   test(`a change between two gets${restore ? ' restored with the same size and timestamps' : ''} never publishes mixed values`, async () => {
     const old =
-      '{"dump_enabled":false,"prime_enabled":false,"killswitch_enabled":false}'
+      '{"dump_enabled":false,"prime_enabled":false,"killswitch_enabled":false,"quota_minimum_remaining_five_hour":0}'
     const newer =
-      '{"dump_enabled":true ,"prime_enabled":true ,"killswitch_enabled":true }'
+      '{"dump_enabled":true ,"prime_enabled":true ,"killswitch_enabled":true ,"quota_minimum_remaining_five_hour":1}'
     expect(Buffer.byteLength(old)).toBe(Buffer.byteLength(newer))
     const f = await fixture(old)
-    const service = await f.open()
+    const copies: SettingsProtectionValues[] = []
+    const service = await f.open({
+      host: 'pi',
+      dependencies: {
+        ...f.options.dependencies,
+        writeAppliedCopy: async (...args) => {
+          copies.push(args[2].values)
+          await writeSettingsProtectionCopy(...args)
+        },
+      },
+    })
     const seen: SettingsGeneration[] = []
     service.watch((generation) => {
       seen.push(generation)
@@ -270,12 +284,23 @@ for (const restore of [false, true]) {
         )
       }
     }
+    await service.dispose()
+    for (const values of copies) {
+      expect(values.quota_minimum_remaining_five_hour).toBe(
+        values.killswitch_enabled ? 1 : 0,
+      )
+    }
+    expect(
+      (await readSettingsProtectionCopy(f.file, 'pi'))?.killswitch_enabled,
+    ).toBe(!restore)
   })
 }
 
 test('a delayed read and repeated triggers serialize passes and publish only the newer coherent values', async () => {
-  const f = await fixture('{"dump_enabled":false,"prime_enabled":false}')
-  const service = await f.open()
+  const f = await fixture(
+    '{"dump_enabled":false,"prime_enabled":false,"killswitch_default_five_hour":5}',
+  )
+  const service = await f.open({ host: 'pi' })
   const entered = gate()
   const release = gate()
   const copied: { id: number; dump: boolean; prime: boolean }[] = []
@@ -294,10 +319,16 @@ test('a delayed read and repeated triggers serialize passes and publish only the
     entered.open()
     await release.promise
   })
-  await writeFile(f.file, '{"dump_enabled":true,"prime_enabled":true}')
+  await writeFile(
+    f.file,
+    '{"dump_enabled":true,"prime_enabled":true,"killswitch_default_five_hour":31}',
+  )
   const first = service.refresh()
   await entered.promise
-  await writeFile(f.file, '{"dump_enabled":false,"prime_enabled":true}')
+  await writeFile(
+    f.file,
+    '{"dump_enabled":false,"prime_enabled":true,"killswitch_default_five_hour":72}',
+  )
   for (let i = 0; i < 8; i++) f.trigger()
   const pending = service.refresh()
   const reads = f.counts.reads
@@ -310,6 +341,11 @@ test('a delayed read and repeated triggers serialize passes and publish only the
   expect(f.counts.reads - reads).toBe(9)
   expect(copied).toEqual([{ id: 2, dump: false, prime: true }])
   expect(service.resolve('pi').prime_enabled).toBe(true)
+  await service.dispose()
+  expect(
+    (await readSettingsProtectionCopy(f.file, 'pi'))
+      ?.killswitch_default_five_hour,
+  ).toBe(72)
 })
 
 test('change effects including a delayed copy finish before a newer generation fires effects', async () => {

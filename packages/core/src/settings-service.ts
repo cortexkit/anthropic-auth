@@ -18,6 +18,10 @@ import {
 } from './model-capabilities.ts'
 import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
+import {
+  readSettingsProtectionCopy,
+  writeSettingsProtectionCopy,
+} from './settings-protection-copy.ts'
 
 export type SettingsValues = {
   [K in SettingsKey]: ValueOf<(typeof settingsDefinition.settings)[K]['value']>
@@ -71,6 +75,8 @@ export interface SettingsFileStatus {
 
 export interface SettingsGeneration {
   readonly id: number
+  /** Time the coherent file version was read; detached persistence retains this time. */
+  readonly readAt: number
   readonly file: string
   readonly status: 'ready' | 'missing' | 'unparseable' | 'unreadable'
   /** Raw file text for inspecting override locations outside request handling; never log it. */
@@ -115,6 +121,8 @@ export type SettingsChangeListener = (
 type CoreSettingsHandle = SettingsHandle<typeof settingsDefinition.settings>
 export interface SettingsServiceOptions {
   file: string
+  /** Acting host: enables persistence and startup recovery of only its own copy set. */
+  host?: SettingsHost
   separateInstall?: boolean
   createMissing?: boolean
   lockTimeoutMs?: number
@@ -123,6 +131,7 @@ export interface SettingsServiceOptions {
   dependencies?: {
     open?: (options: OpenSettingsOptions) => CoreSettingsHandle
     readFile?: (file: string) => Promise<Uint8Array>
+    writeAppliedCopy?: typeof writeSettingsProtectionCopy
     /** Schedule an off-request re-read; return a cancellation function. */
     schedule?: (callback: () => void, delayMs: number) => () => void
   }
@@ -249,8 +258,13 @@ function sameBytes(a: FileBytes, b: FileBytes) {
     : a.status === b.status
 }
 
-type Candidate = Omit<SettingsGeneration, 'id' | 'fileStatus'>
-type Pass = { before: FileBytes; after: FileBytes; candidate: Candidate }
+type Candidate = Omit<SettingsGeneration, 'id' | 'fileStatus' | 'readAt'>
+type Pass = {
+  before: FileBytes
+  after: FileBytes
+  candidate: Candidate
+  readAt: number
+}
 
 class SharedSettingsService {
   users = 0
@@ -351,6 +365,7 @@ class SharedSettingsService {
   }
 
   private async pass(): Promise<Pass> {
+    const readAt = performance.timeOrigin + performance.now()
     const before = await this.bytes()
     let resolved: Awaited<ReturnType<SharedSettingsService['resolveContexts']>>
     let after: FileBytes
@@ -518,6 +533,7 @@ class SharedSettingsService {
     return {
       before,
       after,
+      readAt,
       candidate: {
         file: this.file,
         source,
@@ -565,7 +581,7 @@ class SharedSettingsService {
     }
   }
 
-  private async stabilize(): Promise<Candidate> {
+  private async stabilize(): Promise<Candidate & { readAt: number }> {
     let previous: Pass | undefined
     for (let attempt = 0; attempt < 5; attempt++) {
       let next: Pass
@@ -586,21 +602,27 @@ class SharedSettingsService {
           next.candidate.status === 'unreadable' ||
           next.candidate.status === 'unparseable'
         )
-          return this.fallback(next.candidate.report, next.candidate.status)
-        return next.candidate
+          return {
+            ...this.fallback(next.candidate.report, next.candidate.status),
+            readAt: next.readAt,
+          }
+        return { ...next.candidate, readAt: next.readAt }
       }
       previous = next
     }
-    return this.fallback(
-      [
-        {
-          file: { kind: 'user', path: this.file },
-          keyPath: [],
-          reason: 'unreadable',
-        },
-      ],
-      'unreadable',
-    )
+    return {
+      ...this.fallback(
+        [
+          {
+            file: { kind: 'user', path: this.file },
+            keyPath: [],
+            reason: 'unreadable',
+          },
+        ],
+        'unreadable',
+      ),
+      readAt: 0,
+    }
   }
 
   refresh(): Promise<void> {
@@ -649,8 +671,12 @@ class SharedSettingsService {
       const status = fileStatus(candidate)
       if (
         prior &&
-        JSON.stringify({ ...prior, id: undefined }) ===
-          JSON.stringify({ ...candidate, fileStatus: status })
+        JSON.stringify({ ...prior, id: undefined, readAt: undefined }) ===
+          JSON.stringify({
+            ...candidate,
+            fileStatus: status,
+            readAt: undefined,
+          })
       )
         continue
       const generation = freeze({
@@ -674,7 +700,7 @@ class SharedSettingsService {
           `Settings file is missing at "${this.file}"; non-protection settings use schema defaults. A menu write will recreate it.`,
         )
       }
-      // Await each listener before another pass can publish, so persistence cannot run out of order.
+      // Host effects finish in publication order; detached copy writes order themselves on disk.
       for (const listener of this.listeners) {
         if (this.closed) return
         try {
@@ -715,11 +741,52 @@ class SharedSettingsService {
 class SettingsProtectionLease {
   private current: SettingsGeneration | undefined
   private pending = Promise.resolve()
+  private readonly copies = new Set<Promise<void>>()
+  private copied: string | undefined
 
   constructor(
     private readonly shared: SharedSettingsService,
     private readonly recovery: SettingsProtectionRecovery = {},
+    private readonly options?: SettingsServiceOptions,
   ) {}
+
+  async close(): Promise<void> {
+    await this.pending
+    await Promise.all(this.copies)
+  }
+
+  private persist(generation: SettingsGeneration) {
+    const host = this.options?.host
+    if (!host) return
+    const set = generation.protection[host]
+    if (!set.usable || set.rung !== 0) return
+    const identity = JSON.stringify(set.values)
+    if (identity === this.copied) return
+    this.copied = identity
+    const write =
+      this.options?.dependencies?.writeAppliedCopy ??
+      writeSettingsProtectionCopy
+    const task = Promise.resolve()
+      .then(() =>
+        write(
+          generation.file,
+          host,
+          { readAt: generation.readAt, values: set.values },
+          this.options?.lockTimeoutMs,
+        ),
+      )
+      .catch(() => {
+        const key = `copy:${generation.file}:${host}`
+        if (logged.has(key)) return
+        logged.add(key)
+        logger.warn(
+          'settings',
+          `Could not save applied protection settings for ${host} at "${generation.file}.applied.json"; the previous copy is unchanged.`,
+        )
+      })
+      .finally(() => this.copies.delete(task))
+    this.copies.add(task)
+  }
 
   snapshot(): SettingsGeneration {
     if (!this.current) throw new Error('Settings startup has not finished')
@@ -737,7 +804,13 @@ class SettingsProtectionLease {
     const previous = this.current?.protection[host]
     if (previous) return previous
     for (const [rung, read] of [
-      [1, this.recovery.readAppliedCopy],
+      [
+        1,
+        this.recovery.readAppliedCopy ??
+          (this.options?.host === host
+            ? () => readSettingsProtectionCopy(this.shared.file, host)
+            : undefined),
+      ],
       [2, this.recovery.readLegacyProtection],
     ] as const) {
       try {
@@ -753,6 +826,7 @@ class SettingsProtectionLease {
   private async apply(generation: SettingsGeneration) {
     if (hosts.every((host) => generation.protection[host].usable)) {
       this.current = generation
+      this.persist(generation)
       return
     }
     const contexts = { ...generation.contexts }
@@ -774,6 +848,7 @@ class SettingsProtectionLease {
       }
     }
     this.current = freeze({ ...generation, contexts, protection: sets })
+    this.persist(this.current)
   }
 }
 
@@ -793,7 +868,7 @@ export async function openSettingsService(
   let closed = false
   let closing: Promise<void> | undefined
   const subscriptions = new Set<() => void>()
-  const lease = new SettingsProtectionLease(owned, options.protection)
+  const lease = new SettingsProtectionLease(owned, options.protection, options)
   const unsubscribeLease = owned.watch((generation) =>
     lease.publish(generation),
   )
@@ -811,7 +886,8 @@ export async function openSettingsService(
       if (services.get(file) === owned) services.delete(file)
       closing = owned.close()
     }
-    return closing ?? Promise.resolve()
+    closing = Promise.all([closing, lease.close()]).then(() => {})
+    return closing
   }
   try {
     await owned.ready
