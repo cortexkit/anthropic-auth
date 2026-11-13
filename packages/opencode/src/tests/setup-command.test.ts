@@ -1280,7 +1280,7 @@ async function writeSetupJson(path: string, value: unknown) {
 }
 
 lifetimes.test(
-  'setup reports deferred settings refusal without rolling back credential commit',
+  'setup reports deferred settings refusal and the same command resumes through source retirement',
   async () => {
     const f = await callbackFixture()
     const target = join(f.env.HOME!, 'settings.jsonc')
@@ -1294,13 +1294,30 @@ lifetimes.test(
       dump: { enabled: true },
     })
     await writeSetupJson(f.plan.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
+    const source = await readFile(f.plan.legacyConfigPath, 'utf8')
     expect(await runSetupCommand(['--yes', '--opencode=1'], f.io)).toBe(1)
     expect((await readNativeMigrationJournal(f.plan.paths))?.phase).toBe(
       'committed',
     )
     expect(f.screen()).toContain(core.malformedSettingsText(target))
-    expect(f.screen()).toContain('Set these settings by hand: dump_enabled.')
-    expect(f.screen()).toContain('Credential transfer is committed')
+    expect(f.screen()).toContain(
+      'Accounts were moved, but these settings were not saved: dump_enabled.',
+    )
+    expect(f.screen()).toContain(
+      'Run the same setup command again to finish; nothing needs to be set by hand.',
+    )
+    expect(await readFile(f.plan.legacyConfigPath, 'utf8')).toBe(source)
+    await writeSetupJson(target, {})
+    expect(await runSetupCommand(['--yes', '--opencode=1'], f.io)).toBe(0)
+    expect(JSON.parse(await readFile(target, 'utf8'))).toEqual({
+      dump_enabled: true,
+    })
+    expect((await readNativeMigrationJournal(f.plan.paths))?.phase).toBe(
+      'retired',
+    )
+    await expect(readFile(f.plan.legacyConfigPath)).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
     expectNoDiagnostics(f)
   },
 )

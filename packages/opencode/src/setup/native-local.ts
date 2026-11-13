@@ -355,7 +355,7 @@ export async function writeNativeLocalSetupSettings(
         }),
       )
       report(
-        `${result.reason} Credential transfer is committed. Set these settings by hand: ${keys.join(', ') || '(none)'}.`,
+        `Accounts were moved, but these settings were not saved: ${keys.join(', ') || '(none)'}. ${result.reason} Run the same setup command again to finish; nothing needs to be set by hand.`,
       )
     }
     return result

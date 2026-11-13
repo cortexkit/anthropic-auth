@@ -369,7 +369,12 @@ for (const marker of [false, true]) {
       expect(f.output.join('\n')).toContain(
         core.malformedSettingsText(f.target),
       )
-      expect(f.output.join('\n')).toContain('Credential transfer is committed.')
+      expect(f.output.join('\n')).toContain(
+        'Accounts were moved, but these settings were not saved:',
+      )
+      expect(f.output.join('\n')).toContain(
+        'Run the same setup command again to finish; nothing needs to be set by hand.',
+      )
       for (const key of keys) expect(f.output.join('\n')).toContain(key)
       if (!marker)
         await expect(readFile(`${f.target}.moved`)).rejects.toMatchObject({
@@ -380,7 +385,7 @@ for (const marker of [false, true]) {
 }
 
 lifetimeTest(
-  'a failed settings write leaves transferred credentials committed and lists manual settings',
+  'a failed settings write leaves transferred credentials committed and lists settings to retry',
   async () => {
     const f = await fixture()
     await mkdir(f.target)
@@ -395,6 +400,12 @@ lifetimeTest(
     const screen = f.output.join('\n')
     expect(screen).toContain(
       core.SETTINGS_WRITE_FAILURES['settings-unavailable'].text(f.target),
+    )
+    expect(screen).toContain(
+      'Accounts were moved, but these settings were not saved:',
+    )
+    expect(screen).toContain(
+      'Run the same setup command again to finish; nothing needs to be set by hand.',
     )
     for (const key of keys) expect(screen).toContain(key)
   },
