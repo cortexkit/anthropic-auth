@@ -481,6 +481,9 @@ class SharedSettingsService {
   private readonly unwatch: () => void
   private readonly listeners = new Set<SettingsChangeListener>()
   private readonly fileListeners = new Set<() => void>()
+  private readonly readingListeners = new Set<
+    (generation: SettingsGeneration) => void
+  >()
   private current: SettingsGeneration | undefined
   private running: Promise<void> | undefined
   private pending = false
@@ -536,6 +539,14 @@ class SharedSettingsService {
     }
   }
 
+  /** A newer reading of an unchanged generation, for applied-copy persistence only. */
+  onReading(listener: (generation: SettingsGeneration) => void) {
+    this.readingListeners.add(listener)
+    return () => {
+      this.readingListeners.delete(listener)
+    }
+  }
+
   private async bytes(): Promise<FileBytes> {
     try {
       return {
@@ -582,7 +593,9 @@ class SharedSettingsService {
   }
 
   private async pass(): Promise<Pass> {
-    const readAt = performance.timeOrigin + performance.now()
+    // Wall-clock time: readings are compared across processes, and the
+    // monotonic clock behind performance.now() can stop during system sleep.
+    const readAt = Date.now()
     const before = await this.bytes()
     let resolved: Awaited<ReturnType<SharedSettingsService['resolveContexts']>>
     let after: FileBytes
@@ -893,8 +906,16 @@ class SharedSettingsService {
             fileStatus: status,
             readAt: undefined,
           })
-      )
+      ) {
+        // Same settings, newer reading: hosts see no change, but the applied
+        // copy must learn the newer reading time, or an older reading of
+        // looser values that another process saves late would win.
+        if (candidate.readAt > prior.readAt) {
+          this.current = freeze({ ...prior, readAt: candidate.readAt })
+          for (const listener of this.readingListeners) listener(this.current)
+        }
         continue
+      }
       const generation = freeze({
         ...candidate,
         fileStatus: status,
@@ -994,6 +1015,7 @@ class SharedSettingsService {
     this.unwatch()
     this.listeners.clear()
     this.fileListeners.clear()
+    this.readingListeners.clear()
     await this.running
   }
 }
@@ -1003,7 +1025,10 @@ class SettingsProtectionLease {
   private current: SettingsGeneration | undefined
   private pending = Promise.resolve()
   private readonly copies = new Set<Promise<void>>()
+  /** The last submitted copy write: its values and reading time. */
   private copied: string | undefined
+  private cancelRetry: (() => void) | undefined
+  private closed = false
 
   constructor(
     private readonly shared: SharedSettingsService,
@@ -1012,18 +1037,25 @@ class SettingsProtectionLease {
   ) {}
 
   async close(): Promise<void> {
+    this.closed = true
+    this.cancelRetry?.()
+    this.cancelRetry = undefined
     await this.pending
     await Promise.all(this.copies)
   }
 
   private persist(generation: SettingsGeneration) {
     const host = this.options?.host
-    if (!host) return
+    if (!host || this.closed) return
     const set = generation.protection[host]
     if (!set.usable || set.rung !== 0) return
-    const identity = JSON.stringify(set.values)
+    // A newer reading of the same values is still submitted: the copy keeps
+    // whichever reading is newest, across processes.
+    const identity = JSON.stringify([generation.readAt, set.values])
     if (identity === this.copied) return
     this.copied = identity
+    this.cancelRetry?.()
+    this.cancelRetry = undefined
     const write =
       this.options?.dependencies?.writeAppliedCopy ??
       writeSettingsProtectionCopy
@@ -1038,15 +1070,47 @@ class SettingsProtectionLease {
       )
       .catch(() => {
         const key = `copy:${generation.file}:${host}`
-        if (logged.has(key)) return
-        logged.add(key)
-        logger.warn(
-          'settings',
-          `Could not save applied protection settings for ${host} at "${generation.file}.applied.json"; the previous copy is unchanged.`,
-        )
+        if (!logged.has(key)) {
+          logged.add(key)
+          logger.warn(
+            'settings',
+            `Could not save applied protection settings for ${host} at "${generation.file}.applied.json"; the previous copy is unchanged until a retry succeeds.`,
+          )
+        }
+        // Not done: the next generation or a retry within a minute submits again.
+        if (this.copied === identity) {
+          this.copied = undefined
+          this.scheduleRetry()
+        }
       })
       .finally(() => this.copies.delete(task))
     this.copies.add(task)
+  }
+
+  /** Retry a failed copy write off the request path, with the newest applied generation. */
+  private scheduleRetry() {
+    if (this.closed || this.cancelRetry) return
+    const schedule =
+      this.options?.dependencies?.schedule ??
+      ((callback: () => void, delayMs: number) => {
+        const timer = setTimeout(callback, delayMs)
+        timer.unref?.()
+        return () => clearTimeout(timer)
+      })
+    this.cancelRetry = schedule(() => {
+      this.cancelRetry = undefined
+      if (this.current) this.persist(this.current)
+    }, 60_000)
+  }
+
+  /** The shared file was read again with no change; carry the newer reading time. */
+  reread(generation: SettingsGeneration): Promise<void> {
+    this.pending = this.pending.then(() => {
+      if (!this.current || this.current.id !== generation.id) return
+      this.current = freeze({ ...this.current, readAt: generation.readAt })
+      this.persist(this.current)
+    })
+    return this.pending
   }
 
   snapshot(): SettingsGeneration {
@@ -1213,6 +1277,9 @@ export async function openSettingsService(
   const unsubscribeLease = owned.watch((generation) =>
     lease.publish(generation),
   )
+  const unsubscribeReading = owned.onReading((generation) => {
+    void lease.reread(generation)
+  })
   const use = () => {
     if (closed) throw new Error('Settings service lease is disposed')
     return owned
@@ -1221,6 +1288,7 @@ export async function openSettingsService(
     if (closed) return closing ?? Promise.resolve()
     closed = true
     unsubscribeLease()
+    unsubscribeReading()
     for (const unsubscribe of subscriptions) unsubscribe()
     subscriptions.clear()
     if (--owned.users === 0) {

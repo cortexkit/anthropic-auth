@@ -132,7 +132,7 @@ for (const name of ['settings.jsonc', 'custom-target.jsonc']) {
   })
 }
 
-test('only changed rung-0 protection values schedule a copy', async () => {
+test('every newer rung-0 reading schedules a copy, including unchanged protection values', async () => {
   const f = await fixture()
   const entries: number[] = []
   const service = await f.open('pi', {
@@ -153,8 +153,11 @@ test('only changed rung-0 protection values schedule a copy', async () => {
   await writeFile(f.file, '{broken')
   await service.refresh()
   await service.dispose()
-  expect(entries).toHaveLength(2)
+  // The unrelated dump change is a newer reading of the same protection; it
+  // is submitted so a late, older reading from another process can't win.
+  expect(entries).toHaveLength(3)
   expect(entries[1]!).toBeGreaterThan(entries[0]!)
+  expect(entries[2]!).toBeGreaterThan(entries[1]!)
   expect(
     (await readSettingsProtectionCopy(f.file, 'pi'))
       ?.killswitch_default_five_hour,
@@ -254,6 +257,122 @@ test('two same-host processes committing delayed writes out of read order keep t
   const restart = await f.open()
   expect(restart.resolve('pi').killswitch_default_five_hour).toBe(84)
   expect(restart.snapshot().protection.pi.rung).toBe(1)
+})
+
+for (const reread of ['unrelated-change', 'same-bytes'] as const) {
+  test(`a delayed weaker copy from another process loses to a newer reading of stricter values: ${reread}`, async () => {
+    const weaker = {
+      ...complete,
+      killswitch_enabled: false,
+      killswitch_default_five_hour: 2,
+    }
+    const f = await fixture()
+    let written = gate()
+    const a = await f.open('pi', {
+      dependencies: {
+        writeAppliedCopy: async (...args) => {
+          await writeSettingsProtectionCopy(...args)
+          written.open()
+        },
+      },
+    })
+    await written.promise
+    // Process B reads the weaker file and stalls before saving its copy.
+    await writeFile(f.file, JSON.stringify(weaker))
+    const b = child(f.file, 'pi', true)
+    const reader = b.stdout.getReader()
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+      'read',
+    )
+    reader.releaseLock()
+    // A never sees the weaker version; it reads the stricter values again.
+    written = gate()
+    await writeFile(
+      f.file,
+      JSON.stringify(
+        reread === 'unrelated-change'
+          ? { ...complete, dump_enabled: true }
+          : complete,
+      ),
+    )
+    await a.refresh()
+    // A submits the newer reading; give it a bounded wait so a missing write
+    // fails on the recovered values below rather than on a timeout.
+    await Promise.race([
+      written.promise,
+      new Promise((resolve) => setTimeout(resolve, 1_000)),
+    ])
+    b.stdin.write('continue\n')
+    b.stdin.end()
+    await finished(b)
+    await a.dispose()
+    await writeFile(f.file, '{broken')
+    const restart = await f.open()
+    expect(restart.snapshot().protection.pi.rung).toBe(1)
+    expect(restart.resolve('pi')).toMatchObject({
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 21,
+    })
+  })
+}
+
+test('a failed copy write is retried off the request path and logged once', async () => {
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => {
+    if (record.channel === 'settings') records.push(record)
+  })
+  const f = await fixture()
+  const retries: {
+    callback: () => void
+    delayMs: number
+    cancelled: boolean
+  }[] = []
+  const pending = () => retries.filter((retry) => !retry.cancelled)
+  let failing = true
+  let attempts = 0
+  const service = await f.open('pi', {
+    dependencies: {
+      schedule: (callback, delayMs) => {
+        const retry = { callback, delayMs, cancelled: false }
+        retries.push(retry)
+        return () => {
+          retry.cancelled = true
+        }
+      },
+      writeAppliedCopy: async (...args) => {
+        attempts++
+        if (failing) throw new Error('transient copy failure')
+        await writeSettingsProtectionCopy(...args)
+      },
+    },
+  })
+  const settle = async (count: number) => {
+    for (let i = 0; i < 100 && attempts < count; i++)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const retry = async () => {
+    const [next, ...rest] = pending()
+    expect(rest).toEqual([])
+    expect(next?.delayMs).toBe(60_000)
+    next!.cancelled = true
+    const before = attempts
+    next!.callback()
+    await settle(before + 1)
+  }
+  await settle(1)
+  await retry()
+  expect(await Bun.file(`${f.file}.applied.json`).exists()).toBe(false)
+  failing = false
+  await retry()
+  expect(pending()).toEqual([])
+  await service.dispose()
+  expect(await readSettingsProtectionCopy(f.file, 'pi')).toEqual(complete)
+  expect(
+    records.filter((record) =>
+      record.message.includes('Could not save applied protection'),
+    ),
+  ).toHaveLength(1)
 })
 
 for (const order of ['opencode-first', 'pi-first', 'concurrent'] as const) {
@@ -663,7 +782,7 @@ test('an atomic copy write failure logs once and keeps the previous copy byte-id
     await running.dispose()
     expect(await readFile(`${f.file}.applied.json`, 'utf8')).toBe(before)
     expect(records.map((record) => record.message)).toEqual([
-      `Could not save applied protection settings for pi at "${f.file}.applied.json"; the previous copy is unchanged.`,
+      `Could not save applied protection settings for pi at "${f.file}.applied.json"; the previous copy is unchanged until a retry succeeds.`,
     ])
   } finally {
     rename.mockRestore()
