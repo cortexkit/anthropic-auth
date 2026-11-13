@@ -234,11 +234,13 @@ export function createNativeRuntimeSettings(
      * Called under the legacy store's locks by a write that chose the legacy
      * store: true when the user file became authoritative meanwhile (a move
      * published while the write waited for those locks), so the write must
-     * leave the legacy store alone and go to the user file instead.
+     * leave the legacy store alone and go to the user file instead. A watch,
+     * the timer or another action may already have adopted the file while
+     * the write waited; that counts as lost too.
      */
     async legacyAuthorityLost() {
-      if (!service || userAuthority || options.settingsMode?.() === 'separate')
-        return false
+      if (!service || options.settingsMode?.() === 'separate') return false
+      if (userAuthority) return true
       return (
         (await resolveSettingsMode(
           { target: service.file, separate: false },

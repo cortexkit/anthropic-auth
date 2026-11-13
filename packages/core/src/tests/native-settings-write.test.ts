@@ -1530,6 +1530,109 @@ for (const first of ['writer', 'move'] as const) {
   })
 }
 
+test('a legacy write waiting behind the mover redirects to the file when the timer adopted it meanwhile', async () => {
+  const ticks: (() => Promise<void>)[] = []
+  const paused = deferred()
+  const release = deferred()
+  const linked = deferred()
+  const unlink = deferred()
+  const checked = deferred()
+  let writing = false
+  const f = await fixture(null, {
+    mode: 'legacy',
+    legacy: { dump: { enabled: false } },
+    settingsAuthority: {
+      schedule: (callback) => {
+        ticks.push(callback)
+        return () => {}
+      },
+      options: {
+        fs: {
+          exists: async (path) => {
+            const { lstat } = await import('node:fs/promises')
+            const present = await lstat(path).then(
+              () => true,
+              (error) => {
+                if (error.code === 'ENOENT') return false
+                throw error
+              },
+            )
+            if (writing && path.endsWith('.moved')) checked.resolve()
+            return present
+          },
+        },
+      },
+    },
+  })
+  const { moveSettingsOnce } = await import('@cortexkit/common-auth/settings')
+  const { createSettingsMoveSource } = await import(
+    '../settings-move-source.ts'
+  )
+  const { mapSettingsMoveSources } = await import('../settings-move-map.ts')
+  const { nativePoolStoreLocks } = await import('../pool-store.ts')
+  const settingsUrl = import.meta.resolve('@cortexkit/common-auth/settings')
+  const { setSettingsMoveStepHookForTest } = await import(
+    new URL('move.js', settingsUrl).href
+  )
+  const { setSettingsFsForTest } = await import(
+    new URL('fs.js', settingsUrl).href
+  )
+  const { link } = await import('node:fs/promises')
+  cleanup.push(() => {
+    setSettingsMoveStepHookForTest()
+    setSettingsFsForTest({})
+  })
+  setSettingsMoveStepHookForTest(async (step: string) => {
+    if (step !== 'before-publish') return
+    paused.resolve()
+    await release.promise
+  })
+  // Hold the mover just after it publishes, while it still holds the store
+  // locks the waiting writer needs.
+  setSettingsFsForTest({
+    link: async (from: string, to: string) => {
+      await link(from, to)
+      if (to !== f.file) return
+      linked.resolve()
+      await unlink.promise
+    },
+  })
+  const mover = moveSettingsOnce({
+    definition: settingsDefinition,
+    target: f.file,
+    separateInstall: false,
+    sources: [
+      createSettingsMoveSource({
+        host: 'opencode',
+        path: f.paths.config,
+        locks: [...nativePoolStoreLocks(f.paths)],
+      }),
+    ],
+    map: mapSettingsMoveSources,
+    fence: async () => true,
+    log: { info: () => {}, warn: () => {} },
+  })
+  await paused.promise
+  writing = true
+  // The writer finds legacy mode and then waits for the mover's store locks.
+  const writer = f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  await checked.promise
+  release.resolve()
+  await linked.promise
+  // The 60 s timer adopts the published file before the writer gets the locks.
+  expect(f.runtime.getSettingsStatus?.()).toBeUndefined()
+  for (let tick = 0; tick < 20 && !f.runtime.getSettingsStatus?.(); tick++)
+    await ticks.at(-1)!()
+  expect(f.runtime.getSettingsStatus?.()).toBeDefined()
+  unlink.resolve()
+  expect((await mover).outcome).toBe('moved')
+  expect((await writer).outcome).toBe('saved')
+  expect(parse(await f.text()).dump_enabled).toBe(true)
+  expect((await f.saved()).dump).toEqual({ enabled: false })
+})
+
 test('every user-file watch callback checks authority even without a new resolved generation', async () => {
   let probes = 0
   let marked = false
