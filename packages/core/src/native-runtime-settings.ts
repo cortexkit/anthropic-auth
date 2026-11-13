@@ -182,9 +182,12 @@ export function createNativeRuntimeSettings(
     void recheck().catch(() => {})
   })
   scheduleCheck()
-  const ready = recheck()
-  // Hosts await prepareAction; retain a rejection handler until startup does so.
-  void ready.catch(() => {})
+  let ready = recheck()
+  // A failed startup probe must not fail every later menu action: replace it
+  // so the next action probes again (its own recheck reports a new failure).
+  void ready.catch(() => {
+    ready = Promise.resolve()
+  })
   return {
     resolve,
     status,

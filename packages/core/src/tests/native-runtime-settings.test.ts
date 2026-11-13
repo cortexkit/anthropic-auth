@@ -142,6 +142,34 @@ test('legacy, separate, and absent-service readers preserve the exact legacy rec
   expect(legacy.resolve(storage)).toEqual(storage)
 })
 
+test('a failed startup authority probe does not fail later menu actions', async () => {
+  const f = await fixture({ dump_enabled: true })
+  let failures = 1
+  const reader = createNativeRuntimeSettings({
+    host: 'opencode',
+    settingsService: f.service,
+    settingsMode: () => 'legacy',
+    settingsAuthority: {
+      options: {
+        fs: {
+          exists: async () => {
+            if (failures-- > 0)
+              throw Object.assign(new Error('probe failed'), { code: 'EIO' })
+            return true
+          },
+        },
+      },
+      schedule: () => () => {},
+    },
+  })
+  cleanup.push(reader.close)
+  // Let the startup probe fail and settle.
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  await reader.prepareAction()
+  expect(await reader.prepareWrite()).toBeDefined()
+  expect(reader.status()?.values.dump_enabled).toBe(true)
+})
+
 test('/claude status has all no-model values and every explicit model row override, including equal values', async () => {
   const f = await fixture({
     ...overrides,

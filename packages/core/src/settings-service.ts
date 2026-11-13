@@ -735,8 +735,31 @@ class SharedSettingsService {
           : report.some((entry) => entry.reason === 'unreadable')
             ? 'unreadable'
             : 'ready'
+    // common-auth reads an empty or whitespace-only file, and one from a newer
+    // or invalid schema version, with no report on any protection key. Such a
+    // file (a truncated save, a downgrade) holds no protection the user
+    // chose, so its schema defaults must never replace a known set.
+    const version = raw.schema_version
+    const untrustedFile =
+      (source !== undefined &&
+        /^[\x20\t\r\n]*$/.test(source.replace(/^\uFEFF/, ''))) ||
+      (typeof version === 'number' &&
+        Number.isInteger(version) &&
+        version > 1) ||
+      report.some((entry) => entry.reason === 'invalid-schema-version')
+    if (untrustedFile && status === 'ready') {
+      const identity = `untrusted:${this.file}`
+      if (!logged.has(identity)) {
+        logged.add(identity)
+        logger.warn(
+          'settings',
+          `Settings file "${this.file}" is empty or from another settings version; protection settings keep their last known values.`,
+        )
+      }
+    }
     const usable =
       status === 'ready' &&
+      !untrustedFile &&
       !report.some((entry) =>
         SETTINGS_PROTECTION_KEYS.some((key) => key === entry.keyPath[0]),
       )

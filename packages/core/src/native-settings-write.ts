@@ -6,6 +6,7 @@ import {
   invalidSettingsWriteText,
   malformedSettingsText,
   refusedSettingsWriteText,
+  SETTINGS_WRITE_FAILURES,
   type SettingsKey,
 } from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
@@ -229,6 +230,18 @@ export function planNativeSettingsWrite(
       generation.fileStatus.duplicateKeys.length)
   ) {
     plan.refusal = malformedSettingsText(generation.file)
+    return plan
+  }
+  // An unreadable file has no source text and possibly stale levels: a floor
+  // list or a removal planned from it could drop entries the file still holds.
+  if (
+    present &&
+    generation.status === 'unreadable' &&
+    (accounts.length || edits.some((edit) => edit.remove))
+  ) {
+    plan.refusal = SETTINGS_WRITE_FAILURES['settings-unavailable'].text(
+      generation.file,
+    )
     return plan
   }
   for (const [index, edit] of [...edits.entries()].reverse()) {

@@ -18,6 +18,7 @@ import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import type { NativeRuntimeSettingsOptions } from '../native-runtime-settings.ts'
 import { nativeCacheKeepAlways } from '../native-settings.ts'
+import { planNativeSettingsWrite } from '../native-settings-write.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import {
@@ -1564,4 +1565,52 @@ test('every user-file watch callback checks authority even without a new resolve
   expect(cancelled).toBe(1)
   await f.runtime.close()
   expect(cancelled).toBe(1)
+})
+
+test('an unreadable file refuses floor edits and removals instead of planning from an empty list', async () => {
+  const f = await fixture(
+    JSON.stringify({
+      dump_enabled: true,
+      killswitch_account_floors: [
+        { account: 'kept', host: 'pi', five_hour: 9, seven_day: 9, scoped: 0 },
+      ],
+    }),
+  )
+  // The file is present, but the latest read could not get its text.
+  const generation = {
+    ...f.service.snapshot(),
+    status: 'unreadable' as const,
+    source: undefined,
+  }
+  const unavailable = SETTINGS_WRITE_FAILURES['settings-unavailable'].text(
+    f.file,
+  )
+  expect(
+    planNativeSettingsWrite(
+      {},
+      { killswitch: { accounts: { new: { five_hour: 3, seven_day: 4 } } } },
+      generation,
+      'opencode',
+    ).refusal,
+  ).toBe(unavailable)
+  expect(
+    planNativeSettingsWrite(
+      { dump: { enabled: true } },
+      {},
+      generation,
+      'opencode',
+    ).refusal,
+  ).toBe(unavailable)
+  // A plain value is still written; common-auth re-reads the file under its lock.
+  expect(
+    planNativeSettingsWrite(
+      { dump: { enabled: false } },
+      { dump: { enabled: true } },
+      generation,
+      'opencode',
+    ),
+  ).toMatchObject({
+    refusal: undefined,
+    edits: [{ setting: 'dump_enabled', value: true }],
+  })
 })

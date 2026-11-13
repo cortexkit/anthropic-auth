@@ -1280,3 +1280,40 @@ test('retained references own their watches and keep the resolved protection lea
   expect(f.counts.stops).toBe(1)
   expect(() => retained.snapshot()).toThrow('disposed')
 })
+
+for (const source of [
+  '',
+  '  \n\t',
+  '\uFEFF',
+  '{"schema_version":2,"killswitch_enabled":false}',
+  '{"schema_version":"x","killswitch_enabled":false}',
+]) {
+  test(`an empty or other-version file never counts as usable protection: ${JSON.stringify(source)}`, async () => {
+    const f = await fixture(source)
+    const service = await f.open({
+      protection: { readLegacyProtection: async () => distinctProtection },
+    })
+    for (const host of ['opencode', 'pi'] as const) {
+      expect(service.snapshot().protection[host]).toMatchObject({
+        usable: false,
+        rung: 2,
+      })
+      expect(service.resolve(host).killswitch_enabled).toBe(true)
+    }
+  })
+}
+
+test('a file truncated while running keeps the last-good protection, never the schema default', async () => {
+  const f = await fixture(
+    '{"killswitch_enabled":true,"killswitch_default_five_hour":44}',
+  )
+  const service = await f.open()
+  expect(service.snapshot().protection.pi.rung).toBe(0)
+  await writeFile(f.file, '')
+  await service.refresh()
+  expect(service.snapshot().protection.pi.rung).toBe(1)
+  expect(service.resolve('pi')).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 44,
+  })
+})
