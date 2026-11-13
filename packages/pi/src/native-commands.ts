@@ -26,6 +26,7 @@ import {
   isVaultHosted,
   type NativeMenuDispatch,
   type NativeMenuKillswitchEntry,
+  type NativeSettingsWriteResult,
   nativeAccountCanServe,
   setDumpEnabled,
   VAULT_HOST_CONNECT_REFUSAL,
@@ -50,14 +51,18 @@ export function createPiNativeCommands(
     string,
     { authorization: Awaited<ReturnType<typeof authorize>>; expires: number }
   >()
+  const written = (result: NativeSettingsWriteResult, text: string) =>
+    result.outcome === 'refused' || result.outcome === 'failed'
+      ? { ok: false, text: result.reason }
+      : { ok: true, text }
   const setSection = async (key: string, patch: Record<string, unknown>) => {
-    await (await native.service()).updateSettings((settings) =>
+    return (await native.service()).updateSettings((settings) =>
       mergeNativeSettingsSection(settings, key, patch),
     )
   }
   const setLimits = async (entries: readonly NativeMenuKillswitchEntry[]) => {
     const snapshot = await native.view()
-    await (await native.service()).updateSettings((settings) => {
+    return (await native.service()).updateSettings((settings) => {
       const limits = record(settings.killswitch)
       let accounts = { ...record(limits.accounts) }
       let main = limits.main
@@ -65,7 +70,7 @@ export function createPiNativeCommands(
         const threshold = {
           five_hour: entry.fh,
           seven_day: entry.sd,
-          ...(entry.scoped !== undefined && { scoped: entry.scoped }),
+          scoped: entry.scoped ?? 0,
         }
         if (entry.account === 'main' || entry.account === 'all')
           main = threshold
@@ -241,13 +246,17 @@ export function createPiNativeCommands(
         return { ok: true, text: 'Native OAuth quota and profile refreshed.' }
       }
       case 'routing-mode':
-        await setSection('routing', { mode: request.values.mode })
-        return { ok: true, text: 'Native routing mode updated.' }
+        return written(
+          await setSection('routing', { mode: request.values.mode }),
+          'Native routing mode updated.',
+        )
       case 'routing-max-same-account-wait':
-        await setSection('routing', {
-          maxSameAccountWait: request.values.maxSameAccountWait,
-        })
-        return { ok: true, text: 'Longest wait on the same account updated.' }
+        return written(
+          await setSection('routing', {
+            maxSameAccountWait: request.values.maxSameAccountWait,
+          }),
+          'Longest wait on the same account updated.',
+        )
       case 'routing-reset':
         await clearPiStickyRoutingSession(storagePath, request.sessionId)
         return {
@@ -255,74 +264,105 @@ export function createPiNativeCommands(
           text: 'This session’s sticky assignment was cleared.',
         }
       case 'killswitch-on':
-        await runtime.updateSettings((settings) => {
-          const limits = record(settings.killswitch)
-          return {
-            ...settings,
-            killswitch: {
-              ...limits,
-              enabled: true,
-              main: limits.main ?? { ...DEFAULT_KILLSWITCH_THRESHOLDS },
-            },
-          }
-        })
-        return { ok: true, text: 'Native killswitch enabled.' }
+        return written(
+          await runtime.updateSettings((settings) => {
+            const limits = record(settings.killswitch)
+            return {
+              ...settings,
+              killswitch: {
+                ...limits,
+                enabled: true,
+                main: limits.main ?? { ...DEFAULT_KILLSWITCH_THRESHOLDS },
+              },
+            }
+          }),
+          'Native killswitch enabled.',
+        )
       case 'killswitch-off':
-        await setSection('killswitch', { enabled: false })
-        return { ok: true, text: 'Native killswitch disabled.' }
+        return written(
+          await setSection('killswitch', { enabled: false }),
+          'Native killswitch disabled.',
+        )
       case 'killswitch-set':
-        await setLimits(request.values.entries)
-        return { ok: true, text: 'Native killswitch thresholds updated.' }
+        return written(
+          await setLimits(request.values.entries),
+          'Native killswitch thresholds updated.',
+        )
       case 'cache-on':
       case 'cache-off':
-        await setSection('claudeCache', {
-          enabled: request.action === 'cache-on',
-        })
-        return { ok: true, text: 'Native prompt cache setting updated.' }
+        return written(
+          await setSection('claudeCache', {
+            enabled: request.action === 'cache-on',
+          }),
+          'Native prompt cache setting updated.',
+        )
       case 'cache-mode':
-        await setSection('claudeCache', { mode: request.values.mode })
-        return { ok: true, text: 'Native prompt cache mode updated.' }
+        return written(
+          await setSection('claudeCache', { mode: request.values.mode }),
+          'Native prompt cache mode updated.',
+        )
       case 'cachekeep-always':
-        await runtime.updateSettings(nativeCacheKeepAlways)
-        return { ok: true, text: 'Native CacheKeep is always enabled.' }
+        return written(
+          await runtime.updateSettings(nativeCacheKeepAlways),
+          'Native CacheKeep is always enabled.',
+        )
       case 'cachekeep-off':
-        await setSection('cacheKeep', { enabled: false })
-        return { ok: true, text: 'Native CacheKeep disabled.' }
+        return written(
+          await setSection('cacheKeep', { enabled: false }),
+          'Native CacheKeep disabled.',
+        )
       case 'cachekeep-window':
-        await setSection('cacheKeep', {
-          enabled: true,
-          always: false,
-          startHour: request.values.startHour,
-          endHour: request.values.endHour,
-        })
-        return { ok: true, text: 'Native CacheKeep local time window updated.' }
+        return written(
+          await setSection('cacheKeep', {
+            enabled: true,
+            always: false,
+            startHour: request.values.startHour,
+            endHour: request.values.endHour,
+          }),
+          'Native CacheKeep local time window updated.',
+        )
       case 'cachekeep-subagents':
-        await setSection('cacheKeep', {
-          subagents: request.values.enabled === 'on',
-        })
-        return { ok: true, text: 'Native CacheKeep subagent setting updated.' }
+        return written(
+          await setSection('cacheKeep', {
+            subagents: request.values.enabled === 'on',
+          }),
+          'Native CacheKeep subagent setting updated.',
+        )
       case 'dump-on':
       case 'dump-off': {
         const enabled = request.action === 'dump-on'
-        await setSection('dump', { enabled })
+        const result = written(
+          await setSection('dump', { enabled }),
+          'Native request dumping setting updated.',
+        )
+        if (!result.ok) return result
         setDumpEnabled(enabled)
-        return { ok: true, text: 'Native request dumping setting updated.' }
+        return result
       }
       case 'logging-level':
         // The native runtime stores the level and applies it to the logger.
-        await runtime.setLoggingLevel(request.values.level)
-        return { ok: true, text: 'Native logging level updated.' }
+        return written(
+          await runtime.setLoggingLevel(request.values.level),
+          'Native logging level updated.',
+        )
       case 'fast-on':
       case 'fast-off':
-        await setSection('claudeFast', {
-          enabled: request.action === 'fast-on',
-        })
-        return { ok: true, text: 'Native fast mode setting updated.' }
+        return written(
+          await setSection('claudeFast', {
+            enabled: request.action === 'fast-on',
+          }),
+          'Native fast mode setting updated.',
+        )
       case 'prime-on':
-      case 'prime-off':
-        await setSection('prime', { enabled: request.action === 'prime-on' })
+      case 'prime-off': {
+        const result = written(
+          await setSection('prime', { enabled: request.action === 'prime-on' }),
+          'Native Prime setting updated.',
+        )
+        if (!result.ok) return result
         native.prime?.settingsChanged()
-        return { ok: true, text: 'Native Prime setting updated.' }
+        return result
+      }
       case 'start-fire':
         return {
           ok: false,
@@ -341,9 +381,43 @@ export function createPiNativeCommands(
       const runtime = await native.service()
       await runtime.prepareSettingsAction?.()
       const snapshot = await runtime.read()
-      if (snapshot.mode === 'claustrum' && !(await runtime.vault.read()))
+      if (
+        (command === 'account' || command === 'quota') &&
+        snapshot.mode === 'claustrum' &&
+        !(await runtime.vault.read())
+      )
         return 'Claustrum roster is unavailable; no verified account view has been discovered.'
       const storage = snapshot.policyStorage
+      const settingsStatus = (summary: string) => {
+        const status = runtime.getSettingsStatus?.()
+        if (!status) return summary
+        const { file } = status
+        return [
+          summary,
+          `Settings file: ${file.file}`,
+          ...(file.missing
+            ? ['Settings file is missing; a menu write will recreate it.']
+            : [`Settings file state: ${file.state}`]),
+          ...(file.recreated
+            ? ['Settings file was recreated by a menu write.']
+            : []),
+          ...file.invalidKeys.map((key) => `Invalid setting: ${key}`),
+          ...file.ignoredModelKeys.map(
+            ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
+          ),
+          ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
+          'Settings (no model):',
+          ...Object.entries(status.values).map(
+            ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,
+          ),
+          ...Object.entries(status.modelOverrides).flatMap(([key, rows]) =>
+            (rows ?? []).map(
+              ({ model, value }) =>
+                `  ${key} [${model}]: ${JSON.stringify(value)}`,
+            ),
+          ),
+        ].join('\n')
+      }
       switch (command) {
         case 'account':
           return [
@@ -376,52 +450,68 @@ export function createPiNativeCommands(
               })),
           })
         case 'routing':
-          return `Routing: ${getRoutingMode(storage)}\nLongest wait on the same account: ${getMaxSameAccountWait(storage)}`
+          return settingsStatus(
+            `Routing: ${getRoutingMode(storage)}\nLongest wait on the same account: ${getMaxSameAccountWait(storage)}`,
+          )
         case 'killswitch':
-          return `Killswitch: ${isKillswitchEnabled(storage) ? 'enabled' : 'disabled'}\n${JSON.stringify(storage.killswitch ?? {})}`
+          return settingsStatus(
+            `Killswitch: ${isKillswitchEnabled(storage) ? 'enabled' : 'disabled'}\n${JSON.stringify(storage.killswitch ?? {})}`,
+          )
         case 'cache':
-          return [
-            `1-hour cache: ${isCache1hPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}; mode: ${getCache1hPersistentMode(storage)}`,
-            `- Persisted: ${await runtime.getSettingsPath()}`,
-          ].join('\n')
+          return settingsStatus(
+            [
+              `1-hour cache: ${isCache1hPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}; mode: ${getCache1hPersistentMode(storage)}`,
+              `- Persisted: ${await runtime.getSettingsPath()}`,
+            ].join('\n'),
+          )
         case 'cachekeep': {
           const sessions = await getPiTrackedCacheKeepSessions()
-          return executeCacheKeepCommand({
-            argumentsText: '',
-            enabled: isCacheKeepPersistentlyEnabled(storage),
-            always: isCacheKeepAlways(storage),
-            hybridActive: isCacheKeepHybridActive(storage),
-            window: getCacheKeepWindow(storage),
-            trackedSessions: sessions.length,
-            trackedSessionDetails: sessions,
-            nextPrewarmAt: sessions.length
-              ? Math.min(...sessions.map((session) => session.nextPrewarmAt))
-              : undefined,
-          })
+          return settingsStatus(
+            executeCacheKeepCommand({
+              argumentsText: '',
+              enabled: isCacheKeepPersistentlyEnabled(storage),
+              always: isCacheKeepAlways(storage),
+              hybridActive: isCacheKeepHybridActive(storage),
+              window: getCacheKeepWindow(storage),
+              trackedSessions: sessions.length,
+              trackedSessionDetails: sessions,
+              nextPrewarmAt: sessions.length
+                ? Math.min(...sessions.map((session) => session.nextPrewarmAt))
+                : undefined,
+            }),
+          )
         }
         case 'dump':
-          return [
-            `Request dumping: ${isDumpPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`,
-            `- Persisted: ${await runtime.getSettingsPath()}`,
-          ].join('\n')
+          return settingsStatus(
+            [
+              `Request dumping: ${isDumpPersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`,
+              `- Persisted: ${await runtime.getSettingsPath()}`,
+            ].join('\n'),
+          )
         case 'logging':
-          return [
-            `Logging: ${getPersistedLogLevel(storage) ?? 'info'}`,
-            `- Persisted: ${await runtime.getSettingsPath()}`,
-          ].join('\n')
+          return settingsStatus(
+            [
+              `Logging: ${getPersistedLogLevel(storage) ?? 'info'}`,
+              `- Persisted: ${await runtime.getSettingsPath()}`,
+            ].join('\n'),
+          )
         case 'fast':
-          return [
-            `Fast mode: ${isFastModePersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`,
-            `- Persisted: ${await runtime.getSettingsPath()}`,
-          ].join('\n')
+          return settingsStatus(
+            [
+              `Fast mode: ${isFastModePersistentlyEnabled(storage) ? 'enabled' : 'disabled'}`,
+              `- Persisted: ${await runtime.getSettingsPath()}`,
+            ].join('\n'),
+          )
         case 'prime':
-          return executePrimeCommand({
-            argumentsText: 'status',
-            enabled: isPrimePersistentlyEnabled(storage),
-            accounts:
-              native.prime?.manager.stats(storage) ??
-              buildPrimeAccountStatuses(storage, { now: Date.now() }),
-          }).text
+          return settingsStatus(
+            executePrimeCommand({
+              argumentsText: 'status',
+              enabled: isPrimePersistentlyEnabled(storage),
+              accounts:
+                native.prime?.manager.stats(storage) ??
+                buildPrimeAccountStatuses(storage, { now: Date.now() }),
+            }).text,
+          )
       }
     },
   }
