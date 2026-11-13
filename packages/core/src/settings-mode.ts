@@ -1,5 +1,6 @@
 import { lstat, mkdir } from 'node:fs/promises'
 
+import { anthropicAuthRelease } from './holder-registry.ts'
 import {
   ensureWindowsOwnerOnlyDirectory,
   type OwnerOnlyOptions,
@@ -9,7 +10,7 @@ import {
   resolvePathOptions,
 } from './path-options.ts'
 import { canonicalPath } from './pool-paths.ts'
-import type { SettingsPaths } from './settings-paths.ts'
+import type { SettingsHost, SettingsPaths } from './settings-paths.ts'
 import { writeOwnerOnlyExclusive } from './state-layout-io.ts'
 
 export type SettingsMode = 'separate' | 'user-file' | 'legacy'
@@ -53,13 +54,72 @@ export async function writeSettingsMoveMarker(
 ): Promise<void> {
   if (await hasSettingsMoveMarker(target, options)) return
   const context = resolvePathOptions(options)
-  const bytes = Buffer.from(
-    `${JSON.stringify({
+  await writeSettingsRecord(
+    target,
+    `${target}.moved`,
+    {
       version: 1,
       target: await canonicalPath(target, context),
       at: (options.now ?? Date.now)(),
-    })}\n`,
+    },
+    options,
   )
+}
+
+/** Where `host` records that its legacy store's protection is in the file. */
+export function settingsImportRecordPath(
+  target: string,
+  host: SettingsHost,
+): string {
+  return `${target}.moved.${host}`
+}
+
+/**
+ * Whether `host`'s legacy store was imported into the file, or proved to
+ * hold nothing the file lacks. It confers no authority: only the file or
+ * its `.moved` marker decide which source is in charge.
+ */
+export function hasSettingsImportRecord(
+  target: string,
+  host: SettingsHost,
+  options: SettingsModeOptions = {},
+): Promise<boolean> {
+  return (options.fs?.exists ?? exists)(settingsImportRecordPath(target, host))
+}
+
+/**
+ * Record once that `host`'s store was imported. Write it only after the
+ * import completed (or proved there was nothing to import), never before
+ * the file is published. It holds no settings values.
+ */
+export async function writeSettingsImportRecord(
+  target: string,
+  host: SettingsHost,
+  options: SettingsModeOptions = {},
+): Promise<void> {
+  if (await hasSettingsImportRecord(target, host, options)) return
+  await writeSettingsRecord(
+    target,
+    settingsImportRecordPath(target, host),
+    {
+      version: 1,
+      host,
+      release: anthropicAuthRelease(),
+      at: (options.now ?? Date.now)(),
+    },
+    options,
+  )
+}
+
+/** Write a small owner-only record beside the settings file, exactly once. */
+async function writeSettingsRecord(
+  target: string,
+  path: string,
+  record: Record<string, unknown>,
+  options: SettingsModeOptions,
+): Promise<void> {
+  const context = resolvePathOptions(options)
+  const bytes = Buffer.from(`${JSON.stringify(record)}\n`)
   const parent = context.paths.dirname(target)
   if (options.fs?.mkdir) await options.fs.mkdir(parent)
   // An existing folder is left as it is: %APPDATA%\cortexkit is shared with
@@ -75,19 +135,13 @@ export async function writeSettingsMoveMarker(
   )
     await mkdir(parent, { recursive: true, mode: 0o700 })
   try {
-    if (options.fs?.writeMarker)
-      await options.fs.writeMarker(`${target}.moved`, bytes)
+    if (options.fs?.writeMarker) await options.fs.writeMarker(path, bytes)
     else
-      await writeOwnerOnlyExclusive(
-        `${target}.moved`,
-        bytes,
-        context.platform,
-        {
-          ownership: options.ownership,
-        },
-      )
+      await writeOwnerOnlyExclusive(path, bytes, context.platform, {
+        ownership: options.ownership,
+      })
   } catch (error) {
-    // A concurrent start may have published the same target's marker first.
+    // A concurrent start may have published the same record first.
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
   }
 }

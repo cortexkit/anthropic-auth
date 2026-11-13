@@ -14,11 +14,14 @@ import {
   settingsNotImportedText,
 } from './settings-authority.ts'
 import { settingsDefinition } from './settings-definition.ts'
+import { planSettingsHostImport } from './settings-host-import.ts'
 import {
+  hasSettingsImportRecord,
   hasSettingsMoveMarker,
   resolveSettingsMode,
   type SettingsMode,
   type SettingsModeOptions,
+  writeSettingsImportRecord,
   writeSettingsMoveMarker,
 } from './settings-mode.ts'
 import {
@@ -30,10 +33,17 @@ import { mapSettingsMoveSources } from './settings-move-map.ts'
 import { readSettingsMoveSource } from './settings-move-source.ts'
 import {
   prepareSettingsMoveSources,
+  readOwnLegacySettingsProtection,
   type SettingsMoveSourcesOptions,
 } from './settings-move-sources.ts'
 import { resolveSettingsPaths, type SettingsPaths } from './settings-paths.ts'
-import { openSettingsService } from './settings-service.ts'
+import {
+  openSettingsService,
+  SETTINGS_PROTECTION_KEYS,
+  type SettingsGeneration,
+  type SettingsProtectionValues,
+  type SettingsService,
+} from './settings-service.ts'
 
 export interface SettingsMoveStartupOptions extends SettingsMoveSourcesOptions {
   fence: Pick<
@@ -52,7 +62,12 @@ export interface SettingsMoveStartupResult {
   mode: SettingsMode
   /** Legacy mode still needs watch callbacks and timer checks for a peer's move. */
   mayOpenService: boolean
-  outcome: MoveOutcome | 'marker-present' | 'source-unavailable'
+  outcome:
+    | MoveOutcome
+    | 'marker-present'
+    | 'source-unavailable'
+    /** The file is in charge, but this host's legacy store protects more. */
+    | 'import-refused'
   move?: MoveResult
 }
 
@@ -84,13 +99,22 @@ export async function runSettingsMoveAtStartup(
   ): SettingsMoveStartupResult => ({
     paths,
     mode,
-    mayOpenService: mode !== 'separate',
+    // A host that refused the file stays legacy until it restarts: a service
+    // would let the runtime's authority checks adopt the file anyway.
+    mayOpenService: mode !== 'separate' && outcome !== 'import-refused',
     outcome,
     ...(move ? { move } : {}),
   })
 
-  if (paths.separate) return result('separate', 'separate-install')
-  if ((await resolveSettingsMode(paths, authority)) === 'user-file') {
+  /**
+   * The file is in charge. Mark a usable hand-made file, check that this
+   * host's legacy store was imported (or holds nothing the file lacks)
+   * before adopting it, and report sources whose settings were not imported.
+   */
+  const startOnFile = async (
+    outcome: SettingsMoveStartupResult['outcome'] | undefined,
+    move?: MoveResult,
+  ): Promise<SettingsMoveStartupResult> => {
     const marked = await hasSettingsMoveMarker(paths.target, authority)
     const service = await openSettingsService({ file: paths.target })
     if (!service) throw new Error('Settings service did not open')
@@ -104,6 +128,8 @@ export async function runSettingsMoveAtStartup(
           warn(`Could not write settings move marker ${paths.target}.moved.`)
         }
       }
+      const refused = await importOwnStore(service, generation)
+      if (refused) return refused
       if (generation.status !== 'missing') {
         const prepared = await prepareSettingsMoveSources({
           ...options,
@@ -138,8 +164,69 @@ export async function runSettingsMoveAtStartup(
     } finally {
       await service.dispose()
     }
-    return result('user-file', marked ? 'marker-present' : 'done-already')
+    return result(
+      'user-file',
+      outcome ?? (marked ? 'marker-present' : 'done-already'),
+      move,
+    )
   }
+
+  /**
+   * A host whose legacy store the file never imported (a move under an
+   * explicit target imports only the mover's store, and a hand-made file
+   * imports none) must not lose protection by adopting it. Returns the
+   * refusal to adopt, or undefined once the file may be used.
+   */
+  const importOwnStore = async (
+    service: SettingsService,
+    generation: SettingsGeneration,
+  ): Promise<SettingsMoveStartupResult | undefined> => {
+    const host = options.host
+    // A missing or unusable file already falls back to protection from this
+    // host's applied copy or legacy store; check again at a later start.
+    if (generation.status !== 'ready' || !generation.protection[host].usable)
+      return undefined
+    if (await hasSettingsImportRecord(paths.target, host, authority))
+      return undefined
+    let legacy: SettingsProtectionValues | undefined
+    try {
+      legacy = await readOwnLegacySettingsProtection({ ...options, paths })
+    } catch {
+      // An unreadable store proves nothing either way; check again next start.
+      return undefined
+    }
+    const resolved = service.resolve(host)
+    const plan = legacy
+      ? planSettingsHostImport({
+          host,
+          legacy,
+          resolved: Object.fromEntries(
+            SETTINGS_PROTECTION_KEYS.map((key) => [key, resolved[key]]),
+          ) as SettingsProtectionValues,
+          fileLevels: generation.fileLevels,
+        })
+      : { keys: [], edits: [] }
+    // common-auth 0.48 cannot write a value at this host's level, so a host
+    // whose store protects more than the file refuses the file for now.
+    // With 0.49 this becomes `service.update(plan.edits, host)` (each edit
+    // names its level), followed by the record below.
+    if (plan.keys.length) {
+      warn(
+        `Settings file ${paths.target} is not used by ${host}: its legacy settings protect more for ${plan.keys.join(', ')}. ${host} keeps its legacy settings; set these for ${host} in the settings file to start using it.`,
+      )
+      return result('legacy', 'import-refused')
+    }
+    try {
+      await writeSettingsImportRecord(paths.target, host, authority)
+    } catch {
+      // Without the record the same check simply runs again next start.
+    }
+    return undefined
+  }
+
+  if (paths.separate) return result('separate', 'separate-install')
+  if ((await resolveSettingsMode(paths, authority)) === 'user-file')
+    return startOnFile(undefined)
 
   // Check before vault initialization, then again under the mover's source locks.
   // Store and account files share a folder, including overridden store paths.
@@ -224,11 +311,28 @@ export async function runSettingsMoveAtStartup(
     } catch {
       warn(`Could not write settings move marker ${paths.target}.moved.`)
     }
+    // Every host whose store this move read now has its settings in the
+    // file (a source with no store had none to import).
+    for (const host of new Set(sources.map((source) => source.host))) {
+      try {
+        await writeSettingsImportRecord(
+          paths.target,
+          host as SettingsMoveStartupOptions['host'],
+          authority,
+        )
+      } catch {
+        // That host checks its store against the file at its next start.
+      }
+    }
     return result('user-file', move.outcome, move)
   }
   if (move.outcome === 'failed' || move.outcome === 'busy')
     warn(
       `Settings move ${move.outcome} for ${paths.target}; keeping legacy settings until the next start.`,
     )
-  return result(await resolveSettingsMode(paths, authority), move.outcome, move)
+  const mode = await resolveSettingsMode(paths, authority)
+  // Another start published the file first: adopt it only after the same
+  // import check as any later start.
+  if (mode === 'user-file') return startOnFile(move.outcome, move)
+  return result(mode, move.outcome, move)
 }

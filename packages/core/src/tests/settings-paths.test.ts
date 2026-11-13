@@ -20,9 +20,11 @@ import {
 import type { PathResolutionOptions } from '../path-options.ts'
 import { canonicalPath } from '../pool-paths.ts'
 import {
+  hasSettingsImportRecord,
   hasSettingsMoveMarker,
   resolveSettingsMode,
   type SettingsModeFs,
+  writeSettingsImportRecord,
   writeSettingsMoveMarker,
 } from '../settings-mode.ts'
 import {
@@ -531,5 +533,9 @@ test.skipIf(process.platform !== 'win32')(
     const target = join(shared, 'anthropic-auth.jsonc')
     await writeSettingsMoveMarker(target)
     expect(await hasSettingsMoveMarker(target)).toBe(true)
+    // A host's import record is written the same way, beside the marker.
+    await writeSettingsImportRecord(target, 'pi')
+    expect(await hasSettingsImportRecord(target, 'pi')).toBe(true)
+    expect(await hasSettingsImportRecord(target, 'opencode')).toBe(false)
   },
 )

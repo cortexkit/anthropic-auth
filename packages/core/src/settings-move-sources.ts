@@ -167,6 +167,48 @@ export async function readPeerLegacySettingsProtection(
   )
 }
 
+/**
+ * Read this host's own legacy protection, through its current custody, to
+ * check whether a settings file it did not move holds it. Vault settings
+ * that were never seeded are read from the local store they would be seeded
+ * from. A store that doesn't exist returns undefined; anything that exists
+ * but can't be read throws. Takes no locks and writes nothing.
+ */
+export async function readOwnLegacySettingsProtection(
+  options: SettingsMoveSourcesOptions,
+): Promise<SettingsProtectionValues | undefined> {
+  const paths =
+    options.paths ?? (await resolveSettingsPaths(options.host, options))
+  const mode = await (options.readMode ?? readNativeEnrollmentMode)(
+    options.host,
+    enrollmentEnv(options),
+  )
+  const pool =
+    options.ownPoolPaths ??
+    (await resolveNativePoolPaths(paths.own.account, paths.own.state))
+  const read = async (config: string) => {
+    try {
+      return await readFile(config, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+  }
+  const text =
+    (mode === 'claustrum'
+      ? await read(nativeVaultPaths(pool).config)
+      : undefined) ?? (await read(pool.config))
+  if (text === undefined) return undefined
+  const stored: unknown = JSON.parse(text)
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored))
+    throw new Error('The legacy settings store is not a settings map')
+  return legacySettingsProtection(
+    stored as Record<string, unknown>,
+    options.host,
+    mode,
+  )
+}
+
 function enrollmentEnv(options: SettingsPathOptions) {
   const context = resolvePathOptions(options)
   return {

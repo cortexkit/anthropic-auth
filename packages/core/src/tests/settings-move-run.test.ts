@@ -9,6 +9,7 @@ import { HOLDER_FILE_NAME, type HolderEntry } from '../holder-registry.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
+import { settingsImportRecordPath } from '../settings-mode.ts'
 import { settingsMoveHolderFiles } from '../settings-move-fence.ts'
 import {
   runSettingsMoveAtStartup,
@@ -787,7 +788,7 @@ test('later starts compare only their current-mode explicit values without mergi
   ).toHaveLength(0)
 })
 
-test('a later host whose killswitch source was never read inherits the named file default and logs once', async () => {
+test('a later host whose store was never imported keeps its stricter protection until the file sets it for that host', async () => {
   const f = await fixture()
   f.options.env = {
     ...f.options.env,
@@ -798,22 +799,78 @@ test('a later host whose killswitch source was never read inherits the named fil
   const moved = await f.start()
   expect(moved.outcome).toBe('moved')
   expect(f.reads).not.toContain(f.stores.pi.config)
+  const record = (host: SettingsHost) =>
+    settingsImportRecordPath(moved.paths.target, host)
+  // The explicit target moved only OpenCode's store.
+  expect(
+    Object.keys(
+      JSON.parse(await fs.readFile(record('opencode'), 'utf8')),
+    ).sort(),
+  ).toEqual(['at', 'host', 'release', 'version'])
+  expect(await absent(record('pi'))).toBe(true)
   f.options.host = 'pi'
   f.messages.length = 0
-  expect((await f.start()).outcome).toBe('marker-present')
-  const records = f.messages.filter((message) =>
-    message.includes('were not imported'),
+  // Pi's own store holds a stricter killswitch than Pi resolves from the
+  // file, which cannot yet hold a value for Pi alone: Pi stays legacy.
+  expect(await f.start()).toMatchObject({
+    mode: 'legacy',
+    outcome: 'import-refused',
+    mayOpenService: false,
+  })
+  expect(f.messages).toEqual([
+    `Settings file ${moved.paths.target} is not used by pi: its legacy settings protect more for killswitch_enabled. pi keeps its legacy settings; set these for pi in the settings file to start using it.`,
+  ])
+  expect(await absent(record('pi'))).toBe(true)
+  // Once the file holds Pi's own value (here written by hand; a later
+  // common-auth can write it at Pi's level), Pi adopts the file and records
+  // its import.
+  await fs.writeFile(
+    moved.paths.target,
+    JSON.stringify({
+      schema_version: 1,
+      dump_enabled: true,
+      killswitch_enabled: { default: false, pi: true },
+    }),
   )
-  expect(records).toHaveLength(1)
-  expect(records[0]).toContain(f.stores.pi.config)
-  expect(records[0]).toContain('killswitch_enabled')
+  f.messages.length = 0
+  expect(await f.start()).toMatchObject({
+    mode: 'user-file',
+    outcome: 'marker-present',
+  })
+  expect(await absent(record('pi'))).toBe(false)
   const service = await openSettingsService({ file: moved.paths.target })
-  expect(service!.resolve('pi').killswitch_enabled).toBe(false)
+  expect(service!.resolve('pi').killswitch_enabled).toBe(true)
   await service!.dispose()
   await fs.unlink(moved.paths.target)
   expect((await f.start()).outcome).toBe('marker-present')
   expect(await absent(moved.paths.target)).toBe(true)
   expect(await absent(`${f.stores.pi.config}.MOVED_READPLEASE`)).toBe(true)
+})
+
+test('a default-target move records both hosts, so a later start adopts without a check', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { killswitch: { enabled: true } })
+  expect((await f.start()).outcome).toBe('moved')
+  for (const host of ['opencode', 'pi'] as const)
+    expect(await absent(settingsImportRecordPath(f.paths.target, host))).toBe(
+      false,
+    )
+  f.options.host = 'pi'
+  expect(await f.start()).toMatchObject({
+    mode: 'user-file',
+    outcome: 'marker-present',
+  })
+})
+
+test('a hand-made file is adopted and recorded when the host store protects no more', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { killswitch: { enabled: true } })
+  await put(f.paths.target, { schema_version: 1, killswitch_enabled: true })
+  expect(await f.start()).toMatchObject({ mode: 'user-file' })
+  expect(
+    await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
+  ).toBe(false)
 })
 
 test('a peer store with unreadable custody keeps the start in legacy, and a later start moves its protection', async () => {
