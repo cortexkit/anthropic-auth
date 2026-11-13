@@ -9,6 +9,7 @@ import { HOLDER_FILE_NAME, type HolderEntry } from '../holder-registry.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
+import { settingsMoveHolderFiles } from '../settings-move-fence.ts'
 import {
   runSettingsMoveAtStartup,
   type SettingsMoveStartupOptions,
@@ -417,6 +418,63 @@ test("an older holder can't register between the move's last fence check and pub
   expect(registeredBeforePublish).toBe(false)
   await registration
   expect(registered).toBe(true)
+})
+
+/**
+ * Try to register an entry in `holderFile` the way a registrant does: create
+ * its folder, then take its `holders` lock. Gives up after a short wait
+ * instead of blocking, so a test can tell that the lock is held.
+ */
+async function tryRegister(
+  holderFile: string,
+  release = '2.11.2',
+): Promise<'registered' | 'lock-held'> {
+  await fs.mkdir(dirname(holderFile), { recursive: true, mode: 0o700 })
+  try {
+    await withLock(
+      holderFile,
+      { name: 'holders', ttlMs: 10_000, timeoutMs: 300 },
+      async () => {
+        await fs.writeFile(
+          holderFile,
+          JSON.stringify({ version: 1, entries: [holder(release)] }),
+        )
+      },
+    )
+    return 'registered'
+  } catch (error) {
+    if ((error as Error).name === 'LockContentionError') return 'lock-held'
+    throw error
+  }
+}
+
+test('a holder folder missing at the start is created first, so a registrant during publication waits for the move', async () => {
+  const f = await fixture()
+  f.options.fence.readHolders = undefined
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  const holderFiles = await settingsMoveHolderFiles({
+    ...f.options,
+    stores: [
+      f.paths.own.account,
+      f.paths.defaults.opencode.account,
+      f.paths.defaults.pi.account,
+    ],
+  })
+  // The state-home folder is one the fence depends on; nothing created it.
+  const holderFile = holderFiles.find((file) =>
+    file.startsWith(join(f.root, 'state')),
+  )!
+  expect(await absent(dirname(holderFile))).toBe(true)
+  let attempt: Awaited<ReturnType<typeof tryRegister>> | undefined
+  setSettingsMoveStepHookForTest(async (step: string) => {
+    // After the mover's check for skipped lock folders, just before publication.
+    if (step === 'before-publish') attempt = await tryRegister(holderFile)
+  })
+  expect((await f.start()).outcome).toBe('moved')
+  expect(attempt).toBe('lock-held')
+  expect((await fs.stat(dirname(holderFile))).mode & 0o777).toBe(0o700)
+  // The lock is released once the move has published.
+  expect(await tryRegister(holderFile, '2.12.0')).toBe('registered')
 })
 
 test('the own lower-release holder is excluded and a separate install never moves or opens the service', async () => {

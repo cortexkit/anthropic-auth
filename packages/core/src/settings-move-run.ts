@@ -5,8 +5,9 @@ import {
   moveSettingsOnce,
 } from '@cortexkit/common-auth/settings'
 
-import { HOLDER_LOCK_NAME } from './holder-registry.ts'
+import { ensureHolderDirectory, HOLDER_LOCK_NAME } from './holder-registry.ts'
 import { logger } from './logger.ts'
+import { resolvePathOptions } from './path-options.ts'
 import {
   differingLegacySettings,
   holdsMovedSettings,
@@ -174,6 +175,20 @@ export async function runSettingsMoveAtStartup(
       ...options.fence,
       stores,
     })
+    // common-auth's mover skips a lock whose folder doesn't exist yet, and a
+    // registrant could then create that folder and register while the move
+    // publishes. Create each holder file's folder first (owner-only, as a
+    // registrant would), so every `holders` lock is really taken.
+    const context = resolvePathOptions(options)
+    for (const file of holderFiles) {
+      const folder = context.paths.dirname(file)
+      if (options.authority?.fs?.mkdir) await options.authority.fs.mkdir(folder)
+      else
+        await ensureHolderDirectory(folder, {
+          ...options.authority?.ownership,
+          platform: context.platform,
+        })
+    }
   } catch {
     return result('legacy', 'fence-closed')
   }
