@@ -156,41 +156,58 @@ async function fixture(
   })
   cleanups.push(() => setSettingsFsForTest())
   const open = core.openSettingsService
-  const serviceSpy = spyOn(core, 'openSettingsService').mockImplementation(
-    async (options) => {
-      if (options.host !== 'opencode') return open(options)
-      const service = await open({
-        ...options,
-        dependencies: {
-          readFile: async (path) => {
+  const openService = async (options: core.SettingsServiceOptions) => {
+    if (options.host !== 'opencode') return open(options)
+    const service = await open({
+      ...options,
+      dependencies: {
+        readFile: async (path) => {
+          settingsIO++
+          return fs.readFile(path)
+        },
+        writeAppliedCopy: async () => {},
+        open: (options) => {
+          const handle = openSettings<typeof core.settingsDefinition.settings>(
+            core.settingsDefinition,
+            options,
+          )
+          const get: typeof handle.get = (name, context) => {
             settingsIO++
-            return fs.readFile(path)
-          },
-          writeAppliedCopy: async () => {},
-          open: (options) => {
-            const handle = openSettings<
-              typeof core.settingsDefinition.settings
-            >(core.settingsDefinition, options)
-            const get: typeof handle.get = (name, context) => {
-              settingsIO++
-              return handle.get(name, context)
-            }
-            return {
-              ...handle,
-              get,
-              watch: (callback) => {
-                watch = callback
-                return () => {
-                  watchCloses++
-                  watch = undefined
-                }
-              },
-            }
-          },
+            return handle.get(name, context)
+          }
+          return {
+            ...handle,
+            get,
+            watch: (callback) => {
+              watch = callback
+              return () => {
+                watchCloses++
+                watch = undefined
+              }
+            },
+          }
+        },
+      },
+    })
+    if (service) opened.push(service)
+    return service
+  }
+  const serviceSpy = spyOn(core, 'openSettingsService').mockImplementation(
+    openService,
+  )
+  const starts: core.StartedSettings[] = []
+  const startSettings = core.startSettings
+  const startupSpy = spyOn(core, 'startSettings').mockImplementation(
+    async (options) => {
+      const started = await startSettings({
+        ...options,
+        start: {
+          move: (input) => core.runSettingsMoveAtStartup(input),
+          open: (input) => core.openSettingsService(input),
         },
       })
-      if (service) opened.push(service)
-      return service
+      starts.push(started)
+      return started
     },
   )
   const sources: sourceFactory.NativeSource[] = []
@@ -207,6 +224,7 @@ async function fixture(
   })
   cleanups.push(() => {
     serviceSpy.mockRestore()
+    startupSpy.mockRestore()
     sourceSpy.mockRestore()
   })
   const start = async (onInstall?: () => void) => {
@@ -269,6 +287,8 @@ async function fixture(
     start,
     opened,
     openSettings: open,
+    openService,
+    starts,
     io: () => settingsIO,
     watchCloses: () => watchCloses,
     async changed() {
@@ -305,6 +325,7 @@ for (const stage of ['move', 'service open'] as const) {
   test(`OC2 settings ${stage} failure still installs and serves a legacy-store request`, async () => {
     const f = await fixture()
     await seedLegacyRequest(f)
+    if (stage === 'move') await fs.rm(f.target)
     const records: core.LogTestRecord[] = []
     core.setLogLevel('info')
     core.__setLogTestSink((record) => records.push(record))
@@ -333,21 +354,127 @@ for (const stage of ['move', 'service open'] as const) {
     expect((await instance.live()).headers.get('authorization')).toBe(
       'Bearer sk-ant-oat01-settings-legacy',
     )
-    const warnings = records.filter(
-      (record) =>
-        record.message ===
-        'Settings initialization failed; continuing with legacy settings.',
+    const warnings = records.filter((record) =>
+      record.message.includes('Settings startup failed'),
     )
-    expect(warnings).toHaveLength(1)
-    expect(warnings[0]?.level).toBe('warn')
-    expect(warnings[0]?.message).toBe(
-      'Settings initialization failed; continuing with legacy settings.',
-    )
-    expect(warnings[0]?.payload).toBeUndefined()
+    expect(warnings.length).toBeLessThanOrEqual(1)
+    expect(
+      warnings.every(
+        (record) =>
+          record.level === 'warn' &&
+          record.payload === undefined &&
+          record.message ===
+            'Settings startup failed; protection settings use their last applied values until the settings file can be opened.',
+      ),
+    ).toBe(true)
     expect(JSON.stringify(records)).not.toContain('private settings failure')
     expect(JSON.stringify(warnings)).not.toContain(f.target)
   })
 }
+
+test('OC2 service open failure after a move enforces the stricter applied copy until the authority timer reopens it', async () => {
+  const f = await fixture()
+  await seedLegacyRequest(f)
+  await fs.rm(f.target)
+  const legacy = core.createNativeAccountRuntime({
+    paths: f.paths,
+    host: 'opencode',
+    local: { resolveIdentity: legacyIdentity },
+    vault: { env: f.env },
+  })
+  cleanups.push(() => legacy.close())
+  const credential = await legacy.authorizeLocal('main')
+  if (credential.status !== 'usable')
+    throw new Error('Legacy credential unavailable')
+  const now = Date.now()
+  const window = { remainingPercent: 50, usedPercent: 50, checkedAt: now }
+  await legacy.publishLocal(credential.subject, {
+    quota: {
+      five_hour: window,
+      seven_day: window,
+      accountIdentity: '11111111-2222-4333-8444-555555555555',
+    },
+  })
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: true, failClosedOnUnknownQuota: true },
+    killswitch: {
+      enabled: true,
+      main: { five_hour: 5, seven_day: 0, scoped: 0 },
+    },
+  }))
+  const before = await legacy.read()
+  expect(
+    core.quotaSnapshotPassesPolicy(
+      before.accounts[0]!.quota,
+      before.policyStorage,
+    ),
+  ).toBe(true)
+  await legacy.close()
+  const stricter = {
+    ...core.legacySettingsProtection(before.settings, 'opencode'),
+    killswitch_default_five_hour: 80,
+  }
+  await core.writeSettingsProtectionCopy(f.target, 'opencode', {
+    readAt: now,
+    values: stricter,
+  })
+  let unavailable = true
+  let opens = 0
+  const openFailure = spyOn(core, 'openSettingsService').mockImplementation(
+    (options) => {
+      if (options.host !== 'opencode') return f.openSettings(options)
+      opens++
+      if (unavailable)
+        return Promise.reject(new Error('synthetic settings open failure'))
+      return f.openService(options)
+    },
+  )
+  const ticks: (() => Promise<void>)[] = []
+  const acquire = core.acquireNativeAccountRuntime
+  const acquisition = spyOn(
+    core,
+    'acquireNativeAccountRuntime',
+  ).mockImplementation((options) =>
+    acquire({
+      ...options,
+      settingsAuthority: {
+        ...options.settingsAuthority,
+        schedule: (callback) => {
+          ticks.push(callback)
+          return () => {}
+        },
+      },
+    }),
+  )
+  cleanups.push(() => {
+    openFailure.mockRestore()
+    acquisition.mockRestore()
+  })
+  const instance = await f.start()
+  expect(await fs.stat(`${f.target}.moved`)).toBeDefined()
+  expect(f.starts[0]?.fallback?.rung).toBe(1)
+  const policy = (await instance.runtime.read()).policyStorage
+  expect(core.getKillswitchThresholdsForAccount(policy).five_hour).toBe(80)
+  expect(policy.claudeFast?.enabled).toBe(true)
+  const beforeRequest = opens
+  await expect(instance.live()).rejects.toThrow()
+  expect(opens).toBe(beforeRequest)
+  expect(ticks).toHaveLength(1)
+  unavailable = false
+  await ticks[0]!()
+  expect(instance.runtime.getSettingsStatus?.()).toBeDefined()
+  expect(
+    core.getKillswitchThresholdsForAccount(
+      (await instance.runtime.read()).policyStorage,
+    ).five_hour,
+  ).toBe(5)
+  expect((await instance.live()).headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-settings-legacy',
+  )
+  await instance.dispose()
+  expect(f.watchCloses()).toBe(1)
+})
 
 test('OC2 failed first settings authority check does not abort requests or later menu probes', async () => {
   const f = await fixture()

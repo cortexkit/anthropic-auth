@@ -21,15 +21,13 @@ import {
   type NativeUiOptions,
   nativeVaultRuntimeKey,
   openCodeHolderKind,
-  openSettingsService,
   readNativeEnrollmentMode,
   registerNativePoolHolder,
   resolveNativePoolPaths,
   resolveSettingsPaths,
-  runSettingsMoveAtStartup,
-  type SettingsService,
   setDumpEnabled,
   setLogLevel,
+  startSettings,
   stateLayoutIoFailure,
   stateLayoutOfPaths,
   unmovedRegistrationPolicy,
@@ -358,10 +356,6 @@ export async function setupAnthropicAuth(
     ]),
   )
   ctx = requests.context
-  let settingsService: SettingsService | undefined
-  let settingsMode: Awaited<
-    ReturnType<typeof runSettingsMoveAtStartup>
-  >['mode'] = 'legacy'
   const runtimeOptions = {
     paths,
     host: 'opencode' as const,
@@ -378,62 +372,46 @@ export async function setupAnthropicAuth(
       await legacy.close()
     }
   }
-  try {
-    const startup = await runSettingsMoveAtStartup({
-      host: 'opencode',
-      env: settingsEnv,
-      paths: settingsPaths,
-      ownPoolPaths: paths,
-      initializeVaultSettings: () =>
+  const settingsStartup = await startSettings({
+    host: 'opencode',
+    env: settingsEnv,
+    paths: settingsPaths,
+    ownPoolPaths: paths,
+    initializeVaultSettings: () =>
+      withLegacy(async (legacy) => {
+        await legacy.vault.initializeSettings()
+      }),
+    fence: {
+      // Choosing state-home already listed this process in its holder file.
+      // The layout decision owns that registration, not this plugin, so
+      // there is no plugin-owned registration to pass or release here.
+      registration:
+        holderRegistration ??
+        (stateLayoutOfPaths(paths).kind === 'state-home'
+          ? { status: 'registered' }
+          : undefined),
+    },
+    protection: {
+      readLegacyProtection: () =>
         withLegacy(async (legacy) => {
-          await legacy.vault.initializeSettings()
+          // Recover from the local or vault account store selected by
+          // enrollment, before applying any user-file settings to it.
+          const snapshot = await legacy.read()
+          return legacySettingsProtection(
+            snapshot.settings,
+            'opencode',
+            snapshot.mode,
+          )
         }),
-      fence: {
-        // Choosing state-home already listed this process in its holder file.
-        // The layout decision owns that registration, not this plugin, so
-        // there is no plugin-owned registration to pass or release here.
-        registration:
-          holderRegistration ??
-          (stateLayoutOfPaths(paths).kind === 'state-home'
-            ? { status: 'registered' }
-            : undefined),
-      },
-    })
-    settingsMode = startup.mode
-    if (startup.mayOpenService)
-      settingsService = await openSettingsService({
-        file: settingsPaths.target,
-        host: 'opencode',
-        protection: {
-          readLegacyProtection: () =>
-            withLegacy(async (legacy) => {
-              // Recover from the local or vault account store selected by
-              // enrollment, before applying any user-file settings to it.
-              const snapshot = await legacy.read()
-              return legacySettingsProtection(
-                snapshot.settings,
-                'opencode',
-                snapshot.mode,
-              )
-            }),
-        },
-      })
-  } catch {
-    try {
-      await settingsService?.dispose()
-    } catch {}
-    settingsService = undefined
-    settingsMode = 'legacy'
-    logger.warn(
-      'settings',
-      'Settings initialization failed; continuing with legacy settings.',
-    )
-  }
+    },
+  })
+  const settingsService = settingsStartup.service
   const runtime = acquireNativeAccountRuntime({
     ...runtimeOptions,
     settingsService,
-    settingsFile: settingsPaths.target,
-    settingsMode: () => settingsMode,
+    settingsFile: settingsStartup.file,
+    settingsMode: () => settingsStartup.mode,
+    settingsFallback: settingsStartup.fallback,
     settingsAuthority: { options: { env: settingsEnv } },
   })
   try {
