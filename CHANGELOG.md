@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Pi now waits at most 60 seconds before retrying the same account when rate-limit headers do not confirm exhausted quota, as OpenCode does.
 - Under Thalamus, a turn can survive a short vault restart without losing its account authorization.
 - Under Thalamus, OpenCode and Pi can show why a request is waiting on account availability or a routing delay.
 - Moving to shared routing keeps a session on the account it was already using, preserving its warm cache when that account is still available.

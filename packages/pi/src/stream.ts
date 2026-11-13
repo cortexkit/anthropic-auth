@@ -106,6 +106,7 @@ import {
   signRequestBody,
   startRoutingWait,
   stickyQuotaSnapshotIsFresh,
+  stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
   stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
@@ -2164,6 +2165,7 @@ async function executeWithFallback(options: {
       const permanentAuthFailure =
         preflight instanceof Response && preflight.status === 401
 
+      let retainedResponse: Response | undefined
       let migrate =
         (preflight instanceof Response && preflight.status === 403) ||
         permanentAuthFailure
@@ -2218,22 +2220,19 @@ async function executeWithFallback(options: {
           return holdResponse(decision.retryAfterSeconds, responseHeaders)
         }
         if (decision.action === 'retain') {
-          const headers = hostRetryHeaders(responseHeaders)
-          const retryMs = headers.get('retry-after-ms')
-          const after = headers.get('retry-after')
-          const delayMs =
-            retryMs !== null
-              ? Number(retryMs)
-              : after !== null
-                ? Number.isFinite(Number(after))
-                  ? Number(after) * 1000
-                  : Date.parse(after) - Date.now()
-                : 2_000
-          // Pi owns this retry, so its next attempt time is not observable here.
+          const now = Date.now()
+          const headers = stickyRetainRetryHeaders(responseHeaders, now)
+          const delayMs = Number(headers.get('retry-after-ms'))
+          retainedResponse = new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+          })
           startRoutingWait({
             sessionId,
             reason: 'rate_limited',
             delayMs,
+            nextMs: now + delayMs,
             attempt: stickyQuotaRetries.attempt(
               JSON.stringify([options.storagePath, sessionId]),
             ),
@@ -2324,7 +2323,8 @@ async function executeWithFallback(options: {
       }
       return completeRoute(
         route,
-        preflight instanceof Response ? preflight : response,
+        retainedResponse ??
+          (preflight instanceof Response ? preflight : response),
       )
     }
   }
@@ -2448,6 +2448,8 @@ async function executeWithFallback(options: {
 
   return primaryPreflight instanceof Response ? primaryPreflight : primary
 }
+
+export const __executePiWithFallbackForTest = executeWithFallback
 
 export function streamCortexKitAnthropic(
   model: Model<Api>,

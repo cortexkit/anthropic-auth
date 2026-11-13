@@ -23,6 +23,7 @@ import {
 } from '../native.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
 import {
+  __executePiWithFallbackForTest,
   beginPiPrimaryTurn,
   buildExplicitBaseMessagesUrl,
   clearPiStickyQuotaRetries,
@@ -2140,6 +2141,101 @@ describe('Pi API fallback routing helpers', () => {
     }
   }
 
+  test.each([
+    ['600', '60', '60000'],
+    ['20', '20', '20000'],
+  ])(
+    'Pi caps an unconfirmed 429 retry-after of %s seconds at %s seconds',
+    async (retryAfter, expectedSeconds, expectedMs) => {
+      tempDir = await mkdtemp(join(tmpdir(), 'pi-sticky-retain-'))
+      const storagePath = join(tempDir, 'anthropic-auth.json')
+      process.env.PI_ANTHROPIC_AUTH_ROUTING_STATE_FILE = join(
+        tempDir,
+        'sticky-routes.json',
+      )
+      const now = Date.now()
+      Date.now = mock(() => now)
+      const quota = {
+        checkedAt: now,
+        five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+        seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+      }
+      await saveNativePiFixture(
+        {
+          version: 1,
+          mainAccountId: 'main-account',
+          main: { type: 'opencode', provider: 'anthropic' },
+          quota: {
+            enabled: true,
+            mainQuota: { ...quota, accountIdentity: 'main-account' },
+            mainQuotaCheckedAt: now,
+          },
+          routing: { mode: 'sticky-balanced' },
+          accounts: [],
+        },
+        storagePath,
+      )
+      const reports: Record<string, unknown>[] = []
+      globals[routingKey] = () => ({
+        report: (payload: Record<string, unknown>) => reports.push(payload),
+      })
+      const quotaHeaders = {
+        'anthropic-ratelimit-unified-5h-utilization': '0.2',
+        'anthropic-ratelimit-unified-5h-reset': String(now / 1000 + 3600),
+        'anthropic-ratelimit-future-field': 'raw',
+      }
+      globalThis.fetch = mock(async (input: string | URL | Request) => {
+        const url = input instanceof Request ? input.url : input.toString()
+        if (url.includes('/api/oauth/usage'))
+          return Response.json({
+            five_hour: { utilization: 20 },
+            seven_day: { utilization: 0 },
+          })
+        return Response.json(
+          { error: { type: 'rate_limit_error' } },
+          {
+            status: 429,
+            headers: {
+              ...quotaHeaders,
+              'retry-after': retryAfter,
+              'retry-after-ms': String(Number(retryAfter) * 1000),
+            },
+          },
+        )
+      }) as unknown as typeof fetch
+
+      const response = await __executePiWithFallbackForTest({
+        model: anthropicModel,
+        context: anthropicContext,
+        storagePath,
+        streamOptions: {
+          apiKey: 'sk-ant-oat01-main-access',
+          sessionId: 'pi-retain-headers',
+        },
+      })
+      expect(response.status).toBe(429)
+      expect(response.headers.get('retry-after')).toBe(expectedSeconds)
+      expect(response.headers.get('retry-after-ms')).toBe(expectedMs)
+      for (const [name, value] of Object.entries(quotaHeaders))
+        expect(response.headers.get(name)).toBe(value)
+      expect(await response.json()).toEqual({
+        error: { type: 'rate_limit_error' },
+      })
+      await Bun.sleep(10)
+      expect(reports.filter((row) => row.kind === 'wait')).toEqual([
+        {
+          kind: 'wait',
+          phase: 'start',
+          wait_id: expect.any(String),
+          reason: 'rate_limited',
+          attempt: 1,
+          next_ms: now + Number(expectedMs),
+          message: 'Waiting before retrying the current account.',
+        },
+      ])
+    },
+  )
+
   test('Pi routing reports both confirmed 429 windows with resets and successful raw headers', async () => {
     const result = (await checkStickyQuotaReread(true, false, 'windows'))!
     const reports = result.reports.filter(
@@ -2209,12 +2305,13 @@ describe('Pi API fallback routing helpers', () => {
         wait_id: expect.any(String),
         reason: 'rate_limited',
         attempt: 1,
+        next_ms: expect.any(Number),
         message: 'Waiting before retrying the current account.',
       },
     ])
   })
 
-  test('Pi reports both host-owned unconfirmed retries without claiming their resume time', async () => {
+  test('Pi reports the next attempt time for both host-owned unconfirmed retries', async () => {
     const result = (await checkStickyQuotaReread(false, true, 'unconfirmed'))!
     expect(
       result.reports.filter((row) => row.kind === 'wait').slice(0, 2),
@@ -2225,6 +2322,7 @@ describe('Pi API fallback routing helpers', () => {
         wait_id: expect.any(String),
         reason: 'rate_limited',
         attempt,
+        next_ms: expect.any(Number),
         message: 'Waiting before retrying the current account.',
       })),
     )
