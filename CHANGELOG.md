@@ -4,13 +4,13 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Updated the shared authentication dependency to common-auth 0.49.2.
 - OpenCode 1, OpenCode 2 and Pi now share one settings file, `anthropic-auth.jsonc`, that you can edit by hand, with per-host and per-model overrides. Existing settings move into it once, automatically. Only your own user file is read, never a project file. See [the settings file](docs/settings-file.md).
 - Moving settings never weakens protection: quota floors and the killswitch keep each host's stricter values.
 - Rolling back to the previous release keeps working, but it uses your settings from before the move, not later changes.
 - With the shared file in use, OpenCode 2 and Pi `/claude` Status show the killswitch's default floors (5-hour 5, weekly 10, scoped 0) rather than an empty value. The killswitch stays off and nothing else changes.
 - Storage paths no longer resolve incorrectly on Linux while another process is saving.
 - Changing effort no longer drops the thread tail cache marker on a full request after continuations.
-- Updated the shared authentication dependency to common-auth 0.49.2.
 - Vault enrollment now refuses unsafe token folders even during token replacement or when folder safety checks fail.
 ## 2.11.4
 
