@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import {
   createQuotaRefusalResponse,
   quotaRefusalTiming,
@@ -45,6 +45,136 @@ const hold = (now: number) =>
       resetAt: now + 120_000,
     },
   )
+
+const routingKey = Symbol.for('cortexkit.routing')
+const globals = globalThis as Record<symbol, unknown>
+const previousRouting = globals[routingKey]
+afterEach(() => {
+  if (previousRouting === undefined) delete globals[routingKey]
+  else globals[routingKey] = previousRouting
+})
+function captureWaits() {
+  const reports: Record<string, unknown>[] = []
+  globals[routingKey] = (sessionId: string) => {
+    expect(sessionId).toBe('pi-wait-session')
+    return {
+      report: (payload: Record<string, unknown>) => {
+        reports.push(payload)
+      },
+    }
+  }
+  return reports
+}
+
+for (const reason of [
+  'account_limit',
+  'account_free',
+  'routing_hold',
+] as const) {
+  test.each(['resumed', 'cancelled', 'abandoned'] as const)(
+    `Pi pairs ${reason} wait reports when %s`,
+    async (outcome) => {
+      const clock = new Clock()
+      const reports = captureWaits()
+      const abort = new AbortController()
+      const response = () =>
+        reason === 'account_free'
+          ? createQuotaRefusalResponse(
+              'Synthetic provider text must not be reported',
+              { resetAt: clock.now + 120_000, retryAfterSeconds: 120 },
+              clock.now,
+            )
+          : markPiAccountHold(
+              new Response(null, {
+                status: 429,
+                headers: { 'retry-after': '120' },
+              }),
+              {
+                accountId: 'private account label',
+                resetAt: clock.now + 120_000,
+                reason,
+              },
+            )
+      const pending = withPiQuotaWait({
+        sessionId: 'pi-wait-session',
+        run: async () => response(),
+        resume: async () =>
+          outcome === 'abandoned' ? response() : new Response('served'),
+        signal: abort.signal,
+        wait: clock.options,
+      })
+      await clock.scheduled.promise
+      if (outcome === 'cancelled') {
+        abort.abort()
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+      } else {
+        clock.callback?.()
+        expect((await pending).status).toBe(outcome === 'resumed' ? 200 : 412)
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      const message = {
+        account_limit: 'Waiting for the current account limit to reset.',
+        account_free: 'Waiting for an account to become available.',
+        routing_hold: 'Waiting for shared routing to release the request.',
+      }[reason]
+      const identity = {
+        kind: 'wait',
+        wait_id: expect.any(String),
+        reason,
+        next_ms: clock.now + 120_000,
+        message,
+      }
+      expect(reports).toEqual([
+        { ...identity, phase: 'start' },
+        { ...identity, phase: 'end', outcome },
+      ])
+      expect(reports[0]?.wait_id).toBe(reports[1]?.wait_id)
+      expect(message.length).toBeLessThanOrEqual(160)
+      expect(message).not.toMatch(/\d/)
+    },
+  )
+}
+
+test.each([1_999, 2_000])(
+  'Pi wait reports have a two-second floor at %s milliseconds',
+  async (delay) => {
+    const clock = new Clock()
+    const reports = captureWaits()
+    const pending = withPiQuotaWait({
+      sessionId: 'pi-wait-session',
+      run: async () =>
+        markPiAccountHold(
+          new Response(null, {
+            status: 429,
+            headers: { 'retry-after': String(delay / 1000) },
+          }),
+          { accountId: 'main', resetAt: clock.now + delay },
+        ),
+      resume: async () => new Response('served'),
+      wait: clock.options,
+    })
+    await clock.scheduled.promise
+    clock.callback?.()
+    await pending
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(reports).toHaveLength(delay < 2_000 ? 0 : 2)
+  },
+)
+
+test('Pi owned waits work without a Thalamus routing accessor', async () => {
+  delete globals[routingKey]
+  const clock = new Clock()
+  const pending = withPiQuotaWait({
+    sessionId: 'pi-wait-session',
+    run: async () => hold(clock.now),
+    resume: async () => new Response('served'),
+    wait: clock.options,
+  })
+  await clock.scheduled.promise
+  clock.callback?.()
+  expect(await (await pending).text()).toBe('served')
+  expect(globals[routingKey]).toBeUndefined()
+})
 
 test('Pi waits inside the stream and resumes the same account after showing and clearing its message', async () => {
   const clock = new Clock()

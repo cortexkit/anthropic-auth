@@ -2110,6 +2110,10 @@ describe('Pi API fallback routing helpers', () => {
       clearPiStickyQuotaRetries(storagePath, 'pi-budget')
       expect(await send('pi-budget', 2)).toEqual([initial])
       expect(pluginWaits).toBe(0)
+      if (reporting) {
+        await Bun.sleep(10)
+        return { reports, sessions }
+      }
       return
     }
     const stream = streamCortexKitAnthropic(anthropicModel, anthropicContext, {
@@ -2198,6 +2202,32 @@ describe('Pi API fallback routing helpers', () => {
         (row) => row.outcome === 'served' || row.outcome === 'exhausted',
       ),
     ).toEqual([])
+    expect(result.reports.filter((row) => row.kind === 'wait')).toEqual([
+      {
+        kind: 'wait',
+        phase: 'start',
+        wait_id: expect.any(String),
+        reason: 'rate_limited',
+        attempt: 1,
+        message: 'Waiting before retrying the current account.',
+      },
+    ])
+  })
+
+  test('Pi reports both host-owned unconfirmed retries without claiming their resume time', async () => {
+    const result = (await checkStickyQuotaReread(false, true, 'unconfirmed'))!
+    expect(
+      result.reports.filter((row) => row.kind === 'wait').slice(0, 2),
+    ).toEqual(
+      [1, 2].map((attempt) => ({
+        kind: 'wait',
+        phase: 'start',
+        wait_id: expect.any(String),
+        reason: 'rate_limited',
+        attempt,
+        message: 'Waiting before retrying the current account.',
+      })),
+    )
   })
 
   test.each(['no-accessor', 'throw', 'reject', 'pending'] as const)(

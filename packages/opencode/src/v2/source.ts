@@ -8,6 +8,7 @@ import {
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRoutingMode,
+  hostRetryHeaders,
   isDumpPersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   localMessageThreadCredential,
@@ -47,6 +48,7 @@ import {
   sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
+  startRoutingWait,
   stickyQuotaSnapshotIsFresh,
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
@@ -179,8 +181,8 @@ function stickyHold(
       getMaxSameAccountWait(snapshot.policyStorage),
     ),
   })
-  if (decision.action === 'retain')
-    return {
+  if (decision.action === 'retain') {
+    const result = {
       hold: {
         delayMs: Number(
           stickyRetainRetryHeaders(responseHeaders ?? new Headers()).get(
@@ -189,8 +191,17 @@ function stickyHold(
         ),
       },
     }
+    startRoutingWait({
+      sessionId: input.sessionID,
+      reason: 'rate_limited',
+      delayMs: result.hold.delayMs,
+      nextMs: Date.now() + result.hold.delayMs,
+      attempt: counter.attempt(input.sessionID),
+    })
+    return result
+  }
   if (decision.action !== 'hold') return undefined
-  return {
+  const result = {
     hold: {
       // OpenCode 2 caps each wait; under "max", retries recheck the original cache expiry.
       delayMs: Math.min(
@@ -202,6 +213,13 @@ function stickyHold(
       ),
     },
   }
+  startRoutingWait({
+    sessionId: input.sessionID,
+    reason: 'account_limit',
+    delayMs: result.hold.delayMs,
+    nextMs: Date.now() + result.hold.delayMs,
+  })
+  return result
 }
 
 export type NativeCacheRequestPrepared = Parameters<
@@ -784,10 +802,18 @@ export function createNativeAnthropicSource(
           })
           active.signal.throwIfAborted()
           if (selected?.migrated) stickyQuotaRetries.clear(input.sessionID)
-          if (selected)
-            return advice.hold
-              ? { hold: { delayMs: advice.hold.retry_after_ms } }
-              : selected.accountId
+          if (selected) {
+            if (advice.hold) {
+              startRoutingWait({
+                sessionId: input.sessionID,
+                reason: 'routing_hold',
+                delayMs: advice.hold.retry_after_ms,
+                nextMs: Date.now() + advice.hold.retry_after_ms,
+              })
+              return { hold: { delayMs: advice.hold.retry_after_ms } }
+            }
+            return selected.accountId
+          }
         }
         // OpenCode 2 can hold only when retrying the same refused account.
         routingRelay.override(
@@ -885,17 +911,24 @@ export function createNativeAnthropicSource(
               ]
         if (ordered[0]) return ordered[0].id
       }
-      if (snapshot.mode === 'claustrum')
-        throw await NativeVaultQuotaPolicyError.fromResponse(
-          createNativeVaultNoRouteResponse({
-            snapshot,
-            sessionId: input.sessionID,
-            modelId: modelID,
-            policies,
-            sticky:
-              getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
-          }),
-        )
+      if (snapshot.mode === 'claustrum') {
+        const response = createNativeVaultNoRouteResponse({
+          snapshot,
+          sessionId: input.sessionID,
+          modelId: modelID,
+          policies,
+          sticky: getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
+        })
+        const delayMs =
+          Number(hostRetryHeaders(response.headers).get('retry-after')) * 1000
+        startRoutingWait({
+          sessionId: input.sessionID,
+          reason: 'account_free',
+          delayMs,
+          nextMs: Date.now() + delayMs,
+        })
+        throw await NativeVaultQuotaPolicyError.fromResponse(response)
+      }
       if (advice) return undefined
       // Fall back to a pay-per-token API key account only when the primary
       // Claude subscription account ('main') has run out: a recent usage

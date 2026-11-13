@@ -103,6 +103,7 @@ import {
   setDumpEnabled,
   shouldFallbackStatus,
   signRequestBody,
+  startRoutingWait,
   stickyQuotaSnapshotIsFresh,
   stickyRetryAfterWithJitter,
   stickyRouteCandidateWeight,
@@ -2114,6 +2115,7 @@ async function executeWithFallback(options: {
             accountId: heldAccountId,
             accountIdentity: heldAccountIdentity,
             resetAt: Date.now() + retryAfterSeconds * 1000,
+            reason: routingHold ? 'routing_hold' : 'account_limit',
           },
         )
       }
@@ -2208,6 +2210,28 @@ async function executeWithFallback(options: {
         if (decision.action === 'hold') {
           void response.body?.cancel().catch(() => {})
           return holdResponse(decision.retryAfterSeconds, responseHeaders)
+        }
+        if (decision.action === 'retain') {
+          const headers = hostRetryHeaders(responseHeaders)
+          const retryMs = headers.get('retry-after-ms')
+          const after = headers.get('retry-after')
+          const delayMs =
+            retryMs !== null
+              ? Number(retryMs)
+              : after !== null
+                ? Number.isFinite(Number(after))
+                  ? Number(after) * 1000
+                  : Date.parse(after) - Date.now()
+                : 2_000
+          // Pi owns this retry, so its next attempt time is not observable here.
+          startRoutingWait({
+            sessionId,
+            reason: 'rate_limited',
+            delayMs,
+            attempt: stickyQuotaRetries.attempt(
+              JSON.stringify([options.storagePath, sessionId]),
+            ),
+          })
         }
         migrate = decision.action === 'migrate'
       }
@@ -2468,6 +2492,7 @@ export function streamCortexKitAnthropic(
       const response = await runWithRequestSignal(options?.signal, () =>
         withPiQuotaWait({
           signal: options?.signal,
+          sessionId: options?.sessionId,
           wait,
           run: () => executeWithFallback(request),
           resume: async (hold) => {

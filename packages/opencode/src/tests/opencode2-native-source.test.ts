@@ -271,6 +271,65 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
 
+function waitRecorder(accountFor: () => unknown = () => null) {
+  const globals = globalThis as Record<symbol, unknown>
+  const key = Symbol.for('cortexkit.routing')
+  const prior = globals[key]
+  const reports: Record<string, unknown>[] = []
+  globals[key] = () => ({
+    accountFor: async () => accountFor(),
+    report: (report: Record<string, unknown>) => {
+      if (report.kind === 'wait') reports.push(report)
+    },
+  })
+  cleanups.push(() => {
+    if (prior === undefined) delete globals[key]
+    else globals[key] = prior
+  })
+  return reports
+}
+
+test.each([1_999, 2_000])(
+  'OC2 routing wait reports respect the floor at %s milliseconds',
+  async (delay) => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const reports = waitRecorder(() => ({
+      account_id: identity,
+      credential_id: 'oauth:anthropic',
+      hold: { retry_after_ms: delay },
+    }))
+    const now = Date.now()
+    expect(
+      await atTime(now, async () =>
+        native.chooseAccount({
+          ...scope,
+          phase: 'retry',
+          rerouteFrom: {
+            accountId: 'main',
+            limit: { status: 429, reason: 'provider-429' },
+          },
+        }),
+      ),
+    ).toEqual({ hold: { delayMs: delay } })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(reports).toEqual(
+      delay < 2_000
+        ? []
+        : [
+            {
+              kind: 'wait',
+              phase: 'start',
+              wait_id: expect.any(String),
+              reason: 'routing_hold',
+              next_ms: now + delay,
+              message: 'Waiting for shared routing to release the request.',
+            },
+          ],
+    )
+  },
+)
+
 describe('OC2 shared routing relay', () => {
   test.each(['different account', 'different credential', 'unsupported hold'])(
     'routing quota exemption never leaks to %s',
@@ -2919,8 +2978,97 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     }
   }
 
+  test('OC2 reports both unconfirmed retries as host-owned waits without provider text', async () => {
+    const f = await heldSession('ses_typed_rate_wait')
+    const reports = waitRecorder()
+    const now = Date.now()
+    for (const request of [f.first, await f.host.send(f.session)]) {
+      await f.host.response(request, 429, f.session, {
+        'retry-after': '432000',
+      })
+      expect(await atTime(now, () => f.host.retry(false, f.session))).toEqual({
+        retry: true,
+        delay: 60_000,
+      })
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(reports).toEqual(
+      [1, 2].map((attempt) => ({
+        kind: 'wait',
+        phase: 'start',
+        wait_id: expect.any(String),
+        reason: 'rate_limited',
+        attempt,
+        next_ms: now + 60_000,
+        message: 'Waiting before retrying the current account.',
+      })),
+    )
+    expect(reports[0]?.wait_id).not.toBe(reports[1]?.wait_id)
+  })
+
+  test('OC2 does not need a routing accessor to hand the host its wait', async () => {
+    const f = await heldSession('ses_unhosted_wait')
+    expect(
+      Reflect.get(globalThis, Symbol.for('cortexkit.routing')),
+    ).toBeUndefined()
+    await f.host.response(f.first, 429, f.session, { 'retry-after': '4' })
+    expect(await f.host.retry(false, f.session)).toEqual({
+      retry: true,
+      delay: 4_000,
+    })
+  })
+
+  test('OC2 reports an exhausted pool as a bounded host-owned account-free wait', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const reports = waitRecorder()
+    const now = Date.now()
+    await f.runtime.updateSettings((settings) => ({
+      ...settings,
+      quota: { enabled: true },
+    }))
+    const view = await f.runtime.read()
+    const read = spyOn(f.runtime, 'read').mockImplementation(async () => ({
+      ...view,
+      accounts: view.accounts.map((account) => ({
+        ...account,
+        quota: {
+          accountIdentity: account.accountIdentity,
+          checkedAt: now,
+          five_hour: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            checkedAt: now,
+            resetsAt: new Date(now + 3_600_000).toISOString(),
+          },
+          seven_day: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: now,
+          },
+        },
+      })),
+    }))
+    cleanups.push(() => read.mockRestore())
+    await expect(
+      atTime(now, async () => native.chooseAccount(scope)),
+    ).rejects.toThrow()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(reports).toEqual([
+      {
+        kind: 'wait',
+        phase: 'start',
+        wait_id: expect.any(String),
+        reason: 'account_free',
+        next_ms: now + 900_000,
+        message: 'Waiting for an account to become available.',
+      },
+    ])
+  })
+
   test('a 429 with a short reset holds the session on its account for the jittered reset, keeping its pin', async () => {
     const f = await heldSession()
+    const reports = waitRecorder()
     const now = Date.now()
     await exhaustDefault(f.fixture, now + 120_000, now)
     await f.host.response(f.first, 429, f.session)
@@ -2929,6 +3077,18 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
       retry: true,
       delay: stickyRetryAfterWithJitter(f.session.sessionID, 120) * 1000,
     })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(reports).toEqual([
+      {
+        kind: 'wait',
+        phase: 'start',
+        wait_id: expect.any(String),
+        reason: 'account_limit',
+        next_ms:
+          now + stickyRetryAfterWithJitter(f.session.sessionID, 120) * 1000,
+        message: 'Waiting for the current account limit to reset.',
+      },
+    ])
     expect(f.choose.mock.calls[1]?.[0]).toMatchObject({
       phase: 'retry',
       rerouteFrom: { accountId: 'main', limit: { status: 429 } },

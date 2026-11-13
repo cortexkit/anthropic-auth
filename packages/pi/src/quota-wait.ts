@@ -3,6 +3,7 @@ import {
   createQuotaRefusalResponse,
   hostRetryResponse,
   quotaRefusalDetails,
+  startRoutingWait,
 } from '@cortexkit/anthropic-auth-core'
 
 export type PiQuotaWaitOptions = {
@@ -16,6 +17,7 @@ export type PiAccountHold = {
   accountId: string
   accountIdentity?: string
   resetAt: number
+  reason?: 'account_limit' | 'routing_hold'
 }
 
 const holds = new WeakMap<Response, PiAccountHold>()
@@ -68,6 +70,7 @@ export async function withPiQuotaWait(input: {
   resume: (hold: PiAccountHold | undefined) => Promise<Response>
   signal?: AbortSignal
   wait?: PiQuotaWaitOptions
+  sessionId?: string
 }) {
   const original = await input.run()
   const hold = holds.get(original)
@@ -93,35 +96,51 @@ export async function withPiQuotaWait(input: {
       resetAt: undefined,
       retryAfterSeconds: undefined,
     })
-  await waitForReset(
-    clampHostRetryMs(delay),
-    hold?.resetAt ?? refusal?.timing.resetAt,
-    input.signal,
-    options,
-  )
-  input.signal?.throwIfAborted()
-  let next: Response | undefined
+  const endWait = startRoutingWait({
+    sessionId: input.sessionId,
+    reason: hold?.reason ?? (hold ? 'account_limit' : 'account_free'),
+    delayMs: clampHostRetryMs(delay),
+    nextMs: (options.now?.() ?? Date.now()) + clampHostRetryMs(delay),
+  })
+  let outcome: 'resumed' | 'cancelled' | 'abandoned' = 'abandoned'
   try {
-    next = await input.resume(hold)
-    if (next.ok || next.status === 401)
-      return hostRetryResponse(next, options.now?.() ?? Date.now())
+    await waitForReset(
+      clampHostRetryMs(delay),
+      hold?.resetAt ?? refusal?.timing.resetAt,
+      input.signal,
+      options,
+    )
+    input.signal?.throwIfAborted()
+    let next: Response | undefined
+    try {
+      next = await input.resume(hold)
+      if (next.ok || next.status === 401) {
+        outcome = 'resumed'
+        return hostRetryResponse(next, options.now?.() ?? Date.now())
+      }
+    } catch (error) {
+      if (input.signal?.aborted) throw error
+    }
+    const latest = next && quotaRefusalDetails(next)
+    void next?.body?.cancel().catch(() => {})
+    // Do not leak a rate-limit code or retry guidance into Pi's final error classifier.
+    return createQuotaRefusalResponse(
+      latest?.reason ??
+        refusal?.reason ??
+        'The selected OAuth account cannot serve this request. Open /claude to review account availability.',
+      {
+        resetAt:
+          latest?.timing.resetAt ?? refusal?.timing.resetAt ?? hold?.resetAt,
+        limitName: latest?.timing.limitName ?? refusal?.timing.limitName,
+        retryAfterSeconds: undefined,
+      },
+      options.now?.() ?? Date.now(),
+      { retry: 'manual' },
+    )
   } catch (error) {
-    if (input.signal?.aborted) throw error
+    if (input.signal?.aborted) outcome = 'cancelled'
+    throw error
+  } finally {
+    endWait?.(outcome)
   }
-  const latest = next && quotaRefusalDetails(next)
-  void next?.body?.cancel().catch(() => {})
-  // Do not leak a rate-limit code or retry guidance into Pi's final error classifier.
-  return createQuotaRefusalResponse(
-    latest?.reason ??
-      refusal?.reason ??
-      'The selected OAuth account cannot serve this request. Open /claude to review account availability.',
-    {
-      resetAt:
-        latest?.timing.resetAt ?? refusal?.timing.resetAt ?? hold?.resetAt,
-      limitName: latest?.timing.limitName ?? refusal?.timing.limitName,
-      retryAfterSeconds: undefined,
-    },
-    options.now?.() ?? Date.now(),
-    { retry: 'manual' },
-  )
 }

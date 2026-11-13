@@ -137,6 +137,10 @@ export class StickyQuotaRetryCounter {
   clear(sessionId: string): void {
     this.sessions.delete(sessionId)
   }
+
+  attempt(sessionId: string): number | undefined {
+    return this.sessions.get(sessionId)?.retains
+  }
 }
 
 /**
