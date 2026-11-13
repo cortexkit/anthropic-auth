@@ -97,23 +97,6 @@ export async function settingsMoveHolderFiles(
   ].sort()
 }
 
-function readableHolder(value: unknown): value is HolderEntry {
-  if (!holderEntryLiveness(value)) return false
-  const entry = value as HolderEntry
-  return (
-    typeof entry.release === 'string' &&
-    typeof entry.instance === 'string' &&
-    entry.instance.length > 0 &&
-    ['opencode1', 'opencode2', 'cli', 'setup', 'pi'].includes(entry.role) &&
-    ['legacy', 'explicit', 'pi', 'state-home'].includes(entry.kind) &&
-    (entry.identity === null || typeof entry.identity === 'string') &&
-    Array.isArray(entry.files) &&
-    entry.files.every((file) => typeof file === 'string') &&
-    Number.isFinite(entry.registeredAt) &&
-    entry.registeredAt >= 0
-  )
-}
-
 /**
  * A closed fence is not a startup refusal: the caller keeps serving legacy settings.
  * Any older live holder blocks, even when its file list shares no path with a move source.
@@ -168,26 +151,28 @@ export async function checkSettingsMoveFence(
     }
     for (const value of contents?.entries ?? []) {
       const life = holderEntryLiveness(value)
-      if (life?.pid === self.pid && life.incarnation === self.incarnation)
-        continue
-      if (!readableHolder(value)) {
+      if (!life) {
         blockers.push({
           kind: 'settings-holder',
           holderFile,
-          pid: life?.pid ?? null,
+          pid: null,
           release: null,
           reason: 'unreadable',
         })
         continue
       }
-      if (!(await holderEntryIsLive(value, options.liveness))) continue
-      const release = parseRelease(value.release)
+      if (life.pid === self.pid && life.incarnation === self.incarnation)
+        continue
+      if (!(await holderEntryIsLive(life, options.liveness))) continue
+      const releaseText = (value as { release?: unknown }).release
+      const release =
+        typeof releaseText === 'string' ? parseRelease(releaseText) : undefined
       if (!release || compareRelease(release, floor) < 0) {
         blockers.push({
           kind: 'settings-holder',
           holderFile,
-          pid: value.pid,
-          release: value.release,
+          pid: life.pid,
+          release: typeof releaseText === 'string' ? releaseText : null,
           reason: 'release',
         })
       }

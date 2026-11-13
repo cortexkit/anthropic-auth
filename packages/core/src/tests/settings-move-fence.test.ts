@@ -190,13 +190,7 @@ test('dead, reused and pre-boot peers do not close the fence', async () => {
 
 test('unreadable holder entries and holder files close the fence', async () => {
   const options = await fixture()
-  for (const entry of [
-    null,
-    {},
-    { pid: 200 },
-    holder({ files: null as any }),
-    holder({ release: 123 as any }),
-  ]) {
+  for (const entry of [null, {}, { pid: 200 }]) {
     const result = await checkSettingsMoveFence({
       ...options,
       readHolders: async () => ({ entries: [entry] }),
@@ -225,6 +219,54 @@ test('unreadable holder entries and holder files close the fence', async () => {
     kind: 'holder-file',
     reason: 'EACCES',
   })
+})
+
+test('a dead entry missing role does not close the fence', async () => {
+  const options = await fixture()
+  const entry: Record<string, unknown> = { ...holder({ pid: 999 }) }
+  delete entry.role
+  expect(
+    (
+      await checkSettingsMoveFence({
+        ...options,
+        readHolders: async () => ({ entries: [entry] }),
+      })
+    ).open,
+  ).toBe(true)
+})
+
+test('a live entry with an unknown role at the floor does not close the fence', async () => {
+  const options = await fixture()
+  expect(
+    (
+      await checkSettingsMoveFence({
+        ...options,
+        readHolders: async () => ({
+          entries: [
+            { ...holder(), role: 'future-host', kind: 'future-layout' },
+          ],
+        }),
+      })
+    ).open,
+  ).toBe(true)
+})
+
+test('a live entry with no release closes the fence for its release', async () => {
+  const options = await fixture()
+  for (const release of [undefined, null, 123]) {
+    const entry: Record<string, unknown> = { ...holder(), release }
+    if (release === undefined) delete entry.release
+    const result = await checkSettingsMoveFence({
+      ...options,
+      readHolders: async () => ({ entries: [entry] }),
+    })
+    expect(result.open).toBe(false)
+    expect(result.blockers[0]).toMatchObject({
+      kind: 'settings-holder',
+      reason: 'release',
+      release: null,
+    })
+  }
 })
 
 test('all standard registries and every source store sibling are checked', async () => {
