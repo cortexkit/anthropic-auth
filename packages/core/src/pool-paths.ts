@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
 import * as fsPromises from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import { canonicalFilePath } from '@cortexkit/common-auth/fs'
 
 import { getAccountStatePath, getAccountStoragePath } from './accounts.ts'
-import { canonicalFilePath } from './canonical-file-path.ts'
 import {
   type PathResolutionOptions,
   resolvePathOptions,
@@ -69,7 +69,12 @@ export async function canonicalPath(
   try {
     return platform === 'win32'
       ? await realpath(absolute)
-      : await canonicalFilePath(absolute, { ...fsPromises, realpath })
+      : await canonicalFilePath(absolute, {
+          ...fsPromises,
+          // The shared helper only calls realpath with a string and no encoding,
+          // so the injected resolver does not need Node's buffer overloads.
+          realpath: realpath as typeof fsPromises.realpath,
+        })
   } catch (error) {
     if (
       !(error instanceof Error) ||

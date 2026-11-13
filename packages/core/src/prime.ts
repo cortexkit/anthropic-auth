@@ -3,6 +3,7 @@ import * as fs from 'node:fs'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { canonicalFilePathSync } from '@cortexkit/common-auth/fs'
 
 import {
   type AccountQuotaWindow,
@@ -16,7 +17,6 @@ import {
   type PrimeUsageCounters,
   quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
-import { canonicalFilePathSync } from './canonical-file-path.ts'
 import { logger } from './logger.ts'
 import {
   CLAUDE_HAIKU_4_5_MODEL_ID,

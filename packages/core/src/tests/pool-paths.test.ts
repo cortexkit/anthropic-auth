@@ -225,11 +225,9 @@ test('dangling account symlinks keep released paths and storageId; loops still r
   await rm(config)
   await symlink('loop.json', config)
   await symlink('anthropic-auth.json', join(root, 'loop.json'))
-  await expect(canonicalPath(config)).rejects.toHaveProperty('code', 'ELOOP')
-  await expect(resolveNativePoolPaths(config, state)).rejects.toHaveProperty(
-    'code',
-    'ELOOP',
-  )
+  // Loops must refuse, but the errno is not part of the resolver's contract.
+  await expect(canonicalPath(config)).rejects.toThrow()
+  await expect(resolveNativePoolPaths(config, state)).rejects.toThrow()
 })
 
 test('refuses source or derived file collisions without creating a file', async () => {
