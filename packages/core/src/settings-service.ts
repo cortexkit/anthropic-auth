@@ -105,6 +105,8 @@ export interface SettingsGeneration {
 
 export interface SettingsService {
   readonly file: string
+  /** An independently disposable reference; settings stay live until all references are disposed. */
+  retain(): SettingsService
   /** Synchronous, memory-only reads; unknown models use the no-model context. */
   resolve(host: SettingsHost, model?: string): SettingsValues
   snapshot(): SettingsGeneration
@@ -894,6 +896,53 @@ class SettingsProtectionLease {
   }
 }
 
+/** Share a resolved lease without tying a runtime's lifetime to its first caller. */
+function referenceCountedSettingsService(
+  service: Omit<SettingsService, 'retain'>,
+): SettingsService {
+  let users = 0
+  function reference(): SettingsService {
+    users++
+    let closed = false
+    let closing: Promise<void> | undefined
+    const subscriptions = new Set<() => void>()
+    const use = () => {
+      if (closed) throw new Error('Settings service lease is disposed')
+      return service
+    }
+    return {
+      file: service.file,
+      retain() {
+        use()
+        return reference()
+      },
+      resolve: (host, model) => use().resolve(host, model),
+      snapshot: () => use().snapshot(),
+      status: () => use().status(),
+      refresh: () => use().refresh(),
+      update: (edits, host) => use().update(edits, host),
+      watch(listener) {
+        const unsubscribe = use().watch(listener)
+        const stop = () => {
+          unsubscribe()
+          subscriptions.delete(stop)
+        }
+        subscriptions.add(stop)
+        return stop
+      },
+      dispose() {
+        if (closed) return closing ?? Promise.resolve()
+        closed = true
+        for (const unsubscribe of subscriptions) unsubscribe()
+        subscriptions.clear()
+        closing = --users === 0 ? service.dispose() : Promise.resolve()
+        return closing
+      },
+    }
+  }
+  return reference()
+}
+
 /** One lease per plugin instance; no handle, reads or watch for a separate install. */
 export async function openSettingsService(
   options: SettingsServiceOptions,
@@ -938,7 +987,7 @@ export async function openSettingsService(
     await dispose()
     throw error
   }
-  return {
+  return referenceCountedSettingsService({
     file,
     resolve(host, model) {
       use()
@@ -966,5 +1015,5 @@ export async function openSettingsService(
     refresh: () => use().refresh(),
     update: (edits, host) => use().update(edits, host),
     dispose,
-  }
+  })
 }

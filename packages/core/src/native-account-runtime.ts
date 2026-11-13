@@ -334,8 +334,6 @@ export function acquireNativeAccountRuntime(
     }),
     ...[
       options.beforePoolWrite,
-      options.settingsService,
-      options.settingsMode,
       options.local?.refreshToken,
       options.local?.resolveIdentity,
       options.local?.failurePolicy,
@@ -1107,7 +1105,8 @@ export function createNativeAccountRuntime(
       )
     },
     async getSettingsPath() {
-      return (await selectedStorage()).paths.config
+      check()
+      return runtimeSettings.file() ?? (await selectedStorage()).paths.config
     },
     getSettingsStatus: runtimeSettings.status,
     resolveSettings: runtimeSettings.resolve,
@@ -1913,8 +1912,8 @@ export function createNativeAccountRuntime(
     },
     close() {
       if (closing) return closing
-      runtimeSettings.close()
       const draining = Promise.all([
+        runtimeSettings.close(),
         quotaPublications.close(),
         metadataPublications.drain(),
       ])

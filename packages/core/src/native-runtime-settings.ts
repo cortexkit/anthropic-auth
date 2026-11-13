@@ -31,9 +31,10 @@ export interface NativeRuntimeSettingsStatus {
 }
 
 /**
- * Project policy settings from memory. The host opens and disposes its settings
- * service, and checks the user file and move marker off the request path to
- * decide when to change its cached mode from legacy to user-file.
+ * Project policy settings from memory, retaining a service reference until close.
+ * The host releases its own reference and checks off the request path whether
+ * the user file exists or a marker records a completed settings migration, then
+ * updates the cached legacy/user-file mode.
  */
 export function createNativeRuntimeSettings(
   options: NativeRuntimeSettingsOptions & {
@@ -42,11 +43,11 @@ export function createNativeRuntimeSettings(
   },
 ) {
   const env = options.env ?? process.env
+  const service = options.settingsService?.retain()
   let effects: NativeSettingsEffectFields | undefined
   const generation = () =>
-    options.settingsService &&
-    (options.settingsMode?.() ?? 'user-file') === 'user-file'
-      ? options.settingsService.snapshot()
+    service && (options.settingsMode?.() ?? 'user-file') === 'user-file'
+      ? service.snapshot()
       : undefined
 
   function resolve(stored: AccountStorage, model?: string): AccountStorage
@@ -100,6 +101,15 @@ export function createNativeRuntimeSettings(
     }
   }
 
-  const unwatch = options.settingsService?.watch(() => applyEffects())
-  return { resolve, status, applyEffects, close: () => unwatch?.() }
+  const unwatch = service?.watch(() => applyEffects())
+  return {
+    resolve,
+    status,
+    applyEffects,
+    file: () => generation()?.file,
+    close: () => {
+      unwatch?.()
+      return service?.dispose()
+    },
+  }
 }

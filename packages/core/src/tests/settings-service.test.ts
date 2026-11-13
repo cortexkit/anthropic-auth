@@ -1226,3 +1226,29 @@ test('only the Core settings service opens a production settings handle or selec
   )
   expect(source).not.toMatch(/from ['"]node:fs['"]|\bwatchFile\s*\(/)
 })
+
+test('retained references own their watches and keep the resolved protection lease alive until the last disposal', async () => {
+  const f = await fixture('{"dump_enabled":true}')
+  const original = await f.open()
+  const retained = original.retain()
+  cleanup.push(() => retained.dispose())
+  const changes: number[] = []
+  original.watch(() => {
+    changes.push(1)
+  })
+  retained.watch(() => {
+    changes.push(2)
+  })
+  await original.dispose()
+  expect(() => original.retain()).toThrow('disposed')
+  expect(f.counts.stops).toBe(0)
+  expect(retained.resolve('opencode').dump_enabled).toBe(true)
+  await writeFile(f.file, '{"dump_enabled":false}')
+  await retained.refresh()
+  expect(changes).toEqual([2])
+  expect(retained.resolve('opencode').dump_enabled).toBe(false)
+  await retained.dispose()
+  await retained.dispose()
+  expect(f.counts.stops).toBe(1)
+  expect(() => retained.snapshot()).toThrow('disposed')
+})

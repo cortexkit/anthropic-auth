@@ -22,7 +22,10 @@ import {
   type LogTestRecord,
   setLogLevel,
 } from '../logger.ts'
-import { createNativeAccountRuntime } from '../native-account-runtime.ts'
+import {
+  acquireNativeAccountRuntime,
+  createNativeAccountRuntime,
+} from '../native-account-runtime.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { createNativeRuntimeSettings } from '../native-runtime-settings.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
@@ -78,6 +81,7 @@ async function fixture(values: Record<string, unknown> = {}) {
     mode: (next: SettingsMode) => {
       mode = next
     },
+    settingsMode: () => mode,
   }
 }
 
@@ -458,3 +462,85 @@ test('runtime overlays request policy only and never writes the projected enums 
   expect(JSON.stringify(saved.settings)).not.toContain('"off"')
   expect(JSON.stringify(saved.settings)).not.toContain('"default"')
 })
+
+async function emptyRuntimeStore(root: string) {
+  const paths = await resolveNativePoolPaths(
+    join(root, 'runtime-accounts.json'),
+  )
+  await initializeNativeTestAuthority(paths)
+  const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+  cleanup.push(() => store.close())
+  await store.initialize()
+  return {
+    paths,
+    host: 'opencode' as const,
+    vault: {
+      env: {
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
+          root,
+          'enrollment.json',
+        ),
+      },
+    },
+  }
+}
+
+for (const firstToClose of [0, 1]) {
+  test(`separate settings leases share one native runtime and survive closing acquisition ${firstToClose + 1}`, async () => {
+    const f = await fixture(overrides)
+    await f.reader.close()
+    const peerService = await openSettingsService({ file: f.file })
+    if (!peerService) throw new Error('Expected peer settings lease')
+    cleanup.push(() => peerService.dispose())
+    expect(peerService).not.toBe(f.service)
+    const options = await emptyRuntimeStore(f.root)
+    const first = acquireNativeAccountRuntime({
+      ...options,
+      settingsService: f.service,
+      settingsMode: f.settingsMode,
+    })
+    const second = acquireNativeAccountRuntime({
+      ...options,
+      settingsService: peerService,
+      settingsMode: () => 'user-file',
+    })
+    cleanup.push(() => first.close())
+    cleanup.push(() => second.close())
+    const initial = await first.read('claude-opus-5-5')
+    expect(initial.policyStorage.claudeFast?.enabled).toBe(true)
+    expect(second.peek?.()).toBe(initial)
+    const acquisitions = [first, second]
+    await acquisitions[firstToClose]!.close()
+    await f.service.dispose()
+    await writeFile(f.file, '{"claude_fast_enabled":false}')
+    await peerService.refresh()
+    await peerService.dispose()
+    const remaining = acquisitions[1 - firstToClose]!
+    expect(
+      (await remaining.read('claude-opus-5-5')).policyStorage.claudeFast
+        ?.enabled,
+    ).toBe(false)
+    expect(await remaining.getSettingsPath()).toBe(f.file)
+    f.mode('legacy')
+    expect(await remaining.getSettingsPath()).toBe(options.paths.config)
+    f.mode('user-file')
+    expect(await remaining.getSettingsPath()).toBe(f.file)
+  })
+}
+
+for (const mode of ['user-file', 'legacy', 'separate'] as const) {
+  test(`getSettingsPath returns the ${mode === 'user-file' ? 'user file' : 'legacy store'} in ${mode} mode`, async () => {
+    const f = await fixture()
+    f.mode(mode)
+    const options = await emptyRuntimeStore(f.root)
+    const runtime = createNativeAccountRuntime({
+      ...options,
+      settingsService: f.service,
+      settingsMode: f.settingsMode,
+    })
+    cleanup.push(() => runtime.close())
+    expect(await runtime.getSettingsPath()).toBe(
+      mode === 'user-file' ? f.file : options.paths.config,
+    )
+  })
+}
