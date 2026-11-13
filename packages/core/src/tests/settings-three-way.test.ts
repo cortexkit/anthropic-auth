@@ -263,7 +263,11 @@ function accessPath(
   if (!isNode(node)) return undefined
   if (node.type === 'Identifier')
     return aliases.get(String(node.name)) ?? [String(node.name)]
-  if (node.type === 'TSAsExpression' || node.type === 'TSNonNullExpression')
+  if (
+    node.type === 'TSAsExpression' ||
+    node.type === 'TSNonNullExpression' ||
+    node.type === 'TSSatisfiesExpression'
+  )
     return accessPath(node.expression, aliases)
   if (node.type === 'LogicalExpression') return accessPath(node.left, aliases)
   if (
@@ -283,120 +287,194 @@ function accessPath(
   return [...object, property]
 }
 
-test('every Core three-way field read is inventoried and uses the shared helper', async () => {
-  const coreRoot = resolve(import.meta.dir, '../..')
-  const repoRoot = resolve(coreRoot, '../..')
+function readerName(path: string, owner: string | undefined) {
+  if (path.endsWith('/v2/wire.ts') && owner === 'requestOptions')
+    return 'createNativeWirePolicy transformOptions'
+  if (path.endsWith('/v2/source.ts') && owner === 'chooseAccount')
+    return 'createNativeAnthropicSource chooseAccount'
+  if (path.endsWith('/v2/lifecycle.ts') && owner === 'run')
+    return 'startNativeAnthropicLifecycle run'
+  if (path === 'packages/opencode/src/index.ts' && owner === 'fetch')
+    return 'AnthropicAuthPlugin authTransport.fetch main quota backoff check'
+  return owner ?? '<unnamed>'
+}
+
+function unlistedReads(source: string, file: string) {
   const fields = {
     claude_cache_enabled: ['claudeCache', 'enabled'],
     quota_enabled: ['quota', 'enabled'],
     quota_fail_closed_on_unknown_quota: ['quota', 'failClosedOnUnknownQuota'],
   } as const
-  const found: Record<Key, string[]> = {
-    claude_cache_enabled: [],
-    quota_enabled: [],
-    quota_fail_closed_on_unknown_quota: [],
-  }
-  for await (const file of new Bun.Glob('**/*.ts').scan({
-    cwd: resolve(coreRoot, 'src'),
-    absolute: true,
-  })) {
-    if (file.includes('/tests/')) continue
-    const source = await readFile(file, 'utf8')
-    const ast = parse(source, { sourceType: 'module', plugins: ['typescript'] })
-    function checkRead(
-      path: string[] | undefined,
-      node: AstNode,
-      parent: AstNode | undefined,
-      owner: string | undefined,
-    ) {
-      const key = (Object.keys(fields) as Key[]).find(
-        (key) => fields[key].join('.') === path?.slice(-2).join('.'),
-      )
-      if (!key) return
-      const location = `${relative(repoRoot, file)}:${owner ?? '<unnamed>'}`
-      found[key].push(location)
-      const entry = SETTINGS_THREE_WAY_READERS[key].find(
-        ({ path, reader }) => `${path}:${reader}` === location,
-      )
-      const helper =
-        entry && 'kind' in entry && entry.kind === 'mapping'
-          ? 'toThreeWay'
-          : 'readThreeWayBoolean'
-      expect(
-        parent?.type === 'CallExpression' &&
+  const found: { key: Key; location: string; allowed: boolean }[] = []
+  const ast = parse(source, {
+    sourceType: 'module',
+    plugins: file.endsWith('x') ? ['typescript', 'jsx'] : ['typescript'],
+  })
+  function checkRead(
+    path: string[] | undefined,
+    node: AstNode,
+    parent: AstNode | undefined,
+    owner: string | undefined,
+  ) {
+    const key = (Object.keys(fields) as Key[]).find(
+      (key) => fields[key].join('.') === path?.slice(-2).join('.'),
+    )
+    if (!key) return
+    const location = `${file}:${readerName(file, owner)}`
+    const entry = SETTINGS_THREE_WAY_READERS[key].find(
+      ({ path, reader }) => `${path}:${reader}` === location,
+    )
+    const helper =
+      entry && 'kind' in entry && entry.kind === 'mapping'
+        ? 'toThreeWay'
+        : 'readThreeWayBoolean'
+    found.push({
+      key,
+      location,
+      allowed: Boolean(
+        entry &&
+          parent?.type === 'CallExpression' &&
           isNode(parent.callee) &&
           parent.callee.type === 'Identifier' &&
           parent.callee.name === helper &&
           Array.isArray(parent.arguments) &&
           parent.arguments[0] === node,
-        `${location} must read ${key} through ${helper}`,
-      ).toBe(true)
-    }
-    function bind(
-      pattern: unknown,
-      path: string[],
-      aliases: Map<string, string[]>,
-      owner: string | undefined,
-    ) {
-      if (!isNode(pattern)) return
-      if (pattern.type === 'Identifier') aliases.set(String(pattern.name), path)
-      if (
-        pattern.type === 'ObjectPattern' &&
-        Array.isArray(pattern.properties)
-      ) {
-        for (const property of pattern.properties) {
-          if (!isNode(property) || property.type !== 'ObjectProperty') continue
-          const name = propertyName(property.key)
-          if (!name) continue
-          const childPath = [...path, name]
-          checkRead(childPath, property, undefined, owner)
-          bind(property.value, childPath, aliases, owner)
-        }
+      ),
+    })
+  }
+  function bind(
+    pattern: unknown,
+    path: string[],
+    aliases: Map<string, string[]>,
+    owner: string | undefined,
+  ) {
+    if (!isNode(pattern)) return
+    if (pattern.type === 'Identifier') aliases.set(String(pattern.name), path)
+    if (pattern.type === 'AssignmentPattern')
+      bind(pattern.left, path, aliases, owner)
+    if (pattern.type === 'ObjectPattern' && Array.isArray(pattern.properties)) {
+      for (const property of pattern.properties) {
+        if (!isNode(property) || property.type !== 'ObjectProperty') continue
+        const name = propertyName(property.key)
+        if (!name) continue
+        const childPath = [...path, name]
+        checkRead(childPath, property, undefined, owner)
+        bind(property.value, childPath, aliases, owner)
       }
     }
-    function visit(
-      node: AstNode,
-      parent: AstNode | undefined,
-      owner: string | undefined,
-      aliases: Map<string, string[]>,
+  }
+  function visit(
+    node: AstNode,
+    parent: AstNode | undefined,
+    owner: string | undefined,
+    aliases: Map<string, string[]>,
+  ) {
+    if (node.type === 'FunctionDeclaration') owner = propertyName(node.id)
+    if (node.type === 'ObjectMethod') owner = propertyName(node.key)
+    if (
+      node.type === 'ArrowFunctionExpression' ||
+      node.type === 'FunctionExpression'
     ) {
-      if (node.type === 'FunctionDeclaration') owner = propertyName(node.id)
-      if (node.type === 'BlockStatement' || node.type.includes('Function'))
-        aliases = new Map(aliases)
-      if (Array.isArray(node.params)) {
-        for (const param of node.params) {
-          if (isNode(param) && param.type === 'Identifier')
-            aliases.set(String(param.name), [String(param.name)])
-        }
+      if (parent?.type === 'VariableDeclarator') owner = propertyName(parent.id)
+      if (parent?.type === 'ObjectProperty') owner = propertyName(parent.key)
+    }
+    if (node.type === 'BlockStatement' || node.type.includes('Function'))
+      aliases = new Map(aliases)
+    if (Array.isArray(node.params)) {
+      for (const param of node.params) {
+        if (isNode(param))
+          bind(
+            param,
+            param.type === 'Identifier' ? [String(param.name)] : [],
+            aliases,
+            owner,
+          )
       }
-      if (node.type === 'VariableDeclarator') {
-        const path = accessPath(node.init, aliases)
-        if (path) bind(node.id, path, aliases, owner)
-      }
-      if (
-        node.type === 'MemberExpression' ||
-        node.type === 'OptionalMemberExpression'
+    }
+    if (node.type === 'VariableDeclarator') {
+      const path = accessPath(node.init, aliases)
+      if (path) bind(node.id, path, aliases, owner)
+    }
+    if (node.type === 'AssignmentExpression' && node.operator === '=') {
+      const path = accessPath(node.right, aliases)
+      if (path) bind(node.left, path, aliases, owner)
+    }
+    if (
+      (node.type === 'MemberExpression' ||
+        node.type === 'OptionalMemberExpression') &&
+      !(
+        parent?.type === 'AssignmentExpression' &&
+        parent.left === node &&
+        parent.operator === '='
       )
-        checkRead(accessPath(node, aliases), node, parent, owner)
-      for (const value of Object.values(node)) {
-        if (isNode(value)) visit(value, node, owner, aliases)
-        else if (Array.isArray(value)) {
-          for (const child of value)
-            if (isNode(child)) visit(child, node, owner, aliases)
-        }
+    )
+      checkRead(accessPath(node, aliases), node, parent, owner)
+    for (const value of Object.values(node)) {
+      if (isNode(value)) visit(value, node, owner, aliases)
+      else if (Array.isArray(value)) {
+        for (const child of value)
+          if (isNode(child)) visit(child, node, owner, aliases)
       }
     }
-    visit(ast.program as unknown as AstNode, undefined, undefined, new Map())
   }
-  for (const key of Object.keys(found) as Key[]) {
-    expect(found[key].sort()).toEqual(
-      SETTINGS_THREE_WAY_READERS[key]
-        .filter(
-          ({ path, reader }) =>
-            path.startsWith('packages/core/') && !reader.includes(' (via '),
-        )
-        .map(({ path, reader }) => `${path}:${reader}`)
-        .sort(),
+  visit(ast.program as unknown as AstNode, undefined, undefined, new Map())
+  return found
+}
+
+test.each(['core', 'opencode', 'pi'])(
+  '%s source reads are closed over the schema reader inventory',
+  async (pkg) => {
+    const repoRoot = resolve(import.meta.dir, '../../../..')
+    const found: ReturnType<typeof unlistedReads> = []
+    let scanned = 0
+    for await (const file of new Bun.Glob('**/*.{ts,tsx,js,mjs}').scan({
+      cwd: resolve(repoRoot, 'packages', pkg, 'src'),
+      absolute: true,
+    })) {
+      const path = relative(repoRoot, file).replaceAll('\\', '/')
+      if (path.includes('/tests/')) continue
+      scanned++
+      found.push(...unlistedReads(await readFile(file, 'utf8'), path))
+    }
+    expect(scanned).toBeGreaterThan(0)
+    expect(found.filter(({ allowed }) => !allowed)).toEqual([])
+    for (const key of Object.keys(SETTINGS_THREE_WAY_READERS) as Key[]) {
+      expect(
+        [
+          ...new Set(
+            found
+              .filter((site) => site.key === key)
+              .map(({ location }) => location),
+          ),
+        ].sort(),
+      ).toEqual(
+        SETTINGS_THREE_WAY_READERS[key]
+          .filter(
+            ({ path, reader }) =>
+              path.startsWith(`packages/${pkg}/`) &&
+              !reader.includes(' (via ') &&
+              !reader.includes('persistent cache latch via'),
+          )
+          .map(({ path, reader }) => `${path}:${reader}`)
+          .sort(),
+      )
+    }
+  },
+)
+
+for (const pkg of ['core', 'opencode', 'pi']) {
+  test.each([
+    'return readThreeWayBoolean(s.claudeCache?.enabled, false)',
+    'return readThreeWayBoolean(s["quota"]["enabled"], true)',
+    'const { quota: { enabled = true } } = s; return enabled',
+    'const { claudeCache: cache } = s; const alias = cache; return alias.enabled',
+    'let q; q = s.quota ?? {}; return q.enabled',
+  ])(`${pkg} guard rejects an unlisted reader: %s`, (body) => {
+    const sites = unlistedReads(
+      `function outsider(s) { ${body} }`,
+      `packages/${pkg}/src/accounts.ts`,
     )
-  }
-})
+    expect(sites.length).toBeGreaterThan(0)
+    expect(sites.every(({ allowed }) => !allowed)).toBe(true)
+  })
+}
