@@ -9,7 +9,7 @@ import {
   type UpdateResult,
   type ValueOf,
 } from '@cortexkit/common-auth/settings'
-import { parse } from 'jsonc-parser'
+import { type ParseError, parse } from 'jsonc-parser'
 
 import { logger } from './logger.ts'
 import {
@@ -63,6 +63,11 @@ export interface SettingsContextValues {
   readonly models: Readonly<Record<string, SettingsValues>>
 }
 
+/** Explicit file levels only; values and their validity remain common-auth's responsibility. */
+export type SettingsFileLevels = Readonly<
+  Partial<Record<SettingsKey, readonly string[]>>
+>
+
 export interface SettingsFileStatus {
   readonly file: string
   readonly state: 'ready' | 'missing' | 'unparseable' | 'unreadable'
@@ -81,6 +86,7 @@ export interface SettingsGeneration {
   readonly status: 'ready' | 'missing' | 'unparseable' | 'unreadable'
   /** Raw file text for inspecting override locations outside request handling; never log it. */
   readonly source: string | undefined
+  readonly fileLevels: SettingsFileLevels
   readonly contexts: Readonly<Record<SettingsHost, SettingsContextValues>>
   readonly report: readonly ReportEntry[]
   readonly fileStatus: SettingsFileStatus
@@ -160,6 +166,43 @@ function defaults(): SettingsValues {
       structuredClone(settingsDefinition.settings[key].default),
     ]),
   ) as unknown as SettingsValues
+}
+
+function fileObject(source: string | undefined): Record<string, unknown> {
+  if (source === undefined) return {}
+  const text = source.replace(/^\uFEFF/, '')
+  if (/^[\x20\t\r\n]*$/.test(text)) return {}
+  const errors: ParseError[] = []
+  const raw = parse(text, errors, { allowTrailingComma: true })
+  return !errors.length && raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw
+    : {}
+}
+
+function fileLevels(raw: Record<string, unknown>): SettingsFileLevels {
+  return Object.fromEntries(
+    keys
+      .filter((key) => Object.hasOwn(raw, key))
+      .map((key) => {
+        const declaration = settingsDefinition.settings[key]
+        const value = raw[key]
+        const levels =
+          'overrides' in declaration &&
+          value &&
+          typeof value === 'object' &&
+          !Array.isArray(value)
+            ? Object.keys(value).filter(
+                (level) =>
+                  level === 'default' ||
+                  hosts.some((host) => host === level) ||
+                  ('model' in declaration.overrides &&
+                    declaration.overrides.model &&
+                    modelIds.has(level)),
+              )
+            : ['default']
+        return [key, levels]
+      }),
+  )
 }
 
 function protection(values: SettingsValues): SettingsProtectionValues {
@@ -393,10 +436,7 @@ class SharedSettingsService {
     }
     if (after.status === 'unreadable') addReport([], 'unreadable')
     // Inspect override names and deciding locations only; common-auth validates and resolves values.
-    const raw =
-      source === undefined
-        ? undefined
-        : parse(source.replace(/^\uFEFF/, ''), [], { allowTrailingComma: true })
+    const raw = fileObject(source)
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       for (const key of keys) {
         const declaration = settingsDefinition.settings[key]
@@ -484,7 +524,7 @@ class SharedSettingsService {
           // Drop an invalid host level before considering the remaining default level.
           const fallback =
             window && !Array.isArray(window) && typeof window === 'object'
-              ? window.default
+              ? (window as Record<string, unknown>).default
               : undefined
           values.cache_keep_window =
             Array.isArray(fallback) &&
@@ -537,6 +577,7 @@ class SharedSettingsService {
       candidate: {
         file: this.file,
         source,
+        fileLevels: fileLevels(raw),
         status,
         contexts,
         report,
@@ -565,6 +606,7 @@ class SharedSettingsService {
     return {
       file: this.file,
       source: undefined,
+      fileLevels: this.current?.fileLevels ?? {},
       status,
       contexts,
       report,

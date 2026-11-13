@@ -295,11 +295,13 @@ export type AccountStorage = {
     mainRefreshLeaseTokenHash?: string
   }
   quota?: {
-    enabled?: boolean
+    enabled?: ThreeWayBoolean
     checkIntervalMinutes?: number
     refreshEveryNRequests?: number
-    minimumRemaining?: Partial<Record<QuotaWindowName | '5h' | '1w', number>>
-    failClosedOnUnknownQuota?: boolean
+    minimumRemaining?: Partial<
+      Record<QuotaWindowName | 'scoped' | '5h' | '1w', number>
+    >
+    failClosedOnUnknownQuota?: ThreeWayBoolean
     /** Opt-in OpenCode TUI toast after quota refresh. Default: false. */
     showToasts?: boolean
     mainQuota?: OAuthQuotaSnapshot
@@ -319,7 +321,7 @@ export type AccountStorage = {
     enabled?: boolean
   }
   claudeCache?: {
-    enabled?: boolean
+    enabled?: ThreeWayBoolean
     mode?: Cache1hMode
   }
   dump?: {
@@ -380,7 +382,7 @@ export type AccountStorage = {
   accounts: FallbackAccount[]
 }
 
-/** Readers accept default/on/off alongside booleans without changing legacy store types. */
+/** Shared input for readers of legacy booleans and user-file default/on/off values. */
 export type AccountSettingsReaderInput = Omit<
   AccountStorage,
   'quota' | 'claudeCache'
