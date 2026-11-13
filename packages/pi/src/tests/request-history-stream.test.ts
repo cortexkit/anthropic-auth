@@ -19,15 +19,22 @@ import { saveNativePiFixture } from './native-fixture.ts'
 const originalFetch = globalThis.fetch
 const originalPath = process.env.PI_ANTHROPIC_AUTH_FILE
 let directory: string | undefined
+let currentStoragePath: string | undefined
 
-afterEach(async () => {
+async function cleanupFixture() {
+  // An unclosed runtime keeps polling for vault accounts after its test ends.
+  // Stop it before another test's fake vault receives those background reads.
+  if (currentStoragePath) await closePiNativeRuntime(currentStoragePath)
+  currentStoragePath = undefined
   globalThis.fetch = originalFetch
   if (originalPath === undefined) delete process.env.PI_ANTHROPIC_AUTH_FILE
   else process.env.PI_ANTHROPIC_AUTH_FILE = originalPath
   const finished = directory
   directory = undefined
   if (finished) await rm(finished, { recursive: true, force: true })
-})
+}
+
+afterEach(cleanupFixture)
 
 const model: Model<Api> = {
   id: 'claude-opus-5-5',
@@ -65,6 +72,7 @@ for (const apiKey of ['sk-ant-oat-fixture-history', 'fixture-api-key']) {
     async (emptyUser) => {
       directory = await mkdtemp(join(tmpdir(), 'pi-history-boundary-'))
       const storagePath = join(directory, 'anthropic-auth.json')
+      currentStoragePath = storagePath
       process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
       await saveNativePiFixture(
         {
@@ -148,6 +156,7 @@ for (const apiKey of ['sk-ant-oat-fixture-history', 'fixture-api-key']) {
 test('Pi API-key requests never use message threads', async () => {
   directory = await mkdtemp(join(tmpdir(), 'pi-api-thread-exclusion-'))
   const storagePath = join(directory, 'accounts.json')
+  currentStoragePath = storagePath
   process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
   await saveNativePiFixture(
     {
@@ -207,4 +216,30 @@ test('Pi API-key requests never use message threads', async () => {
   } finally {
     await closePiNativeRuntime(storagePath)
   }
+})
+
+test('Pi history fixture cleanup stops its native vault poll', async () => {
+  directory = await mkdtemp(join(tmpdir(), 'pi-history-poll-cleanup-'))
+  const storagePath = join(directory, 'anthropic-auth.json')
+  currentStoragePath = storagePath
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture({ version: 1, accounts: [] }, storagePath)
+  const polls = new Set<object>()
+  const native = getPiNativeRuntime(storagePath, {
+    vaultPoll: {
+      intervalMs: 2000,
+      setInterval: (() => {
+        const timer = { unref() {} }
+        polls.add(timer)
+        return timer
+      }) as unknown as typeof setInterval,
+      clearInterval: ((timer: object) => {
+        polls.delete(timer)
+      }) as unknown as typeof clearInterval,
+    },
+  })
+  await native.service()
+  expect(polls.size).toBe(1)
+  await cleanupFixture()
+  expect(polls.size).toBe(0)
 })

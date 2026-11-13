@@ -17,6 +17,7 @@ import {
   type Usage,
 } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest } from '../convert.ts'
+import { closePiNativeRuntime } from '../native.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
@@ -243,6 +244,7 @@ test('Pi Haiku first turns, account-default replay and API-key replay receive no
 test('Pi Haiku physical OAuth dispatch carries its prefix control and beta together', () =>
   trackPiTestBody(
     (async () => {
+      const storagePath = getPiAccountStoragePath()
       await saveNativePiFixture(
         {
           version: 1,
@@ -250,7 +252,7 @@ test('Pi Haiku physical OAuth dispatch carries its prefix control and beta toget
           accounts: [],
           thinkingBinding: { prefixMismatchBehavior: 'drop_block' },
         },
-        getPiAccountStoragePath(),
+        storagePath,
       )
       const originalFetch = globalThis.fetch
       let capturedBody: Record<string, unknown> | undefined
@@ -311,6 +313,7 @@ test('Pi Haiku physical OAuth dispatch carries its prefix control and beta toget
           THINKING_BINDING_CONTROLS_BETA,
         )
       } finally {
+        await closePiNativeRuntime(storagePath)
         globalThis.fetch = originalFetch
       }
     })(),
