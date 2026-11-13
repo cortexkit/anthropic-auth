@@ -519,3 +519,17 @@ test('a note never establishes authority, and a deleted file stays in user-file 
   expect(await resolveSettingsMode(paths, { ...options, fs })).toBe('user-file')
   expect(touched.every((path) => !path.endsWith('MOVED_READPLEASE'))).toBe(true)
 })
+
+test.skipIf(process.platform !== 'win32')(
+  'on real Windows the marker is written into an existing shared folder with inherited ACLs',
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'settings-marker-win-'))
+    roots.push(root)
+    // A plain mkdir inherits the parent's ACLs, like %APPDATA%\cortexkit made by another plugin.
+    const shared = join(root, 'cortexkit')
+    await mkdir(shared)
+    const target = join(shared, 'anthropic-auth.jsonc')
+    await writeSettingsMoveMarker(target)
+    expect(await hasSettingsMoveMarker(target)).toBe(true)
+  },
+)

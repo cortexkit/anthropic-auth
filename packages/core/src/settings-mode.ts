@@ -62,7 +62,12 @@ export async function writeSettingsMoveMarker(
   )
   const parent = context.paths.dirname(target)
   if (options.fs?.mkdir) await options.fs.mkdir(parent)
+  // An existing folder is left as it is: %APPDATA%\cortexkit is shared with
+  // other CortexKit plugins and keeps its inherited access-control lists,
+  // which the owner-only helper refuses. Only a missing folder is created
+  // owner-only.
   else if (
+    !(await exists(parent)) &&
     !(await ensureWindowsOwnerOnlyDirectory(parent, {
       ...options.ownership,
       platform: context.platform,
