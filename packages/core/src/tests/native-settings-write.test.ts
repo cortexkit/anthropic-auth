@@ -1889,6 +1889,62 @@ test('a floor edit is refused as busy when the file changed after the list was p
   expect(f.calls).toHaveLength(0)
 })
 
+test('a floor edit during the missing-file grace recreates the file instead of failing as busy', async () => {
+  const f = await fixture(
+    JSON.stringify({
+      killswitch_enabled: true,
+      killswitch_account_floors: [
+        {
+          account: 'kept',
+          host: 'opencode',
+          five_hour: 9,
+          seven_day: 9,
+          scoped: 0,
+        },
+      ],
+    }),
+  )
+  await rm(f.file)
+  await f.service.refresh()
+  // The deleted file's generation stays published for the 2 s grace.
+  expect(f.service.snapshot().status).toBe('ready')
+  const result = await f.runtime.updateSettings((settings) => {
+    const killswitch = settings.killswitch as {
+      accounts: Record<string, unknown>
+    }
+    killswitch.accounts.added = { five_hour: 3, seven_day: 4 }
+  })
+  expect(result.outcome).toBe('saved')
+  const raw = parse(await f.text())
+  expect(raw.killswitch_enabled).toBe(true)
+  expect(
+    (raw.killswitch_account_floors as { account: string; host: string }[])
+      .filter((entry) => entry.host === 'opencode')
+      .map((entry) => entry.account),
+  ).toEqual(['kept', 'added'])
+})
+
+test('a floor edit planned from a missing file is refused as busy when the file appears', async () => {
+  const peerText = '{"killswitch_account_floors":[]}'
+  const f = await fixture(null, {
+    legacy: { killswitch: { enabled: true } },
+  })
+  const result = await f.runtime.updateSettings(async (settings) => {
+    // Another host recreates the file after this generation was read.
+    await writeFile(f.file, peerText)
+    const killswitch = settings.killswitch as {
+      accounts: Record<string, unknown>
+    }
+    killswitch.accounts.added = { five_hour: 3, seven_day: 4 }
+  })
+  expect(result).toMatchObject({
+    outcome: 'failed',
+    reason: SETTINGS_WRITE_FAILURES['settings-busy'].text(f.file),
+  })
+  expect(await f.text()).toBe(peerText)
+  expect(f.calls).toHaveLength(0)
+})
+
 test('a recreation is refused as busy when the file appears while protection is gathered', async () => {
   const peerText =
     '{"killswitch_enabled":true,"killswitch_default_five_hour":77}'

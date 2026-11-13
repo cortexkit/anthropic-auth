@@ -220,7 +220,19 @@ export function planNativeSettingsWrite(
         nextAccounts.get(account),
       ),
   )
-  const plan = { edits, storeChanges, refusal: undefined as string | undefined }
+  const plan = {
+    edits,
+    storeChanges,
+    refusal: undefined as string | undefined,
+    /**
+     * What a floor-list edit was planned from: the file text, or a missing
+     * file. The write is refused as busy if the file is no longer that.
+     */
+    floorsFrom: undefined as
+      | { status: 'missing' }
+      | { status: 'ready'; source: string }
+      | undefined,
+  }
   if (!edits.length && !accounts.length && !storeChanges.length) return plan
   // A watch's save grace period can retain old provenance after the user deletes the file.
   const present = existsSync(generation.file)
@@ -263,11 +275,18 @@ export function planNativeSettingsWrite(
     return plan
   }
   // The settings service has checked the list; parsing its original text retains other hosts' and custody modes' entries.
+  // During the missing-file grace the generation still holds the deleted
+  // file's text; the list is planned from what is on disk now (no file).
+  // An empty file is planned like a missing one but must stay empty.
+  const floorsFrom =
+    present && generation.source !== undefined
+      ? { status: 'ready' as const, source: generation.source }
+      : { status: 'missing' as const }
   const edit = planSettingsAccountFloors(
-    present && generation.source
+    floorsFrom.status === 'ready' && floorsFrom.source
       ? {
           status: 'ready',
-          document: parse(generation.source.replace(/^\uFEFF/, ''), [], {
+          document: parse(floorsFrom.source.replace(/^\uFEFF/, ''), [], {
             allowTrailingComma: true,
           }),
         }
@@ -276,7 +295,10 @@ export function planNativeSettingsWrite(
     host,
     settingsRecreationFloors(generation.protection[host].values, host),
   )
-  if (edit) edits.push(edit)
+  if (edit) {
+    edits.push(edit)
+    plan.floorsFrom = floorsFrom
+  }
   return plan
 }
 

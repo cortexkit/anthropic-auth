@@ -26,6 +26,7 @@ import {
 import type {
   SettingsFileStatus,
   SettingsService,
+  SettingsUpdateOptions,
   SettingsValues,
 } from './settings-service.ts'
 import type { SettingsProtectionFallback } from './settings-start.ts'
@@ -319,8 +320,11 @@ export function createNativeRuntimeSettings(
     async update(
       edits: readonly SettingsEdit[],
       before: Record<string, unknown>,
-      /** The file text a floor list was planned from; see SettingsUpdateOptions. */
-      expectedSource?: string,
+      /** What a floor list was planned from; see SettingsUpdateOptions. */
+      planned: Pick<
+        SettingsUpdateOptions,
+        'expectedSource' | 'expectMissing'
+      > = {},
     ) {
       if (!service) throw new Error('Settings service is not available')
       // Menu commits emit effects once, even when a service watch fires during the edit.
@@ -331,7 +335,7 @@ export function createNativeRuntimeSettings(
           (
             await service.update(edits, options.host, {
               createMissing: true,
-              ...(expectedSource === undefined ? {} : { expectedSource }),
+              ...planned,
             })
           ).outcome === 'updated'
       } finally {

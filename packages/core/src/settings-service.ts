@@ -68,6 +68,11 @@ export interface SettingsUpdateOptions {
    */
   expectedSource?: string
   /**
+   * The edits were planned from a missing file (a floor list started from
+   * the recreation's list). The write is refused as busy if a file exists.
+   */
+  expectMissing?: boolean
+  /**
    * Setup runs while every host is stopped. When the other host then has no
    * recoverable protection set (no applied copy and no legacy store, rather
    * than an unreadable one), recreation carries the writer's set instead of
@@ -1105,13 +1110,19 @@ class SharedSettingsService {
     // the exact text a floor list was computed from. A change in the short
     // window after this check is not caught; common-auth 0.49's planned
     // update runs the planner on the document read under the lock instead.
-    if (options.createMissing || options.expectedSource !== undefined) {
+    if (
+      options.createMissing ||
+      options.expectedSource !== undefined ||
+      options.expectMissing
+    ) {
       const now = await this.bytes()
       const changed =
         options.expectedSource !== undefined
           ? now.status !== 'ready' ||
             now.bytes.toString('utf8') !== options.expectedSource
-          : (now.status === 'missing') !== missing
+          : options.expectMissing
+            ? now.status !== 'missing'
+            : (now.status === 'missing') !== missing
       if (changed)
         throw new SettingsRefusal(
           'settings-busy',

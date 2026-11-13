@@ -1555,16 +1555,16 @@ function buildNativeAccountRuntime(
           return { settings: before, outcome: 'refused', reason: plan.refusal }
         try {
           if (plan.edits.length) {
-            const generation = service.snapshot()
             await runtimeSettings.update(
               plan.edits,
               before,
-              // A whole floor list was computed from this text; refuse if it changed.
-              plan.edits.some(
-                (edit) => edit.setting === 'killswitch_account_floors',
-              ) && generation.status !== 'missing'
-                ? generation.source
-                : undefined,
+              // A whole floor list was computed from this state of the file
+              // (its text, or no file); refuse if the file is no longer so.
+              plan.floorsFrom?.status === 'ready'
+                ? { expectedSource: plan.floorsFrom.source }
+                : plan.floorsFrom?.status === 'missing'
+                  ? { expectMissing: true }
+                  : {},
             )
           }
         } catch (error) {
