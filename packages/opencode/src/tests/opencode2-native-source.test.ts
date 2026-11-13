@@ -72,6 +72,7 @@ import {
 import { holdNativeRelayLock } from '../../../core/src/tests/native-relay-lock-fixture.ts'
 import { requestLockProbe } from '../../../core/src/tests/native-request-lock-fixture.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
+import { vaultOutageClock } from '../../../core/src/tests/vault-outage-clock.ts'
 import { tokenFingerprint } from '../../../core/src/token-fingerprint'
 import { ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
 import {
@@ -1622,6 +1623,7 @@ async function vault(
     install(client: NativeCustodyClient): void
     setTimeout: typeof setTimeout
     clearTimeout: typeof clearTimeout
+    now?: () => number
   },
 ) {
   const { paths, env, store: localStore } = await storage()
@@ -1695,6 +1697,7 @@ async function vault(
       readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
       setTimeout: hosted?.setTimeout,
       clearTimeout: hosted?.clearTimeout,
+      now: hosted?.now,
     },
   })
   await runtime.vault.refresh()
@@ -4323,7 +4326,11 @@ describe('OC2 vault enrollment callbacks for the claude menu', () => {
 })
 
 test('OpenCode 2 serves through a vault outage with the original receipt', async () => {
-  const f = await vault()
+  const clock = vaultOutageClock(Date.now())
+  const f = await vault(undefined, undefined, undefined, undefined, {
+    ...clock,
+    install() {},
+  })
   const native = source(f.runtime, f.paths)
   expect(await native.chooseAccount(scope)).toBe('main')
   const first = await native.authorizeAccount(scope, 'main')
@@ -4345,7 +4352,9 @@ test('OpenCode 2 serves through a vault outage with the original receipt', async
   await native.onAttemptEnd?.(attempt, { status: 401, outputStarted: false })
   expect(f.reports).toHaveLength(0)
   expect(f.gets).toHaveLength(1)
-  await expect(native.authorizeAccount(scope, 'main')).rejects.toThrow()
+  await expect(
+    clock.finish(native.authorizeAccount(scope, 'main')),
+  ).rejects.toThrow()
 })
 
 test('audit OC2 configured 400 policy reaches the installed retry hook and can move accounts', async () => {

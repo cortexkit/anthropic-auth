@@ -39,6 +39,7 @@ import { createNativePoolStore } from '../pool-store.ts'
 import { QuotaManager } from '../quota-manager.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
+import { vaultOutageClock } from './vault-outage-clock.ts'
 import { recordedTimers, watchableVaultClient } from './vault-watch-fixture.ts'
 
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
@@ -63,7 +64,7 @@ const listed: Row = {
   createdAtMs: null,
 }
 
-async function fixture() {
+async function fixture(outageWait = false) {
   const root = await mkdtemp(join(tmpdir(), 'native-vault-runtime-'))
   deferCleanup(() => rm(root, { recursive: true, force: true }))
   const paths = await resolveNativePoolPaths(join(root, 'anthropic-auth.json'))
@@ -111,7 +112,7 @@ async function fixture() {
   })
   let rows: readonly Row[] = [listed]
   let version = 7
-  let clock = now
+  const clock = vaultOutageClock(now)
   let failure: unknown
   let token = '01'.repeat(32)
   const counts = { connects: 0, lists: 0, gets: 0, closes: 0 }
@@ -150,7 +151,10 @@ async function fixture() {
     paths,
     host: 'opencode' as const,
     env,
-    now: () => clock,
+    now: clock.now,
+    ...(outageWait
+      ? { setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout }
+      : {}),
     connect: async () => {
       counts.connects++
       return client
@@ -173,6 +177,7 @@ async function fixture() {
     client,
     store,
     primaryRouteId,
+    finish: clock.finish,
     rows: (value: readonly Row[]) => {
       rows = value
     },
@@ -180,7 +185,7 @@ async function fixture() {
       version = value
     },
     clock: (value: number) => {
-      clock = value
+      clock.set(value)
     },
     failure: (value: unknown) => {
       failure = value
@@ -1731,12 +1736,12 @@ test('vault outage serves the last validated receipt without local fallback', as
 
 for (const remaining of [59_999, 60_000]) {
   test(`vault kept receipt refuses with ${remaining} ms remaining`, async () => {
-    const f = await fixture()
+    const f = await fixture(true)
     await f.runtime.refresh()
     await f.runtime.authorize('main')
     f.clock(now + 3_600_000 - remaining)
     f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-    await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
       code: 'unavailable',
     })
   })
@@ -1744,7 +1749,7 @@ for (const remaining of [59_999, 60_000]) {
 
 test('vault explicit refusal and unknown failure discard the kept receipt', async () => {
   for (const code of ['grant_denied', 'future_failure', 'closed']) {
-    const f = await fixture()
+    const f = await fixture(true)
     await f.runtime.refresh()
     await f.runtime.authorize('main')
     f.failure(Object.assign(new Error('refused'), { code }))
@@ -1752,14 +1757,14 @@ test('vault explicit refusal and unknown failure discard the kept receipt', asyn
       code: 'unavailable',
     })
     f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-    await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
       code: 'unavailable',
     })
   }
 })
 
 test('vault roster removal forgets a receipt even if the same binding returns', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   f.rows([])
@@ -1767,25 +1772,25 @@ test('vault roster removal forgets a receipt even if the same binding returns', 
   f.rows([listed])
   await f.runtime.refresh()
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 test('vault decline forgets a receipt even if reenabled before the next send', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   await f.runtime.setEnabled('main', false)
   await f.runtime.setEnabled('main', true)
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 test('vault rebinding forgets a receipt even if the original account returns', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   f.rows([{ ...listed, accountId: uuid2 }])
@@ -1793,13 +1798,13 @@ test('vault rebinding forgets a receipt even if the original account returns', a
   f.rows([listed])
   await f.runtime.refresh()
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 test('vault kept receipt 401 neither retries nor reports and drops the receipt', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
@@ -1810,14 +1815,14 @@ test('vault kept receipt 401 neither retries nor reports and drops the receipt',
   await f.runtime.reportFailure(kept, 401, 'direct')
   expect(f.counts.gets).toBe(gets)
   expect(f.reports).toHaveLength(0)
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 for (const failedReport of [false, true]) {
   test(`vault reported fresh 401 cannot be kept after outage (report fails=${failedReport})`, async () => {
-    const f = await fixture()
+    const f = await fixture(true)
     await f.runtime.refresh()
     const served = await f.runtime.authorize('main')
     if (failedReport)
@@ -1827,27 +1832,27 @@ for (const failedReport of [false, true]) {
     await f.runtime.reportFailure(served, 401, 'direct').catch(() => {})
     expect(f.reports).toHaveLength(failedReport ? 0 : 1)
     f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-    await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+    await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
       code: 'unavailable',
     })
   })
 }
 
 test('fresh vault runtime has no kept receipt after host restart', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   f.runtime.close()
   const restarted = createNativeVaultRuntime(f.options)
   deferCleanup(() => restarted.close())
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-  await expect(restarted.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(restarted.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 test('adapter shutdown closed is not a vault outage', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   f.failure(new NativeCustodyError('closed'))
@@ -1855,13 +1860,13 @@ test('adapter shutdown closed is not a vault outage', async () => {
     code: 'unavailable',
   })
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNREFUSED' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 test('vault disconnect closes retained custody before reenrollment', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   const tokenPath = f.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
@@ -1872,13 +1877,13 @@ test('vault disconnect closes retained custody before reenrollment', async () =>
   expect(f.counts.closes).toBe(1)
   await writeFile(tokenPath, token, { mode: 0o600 })
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNREFUSED' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 test('roster publication invalidates other live vault runtimes', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   const publisher = createNativeVaultRuntime(f.options)
@@ -1888,20 +1893,20 @@ test('roster publication invalidates other live vault runtimes', async () => {
   f.rows([listed])
   await publisher.refresh()
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
 
 test('kept receipt retry admission forgets before any later 401 reporting', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
   const kept = await f.runtime.authorize('main')
   expect(await f.runtime.prepareRetry(kept)).toMatchObject({ retry: false })
   expect(f.reports).toHaveLength(0)
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
@@ -1947,7 +1952,7 @@ test('adapter kept receipt state is nonsecret and clears on forget and close', a
 })
 
 test('observed roster credential type change forgets the OAuth receipt', async () => {
-  const f = await fixture()
+  const f = await fixture(true)
   await f.runtime.refresh()
   await f.runtime.authorize('main')
   await mutateVaultRoster(f.vaultPaths.roster, (roster) => {
@@ -1962,7 +1967,7 @@ test('observed roster credential type change forgets the OAuth receipt', async (
     return { next: roster, result: undefined }
   })
   f.failure(Object.assign(new Error('outage'), { code: 'ECONNRESET' }))
-  await expect(f.runtime.authorize('main')).rejects.toMatchObject({
+  await expect(f.finish(f.runtime.authorize('main'))).rejects.toMatchObject({
     code: 'unavailable',
   })
 })
@@ -2167,14 +2172,15 @@ const FIVE_MINUTES_MS = 5 * 60_000
 async function watchedRuntime(
   f: Awaited<ReturnType<typeof fixture>>,
   intervalMs = 2_000,
+  outageWait = false,
 ) {
   const timers = recordedTimers(deferCleanup)
   let handled = 0
   const handledWaiters: { count: number; open: () => void }[] = []
   const runtime = createNativeVaultRuntime({
     ...f.options,
-    setTimeout: timers.setTimeout,
-    clearTimeout: timers.clearTimeout,
+    setTimeout: outageWait ? f.options.setTimeout : timers.setTimeout,
+    clearTimeout: outageWait ? f.options.clearTimeout : timers.clearTimeout,
     onRosterNoticeHandled: () => {
       handled++
       for (const waiter of [...handledWaiters])
@@ -2348,9 +2354,9 @@ test('a vault without the watch method falls back and keeps the host pace', asyn
 
 for (const code of ['not_found', 'enrollment_revoked'] as const) {
   test(`a ${code} watch refusal drops kept receipts and refuses as a refused listing does`, async () => {
-    const f = await fixture()
+    const f = await fixture(true)
     const vault = watchableVaultClient(f.client, gate)
-    const w = await watchedRuntime(f)
+    const w = await watchedRuntime(f, 2_000, true)
     const notices = await vault.nth(0)
     await w.runtime.authorize('main')
     // Closed before any notice: the client's confirming listing was refused.
@@ -2370,9 +2376,11 @@ for (const code of ['not_found', 'enrollment_revoked'] as const) {
       })
     } else {
       expect(f.counts.closes).toBe(0)
-      await expect(w.runtime.authorize('main')).rejects.toMatchObject({
-        code: 'unavailable',
-      })
+      await expect(f.finish(w.runtime.authorize('main'))).rejects.toMatchObject(
+        {
+          code: 'unavailable',
+        },
+      )
     }
   })
 }

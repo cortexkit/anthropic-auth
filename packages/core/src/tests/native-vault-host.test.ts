@@ -37,6 +37,7 @@ import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { StickySessionRouter } from '../sticky-routing.ts'
 import { insulaBackground } from './insula-watch-fixture.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
+import { vaultOutageClock } from './vault-outage-clock.ts'
 
 const symbol = Symbol.for('cortexkit.vault')
 const globals = globalThis as unknown as Record<symbol, unknown>
@@ -1348,7 +1349,7 @@ test('a recovered serving relay wins over a pending proven replacement', async (
 })
 
 test('client replacement preserves retain changes made while its roster proof awaited', async () => {
-  const timers = manualTimers(),
+  const timers = vaultOutageClock(now),
     old = outageClient(),
     fresh = outageClient()
   const entered = gate(),
@@ -1374,9 +1375,11 @@ test('client replacement preserves retain changes made while its roster proof aw
   await entered.wait
   custody.retain([{ ...identity, enabled: false, state: 'active' }])
   release.open()
-  await swapped.wait
+  await timers.finish(swapped.wait)
   fresh.fail()
-  await expect(custody.authorize(identity)).rejects.toMatchObject({
+  await expect(
+    timers.finish(custody.authorize(identity)),
+  ).rejects.toMatchObject({
     code: 'unavailable',
   })
 })

@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -12,10 +12,12 @@ import {
   FrameType,
   HEADER_LEN,
   SERVER_PROOF_DOMAIN,
+  SubcClient,
 } from '@cortexkit/subc-client'
 
 import { createNativeCustody, NativeCustodyError } from '../native-custody.ts'
 import { connectNativeVaultScopedClient } from '../native-vault-runtime.ts'
+import { vaultOutageClock } from './vault-outage-clock.ts'
 
 const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1)
 const daemonId = Uint8Array.from({ length: 16 }, (_, index) => index + 1)
@@ -138,10 +140,25 @@ async function startRetryableDaemon(root: string): Promise<RetryableDaemon> {
   }
 }
 
-test('retryable vault route refusals cannot hold native authorization past its two-second budget', async () => {
+test('each vault connect and route-open attempt keeps its two-second bound', async () => {
   const root = await mkdtemp(join(tmpdir(), 'native-vault-connect-timeout-'))
   let daemon: RetryableDaemon | undefined
-  let closeCustody: (() => void) | undefined
+  const clock = vaultOutageClock(0)
+  const connect = SubcClient.connect.bind(SubcClient)
+  const connector = spyOn(SubcClient, 'connect').mockImplementation(
+    (options) => {
+      expect(options.handshakeTimeoutMs).toBe(2_000)
+      expect(options.routeOpenRetryDeadlineMs).toBe(2_000)
+      return connect({
+        ...options,
+        now: clock.now,
+        sleep: async (ms) => {
+          clock.set(clock.now() + ms)
+        },
+        random: () => 0,
+      })
+    },
+  )
   try {
     daemon = await startRetryableDaemon(root)
     const identity: BindIdentity = {
@@ -149,37 +166,68 @@ test('retryable vault route refusals cannot hold native authorization past its t
       harness: 'opencode',
       session: 'native-vault-timeout-test',
     }
-    const custody = createNativeCustody({
-      host: 'opencode',
-      readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
-      connect: () =>
-        connectNativeVaultScopedClient(daemon!.connectionFile, identity),
-    })
-    closeCustody = custody.close
-
-    const started = performance.now()
-    const error = await custody
-      .authorize({
-        credentialId: 'credential-test',
-        accountIdentity: 'account-test',
-      })
-      .then(
-        () => undefined,
-        (failure: unknown) => failure,
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const client = await connectNativeVaultScopedClient(
+        daemon.connectionFile,
+        identity,
       )
-    expect(error).toBeInstanceOf(NativeCustodyError)
-    const elapsedMs = performance.now() - started
-
-    // The two-second retry budget is the behaviour under test: failing fast
-    // on the first refusal fails both the wait below and the retry count
-    // beside it. There is deliberately no upper bound — a loaded runner only
-    // makes a correct wait longer, while a lengthened production budget fails
-    // this test's own 8 s timeout instead of flaking here.
-    expect(elapsedMs).toBeGreaterThanOrEqual(1_500)
+      try {
+        const started = clock.now()
+        await expect(
+          client.getScoped({ credentialId: 'credential-test' }),
+        ).rejects.toThrow()
+        expect(clock.now() - started).toBe(2_000)
+      } finally {
+        client.close()
+      }
+    }
     expect(daemon.routeOpenAttempts()).toBeGreaterThan(1)
   } finally {
-    closeCustody?.()
+    connector.mockRestore()
     await daemon?.close()
     await rm(root, { recursive: true, force: true })
   }
 }, 8_000)
+
+test('cold authorization exhausts the ten-second young-outage wait with the unavailable error', async () => {
+  const clock = vaultOutageClock(0)
+  const durations: number[] = []
+  const custody = createNativeCustody({
+    host: 'opencode',
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+    readToken: async () => ({ token: '01'.repeat(32), token_generation: 1 }),
+    connect: async () => {
+      const started = clock.now()
+      await new Promise<void>((_resolve, reject) => {
+        clock.setTimeout(() => {
+          durations.push(clock.now() - started)
+          reject(
+            Object.assign(new Error('Synthetic vault unreachable'), {
+              code: 'ECONNREFUSED',
+            }),
+          )
+        }, 2_000)
+      })
+      throw new Error('Unreachable connection unexpectedly succeeded')
+    },
+  })
+  try {
+    const error = await clock
+      .finish(
+        custody.authorize({
+          credentialId: 'credential-test',
+          accountIdentity: 'account-test',
+        }),
+      )
+      .catch((failure: unknown) => failure)
+    expect(error).toBeInstanceOf(NativeCustodyError)
+    expect(error).toMatchObject({ code: 'unavailable' })
+    expect(clock.now()).toBe(10_000)
+    expect(durations.length).toBeGreaterThan(1)
+    expect(durations.every((ms) => ms === 2_000)).toBe(true)
+  } finally {
+    custody.close()
+  }
+})

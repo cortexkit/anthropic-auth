@@ -77,8 +77,8 @@ function localHostAuth() {
   }
 }
 
-/** A synthetic vault whose listing holds only the main account's credential
- * row; any attempt to read that credential's token makes the test fail. */
+/** List the main account but refuse background quota authorization without
+ * simulating an unreachable vault or handing out credential material. */
 function mainOnlyVault(): NativeCustodyClient {
   return {
     async listScoped() {
@@ -104,7 +104,12 @@ function mainOnlyVault(): NativeCustodyClient {
       }
     },
     async getScoped() {
-      throw new Error('Add-account tests must not read vault credentials')
+      throw Object.assign(
+        new Error('Synthetic vault refuses credential reads'),
+        {
+          code: 'grant_denied',
+        },
+      )
     },
     async reportAuthFailureScoped() {
       throw new Error('Add-account tests must not report vault failures')
@@ -750,7 +755,10 @@ describe('add-oauth error paths', () => {
       // migration, so a vault-migrated pool is the Claustrum case and a
       // locally migrated pool is the local case.
       const vault = await migrate(emptyStorage(), 'claustrum')
-      const vaultPlugin = await vault.getPlugin({ authorize })
+      const vaultPlugin = await vault.getPlugin({
+        authorize,
+        claustrumScopedConnect: async () => mainOnlyVault(),
+      })
       const refused = await applyMenuAction(
         vault,
         vaultPlugin,

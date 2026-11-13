@@ -4,6 +4,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Under Thalamus, a turn can survive a short vault restart without losing its account authorization.
+- Under Thalamus, OpenCode and Pi can show why a request is waiting on account availability or a routing delay.
+- Moving to shared routing keeps a session on the account it was already using, preserving its warm cache when that account is still available.
+
 ## 2.11.2
 
 - OpenCode 1, OpenCode 2 and Pi now preserve a still-live cache boundary from the previous full request when a message thread ends, avoiding large cache rewrites when continuation entries cannot be reused.
