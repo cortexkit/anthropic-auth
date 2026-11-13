@@ -203,6 +203,7 @@ import {
   readNativeHostAuthKind,
   readNativeMigrationJournal,
   readSessionCachePolicy,
+  readThreeWayBoolean,
   refreshBackoffActive,
   remapModelId,
   remapRequestBodyModel,
@@ -2078,7 +2079,7 @@ const anthropicAuthPlugin = async (
   ) {
     if (
       !storage ||
-      storage.quota?.enabled === false ||
+      !readThreeWayBoolean(storage.quota?.enabled, true) ||
       !accountUuid ||
       getRoutingMode(storage) === 'sticky-balanced' ||
       isPermanentRefreshError(storage.refresh?.mainLastRefreshError)
@@ -3124,7 +3125,7 @@ const anthropicAuthPlugin = async (
     if (
       !force &&
       !requiredByPolicy &&
-      snapshot.policyStorage.quota?.enabled === false
+      !readThreeWayBoolean(snapshot.policyStorage.quota?.enabled, true)
     )
       return unavailable
     for (const account of snapshot.accounts) {
@@ -4870,7 +4871,7 @@ const anthropicAuthPlugin = async (
     mainQuotaIdentity?: MainQuotaIdentityBinding,
   ) {
     if (!accessToken) return
-    if (storage?.quota?.enabled !== true) return
+    if (!readThreeWayBoolean(storage?.quota?.enabled, false)) return
     const quotaKey = mainQuotaIdentity?.quotaKey ?? mainQuotaAccountId
     if (quotaManager.getMain(quotaKey)) return
     if (sidebarMainQuotaRefreshInFlight) return
@@ -7177,7 +7178,7 @@ const anthropicAuthPlugin = async (
           function mainQuotaRoutingEnabled(
             storage: Awaited<ReturnType<typeof loadAccounts>>,
           ) {
-            return storage?.quota?.enabled === true
+            return readThreeWayBoolean(storage?.quota?.enabled, false)
           }
 
           async function inspectStreamingRateLimit(
@@ -8771,7 +8772,10 @@ const anthropicAuthPlugin = async (
                     Date.now(),
                     tokenFingerprint(account.refresh),
                   ) &&
-                  storageArg?.quota?.failClosedOnUnknownQuota !== true &&
+                  !readThreeWayBoolean(
+                    storageArg?.quota?.failClosedOnUnknownQuota,
+                    false,
+                  ) &&
                   !quotaSnapshotHasStandardWindows(getFallbackQuota(account))
                 ) {
                   usable.push(account)
@@ -11026,7 +11030,10 @@ const anthropicAuthPlugin = async (
                 storage,
               )?.quota
               if (
-                storage?.quota?.failClosedOnUnknownQuota &&
+                readThreeWayBoolean(
+                  storage?.quota?.failClosedOnUnknownQuota,
+                  false,
+                ) &&
                 (mainQuota === undefined ||
                   (auth.access.startsWith('sk-ant-oat') &&
                     requestMainQuotaIdentity?.providerAccountUuid ===

@@ -1,5 +1,6 @@
 import {
   type NativeAccountSnapshot,
+  readThreeWayBoolean,
   remapModelId,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
@@ -134,7 +135,10 @@ export function createNativeWirePolicy() {
         cache1hEnabled:
           input.agent !== 'compaction' &&
           input.agent !== 'title' &&
-          (snapshot.policyStorage.claudeCache?.enabled ?? true),
+          readThreeWayBoolean(
+            snapshot.policyStorage.claudeCache?.enabled,
+            true,
+          ),
         cache1hMode: snapshot.policyStorage.claudeCache?.mode ?? 'explicit',
         fastModeEnabled: snapshot.policyStorage.claudeFast?.enabled === true,
         thinkingPrefixMismatchBehavior:

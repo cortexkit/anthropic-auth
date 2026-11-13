@@ -37,6 +37,7 @@ import {
   quotaSnapshotHasStandardWindows,
   readNativeAccountsForRequest,
   readSessionCachePolicy,
+  readThreeWayBoolean,
   remapModelId,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
@@ -667,7 +668,7 @@ export function createNativeAnthropicSource(
         snapshot = await readNativeAccountsForRequest(runtime, active.signal)
         active.signal.throwIfAborted()
       }
-      if (snapshot.policyStorage.quota?.enabled !== false) {
+      if (readThreeWayBoolean(snapshot.policyStorage.quota?.enabled, true)) {
         let refreshed = false
         for (const account of snapshot.accounts) {
           if (!nativeAccountCanServe(account) || account.type !== 'oauth')

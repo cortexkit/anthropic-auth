@@ -6,6 +6,7 @@ import {
   nativeAccountCanServe,
   oauthProfileIsFresh,
   quotaSnapshotCheckedAt,
+  readThreeWayBoolean,
 } from '@cortexkit/anthropic-auth-core'
 
 /**
@@ -36,7 +37,7 @@ export function startNativeAnthropicLifecycle(
       if (abort.signal.aborted) return
       if (!nativeAccountCanServe(account) || account.type !== 'oauth') continue
       if (
-        current.policyStorage.quota?.enabled !== false &&
+        readThreeWayBoolean(current.policyStorage.quota?.enabled, true) &&
         Date.now() - quotaSnapshotCheckedAt(account.quota) >= interval
       ) {
         // Each quota reading or failure is bound to the credential version
