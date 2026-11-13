@@ -24,15 +24,19 @@ An unreadable record never counts as local custody. Requests the plugin would se
 
 ## Storage
 
-Each host keeps its files next to its old sidecar path (`~/.config/opencode/` for OpenCode, `~/.pi/agent/` for Pi, with `~` as `%USERPROFILE%` on Windows, or the directory of `OPENCODE_ANTHROPIC_AUTH_FILE` / `PI_ANTHROPIC_AUTH_FILE`):
+User settings live separately from custody in the shared [`anthropic-auth.jsonc`](settings-file.md): `$HOME/.config/cortexkit/anthropic-auth.jsonc` on Linux/macOS, `%APPDATA%\cortexkit\anthropic-auth.jsonc` on Windows, or `%XDG_CONFIG_HOME%\cortexkit\anthropic-auth.jsonc` on Windows (`$XDG_CONFIG_HOME/cortexkit/anthropic-auth.jsonc` on Linux/macOS) when `XDG_CONFIG_HOME` is absolute. `ANTHROPIC_AUTH_SETTINGS_FILE` can name another absolute path. Every setting is user-only; no project settings file is read. Local, vault and hosted custody use the same settings service.
+
+The following account-store paths are derived from the old sidecar path (`~/.config/opencode/` for OpenCode, `~/.pi/agent/` for Pi, with `~` as `%USERPROFILE%` on Windows, or the directory of `OPENCODE_ANTHROPIC_AUTH_FILE` / `PI_ANTHROPIC_AUTH_FILE`). Machine-written state can instead be in the [state-home layout](environment.md#storage-custody-and-host-paths); the pool config and vault settings file stay beside the account file:
 
 | File | Role |
 | --- | --- |
 | `anthropic-auth.json`, `anthropic-auth-state.json` | Old sidecar files. Read once as the source for migration; not used afterwards. Their path also decides where the other files are created. |
-| `anthropic-auth-pool.json`, `anthropic-auth-pool-state.json` | Local account pool: accounts, API-key routes and settings, and their private credential state. |
+| `anthropic-auth-pool.json`, `anthropic-auth-pool-state.json` | Local account pool: accounts, API-key routes, relay settings and quota metadata, and their private credential state. Old user settings are retained for rollback and used by legacy/separate installs. |
 | `anthropic-auth-native-state.json`, `anthropic-auth-custody-roster.json` | Local runtime metadata. |
 | `anthropic-auth-migration.json` | Migration journal. |
-| `anthropic-auth-vault-settings.json`, `anthropic-auth-vault-store-state.json`, `anthropic-auth-vault-state.json`, `anthropic-auth-vault-roster.json`, `anthropic-auth-vault-routing-state.json` | Vault-mode settings, account metadata and session affinity (which account each session stays on), kept apart from every local file. |
+| `anthropic-auth-vault-settings.json`, `anthropic-auth-vault-store-state.json`, `anthropic-auth-vault-state.json`, `anthropic-auth-vault-roster.json`, `anthropic-auth-vault-routing-state.json` | Vault-mode relay settings, account metadata and session affinity (which account each session stays on), kept apart from local custody files. Old user settings are retained for rollback and used by legacy/separate installs. |
+
+The one-time settings move leaves these sources byte-identical and notes which shared target received the moved settings. The old files stay in use for everything that did not move; sidebar preferences remain in `tui-preferences.jsonc`. The owner-only `<settings path>.moved` marker prevents a second move after deletion, and `<settings path>.applied.json` holds last-applied protection values per host, with no credentials. See [move, recovery and rollback](settings-file.md#the-move-and-the-files-that-stay).
 
 The local pool is shared by every process of that host, including the `opencode-anthropic-auth` CLI for OpenCode. When setup configures both hosts, it refuses if any of their storage paths resolve to the same file, because two hosts writing one file would overwrite each other's accounts and state.
 
@@ -42,7 +46,7 @@ The local pool is shared by every process of that host, including the `opencode-
 
 `npx @cortexkit/opencode-anthropic-auth setup` without vault custody establishes local authority for each selected host. Setup is offline in the sense that every OpenCode, LiteCode and Pi process must be stopped; it can still use the network, for example for Claude sign-in. It rechecks that the processes are stopped before each write. OpenCode 2 alone uses [empty initialization](opencode-2.md#empty-initialization), without opening OpenCode 1 auth or a host database. OpenCode 1, `--opencode=both` and Pi use migration:
 
-- imports the old sidecar's fallback OAuth accounts, API-key routes and settings into the local pool, and carries sticky routing assignments over;
+- imports the old sidecar's fallback OAuth accounts and API-key routes into the local pool, and carries sticky routing assignments over. Settings go to the shared user file when it is authoritative, otherwise to the legacy store; setup itself never runs the one-time settings move. Against an existing user file, setup fills only settings the file does not already give that host;
 - moves OpenCode's stored Claude OAuth login into the pool as the main account and leaves an inert placeholder in OpenCode's auth slot: a fixed, non-secret OAuth-shaped marker that is not a usable credential and only tells OpenCode to route Claude requests through the plugin. A stored OpenCode API key is left as it is;
 - moves Pi's stored Anthropic OAuth login into the pool and removes it from Pi's auth file, only with explicit consent (`--remove-pi-auth` when running with `--yes`).
 

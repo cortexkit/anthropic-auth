@@ -19,6 +19,11 @@ docs/           public user and contributor documentation
 ## `packages/core/src`
 
 - `index.ts`: the barrel. Hosts import Core by package name only.
+- **Shared user settings:**
+  - `settings-definition.ts` declares flat user-only keys and their host/model overrides; the generated schema ships at `packages/core/schema/anthropic-auth.schema.json`. No project settings file is read. Sidebar preferences and relay settings do not move into this file.
+  - `settings-paths.ts` resolves the OS-specific `cortexkit/anthropic-auth.jsonc` user file, `ANTHROPIC_AUTH_SETTINGS_FILE` and separate installs. `settings-service.ts` owns the common-auth handle, per-path leases, watch, coherent in-memory model/host generations and keyed menu writes; `settings-record.ts` projects them into the policy record. `native-runtime-settings.ts` integrates the service with the account runtime.
+  - `settings-start.ts`, `settings-move-run.ts`, `settings-move-fence.ts` and `settings-move-{sources,source,map}.ts` own startup adoption and conversion from the active pool/vault stores. The move leaves sources unchanged and still in use for state that did not move. `settings-mode.ts` owns the `<target>.moved` marker, which prevents a second move after deletion; `.MOVED_READPLEASE` notes are informational. `settings-host-import.ts` preserves a later host's stricter legacy protection only where it has no explicit host value, recording the check in `<target>.moved.<host>`.
+  - `settings-protection-copy.ts` maintains owner-only `<target>.applied.json` beside the user file, with each host's complete last-applied user-file protection set and no credentials. `settings-protection-legacy.ts` provides per-runtime recovery when the file/copy is unusable. Recreation in `settings-service.ts` preserves both known host sets and refuses unknown protection; `settings-three-way.ts` preserves each reader's `default`/`on`/`off` semantics.
 - **Accounts and custody:**
   - `native-account-runtime.ts` is the shared account service. `native-account-view.ts` holds its secret-free views and `native-settings.ts` its settings transforms.
   - Local custody: `native-local-*.ts`, `native-refresh-coordinator.ts`, `native-runtime.ts` and `pool-*.ts` (paths, store, binding, authority).

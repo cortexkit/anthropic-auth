@@ -8,7 +8,7 @@ OpenCode defaults to `~/.config/opencode/`; Pi defaults to `~/.pi/agent/`. On Wi
 
 | File | Contents |
 | --- | --- |
-| `anthropic-auth-pool.json` | Local account rows, route definitions, settings and local quota metadata |
+| `anthropic-auth-pool.json` | Local account rows, route definitions, relay settings and local quota metadata; moved user settings remain here only for rollback, legacy mode or a separate install |
 | `anthropic-auth-pool-state.json` | Private local credentials |
 | `anthropic-auth-native-state.json` | Per-account runtime metadata, including profile, validation and Prime state |
 | `anthropic-auth-pool-routing-state.json` | Default local session pins, keyed by hashed session IDs |
@@ -44,16 +44,18 @@ Quota shows five-hour, seven-day and model-scoped windows when available. OpenCo
 
 Quota figures use the shared wording, such as `5h 40% left, resets 2h29m` and `7d 70% left, resets 3d23h`. Readings older than fifteen minutes include their age, such as `checked 1d6h ago`. Extra usage is shown as `credits 40% left` or `credits spent`, followed by the amount spent and the monthly limit in your account's currency: `credits 75% left · $25.00/$100.00`, `credits spent · $100.35/$100.00`. Without a limit (or without amounts), only the credit figure is shown. In a narrow OpenCode sidebar, amounts that would make the line too wide are shown without cents (`$1,250/$5,000`), and the collapsed sidebar's one-line form is unchanged.
 
-`quota.minimumRemaining.five_hour` and `.seven_day` are minimum **remaining** percentages, not usage percentages (`5h` and `1w` are menu aliases). `quota.failClosedOnUnknownQuota` controls unknown readings where no positive killswitch floor applies. Killswitch thresholds are separate hard blocks:
+`quota_minimum_remaining_five_hour` and `quota_minimum_remaining_seven_day` are minimum **remaining** percentages, not usage percentages (`5h` and `1w` are menu aliases). `quota_fail_closed_on_unknown_quota` controls unknown readings where no positive killswitch floor applies. Killswitch thresholds are separate hard blocks:
 
 - A positive five-hour or seven-day floor blocks missing readings for that window regardless of `failClosedOnUnknownQuota`.
 - A positive `scoped` minimum-remaining percentage blocks missing model-specific quota information. An explicitly empty scoped-window list means no separate window applies.
 - OpenCode can edit killswitch thresholds in **Limits**; Pi does not expose those edits.
 
-The optional `quotaHeaderFeed.enabled` setting is OpenCode-only, disabled by default and requires restart. It publishes allowlisted quota observations, opaque identity and timestamps to owner-only temporary lease files, not tokens, request bodies, model IDs or refresh errors. It shares observations already obtained from responses rather than making new quota API requests.
+The optional `quota_header_feed_enabled` setting is OpenCode-only, disabled by default and requires restart. It publishes allowlisted quota observations, opaque identity and timestamps to owner-only temporary lease files, not tokens, request bodies, model IDs or refresh errors. It shares observations already obtained from responses rather than making new quota API requests.
 
 ## Settings and custody
 
-Use menu actions for routing, cache, CacheKeep, fast mode, diagnostics and supported limits. `claudeCache.mode` accepts `explicit`, `automatic` or `hybrid`; `cacheKeep` controls keepalive, and `relay` controls an optional transport. See [cache](cache.md#cache-modes) and [transports](transports.md#relay) for their effects and costs.
+User settings are shared across OpenCode 1, OpenCode 2 and Pi in [`anthropic-auth.jsonc`](settings-file.md), independent of local, vault or hosted custody. The default is `$HOME/.config/cortexkit/anthropic-auth.jsonc` on Linux/macOS or `%APPDATA%\cortexkit\anthropic-auth.jsonc` on Windows; an absolute `XDG_CONFIG_HOME` takes precedence on every OS, and `ANTHROPIC_AUTH_SETTINGS_FILE` can name another absolute path. See the [complete path and separate-install rules](settings-file.md#location).
 
-Vault settings, roster and routing use a separate `anthropic-auth-vault-*` namespace. While enrolled, local credentials are not served, refreshed, polled or kept warm. See [vault accounts](vault.md#accounts-while-enrolled) and the [authority table](custody-state-machine.md#authority).
+Use menu actions for routing, cache, CacheKeep, fast mode, diagnostics and supported limits, or hand-edit the shared file's flat keys. `claude_cache_mode` accepts `explicit`, `automatic` or `hybrid`; `cache_keep_*` controls keepalive. Relay settings stay in the account store and control an optional transport. See [cache](cache.md#cache-modes) and [transports](transports.md#relay) for their effects and costs. All shared settings are user-only; no project settings file is read.
+
+The startup move reads settings from the current custody mode's pool config or `anthropic-auth-vault-settings.json`; [separate installs](settings-file.md#separate-installs) and legacy-mode processes keep reading and writing there. After the move, those old files still hold state that did not move, plus the old settings for rollback. Sidebar preferences stay in `tui-preferences.jsonc`. Vault roster, credentials, relay settings and routing retain the separate `anthropic-auth-vault-*` namespace. While enrolled, local credentials are not served, refreshed, polled or kept warm. See [vault accounts](vault.md#accounts-while-enrolled) and the [authority table](custody-state-machine.md#authority).
