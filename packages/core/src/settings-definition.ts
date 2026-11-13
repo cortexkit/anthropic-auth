@@ -298,6 +298,11 @@ export const SETTINGS_THREE_WAY_READERS = {
       absent: true,
     },
     {
+      path: 'packages/core/src/accounts.ts',
+      reader: 'killswitchPassesPolicy (via failClosedOnUnknownQuota)',
+      absent: true,
+    },
+    {
       path: 'packages/opencode/src/index.ts',
       reader: 'getRoutableFallbackAccounts',
       absent: false,

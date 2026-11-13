@@ -7,7 +7,7 @@ import {
   type CacheWarmStopReason,
   isCacheWarmStopReason,
 } from '@cortexkit/common-auth/routing-accessor'
-import type { AccountStorage } from './accounts.ts'
+import type { AccountSettingsReaderInput, AccountStorage } from './accounts.ts'
 import {
   type AnthropicBillingRequest,
   type AnthropicBillingWarming,
@@ -46,6 +46,7 @@ import {
   reportSessionCacheWarmStopped,
   requestCacheLifetimeMs,
 } from './session-cache-policy.ts'
+import { readThreeWayBoolean } from './settings-three-way.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
 export const CACHE_KEEP_TTL_MS = 60 * 60_000
@@ -135,7 +136,7 @@ export function parseCacheKeepCommandAction(
 }
 
 export function getCacheKeepWindow(
-  storage: AccountStorage | null,
+  storage: AccountSettingsReaderInput | null,
 ): CacheKeepWindow | undefined {
   const startHour = Number(storage?.cacheKeep?.startHour)
   const endHour = Number(storage?.cacheKeep?.endHour)
@@ -153,24 +154,28 @@ export function getCacheKeepWindow(
   return { startHour, endHour }
 }
 
-export function isCacheKeepAlways(storage: AccountStorage | null) {
+export function isCacheKeepAlways(storage: AccountSettingsReaderInput | null) {
   return (
     storage?.cacheKeep?.enabled === true && storage.cacheKeep.always === true
   )
 }
 
-export function isCacheKeepPersistentlyEnabled(storage: AccountStorage | null) {
+export function isCacheKeepPersistentlyEnabled(
+  storage: AccountSettingsReaderInput | null,
+) {
   return (
     storage?.cacheKeep?.enabled === true &&
     (isCacheKeepAlways(storage) || !!getCacheKeepWindow(storage))
   )
 }
 
-export function isCacheKeepHybridActive(storage: AccountStorage | null) {
+export function isCacheKeepHybridActive(
+  storage: AccountSettingsReaderInput | null,
+) {
   return (
     isCacheKeepPersistentlyEnabled(storage) &&
-    storage?.claudeCache?.enabled === true &&
-    storage.claudeCache.mode === 'hybrid'
+    readThreeWayBoolean(storage?.claudeCache?.enabled, false) &&
+    storage?.claudeCache?.mode === 'hybrid'
   )
 }
 

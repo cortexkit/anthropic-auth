@@ -17,6 +17,10 @@ import type { LogLevel } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
 import { getMaxSameAccountWait } from './routing.ts'
+import {
+  readThreeWayBoolean,
+  type ThreeWayBoolean,
+} from './settings-three-way.ts'
 
 export type { ProviderAccountUuid } from './claude-code.ts'
 
@@ -370,6 +374,23 @@ export type AccountStorage = {
   claustrum?: ClaustrumConfig
   killswitch?: KillswitchConfig
   accounts: FallbackAccount[]
+}
+
+/** Readers accept default/on/off alongside booleans without changing legacy store types. */
+export type AccountSettingsReaderInput = Omit<
+  AccountStorage,
+  'quota' | 'claudeCache'
+> & {
+  quota?: Omit<
+    NonNullable<AccountStorage['quota']>,
+    'enabled' | 'failClosedOnUnknownQuota'
+  > & {
+    enabled?: ThreeWayBoolean
+    failClosedOnUnknownQuota?: ThreeWayBoolean
+  }
+  claudeCache?: Omit<NonNullable<AccountStorage['claudeCache']>, 'enabled'> & {
+    enabled?: ThreeWayBoolean
+  }
 }
 
 /**
@@ -950,8 +971,10 @@ export async function acquireRefreshFileLock(options: {
   }
 }
 
-export function isCache1hPersistentlyEnabled(storage: AccountStorage | null) {
-  return storage?.claudeCache?.enabled === true
+export function isCache1hPersistentlyEnabled(
+  storage: AccountSettingsReaderInput | null,
+) {
+  return readThreeWayBoolean(storage?.claudeCache?.enabled, false)
 }
 
 function normalizeCache1hMode(value: unknown): Cache1hMode {
@@ -995,7 +1018,7 @@ export function shouldFallbackStatus(
 }
 
 export function getQuotaMinimumRemainingThresholds(
-  storage: AccountStorage | null,
+  storage: AccountSettingsReaderInput | null,
 ) {
   const configured = storage?.quota?.minimumRemaining || {}
   return {
@@ -1010,8 +1033,8 @@ export function getQuotaMinimumRemainingThresholds(
   }
 }
 
-function quotaEnabled(storage: AccountStorage | null) {
-  return storage?.quota?.enabled !== false
+export function quotaEnabled(storage: AccountSettingsReaderInput | null) {
+  return readThreeWayBoolean(storage?.quota?.enabled, true)
 }
 
 function refreshBeforeExpiryMs(storage: AccountStorage | null) {
@@ -1243,7 +1266,9 @@ export function formatQuotaBackoffMessage(
   return `Quota API backed off for ${seconds}s after: ${error.message}`
 }
 
-export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
+export function getQuotaCheckIntervalMs(
+  storage: AccountSettingsReaderInput | null,
+) {
   const minutes =
     storage?.quota?.checkIntervalMinutes ?? DEFAULT_QUOTA_CHECK_INTERVAL_MINUTES
   return Math.max(1, minutes) * 60_000
@@ -1284,10 +1309,12 @@ export function getQuotaRefreshEveryNRequests(
     : 0
 }
 
-function failClosedOnUnknownQuota(storage: AccountStorage | null) {
-  return (
-    storage?.quota?.failClosedOnUnknownQuota ??
-    DEFAULT_FAIL_CLOSED_ON_UNKNOWN_QUOTA
+export function failClosedOnUnknownQuota(
+  storage: AccountSettingsReaderInput | null,
+) {
+  return readThreeWayBoolean(
+    storage?.quota?.failClosedOnUnknownQuota,
+    DEFAULT_FAIL_CLOSED_ON_UNKNOWN_QUOTA,
   )
 }
 
@@ -1339,7 +1366,7 @@ export function quotaSnapshotPassesModelScope(
 
 export function quotaSnapshotPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
-  storage: AccountStorage | null,
+  storage: AccountSettingsReaderInput | null,
 ) {
   if (!quotaEnabled(storage)) return true
   const thresholds = getQuotaMinimumRemainingThresholds(storage)
@@ -1418,12 +1445,14 @@ export function normalizeKillswitchThresholds(
   }
 }
 
-export function isKillswitchEnabled(storage: AccountStorage | null) {
+export function isKillswitchEnabled(
+  storage: AccountSettingsReaderInput | null,
+) {
   return storage?.killswitch?.enabled === true
 }
 
 export function getKillswitchThresholdsForAccount(
-  storage: AccountStorage | null,
+  storage: AccountSettingsReaderInput | null,
   accountId?: string,
 ): Record<QuotaWindowName | 'scoped', number> {
   if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
@@ -1443,7 +1472,7 @@ export function getKillswitchThresholdsForAccount(
  */
 export function killswitchPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
-  storage: AccountStorage | null,
+  storage: AccountSettingsReaderInput | null,
   accountId?: string,
   modelId?: string,
 ) {
@@ -1499,7 +1528,7 @@ export type QuotaResetEvidence = {
 /** Only current, identity-bound readings can justify waiting for a stored reset. */
 export function quotaRefusalTiming(input: {
   readings: readonly QuotaResetEvidence[]
-  storage?: AccountStorage | null
+  storage?: AccountSettingsReaderInput | null
   scopedModelId?: string
   modelId?: string
   sessionTtlMs?: number
@@ -1647,7 +1676,7 @@ export function getKillswitchConfig(
 
 export function getQuotaNextRefreshAt(
   quota: OAuthQuotaSnapshot | undefined,
-  storage: AccountStorage | null,
+  storage: AccountSettingsReaderInput | null,
   now: number,
 ) {
   const intervalMs = getQuotaCheckIntervalMs(storage)

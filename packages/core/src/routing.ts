@@ -1,4 +1,8 @@
-import type { AccountStorage, RoutingMode } from './accounts.ts'
+import type {
+  AccountSettingsReaderInput,
+  AccountStorage,
+  RoutingMode,
+} from './accounts.ts'
 
 export const CLAUDE_ROUTING_COMMAND_NAME = 'claude-routing'
 export const ROUTING_MODES = [
@@ -12,7 +16,7 @@ export type MaxSameAccountWait = (typeof MAX_SAME_ACCOUNT_WAITS)[number]
 export const DEFAULT_MAX_SAME_ACCOUNT_WAIT: MaxSameAccountWait = '15'
 
 export function getMaxSameAccountWait(
-  storage: AccountStorage | null,
+  storage: AccountSettingsReaderInput | null,
 ): MaxSameAccountWait {
   const value = storage?.routing?.maxSameAccountWait
   return MAX_SAME_ACCOUNT_WAITS.includes(value as MaxSameAccountWait)

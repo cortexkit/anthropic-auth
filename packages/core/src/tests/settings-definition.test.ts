@@ -8,6 +8,7 @@ import {
   settingsJsonSchema,
 } from '@cortexkit/common-auth/settings'
 import {
+  type AccountSettingsReaderInput,
   type AccountStorage,
   createEmptyStorage,
   getCache1hPersistentMode,
@@ -424,18 +425,17 @@ for (const key of Object.keys(
     const value = await handle.get(key, { host: 'opencode' })
     expect(value).toBe('default')
     const empty = createEmptyStorage()
-    const decoded = createEmptyStorage()
-    const enabled = value === 'default' ? undefined : value === 'on'
+    const decoded: AccountSettingsReaderInput = createEmptyStorage()
     if (key === 'claude_cache_enabled') {
-      decoded.claudeCache = { enabled }
+      decoded.claudeCache = { enabled: value }
       expect(isCache1hPersistentlyEnabled(decoded)).toBe(
         isCache1hPersistentlyEnabled(empty),
       )
     } else {
       decoded.quota =
         key === 'quota_enabled'
-          ? { enabled }
-          : { failClosedOnUnknownQuota: enabled }
+          ? { enabled: value }
+          : { failClosedOnUnknownQuota: value }
       expect(quotaSnapshotPassesPolicy(undefined, decoded)).toBe(
         quotaSnapshotPassesPolicy(undefined, empty),
       )
