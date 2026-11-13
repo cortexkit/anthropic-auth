@@ -798,8 +798,9 @@ test('CLI prints a fixed code and the private file holding the scrubbed detail',
   expect(record.payload.stage).toBe('cli-list')
   expect(record.payload.code).toBe('cli-list/unexpected-error')
   expect(record.detail).toContain('code: ENOTDIR')
+  // canonicalFilePath realpaths the parent first, so ENOTDIR names that ancestor.
   expect(JSON.stringify(record.detail)).toContain(
-    `${join(blocker, '[REDACTED]', '[REDACTED]', '[REDACTED]', 'anthropic-auth.json')}`,
+    `${join(blocker, '[REDACTED]', '[REDACTED]', '[REDACTED]')}`,
   )
   await expect(stat(pluginLog)).rejects.toThrow()
 })
