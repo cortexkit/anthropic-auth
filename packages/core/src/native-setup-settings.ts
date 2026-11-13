@@ -37,6 +37,7 @@ export interface NativeSetupSettingsDifference {
   account?: string
   legacy: unknown
   file: unknown
+  note?: string
 }
 
 export interface NativeSetupSettingsResult {
@@ -225,7 +226,27 @@ export async function writeNativeSetupSettings(
               ]
             : held,
         )
-      } else edits.push({ setting: key, value })
+      } else {
+        // common-auth 0.48 cannot select a Pi-only location for a new key.
+        // Account-floor entries already name their host inside the shared list.
+        const edit: SettingsEdit | undefined =
+          options.host === 'pi' && key !== 'killswitch_account_floors'
+            ? undefined
+            : { setting: key, value }
+        if (edit) edits.push(edit)
+        else {
+          const note =
+            "Pi's value was not imported because the settings file had no Pi entry for it."
+          result.skipped.push(key)
+          result.differing.push({
+            key,
+            legacy: value,
+            file: service.resolve('pi')[key],
+            note,
+          })
+          warn(`Setup skipped setting "${key}" in "${paths.target}": ${note}`)
+        }
+      }
     }
     // The service carries the whole applied protection set in this same edit.
     // Imported protection was omitted above so a stale source cannot replace it.

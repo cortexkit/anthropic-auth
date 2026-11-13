@@ -147,7 +147,7 @@ for (const host of ['opencode', 'pi'] as const) {
 
   for (const marked of [false, true]) {
     for (const invalid of [false, true]) {
-      test(`${host}: parsed file marker=${marked} invalid protection=${invalid} fills normally`, async () => {
+      test(`${host}: parsed file marker=${marked} invalid protection=${invalid} ${host === 'pi' ? 'reports absent Pi values' : 'fills absent values'}`, async () => {
         const f = await fixture(host)
         const text = `// outside comment\n{ "unknown": 19, ${invalid ? '"killswitch_enabled": "invalid",' : ''} }\n`
         await writeFile(f.paths.target, text)
@@ -167,7 +167,18 @@ for (const host of ['opencode', 'pi'] as const) {
         })
         expect(outcome.outcome).toBe('saved')
         expect(f.writes).toEqual([])
-        expect((await contents(f.paths.target)).dump_enabled).toBe(true)
+        expect((await contents(f.paths.target)).dump_enabled).toBe(
+          host === 'opencode' ? true : undefined,
+        )
+        if (host === 'pi')
+          expect(outcome.differing).toEqual([
+            {
+              key: 'dump_enabled',
+              legacy: true,
+              file: false,
+              note: "Pi's value was not imported because the settings file had no Pi entry for it.",
+            },
+          ])
         expect((await contents(f.paths.target)).unknown).toBe(19)
         expect(await readFile(f.paths.target, 'utf8')).toContain(
           '// outside comment',
@@ -215,19 +226,35 @@ for (const host of ['opencode', 'pi'] as const) {
     }`,
     )
     const outcome = await f.write()
-    expect(outcome.skipped).toEqual(['dump_enabled', 'prime_enabled'])
+    expect(outcome.skipped).toEqual(
+      host === 'pi'
+        ? ['refresh_interval_minutes', 'dump_enabled', 'prime_enabled']
+        : ['dump_enabled', 'prime_enabled'],
+    )
     expect(outcome.differing).toEqual([
+      ...(host === 'pi'
+        ? [
+            {
+              key: 'refresh_interval_minutes' as const,
+              legacy: 31,
+              file: 10,
+              note: "Pi's value was not imported because the settings file had no Pi entry for it.",
+            },
+          ]
+        : []),
       { key: 'dump_enabled', legacy: true, file: false },
       { key: 'prime_enabled', legacy: true, file: false },
     ])
-    expect(f.messages).toHaveLength(2)
+    expect(f.messages).toHaveLength(host === 'pi' ? 3 : 2)
     expect(
       f.messages.every((line) => line.includes('Setup skipped setting')),
     ).toBe(true)
     const file = await contents(f.paths.target)
     expect(file.dump_enabled).toBe(false)
     expect(file.prime_enabled).toEqual({ default: true, [host]: false })
-    expect(file.refresh_interval_minutes).toMatchObject({ default: 31 })
+    expect(file.refresh_interval_minutes).toEqual(
+      host === 'pi' ? { opencode: 10 } : { pi: 10, default: 31 },
+    )
     expect(f.writes).toEqual([])
   })
 
@@ -265,7 +292,7 @@ for (const host of ['opencode', 'pi'] as const) {
       } else {
         expect(result.outcome).toBe('saved')
         const file = await contents(f.paths.target)
-        expect(file.dump_enabled).toBe(true)
+        expect(file.dump_enabled).toBe(host === 'opencode' ? true : undefined)
         expect(file.killswitch_enabled).toBe(rung === 1)
         expect(file.max_same_account_wait).toBe(rung === 1 ? 'cache' : 'off')
         expect(file.quota_fail_closed_on_unknown_quota).toBe('on')
@@ -548,4 +575,69 @@ test('a separate install keeps legacy writes even with a malformed shared file a
   ).toMatchObject({ target: 'legacy-store', outcome: 'saved' })
   expect(f.writes).toEqual([legacy])
   expect(await readFile(f.paths.target, 'utf8')).toBe('{')
+})
+
+test('Pi setup reports absent protection and dump keys without changing OpenCode values', async () => {
+  const f = await fixture('pi', {
+    killswitch: { main: { five_hour: 0 } },
+    dump: { enabled: true },
+  })
+  const text = '// OpenCode settings\n{ "unknown": "keep" }\n'
+  await writeFile(f.paths.target, text)
+  const service = await openSettingsService({
+    file: f.paths.target,
+    host: 'opencode',
+  })
+  if (!service) throw new Error('no service')
+  try {
+    const before = service.resolve('opencode')
+    expect(before.killswitch_default_five_hour).toBe(5)
+    expect(before.dump_enabled).toBe(false)
+    const result = await f.write()
+    await service.refresh()
+    expect(service.resolve('opencode').killswitch_default_five_hour).toBe(5)
+    expect(service.resolve('opencode').dump_enabled).toBe(false)
+    expect(result.outcome).toBe('saved')
+    expect(result.skipped.sort()).toEqual([
+      'dump_enabled',
+      'killswitch_default_five_hour',
+      'killswitch_default_scoped',
+      'killswitch_default_seven_day',
+    ])
+    expect(
+      result.differing.find(
+        (entry) => entry.key === 'killswitch_default_five_hour',
+      ),
+    ).toEqual({
+      key: 'killswitch_default_five_hour',
+      legacy: 0,
+      file: 5,
+      note: "Pi's value was not imported because the settings file had no Pi entry for it.",
+    })
+    expect(
+      result.differing.find((entry) => entry.key === 'dump_enabled'),
+    ).toEqual({
+      key: 'dump_enabled',
+      legacy: true,
+      file: false,
+      note: "Pi's value was not imported because the settings file had no Pi entry for it.",
+    })
+    // Even a legacy value equal to the schema default must be reported if skipped.
+    expect(
+      result.differing.find(
+        (entry) => entry.key === 'killswitch_default_scoped',
+      ),
+    ).toMatchObject({
+      legacy: 0,
+      file: 0,
+      note: "Pi's value was not imported because the settings file had no Pi entry for it.",
+    })
+    expect(f.messages).toHaveLength(4)
+    expect(f.writes).toEqual([])
+    expect(await readFile(f.paths.target, 'utf8')).toBe(text)
+    await service.refresh()
+    expect(service.resolve('opencode')).toEqual(before)
+  } finally {
+    await service.dispose()
+  }
 })
