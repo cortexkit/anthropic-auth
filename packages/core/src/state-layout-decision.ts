@@ -446,9 +446,9 @@ function deferLegacyRegistration(
 
 /**
  * Register a legacy start while `ctx` holds the config folder's holder lock.
- * Resolves undefined once registered. When `unmovedRegistrationPolicy` is
- * mandatory a failure refuses; otherwise it is handed to the background
- * retry and the pending registration is returned, and the start serves.
+ * Returns a registered result on success. When registration is mandatory for
+ * datasets staying in place, a failure refuses; otherwise it is handed to the
+ * background retry and the pending registration is returned, and the start serves.
  */
 async function registerLegacyHeld(
   oldDir: string,
@@ -456,7 +456,7 @@ async function registerLegacyHeld(
   identity: string,
   options: DecideStateLayoutOptions,
   ctx: StateLayoutTransitionContext,
-): Promise<NativeHolderRegistration | undefined> {
+): Promise<NativeHolderRegistration> {
   try {
     await registerHeld(
       join(oldDir, HOLDER_FILE_NAME),
@@ -466,7 +466,11 @@ async function registerLegacyHeld(
       options,
       ctx,
     )
-    return undefined
+    return {
+      status: 'registered',
+      settled: Promise.resolve(),
+      close() {},
+    }
   } catch (error) {
     if (unmovedRegistrationPolicy(options) === 'mandatory') throw error
     return deferLegacyRegistration(paths, oldDir, options, error)

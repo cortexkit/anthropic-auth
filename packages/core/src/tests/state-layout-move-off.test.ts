@@ -129,6 +129,31 @@ function decide(m: Machine, options: Partial<DecideStateLayoutOptions> = {}) {
   })
 }
 
+for (const override of [
+  'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+  'OPENCODE_TUI_PREFERENCES_FILE',
+] as const)
+  for (const moveEnabled of [false, true])
+    test(`a successful legacy override registration is observable with ${override} and moving ${moveEnabled}`, async () => {
+      const m = await machine()
+      const decision = await decide(m, {
+        env: { ...m.env, [override]: join(m.root, 'override.json') },
+        moveEnabled,
+      })
+      expect(decision.kind).toBe('legacy')
+      expect(decision.layout).toEqual(LEGACY_STATE_LAYOUT)
+      if (decision.kind !== 'legacy') throw new Error('not expected')
+      expect(decision.registration?.status).toBe('registered')
+      await decision.registration?.settled
+      decision.registration?.close()
+      const holders = JSON.parse(
+        await readFile(join(m.configDir, HOLDER_FILE_NAME), 'utf8'),
+      ) as { entries: { pid: number; kind: string }[] }
+      expect(holders.entries).toContainEqual(
+        expect.objectContaining({ pid: process.pid, kind: 'legacy' }),
+      )
+    })
+
 type Kind = 'legacy' | 'explicit' | 'pi'
 type Failure = 'malformed' | 'write' | 'lock'
 
@@ -591,7 +616,7 @@ for (const homeDefault of ['inaccessible', 'looping'] as const)
       expect(decision.layout).toEqual(LEGACY_STATE_LAYOUT)
       if (decision.kind !== 'legacy') throw new Error('not expected')
       // Registered beside the custom folder's files, not deferred.
-      expect(decision.registration).toBeUndefined()
+      expect(decision.registration?.status).toBe('registered')
       const holders = JSON.parse(
         await readFile(join(m.configDir, HOLDER_FILE_NAME), 'utf8'),
       ) as { entries: { pid: number; kind: string }[] }

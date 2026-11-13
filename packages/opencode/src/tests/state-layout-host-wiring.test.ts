@@ -15,6 +15,8 @@ import { Writable } from 'node:stream'
 import {
   createNativePoolStore,
   decideOpenCodeStateLayout,
+  decideOpenCodeStateLayoutOnce,
+  getSettingsFilePath,
   HOLDER_FILE_NAME,
   HOLDER_REGISTRATION_ERROR_MESSAGES,
   isDumpEnabled,
@@ -31,9 +33,12 @@ import {
   stateLayoutRefusalPublicMessage,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
+import { createOpencodeClient } from '@opencode-ai/sdk'
+import { $ } from 'bun'
 import { parse } from 'jsonc-parser'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { relaySetup } from '../cli'
+import { AnthropicAuthPlugin } from '../index'
 import { runSetupCommand } from '../setup/command'
 import { setupAnthropicAuth, startFailure } from '../v2/setup'
 
@@ -52,6 +57,9 @@ const ENV_KEYS = [
   'OPENCODE_ANTHROPIC_AUTH_ROUTING_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
   'OPENCODE_TUI_PREFERENCES_FILE',
+  'OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR',
+  'OPENCODE_ANTHROPIC_AUTH_RPC_DIR',
   'OPENCODE_AUTH_CONTENT',
 ] as const
 
@@ -97,6 +105,25 @@ async function machine(moveEnabled: boolean) {
   process.env.TMPDIR = join(root, 'tmp')
   setRelocationMoveEnabledForTests(moveEnabled)
   return { root, configDir, stateRoot }
+}
+
+async function defaultMachine(moveEnabled: boolean) {
+  const m = await machine(moveEnabled)
+  const saved = new Map(
+    ['HOME', 'XDG_CONFIG_HOME'].map((key) => [key, process.env[key]]),
+  )
+  cleanups.push(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+  process.env.HOME = m.root
+  process.env.XDG_CONFIG_HOME = join(m.root, '.config')
+  delete process.env.OPENCODE_CONFIG_DIR
+  const configDir = join(m.root, '.config', 'opencode')
+  await mkdir(configDir, { recursive: true })
+  return { ...m, configDir }
 }
 
 type Machine = Awaited<ReturnType<typeof machine>>
@@ -175,6 +202,45 @@ function openCode2Context() {
   } as unknown as Plugin.Context
 }
 
+async function startHost(host: 'opencode1' | 'opencode2', m: Machine) {
+  if (host === 'opencode2') {
+    const dispose = await setupAnthropicAuth(openCode2Context(), {
+      vault: { env: { ...process.env } },
+    })
+    cleanups.push(dispose)
+    return
+  }
+  process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR = join(
+    m.root,
+    'registry',
+  )
+  process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = join(m.root, 'feed')
+  process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = join(m.root, 'rpc')
+  const plugin = await AnthropicAuthPlugin(
+    {
+      client: createOpencodeClient({
+        baseUrl: 'http://127.0.0.1:9',
+        fetch: globalThis.fetch,
+      }),
+      project: {
+        id: 'legacy-settings-fixture',
+        worktree: m.root,
+        time: { created: Date.now() },
+      },
+      directory: m.root,
+      worktree: m.root,
+      serverUrl: new URL('http://127.0.0.1:9'),
+      experimental_workspace: { register() {} },
+      $,
+    },
+    {
+      scopedRosterPollIntervalMs: 0,
+      cacheKeepAggregateRefreshIntervalMs: 0,
+    },
+  )
+  cleanups.push(() => plugin.dispose?.())
+}
+
 test('OpenCode 2 state-home admission permits the settings move without a per-plugin holder lease', async () => {
   const m = await machine(true)
   const dump = isDumpEnabled()
@@ -200,6 +266,80 @@ test('OpenCode 2 state-home admission permits the settings move without a per-pl
     target,
   )
 })
+
+for (const host of ['opencode1', 'opencode2'] as const) {
+  for (const override of [
+    'OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
+    'OPENCODE_TUI_PREFERENCES_FILE',
+  ] as const)
+    test(`${host} default-path legacy registration permits the settings move with ${override}`, async () => {
+      const m = await defaultMachine(true)
+      process.env[override] = join(m.root, 'override.json')
+      const dump = isDumpEnabled()
+      cleanups.push(() => setDumpEnabled(dump))
+      await initializeAuthority()
+      const paths = await resolveNativePoolPaths(
+        undefined,
+        undefined,
+        LEGACY_STATE_LAYOUT,
+      )
+      const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+      await store.updateSettings(() => ({ dump: { enabled: true } }))
+      await store.close()
+      const target = getSettingsFilePath()
+      await startHost(host, m)
+      const decision = await decideOpenCodeStateLayoutOnce({ role: host })
+      expect(decision.kind).toBe('legacy')
+      expect(decision.layout).toEqual(LEGACY_STATE_LAYOUT)
+      expect(await holderEntries(m.configDir)).toContainEqual(
+        expect.objectContaining({
+          pid: process.pid,
+          role: host,
+          kind: 'legacy',
+        }),
+      )
+      const sub = await subfolder(m)
+      if (sub)
+        await expect(
+          readFile(join(sub, 'layout.json'), 'utf8'),
+        ).rejects.toMatchObject({
+          code: 'ENOENT',
+        })
+      expect(parse(await readFile(target, 'utf8')).dump_enabled).toBe(true)
+      expect(JSON.parse(await readFile(`${target}.moved`, 'utf8')).target).toBe(
+        target,
+      )
+    })
+
+  test(`${host} pending legacy registration still prevents the settings move`, async () => {
+    const m = await defaultMachine(false)
+    process.env.OPENCODE_TUI_PREFERENCES_FILE = join(m.root, 'sidebar.json')
+    const dump = isDumpEnabled()
+    cleanups.push(() => setDumpEnabled(dump))
+    await initializeAuthority()
+    const paths = await resolveNativePoolPaths(
+      undefined,
+      undefined,
+      LEGACY_STATE_LAYOUT,
+    )
+    const store = createNativePoolStore({ paths, quota: nativeQuotaCodec })
+    await store.updateSettings(() => ({ dump: { enabled: true } }))
+    await store.close()
+    await writeFile(join(m.configDir, HOLDER_FILE_NAME), '{ invalid')
+    const target = getSettingsFilePath()
+    await startHost(host, m)
+    const decision = await decideOpenCodeStateLayoutOnce({ role: host })
+    expect(decision.kind).toBe('legacy')
+    if (decision.kind !== 'legacy') throw new Error('not expected')
+    expect(decision.registration?.status).toBe('pending')
+    await expect(readFile(target, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+    await expect(readFile(`${target}.moved`, 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+}
 
 for (const moveEnabled of [false, true]) {
   const label = moveEnabled ? 'on' : 'off'
