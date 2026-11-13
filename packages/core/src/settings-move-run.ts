@@ -1,9 +1,12 @@
 import { readFile } from 'node:fs/promises'
+import { isDeepStrictEqual } from 'node:util'
 import {
   type MoveOutcome,
   type MoveResult,
   moveSettingsOnce,
+  SettingsRefusal,
 } from '@cortexkit/common-auth/settings'
+import { parse } from 'jsonc-parser'
 
 import { ensureHolderDirectory, HOLDER_LOCK_NAME } from './holder-registry.ts'
 import { logger } from './logger.ts'
@@ -206,15 +209,39 @@ export async function runSettingsMoveAtStartup(
           fileLevels: generation.fileLevels,
         })
       : { keys: [], edits: [] }
-    // common-auth 0.48 cannot write a value at this host's level, so a host
-    // whose store protects more than the file refuses the file for now.
-    // With 0.49 this becomes `service.update(plan.edits, host)` (each edit
-    // names its level), followed by the record below.
+    // Only a failed write refuses adoption. Resolution belongs to common-auth,
+    // so a changed protection field retries at next start instead of applying
+    // an import computed from an older validated generation.
     if (plan.keys.length) {
-      warn(
-        `Settings file ${paths.target} is not used by ${host}: its legacy settings protect more for ${plan.keys.join(', ')}. ${host} keeps its legacy settings; set these for ${host} in the settings file to start using it.`,
-      )
-      return result('legacy', 'import-refused')
+      const expected = generation.source?.trim()
+        ? parse(generation.source.replace(/^\uFEFF/, ''), [], {
+            allowTrailingComma: true,
+          })
+        : {}
+      try {
+        await service.update((current) => {
+          if (
+            current.status !== 'ready' ||
+            SETTINGS_PROTECTION_KEYS.some(
+              (key) =>
+                !isDeepStrictEqual(
+                  (current.document as Record<string, unknown>)[key],
+                  expected[key],
+                ),
+            )
+          )
+            throw new SettingsRefusal(
+              'settings-busy',
+              'Protection changed before import',
+            )
+          return plan.edits
+        }, host)
+      } catch {
+        warn(
+          `Settings file ${paths.target} is not used by ${host}: writing its legacy protection for ${plan.keys.join(', ')} failed. ${host} keeps its legacy settings and will retry the import at the next start.`,
+        )
+        return result('legacy', 'import-refused')
+      }
     }
     try {
       await writeSettingsImportRecord(paths.target, host, authority)

@@ -3,12 +3,14 @@ import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, win32 } from 'node:path'
 import { withLock } from '@cortexkit/common-auth/fs'
+import { openSettings } from '@cortexkit/common-auth/settings'
 import { parse } from 'jsonc-parser'
 
 import { HOLDER_FILE_NAME, type HolderEntry } from '../holder-registry.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from '../pool-store.ts'
+import { settingsDefinition } from '../settings-definition.ts'
 import { settingsImportRecordPath } from '../settings-mode.ts'
 import { settingsMoveHolderFiles } from '../settings-move-fence.ts'
 import {
@@ -797,7 +799,7 @@ test('later starts compare only their current-mode explicit values without mergi
   ).toHaveLength(0)
 })
 
-test('a later host whose store was never imported keeps its stricter protection until the file sets it for that host', async () => {
+test('later-host import writes stricter protection at its host level before recording adoption', async () => {
   const f = await fixture()
   f.options.env = {
     ...f.options.env,
@@ -819,41 +821,76 @@ test('a later host whose store was never imported keeps its stricter protection 
   expect(await absent(record('pi'))).toBe(true)
   f.options.host = 'pi'
   f.messages.length = 0
-  // Pi's own store holds a stricter killswitch than Pi resolves from the
-  // file, which cannot yet hold a value for Pi alone: Pi stays legacy.
-  expect(await f.start()).toMatchObject({
-    mode: 'legacy',
-    outcome: 'import-refused',
-    mayOpenService: false,
-  })
-  expect(f.messages).toEqual([
-    `Settings file ${moved.paths.target} is not used by pi: its legacy settings protect more for killswitch_enabled. pi keeps its legacy settings; set these for pi in the settings file to start using it.`,
-  ])
-  expect(await absent(record('pi'))).toBe(true)
-  // Once the file holds Pi's own value (here written by hand; a later
-  // common-auth can write it at Pi's level), Pi adopts the file and records
-  // its import.
-  await fs.writeFile(
-    moved.paths.target,
-    JSON.stringify({
-      schema_version: 1,
-      dump_enabled: true,
-      killswitch_enabled: { default: false, pi: true },
-    }),
-  )
-  f.messages.length = 0
   expect(await f.start()).toMatchObject({
     mode: 'user-file',
     outcome: 'marker-present',
   })
   expect(await absent(record('pi'))).toBe(false)
+  expect(
+    parse(await fs.readFile(moved.paths.target, 'utf8')).killswitch_enabled,
+  ).toEqual({ pi: true })
   const service = await openSettingsService({ file: moved.paths.target })
   expect(service!.resolve('pi').killswitch_enabled).toBe(true)
+  expect(service!.resolve('opencode').killswitch_enabled).toBe(false)
   await service!.dispose()
   await fs.unlink(moved.paths.target)
   expect((await f.start()).outcome).toBe('marker-present')
   expect(await absent(moved.paths.target)).toBe(true)
   expect(await absent(`${f.stores.pi.config}.MOVED_READPLEASE`)).toBe(true)
+})
+
+test('later-host import refuses a concurrent protection change without writing or adopting', async () => {
+  const f = await fixture()
+  f.options.env = {
+    ...f.options.env,
+    ANTHROPIC_AUTH_SETTINGS_FILE: join(f.root, 'shared.jsonc'),
+  }
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { killswitch: { enabled: true } })
+  const moved = await f.start()
+  f.options.host = 'pi'
+  f.messages.length = 0
+  const tightened = '{"killswitch_default_five_hour":99}'
+  let raced = false
+  const interceptor = await openSettingsService({
+    file: moved.paths.target,
+    dependencies: {
+      open: (config) => {
+        const handle = openSettings(settingsDefinition, config)
+        return {
+          ...handle,
+          update: async (plan, context) => {
+            if (!raced) {
+              raced = true
+              await io.writeFile(moved.paths.target, tightened)
+            }
+            return handle.update(plan, context)
+          },
+        }
+      },
+    },
+  })
+  cleanup.push(() => interceptor?.dispose())
+  expect(await f.start()).toMatchObject({
+    mode: 'legacy',
+    outcome: 'import-refused',
+    mayOpenService: false,
+  })
+  expect(raced).toBe(true)
+  expect(await io.readFile(moved.paths.target, 'utf8')).toBe(tightened)
+  expect(await absent(settingsImportRecordPath(moved.paths.target, 'pi'))).toBe(
+    true,
+  )
+  expect(
+    f.messages.filter((message) =>
+      message.includes('writing its legacy protection'),
+    ),
+  ).toHaveLength(1)
+  await interceptor?.dispose()
+  expect(await f.start()).toMatchObject({ mode: 'user-file' })
+  expect(await absent(settingsImportRecordPath(moved.paths.target, 'pi'))).toBe(
+    false,
+  )
 })
 
 test('a default-target move records both hosts, so a later start adopts without a check', async () => {

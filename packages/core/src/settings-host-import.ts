@@ -34,9 +34,9 @@ function stricter(key: ProtectionKey, legacy: unknown, file: unknown): boolean {
  * legacy set, its resolved set and the file's explicit levels.
  *
  * `edits` writes those values at the host's own level; account floors need
- * no level, since each list entry names its host. common-auth 0.48 cannot
- * write a level, so until 0.49 the caller refuses to adopt the file when
- * `keys` is not empty and only applies `edits` once it can.
+ * no level, since each list entry names its host. The caller verifies that
+ * the validated protection fields still match the document under the lock
+ * before returning these edits from its writer plan.
  */
 export function planSettingsHostImport(input: {
   host: SettingsHost
