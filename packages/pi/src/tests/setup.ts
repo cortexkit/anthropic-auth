@@ -20,6 +20,7 @@ export function trackPiTestBody<T>(body: Promise<T>): Promise<T> {
   return body
 }
 const HOST_PATH_ENV_VARS = [
+  'ANTHROPIC_AUTH_SETTINGS_FILE',
   'OPENCODE_CONFIG_DIR',
   'OPENCODE_ANTHROPIC_AUTH_FILE',
   'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',

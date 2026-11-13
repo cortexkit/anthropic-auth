@@ -97,12 +97,13 @@ function settingsOptions(): PiSettingsOptions {
             settingsDefinition,
             options,
           )
+          const get: typeof handle.get = (name, context) => {
+            settingsReads++
+            return handle.get(name, context)
+          }
           return {
             ...handle,
-            read: async (...args) => {
-              settingsReads++
-              return handle.read(...args)
-            },
+            get,
             watch: (callback) => {
               callbacks.push(callback)
               watches++
@@ -342,7 +343,7 @@ test('Pi reopens a failed legacy settings service on the authority timer without
   expect(stops).toBe(1)
 })
 
-test('Pi treats import-refused as a serving legacy result without retrying until restart', async () => {
+test('Pi serves legacy settings after a failed import write without retrying until restart', async () => {
   await saveNativePiFixture(
     {
       version: 1,
@@ -359,6 +360,27 @@ test('Pi treats import-refused as a serving legacy result without retrying until
     env: process.env,
     home,
   })
+  let attempts = 0
+  const failing = await core.openSettingsService({
+    file,
+    dependencies: {
+      writeAppliedCopy: async () => {},
+      open: (options) => {
+        const handle = openSettings<typeof settingsDefinition.settings>(
+          settingsDefinition,
+          options,
+        )
+        return {
+          ...handle,
+          update: async () => {
+            attempts++
+            throw new Error('synthetic settings write failure')
+          },
+        }
+      },
+    },
+  })
+  if (!failing) throw new Error('Expected the failing settings service')
   const outcomes: string[] = []
   const begin = core.startSettings
   const start = spyOn(core, 'startSettings').mockImplementation((options) =>
@@ -389,6 +411,8 @@ test('Pi treats import-refused as a serving legacy result without retrying until
     })
     const service = await native.service()
     expect(outcomes).toEqual(['import-refused'])
+    expect(attempts).toBe(1)
+    await failing.dispose()
     expect(await service.getSettingsPath()).not.toBe(file)
     expect(ticks).toHaveLength(0)
     expect(watches).toBe(0)
@@ -415,6 +439,7 @@ test('Pi treats import-refused as a serving legacy result without retrying until
       expect(core.getRoutingMode(stored)).toBe('fallback-first')
     }
     expect(outcomes).toEqual(['import-refused'])
+    expect(attempts).toBe(1)
     expect(ticks).toHaveLength(0)
     expect(records.filter((record) => record.level === 'error')).toHaveLength(0)
     await closePiNativeRuntime(storagePath)
@@ -431,6 +456,53 @@ test('Pi treats import-refused as a serving legacy result without retrying until
     ).toMatchObject({ version: 1, host: 'pi' })
   } finally {
     start.mockRestore()
+    await failing.dispose()
+  }
+})
+
+test('Pi imports stricter legacy protection at its own level and adopts the file in the same start', async () => {
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      prime: { enabled: false },
+      killswitch: { enabled: true, main: { five_hour: 53 } },
+      routing: { mode: 'fallback-first' },
+    },
+    storagePath,
+  )
+  await write({
+    killswitch_enabled: false,
+    killswitch_default_five_hour: 7,
+    routing_mode: 'main-first',
+  })
+  await core.writeSettingsMoveMarker(file, { env: process.env, home })
+  await core.writeSettingsImportRecord(file, 'opencode', {
+    env: process.env,
+    home,
+  })
+  const paths = await resolveNativePoolPaths(storagePath)
+  const legacy = await fs.readFile(paths.config, 'utf8')
+  const native = runtime()
+  const service = await native.service()
+  const snapshot = (await native.requestView()).policyStorage
+  expect(await service.getSettingsPath()).toBe(file)
+  expect(core.isKillswitchEnabled(snapshot)).toBe(true)
+  expect(core.getKillswitchThresholdsForAccount(snapshot).five_hour).toBe(53)
+  expect(core.getRoutingMode(snapshot)).toBe('main-first')
+  expect(
+    JSON.parse(await fs.readFile(`${file}.moved.pi`, 'utf8')),
+  ).toMatchObject({ version: 1, host: 'pi' })
+  expect(await fs.readFile(paths.config, 'utf8')).toBe(legacy)
+  const settings = await core.openSettingsService({ file })
+  if (!settings) throw new Error('Expected the shared settings service')
+  try {
+    expect(settings.resolve('pi').killswitch_enabled).toBe(true)
+    expect(settings.resolve('pi').killswitch_default_five_hour).toBe(53)
+    expect(settings.resolve('opencode').killswitch_enabled).toBe(false)
+    expect(settings.resolve('opencode').killswitch_default_five_hour).toBe(7)
+  } finally {
+    await settings.dispose()
   }
 })
 
