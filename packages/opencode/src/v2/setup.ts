@@ -348,10 +348,10 @@ export async function setupAnthropicAuth(
         OPENCODE_ANTHROPIC_AUTH_STATE_FILE: paths.legacyState,
       }
     : env
-  // A failure to resolve the settings paths must not abort this start, which
-  // 2.11.4 completed: startSettings then resolves them itself and falls back
-  // as for any other settings startup failure. Only fixed text is logged,
-  // since the error may name a path.
+  // A failure to resolve the settings paths must not abort this start:
+  // startSettings then resolves them itself and falls back as for any other
+  // settings startup failure. Only fixed text is logged, since the error may
+  // name a path.
   let settingsPaths: SettingsPaths | undefined
   try {
     settingsPaths = await resolveSettingsPaths('opencode', {
