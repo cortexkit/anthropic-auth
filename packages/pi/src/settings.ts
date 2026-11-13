@@ -4,10 +4,9 @@ import {
   type NativeAccountRuntimeOptions,
   type NativeHolderRegistration,
   openSettingsService,
-  resolveSettingsPaths,
-  runSettingsMoveAtStartup,
   type SettingsMoveStartupOptions,
   type SettingsServiceOptions,
+  startSettings,
 } from '@cortexkit/anthropic-auth-core'
 
 export interface PiSettingsOptions {
@@ -27,31 +26,33 @@ export async function openPiSettings(
   registration: NativeHolderRegistration | undefined,
   options: PiSettingsOptions = {},
 ) {
-  const paths = await resolveSettingsPaths('pi', { env, home })
-  if (paths.separate) return { mode: 'separate' as const, file: paths.target }
-  // A temporary legacy-only runtime initializes vault settings and recovers
-  // legacy protection values. Recovery reads never write those values to a store.
-  const legacy = createNativeAccountRuntime(runtime)
+  // Create a runtime only if migration must initialize the vault settings file.
+  let legacy: ReturnType<typeof createNativeAccountRuntime> | undefined
   try {
-    const initializeVaultSettings = () => legacy.vault.initializeSettings()
-    const started = await runSettingsMoveAtStartup({
+    const initializeVaultSettings = () => {
+      legacy ??= createNativeAccountRuntime(runtime)
+      return legacy.vault.initializeSettings()
+    }
+    return await startSettings({
       ...options.startup,
       host: 'pi',
       env,
       home,
-      paths,
       ownPoolPaths: runtime.paths,
       initializeVaultSettings,
       fence: { registration, ...options.startup?.fence },
-    })
-    const service = await openSettingsService({
-      ...options.service,
-      file: paths.target,
-      host: 'pi',
+      lockTimeoutMs: options.service?.lockTimeoutMs,
+      start: options.service && {
+        open: (settings) =>
+          openSettingsService({ ...options.service, ...settings }),
+      },
       protection: {
         readLegacyProtection: async () => {
+          // Reopening the settings service can outlive startup. Give each
+          // recovery read its own runtime rather than using the closed one.
+          const recovery = createNativeAccountRuntime(runtime)
           try {
-            const snapshot = await legacy.read()
+            const snapshot = await recovery.read()
             return legacySettingsProtection(
               snapshot.policyStorage,
               'pi',
@@ -59,12 +60,13 @@ export async function openPiSettings(
             )
           } catch {
             return undefined
+          } finally {
+            await recovery.close()
           }
         },
       },
     })
-    return { mode: started.mode, file: paths.target, service }
   } finally {
-    await legacy.close()
+    await legacy?.close()
   }
 }

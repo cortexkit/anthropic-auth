@@ -200,15 +200,101 @@ for (const failure of ['move', 'service open'] as const) {
     const warnings = records.filter(
       (record) =>
         record.message ===
-        'Pi settings initialization failed; continuing with available settings.',
+        'Settings startup failed; protection settings use their last applied values until the settings file can be opened.',
     )
-    expect(warnings).toHaveLength(1)
-    expect(warnings[0]).toMatchObject({ level: 'warn', channel: 'settings' })
-    expect(warnings[0]?.payload).toBeUndefined()
-    expect(warnings[0]?.message).not.toContain(file)
-    expect(warnings[0]?.message).not.toContain('private settings failure')
+    expect(warnings.length).toBeLessThanOrEqual(1)
+    for (const warning of warnings) {
+      expect(warning).toMatchObject({ level: 'warn', channel: 'settings' })
+      expect(warning.payload).toBeUndefined()
+      expect(warning.message).not.toContain(file)
+      expect(warning.message).not.toContain('private settings failure')
+    }
   })
 }
+
+test('Pi keeps the stricter applied-copy floor after a moved file cannot open and recovers on the authority timer', async () => {
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      prime: { enabled: false },
+      killswitch: {
+        enabled: false,
+        main: { five_hour: 7, seven_day: 13, scoped: 2 },
+      },
+      routing: { mode: 'fallback-first' },
+      dump: { enabled: true },
+    },
+    storagePath,
+  )
+  await core.writeSettingsProtectionCopy(file, 'pi', {
+    readAt: Date.now(),
+    values: {
+      ...core.legacySettingsProtection({}, 'pi'),
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 61,
+    },
+  })
+  const options = settingsOptions()
+  const open = options.service?.dependencies?.open
+  if (!open) throw new Error('Expected the settings open test dependency')
+  let unavailable = true
+  let opens = 0
+  options.service = {
+    ...options.service,
+    dependencies: {
+      ...options.service?.dependencies,
+      open: (settings) => {
+        opens++
+        if (unavailable) throw new Error('private service open failure')
+        return open(settings)
+      },
+    },
+  }
+  const ticks: (() => Promise<void>)[] = []
+  options.authority = {
+    schedule: (callback, delayMs) => {
+      expect(delayMs).toBe(60_000)
+      ticks.push(callback)
+      return () => {}
+    },
+  }
+  const native = runtime(options)
+  await native.service()
+  expect(await fs.stat(`${file}.moved`)).toBeDefined()
+  const reads = spyOn(fs, 'readFile')
+  try {
+    const snapshot = (await native.requestView()).policyStorage
+    expect(core.getKillswitchThresholdsForAccount(snapshot).five_hour).toBe(61)
+    expect(core.isKillswitchEnabled(snapshot)).toBe(true)
+    expect(core.getRoutingMode(snapshot)).toBe('fallback-first')
+    expect(core.isDumpPersistentlyEnabled(snapshot)).toBe(true)
+    expect(
+      reads.mock.calls.filter(([path]) => String(path).startsWith(file)),
+    ).toEqual([])
+    expect(opens).toBe(2)
+  } finally {
+    reads.mockRestore()
+  }
+  expect(ticks).toHaveLength(1)
+  await write({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 82,
+    routing_mode: 'main-first',
+    dump_enabled: false,
+  })
+  unavailable = false
+  await ticks[0]?.()
+  const recovered = (await native.requestView()).policyStorage
+  expect(core.getKillswitchThresholdsForAccount(recovered).five_hour).toBe(82)
+  expect(core.getRoutingMode(recovered)).toBe('main-first')
+  expect(core.isDumpPersistentlyEnabled(recovered)).toBe(false)
+  expect(opens).toBe(3)
+  expect(ticks).toHaveLength(1)
+  expect(watches).toBe(1)
+  await native.close()
+  expect(stops).toBe(1)
+})
 
 test('Pi keeps serving when the first settings action preparation throws', async () => {
   await write({ routing_mode: 'fallback-first' })
@@ -771,7 +857,7 @@ for (const mode of ['local', 'claustrum'] as const)
 
 test('runtime eviction releases its settings lease and closes the last user-file watch', async () => {
   const entries: PiNativeRuntime[] = []
-  for (let index = 0; index < 17; index++) {
+  const add = async (index: number) => {
     process.env.ANTHROPIC_AUTH_SETTINGS_FILE = join(
       home,
       `eviction-${index}.jsonc`,
@@ -785,8 +871,11 @@ test('runtime eviction releases its settings lease and closes the last user-file
       vaultPoll: { intervalMs: 0 },
     })
     entries.push(native)
-    await native.service()
+    return native
   }
+  for (let index = 0; index < 16; index++) await add(index)
+  await Promise.all(entries.map((native) => native.service()))
+  await (await add(16)).service()
   await entries[0]?.close()
   expect(watches).toBe(17)
   expect(stops).toBe(1)
