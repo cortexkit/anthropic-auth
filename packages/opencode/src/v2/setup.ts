@@ -359,7 +359,9 @@ export async function setupAnthropicAuth(
   )
   ctx = requests.context
   let settingsService: SettingsService | undefined
-  let startup: Awaited<ReturnType<typeof runSettingsMoveAtStartup>>
+  let settingsMode: Awaited<
+    ReturnType<typeof runSettingsMoveAtStartup>
+  >['mode'] = 'legacy'
   const runtimeOptions = {
     paths,
     host: 'opencode' as const,
@@ -377,7 +379,7 @@ export async function setupAnthropicAuth(
     }
   }
   try {
-    startup = await runSettingsMoveAtStartup({
+    const startup = await runSettingsMoveAtStartup({
       host: 'opencode',
       env: settingsEnv,
       paths: settingsPaths,
@@ -397,6 +399,7 @@ export async function setupAnthropicAuth(
             : undefined),
       },
     })
+    settingsMode = startup.mode
     if (startup.mayOpenService)
       settingsService = await openSettingsService({
         file: settingsPaths.target,
@@ -415,28 +418,32 @@ export async function setupAnthropicAuth(
             }),
         },
       })
-  } catch (error) {
-    requests.retire()
-    holderRegistration?.close()
-    await settingsService?.dispose()
-    throw error
+  } catch {
+    try {
+      await settingsService?.dispose()
+    } catch {}
+    settingsService = undefined
+    settingsMode = 'legacy'
+    logger.warn(
+      'settings',
+      'Settings initialization failed; continuing with legacy settings.',
+    )
   }
   const runtime = acquireNativeAccountRuntime({
     ...runtimeOptions,
     settingsService,
     settingsFile: settingsPaths.target,
-    settingsMode: () => startup.mode,
+    settingsMode: () => settingsMode,
     settingsAuthority: { options: { env: settingsEnv } },
   })
   try {
     await runtime.prepareSettingsAction?.()
     runtime.applySettingsEffects?.()
-  } catch (error) {
-    requests.retire()
-    holderRegistration?.close()
-    await runtime.close()
-    await settingsService?.dispose()
-    throw error
+  } catch {
+    logger.warn(
+      'settings',
+      'Settings authority check failed; continuing with current settings.',
+    )
   }
   // Use the same enrollment files the account runtime reads, so the login
   // methods, the menu and request serving always agree on the mode.

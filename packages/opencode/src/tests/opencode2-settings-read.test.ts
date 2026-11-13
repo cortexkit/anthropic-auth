@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
+import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import type { Plugin } from '@opencode/plugin'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
@@ -20,10 +21,21 @@ afterEach(async () => {
   for (const close of cleanups.splice(0).reverse()) await close()
 })
 
-function context(onInstall?: () => void) {
+type TestHook = (draft: any) => unknown
+
+function context(
+  onInstall?: () => void,
+  hooks = new Map<string, TestHook[]>(),
+) {
   const registration = { dispose: async () => {} }
   return {
-    session: { get: async () => ({}), hook: async () => registration },
+    session: {
+      get: async () => ({}),
+      hook: async (name: string, callback: TestHook) => {
+        hooks.set(name, [...(hooks.get(name) ?? []), callback])
+        return registration
+      },
+    },
     model: { transform: async () => registration },
     provider: { transform: async () => registration },
     integration: {
@@ -198,16 +210,55 @@ async function fixture(
     sourceSpy.mockRestore()
   })
   const start = async (onInstall?: () => void) => {
-    const dispose = await setupAnthropicAuth(context(onInstall), {
+    const hooks = new Map<string, TestHook[]>()
+    const dispose = await setupAnthropicAuth(context(onInstall, hooks), {
       paths,
       vault: { env },
+      local: { resolveIdentity: legacyIdentity },
+      fetch: Object.assign(async () => Response.json({}), {
+        preconnect: fetch.preconnect,
+      }),
       cacheKeep: {
         registryDirectory: join(root, 'registry'),
         persistence: { root },
       },
     })
     cleanups.push(dispose)
-    return { dispose, source: sources.at(-1)!, runtime: runtimes.at(-1)! }
+    const live = async () => {
+      const draft = {
+        sessionID: 'settings-availability',
+        agent: 'build',
+        kind: 'primary',
+        model: { providerID: 'anthropic', id: 'claude-sonnet-5' },
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${placeholderSecret('anthropic')}`,
+          },
+          body: JSON.stringify({
+            model: 'claude-sonnet-5',
+            max_tokens: 8,
+            messages: [{ role: 'user', content: 'Hello' }],
+          }),
+        }),
+      }
+      for (const hook of hooks.get('context') ?? [])
+        await hook({ ...draft, messages: [] })
+      const model = { ...draft, headers: {} as Record<string, string> }
+      for (const hook of hooks.get('model.request') ?? []) await hook(model)
+      for (const [name, value] of Object.entries(model.headers))
+        draft.request.headers.set(name, value)
+      for (const hook of hooks.get('http.request') ?? []) await hook(draft)
+      const answered = {
+        ...draft,
+        response: Response.json({ usage: { output_tokens: 1 } }),
+      }
+      for (const hook of hooks.get('http.response') ?? []) await hook(answered)
+      await answered.response.text()
+      return draft.request
+    }
+    return { dispose, live, source: sources.at(-1)!, runtime: runtimes.at(-1)! }
   }
   return {
     root,
@@ -217,6 +268,7 @@ async function fixture(
     target,
     start,
     opened,
+    openSettings: open,
     io: () => settingsIO,
     watchCloses: () => watchCloses,
     async changed() {
@@ -226,6 +278,127 @@ async function fixture(
     },
   }
 }
+
+const legacyIdentity = async () =>
+  ({ accountUuid: '11111111-2222-4333-8444-555555555555' }) as never
+
+async function seedLegacyRequest(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.store.add({
+    id: 'legacy',
+    identity: '11111111-2222-4333-8444-555555555555',
+    credential: {
+      type: 'oauth',
+      access: 'sk-ant-oat01-settings-legacy',
+      refresh: 'synthetic-refresh',
+      expires: Date.now() + 3_600_000,
+    },
+  })
+  await f.store.updateSettings(() => ({
+    mainAccountId: 'legacy',
+    quota: { enabled: false },
+    claudeFast: { enabled: true },
+  }))
+  await put(f.target, { quota_enabled: 'on', claude_fast_enabled: false })
+}
+
+for (const stage of ['move', 'service open'] as const) {
+  test(`OC2 settings ${stage} failure still installs and serves a legacy-store request`, async () => {
+    const f = await fixture()
+    await seedLegacyRequest(f)
+    const records: core.LogTestRecord[] = []
+    core.setLogLevel('info')
+    core.__setLogTestSink((record) => records.push(record))
+    const failure =
+      stage === 'move'
+        ? spyOn(core, 'runSettingsMoveAtStartup').mockRejectedValue(
+            new Error(`private settings failure at ${f.target}`),
+          )
+        : spyOn(core, 'openSettingsService').mockImplementation((options) =>
+            options.host === 'opencode'
+              ? Promise.reject(
+                  new Error(`private settings failure at ${f.target}`),
+                )
+              : f.openSettings(options),
+          )
+    cleanups.push(() => failure.mockRestore())
+    let installed = false
+    const instance = await f.start(() => {
+      installed = true
+    })
+    expect(installed).toBe(true)
+    expect(instance.runtime.getSettingsStatus?.()).toBeUndefined()
+    expect(
+      (await instance.runtime.read()).policyStorage.claudeFast?.enabled,
+    ).toBe(true)
+    expect((await instance.live()).headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-settings-legacy',
+    )
+    const warnings = records.filter(
+      (record) =>
+        record.message ===
+        'Settings initialization failed; continuing with legacy settings.',
+    )
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]?.level).toBe('warn')
+    expect(warnings[0]?.message).toBe(
+      'Settings initialization failed; continuing with legacy settings.',
+    )
+    expect(warnings[0]?.payload).toBeUndefined()
+    expect(JSON.stringify(records)).not.toContain('private settings failure')
+    expect(JSON.stringify(warnings)).not.toContain(f.target)
+  })
+}
+
+test('OC2 failed first settings authority check does not abort requests or later menu probes', async () => {
+  const f = await fixture()
+  await seedLegacyRequest(f)
+  const acquire = core.acquireNativeAccountRuntime
+  let probes = 0
+  const acquisition = spyOn(
+    core,
+    'acquireNativeAccountRuntime',
+  ).mockImplementation((options) => {
+    const runtime = acquire(options)
+    return {
+      ...runtime,
+      prepareSettingsAction: async () => {
+        if (++probes === 1)
+          throw new Error(`private authority failure at ${f.target}`)
+        await runtime.prepareSettingsAction?.()
+      },
+    }
+  })
+  cleanups.push(() => acquisition.mockRestore())
+  const records: core.LogTestRecord[] = []
+  core.setLogLevel('info')
+  core.__setLogTestSink((record) => records.push(record))
+  // Keep the user-file policy permissive so this test isolates startup's probe.
+  await put(f.target, { quota_enabled: 'off' })
+  const instance = await f.start()
+  expect((await instance.live()).headers.get('authorization')).toBe(
+    'Bearer sk-ant-oat01-settings-legacy',
+  )
+  const menu = createNativeMenuCapabilities({
+    runtime: instance.runtime,
+    source: instance.source,
+    start: async () => {},
+  })
+  cleanups.push(() => menu.close())
+  await menu.readStatus('dump')
+  expect(probes).toBe(2)
+  const warnings = records.filter(
+    (record) =>
+      record.message ===
+      'Settings authority check failed; continuing with current settings.',
+  )
+  expect(warnings).toHaveLength(1)
+  expect(warnings[0]?.level).toBe('warn')
+  expect(warnings[0]?.message).toBe(
+    'Settings authority check failed; continuing with current settings.',
+  )
+  expect(warnings[0]?.payload).toBeUndefined()
+  expect(JSON.stringify(records)).not.toContain('private authority failure')
+})
 
 function request(modelID = 'claude-sonnet-5') {
   return {
