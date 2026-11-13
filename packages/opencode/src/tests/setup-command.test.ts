@@ -577,15 +577,16 @@ lifetimes.test(
 )
 
 // Synthetic credential shapes echoed by failing setup steps. The opaque and
-// short values match no built-in pattern, so only exact-value redaction can
-// remove them. The short value also occurs inside ECHO_JWT, so replacing it
-// before the JWT pattern runs would split the token into unredacted pieces.
+// JWT-part values match no built-in pattern, so only exact-value redaction can
+// remove them. Replacing the JWT part before the JWT pattern runs would split
+// the token into unredacted pieces. Keep both values long enough to avoid
+// accidental matches in random temporary directory names.
 const ECHO_BEARER = 'Bearer synthBearerValue0123456789abcdefXYZ'
 const ECHO_JWT =
   'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMtc2V0dXAifQ.c3ludGhldGljLXNldHVwLXNpZ25hdHVyZQ'
 const ECHO_SK = 'sk-ant-synthetic0123456789abcdefSETUP'
 const ECHO_OPAQUE = 'OPAQUE-synthetic-Zq7Xw2Vt9Lm4Hd8Rc'
-const ECHO_SHORT = 'J9'
+const ECHO_JWT_PART = 'eyJhbGciOiJIUzI1NiJ9'
 const ECHO_SECRETS = [
   'synthBearerValue0123456789abcdefXYZ',
   ECHO_JWT,
@@ -641,7 +642,7 @@ async function setupFailureFixture(): Promise<SetupFailureFixture> {
     // Child processes inherit this environment, so its secret-named values
     // are known credentials for redaction.
     SYNTHETIC_SERVICE_TOKEN: ECHO_OPAQUE,
-    SYNTHETIC_SHORT_API_KEY: ECHO_SHORT,
+    SYNTHETIC_JWT_PART_API_KEY: ECHO_JWT_PART,
   }
   const diagnostics = cliDiagnosticsDirectory(env)
   if (diagnostics === undefined) throw new Error('No diagnostics directory')
@@ -832,14 +833,14 @@ describe('setup failure diagnostics', () => {
         `jwt echo: ${ECHO_JWT}`,
         `key echo: ${ECHO_SK}`,
         `install token rejected: ${ECHO_OPAQUE}`,
-        `short key echo: ${ECHO_SHORT}`,
+        `overlapping key echo: ${ECHO_JWT_PART}`,
       ].join('\n')
       const code = await runFailingActivation(fixture, () => new Error(message))
       expect(code).toBe(1)
 
       const screen = fixture.screen()
       expect(screen).not.toContain('vault refused enrollment')
-      expect(screen).not.toContain(`: ${ECHO_SHORT}`)
+      expect(screen).not.toContain(`: ${ECHO_JWT_PART}`)
       expectNoSecretFragments(screen)
 
       const record = await screenDiagnostic(fixture, ACTIVATION_SCREEN)
@@ -851,10 +852,10 @@ describe('setup failure diagnostics', () => {
       expect(detail).toContain('auth header: Bearer [REDACTED]')
       expect(detail).toContain('jwt echo: [REDACTED]')
       expect(detail).toContain('key echo: [REDACTED]')
-      // ECHO_OPAQUE and ECHO_SHORT match no built-in pattern; they are redacted
+      // ECHO_OPAQUE and ECHO_JWT_PART match no built-in pattern; they are redacted
       // only because the fixture environment passes them under secret names.
       expect(detail).toContain('install token rejected: [REDACTED]')
-      expect(detail).toContain('short key echo: [REDACTED]')
+      expect(detail).toContain('overlapping key echo: [REDACTED]')
       expect(detail.some((line) => String(line).startsWith('    at '))).toBe(
         true,
       )
@@ -4900,7 +4901,13 @@ describe('setup CLI boundary', () => {
     'a migrate error hides its unique path and stack from the terminal',
     async () => {
       const f = await callbackFixture()
-      const path = join(f.env.HOME!, 'private-migration-source.json')
+      // A fixed J9 path component catches collisions with synthetic credentials
+      // regardless of the random temporary directory name.
+      const path = join(
+        f.env.HOME!,
+        'setup-failure-cJ9aFk',
+        'private-migration-source.json',
+      )
       const stack = 'at uniqueMigrationStackFrame (private-module.ts:123:4)'
       const error = new Error(`Cannot migrate ${path}`)
       error.stack = `${error.message}\n${stack}`
