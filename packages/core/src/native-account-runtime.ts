@@ -1572,10 +1572,24 @@ export function createNativeAccountRuntime(
       // Capture pre-change settings in the write callback; effects run only
       // after the legacy store commits a change.
       const captured: { before?: NativeSettingsEffectFields } = {}
+      let redirected = false
       const result = await selected.store.updateSettings(async (settings) => {
+        // A startup move may have published the user file while this write
+        // waited for the store locks; the legacy store is then no longer read.
+        if (await runtimeSettings.legacyAuthorityLost()) {
+          redirected = true
+          return settings
+        }
         captured.before = captureNativeSettingsEffectFields(settings)
         return legacyNativeSettings(await mutate(settings))
       })
+      if (redirected) {
+        // Adopt the user file, then write there; the legacy store is untouched.
+        await runtimeSettings.prepareAction()
+        if (!(await runtimeSettings.prepareWrite()))
+          throw new NativeCustodyError('route-unavailable')
+        return runtime.updateSettings(mutator)
+      }
       if (result.outcome === 'updated' && captured.before)
         applyCommittedNativeSettingsEffects(captured.before, result.settings)
       if (result.outcome === 'updated') {

@@ -194,6 +194,22 @@ export function createNativeRuntimeSettings(
       await ready
       await recheck()
     },
+    /**
+     * Called under the legacy store's locks by a write that chose the legacy
+     * store: true when the user file became authoritative meanwhile (a move
+     * published while the write waited for those locks), so the write must
+     * leave the legacy store alone and go to the user file instead.
+     */
+    async legacyAuthorityLost() {
+      if (!service || userAuthority || options.settingsMode?.() === 'separate')
+        return false
+      return (
+        (await resolveSettingsMode(
+          { target: service.file, separate: false },
+          options.settingsAuthority?.options,
+        )) === 'user-file'
+      )
+    },
     /** Recheck authority on the menu path before choosing a write target. */
     async prepareWrite() {
       if (!service || options.settingsMode?.() === 'separate') return undefined

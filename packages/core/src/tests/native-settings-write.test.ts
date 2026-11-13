@@ -1404,7 +1404,7 @@ function deferred() {
 }
 
 for (const first of ['writer', 'move'] as const) {
-  test(`legacy ${first} wins the source locks; no write can land between the move read and publish`, async () => {
+  test(`legacy ${first} wins the source locks; a write never lands in the legacy store after the move publishes`, async () => {
     const paused = deferred()
     const release = deferred()
     const checked = deferred()
@@ -1511,15 +1511,17 @@ for (const first of ['writer', 'move'] as const) {
       expect(mutating).toBe(false)
       release.resolve()
       await mover
-      expect((await writer).outcome).toBe('updated')
+      // The write rechecks authority under the store locks, finds the
+      // published file and redoes the change there instead of in the dead store.
+      expect((await writer).outcome).toBe('saved')
       expect(events).toEqual(['read', 'publish', 'write'])
     }
     await f.runtime.prepareSettingsAction?.()
-    expect(parse(await f.text()).dump_enabled).toBe(first === 'writer')
-    expect((await f.saved()).dump).toEqual({ enabled: true })
+    expect(parse(await f.text()).dump_enabled).toBe(true)
+    expect((await f.saved()).dump).toEqual({ enabled: first === 'writer' })
     expect(
       records.filter((record) => record.message.includes('were not imported')),
-    ).toHaveLength(first === 'move' ? 1 : 0)
+    ).toHaveLength(0)
   })
 }
 
