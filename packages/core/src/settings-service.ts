@@ -6,7 +6,6 @@ import {
   type ReportEntry,
   type SettingsEdit,
   type SettingsHandle,
-  SettingsRefusal,
   type UpdateResult,
   type ValueOf,
 } from '@cortexkit/common-auth/settings'
@@ -274,14 +273,8 @@ export interface SettingsRecreationSide {
   values: SettingsProtectionValues
 }
 
-/**
- * A settings edit that names the override level it writes. common-auth 0.48
- * has no `level`; 0.49 adds it, and only then can a recreation write a value
- * for one host. Until then recreation accepts plans whose edits carry none.
- */
-export type SettingsLevelEdit = SettingsEdit & {
-  level?: 'default' | SettingsHost
-}
+/** A shared-settings edit, including an explicit default or host level. */
+export type SettingsLevelEdit = SettingsEdit
 
 /**
  * The protection edits for a recreated file, as a pure function of both
@@ -362,7 +355,7 @@ export function settingsRecreationForWriter(
 
 /**
  * The floor list a recreation writes when the other host applies the same
- * floors as `host`, which is the only case recreation accepts today.
+ * floors as `host`.
  */
 export function settingsRecreationFloors(
   values: SettingsProtectionValues,
@@ -402,18 +395,14 @@ export interface SettingsRecreationInput {
   none?: boolean
 }
 
-export type SettingsRecreationRefusalReason =
-  | 'own-unknown'
-  | 'peer-unknown'
-  | 'peer-differs'
+export type SettingsRecreationRefusalReason = 'own-unknown' | 'peer-unknown'
 
 /**
  * What a menu write that finds the file missing does, as a pure function of
  * both hosts' sets: the protection edits it carries, or why it is refused.
  * A peer with no set takes the writer's; so does one with no recoverable set
- * when every host is stopped (setup). Otherwise both sets are planned
- * together, and a peer whose non-floor values differ refuses, since the file
- * cannot yet hold a value for one host alone (common-auth 0.48 has no level).
+ * when every host is stopped (setup). Otherwise both known sets are carried
+ * together, with host levels preserving any differing values.
  */
 export function planSettingsFileRecreation(
   writer: SettingsRecreationInput,
@@ -425,10 +414,8 @@ export function planSettingsFileRecreation(
   if (writer.rung === 3) return { refused: 'own-unknown' }
   if (peer.none || (hostsStopped && peer.rung === 3 && !peer.unreadable))
     return { edits: settingsRecreationForWriter(writer.values, writer.host) }
-  const plan = planSettingsRecreation(writer, peer)
-  if (plan.peerDiffers)
-    return { refused: peer.rung === 3 ? 'peer-unknown' : 'peer-differs' }
-  return { edits: plan.edits }
+  if (peer.rung === 3) return { refused: 'peer-unknown' }
+  return { edits: planSettingsRecreation(writer, peer).edits }
 }
 
 /** The state of the user file a menu write found, as common-auth's planned update reports it. */
@@ -1065,37 +1052,11 @@ class SharedSettingsService {
   ): Promise<UpdateResult> {
     if (typeof edits !== 'function' && !edits.length)
       return { outcome: 'unchanged' }
-    const missing = (await this.bytes()).status === 'missing'
+    const peer = host === 'opencode' ? 'pi' : 'opencode'
+    // Protection recovery may do I/O, so gather it before entering the
+    // synchronous writer plan. Only the plan decides whether it is needed.
+    const other = options.createMissing ? await peerProtection(peer) : undefined
     let carried: Record<string, unknown> | undefined
-    let carry: readonly SettingsEdit[] | undefined
-    if (missing && options.createMissing) {
-      if (applied.rung === 3) throw new SettingsRecreationRefusal(this.file)
-      const peer = host === 'opencode' ? 'pi' : 'opencode'
-      const plan = planSettingsFileRecreation(
-        { host, values: applied.values, rung: applied.rung },
-        { host: peer, ...(await peerProtection(peer)) },
-        options.hostsStopped,
-      )
-      // common-auth 0.48 cannot write a value for one host into a new file,
-      // so a plain carry would hand the writer's values to the other host.
-      // Refuse until edits can name their level (common-auth 0.49).
-      if ('refused' in plan) throw new SettingsRecreationRefusal(this.file)
-      carried = Object.fromEntries(
-        plan.edits.map((edit) => [edit.setting, edit.value]),
-      )
-      carry = plan.edits.map(({ setting, value }) => ({ setting, value }))
-    }
-    // Recreation still gathers protection before writing; refuse if the
-    // file's presence changed while those sets were gathered.
-    if (options.createMissing) {
-      const now = await this.bytes()
-      const changed = (now.status === 'missing') !== missing
-      if (changed)
-        throw new SettingsRefusal(
-          'settings-busy',
-          'Settings changed while the write was planned',
-        )
-    }
     // The shared read/watch handle cannot create files. Only the menu's transient writer can.
     const handle = options.createMissing
       ? (this.options.dependencies?.open?.(this.openOptions(true)) ??
@@ -1103,6 +1064,33 @@ class SharedSettingsService {
       : this.handle
     const result = await handle.update(
       (current) => {
+        let carry: readonly SettingsEdit[] | undefined
+        if (current.status === 'missing') {
+          const plan = planSettingsFileRecreation(
+            { host, values: applied.values, rung: applied.rung },
+            {
+              host: peer,
+              ...(other ?? {
+                values: mostRestrictiveSettingsProtection(),
+                rung: 3,
+              }),
+            },
+            options.hostsStopped,
+          )
+          if ('refused' in plan) throw new SettingsRecreationRefusal(this.file)
+          carry = plan.edits
+          // Retain levels in the diagnostic too: a plain map would hide
+          // which host a differing protection value belongs to.
+          carried = {}
+          for (const edit of carry) {
+            if (edit.level) {
+              const levels = carried[edit.setting] as
+                | Record<string, unknown>
+                | undefined
+              carried[edit.setting] = { ...levels, [edit.level]: edit.value }
+            } else carried[edit.setting] = edit.value
+          }
+        }
         const menu = typeof edits === 'function' ? edits(current, carry) : edits
         return carry ? [...carry, ...menu] : menu
       },
@@ -1360,7 +1348,6 @@ class SettingsProtectionLease {
             {
               'own-unknown': `${host}'s protection settings could not be recovered`,
               'peer-unknown': `the protection settings of ${peer} are unknown`,
-              'peer-differs': `${peer} applies different protection settings`,
             }[plan.refused]
           }.`
         : 'A menu write will recreate it.'
