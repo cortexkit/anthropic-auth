@@ -9,6 +9,7 @@ import {
   getQuotaMinimumRemainingThresholds,
 } from '../accounts.ts'
 import { settingsDefinition } from '../settings-definition.ts'
+import { mapSettingsMoveSources } from '../settings-move-map.ts'
 import {
   createSettingsMoveSource,
   readSettingsMoveSource,
@@ -510,16 +511,7 @@ test('the common-auth move publishes valid remaining fields and protection repla
     sources: [createSettingsMoveSource({ ...reader.options, path })],
     fence: () => true,
     log: { info: () => {}, warn: () => {} },
-    map: (sources) => ({
-      entries: sources.flatMap((entry, index) =>
-        entry.present
-          ? Object.entries(entry.value as Record<string, unknown>).map(
-              ([setting, value]) => ({ source: index, setting, value }),
-            )
-          : [],
-      ),
-      unmapped: [],
-    }),
+    map: mapSettingsMoveSources,
   })
   expect(result.outcome).toBe('moved')
   expect(parse(await readFile(target, 'utf8'))).toEqual({
