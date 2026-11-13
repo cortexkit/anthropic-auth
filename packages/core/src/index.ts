@@ -367,6 +367,7 @@ export * from './routing-reports.ts'
 export * from './server-fallback-usage.ts'
 export * from './session-cache-activity.ts'
 export * from './session-cache-policy.ts'
+export * from './settings-definition.ts'
 export type { SseEvent, SseFramer, SseFramerOptions } from './sse.ts'
 export {
   createSseFramer,

@@ -17,6 +17,7 @@
   },
   "files": [
     "dist",
+    "schema/anthropic-auth.schema.json",
     "README.md",
     "LICENSE"
   ],
