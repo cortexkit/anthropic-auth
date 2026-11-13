@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { NativeRefreshFailure } from '@cortexkit/anthropic-auth-core'
+import type {
+  NativeRefreshFailure,
+  NativeSettingsWriteResult,
+} from '@cortexkit/anthropic-auth-core'
 import {
   type AccountCommandStatusProjection,
   type AccountStorage,
@@ -1645,27 +1648,36 @@ const anthropicAuthPlugin = async (
       | 'killswitch',
     patch: Record<string, unknown>,
   ) {
-    await nativeAccounts.updateSettings((settings) =>
-      mergeNativeSettingsSection(settings, section, patch),
+    requireSettingsSaved(
+      await nativeAccounts.updateSettings((settings) =>
+        mergeNativeSettingsSection(settings, section, patch),
+      ),
     )
     return loadAccounts()
+  }
+  class SettingsWriteError extends Error {}
+  function requireSettingsSaved(result: NativeSettingsWriteResult) {
+    if (result.outcome === 'refused' || result.outcome === 'failed')
+      throw new SettingsWriteError(result.reason)
   }
   // Turning the cache on or off also records the effective strategy, as the
   // standalone cache command always did: a pool without a stored mode is
   // saved as { enabled, mode: 'explicit' } instead of leaving mode implicit.
   const setCache1hPersistentEnabled = async (enabled: boolean) => {
-    await nativeAccounts.updateSettings((settings) => ({
-      ...settings,
-      claudeCache: {
-        ...plainSettingsSection(settings.claudeCache),
-        enabled,
-        mode: getCache1hPersistentMode({
-          ...settings,
-          version: 1,
-          accounts: [],
-        }),
-      },
-    }))
+    requireSettingsSaved(
+      await nativeAccounts.updateSettings((settings) => ({
+        ...settings,
+        claudeCache: {
+          ...plainSettingsSection(settings.claudeCache),
+          enabled,
+          mode: getCache1hPersistentMode({
+            ...settings,
+            version: 1,
+            accounts: [],
+          }),
+        },
+      })),
+    )
     return loadAccounts()
   }
   const setCache1hPersistentMode = (
@@ -1677,7 +1689,9 @@ const anthropicAuthPlugin = async (
   // startHour/endHour behind would revive that window as soon as anything
   // reads the hours without first checking `always`.
   const setCacheKeepPersistentAlways = async () => {
-    await nativeAccounts.updateSettings(nativeCacheKeepAlways)
+    requireSettingsSaved(
+      await nativeAccounts.updateSettings(nativeCacheKeepAlways),
+    )
     return loadAccounts()
   }
   const setCacheKeepPersistentWindow = (startHour: number, endHour: number) =>
@@ -1697,7 +1711,7 @@ const anthropicAuthPlugin = async (
   const setLogLevelPersistent = async (
     level: NonNullable<NonNullable<AccountStorage['logging']>['level']>,
   ) => {
-    await nativeAccounts.setLoggingLevel(level)
+    requireSettingsSaved(await nativeAccounts.setLoggingLevel(level))
     return loadAccounts()
   }
   const setPrimePersistentEnabled = (
@@ -5579,15 +5593,15 @@ const anthropicAuthPlugin = async (
     let enabled = previous
     if (action.type === 'enable') {
       enabled = true
+      await setPrimePersistentEnabled(true, accountStoragePath)
       if (!previous) {
-        await setPrimePersistentEnabled(true, accountStoragePath)
         primeManager.start()
         logger.info('commands', 'prime changed', { enabled: true })
       }
     } else if (action.type === 'disable') {
       enabled = false
+      await setPrimePersistentEnabled(false, accountStoragePath)
       if (previous) {
-        await setPrimePersistentEnabled(false, accountStoragePath)
         primeManager.stop()
         logger.info('commands', 'prime changed', { enabled: false })
       }
@@ -6123,7 +6137,7 @@ const anthropicAuthPlugin = async (
     return { text: 'Open /claude to manage native Claude settings.', knobs: {} }
   }
 
-  const dispatchNative: NativeMenuDispatch = async (request, options) => {
+  const applyNativeAction: NativeMenuDispatch = async (request, options) => {
     await nativeAccounts.prepareSettingsAction?.()
     if (options.signal?.aborted)
       throw options.signal.reason ?? new Error('Menu action aborted')
@@ -6271,41 +6285,44 @@ const anthropicAuthPlugin = async (
         const accountIds = snapshot.accounts
           .filter((account) => account.id !== 'main')
           .map((account) => account.id)
-        await nativeAccounts.updateSettings((settings) => {
-          const config = getKillswitchConfig({
-            ...settings,
-            version: 1,
-            accounts: [],
-          })
-          if (request.action !== 'killswitch-set') {
-            const result = executeKillswitchCommand({
-              argumentsText: request.action === 'killswitch-on' ? 'on' : 'off',
-              config,
-              accountIds,
+        requireSettingsSaved(
+          await nativeAccounts.updateSettings((settings) => {
+            const config = getKillswitchConfig({
+              ...settings,
+              version: 1,
+              accounts: [],
             })
-            return { ...settings, killswitch: result.updatedConfig ?? config }
-          }
-          const accounts = { ...config.accounts }
-          const updated: NonNullable<AccountStorage['killswitch']> = {
-            ...config,
-            enabled: true,
-            accounts,
-          }
-          for (const entry of request.values.entries) {
-            const thresholds = {
-              five_hour: entry.fh,
-              seven_day: entry.sd,
-              ...(entry.scoped === undefined ? {} : { scoped: entry.scoped }),
+            if (request.action !== 'killswitch-set') {
+              const result = executeKillswitchCommand({
+                argumentsText:
+                  request.action === 'killswitch-on' ? 'on' : 'off',
+                config,
+                accountIds,
+              })
+              return { ...settings, killswitch: result.updatedConfig ?? config }
             }
-            if (entry.account === 'main' || entry.account === 'all')
-              updated.main = thresholds
-            if (entry.account === 'all') {
-              for (const id of accountIds) accounts[id] = thresholds
-            } else if (entry.account !== 'main')
-              accounts[entry.account] = thresholds
-          }
-          return { ...settings, killswitch: updated }
-        })
+            const accounts = { ...config.accounts }
+            const updated: NonNullable<AccountStorage['killswitch']> = {
+              ...config,
+              enabled: true,
+              accounts,
+            }
+            for (const entry of request.values.entries) {
+              const thresholds = {
+                five_hour: entry.fh,
+                seven_day: entry.sd,
+                ...(entry.scoped === undefined ? {} : { scoped: entry.scoped }),
+              }
+              if (entry.account === 'main' || entry.account === 'all')
+                updated.main = thresholds
+              if (entry.account === 'all') {
+                for (const id of accountIds) accounts[id] = thresholds
+              } else if (entry.account !== 'main')
+                accounts[entry.account] = thresholds
+            }
+            return { ...settings, killswitch: updated }
+          }),
+        )
         text = 'Native killswitch policy updated.'
         break
       }
@@ -6326,6 +6343,16 @@ const anthropicAuthPlugin = async (
         .split('\n')
         .filter((line) => !line.includes('/claude-'))
         .join('\n'),
+    }
+  }
+
+  const dispatchNative: NativeMenuDispatch = async (request, options) => {
+    try {
+      return await applyNativeAction(request, options)
+    } catch (error) {
+      if (error instanceof SettingsWriteError)
+        return { ok: false, text: error.message }
+      throw error
     }
   }
 
@@ -6384,10 +6411,38 @@ const anthropicAuthPlugin = async (
       '',
       invocation.sessionId,
     )
-    return payload.text
+    const summary = payload.text
       .split('\n')
       .filter((line) => !line.includes('/claude-'))
       .join('\n')
+    const status = nativeAccounts.getSettingsStatus?.()
+    if (!status)
+      return `${summary}\nSettings file: ${await nativeAccounts.getSettingsPath()}`
+    const { file } = status
+    return [
+      summary,
+      `Settings file: ${file.file}`,
+      ...(file.missing
+        ? ['Settings file is missing; a menu write will recreate it.']
+        : [`Settings file state: ${file.state}`]),
+      ...(file.recreated
+        ? ['Settings file was recreated by a menu write.']
+        : []),
+      ...file.invalidKeys.map((key) => `Invalid setting: ${key}`),
+      ...file.ignoredModelKeys.map(
+        ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
+      ),
+      ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
+      'Settings (no model):',
+      ...Object.entries(status.values).map(
+        ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,
+      ),
+      ...Object.entries(status.modelOverrides).flatMap(([key, rows]) =>
+        (rows ?? []).map(
+          ({ model, value }) => `  ${key} [${model}]: ${JSON.stringify(value)}`,
+        ),
+      ),
+    ].join('\n')
   }
   const nativeCommands = new Map<
     string,
