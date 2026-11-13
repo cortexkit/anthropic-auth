@@ -1,3 +1,4 @@
+import { types } from 'node:util'
 import {
   assertHostsStopped,
   createProcessFence,
@@ -6,6 +7,7 @@ import {
   isVaultHosted,
   type NativeHolderRegistration,
   NativePiAuthSlotError,
+  NativeSetupSettingsWriteError,
   openNativePiAuthSlot,
   publishNativeEmptyInit,
   readNativeEnrollmentMode,
@@ -194,6 +196,7 @@ export async function runSetupCommand(
     fence,
     paths: paths.get(host),
     removePiAnthropicAuth: consent.get(host) ?? false,
+    reportSettings: print,
   })
   const vaultOptions = (host: HarnessKind) => ({
     ...localOptions(host),
@@ -445,7 +448,12 @@ export async function runSetupCommand(
     await runSetup(plugin, args, { ...options, env, terminal, runner, fence })
     return 0
   } catch (error) {
-    const message = setupRefusalMessage(error) ?? knownFailureMessage(error)
+    const message =
+      setupRefusalMessage(error) ??
+      (types.isNativeError(error) &&
+      error instanceof NativeSetupSettingsWriteError
+        ? new NativeSetupSettingsWriteError().message
+        : knownFailureMessage(error))
     const text = message ?? (await reportThrownFailure(phase, error, env))
     if (text) print(text)
     // When it fails after vault enrollment began, runSetup has already printed

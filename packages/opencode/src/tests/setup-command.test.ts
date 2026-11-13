@@ -1279,6 +1279,32 @@ async function writeSetupJson(path: string, value: unknown) {
   await writeFile(path, JSON.stringify(value), { mode: 0o600 })
 }
 
+lifetimes.test(
+  'setup reports deferred settings refusal without rolling back credential commit',
+  async () => {
+    const f = await callbackFixture()
+    const target = join(f.env.HOME!, 'settings.jsonc')
+    f.env.ANTHROPIC_AUTH_SETTINGS_FILE = target
+    f.io.env!.ANTHROPIC_AUTH_SETTINGS_FILE = target
+    await writeFile(target, '{broken', { mode: 0o600 })
+    await writeSetupJson(f.plan.legacyConfigPath, {
+      version: 1,
+      mainAccountId: 'main',
+      main: { profile: { accountUuid: SETUP_UUID } },
+      dump: { enabled: true },
+    })
+    await writeSetupJson(f.plan.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
+    expect(await runSetupCommand(['--yes', '--opencode=1'], f.io)).toBe(1)
+    expect((await readNativeMigrationJournal(f.plan.paths))?.phase).toBe(
+      'committed',
+    )
+    expect(f.screen()).toContain(core.malformedSettingsText(target))
+    expect(f.screen()).toContain('Set these settings by hand: dump_enabled.')
+    expect(f.screen()).toContain('Credential transfer is committed')
+    expectNoDiagnostics(f)
+  },
+)
+
 for (const host of ['opencode', 'pi'] as const) {
   lifetimes.test(
     `${host} failed activation names retained vault enrollment and both recovery steps`,

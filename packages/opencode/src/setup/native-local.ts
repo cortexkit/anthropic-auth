@@ -7,6 +7,8 @@ import {
   createNativeAccountRuntime,
   custodyTombstoneOAuth,
   inspectNativeHostAuthEntry,
+  legacySettingsProtection,
+  logger,
   NativeMigrationError,
   type NativeMigrationPreflight,
   nativeJournalMayAdoptLaterHostLogin,
@@ -14,10 +16,12 @@ import {
   prepareNativeMigration,
   readNativeEnrollmentMode,
   readNativeMigrationJournal,
+  readSettingsMoveSource,
   releaseNativeMigrationPreflight,
   requireNoSupervisedAuthContentSnapshot,
   runNativeMigration,
   writeNativeHostAuth,
+  writeNativeSetupSettings,
 } from '@cortexkit/anthropic-auth-core'
 import { type NativeSetupPaths, resolveNativeSetupPaths } from './native-paths'
 import {
@@ -46,6 +50,7 @@ export interface NativeLocalSetupOptions {
   preflight?: NativeMigrationPreflight
   skipMigration?: boolean
   beforeCommit?: () => Promise<void>
+  reportSettings?: (message: string) => void
 }
 
 export const SEPARATE_HOST_LOGIN_NOTICE =
@@ -295,6 +300,70 @@ export async function installAbsentNativePlaceholder(
   })
 }
 
+/** Route raw, deferred settings after credential commit without starting the settings move. */
+export async function writeNativeLocalSetupSettings(
+  host: HarnessKind,
+  plan: NativeSetupPaths,
+  options: NativeLocalSetupOptions,
+  settings: Readonly<Record<string, unknown>>,
+) {
+  const report =
+    options.reportSettings ??
+    ((message: string) => logger.warn('setup', message))
+  // This runtime has no settings service: its store mutator receives only the
+  // legacy record's booleans. Released versions cannot read the settings
+  // service's "default"/"on"/"off" values from their stores.
+  const legacy = createNativeAccountRuntime({
+    paths: plan.paths,
+    host,
+    vault: { env: options.env },
+    settingsMode: () => 'legacy',
+    beforePoolWrite: nativeLocalProcessFence(host, options),
+  })
+  try {
+    const result = await writeNativeSetupSettings({
+      host,
+      env: options.env,
+      home: options.env.HOME,
+      source: plan.legacyConfigPath,
+      settings,
+      log: { warn: report },
+      writeLegacySettings: async (moved) => {
+        await legacy.updateSettings((stored) => ({ ...stored, ...moved }))
+      },
+      protection: {
+        readLegacyProtection: async () => {
+          const snapshot = await legacy.read()
+          return legacySettingsProtection(
+            snapshot.settings,
+            host,
+            snapshot.mode,
+          )
+        },
+      },
+    })
+    for (const difference of result.differing)
+      report(
+        `Setup kept the user setting "${difference.key}"${difference.account ? ` for account "${difference.account}"` : ''}; the legacy value ${JSON.stringify(difference.legacy)} was not imported.`,
+      )
+    if (result.outcome !== 'saved') {
+      const keys = Object.keys(
+        readSettingsMoveSource(JSON.stringify(settings), {
+          host,
+          path: plan.legacyConfigPath,
+          quiet: true,
+        }),
+      )
+      report(
+        `${result.reason} Credential transfer is committed. Set these settings by hand: ${keys.join(', ') || '(none)'}.`,
+      )
+    }
+    return result
+  } finally {
+    await legacy.close()
+  }
+}
+
 /** Transfer local credentials while hosts are stopped, before telling the user to restart. */
 export async function migrateNativeLocalForHost(
   host: HarnessKind,
@@ -327,6 +396,13 @@ export async function migrateNativeLocalForHost(
       processFence,
       removePiAnthropicAuth: options.removePiAnthropicAuth,
       preflight: options.preflight,
+      writeSetupSettings: (settings) =>
+        writeNativeLocalSetupSettings(
+          host,
+          plan,
+          { ...options, env },
+          settings,
+        ),
     })
   if (login) {
     const runtime = createNativeAccountRuntime({
