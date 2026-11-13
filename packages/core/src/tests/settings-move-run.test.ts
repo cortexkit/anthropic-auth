@@ -212,7 +212,7 @@ for (const host of ['opencode', 'pi'] as const) {
     expect(f.reads).toEqual([f.stores.opencode.config, f.stores.pi.config])
     f.reads.length = 0
     expect((await f.start()).outcome).toBe('marker-present')
-    expect(f.reads).toEqual([])
+    expect(f.reads.every((path) => path === f.paths.target)).toBe(true)
     const service = await openSettingsService({ file: started.paths.target })
     cleanup.push(() => service?.dispose())
     expect(service?.resolve(host).killswitch_enabled).toBe(false)
@@ -456,7 +456,7 @@ test('source lock timeout never marks the target and legacy reads remain availab
     expect(legacy.settings.dump).toEqual({ enabled: true })
 })
 
-test('an existing user file prevents a startup move even with no marker and a closed fence', async () => {
+test('an existing user file marks authority and reports an unimported source even with a closed fence', async () => {
   const f = await fixture()
   await put(f.paths.target, { schema_version: 1, dump_enabled: false })
   await put(f.stores.opencode.config, { dump: { enabled: true } })
@@ -469,8 +469,11 @@ test('an existing user file prevents a startup move even with no marker and a cl
   const started = await f.start()
   expect(started.mode).toBe('user-file')
   expect(started.outcome).toBe('done-already')
-  expect(f.reads).toEqual([])
-  expect(await absent(f.paths.marker)).toBe(true)
+  expect(f.reads).toEqual([f.paths.target])
+  expect(await absent(f.paths.marker)).toBe(false)
+  expect(
+    f.messages.filter((message) => message.includes('were not imported')),
+  ).toEqual([expect.stringContaining(f.stores.opencode.config)])
 })
 
 test('simulated Windows default targets each move and publish their own marker', async () => {
@@ -571,3 +574,158 @@ test('simulated Windows default targets each move and publish their own marker',
   expect(moves).toHaveLength(2)
   expect(touched.length).toBeGreaterThan(0)
 })
+
+for (const invalid of [false, true]) {
+  test(`hand-made authority marks a parsed file with invalid protection=${invalid} and names every held source`, async () => {
+    const f = await fixture()
+    await put(f.paths.target, {
+      schema_version: 1,
+      dump_enabled: false,
+      ...(invalid ? { killswitch_default_five_hour: 101 } : {}),
+    })
+    await put(f.stores.opencode.config, { dump: { enabled: false } })
+    await put(f.stores.pi.config, { cacheKeep: { startHour: 8, endHour: 12 } })
+    const started = await f.start()
+    expect(started.outcome).toBe('done-already')
+    expect(await absent(f.paths.marker)).toBe(false)
+    const records = f.messages.filter((message) =>
+      message.includes('were not imported'),
+    )
+    expect(records).toHaveLength(2)
+    for (const store of Object.values(f.stores))
+      expect(
+        records.filter((message) => message.includes(store.config)),
+      ).toHaveLength(1)
+    expect(await absent(`${f.stores.opencode.config}.MOVED_READPLEASE`)).toBe(
+      true,
+    )
+    await fs.unlink(f.paths.target)
+    f.options.readMode = async () => 'claustrum'
+    f.options.initializeVaultSettings = async () => {
+      throw new Error('must not seed')
+    }
+    expect((await f.start()).outcome).toBe('marker-present')
+    expect(await absent(f.paths.target)).toBe(true)
+  })
+}
+
+for (const closed of [false, true]) {
+  test(`malformed hand-made file is authoritative with fence closed=${closed}, but never marked`, async () => {
+    const f = await fixture()
+    await put(f.stores.opencode.config, {
+      dump: { enabled: true },
+      killswitch: { enabled: true },
+    })
+    await fs.mkdir(dirname(f.paths.target), { recursive: true })
+    await fs.writeFile(f.paths.target, '{broken')
+    if (closed) f.options.fence.registration = undefined
+    expect((await f.start()).outcome).toBe('done-already')
+    expect(await absent(f.paths.marker)).toBe(true)
+    const service = await openSettingsService({ file: f.paths.target })
+    cleanup.push(() => service?.dispose())
+    expect(service!.resolve('opencode').dump_enabled).toBe(false)
+  })
+}
+
+test('later starts compare only their current-mode explicit values without merging, and log again after a menu change', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { dump: { enabled: true } })
+  expect((await f.start()).outcome).toBe('moved')
+  f.messages.length = 0
+  expect((await f.start()).outcome).toBe('marker-present')
+  expect(
+    f.messages.filter((message) => message.includes('were not imported')),
+  ).toHaveLength(0)
+  const service = await openSettingsService({ file: f.paths.target })
+  await service!.update([{ setting: 'dump_enabled', value: false }], 'opencode')
+  await service!.dispose()
+  for (let start = 0; start < 2; start++) {
+    f.messages.length = 0
+    expect((await f.start()).outcome).toBe('marker-present')
+    const records = f.messages.filter((message) =>
+      message.includes('were not imported'),
+    )
+    expect(records).toHaveLength(1)
+    expect(records[0]).toContain(f.stores.opencode.config)
+    expect(records[0]).toContain('dump_enabled')
+    expect(records[0]).not.toContain(f.stores.pi.config)
+  }
+  f.options.readMode = async () => 'claustrum'
+  f.options.initializeVaultSettings = async () => {
+    throw new Error('must not seed during diagnostics')
+  }
+  f.messages.length = 0
+  await f.start()
+  expect(
+    f.messages.filter((message) => message.includes('were not imported')),
+  ).toHaveLength(0)
+})
+
+test('a later host whose killswitch source was never read inherits the named file default and logs once', async () => {
+  const f = await fixture()
+  f.options.env = {
+    ...f.options.env,
+    ANTHROPIC_AUTH_SETTINGS_FILE: join(f.root, 'shared.jsonc'),
+  }
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { killswitch: { enabled: true } })
+  const moved = await f.start()
+  expect(moved.outcome).toBe('moved')
+  expect(f.reads).not.toContain(f.stores.pi.config)
+  f.options.host = 'pi'
+  f.messages.length = 0
+  expect((await f.start()).outcome).toBe('marker-present')
+  const records = f.messages.filter((message) =>
+    message.includes('were not imported'),
+  )
+  expect(records).toHaveLength(1)
+  expect(records[0]).toContain(f.stores.pi.config)
+  expect(records[0]).toContain('killswitch_enabled')
+  const service = await openSettingsService({ file: moved.paths.target })
+  expect(service!.resolve('pi').killswitch_enabled).toBe(false)
+  await service!.dispose()
+  await fs.unlink(moved.paths.target)
+  expect((await f.start()).outcome).toBe('marker-present')
+  expect(await absent(moved.paths.target)).toBe(true)
+  expect(await absent(`${f.stores.pi.config}.MOVED_READPLEASE`)).toBe(true)
+})
+
+for (const sources of ['none', 'skipped-peer', 'other-target-note'] as const) {
+  test(`marker prevents re-move after deletion with ${sources} and no matching source note`, async () => {
+    const f = await fixture()
+    const note = `${f.stores.opencode.config}.MOVED_READPLEASE`
+    if (sources === 'skipped-peer') {
+      await put(f.stores.pi.config, { dump: { enabled: true } })
+      f.options.readMode = async (host) => {
+        if (host === 'pi') throw new Error('peer custody unreadable')
+        return 'local'
+      }
+    }
+    if (sources === 'other-target-note') {
+      await put(f.stores.opencode.config, { dump: { enabled: true } })
+      await fs.writeFile(
+        note,
+        `Already moved into ${join(f.root, 'another.jsonc')}`,
+      )
+    }
+    expect((await f.start()).outcome).toBe('moved')
+    await fs.unlink(f.paths.target)
+    await put(f.stores.opencode.config, { dump: { enabled: true } })
+    f.options.readMode = async () => 'local'
+    if (sources === 'skipped-peer') f.options.host = 'pi'
+    f.reads.length = 0
+    expect((await f.start()).outcome).toBe('marker-present')
+    expect(await absent(f.paths.target)).toBe(true)
+    expect(f.reads.every((path) => path === f.paths.target)).toBe(true)
+    expect(
+      f.touched.some(
+        (path) => path.endsWith('MOVED_READPLEASE') && path !== note,
+      ),
+    ).toBe(false)
+    if (sources === 'other-target-note')
+      expect(await fs.readFile(note, 'utf8')).toBe(
+        `Already moved into ${join(f.root, 'another.jsonc')}`,
+      )
+  })
+}

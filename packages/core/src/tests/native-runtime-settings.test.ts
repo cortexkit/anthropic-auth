@@ -127,9 +127,16 @@ test('legacy, separate, and absent-service readers preserve the exact legacy rec
   const storage = createEmptyStorage()
   storage.routing = { mode: 'fallback-first' }
   for (const mode of ['legacy', 'separate'] as const) {
-    f.mode(mode)
-    expect(f.reader.resolve(storage, 'claude-opus-5-5')).toEqual(storage)
-    expect(f.reader.status()).toBeUndefined()
+    const reader = createNativeRuntimeSettings({
+      host: 'opencode',
+      settingsService: f.service,
+      settingsMode: () => mode,
+      settingsAuthority: { options: { fs: { exists: async () => false } } },
+    })
+    cleanup.push(reader.close)
+    await reader.prepareAction()
+    expect(reader.resolve(storage, 'claude-opus-5-5')).toEqual(storage)
+    expect(reader.status()).toBeUndefined()
   }
   const legacy = createNativeRuntimeSettings({ host: 'pi' })
   expect(legacy.resolve(storage)).toEqual(storage)
@@ -522,7 +529,8 @@ for (const firstToClose of [0, 1]) {
     ).toBe(false)
     expect(await remaining.getSettingsPath()).toBe(f.file)
     f.mode('legacy')
-    expect(await remaining.getSettingsPath()).toBe(options.paths.config)
+    // Authority cannot be revoked by a stale host mode callback after promotion.
+    expect(await remaining.getSettingsPath()).toBe(f.file)
     f.mode('user-file')
     expect(await remaining.getSettingsPath()).toBe(f.file)
   })

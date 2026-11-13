@@ -1,14 +1,23 @@
 import type { SettingsEdit } from '@cortexkit/common-auth/settings'
 import type { AccountStorage } from './accounts.ts'
 import { setDumpEnabled } from './dump.ts'
-import { parseLogLevel, setLogLevel } from './logger.ts'
+import { logger, parseLogLevel, setLogLevel } from './logger.ts'
 import {
   applyCommittedNativeSettingsEffects,
   captureNativeSettingsEffectFields,
   type NativeSettingsEffectFields,
 } from './native-command-effects.ts'
+import {
+  differingLegacySettings,
+  settingsNotImportedText,
+} from './settings-authority.ts'
 import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
-import { resolveSettingsMode, type SettingsMode } from './settings-mode.ts'
+import {
+  resolveSettingsMode,
+  type SettingsMode,
+  type SettingsModeOptions,
+} from './settings-mode.ts'
+import { readSettingsMoveSource } from './settings-move-source.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import { resolveSettingsRecord } from './settings-record.ts'
 import type {
@@ -21,6 +30,11 @@ export interface NativeRuntimeSettingsOptions {
   settingsService?: SettingsService
   /** Return the cached settings mode; this callback must not read the filesystem. */
   settingsMode?: () => SettingsMode
+  settingsAuthority?: {
+    options?: SettingsModeOptions
+    /** Schedule a background authority check and return its cancellation function. */
+    schedule?: (callback: () => Promise<void>, delayMs: number) => () => void
+  }
 }
 
 export interface NativeRuntimeSettingsStatus {
@@ -33,9 +47,8 @@ export interface NativeRuntimeSettingsStatus {
 
 /**
  * Project policy settings from memory, retaining a service reference until close.
- * The host releases its own reference and checks off the request path whether
- * the user file exists or a marker records a completed settings migration, then
- * updates the cached legacy/user-file mode.
+ * The host awaits prepareAction at instance start and before every menu action.
+ * Watches and a background timer also check authority; requests use memory only.
  */
 export function createNativeRuntimeSettings(
   options: NativeRuntimeSettingsOptions & {
@@ -46,11 +59,17 @@ export function createNativeRuntimeSettings(
   const env = options.env ?? process.env
   const service = options.settingsService?.retain()
   let effects: NativeSettingsEffectFields | undefined
-  let menuAuthority = false
+  let userAuthority = (options.settingsMode?.() ?? 'user-file') === 'user-file'
+  let closed = false
+  let checking: Promise<void> | undefined
+  let cancelCheck: (() => void) | undefined
+  let loggedLateWrite = false
   let writes = 0
   const generation = () =>
     service &&
-    (menuAuthority || (options.settingsMode?.() ?? 'user-file') === 'user-file')
+    (userAuthority ||
+      (options.settingsMode?.() ?? 'user-file') === 'user-file') &&
+    options.settingsMode?.() !== 'separate'
       ? service.snapshot()
       : undefined
 
@@ -105,29 +124,110 @@ export function createNativeRuntimeSettings(
     }
   }
 
+  function recheck(refresh = true): Promise<void> {
+    if (checking) return checking
+    if (closed || !service || options.settingsMode?.() === 'separate')
+      return Promise.resolve()
+    checking = (async () => {
+      if (userAuthority) return
+      if (
+        (await resolveSettingsMode(
+          { target: service.file, separate: false },
+          options.settingsAuthority?.options,
+        )) !== 'user-file'
+      )
+        return
+      // Never await a re-entrant refresh from inside a service publication.
+      if (refresh) await service.refresh()
+      userAuthority = true
+      cancelCheck?.()
+      cancelCheck = undefined
+      if (!writes) applyEffects()
+    })().finally(() => {
+      checking = undefined
+    })
+    return checking
+  }
+  function scheduleCheck() {
+    if (
+      closed ||
+      !service ||
+      userAuthority ||
+      options.settingsMode?.() === 'separate'
+    )
+      return
+    const schedule =
+      options.settingsAuthority?.schedule ??
+      ((callback, delayMs) => {
+        const timer = setTimeout(() => void callback(), delayMs)
+        timer.unref?.()
+        return () => clearTimeout(timer)
+      })
+    cancelCheck = schedule(async () => {
+      cancelCheck = undefined
+      try {
+        await recheck()
+      } catch {
+        // An unavailable authority probe is retried off-request on the next tick.
+      } finally {
+        scheduleCheck()
+      }
+    }, 60_000)
+  }
   const unwatch = service?.watch(() => {
+    void recheck(false).catch(() => {})
     if (!writes) applyEffects()
   })
+  const unonFileEvent = service?.onFileEvent?.(() => {
+    void recheck().catch(() => {})
+  })
+  scheduleCheck()
+  const ready = recheck()
+  // Hosts await prepareAction; retain a rejection handler until startup does so.
+  void ready.catch(() => {})
   return {
     resolve,
     status,
     applyEffects,
     file: () => generation()?.file,
+    async prepareAction() {
+      await ready
+      await recheck()
+    },
     /** Recheck authority on the menu path before choosing a write target. */
     async prepareWrite() {
       if (!service || options.settingsMode?.() === 'separate') return undefined
-      if (!generation()) {
-        if (
-          (await resolveSettingsMode({
-            target: service.file,
-            separate: false,
-          })) !== 'user-file'
-        )
-          return undefined
-        menuAuthority = true
-        await service.refresh()
-      }
-      return service
+      await ready
+      await recheck()
+      return generation() ? service : undefined
+    },
+    async legacyWriteCommitted(
+      source: string,
+      stored: Record<string, unknown>,
+    ) {
+      if (loggedLateWrite || !service) return
+      await recheck()
+      const current = generation()
+      if (!current) return
+      const legacy = readSettingsMoveSource(JSON.stringify(stored), {
+        host: options.host,
+        path: source,
+        quiet: true,
+      })
+      const differing = differingLegacySettings(
+        legacy,
+        {
+          ...current.contexts[options.host].noModel,
+          ...current.protection[options.host].values,
+        },
+        options.host,
+      )
+      if (!differing.length) return
+      loggedLateWrite = true
+      logger.warn(
+        'settings',
+        settingsNotImportedText(source, service.file, differing),
+      )
     },
     async update(
       edits: readonly SettingsEdit[],
@@ -165,9 +265,13 @@ export function createNativeRuntimeSettings(
         (next.dump as { enabled?: boolean } | undefined)?.enabled === true,
       )
     },
-    close: () => {
+    close: async () => {
+      closed = true
+      cancelCheck?.()
       unwatch?.()
-      return service?.dispose()
+      unonFileEvent?.()
+      await checking?.catch(() => {})
+      await service?.dispose()
     },
   }
 }

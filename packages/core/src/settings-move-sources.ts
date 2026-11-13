@@ -34,6 +34,8 @@ export interface SettingsMoveSourcesOptions extends SettingsPathOptions {
   initializeVaultSettings: () => Promise<void>
   readMode?: typeof readNativeEnrollmentMode
   log?: { warn: (message: string) => void }
+  /** Inspect existing sources without seeding a vault or changing legacy state. */
+  inspectOnly?: boolean
 }
 
 export type SettingsMoveSourcesResult =
@@ -125,7 +127,7 @@ export async function prepareSettingsMoveSources(
       cause,
     }
   }
-  if (ownMode === 'claustrum') {
+  if (ownMode === 'claustrum' && !options.inspectOnly) {
     try {
       // This must finish before common-auth reads the source under its locks.
       await options.initializeVaultSettings()

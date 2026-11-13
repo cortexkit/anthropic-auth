@@ -222,6 +222,8 @@ export interface NativeAccountRuntime {
   getSettingsStatus?(): NativeRuntimeSettingsStatus | undefined
   /** Hosts call after startup and committed menu writes; watches use the same deduplicated hook. */
   applySettingsEffects?(): void
+  /** Await at instance start and before every /claude action, never on requests. */
+  prepareSettingsAction?(): Promise<void>
   /** Last completed read, without disk I/O or credential/quota work. */
   peek?(): NativeAccountSnapshot | undefined
   authorizeLocal(
@@ -377,6 +379,8 @@ export function acquireNativeAccountRuntime(
       use().resolveSettings?.(stored, model) ?? stored,
     getSettingsStatus: () => use().getSettingsStatus?.(),
     applySettingsEffects: () => use().applySettingsEffects?.(),
+    prepareSettingsAction: () =>
+      use().prepareSettingsAction?.() ?? Promise.resolve(),
     peek: () => use().peek?.(),
     authorizeLocal: (id, request) => use().authorizeLocal(id, request),
     authorizeApi: (id, signal) => use().authorizeApi(id, signal),
@@ -1123,6 +1127,7 @@ export function createNativeAccountRuntime(
     getSettingsStatus: runtimeSettings.status,
     resolveSettings: runtimeSettings.resolve,
     applySettingsEffects: runtimeSettings.applyEffects,
+    prepareSettingsAction: runtimeSettings.prepareAction,
     async read(model) {
       const view = await readView(model)
       projectedFrom.set(view.snapshot, view)
@@ -1573,6 +1578,16 @@ export function createNativeAccountRuntime(
       })
       if (result.outcome === 'updated' && captured.before)
         applyCommittedNativeSettingsEffects(captured.before, result.settings)
+      if (result.outcome === 'updated') {
+        try {
+          await runtimeSettings.legacyWriteCommitted(
+            selected.paths.config,
+            result.settings,
+          )
+        } catch {
+          // Diagnostic I/O cannot turn a committed legacy write into a failed action.
+        }
+      }
       return result
     },
     async setLoggingLevel(level) {

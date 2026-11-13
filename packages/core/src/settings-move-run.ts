@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises'
 import {
   type MoveOutcome,
   type MoveResult,
@@ -5,6 +6,11 @@ import {
 } from '@cortexkit/common-auth/settings'
 
 import { logger } from './logger.ts'
+import {
+  differingLegacySettings,
+  holdsMovedSettings,
+  settingsNotImportedText,
+} from './settings-authority.ts'
 import { settingsDefinition } from './settings-definition.ts'
 import {
   hasSettingsMoveMarker,
@@ -18,11 +24,13 @@ import {
   type SettingsMoveFenceOptions,
 } from './settings-move-fence.ts'
 import { mapSettingsMoveSources } from './settings-move-map.ts'
+import { readSettingsMoveSource } from './settings-move-source.ts'
 import {
   prepareSettingsMoveSources,
   type SettingsMoveSourcesOptions,
 } from './settings-move-sources.ts'
 import { resolveSettingsPaths, type SettingsPaths } from './settings-paths.ts'
+import { openSettingsService } from './settings-service.ts'
 
 export interface SettingsMoveStartupOptions extends SettingsMoveSourcesOptions {
   fence: Pick<
@@ -39,13 +47,11 @@ export interface SettingsMoveStartupOptions extends SettingsMoveSourcesOptions {
 export interface SettingsMoveStartupResult {
   paths: SettingsPaths
   mode: SettingsMode
-  /** Legacy mode still needs the user-file watch to detect another host's move. */
+  /** Legacy mode still needs watch callbacks and timer checks for a peer's move. */
   mayOpenService: boolean
   outcome: MoveOutcome | 'marker-present' | 'source-unavailable'
   move?: MoveResult
 }
-
-const logged = new Set<string>()
 
 /**
  * Await once at host startup, before opening the settings service's first resolve.
@@ -60,6 +66,7 @@ export async function runSettingsMoveAtStartup(
   const paths =
     options.paths ?? (await resolveSettingsPaths(options.host, options))
   const authority = { ...options, ...options.authority }
+  const logged = new Set<string>()
   const warn = (message: string) => {
     const key = `${paths.target}\0${message}`
     if (logged.has(key)) return
@@ -81,12 +88,54 @@ export async function runSettingsMoveAtStartup(
 
   if (paths.separate) return result('separate', 'separate-install')
   if ((await resolveSettingsMode(paths, authority)) === 'user-file') {
-    return result(
-      'user-file',
-      (await hasSettingsMoveMarker(paths.target, authority))
-        ? 'marker-present'
-        : 'done-already',
-    )
+    const marked = await hasSettingsMoveMarker(paths.target, authority)
+    const service = await openSettingsService({ file: paths.target })
+    if (!service) throw new Error('Settings service did not open')
+    try {
+      const generation = service.snapshot()
+      // Schema-invalid protection entries do not make a hand-made file unparsed.
+      if (!marked && generation.status === 'ready') {
+        try {
+          await writeSettingsMoveMarker(paths.target, authority)
+        } catch {
+          warn(`Could not write settings move marker ${paths.target}.moved.`)
+        }
+      }
+      if (generation.status !== 'missing') {
+        const prepared = await prepareSettingsMoveSources({
+          ...options,
+          paths: marked ? { ...paths, sourceRule: 'own' } : paths,
+          inspectOnly: true,
+          log: { warn: () => {} },
+        })
+        for (const source of prepared.sources) {
+          try {
+            const text = await readFile(source.path, 'utf8')
+            if (!holdsMovedSettings(JSON.parse(text))) continue
+            const host = source.host as SettingsMoveStartupOptions['host']
+            const values = readSettingsMoveSource(text, {
+              host,
+              path: source.path,
+              quiet: true,
+            })
+            const differing = differingLegacySettings(
+              values,
+              service.resolve(host),
+              host,
+            )
+            if (!marked || differing.length)
+              warn(
+                settingsNotImportedText(source.path, paths.target, differing),
+              )
+          } catch {
+            // A diagnostic never restores legacy authority or prevents startup.
+          }
+        }
+      }
+    } finally {
+      await service.dispose()
+    }
+    return result('user-file', marked ? 'marker-present' : 'done-already')
   }
 
   // Check before vault initialization, then again under the mover's source locks.

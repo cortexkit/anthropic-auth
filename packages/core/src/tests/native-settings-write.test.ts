@@ -16,6 +16,7 @@ import {
 } from '../logger.ts'
 import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
+import type { NativeRuntimeSettingsOptions } from '../native-runtime-settings.ts'
 import { nativeCacheKeepAlways } from '../native-settings.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
@@ -52,6 +53,8 @@ async function fixture(
     windowDefault?: { start_hour: number; end_hour: number }[]
     unavailableProtection?: boolean
     failCopy?: boolean
+    settingsAuthority?: NativeRuntimeSettingsOptions['settingsAuthority']
+    pauseLegacy?: () => Promise<void>
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
@@ -70,6 +73,7 @@ async function fixture(
     }))
   const calls: unknown[] = []
   const openModes: boolean[] = []
+  let watchCallback: (() => void) | undefined
   const service = await openSettingsService({
     file,
     host: options.host ?? 'opencode',
@@ -100,7 +104,12 @@ async function fixture(
         )
         return {
           ...handle,
-          watch: () => () => {},
+          watch: (callback) => {
+            watchCallback = callback
+            return () => {
+              watchCallback = undefined
+            }
+          },
           update: async (edits, context) => {
             calls.push({ edits, context })
             if (options.refusal)
@@ -130,10 +139,12 @@ async function fixture(
     paths,
     beforePoolWrite: async () => {
       if (failStore) throw new Error('synthetic store failure')
+      await options.pauseLegacy?.()
     },
     host: options.host ?? 'opencode',
     settingsService: service,
     settingsMode: () => options.mode ?? 'user-file',
+    settingsAuthority: options.settingsAuthority,
     vault: {
       env: {
         OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
@@ -148,6 +159,7 @@ async function fixture(
     },
   })
   cleanup.push(() => runtime.close())
+  await runtime.prepareSettingsAction?.()
   return {
     root,
     file,
@@ -160,6 +172,7 @@ async function fixture(
     calls,
     openModes,
     service,
+    notifyWatch: () => watchCallback?.(),
     text: () => readFile(file, 'utf8'),
     saved: async () => {
       const read = await store.readSettings()
@@ -1181,4 +1194,288 @@ test('removing a user-file log level restores info, while an unrelated edit leav
     settings.prime = { enabled: true }
   })
   expect(getLogLevel()).toBe('trace')
+})
+
+for (const noSources of [false, true]) {
+  test(`60s authority timer observes a peer move with no watch event, no sources=${noSources}`, async () => {
+    const ticks: {
+      callback: () => Promise<void>
+      delay: number
+      cancelled: boolean
+    }[] = []
+    const f = await fixture(null, {
+      mode: 'legacy',
+      legacy: { dump: { enabled: false }, prime: { enabled: true } },
+      settingsAuthority: {
+        schedule: (callback, delay) => {
+          const tick = { callback, delay, cancelled: false }
+          ticks.push(tick)
+          return () => {
+            tick.cancelled = true
+          }
+        },
+      },
+    })
+    expect(ticks).toHaveLength(1)
+    expect(ticks[0]!.delay).toBe(60_000)
+    const before = await f.saved()
+    const { moveSettingsOnce } = await import('@cortexkit/common-auth/settings')
+    const { createSettingsMoveSource } = await import(
+      '../settings-move-source.ts'
+    )
+    const { mapSettingsMoveSources } = await import('../settings-move-map.ts')
+    const { nativePoolStoreLocks } = await import('../pool-store.ts')
+    const { writeSettingsMoveMarker } = await import('../settings-mode.ts')
+    const moved = await moveSettingsOnce({
+      definition: settingsDefinition,
+      target: f.file,
+      separateInstall: false,
+      sources: noSources
+        ? []
+        : [
+            createSettingsMoveSource({
+              host: 'opencode',
+              path: f.paths.config,
+              locks: [...nativePoolStoreLocks(f.paths)],
+            }),
+          ],
+      map: mapSettingsMoveSources,
+      fence: async () => true,
+      log: { info: () => {}, warn: () => {} },
+    })
+    expect(moved.outcome).toBe('moved')
+    await writeSettingsMoveMarker(f.file)
+    // The service fixture suppresses watch notifications, including file creation.
+    expect(
+      f.runtime.resolveSettings!({ version: 1, accounts: [], ...before }).prime,
+    ).toEqual({ enabled: true })
+    await ticks[0]!.callback()
+    const resolved = f.runtime.resolveSettings!({
+      version: 1,
+      accounts: [],
+      ...before,
+    })
+    expect(resolved.prime).toEqual({ enabled: !noSources })
+    expect(await f.runtime.getSettingsPath()).toBe(f.file)
+    expect(
+      (
+        await f.runtime.updateSettings((settings) => {
+          settings.dump = { enabled: true }
+        })
+      ).outcome,
+    ).toBe('saved')
+    expect(await f.saved()).toEqual(before)
+    const file = parse(await f.text())
+    expect(file.dump_enabled).toBe(true)
+    if (noSources)
+      expect(Object.keys(file).sort()).toEqual([
+        'dump_enabled',
+        'schema_version',
+      ])
+    expect(ticks).toHaveLength(1)
+    await rm(f.file)
+    await rm(`${f.file}.moved`)
+    await f.runtime.prepareSettingsAction?.()
+    expect(await f.runtime.getSettingsPath()).toBe(f.file)
+  })
+}
+
+test('malformed hand-made authority uses legacy protection only and refuses menu writes', async () => {
+  const f = await fixture('{broken', {
+    mode: 'legacy',
+    legacy: {
+      dump: { enabled: true },
+      prime: { enabled: true },
+      killswitch: { enabled: true, main: { '5h': 30, '1w': 40 } },
+    },
+  })
+  await f.runtime.prepareSettingsAction?.()
+  const resolved = f.runtime.resolveSettings!({
+    version: 1,
+    accounts: [],
+    ...(await f.saved()),
+  })
+  expect(resolved.dump).toEqual({ enabled: false })
+  expect(resolved.prime).toEqual({ enabled: false })
+  expect(resolved.killswitch).toMatchObject({
+    enabled: true,
+    main: { five_hour: 30, seven_day: 40, scoped: 0 },
+  })
+  expect(
+    (
+      await f.runtime.updateSettings((settings) => {
+        settings.dump = { enabled: true }
+      })
+    ).outcome,
+  ).toBe('refused')
+  expect((await f.saved()).dump).toEqual({ enabled: true })
+})
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+for (const first of ['writer', 'move'] as const) {
+  test(`legacy ${first} wins the source locks; no write can land between the move read and publish`, async () => {
+    const paused = deferred()
+    const release = deferred()
+    const checked = deferred()
+    let writing = false
+    let mutating = false
+    const events: string[] = []
+    const f = await fixture(null, {
+      mode: 'legacy',
+      legacy: { dump: { enabled: false } },
+      pauseLegacy:
+        first === 'writer'
+          ? async () => {
+              paused.resolve()
+              await release.promise
+            }
+          : undefined,
+      settingsAuthority: {
+        options: {
+          fs: {
+            exists: async (path) => {
+              const { lstat } = await import('node:fs/promises')
+              const present = await lstat(path).then(
+                () => true,
+                (error) => {
+                  if (error.code === 'ENOENT') return false
+                  throw error
+                },
+              )
+              if (writing && path.endsWith('.moved')) checked.resolve()
+              return present
+            },
+          },
+        },
+      },
+    })
+    const records: LogTestRecord[] = []
+    __setLogTestSink((record) => records.push(record))
+    const { moveSettingsOnce } = await import('@cortexkit/common-auth/settings')
+    const { createSettingsMoveSource } = await import(
+      '../settings-move-source.ts'
+    )
+    const { mapSettingsMoveSources } = await import('../settings-move-map.ts')
+    const { nativePoolStoreLocks } = await import('../pool-store.ts')
+    const { writeSettingsMoveMarker } = await import('../settings-mode.ts')
+    const { setSettingsMoveStepHookForTest } = await import(
+      new URL('move.js', import.meta.resolve('@cortexkit/common-auth/settings'))
+        .href
+    )
+    cleanup.push(() => {
+      setSettingsMoveStepHookForTest()
+    })
+    setSettingsMoveStepHookForTest(async (step: string) => {
+      if (step !== 'before-publish') return
+      expect(JSON.parse(await readFile(f.paths.config, 'utf8')).dump).toEqual({
+        enabled: first === 'writer',
+      })
+      events.push('read')
+      if (first === 'move') {
+        paused.resolve()
+        await release.promise
+        expect(mutating).toBe(false)
+      }
+      events.push('publish')
+    })
+    const move = async () => {
+      const result = await moveSettingsOnce({
+        definition: settingsDefinition,
+        target: f.file,
+        separateInstall: false,
+        sources: [
+          createSettingsMoveSource({
+            host: 'opencode',
+            path: f.paths.config,
+            locks: [...nativePoolStoreLocks(f.paths)],
+          }),
+        ],
+        map: mapSettingsMoveSources,
+        fence: async () => true,
+        log: { info: () => {}, warn: () => {} },
+      })
+      expect(result.outcome).toBe('moved')
+      await writeSettingsMoveMarker(f.file)
+    }
+    const write = () =>
+      f.runtime.updateSettings((settings) => {
+        mutating = true
+        events.push('write')
+        settings.dump = { enabled: true }
+      })
+    if (first === 'writer') {
+      const writer = write()
+      await paused.promise
+      const mover = move()
+      release.resolve()
+      expect((await writer).outcome).toBe('updated')
+      await mover
+      expect(events).toEqual(['write', 'read', 'publish'])
+    } else {
+      const mover = move()
+      await paused.promise
+      writing = true
+      const writer = write()
+      await checked.promise
+      expect(mutating).toBe(false)
+      release.resolve()
+      await mover
+      expect((await writer).outcome).toBe('updated')
+      expect(events).toEqual(['read', 'publish', 'write'])
+    }
+    await f.runtime.prepareSettingsAction?.()
+    expect(parse(await f.text()).dump_enabled).toBe(first === 'writer')
+    expect((await f.saved()).dump).toEqual({ enabled: true })
+    expect(
+      records.filter((record) => record.message.includes('were not imported')),
+    ).toHaveLength(first === 'move' ? 1 : 0)
+  })
+}
+
+test('every user-file watch callback checks authority even without a new resolved generation', async () => {
+  let probes = 0
+  let marked = false
+  let scheduled = 0
+  let cancelled = 0
+  const f = await fixture(null, {
+    mode: 'legacy',
+    legacy: { prime: { enabled: true } },
+    settingsAuthority: {
+      options: {
+        fs: {
+          exists: async (path) => {
+            probes++
+            return marked && path.endsWith('.moved')
+          },
+        },
+      },
+      schedule: () => {
+        scheduled++
+        return () => {
+          cancelled++
+        }
+      },
+    },
+  })
+  const generation = f.service.snapshot().id
+  const before = probes
+  marked = true
+  f.notifyWatch()
+  expect(probes).toBeGreaterThan(before)
+  await f.runtime.prepareSettingsAction?.()
+  expect(f.service.snapshot().id).toBe(generation)
+  expect(
+    f.runtime.resolveSettings!({ version: 1, accounts: [] }).prime,
+  ).toEqual({ enabled: false })
+  expect(scheduled).toBe(1)
+  expect(cancelled).toBe(1)
+  await f.runtime.close()
+  expect(cancelled).toBe(1)
 })

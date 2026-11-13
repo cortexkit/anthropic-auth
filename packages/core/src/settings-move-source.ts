@@ -55,6 +55,8 @@ export interface SettingsMoveSourceOptions {
   host: SettingsHost
   path: string
   log?: { warn: (message: string) => void }
+  /** Read-only authority comparisons must not consume the move's diagnostics. */
+  quiet?: boolean
 }
 
 const logged = new Set<string>()
@@ -101,6 +103,7 @@ export function readSettingsMoveSource(
   const values: Partial<Record<SettingsKey, unknown>> = {}
   const restrictive = mostRestrictiveSettingsProtection()
   function report(path: string, reason: string) {
+    if (options.quiet) return
     const message = `Settings move from ${options.path}: ${path} ${reason}.`
     if (logged.has(message)) return
     logged.add(message)

@@ -130,6 +130,8 @@ export interface SettingsService {
   status(): SettingsFileStatus
   /** Effects are awaited in publication order; unsubscribe before disposing a host. */
   watch(listener: SettingsChangeListener): () => void
+  /** Every underlying user-file watch callback, even if resolved values stay identical. */
+  onFileEvent?(listener: () => void): () => void
   refresh(): Promise<void>
   update(
     edits: readonly SettingsEdit[],
@@ -349,6 +351,7 @@ class SharedSettingsService {
   private readonly handle: CoreSettingsHandle
   private readonly unwatch: () => void
   private readonly listeners = new Set<SettingsChangeListener>()
+  private readonly fileListeners = new Set<() => void>()
   private current: SettingsGeneration | undefined
   private running: Promise<void> | undefined
   private pending = false
@@ -365,6 +368,7 @@ class SharedSettingsService {
       ? options.dependencies.open(this.openOptions())
       : openSettings(settingsDefinition, this.openOptions())
     this.unwatch = this.handle.watch(() => {
+      for (const listener of this.fileListeners) listener()
       void this.refresh()
     })
     this.ready = this.refresh()
@@ -393,6 +397,13 @@ class SharedSettingsService {
     this.listeners.add(listener)
     return () => {
       this.listeners.delete(listener)
+    }
+  }
+
+  onFileEvent(listener: () => void) {
+    this.fileListeners.add(listener)
+    return () => {
+      this.fileListeners.delete(listener)
     }
   }
 
@@ -843,6 +854,7 @@ class SharedSettingsService {
     this.cancelMissingRead = undefined
     this.unwatch()
     this.listeners.clear()
+    this.fileListeners.clear()
     await this.running
   }
 }
@@ -996,6 +1008,15 @@ function referenceCountedSettingsService(
         subscriptions.add(stop)
         return stop
       },
+      onFileEvent(listener) {
+        const unsubscribe = use().onFileEvent?.(listener) ?? (() => {})
+        const stop = () => {
+          unsubscribe()
+          subscriptions.delete(stop)
+        }
+        subscriptions.add(stop)
+        return stop
+      },
       dispose() {
         if (closed) return closing ?? Promise.resolve()
         closed = true
@@ -1071,6 +1092,15 @@ export async function openSettingsService(
     },
     watch(listener) {
       const unsubscribe = use().watch(() => listener(lease.snapshot()))
+      const stop = () => {
+        unsubscribe()
+        subscriptions.delete(stop)
+      }
+      subscriptions.add(stop)
+      return stop
+    },
+    onFileEvent(listener) {
+      const unsubscribe = use().onFileEvent(listener)
       const stop = () => {
         unsubscribe()
         subscriptions.delete(stop)
