@@ -1,0 +1,203 @@
+import { lstat } from 'node:fs/promises'
+import type { MoveSource } from '@cortexkit/common-auth/settings'
+
+import { logger } from './logger.ts'
+import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
+import { nativeVaultPaths } from './native-vault-paths.ts'
+import { resolvePathOptions } from './path-options.ts'
+import {
+  canonicalPath,
+  type NativePoolPaths,
+  resolveNativePoolPaths,
+} from './pool-paths.ts'
+import { nativePoolStoreLocks } from './pool-store.ts'
+import { createSettingsMoveSource } from './settings-move-source.ts'
+import {
+  resolveSettingsPaths,
+  type SettingsHost,
+  type SettingsPathOptions,
+  type SettingsPaths,
+} from './settings-paths.ts'
+import {
+  LEGACY_STATE_LAYOUT,
+  readStateLayoutMarker,
+  resolveStateHomeTarget,
+  type StateLayout,
+} from './state-layout-paths.ts'
+
+export interface SettingsMoveSourcesOptions extends SettingsPathOptions {
+  host: SettingsHost
+  paths?: SettingsPaths
+  /** The running host's already resolved paths retain its startup layout decision. */
+  ownPoolPaths?: NativePoolPaths
+  /** Initialize only this runtime's vault settings, including first-read seeding. */
+  initializeVaultSettings: () => Promise<void>
+  readMode?: typeof readNativeEnrollmentMode
+  log?: { warn: (message: string) => void }
+}
+
+export type SettingsMoveSourcesResult =
+  | { status: 'ready'; sources: MoveSource[] }
+  | { status: 'separate'; sources: [] }
+  | {
+      status: 'unavailable'
+      sources: []
+      host: SettingsHost
+      reason: 'custody-unreadable' | 'seeding-failed' | 'paths-unreadable'
+      cause: unknown
+    }
+
+const loggedSkips = new Set<string>()
+
+/** Observe a peer's layout without moving files or registering a process for that host. */
+async function peerLayout(
+  host: SettingsHost,
+  options: SettingsMoveSourcesOptions,
+): Promise<StateLayout> {
+  // Pi never relocates its dataset; only OpenCode has a state-home layout.
+  if (host === 'pi') return LEGACY_STATE_LAYOUT
+  const context = resolvePathOptions(options)
+  const xdg = context.env.XDG_CONFIG_HOME
+  const target = resolveStateHomeTarget({
+    home: context.home,
+    env: {
+      XDG_CONFIG_HOME: xdg && context.paths.isAbsolute(xdg) ? xdg : undefined,
+      XDG_STATE_HOME: context.env.XDG_STATE_HOME,
+    },
+  })
+  if (!target) return LEGACY_STATE_LAYOUT
+  const marker = await readStateLayoutMarker(target.dir)
+  if (!marker) return LEGACY_STATE_LAYOUT
+  if (
+    marker.identity !== target.identity ||
+    marker.sub !== (await canonicalPath(target.dir, context))
+  )
+    throw new Error('The peer state layout belongs to another dataset')
+  if (marker.phase === 'committed')
+    return { kind: 'state-home', dir: marker.sub }
+  if (
+    marker.phase === 'rolled-back' ||
+    (marker.phase === 'restored' && marker.restore?.cleanup === 'done')
+  )
+    return LEGACY_STATE_LAYOUT
+  throw new Error('The peer state layout transition is unfinished')
+}
+
+/**
+ * Prepare the common-auth mover's sources, not a startup or authority decision.
+ * An unavailable own source must keep this start in legacy mode; the caller logs
+ * that result once and must not call the mover or publish a marker.
+ */
+export async function prepareSettingsMoveSources(
+  options: SettingsMoveSourcesOptions,
+): Promise<SettingsMoveSourcesResult> {
+  const paths =
+    options.paths ?? (await resolveSettingsPaths(options.host, options))
+  if (paths.separate) return { status: 'separate', sources: [] }
+  const context = resolvePathOptions(options)
+  const env = {
+    ...context.env,
+    // Enrollment's legacy resolver uses os.homedir(); carry the supplied home
+    // through its state-root input instead, so sandboxed callers stay isolated.
+    XDG_STATE_HOME:
+      context.env.XDG_STATE_HOME ||
+      context.paths.join(context.home, '.local', 'state'),
+  }
+  const warn = (message: string) =>
+    options.log ? options.log.warn(message) : logger.warn('settings', message)
+  const skip = (host: SettingsHost, path: string, reason: string) => {
+    const message = `Settings move skipped ${host} source ${path}: ${reason}.`
+    const key = `${paths.target}\0${message}`
+    if (loggedSkips.has(key)) return
+    loggedSkips.add(key)
+    warn(message)
+  }
+  const readMode = options.readMode ?? readNativeEnrollmentMode
+  let ownMode: 'local' | 'claustrum'
+  try {
+    ownMode = await readMode(options.host, env)
+  } catch (cause) {
+    return {
+      status: 'unavailable',
+      sources: [],
+      host: options.host,
+      reason: 'custody-unreadable',
+      cause,
+    }
+  }
+  if (ownMode === 'claustrum') {
+    try {
+      // This must finish before common-auth reads the source under its locks.
+      await options.initializeVaultSettings()
+    } catch (cause) {
+      return {
+        status: 'unavailable',
+        sources: [],
+        host: options.host,
+        reason: 'seeding-failed',
+        cause,
+      }
+    }
+  }
+  const sources: MoveSource[] = []
+  // common-auth uses source order to choose the default for host disagreements.
+  for (const host of ['opencode', 'pi'] as const) {
+    const own = host === options.host
+    if (!own && paths.sourceRule === 'own') continue
+    const store = own ? paths.own : paths.defaults[host]
+    let mode: 'local' | 'claustrum'
+    try {
+      mode = own ? ownMode : await readMode(host, env)
+    } catch {
+      skip(host, store.account, 'custody mode is unreadable')
+      continue
+    }
+    try {
+      const pool =
+        own && options.ownPoolPaths
+          ? options.ownPoolPaths
+          : await resolveNativePoolPaths(
+              store.account,
+              store.state,
+              own ? undefined : await peerLayout(host, options),
+            )
+      const selected = mode === 'claustrum' ? nativeVaultPaths(pool) : pool
+      try {
+        await lstat(selected.config)
+      } catch (error) {
+        // Leave unreadable files to the mover: unlike absence, a read failure
+        // aborts the whole publication rather than silently losing settings.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          skip(
+            host,
+            selected.config,
+            mode === 'claustrum'
+              ? 'vault settings have not been seeded'
+              : 'file is missing',
+          )
+          if (!own && mode === 'claustrum') continue
+        }
+      }
+      sources.push(
+        createSettingsMoveSource({
+          host,
+          path: selected.config,
+          locks: [...nativePoolStoreLocks(selected)],
+          log: { warn },
+        }),
+      )
+    } catch (cause) {
+      if (own)
+        return {
+          status: 'unavailable',
+          sources: [],
+          host,
+          reason: 'paths-unreadable',
+          cause,
+        }
+      // A peer layout that is not safely observable cannot name writer locks.
+      skip(host, store.account, 'store paths or state layout are unreadable')
+    }
+  }
+  return { status: 'ready', sources }
+}
