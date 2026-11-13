@@ -211,6 +211,7 @@ export type {
 } from './native-migration.ts'
 export {
   NativeMigrationError,
+  NativeSetupSettingsWriteError,
   nativePoolHoldsAccountData,
   prepareNativeMigration,
   publishNativeEmptyInit,
@@ -242,6 +243,7 @@ export { NativeRuntimeError } from './native-runtime.ts'
 export { nativeRuntimeOptionIdentity } from './native-runtime-registry.ts'
 export * from './native-runtime-settings.ts'
 export * from './native-settings.ts'
+export * from './native-setup-settings.ts'
 export {
   isNativeTransientAccountError,
   NativeTransientAccountError,

@@ -131,6 +131,28 @@ const settingFields: Record<string, readonly string[]> = {
   killswitch: ['enabled', 'main', 'accounts'],
 }
 
+/** Keep credential-transfer settings separate from settings routed after commit. */
+export function splitNativeMigrationSettings(
+  settings: Record<string, unknown>,
+) {
+  const retained = structuredClone(settings)
+  const moved: Record<string, unknown> = {}
+  for (const [section, fields] of Object.entries(settingFields)) {
+    if (section === 'relay' || settings[section] === undefined) continue
+    const selected = pick(object(settings[section]), fields)
+    if (Object.keys(selected).length) moved[section] = selected
+    const rest = { ...object(retained[section]) }
+    for (const field of fields) delete rest[field]
+    if (Object.keys(rest).length) retained[section] = rest
+    else delete retained[section]
+  }
+  if (settings.fallbackOn !== undefined) {
+    moved.fallbackOn = structuredClone(settings.fallbackOn)
+    delete retained.fallbackOn
+  }
+  return { moved, retained }
+}
+
 export function validateNativeMigrationSettings(
   settings: Record<string, unknown>,
 ): void {

@@ -39,6 +39,7 @@ import {
   projectNativeMigrationRuntime,
   projectNativeMigrationSource,
   requireNativeMigrationSourceRows,
+  splitNativeMigrationSettings,
 } from './native-migration-source.ts'
 import { nativeQuotaCodec } from './native-quota-codec.ts'
 import {
@@ -96,6 +97,17 @@ export class NativeMigrationError extends Error {
   }
 }
 
+/** Credential commit succeeded; keep its source until setup can save settings. */
+export class NativeSetupSettingsWriteError extends Error {
+  readonly code = 'setup-settings-write-failed'
+  constructor() {
+    super(
+      'Credential transfer is committed, but setup settings were not saved. Run setup again to retry before retiring the legacy source.',
+    )
+    this.name = 'NativeSetupSettingsWriteError'
+  }
+}
+
 export interface NativeMigrationCustody {
   /** Use the host’s approved Claustrum token and account-list permission to discover accounts; never open the vault’s credential files. */
   discover: () => Promise<NativeCustodyInventory>
@@ -133,6 +145,15 @@ export interface NativeMigrationOptions {
    * after this migration commits until runNativeCustodyActivation commits.
    */
   requestVaultActivation?: boolean
+  /**
+   * Opt into deferred settings routing: moved fields are excluded from credential
+   * import. Called after commit, outside the pool locks, before source retirement.
+   * Setup adapters must always supply this hook when using the settings writer.
+   * Without it, the existing credential/settings migration contract is unchanged.
+   */
+  writeSetupSettings?: (
+    settings: Readonly<Record<string, unknown>>,
+  ) => Promise<{ outcome: 'saved' | 'refused' | 'failed'; reason?: string }>
 }
 
 /** Result of read-only checks for the selected storage and host. Contains no account data or credential digests. */
@@ -546,6 +567,10 @@ async function capture(
       state: state.data,
       hostAuth: auth.data,
     })
+    if (input.writeSetupSettings)
+      projection.settings = splitNativeMigrationSettings(
+        projection.settings,
+      ).retained
     const mainRouteId = projection.mainRouteId
     const main = projection.accounts.find(
       (account) => account.id === mainRouteId,
@@ -959,6 +984,37 @@ export async function runNativeMigration(
         )
           refuse('settings-changed')
         const step = async (label: string) => hooks.onStep?.(label)
+        const writeSetupSettings = async () => {
+          if (!operation.writeSetupSettings) return
+          const source = await readNativeMigrationSource(
+            'config',
+            operation.legacyConfigPath ?? paths.legacyConfig,
+          )
+          owned(source)
+          // A partial retirement can already have removed the config, but only
+          // after the settings hook completed on the preceding attempt.
+          if (source.data === undefined) return
+          if (
+            source.digest !==
+            (journal ? journal.sources.config : captured.config.digest)
+          )
+            refuse('invalid-source')
+          const { moved } = splitNativeMigrationSettings(
+            source.data as Record<string, unknown>,
+          )
+          await step('before:setup-settings')
+          try {
+            const result = await operation.writeSetupSettings(
+              Object.freeze(moved),
+            )
+            if (result.outcome !== 'saved')
+              throw new NativeSetupSettingsWriteError()
+          } catch {
+            throw new NativeSetupSettingsWriteError()
+          }
+          await requireUnchangedNativeMigrationSource(source)
+          await step('after:setup-settings')
+        }
         const journalHooks = {
           assertOwned: async () => {
             await checkPaths(operation, captured)
@@ -1000,6 +1056,7 @@ export async function runNativeMigration(
           return journal
         }
         if (journal?.phase === 'committed') {
+          await writeSetupSettings()
           journal = await retire(operation, journal, assertMigration, hooks)
           if (journal.activation === null)
             await repair(operation, assertMigration, hooks)
@@ -1446,6 +1503,9 @@ export async function runNativeMigration(
             return journal
           },
         )
+        // heldPool and the host/routing leases have all been released. The hook
+        // may take the ordinary native-store or settings-file writer locks.
+        await writeSetupSettings()
         return await retire(operation, journal, assertMigration, hooks)
       },
     )

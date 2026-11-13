@@ -35,12 +35,14 @@ import {
   snapshotHasServableLocalOAuth,
 } from '../native-migration.ts'
 import { nativeMigrationDigest } from '../native-migration-proof.ts'
+import { projectNativeMigrationSource } from '../native-migration-source.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
 import {
   buildNativeVaultRosterSeed,
   validateNativeVaultRosterSeed,
 } from '../native-roster-seed.ts'
 import { readNativeRuntime, updateNativeRuntime } from '../native-runtime.ts'
+import { writeNativeSetupSettings } from '../native-setup-settings.ts'
 import {
   NativeAuthorityError,
   readNativeMigrationJournal,
@@ -51,6 +53,7 @@ import {
   resolveNativePoolPaths,
 } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
+import { resolveSettingsPaths } from '../settings-paths.ts'
 import { tokenFingerprint } from '../token-fingerprint.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
@@ -1880,3 +1883,158 @@ for (const [point, host] of crashCases)
         code: 'ENOENT',
       })
   })
+
+test('without a setup hook the original credential and settings projection is unchanged', async () => {
+  const f = await fixture()
+  const config = JSON.parse(await readFile(f.paths.legacyConfig, 'utf8'))
+  const projection = projectNativeMigrationSource({
+    host: f.input.host,
+    storageId: f.paths.storageId,
+    configDigest: null,
+    config,
+    state: JSON.parse(await readFile(f.paths.legacyState, 'utf8')),
+    hostAuth: JSON.parse(await readFile(f.input.hostAuthPath, 'utf8')),
+  })
+  expect((await runNativeMigration(f.input)).phase).toBe('retired')
+  expect(await f.store.readSettings()).toMatchObject({
+    status: 'ready',
+    settings: projection.settings,
+  })
+  await f.store.close()
+})
+
+async function setupSettingsFixture(userFile: boolean) {
+  const f = await fixture()
+  const target = join(f.root, 'setup-settings.jsonc')
+  const settingsPaths = await resolveSettingsPaths('opencode', {
+    home: f.root,
+    env: { ANTHROPIC_AUTH_SETTINGS_FILE: target },
+  })
+  if (userFile) await writeFile(target, '{}')
+  const calls: Record<string, unknown>[] = []
+  const legacyWrites: Record<string, unknown>[] = []
+  const imported: Record<string, unknown>[] = []
+  const phases: (string | undefined)[] = []
+  f.input.writeSetupSettings = async (settings) => {
+    phases.push((await readNativeMigrationJournal(f.paths))?.phase)
+    const read = await f.store.readSettings()
+    if (read.status !== 'ready') throw new Error('Settings were not ready')
+    imported.push(read.settings)
+    calls.push(structuredClone(settings))
+    return writeNativeSetupSettings({
+      host: 'opencode',
+      settings,
+      source: f.paths.legacyConfig,
+      paths: settingsPaths,
+      writeLegacySettings: async (moved) => {
+        legacyWrites.push(moved)
+        // Acquires the same native-store writer locks migration normally holds.
+        // Completing here proves the after-commit hook cannot wait on itself.
+        await f.store.updateSettings((stored) => ({ ...stored, ...moved }))
+      },
+    })
+  }
+  return { ...f, target, settingsPaths, calls, legacyWrites, imported, phases }
+}
+
+for (const userFile of [false, true]) {
+  test(`after-commit setup settings route once to ${userFile ? 'user file' : 'legacy store'} outside credential writer locks`, async () => {
+    const f = await setupSettingsFixture(userFile)
+    expect((await runNativeMigration(f.input)).phase).toBe('retired')
+    expect(f.phases).toEqual(['committed'])
+    // Credential import must not include a moved setting, even transiently.
+    expect(f.imported).toEqual([
+      {
+        mainAccountId: 'primary-route',
+        formerMainRowId: 'primary-route',
+        claustrum: { mode: 'local', disabledAccountIdentities: [] },
+      },
+    ])
+    expect(f.calls).toEqual([
+      { fallbackOn: [], costZeroing: { enabled: false } },
+    ])
+    const stored = await f.store.readSettings()
+    if (userFile) {
+      expect(JSON.parse(await readFile(f.target, 'utf8'))).toMatchObject({
+        fallback_on: [],
+        cost_zeroing_enabled: false,
+      })
+      expect(f.legacyWrites).toEqual([])
+      expect(stored).toMatchObject({
+        status: 'ready',
+        settings: {
+          mainAccountId: 'primary-route',
+          formerMainRowId: 'primary-route',
+        },
+      })
+      expect(JSON.stringify(stored)).not.toContain('costZeroing')
+    } else {
+      expect(f.legacyWrites).toEqual(f.calls)
+      expect(stored).toMatchObject({ status: 'ready', settings: f.calls[0] })
+      await expect(readFile(f.target)).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+    const journal = await readFile(f.paths.journal, 'utf8')
+    expect(journal).not.toContain('costZeroing')
+    expect(journal).not.toContain('fallbackOn')
+    expect(journal).not.toContain(f.target)
+    await f.store.close()
+  })
+}
+
+test('setup resume after credential commit re-decides authority when the marker appeared between runs', async () => {
+  const f = await setupSettingsFixture(false)
+  await stopAt(f.input, 'after-write:journal:committed')
+  expect(f.calls).toEqual([])
+  expect((await readNativeMigrationJournal(f.paths))?.phase).toBe('committed')
+  await writeFile(f.target, '{}')
+  await writeFile(f.settingsPaths.marker, 'peer-move-marker')
+  expect((await runNativeMigration(f.input)).phase).toBe('retired')
+  expect(f.legacyWrites).toEqual([])
+  expect(JSON.parse(await readFile(f.target, 'utf8'))).toMatchObject({
+    cost_zeroing_enabled: false,
+  })
+  await f.store.close()
+})
+
+test('a crash after setup settings but before retire resumes fill-only without writing them twice', async () => {
+  const f = await setupSettingsFixture(true)
+  await stopAt(f.input, 'after:setup-settings')
+  const bytes = await readFile(f.target, 'utf8')
+  const before = await stat(f.target, { bigint: true })
+  expect((await readNativeMigrationJournal(f.paths))?.phase).toBe('committed')
+  await expect(readFile(f.paths.legacyConfig)).resolves.toBeDefined()
+  expect((await runNativeMigration(f.input)).phase).toBe('retired')
+  expect(f.calls).toHaveLength(2)
+  expect(f.calls[1]).toEqual(f.calls[0])
+  expect(await readFile(f.target, 'utf8')).toBe(bytes)
+  expect((await stat(f.target, { bigint: true })).mtimeNs).toBe(before.mtimeNs)
+  expect(f.legacyWrites).toEqual([])
+  await f.store.close()
+})
+
+for (const outcome of ['refused', 'failed', 'thrown'] as const) {
+  test(`a ${outcome} after-commit settings hook preserves committed credentials and the source for retry`, async () => {
+    const f = await setupSettingsFixture(true)
+    const working = f.input.writeSetupSettings
+    f.input.writeSetupSettings = async () => {
+      if (outcome === 'thrown') throw new Error('private details')
+      return { outcome, reason: 'fixed settings refusal' }
+    }
+    await expect(runNativeMigration(f.input)).rejects.toMatchObject({
+      code: 'setup-settings-write-failed',
+      message:
+        'Credential transfer is committed, but setup settings were not saved. Run setup again to retry before retiring the legacy source.',
+    })
+    expect((await readNativeMigrationJournal(f.paths))?.phase).toBe('committed')
+    await expect(readFile(f.paths.legacyConfig)).resolves.toBeDefined()
+    expect(JSON.parse(await readFile(f.target, 'utf8'))).toEqual({})
+    expect((await f.store.read()).status).toBe('ready')
+    f.input.writeSetupSettings = working
+    expect((await runNativeMigration(f.input)).phase).toBe('retired')
+    await expect(readFile(f.paths.legacyConfig)).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+    expect(f.legacyWrites).toEqual([])
+    await f.store.close()
+  })
+}
