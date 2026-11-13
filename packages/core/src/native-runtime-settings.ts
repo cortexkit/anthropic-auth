@@ -46,6 +46,12 @@ export interface NativeRuntimeSettingsOptions {
    * open the service again until it replaces the fallback.
    */
   settingsFallback?: SettingsProtectionFallback
+  /**
+   * From `startSettings` in legacy mode when the service could not open: the
+   * authority timer and menu actions open it again off the request path, so a
+   * move another host publishes later is still noticed.
+   */
+  settingsReopen?: () => Promise<SettingsService | undefined>
 }
 
 export interface NativeRuntimeSettingsStatus {
@@ -70,8 +76,13 @@ export function createNativeRuntimeSettings(
   const env = options.env ?? process.env
   let service = options.settingsService?.retain()
   let fallback = service ? undefined : options.settingsFallback
+  let reopenLegacy = service || fallback ? undefined : options.settingsReopen
+  // Set when a fallback started with unknown authority later learns the true
+  // mode; it then replaces the host's cached mode for this runtime.
+  let probedMode: SettingsMode | undefined
+  const mode = () => probedMode ?? options.settingsMode?.() ?? 'user-file'
   let effects: NativeSettingsEffectFields | undefined
-  let userAuthority = (options.settingsMode?.() ?? 'user-file') === 'user-file'
+  let userAuthority = mode() === 'user-file'
   let closed = false
   let checking: Promise<void> | undefined
   let cancelCheck: (() => void) | undefined
@@ -79,9 +90,8 @@ export function createNativeRuntimeSettings(
   let writes = 0
   const generation = () =>
     service &&
-    (userAuthority ||
-      (options.settingsMode?.() ?? 'user-file') === 'user-file') &&
-    options.settingsMode?.() !== 'separate'
+    (userAuthority || mode() === 'user-file') &&
+    mode() !== 'separate'
       ? service.snapshot()
       : undefined
 
@@ -91,7 +101,7 @@ export function createNativeRuntimeSettings(
     model?: string,
   ): Record<string, unknown>
   function resolve(stored: Record<string, unknown>, model?: string) {
-    if (fallback && options.settingsMode?.() !== 'separate')
+    if (fallback && mode() !== 'separate')
       return overlaySettingsProtection(stored, fallback.values, options.host)
     return resolveSettingsRecord(stored, generation(), options.host, model)
   }
@@ -140,8 +150,7 @@ export function createNativeRuntimeSettings(
 
   function recheck(refresh = true): Promise<void> {
     if (checking) return checking
-    if (closed || !service || options.settingsMode?.() === 'separate')
-      return Promise.resolve()
+    if (closed || !service || mode() === 'separate') return Promise.resolve()
     checking = (async () => {
       if (userAuthority) return
       if (
@@ -162,24 +171,45 @@ export function createNativeRuntimeSettings(
     })
     return checking
   }
-  /** Off the request path: replace the protection fallback with an opened service. */
+  /**
+   * Off the request path: open the service that failed to open at start,
+   * replacing the protection fallback, or joining a legacy runtime so it can
+   * notice a later move. A fallback whose authority was unknown first asks
+   * again which source is in charge, and leaves the fallback once a check
+   * proves no move happened.
+   */
   async function reopen() {
+    if (closed || service) return
     const current = fallback
-    if (!current || closed) return
-    const next = await current.reopen()
+    if (current?.resolveAuthority) {
+      // A failing check throws and keeps the fallback until the next try.
+      const found = await current.resolveAuthority()
+      if (closed || service || fallback !== current) return
+      if (found !== 'user-file') {
+        probedMode = found
+        userAuthority = false
+        fallback = undefined
+        if (found === 'legacy') reopenLegacy = current.reopen
+      }
+    }
+    const before = fallback
+    const open = before?.reopen ?? reopenLegacy
+    if (!open) return
+    const next = await open()
     if (!next) return
-    if (closed || fallback !== current) {
+    if (closed || service || fallback !== before) {
       await next.dispose()
       return
     }
     service = next
     fallback = undefined
+    reopenLegacy = undefined
     subscribe(next)
     if (!writes) applyEffects()
   }
   function scheduleCheck() {
-    if (closed || options.settingsMode?.() === 'separate') return
-    if (!fallback && (!service || userAuthority)) return
+    if (closed || mode() === 'separate') return
+    if (!fallback && !reopenLegacy && (!service || userAuthority)) return
     const schedule =
       options.settingsAuthority?.schedule ??
       ((callback, delayMs) => {
@@ -190,8 +220,9 @@ export function createNativeRuntimeSettings(
     cancelCheck = schedule(async () => {
       cancelCheck = undefined
       try {
-        if (fallback) await reopen()
-        else await recheck()
+        if (!service) await reopen()
+        // A legacy runtime that just opened its service checks for a move now.
+        if (service) await recheck()
       } catch {
         // An unavailable authority probe is retried off-request on the next tick.
       } finally {
@@ -239,7 +270,7 @@ export function createNativeRuntimeSettings(
      * the write waited; that counts as lost too.
      */
     async legacyAuthorityLost() {
-      if (!service || options.settingsMode?.() === 'separate') return false
+      if (!service || mode() === 'separate') return false
       if (userAuthority) return true
       return (
         (await resolveSettingsMode(
@@ -250,7 +281,7 @@ export function createNativeRuntimeSettings(
     },
     /** Recheck authority on the menu path before choosing a write target. */
     async prepareWrite() {
-      if (options.settingsMode?.() === 'separate') return undefined
+      if (mode() === 'separate') return undefined
       await reopen().catch(() => {})
       if (!service) return undefined
       await ready

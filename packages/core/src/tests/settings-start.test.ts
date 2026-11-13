@@ -150,7 +150,7 @@ test('without an applied copy the fallback uses the legacy store, then the stric
   })
 })
 
-test('a failed start with no file and no marker stays in plain legacy mode', async () => {
+test('a failed start with no file and no marker stays in legacy mode with a way to open the service later', async () => {
   const f = await fixture('absent')
   for (const failure of ['move', 'open'] as const) {
     const started = await startSettings({
@@ -172,9 +172,141 @@ test('a failed start with no file and no marker stays in plain legacy mode', asy
         },
       },
     })
-    expect(started).toEqual({ mode: 'legacy', file: f.target })
+    expect(started).toMatchObject({ mode: 'legacy', file: f.target })
+    expect(started.service).toBeUndefined()
+    expect(started.fallback).toBeUndefined()
+    expect(started.reopen).toBeDefined()
   }
 })
+
+test('a legacy runtime whose service failed to open notices a later move by another host', async () => {
+  const f = await fixture('absent')
+  const started = await startSettings({
+    ...f.options,
+    start: {
+      move: async () => ({
+        paths: f.paths,
+        mode: 'legacy',
+        mayOpenService: true,
+        outcome: 'fence-closed',
+      }),
+      open: f.options.start!.open,
+    },
+  })
+  expect(started).toMatchObject({ mode: 'legacy', file: f.target })
+  expect(started.service).toBeUndefined()
+  const ticks: (() => Promise<void>)[] = []
+  const reader = createNativeRuntimeSettings({
+    host: 'opencode',
+    settingsMode: () => started.mode,
+    settingsReopen: started.reopen,
+    settingsAuthority: {
+      schedule: (callback) => {
+        ticks.push(callback)
+        return () => {}
+      },
+    },
+    env: {},
+  })
+  cleanup.push(reader.close)
+  const stored = { dump: { enabled: true } }
+  const dump = () =>
+    (reader.resolve(stored) as { dump: { enabled: boolean } }).dump.enabled
+  expect(dump()).toBe(true)
+  // The first timer tick opens the service; the file is still absent.
+  expect(ticks).toHaveLength(1)
+  await ticks.at(-1)!()
+  expect(f.opens()).toBe(2)
+  expect(dump()).toBe(true)
+  expect(reader.file()).toBeUndefined()
+  // Another host publishes the file; the next tick adopts it.
+  await writeFile(f.target, '{"dump_enabled":false}')
+  await ticks.at(-1)!()
+  expect(reader.file()).toBe(f.target)
+  expect(dump()).toBe(false)
+})
+
+for (const truth of ['legacy', 'user-file'] as const) {
+  test(`an unknown authority at start is asked again off the request path and settles on ${truth}`, async () => {
+    const f = await fixture('absent')
+    let probeFails = true
+    const started = await startSettings({
+      ...f.options,
+      start: {
+        move: async () => {
+          throw new Error('synthetic move failure')
+        },
+        open: openSettingsService,
+      },
+      authority: {
+        fs: {
+          exists: async (path) => {
+            if (probeFails)
+              throw Object.assign(new Error('probe failed'), {
+                code: 'EACCES',
+              })
+            return Bun.file(path).exists()
+          },
+        },
+      },
+    })
+    expect(started.mode).toBe('user-file')
+    expect(started.fallback?.resolveAuthority).toBeDefined()
+    const ticks: (() => Promise<void>)[] = []
+    const reader = createNativeRuntimeSettings({
+      host: 'opencode',
+      settingsMode: () => started.mode,
+      settingsFallback: started.fallback,
+      settingsAuthority: {
+        schedule: (callback) => {
+          ticks.push(callback)
+          return () => {}
+        },
+      },
+      env: {},
+    })
+    cleanup.push(reader.close)
+    const stored = {
+      killswitch: { enabled: true, main: { five_hour: 5 } },
+      dump: { enabled: true },
+    }
+    const resolved = () =>
+      reader.resolve(stored) as {
+        killswitch: { enabled: boolean; main: { five_hour: number } }
+        dump: { enabled: boolean }
+      }
+    // While the check fails, the fallback's protection applies.
+    await ticks.at(-1)!()
+    expect(reader.fallbackFile()).toBe(f.target)
+    expect(resolved().killswitch.enabled).toBe(false)
+    if (truth === 'user-file')
+      await writeFile(
+        f.target,
+        '{"killswitch_enabled":true,"dump_enabled":false}',
+      )
+    probeFails = false
+    await ticks.at(-1)!()
+    expect(reader.fallbackFile()).toBeUndefined()
+    if (truth === 'legacy') {
+      // No move happened: the legacy store is right, not schema defaults.
+      expect(resolved().killswitch).toMatchObject({
+        enabled: true,
+        main: { five_hour: 5 },
+      })
+      expect(resolved().dump.enabled).toBe(true)
+      expect(reader.file()).toBeUndefined()
+      // The service opened anyway, so a later move is still noticed.
+      await writeFile(f.target, '{"dump_enabled":false}')
+      await ticks.at(-1)!()
+      expect(reader.file()).toBe(f.target)
+      expect(resolved().dump.enabled).toBe(false)
+    } else {
+      expect(reader.file()).toBe(f.target)
+      expect(resolved().killswitch.enabled).toBe(true)
+      expect(resolved().dump.enabled).toBe(false)
+    }
+  })
+}
 
 test('a marker, or an authority check that fails, keeps the file in charge', async () => {
   const f = await fixture('absent')

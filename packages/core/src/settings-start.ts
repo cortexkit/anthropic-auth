@@ -39,6 +39,13 @@ export interface SettingsProtectionFallback {
   readonly values: SettingsProtectionValues
   /** Off the request path: open the service again; undefined while it still fails. */
   reopen(): Promise<SettingsService | undefined>
+  /**
+   * Present only when startup could not tell which source is in charge and
+   * fell back to the file as a precaution. Off the request path, asks again;
+   * throws while the check still fails. A result other than 'user-file'
+   * means no move happened and the fallback should be dropped.
+   */
+  resolveAuthority?(): Promise<SettingsMode>
 }
 
 export interface StartedSettings {
@@ -49,6 +56,11 @@ export interface StartedSettings {
   service?: SettingsService
   /** Set instead of `service` when the file is in charge but could not open. */
   fallback?: SettingsProtectionFallback
+  /**
+   * Set in legacy mode when the service could not open: open it again off
+   * the request path, so a move another host publishes later is noticed.
+   */
+  reopen?: () => Promise<SettingsService | undefined>
 }
 
 let warned = false
@@ -72,9 +84,15 @@ export async function startSettings(
     lockTimeoutMs: options.lockTimeoutMs,
   })
   let file = ''
+  // A move this start completed keeps the file in charge even if a later
+  // authority check could not confirm it: for example, when writing the
+  // `<file>.moved` marker failed and the file was then deleted, the check
+  // finds neither and would wrongly report that no move happened.
+  let moved = false
   try {
     const started = await move(options)
     file = started.paths.target
+    moved = started.mode === 'user-file'
     if (!started.mayOpenService) return { mode: started.mode, file }
     const service = await open(serviceOptions(file))
     if (!service) return { mode: started.mode, file }
@@ -88,26 +106,40 @@ export async function startSettings(
       )
     }
   }
-  let mode: SettingsMode = 'user-file'
-  try {
+  const reopen = async () => {
+    if (!file) return undefined
+    try {
+      return await open(serviceOptions(file))
+    } catch {
+      return undefined
+    }
+  }
+  const probe = async () => {
     const paths =
       options.paths ?? (await resolveSettingsPaths(options.host, options))
     file = paths.target
-    mode = await resolveSettingsMode(paths, {
-      ...options,
-      ...options.authority,
-    })
-  } catch {
-    // An unknown authority is treated as the file being in charge.
-    mode = 'user-file'
-    if (!file) {
-      try {
-        file = getSettingsFilePath(options)
-      } catch {
-        // Without a path only the legacy store and the strictest set remain.
+    return resolveSettingsMode(paths, { ...options, ...options.authority })
+  }
+  let mode: SettingsMode = 'user-file'
+  let unknown = false
+  if (!moved) {
+    try {
+      mode = await probe()
+    } catch {
+      // An unknown authority is treated as the file being in charge until a
+      // later check off the request path can tell.
+      mode = 'user-file'
+      unknown = true
+      if (!file) {
+        try {
+          file = getSettingsFilePath(options)
+        } catch {
+          // Without a path only the legacy store and the strictest set remain.
+        }
       }
     }
   }
+  if (mode === 'legacy') return { mode, file, reopen }
   if (mode !== 'user-file') return { mode, file }
   const recovered = await recoverSettingsProtection(
     file,
@@ -120,17 +152,13 @@ export async function startSettings(
     mode,
     file,
     fallback: {
-      file,
+      get file() {
+        return file
+      },
       rung: recovered.rung,
       values: recovered.values,
-      async reopen() {
-        if (!file) return undefined
-        try {
-          return await open(serviceOptions(file))
-        } catch {
-          return undefined
-        }
-      },
+      reopen,
+      ...(unknown ? { resolveAuthority: probe } : {}),
     },
   }
 }
