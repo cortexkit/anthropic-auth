@@ -1,6 +1,15 @@
+import { existsSync } from 'node:fs'
 import { isDeepStrictEqual } from 'node:util'
 import type { SettingsEdit } from '@cortexkit/common-auth/settings'
-import type { SettingsKey } from './settings-definition.ts'
+import { parse } from 'jsonc-parser'
+import {
+  invalidSettingsWriteText,
+  malformedSettingsText,
+  refusedSettingsWriteText,
+  type SettingsKey,
+} from './settings-definition.ts'
+import type { SettingsHost } from './settings-paths.ts'
+import type { SettingsGeneration, SettingsValues } from './settings-service.ts'
 
 type Settings = Record<string, unknown>
 
@@ -161,8 +170,28 @@ function changes(
   )
 }
 
-/** Plan before committing: callers can add account edits and refusal checks to the same transaction. */
-export function planNativeSettingsWrite(before: Settings, after: Settings) {
+function accountFloors(settings: Settings) {
+  return new Map(
+    Object.entries(object(at(settings, ['killswitch', 'accounts']))).map(
+      ([account, value]) => [
+        account,
+        {
+          five_hour: object(value).five_hour ?? object(value)['5h'] ?? 5,
+          seven_day: object(value).seven_day ?? object(value)['1w'] ?? 10,
+          scoped: object(value).scoped ?? 0,
+        },
+      ],
+    ),
+  )
+}
+
+/** Plan the whole menu transaction before either the file or the legacy store changes. */
+export function planNativeSettingsWrite(
+  before: Settings,
+  after: Settings,
+  generation: SettingsGeneration,
+  host: SettingsHost,
+) {
   const left = flat(before)
   const right = flat(after)
   const edits: SettingsEdit[] = []
@@ -174,7 +203,85 @@ export function planNativeSettingsWrite(before: Settings, after: Settings) {
         : { setting: key, value: right[key] },
     )
   }
-  return { edits, storeChanges: changes(storeHeld(before), storeHeld(after)) }
+  const storeChanges = changes(storeHeld(before), storeHeld(after))
+  const previousAccounts = accountFloors(before)
+  const nextAccounts = accountFloors(after)
+  const accounts = [
+    ...new Set([...previousAccounts.keys(), ...nextAccounts.keys()]),
+  ].filter(
+    (account) =>
+      !isDeepStrictEqual(
+        previousAccounts.get(account),
+        nextAccounts.get(account),
+      ),
+  )
+  const plan = { edits, storeChanges, refusal: undefined as string | undefined }
+  if (!edits.length && !accounts.length && !storeChanges.length) return plan
+  // A watch's save grace period can retain old provenance after the user deletes the file.
+  const present = existsSync(generation.file)
+  if (
+    present &&
+    (generation.status === 'unparseable' ||
+      generation.fileStatus.duplicateKeys.length)
+  ) {
+    plan.refusal = malformedSettingsText(generation.file)
+    return plan
+  }
+  for (const [index, edit] of [...edits.entries()].reverse()) {
+    if (!edit.remove) continue
+    const key = edit.setting as SettingsKey
+    const levels = (present && generation.fileLevels[key]) || []
+    if (levels.includes(host) && levels.includes('default')) {
+      plan.refusal = refusedSettingsWriteText(key, generation.file)
+      return plan
+    }
+    // Only explicit file values for this host or the file's default count, not declared schema defaults.
+    if (!levels.includes(host) && !levels.includes('default'))
+      edits.splice(index, 1)
+  }
+  if (!accounts.length) return plan
+  const key = 'killswitch_account_floors'
+  if (present && generation.report.some((entry) => entry.keyPath[0] === key)) {
+    plan.refusal = invalidSettingsWriteText(key, generation.file)
+    return plan
+  }
+  // The settings service has checked the list; parsing its original text retains other hosts' and custody modes' entries.
+  const raw =
+    present && generation.source
+      ? object(
+          parse(generation.source.replace(/^\uFEFF/, ''), [], {
+            allowTrailingComma: true,
+          }),
+        )
+      : {}
+  let floors = structuredClone(
+    (raw[key] ?? []) as SettingsValues['killswitch_account_floors'],
+  )
+  const original = structuredClone(floors)
+  for (const account of accounts) {
+    floors = floors.flatMap((entry) =>
+      entry.account === account && entry.host === 'both'
+        ? [
+            { ...entry, host: 'opencode' as const },
+            { ...entry, host: 'pi' as const },
+          ]
+        : [entry],
+    )
+    const index = floors.findIndex(
+      (entry) => entry.account === account && entry.host === host,
+    )
+    const value = nextAccounts.get(account)
+    if (value === undefined) {
+      if (index !== -1) floors.splice(index, 1)
+    } else {
+      const entry = { account, host, ...value }
+      if (index === -1) floors.push(entry as (typeof floors)[number])
+      else floors[index] = entry as (typeof floors)[number]
+    }
+  }
+  if (!isDeepStrictEqual(original, floors))
+    edits.push({ setting: key, value: floors })
+  return plan
 }
 
 /** Apply only store-held deltas to a fresh legacy record, never the resolved settings projection. */

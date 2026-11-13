@@ -337,6 +337,13 @@ export function refusedSettingsRecreationText(file: string): string {
   return `Cannot recreate settings file "${resolve(file)}": protection settings are unknown. Edit the settings file to set them before trying again.`
 }
 
+export function invalidSettingsWriteText(
+  key: SettingsKey,
+  file: string,
+): string {
+  return `Cannot write setting "${key}" to "${resolve(file)}": the existing value is invalid. Edit the settings file to set a valid value.`
+}
+
 /** Only fixed, local text is shown; dependency errors can contain file contents. */
 export const SETTINGS_WRITE_FAILURES = {
   'settings-unparseable': {

@@ -1503,12 +1503,20 @@ export function createNativeAccountRuntime(
         return next
       }
       if (service) {
+        await service.refresh()
         const stored = await selected.store.readSettings()
         if (stored.status !== 'ready')
           throw new NativeCustodyError('route-unavailable')
         const before = runtimeSettings.resolve(stored.settings)
         const next = await mutate(structuredClone(before))
-        const plan = planNativeSettingsWrite(before, next)
+        const plan = planNativeSettingsWrite(
+          before,
+          next,
+          service.snapshot(),
+          options.host,
+        )
+        if (plan.refusal)
+          return { settings: before, outcome: 'refused', reason: plan.refusal }
         try {
           if (plan.edits.length)
             await runtimeSettings.update(plan.edits, before)

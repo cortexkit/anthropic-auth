@@ -16,9 +16,12 @@ import {
 } from '../logger.ts'
 import { createNativeAccountRuntime } from '../native-account-runtime.ts'
 import { nativeQuotaCodec } from '../native-quota-codec.ts'
+import { nativeCacheKeepAlways } from '../native-settings.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import {
+  invalidSettingsWriteText,
+  refusedSettingsWriteText,
   SETTINGS_WRITE_FAILURES,
   settingsDefinition,
 } from '../settings-definition.ts'
@@ -41,6 +44,7 @@ async function fixture(
     mode?: SettingsMode
     refusal?: SettingsRefusalCode
     legacy?: Record<string, unknown>
+    windowDefault?: { start_hour: number; end_hour: number }[]
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
@@ -63,7 +67,21 @@ async function fixture(
     host: options.host ?? 'opencode',
     dependencies: {
       open: (config) => {
-        const handle = openSettings(settingsDefinition, config)
+        const handle = openSettings(
+          {
+            ...settingsDefinition,
+            settings: {
+              ...settingsDefinition.settings,
+              cache_keep_window: {
+                ...settingsDefinition.settings.cache_keep_window,
+                default:
+                  options.windowDefault ??
+                  settingsDefinition.settings.cache_keep_window.default,
+              },
+            },
+          },
+          config,
+        )
         return {
           ...handle,
           watch: () => () => {},
@@ -253,6 +271,287 @@ test('partial Pi main thresholds complete scoped with zero before comparison and
   expect(f.calls).toHaveLength(1)
 })
 
+for (const host of ['opencode', 'pi'] as const) {
+  test(`${host} account floor edits split both and preserve every other host and mode in the list`, async () => {
+    const both = {
+      account: 'vault:shared',
+      host: 'both',
+      five_hour: 20,
+      seven_day: 30,
+      scoped: 4,
+    }
+    const own = {
+      account: 'local',
+      host,
+      five_hour: 11,
+      seven_day: 22,
+      scoped: 3,
+    }
+    const otherHost = host === 'pi' ? 'opencode' : 'pi'
+    const others = [
+      {
+        account: 'local',
+        host: otherHost,
+        five_hour: 40,
+        seven_day: 50,
+        scoped: 6,
+      },
+      {
+        account: 'vault:other-mode',
+        host,
+        five_hour: 7,
+        seven_day: 8,
+        scoped: 9,
+      },
+    ]
+    const f = await fixture(
+      `{
+      // outside list stays
+      "killswitch_account_floors": [
+        // inside list is replaced
+        ${[both, own, ...others].map((entry) => JSON.stringify(entry)).join(',\n')}
+      ],
+      "untouched": {"value":42} // outside tail stays
+    }`,
+      { host },
+    )
+    const result = await f.runtime.updateSettings((settings) => {
+      const killswitch = settings.killswitch as {
+        accounts: Record<string, unknown>
+      }
+      expect(killswitch.accounts['vault:shared']).toEqual({
+        five_hour: 20,
+        seven_day: 30,
+        scoped: 4,
+      })
+      killswitch.accounts['vault:shared'] = { five_hour: 5, seven_day: 6 }
+      killswitch.accounts.local = { five_hour: 1, seven_day: 2 }
+      killswitch.accounts.new = { five_hour: 3, seven_day: 4 }
+    })
+    expect(result.outcome).toBe('saved')
+    const text = await f.text()
+    expect(text).toContain('// outside list stays')
+    expect(text).toContain('// outside tail stays')
+    expect(text).not.toContain('// inside list is replaced')
+    const saved = parse(text)
+    expect(saved.untouched).toEqual({ value: 42 })
+    expect(saved.killswitch_account_floors).toEqual([
+      ...(['opencode', 'pi'] as const).map((target) =>
+        target === host
+          ? {
+              account: both.account,
+              host,
+              five_hour: 5,
+              seven_day: 6,
+              scoped: 0,
+            }
+          : { ...both, host: target },
+      ),
+      { account: 'local', host, five_hour: 1, seven_day: 2, scoped: 0 },
+      ...others,
+      { account: 'new', host, five_hour: 3, seven_day: 4, scoped: 0 },
+    ])
+    expect(f.calls).toHaveLength(1)
+    expect(result.settings.killswitch).toMatchObject({
+      accounts: {
+        'vault:shared': { five_hour: 5, seven_day: 6, scoped: 0 },
+        local: { five_hour: 1, seven_day: 2, scoped: 0 },
+        new: { five_hour: 3, seven_day: 4, scoped: 0 },
+      },
+    })
+  })
+
+  test(`${host} removing account floors splits both before removing only the acting host`, async () => {
+    const both = {
+      account: 'shared',
+      host: 'both',
+      five_hour: 12,
+      seven_day: 13,
+      scoped: 14,
+    }
+    const own = {
+      account: 'local',
+      host,
+      five_hour: 2,
+      seven_day: 3,
+      scoped: 4,
+    }
+    const f = await fixture(
+      JSON.stringify({ killswitch_account_floors: [both, own] }),
+      { host },
+    )
+    const result = await f.runtime.updateSettings((settings) => {
+      const killswitch = settings.killswitch as {
+        accounts: Record<string, unknown>
+      }
+      delete killswitch.accounts.shared
+      delete killswitch.accounts.local
+    })
+    expect(result.outcome).toBe('saved')
+    expect(parse(await f.text()).killswitch_account_floors).toEqual([
+      { ...both, host: host === 'pi' ? 'opencode' : 'pi' },
+    ])
+    expect(result.settings.killswitch).toMatchObject({ accounts: {} })
+  })
+}
+
+for (const [source, expected, writes] of [
+  ['{"dump_enabled":true,"untouched":4}', { untouched: 4 }, 1],
+  ['{"dump_enabled":{"pi":true},"untouched":4}', { untouched: 4 }, 1],
+  [
+    '{"dump_enabled":{"default":true,"opencode":false},"untouched":4}',
+    { dump_enabled: { opencode: false }, untouched: 4 },
+    1,
+  ],
+  [
+    '{"dump_enabled":{"opencode":true},"untouched":4}',
+    { dump_enabled: { opencode: true }, untouched: 4 },
+    0,
+  ],
+  ['{"untouched":4}', { untouched: 4 }, 0],
+] as const) {
+  test(`Pi removes a leaf only where the user file gives it a value: ${source}`, async () => {
+    const f = await fixture(source, { host: 'pi' })
+    const result = await f.runtime.updateSettings((settings) => {
+      delete settings.dump
+    })
+    expect(result.outcome).toBe('saved')
+    expect(parse(await f.text())).toEqual(expected)
+    expect(f.calls).toHaveLength(writes)
+  })
+}
+
+test('removing a leaf after the file disappeared during save grace writes nothing', async () => {
+  const f = await fixture('{"dump_enabled":{"default":false,"opencode":true}}')
+  await rm(f.file)
+  const result = await f.runtime.updateSettings((settings) => {
+    delete settings.dump
+  })
+  expect(result.outcome).toBe('saved')
+  expect(f.calls).toHaveLength(0)
+  await expect(f.text()).rejects.toThrow()
+})
+
+for (const host of ['opencode', 'pi'] as const) {
+  test(`${host} removing a host leaf with a top-level fallback refuses the whole file and store transaction`, async () => {
+    const source = `{\n // keep all bytes\n "dump_enabled":{"default":false,"${host}":true}}`
+    const f = await fixture(source, {
+      host,
+      legacy: { nativeAccountOrder: ['a'] },
+    })
+    const stored = await f.saved()
+    const result = await f.runtime.updateSettings((settings) => {
+      delete settings.dump
+      settings.prime = { enabled: true }
+      settings.nativeAccountOrder = ['b', 'a']
+    })
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      reason: refusedSettingsWriteText('dump_enabled', f.file),
+    })
+    expect(await f.text()).toBe(source)
+    expect(await f.saved()).toEqual(stored)
+    expect(f.calls).toHaveLength(0)
+  })
+}
+
+test('nativeCacheKeepAlways deletes the deciding window, not the other host window', async () => {
+  const f = await fixture(
+    '{"cache_keep_window":{"opencode":[{"start_hour":1,"end_hour":2}],"pi":[{"start_hour":3,"end_hour":4}]}}',
+  )
+  const result = await f.runtime.updateSettings(nativeCacheKeepAlways)
+  expect(result.outcome).toBe('saved')
+  expect(parse(await f.text())).toEqual({
+    cache_keep_window: { pi: [{ start_hour: 3, end_hour: 4 }] },
+    cache_keep_enabled: true,
+    cache_keep_always: true,
+  })
+})
+
+test('nativeCacheKeepAlways with no file window saves even when the declared default supplies a window', async () => {
+  const f = await fixture('{}', {
+    windowDefault: [{ start_hour: 5, end_hour: 6 }],
+  })
+  const result = await f.runtime.updateSettings((settings) => {
+    expect(settings.cacheKeep).toMatchObject({ startHour: 5, endHour: 6 })
+    return nativeCacheKeepAlways(settings)
+  })
+  expect(result.outcome).toBe('saved')
+  expect(parse(await f.text())).toEqual({
+    cache_keep_enabled: true,
+    cache_keep_always: true,
+  })
+  expect(f.calls).toHaveLength(1)
+})
+
+test('an invalid setting elsewhere does not prevent an account list write and stays unchanged', async () => {
+  const source =
+    '{\n // keep invalid for the user\n "refresh_interval_minutes":"bad", "unknown":42}'
+  const f = await fixture(source)
+  const result = await f.runtime.updateSettings((settings) => {
+    const killswitch = settings.killswitch as {
+      accounts: Record<string, unknown>
+    }
+    killswitch.accounts.new = { five_hour: 3, seven_day: 4 }
+  })
+  expect(result.outcome).toBe('saved')
+  expect(parse(await f.text())).toEqual({
+    refresh_interval_minutes: 'bad',
+    unknown: 42,
+    killswitch_account_floors: [
+      {
+        account: 'new',
+        host: 'opencode',
+        five_hour: 3,
+        seven_day: 4,
+        scoped: 0,
+      },
+    ],
+  })
+  expect(await f.text()).toContain('// keep invalid for the user')
+})
+
+const validFloor = {
+  account: 'other',
+  host: 'pi',
+  five_hour: 7,
+  seven_day: 8,
+  scoped: 9,
+}
+for (const [label, entries] of [
+  ['out of range', [{ ...validFloor, five_hour: 101 }]],
+  [
+    'missing key',
+    [{ account: 'other', host: 'pi', five_hour: 7, seven_day: 8 }],
+  ],
+  ['unknown key', [{ ...validFloor, extra: 1 }]],
+  ['legacy alias', [{ ...validFloor, '5h': 7 }]],
+  ['overlap both first', [{ ...validFloor, host: 'both' }, validFloor]],
+  ['overlap both last', [validFloor, { ...validFloor, host: 'both' }]],
+  ['duplicate host', [validFloor, validFloor]],
+] as const) {
+  test(`an account edit refuses the entire transaction when another entry has ${label}`, async () => {
+    const source = JSON.stringify({ killswitch_account_floors: entries })
+    const f = await fixture(source, { legacy: { nativeAccountOrder: ['a'] } })
+    const stored = await f.saved()
+    const result = await f.runtime.updateSettings((settings) => {
+      const killswitch = settings.killswitch as {
+        accounts: Record<string, unknown>
+      }
+      killswitch.accounts.new = { five_hour: 3, seven_day: 4 }
+      settings.prime = { enabled: true }
+      settings.nativeAccountOrder = ['b', 'a']
+    })
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      reason: invalidSettingsWriteText('killswitch_account_floors', f.file),
+    })
+    expect(await f.text()).toBe(source)
+    expect(await f.saved()).toEqual(stored)
+    expect(f.calls).toHaveLength(0)
+  })
+}
+
 test('the mutator gets applied ladder protection and returning it unchanged creates no missing file', async () => {
   const f = await fixture(
     '{"killswitch_enabled":true,"killswitch_default_scoped":7}',
@@ -337,6 +636,7 @@ test('store-only and mixed menu changes never write projected three-way strings 
     settings.nativeAccountOrder = ['b', 'a']
   })
   expect(f.calls).toHaveLength(0)
+  expect(await f.saved()).toEqual({ ...before, nativeAccountOrder: ['b', 'a'] })
   await f.runtime.updateSettings((settings) => {
     settings.nativeAccountOrder = ['a', 'b']
     settings.dump = { enabled: true }
@@ -347,6 +647,45 @@ test('store-only and mixed menu changes never write projected three-way strings 
   expect(parse(await f.text()).dump_enabled).toBe(true)
   expect(f.calls).toHaveLength(1)
 })
+
+for (const host of ['opencode', 'pi'] as const) {
+  test(`${host} a mixed account-floor write never persists the effective record to the legacy store`, async () => {
+    const f = await fixture(
+      '{"claude_cache_enabled":"off","quota_enabled":"on","quota_fail_closed_on_unknown_quota":"off"}',
+      {
+        host,
+        legacy: {
+          nativeAccountOrder: ['a'],
+          claudeCache: { enabled: true, mode: 'explicit' },
+          quota: { enabled: false, failClosedOnUnknownQuota: true },
+          killswitch: { enabled: false, accounts: { old: { five_hour: 50 } } },
+          cacheKeep: { enabled: false, startHour: 1, endHour: 2 },
+        },
+      },
+    )
+    const legacy = await f.saved()
+    const result = await f.runtime.updateSettings((settings) => {
+      expect(settings.claudeCache).toMatchObject({ enabled: 'off' })
+      expect(settings.quota).toMatchObject({
+        enabled: 'on',
+        failClosedOnUnknownQuota: 'off',
+      })
+      const killswitch = settings.killswitch as {
+        accounts: Record<string, unknown>
+      }
+      killswitch.accounts.new = { five_hour: 1, seven_day: 2 }
+      settings.nativeAccountOrder = ['b', 'a']
+    })
+    expect(result.outcome).toBe('saved')
+    expect(await f.saved()).toEqual({
+      ...legacy,
+      nativeAccountOrder: ['b', 'a'],
+    })
+    expect(parse(await f.text()).killswitch_account_floors).toEqual([
+      { account: 'new', host, five_hour: 1, seven_day: 2, scoped: 0 },
+    ])
+  })
+}
 
 test('a refused mixed edit changes neither file nor legacy store', async () => {
   const f = await fixture('{}', {
@@ -403,6 +742,31 @@ for (const source of [
     })
     expect(await f.text()).toBe(source)
   })
+}
+
+for (const source of ['{"dump_enabled":', '{"unknown":{"same":1,"same":2}}']) {
+  for (const action of ['account', 'remove', 'store'] as const) {
+    test(`malformed or duplicate JSONC refuses ${action} writes before either destination changes: ${source}`, async () => {
+      const f = await fixture(source, { legacy: { nativeAccountOrder: ['a'] } })
+      const stored = await f.saved()
+      const result = await f.runtime.updateSettings((settings) => {
+        if (action === 'account') {
+          const killswitch = settings.killswitch as {
+            accounts: Record<string, unknown>
+          }
+          killswitch.accounts.new = { five_hour: 1, seven_day: 2 }
+        } else if (action === 'remove') delete settings.dump
+        else settings.nativeAccountOrder = ['b', 'a']
+      })
+      expect(result).toMatchObject({
+        outcome: 'refused',
+        reason: SETTINGS_WRITE_FAILURES['settings-unparseable'].text(f.file),
+      })
+      expect(await f.text()).toBe(source)
+      expect(await f.saved()).toEqual(stored)
+      expect(f.calls).toHaveLength(0)
+    })
+  }
 }
 
 for (const field of ['mainAccountId', 'claustrum', 'relay']) {
