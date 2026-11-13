@@ -2,6 +2,8 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
 ## 2.11.3
 
 - Pi now waits at most 60 seconds before retrying the same account when rate-limit headers do not confirm exhausted quota, as OpenCode does.
