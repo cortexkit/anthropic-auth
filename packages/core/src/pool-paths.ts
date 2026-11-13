@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto'
+import * as fsPromises from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 
 import { getAccountStatePath, getAccountStoragePath } from './accounts.ts'
+import { canonicalFilePath } from './canonical-file-path.ts'
 import {
   type PathResolutionOptions,
   resolvePathOptions,
@@ -62,10 +64,12 @@ export async function canonicalPath(
   path: string,
   options: PathResolutionOptions = {},
 ): Promise<string> {
-  const { paths, realpath } = resolvePathOptions(options)
+  const { paths, platform, realpath } = resolvePathOptions(options)
   const absolute = paths.resolve(path)
   try {
-    return await realpath(absolute)
+    return platform === 'win32'
+      ? await realpath(absolute)
+      : await canonicalFilePath(absolute, { ...fsPromises, realpath })
   } catch (error) {
     if (
       !(error instanceof Error) ||
@@ -77,6 +81,7 @@ export async function canonicalPath(
   }
   const parent = paths.dirname(absolute)
   if (parent === absolute) return absolute
+  // Keep the configured name for missing files, including dangling symlinks.
   return paths.join(
     await canonicalPath(parent, options),
     paths.basename(absolute),

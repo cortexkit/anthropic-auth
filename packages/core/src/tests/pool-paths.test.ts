@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
+  mkdir,
   mkdtemp,
   readdir,
   realpath,
@@ -8,7 +10,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 
 import { canonicalPath, resolveNativePoolPaths } from '../pool-paths.ts'
 
@@ -100,6 +102,134 @@ test('canonicalPath resolves directory aliases for existing and nonexistent leav
     await canonicalPath(join(alias, 'missing', 'nested', 'source.json')),
   ).toBe(missing)
   expect(await readdir(root)).toEqual(['source.json'])
+})
+
+test('canonicalPath never realpaths an atomically replaced file leaf', async () => {
+  const root = await fixture()
+  const file = join(root, 'accounts.json')
+  await writeFile(file, '{}')
+  const calls: string[] = []
+  const result = await canonicalPath(file, {
+    realpath: async (path) => {
+      calls.push(path)
+      const canonical = await realpath(path)
+      return path === file ? `${canonical} (deleted)` : canonical
+    },
+  })
+  expect(result).toBe(file)
+  expect(calls).not.toContain(file)
+})
+
+test('Windows canonicalPath retains the configured realpath resolver', async () => {
+  const calls: string[] = []
+  expect(
+    await canonicalPath('C:\\config\\accounts.json', {
+      platform: 'win32',
+      realpath: async (path) => {
+        calls.push(path)
+        return 'D:\\canonical\\accounts.json'
+      },
+    }),
+  ).toBe('D:\\canonical\\accounts.json')
+  expect(calls).toEqual(['C:\\config\\accounts.json'])
+})
+
+// The released resolver realpathed each leaf and walked parents on ENOENT.
+// Keep this independent reference to protect persisted storage identities.
+async function releasedCanonicalPath(path: string): Promise<string> {
+  const absolute = resolve(path)
+  try {
+    return await realpath(absolute)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  const parent = dirname(absolute)
+  if (parent === absolute) return absolute
+  return join(await releasedCanonicalPath(parent), basename(absolute))
+}
+
+async function releasedPoolPaths(config: string, state: string) {
+  const legacyConfig = await releasedCanonicalPath(config)
+  const legacyState = await releasedCanonicalPath(state)
+  const paths = {
+    legacyConfig,
+    legacyState,
+    config: await releasedCanonicalPath(
+      join(dirname(legacyConfig), 'anthropic-auth-pool.json'),
+    ),
+    state: await releasedCanonicalPath(
+      join(dirname(legacyState), 'anthropic-auth-pool-state.json'),
+    ),
+    runtime: await releasedCanonicalPath(
+      join(dirname(legacyState), 'anthropic-auth-native-state.json'),
+    ),
+    journal: await releasedCanonicalPath(
+      join(dirname(legacyState), 'anthropic-auth-migration.json'),
+    ),
+    roster: await releasedCanonicalPath(
+      join(dirname(legacyState), 'anthropic-auth-custody-roster.json'),
+    ),
+  }
+  return {
+    ...paths,
+    storageId: createHash('sha256')
+      .update(JSON.stringify(['anthropic', paths.config, paths.state]))
+      .digest('hex'),
+  }
+}
+
+test('pool paths and storageId equal the released resolver for files and symlink aliases', async () => {
+  const root = await fixture()
+  const folder = join(root, 'real')
+  await mkdir(folder)
+  const config = join(folder, 'anthropic-auth.json')
+  const state = join(folder, 'anthropic-auth-state.json')
+  const baseline = await resolveNativePoolPaths(config, state, {
+    kind: 'legacy',
+  })
+  for (const [key, path] of Object.entries(baseline)) {
+    if (key !== 'storageId') await writeFile(path, '{}')
+  }
+  await symlink(folder, join(root, 'folder-link'), 'dir')
+  const links = join(root, 'file-links')
+  await mkdir(links)
+  await symlink(config, join(links, 'anthropic-auth.json'))
+  await symlink(
+    '../real/anthropic-auth-state.json',
+    join(links, 'anthropic-auth-state.json'),
+  )
+  // The derived pool config can itself be a symlink, not just its account input.
+  await writeFile(join(root, 'pool-target.json'), '{}')
+  await rm(baseline.config)
+  await symlink('../pool-target.json', baseline.config)
+  for (const directory of [folder, join(root, 'folder-link'), links]) {
+    const inputs = [
+      join(directory, 'anthropic-auth.json'),
+      join(directory, 'anthropic-auth-state.json'),
+    ] as const
+    expect(await resolveNativePoolPaths(...inputs, { kind: 'legacy' })).toEqual(
+      await releasedPoolPaths(...inputs),
+    )
+  }
+})
+
+test('dangling account symlinks keep released paths and storageId; loops still refuse', async () => {
+  const root = await fixture()
+  const config = join(root, 'anthropic-auth.json')
+  const state = join(root, 'anthropic-auth-state.json')
+  await symlink('missing.json', config)
+  expect(await canonicalPath(config)).toBe(await releasedCanonicalPath(config))
+  expect(
+    await resolveNativePoolPaths(config, state, { kind: 'legacy' }),
+  ).toEqual(await releasedPoolPaths(config, state))
+  await rm(config)
+  await symlink('loop.json', config)
+  await symlink('anthropic-auth.json', join(root, 'loop.json'))
+  await expect(canonicalPath(config)).rejects.toHaveProperty('code', 'ELOOP')
+  await expect(resolveNativePoolPaths(config, state)).rejects.toHaveProperty(
+    'code',
+    'ELOOP',
+  )
 })
 
 test('refuses source or derived file collisions without creating a file', async () => {

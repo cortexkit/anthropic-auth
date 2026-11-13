@@ -180,6 +180,33 @@ describe('PrimeManager storage namespaces', () => {
     )
   })
 
+  test('missing and dangling storage files retain their configured-path fingerprint', async () => {
+    const directory = await tempMarkerRoot()
+    const realFolder = join(directory, 'real')
+    const aliasFolder = join(directory, 'alias')
+    await mkdir(realFolder)
+    await symlink(realFolder, aliasFolder, 'dir')
+    await symlink('absent.json', join(realFolder, 'dangling.json'))
+    for (const path of [
+      join(aliasFolder, 'missing.json'),
+      join(aliasFolder, 'dangling.json'),
+    ]) {
+      const releasedFingerprint = createHash('sha256')
+        .update(resolve(path))
+        .digest('hex')
+        .slice(0, 12)
+      expect(primeStorageFingerprint(path)).toBe(releasedFingerprint)
+    }
+  })
+
+  test('storage symlink loops still refuse a fingerprint', async () => {
+    const directory = await tempMarkerRoot()
+    const file = join(directory, 'loop.json')
+    await symlink('other.json', file)
+    await symlink('loop.json', join(directory, 'other.json'))
+    expect(() => primeStorageFingerprint(file)).toThrow()
+  })
+
   test('unverified identities in different stores prime independently', async () => {
     const markerDir = await tempMarkerRoot()
     const reset = Date.now() - PRIME_DUE_OFFSET_MS

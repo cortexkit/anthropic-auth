@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { realpathSync } from 'node:fs'
+import * as fs from 'node:fs'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -16,6 +16,7 @@ import {
   type PrimeUsageCounters,
   quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
+import { canonicalFilePathSync } from './canonical-file-path.ts'
 import { logger } from './logger.ts'
 import {
   CLAUDE_HAIKU_4_5_MODEL_ID,
@@ -397,7 +398,14 @@ export function primeStorageFingerprint(storagePath: string): string {
   const absolutePath = resolve(storagePath)
   let canonicalPath: string
   try {
-    canonicalPath = realpathSync(absolutePath)
+    if (process.platform === 'win32') {
+      canonicalPath = fs.realpathSync(absolutePath)
+    } else {
+      // Missing files historically hash the configured absolute path, even
+      // when an existing parent is an alias. Keep that persisted identity.
+      fs.lstatSync(absolutePath)
+      canonicalPath = canonicalFilePathSync(absolutePath, fs)
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     canonicalPath = absolutePath

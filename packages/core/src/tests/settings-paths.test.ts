@@ -324,6 +324,24 @@ test('canonical comparison errors other than absence are not mistaken for differ
   )
 })
 
+test('atomic leaf replacement cannot make the default settings install separate', async () => {
+  const { options } = await sandbox()
+  const defaults = getDefaultSettingsStorePaths('opencode', options)
+  await mkdir(dirname(defaults.account), { recursive: true })
+  await writeFile(defaults.account, '{}')
+  await writeFile(defaults.state, '{}')
+  let replaced = false
+  options.realpath = async (path) => {
+    const result = await realpath(path)
+    if (path === defaults.account && !replaced) {
+      replaced = true
+      return `${result} (deleted)`
+    }
+    return result
+  }
+  expect(await isSeparateSettingsInstall('opencode', options)).toBe(false)
+})
+
 test('an env with no home variable uses only the supplied sandbox home', async () => {
   const { root, options } = await sandbox()
   options.env = {}
