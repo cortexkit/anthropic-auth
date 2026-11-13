@@ -124,7 +124,12 @@ async function fixture(host: SettingsHost = 'opencode') {
       registration: { status: 'registered' },
       floor: '2.12.0',
       self: { pid: 100, incarnation: 'self', instance: 'own-copy' },
-      liveness: { pidAlive: () => true, incarnation: async () => 'peer' },
+      liveness: {
+        pidAlive: () => true,
+        // This process (pid 100) is its own incarnation, so its own entry is
+        // live and only the self check can exclude it.
+        incarnation: async (pid) => (pid === 100 ? 'self' : 'peer'),
+      },
       artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
       readHolders: async () => undefined,
     },
@@ -365,60 +370,64 @@ async function heldHolderLock(
   )
 }
 
-test('an older holder registering while the move waits for its holder lock keeps the move from publishing', async () => {
+/** Wait until `path` exists: the event a test waits for, not a fixed delay. */
+async function waitForPath(path: string, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs
+  while (await absent(path)) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${path}`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
+/** Two holder files the move takes `holders` locks on: both hosts' store folders. */
+function twoHolderFiles(f: Awaited<ReturnType<typeof fixture>>) {
+  return [
+    join(dirname(f.paths.defaults.opencode.account), HOLDER_FILE_NAME),
+    join(dirname(f.paths.defaults.pi.account), HOLDER_FILE_NAME),
+  ] as const
+}
+
+test('an older holder registering while the move waits for its holder locks keeps the move from publishing', async () => {
   const f = await fixture()
   f.options.fence.readHolders = undefined
   await put(f.stores.opencode.config, { dump: { enabled: true } })
   await put(f.stores.pi.config, { killswitch: { enabled: true } })
-  const holderFile = join(
-    dirname(f.paths.defaults.pi.account),
-    HOLDER_FILE_NAME,
-  )
+  const [first, second] = twoHolderFiles(f)
+  expect(first).not.toBe(second)
   let started: ReturnType<typeof f.start> | undefined
-  await heldHolderLock(holderFile, async () => {
-    started = f.start()
-    // The move passes its first, unlocked check and then waits for this lock.
-    await new Promise((resolve) => setTimeout(resolve, 500))
-    await fs.writeFile(
-      holderFile,
-      JSON.stringify({ version: 1, entries: [holder('2.11.2')] }),
-    )
-  })
+  await heldHolderLock(first, () =>
+    heldHolderLock(second, async () => {
+      started = f.start()
+      // The mover takes its settings-move lock only after both unlocked
+      // fence checks passed; it then waits for the holder locks held here.
+      await waitForPath(`${f.paths.target}.settings-move.lock`)
+      await fs.writeFile(
+        second,
+        JSON.stringify({ version: 1, entries: [holder('2.11.2')] }),
+      )
+    }),
+  )
   expect((await started)?.outcome).toBe('fence-closed')
   expect(await absent(f.paths.target)).toBe(true)
   expect(await absent(f.paths.marker)).toBe(true)
 })
 
-test("an older holder can't register between the move's last fence check and publication", async () => {
+test("an older holder can't register in either holder file between the move's last fence check and publication", async () => {
   const f = await fixture()
   f.options.fence.readHolders = undefined
   await put(f.stores.opencode.config, { dump: { enabled: true } })
   await put(f.stores.pi.config, { killswitch: { enabled: true } })
-  const holderFile = join(
-    dirname(f.paths.defaults.pi.account),
-    HOLDER_FILE_NAME,
-  )
-  let registration: Promise<void> | undefined
-  let registered = false
-  let registeredBeforePublish: boolean | undefined
+  const files = twoHolderFiles(f)
+  const attempts: Awaited<ReturnType<typeof tryRegister>>[] = []
   setSettingsMoveStepHookForTest(async (step: string) => {
     // 'locked' runs right after the mover's fence check under its locks.
-    if (step === 'locked') {
-      registration = heldHolderLock(holderFile, async () => {
-        await fs.writeFile(
-          holderFile,
-          JSON.stringify({ version: 1, entries: [holder('2.11.2')] }),
-        )
-        registered = true
-      })
-      await new Promise((resolve) => setTimeout(resolve, 300))
-    }
-    if (step === 'before-publish') registeredBeforePublish = registered
+    if (step === 'locked')
+      for (const file of files) attempts.push(await tryRegister(file))
   })
   expect((await f.start()).outcome).toBe('moved')
-  expect(registeredBeforePublish).toBe(false)
-  await registration
-  expect(registered).toBe(true)
+  expect(attempts).toEqual(['lock-held', 'lock-held'])
+  // Both locks are released once the move has published.
+  for (const file of files) expect(await tryRegister(file)).toBe('registered')
 })
 
 /**

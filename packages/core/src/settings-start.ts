@@ -65,6 +65,11 @@ export interface StartedSettings {
 
 let warned = false
 
+/** Tests only: let the next failed start log its one warning again. */
+export function __resetSettingsStartWarningForTest(): void {
+  warned = false
+}
+
 /**
  * The one settings startup every host calls; it never throws. It runs the
  * move, then opens the service. When either fails, a file that is (or may

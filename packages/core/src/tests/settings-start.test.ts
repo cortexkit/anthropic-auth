@@ -1,11 +1,20 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { createNativeRuntimeSettings } from '../native-runtime-settings.ts'
-import type { SettingsPaths } from '../settings-paths.ts'
+import { resolveNativePoolPaths } from '../pool-paths.ts'
+import { settingsImportRecordPath } from '../settings-mode.ts'
+import { resolveSettingsPaths, type SettingsPaths } from '../settings-paths.ts'
 import { writeSettingsProtectionCopy } from '../settings-protection-copy.ts'
 import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import {
@@ -13,7 +22,11 @@ import {
   openSettingsService,
   type SettingsProtectionValues,
 } from '../settings-service.ts'
-import { type StartSettingsOptions, startSettings } from '../settings-start.ts'
+import {
+  __resetSettingsStartWarningForTest,
+  type StartSettingsOptions,
+  startSettings,
+} from '../settings-start.ts'
 
 const cleanup: (() => unknown)[] = []
 afterEach(async () => {
@@ -72,6 +85,7 @@ async function fixture(file: 'present' | 'absent' = 'present') {
 test('a service open that throws after a move applies the stricter applied copy, never the legacy store', async () => {
   const records: LogTestRecord[] = []
   __setLogTestSink((record) => records.push(record))
+  __resetSettingsStartWarningForTest()
   const f = await fixture()
   await writeSettingsProtectionCopy(f.target, 'opencode', {
     readAt: Date.now(),
@@ -81,13 +95,24 @@ test('a service open that throws after a move applies the stricter applied copy,
   expect(started).toMatchObject({ mode: 'user-file', file: f.target })
   expect(started.service).toBeUndefined()
   expect(started.fallback).toMatchObject({ rung: 1, values: stricter })
-  const warnings = records.filter((record) =>
-    record.message.includes('Settings startup failed'),
-  )
-  expect(warnings.length).toBeLessThanOrEqual(1)
-  expect(warnings.every((record) => !record.message.includes(f.root))).toBe(
-    true,
-  )
+  const warnings = () =>
+    records.filter((record) =>
+      record.message.includes('Settings startup failed'),
+    )
+  // Exactly one warning, naming no path.
+  expect(warnings()).toHaveLength(1)
+  expect(warnings()[0]!.message).not.toContain(f.root)
+  // A second failed start in the same process does not warn again.
+  await startSettings({
+    ...f.options,
+    start: {
+      ...f.options.start,
+      open: async () => {
+        throw new Error('synthetic open failure')
+      },
+    },
+  })
+  expect(warnings()).toHaveLength(1)
 
   const ticks: (() => Promise<void>)[] = []
   const reader = createNativeRuntimeSettings({
@@ -345,4 +370,42 @@ test('the normal path returns the opened service', async () => {
   expect(started.mode).toBe('user-file')
   expect(started.fallback).toBeUndefined()
   expect(started.service?.resolve('opencode').killswitch_enabled).toBe(false)
+})
+
+test('startSettings runs the real move: the legacy store is published and the service opens on it', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'settings-start-')))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const options: StartSettingsOptions = {
+    host: 'opencode',
+    home: root,
+    platform: 'linux',
+    env: { HOME: root, XDG_STATE_HOME: join(root, 'state') },
+    readMode: async () => 'local',
+    initializeVaultSettings: async () => {},
+    log: { warn: () => {} },
+    fence: {
+      registration: { status: 'registered' },
+      floor: '2.12.0',
+      liveness: { pidAlive: () => false, incarnation: async () => null },
+      artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
+      readHolders: async () => undefined,
+    },
+  }
+  const paths = await resolveSettingsPaths('opencode', options)
+  const store = await resolveNativePoolPaths(paths.own.account, paths.own.state)
+  await mkdir(dirname(store.config), { recursive: true })
+  await writeFile(
+    store.config,
+    JSON.stringify({ killswitch: { enabled: true }, dump: { enabled: true } }),
+  )
+  const started = await startSettings(options)
+  cleanup.push(() => started.service?.dispose())
+  expect(started).toMatchObject({ mode: 'user-file', file: paths.target })
+  expect(started.fallback).toBeUndefined()
+  expect(started.service?.resolve('opencode')).toMatchObject({
+    killswitch_enabled: true,
+    dump_enabled: true,
+  })
+  await lstat(paths.marker)
+  await lstat(settingsImportRecordPath(paths.target, 'opencode'))
 })
