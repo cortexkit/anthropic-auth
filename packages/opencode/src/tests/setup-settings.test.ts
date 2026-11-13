@@ -314,8 +314,9 @@ lifetimeTest(
   async () => {
     const f = await fixture()
     await f.marker()
-    // Pi's own default store under the same home, never read by OpenCode before.
-    await json(join(f.home, '.pi', 'agent', 'anthropic-auth.json'), {
+    // Pi's own settings store (its account pool) under the same home, never
+    // read by OpenCode before.
+    await json(join(f.home, '.pi', 'agent', 'anthropic-auth-pool.json'), {
       version: 1,
       accounts: [],
       killswitch: { enabled: true, main: { five_hour: 55 } },

@@ -1125,10 +1125,11 @@ for (const pi of ['never ran', 'stricter', 'unreadable'] as const) {
   test(`OC2 recreating a missing settings file when Pi's store is ${pi} ${pi === 'unreadable' ? 'is refused' : 'succeeds'}`, async () => {
     const f = await fixture()
     await core.writeSettingsMoveMarker(f.target, { env: f.env })
-    // Pi's own default store under the same home.
-    const store = core.getDefaultSettingsStorePaths('pi', {
-      env: f.env,
-    }).account
+    // Pi's own settings store (its account pool) under the same home.
+    const store = join(
+      dirname(core.getDefaultSettingsStorePaths('pi', { env: f.env }).account),
+      'anthropic-auth-pool.json',
+    )
     if (pi === 'stricter')
       await put(store, {
         version: 1,

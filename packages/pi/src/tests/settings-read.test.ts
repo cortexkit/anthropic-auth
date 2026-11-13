@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import * as fs from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import {
   __setLogTestSink,
@@ -1437,9 +1437,12 @@ for (const peer of ['never ran', 'stricter'] as const) {
   test(`Pi recreates a missing settings file when OpenCode's store is ${peer}`, async () => {
     await core.writeSettingsMoveMarker(file)
     if (peer === 'stricter') {
-      // OpenCode's own default store under the same home.
-      const store = core.getDefaultSettingsStorePaths('opencode').account
-      await fs.mkdir(join(store, '..'), { recursive: true })
+      // OpenCode's own settings store (its account pool) under the same home.
+      const store = join(
+        dirname(core.getDefaultSettingsStorePaths('opencode').account),
+        'anthropic-auth-pool.json',
+      )
+      await fs.mkdir(dirname(store), { recursive: true })
       await fs.writeFile(
         store,
         JSON.stringify({

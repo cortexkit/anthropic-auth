@@ -766,7 +766,10 @@ for (const peer of [
   test(`setup recreating a missing file with a ${peer} Pi ${peer === 'stricter' ? "keeps Pi's own set" : 'refuses'}`, async () => {
     const f = await fixture('opencode', legacy)
     await writeFile(f.paths.marker, 'marker')
-    const store = f.paths.defaults.pi.account
+    const store = join(
+      dirname(f.paths.defaults.pi.account),
+      'anthropic-auth-pool.json',
+    )
     await mkdir(dirname(store), { recursive: true })
     if (peer === 'stricter')
       await writeFile(
