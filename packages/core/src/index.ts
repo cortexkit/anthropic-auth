@@ -373,6 +373,7 @@ export * from './settings-definition.ts'
 export * from './settings-mode.ts'
 export * from './settings-move-fence.ts'
 export * from './settings-paths.ts'
+export * from './settings-service.ts'
 export * from './settings-three-way.ts'
 export type { SseEvent, SseFramer, SseFramerOptions } from './sse.ts'
 export {

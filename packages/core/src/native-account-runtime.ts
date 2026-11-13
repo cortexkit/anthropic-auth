@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
 import { withLock as acquireLock } from '@cortexkit/common-auth/fs'
 import {
   fingerprintOf,
@@ -119,6 +120,7 @@ import {
   nativeRelocationGuard,
   type RelocationGuard,
 } from './relocation-guard.ts'
+import { getSettingsFilePath } from './settings-paths.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -131,6 +133,8 @@ export type {
 export interface NativeAccountRuntimeOptions {
   paths: NativePoolPaths
   host: 'opencode' | 'pi'
+  /** The resolved user settings target, independent of the account store. */
+  settingsFile?: string
   /** The opencode-anthropic-auth setup command rechecks that hosts are stopped before credential-file writes, so migration cannot change credentials used by a running host. */
   beforePoolWrite?: () => Promise<void>
   local?: Partial<
@@ -305,6 +309,9 @@ export function acquireNativeAccountRuntime(
   options: NativeAccountRuntimeOptions,
 ): NativeAccountRuntime {
   const key = JSON.stringify([
+    resolve(
+      options.settingsFile ?? getSettingsFilePath({ env: options.vault?.env }),
+    ),
     nativeVaultRuntimeKey({
       ...options.vault,
       paths: options.paths,
