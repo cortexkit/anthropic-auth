@@ -691,17 +691,49 @@ test('a later host whose killswitch source was never read inherits the named fil
   expect(await absent(`${f.stores.pi.config}.MOVED_READPLEASE`)).toBe(true)
 })
 
-for (const sources of ['none', 'skipped-peer', 'other-target-note'] as const) {
+test('a peer store with unreadable custody keeps the start in legacy, and a later start moves its protection', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  await put(f.stores.pi.config, { killswitch: { enabled: true } })
+  f.options.readMode = async (host) => {
+    if (host === 'pi') throw new Error('peer custody unreadable')
+    return 'local'
+  }
+  const first = await f.start()
+  expect(first).toMatchObject({ mode: 'legacy', outcome: 'source-unavailable' })
+  expect(await absent(f.paths.target)).toBe(true)
+  expect(await absent(f.paths.marker)).toBe(true)
+  expect(await absent(`${f.stores.opencode.config}.MOVED_READPLEASE`)).toBe(
+    true,
+  )
+  expect(
+    f.messages.filter((message) =>
+      message.includes('Settings move unavailable for pi'),
+    ),
+  ).toHaveLength(1)
+  f.options.readMode = async () => 'local'
+  expect((await f.start()).outcome).toBe('moved')
+  const service = await openSettingsService({ file: f.paths.target })
+  cleanup.push(() => service?.dispose())
+  expect(service!.resolve('pi').killswitch_enabled).toBe(true)
+  expect(service!.resolve('opencode').dump_enabled).toBe(true)
+})
+
+test('a peer with no store is still skipped when its custody is unreadable', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  f.options.readMode = async (host) => {
+    if (host === 'pi') throw new Error('peer custody unreadable')
+    return 'local'
+  }
+  expect((await f.start()).outcome).toBe('moved')
+  expect(await absent(f.paths.marker)).toBe(false)
+})
+
+for (const sources of ['none', 'other-target-note'] as const) {
   test(`marker prevents re-move after deletion with ${sources} and no matching source note`, async () => {
     const f = await fixture()
     const note = `${f.stores.opencode.config}.MOVED_READPLEASE`
-    if (sources === 'skipped-peer') {
-      await put(f.stores.pi.config, { dump: { enabled: true } })
-      f.options.readMode = async (host) => {
-        if (host === 'pi') throw new Error('peer custody unreadable')
-        return 'local'
-      }
-    }
     if (sources === 'other-target-note') {
       await put(f.stores.opencode.config, { dump: { enabled: true } })
       await fs.writeFile(
@@ -713,7 +745,6 @@ for (const sources of ['none', 'skipped-peer', 'other-target-note'] as const) {
     await fs.unlink(f.paths.target)
     await put(f.stores.opencode.config, { dump: { enabled: true } })
     f.options.readMode = async () => 'local'
-    if (sources === 'skipped-peer') f.options.host = 'pi'
     f.reads.length = 0
     expect((await f.start()).outcome).toBe('marker-present')
     expect(await absent(f.paths.target)).toBe(true)

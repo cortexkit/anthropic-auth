@@ -153,7 +153,9 @@ export async function runSettingsMoveAtStartup(
   )({ ...options, paths })
   if (prepared.status !== 'ready') {
     if (prepared.status === 'unavailable')
-      warn(`Settings move unavailable for ${options.host}: ${prepared.reason}.`)
+      warn(
+        `Settings move unavailable for ${prepared.host}: ${prepared.reason}; keeping legacy settings until the next start.`,
+      )
     return result('legacy', 'source-unavailable')
   }
   const move = await (options.dependencies?.move ?? moveSettingsOnce)({

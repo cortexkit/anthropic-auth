@@ -374,7 +374,7 @@ for (const failure of ['mode', 'seed'] as const) {
 }
 
 for (const failure of ['mode', 'unseeded'] as const) {
-  test(`peer ${failure} is skipped and named once without vault initialization`, async () => {
+  test(`peer ${failure} with an existing store prepares no sources, without vault initialization`, async () => {
     const f = await fixture()
     await put(f.defaults.opencode.config, { dump: { enabled: true } })
     await put(f.defaults.pi.config, { dump: { enabled: false } })
@@ -383,15 +383,25 @@ for (const failure of ['mode', 'unseeded'] as const) {
       if (failure === 'mode') throw new Error('unreadable peer authority')
       return 'claustrum'
     }
-    await prepareSettingsMoveSources(f.options)
     const moved = await f.move()
-    expect(moved.document).toEqual({ schema_version: 1, dump_enabled: true })
-    expect(f.messages).toHaveLength(1)
-    expect(f.messages[0]).toContain('pi source')
-    expect(f.reads).toEqual([f.defaults.opencode.config])
+    expect(moved.prepared).toMatchObject({
+      status: 'unavailable',
+      host: 'pi',
+      reason: failure === 'mode' ? 'custody-unreadable' : 'vault-unseeded',
+    })
+    expect(moved.result).toBeUndefined()
+    expect(await absent(moved.paths.target)).toBe(true)
+    expect(f.reads).toEqual([])
     expect(f.seeds()).toBe(0)
     expect(await absent(f.vaults.pi.config)).toBe(true)
     expect(await absent(`${f.defaults.pi.config}.MOVED_READPLEASE`)).toBe(true)
+    // Diagnostics after a move still inspect what they can and skip the peer.
+    const inspected = await prepareSettingsMoveSources({
+      ...f.options,
+      inspectOnly: true,
+    })
+    expect(inspected.status).toBe('ready')
+    expect(inspected.sources.map((source) => source.host)).toEqual(['opencode'])
   })
 }
 
@@ -457,7 +467,7 @@ for (const mode of ['local', 'claustrum'] as const) {
 }
 
 for (const marker of ['preparing', 'unreadable'] as const) {
-  test(`a peer with a ${marker} layout marker is skipped read-only and named once`, async () => {
+  test(`a peer with a ${marker} layout marker prepares no sources and stays read-only`, async () => {
     const f = await fixture('pi')
     await put(f.defaults.opencode.config, { dump: { enabled: true } })
     await put(f.defaults.pi.config, { prime: { enabled: false } })
@@ -483,13 +493,15 @@ for (const marker of ['preparing', 'unreadable'] as const) {
           },
     )
     const before = await fs.readFile(markerPath, 'utf8')
-    await prepareSettingsMoveSources(f.options)
     const moved = await f.move()
-    expect(moved.result?.outcome).toBe('moved')
-    expect(moved.document).toEqual({ schema_version: 1, prime_enabled: false })
-    expect(f.reads).toEqual([f.defaults.pi.config])
-    expect(f.messages).toHaveLength(1)
-    expect(f.messages[0]).toContain('opencode source')
+    expect(moved.prepared).toMatchObject({
+      status: 'unavailable',
+      host: 'opencode',
+      reason: 'paths-unreadable',
+    })
+    expect(moved.result).toBeUndefined()
+    expect(await absent(moved.paths.target)).toBe(true)
+    expect(f.reads).toEqual([])
     expect(await fs.readFile(markerPath, 'utf8')).toBe(before)
     expect(await absent(`${f.defaults.opencode.config}.MOVED_READPLEASE`)).toBe(
       true,

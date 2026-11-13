@@ -47,11 +47,45 @@ export type SettingsMoveSourcesResult =
       status: 'unavailable'
       sources: []
       host: SettingsHost
-      reason: 'custody-unreadable' | 'seeding-failed' | 'paths-unreadable'
+      reason:
+        | 'custody-unreadable'
+        | 'seeding-failed'
+        | 'paths-unreadable'
+        | 'vault-unseeded'
       cause: unknown
     }
 
 const loggedSkips = new Set<string>()
+
+/**
+ * True only when neither the peer's default pool config nor its vault config
+ * exists, so skipping it loses nothing. An unreadable layout or file is not
+ * absence.
+ */
+async function peerStoreAbsent(
+  host: SettingsHost,
+  store: { account: string; state: string },
+  options: SettingsPathOptions,
+): Promise<boolean> {
+  try {
+    const pool = await resolveNativePoolPaths(
+      store.account,
+      store.state,
+      await peerLayout(host, options),
+    )
+    for (const config of [pool.config, nativeVaultPaths(pool).config]) {
+      try {
+        await lstat(config)
+        return false
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false
+      }
+    }
+    return true
+  } catch {
+    return false
+  }
+}
 
 /** Observe a peer's layout without moving files or registering a process for that host. */
 async function peerLayout(
@@ -200,6 +234,21 @@ export async function prepareSettingsMoveSources(
     }
   }
   const sources: MoveSource[] = []
+  // A default-target move must carry both hosts' settings. When an existing
+  // peer store can't be read safely, preparation returns unavailable: the
+  // start publishes nothing and the peer's settings move at a later start
+  // instead of being lost. Inspection for diagnostics keeps skipping it.
+  const peerUnavailable = (
+    host: SettingsHost,
+    reason: Extract<
+      SettingsMoveSourcesResult,
+      { status: 'unavailable' }
+    >['reason'],
+    cause: unknown,
+  ): SettingsMoveSourcesResult | undefined =>
+    options.inspectOnly
+      ? undefined
+      : { status: 'unavailable', sources: [], host, reason, cause }
   // common-auth uses source order to choose the default for host disagreements.
   for (const host of ['opencode', 'pi'] as const) {
     const own = host === options.host
@@ -208,7 +257,11 @@ export async function prepareSettingsMoveSources(
     let mode: 'local' | 'claustrum'
     try {
       mode = own ? ownMode : await readMode(host, env)
-    } catch {
+    } catch (cause) {
+      if (!(await peerStoreAbsent(host, store, options))) {
+        const refused = peerUnavailable(host, 'custody-unreadable', cause)
+        if (refused) return refused
+      }
       skip(host, store.account, 'custody mode is unreadable')
       continue
     }
@@ -235,7 +288,11 @@ export async function prepareSettingsMoveSources(
               ? 'vault settings have not been seeded'
               : 'file is missing',
           )
-          if (!own && mode === 'claustrum') continue
+          if (!own && mode === 'claustrum') {
+            const refused = peerUnavailable(host, 'vault-unseeded', error)
+            if (refused) return refused
+            continue
+          }
         }
       }
       sources.push(
@@ -256,6 +313,8 @@ export async function prepareSettingsMoveSources(
           cause,
         }
       // A peer layout that is not safely observable cannot name writer locks.
+      const refused = peerUnavailable(host, 'paths-unreadable', cause)
+      if (refused) return refused
       skip(host, store.account, 'store paths or state layout are unreadable')
     }
   }
