@@ -31,7 +31,13 @@ import { createPiNativeCommands } from '../native-commands.ts'
 import { getPiConfigDir } from '../paths.ts'
 import type { PiSettingsOptions } from '../settings.ts'
 import { __sendPiAnthropicRequestForTest } from '../stream.ts'
+import releaseSnapshots from './fixtures/settings-2.11.2.json'
 import { saveNativePiFixture } from './native-fixture.ts'
+import {
+  snapshotReaderOutputs,
+  snapshotSettings,
+} from './settings-snapshot-fixture.ts'
+import { observeSettings } from './settings-snapshot-observe.ts'
 
 let home: string
 let storagePath: string
@@ -818,10 +824,13 @@ for (const variable of [
       target,
       '{"schema_version":1,"routing_mode":"main-first"}',
     )
+    const userBefore = await fs.readFile(target, 'utf8')
     const readFile = spyOn(fs, 'readFile')
     try {
       const native = runtime()
       const service = await native.service()
+      const paths = await resolveNativePoolPaths(storagePath)
+      expect(await service.getSettingsPath()).toBe(paths.config)
       const storage = (await native.requestView()).policyStorage
       expect(storage.routing?.mode).toBe('sticky-balanced')
       expect(storage.quota?.enabled).toBeUndefined()
@@ -837,11 +846,103 @@ for (const variable of [
       ).toEqual([])
       expect(watches).toBe(0)
       expect(settingsReads).toBe(0)
+      expect(await fs.exists(`${target}.moved`)).toBe(false)
     } finally {
       readFile.mockRestore()
     }
+    expect(await fs.readFile(target, 'utf8')).toBe(userBefore)
+    const paths = await resolveNativePoolPaths(storagePath)
+    expect(JSON.parse(await fs.readFile(paths.config, 'utf8')).dump).toEqual({
+      enabled: true,
+    })
   })
 }
+
+test('an OpenCode store override does not make Pi separate', async () => {
+  delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+  process.env.OPENCODE_ANTHROPIC_AUTH_FILE = join(
+    home,
+    'other-install',
+    'anthropic-auth.json',
+  )
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      prime: { enabled: false },
+      routing: { mode: 'fallback-first' },
+    },
+    storagePath,
+  )
+  file = getSettingsFilePath({ env: process.env, home })
+  const native = runtime()
+  const service = await native.service()
+  expect(await service.getSettingsPath()).toBe(file)
+  expect(await fs.exists(`${file}.moved`)).toBe(true)
+  expect(core.getRoutingMode((await native.requestView()).policyStorage)).toBe(
+    'fallback-first',
+  )
+})
+
+for (const overridden of [false, true])
+  test(`absolute shared target moves Pi's resolved stores with Pi override ${overridden}`, async () => {
+    const defaultPaths = await resolveNativePoolPaths(storagePath)
+    const defaults = core.createNativePoolStore({
+      paths: defaultPaths,
+      quota: nativeQuotaCodec,
+    })
+    await defaults.updateSettings((stored) => ({
+      ...stored,
+      routing: { mode: 'main-first' },
+    }))
+    await defaults.close()
+    if (overridden)
+      storagePath = join(home, 'private-agent', 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        accounts: [],
+        prime: { enabled: false },
+        routing: { mode: 'fallback-first' },
+      },
+      storagePath,
+    )
+    const own = await resolveNativePoolPaths(storagePath)
+    const sourceBytes = await fs.readFile(own.config, 'utf8')
+    const peerAccount = join(home, '.config', 'opencode', 'anthropic-auth.json')
+    const peerPaths = await resolveNativePoolPaths(
+      peerAccount,
+      join(home, '.config', 'opencode', 'anthropic-auth-state.json'),
+    )
+    const peer = core.createNativePoolStore({
+      paths: peerPaths,
+      quota: nativeQuotaCodec,
+    })
+    await peer.initialize()
+    await peer.updateSettings(() => ({ routing: { mode: 'sticky-balanced' } }))
+    await peer.close()
+    const readFile = spyOn(fs, 'readFile')
+    try {
+      const native = runtime()
+      const service = await native.service()
+      expect(await service.getSettingsPath()).toBe(file)
+      expect(
+        core.getRoutingMode((await native.requestView()).policyStorage),
+      ).toBe('fallback-first')
+      expect(await fs.exists(`${file}.moved`)).toBe(true)
+      const reads = readFile.mock.calls.map(([path]) => String(path))
+      expect(reads).not.toContain(peerAccount)
+      expect(reads).not.toContain(peerPaths.config)
+      expect(reads).not.toContain(nativeVaultPaths(peerPaths).config)
+      if (overridden) expect(reads).not.toContain(defaultPaths.config)
+    } finally {
+      readFile.mockRestore()
+    }
+    expect(await fs.readFile(own.config, 'utf8')).toBe(sourceBytes)
+    expect(await fs.exists(`${own.config}.MOVED_READPLEASE`)).toBe(true)
+    expect(await fs.exists(`${peerPaths.config}.MOVED_READPLEASE`)).toBe(false)
+  })
 
 test('every claude action rechecks a peer marker without a request-path authority read', async () => {
   const options = settingsOptions()
@@ -957,6 +1058,84 @@ async function seedVaultSettings(
   await store.updateSettings(() => nativeAccountSettings(stored))
   await store.close()
 }
+
+for (const mode of ['local', 'claustrum'] as const)
+  for (const peer of ['absent', 'same'] as const)
+    for (const fixture of ['explicit', 'absent'] as const)
+      test(`2.11.2 byte snapshots: ${mode}, OpenCode ${peer}, three-way ${fixture}`, async () => {
+        delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+        file = getSettingsFilePath({ env: process.env, home })
+        const stored = snapshotSettings(fixture === 'absent')
+        await saveNativePiFixture(stored, storagePath)
+        const paths = await resolveNativePoolPaths(storagePath)
+        const store = core.createNativePoolStore({
+          paths,
+          quota: nativeQuotaCodec,
+        })
+        await store.updateSettings(() => nativeAccountSettings(stored))
+        await store.close()
+        if (mode === 'claustrum') await seedVaultSettings(paths, stored)
+        if (peer === 'same') {
+          const peerPaths = await resolveNativePoolPaths(
+            join(home, '.config', 'opencode', 'anthropic-auth.json'),
+            join(home, '.config', 'opencode', 'anthropic-auth-state.json'),
+          )
+          const other = core.createNativePoolStore({
+            paths: peerPaths,
+            quota: nativeQuotaCodec,
+          })
+          await other.initialize()
+          await other.updateSettings(() => nativeAccountSettings(stored))
+          await other.close()
+        }
+        const selected = mode === 'claustrum' ? nativeVaultPaths(paths) : paths
+        const sourceBytes = await fs.readFile(selected.config, 'utf8')
+        const legacy = core.createNativeAccountRuntime({ paths, host: 'pi' })
+        const before = (await legacy.read()).policyStorage
+        await legacy.close()
+        expect(Object.keys(snapshotReaderOutputs(before)).sort()).toEqual(
+          Object.keys(core.SETTINGS_DEFAULT_READERS).sort(),
+        )
+        expect(
+          [
+            ...core.SETTINGS_THREE_WAY_READERS.claude_cache_enabled,
+            ...core.SETTINGS_THREE_WAY_READERS.quota_enabled,
+          ]
+            .filter(({ path }) => path.startsWith('packages/pi/'))
+            .map(({ reader }) => String(reader))
+            .sort(),
+        ).toEqual(
+          [
+            'sendAnthropicRequest (via isCache1hPersistentlyEnabled)',
+            'createPiNativeCommands status cache (via isCache1hPersistentlyEnabled)',
+            'requestPolicy (via quotaSnapshotPassesPolicy)',
+            'getPiRoutingServices getUsableFallbackAccounts (via quotaSnapshotPassesPolicy)',
+          ].sort(),
+        )
+        const settings = settingsOptions()
+        settings.startup = {
+          readMode: async (host) => (host === 'pi' ? mode : 'local'),
+        }
+        const native = runtime(settings)
+        const after = (await native.view()).policyStorage
+        expect(await (await native.service()).getSettingsPath()).toBe(file)
+        expect(await fs.exists(`${file}.moved`)).toBe(true)
+        expect(await fs.readFile(selected.config, 'utf8')).toBe(sourceBytes)
+        const expected = JSON.stringify(releaseSnapshots[fixture])
+        for (const [phase, storage] of [
+          ['before', before],
+          ['after', after],
+        ] as const) {
+          const observed = await observeSettings(
+            storage,
+            join(home, `observe-${phase}`, 'anthropic-auth.json'),
+          )
+          expect(JSON.stringify(observed), phase).toBe(expected)
+          expect(observed.sends).toHaveLength(1)
+          expect(observed.logs.length).toBeGreaterThan(0)
+          expect(observed.tracks).toHaveLength(1)
+        }
+      })
 
 function readerOutputs(storage: core.AccountStorage) {
   const main = core.getKillswitchThresholdsForAccount(storage)
