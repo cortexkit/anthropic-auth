@@ -11,7 +11,11 @@ import {
 } from '@cortexkit/common-auth/settings'
 import { type ParseError, parse } from 'jsonc-parser'
 
-import { parseClaudeGateway } from './gateway.ts'
+import {
+  gatewaySettingsFile,
+  isGatewaySettingsFile,
+  parseClaudeGateway,
+} from './gateway.ts'
 import { logger } from './logger.ts'
 import {
   CLAUDE_MODEL_CAPABILITIES,
@@ -138,6 +142,11 @@ export interface SettingsFileStatus {
   readonly invalidKeys: readonly string[]
   readonly ignoredModelKeys: readonly { setting: SettingsKey; model: string }[]
   readonly duplicateKeys: readonly string[]
+  /**
+   * Set when the file names a gateway but is not the default settings file of
+   * the operating system account, so the gateway is not used.
+   */
+  readonly gatewayIgnored?: 'not-default-location'
 }
 
 export interface SettingsGeneration {
@@ -152,6 +161,8 @@ export interface SettingsGeneration {
   readonly contexts: Readonly<Record<SettingsHost, SettingsContextValues>>
   readonly report: readonly ReportEntry[]
   readonly fileStatus: SettingsFileStatus
+  /** See SettingsFileStatus.gatewayIgnored. */
+  readonly gatewayIgnored?: 'not-default-location'
   /** Recover an unusable set as a whole from last-good values or startup recovery, never per key. */
   readonly protection: Readonly<
     Record<
@@ -226,6 +237,8 @@ export interface SettingsServiceOptions {
     writeAppliedCopy?: typeof writeSettingsProtectionCopy
     /** Schedule an off-request re-read; return a cancellation function. */
     schedule?: (callback: () => void, delayMs: number) => () => void
+    /** Test seam: the file the gateway is honoured from (gatewaySettingsFile). */
+    gatewaySettingsFile?: () => string | undefined
   }
 }
 
@@ -643,6 +656,9 @@ function fileStatus(candidate: Candidate): SettingsFileStatus {
     duplicateKeys: candidate.report
       .filter((entry) => entry.reason === 'duplicate-key')
       .map((entry) => entry.keyPath.join('.')),
+    ...(candidate.gatewayIgnored
+      ? { gatewayIgnored: candidate.gatewayIgnored }
+      : {}),
   }
 }
 
@@ -883,6 +899,22 @@ class SharedSettingsService {
     const gatewayInvalid = report.some((entry) =>
       isGatewayKey(entry.keyPath[0]),
     )
+    // A gateway is honoured only from the operating system account's default
+    // settings file, never from one an environment variable chose.
+    const gatewayIgnored =
+      !gatewayInvalid &&
+      hosts.some((host) => contexts[host].noModel.gateway_url !== '') &&
+      !(await this.atGatewaySettingsFile())
+    if (gatewayIgnored) {
+      const identity = `gateway-location:${this.file}`
+      if (!logged.has(identity)) {
+        logged.add(identity)
+        logger.warn(
+          'settings',
+          `Settings file "${this.file}" is not in its default location; the Claude gateway it names is ignored, and Claude OAuth model requests go directly to https://api.anthropic.com.`,
+        )
+      }
+    }
     for (const host of hosts) {
       const previous = this.current?.contexts[host]
       for (const [model, values] of [
@@ -919,7 +951,7 @@ class SharedSettingsService {
             continue
           if (lastGood) values[key] = lastGood[key] as never
         }
-        if (gatewayInvalid) {
+        if (gatewayInvalid || gatewayIgnored) {
           values.gateway_url = ''
           values.gateway_headers = {}
         }
@@ -1008,8 +1040,21 @@ class SharedSettingsService {
         contexts,
         report,
         protection: sets,
+        ...(gatewayIgnored
+          ? { gatewayIgnored: 'not-default-location' as const }
+          : {}),
       },
     }
+  }
+
+  private gatewayLocation: Promise<boolean> | undefined
+  /** Whether this file is the gateway settings file; checked once per service. */
+  private atGatewaySettingsFile(): Promise<boolean> {
+    this.gatewayLocation ??= isGatewaySettingsFile(
+      this.file,
+      (this.options.dependencies?.gatewaySettingsFile ?? gatewaySettingsFile)(),
+    )
+    return this.gatewayLocation
   }
 
   private fallback(

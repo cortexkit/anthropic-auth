@@ -146,6 +146,8 @@ async function fixture(
                   return fs.readFile(path)
                 },
                 writeAppliedCopy: async () => {},
+                // Stands in for the OS account's default settings file.
+                gatewaySettingsFile: () => target,
                 open: (options) => {
                   const handle = openSettings<
                     typeof core.settingsDefinition.settings

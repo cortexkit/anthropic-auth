@@ -1,12 +1,22 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
+import { tmpdir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import { dumpDirectRequest, resetDumpState, setDumpEnabled } from '../dump.ts'
 import {
   type ClaudeGateway,
   claudeGatewayModelUrl,
+  gatewaySettingsFile,
+  isGatewaySettingsFile,
   parseClaudeGateway,
   rememberClaudeGatewaySecrets,
 } from '../gateway.ts'
@@ -250,7 +260,14 @@ test('the model fetch never sends sign-in, refresh, usage or profile requests to
   expect(seen).toHaveLength(4)
 })
 
-async function settingsFixture(values: Record<string, unknown>) {
+async function settingsFixture(
+  values: Record<string, unknown>,
+  // The OS account's default settings file; tests use a temporary file.
+  defaultFile: (root: string, file: string) => string | undefined = (
+    _root,
+    file,
+  ) => file,
+) {
   const root = await mkdtemp(join(tmpdir(), 'gateway-settings-'))
   cleanup.push(() => rm(root, { recursive: true, force: true }))
   const file = join(root, 'settings.jsonc')
@@ -258,6 +275,7 @@ async function settingsFixture(values: Record<string, unknown>) {
   const service = await openSettingsService({
     file,
     dependencies: {
+      gatewaySettingsFile: () => defaultFile(root, file),
       open: (options) => {
         const handle = openSettings(settingsDefinition, options)
         return { ...handle, watch: () => () => {} }
@@ -510,4 +528,70 @@ test('request dumps redact configured gateway header values', async () => {
   expect(text).toContain('visible')
   for (const name of files)
     expect(await readFile(join(directory, name), 'utf8')).not.toContain(SECRET)
+})
+
+test('the gateway settings file comes from the OS account, never from the environment', () => {
+  const saved = { ...process.env }
+  try {
+    process.env.HOME = '/tmp/elsewhere-home'
+    process.env.XDG_CONFIG_HOME = '/tmp/elsewhere-config'
+    process.env.APPDATA = '/tmp/elsewhere-appdata'
+    process.env.USERPROFILE = '/tmp/elsewhere-profile'
+    process.env.ANTHROPIC_AUTH_SETTINGS_FILE = '/tmp/elsewhere/settings.jsonc'
+    const home = userInfo().homedir
+    expect(gatewaySettingsFile()).toBe(
+      process.platform === 'win32'
+        ? join(home, 'AppData', 'Roaming', 'cortexkit', 'anthropic-auth.jsonc')
+        : join(home, '.config', 'cortexkit', 'anthropic-auth.jsonc'),
+    )
+  } finally {
+    for (const key of Object.keys(process.env))
+      if (!(key in saved)) delete process.env[key]
+    Object.assign(process.env, saved)
+  }
+})
+
+test('a settings file outside its default location names a gateway that is ignored, with one warning and a Status note', async () => {
+  const logs = captureLogs()
+  const f = await settingsFixture(
+    {
+      gateway_url: 'https://gateway.example.test',
+      gateway_headers: { 'x-gateway-key': SECRET },
+    },
+    (root) => join(root, 'default', 'anthropic-auth.jsonc'),
+  )
+  for (const host of ['opencode', 'pi'] as const) {
+    const reader = f.reader(host)
+    expect(reader.gateway()).toBeUndefined()
+    const status = reader.status()
+    expect(status?.file.gatewayIgnored).toBe('not-default-location')
+    expect(status?.values.gateway).toBeNull()
+    expect(status?.file.invalidKeys).toEqual([])
+  }
+  await f.service.refresh()
+  expect(
+    logs.filter(
+      (record) =>
+        record.level === 'warn' &&
+        record.message.includes('not in its default location'),
+    ),
+  ).toHaveLength(1)
+  expect(JSON.stringify(logs)).not.toContain(SECRET)
+})
+
+test('the default location is compared as a real path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-location-'))
+  cleanup.push(() => rm(root, { recursive: true, force: true }))
+  const file = join(root, 'real', 'anthropic-auth.jsonc')
+  const link = join(root, 'linked', 'anthropic-auth.jsonc')
+  await mkdir(join(root, 'real'))
+  await mkdir(join(root, 'linked'))
+  await writeFile(file, '{}')
+  await symlink(file, link)
+  expect(await isGatewaySettingsFile(file, link)).toBe(true)
+  expect(await isGatewaySettingsFile(link, file)).toBe(true)
+  expect(await isGatewaySettingsFile(join(root, 'other.jsonc'), link)).toBe(
+    false,
+  )
+  expect(await isGatewaySettingsFile(file, undefined)).toBe(false)
 })
