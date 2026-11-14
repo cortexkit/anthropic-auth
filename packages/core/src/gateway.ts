@@ -1,3 +1,6 @@
+import { realpath } from 'node:fs/promises'
+import { userInfo } from 'node:os'
+import { isAbsolute, join, resolve } from 'node:path'
 import { customHeadersFromEntries } from './custom-headers.ts'
 import { logger } from './logger.ts'
 
@@ -222,4 +225,39 @@ export function warnClaudeGatewayRelayIgnored(gateway: ClaudeGateway): void {
     'gateway',
     'a relay is configured, but Claude OAuth model requests use the gateway from the settings file; the relay is not used for them',
   )
+}
+
+/**
+ * The settings file the gateway is honoured from: the default location under
+ * the operating system account's own home directory, as the OS reports it.
+ * Environment variables (HOME, USERPROFILE, APPDATA, XDG_CONFIG_HOME,
+ * ANTHROPIC_AUTH_SETTINGS_FILE) never choose it, so an environment a project
+ * can influence cannot point the gateway at another file. Undefined when the
+ * OS reports no usable home directory.
+ */
+export function gatewaySettingsFile(): string | undefined {
+  let home: string
+  try {
+    home = userInfo().homedir
+  } catch {
+    return undefined
+  }
+  if (!home || !isAbsolute(home)) return undefined
+  return process.platform === 'win32'
+    ? join(home, 'AppData', 'Roaming', 'cortexkit', 'anthropic-auth.jsonc')
+    : join(home, '.config', 'cortexkit', 'anthropic-auth.jsonc')
+}
+
+async function canonical(path: string): Promise<string> {
+  const real = await realpath(path).catch(() => resolve(path))
+  return process.platform === 'win32' ? real.toLowerCase() : real
+}
+
+/** True when `file` is the gateway settings file, compared as real paths. */
+export async function isGatewaySettingsFile(
+  file: string,
+  expected: string | undefined = gatewaySettingsFile(),
+): Promise<boolean> {
+  if (!expected) return false
+  return (await canonical(file)) === (await canonical(expected))
 }

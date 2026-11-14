@@ -181,6 +181,17 @@ Apart from the URL and the added headers, each request is the one the plugin
 would send to Anthropic: same identity, billing header, signing, betas and
 cache markers.
 
+The gateway is honoured only from the settings file at its default location
+for your operating system account: `~/.config/cortexkit/anthropic-auth.jsonc`
+on Linux and macOS, `%USERPROFILE%\AppData\Roaming\cortexkit\anthropic-auth.jsonc`
+on Windows, where the home or profile directory is the one the operating
+system reports for your account. `HOME`, `USERPROFILE`, `APPDATA`,
+`XDG_CONFIG_HOME` and `ANTHROPIC_AUTH_SETTINGS_FILE` never decide it; the paths
+are compared after resolving links. If the settings file in use is anywhere
+else, a gateway it names is ignored, one warning is logged, and Status says
+"Gateway ignored: settings file is not in its default location". Other
+settings in that file still apply.
+
 These settings are read only from your own user settings file. A project file,
 a provider `baseURL`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS` can
 never set or change the gateway, and the `/claude` menu never writes it. A

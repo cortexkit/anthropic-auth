@@ -95,6 +95,8 @@ function settingsOptions(): PiSettingsOptions {
     service: {
       dependencies: {
         writeAppliedCopy: async () => {},
+        // Stands in for the OS account's default settings file.
+        gatewaySettingsFile: () => file,
         readFile: async (path) => {
           settingsReads++
           return fs.readFile(path)

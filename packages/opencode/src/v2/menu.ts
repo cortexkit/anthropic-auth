@@ -143,6 +143,9 @@ export function createNativeMenuCapabilities(options: {
         ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
+      ...(file.gatewayIgnored
+        ? ['Gateway ignored: settings file is not in its default location']
+        : []),
       'Settings (no model):',
       ...Object.entries(status.values).map(
         ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,
