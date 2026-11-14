@@ -321,7 +321,7 @@ async function posixAccountHome(
     if (dsclAttribute(record, 'UniqueID') !== String(uid)) return undefined
     return dsclAttribute(record, 'NFSHomeDirectory')
   }
-  // getent also covers accounts from NSS sources such as LDAP; a system
+  // getent also covers accounts from directory services such as LDAP; a system
   // without it still has the local passwd file.
   const entry = await run('/usr/bin/getent', ['passwd', String(uid)], env)
     .then((text) => passwdHome(text, uid))

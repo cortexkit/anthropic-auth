@@ -132,10 +132,10 @@ export function createAnthropicOAuthFetch(
       signal?.throwIfAborted()
       requireAnthropicOAuthOrigin(fetchInputUrl(input), current())
       const sentAt = performance.now()
-      // Bun's `tls` option can turn certificate checks off (OpenCode 1 once
-      // did so when ANTHROPIC_INSECURE was set), and the environment can come
-      // from a repository's `.env`. An OAuth send always uses the default
-      // checks, so an on-path attacker cannot take the token.
+      // Bun's `tls` option can turn certificate checks off, and a caller may
+      // build it from the environment, which can come from a repository's
+      // `.env`. An OAuth send always uses the default checks, so an on-path
+      // attacker cannot take the token.
       const { tls: _tls, ...checked } = (init ?? {}) as RequestInit & {
         tls?: unknown
       }
