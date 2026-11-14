@@ -4,9 +4,14 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- You can send Claude subscription (sign-in) model requests through your own gateway by setting `gateway_url` and `gateway_headers` in your user settings file at its default location. Sign-in, refresh and usage still go only to Anthropic, and a project file, provider `baseURL` or environment variable still cannot redirect your token. A local `http:` gateway is refused while `HTTP_PROXY` is set, unless `NO_PROXY` lists its host, so a proxy never sees your token in plain text. See [Custom gateway](docs/settings-file.md#custom-gateway). Addresses #692.
+- You can send Claude subscription (sign-in) model requests through your own gateway by setting `gateway_url` and `gateway_headers` in your user settings file at its default location. Sign-in, refresh and usage still go only to Anthropic, and a project file, provider `baseURL` or environment variable still cannot redirect your token. A local `http:` gateway is refused while `HTTP_PROXY` is set, unless each of `NO_PROXY` and `no_proxy` that is set lists its host, so a proxy never sees your token in plain text. See [Custom gateway](docs/settings-file.md#custom-gateway). Addresses #692.
 - `ANTHROPIC_INSECURE` no longer turns off TLS checks on Claude sign-in requests; it still applies to API-key requests with `ANTHROPIC_BASE_URL`.
 - Requests to an HTTP relay, and the relay's own requests to Anthropic, no longer follow redirects.
+- A relay is now used only when the account settings are in their default place; a relay named by settings moved with an environment variable is ignored. Requests then go directly to Anthropic, `/claude` Status says why, and `relay setup` refuses. See [Where the relay is read from](docs/transports.md#where-the-relay-is-read-from).
+- A plain `http://` or `ws://` relay is no longer used while `HTTP_PROXY` or `http_proxy` is set, unless each of `NO_PROXY` and `no_proxy` that is set lists its host, so a proxy never sees your sign-in in plain text. This is checked again right before every send to the relay, retries included. Requests go directly to Anthropic when `relay.fallbackToDirect` allows it and fail otherwise. See [Plain-text relays and proxy settings](docs/transports.md#plain-text-relays-and-proxy-settings).
+- A `ws://` relay is now reached over `ws://` instead of `wss://`.
+- A changed relay URL or secret now applies to the next WebSocket relay request of an ongoing conversation.
+- OpenCode 2's `/claude` settings status shows the settings file path again instead of `[object Promise]`.
 
 ## 2.12.0
 

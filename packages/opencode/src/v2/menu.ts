@@ -123,10 +123,14 @@ export function createNativeMenuCapabilities(options: {
     result.outcome === 'refused' || result.outcome === 'failed'
       ? { ok: false, text: result.reason }
       : done()
-  const settingsStatus = (summary: string) => {
+  const settingsStatus = async (summary: string) => {
     const status = runtime.getSettingsStatus?.()
     if (!status)
-      return `${summary}\nSettings file: ${runtime.getSettingsPath()}`
+      return [
+        summary,
+        `Settings file: ${await runtime.getSettingsPath()}`,
+        ...(runtime.getRelayStatusNotes?.() ?? []),
+      ].join('\n')
     const { file } = status
     return [
       summary,
@@ -145,6 +149,7 @@ export function createNativeMenuCapabilities(options: {
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
       ...claudeGatewayStatusNotes(file.gatewayIgnored, status.values.gateway),
+      ...(runtime.getRelayStatusNotes?.() ?? []),
       'Settings (no model):',
       ...Object.entries(status.values).map(
         ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,

@@ -257,8 +257,18 @@ export const CLAUDE_GATEWAY_PROXY_REFUSAL =
  * `no_proxy`, when non-empty, is used in place of `NO_PROXY`; it is a comma
  * list whose entries are trimmed, and `*`, the exact host (`[::1]` for IPv6,
  * any letter case) and `host:port` with the URL's own explicit port exempt the
- * host. Bun also exempts some host suffixes; those are not accepted here, so
- * this check can only refuse more than Bun would proxy, never less.
+ * host. Bun also exempts some host suffixes.
+ *
+ * Pi's host may run on Node instead. Measured on Node 26.10: fetch ignores
+ * every proxy variable unless `NODE_USE_ENV_PROXY=1` is set at start. With it,
+ * `HTTP_PROXY` and `http_proxy` apply to http URLs, and a set `no_proxy` is
+ * used in place of `NO_PROXY` even when it is empty: `no_proxy=` beside
+ * `NO_PROXY=*` still sends through the proxy, where Bun would not.
+ *
+ * The two runtimes disagree, so the host counts as exempt only when every
+ * set `no_proxy` and `NO_PROXY` exempts it, and a set but empty one exempts
+ * nothing. Suffix entries are never accepted. This check can therefore only
+ * refuse more than either runtime would proxy, never less.
  */
 export function claudeGatewayProxyApplies(
   origin: string,
@@ -272,16 +282,18 @@ export function claudeGatewayProxyApplies(
   }
   if (url.protocol !== 'http:') return false
   if (!env.HTTP_PROXY && !env.http_proxy) return false
-  const list = env.no_proxy ? env.no_proxy : (env.NO_PROXY ?? '')
   const host = url.hostname.toLowerCase()
   // `host:port` was measured only with a port written in the URL.
   const withPort = url.port ? `${host}:${url.port}` : undefined
-  for (const raw of list.split(',')) {
-    const entry = raw.trim().toLowerCase()
-    if (!entry) continue
-    if (entry === '*' || entry === host || entry === withPort) return false
-  }
-  return true
+  const exempts = (list: string) =>
+    list.split(',').some((raw) => {
+      const entry = raw.trim().toLowerCase()
+      return entry === '*' || entry === host || entry === withPort
+    })
+  const lists = [env.no_proxy, env.NO_PROXY].filter(
+    (list): list is string => list !== undefined,
+  )
+  return lists.length === 0 || !lists.every(exempts)
 }
 
 const warnedProxyRefused = new Set<string>()
@@ -452,6 +464,159 @@ export async function lookupGatewaySettingsFile(
   } catch {
     return undefined
   }
+}
+
+// Windows records every local profile's folder under the account's security
+// identifier (SID) here. It is present in every kind of session, including
+// SSH, scheduled tasks and services.
+const WINDOWS_PROFILE_LIST =
+  'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList'
+// Windows writes the signed-in user's profile folder here at an interactive
+// sign-in. It is the registry's copy, not the process environment's
+// USERPROFILE, but sessions without an interactive sign-in may lack it.
+const WINDOWS_VOLATILE_ENVIRONMENT = 'HKCU\\Volatile Environment'
+
+/**
+ * One registry string value from `reg.exe query` output. A value holding `%`
+ * would need environment expansion, which this lookup never does, so it is
+ * not accepted.
+ */
+function registryPath(output: string, name: string): string | undefined {
+  const value = new RegExp(
+    `^\\s*${name}\\s+REG_(?:EXPAND_)?SZ\\s+(.+?)\\s*$`,
+    'im',
+  ).exec(output)?.[1]
+  return value && !value.includes('%') ? value : undefined
+}
+
+/** The process account's SID, from whoami, which reads the process token. */
+async function windowsAccountSid(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
+  const output = await dependencies.run(
+    win32.join(WINDOWS_ROOT, 'System32', 'whoami.exe'),
+    ['/user', '/fo', 'csv', '/nh'],
+    { SystemRoot: WINDOWS_ROOT },
+  )
+  // CSV: "<domain>\<name>","<SID>". Only a well-formed SID is accepted, as it
+  // becomes part of a registry key name.
+  return /"(S-1-\d+(?:-\d+)+)"\s*$/m.exec(output)?.[1]
+}
+
+async function windowsProfile(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
+  const reg = win32.join(WINDOWS_ROOT, 'System32', 'reg.exe')
+  const env = { SystemRoot: WINDOWS_ROOT }
+  const fromProfileList = await windowsAccountSid(dependencies)
+    .then(async (sid) =>
+      sid
+        ? registryPath(
+            await dependencies.run(
+              reg,
+              [
+                'query',
+                `${WINDOWS_PROFILE_LIST}\\${sid}`,
+                '/v',
+                'ProfileImagePath',
+              ],
+              env,
+            ),
+            'ProfileImagePath',
+          )
+        : undefined,
+    )
+    .catch(() => undefined)
+  if (fromProfileList) return fromProfileList
+  return registryPath(
+    await dependencies.run(
+      reg,
+      ['query', WINDOWS_VOLATILE_ENVIRONMENT, '/v', 'USERPROFILE'],
+      env,
+    ),
+    'USERPROFILE',
+  )
+}
+
+/**
+ * Looks up the operating system account's home folder without reading the
+ * environment, the same way as lookupGatewaySettingsFile: on POSIX from the
+ * account database for the process's user id, on Windows the profile folder
+ * the registry records for the process account's SID (the folder
+ * `%USERPROFILE%` normally names), or else the signed-in user's volatile
+ * environment key. Undefined when the lookup fails.
+ */
+export async function lookupAccountHome(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
+  try {
+    if (dependencies.platform === 'win32') {
+      const profile = await windowsProfile(dependencies)
+      return profile && win32.isAbsolute(profile) ? profile : undefined
+    }
+    const home = await posixAccountHome(dependencies)
+    return home && posix.isAbsolute(home) ? home : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** How long a failed account-home lookup is trusted before it is retried. */
+export const ACCOUNT_HOME_RETRY_MS = 60_000
+
+/**
+ * Caches an account-home lookup: a found home for the life of the process,
+ * a failure only for `retryMs`. The first lookup is awaited by whoever asks
+ * first. After a failure, callers get undefined at once and a retry starts
+ * in the background once `retryMs` has passed, so a slow or failing lookup
+ * never holds a request.
+ */
+export function createAccountHomeCache(
+  lookup: () => Promise<string | undefined>,
+  options: { now?: () => number; retryMs?: number } = {},
+): () => Promise<string | undefined> {
+  const now = options.now ?? Date.now
+  const retryMs = options.retryMs ?? ACCOUNT_HOME_RETRY_MS
+  let found: Promise<string> | undefined
+  let pending: Promise<string | undefined> | undefined
+  let failedAt: number | undefined
+  const start = () => {
+    const attempt = lookup()
+      .catch(() => undefined)
+      .then((home) => {
+        if (pending === attempt) pending = undefined
+        if (home === undefined) failedAt = now()
+        else found = Promise.resolve(home)
+        return home
+      })
+    pending = attempt
+    return attempt
+  }
+  return () => {
+    if (found) return found
+    if (failedAt === undefined) return pending ?? start()
+    if (!pending && now() - failedAt >= retryMs) void start()
+    return Promise.resolve(undefined)
+  }
+}
+
+const cachedAccountHome = createAccountHomeCache(() =>
+  lookupAccountHome({
+    platform: process.platform,
+    uid: process.getuid?.(),
+    run: runProgram,
+    readFile: (path) => readFile(path, 'utf8'),
+  }),
+)
+
+/**
+ * The operating system account's home folder (see lookupAccountHome). HOME,
+ * USERPROFILE and the XDG variables never choose it. A found home is kept for
+ * the process; a failed lookup is retried in the background after
+ * ACCOUNT_HOME_RETRY_MS. Undefined while the home cannot be found.
+ */
+export function accountHome(): Promise<string | undefined> {
+  return cachedAccountHome()
 }
 
 let accountSettingsFile: Promise<string | undefined> | undefined

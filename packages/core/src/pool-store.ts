@@ -119,6 +119,31 @@ export function createNativePoolStore(options: NativePoolStoreOptions) {
   return trackStore(options.paths.state, openNativePoolStore(options))
 }
 
+const exactSettingsReaders = new Map<string, ReturnType<typeof openPoolStore>>()
+
+/**
+ * Reads the plugin settings from exactly the config file at `configPath`, for
+ * a caller that resolved that file itself and must not read through another
+ * path's text. Nothing is ever written or locked through the store opened for
+ * it, so its state path is never used and is set to the config path.
+ */
+export function readNativePoolSettingsAt(
+  configPath: string,
+  quota: NativeQuotaCodec,
+) {
+  let reader = exactSettingsReaders.get(configPath)
+  if (!reader) {
+    reader = openPoolStore({
+      provider: 'anthropic',
+      configPath,
+      statePath: configPath,
+      quota,
+    })
+    exactSettingsReaders.set(configPath, reader)
+  }
+  return reader.readSettings()
+}
+
 function openNativePoolStore(options: NativePoolStoreOptions) {
   const store = openPoolStore({
     provider: 'anthropic',

@@ -126,9 +126,17 @@ import {
   resolveLocalRoutingDestination,
   stateLayoutOfPaths,
 } from './pool-paths.ts'
-import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
+import {
+  createNativePoolStore,
+  nativePoolStoreLocks,
+  readNativePoolSettingsAt,
+} from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
 import { effectiveRelayTransport, type RelayConfig } from './relay.ts'
+import {
+  createRelayLocationCheck,
+  type RelayLocation,
+} from './relay-location.ts'
 import {
   nativeRelocationGuard,
   type RelocationGuard,
@@ -218,7 +226,22 @@ export interface NativeAccountRuntime {
   drainRoutingPublications(): Promise<void>
   /** Fresh private relay authorization for transport only; never include it in a status snapshot. */
   getRelayConfig(): Promise<RelayConfig | null>
+  /**
+   * Refuses (NativeRuntimeError `relay-not-default-location`, or
+   * `relay-account-home-unknown` when the account's home folder cannot be
+   * found) when a relay saved now would be ignored. updateRelay runs the same
+   * check before enabling a relay.
+   */
+  assertRelayLocation(): Promise<void>
   updateRelay(patch: NativeRelayUpdate): Promise<void>
+  /**
+   * Status lines about the relay from memory: why the last read ignored a
+   * configured relay (its account settings are not in their default
+   * location, or the account's home folder could not be found), or that the
+   * relay in use is refused because a proxy setting would carry it in plain
+   * text. Never names a value.
+   */
+  getRelayStatusNotes?(): string[]
   read(model?: string): Promise<NativeAccountSnapshot>
   /** Memory-only policy settings for a tracked target; never persist the returned record. */
   resolveSettings?(stored: AccountStorage, model?: string): AccountStorage
@@ -384,8 +407,10 @@ export function acquireNativeAccountRuntime(
     drainQuotaPublications,
     drainRoutingPublications,
     getRelayConfig: () => use().getRelayConfig(),
+    assertRelayLocation: () => use().assertRelayLocation(),
     getSettingsPath: () => use().getSettingsPath(),
     updateRelay: (patch) => use().updateRelay(patch),
+    getRelayStatusNotes: () => use().getRelayStatusNotes?.() ?? [],
     read: (model) => use().read(model),
     resolveSettings: (stored, model) =>
       use().resolveSettings?.(stored, model) ?? stored,
@@ -494,6 +519,13 @@ function buildNativeAccountRuntime(
   const withLock = observeNativeLocks(() => acquireLock, onLockEvent)
   const now = options.local?.now ?? options.vault?.now ?? Date.now
   const vaultPaths = nativeVaultPaths(paths)
+  // Which store files a relay may be read from; the account lookup behind
+  // it starts now so requests find it already done.
+  const relayLocation = createRelayLocationCheck(options.host, {
+    local: paths,
+    vault: vaultPaths,
+  })
+  relayLocation.prepare()
   const relocation = nativeRelocationGuard(paths)
   // A state-home process stops serving once its dataset is in conflict; a
   // legacy process keeps exactly the checks it had before.
@@ -911,6 +943,21 @@ function buildNativeAccountRuntime(
       runtime: metadata.status === 'ready' ? metadata.state : undefined,
       roster,
     })
+    // A relay in account settings outside their default location is never
+    // used: show it as off, so every host sends directly and Status says why.
+    const relay = snapshot.policyStorage.relay
+    const location =
+      relay?.enabled === true ? await relayLocation.locate(mode) : 'default'
+    if (relay && location !== 'default') {
+      snapshot.policyStorage.relay = { ...relay, enabled: false }
+      relayLocation.ignored(mode, location)
+    } else
+      relayLocation.clear(
+        relay?.enabled === true && typeof relay.url === 'string'
+          ? relay.url
+          : undefined,
+      )
+    check()
     for (const account of snapshot.accounts) {
       const lineage =
         mode === 'local'
@@ -1021,6 +1068,14 @@ function buildNativeAccountRuntime(
     drainRoutingPublications: () => vaultRouter.drain(),
     async getRelayConfig() {
       const { mode, paths, store } = await selectedStorage()
+      const { location, files } = await relayLocation.resolve(mode)
+      // At the default place, read through the default store's canonical
+      // files the check matched, never the selected path text again: a folder
+      // swapped for a link after the check cannot redirect these reads.
+      const readSettings = files
+        ? () => readNativePoolSettingsAt(files.config, nativeQuotaCodec)
+        : () => store.readSettings()
+      const runtimeFile = files ? files.runtime : paths.runtime
       // Both files are atomically published, but a reader can cross a relay
       // change between reading its URL and private token. Never send that torn
       // pair: all hosts retry a mismatched generation briefly, then refuse
@@ -1028,12 +1083,24 @@ function buildNativeAccountRuntime(
       // legacy data; a mixed stamped/unstamped pair must also wait for agreement.
       for (let attempt = 0; attempt < 4; attempt++) {
         if (attempt) await new Promise((resolve) => setTimeout(resolve, 10))
-        const settings = await store.readSettings()
+        const settings = await readSettings()
         if (settings.status !== 'ready')
           throw new NativeRuntimeError('publication-refused')
+        if (location !== 'default') {
+          // Settings outside their default location never choose a relay:
+          // requests go directly, as if no relay were configured.
+          const raw = settings.settings.relay
+          if (
+            raw &&
+            typeof raw === 'object' &&
+            (raw as Record<string, unknown>).enabled === true
+          )
+            relayLocation.ignored(mode, location)
+          return null
+        }
         const flags = relayFlags(settings.settings.relay)
         const generation = relayGeneration(settings.settings.relay)
-        const read = await readNativeRuntime(paths.runtime, paths.storageId)
+        const read = await readNativeRuntime(runtimeFile, paths.storageId)
         await requireMode(mode)
         const state = read.status === 'ready' ? read.state : undefined
         if (generation !== state?.relayGeneration) continue
@@ -1043,6 +1110,11 @@ function buildNativeAccountRuntime(
       }
       throw new NativeRuntimeError('relay-inconsistent')
     },
+    async assertRelayLocation() {
+      const { mode } = await selectedStorage()
+      requireRelayLocation(await relayLocation.locate(mode))
+    },
+    getRelayStatusNotes: () => relayLocation.statusNotes(),
     async updateRelay(input) {
       const patch = captureNativePlainData(input) as NativeRelayUpdate
       if (
@@ -1080,6 +1152,14 @@ function buildNativeAccountRuntime(
       )
         throw new NativeRuntimeError('publication-refused')
       const { mode, paths, store } = await selectedStorage()
+      // A relay saved into account settings outside their default location
+      // would only be ignored, so refuse it. Turning a relay off, without
+      // naming a new URL or token, stays allowed.
+      const turnsOff =
+        (patch.enabled === false || patch.token === null) &&
+        !patch.url &&
+        typeof patch.token !== 'string'
+      if (!turnsOff) requireRelayLocation(await relayLocation.locate(mode))
       await withLock(
         paths.config,
         { ...POOL_LOCK_DEFAULTS, name: 'native-relay' },
@@ -2237,6 +2317,14 @@ export function primeDelta(delta: PrimeUsageDelta) {
   )
     throw new NativeRuntimeError('publication-refused')
   return { inputTokens, outputTokens }
+}
+
+/** Refuses to save or set up a relay that would be ignored where it is. */
+function requireRelayLocation(location: RelayLocation): void {
+  if (location === 'home-unknown')
+    throw new NativeRuntimeError('relay-account-home-unknown')
+  if (location !== 'default')
+    throw new NativeRuntimeError('relay-not-default-location')
 }
 
 function relayFlags(input: unknown): Omit<RelayConfig, 'token'> {

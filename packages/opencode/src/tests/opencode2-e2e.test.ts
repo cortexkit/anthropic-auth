@@ -770,7 +770,9 @@ export default {id:'cortexkit-anthropic-auth',async setup(ctx){${routingSetup}ap
   // upstream. The plugin refuses any OAuth destination but api.anthropic.com
   // unless a test-only global symbol names the exact loopback origin; it is
   // never read from the environment. A test plugin listed first sets it.
-  const loopbackSetup = `globalThis[Symbol.for('cortexkit.anthropic-auth.test-oauth-loopback-origin')]=${JSON.stringify(upstream.url.origin)};`
+  // The same plugin skips the relay location check: this test's account
+  // store lives in a temporary folder, never in the account's default place.
+  const loopbackSetup = `globalThis[Symbol.for('cortexkit.anthropic-auth.test-oauth-loopback-origin')]=${JSON.stringify(upstream.url.origin)};globalThis[Symbol.for('cortexkit.anthropic-auth.test-only.relay-account-home')]='unchecked';`
   let loopbackPlugin: string
   if (host === 'oc2') {
     const loopbackDirectory = join(project, 'test-oauth-loopback')

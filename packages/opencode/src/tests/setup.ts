@@ -7,6 +7,19 @@ import {
 import { restoreTestSafetyPaths } from './preload-sandbox'
 import { DEFAULT_FETCH_MOCK } from './test-fetch'
 
+// Tests keep their account stores in temporary folders chosen with
+// environment variables, never in the operating system account's default
+// place, so every test starts with the relay location check skipped. Tests of
+// that check install their own value; the next test starts from this again.
+const RELAY_ACCOUNT_HOME = Symbol.for(
+  'cortexkit.anthropic-auth.test-only.relay-account-home',
+)
+const relayAccountHome = globalThis as Record<symbol, unknown>
+relayAccountHome[RELAY_ACCOUNT_HOME] = 'unchecked'
+beforeEach(() => {
+  relayAccountHome[RELAY_ACCOUNT_HOME] = 'unchecked'
+})
+
 const nativeFetch = globalThis.fetch
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 const CROSS_ORIGIN_CREDENTIAL_HEADERS = [

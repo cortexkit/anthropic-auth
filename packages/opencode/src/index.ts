@@ -6451,7 +6451,11 @@ const anthropicAuthPlugin = async (
       .join('\n')
     const status = nativeAccounts.getSettingsStatus?.()
     if (!status)
-      return `${summary}\nSettings file: ${await nativeAccounts.getSettingsPath()}`
+      return [
+        summary,
+        `Settings file: ${await nativeAccounts.getSettingsPath()}`,
+        ...(nativeAccounts.getRelayStatusNotes?.() ?? []),
+      ].join('\n')
     const { file } = status
     return [
       summary,
@@ -6468,6 +6472,7 @@ const anthropicAuthPlugin = async (
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
       ...claudeGatewayStatusNotes(file.gatewayIgnored, status.values.gateway),
+      ...(nativeAccounts.getRelayStatusNotes?.() ?? []),
       'Settings (no model):',
       ...Object.entries(status.values).map(
         ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,

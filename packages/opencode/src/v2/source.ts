@@ -37,9 +37,11 @@ import {
   peekRoutingAccount,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
+  RELAY_PROXY_REFUSAL,
   readNativeAccountsForRequest,
   readSessionCachePolicy,
   readThreeWayBoolean,
+  relayProxyApplies,
   remapModelId,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
@@ -55,6 +57,7 @@ import {
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
   warnClaudeGatewayRelayIgnored,
+  warnRelayProxyRefused,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   ChooseAccountInput,
@@ -594,6 +597,17 @@ export function createNativeAnthropicSource(
           ...gatewayField,
         }
       throw new NativeAnthropicTransportRefusal()
+    }
+    if (relayProxyApplies(relay.url)) {
+      // Nothing is sent to the relay. Like a relay that cannot be reached,
+      // this goes direct when fallbackToDirect allows it and fails otherwise.
+      warnRelayProxyRefused()
+      if (!relay.fallbackToDirect) throw new Error(RELAY_PROXY_REFUSAL)
+      return {
+        dispatch: { kind: 'direct' as const },
+        relayFallback: false,
+        ...gatewayField,
+      }
     }
     return {
       dispatch: {
