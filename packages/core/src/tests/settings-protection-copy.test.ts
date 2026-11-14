@@ -77,6 +77,8 @@ async function fixture(source: unknown = complete, name = 'settings.jsonc') {
     const service = await openSettingsService({
       file,
       host,
+      // These tests are about a host that uses the file.
+      adopted: () => true,
       ...options,
       dependencies: { ...dependencies, ...options.dependencies },
     })
@@ -209,7 +211,7 @@ function child(file: string, host: SettingsHost, delay = false) {
     import { writeSettingsProtectionCopy } from ${JSON.stringify(copyModule)};
     import { settingsDefinition } from ${JSON.stringify(definitionModule)};
     import { openSettings } from '@cortexkit/common-auth/settings';
-    const service = await openSettingsService({file:${JSON.stringify(file)},host:${JSON.stringify(host)},dependencies:{
+    const service = await openSettingsService({file:${JSON.stringify(file)},host:${JSON.stringify(host)},adopted:()=>true,dependencies:{
       open: options => ({...openSettings(settingsDefinition, options),watch:()=>()=>{}}),
       writeAppliedCopy: async (...args) => {
         ${delay ? "console.log('read'); await new Promise(resolve => process.stdin.once('data',resolve)); process.stdin.pause();" : ''}
@@ -526,11 +528,11 @@ for (const missing of [false, true]) {
           await store.updateSettings(() => ({ dump: { enabled: true } }))
         if (storeState === 'unparseable')
           await writeFile(paths.config, '{bad-store')
-        let legacyReads = 0
+        const legacyReads: SettingsHost[] = []
         const service = await f.open('pi', {
           protection: {
             readLegacyProtection: async (host) => {
-              legacyReads++
+              legacyReads.push(host)
               return readLegacySettingsProtection({
                 host,
                 localStore: store,
@@ -597,8 +599,15 @@ for (const missing of [false, true]) {
                 },
           )
         }
-        // The other host may recover its own store, but only Pi reads Pi's copy.
-        expect(legacyReads).toBe(copy === 'valid' ? 1 : 2)
+        // Only Pi reads Pi's copy, and reads its store only without a valid
+        // one. OpenCode never adopted the file through this Pi lease, so its
+        // set always comes from its own ladder, never from an earlier reading.
+        expect(legacyReads.filter((host) => host === 'pi')).toHaveLength(
+          copy === 'valid' ? 0 : 1,
+        )
+        expect(legacyReads.filter((host) => host === 'opencode')).not.toEqual(
+          [],
+        )
         await service.dispose()
         expect(await readFile(path, 'utf8').catch(() => undefined)).toBe(before)
       })

@@ -134,7 +134,10 @@ import {
 } from './relocation-guard.ts'
 import { SETTINGS_WRITE_FAILURES } from './settings-definition.ts'
 import { getSettingsFilePath } from './settings-paths.ts'
-import { SettingsRecreationRefusal } from './settings-service.ts'
+import {
+  SettingsAdoptionRefusal,
+  SettingsRecreationRefusal,
+} from './settings-service.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
@@ -1567,6 +1570,17 @@ function buildNativeAccountRuntime(
               outcome: 'refused',
               reason: error.message,
             }
+          // A file appeared after this write was prepared on a missing file,
+          // and this host has not passed its import check for it: the edit
+          // was refused under the writer lock, as while the host is held.
+          if (error instanceof SettingsAdoptionRefusal) {
+            await service.refresh().catch(() => {})
+            return {
+              settings: runtimeSettings.resolve(stored.settings),
+              outcome: 'refused',
+              reason: runtimeSettings.checkingRefusal(),
+            }
+          }
           const failure =
             error instanceof SettingsRefusal
               ? SETTINGS_WRITE_FAILURES[error.code]

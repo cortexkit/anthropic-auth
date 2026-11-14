@@ -20,7 +20,6 @@ import {
   resolveSettingsPaths,
   type SettingsPaths,
 } from './settings-paths.ts'
-import { writeSettingsProtectionCopy } from './settings-protection-copy.ts'
 import {
   openSettingsService,
   recoverSettingsProtection,
@@ -173,15 +172,10 @@ export async function startSettings(
   const move = options.start?.move ?? runSettingsMoveAtStartup
   const open = options.start?.open ?? openSettingsService
 
-  // Applied copies wait until this host uses the file. The newest one held
-  // back is written when it adopts the file.
+  // Applied copies and last-good sets wait until this host uses the file:
+  // the service's lease checks this flag before saving either, whatever copy
+  // writer a host's own open seam supplies.
   let adopted = false
-  let held: Parameters<typeof writeSettingsProtectionCopy> | undefined
-  const writeAppliedCopy: typeof writeSettingsProtectionCopy = (...args) => {
-    if (adopted) return writeSettingsProtectionCopy(...args)
-    held = args
-    return Promise.resolve()
-  }
   const serviceOptions = (file: string): SettingsServiceOptions => ({
     file,
     host: options.host,
@@ -190,9 +184,6 @@ export async function startSettings(
     // Until this host adopts the file, a missing or unusable file recovers
     // its protection from the ladder, never from a set the file once held.
     adopted: () => adopted,
-    // A host's own open seam (used by host tests) spreads its own service
-    // dependencies over these options, so it keeps them and its copy writer.
-    ...(options.start?.open ? {} : { dependencies: { writeAppliedCopy } }),
   })
 
   let paths: SettingsPaths | undefined
@@ -220,10 +211,9 @@ export async function startSettings(
     if (outcome === 'pending') return 'pending'
     if (outcome !== 'adopt') return false
     adopted = true
-    const copy = held
-    held = undefined
-    // A failure leaves the copy to the next generation this host applies.
-    if (copy) await writeSettingsProtectionCopy(...copy).catch(() => {})
+    // Record the adopted set at once; its applied copy is saved after, and a
+    // failed save is retried by the lease.
+    service.noteAdoption?.()
     return true
   }
   const track = (service: SettingsService | undefined) => {

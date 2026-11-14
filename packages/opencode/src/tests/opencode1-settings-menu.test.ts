@@ -89,6 +89,8 @@ async function fixture(
     const service = await core.openSettingsService({
       file,
       host: 'opencode',
+      // These menu tests are about a host that uses the file.
+      adopted: () => true,
       dependencies: {
         writeAppliedCopy: async () => {},
         open: (config) => {

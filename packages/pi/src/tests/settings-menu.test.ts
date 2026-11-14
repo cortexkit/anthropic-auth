@@ -100,7 +100,12 @@ async function writeFile(values: Record<string, unknown> = {}) {
 async function handleRefusal(code: SettingsRefusalCode) {
   const probe = join(home, 'refusal-probe.jsonc')
   await fs.writeFile(probe, '{}')
-  const service = await openSettingsService({ file: probe, host: 'pi' })
+  // The probe writes as a host that uses the file.
+  const service = await openSettingsService({
+    file: probe,
+    host: 'pi',
+    adopted: () => true,
+  })
   if (!service) throw new Error('Probe settings service unavailable')
   try {
     await service.update([{ setting: 'log_level', value: 'invalid' }], 'pi')

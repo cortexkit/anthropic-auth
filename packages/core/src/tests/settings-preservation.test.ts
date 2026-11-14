@@ -478,7 +478,12 @@ for (const host of ['opencode', 'pi'] as const) {
       publishedRuntime(before[2])
       expect((await runSettingsMoveAtStartup(f.options)).outcome).toBe('moved')
       await check()
-      const service = await openSettingsService({ file: f.paths.target, host })
+      // This host moved the file, so it uses it.
+      const service = await openSettingsService({
+        file: f.paths.target,
+        host,
+        adopted: () => true,
+      })
       if (!service) throw new Error('Missing settings service')
       cleanup.push(() => service.dispose())
       await service.update(

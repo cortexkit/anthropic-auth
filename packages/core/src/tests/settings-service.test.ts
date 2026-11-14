@@ -23,6 +23,7 @@ import {
   writeSettingsProtectionCopy,
 } from '../settings-protection-copy.ts'
 import {
+  mostRestrictiveSettingsProtection,
   openSettingsService,
   SETTINGS_PROTECTION_KEYS,
   type SettingsGeneration,
@@ -62,6 +63,8 @@ async function fixture(source = '{}', realWatch = false) {
   let onGet: ((key: string, count: number) => Promise<void>) | undefined
   const options: SettingsServiceOptions = {
     file,
+    // A host lease opened here uses the file unless a test says otherwise.
+    adopted: () => true,
     dependencies: {
       readFile: async (path) => {
         counts.reads++
@@ -800,7 +803,12 @@ test('a file still missing after 2 s publishes defaults once without waiting on 
     expect(service.resolve(host).dump_enabled).toBe(false)
     expect(service.resolve(host).refresh_interval_minutes).toBe(10)
     expect(service.resolve(host).killswitch_enabled).toBe(true)
-    expect(protectionOf(service.resolve(host))).toEqual(distinctProtection)
+    // Pi keeps its own last-good set. OpenCode never adopted the file, so
+    // the file's earlier reading is not its set, and with no recovery source
+    // its set is the strictest one.
+    expect(protectionOf(service.resolve(host))).toEqual(
+      host === 'pi' ? distinctProtection : mostRestrictiveSettingsProtection(),
+    )
     expect(service.snapshot().protection[host].usable).toBe(false)
   }
   expect(service.status().missing).toBe(true)
@@ -924,7 +932,9 @@ for (const bad of [
       if (record.channel === 'settings') records.push(record)
     })
     const f = await fixture(JSON.stringify(distinctProtection))
-    const service = await f.open()
+    // Each host keeps a last-good set only through its own adopted lease.
+    const service = await f.open({ host: 'opencode' })
+    await f.open({ host: 'pi' })
     await writeFile(
       f.file,
       JSON.stringify({ killswitch_enabled: false, dump_enabled: true, ...bad }),
@@ -974,9 +984,12 @@ for (const tags of [
       dump_enabled: true,
     })
     const f = await fixture(invalid)
-    const service = await f.open({
-      protection: { readLegacyProtection: async () => distinctProtection },
-    })
+    // Each host keeps a last-good set only through its own adopted lease.
+    const protection = {
+      readLegacyProtection: async () => distinctProtection,
+    }
+    const service = await f.open({ host: 'opencode', protection })
+    await f.open({ host: 'pi', protection })
     for (const host of ['opencode', 'pi'] as const) {
       expect(service.snapshot().protection[host].rung).toBe(2)
       expect(protectionOf(service.resolve(host))).toEqual(distinctProtection)
@@ -1315,7 +1328,7 @@ test('a file truncated while running keeps the last-good protection, never the s
   const f = await fixture(
     '{"killswitch_enabled":true,"killswitch_default_five_hour":44}',
   )
-  const service = await f.open()
+  const service = await f.open({ host: 'pi' })
   expect(service.snapshot().protection.pi.rung).toBe(0)
   await writeFile(f.file, '')
   await service.refresh()
@@ -1323,5 +1336,101 @@ test('a file truncated while running keeps the last-good protection, never the s
   expect(service.resolve('pi')).toMatchObject({
     killswitch_enabled: true,
     killswitch_default_five_hour: 44,
+  })
+})
+
+// A host's protection may come only from a generation its own lease adopted.
+const weaker: SettingsProtectionValues = {
+  ...mostRestrictiveSettingsProtection(),
+  killswitch_enabled: false,
+  killswitch_default_five_hour: 5,
+}
+
+for (const adopted of [undefined, false] as const) {
+  test(`a host lease ${adopted === undefined ? 'opened without an adoption flag' : 'whose host has not adopted the file'} saves no applied copy, whatever copy writer it is given`, async () => {
+    const f = await fixture('{"killswitch_enabled":false}')
+    const writes: unknown[] = []
+    const service = await f.open({
+      host: 'pi',
+      adopted: adopted === undefined ? undefined : () => adopted,
+      dependencies: {
+        ...f.options.dependencies,
+        writeAppliedCopy: async (...args) => {
+          writes.push(args)
+        },
+      },
+    })
+    expect(service.snapshot().protection.pi.rung).toBe(0)
+    await writeFile(f.file, '{"killswitch_enabled":false,"dump_enabled":true}')
+    await service.refresh()
+    await service.dispose()
+    expect(writes).toEqual([])
+  })
+}
+
+test('adoption saves the adopted set as the applied copy and as last-good at once, even when the copy write fails', async () => {
+  const f = await fixture(
+    '{"killswitch_enabled":true,"killswitch_default_five_hour":61}',
+  )
+  // An older, weaker copy of OpenCode's set is all that is on disk.
+  await writeSettingsProtectionCopy(f.file, 'opencode', {
+    readAt: 1,
+    values: weaker,
+  })
+  let adopted = false
+  const attempts: unknown[] = []
+  const opencode = await f.open({
+    host: 'opencode',
+    adopted: () => adopted,
+    dependencies: {
+      ...f.options.dependencies,
+      writeAppliedCopy: async (...args) => {
+        attempts.push(args[2])
+        throw new Error('synthetic copy failure')
+      },
+    },
+  })
+  expect(attempts).toEqual([])
+  adopted = true
+  opencode.noteAdoption?.()
+  // Pi recreates the deleted file before any later publication: OpenCode's
+  // set must be the one it adopted, not the stale copy on disk.
+  const pi = await f.open({ host: 'pi', adopted: () => true })
+  await rm(f.file)
+  await pi.update([{ setting: 'dump_enabled', value: true }], 'pi', {
+    createMissing: true,
+  })
+  expect(opencode.resolve('opencode')).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 61,
+  })
+  // The adopted set was also submitted as the applied copy.
+  expect(attempts[0]).toMatchObject({
+    values: { killswitch_enabled: true, killswitch_default_five_hour: 61 },
+  })
+})
+
+test("an unusable file recovers the other host's set from its adopted sets or the ladder, never from the file's earlier reading", async () => {
+  const f = await fixture(
+    '{"killswitch_enabled":{"default":true,"pi":false},"killswitch_default_five_hour":61}',
+  )
+  const opencode = await f.open({ host: 'opencode', adopted: () => true })
+  expect(opencode.snapshot().protection.pi).toMatchObject({
+    rung: 0,
+    values: { killswitch_enabled: false },
+  })
+  await writeFile(f.file, '')
+  await opencode.refresh()
+  // Pi never adopted the file through any lease, and no ladder source is
+  // given, so Pi's set is unknown: the strictest one.
+  expect(opencode.snapshot().protection.pi).toEqual({
+    usable: false,
+    rung: 3,
+    values: mostRestrictiveSettingsProtection(),
+  })
+  // OpenCode adopted the file, so its own earlier set is its last-good.
+  expect(opencode.snapshot().protection.opencode).toMatchObject({
+    rung: 1,
+    values: { killswitch_enabled: true, killswitch_default_five_hour: 61 },
   })
 })

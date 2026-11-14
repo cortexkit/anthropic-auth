@@ -19,6 +19,7 @@ import {
 import {
   refusedSettingsRecreationText,
   type SettingsKey,
+  settingsCheckPendingText,
   settingsDefinition,
 } from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
@@ -58,9 +59,29 @@ export class SettingsRecreationRefusal extends Error {
   }
 }
 
+/**
+ * A write into an existing settings file by a host that has not adopted it
+ * (its import check has not passed). The file may protect less than the
+ * host's legacy store, so the write is refused under the writer lock; the
+ * caller reports the same refusal as while the host is held by that check.
+ */
+export class SettingsAdoptionRefusal extends Error {
+  constructor(readonly file: string) {
+    super(settingsCheckPendingText(file))
+    this.name = 'SettingsAdoptionRefusal'
+  }
+}
+
 export interface SettingsUpdateOptions {
   /** Only menu writes and setup with a <target>.moved marker and no user file may create it. */
   createMissing?: boolean
+  /**
+   * This write is the host's import into the file (the import check, or
+   * setup filling the file from the legacy store), which by design runs
+   * before the host adopts the file. Every other write by a host lease that
+   * has not adopted the file is refused when the file exists.
+   */
+  importing?: boolean
 }
 
 export interface SettingsProtectionRecovery {
@@ -148,6 +169,14 @@ export interface SettingsService {
     host: SettingsHost,
     options?: SettingsUpdateOptions,
   ): Promise<UpdateResult>
+  /**
+   * Called once the acting host has passed its import check for this file
+   * (after its `adopted` option turned true): the lease records the
+   * generation it holds as that host's last-good set at once, before the
+   * applied copy is saved, so a failed copy write leaves no stale window.
+   * Does nothing while `adopted` still returns false.
+   */
+  noteAdoption?(): void
   dispose(): Promise<void>
 }
 
@@ -169,8 +198,10 @@ export interface SettingsServiceOptions {
    * Until then the file's values are never this host's last-good protection:
    * a file it has not imported may protect less than its legacy store, so a
    * missing or unusable file recovers this host's set from the ladder (its
-   * applied copy, then its legacy store, then the strictest set). Omitted
-   * means the host uses the file.
+   * applied copy, then its legacy store, then the strictest set). Nor does
+   * the lease save an applied copy from it, and a write into the existing
+   * file is refused unless it is the host's import. Omitted means the host
+   * has not adopted the file: every production caller passes it explicitly.
    */
   adopted?: () => boolean
   /** Dependency seams for deterministic file-race and no-I/O tests. */
@@ -1081,6 +1112,12 @@ class SharedSettingsService {
     host: SettingsHost,
     options: SettingsUpdateOptions,
     applied: SettingsGeneration['protection'][SettingsHost],
+    /**
+     * Whether the writing lease may change an existing file: false for a host
+     * lease whose host has not adopted it. Read under the writer lock, since
+     * the file may appear after the caller last saw it missing.
+     */
+    mayChangeFile: () => boolean,
     peerProtection: (
       host: SettingsHost,
     ) => Promise<Omit<SettingsRecreationInput, 'host'>> = async () => ({
@@ -1102,6 +1139,12 @@ class SharedSettingsService {
       : this.handle
     const result = await handle.update(
       (current) => {
+        if (
+          current.status !== 'missing' &&
+          !options.importing &&
+          !mayChangeFile()
+        )
+          throw new SettingsAdoptionRefusal(this.file)
         let carry: readonly SettingsEdit[] | undefined
         if (current.status === 'missing') {
           const plan = planSettingsFileRecreation(
@@ -1225,7 +1268,23 @@ class SettingsProtectionLease {
 
   /** Whether the acting host uses the file; see `SettingsServiceOptions.adopted`. */
   private adopted() {
-    return this.options?.adopted?.() ?? true
+    return this.options?.adopted?.() ?? false
+  }
+
+  /**
+   * Whether a write through this lease may change an existing file. A lease
+   * with no acting host records no host's protection, so only a host lease
+   * is held to its host's adoption.
+   */
+  mayChangeFile() {
+    return !this.options?.host || this.adopted()
+  }
+
+  /** See `SettingsService.noteAdoption`. */
+  noteAdoption() {
+    if (!this.current || !this.options?.host || !this.adopted()) return
+    this.recordLastGood(this.current)
+    this.persist(this.current)
   }
 
   /**
@@ -1257,7 +1316,9 @@ class SettingsProtectionLease {
 
   private persist(generation: SettingsGeneration) {
     const host = this.options?.host
-    if (!host || this.closed) return
+    // Only a set this host adopted becomes its applied copy, whatever copy
+    // writer the options supply: recovery trusts the copy as this host's own.
+    if (!host || this.closed || !this.adopted()) return
     const set = generation.protection[host]
     if (!set.usable || set.rung !== 0) return
     // A newer reading of the same values is still submitted: the copy keeps
@@ -1426,12 +1487,19 @@ class SettingsProtectionLease {
   }
 
   private async recover(host: SettingsHost) {
-    // A host that has not adopted the file takes no protection from it, not
-    // even a set it read earlier: that file may protect less than the host's
-    // legacy store, which its import check has not compared yet.
-    if (host !== this.options?.host || this.adopted()) {
+    // A host's set is taken only from a file that host adopted: its last-good
+    // set, which only its own adopted lease records. The set this lease read
+    // from the file is used only for its own host, once adopted. Another
+    // host's set in that reading was never adopted through this lease, and a
+    // host that has not adopted the file takes no protection from it either:
+    // that file may protect less than the host's legacy store, which its
+    // import check has not compared yet.
+    const own = host === this.options?.host
+    if (!own || this.adopted()) {
       const good = this.shared.lastGoodProtection(host)
       if (good) return { values: good, rung: 1 as const }
+    }
+    if (own && this.adopted()) {
       const previous = this.current?.protection[host]
       // A set read from the file earlier is a last-good recovery now.
       if (previous)
@@ -1504,6 +1572,7 @@ function referenceCountedSettingsService(
       status: () => use().status(),
       refresh: () => use().refresh(),
       update: (edits, host, options) => use().update(edits, host, options),
+      noteAdoption: () => use().noteAdoption?.(),
       watch(listener) {
         const unsubscribe = use().watch(listener)
         const stop = () => {
@@ -1624,8 +1693,13 @@ export async function openSettingsService(
         host,
         options,
         lease.snapshot().protection[host],
+        () => lease.mayChangeFile(),
         (peer) => lease.peerProtection(peer),
       ),
+    noteAdoption() {
+      use()
+      lease.noteAdoption()
+    },
     dispose,
   })
 }

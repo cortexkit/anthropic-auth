@@ -185,23 +185,28 @@ export async function importSettingsHostStore(
         })
       : {}
     try {
-      await service.update((current) => {
-        if (
-          current.status !== 'ready' ||
-          SETTINGS_PROTECTION_KEYS.some(
-            (key) =>
-              !isDeepStrictEqual(
-                (current.document as Record<string, unknown>)[key],
-                expected[key],
-              ),
+      await service.update(
+        (current) => {
+          if (
+            current.status !== 'ready' ||
+            SETTINGS_PROTECTION_KEYS.some(
+              (key) =>
+                !isDeepStrictEqual(
+                  (current.document as Record<string, unknown>)[key],
+                  expected[key],
+                ),
+            )
           )
-        )
-          throw new SettingsRefusal(
-            'settings-busy',
-            'Protection changed before import',
-          )
-        return plan.edits
-      }, host)
+            throw new SettingsRefusal(
+              'settings-busy',
+              'Protection changed before import',
+            )
+          return plan.edits
+        },
+        host,
+        // The import check runs before this host adopts the file.
+        { importing: true },
+      )
     } catch {
       warn(
         `Settings file ${paths.target} is not used by ${host}: writing its legacy protection for ${plan.keys.join(', ')} failed. ${host} keeps its legacy settings and will retry the import ${retry}.`,
@@ -263,7 +268,12 @@ export async function runSettingsMoveAtStartup(
     move?: MoveResult,
   ): Promise<SettingsMoveStartupResult> => {
     const marked = await hasSettingsMoveMarker(paths.target, authority)
-    const service = await openSettingsService({ file: paths.target })
+    // This lease only runs the import check, before any host adopts the
+    // file through it, and has no acting host whose protection it records.
+    const service = await openSettingsService({
+      file: paths.target,
+      adopted: () => false,
+    })
     if (!service) throw new Error('Settings service did not open')
     let importPending = false
     try {

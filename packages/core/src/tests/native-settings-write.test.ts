@@ -76,6 +76,12 @@ async function fixture(
     adoption?: SettingsAdoptionCheck
     /** The runtime starts on a missing file whose import it still owes. */
     importPending?: boolean
+    /**
+     * Whether this host's lease starts adopted. By default it does unless an
+     * import check or a pending import is given; an import check that passes
+     * adopts it, as `startSettings` does.
+     */
+    adopted?: boolean
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
@@ -95,9 +101,11 @@ async function fixture(
   const calls: unknown[] = []
   const openModes: boolean[] = []
   let watchCallback: (() => void) | undefined
+  let adopted = options.adopted ?? !(options.adoption || options.importPending)
   const service = await openSettingsService({
     file,
     host: options.host ?? 'opencode',
+    adopted: () => adopted,
     dependencies: {
       ...(options.failCopy
         ? {
@@ -178,7 +186,16 @@ async function fixture(
   })
   if (!service) throw new Error('Settings service unavailable')
   cleanup.push(() => service.dispose())
-  if (options.adoption) setSettingsAdoptionCheck(service, options.adoption)
+  const adoption = options.adoption
+  if (adoption)
+    setSettingsAdoptionCheck(service, async (checked) => {
+      const outcome = await adoption(checked)
+      if (outcome === true) {
+        adopted = true
+        checked.noteAdoption?.()
+      }
+      return outcome
+    })
   if (options.importPending) markSettingsImportPending(service)
   let failStore = false
   const runtime = createNativeAccountRuntime({
@@ -234,7 +251,11 @@ async function fixture(
  * never the other host's protection, since that host may not have adopted it.
  */
 async function adoptPeer(file: string) {
-  const peer = await openSettingsService({ file, host: 'pi' })
+  const peer = await openSettingsService({
+    file,
+    host: 'pi',
+    adopted: () => true,
+  })
   if (!peer) throw new Error('Peer service unavailable')
   cleanup.push(() => peer.dispose())
 }
@@ -785,7 +806,11 @@ test('recreation with differing peers writes host levels and each host resolves 
       ],
     }),
   )
-  const peer = await openSettingsService({ file: f.file, host: 'pi' })
+  const peer = await openSettingsService({
+    file: f.file,
+    host: 'pi',
+    adopted: () => true,
+  })
   if (!peer) throw new Error('Peer service unavailable')
   cleanup.push(() => peer.dispose())
   expect(peer.resolve('pi').killswitch_enabled).toBe(true)
@@ -2183,3 +2208,29 @@ for (const appeared of ['usable', 'empty', 'invalid'] as const) {
     expect((await f.saved()).dump).toEqual({ enabled: true })
   })
 }
+
+test('a file that appears after a menu write was prepared on a missing file is refused under the writer lock while this host has not imported it', async () => {
+  let file!: string
+  const source = '{"dump_enabled":false}'
+  const f = await fixture(null, {
+    legacy: { dump: { enabled: true } },
+    adoption: async (service) =>
+      service.snapshot().status === 'missing' ? 'pending' : false,
+    importPending: true,
+    settingsAuthority: { schedule: () => () => {} },
+    // The write passed its hold check on a missing file; the file appears
+    // only once the writer is about to take its lock.
+    beforeUpdate: () => writeFile(file, source),
+  })
+  file = f.file
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result).toMatchObject({
+    outcome: 'refused',
+    reason: settingsCheckPendingText(f.file),
+  })
+  expect(f.calls).toHaveLength(1)
+  expect(await f.text()).toBe(source)
+  expect((await f.saved()).dump).toEqual({ enabled: true })
+})

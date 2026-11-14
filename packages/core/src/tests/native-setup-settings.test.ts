@@ -836,3 +836,35 @@ for (const peer of [
     })
   })
 }
+
+// Setup's lease uses the file only once setup's own write commits: a file
+// setup refused or failed to write must never become this host's applied copy.
+test('a refused setup saves no applied copy from the file it never imported', async () => {
+  const f = await fixture('opencode', {
+    killswitch: { enabled: true, main: { five_hour: 61, seven_day: 61 } },
+  })
+  // Usable, but its duplicate keys make setup refuse before writing.
+  await writeFile(
+    f.paths.target,
+    '{"killswitch_enabled":false,"dump_enabled":true,"dump_enabled":false}',
+  )
+  expect((await f.write()).outcome).toBe('refused')
+  await absent(`${f.paths.target}.applied.json`)
+})
+
+test('a committed setup saves the applied copy of the generation it wrote', async () => {
+  const f = await fixture('opencode', {
+    killswitch: { enabled: true, main: { five_hour: 61, seven_day: 61 } },
+  })
+  await writeFile(f.paths.target, '{}')
+  expect((await f.write()).outcome).toBe('saved')
+  const copy = JSON.parse(
+    await readFile(`${f.paths.target}.applied.json`, 'utf8'),
+  )
+  expect(Object.keys(copy)).toEqual(['opencode'])
+  expect(copy.opencode.values).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 61,
+    killswitch_default_seven_day: 61,
+  })
+})

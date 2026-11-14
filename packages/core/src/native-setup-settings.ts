@@ -331,6 +331,7 @@ export async function writeNativeSetupSettings(
     else logger.warn('settings', message)
   }
   let service: Awaited<ReturnType<typeof openSettingsService>>
+  let committing = false
   try {
     // Reject the resolved record's "default"/"on"/"off" values even on the
     // legacy branch: released versions understand only booleans in their stores.
@@ -344,6 +345,11 @@ export async function writeNativeSetupSettings(
       file: paths.target,
       host: options.host,
       protection: options.protection,
+      // Setup's lease counts as adopted only for the generation setup's own
+      // write produced, at the moment that write commits: a file setup has
+      // not imported into must never become this host's last-good set or
+      // applied copy, even if setup is refused or its write fails.
+      adopted: () => committing,
     })
     if (!service) throw new Error('Settings service did not open')
     const generation = service.snapshot()
@@ -423,7 +429,7 @@ export async function writeNativeSetupSettings(
         for (let attempt = 1; ; attempt++) {
           const snapshot = service.snapshot()
           try {
-            await service.update(
+            const written = await service.update(
               (current, carry) => {
                 // Decide again from the file as it is under the writer lock,
                 // so a value written since the snapshot is never overwritten.
@@ -439,8 +445,19 @@ export async function writeNativeSetupSettings(
                 return plan.edits
               },
               options.host,
-              { createMissing: missing },
+              // Setup's write is this host's import into the file.
+              { createMissing: missing, importing: true },
             )
+            if (written.outcome === 'updated') {
+              // The update re-reads the file before it returns, so the lease
+              // holds the generation setup wrote: record that one only.
+              committing = true
+              try {
+                service.noteAdoption?.()
+              } finally {
+                committing = false
+              }
+            }
             break
           } catch (error) {
             if (!(error instanceof SetupProtectionChanged)) throw error
