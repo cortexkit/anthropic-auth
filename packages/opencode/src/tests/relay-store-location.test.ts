@@ -4,7 +4,7 @@
 // bearer custody hands out is sent directly to Anthropic and never to the
 // relay the moved store names.
 import { afterEach, describe, expect } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
@@ -366,30 +366,29 @@ describe('OpenCode 1: a relay named by a store moved with one variable is ignore
     expect(direct).toEqual([])
   })
 
-  test('vault mode, store in its default place and moved to the state folder: its relay is still used', async () => {
+  test('hosted mode, store in its default place and moved to the state folder: its relay is still used', async () => {
     const base = await startBody('relay-store-location-')
     resetLayoutDecisions()
     lifetimes.deferCleanup(resetLayoutDecisions)
     const relay = loopbackRelay()
     const { home, user } = await userInstall(base, relaySettings(relay.url))
     // The default folder found as OpenCode finds it, with no file named by
-    // a path variable, so the start may move the files to the state folder.
+    // a path variable (Thalamus custody needs no enrollment file), so the
+    // start may move the files to the state folder.
     delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
     process.env.OPENCODE_CONFIG_DIR = join(home, '.config', 'opencode')
+    hostByThalamus()
     const direct = mockAnthropic()
     const response = await send(user.hostAuthPath)
     expect(response.status).toBe(200)
-    const moved = await readFile(
-      join(
-        base,
-        'state',
-        'cortexkit',
-        'anthropic-auth',
-        'opencode',
-        'layout.json',
-      ),
-      'utf8',
+    // The state folder's subfolder for this config folder; its name carries
+    // a hash when the config folder is not the one HOME implies.
+    const parent = join(base, 'state', 'cortexkit', 'anthropic-auth')
+    const sub = (await readdir(parent)).find((name) =>
+      /^opencode(-[0-9a-f]{16})?$/.test(name),
     )
+    if (!sub) throw new Error('the dataset was not moved')
+    const moved = await readFile(join(parent, sub, 'layout.json'), 'utf8')
     expect(JSON.parse(moved)).toMatchObject({ phase: 'committed' })
     expect(relay.seen).toEqual([`Bearer ${BEARER}`])
     expect(direct).toEqual([])
