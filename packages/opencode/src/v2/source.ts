@@ -1460,24 +1460,26 @@ export function createNativeAnthropicSource(
           }
         } else refusalHeaders.delete(refusalKey)
         state.responseHeaders = headers
-        const served = input.status < 400 && !servedTurns.has(input.sessionID)
-        if (served) servedTurns.add(input.sessionID)
-        if (input.status === 429) reportRateLimit(input, state)
-        else
-          routingRelay.report(
-            input.sessionID,
-            {
-              accountIdentity: state.account.accountIdentity,
-              credentialId:
-                input.provenance.kind === 'vault'
-                  ? input.provenance.credentialId
-                  : state.account.credentialId,
-            },
-            headers,
-            input.status,
-            state.scope.modelID,
-            served,
-          )
+        if (input.reportRouting !== false) {
+          const served = input.status < 400 && !servedTurns.has(input.sessionID)
+          if (served) servedTurns.add(input.sessionID)
+          if (input.status === 429) reportRateLimit(input, state)
+          else
+            routingRelay.report(
+              input.sessionID,
+              {
+                accountIdentity: state.account.accountIdentity,
+                credentialId:
+                  input.provenance.kind === 'vault'
+                    ? input.provenance.credentialId
+                    : state.account.credentialId,
+              },
+              headers,
+              input.status,
+              state.scope.modelID,
+              served,
+            )
+        }
       }
       const requestId = extractAnthropicRequestId(headers)
       if (requestId) options.onRequestId?.(input, requestId)

@@ -604,6 +604,12 @@ export function createNativeCacheKeep(
     const native = createNativeAnthropicAdapter({
       source: {
         ...source,
+        quotaFromHeaders(headers, input) {
+          return source.quotaFromHeaders?.(headers, {
+            ...input,
+            reportRouting: false,
+          })
+        },
         billingRequest(input) {
           const billing = source.billingRequest?.(input)
           return billing

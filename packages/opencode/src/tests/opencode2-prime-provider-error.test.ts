@@ -939,6 +939,42 @@ test('OC2 Prime records one successful send usage and keeps no credential afterw
   expectNoCredential(fixture.seen)
 })
 
+for (const status of [200, 429]) {
+  test(`OC2 Prime harvests quota without routing reports at status ${status}`, async () => {
+    const reports: unknown[] = []
+    const globals = globalThis as Record<symbol, unknown>
+    const key = Symbol.for('cortexkit.routing')
+    const original = globals[key]
+    globals[key] = () => ({ report: (report: unknown) => reports.push(report) })
+    deferCleanup(() => {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    })
+    const provider = startProvider(suite, () =>
+      status === 200
+        ? usageReply('req_prime_quota_only')
+        : Response.json(
+            {
+              type: 'error',
+              error: { type: 'rate_limit_error', message: 'limited' },
+            },
+            {
+              status,
+              headers: { 'anthropic-ratelimit-unified-5h-utilization': '1' },
+            },
+          ),
+    )
+    const fixture = await primeFixture(provider, true)
+    expect(await fixture.send()).toMatchObject({ ok: status === 200, status })
+    expect(provider.sent).toEqual([FIRST])
+    expect(reports).toEqual([])
+    expect(
+      (await primeCounters(fixture.runtime))?.quota?.five_hour
+        ?.remainingPercent,
+    ).toBe(status === 200 ? 75 : 0)
+  })
+}
+
 test('OC2 Prime 401 that repeats its credential reaches the source scrubbed, and the retry holds only its own credential', async () => {
   let heldAtRetry: unknown
   let fixture: Awaited<ReturnType<typeof primeFixture>> | undefined
