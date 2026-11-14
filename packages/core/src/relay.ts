@@ -319,8 +319,10 @@ export const RELAY_PROXY_REFUSAL =
  */
 function relayHttpUrl(url: string): string {
   const parsed = new URL(url)
+  // An http or https URL is used exactly as configured.
   if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
   else if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+  else return url
   return parsed.toString()
 }
 
