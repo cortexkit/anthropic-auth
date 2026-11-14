@@ -5052,3 +5052,56 @@ test('the gateway read for an authorization travels with it, and no gateway keep
     'https://gateway-once.example.test',
   )
 })
+
+test('a queued direct retry with a gateway still gets the WebSocket relay dispatch', async () => {
+  const fixture = await vault([7, 8])
+  await fixture.runtime.updateRelay({
+    enabled: true,
+    transport: 'http',
+    url: 'https://relay.invalid',
+    fallbackToDirect: true,
+    token: 'synthetic-relay-token',
+  })
+  let current: ReturnType<NonNullable<NativeAccountRuntime['getClaudeGateway']>>
+  const runtime: NativeAccountRuntime = {
+    ...fixture.runtime,
+    getClaudeGateway: () => current,
+  }
+  const native = source(runtime, fixture.paths)
+  await native.chooseAccount(scope)
+  const first = await native.authorizeAccount(scope, 'main')
+  if (!first) throw new Error('Vault authorization refused')
+  expect(first.dispatch?.kind).toBe('http-relay')
+  const limit = await native.limitFromRelayFailure?.({
+    ...context(first.provenance),
+    dispatch: 'http-relay',
+    status: 502,
+  })
+  if (!limit) throw new Error('Direct fallback was not offered')
+  await native.onAttemptEnd?.(
+    { ...context(first.provenance), dispatch: 'http-relay' },
+    { outputStarted: false },
+  )
+  expect(await native.retrySameAccount?.(sameAccountInput(limit))).toEqual({
+    accountId: 'main',
+  })
+  // Before the queued retry runs, the relay becomes a WebSocket relay and a
+  // gateway is set. The retry must not become a plain direct send: a request
+  // the gateway does not take still meets the WebSocket relay's refusal.
+  await fixture.runtime.updateRelay({
+    enabled: true,
+    transport: 'websocket',
+    url: 'https://relay.invalid',
+    token: 'synthetic-relay-token',
+  })
+  current = {
+    origin: 'https://gateway-retry.example.test',
+    pathPrefix: '',
+    headers: [],
+  }
+  const retried = await native.authorizeAccount(scope, 'main')
+  expect(retried?.dispatch).toEqual({ kind: 'websocket-relay' })
+  expect(retried?.route === 'oauth' && retried.gateway?.origin).toBe(
+    'https://gateway-retry.example.test',
+  )
+})

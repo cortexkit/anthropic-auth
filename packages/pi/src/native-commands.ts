@@ -3,7 +3,7 @@ import {
   authorize,
   buildClaudeQuotaSummary,
   buildPrimeAccountStatuses,
-  claudeGatewayIgnoredNote,
+  claudeGatewayStatusNotes,
   DEFAULT_KILLSWITCH_THRESHOLDS,
   exchange,
   executeCacheKeepCommand,
@@ -407,9 +407,10 @@ export function createPiNativeCommands(
             ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
           ),
           ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
-          ...(file.gatewayIgnored
-            ? [claudeGatewayIgnoredNote(file.gatewayIgnored)]
-            : []),
+          ...claudeGatewayStatusNotes(
+            file.gatewayIgnored,
+            status.values.gateway,
+          ),
           'Settings (no model):',
           ...Object.entries(status.values).map(
             ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,

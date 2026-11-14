@@ -47,8 +47,8 @@ import {
   cacheWarmCacheablePrefixFingerprint,
   clampHostRetryMs,
   claudeGatewayHeaderValues,
-  claudeGatewayIgnoredNote,
   claudeGatewayModelUrl,
+  claudeGatewayStatusNotes,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   createDumpResponseObserver,
@@ -306,6 +306,7 @@ import {
   fetchOAuth,
   fetchOAuthModel,
   isAllowedOAuthDestination,
+  oauthDestinationRefusal,
   requireOAuthDestination,
 } from './oauth-destination.ts'
 import { pluginTestHandles } from './plugin-test-handles.ts'
@@ -6466,9 +6467,7 @@ const anthropicAuthPlugin = async (
         ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
-      ...(file.gatewayIgnored
-        ? [claudeGatewayIgnoredNote(file.gatewayIgnored)]
-        : []),
+      ...claudeGatewayStatusNotes(file.gatewayIgnored, status.values.gateway),
       'Settings (no model):',
       ...Object.entries(status.values).map(
         ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,
@@ -7826,13 +7825,20 @@ const anthropicAuthPlugin = async (
               claudeGatewayModelUrl(requestUrl, configuredGateway)
                 ? configuredGateway
                 : undefined
-            if (!isAllowedOAuthDestination(requestUrl, gateway)) {
-              logger.warn(
-                'oauth-destination',
-                'refused a Claude OAuth request to a non-Anthropic origin; nothing was sent',
-                { route },
-              )
-              return localInvalidRequestResponse(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+            const destinationRefusal = oauthDestinationRefusal(
+              requestUrl,
+              gateway,
+            )
+            if (destinationRefusal) {
+              // A gateway send refused because of a proxy setting has already
+              // logged its own warning, once.
+              if (destinationRefusal === ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+                logger.warn(
+                  'oauth-destination',
+                  'refused a Claude OAuth request to a non-Anthropic origin; nothing was sent',
+                  { route },
+                )
+              return localInvalidRequestResponse(destinationRefusal)
             }
             // A request admitted with the placeholder cannot switch to a
             // separate login while native authorization or refresh is waiting.

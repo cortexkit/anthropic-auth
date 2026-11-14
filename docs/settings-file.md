@@ -182,6 +182,17 @@ Through the gateway:
 - Redirects are refused, as for every sign-in request.
 - Certificates are always checked; `ANTHROPIC_INSECURE` never applies to
   sign-in requests.
+- A loopback `http:` gateway is refused while `HTTP_PROXY` or `http_proxy` is
+  set, because Bun would send those plain-text requests, with your sign-in
+  token and gateway headers, through that proxy, and a repository's `.env`
+  file can set the variable. Each such request fails with "Gateway refused: a
+  proxy setting would carry plain-http requests"; one warning is logged,
+  Status shows the same line, and nothing goes to `api.anthropic.com`
+  instead. To allow it, list the gateway host in `NO_PROXY` (or `no_proxy`,
+  which takes its place when set): `*`, the exact host (`127.0.0.1`,
+  `localhost` or `[::1]`) or `host:port` with the gateway's port, in a
+  comma-separated list. An `https:` gateway is not affected: a proxy can only
+  tunnel it, and its certificate is still checked.
 
 Apart from the URL and the added headers, each request is the one the plugin
 would send to Anthropic: same identity, billing header, signing, betas and
@@ -198,7 +209,11 @@ under `C:\Windows`). It looks once per process, when settings are first
 read. `HOME`, `USERPROFILE`, `APPDATA`, `XDG_CONFIG_HOME` and
 `ANTHROPIC_AUTH_SETTINGS_FILE` never decide it. The paths are compared after
 resolving links, again every time the file is read, so a link that later
-points elsewhere stops the gateway at once. If the settings file in use is
+points elsewhere stops the gateway at once. When the file in use is reached
+through another path than the default one (for example, the default path is a
+link to it), the default path is watched as well, so removing or retargeting
+it stops the gateway at once even though the file itself has not changed. If
+the settings file in use is
 anywhere else, a gateway it names is ignored, one warning is logged, and
 Status says "Gateway ignored: settings file is not in its default location".
 If the account's home folder cannot be found, the gateway is ignored the same
