@@ -203,3 +203,24 @@ test('View status opens all section lines without dispatching an account action'
     cleanup()
   }
 })
+
+test('a settings status without a settings snapshot names the settings file, not a pending promise', async () => {
+  const capabilities = createNativeMenuCapabilities({
+    runtime: {
+      read: async () => snapshotWith('local', []),
+      getSettingsPath: async () => '/synthetic/anthropic-auth-pool.json',
+      getRelayStatusNotes: () => [],
+    } as unknown as NativeAccountRuntime,
+    source: {} as NativeSource,
+    start: async () => {},
+  })
+  try {
+    const status = await capabilities.readStatus('routing')
+    expect(status).toContain(
+      'Settings file: /synthetic/anthropic-auth-pool.json',
+    )
+    expect(status).not.toContain('[object Promise]')
+  } finally {
+    capabilities.close()
+  }
+})

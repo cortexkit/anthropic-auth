@@ -8,6 +8,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - `ANTHROPIC_INSECURE` no longer turns off TLS checks on Claude sign-in requests; it still applies to API-key requests with `ANTHROPIC_BASE_URL`.
 - Requests to an HTTP relay, and the relay's own requests to Anthropic, no longer follow redirects.
 - A relay is now used only when the account settings are in their default place; a relay named by settings moved with an environment variable is ignored. Requests then go directly to Anthropic, `/claude` Status says why, and `relay setup` refuses. See [Where the relay is read from](docs/transports.md#where-the-relay-is-read-from).
+- A plain `http://` or `ws://` relay is no longer used while `HTTP_PROXY` or `http_proxy` is set, unless `NO_PROXY` lists its host, so a proxy never sees your sign-in in plain text. Requests go directly to Anthropic when `relay.fallbackToDirect` allows it and fail otherwise. See [Plain-text relays and proxy settings](docs/transports.md#plain-text-relays-and-proxy-settings).
+- A `ws://` relay is now reached over `ws://` instead of `wss://`.
+- A changed relay URL or secret now applies to the next WebSocket relay request of an ongoing conversation.
+- OpenCode 2's `/claude` settings status shows the settings file path again instead of `[object Promise]`.
 
 ## 2.12.0
 
