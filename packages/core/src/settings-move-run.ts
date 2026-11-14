@@ -164,14 +164,23 @@ export async function importSettingsHostStore(
     )
     return 'unknown'
   }
-  const resolved = service.resolve(host)
+  // The legacy set is compared only with the generation validated above.
+  // A newer reading may be unusable, and then the lease serves a recovered
+  // set (this host's own legacy store, or the strictest set) that the file
+  // never held: comparing against it could find nothing to import and adopt
+  // the file without its stricter legacy protection. So a reading published
+  // while the legacy store was read sends the check round again.
+  if (service.snapshot().id !== generation.id) {
+    warn(
+      `Settings file ${paths.target} is not used by ${host} yet: it changed while ${host}'s legacy settings were being checked against it. ${host} keeps its legacy settings and checks again ${retry}.`,
+    )
+    return 'retry'
+  }
   const plan = legacy
     ? planSettingsHostImport({
         host,
         legacy,
-        resolved: Object.fromEntries(
-          SETTINGS_PROTECTION_KEYS.map((key) => [key, resolved[key]]),
-        ) as SettingsProtectionValues,
+        resolved: generation.protection[host].values,
         fileLevels: generation.fileLevels,
       })
     : { keys: [], edits: [] }

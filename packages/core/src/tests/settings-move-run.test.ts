@@ -943,6 +943,47 @@ test('later-host import refuses a concurrent protection change without writing o
   )
 })
 
+test('an import check whose file turns unusable while the legacy store is read neither records the import nor adopts the file', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { killswitch: { enabled: true } })
+  const weaker = { schema_version: 1, killswitch_enabled: false }
+  await put(f.paths.target, weaker)
+  let published = false
+  f.options.readMode = async () => {
+    if (!published) {
+      published = true
+      // An editor truncates the file mid-save while the check reads the
+      // legacy store; the startup lease publishes the unusable reading and
+      // serves its recovered set instead of the file's.
+      await fs.writeFile(f.paths.target, '{broken')
+      const observer = await openSettingsService({ file: f.paths.target })
+      await observer!.refresh()
+      expect(observer!.snapshot().status).toBe('unparseable')
+      await observer!.dispose()
+    }
+    return 'local'
+  }
+  expect(await f.start()).toMatchObject({
+    mode: 'legacy',
+    outcome: 'import-pending',
+    mayOpenService: true,
+  })
+  expect(published).toBe(true)
+  expect(
+    await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
+  ).toBe(true)
+  // Once the save finishes, the next check imports the stricter legacy
+  // killswitch before adopting the file.
+  await put(f.paths.target, weaker)
+  expect(await f.start()).toMatchObject({ mode: 'user-file' })
+  expect(
+    await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
+  ).toBe(false)
+  const service = await openSettingsService({ file: f.paths.target })
+  cleanup.push(() => service?.dispose())
+  expect(service!.resolve('opencode').killswitch_enabled).toBe(true)
+})
+
 test('a default-target move records both hosts, so a later start adopts without a check', async () => {
   const f = await fixture()
   await put(f.stores.opencode.config, { dump: { enabled: true } })

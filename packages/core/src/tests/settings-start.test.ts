@@ -918,6 +918,83 @@ for (const unusable of ['empty', 'invalid protection'] as const) {
   })
 }
 
+test('a running legacy host whose file turns unusable while its import check reads the legacy store does not adopt the file', async () => {
+  const f = await fixture('absent')
+  await writeFile(f.options.ownPoolPaths!.config, JSON.stringify(strictStore))
+  let armed = false
+  let published = false
+  const started = await startSettings({
+    ...f.options,
+    // While the file is unusable, this host's lease recovers its own legacy
+    // set, as the runtime wires it.
+    protection: {
+      readLegacyProtection: async (host) =>
+        legacySettingsProtection(strictStore, host),
+    },
+    readMode: async () => {
+      if (armed) {
+        armed = false
+        // An editor truncates the file mid-save while the check reads the
+        // legacy store, and the lease publishes that unusable reading.
+        await writeFile(f.target, '{broken')
+        await started.service!.refresh()
+        expect(started.service!.snapshot().status).toBe('unparseable')
+        published = true
+      }
+      return 'local'
+    },
+    start: {
+      move: async () => ({
+        paths: f.paths,
+        mode: 'legacy',
+        mayOpenService: true,
+        outcome: 'fence-closed',
+      }),
+    },
+  })
+  cleanup.push(() => started.service?.dispose())
+  const clock = timer()
+  const reader = createNativeRuntimeSettings({
+    host: 'opencode',
+    settingsMode: () => started.mode,
+    settingsService: started.service,
+    settingsAuthority: { schedule: clock.schedule },
+    env: {},
+  })
+  cleanup.push(reader.close)
+  const served = () => reader.resolve(strictStore) as Resolved
+  const strict = () =>
+    expect(served().killswitch).toMatchObject({
+      enabled: true,
+      main: { five_hour: 61 },
+    })
+  const weaker = '{"killswitch_enabled":false,"dump_enabled":false}'
+  await writeFile(f.target, weaker)
+  await started.service!.refresh()
+  armed = true
+  await checkUntil(clock, () => published, strict)
+  await clock.tick()
+  expect(published).toBe(true)
+  expect(reader.file()).toBeUndefined()
+  strict()
+  expect(await exists(settingsImportRecordPath(f.target, 'opencode'))).toBe(
+    false,
+  )
+  // The save finishes: the next check imports the stricter legacy set.
+  await writeFile(f.target, weaker)
+  await checkUntil(
+    clock,
+    () => exists(settingsImportRecordPath(f.target, 'opencode')),
+    strict,
+  )
+  expect(reader.file()).toBe(f.target)
+  strict()
+  expect(parse(await readFile(f.target, 'utf8')).killswitch_enabled).toEqual({
+    default: false,
+    opencode: true,
+  })
+})
+
 test('a start on an empty file writes no marker or import record, and imports once the file is filled', async () => {
   const f = await fixture()
   await writeFile(f.target, '  \n')

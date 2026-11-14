@@ -868,3 +868,43 @@ test('a committed setup saves the applied copy of the generation it wrote', asyn
     killswitch_default_seven_day: 61,
   })
 })
+
+// OpenCode's setup leaves its new native store without the migrated values
+// when the file already holds them, so the applied copy is all that keeps
+// them until OpenCode imports the file itself.
+test('a setup with nothing to write keeps the protection the file already held after the file is deleted', async () => {
+  const f = await fixture('opencode', {
+    killswitch: { enabled: true, main: { five_hour: 61, seven_day: 61 } },
+  })
+  const file = JSON.stringify({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 61,
+    killswitch_default_seven_day: 61,
+    killswitch_default_scoped: 0,
+  })
+  await writeFile(f.paths.target, file)
+  expect((await f.write()).outcome).toBe('saved')
+  // Setup had no edits to make, and wrote nothing to the legacy store.
+  expect(await readFile(f.paths.target, 'utf8')).toBe(file)
+  expect(f.writes).toEqual([])
+  // The new native store holds no killswitch.
+  await writeFile(f.paths.own.account, '{}')
+  await rm(f.paths.target)
+  // OpenCode starts before it has imported the file.
+  const service = await openSettingsService({
+    file: f.paths.target,
+    host: 'opencode',
+    protection: f.options.protection,
+    adopted: () => false,
+  })
+  try {
+    expect(service!.snapshot().status).toBe('missing')
+    expect(service!.resolve('opencode')).toMatchObject({
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 61,
+      killswitch_default_seven_day: 61,
+    })
+  } finally {
+    await service?.dispose()
+  }
+})

@@ -423,9 +423,30 @@ export async function writeNativeSetupSettings(
         snapshot: generation,
       })
       skips = initial.skips
+      const lease = service
+      // Setup's write, or its finding that the file already holds this host's
+      // migrated protection, is this host's import: the generation it checked
+      // becomes the host's last-good set and applied copy. Without them a
+      // file deleted before the host's own import check would recover the
+      // host's set from its new native store, which setup may never have
+      // written, and lose the migrated protection.
+      const adopt = () => {
+        committing = true
+        try {
+          lease.noteAdoption?.()
+        } finally {
+          committing = false
+        }
+      }
       // The service carries the whole applied protection set into a missing
       // file in this same edit.
-      if (initial.edits.length || (missing && Object.keys(values).length)) {
+      const write =
+        initial.edits.length > 0 || (missing && Object.keys(values).length > 0)
+      // With nothing to write, the plan checked `generation` itself; the lease
+      // still holding it means the file was not changed since. Otherwise the
+      // locked plan below checks the file again before adopting it.
+      if (!write && !missing && service.snapshot().id === generation.id) adopt()
+      else if (write || !missing) {
         for (let attempt = 1; ; attempt++) {
           const snapshot = service.snapshot()
           try {
@@ -448,16 +469,14 @@ export async function writeNativeSetupSettings(
               // Setup's write is this host's import into the file.
               { createMissing: missing, importing: true },
             )
-            if (written.outcome === 'updated') {
-              // The update re-reads the file before it returns, so the lease
-              // holds the generation setup wrote: record that one only.
-              committing = true
-              try {
-                service.noteAdoption?.()
-              } finally {
-                committing = false
-              }
-            }
+            // The update re-reads the file before it returns, so the lease
+            // holds the generation setup wrote: record that one only.
+            if (written.outcome === 'updated') adopt()
+            // Nothing to write under the lock: the plan found the file's
+            // protection matching `snapshot`. Adopt only that generation, so
+            // a change after the lock was released is checked again first.
+            else if (service.snapshot().id === snapshot.id) adopt()
+            else throw new SetupProtectionChanged()
             break
           } catch (error) {
             if (!(error instanceof SetupProtectionChanged)) throw error
