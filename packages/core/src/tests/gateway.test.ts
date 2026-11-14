@@ -8,14 +8,18 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import { dumpDirectRequest, resetDumpState, setDumpEnabled } from '../dump.ts'
 import {
+  CLAUDE_GATEWAY_PROXY_REFUSAL,
   type ClaudeGateway,
   claudeGatewayModelUrl,
+  claudeGatewayProxyApplies,
   claudeGatewaySecretValues,
+  claudeGatewayStatusNotes,
   isGatewaySettingsFile,
   lookupGatewaySettingsFile,
   parseClaudeGateway,
@@ -890,4 +894,290 @@ test('the default location is compared as a real path', async () => {
     false,
   )
   expect(await isGatewaySettingsFile(file, undefined)).toBe(false)
+})
+
+// Every case below was measured against Bun 1.3.14's own fetch (HTTP_PROXY
+// pointing at a local listener): `proxied` is what Bun does, and the check
+// must refuse at least those. Suffix forms Bun also exempts (`.0.0.1`) are
+// refused here on purpose.
+test.each<[string, Record<string, string>, boolean]>([
+  ['no proxy variable', {}, false],
+  ['HTTP_PROXY', { HTTP_PROXY: 'http://127.0.0.1:9' }, true],
+  ['http_proxy', { http_proxy: 'http://127.0.0.1:9' }, true],
+  ['a value that is not a URL', { HTTP_PROXY: 'not a url' }, true],
+  ['an empty HTTP_PROXY', { HTTP_PROXY: '' }, false],
+  [
+    'an empty HTTP_PROXY beside http_proxy',
+    { HTTP_PROXY: '', http_proxy: 'http://127.0.0.1:9' },
+    true,
+  ],
+  ['ALL_PROXY, which Bun ignores for http', { ALL_PROXY: 'http://p:9' }, false],
+  [
+    'HTTPS_PROXY, which Bun ignores for http',
+    { HTTPS_PROXY: 'http://p:9' },
+    false,
+  ],
+  ['NO_PROXY=127.0.0.1', { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.1' }, false],
+  ['no_proxy=127.0.0.1', { HTTP_PROXY: 'x', no_proxy: '127.0.0.1' }, false],
+  ['NO_PROXY=*', { HTTP_PROXY: 'x', NO_PROXY: ' * ' }, false],
+  [
+    'a trimmed comma list',
+    { HTTP_PROXY: 'x', NO_PROXY: 'a.com, 127.0.0.1 ' },
+    false,
+  ],
+  ['host:port', { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.1:43123' }, false],
+  [
+    'host with another port',
+    { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.1:1' },
+    true,
+  ],
+  ['a semicolon list', { HTTP_PROXY: 'x', NO_PROXY: 'a.com;127.0.0.1' }, true],
+  ['a suffix', { HTTP_PROXY: 'x', NO_PROXY: '.0.0.1' }, true],
+  ['a CIDR range', { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.0/8' }, true],
+  ['another loopback name', { HTTP_PROXY: 'x', NO_PROXY: 'localhost' }, true],
+  [
+    'no_proxy, which replaces NO_PROXY',
+    { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.1', no_proxy: 'a.com' },
+    true,
+  ],
+  [
+    'an empty no_proxy, which leaves NO_PROXY',
+    { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.1', no_proxy: '' },
+    false,
+  ],
+])('a plain-http gateway with %s: proxied is %p', (_name, env, proxied) => {
+  expect(claudeGatewayProxyApplies('http://127.0.0.1:43123', env)).toBe(proxied)
+})
+
+test('the proxy check knows the IPv6 and named loopback forms, and leaves https alone', () => {
+  const env = { HTTP_PROXY: 'x' }
+  expect(claudeGatewayProxyApplies('http://[::1]:8080', env)).toBe(true)
+  expect(
+    claudeGatewayProxyApplies('http://[::1]:8080', { ...env, NO_PROXY: '::1' }),
+  ).toBe(true)
+  expect(
+    claudeGatewayProxyApplies('http://[::1]:8080', {
+      ...env,
+      NO_PROXY: '[::1]',
+    }),
+  ).toBe(false)
+  expect(
+    claudeGatewayProxyApplies('http://localhost:8080', {
+      ...env,
+      NO_PROXY: 'LOCALHOST',
+    }),
+  ).toBe(false)
+  // A port-less URL is not exempted by host:port, a form measured only with
+  // an explicit port.
+  expect(
+    claudeGatewayProxyApplies('http://localhost', {
+      ...env,
+      NO_PROXY: 'localhost:80',
+    }),
+  ).toBe(true)
+  expect(
+    claudeGatewayProxyApplies('https://gateway.example.test', {
+      HTTP_PROXY: 'x',
+      HTTPS_PROXY: 'x',
+    }),
+  ).toBe(false)
+  const status = {
+    origin: 'http://127.0.0.1:43123',
+    pathPrefix: '',
+    headerNames: [],
+  }
+  expect(claudeGatewayStatusNotes(undefined, status, env)).toEqual([
+    CLAUDE_GATEWAY_PROXY_REFUSAL,
+  ])
+  expect(claudeGatewayStatusNotes(undefined, status, {})).toEqual([])
+  expect(claudeGatewayStatusNotes(undefined, null, env)).toEqual([])
+})
+
+/**
+ * Runs a model send to a plain-http loopback gateway in a child process
+ * started with `env`, as a repository's `.env` would set it, with a proxy
+ * listener and the gateway listening. Bun reads the proxy variables when the
+ * process starts, so this cannot run in the test process.
+ */
+async function sendThroughProxyEnv(env: Record<string, string>) {
+  const proxyHits: string[] = []
+  const gatewayHits: string[] = []
+  // A raw listener, so any connection counts, whatever the proxy request
+  // looks like.
+  const proxy = createServer((socket) => {
+    socket.once('data', (chunk) => {
+      proxyHits.push(chunk.toString('latin1').split('\r\n')[0] ?? '')
+      socket.end(
+        'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}',
+      )
+    })
+    socket.on('error', () => {})
+  })
+  await new Promise<void>((resolve) =>
+    proxy.listen(0, '127.0.0.1', () => resolve()),
+  )
+  const proxyAddress = proxy.address()
+  const proxyPort =
+    typeof proxyAddress === 'object' && proxyAddress ? proxyAddress.port : 0
+  const gatewayServer = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(request) {
+      gatewayHits.push(
+        `${new URL(request.url).pathname} ${request.headers.get('x-gateway-key')}`,
+      )
+      return new Response('{}')
+    },
+  })
+  cleanup.push(() => {
+    proxy.close()
+    gatewayServer.stop(true)
+  })
+  const origin = `http://127.0.0.1:${gatewayServer.port}`
+  const proxyUrl = `http://127.0.0.1:${proxyPort}`
+  const modulePath = (name: string) =>
+    JSON.stringify(join(import.meta.dir, '..', name))
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => !/^(?:http|https|all|no)_proxy$/i.test(name),
+    ),
+  )
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      '-e',
+      `
+        const { createClaudeModelFetch } = await import(${modulePath('oauth-origin.ts')})
+        const { claudeGatewayStatusNotes } = await import(${modulePath('gateway.ts')})
+        const { __setLogTestSink } = await import(${modulePath('logger.ts')})
+        const logs = []
+        __setLogTestSink((record) => logs.push(record))
+        const gateway = {
+          origin: ${JSON.stringify(origin)},
+          pathPrefix: '/claude',
+          headers: [['x-gateway-key', ${JSON.stringify(SECRET)}]],
+        }
+        const send = createClaudeModelFetch({ gateway })
+        const outcomes = []
+        for (const _ of [1, 2]) {
+          try {
+            const response = await send('https://api.anthropic.com/v1/messages?beta=true', {
+              method: 'POST',
+              headers: { authorization: 'Bearer proxy-test-token' },
+              body: '{"model":"m"}',
+            })
+            outcomes.push('sent ' + response.status)
+          } catch (error) {
+            outcomes.push('refused ' + error.message)
+          }
+        }
+        console.log(JSON.stringify({
+          outcomes,
+          warnings: logs.filter((record) => record.level === 'warn').map((record) => record.message),
+          notes: claudeGatewayStatusNotes(undefined, { origin: gateway.origin, pathPrefix: '/claude', headerNames: ['x-gateway-key'] }),
+        }))
+        process.exit(0)
+      `,
+    ],
+    {
+      env: {
+        ...inherited,
+        ...Object.fromEntries(
+          Object.entries(env).map(([name, value]) => [
+            name,
+            value.replace('$PROXY', proxyUrl),
+          ]),
+        ),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  const [output, errors, code] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ])
+  expect({ code, errors: code === 0 ? '' : errors }).toEqual({
+    code: 0,
+    errors: '',
+  })
+  const result = JSON.parse(output.trim().split('\n').at(-1) ?? '{}') as {
+    outcomes: string[]
+    warnings: string[]
+    notes: string[]
+  }
+  return { ...result, proxyHits, gatewayHits, proxyUrl }
+}
+
+for (const name of ['HTTP_PROXY', 'http_proxy'])
+  test(`a plain-http gateway send is refused when ${name} would carry it, and the proxy never receives it`, async () => {
+    const result = await sendThroughProxyEnv({ [name]: '$PROXY' })
+    expect(result.proxyHits).toEqual([])
+    expect(result.gatewayHits).toEqual([])
+    // Refused every time, with the fixed text; nothing goes to
+    // api.anthropic.com instead.
+    expect(result.outcomes).toEqual([
+      `refused ${CLAUDE_GATEWAY_PROXY_REFUSAL}`,
+      `refused ${CLAUDE_GATEWAY_PROXY_REFUSAL}`,
+    ])
+    expect(result.warnings).toHaveLength(1)
+    expect(result.warnings[0]).toContain('proxy setting')
+    expect(result.notes).toEqual([CLAUDE_GATEWAY_PROXY_REFUSAL])
+    // Neither the proxy's address nor a header value is named anywhere.
+    const text = JSON.stringify(result.outcomes.concat(result.warnings))
+    expect(text).not.toContain(result.proxyUrl)
+    expect(text).not.toContain(SECRET)
+  })
+
+test('a plain-http gateway the NO_PROXY list exempts is sent to the gateway, not the proxy', async () => {
+  const result = await sendThroughProxyEnv({
+    HTTP_PROXY: '$PROXY',
+    NO_PROXY: 'example.test, 127.0.0.1',
+  })
+  expect(result.proxyHits).toEqual([])
+  expect(result.gatewayHits).toEqual([
+    `/claude/v1/messages ${SECRET}`,
+    `/claude/v1/messages ${SECRET}`,
+  ])
+  expect(result.outcomes).toEqual(['sent 200', 'sent 200'])
+  expect(result.warnings).toEqual([])
+  expect(result.notes).toEqual([])
+})
+
+async function eventually(check: () => boolean, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('condition not reached')
+    await Bun.sleep(25)
+  }
+}
+
+test('removing or retargeting the default path stops the gateway at once, though the file in use is unchanged', async () => {
+  const f = await settingsFixture(
+    { gateway_url: 'https://gateway.example.test' },
+    (root) => join(root, 'default', 'anthropic-auth.jsonc'),
+    async (root, file) => {
+      // The default path is a symlink to the file in use, so it qualifies.
+      await mkdir(join(root, 'default'))
+      await symlink(file, join(root, 'default', 'anthropic-auth.jsonc'))
+    },
+  )
+  const root = join(f.file, '..')
+  const defaultFile = join(root, 'default', 'anthropic-auth.jsonc')
+  const reader = f.reader('opencode')
+  expect(reader.gateway()?.origin).toBe('https://gateway.example.test')
+  // The fixture's own file watch is off and the file in use is not touched:
+  // only a watch on the default path can notice these changes.
+  await rm(defaultFile)
+  await eventually(() => reader.gateway() === undefined)
+  expect(reader.status()?.file.gatewayIgnored).toBe('not-default-location')
+  await symlink(f.file, defaultFile)
+  await eventually(() => reader.gateway() !== undefined)
+  const other = join(root, 'other.jsonc')
+  await writeFile(other, '{}')
+  await rm(defaultFile)
+  await symlink(other, defaultFile)
+  await eventually(() => reader.gateway() === undefined)
+  expect(reader.status()?.file.gatewayIgnored).toBe('not-default-location')
 })

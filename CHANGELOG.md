@@ -4,7 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- You can send Claude subscription (sign-in) model requests through your own gateway by setting `gateway_url` and `gateway_headers` in your user settings file at its default location. Sign-in, refresh and usage still go only to Anthropic, and a project file, provider `baseURL` or environment variable still cannot redirect your token. See [Custom gateway](docs/settings-file.md#custom-gateway). Addresses #692.
+- You can send Claude subscription (sign-in) model requests through your own gateway by setting `gateway_url` and `gateway_headers` in your user settings file at its default location. Sign-in, refresh and usage still go only to Anthropic, and a project file, provider `baseURL` or environment variable still cannot redirect your token. A local `http:` gateway is refused while `HTTP_PROXY` is set, unless `NO_PROXY` lists its host, so a proxy never sees your token in plain text. See [Custom gateway](docs/settings-file.md#custom-gateway). Addresses #692.
 - `ANTHROPIC_INSECURE` no longer turns off TLS checks on Claude sign-in requests; it still applies to API-key requests with `ANTHROPIC_BASE_URL`.
 - Requests to an HTTP relay, and the relay's own requests to Anthropic, no longer follow redirects.
 

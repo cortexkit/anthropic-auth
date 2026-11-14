@@ -1,6 +1,8 @@
 import {
+  ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   type AnthropicOAuthOriginOptions,
   type ClaudeGateway,
+  ClaudeGatewayProxyRefusal,
   createAnthropicOAuthFetch,
   createClaudeModelFetch,
   logger,
@@ -110,11 +112,25 @@ export function isAllowedOAuthDestination(
   url: string,
   gateway?: ClaudeGateway,
 ): boolean {
+  return oauthDestinationRefusal(url, gateway) === undefined
+}
+
+/**
+ * Undefined when an OAuth token may be sent to `url`; otherwise the fixed
+ * refusal text, which never includes the URL or any credential. A gateway
+ * send refused because a proxy setting would carry it gets its own text.
+ */
+export function oauthDestinationRefusal(
+  url: string,
+  gateway?: ClaudeGateway,
+): string | undefined {
   try {
     requireOAuthDestination(url, gateway)
-    return true
-  } catch {
-    return false
+    return undefined
+  } catch (error) {
+    return error instanceof ClaudeGatewayProxyRefusal
+      ? error.message
+      : ANTHROPIC_OAUTH_ORIGIN_REFUSAL
   }
 }
 

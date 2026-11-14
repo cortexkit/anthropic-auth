@@ -1,8 +1,11 @@
 import {
   applyClaudeGatewayHeaders,
+  CLAUDE_GATEWAY_PROXY_REFUSAL,
   type ClaudeGateway,
   claudeGatewayModelUrl,
+  claudeGatewayProxyApplies,
   isClaudeGatewayUrl,
+  warnClaudeGatewayProxyRefused,
 } from './gateway.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
@@ -37,9 +40,22 @@ export const ANTHROPIC_OAUTH_ORIGIN_REFUSAL =
 export class AnthropicOAuthOriginError extends Error {
   readonly check = 'oauth_destination'
 
-  constructor() {
-    super(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+  constructor(message: string = ANTHROPIC_OAUTH_ORIGIN_REFUSAL) {
+    super(message)
     this.name = 'AnthropicOAuthOriginError'
+  }
+}
+
+/**
+ * A plain-http send to the user's gateway was refused locally because a
+ * proxy setting would carry it (see claudeGatewayProxyApplies). Nothing was
+ * sent, and nothing falls back to api.anthropic.com. Its message is fixed
+ * and names no value.
+ */
+export class ClaudeGatewayProxyRefusal extends AnthropicOAuthOriginError {
+  constructor() {
+    super(CLAUDE_GATEWAY_PROXY_REFUSAL)
+    this.name = 'ClaudeGatewayProxyRefusal'
   }
 }
 
@@ -78,7 +94,8 @@ function sameOrigin(url: URL, origin: string): boolean {
  * Returns the parsed URL when an OAuth token may be sent to it: HTTPS on
  * api.anthropic.com's default port (or the caller's extra origin, or inside
  * the caller's gateway), with no user name or password in the URL. Throws
- * otherwise.
+ * otherwise, and also for a plain-http gateway URL that a proxy setting
+ * would carry (ClaudeGatewayProxyRefusal).
  */
 export function requireAnthropicOAuthOrigin(
   value: string,
@@ -94,8 +111,17 @@ export function requireAnthropicOAuthOrigin(
   if (url.username || url.password) throw refuse('destination')
   if (url.protocol === 'https:' && url.origin === ANTHROPIC_OAUTH_ORIGIN)
     return url
+  if (options.gateway && isClaudeGatewayUrl(url, options.gateway)) {
+    // Checked before any other allowance, so no other rule can let a
+    // proxied plain-http gateway send through. The refusal is never
+    // replaced by the caller's wording, so it always says why.
+    if (claudeGatewayProxyApplies(url.origin)) {
+      warnClaudeGatewayProxyRefused(options.gateway)
+      throw new ClaudeGatewayProxyRefusal()
+    }
+    return url
+  }
   if (options.extraOrigin && sameOrigin(url, options.extraOrigin)) return url
-  if (options.gateway && isClaudeGatewayUrl(url, options.gateway)) return url
   throw refuse('destination')
 }
 

@@ -232,6 +232,74 @@ export function warnClaudeGatewayRelayIgnored(gateway: ClaudeGateway): void {
   )
 }
 
+type ProxyEnvironment = Readonly<Record<string, string | undefined>>
+
+/**
+ * Fixed text for refusing a plain-http gateway send that a proxy setting
+ * would carry. It names no value: the variables may hold credentials.
+ */
+export const CLAUDE_GATEWAY_PROXY_REFUSAL =
+  'Gateway refused: a proxy setting would carry plain-http requests'
+
+/**
+ * True when a plain-http request to `origin` would go through a proxy.
+ *
+ * Bun's fetch sends a plain-http request through `HTTP_PROXY` or
+ * `http_proxy`, and fetch has no per-request way to turn that off. A
+ * repository's `.env` can set those variables, so a proxy it names would
+ * receive the OAuth bearer, the gateway headers and the conversation in
+ * clear text. (An https gateway is only tunnelled through a proxy, and TLS
+ * still checks the gateway's certificate, so it is not affected.)
+ *
+ * Measured on Bun 1.3.14: `HTTP_PROXY` and `http_proxy` apply to http URLs,
+ * and any non-empty value counts, even one that is not a URL. `ALL_PROXY`,
+ * `all_proxy`, `HTTPS_PROXY` and `https_proxy` do not apply to http URLs.
+ * `no_proxy`, when non-empty, is used in place of `NO_PROXY`; it is a comma
+ * list whose entries are trimmed, and `*`, the exact host (`[::1]` for IPv6,
+ * any letter case) and `host:port` with the URL's own explicit port exempt the
+ * host. Bun also exempts some host suffixes; those are not accepted here, so
+ * this check can only refuse more than Bun would proxy, never less.
+ */
+export function claudeGatewayProxyApplies(
+  origin: string,
+  env: ProxyEnvironment = process.env,
+): boolean {
+  let url: URL
+  try {
+    url = new URL(origin)
+  } catch {
+    return true
+  }
+  if (url.protocol !== 'http:') return false
+  if (!env.HTTP_PROXY && !env.http_proxy) return false
+  const list = env.no_proxy ? env.no_proxy : (env.NO_PROXY ?? '')
+  const host = url.hostname.toLowerCase()
+  // `host:port` was measured only with a port written in the URL.
+  const withPort = url.port ? `${host}:${url.port}` : undefined
+  for (const raw of list.split(',')) {
+    const entry = raw.trim().toLowerCase()
+    if (!entry) continue
+    if (entry === '*' || entry === host || entry === withPort) return false
+  }
+  return true
+}
+
+const warnedProxyRefused = new Set<string>()
+
+/**
+ * Logs once per gateway destination that its plain-http sends are refused
+ * because a proxy setting would carry them. Names no variable value.
+ */
+export function warnClaudeGatewayProxyRefused(gateway: ClaudeGateway): void {
+  const key = `${gateway.origin}${gateway.pathPrefix}`
+  if (warnedProxyRefused.has(key)) return
+  warnedProxyRefused.add(key)
+  logger.warn(
+    'gateway',
+    'Claude OAuth model requests to the http gateway are refused: a proxy setting (HTTP_PROXY or http_proxy) would carry them in plain text. Exempt the gateway host with NO_PROXY, or use an https gateway.',
+  )
+}
+
 /** Why a gateway named in the settings file is not used. */
 export type ClaudeGatewayIgnored =
   | 'not-default-location'
@@ -242,6 +310,22 @@ export function claudeGatewayIgnoredNote(reason: ClaudeGatewayIgnored): string {
   return reason === 'account-home-unknown'
     ? "Gateway ignored: the operating system account's home folder could not be found"
     : 'Gateway ignored: settings file is not in its default location'
+}
+
+/**
+ * The Status lines about the gateway: why a configured gateway is ignored,
+ * or that its plain-http sends are refused because of a proxy setting.
+ * They name no header or environment value.
+ */
+export function claudeGatewayStatusNotes(
+  ignored: ClaudeGatewayIgnored | undefined,
+  gateway: ClaudeGatewayStatus | null | undefined,
+  env: ProxyEnvironment = process.env,
+): string[] {
+  if (ignored) return [claudeGatewayIgnoredNote(ignored)]
+  return gateway && claudeGatewayProxyApplies(gateway.origin, env)
+    ? [CLAUDE_GATEWAY_PROXY_REFUSAL]
+    : []
 }
 
 /** Runs one program and returns its standard output. */

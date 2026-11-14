@@ -1,5 +1,6 @@
 import {
   type AnthropicBillingWarming,
+  type ClaudeGateway,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   decideStickyQuotaFailure,
@@ -492,7 +493,7 @@ export function createNativeAnthropicSource(
     const current = await runtime.read(modelID)
     syncDumpEnabled(current)
     active.signal.throwIfAborted()
-    assertTransport(current)
+    assertTransport(current, route === 'oauth' ? gateway() : undefined)
     const account = current.accounts.find((row) => row.id === accountId)
     if (
       !account ||
@@ -524,16 +525,19 @@ export function createNativeAnthropicSource(
 
   // The user's gateway from their own settings file, read from memory.
   const gateway = () => runtime.getClaudeGateway?.()
+  // Callers always pass the gateway the send would use, never a default:
+  // `undefined` means no gateway (for example an API-key route), and must not
+  // be replaced by a fresh read of the settings.
   const assertTransport = (
     snapshot: NativeAccountSnapshot,
-    current = gateway(),
+    current: ClaudeGateway | undefined,
   ) => {
     const selected = snapshot.policyStorage.relay
-    // With a gateway, a WebSocket relay does not refuse the authorization:
-    // the adapter sends a gateway-routed model request to the gateway and
-    // refuses any other request itself, once its URL is known. An API-key
-    // route still meets the refusal here, since dispatchFor checks it
-    // without the gateway.
+    // With a gateway, a WebSocket relay does not refuse here: dispatchFor
+    // hands the adapter the WebSocket relay's dispatch, and the adapter sends
+    // a gateway-routed model request to the gateway and refuses any other
+    // request itself, once its URL is known. Without a gateway (an API-key
+    // route always passes none) the refusal happens here.
     if (
       !current &&
       selected?.enabled === true &&
@@ -556,19 +560,22 @@ export function createNativeAnthropicSource(
     const gatewayField = current ? { gateway: current } : {}
     if (current && snapshot.policyStorage.relay?.enabled === true)
       warnClaudeGatewayRelayIgnored(current)
-    if (direct || snapshot.policyStorage.relay?.enabled !== true)
-      return {
-        dispatch: { kind: 'direct' as const },
-        relayFallback: false,
-        ...gatewayField,
-      }
     const selected = snapshot.policyStorage.relay
+    // Decided before the direct case: a queued direct retry must still meet
+    // the WebSocket relay's refusal for any request the gateway does not take.
     if (
       current &&
+      selected?.enabled === true &&
       effectiveRelayTransport(selected.transport, selected.url) === 'websocket'
     )
       return {
         dispatch: { kind: 'websocket-relay' as const },
+        relayFallback: false,
+        ...gatewayField,
+      }
+    if (direct || selected?.enabled !== true)
+      return {
+        dispatch: { kind: 'direct' as const },
         relayFallback: false,
         ...gatewayField,
       }
@@ -723,7 +730,7 @@ export function createNativeAnthropicSource(
       active.signal.throwIfAborted()
       // Account selection rejects a WebSocket relay before any OAuth token
       // refresh or retrieval starts.
-      assertTransport(snapshot)
+      assertTransport(snapshot, gateway())
       if (snapshot.mode === 'claustrum') {
         snapshot = await readNativeAccountsForRequest(runtime, active.signal)
         snapshot = {
@@ -790,7 +797,7 @@ export function createNativeAnthropicSource(
       if (advice) {
         snapshot = await runtime.read(modelID)
         active.signal.throwIfAborted()
-        assertTransport(snapshot)
+        assertTransport(snapshot, gateway())
       }
       const oauth: NativeAccountView[] = []
       const policies = new Map<string, NativeAccountPolicy>()
@@ -1026,7 +1033,7 @@ export function createNativeAnthropicSource(
         )
         const snapshot = await runtime.read(modelID)
         active.signal.throwIfAborted()
-        assertTransport(snapshot)
+        assertTransport(snapshot, gateway())
         const account = snapshot.accounts.find(
           (row) => row.id === input.accountId,
         )
@@ -1052,7 +1059,7 @@ export function createNativeAnthropicSource(
       )
       const snapshot = await runtime.read(modelID)
       active.signal.throwIfAborted()
-      assertTransport(snapshot)
+      assertTransport(snapshot, gateway())
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
       )
@@ -1085,7 +1092,7 @@ export function createNativeAnthropicSource(
       const snapshot = await runtime.read(modelID)
       syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
-      assertTransport(snapshot)
+      assertTransport(snapshot, gateway())
       const account = snapshot.accounts.find((row) => row.id === accountId)
       if (!account || !eligible(account, snapshot, modelID, scope.sessionID)) {
         onRefusal?.(
