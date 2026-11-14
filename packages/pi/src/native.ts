@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 import {
   type AccountStorage,
   acquireNativeAccountRuntime,
+  type ClaudeGateway,
   createNativeUsagePublisher,
   decidePiStateLayout,
   getAccountStatePath,
@@ -360,6 +361,11 @@ export class PiNativeRuntime {
   /** Resolve target settings from the initialized service without request I/O. */
   resolveSettings(stored: AccountStorage, model?: string): AccountStorage {
     return this.publishedRuntime?.resolveSettings?.(stored, model) ?? stored
+  }
+
+  /** The user's gateway for OAuth model requests, from memory only. */
+  claudeGateway(): ClaudeGateway | undefined {
+    return this.closed ? undefined : this.publishedRuntime?.getClaudeGateway?.()
   }
 
   async routingPath(): Promise<string> {
@@ -730,4 +736,11 @@ export function closePiNativeRuntime(
   return Promise.all(closingRuntimes.get(resolve(storagePath)) ?? []).then(
     () => {},
   )
+}
+
+/** The gateway for a context's model requests, without starting account I/O. */
+export function piClaudeGatewayFromMemory(
+  storagePath = getPiAccountStoragePath(),
+): ClaudeGateway | undefined {
+  return cachedPiNativeRuntime(storagePath)?.claudeGateway()
 }

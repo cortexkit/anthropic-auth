@@ -1,3 +1,9 @@
+import {
+  applyClaudeGatewayHeaders,
+  type ClaudeGateway,
+  claudeGatewayModelUrl,
+  isClaudeGatewayUrl,
+} from './gateway.ts'
 import { copyStreamResponseTiming } from './stream-completion.ts'
 
 /**
@@ -10,6 +16,11 @@ import { copyStreamResponseTiming } from './stream-completion.ts'
  * user opened, so the URL alone is not trusted: every OAuth send checks its
  * final URL here before the token leaves the process. API-key routes are not
  * checked here; they keep whatever base URL the user configured.
+ *
+ * Model requests may also go to the gateway the user named in their own
+ * settings file (see gateway.ts). Only the model-request send passes that
+ * gateway here; sign-in, refresh, usage and other sends never do, so they
+ * stay limited to api.anthropic.com.
  */
 
 export const ANTHROPIC_OAUTH_ORIGIN = 'https://api.anthropic.com'
@@ -40,6 +51,12 @@ export interface AnthropicOAuthOriginOptions {
    */
   readonly extraOrigin?: string
   /**
+   * The user's gateway from their settings file, for model requests only.
+   * A URL with its exact origin and under its path prefix is accepted. Never
+   * derived from provider configuration or the environment.
+   */
+  readonly gateway?: ClaudeGateway
+  /**
    * Builds the error thrown for a refused URL. `unparseable` means the value
    * is not a URL at all. Defaults to AnthropicOAuthOriginError for both.
    */
@@ -59,8 +76,9 @@ function sameOrigin(url: URL, origin: string): boolean {
 
 /**
  * Returns the parsed URL when an OAuth token may be sent to it: HTTPS on
- * api.anthropic.com's default port (or the caller's extra origin), with no
- * user name or password in the URL. Throws otherwise.
+ * api.anthropic.com's default port (or the caller's extra origin, or inside
+ * the caller's gateway), with no user name or password in the URL. Throws
+ * otherwise.
  */
 export function requireAnthropicOAuthOrigin(
   value: string,
@@ -77,6 +95,7 @@ export function requireAnthropicOAuthOrigin(
   if (url.protocol === 'https:' && url.origin === ANTHROPIC_OAUTH_ORIGIN)
     return url
   if (options.extraOrigin && sameOrigin(url, options.extraOrigin)) return url
+  if (options.gateway && isClaudeGatewayUrl(url, options.gateway)) return url
   throw refuse('destination')
 }
 
@@ -122,4 +141,74 @@ export function createAnthropicOAuthFetch(
       },
     },
   )
+}
+
+export interface ClaudeModelFetchOptions {
+  /** Origin options for every send (test-only loopback, refusal wording). */
+  readonly origin?:
+    | AnthropicOAuthOriginOptions
+    | (() => AnthropicOAuthOriginOptions)
+  /**
+   * The user's gateway, or undefined for none. A function is read on every
+   * call, so a keep-warm or Prime send follows the current settings; a live
+   * request passes the value it read once, so all its sends agree.
+   */
+  readonly gateway?:
+    | ClaudeGateway
+    | undefined
+    | (() => ClaudeGateway | undefined)
+}
+
+/**
+ * A fetch for Claude OAuth model requests (`POST /v1/messages`). Without a
+ * gateway it is createAnthropicOAuthFetch. With one, a model request to
+ * api.anthropic.com goes to the gateway instead, carrying the gateway
+ * headers; only the URL and those headers change. Other URLs are not moved
+ * and are checked without the gateway, so nothing but a model request can
+ * reach it. Redirects are refused either way.
+ */
+export function createClaudeModelFetch(
+  options: ClaudeModelFetchOptions = {},
+): typeof fetch {
+  const origin = () =>
+    typeof options.origin === 'function'
+      ? options.origin()
+      : (options.origin ?? {})
+  const gatewayNow = () =>
+    typeof options.gateway === 'function' ? options.gateway() : options.gateway
+  const direct = createAnthropicOAuthFetch(origin)
+  return Object.assign(
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const gateway = gatewayNow()
+      const url = fetchInputUrl(input)
+      const target =
+        gateway &&
+        (init?.method ?? requestMethod(input)).toUpperCase() === 'POST'
+          ? claudeGatewayModelUrl(url, gateway)
+          : undefined
+      if (!gateway || !target) return direct(input, init)
+      const headers = applyClaudeGatewayHeaders(
+        new Headers(
+          init?.headers ?? (input instanceof Request ? input.headers : {}),
+        ),
+        gateway,
+      )
+      const routed =
+        input instanceof Request
+          ? new Request(target.toString(), input)
+          : target
+      return createAnthropicOAuthFetch(() => ({ ...origin(), gateway }))(
+        routed,
+        { ...init, headers },
+      )
+    },
+    { preconnect: direct.preconnect },
+  )
+}
+
+function requestMethod(input: Parameters<typeof fetch>[0]): string {
+  return input instanceof Request ? input.method : 'GET'
 }

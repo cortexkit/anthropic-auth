@@ -9,12 +9,16 @@ import { createHash, randomUUID } from 'node:crypto'
 import {
   type AnthropicBillingRequest,
   AnthropicOAuthOriginError,
+  applyClaudeGatewayHeaders,
   applyCustomHeaders,
   applyRunnerTurnNotes,
   assertHostAuthorityStable,
   assertNotCustodyTombstone,
   type ClaudeCodeIdentity,
+  type ClaudeGateway,
   classifyGzipRejection,
+  claudeGatewayHeaderValues,
+  claudeGatewayModelUrl,
   createDumpResponseObserver,
   createProviderErrorRedactor,
   createProviderErrorResponseScope,
@@ -208,6 +212,12 @@ export type NativeAnthropicAuthorization<P> =
       readonly headers?: HeaderEdits
       readonly provenance: P
       readonly dispatch?: NativeAnthropicDispatch
+      /**
+       * The user's gateway from their own settings file, read once when this
+       * send was authorized (always with a direct dispatch). A model request
+       * goes there instead of api.anthropic.com.
+       */
+      readonly gateway?: ClaudeGateway
     }
   | {
       readonly route: 'api'
@@ -623,6 +633,7 @@ interface PendingSend {
   readonly dispatch?: NativeAnthropicDispatch
   readonly apiHeaders?: HeaderEdits
   readonly oauthHeaders?: HeaderEdits
+  readonly gateway?: ClaudeGateway
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -897,8 +908,12 @@ export function createNativeAnthropicAdapter<Q, P>(
     send: PendingSend,
     mode: ProviderResponseMode,
     physical: Headers,
+    // Header values of the gateway this send goes to; its errors may echo them.
+    gatewaySecrets: readonly string[] = [],
   ) => {
-    const secrets = sendSecrets(send, physical)
+    const secrets = [
+      ...new Set([...sendSecrets(send, physical), ...gatewaySecrets]),
+    ]
     const scope = createProviderErrorResponseScope(secrets, mode)
     modes.set(data, mode)
     owned.set(data, {
@@ -1158,6 +1173,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         },
         dispatch: auth.dispatch,
         oauthHeaders: auth.headers,
+        ...(auth.gateway ? { gateway: auth.gateway } : {}),
       })
       const extra = lowerCaseEdits(auth.headers)
       for (const name of CREDENTIAL_HEADERS) delete extra[name]
@@ -1252,13 +1268,30 @@ export function createNativeAnthropicAdapter<Q, P>(
         request.url,
         send.baseURL !== undefined ? { baseURL: send.baseURL } : {},
       ).url?.toString() ?? request.url
+    // The user's gateway, as read when this send was authorized, takes OAuth
+    // model requests sent directly; a relay dispatch never carries one. The
+    // thread, gzip, URL and redaction choices below all use this value.
+    const configuredGateway =
+      data.route === 'oauth' &&
+      send.dispatch?.kind !== 'http-relay' &&
+      send.dispatch?.kind !== 'websocket-relay' &&
+      request.method.toUpperCase() === 'POST'
+        ? send.gateway
+        : undefined
+    const gatewayUrl = configuredGateway
+      ? claudeGatewayModelUrl(url, configuredGateway)
+      : undefined
+    const gateway: ClaudeGateway | undefined = gatewayUrl
+      ? configuredGateway
+      : undefined
 
     try {
       if (data.route === 'oauth' && send.oauth) {
         // The request URL comes from provider configuration, which a project
         // file in an opened repository can set. An OAuth token goes only to
-        // Anthropic: refuse anything else before the request is built.
-        requireOAuthDestination(url)
+        // Anthropic (or the user's own gateway, for a model request): refuse
+        // anything else before the request is built.
+        requireOAuthDestination(url, gateway)
         const { accessToken, identity } = send.oauth
         for (const [name, value] of Object.entries(
           lowerCaseEdits(send.oauthHeaders),
@@ -1365,7 +1398,13 @@ export function createNativeAnthropicAdapter<Q, P>(
       isRecord(finalPayload) && finalPayload.stream === true
         ? 'event-stream'
         : 'http'
-    holdRedactor(data, send, responseMode, headers)
+    holdRedactor(
+      data,
+      send,
+      responseMode,
+      headers,
+      claudeGatewayHeaderValues(gateway),
+    )
     if (data.route === 'oauth' && messages && body !== undefined) {
       await source.onRequestPrepared?.({
         ...contextOf(attempt, data),
@@ -1384,7 +1423,9 @@ export function createNativeAnthropicAdapter<Q, P>(
       !isAuxiliaryAgent(attempt.agent) &&
       attempt.agent !== 'cachekeep' &&
       attempt.agent !== 'compaction' &&
-      correlation[LANE_START_REQUEST_HEADER] !== '1'
+      correlation[LANE_START_REQUEST_HEADER] !== '1' &&
+      // Gateways may refuse the thread route: send full requests.
+      !gateway
     ) {
       const expectedAccountUuid = send.oauth.identity?.accountUuid
       let resendAuthorization: NativeAnthropicAuthorization<P> | undefined
@@ -1657,7 +1698,9 @@ export function createNativeAnthropicAdapter<Q, P>(
       return relayRequest
     }
     let wireBody: string | Uint8Array | undefined = body
-    if (data.route === 'oauth' && messages && body !== undefined) {
+    // Claude Code compresses only to api.anthropic.com, so a gateway gets the
+    // uncompressed body.
+    if (data.route === 'oauth' && messages && body !== undefined && !gateway) {
       const decision = await decideRequestGzip({
         url,
         body,
@@ -1692,7 +1735,12 @@ export function createNativeAnthropicAdapter<Q, P>(
       dropDumpContext(data)
     }
     assertHostAuthorityStable()
-    const finalRequest = new Request(url, {
+    // Only the destination and the gateway's own headers change.
+    if (gateway && gatewayUrl) {
+      requireOAuthDestination(gatewayUrl.toString(), gateway)
+      applyClaudeGatewayHeaders(headers, gateway)
+    }
+    const finalRequest = new Request(gatewayUrl?.toString() ?? url, {
       method: request.method,
       headers,
       // An OAuth bearer must not follow a redirect to another host.

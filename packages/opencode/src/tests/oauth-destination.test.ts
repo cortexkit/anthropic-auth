@@ -6,23 +6,28 @@ import {
 import {
   isAllowedOAuthDestination,
   requireOAuthDestination,
-  TEST_OAUTH_LOOPBACK_ORIGIN_ENV,
+  TEST_OAUTH_LOOPBACK_ORIGIN_KEY,
   testOAuthLoopbackOrigin,
 } from '../oauth-destination'
 
-const KEYS = [TEST_OAUTH_LOOPBACK_ORIGIN_ENV, 'ANTHROPIC_BASE_URL']
+// The variable name the escape hatch used to read; it must stay inert.
+const RETIRED_ENV = 'ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN'
+const KEYS = [RETIRED_ENV, 'ANTHROPIC_BASE_URL']
 const saved = new Map<string, string | undefined>()
+const hook = globalThis as Record<symbol, unknown>
 beforeEach(() => {
   for (const key of KEYS) {
     saved.set(key, process.env[key])
     delete process.env[key]
   }
+  delete hook[TEST_OAUTH_LOOPBACK_ORIGIN_KEY]
 })
 afterEach(() => {
   for (const [key, value] of saved) {
     if (value === undefined) delete process.env[key]
     else process.env[key] = value
   }
+  delete hook[TEST_OAUTH_LOOPBACK_ORIGIN_KEY]
 })
 
 test.each([
@@ -31,7 +36,7 @@ test.each([
   'http://localhost:43123',
   'http://[::1]:43123',
 ])('accepts the exact loopback origin %s', (value) => {
-  process.env[TEST_OAUTH_LOOPBACK_ORIGIN_ENV] = value
+  hook[TEST_OAUTH_LOOPBACK_ORIGIN_KEY] = value
   expect(testOAuthLoopbackOrigin()).toBe(value)
   expect(isAllowedOAuthDestination(`${value}/v1/messages?beta=true`)).toBe(true)
 })
@@ -47,7 +52,7 @@ test.each([
   ['a non-HTTP scheme', 'ws://127.0.0.1:43123'],
   ['a value that is not a URL', '127.0.0.1:43123'],
 ])('ignores %s, leaving OAuth limited to api.anthropic.com', (_, value) => {
-  process.env[TEST_OAUTH_LOOPBACK_ORIGIN_ENV] = value
+  hook[TEST_OAUTH_LOOPBACK_ORIGIN_KEY] = value
   expect(testOAuthLoopbackOrigin()).toBeUndefined()
   const target = value.startsWith('127.') ? `http://${value}` : value
   expect(() => requireOAuthDestination(`${target}/v1/messages`)).toThrow(
@@ -71,4 +76,14 @@ test('a URL with userinfo is refused even on the official host', () => {
       'https://user:sk-ant-oat01-userinfo@api.anthropic.com/v1/messages',
     ),
   ).toThrow(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+})
+
+test('the environment variable alone never opens a loopback origin', () => {
+  // A project's .env file can set environment variables when OpenCode runs
+  // from source; only code in the process can set the test hook.
+  process.env[RETIRED_ENV] = 'http://127.0.0.1:43123'
+  expect(testOAuthLoopbackOrigin()).toBeUndefined()
+  expect(isAllowedOAuthDestination('http://127.0.0.1:43123/v1/messages')).toBe(
+    false,
+  )
 })

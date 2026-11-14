@@ -4,7 +4,7 @@
 
 For Claude Pro/Max OAuth requests, the plugin changes outgoing HTTP headers and bodies after OpenCode constructs the request and before dispatch to Anthropic:
 
-1. Check the destination. OAuth requests go only to `https://api.anthropic.com`: if a provider `baseURL` or `ANTHROPIC_BASE_URL` points anywhere else, the plugin refuses the request locally with a 400 and sends nothing. `ANTHROPIC_BASE_URL` still applies to API-key routes.
+1. Check the destination. OAuth requests go only to `https://api.anthropic.com`: if a provider `baseURL` or `ANTHROPIC_BASE_URL` points anywhere else, the plugin refuses the request locally with a 400 and sends nothing. `ANTHROPIC_BASE_URL` still applies to API-key routes. The one exception is a [custom gateway](settings-file.md#custom-gateway) set in your own user settings file: model requests then go to it, as full uncompressed requests, with only the URL and the gateway headers changed. A project file, provider `baseURL` or environment variable can never set or widen it.
 2. Normalize Claude-compatible OAuth headers and beta flags.
 3. Remove OpenCode-specific identity text from system blocks.
 4. Prepend Claude Code identity and billing-header blocks.

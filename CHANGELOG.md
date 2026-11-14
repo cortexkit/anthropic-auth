@@ -12,6 +12,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Storage paths no longer resolve incorrectly on Linux while another process is saving.
 - Changing effort no longer drops the thread tail cache marker on a full request after continuations.
 - Vault enrollment now refuses unsafe token folders even during token replacement or when folder safety checks fail.
+- You can send Claude subscription (sign-in) model requests through your own gateway by setting `gateway_url` and `gateway_headers` in your user settings file. Sign-in, refresh and usage still go only to Anthropic, and a project file, provider `baseURL` or environment variable still cannot redirect your token. See [Custom gateway](docs/settings-file.md#custom-gateway). Addresses #692.
 ## 2.11.4
 
 - OpenCode 2 now preserves billing reports for thread-recovery resends even when the host finishes the rejected request before its resend returns.

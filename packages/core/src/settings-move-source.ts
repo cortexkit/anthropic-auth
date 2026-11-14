@@ -1,14 +1,21 @@
 import type { MoveSource } from '@cortexkit/common-auth/settings'
 import { logger } from './logger.ts'
 import { validateNativeMigrationSettings } from './native-migration-source.ts'
-import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
+import {
+  type SETTINGS_FILE_ONLY_KEYS,
+  type SettingsKey,
+  settingsDefinition,
+} from './settings-definition.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import {
   mostRestrictiveSettingsProtection,
   type SettingsValues,
 } from './settings-service.ts'
 
-/** Legacy paths by schema key; cache_keep_window combines the two named sibling hours. */
+/**
+ * Legacy paths by schema key; cache_keep_window combines the two named
+ * sibling hours. File-only settings have no legacy path.
+ */
 export const SETTINGS_MOVE_PATHS = {
   routing_mode: ['routing', 'mode'],
   max_same_account_wait: ['routing', 'maxSameAccountWait'],
@@ -49,7 +56,10 @@ export const SETTINGS_MOVE_PATHS = {
     'prefixMismatchBehavior',
   ],
   turn_end_note_tools: ['turnEndNote', 'tools'],
-} as const satisfies Record<SettingsKey, readonly string[]>
+} as const satisfies Record<
+  Exclude<SettingsKey, (typeof SETTINGS_FILE_ONLY_KEYS)[number]>,
+  readonly string[]
+>
 
 export interface SettingsMoveSourceOptions {
   host: SettingsHost

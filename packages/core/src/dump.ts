@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { extractBillingHeaderCCH } from './cch.ts'
+import { isClaudeGatewaySecretHeader } from './gateway.ts'
 import { parseJsonRedacted } from './json.ts'
 import { isSecretKey, logger, relayLog } from './logger.ts'
 import type { ProviderErrorSummary } from './provider-error.ts'
@@ -607,6 +608,7 @@ function redactForDump(value: unknown): unknown {
       lower === 'x-api-key' ||
       lower === 'cookie' ||
       lower === 'set-cookie' ||
+      isClaudeGatewaySecretHeader(key) ||
       isSecretKey(key)
     ) {
       redacted[key] = '[redacted]'

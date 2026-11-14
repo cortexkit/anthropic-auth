@@ -53,6 +53,7 @@ import {
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  warnClaudeGatewayRelayIgnored,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   ChooseAccountInput,
@@ -521,9 +522,18 @@ export function createNativeAnthropicSource(
     return { snapshot: current, account }
   }
 
-  const assertTransport = (snapshot: NativeAccountSnapshot) => {
+  // The user's gateway from their own settings file, read from memory.
+  const gateway = () => runtime.getClaudeGateway?.()
+  const assertTransport = (
+    snapshot: NativeAccountSnapshot,
+    current = gateway(),
+  ) => {
     const selected = snapshot.policyStorage.relay
+    // With a gateway, OAuth requests ignore the relay, so a WebSocket relay
+    // does not refuse them here. An API-key route still meets the refusal in
+    // dispatchFor, which checks it without the gateway.
     if (
+      !current &&
       selected?.enabled === true &&
       effectiveRelayTransport(selected.transport, selected.url) === 'websocket'
     )
@@ -532,10 +542,22 @@ export function createNativeAnthropicSource(
   const dispatchFor = async (
     snapshot: NativeAccountSnapshot,
     direct: boolean,
+    route: 'oauth' | 'api',
   ) => {
-    assertTransport(snapshot)
-    if (direct || snapshot.policyStorage.relay?.enabled !== true)
-      return { dispatch: { kind: 'direct' as const }, relayFallback: false }
+    // The gateway is read once per authorization; the adapter uses this
+    // value for the send, so the relay choice and the destination agree.
+    const current = route === 'oauth' ? gateway() : undefined
+    assertTransport(snapshot, current)
+    if (current && snapshot.policyStorage.relay?.enabled === true)
+      warnClaudeGatewayRelayIgnored(current)
+    // The gateway replaces the relay for OAuth model requests; it is sent
+    // as a direct dispatch, with no relay attempt or fallback.
+    if (direct || current || snapshot.policyStorage.relay?.enabled !== true)
+      return {
+        dispatch: { kind: 'direct' as const },
+        relayFallback: false,
+        gateway: current,
+      }
     // Account and status data exclude the relay secret. Obtain it through the
     // private transport accessor immediately before preparing the send.
     const relay = await runtime.getRelayConfig()
@@ -1055,10 +1077,12 @@ export function createNativeAnthropicSource(
       const choice = queue?.shift()
       if (queue?.length === 0) recoveries.delete(queueKey)
       if (choice && !sameAccount(account, choice.account)) return undefined
-      const { dispatch, relayFallback } = await dispatchFor(
-        snapshot,
-        choice?.direct === true,
-      )
+      const {
+        dispatch,
+        relayFallback,
+        gateway: sendGateway,
+      } = await dispatchFor(snapshot, choice?.direct === true, account.type)
+      const gatewayField = sendGateway ? { gateway: sendGateway } : {}
       active.signal.throwIfAborted()
       if (choice?.auth) {
         if (
@@ -1088,7 +1112,9 @@ export function createNativeAnthropicSource(
             relayFallback,
           })
         recordServed(scope, account)
-        return { ...choice.auth, dispatch }
+        if (choice.auth.route === 'api') return { ...choice.auth, dispatch }
+        const { gateway: _earlier, ...auth } = choice.auth
+        return { ...auth, dispatch, ...gatewayField }
       }
       const common = {
         scope: { ...scope, modelID },
@@ -1177,6 +1203,7 @@ export function createNativeAnthropicSource(
           credentialId: receipt.credentialId,
           provenance,
           dispatch,
+          ...gatewayField,
           identity: getClaudeCodeIdentityForVerifiedAccount(
             identity,
             identity as ProviderAccountUuid,
@@ -1218,6 +1245,7 @@ export function createNativeAnthropicSource(
         credentialId: localMessageThreadCredential(material.subject.binding),
         provenance,
         dispatch,
+        ...gatewayField,
         identity: getClaudeCodeIdentityForVerifiedAccount(
           identity,
           identity as ProviderAccountUuid,

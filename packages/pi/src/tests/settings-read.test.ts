@@ -1095,7 +1095,15 @@ for (const mode of ['local', 'claustrum'] as const)
         const before = (await legacy.read()).policyStorage
         await legacy.close()
         expect(Object.keys(snapshotReaderOutputs(before)).sort()).toEqual(
-          Object.keys(core.SETTINGS_DEFAULT_READERS).sort(),
+          // File-only settings (the gateway) have no legacy-record reader.
+          Object.keys(core.SETTINGS_DEFAULT_READERS)
+            .filter(
+              (key) =>
+                !(core.SETTINGS_FILE_ONLY_KEYS as readonly string[]).includes(
+                  key,
+                ),
+            )
+            .sort(),
         )
         expect(
           [
@@ -1201,7 +1209,13 @@ function readerOutputs(storage: core.AccountStorage) {
     turn_end_note_tools: noteBody,
   }
   expect(Object.keys(outputs).sort()).toEqual(
-    Object.keys(core.SETTINGS_DEFAULT_READERS).sort(),
+    // File-only settings (the gateway) have no legacy-record reader.
+    Object.keys(core.SETTINGS_DEFAULT_READERS)
+      .filter(
+        (key) =>
+          !(core.SETTINGS_FILE_ONLY_KEYS as readonly string[]).includes(key),
+      )
+      .sort(),
   )
   return JSON.stringify(outputs)
 }
@@ -1477,3 +1491,35 @@ for (const peer of ['never ran', 'stricter'] as const) {
       })
   })
 }
+
+test('the gateway comes from the user file, and Status shows header names only', async () => {
+  const secret = 'pi-settings-gateway-secret'
+  await write({
+    gateway_url: 'https://pi.example.test/claude',
+    gateway_headers: { 'X-Gateway-Key': secret },
+  })
+  const native = runtime()
+  const service = await native.service()
+  expect(service.getClaudeGateway?.()).toEqual({
+    origin: 'https://pi.example.test',
+    pathPrefix: '/claude',
+    headers: [['x-gateway-key', secret]],
+  })
+  expect(native.claudeGateway()?.origin).toBe('https://pi.example.test')
+  const status = service.getSettingsStatus?.()
+  expect(status?.values.gateway).toEqual({
+    origin: 'https://pi.example.test',
+    pathPrefix: '/claude',
+    headerNames: ['x-gateway-key'],
+  })
+  expect(JSON.stringify(status)).not.toContain(secret)
+  expect(JSON.stringify(records)).not.toContain(secret)
+  // An invalid header set means no gateway.
+  await write({
+    gateway_url: 'https://gateway.example.test',
+    gateway_headers: { authorization: secret },
+  })
+  await changed(native, () => service.getClaudeGateway?.() === undefined)
+  expect(JSON.stringify(service.getSettingsStatus?.())).not.toContain(secret)
+  expect(JSON.stringify(records)).not.toContain(secret)
+})

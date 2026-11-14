@@ -11,6 +11,7 @@ import {
 } from '@cortexkit/common-auth/settings'
 import { type ParseError, parse } from 'jsonc-parser'
 
+import { parseClaudeGateway } from './gateway.ts'
 import { logger } from './logger.ts'
 import {
   CLAUDE_MODEL_CAPABILITIES,
@@ -44,6 +45,20 @@ export const SETTINGS_PROTECTION_KEYS = [
   'killswitch_default_scoped',
   'killswitch_account_floors',
 ] as const satisfies readonly SettingsKey[]
+
+/**
+ * The gateway settings are validated together. Any problem with either one
+ * means no gateway at all: model requests go directly to api.anthropic.com,
+ * never to a last-good or partly valid gateway.
+ */
+export const SETTINGS_GATEWAY_KEYS = [
+  'gateway_url',
+  'gateway_headers',
+] as const satisfies readonly SettingsKey[]
+
+function isGatewayKey(key: unknown): boolean {
+  return SETTINGS_GATEWAY_KEYS.some((gatewayKey) => gatewayKey === key)
+}
 
 export type SettingsProtectionValues = Pick<
   SettingsValues,
@@ -526,7 +541,9 @@ function reportText(entry: ReportEntry): string {
 }
 
 function logReports(report: readonly ReportEntry[]) {
+  const gateway = report.filter((entry) => isGatewayKey(entry.keyPath[0]))
   for (const entry of report) {
+    if (isGatewayKey(entry.keyPath[0])) continue
     const identity = JSON.stringify([
       entry.file.path,
       entry.keyPath,
@@ -536,6 +553,47 @@ function logReports(report: readonly ReportEntry[]) {
     logged.add(identity)
     logger.warn('settings', reportText(entry))
   }
+  if (!gateway.length) return
+  // One warning per invalid gateway configuration, however many entries it
+  // has; the keys it names hold no values.
+  const identity = JSON.stringify([
+    'gateway',
+    gateway[0]?.file.path,
+    gateway.map((entry) => [entry.keyPath, entry.reason]).sort(),
+  ])
+  if (logged.has(identity)) return
+  logged.add(identity)
+  const names = [
+    ...new Set(gateway.map((entry) => entry.keyPath[0] as string)),
+  ].join(', ')
+  logger.warn(
+    'settings',
+    `Settings invalid-value in "${gateway[0]?.file.path}" (${names}). The Claude gateway is not used; Claude OAuth model requests go directly to https://api.anthropic.com.`,
+  )
+}
+
+function withoutGateway(
+  contexts: Readonly<Record<SettingsHost, SettingsContextValues>>,
+): Record<SettingsHost, SettingsContextValues> {
+  const clear = (values: SettingsValues): SettingsValues => ({
+    ...values,
+    gateway_url: '',
+    gateway_headers: {},
+  })
+  return Object.fromEntries(
+    hosts.map((host) => [
+      host,
+      {
+        noModel: clear(contexts[host].noModel),
+        models: Object.fromEntries(
+          Object.entries(contexts[host].models).map(([model, values]) => [
+            model,
+            clear(values),
+          ]),
+        ),
+      },
+    ]),
+  ) as Record<SettingsHost, SettingsContextValues>
 }
 
 function fileStatus(candidate: Candidate): SettingsFileStatus {
@@ -812,6 +870,19 @@ class SharedSettingsService {
           'invalid-value',
         )
     }
+    // The descriptors only check the gateway values' types. Check the URL and
+    // header rules here, once per host, since `gateway_url` can differ by host.
+    for (const host of hosts) {
+      const values = contexts[host].noModel
+      const parsed = parseClaudeGateway(
+        values.gateway_url,
+        values.gateway_headers,
+      )
+      if (!parsed.ok) addReport([parsed.problem], 'invalid-value')
+    }
+    const gatewayInvalid = report.some((entry) =>
+      isGatewayKey(entry.keyPath[0]),
+    )
     for (const host of hosts) {
       const previous = this.current?.contexts[host]
       for (const [model, values] of [
@@ -825,6 +896,7 @@ class SharedSettingsService {
           if (
             entry.reason !== 'invalid-value' ||
             !keys.includes(key) ||
+            isGatewayKey(key) ||
             SETTINGS_PROTECTION_KEYS.some(
               (protectedKey) => protectedKey === key,
             )
@@ -846,6 +918,10 @@ class SharedSettingsService {
           )
             continue
           if (lastGood) values[key] = lastGood[key] as never
+        }
+        if (gatewayInvalid) {
+          values.gateway_url = ''
+          values.gateway_headers = {}
         }
         if (!lastGood && values.cache_keep_window.length > 1) {
           // Drop an invalid host level before considering the remaining default level.
@@ -940,8 +1016,22 @@ class SharedSettingsService {
     report: readonly ReportEntry[],
     status: 'unreadable' | 'unparseable',
   ): Candidate {
+    const kept = this.current?.contexts
+    // Settings that cannot be read keep their last good values, except the
+    // gateway: the user may have just removed it, so an OAuth token never
+    // goes to it until the file reads again.
+    if (kept && hosts.some((host) => kept[host].noModel.gateway_url !== '')) {
+      const identity = `gateway-unread:${this.file}:${status}`
+      if (!logged.has(identity)) {
+        logged.add(identity)
+        logger.warn(
+          'settings',
+          `Settings file "${this.file}" is ${status}; the Claude gateway is not used until it reads again, and Claude OAuth model requests go directly to https://api.anthropic.com.`,
+        )
+      }
+    }
     const contexts =
-      this.current?.contexts ??
+      (kept && withoutGateway(kept)) ??
       (Object.fromEntries(
         hosts.map((host) => [
           host,

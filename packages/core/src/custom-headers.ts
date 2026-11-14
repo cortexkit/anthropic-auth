@@ -55,6 +55,33 @@ function setCustomHeader(headers: Headers, name: string, value: string) {
   headers.set(name, value)
 }
 
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+
+/**
+ * Builds headers from name/value pairs under the same rules as
+ * ANTHROPIC_CUSTOM_HEADERS: protected headers are refused. It is stricter
+ * about form, because the pairs come from a settings file rather than a
+ * shell: each name must be a valid header token, each value a string with no
+ * line breaks, and no name may repeat in another letter case. Throws
+ * TypeError on the first problem; the message never includes a value.
+ */
+export function customHeadersFromEntries(
+  entries: Iterable<readonly [string, unknown]>,
+): Headers {
+  const headers = new Headers()
+  const seen = new Set<string>()
+  for (const [name, value] of entries) {
+    if (!HEADER_NAME.test(name)) throw new TypeError('invalid header name')
+    if (typeof value !== 'string' || /[\r\n\0]/.test(value))
+      throw new TypeError('invalid header value')
+    const lower = name.toLowerCase()
+    if (seen.has(lower)) throw new TypeError('duplicate header')
+    seen.add(lower)
+    setCustomHeader(headers, name, value)
+  }
+  return headers
+}
+
 export function parseCustomHeaders(raw: string | undefined): Headers {
   if (!raw?.trim()) return new Headers()
 

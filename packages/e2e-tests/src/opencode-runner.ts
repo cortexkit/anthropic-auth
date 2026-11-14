@@ -333,13 +333,35 @@ export function createIsolatedEnv(root = tmpdir()): IsolatedEnv {
   }
 }
 
+/**
+ * Writes a test-only OpenCode plugin that lets Claude OAuth requests reach
+ * the local mock server. The plugin refuses OAuth destinations other than
+ * api.anthropic.com unless this global symbol names the exact loopback
+ * origin; it is never read from the environment. Listed before the plugin
+ * under test, so the origin is set before any request is sent.
+ */
+function writeLoopbackOriginPlugin(env: IsolatedEnv, origin: string): string {
+  const path = join(env.configDir, 'test-oauth-loopback-origin.mjs')
+  writeFileSync(
+    path,
+    `globalThis[Symbol.for('cortexkit.anthropic-auth.test-oauth-loopback-origin')] = ${JSON.stringify(origin)}
+export const TestOAuthLoopbackOrigin = async () => ({})
+`,
+  )
+  return `file://${path}`
+}
+
 function writeConfigs(env: IsolatedEnv, options: SpawnOptions) {
+  const loopback = writeLoopbackOriginPlugin(
+    env,
+    new URL(options.anthropicBaseURL).origin,
+  )
   writeFileSync(
     join(env.configDir, 'opencode.json'),
     JSON.stringify(
       {
         $schema: 'https://opencode.ai/config.json',
-        plugin: [`file://${PLUGIN_ENTRY}`],
+        plugin: [loopback, `file://${PLUGIN_ENTRY}`],
         autoupdate: false,
         // The live host catalog can deprecate models independently of the pinned
         // OpenCode binary. The mock still serves the harness's default model.
@@ -1063,12 +1085,8 @@ export async function spawnOpencode(
       delete childEnv.OPENCODE_AUTH_CONTENT
     childEnv.ANTHROPIC_BASE_URL = options.anthropicBaseURL
     // The plugin sends Claude OAuth requests only to api.anthropic.com and
-    // refuses them when ANTHROPIC_BASE_URL points elsewhere. This test-only
-    // variable lets them reach the local mock server too; it accepts only a
-    // loopback origin.
-    childEnv.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = new URL(
-      options.anthropicBaseURL,
-    ).origin
+    // refuses them when ANTHROPIC_BASE_URL points elsewhere; the test-only
+    // plugin written with the config lets them reach the local mock server.
     childEnv.ANTHROPIC_API_KEY = 'test-key-not-real'
     for (const [key, value] of Object.entries(options.childEnv ?? {})) {
       if (value === undefined) delete childEnv[key]

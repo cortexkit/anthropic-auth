@@ -170,6 +170,10 @@ const fileValues = {
   log_level: 'debug',
   thinking_binding_prefix_mismatch_behavior: 'drop_block',
   turn_end_note_tools: ['custom'],
+  // File-only: the gateway has no legacy-shaped leaf, so the record never
+  // carries it.
+  gateway_url: 'https://gateway.example/claude',
+  gateway_headers: { 'x-gateway-team': 'platform' },
 } satisfies SettingsValues
 
 test("all declared defaults replace legacy moved settings in today's complete record shape", async () => {
@@ -195,11 +199,14 @@ test('every file setting projects into its corresponding legacy-shaped leaf', as
     )
 })
 
-test('host levels apply to every setting except the account-floor list', async () => {
+test('host levels apply to every setting except the account-floor list and the gateway', async () => {
   const source = Object.fromEntries(
     Object.entries(fileValues).map(([key, value]) => [
       key,
-      key === 'killswitch_account_floors'
+      // List, record and gateway settings take no host levels.
+      key === 'killswitch_account_floors' ||
+      key === 'gateway_headers' ||
+      key === 'gateway_url'
         ? value
         : {
             default:

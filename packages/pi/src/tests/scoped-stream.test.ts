@@ -1,6 +1,6 @@
 import { expect, test as registerTest, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
@@ -3767,4 +3767,273 @@ test('Pi model-request billing carries the keep-warm state each accepted step le
   const [localOff] = await step('pi-warming-local-off')
   expect(localOff).toMatchObject({ outcome: 'completed' })
   expect(warming(localOff)).toEqual({ on: false })
+})
+
+const PI_GATEWAY_SECRET = 'pi-gateway-header-secret'
+const PI_GATEWAY = 'https://gateway.example.test'
+async function useGateway(
+  f: Awaited<ReturnType<typeof fixture>>,
+  pathPrefix: string | undefined,
+) {
+  const runtime = await f.native.service()
+  const gateway =
+    pathPrefix === undefined
+      ? undefined
+      : {
+          origin: PI_GATEWAY,
+          pathPrefix,
+          headers: [['x-gateway-key', PI_GATEWAY_SECRET]] as [string, string][],
+        }
+  const spy = spyOn(runtime, 'getClaudeGateway').mockReturnValue(gateway)
+  deferCleanup(() => spy.mockRestore())
+}
+function recordSends(gatewayAnswer?: () => Response) {
+  const sent: Array<{
+    url: string
+    headers: Headers
+    body: string
+    gzip: boolean
+  }> = []
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const request =
+        input instanceof Request
+          ? new Request(input, init)
+          : new Request(String(input), init)
+      const gzip = request.headers.get('content-encoding') === 'gzip'
+      const bytes = Buffer.from(await request.arrayBuffer())
+      const body = (gzip ? gunzipSync(bytes) : bytes).toString()
+      sent.push({ url: request.url, headers: request.headers, body, gzip })
+      if (gatewayAnswer && request.url.startsWith(PI_GATEWAY))
+        return gatewayAnswer()
+      if (request.url.includes('/api/oauth/usage'))
+        return Response.json({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(Date.now() - 120_000).toISOString(),
+          },
+          seven_day: {
+            utilization: 0,
+            resets_at: new Date(Date.now() + 604_800_000).toISOString(),
+          },
+        })
+      // Prime asks for one token and reads a JSON answer.
+      if (body && JSON.parse(body).max_tokens === 1)
+        return Response.json(
+          { usage: { input_tokens: 11, output_tokens: 1 } },
+          { headers: { 'request-id': 'req_pi_gateway_prime' } },
+        )
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  return sent
+}
+async function sendPrimary(
+  f: Awaited<ReturnType<typeof fixture>>,
+  sessionId: string,
+) {
+  beginPiPrimaryTurn(f.path, sessionId)
+  deferCleanup(() => {
+    endPiPrimaryTurn(f.path, sessionId)
+    forgetPiMessageThread(sessionId)
+  })
+  const response = await __sendPiAnthropicRequestForTest(
+    {
+      model,
+      context: {
+        ...context,
+        messages: [{ role: 'user', content: 'x'.repeat(9000), timestamp: 1 }],
+      },
+      storagePath: f.path,
+      requestOrigin: 'agent-loop',
+      streamOptions: {
+        sessionId,
+        onPayload: (payload) => payload,
+        onResponse: () => {},
+        onProviderStreamEvent: () => {},
+      },
+    },
+    { native: f.native, fetch: globalThis.fetch },
+  )
+  await response.text()
+}
+
+test('Pi sends model and keep-warm requests to the gateway as full uncompressed requests', async () => {
+  const f = await fixture()
+  const sent = recordSends()
+  // Without a gateway the same primary request is threaded and gzipped.
+  await useGateway(f, undefined)
+  await sendPrimary(f, 'pi-gateway-control')
+  expect(sent).toHaveLength(1)
+  expect(sent[0]?.url).toBe('https://api.anthropic.com/v1/messages?beta=true')
+  expect(sent[0]?.gzip).toBe(true)
+  expect(JSON.parse(sent[0]!.body).thread).toEqual({ type: 'create' })
+
+  await useGateway(f, '/claude')
+  await sendPrimary(f, 'pi-gateway-primary')
+  expect(sent).toHaveLength(2)
+  const live = sent[1]!
+  expect(live.url).toBe(`${PI_GATEWAY}/claude/v1/messages?beta=true`)
+  expect(live.headers.get('x-gateway-key')).toBe(PI_GATEWAY_SECRET)
+  expect(live.headers.get('authorization')).toMatch(
+    /^Bearer vault-test-access-/,
+  )
+  expect(live.gzip).toBe(false)
+  expect(JSON.parse(live.body).thread).toBeUndefined()
+  expect(await signRequestBody(live.body)).toBe(live.body)
+
+  const prewarm = await __prewarmPiCacheKeepForTest({
+    sessionId: 'pi-gateway-warm',
+    // CacheKeep keeps the Anthropic URL and applies the current gateway.
+    url: 'https://api.anthropic.com/v1/messages?beta=true',
+    headers: new Headers(),
+    bodyText: live.body,
+    oauthAccountId: 'main',
+    oauthAccountIdentity: fixtureAccountIdentity('main'),
+    accountStoragePath: f.path,
+  })
+  expect(prewarm).toMatchObject({ ok: true })
+  expect(sent).toHaveLength(3)
+  const warm = sent[2]!
+  expect(warm.url).toBe(`${PI_GATEWAY}/claude/v1/messages?beta=true`)
+  expect(warm.headers.get('x-gateway-key')).toBe(PI_GATEWAY_SECRET)
+  expect(warm.gzip).toBe(false)
+  expect(JSON.parse(warm.body).thread).toBeUndefined()
+  expect(JSON.parse(warm.body).max_tokens).toBe(0)
+})
+
+test('Pi Prime goes to the gateway; quota reads stay on Anthropic', async () => {
+  const f = await fixture()
+  await useGateway(f, '/claude')
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    prime: { enabled: true },
+  }))
+  f.native.prime!.manager.options.markerDir = join(dir!, 'prime')
+  const sent = recordSends()
+  await f.native.prime!.manager.tick()
+  const models = sent.filter((entry) => entry.url.includes('/v1/messages'))
+  expect(models.map((entry) => entry.url)).toEqual([
+    `${PI_GATEWAY}/claude/v1/messages?beta=true`,
+  ])
+  expect(models[0]?.headers.get('x-gateway-key')).toBe(PI_GATEWAY_SECRET)
+  for (const entry of sent.filter(
+    (item) => !item.url.includes('/v1/messages'),
+  )) {
+    expect(new URL(entry.url).origin).toBe('https://api.anthropic.com')
+    expect(entry.headers.has('x-gateway-key')).toBe(false)
+  }
+})
+
+test('Pi sends to the gateway instead of a configured relay, with one warning', async () => {
+  const f = await fixture('main-first', true)
+  await useGateway(f, '/relayed')
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => records.push(record))
+  deferCleanup(() => __setLogTestSink(null))
+  const sent = recordSends()
+  await sendPrimary(f, 'pi-gateway-relay-1')
+  await sendPrimary(f, 'pi-gateway-relay-2')
+  expect(sent.map((entry) => entry.url)).toEqual([
+    `${PI_GATEWAY}/relayed/v1/messages?beta=true`,
+    `${PI_GATEWAY}/relayed/v1/messages?beta=true`,
+  ])
+  expect(
+    records.filter(
+      (record) =>
+        record.level === 'warn' && record.message.includes('relay is not used'),
+    ),
+  ).toHaveLength(1)
+})
+
+test('Pi still refuses a foreign model baseUrl with a gateway set', async () => {
+  const f = await fixture()
+  await useGateway(f, '/claude')
+  const sent = recordSends()
+  const result = await streamCortexKitAnthropic(
+    { ...model, baseUrl: `${PI_GATEWAY}/claude` },
+    context,
+  ).result()
+  expect(result.stopReason).toBe('error')
+  expect(result.errorMessage).toContain('official Anthropic HTTPS origin')
+  expect(sent).toEqual([])
+})
+
+test('Pi redacts a gateway error that echoes a gateway header value, in the response, logs and dump', async () => {
+  const f = await fixture()
+  await useGateway(f, '/redact')
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    dump: { enabled: true },
+  }))
+  const dumps = await mkdtemp(join(dir!, 'dumps-'))
+  const previousDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+  process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumps
+  deferCleanup(() => {
+    if (previousDir === undefined)
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDir
+  })
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => records.push(record))
+  deferCleanup(() => __setLogTestSink(null))
+  const sent = recordSends(() =>
+    Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: `gateway rejected key ${PI_GATEWAY_SECRET}`,
+        },
+      },
+      { status: 400 },
+    ),
+  )
+  const response = await __sendPiAnthropicRequestForTest(
+    {
+      model,
+      context,
+      storagePath: f.path,
+      streamOptions: { sessionId: 'pi-gateway-redact' },
+    },
+    { native: f.native, fetch: globalThis.fetch },
+  )
+  const text = await response.text()
+  expect(sent.some((entry) => entry.url.startsWith(PI_GATEWAY))).toBe(true)
+  expect(text).not.toContain(PI_GATEWAY_SECRET)
+  expect(text).toContain('[REDACTED]')
+  await Bun.sleep(20)
+  expect(JSON.stringify(records)).not.toContain(PI_GATEWAY_SECRET)
+  const files = await readdir(dumps)
+  expect(files.length).toBeGreaterThan(0)
+  for (const name of files)
+    expect(await readFile(join(dumps, name), 'utf8')).not.toContain(
+      PI_GATEWAY_SECRET,
+    )
+})
+
+test('Pi keep-warm uses the gateway of the target runtime, not the default-path runtime', async () => {
+  const f = await fixture()
+  await useGateway(f, '/target')
+  const sent = recordSends()
+  await sendPrimary(f, 'pi-gateway-target')
+  const live = sent.at(-1)!
+  expect(live.url).toBe(`${PI_GATEWAY}/target/v1/messages?beta=true`)
+  // The default storage path now names another install with no runtime.
+  process.env.PI_ANTHROPIC_AUTH_FILE = join(dir!, 'other-install.json')
+  const prewarm = await __prewarmPiCacheKeepForTest({
+    sessionId: 'pi-gateway-target-warm',
+    url: 'https://api.anthropic.com/v1/messages?beta=true',
+    headers: new Headers(),
+    bodyText: live.body,
+    oauthAccountId: 'main',
+    oauthAccountIdentity: fixtureAccountIdentity('main'),
+    accountStoragePath: f.path,
+  })
+  expect(prewarm).toMatchObject({ ok: true })
+  expect(sent.at(-1)?.url).toBe(`${PI_GATEWAY}/target/v1/messages?beta=true`)
+  expect(sent.at(-1)?.headers.get('x-gateway-key')).toBe(PI_GATEWAY_SECRET)
 })
