@@ -360,6 +360,17 @@ export function warnRelayProxyRefused(): void {
   logger.warn('relay', RELAY_PROXY_REFUSAL)
 }
 
+/**
+ * Throws the fixed refusal when a send to the relay at `url` would go through
+ * a proxy in plain text. A thrown refusal is handled like an unreachable
+ * relay: direct with fallbackToDirect, an error without it.
+ */
+function refuseProxiedRelaySend(url: string): void {
+  if (!relayProxyApplies(url)) return
+  warnRelayProxyRefused()
+  throw new Error(RELAY_PROXY_REFUSAL)
+}
+
 export function generateRelayToken() {
   return randomBytes(32).toString('base64url')
 }
@@ -482,6 +493,10 @@ async function postRelay(
   signal?: AbortSignal | null,
 ): Promise<Response> {
   signal?.throwIfAborted()
+  // The proxy settings can change while an attempt waits or is authorized,
+  // so every post is checked again right before it is sent: the first post,
+  // the 409 full-sync retry and a WebSocket relay's HTTP rescue alike.
+  refuseProxiedRelaySend(config.url)
   const stringifyStart = perfNowMs()
   const body = JSON.stringify(payload)
   relayPerfLog('http_payload_stringify', {
@@ -1091,6 +1106,9 @@ class PersistentRelaySession {
     )
       return
     if (this.connecting) return await this.connecting
+    // The handshake carries the relay token; refuse it when a proxy setting
+    // added since the request started would carry a plain ws: handshake.
+    refuseProxiedRelaySend(this.config.url)
 
     this.connecting = new Promise<void>((resolve, reject) => {
       const url = toWebSocketUrl(this.config.url, this.config.token)

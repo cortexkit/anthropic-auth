@@ -10,7 +10,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { basename, join, relative, resolve } from 'node:path'
 import { createAccountHomeCache, lookupAccountHome } from '../gateway.ts'
 import { resetNativeHolderRegistryForTests } from '../holder-registry.ts'
 import { createNativeAccountRuntime } from '../native-account-runtime.ts'
@@ -215,6 +215,36 @@ test('the selected store is checked again on every read, never from a cached ans
   await rm(defaults.vault.config)
   await writeFile(defaults.vault.config, '{}', { mode: 0o600 })
   expect(await check.locate('claustrum')).toBe('default')
+})
+
+test('a store found at the default place is read through the default files the check matched', async () => {
+  const home = await realpath(await scratch('relay-home-'))
+  const elsewhere = await realpath(await scratch('relay-moved-'))
+  const defaults = await defaultVaultFiles(home)
+  hook[TEST_RELAY_ACCOUNT_HOME_KEY] = () => home
+  // Selected through a folder link that reaches the default store: the files
+  // to read are the default store's own, not this path text, which a swapped
+  // folder could later point somewhere else.
+  const link = join(elsewhere, 'link')
+  await symlink(join(home, '.config', 'opencode'), link)
+  const selected = {
+    config: join(link, basename(defaults.vault.config)),
+    runtime: join(link, basename(defaults.vault.runtime)),
+  }
+  const check = createRelayLocationCheck('opencode', {
+    local: defaults.local,
+    vault: selected,
+  })
+  expect(await check.resolve('claustrum')).toEqual({
+    location: 'default',
+    files: {
+      config: await realpath(defaults.vault.config),
+      runtime: await realpath(defaults.vault.runtime),
+    },
+  })
+  await rm(link)
+  await mkdir(link)
+  expect(await check.resolve('claustrum')).toEqual({ location: 'elsewhere' })
 })
 
 test('a default store moved to the state folder keeps its relay, even after another store was checked first in the process', async () => {

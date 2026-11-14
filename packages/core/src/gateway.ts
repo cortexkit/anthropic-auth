@@ -257,8 +257,18 @@ export const CLAUDE_GATEWAY_PROXY_REFUSAL =
  * `no_proxy`, when non-empty, is used in place of `NO_PROXY`; it is a comma
  * list whose entries are trimmed, and `*`, the exact host (`[::1]` for IPv6,
  * any letter case) and `host:port` with the URL's own explicit port exempt the
- * host. Bun also exempts some host suffixes; those are not accepted here, so
- * this check can only refuse more than Bun would proxy, never less.
+ * host. Bun also exempts some host suffixes.
+ *
+ * Pi's host may run on Node instead. Measured on Node 26.10: fetch ignores
+ * every proxy variable unless `NODE_USE_ENV_PROXY=1` is set at start. With it,
+ * `HTTP_PROXY` and `http_proxy` apply to http URLs, and a set `no_proxy` is
+ * used in place of `NO_PROXY` even when it is empty: `no_proxy=` beside
+ * `NO_PROXY=*` still sends through the proxy, where Bun would not.
+ *
+ * The two runtimes disagree, so the host counts as exempt only when every
+ * set `no_proxy` and `NO_PROXY` exempts it, and a set but empty one exempts
+ * nothing. Suffix entries are never accepted. This check can therefore only
+ * refuse more than either runtime would proxy, never less.
  */
 export function claudeGatewayProxyApplies(
   origin: string,
@@ -272,16 +282,18 @@ export function claudeGatewayProxyApplies(
   }
   if (url.protocol !== 'http:') return false
   if (!env.HTTP_PROXY && !env.http_proxy) return false
-  const list = env.no_proxy ? env.no_proxy : (env.NO_PROXY ?? '')
   const host = url.hostname.toLowerCase()
   // `host:port` was measured only with a port written in the URL.
   const withPort = url.port ? `${host}:${url.port}` : undefined
-  for (const raw of list.split(',')) {
-    const entry = raw.trim().toLowerCase()
-    if (!entry) continue
-    if (entry === '*' || entry === host || entry === withPort) return false
-  }
-  return true
+  const exempts = (list: string) =>
+    list.split(',').some((raw) => {
+      const entry = raw.trim().toLowerCase()
+      return entry === '*' || entry === host || entry === withPort
+    })
+  const lists = [env.no_proxy, env.NO_PROXY].filter(
+    (list): list is string => list !== undefined,
+  )
+  return lists.length === 0 || !lists.every(exempts)
 }
 
 const warnedProxyRefused = new Set<string>()

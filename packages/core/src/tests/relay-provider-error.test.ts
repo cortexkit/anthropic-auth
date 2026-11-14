@@ -681,15 +681,72 @@ test('real WebSocket state-mismatch and done logs keep only fixed metadata', asy
 /**
  * Collect garbage until every tracked object is gone or the rounds run out.
  * Each round yields a macrotask first, so objects kept alive for the
- * current job by `WeakRef.deref` are released before the collection.
+ * current job by `WeakRef.deref` are released before the collection. A
+ * round that still finds an object alive runs the relay code again before
+ * the next one (see runRelayCodeAgain).
  */
 async function collected(refs: WeakRef<object>[]) {
   for (let round = 0; round < 20; round += 1) {
     await new Promise<void>((resolve) => setImmediate(resolve))
     Bun.gc(true)
     if (refs.every((ref) => ref.deref() === undefined)) return true
+    await runRelayCodeAgain()
   }
   return false
+}
+
+/**
+ * Sends throwaway requests through the relay's WebSocket and HTTP paths.
+ *
+ * JavaScriptCore compiles hot functions on a background thread. A finished
+ * compile waits on the engine's JIT worklist until its function runs again,
+ * and while it waits it keeps the values it captured from that function's
+ * frame alive as GC roots: a heap snapshot names the root "JITWorkList".
+ * When a compile of a relay function lands during a test, that test's
+ * authorization can stay reachable only through such a root, although no
+ * relay object holds it. This is an engine root, not a leak. Running the same
+ * relay code again lets the engine install the compile and drop those roots.
+ */
+async function runRelayCodeAgain() {
+  const relay = startRelay({
+    ws: (socket, payload) => {
+      const streaming = payload.body?.includes('"stream":true') === true
+      startResponse(socket, payload.id, 200, {
+        'content-type': streaming ? 'text/event-stream' : 'application/json',
+      })
+      sendChunks(socket, payload.id, [
+        encoder.encode(streaming ? successPrefix : '{"id":"msg_ok"}'),
+      ])
+      socket.send(JSON.stringify({ type: 'done', id: payload.id }))
+    },
+    http: () =>
+      new Response('{"id":"msg_ok"}', {
+        headers: {
+          'content-type': 'application/json',
+          'request-id': 'req_throwaway',
+        },
+      }),
+  })
+  try {
+    for (const [transport, streaming] of [
+      ['websocket', false],
+      ['websocket', true],
+      ['http', false],
+    ] as const) {
+      const response = await send({
+        relay,
+        transport,
+        optimistic: streaming,
+        body: streaming ? streamingBody('again') : requestBody('again'),
+        authorize: async () => ({
+          headers: new Headers({ authorization: `Bearer ${V0}` }),
+        }),
+      })
+      await response.text()
+    }
+  } finally {
+    await relay.close()
+  }
 }
 
 for (const ending of ['done', 'cancel', 'error'] as const) {

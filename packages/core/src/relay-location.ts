@@ -249,6 +249,15 @@ export interface RelayLocationCheck {
    * store's two files are checked and resolved again on every call.
    */
   locate(mode: 'local' | 'claustrum'): Promise<RelayLocation>
+  /**
+   * Like `locate`, and at 'default' also the default store's canonical files
+   * the selected ones matched. A relay is read through those files, not the
+   * selected path text, so a folder swapped after the check cannot redirect
+   * the read. `files` is absent only when tests skip the check.
+   */
+  resolve(
+    mode: 'local' | 'claustrum',
+  ): Promise<{ location: RelayLocation; files?: RelayStoreFiles }>
   /** Starts the lookups early, off the request path. */
   prepare(): void
   /** Records that a configured relay was ignored; logs once per store. */
@@ -275,16 +284,18 @@ export function createRelayLocationCheck(
 ): RelayLocationCheck {
   let ignoredNow: Exclude<RelayLocation, 'default'> | undefined
   let relayInUse: string | undefined
-  async function locate(mode: 'local' | 'claustrum'): Promise<RelayLocation> {
+  async function resolve(
+    mode: 'local' | 'claustrum',
+  ): Promise<{ location: RelayLocation; files?: RelayStoreFiles }> {
     const hook = testAccountHome()
-    if (hook === 'unchecked') return 'default'
+    if (hook === 'unchecked') return { location: 'default' }
     let home: string | undefined
     try {
       home = hook ? await hook() : await accountHome()
     } catch {
       home = undefined
     }
-    if (!home) return 'home-unknown'
+    if (!home) return { location: 'home-unknown' }
     try {
       const files = mode === 'claustrum' ? selected.vault : selected.local
       const [defaults, own] = await Promise.all([
@@ -295,14 +306,18 @@ export function createRelayLocationCheck(
       return own &&
         own.config === expected.config &&
         own.runtime === expected.runtime
-        ? 'default'
-        : 'elsewhere'
+        ? { location: 'default', files: expected }
+        : { location: 'elsewhere' }
     } catch {
-      return 'elsewhere'
+      return { location: 'elsewhere' }
     }
+  }
+  async function locate(mode: 'local' | 'claustrum'): Promise<RelayLocation> {
+    return (await resolve(mode)).location
   }
   return {
     locate,
+    resolve,
     prepare() {
       if (testAccountHome() === 'unchecked') return
       void locate('local').catch(() => {})

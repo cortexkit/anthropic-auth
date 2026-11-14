@@ -188,11 +188,11 @@ Through the gateway:
   file can set the variable. Each such request fails with "Gateway refused: a
   proxy setting would carry plain-http requests"; one warning is logged,
   Status shows the same line, and nothing goes to `api.anthropic.com`
-  instead. To allow it, list the gateway host in `NO_PROXY` (or `no_proxy`,
-  which takes its place when set): `*`, the exact host (`127.0.0.1`,
-  `localhost` or `[::1]`) or `host:port` with the gateway's port, in a
-  comma-separated list. An `https:` gateway is not affected: a proxy can only
-  tunnel it, and its certificate is still checked.
+  instead. To allow it, list the gateway host in `NO_PROXY`, and also in
+  `no_proxy` when that is set (an empty one lists no host): `*`, the exact
+  host (`127.0.0.1`, `localhost` or `[::1]`) or `host:port` with the
+  gateway's port, in a comma-separated list. An `https:` gateway is not
+  affected: a proxy can only tunnel it, and its certificate is still checked.
 
 Apart from the URL and the added headers, each request is the one the plugin
 would send to Anthropic: same identity, billing header, signing, betas and

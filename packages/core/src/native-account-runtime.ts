@@ -126,7 +126,11 @@ import {
   resolveLocalRoutingDestination,
   stateLayoutOfPaths,
 } from './pool-paths.ts'
-import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
+import {
+  createNativePoolStore,
+  nativePoolStoreLocks,
+  readNativePoolSettingsAt,
+} from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
 import { effectiveRelayTransport, type RelayConfig } from './relay.ts'
 import {
@@ -1064,7 +1068,14 @@ function buildNativeAccountRuntime(
     drainRoutingPublications: () => vaultRouter.drain(),
     async getRelayConfig() {
       const { mode, paths, store } = await selectedStorage()
-      const location = await relayLocation.locate(mode)
+      const { location, files } = await relayLocation.resolve(mode)
+      // At the default place, read through the default store's canonical
+      // files the check matched, never the selected path text again: a folder
+      // swapped for a link after the check cannot redirect these reads.
+      const readSettings = files
+        ? () => readNativePoolSettingsAt(files.config, nativeQuotaCodec)
+        : () => store.readSettings()
+      const runtimeFile = files ? files.runtime : paths.runtime
       // Both files are atomically published, but a reader can cross a relay
       // change between reading its URL and private token. Never send that torn
       // pair: all hosts retry a mismatched generation briefly, then refuse
@@ -1072,7 +1083,7 @@ function buildNativeAccountRuntime(
       // legacy data; a mixed stamped/unstamped pair must also wait for agreement.
       for (let attempt = 0; attempt < 4; attempt++) {
         if (attempt) await new Promise((resolve) => setTimeout(resolve, 10))
-        const settings = await store.readSettings()
+        const settings = await readSettings()
         if (settings.status !== 'ready')
           throw new NativeRuntimeError('publication-refused')
         if (location !== 'default') {
@@ -1089,7 +1100,7 @@ function buildNativeAccountRuntime(
         }
         const flags = relayFlags(settings.settings.relay)
         const generation = relayGeneration(settings.settings.relay)
-        const read = await readNativeRuntime(paths.runtime, paths.storageId)
+        const read = await readNativeRuntime(runtimeFile, paths.storageId)
         await requireMode(mode)
         const state = read.status === 'ready' ? read.state : undefined
         if (generation !== state?.relayGeneration) continue

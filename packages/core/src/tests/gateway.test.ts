@@ -901,10 +901,12 @@ test('the default location is compared as a real path', async () => {
   expect(await isGatewaySettingsFile(file, undefined)).toBe(false)
 })
 
-// Every case below was measured against Bun 1.3.14's own fetch (HTTP_PROXY
-// pointing at a local listener): `proxied` is what Bun does, and the check
-// must refuse at least those. Suffix forms Bun also exempts (`.0.0.1`) are
-// refused here on purpose.
+// The cases below were measured against Bun 1.3.14's own fetch and Node
+// 26.10's fetch with NODE_USE_ENV_PROXY=1 (HTTP_PROXY pointing at a local
+// listener). The check must refuse whatever either runtime proxies, so
+// `proxied` is true when either one does, and also where only the stricter
+// rule (every set no_proxy and NO_PROXY must exempt) refuses. Suffix forms
+// both runtimes exempt (`.0.0.1`) are refused here on purpose.
 test.each<[string, Record<string, string>, boolean]>([
   ['no proxy variable', {}, false],
   ['HTTP_PROXY', { HTTP_PROXY: 'http://127.0.0.1:9' }, true],
@@ -945,9 +947,28 @@ test.each<[string, Record<string, string>, boolean]>([
     { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.1', no_proxy: 'a.com' },
     true,
   ],
+  // Bun skips an empty no_proxy and uses NO_PROXY, but Node with
+  // NODE_USE_ENV_PROXY=1 uses the empty no_proxy and proxies, so it exempts
+  // nothing here.
   [
-    'an empty no_proxy, which leaves NO_PROXY',
+    'an empty no_proxy beside an exempting NO_PROXY',
     { HTTP_PROXY: 'x', NO_PROXY: '127.0.0.1', no_proxy: '' },
+    true,
+  ],
+  [
+    'an empty no_proxy beside NO_PROXY=*',
+    { HTTP_PROXY: 'x', NO_PROXY: '*', no_proxy: '' },
+    true,
+  ],
+  ['an empty NO_PROXY alone', { HTTP_PROXY: 'x', NO_PROXY: '' }, true],
+  [
+    'an exempting no_proxy beside a NO_PROXY that does not exempt',
+    { HTTP_PROXY: 'x', NO_PROXY: 'a.com', no_proxy: '127.0.0.1' },
+    true,
+  ],
+  [
+    'no_proxy and NO_PROXY that both exempt',
+    { HTTP_PROXY: 'x', NO_PROXY: '*', no_proxy: '127.0.0.1' },
     false,
   ],
 ])('a plain-http gateway with %s: proxied is %p', (_name, env, proxied) => {

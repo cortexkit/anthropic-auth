@@ -61,7 +61,11 @@ function relayServer() {
   return { server, seen, http: server.url.href.replace(/\/$/, '') }
 }
 
-async function send(relay: RelayConfig, affinity = randomUUID()) {
+async function send(
+  relay: RelayConfig,
+  affinity = randomUUID(),
+  authorize: () => void = () => {},
+) {
   const direct: string[] = []
   const response = await sendViaRelay({
     config: relay,
@@ -74,11 +78,18 @@ async function send(relay: RelayConfig, affinity = randomUUID()) {
       direct.push('direct')
       return new Response('direct')
     },
-    authorizeAttempt: async () => ({
-      headers: new Headers({ authorization: 'Bearer test-access' }),
-    }),
+    authorizeAttempt: async () => {
+      authorize()
+      return { headers: new Headers({ authorization: 'Bearer test-access' }) }
+    },
   })
   return { text: await response.text(), direct }
+}
+
+/** Sets a proxy that would carry plain-http relay sends. */
+function startProxy() {
+  // An address nothing listens on: the proxy must never be reached.
+  process.env.HTTP_PROXY = 'http://127.0.0.1:9'
 }
 
 test('a plain relay URL counts as proxied exactly when a proxy setting would carry it', () => {
@@ -182,5 +193,84 @@ test('a WebSocket session is not reused for another relay URL or token', async (
   } finally {
     first.server.stop(true)
     second.server.stop(true)
+  }
+})
+
+test('a proxy set while an HTTP relay attempt is authorized stops that post: direct with fallbackToDirect, an error without', async () => {
+  clearProxy()
+  const relay = relayServer()
+  try {
+    expect(
+      await send(config(`${relay.http}/relay`), randomUUID(), startProxy),
+    ).toEqual({ text: 'direct', direct: ['direct'] })
+    clearProxy()
+    await expect(
+      send(
+        config(`${relay.http}/relay`, { fallbackToDirect: false }),
+        randomUUID(),
+        startProxy,
+      ),
+    ).rejects.toThrow(RELAY_PROXY_REFUSAL)
+    expect(relay.seen).toEqual([])
+  } finally {
+    relay.server.stop(true)
+  }
+})
+
+test("a proxy set during a WebSocket relay's HTTP rescue stops the rescue post", async () => {
+  clearProxy()
+  const relay = relayServer()
+  try {
+    // The upgrade is refused before any attempt is authorized, so the only
+    // authorization is the rescue's, and the proxy appears during it.
+    expect(
+      await send(
+        config(relay.http, { transport: 'websocket' }),
+        randomUUID(),
+        startProxy,
+      ),
+    ).toEqual({ text: 'direct', direct: ['direct'] })
+    expect(relay.seen).toEqual(['upgrade /ws'])
+  } finally {
+    relay.server.stop(true)
+  }
+})
+
+test('a proxy set while the 409 full-sync retry is authorized stops the retry post', async () => {
+  clearProxy()
+  const seen: string[] = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(request) {
+      const { mode } = (await request.json()) as { mode: string }
+      seen.push(mode)
+      // The relay lost this conversation's state, so a patch needs a full copy.
+      if (mode === 'patch') return new Response('stale', { status: 409 })
+      return new Response('relayed', {
+        headers: { 'request-id': 'req_relay_test' },
+      })
+    },
+  })
+  try {
+    const relay = config(server.url.href)
+    const affinity = randomUUID()
+    expect(await send(relay, affinity)).toEqual({
+      text: 'relayed',
+      direct: [],
+    })
+    // The second request is sent as a patch; its 409 retry is the second
+    // authorization, and the proxy appears there.
+    let authorizations = 0
+    expect(
+      await send(relay, affinity, () => {
+        authorizations += 1
+        if (authorizations === 2) startProxy()
+      }),
+    ).toEqual({ text: 'direct', direct: ['direct'] })
+    expect(authorizations).toBe(2)
+    expect(seen).toEqual(['full_sync', 'patch'])
+  } finally {
+    server.stop(true)
   }
 })
