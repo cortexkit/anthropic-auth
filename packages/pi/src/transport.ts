@@ -5,8 +5,10 @@ import {
 } from 'node:perf_hooks'
 import {
   type AnthropicOAuthOriginOptions,
+  type ClaudeGateway,
   copyStreamResponseTiming,
   createAnthropicOAuthFetch,
+  createClaudeModelFetch,
   type IncompleteStreamDiagnostics,
   requireAnthropicOAuthOrigin,
 } from '@cortexkit/anthropic-auth-core'
@@ -21,9 +23,19 @@ const PI_OAUTH_ORIGIN: AnthropicOAuthOriginOptions = {
     ),
 }
 
-/** Model base URLs and remembered cache-warm URLs must send OAuth tokens only to Anthropic’s HTTPS server. */
-export function requirePiOAuthOrigin(value: string): URL {
-  return requireAnthropicOAuthOrigin(value, PI_OAUTH_ORIGIN)
+/**
+ * Model base URLs and remembered cache-warm URLs must send OAuth tokens only
+ * to Anthropic’s HTTPS server. Pass `gateway` only for a model request: it is
+ * the user's gateway from their own settings file, never provider config.
+ */
+export function requirePiOAuthOrigin(
+  value: string,
+  gateway?: ClaudeGateway,
+): URL {
+  return requireAnthropicOAuthOrigin(
+    value,
+    gateway ? { ...PI_OAUTH_ORIGIN, gateway } : PI_OAUTH_ORIGIN,
+  )
 }
 
 export function buildPiOAuthMessagesUrl(baseUrl: string): URL {
@@ -134,4 +146,15 @@ export async function fetchPiStreamResponse(
     settle()
     throw error
   }
+}
+
+/**
+ * Fetch for OAuth model requests: like fetchPiOAuth, but a model request to
+ * api.anthropic.com goes to the user's gateway, read on every call, with its
+ * headers. Keep-warm sends use it, so they follow the current settings.
+ */
+export function createPiOAuthModelFetch(
+  gateway: () => ClaudeGateway | undefined,
+): typeof fetch {
+  return createClaudeModelFetch({ origin: PI_OAUTH_ORIGIN, gateway })
 }

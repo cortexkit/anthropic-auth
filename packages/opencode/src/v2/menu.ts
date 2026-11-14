@@ -7,6 +7,7 @@ import {
   buildPrimeStatusSummary,
   type CacheKeepSessionRegistry,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+  claudeGatewayStatusNotes,
   effectiveRelayTransport,
   exchange,
   formatNativeAccountState,
@@ -143,6 +144,7 @@ export function createNativeMenuCapabilities(options: {
         ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
+      ...claudeGatewayStatusNotes(file.gatewayIgnored, status.values.gateway),
       'Settings (no model):',
       ...Object.entries(status.values).map(
         ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,

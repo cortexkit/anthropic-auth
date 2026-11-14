@@ -146,6 +146,8 @@ async function fixture(
                   return fs.readFile(path)
                 },
                 writeAppliedCopy: async () => {},
+                // Stands in for the OS account's default settings file.
+                gatewaySettingsFile: () => target,
                 open: (options) => {
                   const handle = openSettings<
                     typeof core.settingsDefinition.settings
@@ -244,7 +246,7 @@ async function fixture(
       expect(response.status).toBe(200)
       return sent.at(-1)!
     }
-    return { plugin, runtime, request }
+    return { plugin, runtime, request, loader }
   }
   return {
     pool,
@@ -795,4 +797,369 @@ describe('OpenCode 1 settings service reads', () => {
       }
     }
   }
+})
+
+describe('OpenCode 1 user gateway', () => {
+  installLoaderSetup(ctx)
+  const SECRET = 'oc1-gateway-header-secret'
+  const GATEWAY = 'https://gateway.example.test'
+
+  type Seen = {
+    url: string
+    headers: Headers
+    body: string
+    tls: unknown
+  }
+  function record(
+    gatewayAnswer?: (body: Record<string, unknown>) => Response | undefined,
+  ) {
+    const seen: Seen[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission(
+        ctx,
+        (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          const url = input instanceof Request ? input.url : String(input)
+          seen.push({
+            url,
+            headers: new Headers(init?.headers),
+            body: typeof init?.body === 'string' ? init.body : '',
+            tls: (init as { tls?: unknown } | undefined)?.tls,
+          })
+          if (url.startsWith(GATEWAY) && gatewayAnswer) {
+            const answer = gatewayAnswer(
+              typeof init?.body === 'string' ? JSON.parse(init.body) : {},
+            )
+            if (answer) return answer
+          }
+          if (url.includes('/api/oauth/usage'))
+            return Response.json({
+              five_hour: { utilization: 10 },
+              seven_day: { utilization: 10 },
+            })
+          return Response.json(
+            {
+              id: `msg-gateway-${seen.length}`,
+              type: 'message',
+              role: 'assistant',
+              model: 'claude-opus-5-5',
+              content: [{ type: 'text', text: 'ok' }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1, output_tokens: 1 },
+            },
+            { headers: { 'request-id': `req_gateway_${seen.length}` } },
+          )
+        },
+      ),
+    ) as unknown as typeof fetch
+    return seen
+  }
+  const largeRequest = (session: string) => ({
+    method: 'POST',
+    headers: { 'x-session-affinity': session },
+    body: JSON.stringify({
+      model: 'claude-opus-5-5',
+      max_tokens: 8,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `Review: ${'x'.repeat(9000)}`,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      ],
+    }),
+  })
+  const logs = () => {
+    const records: core.LogTestRecord[] = []
+    core.__setLogTestSink((entry) => records.push(entry))
+    return records
+  }
+
+  test('model and keep-warm requests go to the gateway as full uncompressed requests; nothing else does', async () => {
+    let now = 1_000
+    const realNow = Date.now
+    Date.now = mock(() => now) as unknown as typeof Date.now
+    cleanups.push(() => {
+      Date.now = realNow
+    })
+    const f = await fixture()
+    await f.put({
+      quota_enabled: 'off',
+      claude_cache_enabled: 'on',
+      claude_cache_mode: 'hybrid',
+      cache_keep_enabled: true,
+      cache_keep_always: true,
+      gateway_url: `${GATEWAY}/claude`,
+      gateway_headers: { 'X-Gateway-Key': SECRET },
+    })
+    const seen = record()
+    const records = logs()
+    const instance = await f.launch()
+    const response = await instance.loader.fetch!(
+      MESSAGES_URL,
+      largeRequest('ses-oc1-gateway'),
+    )
+    await response.text()
+    expect(response.status).toBe(200)
+    const routed = () => seen.filter((entry) => entry.url.startsWith(GATEWAY))
+    expect(routed()).toHaveLength(1)
+    const live = routed()[0]!
+    expect(live.url).toBe(`${GATEWAY}/claude/v1/messages?beta=true`)
+    expect(live.headers.get('x-gateway-key')).toBe(SECRET)
+    expect(live.headers.get('authorization')).toStartWith('Bearer ')
+    expect(live.headers.get('content-encoding')).toBeNull()
+    const liveBody = JSON.parse(live.body)
+    expect(liveBody.thread).toBeUndefined()
+    expect(JSON.stringify(liveBody.messages)).toContain('x'.repeat(9000))
+
+    now += 55 * 60_000
+    await getPluginTestHandles(instance.plugin).cacheKeepManager.tick()
+    expect(routed()).toHaveLength(2)
+    const warm = routed()[1]!
+    expect(warm.url).toBe(`${GATEWAY}/claude/v1/messages?beta=true`)
+    expect(warm.headers.get('x-gateway-key')).toBe(SECRET)
+    expect(warm.headers.get('content-encoding')).toBeNull()
+    const warmBody = JSON.parse(warm.body)
+    expect(warmBody.max_tokens).toBe(0)
+    expect(warmBody.thread).toBeUndefined()
+    expect(warmBody.messages).toEqual(liveBody.messages)
+
+    // Sign-in, refresh, usage and every other request stay on Anthropic's
+    // hosts and never carry the gateway headers.
+    for (const entry of seen.filter((item) => !item.url.startsWith(GATEWAY))) {
+      expect(new URL(entry.url).hostname).toEndWith('anthropic.com')
+      expect(entry.headers.has('x-gateway-key')).toBe(false)
+    }
+    expect(JSON.stringify(records)).not.toContain(SECRET)
+  })
+
+  test('an invalid gateway falls back to Anthropic with one warning', async () => {
+    const f = await fixture()
+    await f.put({
+      quota_enabled: 'off',
+      gateway_url: 'http://gateway.example.test/claude',
+      gateway_headers: { 'X-Gateway-Key': SECRET },
+    })
+    const seen = record()
+    const records = logs()
+    const instance = await f.launch()
+    await instance.request()
+    const models = seen.filter((entry) => entry.url.includes('/v1/messages'))
+    expect(models).toHaveLength(1)
+    expect(new URL(models[0]!.url).origin).toBe('https://api.anthropic.com')
+    expect(models[0]!.headers.has('x-gateway-key')).toBe(false)
+    expect(
+      records.filter(
+        (entry) =>
+          entry.level === 'warn' && entry.message.includes('Claude gateway'),
+      ),
+    ).toHaveLength(1)
+    expect(JSON.stringify(records)).not.toContain(SECRET)
+  })
+
+  test('ANTHROPIC_BASE_URL elsewhere is still refused for OAuth with a gateway set', async () => {
+    const f = await fixture()
+    await f.put({
+      quota_enabled: 'off',
+      gateway_url: `${GATEWAY}/claude`,
+    })
+    const seen = record()
+    const previous = process.env.ANTHROPIC_BASE_URL
+    cleanups.push(() => {
+      if (previous === undefined) delete process.env.ANTHROPIC_BASE_URL
+      else process.env.ANTHROPIC_BASE_URL = previous
+    })
+    const instance = await f.launch()
+    for (const base of ['https://proxy.example.test', `${GATEWAY}/other`]) {
+      process.env.ANTHROPIC_BASE_URL = base
+      const refused = await instance.loader.fetch!(
+        MESSAGES_URL,
+        largeRequest('ses-oc1-base-url'),
+      )
+      expect(refused.status).toBe(400)
+      expect(((await refused.json()) as any).error.message).toBe(
+        core.ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+      )
+    }
+    expect(seen.filter((entry) => entry.url.includes('/v1/messages'))).toEqual(
+      [],
+    )
+  })
+
+  for (const gateway of [true, false])
+    test(`ANTHROPIC_INSECURE never turns off certificate checks on an OAuth send${gateway ? ' to the gateway' : ''}`, async () => {
+      const f = await fixture()
+      await f.put({
+        quota_enabled: 'off',
+        ...(gateway ? { gateway_url: `${GATEWAY}/claude` } : {}),
+      })
+      const seen = record()
+      const previous = {
+        base: process.env.ANTHROPIC_BASE_URL,
+        insecure: process.env.ANTHROPIC_INSECURE,
+      }
+      cleanups.push(() => {
+        if (previous.base === undefined) delete process.env.ANTHROPIC_BASE_URL
+        else process.env.ANTHROPIC_BASE_URL = previous.base
+        if (previous.insecure === undefined)
+          delete process.env.ANTHROPIC_INSECURE
+        else process.env.ANTHROPIC_INSECURE = previous.insecure
+      })
+      // A repository `.env` can set both; the base URL passes the OAuth
+      // destination check, so nothing else stops the send.
+      process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
+      process.env.ANTHROPIC_INSECURE = '1'
+      const instance = await f.launch()
+      const response = await instance.loader.fetch!(
+        MESSAGES_URL,
+        largeRequest('ses-oc1-insecure'),
+      )
+      await response.text()
+      expect(response.status).toBe(200)
+      const models = seen.filter((entry) => entry.url.includes('/v1/messages'))
+      expect(models).toHaveLength(1)
+      expect(new URL(models[0]!.url).origin).toBe(
+        gateway ? GATEWAY : 'https://api.anthropic.com',
+      )
+      for (const entry of seen) expect(entry.tls).toBeUndefined()
+    })
+
+  test('a gateway takes requests instead of a configured relay, with one warning', async () => {
+    const f = await fixture()
+    await f.put({
+      quota_enabled: 'off',
+      gateway_url: `${GATEWAY}/relayed`,
+    })
+    const seen = record()
+    const records = logs()
+    const instance = await f.launch()
+    await instance.runtime.updateRelay({
+      enabled: true,
+      transport: 'http',
+      url: 'https://relay.example.test/send',
+      token: 'synthetic-relay-token',
+      fallbackToDirect: true,
+    })
+    await instance.request()
+    await instance.request()
+    const models = seen.filter(
+      (entry) =>
+        entry.url.includes('/v1/messages') ||
+        entry.url.startsWith('https://relay.example.test'),
+    )
+    expect(models.map((entry) => entry.url)).toEqual([
+      `${GATEWAY}/relayed/v1/messages?beta=true`,
+      `${GATEWAY}/relayed/v1/messages?beta=true`,
+    ])
+    expect(
+      records.filter(
+        (entry) =>
+          entry.level === 'warn' && entry.message.includes('relay is not used'),
+      ),
+    ).toHaveLength(1)
+  })
+
+  const echo = (status: number) =>
+    Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: `gateway rejected key ${SECRET}`,
+        },
+      },
+      { status },
+    )
+
+  test('gateway errors echoing a gateway header value are redacted for model and keep-warm sends, logs and dumps', async () => {
+    let now = 1_000
+    const realNow = Date.now
+    Date.now = mock(() => now) as unknown as typeof Date.now
+    cleanups.push(() => {
+      Date.now = realNow
+    })
+    const dumps = await fs.mkdtemp(join(ctx.migratedPool!.root, 'dumps-'))
+    const previousDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumps
+    cleanups.push(() => {
+      core.setDumpEnabled(false)
+      if (previousDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDir
+    })
+    const f = await fixture()
+    await f.put({
+      quota_enabled: 'off',
+      dump_enabled: true,
+      claude_cache_enabled: 'on',
+      claude_cache_mode: 'hybrid',
+      cache_keep_enabled: true,
+      cache_keep_always: true,
+      gateway_url: `${GATEWAY}/redact`,
+      gateway_headers: { 'X-Gateway-Key': SECRET },
+    })
+    // The live send is accepted so it is kept warm; the warm is rejected.
+    const seen = record((body) =>
+      body.max_tokens === 0 ? echo(401) : undefined,
+    )
+    const records = logs()
+    const instance = await f.launch()
+    const live = await instance.loader.fetch!(
+      MESSAGES_URL,
+      largeRequest('ses-oc1-gateway-redact'),
+    )
+    await live.text()
+    expect(live.status).toBe(200)
+    now += 55 * 60_000
+    await getPluginTestHandles(instance.plugin).cacheKeepManager.tick()
+    const warms = seen.filter(
+      (entry) =>
+        entry.url.startsWith(GATEWAY) &&
+        JSON.parse(entry.body).max_tokens === 0,
+    )
+    expect(warms).toHaveLength(1)
+
+    // A rejected live send reaches OpenCode redacted.
+    record(() => echo(400))
+    const rejected = await instance.loader.fetch!(
+      MESSAGES_URL,
+      largeRequest('ses-oc1-gateway-redact-2'),
+    )
+    const text = await rejected.text()
+    expect(rejected.status).toBe(400)
+    expect(text).not.toContain(SECRET)
+    expect(text).toContain('[REDACTED]')
+    await Bun.sleep(20)
+    expect(JSON.stringify(records)).not.toContain(SECRET)
+    const files = await fs.readdir(dumps)
+    expect(files.length).toBeGreaterThan(0)
+    for (const name of files)
+      expect(await fs.readFile(join(dumps, name), 'utf8')).not.toContain(SECRET)
+  })
+
+  test('an ANTHROPIC_BASE_URL on api.anthropic.com with an extra path still goes to the gateway', async () => {
+    const f = await fixture()
+    await f.put({
+      quota_enabled: 'off',
+      gateway_url: `${GATEWAY}/claude`,
+    })
+    const seen = record()
+    const previous = process.env.ANTHROPIC_BASE_URL
+    process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com/extra'
+    cleanups.push(() => {
+      if (previous === undefined) delete process.env.ANTHROPIC_BASE_URL
+      else process.env.ANTHROPIC_BASE_URL = previous
+    })
+    const instance = await f.launch()
+    await instance.request()
+    expect(
+      seen
+        .filter((entry) => entry.url.includes('/v1/messages'))
+        .map((entry) => entry.url),
+    ).toEqual([`${GATEWAY}/claude/v1/messages?beta=true`])
+  })
 })

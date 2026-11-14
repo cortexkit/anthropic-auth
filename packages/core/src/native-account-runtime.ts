@@ -20,6 +20,7 @@ import {
   quotaSnapshotPassesPolicy,
 } from './accounts.ts'
 import { resolveClaudeCodeIdentity } from './claude-code.ts'
+import type { ClaudeGateway } from './gateway.ts'
 import { type LogLevel, logger } from './logger.ts'
 import {
   applyNativeMetadataPatch,
@@ -223,6 +224,11 @@ export interface NativeAccountRuntime {
   resolveSettings?(stored: AccountStorage, model?: string): AccountStorage
   /** No-model settings and every explicit model override, for /claude status. */
   getSettingsStatus?(): NativeRuntimeSettingsStatus | undefined
+  /**
+   * The user's gateway for Claude OAuth model requests, from memory. Hosts
+   * use it only for model requests, never for sign-in, refresh or usage.
+   */
+  getClaudeGateway?(): ClaudeGateway | undefined
   /** Hosts call after startup and committed menu writes; watches use the same deduplicated hook. */
   applySettingsEffects?(): void
   /** Await at instance start and before every /claude action, never on requests. */
@@ -384,6 +390,7 @@ export function acquireNativeAccountRuntime(
     resolveSettings: (stored, model) =>
       use().resolveSettings?.(stored, model) ?? stored,
     getSettingsStatus: () => use().getSettingsStatus?.(),
+    getClaudeGateway: () => use().getClaudeGateway?.(),
     applySettingsEffects: () => use().applySettingsEffects?.(),
     prepareSettingsAction: () =>
       use().prepareSettingsAction?.() ?? Promise.resolve(),
@@ -1147,6 +1154,7 @@ function buildNativeAccountRuntime(
       return runtimeSettings.file() ?? (await selectedStorage()).paths.config
     },
     getSettingsStatus: runtimeSettings.status,
+    getClaudeGateway: runtimeSettings.gateway,
     resolveSettings: runtimeSettings.resolve,
     applySettingsEffects: runtimeSettings.applyEffects,
     prepareSettingsAction: runtimeSettings.prepareAction,

@@ -104,6 +104,8 @@ test('all shared settings are flat, user-only and have exactly the allowed overr
       'log_level',
       'thinking_binding_prefix_mismatch_behavior',
       'turn_end_note_tools',
+      'gateway_url',
+      'gateway_headers',
     ].sort(),
   )
   const modelKeys = [
@@ -123,7 +125,11 @@ test('all shared settings are flat, user-only and have exactly the allowed overr
     expect<unknown>(
       'overrides' in declaration ? declaration.overrides : undefined,
     ).toEqual(
-      key === 'killswitch_account_floors'
+      // List and record settings take no overrides, nor does the gateway:
+      // one gateway with its headers serves both hosts.
+      key === 'killswitch_account_floors' ||
+        key === 'gateway_headers' ||
+        key === 'gateway_url'
         ? undefined
         : modelKeys.includes(key)
           ? { host: true, model: true }
@@ -378,6 +384,9 @@ const defaultReaders = {
   log_level: (s: AccountStorage) => getPersistedLogLevel(s) ?? 'default',
   thinking_binding_prefix_mismatch_behavior: getThinkingPrefixMismatchBehavior,
   turn_end_note_tools: readTurnEndTools,
+  // File-only: without the settings no gateway is used.
+  gateway_url: () => '',
+  gateway_headers: () => ({}),
 } satisfies Record<
   Exclude<SettingsKey, keyof typeof SETTINGS_THREE_WAY_READERS>,
   (storage: AccountStorage) => unknown

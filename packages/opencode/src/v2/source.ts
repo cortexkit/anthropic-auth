@@ -1,5 +1,6 @@
 import {
   type AnthropicBillingWarming,
+  type ClaudeGateway,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   decideStickyQuotaFailure,
@@ -53,6 +54,7 @@ import {
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
   stickyRouteFamilyForModel,
+  warnClaudeGatewayRelayIgnored,
 } from '@cortexkit/anthropic-auth-core'
 import type {
   ChooseAccountInput,
@@ -491,7 +493,7 @@ export function createNativeAnthropicSource(
     const current = await runtime.read(modelID)
     syncDumpEnabled(current)
     active.signal.throwIfAborted()
-    assertTransport(current)
+    assertTransport(current, route === 'oauth' ? gateway() : undefined)
     const account = current.accounts.find((row) => row.id === accountId)
     if (
       !account ||
@@ -521,9 +523,23 @@ export function createNativeAnthropicSource(
     return { snapshot: current, account }
   }
 
-  const assertTransport = (snapshot: NativeAccountSnapshot) => {
+  // The user's gateway from their own settings file, read from memory.
+  const gateway = () => runtime.getClaudeGateway?.()
+  // Callers always pass the gateway the send would use, never a default:
+  // `undefined` means no gateway (for example an API-key route), and must not
+  // be replaced by a fresh read of the settings.
+  const assertTransport = (
+    snapshot: NativeAccountSnapshot,
+    current: ClaudeGateway | undefined,
+  ) => {
     const selected = snapshot.policyStorage.relay
+    // With a gateway, a WebSocket relay does not refuse here: dispatchFor
+    // hands the adapter the WebSocket relay's dispatch, and the adapter sends
+    // a gateway-routed model request to the gateway and refuses any other
+    // request itself, once its URL is known. Without a gateway (an API-key
+    // route always passes none) the refusal happens here.
     if (
+      !current &&
       selected?.enabled === true &&
       effectiveRelayTransport(selected.transport, selected.url) === 'websocket'
     )
@@ -532,10 +548,37 @@ export function createNativeAnthropicSource(
   const dispatchFor = async (
     snapshot: NativeAccountSnapshot,
     direct: boolean,
+    route: 'oauth' | 'api',
   ) => {
-    assertTransport(snapshot)
-    if (direct || snapshot.policyStorage.relay?.enabled !== true)
-      return { dispatch: { kind: 'direct' as const }, relayFallback: false }
+    // The gateway is read once per authorization; the adapter uses this
+    // value for the send. The URL is not known yet, so the dispatch below is
+    // the one a request the gateway does not take uses (the relay, or the
+    // WebSocket relay's refusal); the adapter sends only a gateway-routed
+    // model request directly to the gateway instead.
+    const current = route === 'oauth' ? gateway() : undefined
+    assertTransport(snapshot, current)
+    const gatewayField = current ? { gateway: current } : {}
+    if (current && snapshot.policyStorage.relay?.enabled === true)
+      warnClaudeGatewayRelayIgnored(current)
+    const selected = snapshot.policyStorage.relay
+    // Decided before the direct case: a queued direct retry must still meet
+    // the WebSocket relay's refusal for any request the gateway does not take.
+    if (
+      current &&
+      selected?.enabled === true &&
+      effectiveRelayTransport(selected.transport, selected.url) === 'websocket'
+    )
+      return {
+        dispatch: { kind: 'websocket-relay' as const },
+        relayFallback: false,
+        ...gatewayField,
+      }
+    if (direct || selected?.enabled !== true)
+      return {
+        dispatch: { kind: 'direct' as const },
+        relayFallback: false,
+        ...gatewayField,
+      }
     // Account and status data exclude the relay secret. Obtain it through the
     // private transport accessor immediately before preparing the send.
     const relay = await runtime.getRelayConfig()
@@ -543,7 +586,15 @@ export function createNativeAnthropicSource(
       throw new Error(
         'request refused: native HTTP relay configuration is unavailable',
       )
-    if (relay.transport !== 'http') throw new NativeAnthropicTransportRefusal()
+    if (relay.transport !== 'http') {
+      if (current)
+        return {
+          dispatch: { kind: 'websocket-relay' as const },
+          relayFallback: false,
+          ...gatewayField,
+        }
+      throw new NativeAnthropicTransportRefusal()
+    }
     return {
       dispatch: {
         kind: 'http-relay' as const,
@@ -551,6 +602,7 @@ export function createNativeAnthropicSource(
         token: relay.token,
       },
       relayFallback: relay.fallbackToDirect,
+      ...gatewayField,
     }
   }
 
@@ -678,7 +730,7 @@ export function createNativeAnthropicSource(
       active.signal.throwIfAborted()
       // Account selection rejects a WebSocket relay before any OAuth token
       // refresh or retrieval starts.
-      assertTransport(snapshot)
+      assertTransport(snapshot, gateway())
       if (snapshot.mode === 'claustrum') {
         snapshot = await readNativeAccountsForRequest(runtime, active.signal)
         snapshot = {
@@ -745,7 +797,7 @@ export function createNativeAnthropicSource(
       if (advice) {
         snapshot = await runtime.read(modelID)
         active.signal.throwIfAborted()
-        assertTransport(snapshot)
+        assertTransport(snapshot, gateway())
       }
       const oauth: NativeAccountView[] = []
       const policies = new Map<string, NativeAccountPolicy>()
@@ -981,7 +1033,7 @@ export function createNativeAnthropicSource(
         )
         const snapshot = await runtime.read(modelID)
         active.signal.throwIfAborted()
-        assertTransport(snapshot)
+        assertTransport(snapshot, gateway())
         const account = snapshot.accounts.find(
           (row) => row.id === input.accountId,
         )
@@ -1007,7 +1059,7 @@ export function createNativeAnthropicSource(
       )
       const snapshot = await runtime.read(modelID)
       active.signal.throwIfAborted()
-      assertTransport(snapshot)
+      assertTransport(snapshot, gateway())
       const account = snapshot.accounts.find(
         (row) => row.id === input.accountId,
       )
@@ -1040,7 +1092,7 @@ export function createNativeAnthropicSource(
       const snapshot = await runtime.read(modelID)
       syncDumpEnabled(snapshot)
       active.signal.throwIfAborted()
-      assertTransport(snapshot)
+      assertTransport(snapshot, gateway())
       const account = snapshot.accounts.find((row) => row.id === accountId)
       if (!account || !eligible(account, snapshot, modelID, scope.sessionID)) {
         onRefusal?.(
@@ -1055,10 +1107,12 @@ export function createNativeAnthropicSource(
       const choice = queue?.shift()
       if (queue?.length === 0) recoveries.delete(queueKey)
       if (choice && !sameAccount(account, choice.account)) return undefined
-      const { dispatch, relayFallback } = await dispatchFor(
-        snapshot,
-        choice?.direct === true,
-      )
+      const {
+        dispatch,
+        relayFallback,
+        gateway: sendGateway,
+      } = await dispatchFor(snapshot, choice?.direct === true, account.type)
+      const gatewayField = sendGateway ? { gateway: sendGateway } : {}
       active.signal.throwIfAborted()
       if (choice?.auth) {
         if (
@@ -1088,7 +1142,9 @@ export function createNativeAnthropicSource(
             relayFallback,
           })
         recordServed(scope, account)
-        return { ...choice.auth, dispatch }
+        if (choice.auth.route === 'api') return { ...choice.auth, dispatch }
+        const { gateway: _earlier, ...auth } = choice.auth
+        return { ...auth, dispatch, ...gatewayField }
       }
       const common = {
         scope: { ...scope, modelID },
@@ -1177,6 +1233,7 @@ export function createNativeAnthropicSource(
           credentialId: receipt.credentialId,
           provenance,
           dispatch,
+          ...gatewayField,
           identity: getClaudeCodeIdentityForVerifiedAccount(
             identity,
             identity as ProviderAccountUuid,
@@ -1218,6 +1275,7 @@ export function createNativeAnthropicSource(
         credentialId: localMessageThreadCredential(material.subject.binding),
         provenance,
         dispatch,
+        ...gatewayField,
         identity: getClaudeCodeIdentityForVerifiedAccount(
           identity,
           identity as ProviderAccountUuid,

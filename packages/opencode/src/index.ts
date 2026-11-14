@@ -46,6 +46,9 @@ import {
   cacheKeepSourceWarmIdleCap,
   cacheWarmCacheablePrefixFingerprint,
   clampHostRetryMs,
+  claudeGatewayHeaderValues,
+  claudeGatewayModelUrl,
+  claudeGatewayStatusNotes,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   createDumpResponseObserver,
@@ -242,6 +245,7 @@ import {
   tokenFingerprint,
   VAULT_HOST_CONNECT_REFUSAL,
   VAULT_HOST_STATUS,
+  warnClaudeGatewayRelayIgnored,
   withAbortableFetch,
   withSessionCacheReportHandoff,
 } from '@cortexkit/anthropic-auth-core'
@@ -300,7 +304,9 @@ import {
 import { createNativeCommand } from './native-command.js'
 import {
   fetchOAuth,
+  fetchOAuthModel,
   isAllowedOAuthDestination,
+  oauthDestinationRefusal,
   requireOAuthDestination,
 } from './oauth-destination.ts'
 import { pluginTestHandles } from './plugin-test-handles.ts'
@@ -3883,6 +3889,14 @@ const anthropicAuthPlugin = async (
       }
     },
   }
+  /**
+   * The user's gateway when `url` is a model request it takes, else
+   * undefined: the OAuth destination check then allows only Anthropic.
+   */
+  function modelGateway(url: string) {
+    const gateway = nativeAccounts.getClaudeGateway?.()
+    return gateway && claudeGatewayModelUrl(url, gateway) ? gateway : undefined
+  }
   const cacheKeepRegistry = new CacheKeepSessionRegistry({
     ...getCacheKeepRegistryDirectories('opencode'),
   })
@@ -3908,7 +3922,8 @@ const anthropicAuthPlugin = async (
       })
     },
     // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
-    fetchImpl: fetchOAuth,
+    // A keep-warm is a model request, so it follows the current gateway.
+    fetchImpl: fetchOAuthModel(() => nativeAccounts.getClaudeGateway?.()),
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     onTargetChanged: (target) => {
@@ -4095,7 +4110,8 @@ const anthropicAuthPlugin = async (
     prepareHeaders: async (headers, target, attempt) => {
       // A remembered URL gets the same destination rule as a live request;
       // refuse it before any credential is authorized for the prewarm.
-      if (!isAllowedOAuthDestination(target.url)) return undefined
+      if (!isAllowedOAuthDestination(target.url, modelGateway(target.url)))
+        return undefined
       const accountId = target.oauthAccountId ?? 'main'
       let modelId: string | undefined
       try {
@@ -4343,6 +4359,8 @@ const anthropicAuthPlugin = async (
     let scopedAttempt: NativeCustodyReceipt | undefined
     // Token sent on the latest Prime network attempt, kept for error redaction.
     let primeSecret = ''
+    // Header values of the gateway Prime is sent to, redacted the same way.
+    let primeGatewaySecrets: string[] = []
     // The response scope of the latest physical Prime send.
     let physicalScope: ProviderErrorResponseScope | undefined
     try {
@@ -4363,7 +4381,10 @@ const anthropicAuthPlugin = async (
       const primeRequest = rewriteUrl(PRIME_MESSAGES_URL, { baseURL: '' })
       const primeUrl =
         primeRequest.url?.toString() ?? primeRequest.input.toString()
-      requireOAuthDestination(primeUrl)
+      // Prime is a model request: it follows the user's gateway, if any.
+      const primeGateway = nativeAccounts.getClaudeGateway?.()
+      primeGatewaySecrets = claudeGatewayHeaderValues(primeGateway)
+      requireOAuthDestination(primeUrl, modelGateway(primeUrl))
       const initialAuthorization = await authorizeOAuth(
         accountId,
         undefined,
@@ -4417,9 +4438,14 @@ const anthropicAuthPlugin = async (
       // handling; cancellation clears the copied token before cancelling
       // the underlying connection. Prime uses a non-streaming HTTP body.
       const sendPhysical = async () => {
-        const scope = createProviderErrorResponseScope([primeSecret], 'http')
+        const scope = createProviderErrorResponseScope(
+          [primeSecret, ...primeGatewaySecrets],
+          'http',
+        )
         physicalScope = scope
-        return scope.redactResponse(await fetchOAuth(primeUrl, primeInit))
+        return scope.redactResponse(
+          await fetchOAuthModel(primeGateway)(primeUrl, primeInit),
+        )
       }
       let response = await sendPhysical()
       if (response.status === 401 && scopedAttempt && !signal.aborted) {
@@ -4542,7 +4568,10 @@ const anthropicAuthPlugin = async (
     } catch (caught) {
       // No response will clear this attempt's copied token; clear it here.
       physicalScope?.dispose()
-      const scope = createProviderErrorResponseScope([primeSecret], 'http')
+      const scope = createProviderErrorResponseScope(
+        [primeSecret, ...primeGatewaySecrets],
+        'http',
+      )
       const error = scope.redactError(caught)
       scope.dispose()
       return {
@@ -6438,6 +6467,7 @@ const anthropicAuthPlugin = async (
         ({ setting, model }) => `Ignored model key: ${setting}.${model}`,
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
+      ...claudeGatewayStatusNotes(file.gatewayIgnored, status.values.gateway),
       'Settings (no model):',
       ...Object.entries(status.values).map(
         ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,
@@ -7780,17 +7810,35 @@ const anthropicAuthPlugin = async (
             // destination other than Anthropic before authorizing a token,
             // with a local 400 that no fallback account or retry repeats.
             const rewritten = rewriteUrl(input)
-            if (
-              !isAllowedOAuthDestination(
-                rewritten.url?.toString() ?? fetchInputUrl(rewritten.input),
-              )
-            ) {
-              logger.warn(
-                'oauth-destination',
-                'refused a Claude OAuth request to a non-Anthropic origin; nothing was sent',
-                { route },
-              )
-              return localInvalidRequestResponse(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+            const requestUrl =
+              rewritten.url?.toString() ?? fetchInputUrl(rewritten.input)
+            // The user's gateway from their own settings file takes model
+            // requests only. It is read once, so every send of this request
+            // (and its thread, relay and gzip decisions) agrees.
+            const configuredGateway = nativeAccounts.getClaudeGateway?.()
+            const gateway =
+              configuredGateway &&
+              (
+                init?.method ??
+                (input instanceof Request ? input.method : 'GET')
+              ).toUpperCase() === 'POST' &&
+              claudeGatewayModelUrl(requestUrl, configuredGateway)
+                ? configuredGateway
+                : undefined
+            const destinationRefusal = oauthDestinationRefusal(
+              requestUrl,
+              gateway,
+            )
+            if (destinationRefusal) {
+              // A gateway send refused because of a proxy setting has already
+              // logged its own warning, once.
+              if (destinationRefusal === ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+                logger.warn(
+                  'oauth-destination',
+                  'refused a Claude OAuth request to a non-Anthropic origin; nothing was sent',
+                  { route },
+                )
+              return localInvalidRequestResponse(destinationRefusal)
             }
             // A request admitted with the placeholder cannot switch to a
             // separate login while native authorization or refresh is waiting.
@@ -8363,8 +8411,12 @@ const anthropicAuthPlugin = async (
               // Keep the sent token only to redact provider errors before dumps,
               // diagnostics, routing or host reads. Clear that copy when the
               // response finishes, errors or is cancelled.
+              // A gateway error may echo the gateway's own header values.
               const scope = createProviderErrorResponseScope(
-                [nativeAuthorization.accessToken],
+                [
+                  nativeAuthorization.accessToken,
+                  ...claudeGatewayHeaderValues(gateway),
+                ],
                 streaming ? 'event-stream' : 'http',
               )
               try {
@@ -8372,18 +8424,22 @@ const anthropicAuthPlugin = async (
                   wireBody: RequestInit['body'],
                   wireHeaders: Headers,
                 ) =>
-                  // fetchOAuth rechecks the destination and refuses redirects.
-                  fetchOAuth(rewritten.input, {
+                  // fetchOAuthModel rechecks the destination, refuses
+                  // redirects and, with a gateway, sends there instead. The
+                  // ANTHROPIC_INSECURE opt-out applies to API-key routes only:
+                  // an OAuth send always checks certificates.
+                  fetchOAuthModel(gateway)(rewritten.input, {
                     ...init,
                     body: wireBody,
                     headers: wireHeaders,
-                    ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
                   })
                 // Claude Code gzips large bodies on the wire. `body` stays the
                 // signed uncompressed wire text for dumps and relay fallback.
                 // CacheKeep retains the separate full stateless template.
+                // Claude Code compresses only to api.anthropic.com, so a
+                // gateway gets the uncompressed body.
                 const response = scope.redactResponse(
-                  typeof body === 'string'
+                  typeof body === 'string' && !gateway
                     ? await sendWithRequestGzip({
                         url:
                           rewritten.url?.toString() ??
@@ -8448,12 +8504,20 @@ const anthropicAuthPlugin = async (
                 return localInvalidRequestResponse(error.message)
               throw error
             }
+            // A gateway takes model requests instead of the relay, with no
+            // relay attempt and no fallback to api.anthropic.com.
+            if (gateway && relayConfig) {
+              warnClaudeGatewayRelayIgnored(gateway)
+              relayConfig = null
+            }
             let threadRequest: MessageThreadRequest | undefined
             if (
               typeof body === 'string' &&
               requestClass === 'main' &&
               !subagentRequest &&
               !laneStartRequest &&
+              // Gateways may refuse the thread route: send full requests.
+              !gateway &&
               (!relayConfig ||
                 effectiveRelayTransport(
                   relayConfig.transport,

@@ -66,6 +66,7 @@ import {
   type NativeAnthropicAttemptOutcome,
   type NativeAnthropicAuthorization,
   type NativeAnthropicBodyOptions,
+  type NativeAnthropicDispatch,
   NativeAnthropicLocalRefusal,
   NativeAnthropicNoAccountError,
   type NativeAnthropicRequestContext,
@@ -73,6 +74,7 @@ import {
   NativeAnthropicRevokedError,
   type NativeAnthropicSource,
   NativeAnthropicStateRefusal,
+  NativeAnthropicTransportRefusal,
   NO_ACCOUNT_REFUSAL,
 } from '../v2/adapter'
 import { createNativeWirePolicy } from '../v2/wire'
@@ -89,7 +91,6 @@ type Quota = { readonly unified: string | null; readonly scoped: string | null }
 type Data = NativeAnthropicAttemptData<Provenance>
 
 const ENV_KEYS = [
-  'ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_MODEL',
@@ -102,6 +103,12 @@ const savedEnv = new Map<string, string | undefined>()
 const routingKey = Symbol.for('cortexkit.routing')
 const globals = globalThis as Record<symbol, unknown>
 const originalRouting = globals[routingKey]
+// Test-only OAuth loopback origin, read by oauth-destination.ts from this
+// global symbol (never from the environment).
+const loopbackHook = globalThis as Record<symbol, unknown>
+const LOOPBACK_KEY = Symbol.for(
+  'cortexkit.anthropic-auth.test-oauth-loopback-origin',
+)
 beforeEach(() => {
   for (const key of ENV_KEYS) {
     savedEnv.set(key, process.env[key])
@@ -109,6 +116,7 @@ beforeEach(() => {
   }
 })
 afterEach(() => {
+  delete loopbackHook[LOOPBACK_KEY]
   if (originalRouting === undefined) delete globals[routingKey]
   else globals[routingKey] = originalRouting
   for (const [key, value] of savedEnv) {
@@ -2695,7 +2703,7 @@ describe('OpenCode 2 native Anthropic adapter: OAuth destination', () => {
     const upstream = loopbackServer()
     const other = loopbackServer()
     try {
-      process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+      loopbackHook[LOOPBACK_KEY] = upstream.origin
       const oauthHost = new Host(
         createNativeAnthropicAdapter({
           source: makeSource({
@@ -4048,3 +4056,367 @@ for (const transport of ['direct-gzip', 'http-relay'] as const) {
     }
   })
 }
+
+describe('OpenCode 2 native Anthropic adapter: user gateway', () => {
+  const OAUTH_TOKEN = 'sk-ant-oat01-gateway-canary'
+  const GATEWAY_SECRET = 'gateway-header-secret-canary'
+  let gatewayServer: ReturnType<typeof Bun.serve> | undefined
+  const received: Array<{ url: string; headers: Headers; body: string }> = []
+  let gatewayAnswer: (() => Response) | undefined
+  beforeEach(() => {
+    received.length = 0
+    gatewayAnswer = undefined
+    gatewayServer = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        received.push({
+          url: request.url,
+          headers: new Headers(request.headers),
+          body: await request.text(),
+        })
+        return (
+          gatewayAnswer?.() ??
+          new Response('{}', {
+            headers: { 'content-type': 'application/json' },
+          })
+        )
+      },
+    })
+  })
+  afterEach(() => {
+    gatewayServer?.stop(true)
+  })
+
+  const gateway = (): core.ClaudeGateway => ({
+    origin: `http://127.0.0.1:${gatewayServer?.port}`,
+    pathPrefix: '/claude',
+    headers: [['x-gateway-key', GATEWAY_SECRET]],
+  })
+  const largePayload = () => {
+    const payload = sonnetPayload()
+    payload.messages[0] = {
+      role: 'user',
+      content: [{ type: 'text', text: `Review: ${'x'.repeat(9000)}` }],
+    }
+    return payload
+  }
+  // The source reads the gateway once per authorization and hands it to
+  // the adapter on that authorization.
+  const oauthSource = (claudeGateway?: () => core.ClaudeGateway | undefined) =>
+    makeSource({
+      authorize: () => {
+        const current = claudeGateway?.()
+        return oauth(
+          OAUTH_TOKEN,
+          { custody: 'local', receipt: 'local:1' },
+          current ? { gateway: current } : {},
+        )
+      },
+    }).source
+  const hostFor = (source: ReturnType<typeof oauthSource>) =>
+    new Host(
+      createNativeAnthropicAdapter({
+        source,
+        requestGzipLatch: new RequestGzipLatch(),
+      }).adapter,
+    )
+
+  test.each([
+    ['a model request', scopeOf()],
+    [
+      'a keep-warm request',
+      scopeOf({ agent: 'cachekeep', sessionID: 'oc2-cachekeep:ses_alpha' }),
+    ],
+    [
+      'a Prime request',
+      scopeOf({ agent: 'prime', sessionID: 'oc2-prime:acct-local' }),
+    ],
+  ])(
+    '%s goes to the gateway as a full, uncompressed request with the gateway headers',
+    async (_name, scope) => {
+      const host = hostFor(oauthSource(gateway))
+      const { final } = await host.run(scope, hostRequest(largePayload()))
+      expect(final.redirect).toBe('error')
+      await (await fetch(final)).text()
+      expect(received).toHaveLength(1)
+      const sent = received[0]!
+      const url = new URL(sent.url)
+      expect(url.pathname).toBe('/claude/v1/messages')
+      expect(url.search).toBe('?beta=true')
+      expect(sent.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
+      expect(sent.headers.get('authorization')).toBe(`Bearer ${OAUTH_TOKEN}`)
+      expect(sent.headers.get('content-encoding')).toBeNull()
+      const body = JSON.parse(sent.body)
+      expect(body.thread).toBeUndefined()
+      expect(body.messages[0].content[0].text).toContain('x'.repeat(9000))
+      expect(await signRequestBody(sent.body)).toBe(sent.body)
+    },
+  )
+
+  test('the same primary request without a gateway goes to Anthropic threaded and gzipped', async () => {
+    const host = hostFor(oauthSource())
+    const { final } = await host.run(scopeOf(), hostRequest(largePayload()))
+    expect(new URL(final.url).origin).toBe('https://api.anthropic.com')
+    expect(final.headers.get('content-encoding')).toBe('gzip')
+    expect(final.headers.has('x-gateway-key')).toBe(false)
+    const plain = new TextDecoder().decode(
+      gunzipSync(new Uint8Array(await final.clone().arrayBuffer())),
+    )
+    expect(JSON.parse(plain).thread).toEqual({ type: 'create' })
+  })
+
+  test('request bytes are unchanged apart from the URL and the gateway headers', async () => {
+    // A title request is never threaded or gzipped, so both sends are full.
+    const scope = scopeOf({ agent: 'title' })
+    const direct = await hostFor(oauthSource()).run(
+      scope,
+      hostRequest(sonnetPayload()),
+    )
+    const routed = await hostFor(oauthSource(gateway)).run(
+      scope,
+      hostRequest(sonnetPayload()),
+    )
+    expect(await routed.final.clone().text()).toBe(
+      await direct.final.clone().text(),
+    )
+    const headers = (request: Request) => {
+      const all = Object.fromEntries(request.headers)
+      // Each send gets its own request id.
+      delete all['x-client-request-id']
+      return all
+    }
+    const routedHeaders = headers(routed.final)
+    expect(routedHeaders['x-gateway-key']).toBe(GATEWAY_SECRET)
+    delete routedHeaders['x-gateway-key']
+    expect(routedHeaders).toEqual(headers(direct.final))
+    expect(new URL(routed.final.url).pathname).toBe('/claude/v1/messages')
+  })
+
+  test('with no gateway set the request is byte-identical to a source without the gateway hook', async () => {
+    const before = await hostFor(oauthSource()).run(
+      scopeOf({ agent: 'title' }),
+      hostRequest(sonnetPayload()),
+    )
+    const after = await hostFor(oauthSource(() => undefined)).run(
+      scopeOf({ agent: 'title' }),
+      hostRequest(sonnetPayload()),
+    )
+    expect(after.final.url).toBe(before.final.url)
+    expect(await after.final.clone().text()).toBe(
+      await before.final.clone().text(),
+    )
+    const strip = (request: Request) => {
+      const all = Object.fromEntries(request.headers)
+      delete all['x-client-request-id']
+      return all
+    }
+    expect(strip(after.final)).toEqual(strip(before.final))
+  })
+
+  test('a provider baseURL or ANTHROPIC_BASE_URL elsewhere is still refused with a gateway set', async () => {
+    const elsewhere = loopbackServer()
+    try {
+      const host = hostFor(oauthSource(gateway))
+      for (const request of [
+        hostRequest(sonnetPayload(), {
+          url: `${elsewhere.origin}/v1/messages`,
+        }),
+        hostRequest(sonnetPayload(), {
+          url: `${elsewhere.origin}/claude/v1/messages`,
+        }),
+      ]) {
+        const started = await host.begin(scopeOf())
+        await expect(host.send(started, request)).rejects.toBeInstanceOf(
+          NativeAnthropicLocalRefusal,
+        )
+      }
+      process.env.ANTHROPIC_BASE_URL = elsewhere.origin
+      const started = await host.begin(scopeOf())
+      await expect(
+        host.send(started, hostRequest(sonnetPayload())),
+      ).rejects.toThrow(ANTHROPIC_OAUTH_ORIGIN_REFUSAL)
+      expect(host.sent).toHaveLength(0)
+      expect(elsewhere.received).toEqual([])
+      expect(received).toEqual([])
+    } finally {
+      elsewhere.stop()
+    }
+  })
+
+  test('a non-model request is not sent to the gateway', async () => {
+    const host = hostFor(oauthSource(gateway))
+    const { final } = await host.run(
+      scopeOf(),
+      hostRequest(
+        { model: 'claude-sonnet-5', messages: [] },
+        { url: 'https://api.anthropic.com/v1/messages/count_tokens' },
+      ),
+    )
+    expect(new URL(final.url).origin).toBe('https://api.anthropic.com')
+    expect(final.headers.has('x-gateway-key')).toBe(false)
+  })
+
+  test('a gateway error echoing a gateway header value is redacted in the response, logs and dump', async () => {
+    const dumps = await mkdtemp(join(tmpdir(), 'oc2-gateway-dump-'))
+    const previousDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+    process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumps
+    core.setDumpEnabled(true)
+    const records: core.LogTestRecord[] = []
+    core.__setLogTestSink((record) => records.push(record))
+    try {
+      gatewayAnswer = () =>
+        Response.json(
+          {
+            type: 'error',
+            error: {
+              type: 'authentication_error',
+              message: `gateway rejected key ${GATEWAY_SECRET}`,
+            },
+          },
+          { status: 401 },
+        )
+      const native = createNativeAnthropicAdapter({
+        source: oauthSource(gateway),
+      })
+      const host = new Host(native.adapter)
+      const payload = { ...sonnetPayload(), stream: false }
+      const { final, attempt } = await host.run(
+        scopeOf({ agent: 'title' }),
+        hostRequest(payload),
+      )
+      const physical = await fetch(final)
+      const response = (await native.adapter.rewriteResponse?.({
+        ...attempt,
+        request: final,
+        response: physical,
+        attempt,
+      })) as Response
+      const text = await response.text()
+      expect(text).not.toContain(GATEWAY_SECRET)
+      expect(text).toContain('[REDACTED]')
+      await native.adapter.onAttemptEnd?.(attempt, {
+        outputStarted: false,
+        status: 401,
+      })
+      await Bun.sleep(20)
+      expect(JSON.stringify(records)).not.toContain(GATEWAY_SECRET)
+      for (const name of await readdir(dumps))
+        expect(await readFile(join(dumps, name), 'utf8')).not.toContain(
+          GATEWAY_SECRET,
+        )
+    } finally {
+      core.setDumpEnabled(false)
+      core.__setLogTestSink(null)
+      if (previousDir === undefined)
+        delete process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
+      else process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = previousDir
+      await rm(dumps, { recursive: true, force: true })
+    }
+  })
+
+  test('a provider base URL with an extra path on api.anthropic.com still goes to the gateway', async () => {
+    const host = hostFor(oauthSource(gateway))
+    const { final } = await host.run(
+      scopeOf({ agent: 'title' }),
+      hostRequest(sonnetPayload(), {
+        url: 'https://api.anthropic.com/extra//v1/messages',
+      }),
+    )
+    expect(new URL(final.url).pathname).toBe('/claude/v1/messages')
+    expect(final.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
+  })
+
+  test('API-key routes ignore the gateway', async () => {
+    const { source } = makeSource({
+      authorize: () =>
+        apiKey('sk-ant-api03-gateway-key', {
+          custody: 'api',
+          receipt: 'api:1',
+        }),
+    })
+    const { final } = await hostFor(source).run(
+      scopeOf(),
+      hostRequest(sonnetPayload()),
+    )
+    expect(new URL(final.url).origin).toBe('https://api.anthropic.com')
+    expect(final.headers.has('x-gateway-key')).toBe(false)
+  })
+
+  // A relay and a gateway can both be configured. The relay choice is made
+  // per request URL: only a gateway-routed model request skips the relay.
+  const relayedSource = (dispatch: NativeAnthropicDispatch) =>
+    makeSource({
+      authorize: () =>
+        oauth(
+          OAUTH_TOKEN,
+          { custody: 'local', receipt: 'local:1' },
+          { dispatch, gateway: gateway() },
+        ),
+    }).source
+  const httpRelay = {
+    kind: 'http-relay' as const,
+    url: 'https://relay.example.test/send',
+    token: 'relay-secret',
+  }
+
+  test('with an HTTP relay, a model request goes straight to the gateway with no relay token', async () => {
+    const { final } = await hostFor(relayedSource(httpRelay)).run(
+      scopeOf(),
+      hostRequest(sonnetPayload()),
+    )
+    expect(new URL(final.url).pathname).toBe('/claude/v1/messages')
+    expect(final.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
+    expect(final.headers.get('authorization')).toBe(`Bearer ${OAUTH_TOKEN}`)
+    expect(final.headers.has('x-relay-token')).toBe(false)
+    expect(final.redirect).toBe('error')
+    expect(await final.clone().text()).not.toContain('relay-secret')
+  })
+
+  test('with an HTTP relay, a request the gateway does not take still uses the relay', async () => {
+    const { final } = await hostFor(relayedSource(httpRelay)).run(
+      scopeOf(),
+      hostRequest(
+        { model: 'claude-sonnet-5', messages: [] },
+        { url: 'https://api.anthropic.com/v1/messages/count_tokens' },
+      ),
+    )
+    expect(final.url).toBe('https://relay.example.test/send')
+    expect(final.redirect).toBe('error')
+    expect(final.headers.get('x-relay-token')).toBe('relay-secret')
+    expect(final.headers.has('authorization')).toBe(false)
+    const envelope = JSON.parse(await final.clone().text())
+    expect(envelope.upstream.url).toBe(
+      'https://api.anthropic.com/v1/messages/count_tokens',
+    )
+    expect(JSON.stringify(envelope)).not.toContain(GATEWAY_SECRET)
+  })
+
+  test('with a WebSocket relay, a model request goes to the gateway and any other request is refused', async () => {
+    const host = hostFor(relayedSource({ kind: 'websocket-relay' }))
+    const { final } = await host.run(scopeOf(), hostRequest(sonnetPayload()))
+    expect(new URL(final.url).pathname).toBe('/claude/v1/messages')
+    expect(final.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
+    const started = await host.begin(scopeOf())
+    await expect(
+      host.send(
+        started,
+        hostRequest(
+          { model: 'claude-sonnet-5', messages: [] },
+          { url: 'https://api.anthropic.com/v1/messages/count_tokens' },
+        ),
+      ),
+    ).rejects.toBeInstanceOf(NativeAnthropicTransportRefusal)
+  })
+
+  test('a versioned provider base URL on api.anthropic.com still goes to the gateway', async () => {
+    const { final } = await hostFor(oauthSource(gateway)).run(
+      scopeOf({ agent: 'title' }),
+      hostRequest(sonnetPayload(), {
+        url: 'https://api.anthropic.com/v2/messages?beta=true',
+      }),
+    )
+    expect(new URL(final.url).pathname).toBe('/claude/v1/messages')
+    expect(final.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
+  })
+})

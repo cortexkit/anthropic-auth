@@ -98,7 +98,6 @@ const envKeys = [
   'XDG_STATE_HOME',
   'TMPDIR',
   'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN',
 ] as const
 const originalFetch = globalThis.fetch
 const provider: Provider = {
@@ -120,7 +119,14 @@ let currentOwner: BodyOwner | undefined
 let teardownRequested = false
 // Register cancellation before createTestLifetimeSuite's afterEach hook:
 // stop test I/O before that hook waits for timed-out tests to finish.
+// Test-only OAuth loopback origin, read by oauth-destination.ts from this
+// global symbol (never from the environment).
+const loopbackHook = globalThis as Record<symbol, unknown>
+const LOOPBACK_KEY = Symbol.for(
+  'cortexkit.anthropic-auth.test-oauth-loopback-origin',
+)
 afterEach(async () => {
+  delete loopbackHook[LOOPBACK_KEY]
   teardownRequested = true
   const closing = [...owners]
   const pluginsToClose = closing.flatMap((owner) => [...owner.plugins])
@@ -4508,7 +4514,7 @@ test('OC1 vault OAuth: a 401 retry to a destination that is no longer allowed is
   // the newer credential must be refused instead of sent.
   const upstream = destinationServer((count) => {
     if (count !== 1) return undefined
-    delete process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
+    delete loopbackHook[LOOPBACK_KEY]
     fixture.rotateVault()
     return Response.json(
       {
@@ -4518,7 +4524,7 @@ test('OC1 vault OAuth: a 401 retry to a destination that is no longer allowed is
       { status: 401 },
     )
   })
-  process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+  loopbackHook[LOOPBACK_KEY] = upstream.origin
   routeLoopback(fixture, [upstream.origin])
   const plugin = await createPlugin({
     claustrumScopedConnect: async () => fixture.scopedClient,
@@ -4535,8 +4541,7 @@ for (const admitted of [false, true]) {
   test(`OC1 vault CacheKeep prewarm to a remembered loopback URL ${admitted ? 'is sent when the test origin admits it' : 'is refused without authorizing a credential'}`, async () => {
     const fixture = await migrateServingFixture('claustrum')
     const upstream = destinationServer()
-    if (admitted)
-      process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+    if (admitted) loopbackHook[LOOPBACK_KEY] = upstream.origin
     routeLoopback(fixture, [upstream.origin])
     const plugin = await createPlugin({
       claustrumScopedConnect: async () => fixture.scopedClient,
@@ -4587,8 +4592,7 @@ for (const admitted of [false, true]) {
     await enablePrime(fixture)
     const upstream = destinationServer()
     process.env.ANTHROPIC_BASE_URL = upstream.origin
-    if (admitted)
-      process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.origin
+    if (admitted) loopbackHook[LOOPBACK_KEY] = upstream.origin
     network.mockImplementation(async (input, init) => {
       const url = input instanceof Request ? input.url : input.toString()
       if (url.includes('/api/oauth/usage')) return primeWindows()

@@ -1,6 +1,10 @@
 import {
+  ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   type AnthropicOAuthOriginOptions,
+  type ClaudeGateway,
+  ClaudeGatewayProxyRefusal,
   createAnthropicOAuthFetch,
+  createClaudeModelFetch,
   logger,
   requireAnthropicOAuthOrigin,
 } from '@cortexkit/anthropic-auth-core'
@@ -9,26 +13,35 @@ import {
  * Test-only escape hatch for the OAuth destination rule.
  *
  * End-to-end suites run a real OpenCode process against a local mock of the
- * Anthropic API, so they need OAuth sends to reach a loopback server. Setting
- * this variable to that server's exact origin (for example
- * `http://127.0.0.1:43123`) allows it in addition to api.anthropic.com. Only
- * an `http://` or `https://` origin on 127.0.0.1, [::1] or localhost, with an
- * explicit port and no user name, password, path, query or fragment, is
- * accepted; any other value is ignored, so OAuth stays limited to
- * api.anthropic.com. ANTHROPIC_BASE_URL never widens the rule. It is not a
- * user setting and is deliberately left out of the public documentation.
+ * Anthropic API, so they need OAuth sends to reach a loopback server. Test
+ * code sets the server's exact origin (for example `http://127.0.0.1:43123`)
+ * on `globalThis` under this symbol, from a test preload or a test-only
+ * plugin loaded before this one; it is then allowed in addition to
+ * api.anthropic.com. Only an `http://` or `https://` origin on 127.0.0.1,
+ * [::1] or localhost, with an explicit port and no user name, password, path,
+ * query or fragment, is accepted; any other value is ignored, so OAuth stays
+ * limited to api.anthropic.com.
+ *
+ * It is deliberately not an environment variable: OpenCode started from
+ * source loads a `.env` file from the working directory, so an opened
+ * repository could set one. Only code already running in the process can set
+ * this symbol. ANTHROPIC_BASE_URL never widens the rule. It is not a user
+ * setting and is deliberately left out of the public documentation.
  */
-export const TEST_OAUTH_LOOPBACK_ORIGIN_ENV =
-  'ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN'
+export const TEST_OAUTH_LOOPBACK_ORIGIN_KEY = Symbol.for(
+  'cortexkit.anthropic-auth.test-oauth-loopback-origin',
+)
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]', 'localhost'])
 
 let warnedValue: string | undefined
 
-/** The accepted loopback origin from TEST_OAUTH_LOOPBACK_ORIGIN_ENV, if any. */
+/** The accepted loopback origin from TEST_OAUTH_LOOPBACK_ORIGIN_KEY, if any. */
 export function testOAuthLoopbackOrigin(): string | undefined {
-  const raw = process.env[TEST_OAUTH_LOOPBACK_ORIGIN_ENV]
-  if (!raw) return undefined
+  const raw = (globalThis as Record<symbol, unknown>)[
+    TEST_OAUTH_LOOPBACK_ORIGIN_KEY
+  ]
+  if (typeof raw !== 'string' || !raw) return undefined
   const accepted = parseLoopbackOrigin(raw)
   // Warn once per distinct value so the hatch is never silently active.
   if (warnedValue !== raw) {
@@ -37,13 +50,11 @@ export function testOAuthLoopbackOrigin(): string | undefined {
       logger.warn(
         'oauth-destination',
         'test-only loopback origin is allowed for Claude OAuth requests',
-        { env: TEST_OAUTH_LOOPBACK_ORIGIN_ENV },
       )
     else
       logger.warn(
         'oauth-destination',
         'ignored an invalid test-only loopback origin; Claude OAuth requests stay limited to https://api.anthropic.com',
-        { env: TEST_OAUTH_LOOPBACK_ORIGIN_ENV },
       )
   }
   return accepted
@@ -66,9 +77,12 @@ function parseLoopbackOrigin(raw: string): string | undefined {
   return url.origin
 }
 
-function originOptions(): AnthropicOAuthOriginOptions {
+function originOptions(gateway?: ClaudeGateway): AnthropicOAuthOriginOptions {
   const extraOrigin = testOAuthLoopbackOrigin()
-  return extraOrigin ? { extraOrigin } : {}
+  return {
+    ...(extraOrigin ? { extraOrigin } : {}),
+    ...(gateway ? { gateway } : {}),
+  }
 }
 
 /**
@@ -81,18 +95,42 @@ function originOptions(): AnthropicOAuthOriginOptions {
  * `bun run` (from source) loads a `.env` file from the working directory, so
  * an opened repository could set the variable. An OAuth token therefore goes
  * only to api.anthropic.com whatever the variable says.
+ *
+ * Pass `gateway` only for a model request: it is the user's gateway from
+ * their own settings file (NativeAccountRuntime.getClaudeGateway), never a
+ * value taken from provider configuration or the environment.
  */
-export function requireOAuthDestination(url: string): URL {
-  return requireAnthropicOAuthOrigin(url, originOptions())
+export function requireOAuthDestination(
+  url: string,
+  gateway?: ClaudeGateway,
+): URL {
+  return requireAnthropicOAuthOrigin(url, originOptions(gateway))
 }
 
 /** True when an OAuth token may be sent to `url`. */
-export function isAllowedOAuthDestination(url: string): boolean {
+export function isAllowedOAuthDestination(
+  url: string,
+  gateway?: ClaudeGateway,
+): boolean {
+  return oauthDestinationRefusal(url, gateway) === undefined
+}
+
+/**
+ * Undefined when an OAuth token may be sent to `url`; otherwise the fixed
+ * refusal text, which never includes the URL or any credential. A gateway
+ * send refused because a proxy setting would carry it gets its own text.
+ */
+export function oauthDestinationRefusal(
+  url: string,
+  gateway?: ClaudeGateway,
+): string | undefined {
   try {
-    requireOAuthDestination(url)
-    return true
-  } catch {
-    return false
+    requireOAuthDestination(url, gateway)
+    return undefined
+  } catch (error) {
+    return error instanceof ClaudeGatewayProxyRefusal
+      ? error.message
+      : ANTHROPIC_OAUTH_ORIGIN_REFUSAL
   }
 }
 
@@ -101,3 +139,14 @@ export function isAllowedOAuthDestination(url: string): boolean {
  * redirects.
  */
 export const fetchOAuth: typeof fetch = createAnthropicOAuthFetch(originOptions)
+
+/**
+ * Fetch for OAuth model requests: like fetchOAuth, but a model request goes
+ * to the user's gateway with its headers when one is set. See
+ * createClaudeModelFetch.
+ */
+export function fetchOAuthModel(
+  gateway: ClaudeGateway | undefined | (() => ClaudeGateway | undefined),
+): typeof fetch {
+  return createClaudeModelFetch({ origin: () => originOptions(), gateway })
+}

@@ -471,6 +471,8 @@ async function postRelay(
     relayBytes: body.length,
     mode: payload.mode,
   })
+  // The envelope carries the upstream credential, so a relay that answers
+  // with a redirect must not have it re-posted somewhere else.
   return fetch(config.url, {
     method: 'POST',
     headers: {
@@ -478,6 +480,7 @@ async function postRelay(
       'x-relay-token': config.token,
     },
     body,
+    redirect: 'error',
     signal: signal ?? undefined,
   })
 }
@@ -2322,10 +2325,13 @@ function headersToObject(headers) {
 async function handleRelayPayload(env, payload) {
   const prepared = await prepareUpstream(env, payload)
   if (prepared.error) return prepared
+  // The upstream headers carry the caller's credential: a redirect is
+  // returned to the caller as it is, never followed with them.
   const upstream = await fetch(payload.upstream.url, {
     method: payload.upstream.method || 'POST',
     headers: payload.upstream.headers,
     body: prepared.body,
+    redirect: 'manual',
   })
   return { upstream, stateWrite: prepared.stateWrite }
 }
@@ -2354,6 +2360,7 @@ async function handleWebSocket(socket, env, ctx, payload, getState, setState) {
       method: payload.upstream.method || 'POST',
       headers: payload.upstream.headers,
       body: result.body,
+      redirect: 'manual',
     })
     ctx?.waitUntil?.(result.checkpoint)
     const upstream = await upstreamPromise

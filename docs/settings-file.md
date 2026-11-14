@@ -50,6 +50,7 @@ file are flat, lower-case snake_case, not the legacy nested camelCase names.
 | Logging | `log_level` |
 | Thinking binding | `thinking_binding_prefix_mismatch_behavior` |
 | Turn-end notes | `turn_end_note_tools` |
+| Custom gateway | `gateway_url`, `gateway_headers` (see [Custom gateway](#custom-gateway)) |
 
 `max_same_account_wait` takes `"off"`, `"15m"` (the default) or `"cache"`;
 the menu calls it **Longest wait on the same account**. Floors are percentages
@@ -119,12 +120,122 @@ drop the `[1m]` qualifier and use the table's longest matching model id/suffix.
 Unknown models use the no-model values. Unrecognized model override keys are
 ignored, logged and named in Status.
 
-`killswitch_account_floors` is the exception: it takes **no overrides**. It is
-a list of complete `{account, host, five_hour, seven_day, scoped}` entries.
-`host` is `opencode`, `pi` or `both`; each host applies its own and `both`
-entries. `account` is the local row id or vault roster route id, never an email
+`killswitch_account_floors`, `gateway_url` and `gateway_headers` are the
+exceptions: they take **no overrides**. The floors setting is a list of
+complete `{account, host, five_hour, seven_day, scoped}` entries. `host` is
+`opencode`, `pi` or `both`; each host applies its own and `both` entries. `account` is the local row id or vault roster route id, never an email
 or account identity. Entries may not overlap for the same account and host.
 The legacy aliases `5h` and `1w` are not valid keys here.
+
+## Custom gateway
+
+Claude sign-in (OAuth) model requests normally go only to
+`https://api.anthropic.com`. To send them through your own gateway instead,
+set both settings in your user settings file:
+
+```jsonc
+{
+  "schema_version": 1,
+  "gateway_url": "https://gateway.example.com/claude",
+  "gateway_headers": { "X-Gateway-Key": "your gateway secret" }
+}
+```
+
+- `gateway_url` is an absolute `https:` URL, or `http:` only for a loopback
+  host (`127.0.0.1`, `[::1]` or `localhost`). It may have a path prefix, but no
+  user name, password, query or fragment. Model requests go to
+  `<gateway_url>/v1/messages?beta=true`. An empty value (the default) means no
+  gateway.
+- `gateway_headers` is an object of header names and string values added to
+  every gateway request. The same rules as
+  `ANTHROPIC_CUSTOM_HEADERS` apply: authentication, protocol, body-framing and
+  the plugin's own internal headers (such as `authorization`, `x-api-key`,
+  `anthropic-beta`, `anthropic-version`, `content-type`, `content-encoding`)
+  are refused, and so are invalid names, line breaks in values, and the same
+  name twice.
+
+Neither setting takes host or model keys: one gateway, with its headers,
+serves OpenCode 1, OpenCode 2 and Pi alike, so one host's gateway headers are
+never sent to another gateway. An override object on either setting makes the
+gateway invalid.
+
+The gateway applies only to model requests on OpenCode 1, OpenCode 2 and Pi,
+including keep-warm and Prime sends. A model request is a `POST` to
+`api.anthropic.com` whose path ends in `/messages`, also when a provider
+`baseURL` on `api.anthropic.com` adds a path or another version in front of it
+(`/v2/messages` still goes to the gateway's `/v1/messages`); a path with `.` or
+`..` segments is not treated as one, and neither is a sub-resource such as
+`/v1/messages/count_tokens`. Sign-in, token refresh, usage and quota,
+profile and every other Anthropic endpoint still go only to
+`https://api.anthropic.com`, and API-key accounts keep their own base URL.
+Through the gateway:
+
+- Every request is a full request: message threads are not used, because a
+  gateway may not support them.
+- Request bodies are not gzipped; Claude Code compresses only to
+  `api.anthropic.com`.
+- The relay is not used for model requests. If a relay is also configured,
+  the gateway wins for them and one warning says the relay is ignored. Nothing
+  retries or falls back to `api.anthropic.com` directly. Other sign-in
+  requests the gateway does not take still use the relay as before, and a
+  WebSocket relay still refuses them.
+- Redirects are refused, as for every sign-in request.
+- Certificates are always checked; `ANTHROPIC_INSECURE` never applies to
+  sign-in requests.
+- A loopback `http:` gateway is refused while `HTTP_PROXY` or `http_proxy` is
+  set, because Bun would send those plain-text requests, with your sign-in
+  token and gateway headers, through that proxy, and a repository's `.env`
+  file can set the variable. Each such request fails with "Gateway refused: a
+  proxy setting would carry plain-http requests"; one warning is logged,
+  Status shows the same line, and nothing goes to `api.anthropic.com`
+  instead. To allow it, list the gateway host in `NO_PROXY` (or `no_proxy`,
+  which takes its place when set): `*`, the exact host (`127.0.0.1`,
+  `localhost` or `[::1]`) or `host:port` with the gateway's port, in a
+  comma-separated list. An `https:` gateway is not affected: a proxy can only
+  tunnel it, and its certificate is still checked.
+
+Apart from the URL and the added headers, each request is the one the plugin
+would send to Anthropic: same identity, billing header, signing, betas and
+cache markers.
+
+The gateway is honoured only from the settings file at its default location
+for your operating system account: `~/.config/cortexkit/anthropic-auth.jsonc`
+on Linux and macOS, and `cortexkit\anthropic-auth.jsonc` in your roaming
+AppData folder on Windows. The plugin finds that location from the account
+itself, never from the environment: the account database entry for your user
+id on Linux (`getent`, or `/etc/passwd`), the directory record on macOS
+(`dscl`), and the user's `Shell Folders` registry key on Windows (`reg.exe`
+under `C:\Windows`). It looks once per process, when settings are first
+read. `HOME`, `USERPROFILE`, `APPDATA`, `XDG_CONFIG_HOME` and
+`ANTHROPIC_AUTH_SETTINGS_FILE` never decide it. The paths are compared after
+resolving links, again every time the file is read, so a link that later
+points elsewhere stops the gateway at once. When the file in use is reached
+through another path than the default one (for example, the default path is a
+link to it), the default path is watched as well, so removing or retargeting
+it stops the gateway at once even though the file itself has not changed. If
+the settings file in use is
+anywhere else, a gateway it names is ignored, one warning is logged, and
+Status says "Gateway ignored: settings file is not in its default location".
+If the account's home folder cannot be found, the gateway is ignored the same
+way and Status says so. Other settings in that file still apply.
+
+These settings are read only from your own user settings file. A project file,
+a provider `baseURL`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS` can
+never set or change the gateway, and the `/claude` menu never writes it. A
+separate install, or a host that has not moved to the settings file yet, uses
+no gateway.
+
+If either setting is invalid, there is **no gateway**: model requests go to
+`https://api.anthropic.com` as usual, one warning is logged for that
+configuration, and Status lists the invalid setting. The plugin never keeps
+using an earlier gateway value after an invalid edit. The same holds while the
+settings file is malformed or cannot be read: other settings keep their last
+good values, but the gateway is not used until the file reads again.
+
+Header values are treated as secrets. They are never logged, written to
+request dumps, shown in Status or the sidebar, or sent to the TUI, and an error
+from the gateway that repeats one has it replaced with `[REDACTED]`. Status shows
+the gateway's origin and path prefix and the header names only.
 
 ## Editing and Status
 

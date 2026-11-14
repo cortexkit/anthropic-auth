@@ -11,6 +11,13 @@ import {
 } from '@cortexkit/common-auth/settings'
 import { type ParseError, parse } from 'jsonc-parser'
 
+import {
+  type ClaudeGatewayIgnored,
+  gatewaySettingsFile,
+  isGatewaySettingsFile,
+  parseClaudeGateway,
+  rememberClaudeGatewaySecrets,
+} from './gateway.ts'
 import { logger } from './logger.ts'
 import {
   CLAUDE_MODEL_CAPABILITIES,
@@ -44,6 +51,27 @@ export const SETTINGS_PROTECTION_KEYS = [
   'killswitch_default_scoped',
   'killswitch_account_floors',
 ] as const satisfies readonly SettingsKey[]
+
+/**
+ * The gateway settings are validated together. Any problem with either one
+ * means no gateway at all: model requests go directly to api.anthropic.com,
+ * never to a last-good or partly valid gateway.
+ */
+export const SETTINGS_GATEWAY_KEYS = [
+  'gateway_url',
+  'gateway_headers',
+] as const satisfies readonly SettingsKey[]
+
+function isGatewayKey(key: unknown): boolean {
+  return SETTINGS_GATEWAY_KEYS.some((gatewayKey) => gatewayKey === key)
+}
+
+/** True when two paths are written the same once made absolute. */
+function samePathText(a: string, b: string): boolean {
+  const fold = (path: string) =>
+    process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path)
+  return fold(a) === fold(b)
+}
 
 export type SettingsProtectionValues = Pick<
   SettingsValues,
@@ -123,6 +151,12 @@ export interface SettingsFileStatus {
   readonly invalidKeys: readonly string[]
   readonly ignoredModelKeys: readonly { setting: SettingsKey; model: string }[]
   readonly duplicateKeys: readonly string[]
+  /**
+   * Set when the file names a gateway that is not used: the file is not the
+   * default settings file of the operating system account, or that
+   * account's home folder could not be found.
+   */
+  readonly gatewayIgnored?: ClaudeGatewayIgnored
 }
 
 export interface SettingsGeneration {
@@ -137,6 +171,8 @@ export interface SettingsGeneration {
   readonly contexts: Readonly<Record<SettingsHost, SettingsContextValues>>
   readonly report: readonly ReportEntry[]
   readonly fileStatus: SettingsFileStatus
+  /** See SettingsFileStatus.gatewayIgnored. */
+  readonly gatewayIgnored?: ClaudeGatewayIgnored
   /** Recover an unusable set as a whole from last-good values or startup recovery, never per key. */
   readonly protection: Readonly<
     Record<
@@ -211,6 +247,8 @@ export interface SettingsServiceOptions {
     writeAppliedCopy?: typeof writeSettingsProtectionCopy
     /** Schedule an off-request re-read; return a cancellation function. */
     schedule?: (callback: () => void, delayMs: number) => () => void
+    /** Test seam: the file the gateway is honoured from (gatewaySettingsFile). */
+    gatewaySettingsFile?: () => string | undefined | Promise<string | undefined>
   }
 }
 
@@ -526,7 +564,9 @@ function reportText(entry: ReportEntry): string {
 }
 
 function logReports(report: readonly ReportEntry[]) {
+  const gateway = report.filter((entry) => isGatewayKey(entry.keyPath[0]))
   for (const entry of report) {
+    if (isGatewayKey(entry.keyPath[0])) continue
     const identity = JSON.stringify([
       entry.file.path,
       entry.keyPath,
@@ -536,6 +576,47 @@ function logReports(report: readonly ReportEntry[]) {
     logged.add(identity)
     logger.warn('settings', reportText(entry))
   }
+  if (!gateway.length) return
+  // One warning per invalid gateway configuration, however many entries it
+  // has; the keys it names hold no values.
+  const identity = JSON.stringify([
+    'gateway',
+    gateway[0]?.file.path,
+    gateway.map((entry) => [entry.keyPath, entry.reason]).sort(),
+  ])
+  if (logged.has(identity)) return
+  logged.add(identity)
+  const names = [
+    ...new Set(gateway.map((entry) => entry.keyPath[0] as string)),
+  ].join(', ')
+  logger.warn(
+    'settings',
+    `Settings invalid-value in "${gateway[0]?.file.path}" (${names}). The Claude gateway is not used; Claude OAuth model requests go directly to https://api.anthropic.com.`,
+  )
+}
+
+function withoutGateway(
+  contexts: Readonly<Record<SettingsHost, SettingsContextValues>>,
+): Record<SettingsHost, SettingsContextValues> {
+  const clear = (values: SettingsValues): SettingsValues => ({
+    ...values,
+    gateway_url: '',
+    gateway_headers: {},
+  })
+  return Object.fromEntries(
+    hosts.map((host) => [
+      host,
+      {
+        noModel: clear(contexts[host].noModel),
+        models: Object.fromEntries(
+          Object.entries(contexts[host].models).map(([model, values]) => [
+            model,
+            clear(values),
+          ]),
+        ),
+      },
+    ]),
+  ) as Record<SettingsHost, SettingsContextValues>
 }
 
 function fileStatus(candidate: Candidate): SettingsFileStatus {
@@ -585,6 +666,9 @@ function fileStatus(candidate: Candidate): SettingsFileStatus {
     duplicateKeys: candidate.report
       .filter((entry) => entry.reason === 'duplicate-key')
       .map((entry) => entry.keyPath.join('.')),
+    ...(candidate.gatewayIgnored
+      ? { gatewayIgnored: candidate.gatewayIgnored }
+      : {}),
   }
 }
 
@@ -621,6 +705,9 @@ class SharedSettingsService {
   private closed = false
   private cancelMissingRead: (() => void) | undefined
   private missingConfirmed = false
+  // Watches the gateway's default settings path when the file in use is a
+  // different path that resolves to the same file (see gatewayLocationProblem).
+  private defaultWatch: { file: string; stop: () => void } | undefined
   private readonly lastGood = new Map<SettingsHost, SettingsProtectionValues>()
 
   constructor(
@@ -812,6 +899,43 @@ class SharedSettingsService {
           'invalid-value',
         )
     }
+    // The descriptors only check the gateway values' types. Check the URL and
+    // header rules here for each host's resolved values. A valid gateway's
+    // header values are recorded as secrets now, before this generation is
+    // published, so every send that can use them (a keep-warm or Prime send
+    // that reads the gateway only inside its fetch included) already redacts
+    // them from provider errors and dumps.
+    for (const host of hosts) {
+      const values = contexts[host].noModel
+      const parsed = parseClaudeGateway(
+        values.gateway_url,
+        values.gateway_headers,
+      )
+      if (parsed.ok) rememberClaudeGatewaySecrets(parsed.gateway)
+      else addReport([parsed.problem], 'invalid-value')
+    }
+    const gatewayInvalid = report.some((entry) =>
+      isGatewayKey(entry.keyPath[0]),
+    )
+    // A gateway is honoured only from the operating system account's default
+    // settings file, never from one an environment variable chose.
+    const gatewayIgnored =
+      !gatewayInvalid &&
+      hosts.some((host) => contexts[host].noModel.gateway_url !== '')
+        ? await this.gatewayLocationProblem()
+        : undefined
+    if (gatewayIgnored) {
+      const identity = `gateway-location:${this.file}:${gatewayIgnored}`
+      if (!logged.has(identity)) {
+        logged.add(identity)
+        logger.warn(
+          'settings',
+          gatewayIgnored === 'account-home-unknown'
+            ? `The operating system account's home folder could not be found, so the Claude gateway in settings file "${this.file}" is ignored, and Claude OAuth model requests go directly to https://api.anthropic.com.`
+            : `Settings file "${this.file}" is not in its default location; the Claude gateway it names is ignored, and Claude OAuth model requests go directly to https://api.anthropic.com.`,
+        )
+      }
+    }
     for (const host of hosts) {
       const previous = this.current?.contexts[host]
       for (const [model, values] of [
@@ -825,6 +949,7 @@ class SharedSettingsService {
           if (
             entry.reason !== 'invalid-value' ||
             !keys.includes(key) ||
+            isGatewayKey(key) ||
             SETTINGS_PROTECTION_KEYS.some(
               (protectedKey) => protectedKey === key,
             )
@@ -846,6 +971,10 @@ class SharedSettingsService {
           )
             continue
           if (lastGood) values[key] = lastGood[key] as never
+        }
+        if (gatewayInvalid || gatewayIgnored) {
+          values.gateway_url = ''
+          values.gateway_headers = {}
         }
         if (!lastGood && values.cache_keep_window.length > 1) {
           // Drop an invalid host level before considering the remaining default level.
@@ -932,7 +1061,60 @@ class SharedSettingsService {
         contexts,
         report,
         protection: sets,
+        ...(gatewayIgnored ? { gatewayIgnored } : {}),
       },
+    }
+  }
+
+  private async gatewayLocationProblem(): Promise<
+    ClaudeGatewayIgnored | undefined
+  > {
+    // The account's default file is looked up once per process; the file in
+    // use is compared with it again for every generation that names a
+    // gateway, so a path that later resolves elsewhere (a retargeted
+    // symlink, a replaced file) stops the gateway at once.
+    const expected = await (
+      this.options.dependencies?.gatewaySettingsFile ?? gatewaySettingsFile
+    )()
+    if (!expected) return 'account-home-unknown'
+    if (!(await isGatewaySettingsFile(this.file, expected)))
+      return 'not-default-location'
+    // The file in use passed only because it and the default path resolve to
+    // the same file, for example when the default path is a symlink to it.
+    // Removing or retargeting the default path does not change the file in
+    // use, so its own watch never fires: watch the default path too, with the
+    // same settings watch, and read again when it changes. Without that watch
+    // the gateway is not used.
+    if (
+      !samePathText(this.file, expected) &&
+      !this.watchGatewayDefault(expected)
+    )
+      return 'not-default-location'
+    return undefined
+  }
+
+  /**
+   * Starts the default-path watch (once); false when it cannot start. It is
+   * the watch of a settings handle for that path, opened the same way as the
+   * service's own handle and used only for its watch: it notices the path
+   * being removed or pointed at different contents (a folder watch plus a
+   * periodic check), and is never read from or written to.
+   */
+  private watchGatewayDefault(file: string): boolean {
+    if (this.closed) return false
+    if (this.defaultWatch?.file === file) return true
+    this.defaultWatch?.stop()
+    this.defaultWatch = undefined
+    try {
+      const options = { ...this.openOptions(), file }
+      const handle = this.options.dependencies?.open
+        ? this.options.dependencies.open(options)
+        : openSettings(settingsDefinition, options)
+      const stop = handle.watch(() => void this.refresh())
+      this.defaultWatch = { file, stop }
+      return true
+    } catch {
+      return false
     }
   }
 
@@ -940,8 +1122,22 @@ class SharedSettingsService {
     report: readonly ReportEntry[],
     status: 'unreadable' | 'unparseable',
   ): Candidate {
+    const kept = this.current?.contexts
+    // Settings that cannot be read keep their last good values, except the
+    // gateway: the user may have just removed it, so an OAuth token never
+    // goes to it until the file reads again.
+    if (kept && hosts.some((host) => kept[host].noModel.gateway_url !== '')) {
+      const identity = `gateway-unread:${this.file}:${status}`
+      if (!logged.has(identity)) {
+        logged.add(identity)
+        logger.warn(
+          'settings',
+          `Settings file "${this.file}" is ${status}; the Claude gateway is not used until it reads again, and Claude OAuth model requests go directly to https://api.anthropic.com.`,
+        )
+      }
+    }
     const contexts =
-      this.current?.contexts ??
+      (kept && withoutGateway(kept)) ??
       (Object.fromEntries(
         hosts.map((host) => [
           host,
@@ -1196,6 +1392,8 @@ class SharedSettingsService {
     this.cancelMissingRead?.()
     this.cancelMissingRead = undefined
     this.unwatch()
+    this.defaultWatch?.stop()
+    this.defaultWatch = undefined
     this.listeners.clear()
     this.fileListeners.clear()
     this.readingListeners.clear()

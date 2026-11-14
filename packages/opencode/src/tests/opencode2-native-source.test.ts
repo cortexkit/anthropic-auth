@@ -5089,3 +5089,127 @@ test('real OC2 vault source bills recovery sends even when the host ends the ori
   expect(billingInputs.mock.results).toHaveLength(sent.length)
   expect(billingInputs.mock.results.every((result) => result.value)).toBe(true)
 })
+
+for (const transport of ['http', 'websocket'] as const)
+  test(`with a ${transport} relay and a gateway, the authorization carries both, with one warning`, async () => {
+    const fixture = await vault()
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      transport,
+      url: 'https://relay.invalid',
+      token: 'synthetic-relay-token',
+    })
+    const origin = `https://gateway-${transport}.example.test`
+    const runtime: NativeAccountRuntime = {
+      ...fixture.runtime,
+      getClaudeGateway: () => ({ origin, pathPrefix: '', headers: [] }),
+    }
+    const logs: { level: string; message: string }[] = []
+    __setLogTestSink((record) => logs.push(record))
+    try {
+      const native = source(runtime, fixture.paths)
+      for (const _ of [1, 2]) {
+        expect(await native.chooseAccount(scope)).toBe('main')
+        const auth = await native.authorizeAccount(scope, 'main')
+        // The request URL is not known yet: the adapter sends a model
+        // request to the gateway and any other request through this
+        // dispatch (the HTTP relay, or the WebSocket relay's refusal).
+        expect(auth?.dispatch).toMatchObject({
+          kind: transport === 'http' ? 'http-relay' : 'websocket-relay',
+        })
+        expect(auth?.route === 'oauth' && auth.gateway?.origin).toBe(origin)
+      }
+      expect(
+        logs.filter(
+          (record) =>
+            record.level === 'warn' && record.message.includes('relay'),
+        ),
+      ).toHaveLength(1)
+    } finally {
+      __setLogTestSink(null)
+    }
+  })
+
+test('the gateway read for an authorization travels with it, and no gateway keeps the relay', async () => {
+  const fixture = await vault()
+  await fixture.runtime.updateRelay({
+    enabled: true,
+    transport: 'http',
+    url: 'https://relay.invalid',
+    token: 'synthetic-relay-token',
+  })
+  let current: ReturnType<NonNullable<NativeAccountRuntime['getClaudeGateway']>>
+  const runtime: NativeAccountRuntime = {
+    ...fixture.runtime,
+    getClaudeGateway: () => current,
+  }
+  const native = source(runtime, fixture.paths)
+  expect(await native.chooseAccount(scope)).toBe('main')
+  const relayed = await native.authorizeAccount(scope, 'main')
+  expect(relayed?.dispatch).toMatchObject({ kind: 'http-relay' })
+  expect(relayed?.route === 'oauth' && relayed.gateway).toBeFalsy()
+  current = {
+    origin: 'https://gateway-once.example.test',
+    pathPrefix: '',
+    headers: [],
+  }
+  expect(await native.chooseAccount(scope)).toBe('main')
+  const routed = await native.authorizeAccount(scope, 'main')
+  expect(routed?.dispatch).toMatchObject({ kind: 'http-relay' })
+  expect(routed?.route === 'oauth' && routed.gateway?.origin).toBe(
+    'https://gateway-once.example.test',
+  )
+})
+
+test('a queued direct retry with a gateway still gets the WebSocket relay dispatch', async () => {
+  const fixture = await vault([7, 8])
+  await fixture.runtime.updateRelay({
+    enabled: true,
+    transport: 'http',
+    url: 'https://relay.invalid',
+    fallbackToDirect: true,
+    token: 'synthetic-relay-token',
+  })
+  let current: ReturnType<NonNullable<NativeAccountRuntime['getClaudeGateway']>>
+  const runtime: NativeAccountRuntime = {
+    ...fixture.runtime,
+    getClaudeGateway: () => current,
+  }
+  const native = source(runtime, fixture.paths)
+  await native.chooseAccount(scope)
+  const first = await native.authorizeAccount(scope, 'main')
+  if (!first) throw new Error('Vault authorization refused')
+  expect(first.dispatch?.kind).toBe('http-relay')
+  const limit = await native.limitFromRelayFailure?.({
+    ...context(first.provenance),
+    dispatch: 'http-relay',
+    status: 502,
+  })
+  if (!limit) throw new Error('Direct fallback was not offered')
+  await native.onAttemptEnd?.(
+    { ...context(first.provenance), dispatch: 'http-relay' },
+    { outputStarted: false },
+  )
+  expect(await native.retrySameAccount?.(sameAccountInput(limit))).toEqual({
+    accountId: 'main',
+  })
+  // Before the queued retry runs, the relay becomes a WebSocket relay and a
+  // gateway is set. The retry must not become a plain direct send: a request
+  // the gateway does not take still meets the WebSocket relay's refusal.
+  await fixture.runtime.updateRelay({
+    enabled: true,
+    transport: 'websocket',
+    url: 'https://relay.invalid',
+    token: 'synthetic-relay-token',
+  })
+  current = {
+    origin: 'https://gateway-retry.example.test',
+    pathPrefix: '',
+    headers: [],
+  }
+  const retried = await native.authorizeAccount(scope, 'main')
+  expect(retried?.dispatch).toEqual({ kind: 'websocket-relay' })
+  expect(retried?.route === 'oauth' && retried.gateway?.origin).toBe(
+    'https://gateway-retry.example.test',
+  )
+})

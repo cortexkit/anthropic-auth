@@ -8,7 +8,10 @@ import {
   createEmptyStorage,
   getQuotaMinimumRemainingThresholds,
 } from '../accounts.ts'
-import { settingsDefinition } from '../settings-definition.ts'
+import {
+  SETTINGS_FILE_ONLY_KEYS,
+  settingsDefinition,
+} from '../settings-definition.ts'
 import { mapSettingsMoveSources } from '../settings-move-map.ts'
 import {
   createSettingsMoveSource,
@@ -43,8 +46,13 @@ function source(host: SettingsHost = 'opencode') {
 }
 
 test('the closed move map names every schema key and only explicitly held user settings move', () => {
+  // File-only settings (the gateway) have no legacy store to move from.
   expect(Object.keys(SETTINGS_MOVE_PATHS).sort()).toEqual(
-    Object.keys(settingsDefinition.settings).sort(),
+    Object.keys(settingsDefinition.settings)
+      .filter(
+        (key) => !(SETTINGS_FILE_ONLY_KEYS as readonly string[]).includes(key),
+      )
+      .sort(),
   )
   const fixture = {
     routing: { mode: 'fallback-first', maxSameAccountWait: 'max' },

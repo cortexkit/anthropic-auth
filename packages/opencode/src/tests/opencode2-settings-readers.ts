@@ -97,10 +97,19 @@ export function settingsReaderOutputs(
     thinking_binding_prefix_mismatch_behavior:
       core.getThinkingPrefixMismatchBehavior(s),
     turn_end_note_tools: tools,
-  } satisfies Record<core.SettingsKey, unknown>
+    // File-only settings (the gateway) have no legacy-record reader.
+  } satisfies Record<
+    Exclude<core.SettingsKey, (typeof core.SETTINGS_FILE_ONLY_KEYS)[number]>,
+    unknown
+  >
   if (inventory)
     expect(Object.keys(outputs).sort()).toEqual(
-      Object.keys(core.SETTINGS_DEFAULT_READERS).sort(),
+      Object.keys(core.SETTINGS_DEFAULT_READERS)
+        .filter(
+          (key) =>
+            !(core.SETTINGS_FILE_ONLY_KEYS as readonly string[]).includes(key),
+        )
+        .sort(),
     )
   const wire = createNativeWirePolicy().requestOptions(
     {

@@ -108,6 +108,84 @@ describe('relay client', () => {
     })
   })
 
+  test('the relay POST refuses redirects, so the envelope is never re-posted elsewhere', async () => {
+    const inits: (RequestInit | undefined)[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock(async (_input, init) => {
+      inits.push(init)
+      return new Response('ok', { status: 200 })
+    }) as unknown as typeof fetch
+    try {
+      await sendViaRelay({
+        config,
+        input: 'https://api.anthropic.com/v1/messages?beta=true',
+        init: { method: 'POST' },
+        headers: headers('session-relay-redirect'),
+        body: JSON.stringify({ messages: ['one'] }),
+        fallback: async () => new Response('direct'),
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+    expect(inits).toHaveLength(1)
+    expect(inits[0]?.redirect).toBe('error')
+  })
+
+  test('the relay Worker never follows an upstream redirect with the forwarded credential', async () => {
+    const source = WORKER_SCRIPT.replace(
+      /export default[\s\S]*$/,
+      'return { handleRelayPayload, hashBody }',
+    )
+    const worker = new Function(source)() as {
+      handleRelayPayload: (
+        env: unknown,
+        payload: Record<string, unknown>,
+      ) => Promise<{ upstream?: Response }>
+      hashBody: (body: string) => Promise<string>
+    }
+    const inits: (RequestInit | undefined)[] = []
+    const originalFetch = globalThis.fetch
+    const originalLog = console.log
+    globalThis.fetch = mock(async (_input, init) => {
+      inits.push(init)
+      return new Response(null, {
+        status: 307,
+        headers: { location: 'https://elsewhere.example.test/' },
+      })
+    }) as unknown as typeof fetch
+    console.log = () => {}
+    try {
+      const body = JSON.stringify({ messages: ['one'] })
+      const result = await worker.handleRelayPayload(
+        { RELAY_STATE: { put: async () => {} } },
+        {
+          protocol: 1,
+          type: 'request',
+          affinity: 'session-worker-redirect',
+          upstream: {
+            url: 'https://api.anthropic.com/v1/messages',
+            method: 'POST',
+            headers: { authorization: 'Bearer access-token' },
+          },
+          mode: 'full_sync',
+          revision: 1,
+          body,
+          next_hash: await worker.hashBody(body),
+        },
+      )
+      expect(result.upstream?.status).toBe(307)
+    } finally {
+      globalThis.fetch = originalFetch
+      console.log = originalLog
+    }
+    expect(inits).toHaveLength(1)
+    expect(inits[0]?.redirect).toBe('manual')
+    // The WebSocket path's upstream fetch uses the same setting.
+    expect(
+      WORKER_SCRIPT.match(/redirect: 'manual'/g)?.length ?? 0,
+    ).toBeGreaterThanOrEqual(2)
+  })
+
   test('sends full sync first and patch on next request', async () => {
     const calls: unknown[] = []
     const originalFetch = globalThis.fetch
