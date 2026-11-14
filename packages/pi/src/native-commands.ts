@@ -391,7 +391,8 @@ export function createPiNativeCommands(
       const storage = snapshot.policyStorage
       const settingsStatus = (summary: string) => {
         const status = runtime.getSettingsStatus?.()
-        if (!status) return summary
+        const relayNotes = runtime.getRelayStatusNotes?.() ?? []
+        if (!status) return [summary, ...relayNotes].join('\n')
         const { file } = status
         return [
           summary,
@@ -411,6 +412,7 @@ export function createPiNativeCommands(
             file.gatewayIgnored,
             status.values.gateway,
           ),
+          ...relayNotes,
           'Settings (no model):',
           ...Object.entries(status.values).map(
             ([key, value]) => `  ${key}: ${JSON.stringify(value)}`,

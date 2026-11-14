@@ -236,7 +236,9 @@ export interface RelaySetupDeps {
 }
 
 export async function relaySetup(deps: RelaySetupDeps = {}) {
-  await withNativeAccounts((runtime) => runtime.read())
+  // Refuse before provisioning anything when the relay would be ignored
+  // because the account settings are not in their default location.
+  await withNativeAccounts((runtime) => runtime.assertRelayLocation())
   const fetchImpl = deps.fetchImpl ?? fetch
   const ask = deps.prompt ?? prompt
   const warn = deps.warn ?? ((message: string) => console.warn(message))

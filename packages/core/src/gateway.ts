@@ -454,6 +454,63 @@ export async function lookupGatewaySettingsFile(
   }
 }
 
+// Windows writes the signed-in user's profile folder here at sign-in. It is
+// the registry's copy, not the process environment's USERPROFILE.
+const WINDOWS_VOLATILE_ENVIRONMENT = 'HKCU\\Volatile Environment'
+
+async function windowsProfile(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
+  const output = await dependencies.run(
+    win32.join(WINDOWS_ROOT, 'System32', 'reg.exe'),
+    ['query', WINDOWS_VOLATILE_ENVIRONMENT, '/v', 'USERPROFILE'],
+    { SystemRoot: WINDOWS_ROOT },
+  )
+  const value = /^\s*USERPROFILE\s+REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/im.exec(
+    output,
+  )?.[1]
+  return value && !value.includes('%') ? value : undefined
+}
+
+/**
+ * Looks up the operating system account's home folder without reading the
+ * environment, the same way as lookupGatewaySettingsFile: on POSIX from the
+ * account database for the process's user id, on Windows the profile folder
+ * from the signed-in user's registry (the folder `%USERPROFILE%` normally
+ * names). Undefined when the lookup fails.
+ */
+export async function lookupAccountHome(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
+  try {
+    if (dependencies.platform === 'win32') {
+      const profile = await windowsProfile(dependencies)
+      return profile && win32.isAbsolute(profile) ? profile : undefined
+    }
+    const home = await posixAccountHome(dependencies)
+    return home && posix.isAbsolute(home) ? home : undefined
+  } catch {
+    return undefined
+  }
+}
+
+let accountHomeFolder: Promise<string | undefined> | undefined
+
+/**
+ * The operating system account's home folder (see lookupAccountHome). HOME,
+ * USERPROFILE and the XDG variables never choose it. The lookup runs once per
+ * process; undefined when the home cannot be found.
+ */
+export function accountHome(): Promise<string | undefined> {
+  accountHomeFolder ??= lookupAccountHome({
+    platform: process.platform,
+    uid: process.getuid?.(),
+    run: runProgram,
+    readFile: (path) => readFile(path, 'utf8'),
+  })
+  return accountHomeFolder
+}
+
 let accountSettingsFile: Promise<string | undefined> | undefined
 
 /**

@@ -50,6 +50,7 @@ import {
   type PublicationOptions,
   renameWithWindowsSharingRetry,
 } from './publication-rename.ts'
+import { RELAY_SAVE_REFUSAL } from './relay-location.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 const withLock = observeNativeLocks(() => acquireLock)
@@ -147,7 +148,8 @@ export class NativeRuntimeError extends Error {
       | 'runtime-io'
       | 'runtime-conflict'
       | 'publication-refused'
-      | 'relay-inconsistent',
+      | 'relay-inconsistent'
+      | 'relay-not-default-location',
   ) {
     super(
       {
@@ -160,6 +162,7 @@ export class NativeRuntimeError extends Error {
         'publication-refused': 'Anthropic runtime publication was refused',
         'relay-inconsistent':
           'request refused: relay configuration is inconsistent; no request was sent',
+        'relay-not-default-location': RELAY_SAVE_REFUSAL,
       }[code],
     )
     this.name = 'NativeRuntimeError'

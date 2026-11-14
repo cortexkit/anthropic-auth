@@ -338,13 +338,16 @@ export function createIsolatedEnv(root = tmpdir()): IsolatedEnv {
  * the local mock server. The plugin refuses OAuth destinations other than
  * api.anthropic.com unless this global symbol names the exact loopback
  * origin; it is never read from the environment. Listed before the plugin
- * under test, so the origin is set before any request is sent.
+ * under test, so the origin is set before any request is sent. It also skips
+ * the relay location check, because these account stores live in temporary
+ * folders, never in the operating system account's default place.
  */
 function writeLoopbackOriginPlugin(env: IsolatedEnv, origin: string): string {
   const path = join(env.configDir, 'test-oauth-loopback-origin.mjs')
   writeFileSync(
     path,
     `globalThis[Symbol.for('cortexkit.anthropic-auth.test-oauth-loopback-origin')] = ${JSON.stringify(origin)}
+globalThis[Symbol.for('cortexkit.anthropic-auth.test-only.relay-account-home')] = 'unchecked'
 export const TestOAuthLoopbackOrigin = async () => ({})
 `,
   )
@@ -662,6 +665,11 @@ async function prepareNativeAccounts(input: {
       throw new Error(
         'A vault fixture must activate through its real auth.json',
       )
+      // This store lives in a temporary folder, never in the account's default
+      // place; skip the relay location check so a fixture relay can be saved.
+    ;(globalThis as Record<symbol, unknown>)[
+      Symbol.for('cortexkit.anthropic-auth.test-only.relay-account-home')
+    ] = 'unchecked'
     const runtime = createNativeAccountRuntime({
       paths,
       host: 'opencode',
