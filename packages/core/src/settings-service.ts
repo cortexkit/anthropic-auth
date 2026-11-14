@@ -12,9 +12,11 @@ import {
 import { type ParseError, parse } from 'jsonc-parser'
 
 import {
+  type ClaudeGatewayIgnored,
   gatewaySettingsFile,
   isGatewaySettingsFile,
   parseClaudeGateway,
+  rememberClaudeGatewaySecrets,
 } from './gateway.ts'
 import { logger } from './logger.ts'
 import {
@@ -143,10 +145,11 @@ export interface SettingsFileStatus {
   readonly ignoredModelKeys: readonly { setting: SettingsKey; model: string }[]
   readonly duplicateKeys: readonly string[]
   /**
-   * Set when the file names a gateway but is not the default settings file of
-   * the operating system account, so the gateway is not used.
+   * Set when the file names a gateway that is not used: the file is not the
+   * default settings file of the operating system account, or that
+   * account's home folder could not be found.
    */
-  readonly gatewayIgnored?: 'not-default-location'
+  readonly gatewayIgnored?: ClaudeGatewayIgnored
 }
 
 export interface SettingsGeneration {
@@ -162,7 +165,7 @@ export interface SettingsGeneration {
   readonly report: readonly ReportEntry[]
   readonly fileStatus: SettingsFileStatus
   /** See SettingsFileStatus.gatewayIgnored. */
-  readonly gatewayIgnored?: 'not-default-location'
+  readonly gatewayIgnored?: ClaudeGatewayIgnored
   /** Recover an unusable set as a whole from last-good values or startup recovery, never per key. */
   readonly protection: Readonly<
     Record<
@@ -238,7 +241,7 @@ export interface SettingsServiceOptions {
     /** Schedule an off-request re-read; return a cancellation function. */
     schedule?: (callback: () => void, delayMs: number) => () => void
     /** Test seam: the file the gateway is honoured from (gatewaySettingsFile). */
-    gatewaySettingsFile?: () => string | undefined
+    gatewaySettingsFile?: () => string | undefined | Promise<string | undefined>
   }
 }
 
@@ -887,14 +890,19 @@ class SharedSettingsService {
         )
     }
     // The descriptors only check the gateway values' types. Check the URL and
-    // header rules here, once per host, since `gateway_url` can differ by host.
+    // header rules here for each host's resolved values. A valid gateway's
+    // header values are recorded as secrets now, before this generation is
+    // published, so every send that can use them (a keep-warm or Prime send
+    // that reads the gateway only inside its fetch included) already redacts
+    // them from provider errors and dumps.
     for (const host of hosts) {
       const values = contexts[host].noModel
       const parsed = parseClaudeGateway(
         values.gateway_url,
         values.gateway_headers,
       )
-      if (!parsed.ok) addReport([parsed.problem], 'invalid-value')
+      if (parsed.ok) rememberClaudeGatewaySecrets(parsed.gateway)
+      else addReport([parsed.problem], 'invalid-value')
     }
     const gatewayInvalid = report.some((entry) =>
       isGatewayKey(entry.keyPath[0]),
@@ -903,15 +911,18 @@ class SharedSettingsService {
     // settings file, never from one an environment variable chose.
     const gatewayIgnored =
       !gatewayInvalid &&
-      hosts.some((host) => contexts[host].noModel.gateway_url !== '') &&
-      !(await this.atGatewaySettingsFile())
+      hosts.some((host) => contexts[host].noModel.gateway_url !== '')
+        ? await this.gatewayLocationProblem()
+        : undefined
     if (gatewayIgnored) {
-      const identity = `gateway-location:${this.file}`
+      const identity = `gateway-location:${this.file}:${gatewayIgnored}`
       if (!logged.has(identity)) {
         logged.add(identity)
         logger.warn(
           'settings',
-          `Settings file "${this.file}" is not in its default location; the Claude gateway it names is ignored, and Claude OAuth model requests go directly to https://api.anthropic.com.`,
+          gatewayIgnored === 'account-home-unknown'
+            ? `The operating system account's home folder could not be found, so the Claude gateway in settings file "${this.file}" is ignored, and Claude OAuth model requests go directly to https://api.anthropic.com.`
+            : `Settings file "${this.file}" is not in its default location; the Claude gateway it names is ignored, and Claude OAuth model requests go directly to https://api.anthropic.com.`,
         )
       }
     }
@@ -1040,21 +1051,25 @@ class SharedSettingsService {
         contexts,
         report,
         protection: sets,
-        ...(gatewayIgnored
-          ? { gatewayIgnored: 'not-default-location' as const }
-          : {}),
+        ...(gatewayIgnored ? { gatewayIgnored } : {}),
       },
     }
   }
 
-  private gatewayLocation: Promise<boolean> | undefined
-  /** Whether this file is the gateway settings file; checked once per service. */
-  private atGatewaySettingsFile(): Promise<boolean> {
-    this.gatewayLocation ??= isGatewaySettingsFile(
-      this.file,
-      (this.options.dependencies?.gatewaySettingsFile ?? gatewaySettingsFile)(),
-    )
-    return this.gatewayLocation
+  private async gatewayLocationProblem(): Promise<
+    ClaudeGatewayIgnored | undefined
+  > {
+    // The account's default file is looked up once per process; the file in
+    // use is compared with it again for every generation that names a
+    // gateway, so a path that later resolves elsewhere (a retargeted
+    // symlink, a replaced file) stops the gateway at once.
+    const expected = await (
+      this.options.dependencies?.gatewaySettingsFile ?? gatewaySettingsFile
+    )()
+    if (!expected) return 'account-home-unknown'
+    return (await isGatewaySettingsFile(this.file, expected))
+      ? undefined
+      : 'not-default-location'
   }
 
   private fallback(

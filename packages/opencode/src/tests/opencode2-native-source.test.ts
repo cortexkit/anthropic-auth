@@ -5091,7 +5091,7 @@ test('real OC2 vault source bills recovery sends even when the host ends the ori
 })
 
 for (const transport of ['http', 'websocket'] as const)
-  test(`a gateway takes OAuth requests instead of a configured ${transport} relay, with one warning`, async () => {
+  test(`with a ${transport} relay and a gateway, the authorization carries both, with one warning`, async () => {
     const fixture = await vault()
     await fixture.runtime.updateRelay({
       enabled: true,
@@ -5111,9 +5111,12 @@ for (const transport of ['http', 'websocket'] as const)
       for (const _ of [1, 2]) {
         expect(await native.chooseAccount(scope)).toBe('main')
         const auth = await native.authorizeAccount(scope, 'main')
-        // No relay attempt and so no relay fallback to api.anthropic.com.
-        expect(auth?.dispatch).toEqual({ kind: 'direct' })
-        // The adapter sends to the gateway read for this authorization.
+        // The request URL is not known yet: the adapter sends a model
+        // request to the gateway and any other request through this
+        // dispatch (the HTTP relay, or the WebSocket relay's refusal).
+        expect(auth?.dispatch).toMatchObject({
+          kind: transport === 'http' ? 'http-relay' : 'websocket-relay',
+        })
         expect(auth?.route === 'oauth' && auth.gateway?.origin).toBe(origin)
       }
       expect(
@@ -5152,7 +5155,7 @@ test('the gateway read for an authorization travels with it, and no gateway keep
   }
   expect(await native.chooseAccount(scope)).toBe('main')
   const routed = await native.authorizeAccount(scope, 'main')
-  expect(routed?.dispatch).toEqual({ kind: 'direct' })
+  expect(routed?.dispatch).toMatchObject({ kind: 'http-relay' })
   expect(routed?.route === 'oauth' && routed.gateway?.origin).toBe(
     'https://gateway-once.example.test',
   )

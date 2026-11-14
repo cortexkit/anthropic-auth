@@ -66,6 +66,7 @@ import {
   type NativeAnthropicAttemptOutcome,
   type NativeAnthropicAuthorization,
   type NativeAnthropicBodyOptions,
+  type NativeAnthropicDispatch,
   NativeAnthropicLocalRefusal,
   NativeAnthropicNoAccountError,
   type NativeAnthropicRequestContext,
@@ -73,6 +74,7 @@ import {
   NativeAnthropicRevokedError,
   type NativeAnthropicSource,
   NativeAnthropicStateRefusal,
+  NativeAnthropicTransportRefusal,
   NO_ACCOUNT_REFUSAL,
 } from '../v2/adapter'
 import { createNativeWirePolicy } from '../v2/wire'
@@ -4341,32 +4343,78 @@ describe('OpenCode 2 native Anthropic adapter: user gateway', () => {
     expect(final.headers.has('x-gateway-key')).toBe(false)
   })
 
-  test('a relay dispatch keeps the relay and never adds gateway headers', async () => {
-    const { source } = makeSource({
+  // A relay and a gateway can both be configured. The relay choice is made
+  // per request URL: only a gateway-routed model request skips the relay.
+  const relayedSource = (dispatch: NativeAnthropicDispatch) =>
+    makeSource({
       authorize: () =>
         oauth(
           OAUTH_TOKEN,
           { custody: 'local', receipt: 'local:1' },
-          {
-            dispatch: {
-              kind: 'http-relay',
-              url: 'https://relay.example.test/send',
-              token: 'relay-secret',
-            },
-            // A source never pairs these; the adapter ignores the gateway.
-            gateway: gateway(),
-          },
+          { dispatch, gateway: gateway() },
         ),
-    })
-    const { final } = await hostFor(source).run(
+    }).source
+  const httpRelay = {
+    kind: 'http-relay' as const,
+    url: 'https://relay.example.test/send',
+    token: 'relay-secret',
+  }
+
+  test('with an HTTP relay, a model request goes straight to the gateway with no relay token', async () => {
+    const { final } = await hostFor(relayedSource(httpRelay)).run(
       scopeOf(),
       hostRequest(sonnetPayload()),
     )
+    expect(new URL(final.url).pathname).toBe('/claude/v1/messages')
+    expect(final.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
+    expect(final.headers.get('authorization')).toBe(`Bearer ${OAUTH_TOKEN}`)
+    expect(final.headers.has('x-relay-token')).toBe(false)
+    expect(final.redirect).toBe('error')
+    expect(await final.clone().text()).not.toContain('relay-secret')
+  })
+
+  test('with an HTTP relay, a request the gateway does not take still uses the relay', async () => {
+    const { final } = await hostFor(relayedSource(httpRelay)).run(
+      scopeOf(),
+      hostRequest(
+        { model: 'claude-sonnet-5', messages: [] },
+        { url: 'https://api.anthropic.com/v1/messages/count_tokens' },
+      ),
+    )
     expect(final.url).toBe('https://relay.example.test/send')
+    expect(final.redirect).toBe('error')
     const envelope = JSON.parse(await final.clone().text())
     expect(envelope.upstream.url).toBe(
-      'https://api.anthropic.com/v1/messages?beta=true',
+      'https://api.anthropic.com/v1/messages/count_tokens',
     )
     expect(JSON.stringify(envelope)).not.toContain(GATEWAY_SECRET)
+  })
+
+  test('with a WebSocket relay, a model request goes to the gateway and any other request is refused', async () => {
+    const host = hostFor(relayedSource({ kind: 'websocket-relay' }))
+    const { final } = await host.run(scopeOf(), hostRequest(sonnetPayload()))
+    expect(new URL(final.url).pathname).toBe('/claude/v1/messages')
+    expect(final.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
+    const started = await host.begin(scopeOf())
+    await expect(
+      host.send(
+        started,
+        hostRequest(
+          { model: 'claude-sonnet-5', messages: [] },
+          { url: 'https://api.anthropic.com/v1/messages/count_tokens' },
+        ),
+      ),
+    ).rejects.toBeInstanceOf(NativeAnthropicTransportRefusal)
+  })
+
+  test('a versioned provider base URL on api.anthropic.com still goes to the gateway', async () => {
+    const { final } = await hostFor(oauthSource(gateway)).run(
+      scopeOf({ agent: 'title' }),
+      hostRequest(sonnetPayload(), {
+        url: 'https://api.anthropic.com/v2/messages?beta=true',
+      }),
+    )
+    expect(new URL(final.url).pathname).toBe('/claude/v1/messages')
+    expect(final.headers.get('x-gateway-key')).toBe(GATEWAY_SECRET)
   })
 })

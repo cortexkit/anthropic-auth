@@ -47,6 +47,7 @@ import {
   cacheWarmCacheablePrefixFingerprint,
   clampHostRetryMs,
   claudeGatewayHeaderValues,
+  claudeGatewayIgnoredNote,
   claudeGatewayModelUrl,
   computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
@@ -6466,7 +6467,7 @@ const anthropicAuthPlugin = async (
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
       ...(file.gatewayIgnored
-        ? ['Gateway ignored: settings file is not in its default location']
+        ? [claudeGatewayIgnoredNote(file.gatewayIgnored)]
         : []),
       'Settings (no model):',
       ...Object.entries(status.values).map(
@@ -8418,12 +8419,13 @@ const anthropicAuthPlugin = async (
                   wireHeaders: Headers,
                 ) =>
                   // fetchOAuthModel rechecks the destination, refuses
-                  // redirects and, with a gateway, sends there instead.
+                  // redirects and, with a gateway, sends there instead. The
+                  // ANTHROPIC_INSECURE opt-out applies to API-key routes only:
+                  // an OAuth send always checks certificates.
                   fetchOAuthModel(gateway)(rewritten.input, {
                     ...init,
                     body: wireBody,
                     headers: wireHeaders,
-                    ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
                   })
                 // Claude Code gzips large bodies on the wire. `body` stays the
                 // signed uncompressed wire text for dumps and relay fallback.

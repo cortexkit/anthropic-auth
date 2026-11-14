@@ -1,6 +1,6 @@
-import { realpath } from 'node:fs/promises'
-import { userInfo } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { execFile } from 'node:child_process'
+import { readFile, realpath } from 'node:fs/promises'
+import { posix, resolve, win32 } from 'node:path'
 import { customHeadersFromEntries } from './custom-headers.ts'
 import { logger } from './logger.ts'
 
@@ -122,6 +122,7 @@ export function isClaudeGatewayUrl(url: URL, gateway: ClaudeGateway): boolean {
 }
 
 const MODEL_REQUEST_PATH = '/v1/messages'
+const MODEL_REQUEST_SUFFIX = '/messages'
 const ANTHROPIC_API_ORIGIN = 'https://api.anthropic.com'
 
 function hasDotSegment(raw: string): boolean {
@@ -135,11 +136,12 @@ function hasDotSegment(raw: string): boolean {
  * Where a model request goes through the gateway, or undefined when `url` is
  * not a model request the gateway takes. A model request URL is a URL on
  * `https://api.anthropic.com`, or inside the gateway, whose path ends in
- * `/v1/messages` once repeated slashes are collapsed; a provider base URL can
- * add a path in front of it. It always goes to `<gateway prefix>/v1/messages`
- * with its query (`?beta=true`) kept. A path with `.` or `..` segments, other
- * Anthropic endpoints and other hosts are left alone, so the OAuth
- * destination check still decides them without the gateway.
+ * `/messages` once repeated and trailing slashes are collapsed; a provider
+ * base URL can add a path or another version segment in front of it. It
+ * always goes to `<gateway prefix>/v1/messages` with its query
+ * (`?beta=true`) kept. A path with `.` or `..` segments, other Anthropic
+ * endpoints and other hosts are left alone, so the OAuth destination check
+ * still decides them without the gateway.
  */
 export function claudeGatewayModelUrl(
   url: string | URL,
@@ -153,8 +155,11 @@ export function claudeGatewayModelUrl(
     return undefined
   }
   if (source.username || source.password) return undefined
-  const path = source.pathname.replace(/\/{2,}/g, '/')
-  if (!path.endsWith(MODEL_REQUEST_PATH)) return undefined
+  // Repeated and trailing slashes are collapsed. A model request path ends
+  // in `/messages` (`/v1/messages`, or `/v2/messages` from a versioned base
+  // URL); `/messages/count_tokens` and other sub-resources do not.
+  const path = source.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+  if (!path.endsWith(MODEL_REQUEST_SUFFIX)) return undefined
   const direct =
     source.protocol === 'https:' && source.origin === ANTHROPIC_API_ORIGIN
   if (!direct && !isClaudeGatewayUrl(source, gateway)) return undefined
@@ -227,25 +232,163 @@ export function warnClaudeGatewayRelayIgnored(gateway: ClaudeGateway): void {
   )
 }
 
+/** Why a gateway named in the settings file is not used. */
+export type ClaudeGatewayIgnored =
+  | 'not-default-location'
+  | 'account-home-unknown'
+
+/** The Status line for an ignored gateway; it names no value. */
+export function claudeGatewayIgnoredNote(reason: ClaudeGatewayIgnored): string {
+  return reason === 'account-home-unknown'
+    ? "Gateway ignored: the operating system account's home folder could not be found"
+    : 'Gateway ignored: settings file is not in its default location'
+}
+
+/** Runs one program and returns its standard output. */
+export type AccountLookupRun = (
+  file: string,
+  args: readonly string[],
+  env: Readonly<Record<string, string>>,
+) => Promise<string>
+
+export interface AccountSettingsFileDependencies {
+  readonly platform: NodeJS.Platform
+  readonly uid: number | undefined
+  readonly run: AccountLookupRun
+  readonly readFile: (path: string) => Promise<string>
+}
+
+// Windows keeps reg.exe here on every supported install. The SystemRoot
+// environment variable is not used to find it, because the environment is
+// exactly what this lookup must not depend on.
+const WINDOWS_ROOT = 'C:\\Windows'
+const WINDOWS_SHELL_FOLDERS =
+  'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders'
+
+const runProgram: AccountLookupRun = (file, args, env) =>
+  new Promise((resolvePromise, reject) => {
+    execFile(
+      file,
+      [...args],
+      {
+        // A fixed environment with no inherited PATH, so a project's `.env`
+        // cannot change which program runs or how it looks the account up.
+        env: { ...env },
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024,
+        timeout: 5_000,
+        windowsHide: true,
+      },
+      (error, stdout) => (error ? reject(error) : resolvePromise(stdout)),
+    )
+  })
+
+function passwdHome(text: string, uid: number): string | undefined {
+  for (const line of text.split('\n')) {
+    const fields = line.trim().split(':')
+    if (fields.length >= 7 && fields[2] === String(uid)) return fields[5]
+  }
+  return undefined
+}
+
+/** One attribute of `dscl -read` output, which wraps a value with spaces. */
+function dsclAttribute(text: string, name: string): string | undefined {
+  const lines = text.split('\n')
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index] ?? ''
+    if (!line.startsWith(`${name}:`)) continue
+    const value = line.slice(name.length + 1).trim()
+    return value || lines[index + 1]?.trim() || undefined
+  }
+  return undefined
+}
+
+async function posixAccountHome(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
+  const { uid, run } = dependencies
+  if (uid === undefined || !Number.isInteger(uid) || uid < 0) return undefined
+  const env = { LC_ALL: 'C' }
+  if (dependencies.platform === 'darwin') {
+    // `id -un` names the account of the process's user id, not $USER.
+    const name = (await run('/usr/bin/id', ['-un'], env)).trim()
+    if (!name || /[/:\s]/.test(name)) return undefined
+    const record = await run(
+      '/usr/bin/dscl',
+      ['.', '-read', `/Users/${name}`, 'UniqueID', 'NFSHomeDirectory'],
+      env,
+    )
+    if (dsclAttribute(record, 'UniqueID') !== String(uid)) return undefined
+    return dsclAttribute(record, 'NFSHomeDirectory')
+  }
+  // getent also covers accounts from NSS sources such as LDAP; a system
+  // without it still has the local passwd file.
+  const entry = await run('/usr/bin/getent', ['passwd', String(uid)], env)
+    .then((text) => passwdHome(text, uid))
+    .catch(() => undefined)
+  if (entry !== undefined) return entry
+  return passwdHome(await dependencies.readFile('/etc/passwd'), uid)
+}
+
+async function windowsAppData(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
+  // `Shell Folders` holds the already expanded path of the signed-in user's
+  // roaming AppData folder, including a redirected one.
+  const output = await dependencies.run(
+    win32.join(WINDOWS_ROOT, 'System32', 'reg.exe'),
+    ['query', WINDOWS_SHELL_FOLDERS, '/v', 'AppData'],
+    { SystemRoot: WINDOWS_ROOT },
+  )
+  const value = /^\s*AppData\s+REG_SZ\s+(.+?)\s*$/im.exec(output)?.[1]
+  return value && !value.includes('%') ? value : undefined
+}
+
 /**
- * The settings file the gateway is honoured from: the default location under
- * the operating system account's own home directory, as the OS reports it.
- * Environment variables (HOME, USERPROFILE, APPDATA, XDG_CONFIG_HOME,
- * ANTHROPIC_AUTH_SETTINGS_FILE) never choose it, so an environment a project
- * can influence cannot point the gateway at another file. Undefined when the
- * OS reports no usable home directory.
+ * Looks up the settings file the gateway is honoured from, without reading
+ * the environment: the default location under the operating system
+ * account's own home (POSIX, from the account database for the process's
+ * user id) or its roaming AppData folder (Windows, from the user's registry).
+ * Undefined when the lookup fails.
  */
-export function gatewaySettingsFile(): string | undefined {
-  let home: string
+export async function lookupGatewaySettingsFile(
+  dependencies: AccountSettingsFileDependencies,
+): Promise<string | undefined> {
   try {
-    home = userInfo().homedir
+    if (dependencies.platform === 'win32') {
+      const appData = await windowsAppData(dependencies)
+      return appData && win32.isAbsolute(appData)
+        ? win32.join(appData, 'cortexkit', 'anthropic-auth.jsonc')
+        : undefined
+    }
+    const home = await posixAccountHome(dependencies)
+    return home && posix.isAbsolute(home)
+      ? posix.join(home, '.config', 'cortexkit', 'anthropic-auth.jsonc')
+      : undefined
   } catch {
     return undefined
   }
-  if (!home || !isAbsolute(home)) return undefined
-  return process.platform === 'win32'
-    ? join(home, 'AppData', 'Roaming', 'cortexkit', 'anthropic-auth.jsonc')
-    : join(home, '.config', 'cortexkit', 'anthropic-auth.jsonc')
+}
+
+let accountSettingsFile: Promise<string | undefined> | undefined
+
+/**
+ * The settings file the gateway is honoured from (see
+ * lookupGatewaySettingsFile). Environment variables (HOME, USERPROFILE,
+ * APPDATA, XDG_CONFIG_HOME, ANTHROPIC_AUTH_SETTINGS_FILE) never choose it, so
+ * an environment a project can influence cannot point the gateway at another
+ * file. `os.userInfo()` is not used: under Bun its home follows HOME. The
+ * lookup runs once per process, when settings are first read, never on a
+ * request. Undefined when the account's home cannot be found.
+ */
+export function gatewaySettingsFile(): Promise<string | undefined> {
+  accountSettingsFile ??= lookupGatewaySettingsFile({
+    platform: process.platform,
+    uid: process.getuid?.(),
+    run: runProgram,
+    readFile: (path) => readFile(path, 'utf8'),
+  })
+  return accountSettingsFile
 }
 
 async function canonical(path: string): Promise<string> {
@@ -256,7 +399,7 @@ async function canonical(path: string): Promise<string> {
 /** True when `file` is the gateway settings file, compared as real paths. */
 export async function isGatewaySettingsFile(
   file: string,
-  expected: string | undefined = gatewaySettingsFile(),
+  expected: string | undefined,
 ): Promise<boolean> {
   if (!expected) return false
   return (await canonical(file)) === (await canonical(expected))

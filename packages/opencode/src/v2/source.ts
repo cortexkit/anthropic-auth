@@ -529,9 +529,11 @@ export function createNativeAnthropicSource(
     current = gateway(),
   ) => {
     const selected = snapshot.policyStorage.relay
-    // With a gateway, OAuth requests ignore the relay, so a WebSocket relay
-    // does not refuse them here. An API-key route still meets the refusal in
-    // dispatchFor, which checks it without the gateway.
+    // With a gateway, a WebSocket relay does not refuse the authorization:
+    // the adapter sends a gateway-routed model request to the gateway and
+    // refuses any other request itself, once its URL is known. An API-key
+    // route still meets the refusal here, since dispatchFor checks it
+    // without the gateway.
     if (
       !current &&
       selected?.enabled === true &&
@@ -545,18 +547,30 @@ export function createNativeAnthropicSource(
     route: 'oauth' | 'api',
   ) => {
     // The gateway is read once per authorization; the adapter uses this
-    // value for the send, so the relay choice and the destination agree.
+    // value for the send. The URL is not known yet, so the dispatch below is
+    // the one a request the gateway does not take uses (the relay, or the
+    // WebSocket relay's refusal); the adapter sends only a gateway-routed
+    // model request directly to the gateway instead.
     const current = route === 'oauth' ? gateway() : undefined
     assertTransport(snapshot, current)
+    const gatewayField = current ? { gateway: current } : {}
     if (current && snapshot.policyStorage.relay?.enabled === true)
       warnClaudeGatewayRelayIgnored(current)
-    // The gateway replaces the relay for OAuth model requests; it is sent
-    // as a direct dispatch, with no relay attempt or fallback.
-    if (direct || current || snapshot.policyStorage.relay?.enabled !== true)
+    if (direct || snapshot.policyStorage.relay?.enabled !== true)
       return {
         dispatch: { kind: 'direct' as const },
         relayFallback: false,
-        gateway: current,
+        ...gatewayField,
+      }
+    const selected = snapshot.policyStorage.relay
+    if (
+      current &&
+      effectiveRelayTransport(selected.transport, selected.url) === 'websocket'
+    )
+      return {
+        dispatch: { kind: 'websocket-relay' as const },
+        relayFallback: false,
+        ...gatewayField,
       }
     // Account and status data exclude the relay secret. Obtain it through the
     // private transport accessor immediately before preparing the send.
@@ -565,7 +579,15 @@ export function createNativeAnthropicSource(
       throw new Error(
         'request refused: native HTTP relay configuration is unavailable',
       )
-    if (relay.transport !== 'http') throw new NativeAnthropicTransportRefusal()
+    if (relay.transport !== 'http') {
+      if (current)
+        return {
+          dispatch: { kind: 'websocket-relay' as const },
+          relayFallback: false,
+          ...gatewayField,
+        }
+      throw new NativeAnthropicTransportRefusal()
+    }
     return {
       dispatch: {
         kind: 'http-relay' as const,
@@ -573,6 +595,7 @@ export function createNativeAnthropicSource(
         token: relay.token,
       },
       relayFallback: relay.fallbackToDirect,
+      ...gatewayField,
     }
   }
 

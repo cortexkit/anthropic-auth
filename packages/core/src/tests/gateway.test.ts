@@ -160,6 +160,11 @@ test('only a model request URL maps to the gateway', () => {
     'https://api.anthropic.com//v1//messages?beta=true',
     'https://api.anthropic.com/a/b/v1/messages?beta=true',
     'https://gateway.example.test/claude/extra/v1/messages?beta=true',
+    // A versioned base URL such as https://api.anthropic.com/v2 yields
+    // /v2/messages; it still goes to the gateway, never straight past it.
+    'https://api.anthropic.com/v2/messages?beta=true',
+    'https://api.anthropic.com/messages?beta=true',
+    'https://api.anthropic.com/v1/messages/?beta=true',
   ])
     expect(claudeGatewayModelUrl(url, g)?.href).toBe(
       'https://gateway.example.test/claude/v1/messages?beta=true',
@@ -169,6 +174,9 @@ test('only a model request URL maps to the gateway', () => {
     'https://api.anthropic.com/./v1/messages',
     'https://api.anthropic.com/x/%2e%2e/v1/messages',
     'https://api.anthropic.com/v1/messages/count_tokens',
+    'https://api.anthropic.com/v2/messages/count_tokens',
+    'https://api.anthropic.com/v1/messages/batches',
+    'https://api.anthropic.com/v1/foo-messages',
     'https://api.anthropic.com/api/oauth/usage',
     'https://api.anthropic.com/api/oauth/profile',
     'https://api.anthropic.com/v1/oauth/token',

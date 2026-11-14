@@ -214,8 +214,9 @@ export type NativeAnthropicAuthorization<P> =
       readonly dispatch?: NativeAnthropicDispatch
       /**
        * The user's gateway from their own settings file, read once when this
-       * send was authorized (always with a direct dispatch). A model request
-       * goes there instead of api.anthropic.com.
+       * send was authorized. A model request goes there directly instead of
+       * api.anthropic.com, whatever `dispatch` says; any other request uses
+       * `dispatch`.
        */
       readonly gateway?: ClaudeGateway
     }
@@ -1032,8 +1033,15 @@ export function createNativeAnthropicAdapter<Q, P>(
     return response
   }
 
+  // Sends authorized for an HTTP relay that went straight to the user's
+  // gateway instead (a gateway-routed model request). Every later step treats
+  // them as direct sends.
+  const sentDirect = new WeakSet<Data>()
+  const dispatchOf = (data: Data): 'direct' | 'http-relay' =>
+    sentDirect.has(data) ? 'direct' : data.dispatch
+
   const fromUpstream = (headers: Headers, data: Data) => {
-    if (data.dispatch !== 'http-relay') return true
+    if (dispatchOf(data) !== 'http-relay') return true
     const upstream = /^req_[A-Za-z0-9_-]+$/.test(
       headers.get('request-id') ?? '',
     )
@@ -1112,7 +1120,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     transport: attempt.transport,
     route: data.route,
     provenance: resendProvenance.get(data) ?? data.provenance,
-    dispatch: data.dispatch,
+    dispatch: dispatchOf(data),
   })
 
   const accountHeaders = (
@@ -1143,7 +1151,13 @@ export function createNativeAnthropicAdapter<Q, P>(
     auth: NativeAnthropicAuthorization<P> | undefined,
   ): AccountHeadersResult<Data> => {
     if (!auth) throw refuse(scope)
-    if (auth.dispatch?.kind === 'websocket-relay')
+    // With the user's gateway, a model request goes to the gateway and only
+    // other requests meet the WebSocket relay's refusal, which rewriteSend
+    // applies once the request URL is known.
+    if (
+      auth.dispatch?.kind === 'websocket-relay' &&
+      !(auth.route === 'oauth' && auth.gateway)
+    )
       throw new NativeAnthropicTransportRefusal()
     const dispatch =
       auth.dispatch?.kind === 'http-relay' ? 'http-relay' : 'direct'
@@ -1272,13 +1286,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         send.baseURL !== undefined ? { baseURL: send.baseURL } : {},
       ).url?.toString() ?? request.url
     // The user's gateway, as read when this send was authorized, takes OAuth
-    // model requests sent directly; a relay dispatch never carries one. The
-    // thread, gzip, URL and redaction choices below all use this value.
+    // model requests. The thread, gzip, URL and redaction choices below all
+    // use this value.
     const configuredGateway =
-      data.route === 'oauth' &&
-      send.dispatch?.kind !== 'http-relay' &&
-      send.dispatch?.kind !== 'websocket-relay' &&
-      request.method.toUpperCase() === 'POST'
+      data.route === 'oauth' && request.method.toUpperCase() === 'POST'
         ? send.gateway
         : undefined
     const gatewayUrl = configuredGateway
@@ -1287,6 +1298,18 @@ export function createNativeAnthropicAdapter<Q, P>(
     const gateway: ClaudeGateway | undefined = gatewayUrl
       ? configuredGateway
       : undefined
+    // The relay choice is made per request: a gateway-routed model request
+    // goes straight to the gateway, never through a relay; any other request
+    // keeps the authorized dispatch, so it still uses the relay or meets the
+    // WebSocket relay's refusal.
+    const dispatch = gateway ? undefined : send.dispatch
+    if (dispatch?.kind === 'websocket-relay')
+      throw new NativeAnthropicTransportRefusal()
+    if (gateway && send.dispatch?.kind === 'http-relay') sentDirect.add(data)
+    // A send authorized for a relay carries the relay token header from its
+    // authorization. The relay envelope sets its own, and a send routed to
+    // the gateway must never carry it, so it is dropped here for every send.
+    headers.delete('x-relay-token')
 
     try {
       if (data.route === 'oauth' && send.oauth) {
@@ -1642,7 +1665,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       body = await signRequestBody(body)
       ensureLive()
     }
-    if (send.dispatch?.kind === 'http-relay') {
+    if (dispatch?.kind === 'http-relay') {
       // Each HTTP relay attempt sends the complete upstream body, not a patch.
       // A host retry authorizes credentials again and builds a new envelope;
       // it must not reuse this attempt's authorization.
@@ -1679,7 +1702,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           method: request.method,
           headers: new Headers(headers),
           dispatch: 'http-relay',
-          relayUrl: send.dispatch.url,
+          relayUrl: dispatch.url,
           envelope: envelope as Record<string, unknown>,
           relayBytes: envelopeText.length,
           ...(tag ? { tag } : {}),
@@ -1689,11 +1712,11 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       assertHostAuthorityStable()
       const clientRequestId = headers.get('x-client-request-id')
-      const relayRequest = new Request(send.dispatch.url, {
+      const relayRequest = new Request(dispatch.url, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-relay-token': send.dispatch.token,
+          'x-relay-token': dispatch.token,
           ...(clientRequestId
             ? { 'x-client-request-id': clientRequestId }
             : {}),
@@ -2236,7 +2259,10 @@ export function createNativeAnthropicAdapter<Q, P>(
       // This hook has copied the failed send's classification into safe data.
       // It no longer needs the redactor's credentials to classify the error.
       release(data)
-      if (data.dispatch === 'http-relay' && relayUpstream.get(data) === false)
+      if (
+        dispatchOf(data) === 'http-relay' &&
+        relayUpstream.get(data) === false
+      )
         return undefined
       return source.limitFromHostError?.(safe, contextOf(attempt, data))
     },
@@ -2249,7 +2275,7 @@ export function createNativeAnthropicAdapter<Q, P>(
         billingSend &&
         !billingSend.received &&
         !localRefusals.has(data) &&
-        data.dispatch === 'direct'
+        dispatchOf(data) === 'direct'
       )
         reportAnthropicBillingFailure(billingSend.input)
       pending.delete(data)
@@ -2321,7 +2347,7 @@ export function createNativeAnthropicAdapter<Q, P>(
       const ended = source.onAttemptEnd?.(contextOf(attempt, data), {
         ...rest,
         ...(status !== undefined &&
-        (data.dispatch !== 'http-relay' || relayUpstream.get(data) === true)
+        (dispatchOf(data) !== 'http-relay' || relayUpstream.get(data) === true)
           ? { status }
           : {}),
         ...(check !== undefined ? { localRefusal: { check } } : {}),

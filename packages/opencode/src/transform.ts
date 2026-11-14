@@ -524,7 +524,8 @@ function createToolNameRewriter(
 
 /**
  * Check if TLS verification should be skipped for custom API endpoints.
- * Only effective when ANTHROPIC_BASE_URL is also set.
+ * Only effective when ANTHROPIC_BASE_URL is also set, and only on API-key
+ * routes: Claude OAuth sends always check certificates.
  */
 export function isInsecure(): boolean {
   if (!process.env.ANTHROPIC_BASE_URL?.trim()) return false
