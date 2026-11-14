@@ -12,10 +12,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - A `ws://` relay is now reached over `ws://` instead of `wss://`.
 - A changed relay URL or secret now applies to the next WebSocket relay request of an ongoing conversation.
 - OpenCode 2's `/claude` settings status shows the settings file path again instead of `[object Promise]`.
+- Under Thalamus, OpenCode 2 now reports which login answered after recovering a rejected conversation thread; keep-warm requests and Prime's quota-window starter requests refresh quota without counting as answered user turns.
 
 ## 2.12.0
 
-- Under Thalamus, OpenCode 2 now reports which login answered after recovering a rejected conversation thread; keep-warm requests and Prime's quota-window starter requests refresh quota without counting as answered user turns.
 - OpenCode 1, OpenCode 2 and Pi now share one settings file, `anthropic-auth.jsonc`, that you can edit by hand, with per-host and per-model overrides. Existing settings move into it once, automatically, after every running copy is updated and can be checked. With a custom `XDG_CONFIG_HOME` or an explicit settings file path (`ANTHROPIC_AUTH_SETTINGS_FILE`), each host moves only its own settings. Only your own user file is read, never a project file. See [the settings file](docs/settings-file.md).
 - Moving settings never weakens protection: each host keeps at least its own effective killswitch, quota-floor, unknown-quota and same-account wait protection, including defaults. The same checks cover adopting the file while running, setup and recreating a missing file. If protection cannot be read, the host keeps its old settings or refuses the write.
 - Updated the shared authentication dependency to common-auth 0.49.2.
