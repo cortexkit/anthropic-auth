@@ -160,10 +160,12 @@ never sent to another gateway. An override object on either setting makes the
 gateway invalid.
 
 The gateway applies only to model requests on OpenCode 1, OpenCode 2 and Pi,
-including keep-warm and Prime sends. A model request is a `POST` whose path
-ends in `/v1/messages`, also when a provider `baseURL` on `api.anthropic.com`
-adds a path in front of it; a path with `.` or `..` segments is not treated as
-one. Sign-in, token refresh, usage and quota,
+including keep-warm and Prime sends. A model request is a `POST` to
+`api.anthropic.com` whose path ends in `/messages`, also when a provider
+`baseURL` on `api.anthropic.com` adds a path or another version in front of it
+(`/v2/messages` still goes to the gateway's `/v1/messages`); a path with `.` or
+`..` segments is not treated as one, and neither is a sub-resource such as
+`/v1/messages/count_tokens`. Sign-in, token refresh, usage and quota,
 profile and every other Anthropic endpoint still go only to
 `https://api.anthropic.com`, and API-key accounts keep their own base URL.
 Through the gateway:
@@ -172,10 +174,14 @@ Through the gateway:
   gateway may not support them.
 - Request bodies are not gzipped; Claude Code compresses only to
   `api.anthropic.com`.
-- The relay is not used. If a relay is also configured, the gateway wins and
-  one warning says the relay is ignored. Nothing retries or falls back to
-  `api.anthropic.com` directly.
+- The relay is not used for model requests. If a relay is also configured,
+  the gateway wins for them and one warning says the relay is ignored. Nothing
+  retries or falls back to `api.anthropic.com` directly. Other sign-in
+  requests the gateway does not take still use the relay as before, and a
+  WebSocket relay still refuses them.
 - Redirects are refused, as for every sign-in request.
+- Certificates are always checked; `ANTHROPIC_INSECURE` never applies to
+  sign-in requests.
 
 Apart from the URL and the added headers, each request is the one the plugin
 would send to Anthropic: same identity, billing header, signing, betas and
@@ -183,14 +189,20 @@ cache markers.
 
 The gateway is honoured only from the settings file at its default location
 for your operating system account: `~/.config/cortexkit/anthropic-auth.jsonc`
-on Linux and macOS, `%USERPROFILE%\AppData\Roaming\cortexkit\anthropic-auth.jsonc`
-on Windows, where the home or profile directory is the one the operating
-system reports for your account. `HOME`, `USERPROFILE`, `APPDATA`,
-`XDG_CONFIG_HOME` and `ANTHROPIC_AUTH_SETTINGS_FILE` never decide it; the paths
-are compared after resolving links. If the settings file in use is anywhere
-else, a gateway it names is ignored, one warning is logged, and Status says
-"Gateway ignored: settings file is not in its default location". Other
-settings in that file still apply.
+on Linux and macOS, and `cortexkit\anthropic-auth.jsonc` in your roaming
+AppData folder on Windows. The plugin finds that location from the account
+itself, never from the environment: the account database entry for your user
+id on Linux (`getent`, or `/etc/passwd`), the directory record on macOS
+(`dscl`), and the user's `Shell Folders` registry key on Windows (`reg.exe`
+under `C:\Windows`). It looks once per process, when settings are first
+read. `HOME`, `USERPROFILE`, `APPDATA`, `XDG_CONFIG_HOME` and
+`ANTHROPIC_AUTH_SETTINGS_FILE` never decide it. The paths are compared after
+resolving links, again every time the file is read, so a link that later
+points elsewhere stops the gateway at once. If the settings file in use is
+anywhere else, a gateway it names is ignored, one warning is logged, and
+Status says "Gateway ignored: settings file is not in its default location".
+If the account's home folder cannot be found, the gateway is ignored the same
+way and Status says so. Other settings in that file still apply.
 
 These settings are read only from your own user settings file. A project file,
 a provider `baseURL`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS` can

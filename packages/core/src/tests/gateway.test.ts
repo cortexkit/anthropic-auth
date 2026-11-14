@@ -8,15 +8,16 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises'
-import { tmpdir, userInfo } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openSettings } from '@cortexkit/common-auth/settings'
 import { dumpDirectRequest, resetDumpState, setDumpEnabled } from '../dump.ts'
 import {
   type ClaudeGateway,
   claudeGatewayModelUrl,
-  gatewaySettingsFile,
+  claudeGatewaySecretValues,
   isGatewaySettingsFile,
+  lookupGatewaySettingsFile,
   parseClaudeGateway,
   rememberClaudeGatewaySecrets,
 } from '../gateway.ts'
@@ -24,6 +25,7 @@ import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { createNativeRuntimeSettings } from '../native-runtime-settings.ts'
 import {
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+  createAnthropicOAuthFetch,
   createClaudeModelFetch,
   requireAnthropicOAuthOrigin,
 } from '../oauth-origin.ts'
@@ -275,11 +277,14 @@ async function settingsFixture(
     _root,
     file,
   ) => file,
+  // Runs after the file is written and before the service first reads it.
+  prepare?: (root: string, file: string) => Promise<void>,
 ) {
   const root = await mkdtemp(join(tmpdir(), 'gateway-settings-'))
   cleanup.push(() => rm(root, { recursive: true, force: true }))
   const file = join(root, 'settings.jsonc')
   await writeFile(file, JSON.stringify({ schema_version: 1, ...values }))
+  await prepare?.(root, file)
   const service = await openSettingsService({
     file,
     dependencies: {
@@ -538,24 +543,307 @@ test('request dumps redact configured gateway header values', async () => {
     expect(await readFile(join(directory, name), 'utf8')).not.toContain(SECRET)
 })
 
-test('the gateway settings file comes from the OS account, never from the environment', () => {
-  const saved = { ...process.env }
-  try {
-    process.env.HOME = '/tmp/elsewhere-home'
-    process.env.XDG_CONFIG_HOME = '/tmp/elsewhere-config'
-    process.env.APPDATA = '/tmp/elsewhere-appdata'
-    process.env.USERPROFILE = '/tmp/elsewhere-profile'
-    process.env.ANTHROPIC_AUTH_SETTINGS_FILE = '/tmp/elsewhere/settings.jsonc'
-    const home = userInfo().homedir
-    expect(gatewaySettingsFile()).toBe(
-      process.platform === 'win32'
-        ? join(home, 'AppData', 'Roaming', 'cortexkit', 'anthropic-auth.jsonc')
-        : join(home, '.config', 'cortexkit', 'anthropic-auth.jsonc'),
-    )
-  } finally {
-    for (const key of Object.keys(process.env))
-      if (!(key in saved)) delete process.env[key]
-    Object.assign(process.env, saved)
+test('the gateway settings file comes from the OS account, never from HOME, USERPROFILE or APPDATA', async () => {
+  // Under Bun, os.userInfo().homedir follows HOME, so this uses a real
+  // settings service with no lookup seam: a fake home holding a gateway file
+  // at every default location must not make that file the gateway's.
+  const fake = await mkdtemp(join(tmpdir(), 'gateway-fake-home-'))
+  cleanup.push(() => rm(fake, { recursive: true, force: true }))
+  const contents = JSON.stringify({
+    schema_version: 1,
+    gateway_url: 'https://gateway.example.test',
+    gateway_headers: { 'x-gateway-key': SECRET },
+  })
+  const posixFile = join(fake, '.config', 'cortexkit', 'anthropic-auth.jsonc')
+  const appDataFile = join(fake, 'AppData', 'cortexkit', 'anthropic-auth.jsonc')
+  const roamingFile = join(
+    fake,
+    'AppData',
+    'Roaming',
+    'cortexkit',
+    'anthropic-auth.jsonc',
+  )
+  for (const file of [posixFile, appDataFile, roamingFile]) {
+    await mkdir(join(file, '..'), { recursive: true })
+    await writeFile(file, contents)
+  }
+  // The environment is chosen when the process starts, as a repository's
+  // `.env` would be, so the check runs in a child process launched with it.
+  const file = process.platform === 'win32' ? appDataFile : posixFile
+  const modulePath = (name: string) =>
+    JSON.stringify(join(import.meta.dir, '..', name))
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      '-e',
+      `
+        const { gatewaySettingsFile } = await import(${modulePath('gateway.ts')})
+        const { openSettingsService } = await import(${modulePath('settings-service.ts')})
+        const { createNativeRuntimeSettings } = await import(${modulePath('native-runtime-settings.ts')})
+        const file = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+        const service = await openSettingsService({ file })
+        const reader = createNativeRuntimeSettings({
+          host: 'opencode',
+          settingsService: service,
+          settingsMode: () => 'user-file',
+          env: {},
+        })
+        console.log(JSON.stringify({
+          expected: (await gatewaySettingsFile()) ?? null,
+          gateway: reader.gateway()?.origin ?? null,
+          ignored: service.status().gatewayIgnored ?? null,
+        }))
+        process.exit(0)
+      `,
+    ],
+    {
+      env: {
+        ...process.env,
+        HOME: fake,
+        USERPROFILE: fake,
+        APPDATA: join(fake, 'AppData'),
+        XDG_CONFIG_HOME: join(fake, '.config'),
+        ANTHROPIC_AUTH_SETTINGS_FILE: file,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  const [output, errors, code] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ])
+  expect({ code, errors: code === 0 ? '' : errors }).toEqual({
+    code: 0,
+    errors: '',
+  })
+  const result = JSON.parse(output.trim().split('\n').at(-1) ?? '{}')
+  expect(result.expected).not.toBe(file)
+  expect(result.gateway).toBeNull()
+  expect(result.ignored).not.toBeNull()
+})
+
+function lookupDependencies(
+  platform: NodeJS.Platform,
+  outputs: Record<string, string | Error>,
+  passwd = '',
+) {
+  const calls: {
+    file: string
+    args: readonly string[]
+    env: Readonly<Record<string, string>>
+  }[] = []
+  return {
+    calls,
+    dependencies: {
+      platform,
+      uid: 1000,
+      run: async (
+        file: string,
+        args: readonly string[],
+        env: Readonly<Record<string, string>>,
+      ) => {
+        calls.push({ file, args, env })
+        const output = outputs[file]
+        if (output === undefined || output instanceof Error)
+          throw output ?? new Error('not found')
+        return output
+      },
+      readFile: async () => passwd,
+    },
+  }
+}
+
+test('the account lookup runs fixed programs by absolute path with no inherited PATH', async () => {
+  const linux = lookupDependencies('linux', {
+    '/usr/bin/getent': 'me:x:1000:1000:Me:/home/me:/bin/sh\n',
+  })
+  expect(await lookupGatewaySettingsFile(linux.dependencies)).toBe(
+    '/home/me/.config/cortexkit/anthropic-auth.jsonc',
+  )
+  expect(linux.calls).toEqual([
+    { file: '/usr/bin/getent', args: ['passwd', '1000'], env: { LC_ALL: 'C' } },
+  ])
+  // Without getent, the local passwd file is read by user id.
+  const fallback = lookupDependencies(
+    'linux',
+    {},
+    'root:x:0:0::/root:/bin/sh\nme:x:1000:1000::/srv/me:/bin/sh\n',
+  )
+  expect(await lookupGatewaySettingsFile(fallback.dependencies)).toBe(
+    '/srv/me/.config/cortexkit/anthropic-auth.jsonc',
+  )
+  // An entry for another id, or a relative home, is no answer.
+  for (const passwd of [
+    'me:x:1001:1000::/home/me:/bin/sh',
+    'me:x:1000:1::home:',
+  ])
+    expect(
+      await lookupGatewaySettingsFile(
+        lookupDependencies('linux', {}, passwd).dependencies,
+      ),
+    ).toBeUndefined()
+
+  const mac = lookupDependencies('darwin', {
+    '/usr/bin/id': 'me\n',
+    '/usr/bin/dscl': 'NFSHomeDirectory:\n /Users/Me Home\nUniqueID: 1000\n',
+  })
+  expect(await lookupGatewaySettingsFile(mac.dependencies)).toBe(
+    '/Users/Me Home/.config/cortexkit/anthropic-auth.jsonc',
+  )
+  expect(mac.calls.map(({ file, env }) => [file, env])).toEqual([
+    ['/usr/bin/id', { LC_ALL: 'C' }],
+    ['/usr/bin/dscl', { LC_ALL: 'C' }],
+  ])
+  expect(mac.calls[1]?.args).toEqual([
+    '.',
+    '-read',
+    '/Users/me',
+    'UniqueID',
+    'NFSHomeDirectory',
+  ])
+  // A record for another user id is refused.
+  expect(
+    await lookupGatewaySettingsFile(
+      lookupDependencies('darwin', {
+        '/usr/bin/id': 'me\n',
+        '/usr/bin/dscl': 'NFSHomeDirectory: /Users/me\nUniqueID: 501\n',
+      }).dependencies,
+    ),
+  ).toBeUndefined()
+
+  const reg = 'C:\\Windows\\System32\\reg.exe'
+  const windows = lookupDependencies('win32', {
+    [reg]:
+      '\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders\r\n    AppData    REG_SZ    D:\\Profiles\\me\\Roaming\r\n\r\n',
+  })
+  expect(await lookupGatewaySettingsFile(windows.dependencies)).toBe(
+    'D:\\Profiles\\me\\Roaming\\cortexkit\\anthropic-auth.jsonc',
+  )
+  expect(windows.calls).toEqual([
+    {
+      file: reg,
+      args: [
+        'query',
+        'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders',
+        '/v',
+        'AppData',
+      ],
+      env: { SystemRoot: 'C:\\Windows' },
+    },
+  ])
+  // An unexpanded value is no answer; nor is a failed program.
+  expect(
+    await lookupGatewaySettingsFile(
+      lookupDependencies('win32', {
+        [reg]: '    AppData    REG_SZ    %USERPROFILE%\\AppData\\Roaming\r\n',
+      }).dependencies,
+    ),
+  ).toBeUndefined()
+  expect(
+    await lookupGatewaySettingsFile(
+      lookupDependencies('win32', { [reg]: new Error('denied') }).dependencies,
+    ),
+  ).toBeUndefined()
+})
+
+test('a failed account lookup ignores the gateway, with one warning and a Status note', async () => {
+  const logs = captureLogs()
+  const f = await settingsFixture(
+    {
+      gateway_url: 'https://gateway.example.test',
+      gateway_headers: { 'x-gateway-key': SECRET },
+    },
+    () => undefined,
+  )
+  const reader = f.reader('pi')
+  expect(reader.gateway()).toBeUndefined()
+  expect(reader.status()?.file.gatewayIgnored).toBe('account-home-unknown')
+  await f.service.refresh()
+  expect(
+    logs.filter(
+      (record) =>
+        record.level === 'warn' && record.message.includes('home folder'),
+    ),
+  ).toHaveLength(1)
+  expect(JSON.stringify(logs)).not.toContain(SECRET)
+})
+
+test('the default location is checked again for every settings generation', async () => {
+  const f = await settingsFixture(
+    { gateway_url: 'https://gateway.example.test' },
+    (root) => join(root, 'default', 'anthropic-auth.jsonc'),
+    async (root, file) => {
+      // The default path is a symlink to the file in use, so it qualifies.
+      await mkdir(join(root, 'default'))
+      await symlink(file, join(root, 'default', 'anthropic-auth.jsonc'))
+    },
+  )
+  const root = join(f.file, '..')
+  const defaultFile = join(root, 'default', 'anthropic-auth.jsonc')
+  const other = join(root, 'other.jsonc')
+  await writeFile(other, '{}')
+  const reader = f.reader('opencode')
+  expect(reader.gateway()?.origin).toBe('https://gateway.example.test')
+  // The symlink now points elsewhere: the next generation fails closed.
+  await rm(defaultFile)
+  await symlink(other, defaultFile)
+  await writeFile(
+    f.file,
+    JSON.stringify({
+      schema_version: 1,
+      gateway_url: 'https://attacker.example.test',
+    }),
+  )
+  await f.service.refresh()
+  expect(reader.gateway()).toBeUndefined()
+  expect(reader.status()?.file.gatewayIgnored).toBe('not-default-location')
+})
+
+test('rotated gateway header values are redaction secrets as soon as the settings generation is published', async () => {
+  const rotated = `rotated-gateway-canary-${crypto.randomUUID()}`
+  const f = await settingsFixture({
+    gateway_url: 'https://gateway.example.test',
+    gateway_headers: { 'x-gateway-key': SECRET },
+  })
+  await writeFile(
+    f.file,
+    JSON.stringify({
+      schema_version: 1,
+      gateway_url: 'https://gateway.example.test',
+      gateway_headers: { 'x-gateway-key': rotated },
+    }),
+  )
+  await f.service.refresh()
+  // No host has read the gateway yet (a keep-warm first reads it inside its
+  // fetch, after its error scope is built), and the value is already known.
+  expect(claudeGatewaySecretValues()).toContain(rotated)
+})
+
+test('an OAuth send drops any TLS option, so certificate checks always apply', async () => {
+  const inits: (RequestInit & { tls?: unknown })[] = []
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    inits.push(init ?? {})
+    return new Response('{}')
+  }) as typeof fetch
+  const insecure = {
+    method: 'POST',
+    body: '{}',
+    tls: { rejectUnauthorized: false },
+  } as RequestInit
+  await createAnthropicOAuthFetch()(
+    'https://api.anthropic.com/v1/messages',
+    insecure,
+  )
+  await createClaudeModelFetch({ gateway: gateway() })(
+    'https://api.anthropic.com/v1/messages',
+    insecure,
+  )
+  expect(inits).toHaveLength(2)
+  for (const init of inits) {
+    expect('tls' in init).toBe(false)
+    expect(init.redirect).toBe('error')
   }
 })
 

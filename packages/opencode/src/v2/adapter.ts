@@ -1197,6 +1197,13 @@ export function createNativeAnthropicAdapter<Q, P>(
       // rewriteRequest finalizes betas for the outgoing body. Omit that header
       // here so the installer's later generic edits cannot overwrite it.
       delete extra['anthropic-beta']
+      // With a gateway, a send authorized for an HTTP relay may still go
+      // straight to the gateway once rewriteSend sees its URL. These edits
+      // win on the wire after that rewrite, so they must suit both sends:
+      // they neither remove the bearer rewriteSend sets for the gateway nor
+      // add the relay token, which the relay request carries itself.
+      if (auth.dispatch?.kind === 'http-relay' && auth.gateway)
+        return { headers: { ...extra, 'x-api-key': null }, attempt: data }
       return {
         headers: relayHeaders ?? {
           ...extra,
