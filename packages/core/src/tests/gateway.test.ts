@@ -295,7 +295,12 @@ async function settingsFixture(
       gatewaySettingsFile: () => defaultFile(root, file),
       open: (options) => {
         const handle = openSettings(settingsDefinition, options)
-        return { ...handle, watch: () => () => {} }
+        // Only the file in use gets a silent watch, so a test refreshes it by
+        // hand; the watch of the default path (see the default-path tests)
+        // stays real.
+        return options.file === file
+          ? { ...handle, watch: () => () => {} }
+          : handle
       },
     },
   })

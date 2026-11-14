@@ -1,6 +1,5 @@
-import { watch } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { basename, dirname, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import {
   type OpenSettingsOptions,
   openSettings,
@@ -72,30 +71,6 @@ function samePathText(a: string, b: string): boolean {
   const fold = (path: string) =>
     process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path)
   return fold(a) === fold(b)
-}
-
-/**
- * Watches one path through its folder, so removing, replacing or
- * retargeting it (a symlink) is seen, not only edits to the file it names.
- * `onChange` runs for events on that name, or events that name no file;
- * `onStopped` runs when the watch fails. Throws when it cannot start, for
- * example when the folder does not exist. Returns a function that stops it.
- */
-export function watchSettingsPath(
-  file: string,
-  onChange: () => void,
-  onStopped: () => void,
-): () => void {
-  const name = basename(file)
-  const watcher = watch(
-    dirname(file),
-    { persistent: false },
-    (_event, changed) => {
-      if (!changed || String(changed) === name) onChange()
-    },
-  )
-  watcher.on('error', onStopped)
-  return () => watcher.close()
 }
 
 export type SettingsProtectionValues = Pick<
@@ -274,8 +249,6 @@ export interface SettingsServiceOptions {
     schedule?: (callback: () => void, delayMs: number) => () => void
     /** Test seam: the file the gateway is honoured from (gatewaySettingsFile). */
     gatewaySettingsFile?: () => string | undefined | Promise<string | undefined>
-    /** Test seam: watches one path (watchSettingsPath). */
-    watchGatewayDefault?: typeof watchSettingsPath
   }
 }
 
@@ -1109,8 +1082,9 @@ class SharedSettingsService {
     // The file in use passed only because it and the default path resolve to
     // the same file, for example when the default path is a symlink to it.
     // Removing or retargeting the default path does not change the file in
-    // use, so its own watch never fires: watch the default path too, and
-    // read again when it changes. Without that watch the gateway is not used.
+    // use, so its own watch never fires: watch the default path too, with the
+    // same settings watch, and read again when it changes. Without that watch
+    // the gateway is not used.
     if (
       !samePathText(this.file, expected) &&
       !this.watchGatewayDefault(expected)
@@ -1119,25 +1093,24 @@ class SharedSettingsService {
     return undefined
   }
 
-  /** Starts the default-path watch (once); false when it cannot run. */
+  /**
+   * Starts the default-path watch (once); false when it cannot start. It is
+   * the watch of a settings handle for that path, opened the same way as the
+   * service's own handle and used only for its watch: it notices the path
+   * being removed or pointed at different contents (a folder watch plus a
+   * periodic check), and is never read from or written to.
+   */
   private watchGatewayDefault(file: string): boolean {
     if (this.closed) return false
     if (this.defaultWatch?.file === file) return true
     this.defaultWatch?.stop()
     this.defaultWatch = undefined
-    const stopped = () => {
-      // The watch failed or its folder went away: drop it, so the next
-      // reading starts a new one or, if it cannot, stops using the gateway.
-      if (this.defaultWatch?.file === file) {
-        this.defaultWatch.stop()
-        this.defaultWatch = undefined
-      }
-      void this.refresh()
-    }
     try {
-      const stop = (
-        this.options.dependencies?.watchGatewayDefault ?? watchSettingsPath
-      )(file, () => void this.refresh(), stopped)
+      const options = { ...this.openOptions(), file }
+      const handle = this.options.dependencies?.open
+        ? this.options.dependencies.open(options)
+        : openSettings(settingsDefinition, options)
+      const stop = handle.watch(() => void this.refresh())
       this.defaultWatch = { file, stop }
       return true
     } catch {
