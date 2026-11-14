@@ -375,7 +375,7 @@ test('the account home comes from the account database or the Windows registry',
   // environment key is used.
   const volatile =
     '\r\nHKEY_CURRENT_USER\\Volatile Environment\r\n    USERPROFILE    REG_SZ    C:\\Users\\me\r\n\r\n'
-  for (const profileList of [
+  const profileLists: Record<string, string>[] = [
     {},
     { [WHOAMI_USER]: `"desktop-1\\me","${SID}"\r\n` },
     {
@@ -385,7 +385,8 @@ test('the account home comes from the account database or the Windows registry',
     },
     // A SID that is not well formed never reaches a registry key name.
     { [WHOAMI_USER]: '"desktop-1\\me","S-1-5-21\\..\\x"\r\n' },
-  ]) {
+  ]
+  for (const profileList of profileLists) {
     const fallback = lookup('win32', { ...profileList, [VOLATILE]: volatile })
     expect(await lookupAccountHome(fallback.dependencies)).toBe('C:\\Users\\me')
     expect(
