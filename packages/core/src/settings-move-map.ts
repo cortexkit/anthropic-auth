@@ -1,5 +1,8 @@
 import type { LegacySource, MapResult } from '@cortexkit/common-auth/settings'
-import { settingsProtectionStricter } from './settings-host-import.ts'
+import {
+  KILLSWITCH_FLOOR_KEYS,
+  settingsProtectionStricter,
+} from './settings-host-import.ts'
 import { legacySettingsProtection } from './settings-protection-legacy.ts'
 import {
   SETTINGS_PROTECTION_KEYS,
@@ -83,7 +86,8 @@ export function mapSettingsMoveSources(sources: LegacySource[]): MapResult {
  * as this host's own value, so common-auth keeps it at the host's level (or
  * as the default, with the other host's value at its level) and no host
  * leaves the move weaker than its legacy store left it. A source with no
- * store has no legacy settings and inherits as before.
+ * store has no legacy settings and inherits as before. Killswitch floors
+ * are carried only from a source whose killswitch was on.
  */
 function keepImplicitProtection(
   sources: LegacySource[],
@@ -109,6 +113,16 @@ function keepImplicitProtection(
         {},
         legacy.host as 'opencode' | 'pi',
       )[setting]
+      // Killswitch floors protect only while the killswitch is on: a host
+      // whose killswitch was off held no account back, so its default
+      // floors are no protection to carry.
+      if (
+        KILLSWITCH_FLOOR_KEYS.has(setting) &&
+        ((legacy.value as Partial<SettingsValues>).killswitch_enabled ??
+          legacySettingsProtection({}, legacy.host as 'opencode' | 'pi')
+            .killswitch_enabled) !== true
+      )
+        continue
       if (settingsProtectionStricter(setting, implicit, inherited.value))
         added.push({ source, setting, value: implicit })
     }

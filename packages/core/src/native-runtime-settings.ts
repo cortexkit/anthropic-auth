@@ -13,6 +13,7 @@ import {
 import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
 import {
   getSettingsAdoptionCheck,
+  isSettingsImportPending,
   resolveSettingsMode,
   type SettingsMode,
   type SettingsModeOptions,
@@ -25,6 +26,7 @@ import {
 } from './settings-record.ts'
 import type {
   SettingsFileStatus,
+  SettingsGeneration,
   SettingsService,
   SettingsUpdate,
   SettingsValues,
@@ -80,6 +82,7 @@ export function createNativeRuntimeSettings(
   const env = options.env ?? process.env
   // Read before retaining: the check is attached to the handle startSettings returned.
   let adoption = getSettingsAdoptionCheck(options.settingsService)
+  const startedPending = isSettingsImportPending(options.settingsService)
   let service = options.settingsService?.retain()
   let fallback = service ? undefined : options.settingsFallback
   let reopenLegacy = service || fallback ? undefined : options.settingsReopen
@@ -95,12 +98,24 @@ export function createNativeRuntimeSettings(
   let cancelCheck: (() => void) | undefined
   let loggedLateWrite = false
   let writes = 0
-  const generation = () =>
-    service &&
-    (userAuthority || mode() === 'user-file') &&
-    mode() !== 'separate'
-      ? service.snapshot()
-      : undefined
+  // Set while this host uses a missing file whose import it still owes (see
+  // SettingsAdoptionCheck). A file that then appears is not used until the
+  // import check passes: until then requests keep the last missing-file
+  // reading, whose protection came from this host's own recovery.
+  let importPending = startedPending
+  let pinned: SettingsGeneration | undefined
+  const generation = () => {
+    if (
+      !service ||
+      !(userAuthority || mode() === 'user-file') ||
+      mode() === 'separate'
+    )
+      return undefined
+    const current = service.snapshot()
+    if (!importPending) return current
+    if (current.status === 'missing') pinned = current
+    return pinned
+  }
 
   function resolve(stored: AccountStorage, model?: string): AccountStorage
   function resolve(
@@ -160,10 +175,11 @@ export function createNativeRuntimeSettings(
     if (closed || !service || mode() === 'separate') return Promise.resolve()
     const current = service
     checking = (async () => {
-      if (userAuthority) return
+      if (userAuthority && !importPending) return
       if (
+        !userAuthority &&
         (await resolveSettingsMode(
-          { target: current.file, separate: false },
+          { target: current.file, separate: mode() === 'separate' },
           options.settingsAuthority?.options,
         )) !== 'user-file'
       )
@@ -174,11 +190,16 @@ export function createNativeRuntimeSettings(
       // holds: adopt it only once the import check passes. Until then the
       // host keeps legacy settings, and the timer, watches and menu actions
       // check again.
-      if (adoption && !(await adoption(current))) return
+      const adopted = adoption ? await adoption(current) : true
+      if (!adopted) return
       if (closed || service !== current) return
+      importPending = adopted === 'pending'
+      if (!importPending) pinned = undefined
       userAuthority = true
-      cancelCheck?.()
-      cancelCheck = undefined
+      if (!importPending) {
+        cancelCheck?.()
+        cancelCheck = undefined
+      }
       if (!writes) applyEffects()
     })().finally(() => {
       checking = undefined
@@ -208,16 +229,28 @@ export function createNativeRuntimeSettings(
       }
     }
     const before = fallback
-    const open = before?.reopen ?? reopenLegacy
+    const legacy = before ? undefined : reopenLegacy
+    const open = before?.reopen ?? legacy
     if (!open) return
     const next = await open()
-    if (!next) return
+    if (!next) {
+      // A reopen that found a separate install never opens the shared file;
+      // this runtime then stays separate and stops checking.
+      if (legacy && reopenLegacy === legacy && legacy.separate?.()) {
+        probedMode = 'separate'
+        reopenLegacy = undefined
+        userAuthority = false
+      }
+      return
+    }
     if (closed || service || fallback !== before) {
       await next.dispose()
       return
     }
     service = next
     adoption = getSettingsAdoptionCheck(next)
+    importPending = before?.importPending?.() ?? false
+    pinned = undefined
     fallback = undefined
     reopenLegacy = undefined
     subscribe(next)
@@ -225,7 +258,12 @@ export function createNativeRuntimeSettings(
   }
   function scheduleCheck() {
     if (closed || mode() === 'separate') return
-    if (!fallback && !reopenLegacy && (!service || userAuthority)) return
+    if (
+      !fallback &&
+      !reopenLegacy &&
+      (!service || (userAuthority && !importPending))
+    )
+      return
     const schedule =
       options.settingsAuthority?.schedule ??
       ((callback, delayMs) => {
@@ -281,6 +319,11 @@ export function createNativeRuntimeSettings(
     /** The settings file while the protection fallback is in use, else undefined. */
     fallbackFile: () => fallback?.file,
     /**
+     * The settings file while it is open but this host does not use it yet
+     * (its import check has not passed), else undefined.
+     */
+    checkingFile: () => (service && !generation() ? service.file : undefined),
+    /**
      * Called under the legacy store's locks by a write that chose the legacy
      * store: true when the user file became authoritative meanwhile (a move
      * published while the write waited for those locks), so the write must
@@ -293,7 +336,7 @@ export function createNativeRuntimeSettings(
       if (userAuthority) return true
       return (
         (await resolveSettingsMode(
-          { target: service.file, separate: false },
+          { target: service.file, separate: mode() === 'separate' },
           options.settingsAuthority?.options,
         )) === 'user-file'
       )
@@ -349,6 +392,12 @@ export function createNativeRuntimeSettings(
           ).outcome === 'updated'
       } finally {
         writes--
+      }
+      // A write that recreated a missing file whose import this host still
+      // owes is checked now, so this host uses the file it just wrote.
+      if (importPending) {
+        await checking?.catch(() => {})
+        await recheck(false).catch(() => {})
       }
       const next = resolve(before)
       const withLevel = (settings: Record<string, unknown>) => ({

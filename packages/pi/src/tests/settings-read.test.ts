@@ -1434,8 +1434,11 @@ test('the stream applies model settings and mirrors dump_enabled from every snap
 })
 
 for (const peer of ['never ran', 'stricter'] as const) {
-  test(`Pi recreates a missing settings file when OpenCode's store is ${peer}`, async () => {
+  test(`Pi ${peer === 'never ran' ? 'refuses to recreate a missing explicit-target settings file when no OpenCode store is found' : "recreates a missing settings file when OpenCode's store is stricter"}`, async () => {
     await core.writeSettingsMoveMarker(file)
+    // The test preload points OpenCode's state file elsewhere; an OpenCode
+    // path override set here would leave OpenCode's store unknown.
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_STATE_FILE
     if (peer === 'stricter') {
       // OpenCode's own settings store (its account pool) under the same home.
       const store = join(
@@ -1458,6 +1461,13 @@ for (const peer of ['never ran', 'stricter'] as const) {
       ...stored,
       dump: { enabled: true },
     }))
+    if (peer === 'never ran') {
+      // Under an explicit target an OpenCode with a private store could share
+      // the file, so a missing default store leaves its protection unknown.
+      expect(result.outcome).toBe('refused')
+      await expect(fs.stat(file)).rejects.toMatchObject({ code: 'ENOENT' })
+      return
+    }
     expect(result.outcome).toBe('saved')
     const written = parse(await fs.readFile(file, 'utf8'))
     expect(written).toHaveProperty('dump_enabled')

@@ -493,6 +493,35 @@ for (const scenario of implicitCases) {
   }
 }
 
+// A host whose killswitch was off held no account back, so its implicit
+// floors 5/10 are no protection: carrying them would leave it on at 5/10,
+// stricter than both sources.
+for (const offHost of ['opencode', 'pi'] as const) {
+  test(`a killswitch that was off on ${offHost} carries no implicit floors: both hosts end on at the other host's 1/1`, async () => {
+    const onHost = offHost === 'opencode' ? 'pi' : 'opencode'
+    const settings = {
+      [onHost]: {
+        killswitch: { enabled: true, main: { five_hour: 1, seven_day: 1 } },
+      },
+      [offHost]: { dump: { enabled: true } },
+    }
+    const f = await move(
+      (['opencode', 'pi'] as const).map((host) => ({
+        host,
+        settings: settings[host] as Record<string, unknown>,
+      })),
+    )
+    expect(f.result.outcome).toBe('moved')
+    const { service } = await resolve(f.file)
+    for (const host of ['opencode', 'pi'] as const)
+      expect(service.resolve(host)).toMatchObject({
+        killswitch_enabled: true,
+        killswitch_default_five_hour: 1,
+        killswitch_default_seven_day: 1,
+      })
+  })
+}
+
 test('absent sources and absent account settings do not seed a list, while an explicit empty list is carried', () => {
   expect(
     mapSettingsMoveSources([

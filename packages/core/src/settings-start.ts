@@ -3,6 +3,7 @@ import { readNativeEnrollmentMode } from './native-enrollment-authority.ts'
 import { requireNativePoolAuthority } from './pool-authority.ts'
 import { resolveNativePoolPaths } from './pool-paths.ts'
 import {
+  markSettingsImportPending,
   resolveSettingsMode,
   type SettingsAdoptionCheck,
   type SettingsMode,
@@ -58,6 +59,12 @@ export interface SettingsProtectionFallback {
    */
   reopen(): Promise<SettingsService | undefined>
   /**
+   * True when the service the last `reopen` returned was adopted for a
+   * missing file whose import is still owed: the runtime must pass the
+   * import check again before it uses a file that appears.
+   */
+  importPending?(): boolean
+  /**
    * Present with `resolveAuthority`: once it finds legacy mode, open the
    * service only to notice a later move, without adopting the file.
    */
@@ -98,6 +105,11 @@ export interface StartedSettings {
 export interface SettingsReopen {
   (): Promise<SettingsService | undefined>
   readonly retryDelaysMs?: readonly number[]
+  /**
+   * True once a reopen found that this host is a separate install: it never
+   * opens the shared settings file, and the runtime treats it as separate.
+   */
+  readonly separate?: () => boolean
 }
 
 /** A repaired enrollment or migration is usually noticed within seconds. */
@@ -200,6 +212,9 @@ export async function startSettings(
       warnOnce,
       'at its next settings check',
     )
+    // A missing file is used without an import: no applied copy comes from
+    // it, and the check runs again once a file appears.
+    if (outcome === 'pending') return 'pending'
     if (outcome !== 'adopt') return false
     adopted = true
     const copy = held
@@ -225,11 +240,13 @@ export async function startSettings(
       file = started.paths.target
       paths = started.paths
       moved = started.mode === 'user-file'
-      // The startup move already ran the import check before choosing the file.
-      adopted = moved
+      // The startup move already ran the import check before choosing the
+      // file, unless the file is missing and this host's import is pending.
+      adopted = moved && !started.importPending
       if (!started.mayOpenService) return { mode: started.mode, file }
       const service = track(await open(serviceOptions(file)))
       if (!service) return { mode: started.mode, file }
+      if (started.importPending) markSettingsImportPending(service)
       return { mode: started.mode, file, service }
     } catch {
       if (!warned) {
@@ -265,8 +282,10 @@ export async function startSettings(
   }
   /**
    * Off the request path, replacing the fallback: open the service, and hand
-   * it over only once this host's import check passes.
+   * it over only once this host's import check passes (or is pending on a
+   * missing file, which `importPending` then reports).
    */
+  let importPending = false
   const reopenOnFile = async () => {
     try {
       await passPreflight()
@@ -276,7 +295,11 @@ export async function startSettings(
     const service = await openService()
     if (!service) return undefined
     try {
-      if (await adopt(service)) return service
+      const adoption = await adopt(service)
+      if (adoption) {
+        importPending = adoption === 'pending'
+        return service
+      }
     } catch {
       // An unavailable check keeps the fallback until the next try.
     }
@@ -284,6 +307,10 @@ export async function startSettings(
     return undefined
   }
   if (refused) {
+    // Injected paths say without any I/O that this is a separate install,
+    // which never uses the shared settings file.
+    if (options.paths?.separate)
+      return { mode: 'separate', file: options.paths.target }
     // Requests are refused by the host's credential checks while the
     // preflight refuses, so plain legacy mode with no settings I/O is enough.
     // Once it passes, requests must be served at once: legacy values apply
@@ -295,17 +322,25 @@ export async function startSettings(
     } catch {
       // Without a path the runtime key uses an explicit "no settings file".
     }
+    // Whether this is a separate install is known only once the paths can be
+    // resolved, after the preflight passes. A separate install then never
+    // opens the shared file: it resolves paths to the user's default file.
+    let separate = false
     const reopenAfterPreflight: SettingsReopen = Object.assign(
       async () => {
+        if (separate) return undefined
         try {
           await passPreflight()
-          file = (await resolvePaths()).target
+          const resolved = await resolvePaths()
+          file = resolved.target
+          separate = resolved.separate
         } catch {
           return undefined
         }
+        if (separate) return undefined
         return openService()
       },
-      { retryDelaysMs: PREFLIGHT_RETRY_DELAYS_MS },
+      { retryDelaysMs: PREFLIGHT_RETRY_DELAYS_MS, separate: () => separate },
     )
     return { mode: 'legacy', file, reopen: reopenAfterPreflight }
   }
@@ -347,6 +382,7 @@ export async function startSettings(
       rung: recovered.rung,
       values: recovered.values,
       reopen: reopenOnFile,
+      importPending: () => importPending,
       ...(unknown ? { reopenLegacy, resolveAuthority: probe } : {}),
     },
   }

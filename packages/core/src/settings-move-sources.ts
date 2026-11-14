@@ -13,6 +13,7 @@ import {
 import { nativePoolStoreLocks } from './pool-store.ts'
 import { createSettingsMoveSource } from './settings-move-source.ts'
 import {
+  hasPrivateSettingsConfigHome,
   resolveSettingsPaths,
   type SettingsHost,
   type SettingsPathOptions,
@@ -123,12 +124,21 @@ async function peerLayout(
 
 /**
  * Read the other host's legacy protection for recreating a missing settings
- * file: its default store, through its current custody and state layout,
- * without seeding a vault, taking locks or writing anything. A local store
- * that doesn't exist, or a separate install, returns undefined: that host
- * has no set to keep. Anything that exists but can't be read, including an
- * unreadable custody or layout and vault settings that were never seeded,
- * throws, so the caller can tell an unknown set from a missing one.
+ * file, from the store a default-target move would read for it: its default
+ * store, through its current custody and state layout, without seeding a
+ * vault, taking locks or writing anything. Under the default target, a local
+ * store that doesn't exist returns undefined: that host never ran here and
+ * has no set to keep.
+ *
+ * Anything else that can't name or read the peer's set throws, so the
+ * caller treats it as unknown and never as "no set":
+ * - a store that exists but can't be read, including an unreadable custody
+ *   or layout, and vault settings that were never seeded;
+ * - a private XDG_CONFIG_HOME, for which a move reads only its own store;
+ * - the peer's own path overrides set in this process, since the peer may
+ *   run with them or without them;
+ * - under an explicit target, a default store that doesn't exist: a peer
+ *   sharing that file may keep a private store this process can't see.
  */
 export async function readPeerLegacySettingsProtection(
   options: SettingsPathOptions & {
@@ -136,8 +146,21 @@ export async function readPeerLegacySettingsProtection(
     readMode?: typeof readNativeEnrollmentMode
   },
 ): Promise<SettingsProtectionValues | undefined> {
+  if (await hasPrivateSettingsConfigHome(options))
+    throw new Error(
+      'A move under a private config home reads only its own store, so the peer store is unknown',
+    )
   const paths = await resolveSettingsPaths(options.host, options)
-  if (paths.separate) return undefined
+  // For the peer host, `own` is where this environment puts its store.
+  for (const key of ['account', 'state'] as const)
+    if (
+      (await canonicalPath(paths.own[key], options)) !==
+      (await canonicalPath(paths.defaults[options.host][key], options))
+    )
+      throw new Error(
+        'The peer path overrides set here leave its store unknown',
+      )
+  const explicitTarget = paths.sourceRule === 'own'
   const store = paths.defaults[options.host]
   const mode = await (options.readMode ?? readNativeEnrollmentMode)(
     options.host,
@@ -153,7 +176,11 @@ export async function readPeerLegacySettingsProtection(
   try {
     text = await readFile(selected.config, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && mode === 'local')
+    if (
+      (error as NodeJS.ErrnoException).code === 'ENOENT' &&
+      mode === 'local' &&
+      !explicitTarget
+    )
       return undefined
     throw error
   }

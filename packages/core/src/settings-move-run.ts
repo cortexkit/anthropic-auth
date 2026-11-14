@@ -75,13 +75,42 @@ export interface SettingsMoveStartupResult {
      * to check it. The host stays legacy, and its runtime checks again.
      */
     | 'import-unknown'
+    /**
+     * The file is in charge, but this host's legacy store was never imported
+     * and the file can't be checked against it yet: it is empty, unparseable,
+     * unreadable, or holds an invalid protection value. The host stays
+     * legacy, and its runtime runs the import check again.
+     */
+    | 'import-pending'
   move?: MoveResult
+  /**
+   * In user-file mode: the file is missing and this host's legacy store was
+   * never imported. The host uses the file (its protection comes from this
+   * host's own recovery while it is missing), but its runtime must pass the
+   * import check before it uses a file that appears.
+   */
+  importPending?: boolean
 }
 
 /** What a host's import check decided about using the settings file. */
 export type SettingsHostImportOutcome =
-  /** The file holds this host's legacy protection, or the check is not due yet. */
+  /** The file holds this host's legacy protection. */
   | 'adopt'
+  /**
+   * The file is missing and this host's legacy store was never imported. The
+   * host may use the file's service now: while the file is missing, its
+   * protection comes from this host's applied copy or legacy store, and its
+   * own menu write recreates the file carrying that set. Once a file appears
+   * again, the host must pass this check before it uses that file's values.
+   */
+  | 'pending'
+  /**
+   * The file exists but can't be checked yet: it is empty, unparseable,
+   * unreadable, or holds an invalid protection value. Its protection would
+   * replace this host's legacy set as soon as it became usable, so the host
+   * keeps its legacy settings and runs the check again later.
+   */
+  | 'retry'
   /** Writing the stricter legacy values failed or raced a protection change. */
   | 'refused'
   /** This host's legacy store could not be read, so its protection is unknown. */
@@ -111,12 +140,19 @@ export async function importSettingsHostStore(
   const { host, paths } = options
   const authority = { ...options, ...options.authority }
   const generation = service.snapshot()
-  // A missing or unusable file already falls back to protection from this
-  // host's applied copy or legacy store; the check runs again at a later start.
-  if (generation.status !== 'ready' || !generation.protection[host].usable)
-    return 'adopt'
+  // An imported host's protection is in the file, or in its applied copy
+  // while the file is unusable.
   if (await hasSettingsImportRecord(paths.target, host, authority))
     return 'adopt'
+  if (generation.status === 'missing') return 'pending'
+  // A file this check can't compare against must not be adopted: its values
+  // would replace the legacy set, without an import, once it becomes usable.
+  if (generation.status !== 'ready' || !generation.protection[host].usable) {
+    warn(
+      `Settings file ${paths.target} is not used by ${host} yet: it is empty, unreadable or holds invalid protection settings, so ${host}'s legacy settings can't be checked against it. ${host} keeps its legacy settings until the file can be checked.`,
+    )
+    return 'retry'
+  }
   let legacy: SettingsProtectionValues | undefined
   try {
     legacy = await readOwnLegacySettingsProtection({ ...options, paths })
@@ -229,10 +265,17 @@ export async function runSettingsMoveAtStartup(
     const marked = await hasSettingsMoveMarker(paths.target, authority)
     const service = await openSettingsService({ file: paths.target })
     if (!service) throw new Error('Settings service did not open')
+    let importPending = false
     try {
       const generation = service.snapshot()
-      // Schema-invalid protection entries do not make a hand-made file unparsed.
-      if (!marked && generation.status === 'ready') {
+      // Only a usable file is marked: an empty, unparseable or invalid one may
+      // be a save in progress, and a marker would keep a later deletion of it
+      // in charge.
+      if (
+        !marked &&
+        generation.status === 'ready' &&
+        generation.protection[options.host].usable
+      ) {
         try {
           await writeSettingsMoveMarker(paths.target, authority)
         } catch {
@@ -249,6 +292,10 @@ export async function runSettingsMoveAtStartup(
       // The runtime keeps its service in legacy mode and checks again off the
       // request path, so a store that becomes readable is imported then.
       if (imported === 'unknown') return result('legacy', 'import-unknown')
+      // The same holds for a file that can't be checked yet: the runtime runs
+      // the check again once the file is usable.
+      if (imported === 'retry') return result('legacy', 'import-pending')
+      importPending = imported === 'pending'
       if (generation.status !== 'missing') {
         const prepared = await prepareSettingsMoveSources({
           ...options,
@@ -283,11 +330,14 @@ export async function runSettingsMoveAtStartup(
     } finally {
       await service.dispose()
     }
-    return result(
-      'user-file',
-      outcome ?? (marked ? 'marker-present' : 'done-already'),
-      move,
-    )
+    return {
+      ...result(
+        'user-file',
+        outcome ?? (marked ? 'marker-present' : 'done-already'),
+        move,
+      ),
+      ...(importPending ? { importPending: true } : {}),
+    }
   }
 
   if (paths.separate) return result('separate', 'separate-install')

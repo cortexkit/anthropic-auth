@@ -344,6 +344,14 @@ export function invalidSettingsWriteText(
   return `Cannot write setting "${key}" to "${resolve(file)}": the existing value is invalid. Edit the settings file to set a valid value.`
 }
 
+/**
+ * A menu write while this host still checks the settings file against its
+ * legacy settings before using it: neither source can take the write yet.
+ */
+export function settingsCheckPendingText(file?: string): string {
+  return `Settings were not changed: ${file ? `the settings file "${resolve(file)}"` : 'the settings file'} is still being checked against this host's settings. Try again shortly.`
+}
+
 /** Only fixed, local text is shown; dependency errors can contain file contents. */
 export const SETTINGS_WRITE_FAILURES = {
   'settings-unparseable': {

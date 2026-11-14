@@ -26,9 +26,15 @@ import {
   refusedSettingsRecreationText,
   refusedSettingsWriteText,
   SETTINGS_WRITE_FAILURES,
+  settingsCheckPendingText,
   settingsDefinition,
 } from '../settings-definition.ts'
-import { resolveSettingsMode, type SettingsMode } from '../settings-mode.ts'
+import {
+  resolveSettingsMode,
+  type SettingsAdoptionCheck,
+  type SettingsMode,
+  setSettingsAdoptionCheck,
+} from '../settings-mode.ts'
 import {
   readSettingsProtectionCopy,
   writeSettingsProtectionCopy,
@@ -64,6 +70,8 @@ async function fixture(
     settingsAuthority?: NativeRuntimeSettingsOptions['settingsAuthority']
     pauseLegacy?: () => Promise<void>
     beforeUpdate?: () => Promise<void>
+    /** The import check a runtime must pass before it uses the file. */
+    adoption?: SettingsAdoptionCheck
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
@@ -166,6 +174,7 @@ async function fixture(
   })
   if (!service) throw new Error('Settings service unavailable')
   cleanup.push(() => service.dispose())
+  if (options.adoption) setSettingsAdoptionCheck(service, options.adoption)
   let failStore = false
   const runtime = createNativeAccountRuntime({
     paths,
@@ -2056,4 +2065,25 @@ test('a ready file at the writer lock needs no rung-3 protection carry', async (
     killswitch_default_five_hour: 77,
     dump_enabled: true,
   })
+})
+
+test('a menu write while the import check holds this host on legacy is refused with a plain retry message, leaving both sources alone', async () => {
+  const f = await fixture('{"dump_enabled":false}', {
+    mode: 'legacy',
+    legacy: { dump: { enabled: true } },
+    // This host's import check has not passed yet.
+    adoption: async () => false,
+    settingsAuthority: { schedule: () => () => {} },
+  })
+  const before = await f.text()
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: false }
+  })
+  expect(result).toMatchObject({
+    outcome: 'refused',
+    reason: settingsCheckPendingText(f.file),
+  })
+  expect(result.settings.dump).toEqual({ enabled: true })
+  expect(await f.text()).toBe(before)
+  expect((await f.saved()).dump).toEqual({ enabled: true })
 })

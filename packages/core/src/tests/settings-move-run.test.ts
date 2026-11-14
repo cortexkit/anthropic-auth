@@ -713,7 +713,7 @@ test('simulated Windows default targets each move and publish their own marker',
 })
 
 for (const invalid of [false, true]) {
-  test(`hand-made authority marks a parsed file with invalid protection=${invalid} and names every held source`, async () => {
+  test(`hand-made authority ${invalid ? 'neither marks nor adopts a parsed file with invalid protection' : 'marks a parsed file and names every held source'}`, async () => {
     const f = await fixture()
     await put(f.paths.target, {
       schema_version: 1,
@@ -723,6 +723,22 @@ for (const invalid of [false, true]) {
     await put(f.stores.opencode.config, { dump: { enabled: false } })
     await put(f.stores.pi.config, { cacheKeep: { startHour: 8, endHour: 12 } })
     const started = await f.start()
+    if (invalid) {
+      // The file can't be checked against this host's legacy store: once
+      // fixed, its values would replace that store's without an import. The
+      // host stays legacy, keeps the service to check again, and leaves no
+      // marker that would keep the file in charge after a deletion.
+      expect(started).toMatchObject({
+        mode: 'legacy',
+        outcome: 'import-pending',
+        mayOpenService: true,
+      })
+      expect(await absent(f.paths.marker)).toBe(true)
+      expect(
+        await absent(settingsImportRecordPath(f.paths.target, 'opencode')),
+      ).toBe(true)
+      return
+    }
     expect(started.outcome).toBe('done-already')
     expect(await absent(f.paths.marker)).toBe(false)
     const records = f.messages.filter((message) =>
@@ -747,7 +763,7 @@ for (const invalid of [false, true]) {
 }
 
 for (const closed of [false, true]) {
-  test(`malformed hand-made file is authoritative with fence closed=${closed}, but never marked`, async () => {
+  test(`malformed hand-made file is authoritative with fence closed=${closed}, but never marked or adopted`, async () => {
     const f = await fixture()
     await put(f.stores.opencode.config, {
       dump: { enabled: true },
@@ -756,7 +772,13 @@ for (const closed of [false, true]) {
     await fs.mkdir(dirname(f.paths.target), { recursive: true })
     await fs.writeFile(f.paths.target, '{broken')
     if (closed) f.options.fence.registration = undefined
-    expect((await f.start()).outcome).toBe('done-already')
+    // No move runs, and the host keeps its legacy settings until the file
+    // parses and its import check passes.
+    expect(await f.start()).toMatchObject({
+      mode: 'legacy',
+      outcome: 'import-pending',
+      mayOpenService: true,
+    })
     expect(await absent(f.paths.marker)).toBe(true)
     const service = await openSettingsService({ file: f.paths.target })
     cleanup.push(() => service?.dispose())

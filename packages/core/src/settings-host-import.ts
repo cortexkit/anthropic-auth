@@ -8,6 +8,18 @@ import {
 
 type ProtectionKey = (typeof SETTINGS_PROTECTION_KEYS)[number]
 
+/**
+ * The killswitch's default floors. They hold accounts back only while the
+ * killswitch is on, so a host whose legacy killswitch was off contributes
+ * none of them.
+ */
+export const KILLSWITCH_FLOOR_KEYS: ReadonlySet<string> =
+  new Set<ProtectionKey>([
+    'killswitch_default_five_hour',
+    'killswitch_default_seven_day',
+    'killswitch_default_scoped',
+  ])
+
 /** Higher ranks protect more; values not listed rank lowest. */
 const ranks: Partial<Record<ProtectionKey, Record<string, number>>> = {
   // Core treats an unset choice as fail-closed, but OpenCode 1's own checks do not.
@@ -39,7 +51,8 @@ export function settingsProtectionStricter(
  * The import a host owes the settings file when its legacy store was never
  * imported: for each protection key the file sets for this host no value of
  * its own (fill-only), the host's legacy value where it protects more than
- * what the host now resolves from the file. A pure function of the host's
+ * what the host now resolves from the file. Killswitch floors count only
+ * when the host's legacy killswitch was on. A pure function of the host's
  * legacy set, its resolved set and the file's explicit levels.
  *
  * `edits` writes those values at the host's own level; account floors need
@@ -59,12 +72,14 @@ export function planSettingsHostImport(input: {
   for (const key of SETTINGS_PROTECTION_KEYS) {
     if (key === 'killswitch_account_floors') continue
     if (input.fileLevels[key]?.includes(host)) continue
+    if (!legacy.killswitch_enabled && KILLSWITCH_FLOOR_KEYS.has(key)) continue
     if (!settingsProtectionStricter(key, legacy[key], resolved[key])) continue
     keys.push(key)
     edits.push({ setting: key, level: host, value: legacy[key] })
   }
   // An account the file gives this host no floor for uses the file's
-  // default thresholds; a legacy floor above them is protection to keep.
+  // default thresholds; a legacy floor above them is protection to keep,
+  // but only if the legacy killswitch was on.
   const covered = new Set(
     resolved.killswitch_account_floors
       .filter((entry) => entry.host === host || entry.host === 'both')
@@ -72,6 +87,7 @@ export function planSettingsHostImport(input: {
   )
   const missing = legacy.killswitch_account_floors.filter(
     (entry) =>
+      legacy.killswitch_enabled &&
       (entry.host === host || entry.host === 'both') &&
       !covered.has(entry.account) &&
       (entry.five_hour > resolved.killswitch_default_five_hour ||

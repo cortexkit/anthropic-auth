@@ -230,6 +230,13 @@ for (const copyHost of ['opencode', 'pi'] as const) {
         readAt: 1,
         values: copied,
       })
+      // Under this explicit target Pi's protection is known only from its
+      // applied copy: with no Pi store found, recreation would be refused.
+      if (copyHost === 'opencode')
+        await core.writeSettingsProtectionCopy(f.target, 'pi', {
+          readAt: 1,
+          values: copied,
+        })
       const storedProtection = {
         killswitch: { enabled: true, main: { five_hour: 31 } },
       }

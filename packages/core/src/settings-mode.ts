@@ -164,11 +164,13 @@ export async function resolveSettingsMode(
  * Decides, off the request path, whether a running host may start using the
  * settings file through `service` (its own handle on that file). It runs the
  * host's import check, and returns false to keep the host's current
- * authority and ask again at the next check.
+ * authority and ask again at the next check. 'pending' lets the host use a
+ * missing file, whose protection comes from the host's own recovery, but
+ * the host must pass the check again before it uses a file that appears.
  */
 export type SettingsAdoptionCheck = (
   service: SettingsService,
-) => Promise<boolean>
+) => Promise<boolean | 'pending'>
 
 // Keyed by the service handle `startSettings` returned, so hosts pass the
 // check to their runtime without carrying another option.
@@ -187,4 +189,22 @@ export function getSettingsAdoptionCheck(
   service: object | undefined,
 ): SettingsAdoptionCheck | undefined {
   return service ? adoptionChecks.get(service) : undefined
+}
+
+// Handles whose host started on a missing file it never imported, keyed like
+// the adoption checks.
+const pendingImports = new WeakSet<object>()
+
+/**
+ * Record that the host uses `service`'s missing file without having imported
+ * its legacy store, so its runtime runs the import check before it uses a
+ * file that appears.
+ */
+export function markSettingsImportPending(service: object): void {
+  pendingImports.add(service)
+}
+
+/** Whether `service` was marked; read it before retaining the handle. */
+export function isSettingsImportPending(service: object | undefined): boolean {
+  return service ? pendingImports.has(service) : false
 }

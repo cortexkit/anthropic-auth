@@ -132,7 +132,10 @@ import {
   nativeRelocationGuard,
   type RelocationGuard,
 } from './relocation-guard.ts'
-import { SETTINGS_WRITE_FAILURES } from './settings-definition.ts'
+import {
+  SETTINGS_WRITE_FAILURES,
+  settingsCheckPendingText,
+} from './settings-definition.ts'
 import { getSettingsFilePath } from './settings-paths.ts'
 import { SettingsRecreationRefusal } from './settings-service.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
@@ -1621,7 +1624,13 @@ function buildNativeAccountRuntime(
         // Adopt the user file, then write there; the legacy store is untouched.
         await runtimeSettings.prepareAction()
         if (!(await runtimeSettings.prepareWrite()))
-          throw new NativeCustodyError('route-unavailable')
+          // The file is in charge, but this host's import check has not
+          // passed yet: neither source may take the write.
+          return {
+            settings: runtimeSettings.resolve(result.settings),
+            outcome: 'refused',
+            reason: settingsCheckPendingText(runtimeSettings.checkingFile()),
+          }
         return runtime.updateSettings(mutator)
       }
       if (result.outcome === 'updated' && captured.before)

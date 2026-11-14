@@ -90,7 +90,7 @@ async function fixture(
   if (mode === 'user-file')
     await put({
       quota_enabled: 'off',
-      quota_fail_closed_on_unknown_quota: false,
+      quota_fail_closed_on_unknown_quota: 'off',
     })
 
   const { setSettingsFsForTest } = await import(
@@ -267,9 +267,11 @@ async function fixture(
 describe('OpenCode 1 settings service reads', () => {
   installLoaderSetup(ctx)
 
-  test('a menu write recreates a missing settings file when Pi never ran', async () => {
+  test('a menu write refuses to recreate a missing explicit-target settings file when no Pi store is found', async () => {
     const f = await fixture()
-    // Point the Pi store lookup at this test's folder, where Pi never ran.
+    // Point the Pi store lookup at this test's folder, where no Pi store
+    // exists. Under an explicit target a Pi with a private store could share
+    // the file, so its protection is unknown and the write is refused.
     const saved = {
       HOME: process.env.HOME,
       PI_ANTHROPIC_AUTH_FILE: process.env.PI_ANTHROPIC_AUTH_FILE,
@@ -294,10 +296,8 @@ describe('OpenCode 1 settings service reads', () => {
       ...settings,
       dump: { enabled: true },
     }))
-    expect(result.outcome).toBe('saved')
-    expect(parse(await fs.readFile(f.target, 'utf8'))).toMatchObject({
-      dump_enabled: true,
-    })
+    expect(result.outcome).toBe('refused')
+    await expect(fs.stat(f.target)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   test('unmigrated model enumeration preserves the original refusal and host-only artifacts', async () => {
@@ -610,7 +610,7 @@ describe('OpenCode 1 settings service reads', () => {
       await f.put({
         claude_cache_enabled: 'on',
         quota_enabled: 'on',
-        quota_fail_closed_on_unknown_quota: true,
+        quota_fail_closed_on_unknown_quota: 'on',
       })
       const instance = await f.launch(f.pool.root)
       expect(

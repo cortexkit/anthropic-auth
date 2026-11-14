@@ -56,6 +56,8 @@ test('only keys where the legacy store protects more, and the file sets no value
 test('a legacy account floor is imported only for an account the file gives the host no floor for', () => {
   const resolved: SettingsProtectionValues = {
     ...base,
+    // Floors protect only under an enabled killswitch.
+    killswitch_enabled: true,
     killswitch_account_floors: [
       floor('covered', 'pi', 1),
       floor('other', 'opencode', 1),
@@ -65,6 +67,7 @@ test('a legacy account floor is imported only for an account the file gives the 
     host: 'pi',
     legacy: {
       ...base,
+      killswitch_enabled: true,
       killswitch_account_floors: [
         floor('covered', 'pi', 90),
         floor('other', 'pi', 90),
@@ -92,4 +95,52 @@ test('a legacy set that protects no more than the file needs no import', () => {
       fileLevels: {},
     }),
   ).toEqual({ keys: [], edits: [] })
+})
+
+// A killswitch that was off held no account back: its floors, implicit or
+// stored, are no protection to import. Importing them would leave the host
+// on at those floors, stricter than its legacy store and the file.
+test('a legacy killswitch that was off imports no floors into a file whose killswitch is on', () => {
+  const resolved: SettingsProtectionValues = {
+    ...base,
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 1,
+    killswitch_default_seven_day: 1,
+  }
+  for (const legacy of [
+    legacySettingsProtection({ dump: { enabled: true } }, 'pi'),
+    legacySettingsProtection(
+      {
+        killswitch: {
+          enabled: false,
+          main: { five_hour: 50, seven_day: 60 },
+          accounts: { main: { five_hour: 90 } },
+        },
+      },
+      'pi',
+    ),
+  ])
+    expect(
+      planSettingsHostImport({ host: 'pi', legacy, resolved, fileLevels: {} }),
+    ).toEqual({ keys: [], edits: [] })
+})
+
+test('a legacy killswitch that was on keeps its implicit floors 5/10 over a weaker file', () => {
+  const plan = planSettingsHostImport({
+    host: 'pi',
+    legacy: legacySettingsProtection({ killswitch: { enabled: true } }, 'pi'),
+    resolved: {
+      ...base,
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 1,
+      killswitch_default_seven_day: 1,
+    },
+    fileLevels: {},
+  })
+  expect(
+    [...plan.edits].sort((a, b) => a.setting.localeCompare(b.setting)),
+  ).toEqual([
+    { setting: 'killswitch_default_five_hour', level: 'pi', value: 5 },
+    { setting: 'killswitch_default_seven_day', level: 'pi', value: 10 },
+  ])
 })

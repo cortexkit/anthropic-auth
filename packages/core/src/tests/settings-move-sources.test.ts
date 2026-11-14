@@ -737,3 +737,76 @@ test('the peer legacy reader follows the peer custody and never seeds a vault', 
   await put(f.vaults.pi.config, { killswitch: { enabled: true } })
   expect(await read()).toMatchObject({ killswitch_enabled: true })
 })
+
+// A recreation that reads no peer set takes the writer's set for both hosts.
+// Where a move would not read the peer's default store, the peer's own path
+// overrides are set here, or (under an explicit target, which a peer with a
+// private store also shares) its default store is absent, the peer's set is
+// unknown: the reader throws so the recreation refuses, and never reports
+// "no set".
+for (const scenario of [
+  'peer overrides with a default-location peer store',
+  'peer overrides with no default-location peer store',
+  'a private XDG_CONFIG_HOME',
+  'an explicit target with a private peer pool',
+  'an explicit target with no default-location peer store',
+] as const) {
+  test(`the peer legacy reader treats the peer set as unknown under ${scenario}`, async () => {
+    const f = await fixture('opencode')
+    const other = join(f.root, 'other-pi')
+    if (scenario.startsWith('peer overrides'))
+      f.options.env = {
+        ...f.options.env,
+        PI_AGENT_DIR: other,
+        PI_ANTHROPIC_AUTH_FILE: join(other, 'auth.json'),
+      }
+    else if (scenario === 'a private XDG_CONFIG_HOME')
+      f.options.env = {
+        ...f.options.env,
+        XDG_CONFIG_HOME: join(f.root, 'private'),
+      }
+    else
+      f.options.env = {
+        ...f.options.env,
+        ANTHROPIC_AUTH_SETTINGS_FILE: join(f.root, 'shared.jsonc'),
+        ...(scenario === 'an explicit target with a private peer pool'
+          ? { PI_ANTHROPIC_AUTH_FILE: join(other, 'auth.json') }
+          : {}),
+      }
+    if (
+      scenario !== 'peer overrides with no default-location peer store' &&
+      scenario !== 'an explicit target with no default-location peer store'
+    )
+      await put(f.defaults.pi.config, {
+        killswitch: { enabled: true, main: { '5h': 45 } },
+      })
+    await expect(
+      readPeerLegacySettingsProtection({
+        ...f.options,
+        host: 'pi',
+        readMode: f.options.readMode,
+      }),
+    ).rejects.toThrow()
+  })
+}
+
+test("under an explicit target the peer legacy reader reads the peer's default store when it exists", async () => {
+  const f = await fixture('opencode')
+  f.options.env = {
+    ...f.options.env,
+    ANTHROPIC_AUTH_SETTINGS_FILE: join(f.root, 'shared.jsonc'),
+  }
+  await put(f.defaults.pi.config, {
+    killswitch: { enabled: true, main: { '5h': 45 } },
+  })
+  expect(
+    await readPeerLegacySettingsProtection({
+      ...f.options,
+      host: 'pi',
+      readMode: f.options.readMode,
+    }),
+  ).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 45,
+  })
+})
