@@ -178,14 +178,14 @@ function loopbackRelay() {
   return { seen, url: `http://127.0.0.1:${server.port}/forward` }
 }
 
-function relaySettings(url: string) {
+function relaySettings(url: string, fallbackToDirect = false) {
   return {
     relay: {
       enabled: true,
       transport: 'http',
       url,
       token: 'relay-token',
-      fallbackToDirect: false,
+      fallbackToDirect,
     },
   }
 }
@@ -353,4 +353,73 @@ describe('OpenCode 1: a relay named by a store moved with one variable is ignore
     expect(relay.seen).toEqual([`Bearer ${BEARER}`])
     expect(direct).toEqual([])
   })
+
+  test('hosted mode, store in its default place: its relay is still used', async () => {
+    const base = await startBody('relay-store-location-')
+    const relay = loopbackRelay()
+    const { user } = await userInstall(base, relaySettings(relay.url))
+    hostByThalamus()
+    const direct = mockAnthropic()
+    const response = await send(user.hostAuthPath)
+    expect(response.status).toBe(200)
+    expect(relay.seen).toEqual([`Bearer ${BEARER}`])
+    expect(direct).toEqual([])
+  })
+
+  test('vault mode, store in its default place and moved to the state folder: its relay is still used', async () => {
+    const base = await startBody('relay-store-location-')
+    resetLayoutDecisions()
+    lifetimes.deferCleanup(resetLayoutDecisions)
+    const relay = loopbackRelay()
+    const { home, user } = await userInstall(base, relaySettings(relay.url))
+    // The default folder found as OpenCode finds it, with no file named by
+    // a path variable, so the start may move the files to the state folder.
+    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    process.env.OPENCODE_CONFIG_DIR = join(home, '.config', 'opencode')
+    const direct = mockAnthropic()
+    const response = await send(user.hostAuthPath)
+    expect(response.status).toBe(200)
+    const moved = await readFile(
+      join(
+        base,
+        'state',
+        'cortexkit',
+        'anthropic-auth',
+        'opencode',
+        'layout.json',
+      ),
+      'utf8',
+    )
+    expect(JSON.parse(moved)).toMatchObject({ phase: 'committed' })
+    expect(relay.seen).toEqual([`Bearer ${BEARER}`])
+    expect(direct).toEqual([])
+  })
+
+  test('vault mode, store in its default place: a plain-http relay a proxy setting would carry is not used', async () => {
+    const base = await startBody('relay-store-location-')
+    const relay = loopbackRelay()
+    const { user } = await userInstall(base, relaySettings(relay.url, true))
+    const saved = ['HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy'].map(
+      (key) => [key, process.env[key]] as const,
+    )
+    lifetimes.deferCleanup(() => {
+      for (const [key, value] of saved)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+    })
+    for (const [key] of saved) delete process.env[key]
+    // Nothing listens there; the proxy must never be reached.
+    process.env.HTTP_PROXY = 'http://127.0.0.1:9'
+    const direct = mockAnthropic()
+    const response = await send(user.hostAuthPath)
+    expect(response.status).toBe(200)
+    expect(relay.seen).toEqual([])
+    expect(direct).toEqual([`Bearer ${BEARER}`])
+  })
 })
+
+function resetLayoutDecisions() {
+  core.resetStateLayoutDecisionsForTests()
+  core.resetProcessStateLayoutsForTests()
+  core.resetNativeHolderRegistryForTests()
+}

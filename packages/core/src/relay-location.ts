@@ -1,3 +1,4 @@
+import { lstat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { ACCOUNT_FILE_NAME, ACCOUNT_STATE_FILE_NAME } from './accounts.ts'
@@ -9,7 +10,12 @@ import {
   type NativePoolPaths,
   resolveNativePoolPaths,
 } from './pool-paths.ts'
-import { LEGACY_STATE_LAYOUT } from './state-layout-paths.ts'
+import { RELAY_PROXY_REFUSAL, relayProxyApplies } from './relay.ts'
+import {
+  LEGACY_STATE_LAYOUT,
+  processStateLayout,
+  type StateLayout,
+} from './state-layout-paths.ts'
 
 /**
  * Where the relay may come from.
@@ -31,6 +37,12 @@ import { LEGACY_STATE_LAYOUT } from './state-layout-paths.ts'
  * - Pi: `<home>/.pi/agent/anthropic-auth.json`.
  *
  * On Windows `<home>` is the user's profile folder (`%USERPROFILE%`).
+ *
+ * The store's own relay files must be regular files: a selected settings or
+ * runtime file whose last path component is a symbolic link is treated as
+ * not in the default place, because the link could be repointed after the
+ * check. The selected files are resolved again on every check; only the
+ * default store's resolved paths are cached.
  */
 
 /** The Status line, and the reason, when a configured relay is not used. */
@@ -40,6 +52,24 @@ export const RELAY_IGNORED_NOTE =
 /** Why saving a relay is refused when the account store is elsewhere. */
 export const RELAY_SAVE_REFUSAL =
   'Relay not saved: account settings are not in their default location'
+
+/**
+ * The Status line, and the reason, when a configured relay is not used
+ * because the operating system account's home folder could not be found, so
+ * the default place is unknown.
+ */
+export const RELAY_HOME_UNKNOWN_NOTE =
+  "Relay ignored: the operating system account's home folder could not be found"
+
+/** Why saving a relay is refused when the account's home is unknown. */
+export const RELAY_SAVE_HOME_UNKNOWN_REFUSAL =
+  "Relay not saved: the operating system account's home folder could not be found"
+
+/**
+ * Where the selected store is: its default place, somewhere else, or unknown
+ * because the operating system account's home folder could not be found.
+ */
+export type RelayLocation = 'default' | 'elsewhere' | 'home-unknown'
 
 /**
  * Test-only escape hatch for the relay location check.
@@ -81,24 +111,30 @@ export interface RelayStoreSelection {
   readonly vault: RelayStoreFiles
 }
 
+/** The folder of `host`'s default store under `home`. */
+function defaultStoreDir(host: 'opencode' | 'pi', home: string): string {
+  return host === 'opencode'
+    ? join(home, '.config', 'opencode')
+    : join(home, '.pi', 'agent')
+}
+
 /**
  * The default store's relay files for `host` under `home`, resolved exactly
  * as the host resolves a store with no environment override: the same file
- * names and, for OpenCode, the state layout this process decided for that
- * folder. Pi's files never move, so Pi always uses the legacy layout.
+ * names and, for OpenCode, `layout`, which defaults to the state layout this
+ * process decided for that folder. Pi's files never move, so Pi always uses
+ * the legacy layout.
  */
 export async function defaultRelayStoreFiles(
   host: 'opencode' | 'pi',
   home: string,
+  layout?: StateLayout,
 ): Promise<RelayStoreSelection> {
-  const dir =
-    host === 'opencode'
-      ? join(home, '.config', 'opencode')
-      : join(home, '.pi', 'agent')
+  const dir = defaultStoreDir(host, home)
   const local: NativePoolPaths = await resolveNativePoolPaths(
     join(dir, ACCOUNT_FILE_NAME),
     join(dir, ACCOUNT_STATE_FILE_NAME),
-    host === 'pi' ? LEGACY_STATE_LAYOUT : undefined,
+    host === 'pi' ? LEGACY_STATE_LAYOUT : layout,
   )
   const vault = nativeVaultPaths(local)
   return {
@@ -107,71 +143,129 @@ export async function defaultRelayStoreFiles(
   }
 }
 
-// Canonical forms, cached per process by path text. A different path is a
-// different key, so changing paths never reuses a stale entry.
-const canonicalForms = new Map<string, Promise<string>>()
-
-function canonicalForm(path: string): Promise<string> {
-  let form = canonicalForms.get(path)
-  if (!form) {
-    form = canonicalPath(path)
-    // A failed resolution is not cached, so a later check retries it.
-    form.catch(() => canonicalForms.delete(path))
-    canonicalForms.set(path, form)
+/**
+ * Remembers a resolution that succeeded, keyed by text; a failed one is
+ * forgotten, so the next check tries again.
+ */
+function remembered<T>(
+  cache: Map<string, Promise<T>>,
+  key: string,
+  compute: () => Promise<T>,
+): Promise<T> {
+  let value = cache.get(key)
+  if (!value) {
+    value = compute()
+    value.catch(() => cache.delete(key))
+    cache.set(key, value)
   }
-  return form
+  return value
 }
 
-// The default store's canonical files, per host and home folder.
+// The default account file's canonical path, per host and home folder. The
+// state-layout decision for the default store is recorded under it.
+const defaultAccountFiles = new Map<string, Promise<string>>()
+
+// The default store's canonical files, per host, home folder and the layout
+// decided for it. A layout decided later in the process is a new key, so a
+// default resolved before that decision is never reused after it.
 const defaultForms = new Map<string, Promise<RelayStoreSelection>>()
 
-function defaultCanonicalFiles(
+async function defaultCanonicalFiles(
   host: 'opencode' | 'pi',
   home: string,
 ): Promise<RelayStoreSelection> {
-  const key = JSON.stringify([host, home])
-  let files = defaultForms.get(key)
-  if (!files) {
-    files = defaultRelayStoreFiles(host, home).then(
-      async ({ local, vault }) => ({
+  let layout: StateLayout = LEGACY_STATE_LAYOUT
+  if (host === 'opencode') {
+    const accountFile = await remembered(
+      defaultAccountFiles,
+      JSON.stringify([host, home]),
+      () => canonicalPath(join(defaultStoreDir(host, home), ACCOUNT_FILE_NAME)),
+    )
+    layout = processStateLayout(accountFile)
+  }
+  return remembered(
+    defaultForms,
+    JSON.stringify([
+      host,
+      home,
+      layout.kind === 'state-home' ? layout.dir : layout.kind,
+    ]),
+    async () => {
+      const { local, vault } = await defaultRelayStoreFiles(host, home, layout)
+      return {
         local: await canonicalFiles(local),
         vault: await canonicalFiles(vault),
-      }),
-    )
-    files.catch(() => defaultForms.delete(key))
-    defaultForms.set(key, files)
-  }
-  return files
+      }
+    },
+  )
 }
 
 async function canonicalFiles(
   files: RelayStoreFiles,
 ): Promise<RelayStoreFiles> {
   const [config, runtime] = await Promise.all([
-    canonicalForm(files.config),
-    canonicalForm(files.runtime),
+    canonicalPath(files.config),
+    canonicalPath(files.runtime),
   ])
   return { config, runtime }
+}
+
+/** True when the last component of `path` is a symbolic link. */
+async function leafIsLink(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isSymbolicLink()
+  } catch (error) {
+    // A file not created yet is no link; any other failure counts as one, so
+    // the check fails closed.
+    return !(
+      error instanceof Error &&
+      'code' in error &&
+      (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+    )
+  }
+}
+
+/**
+ * The selected files resolved now, never from a cache, or undefined when one
+ * of them is a symbolic link.
+ */
+async function selectedCanonicalFiles(
+  files: RelayStoreFiles,
+): Promise<RelayStoreFiles | undefined> {
+  const links = await Promise.all([
+    leafIsLink(files.config),
+    leafIsLink(files.runtime),
+  ])
+  if (links.some(Boolean)) return undefined
+  return canonicalFiles(files)
 }
 
 const warnedStores = new Set<string>()
 
 export interface RelayLocationCheck {
   /**
-   * True when `mode`'s store is the default store, so its relay may be used.
-   * False when it is elsewhere or the account lookup failed. Every lookup and
-   * path resolution behind it is cached, so after the first call this does
-   * no file or process I/O.
+   * Where `mode`'s store is; its relay may be used only at 'default'. The
+   * account lookup and the default store's paths are cached; the selected
+   * store's two files are checked and resolved again on every call.
    */
-  atDefault(mode: 'local' | 'claustrum'): Promise<boolean>
+  locate(mode: 'local' | 'claustrum'): Promise<RelayLocation>
   /** Starts the lookups early, off the request path. */
   prepare(): void
   /** Records that a configured relay was ignored; logs once per store. */
-  ignored(mode: 'local' | 'claustrum'): void
-  /** Records that the last read found no ignored relay. */
-  clear(): void
-  /** The Status lines: the ignored-relay note, or none. */
-  statusNotes(): string[]
+  ignored(
+    mode: 'local' | 'claustrum',
+    location: Exclude<RelayLocation, 'default'>,
+  ): void
+  /**
+   * Records that the last read found no ignored relay, and the URL of the
+   * relay it found in use, if any.
+   */
+  clear(relayUrl?: string): void
+  /**
+   * The Status lines: why a configured relay is ignored, or that the relay
+   * in use is refused because a proxy setting would carry it; or none.
+   */
+  statusNotes(env?: Readonly<Record<string, string | undefined>>): string[]
 }
 
 /** The relay location check for one runtime's local and vault stores. */
@@ -179,47 +273,66 @@ export function createRelayLocationCheck(
   host: 'opencode' | 'pi',
   selected: RelayStoreSelection,
 ): RelayLocationCheck {
-  let ignoredNow = false
-  async function atDefault(mode: 'local' | 'claustrum'): Promise<boolean> {
+  let ignoredNow: Exclude<RelayLocation, 'default'> | undefined
+  let relayInUse: string | undefined
+  async function locate(mode: 'local' | 'claustrum'): Promise<RelayLocation> {
     const hook = testAccountHome()
-    if (hook === 'unchecked') return true
+    if (hook === 'unchecked') return 'default'
+    let home: string | undefined
     try {
-      const home = hook ? await hook() : await accountHome()
-      if (!home) return false
+      home = hook ? await hook() : await accountHome()
+    } catch {
+      home = undefined
+    }
+    if (!home) return 'home-unknown'
+    try {
       const files = mode === 'claustrum' ? selected.vault : selected.local
       const [defaults, own] = await Promise.all([
         defaultCanonicalFiles(host, home),
-        canonicalFiles(files),
+        selectedCanonicalFiles(files),
       ])
       const expected = mode === 'claustrum' ? defaults.vault : defaults.local
-      return own.config === expected.config && own.runtime === expected.runtime
+      return own &&
+        own.config === expected.config &&
+        own.runtime === expected.runtime
+        ? 'default'
+        : 'elsewhere'
     } catch {
-      return false
+      return 'elsewhere'
     }
   }
   return {
-    atDefault,
+    locate,
     prepare() {
       if (testAccountHome() === 'unchecked') return
-      void atDefault('local').catch(() => {})
-      void atDefault('claustrum').catch(() => {})
+      void locate('local').catch(() => {})
+      void locate('claustrum').catch(() => {})
     },
-    ignored(mode) {
-      ignoredNow = true
-      const key =
+    ignored(mode, location) {
+      ignoredNow = location
+      relayInUse = undefined
+      const store =
         mode === 'claustrum' ? selected.vault.config : selected.local.config
+      const key = JSON.stringify([store, location])
       if (warnedStores.has(key)) return
       warnedStores.add(key)
       logger.warn(
         'relay',
-        'a relay is configured, but the account settings are not in their default location, so it is ignored and requests go directly to Anthropic',
+        location === 'home-unknown'
+          ? "a relay is configured, but the operating system account's home folder could not be found, so it is ignored and requests go directly to Anthropic"
+          : 'a relay is configured, but the account settings are not in their default location, so it is ignored and requests go directly to Anthropic',
       )
     },
-    clear() {
-      ignoredNow = false
+    clear(relayUrl) {
+      ignoredNow = undefined
+      relayInUse = relayUrl
     },
-    statusNotes() {
-      return ignoredNow ? [RELAY_IGNORED_NOTE] : []
+    statusNotes(env = process.env) {
+      if (ignoredNow === 'home-unknown') return [RELAY_HOME_UNKNOWN_NOTE]
+      if (ignoredNow === 'elsewhere') return [RELAY_IGNORED_NOTE]
+      return relayInUse && relayProxyApplies(relayInUse, env)
+        ? [RELAY_PROXY_REFUSAL]
+        : []
     },
   }
 }

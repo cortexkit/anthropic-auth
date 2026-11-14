@@ -8,8 +8,9 @@ import {
   reportAnthropicBillingFailure,
 } from './billing.ts'
 import { dumpRelayRequest } from './dump.ts'
+import { claudeGatewayProxyApplies } from './gateway.ts'
 import { parseJsonRedacted } from './json.ts'
-import { relayLog } from './logger.ts'
+import { logger, relayLog } from './logger.ts'
 import {
   createProviderErrorResponseScope,
   createProviderErrorStreamScope,
@@ -294,7 +295,6 @@ class RelayWebSocketConnectionResetError extends Error {
 
 const sessionState = new Map<string, RelaySessionState>()
 const websocketSessions = new Map<string, PersistentRelaySession>()
-const loggedRelayConfigMessages = new Set<string>()
 const RELAY_SESSION_STATE_TTL_MS = 2 * 60 * 60_000
 const RELAY_WEBSOCKET_IDLE_TTL_MS = 30 * 60_000
 const MAX_RELAY_SESSION_STATES = 128
@@ -306,39 +306,56 @@ function createRequestId() {
   return `req_${Date.now().toString(36)}_${nextRequestId.toString(36)}`
 }
 
-function logRelayConfigOnce(message: string): void {
-  if (loggedRelayConfigMessages.has(message)) return
-  loggedRelayConfigMessages.add(message)
-  relayLog(message)
+/**
+ * Fixed text for refusing a relay send that a proxy setting would carry in
+ * plain text. It names no value: the variables may hold credentials.
+ */
+export const RELAY_PROXY_REFUSAL =
+  'Relay refused: a proxy setting would carry plain-http requests'
+
+/**
+ * The plain-http URL a relay URL's requests use: a `ws:` relay is reached at
+ * `http:` and a `wss:` relay at `https:` when its requests go over HTTP.
+ */
+function relayHttpUrl(url: string): string {
+  const parsed = new URL(url)
+  if (parsed.protocol === 'ws:') parsed.protocol = 'http:'
+  else if (parsed.protocol === 'wss:') parsed.protocol = 'https:'
+  return parsed.toString()
 }
 
-export function getRelayConfig(
-  storage: AccountStorage | null,
-): RelayConfig | null {
-  const relay = storage?.relay
-  if (!relay) {
-    logRelayConfigOnce('disabled: no relay config found')
-    return null
+/**
+ * True when a send to the relay at `url` would go in plain text through a
+ * proxy that a proxy setting names. The relay envelope carries the account's
+ * bearer and the relay token, so such a send is refused, by the same rule as
+ * a plain-http gateway (see claudeGatewayProxyApplies). A `ws:` relay counts
+ * as plain http: its HTTP rescue posts to `http:`, and a WebSocket handshake
+ * is plain text too. `https:` and `wss:` relays are never affected. A URL
+ * that cannot be parsed counts as affected, so the check fails closed.
+ */
+export function relayProxyApplies(
+  url: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  let httpUrl: string
+  try {
+    httpUrl = relayHttpUrl(url)
+  } catch {
+    return true
   }
-  if (relay.enabled !== true) {
-    logRelayConfigOnce('disabled: relay.enabled is not true')
-    return null
-  }
-  if (!relay.url?.trim() || !relay.token?.trim()) {
-    logRelayConfigOnce('disabled: missing relay url or token')
-    return null
-  }
-  const transport = effectiveRelayTransport(relay.transport, relay.url)
-  logRelayConfigOnce(
-    `configured transport=${transport} protocol=${transport === 'websocket' ? 2 : 1} url=${relay.url.trim()} fallbackToDirect=${relay.fallbackToDirect !== false}`,
+  return claudeGatewayProxyApplies(httpUrl, env)
+}
+
+let warnedRelayProxyRefused = false
+
+/** Logs once per process that plain-text relay sends are being refused. */
+export function warnRelayProxyRefused(): void {
+  if (warnedRelayProxyRefused) return
+  warnedRelayProxyRefused = true
+  relayLog(
+    'relay sends are refused: a proxy setting (HTTP_PROXY or http_proxy) would carry them in plain text. Exempt the relay host with NO_PROXY, or use an https relay.',
   )
-  return {
-    enabled: true,
-    url: relay.url.trim(),
-    token: relay.token.trim(),
-    fallbackToDirect: relay.fallbackToDirect !== false,
-    transport,
-  }
+  logger.warn('relay', RELAY_PROXY_REFUSAL)
 }
 
 export function generateRelayToken() {
@@ -472,8 +489,9 @@ async function postRelay(
     mode: payload.mode,
   })
   // The envelope carries the upstream credential, so a relay that answers
-  // with a redirect must not have it re-posted somewhere else.
-  return fetch(config.url, {
+  // with a redirect must not have it re-posted somewhere else. A WebSocket
+  // relay's HTTP rescue posts to the same host over http or https.
+  return fetch(relayHttpUrl(config.url), {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -744,7 +762,9 @@ async function sendRelayHttp(options: {
 
 function toWebSocketUrl(url: string, token: string) {
   const parsed = new URL(url)
-  parsed.protocol = parsed.protocol === 'http:' ? 'ws:' : 'wss:'
+  // A plain relay stays plain and a TLS relay stays TLS.
+  parsed.protocol =
+    parsed.protocol === 'http:' || parsed.protocol === 'ws:' ? 'ws:' : 'wss:'
   parsed.pathname = '/ws'
   parsed.searchParams.set('token', token)
   return parsed.toString()
@@ -1836,23 +1856,37 @@ function cleanupRelaySessionCaches(now = Date.now()) {
     sessionState.delete(oldest)
   }
 
-  for (const [affinity, session] of websocketSessions) {
+  for (const [key, session] of websocketSessions) {
     if (session.canEvict(now)) {
       session.dispose()
-      websocketSessions.delete(affinity)
+      websocketSessions.delete(key)
     }
   }
   while (websocketSessions.size > MAX_RELAY_WEBSOCKET_SESSIONS) {
     let evicted = false
-    for (const [affinity, session] of websocketSessions) {
+    for (const [key, session] of websocketSessions) {
       if (!session.canEvict(now)) continue
       session.dispose()
-      websocketSessions.delete(affinity)
+      websocketSessions.delete(key)
       evicted = true
       break
     }
     if (!evicted) break
   }
+}
+
+/**
+ * A WebSocket session serves one affinity on one relay with one token. A
+ * changed relay URL or token gets a new session, so a request is never sent
+ * over a socket to the old relay or with the old token; the old session is
+ * evicted once idle, like any other. The token appears only as a hash.
+ */
+function websocketSessionKey(config: RelayConfig, affinity: string): string {
+  return JSON.stringify([
+    affinity,
+    config.url,
+    createHash('sha256').update(config.token).digest('hex'),
+  ])
 }
 
 function getPersistentRelaySession(
@@ -1861,13 +1895,14 @@ function getPersistentRelaySession(
   timers: RelayTimerImplementations,
 ) {
   cleanupRelaySessionCaches()
-  const existing = websocketSessions.get(affinity)
+  const key = websocketSessionKey(config, affinity)
+  const existing = websocketSessions.get(key)
   if (existing) {
     existing.touch()
     return existing
   }
   const session = new PersistentRelaySession(config, affinity, timers)
-  websocketSessions.set(affinity, session)
+  websocketSessions.set(key, session)
   cleanupRelaySessionCaches()
   return session
 }
@@ -1926,6 +1961,13 @@ export async function sendViaRelay(options: {
   } = options
   requireUpstreamUrl?.(input instanceof Request ? input.url : input.toString())
   if (!config || !isRelayableAnthropicRequest(input, body)) return fallback()
+  if (relayProxyApplies(config.url)) {
+    // Nothing is sent to the relay. Like a relay that cannot be reached, this
+    // goes direct when fallbackToDirect allows it and fails otherwise.
+    warnRelayProxyRefused()
+    if (config.fallbackToDirect) return fallback()
+    throw new Error(RELAY_PROXY_REFUSAL)
+  }
 
   const affinity =
     explicitAffinity ||

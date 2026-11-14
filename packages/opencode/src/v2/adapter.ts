@@ -42,7 +42,9 @@ import {
   type ProviderErrorResponseScope,
   type ProviderResponseMode,
   prepareMessageThreadRequest,
+  RELAY_PROXY_REFUSAL,
   type RequestGzipLatch,
+  relayProxyApplies,
   remapModelId,
   remapRequestBodyModel,
   reportAnthropicBillingFailure,
@@ -1594,6 +1596,10 @@ export function createNativeAnthropicAdapter<Q, P>(
           }
           let response: Response
           if (dispatch?.kind === 'http-relay') {
+            // Checked again at send time: the dispatch was chosen before a
+            // proxy setting could have appeared.
+            if (relayProxyApplies(dispatch.url))
+              throw new Error(RELAY_PROXY_REFUSAL)
             const envelope = {
               protocol: 1,
               type: 'request',
@@ -1718,6 +1724,9 @@ export function createNativeAnthropicAdapter<Q, P>(
         dropDumpContext(data)
       }
       assertHostAuthorityStable()
+      // Checked again at send time: the dispatch was chosen before a proxy
+      // setting could have appeared.
+      if (relayProxyApplies(dispatch.url)) throw new Error(RELAY_PROXY_REFUSAL)
       const clientRequestId = headers.get('x-client-request-id')
       const relayRequest = new Request(dispatch.url, {
         method: 'POST',

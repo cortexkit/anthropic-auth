@@ -50,7 +50,10 @@ import {
   type PublicationOptions,
   renameWithWindowsSharingRetry,
 } from './publication-rename.ts'
-import { RELAY_SAVE_REFUSAL } from './relay-location.ts'
+import {
+  RELAY_SAVE_HOME_UNKNOWN_REFUSAL,
+  RELAY_SAVE_REFUSAL,
+} from './relay-location.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
 
 const withLock = observeNativeLocks(() => acquireLock)
@@ -149,7 +152,8 @@ export class NativeRuntimeError extends Error {
       | 'runtime-conflict'
       | 'publication-refused'
       | 'relay-inconsistent'
-      | 'relay-not-default-location',
+      | 'relay-not-default-location'
+      | 'relay-account-home-unknown',
   ) {
     super(
       {
@@ -163,6 +167,7 @@ export class NativeRuntimeError extends Error {
         'relay-inconsistent':
           'request refused: relay configuration is inconsistent; no request was sent',
         'relay-not-default-location': RELAY_SAVE_REFUSAL,
+        'relay-account-home-unknown': RELAY_SAVE_HOME_UNKNOWN_REFUSAL,
       }[code],
     )
     this.name = 'NativeRuntimeError'

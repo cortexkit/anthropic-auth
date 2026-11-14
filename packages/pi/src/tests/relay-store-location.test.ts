@@ -4,14 +4,14 @@
 // bearer Thalamus hands out is sent directly to Anthropic and never to the
 // relay the moved store names.
 import { expect } from 'bun:test'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import { TEST_RELAY_ACCOUNT_HOME_KEY } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
-import { closePiNativeRuntime } from '../native.ts'
+import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
 import { trackPiTestBody } from './setup.ts'
@@ -80,20 +80,35 @@ const keys = [
   'PI_CODING_AGENT_DIR',
   'PI_AGENT_DIR',
   'PI_ANTHROPIC_AUTH_FILE',
+  'PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE',
   'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
   'CORTEXKIT_VAULT_HOST',
+  'HTTP_PROXY',
+  'http_proxy',
+  'NO_PROXY',
+  'no_proxy',
 ]
 
+interface RunOptions {
+  /** Thalamus custody (the default), or Pi's own vault enrollment. */
+  readonly custody?: 'hosted' | 'vault'
+  readonly fallbackToDirect?: boolean
+  /** Sets a proxy setting that would carry plain-http requests. */
+  readonly proxy?: boolean
+}
+
 /**
- * Pi under Thalamus, with a relay saved in a store at `storeDir` and the OS
- * account home stubbed to `home`; `point` sets the variables that select the
- * store. Returns what the relay and the mock Anthropic API received.
+ * Pi with vault or Thalamus custody, a relay saved in a store at `storeDir`
+ * and the OS account home stubbed to `home`; `point` sets the variables that
+ * select the store. Returns what the relay and the mock Anthropic API
+ * received.
  */
 async function run(
   base: string,
   storeDir: string,
   home: string,
   point: () => void,
+  options: RunOptions = {},
 ) {
   await mkdir(storeDir, { recursive: true, mode: 0o700 })
   const storagePath = join(storeDir, 'anthropic-auth.json')
@@ -143,8 +158,18 @@ async function run(
     primary: false,
   })
   core.resetVaultHostAuthorityForTests?.()
-  process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
-  globals[vaultKey] = () => userHostedVault()
+  if (options.custody === 'vault') {
+    const tokenPath = join(base, 'pi-enrollment.json')
+    await writeFile(
+      tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    process.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE = tokenPath
+  } else {
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    globals[vaultKey] = () => userHostedVault()
+  }
   {
     // Saved while the preload skips the location check, as a store
     // prepared by someone else would be.
@@ -162,7 +187,7 @@ async function run(
         url: relayUrl,
         token: 'relay-token',
         transport: 'http',
-        fallbackToDirect: false,
+        fallbackToDirect: options.fallbackToDirect ?? false,
       })
     } finally {
       await runtime.close()
@@ -177,6 +202,14 @@ async function run(
   ])
     delete process.env[key]
   point()
+  // Nothing listens there; the proxy must never be reached.
+  if (options.proxy) process.env.HTTP_PROXY = 'http://127.0.0.1:9'
+  // Pi's own vault custody connects through the runtime this stream uses.
+  if (options.custody === 'vault')
+    getPiNativeRuntime(storagePath, {
+      connect: async () => userHostedVault() as never,
+      vaultPoll: { intervalMs: 0 },
+    })
   const direct: string[] = []
   globalThis.fetch = Object.assign(
     async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -234,20 +267,52 @@ for (const variable of [
     25_000,
   )
 
+for (const custody of ['hosted', 'vault'] as const)
+  lifetimes.test(
+    `Pi ${custody}: a relay in the default store is still used`,
+    () =>
+      trackPiTestBody(
+        (async () => {
+          const base = await mkdtemp(join(tmpdir(), 'pi-relay-location-'))
+          const home = join(base, 'home')
+          const agentDir = join(home, '.pi', 'agent')
+          const { result, seen, direct } = await run(
+            base,
+            agentDir,
+            home,
+            () => {
+              process.env.PI_CODING_AGENT_DIR = agentDir
+            },
+            { custody },
+          )
+          expect(result.stopReason).toBe('stop')
+          expect(seen).toEqual([`Bearer ${BEARER}`])
+          expect(direct).toEqual([])
+        })(),
+      ),
+    25_000,
+  )
+
 lifetimes.test(
-  'Pi hosted: a relay in the default store is still used',
+  'Pi hosted: a plain-http relay in the default store that a proxy setting would carry is not used',
   () =>
     trackPiTestBody(
       (async () => {
         const base = await mkdtemp(join(tmpdir(), 'pi-relay-location-'))
         const home = join(base, 'home')
         const agentDir = join(home, '.pi', 'agent')
-        const { result, seen, direct } = await run(base, agentDir, home, () => {
-          process.env.PI_CODING_AGENT_DIR = agentDir
-        })
+        const { result, seen, direct } = await run(
+          base,
+          agentDir,
+          home,
+          () => {
+            process.env.PI_CODING_AGENT_DIR = agentDir
+          },
+          { fallbackToDirect: true, proxy: true },
+        )
         expect(result.stopReason).toBe('stop')
-        expect(seen).toEqual([`Bearer ${BEARER}`])
-        expect(direct).toEqual([])
+        expect(seen).toEqual([])
+        expect(direct).toEqual([`Bearer ${BEARER}`])
       })(),
     ),
   25_000,

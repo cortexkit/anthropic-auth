@@ -34,6 +34,7 @@ import {
   nativeAccountPolicy,
   type ProviderAccountUuid,
   quotaSnapshotPassesPolicy,
+  RELAY_PROXY_REFUSAL,
   readNativeAccountsForRequest,
   readNativeEnrollmentMode,
   resetVaultHostAuthorityForTests,
@@ -5280,5 +5281,47 @@ describe('OC2 relay from a store outside its default place', () => {
       url: relay.url,
       token: relay.token,
     })
+  })
+
+  test('vault mode, store in its default place: a plain-http relay a proxy setting would carry is not used', async () => {
+    const saved = ['HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy'].map(
+      (key) => [key, process.env[key]] as const,
+    )
+    cleanups.push(() => {
+      for (const [key, value] of saved)
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+    })
+    for (const [key] of saved) delete process.env[key]
+    const f = await vault()
+    const plain = { ...relay, url: 'http://127.0.0.1:9/relay' }
+    const accountHome = await home()
+    await mkdir(join(accountHome, '.config'))
+    await symlink(
+      dirname(f.paths.legacyConfig),
+      join(accountHome, '.config', 'opencode'),
+    )
+    hook[TEST_RELAY_ACCOUNT_HOME_KEY] = () => accountHome
+    const dispatch = async () => {
+      const native = source(f.runtime, f.paths)
+      expect(await native.chooseAccount(scope)).toBe('main')
+      const auth = await native.authorizeAccount(scope, 'main')
+      if (!auth) throw new Error('Native authorization refused')
+      return auth.dispatch
+    }
+    await f.runtime.updateRelay({ ...plain, fallbackToDirect: true })
+    expect(await dispatch()).toEqual({
+      kind: 'http-relay',
+      url: plain.url,
+      token: plain.token,
+    })
+    process.env.HTTP_PROXY = 'http://proxy.example.test:8080'
+    // With fallbackToDirect the request goes direct; without it, it fails.
+    expect(await dispatch()).toEqual({ kind: 'direct' })
+    expect(f.runtime.getRelayStatusNotes?.()).toEqual([RELAY_PROXY_REFUSAL])
+    await f.runtime.updateRelay({ fallbackToDirect: false })
+    await expect(dispatch()).rejects.toThrow(RELAY_PROXY_REFUSAL)
+    process.env.NO_PROXY = '127.0.0.1'
+    expect(await dispatch()).toMatchObject({ kind: 'http-relay' })
   })
 })
