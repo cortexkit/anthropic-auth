@@ -665,11 +665,6 @@ async function prepareNativeAccounts(input: {
       throw new Error(
         'A vault fixture must activate through its real auth.json',
       )
-      // This store lives in a temporary folder, never in the account's default
-      // place; skip the relay location check so a fixture relay can be saved.
-    ;(globalThis as Record<symbol, unknown>)[
-      Symbol.for('cortexkit.anthropic-auth.test-only.relay-account-home')
-    ] = 'unchecked'
     const runtime = createNativeAccountRuntime({
       paths,
       host: 'opencode',
