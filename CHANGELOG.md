@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.12.0
 
 - OpenCode 1, OpenCode 2 and Pi now share one settings file, `anthropic-auth.jsonc`, that you can edit by hand, with per-host and per-model overrides. Existing settings move into it once, automatically, after every running copy is updated and can be checked. With a custom `XDG_CONFIG_HOME` or an explicit settings file path (`ANTHROPIC_AUTH_SETTINGS_FILE`), each host moves only its own settings. Only your own user file is read, never a project file. See [the settings file](docs/settings-file.md).
 - Moving settings never weakens protection: each host keeps at least its own effective killswitch, quota-floor, unknown-quota and same-account wait protection, including defaults. The same checks cover adopting the file while running, setup and recreating a missing file. If protection cannot be read, the host keeps its old settings or refuses the write.
@@ -12,6 +12,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Storage paths no longer resolve incorrectly on Linux while another process is saving.
 - Changing effort no longer drops the thread tail cache marker on a full request after continuations.
 - Vault enrollment now refuses unsafe token folders even during token replacement or when folder safety checks fail.
+
 ## 2.11.4
 
 - OpenCode 2 now preserves billing reports for thread-recovery resends even when the host finishes the rejected request before its resend returns.
