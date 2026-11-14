@@ -3,6 +3,7 @@ import {
   authorize,
   buildClaudeQuotaSummary,
   buildPrimeAccountStatuses,
+  claudeGatewayIgnoredNote,
   DEFAULT_KILLSWITCH_THRESHOLDS,
   exchange,
   executeCacheKeepCommand,
@@ -407,7 +408,7 @@ export function createPiNativeCommands(
           ),
           ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
           ...(file.gatewayIgnored
-            ? ['Gateway ignored: settings file is not in its default location']
+            ? [claudeGatewayIgnoredNote(file.gatewayIgnored)]
             : []),
           'Settings (no model):',
           ...Object.entries(status.values).map(

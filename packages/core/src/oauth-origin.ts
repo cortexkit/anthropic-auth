@@ -105,9 +105,10 @@ function fetchInputUrl(input: Parameters<typeof fetch>[0]): string {
 
 /**
  * A fetch for OAuth sends. It checks each URL with
- * requireAnthropicOAuthOrigin before dispatch and always sets
+ * requireAnthropicOAuthOrigin before dispatch, always sets
  * `redirect: 'error'`, so an approved destination cannot forward the token
- * elsewhere with a redirect. It calls the global fetch at call time, so test
+ * elsewhere with a redirect, and drops any `tls` option, so certificate
+ * checks always apply. It calls the global fetch at call time, so test
  * stubs installed later still apply. Options are read on every call when
  * given as a function.
  */
@@ -131,7 +132,14 @@ export function createAnthropicOAuthFetch(
       signal?.throwIfAborted()
       requireAnthropicOAuthOrigin(fetchInputUrl(input), current())
       const sentAt = performance.now()
-      const response = await fetch(input, { ...init, redirect: 'error' })
+      // Bun's `tls` option can turn certificate checks off (OpenCode 1 once
+      // did so when ANTHROPIC_INSECURE was set), and the environment can come
+      // from a repository's `.env`. An OAuth send always uses the default
+      // checks, so an on-path attacker cannot take the token.
+      const { tls: _tls, ...checked } = (init ?? {}) as RequestInit & {
+        tls?: unknown
+      }
+      const response = await fetch(input, { ...checked, redirect: 'error' })
       return copyStreamResponseTiming(response, response, sentAt)
     },
     {

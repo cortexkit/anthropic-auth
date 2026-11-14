@@ -7,6 +7,7 @@ import {
   buildPrimeStatusSummary,
   type CacheKeepSessionRegistry,
   CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
+  claudeGatewayIgnoredNote,
   effectiveRelayTransport,
   exchange,
   formatNativeAccountState,
@@ -144,7 +145,7 @@ export function createNativeMenuCapabilities(options: {
       ),
       ...file.duplicateKeys.map((key) => `Duplicate setting: ${key}`),
       ...(file.gatewayIgnored
-        ? ['Gateway ignored: settings file is not in its default location']
+        ? [claudeGatewayIgnoredNote(file.gatewayIgnored)]
         : []),
       'Settings (no model):',
       ...Object.entries(status.values).map(
