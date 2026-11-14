@@ -522,6 +522,55 @@ for (const offHost of ['opencode', 'pi'] as const) {
   })
 }
 
+// Floors a host stored while its killswitch was off held no account back.
+// Once the other host's killswitch is on, the off host inherits that `on`, so
+// its stored floors and account rows would become live protection; they are
+// not carried. When every source is off they stay as stored (see the vault
+// floor tests above).
+for (const enabled of ['omitted', 'false'] as const) {
+  test(`floors OpenCode stored with its killswitch ${enabled === 'omitted' ? 'unset' : 'off'} are not carried beside Pi's enabled killswitch`, async () => {
+    const settings = {
+      opencode: {
+        killswitch: {
+          ...(enabled === 'false' ? { enabled: false } : {}),
+          main: { five_hour: 1, seven_day: 1 },
+          accounts: { 'vault:A': { five_hour: 50, seven_day: 50 } },
+        },
+      },
+      // Pi's killswitch is on at its implicit floors 5/10.
+      pi: { killswitch: { enabled: true } },
+    }
+    const f = await move(
+      (['opencode', 'pi'] as const).map((host) => ({
+        host,
+        settings: settings[host],
+      })),
+    )
+    expect(f.result.outcome).toBe('moved')
+    const document = parse(await readFile(f.file, 'utf8'))
+    expect(document.killswitch_account_floors).toBeUndefined()
+    const resolved = await resolve(f.file)
+    const floors = {
+      killswitch_default_five_hour: 5,
+      killswitch_default_seven_day: 10,
+    }
+    expect(resolved.service.resolve('pi')).toMatchObject({
+      killswitch_enabled: true,
+      ...floors,
+    })
+    // OpenCode is on only if it inherits Pi's value, and then at Pi's floors,
+    // never at the 1/1 it stored while off.
+    expect(resolved.service.resolve('opencode')).toMatchObject({
+      killswitch_enabled: enabled === 'omitted',
+      ...floors,
+    })
+    for (const host of ['opencode', 'pi'] as const)
+      expect(
+        getKillswitchThresholdsForAccount(resolved.record(host), 'vault:A'),
+      ).toEqual({ five_hour: 5, seven_day: 10, scoped: 0 })
+  })
+}
+
 test('absent sources and absent account settings do not seed a list, while an explicit empty list is carried', () => {
   expect(
     mapSettingsMoveSources([

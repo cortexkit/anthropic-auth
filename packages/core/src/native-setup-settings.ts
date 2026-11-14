@@ -15,7 +15,10 @@ import {
   SETTINGS_WRITE_FAILURES,
   type SettingsKey,
 } from './settings-definition.ts'
-import { planSettingsHostImport } from './settings-host-import.ts'
+import {
+  KILLSWITCH_FLOOR_KEYS,
+  planSettingsHostImport,
+} from './settings-host-import.ts'
 import {
   resolveSettingsMode,
   type SettingsModeOptions,
@@ -211,12 +214,25 @@ function planSetupEdits(input: {
     resolved,
     fileLevels: levels,
   })
+  // Floors protect only while the killswitch is on. This host's stored floors
+  // held no account back if its legacy killswitch was off; when the file has
+  // the killswitch on for any host they would become live protection (this
+  // host's, or the other host's through the default level), so they are
+  // reported as not written instead of filled.
+  const dropFloors =
+    !legacy.killswitch_enabled &&
+    (resolved.killswitch_enabled ||
+      (['opencode', 'pi'] as const).some(
+        (each) => snapshot.protection[each].values.killswitch_enabled,
+      ))
   const filled = new Set<SettingsKey>()
   for (const key of Object.keys(values) as SettingsKey[]) {
     if (key === 'killswitch_account_floors') continue
     const value = values[key]
     const keyLevels = levels[key] ?? []
-    if (!keyLevels.length && !(missing && protectionKeys.has(key))) {
+    if (dropFloors && KILLSWITCH_FLOOR_KEYS.has(key))
+      skip(key, value, resolved[key as ProtectionKey])
+    else if (!keyLevels.length && !(missing && protectionKeys.has(key))) {
       filled.add(key)
       edits.push(fill(key, value))
     } else if (protectionKeys.has(key)) {
@@ -279,8 +295,13 @@ function planSetupEdits(input: {
     const kept = (floors as AccountFloor[]).find(
       (existing) => existing.account === entry.account && own(existing),
     )
-    if (kept)
-      skip(floorsKey, thresholds(entry), thresholds(kept), entry.account)
+    if (kept || dropFloors)
+      skip(
+        floorsKey,
+        thresholds(entry),
+        kept && thresholds(kept),
+        entry.account,
+      )
     else appended.push({ ...entry, host })
   }
   if (appended.length)

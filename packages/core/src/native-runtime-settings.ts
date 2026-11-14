@@ -10,7 +10,12 @@ import {
   differingLegacySettings,
   settingsNotImportedText,
 } from './settings-authority.ts'
-import { type SettingsKey, settingsDefinition } from './settings-definition.ts'
+import {
+  type SettingsKey,
+  settingsCheckPendingText,
+  settingsDefinition,
+  settingsFileUnusableText,
+} from './settings-definition.ts'
 import {
   getSettingsAdoptionCheck,
   isSettingsImportPending,
@@ -24,12 +29,13 @@ import {
   overlaySettingsProtection,
   resolveSettingsRecord,
 } from './settings-record.ts'
-import type {
-  SettingsFileStatus,
-  SettingsGeneration,
-  SettingsService,
-  SettingsUpdate,
-  SettingsValues,
+import {
+  type SettingsFileStatus,
+  type SettingsGeneration,
+  type SettingsService,
+  type SettingsUpdate,
+  type SettingsValues,
+  settingsFileProblem,
 } from './settings-service.ts'
 import type {
   SettingsProtectionFallback,
@@ -116,6 +122,16 @@ export function createNativeRuntimeSettings(
     if (current.status === 'missing') pinned = current
     return pinned
   }
+  /**
+   * True while this host uses a missing file whose import it owes and a file
+   * has appeared that its import check has not passed: requests keep the
+   * pinned missing-file reading, and a menu write must not land in the file
+   * this host has not imported.
+   */
+  const heldByCheck = () =>
+    importPending &&
+    generation() !== undefined &&
+    service?.snapshot().status !== 'missing'
 
   function resolve(stored: AccountStorage, model?: string): AccountStorage
   function resolve(
@@ -322,7 +338,25 @@ export function createNativeRuntimeSettings(
      * The settings file while it is open but this host does not use it yet
      * (its import check has not passed), else undefined.
      */
-    checkingFile: () => (service && !generation() ? service.file : undefined),
+    checkingFile: () =>
+      service && (!generation() || heldByCheck()) ? service.file : undefined,
+    /**
+     * Why a menu write is refused while `checkingFile` is set. A file that
+     * can't be used stays held until the user fixes it, so the text names its
+     * problem; any other hold (the check running, a busy lock, an unreadable
+     * legacy store) clears by itself.
+     */
+    checkingRefusal(): string {
+      const file = service?.file
+      const current = service?.snapshot()
+      const problem =
+        current && current.status !== 'missing'
+          ? settingsFileProblem(current, options.host)
+          : undefined
+      return problem
+        ? settingsFileUnusableText(problem, file)
+        : settingsCheckPendingText(file)
+    },
     /**
      * Called under the legacy store's locks by a write that chose the legacy
      * store: true when the user file became authoritative meanwhile (a move
@@ -348,7 +382,7 @@ export function createNativeRuntimeSettings(
       if (!service) return undefined
       await ready
       await recheck()
-      return generation() ? service : undefined
+      return generation() && !heldByCheck() ? service : undefined
     },
     async legacyWriteCommitted(
       source: string,

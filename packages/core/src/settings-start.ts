@@ -187,6 +187,9 @@ export async function startSettings(
     host: options.host,
     protection: options.protection,
     lockTimeoutMs: options.lockTimeoutMs,
+    // Until this host adopts the file, a missing or unusable file recovers
+    // its protection from the ladder, never from a set the file once held.
+    adopted: () => adopted,
     // A host's own open seam (used by host tests) spreads its own service
     // dependencies over these options, so it keeps them and its copy writer.
     ...(options.start?.open ? {} : { dependencies: { writeAppliedCopy } }),

@@ -28,8 +28,10 @@ import {
   SETTINGS_WRITE_FAILURES,
   settingsCheckPendingText,
   settingsDefinition,
+  settingsFileUnusableText,
 } from '../settings-definition.ts'
 import {
+  markSettingsImportPending,
   resolveSettingsMode,
   type SettingsAdoptionCheck,
   type SettingsMode,
@@ -72,6 +74,8 @@ async function fixture(
     beforeUpdate?: () => Promise<void>
     /** The import check a runtime must pass before it uses the file. */
     adoption?: SettingsAdoptionCheck
+    /** The runtime starts on a missing file whose import it still owes. */
+    importPending?: boolean
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'native-settings-write-'))
@@ -175,6 +179,7 @@ async function fixture(
   if (!service) throw new Error('Settings service unavailable')
   cleanup.push(() => service.dispose())
   if (options.adoption) setSettingsAdoptionCheck(service, options.adoption)
+  if (options.importPending) markSettingsImportPending(service)
   let failStore = false
   const runtime = createNativeAccountRuntime({
     paths,
@@ -221,6 +226,17 @@ async function fixture(
       return read.settings
     },
   }
+}
+
+/**
+ * Pi uses the same file in this process: its own lease records Pi's set, and
+ * a recreation carries that set for Pi. A set merely read from the file is
+ * never the other host's protection, since that host may not have adopted it.
+ */
+async function adoptPeer(file: string) {
+  const peer = await openSettingsService({ file, host: 'pi' })
+  if (!peer) throw new Error('Peer service unavailable')
+  cleanup.push(() => peer.dispose())
 }
 
 test('menu writes only cache_keep_subagents and preserves real JSONC comments, order and unknown keys', async () => {
@@ -815,6 +831,25 @@ test('recreation with differing peers writes host levels and each host resolves 
   ])
 })
 
+test("a recreation carries the other host's own legacy set, never that host's set read from a file it may not have adopted", async () => {
+  // Pi's set in the deleted file is weaker than Pi's own store, and no Pi
+  // lease in this process adopted the file.
+  const f = await fixture('{"killswitch_enabled":false}', {
+    legacy: { killswitch: { enabled: false } },
+    peerLegacy: { killswitch: { enabled: true, main: { five_hour: 61 } } },
+  })
+  await rm(f.file)
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: true }
+  })
+  expect(result.outcome).toBe('saved')
+  expect(parse(await f.text())).toMatchObject({
+    killswitch_enabled: { default: false, pi: true },
+    killswitch_default_five_hour: { pi: 61 },
+    dump_enabled: true,
+  })
+})
+
 test('recreation carries plain values when both hosts apply the same protection set', async () => {
   const floors = [
     {
@@ -841,6 +876,7 @@ test('recreation carries plain values when both hosts apply the same protection 
       killswitch_account_floors: floors,
     }),
   )
+  await adoptPeer(f.file)
   await rm(f.file)
   const result = await f.runtime.updateSettings((settings) => {
     settings.dump = { enabled: true }
@@ -1015,6 +1051,7 @@ test('a failed copy write never replaces the applied protection carried by a rec
       failCopy: true,
     },
   )
+  await adoptPeer(f.file)
   const old = legacySettingsProtection({}, 'opencode')
   await writeSettingsProtectionCopy(f.file, 'opencode', {
     readAt: 1,
@@ -1961,6 +1998,7 @@ test('a floor edit during the missing-file grace recreates the file instead of f
       ],
     }),
   )
+  await adoptPeer(f.file)
   await rm(f.file)
   await f.service.refresh()
   // The deleted file's generation stays published for the 2 s grace.
@@ -2040,6 +2078,7 @@ test('the writer lock observes a deletion after protection was gathered', async 
     beforeUpdate: () => rm(file),
   })
   file = f.file
+  await adoptPeer(f.file)
   const result = await f.runtime.updateSettings((settings) => {
     settings.dump = { enabled: true }
   })
@@ -2087,3 +2126,60 @@ test('a menu write while the import check holds this host on legacy is refused w
   expect(await f.text()).toBe(before)
   expect((await f.saved()).dump).toEqual({ enabled: true })
 })
+
+test('a menu write while the import check holds this host on an unusable file names the problem instead of asking to retry', async () => {
+  const f = await fixture('', {
+    mode: 'legacy',
+    legacy: { dump: { enabled: true } },
+    // An empty file can't be checked against this host's legacy settings.
+    adoption: async () => false,
+    settingsAuthority: { schedule: () => () => {} },
+  })
+  const result = await f.runtime.updateSettings((settings) => {
+    settings.dump = { enabled: false }
+  })
+  expect(result).toMatchObject({
+    outcome: 'refused',
+    reason: settingsFileUnusableText('is empty', f.file),
+  })
+  expect(await f.text()).toBe('')
+  expect((await f.saved()).dump).toEqual({ enabled: true })
+})
+
+// A host that uses a missing file whose import it still owes keeps the
+// missing-file reading while a file that then appears waits for its import
+// check; a menu write must not land in that file and report success.
+for (const appeared of ['usable', 'empty', 'invalid'] as const) {
+  test(`a menu write while ${appeared === 'usable' ? 'a usable' : `an ${appeared}`} file that appeared over a missing one awaits this host's import is refused, leaving both sources alone`, async () => {
+    const f = await fixture(null, {
+      legacy: { dump: { enabled: true } },
+      adoption: async (service) =>
+        service.snapshot().status === 'missing' ? 'pending' : false,
+      importPending: true,
+      settingsAuthority: { schedule: () => () => {} },
+    })
+    const source = {
+      usable: '{"dump_enabled":false}',
+      empty: '',
+      invalid:
+        '{"quota_fail_closed_on_unknown_quota":"sometimes","dump_enabled":false}',
+    }[appeared]
+    await writeFile(f.file, source)
+    const result = await f.runtime.updateSettings((settings) => {
+      settings.dump = { enabled: false }
+    })
+    expect(result).toMatchObject({
+      outcome: 'refused',
+      reason: {
+        usable: settingsCheckPendingText(f.file),
+        empty: settingsFileUnusableText('is empty', f.file),
+        invalid: settingsFileUnusableText(
+          'has an invalid value for quota_fail_closed_on_unknown_quota',
+          f.file,
+        ),
+      }[appeared],
+    })
+    expect(await f.text()).toBe(source)
+    expect((await f.saved()).dump).toEqual({ enabled: true })
+  })
+}

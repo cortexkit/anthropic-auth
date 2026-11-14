@@ -17,6 +17,7 @@ import { CLAUDE_MODEL_CAPABILITIES } from '../model-capabilities.ts'
 import { acquireNativeAccountRuntime } from '../native-account-runtime.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { settingsDefinition } from '../settings-definition.ts'
+import type { SettingsHost } from '../settings-paths.ts'
 import {
   readSettingsProtectionCopy,
   writeSettingsProtectionCopy,
@@ -781,8 +782,11 @@ test('a file still missing after 2 s publishes defaults once without waiting on 
   )
   const timer = manualTimer()
   // A host's lease logs the missing file, saying what its menu write would do.
+  // OpenCode never ran here, so Pi's write would recreate the file with its
+  // own set.
   const service = await f.open({
     host: 'pi',
+    protection: { readPeerLegacyProtection: async () => undefined },
     dependencies: { ...f.options.dependencies, schedule: timer.schedule },
   })
   await rm(f.file)
@@ -1140,21 +1144,23 @@ test("two runtime leases sharing an unusable target recover their own stores, ne
 test('process memory outranks an older copy, including a new lease on a shared handle', async () => {
   const f = await fixture(JSON.stringify(distinctProtection))
   let recoveryReads = 0
+  // Only a host's own lease records its last-good set, so both leases act
+  // for Pi and only Pi's recovery is counted.
   const protection = {
-    readAppliedCopy: async () => {
-      recoveryReads++
+    readAppliedCopy: async (host: SettingsHost) => {
+      if (host === 'pi') recoveryReads++
       return { ...distinctProtection, killswitch_enabled: false }
     },
-    readLegacyProtection: async () => {
-      recoveryReads++
+    readLegacyProtection: async (host: SettingsHost) => {
+      if (host === 'pi') recoveryReads++
       return undefined
     },
   }
-  const first = await f.open({ protection })
+  const first = await f.open({ host: 'pi', protection })
   expect(recoveryReads).toBe(0)
   await writeFile(f.file, '{broken')
   await first.refresh()
-  const second = await f.open({ protection })
+  const second = await f.open({ host: 'pi', protection })
   for (const service of [first, second]) {
     expect(protectionOf(service.resolve('pi'))).toEqual(distinctProtection)
     expect(service.snapshot().protection.pi.rung).toBe(1)

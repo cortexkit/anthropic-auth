@@ -352,6 +352,18 @@ export function settingsCheckPendingText(file?: string): string {
   return `Settings were not changed: ${file ? `the settings file "${resolve(file)}"` : 'the settings file'} is still being checked against this host's settings. Try again shortly.`
 }
 
+/**
+ * A menu write while this host can't use the settings file until the user
+ * fixes it. `problem` says what is wrong in plain words, such as "is empty";
+ * it never quotes a value from the file.
+ */
+export function settingsFileUnusableText(
+  problem: string,
+  file?: string,
+): string {
+  return `Settings were not changed: ${file ? `the settings file "${resolve(file)}"` : 'the settings file'} ${problem}. Fix the file to change settings.`
+}
+
 /** Only fixed, local text is shown; dependency errors can contain file contents. */
 export const SETTINGS_WRITE_FAILURES = {
   'settings-unparseable': {

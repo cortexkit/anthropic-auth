@@ -132,10 +132,7 @@ import {
   nativeRelocationGuard,
   type RelocationGuard,
 } from './relocation-guard.ts'
-import {
-  SETTINGS_WRITE_FAILURES,
-  settingsCheckPendingText,
-} from './settings-definition.ts'
+import { SETTINGS_WRITE_FAILURES } from './settings-definition.ts'
 import { getSettingsFilePath } from './settings-paths.ts'
 import { SettingsRecreationRefusal } from './settings-service.ts'
 import { StickySessionRouter } from './sticky-routing.ts'
@@ -1629,7 +1626,7 @@ function buildNativeAccountRuntime(
           return {
             settings: runtimeSettings.resolve(result.settings),
             outcome: 'refused',
-            reason: settingsCheckPendingText(runtimeSettings.checkingFile()),
+            reason: runtimeSettings.checkingRefusal(),
           }
         return runtime.updateSettings(mutator)
       }

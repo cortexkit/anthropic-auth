@@ -34,10 +34,24 @@ export function mapSettingsMoveSources(sources: LegacySource[]): MapResult {
     pi: [],
   }
   let accountSource: number | undefined
+  // Floors protect only while the killswitch is on. A host whose killswitch
+  // was off stored floors that held no account back; once another source's
+  // killswitch is on they would become live protection (this host inherits
+  // that `on`, and a first source's floors become the default the other host
+  // inherits), so they are not carried. When every source is off they stay
+  // as stored, protecting no one.
+  const live = sources.some(killswitchOn)
   for (const [source, legacy] of sources.entries()) {
     if (!legacy.present) continue
+    const dropFloors = live && !killswitchOn(legacy)
     const values = legacy.value as Partial<SettingsValues>
     for (const [setting, value] of Object.entries(values)) {
+      if (
+        dropFloors &&
+        (KILLSWITCH_FLOOR_KEYS.has(setting) ||
+          setting === 'killswitch_account_floors')
+      )
+        continue
       if (setting === 'killswitch_account_floors') {
         accountSource ??= source
         floors[legacy.host as 'opencode' | 'pi'] =
@@ -75,6 +89,16 @@ export function mapSettingsMoveSources(sources: LegacySource[]): MapResult {
     })
   }
   return { entries, unmapped: [] }
+}
+
+/** A source's effective legacy killswitch: its stored value, or its reader's default. */
+function killswitchOn(legacy: LegacySource): boolean {
+  if (!legacy.present) return false
+  return (
+    ((legacy.value as Partial<SettingsValues>).killswitch_enabled ??
+      legacySettingsProtection({}, legacy.host as 'opencode' | 'pi')
+        .killswitch_enabled) === true
+  )
 }
 
 /**
@@ -116,13 +140,7 @@ function keepImplicitProtection(
       // Killswitch floors protect only while the killswitch is on: a host
       // whose killswitch was off held no account back, so its default
       // floors are no protection to carry.
-      if (
-        KILLSWITCH_FLOOR_KEYS.has(setting) &&
-        ((legacy.value as Partial<SettingsValues>).killswitch_enabled ??
-          legacySettingsProtection({}, legacy.host as 'opencode' | 'pi')
-            .killswitch_enabled) !== true
-      )
-        continue
+      if (KILLSWITCH_FLOOR_KEYS.has(setting) && !killswitchOn(legacy)) continue
       if (settingsProtectionStricter(setting, implicit, inherited.value))
         added.push({ source, setting, value: implicit })
     }

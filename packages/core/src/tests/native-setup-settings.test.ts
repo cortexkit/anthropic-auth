@@ -467,6 +467,40 @@ for (const tag of ['both', 'pi'] as const) {
   })
 }
 
+// Floors a host stored while its killswitch was off held no account back.
+// When the file has the killswitch on for any host, filling them would make
+// them live: OpenCode writes the default level, which Pi inherits here.
+test('setup does not fill floors or account rows stored with the killswitch off when the file has it on', async () => {
+  const f = await fixture('opencode', {
+    killswitch: {
+      main: { five_hour: 50, seven_day: 50 },
+      accounts: { 'row-1': { five_hour: 60 } },
+    },
+  })
+  await writeFile(f.paths.target, '{ "killswitch_enabled": { "pi": true } }')
+  const result = await f.write()
+  expect(result.outcome).toBe('saved')
+  const file = await contents(f.paths.target)
+  expect(file).toEqual({ killswitch_enabled: { pi: true } })
+  expect(result.skipped).toEqual(
+    expect.arrayContaining([
+      'killswitch_default_five_hour',
+      'killswitch_default_seven_day',
+      'killswitch_account_floors',
+    ]),
+  )
+  const service = await openSettingsService({ file: f.paths.target })
+  try {
+    expect(service?.resolve('pi')).toMatchObject({
+      killswitch_enabled: true,
+      killswitch_default_five_hour: 5,
+      killswitch_default_seven_day: 10,
+    })
+  } finally {
+    await service?.dispose()
+  }
+})
+
 test('invalid existing floor lists refuse appends rather than normalizing existing entries', async () => {
   const f = await fixture('pi', {
     killswitch: { accounts: { missing: { five_hour: 9 } } },

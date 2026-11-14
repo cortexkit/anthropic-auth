@@ -163,6 +163,16 @@ export interface SettingsServiceOptions {
   separateInstall?: boolean
   lockTimeoutMs?: number
   protection?: SettingsProtectionRecovery
+  /**
+   * False while the acting host has not passed its import check for this
+   * file (see `importSettingsHostStore`), so it does not use the file yet.
+   * Until then the file's values are never this host's last-good protection:
+   * a file it has not imported may protect less than its legacy store, so a
+   * missing or unusable file recovers this host's set from the ladder (its
+   * applied copy, then its legacy store, then the strictest set). Omitted
+   * means the host uses the file.
+   */
+  adopted?: () => boolean
   /** Dependency seams for deterministic file-race and no-I/O tests. */
   dependencies?: {
     open?: (options: OpenSettingsOptions) => CoreSettingsHandle
@@ -440,6 +450,32 @@ export function planSettingsMenuWrite(
   return current.status === 'missing' ? [...carry(), ...edits] : edits
 }
 
+/**
+ * Why `host` can't use the file, in plain words for a refused menu write, or
+ * undefined when it can (or the file is missing). It names at most a
+ * declared setting, never a value: file contents may hold secrets.
+ */
+export function settingsFileProblem(
+  generation: SettingsGeneration,
+  host: SettingsHost,
+): string | undefined {
+  if (generation.status === 'missing') return undefined
+  if (generation.status === 'unparseable') return "can't be parsed"
+  if (generation.status === 'unreadable') return "can't be read"
+  if (generation.protection[host].usable) return undefined
+  if (
+    generation.source !== undefined &&
+    /^[\x20\t\r\n]*$/.test(generation.source.replace(/^\uFEFF/, ''))
+  )
+    return 'is empty'
+  const invalid = generation.report.find((entry) =>
+    SETTINGS_PROTECTION_KEYS.some((key) => key === entry.keyPath[0]),
+  )
+  if (invalid) return `has an invalid value for ${invalid.keyPath[0]}`
+  // The remaining unusable file is one from a newer or invalid schema version.
+  return 'is from a newer or unknown settings version'
+}
+
 export function mostRestrictiveSettingsProtection(): SettingsProtectionValues {
   return {
     ...protection(defaults()),
@@ -587,6 +623,15 @@ class SharedSettingsService {
 
   lastGoodProtection(host: SettingsHost) {
     return this.lastGood.get(host)
+  }
+
+  /**
+   * Only a lease of `host` records its set, and only from a generation that
+   * host uses: a reading of the file alone says nothing about whether a host
+   * adopted it, and a set it never adopted must not become its recovery.
+   */
+  recordLastGood(host: SettingsHost, values: SettingsProtectionValues) {
+    this.lastGood.set(host, values)
   }
 
   watch(listener: SettingsChangeListener) {
@@ -1009,10 +1054,6 @@ class SharedSettingsService {
         id: (prior?.id ?? 0) + 1,
       })
       this.current = generation
-      for (const host of hosts) {
-        if (generation.protection[host].usable)
-          this.lastGood.set(host, generation.protection[host].values)
-      }
       logReports(generation.report)
       // The missing-file line is logged by a host's lease, which can tell
       // whether that host's menu write would recreate the file or be refused.
@@ -1173,12 +1214,38 @@ class SettingsProtectionLease {
     | undefined
   private cancelRetry: (() => void) | undefined
   private closed = false
+  /** Set once this lease has seen its host adopt the file. */
+  private sawAdoption = false
 
   constructor(
     private readonly shared: SharedSettingsService,
     private readonly recovery: SettingsProtectionRecovery = {},
     private readonly options?: SettingsServiceOptions,
   ) {}
+
+  /** Whether the acting host uses the file; see `SettingsServiceOptions.adopted`. */
+  private adopted() {
+    return this.options?.adopted?.() ?? true
+  }
+
+  /**
+   * Record the acting host's set as last-good, but only from a generation it
+   * uses. The import check runs on the generation this lease last applied,
+   * so when adoption is first seen that generation is recorded too.
+   */
+  private recordLastGood(generation: SettingsGeneration) {
+    const host = this.options?.host
+    if (!host || !this.adopted()) return
+    if (!this.sawAdoption) {
+      this.sawAdoption = true
+      const adopted = this.current?.protection[host]
+      if (adopted?.usable && adopted.rung === 0)
+        this.shared.recordLastGood(host, adopted.values)
+    }
+    const set = generation.protection[host]
+    if (set.usable && set.rung === 0)
+      this.shared.recordLastGood(host, set.values)
+  }
 
   async close(): Promise<void> {
     this.closed = true
@@ -1287,7 +1354,8 @@ class SettingsProtectionLease {
 
   /**
    * The other host's whole set for recreating a missing file: its last-good
-   * set in this process, then its applied copy, then its own legacy store.
+   * set in this process (recorded only by that host's own lease, from a file
+   * it adopted), then its applied copy, then its own legacy store.
    * `none` means both sources were read and hold nothing (that host never
    * ran). Anything else that yields no set is unknown (rung 3): a copy or
    * store that exists but can't be read, or no legacy reader at all. An
@@ -1358,10 +1426,19 @@ class SettingsProtectionLease {
   }
 
   private async recover(host: SettingsHost) {
-    const good = this.shared.lastGoodProtection(host)
-    if (good) return { values: good, rung: 1 as const }
-    const previous = this.current?.protection[host]
-    if (previous) return previous
+    // A host that has not adopted the file takes no protection from it, not
+    // even a set it read earlier: that file may protect less than the host's
+    // legacy store, which its import check has not compared yet.
+    if (host !== this.options?.host || this.adopted()) {
+      const good = this.shared.lastGoodProtection(host)
+      if (good) return { values: good, rung: 1 as const }
+      const previous = this.current?.protection[host]
+      // A set read from the file earlier is a last-good recovery now.
+      if (previous)
+        return previous.rung === 0
+          ? { values: previous.values, rung: 1 as const }
+          : previous
+    }
     return recoverSettingsProtection(
       this.shared.file,
       host,
@@ -1371,6 +1448,7 @@ class SettingsProtectionLease {
   }
 
   private async apply(generation: SettingsGeneration) {
+    this.recordLastGood(generation)
     if (hosts.every((host) => generation.protection[host].usable)) {
       this.current = generation
       this.persist(generation)

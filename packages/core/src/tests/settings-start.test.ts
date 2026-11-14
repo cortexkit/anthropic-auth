@@ -11,6 +11,7 @@ import {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { openSettings } from '@cortexkit/common-auth/settings'
 import { parse } from 'jsonc-parser'
 
 import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
@@ -18,6 +19,7 @@ import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
 import { createNativeRuntimeSettings } from '../native-runtime-settings.ts'
 import { beginNativeEmptyInit } from '../pool-authority.ts'
 import { resolveNativePoolPaths } from '../pool-paths.ts'
+import { settingsDefinition } from '../settings-definition.ts'
 import { settingsImportRecordPath } from '../settings-mode.ts'
 import {
   getSettingsFilePath,
@@ -998,6 +1000,98 @@ test('a host using a missing file it never imported checks a file that reappears
   )
   strict()
   expect(served().dump?.enabled).toBe(false)
+  expect(started.service!.resolve('opencode')).toMatchObject({
+    killswitch_enabled: true,
+    killswitch_default_five_hour: 61,
+  })
+})
+
+// A file that appeared and was deleted again before this host imported its
+// legacy store must not become the host's protection once it is missing.
+test('a host using a missing file it never imported keeps its own protection after a file it could not import is deleted', async () => {
+  const f = await fixture('absent')
+  await writeFile(f.options.ownPoolPaths!.config, JSON.stringify(strictStore))
+  // The file was moved by another host and then deleted.
+  await writeFile(f.paths.marker, '{}')
+  // Every lease of one file shares a reader, opened here with seams: the
+  // import's write into the file fails, and a deletion is confirmed at once
+  // instead of after two seconds.
+  const interceptor = await openSettingsService({
+    file: f.target,
+    dependencies: {
+      open: (config) => {
+        const handle = openSettings(settingsDefinition, config)
+        return {
+          ...handle,
+          update: async () => {
+            throw new Error('synthetic write failure')
+          },
+        }
+      },
+      schedule: (callback) => {
+        const timer = setTimeout(callback, 10)
+        return () => clearTimeout(timer)
+      },
+    },
+  })
+  cleanup.push(() => interceptor?.dispose())
+  const warnings: string[] = []
+  const started = await startSettings({
+    ...f.options,
+    log: { warn: (message) => warnings.push(message) },
+    protection: {
+      readLegacyProtection: async (host) =>
+        legacySettingsProtection(strictStore, host),
+    },
+    start: {},
+  })
+  cleanup.push(() => started.service?.dispose())
+  const clock = timer()
+  const reader = createNativeRuntimeSettings({
+    host: 'opencode',
+    settingsMode: () => started.mode,
+    settingsService: started.service,
+    settingsAuthority: { schedule: clock.schedule },
+    env: {},
+  })
+  cleanup.push(reader.close)
+  const served = () => reader.resolve(strictStore) as Resolved
+  const strict = () =>
+    expect(served().killswitch).toMatchObject({
+      enabled: true,
+      main: { five_hour: 61 },
+    })
+  await reader.prepareAction()
+  expect(reader.file()).toBe(f.target)
+  strict()
+  // A weaker file appears, and writing this host's import into it fails.
+  await writeFile(f.target, '{"killswitch_enabled":false,"dump_enabled":false}')
+  await checkUntil(clock, () =>
+    warnings.some((message) =>
+      message.includes('writing its legacy protection'),
+    ),
+  )
+  expect(
+    warnings.some((message) =>
+      message.includes('writing its legacy protection'),
+    ),
+  ).toBe(true)
+  expect(await exists(settingsImportRecordPath(f.target, 'opencode'))).toBe(
+    false,
+  )
+  strict()
+  // The user deletes it again.
+  await rm(f.target)
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await started.service!.refresh()
+    if (started.service!.snapshot().status === 'missing') break
+    await Bun.sleep(20)
+  }
+  expect(started.service!.snapshot().status).toBe('missing')
+  await clock.tick()
+  // The missing file recovers this host's own legacy protection, not the
+  // deleted file's weaker set.
+  strict()
   expect(started.service!.resolve('opencode')).toMatchObject({
     killswitch_enabled: true,
     killswitch_default_five_hour: 61,

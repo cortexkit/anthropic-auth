@@ -30,6 +30,8 @@ import { parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view.ts'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import { writeSettingsProtectionCopy } from '../../../core/src/settings-protection-copy.ts'
+import { legacySettingsProtection } from '../../../core/src/settings-protection-legacy.ts'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { createPiNativeCommands } from '../native-commands.ts'
 import { saveNativePiFixture } from './native-fixture.ts'
@@ -521,6 +523,12 @@ test('settings status shows no-model values, row-id overrides and all diagnostic
 
 test('settings status names a missing file and its later recreation', async () => {
   await writeFile()
+  // OpenCode's applied copy is the record of the set it uses, which a
+  // recreation by Pi carries for it.
+  await writeSettingsProtectionCopy(file, 'opencode', {
+    readAt: 1,
+    values: legacySettingsProtection({}, 'opencode'),
+  })
   const f = await controller()
   await fs.unlink(file)
   await f.confirmMissing()
@@ -531,6 +539,22 @@ test('settings status names a missing file and its later recreation', async () =
   expect(await f.backend.readStatus('cache', {})).toContain(
     'Settings file was recreated by a menu write.',
   )
+})
+
+// The file only says what it held, not whether OpenCode adopted it, so a set
+// read from it is never OpenCode's protection. With no applied copy, and an
+// OpenCode store this environment can't read (a non-default state folder),
+// OpenCode's set is unknown and the recreation is refused.
+test("a recreation is refused when OpenCode's set is known only from the deleted file", async () => {
+  await writeFile()
+  const f = await controller()
+  await fs.unlink(file)
+  await f.confirmMissing()
+  expect(await f.execute({ action: 'dump-on' })).toEqual({
+    ok: false,
+    text: refusedSettingsRecreationText(file),
+  })
+  expect(await fs.exists(file)).toBe(false)
 })
 
 for (const custody of ['local', 'claustrum'] as const)
