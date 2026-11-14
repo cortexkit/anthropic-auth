@@ -287,7 +287,7 @@ async function userInstall(base: string, extra: Record<string, unknown> = {}) {
   return { home, user }
 }
 
-/** Thalamus custody: no enrollment file; the host hands out receipts. */
+/** Thalamus custody: no enrollment file; the host provides the user's bearer. */
 function hostByThalamus() {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE
   core.resetVaultHostAuthorityForTests?.()
