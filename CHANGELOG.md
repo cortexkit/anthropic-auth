@@ -2,6 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- You can send Claude subscription (sign-in) model requests through your own gateway by setting `gateway_url` and `gateway_headers` in your user settings file. Sign-in, refresh and usage still go only to Anthropic, and a project file, provider `baseURL` or environment variable still cannot redirect your token. See [Custom gateway](docs/settings-file.md#custom-gateway). Addresses #692.
+
 ## 2.12.0
 
 - Under Thalamus, OpenCode 2 now reports which login answered after recovering a rejected conversation thread; keep-warm requests and Prime's quota-window starter requests refresh quota without counting as answered user turns.

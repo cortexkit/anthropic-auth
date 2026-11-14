@@ -13,6 +13,7 @@ import { createNativePoolStore } from '../pool-store.ts'
 import { applySessionCacheTtl } from '../session-cache-policy.ts'
 import {
   SETTINGS_DEFAULT_READERS,
+  SETTINGS_FILE_ONLY_KEYS,
   SETTINGS_THREE_WAY_READERS,
   settingsDefinition,
 } from '../settings-definition.ts'
@@ -137,7 +138,12 @@ async function fixture(
 test('preservation snapshots execute exactly the schema-named Core readers', () => {
   expect(Object.keys(coreDefaultReaders).sort()).toEqual(
     Object.entries(SETTINGS_DEFAULT_READERS)
-      .filter(([, name]) => name.startsWith('packages/core/'))
+      // File-only settings have no legacy-record reader to preserve.
+      .filter(
+        ([key, name]) =>
+          name.startsWith('packages/core/') &&
+          !(SETTINGS_FILE_ONLY_KEYS as readonly string[]).includes(key),
+      )
       .map(([key]) => key)
       .sort(),
   )

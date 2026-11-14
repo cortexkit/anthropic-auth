@@ -4,6 +4,7 @@ import {
   type ApiKeyAccount,
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
+  applyClaudeGatewayHeaders,
   applyCustomHeaders,
   assertHostAuthorityStable,
   buildBillingHeaderValue,
@@ -15,6 +16,8 @@ import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
   type ClaudeCodeIdentity,
+  claudeGatewayHeaderValues,
+  claudeGatewayModelUrl,
   copyStreamResponseTiming,
   createAnthropicStreamCompletion,
   createDumpResponseObserver,
@@ -110,6 +113,7 @@ import {
   stickyRetryAfterWithJitter,
   stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
+  warnClaudeGatewayRelayIgnored,
   withAnthropicBilling,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -138,6 +142,7 @@ import {
   type PiNativeRuntime,
   peekPiNativeSnapshot,
   piAttemptAccessToken,
+  piClaudeGatewayFromMemory,
   resolvePiSettingsFromMemory,
 } from './native.ts'
 import { getPiAccountStoragePath } from './paths.ts'
@@ -149,6 +154,7 @@ import {
 } from './quota-wait.ts'
 import {
   buildPiOAuthMessagesUrl,
+  createPiOAuthModelFetch,
   fetchPiOAuth,
   fetchPiStreamResponse,
   requirePiOAuthOrigin,
@@ -467,6 +473,14 @@ const piCacheKeep = new PiCacheKeep(
       }
     },
     fetchImpl: fetchPiOAuth,
+    // A keep-warm is a model request, so it follows the current gateway of
+    // the target's own runtime.
+    fetchForTarget: (target) =>
+      createPiOAuthModelFetch(() =>
+        piClaudeGatewayFromMemory(
+          target.accountStoragePath ?? getPiAccountStoragePath(),
+        ),
+      ),
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
     resolveSettings: resolvePiSettingsFromMemory,
     onTrackedSessionsChanged: (sessions) =>
@@ -1021,6 +1035,17 @@ async function sendAnthropicRequest(
   let input = options.apiAccount
     ? new URL('https://api.anthropic.com/v1/messages')
     : buildPiOAuthMessagesUrl(options.model.baseUrl)
+  // The user's gateway from their own settings file takes OAuth model
+  // requests, Prime included. It is read once, so the relay, thread, gzip and
+  // URL choices below agree. `input` stays the Anthropic URL for CacheKeep,
+  // which applies the gateway current at each warm.
+  const configuredGateway = options.apiAccount
+    ? undefined
+    : servingRuntime.getClaudeGateway?.()
+  const gatewayUrl = configuredGateway
+    ? claudeGatewayModelUrl(input, configuredGateway)
+    : undefined
+  const gateway = gatewayUrl ? configuredGateway : undefined
   const init: RequestInit = {
     method: 'POST',
     headers,
@@ -1120,13 +1145,21 @@ async function sendAnthropicRequest(
       throw new Error('Pi native OAuth route identity changed')
     return attempt
   }
-  const relayConfig = options.apiAccount
+  let relayConfig = options.apiAccount
     ? null
     : await (await native.service()).getRelayConfig()
+  // A gateway takes the request instead of the relay, with no relay attempt
+  // and no fallback to api.anthropic.com.
+  if (gateway && relayConfig) {
+    warnClaudeGatewayRelayIgnored(gateway)
+    relayConfig = null
+  }
   let threadRequest: MessageThreadRequest | undefined
   if (
     !options.apiAccount &&
     !options.prime &&
+    // Gateways may refuse the thread route: send full requests.
+    !gateway &&
     isPiPrimaryThreadRequest(
       options.storagePath,
       options.streamOptions,
@@ -1192,8 +1225,27 @@ async function sendAnthropicRequest(
       await options.prime?.beforeSend()
       init.signal?.throwIfAborted()
       assertHostAuthorityStable()
-      const scope = createProviderErrorResponseScope([secret], 'event-stream')
+      const scope = createProviderErrorResponseScope(
+        // A gateway error may echo the gateway's own header values.
+        [secret, ...claudeGatewayHeaderValues(gateway)],
+        'event-stream',
+      )
       physical.scope = scope
+      // Only the destination and the gateway's own headers change; the body
+      // goes uncompressed, as Claude Code compresses only to
+      // api.anthropic.com.
+      if (gateway && gatewayUrl) {
+        requirePiOAuthOrigin(gatewayUrl.toString(), gateway)
+        const gatewayHeaders = applyClaudeGatewayHeaders(
+          new Headers(headers),
+          gateway,
+        )
+        return scope.redactResponse(
+          await physicalFetch(() =>
+            fetchResponse(gatewayUrl, { ...init, headers: gatewayHeaders }),
+          ),
+        )
+      }
       // OAuth bodies go gzipped as Claude Code sends them; `bodyText` stays
       // the signed identity text for dumps and CacheKeep.
       if (options.apiAccount || typeof init.body !== 'string')
@@ -1291,7 +1343,11 @@ async function sendAnthropicRequest(
     } catch (caught) {
       // No response leaves this send, so its credentials retire here.
       physical.scope?.dispose()
-      const scope = createProviderErrorResponseScope([secret], 'event-stream')
+      const scope = createProviderErrorResponseScope(
+        // A gateway error may echo the gateway's own header values.
+        [secret, ...claudeGatewayHeaderValues(gateway)],
+        'event-stream',
+      )
       const error = scope.redactError(caught)
       scope.dispose()
       await dumpDirectRequest({

@@ -26,6 +26,7 @@ import type {
 import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
+import { claudeGatewaySecretValues } from './gateway.ts'
 import { logger } from './logger.ts'
 import { getClaudeModelCatalogue } from './model-capabilities.ts'
 import { CLAUDE_OPUS_5_5_PRICING } from './models.ts'
@@ -664,6 +665,10 @@ function cacheKeepSentCredentials(headers: Headers): string[] {
   }
   const apiKey = headers.get('x-api-key')
   if (apiKey) credentials.push(apiKey)
+  // The host's fetch may send the warm to the user's gateway with its own
+  // headers, which are added after these headers; a gateway error may echo
+  // them, so every configured gateway header value is redacted too.
+  credentials.push(...claudeGatewaySecretValues())
   return credentials
 }
 
@@ -748,6 +753,11 @@ export class CacheKeepManager {
         model?: string,
       ) => AccountStorage
       fetchImpl?: typeof fetch
+      /**
+       * The fetch for one target's warm, when it depends on the target (for
+       * example the gateway of the target's own runtime). Wins over fetchImpl.
+       */
+      fetchForTarget?: (target: Readonly<CacheKeepTarget>) => typeof fetch
       billingRequest?: (
         target: CacheKeepTarget,
         attempt: CacheKeepPrewarmAttempt,
@@ -1907,7 +1917,8 @@ export class CacheKeepManager {
         }
       }
 
-      const fetchImpl = this.options.fetchImpl ?? fetch
+      const fetchImpl =
+        this.options.fetchForTarget?.(target) ?? this.options.fetchImpl ?? fetch
       const prewarmTarget = { ...preparedTarget, bodyText: prewarm.bodyText }
       let headers = this.options.prepareHeaders
         ? await this.options.prepareHeaders(

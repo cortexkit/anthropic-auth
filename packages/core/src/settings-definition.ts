@@ -7,6 +7,7 @@ import {
   number,
   object,
   oneOf,
+  record,
   type SettingsRefusalCode,
   string,
 } from '@cortexkit/common-auth/settings'
@@ -111,10 +112,27 @@ export const settingsDefinition = defineSettings({
       value: list(string()),
       default: ['board', 'ctx_reduce'],
     },
+    // The user's gateway for Claude OAuth model requests; '' means none.
+    // Gateway values are validated beyond their type in settings-service.ts.
+    // Neither setting takes host or model overrides: one gateway with its
+    // headers serves both hosts, so one host's secret headers can never go
+    // to another host's gateway.
+    gateway_url: { ...user, value: string(), default: '' },
+    gateway_headers: { ...user, value: record(string()), default: {} },
   },
 })
 
 export type SettingsKey = keyof typeof settingsDefinition.settings
+
+/**
+ * Settings that exist only in the user settings file: no legacy store holds
+ * them, so the one-time move never reads or writes them, and the `/claude`
+ * menu never writes them.
+ */
+export const SETTINGS_FILE_ONLY_KEYS = [
+  'gateway_url',
+  'gateway_headers',
+] as const satisfies readonly SettingsKey[]
 
 /** Empty: no Pi-specific default is needed beyond per-reader default/on/off handling. */
 export const SETTINGS_PI_DIFFERING_FIELDS =
@@ -174,6 +192,8 @@ export const SETTINGS_DEFAULT_READERS = {
   thinking_binding_prefix_mismatch_behavior:
     'packages/core/src/thinking-binding.ts:getThinkingPrefixMismatchBehavior',
   turn_end_note_tools: 'packages/core/src/turn-end-note.ts:applyTurnEndNotes',
+  gateway_url: 'packages/core/src/native-runtime-settings.ts:gateway',
+  gateway_headers: 'packages/core/src/native-runtime-settings.ts:gateway',
 } as const satisfies Record<SettingsKey, string>
 
 /** These enum members defer to the existing environment/account inference. */

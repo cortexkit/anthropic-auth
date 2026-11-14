@@ -1,5 +1,12 @@
 import type { AccountStorage } from './accounts.ts'
 import { setDumpEnabled } from './dump.ts'
+import {
+  type ClaudeGateway,
+  type ClaudeGatewayStatus,
+  claudeGatewayStatus,
+  parseClaudeGateway,
+  rememberClaudeGatewaySecrets,
+} from './gateway.ts'
 import { logger, parseLogLevel, setLogLevel } from './logger.ts'
 import {
   applyCommittedNativeSettingsEffects,
@@ -68,7 +75,13 @@ export interface NativeRuntimeSettingsOptions {
 
 export interface NativeRuntimeSettingsStatus {
   file: SettingsFileStatus
-  values: SettingsValues
+  /**
+   * No-model values. Gateway header values are secrets, so `gateway_headers`
+   * is left out; `gateway` shows the gateway in use, with header names only.
+   */
+  values: Omit<SettingsValues, 'gateway_headers'> & {
+    gateway: ClaudeGatewayStatus | null
+  }
   modelOverrides: Partial<
     Record<SettingsKey, { model: string; value: SettingsValues[SettingsKey] }[]>
   >
@@ -176,14 +189,41 @@ export function createNativeRuntimeSettings(
         .map(([model, values]) => ({ model, value: values[key] }))
       modelOverrides[key] = rows
     }
+    const { gateway_headers: _secret, ...values } = context.noModel
     return {
       file: current.fileStatus,
       values: {
-        ...context.noModel,
+        ...values,
         ...current.protection[options.host].values,
+        gateway: claudeGatewayStatus(gateway()) ?? null,
       },
       modelOverrides,
     }
+  }
+
+  // Parsed once per settings generation; requests read it from memory.
+  let gatewayCache:
+    | { generation: SettingsGeneration; gateway: ClaudeGateway | undefined }
+    | undefined
+  /**
+   * The user's gateway for Claude OAuth model requests, from the user
+   * settings file only. Undefined without a gateway, in legacy mode, for a
+   * separate install, and whenever the gateway settings are invalid (the
+   * settings service then reports and clears them).
+   */
+  function gateway(): ClaudeGateway | undefined {
+    const current = generation()
+    if (!current) return undefined
+    if (gatewayCache?.generation === current) return gatewayCache.gateway
+    const values = current.contexts[options.host].noModel
+    const parsed = parseClaudeGateway(
+      values.gateway_url,
+      values.gateway_headers,
+    )
+    const next = parsed.ok ? parsed.gateway : undefined
+    rememberClaudeGatewaySecrets(next)
+    gatewayCache = { generation: current, gateway: next }
+    return next
   }
 
   function recheck(refresh = true): Promise<void> {
@@ -325,6 +365,7 @@ export function createNativeRuntimeSettings(
   return {
     resolve,
     status,
+    gateway,
     applyEffects,
     file: () => generation()?.file,
     async prepareAction() {

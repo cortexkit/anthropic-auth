@@ -14,7 +14,7 @@ Path conventions depend on the artifact. In these docs:
 
 | Variable | Effect |
 | --- | --- |
-| `ANTHROPIC_BASE_URL` | Override the Anthropic endpoint with an HTTP(S) URL on API-key routes. Claude sign-in (OAuth) requests go only to `https://api.anthropic.com`, so OpenCode refuses them while this points elsewhere |
+| `ANTHROPIC_BASE_URL` | Override the Anthropic endpoint with an HTTP(S) URL on API-key routes. Claude sign-in (OAuth) requests go only to `https://api.anthropic.com` (or the [custom gateway](settings-file.md#custom-gateway) in your own settings file), so OpenCode refuses them while this points elsewhere; it never sets or widens the gateway |
 | `ANTHROPIC_INSECURE` | OpenCode 1 TLS opt-out: `1` or `true`, effective only with `ANTHROPIC_BASE_URL`; avoid outside controlled diagnostics |
 | `ANTHROPIC_CUSTOM_HEADERS` | Add proxy metadata on API-key routes; ignored for OAuth |
 | `ANTHROPIC_MODEL` | Default proxy alias for any `claude-*` model |

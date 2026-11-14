@@ -176,8 +176,15 @@ test('/claude status has all no-model values and every explicit model row overri
     claude_fast_enabled: { default: true, 'claude-opus-5-5': true },
   })
   const status = f.reader.status()!
+  // Gateway header values are secrets: Status carries the gateway summary
+  // (origin, path and header names) in place of `gateway_headers`.
   expect(Object.keys(status.values).sort()).toEqual(
-    Object.keys(settingsDefinition.settings).sort(),
+    [
+      ...Object.keys(settingsDefinition.settings).filter(
+        (key) => key !== 'gateway_headers',
+      ),
+      'gateway',
+    ].sort(),
   )
   expect(status.values.claude_cache_mode).toBe('explicit')
   expect(Object.keys(status.modelOverrides).sort()).toEqual(

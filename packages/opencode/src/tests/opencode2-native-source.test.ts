@@ -5089,3 +5089,71 @@ test('real OC2 vault source bills recovery sends even when the host ends the ori
   expect(billingInputs.mock.results).toHaveLength(sent.length)
   expect(billingInputs.mock.results.every((result) => result.value)).toBe(true)
 })
+
+for (const transport of ['http', 'websocket'] as const)
+  test(`a gateway takes OAuth requests instead of a configured ${transport} relay, with one warning`, async () => {
+    const fixture = await vault()
+    await fixture.runtime.updateRelay({
+      enabled: true,
+      transport,
+      url: 'https://relay.invalid',
+      token: 'synthetic-relay-token',
+    })
+    const origin = `https://gateway-${transport}.example.test`
+    const runtime: NativeAccountRuntime = {
+      ...fixture.runtime,
+      getClaudeGateway: () => ({ origin, pathPrefix: '', headers: [] }),
+    }
+    const logs: { level: string; message: string }[] = []
+    __setLogTestSink((record) => logs.push(record))
+    try {
+      const native = source(runtime, fixture.paths)
+      for (const _ of [1, 2]) {
+        expect(await native.chooseAccount(scope)).toBe('main')
+        const auth = await native.authorizeAccount(scope, 'main')
+        // No relay attempt and so no relay fallback to api.anthropic.com.
+        expect(auth?.dispatch).toEqual({ kind: 'direct' })
+        // The adapter sends to the gateway read for this authorization.
+        expect(auth?.route === 'oauth' && auth.gateway?.origin).toBe(origin)
+      }
+      expect(
+        logs.filter(
+          (record) =>
+            record.level === 'warn' && record.message.includes('relay'),
+        ),
+      ).toHaveLength(1)
+    } finally {
+      __setLogTestSink(null)
+    }
+  })
+
+test('the gateway read for an authorization travels with it, and no gateway keeps the relay', async () => {
+  const fixture = await vault()
+  await fixture.runtime.updateRelay({
+    enabled: true,
+    transport: 'http',
+    url: 'https://relay.invalid',
+    token: 'synthetic-relay-token',
+  })
+  let current: ReturnType<NonNullable<NativeAccountRuntime['getClaudeGateway']>>
+  const runtime: NativeAccountRuntime = {
+    ...fixture.runtime,
+    getClaudeGateway: () => current,
+  }
+  const native = source(runtime, fixture.paths)
+  expect(await native.chooseAccount(scope)).toBe('main')
+  const relayed = await native.authorizeAccount(scope, 'main')
+  expect(relayed?.dispatch).toMatchObject({ kind: 'http-relay' })
+  expect(relayed?.route === 'oauth' && relayed.gateway).toBeFalsy()
+  current = {
+    origin: 'https://gateway-once.example.test',
+    pathPrefix: '',
+    headers: [],
+  }
+  expect(await native.chooseAccount(scope)).toBe('main')
+  const routed = await native.authorizeAccount(scope, 'main')
+  expect(routed?.dispatch).toEqual({ kind: 'direct' })
+  expect(routed?.route === 'oauth' && routed.gateway?.origin).toBe(
+    'https://gateway-once.example.test',
+  )
+})

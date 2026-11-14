@@ -1075,6 +1075,15 @@
           "additionalProperties": false
         }
       ]
+    },
+    "gateway_url": {
+      "type": "string"
+    },
+    "gateway_headers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
     }
   },
   "additionalProperties": false

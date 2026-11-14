@@ -67,7 +67,14 @@ import * as sourceFactory from '../v2/source'
 
 const cleanups: Array<() => void | Promise<void>> = []
 let reportFailure: (() => void) | undefined
+// Test-only OAuth loopback origin, read by oauth-destination.ts from this
+// global symbol (never from the environment).
+const loopbackHook = globalThis as Record<symbol, unknown>
+const LOOPBACK_KEY = Symbol.for(
+  'cortexkit.anthropic-auth.test-oauth-loopback-origin',
+)
 afterEach(async () => {
+  delete loopbackHook[LOOPBACK_KEY]
   const report = reportFailure
   reportFailure = undefined
   report?.()
@@ -2198,12 +2205,11 @@ test('an OpenCode 2 instance that boots after the cache expired adopts nothing',
 
 /** Sets the test-only loopback OAuth origin until the test's cleanup. */
 function admitLoopbackOrigin(origin: string) {
-  const saved = process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
-  process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = origin
+  const saved = loopbackHook[LOOPBACK_KEY]
+  loopbackHook[LOOPBACK_KEY] = origin
   cleanups.push(() => {
-    if (saved === undefined)
-      delete process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
-    else process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = saved
+    if (saved === undefined) delete loopbackHook[LOOPBACK_KEY]
+    else loopbackHook[LOOPBACK_KEY] = saved
   })
 }
 
@@ -2228,8 +2234,7 @@ for (const stillAdmitted of [true, false]) {
     expect((await f.registry.list()).map((session) => session.id)).toEqual([
       'ses_oc2_keep',
     ])
-    if (!stillAdmitted)
-      delete process.env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN
+    if (!stillAdmitted) delete loopbackHook[LOOPBACK_KEY]
     f.due()
     await f.timers.fire()
     expect(f.sent.map((request) => new URL(request.url).origin)).toEqual(

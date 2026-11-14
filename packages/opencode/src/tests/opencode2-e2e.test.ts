@@ -727,10 +727,6 @@ async function scenario(
       throw new Error('Synthetic transport cleanup failed (details redacted)')
     }
   })
-  // The provider baseURL below points OAuth requests at the synthetic
-  // upstream. The plugin refuses any OAuth destination but api.anthropic.com
-  // unless this test-only variable names the exact loopback origin.
-  env.ANTHROPIC_AUTH_TEST_OAUTH_LOOPBACK_ORIGIN = upstream.url.origin
   const paths = await seed(
     env,
     transport === 'direct' ? undefined : { url: relay.url.href, transport },
@@ -770,6 +766,39 @@ export default {id:'cortexkit-anthropic-auth',async setup(ctx){${routingSetup}ap
     )
     plugin = pathToFileURL(pluginDirectory).href
   }
+  // The provider baseURL below points OAuth requests at the synthetic
+  // upstream. The plugin refuses any OAuth destination but api.anthropic.com
+  // unless a test-only global symbol names the exact loopback origin; it is
+  // never read from the environment. A test plugin listed first sets it.
+  const loopbackSetup = `globalThis[Symbol.for('cortexkit.anthropic-auth.test-oauth-loopback-origin')]=${JSON.stringify(upstream.url.origin)};`
+  let loopbackPlugin: string
+  if (host === 'oc2') {
+    const loopbackDirectory = join(project, 'test-oauth-loopback')
+    await mkdir(loopbackDirectory)
+    await writeFile(
+      join(loopbackDirectory, 'package.json'),
+      JSON.stringify({
+        name: '@cortexkit/oc2-test-oauth-loopback',
+        version: '0.0.0',
+        type: 'module',
+        exports: { './server': './server.js' },
+      }),
+    )
+    await writeFile(
+      join(loopbackDirectory, 'server.js'),
+      `${loopbackSetup}
+export default {id:'cortexkit-test-oauth-loopback',async setup(){return async()=>{}}};`,
+    )
+    loopbackPlugin = pathToFileURL(loopbackDirectory).href
+  } else {
+    const loopbackFile = join(project, 'test-oauth-loopback.mjs')
+    await writeFile(
+      loopbackFile,
+      `${loopbackSetup}
+export const TestOAuthLoopbackOrigin = async () => ({})`,
+    )
+    loopbackPlugin = pathToFileURL(loopbackFile).href
+  }
   if (host === 'oc1') {
     await mkdir(join(env.XDG_DATA_HOME!, 'opencode'), { recursive: true })
     await writeFile(
@@ -783,7 +812,7 @@ export default {id:'cortexkit-anthropic-auth',async setup(ctx){${routingSetup}ap
     JSON.stringify(
       host === 'oc2'
         ? {
-            plugins: [plugin],
+            plugins: [loopbackPlugin, plugin],
             providers: {
               anthropic: {
                 settings: {
@@ -795,7 +824,7 @@ export default {id:'cortexkit-anthropic-auth',async setup(ctx){${routingSetup}ap
             },
           }
         : {
-            plugin: [plugin],
+            plugin: [loopbackPlugin, plugin],
             provider: {
               anthropic: { options: { baseURL: `${upstream.url.origin}/v1` } },
             },

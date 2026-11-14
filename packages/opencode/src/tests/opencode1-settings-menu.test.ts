@@ -570,12 +570,16 @@ test('OC1 status lists every no-model value, model row override and file diagnos
   for (const [key, definition] of Object.entries(
     core.settingsDefinition.settings,
   )) {
+    // Gateway header values are secrets: Status names the headers only.
+    if (key === 'gateway_headers') continue
     expect(status).toContain(`${key}: `)
     if (key === 'prime_enabled')
       expect(status).toContain(
         `prime_enabled: ${JSON.stringify(definition.default)}`,
       )
   }
+  expect(status).toContain('gateway: null')
+  expect(status).not.toContain('gateway_headers')
   expect(status).toContain('Invalid setting: prime_enabled')
   expect(status).toContain('Ignored model key: claude_cache_enabled.not-a-row')
   expect(status).toContain('Duplicate setting: dump_enabled')

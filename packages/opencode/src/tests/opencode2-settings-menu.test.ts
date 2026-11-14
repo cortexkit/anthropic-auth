@@ -457,12 +457,16 @@ test('OC2 status uses every no-model value and lists model row values and file d
     'thinking_binding_prefix_mismatch_behavior [claude-opus-5-5]: "error"',
   )
   for (const [key, value] of Object.entries(core.settingsDefinition.settings)) {
+    // Gateway header values are secrets: Status names the headers only.
+    if (key === 'gateway_headers') continue
     expect(status).toContain(`${key}: `)
     if (key === 'prime_enabled')
       expect(status).toContain(
         `prime_enabled: ${JSON.stringify(value.default)}`,
       )
   }
+  expect(status).toContain('gateway: null')
+  expect(status).not.toContain('gateway_headers')
   expect(status).toContain('Invalid setting: prime_enabled')
   expect(status).toContain('Ignored model key: claude_cache_enabled.not-a-row')
   expect(status).toContain('Duplicate setting: dump_enabled')
