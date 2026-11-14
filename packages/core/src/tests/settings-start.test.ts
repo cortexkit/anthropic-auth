@@ -665,7 +665,12 @@ test('a running legacy host adopts a hand-made file only after importing its str
   cleanup.push(reader.close)
   // The user writes a settings file by hand while this host runs.
   await writeFile(f.target, '{"dump_enabled":false}')
-  await clock.tick()
+  // A tick can join a startup check that still saw no file. Advance checks
+  // until the runtime has finished importing protection and adopted the file.
+  const adoptionDeadline = Date.now() + 4_000
+  do {
+    await clock.tick()
+  } while (reader.file() !== f.target && Date.now() < adoptionDeadline)
   expect(reader.file()).toBe(f.target)
   const resolved = reader.resolve(stored) as Resolved
   expect(resolved.killswitch).toMatchObject({
