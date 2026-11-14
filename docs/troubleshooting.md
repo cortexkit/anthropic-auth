@@ -43,6 +43,8 @@ The `/claude` menu manages the plugin's account pool. Adding an account there an
 
 For a fresh installation, complete the [main-account connection](opencode-2.md#empty-initialization) before adding fallback accounts.
 
+**Moving from OpenCode 1 to OpenCode 2.3 or later:** on its first start with a new database, OpenCode 2.3 imports OpenCode 1's `auth.json`. After OpenCode 1 setup, the Anthropic entry there is the plugin's inert marker: an OAuth entry with an empty access token and a `claustrum-tombstone:` refresh value. OpenCode 2 imports it as an ordinary Anthropic sign-in and can make it the active connection. That connection does not route to the plugin, so model requests fail even though `/claude` shows your accounts. To fix it, connect once with the plugin's own method as in step 1 above and make sure that connection is the active Anthropic account. Your accounts and settings are not affected.
+
 ### Other request failures
 
 Check `/claude` for custody, account, routing and quota status first. Unknown quota, positive remaining-quota floors and model-scoped exhaustion can block an account even when it has a token. Resetting a session pin is not a way to bypass limits.
