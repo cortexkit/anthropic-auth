@@ -4383,6 +4383,8 @@ describe('OpenCode 2 native Anthropic adapter: user gateway', () => {
     )
     expect(final.url).toBe('https://relay.example.test/send')
     expect(final.redirect).toBe('error')
+    expect(final.headers.get('x-relay-token')).toBe('relay-secret')
+    expect(final.headers.has('authorization')).toBe(false)
     const envelope = JSON.parse(await final.clone().text())
     expect(envelope.upstream.url).toBe(
       'https://api.anthropic.com/v1/messages/count_tokens',

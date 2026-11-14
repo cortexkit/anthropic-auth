@@ -808,6 +808,7 @@ describe('OpenCode 1 user gateway', () => {
     url: string
     headers: Headers
     body: string
+    tls: unknown
   }
   function record(
     gatewayAnswer?: (body: Record<string, unknown>) => Response | undefined,
@@ -822,6 +823,7 @@ describe('OpenCode 1 user gateway', () => {
             url,
             headers: new Headers(init?.headers),
             body: typeof init?.body === 'string' ? init.body : '',
+            tls: (init as { tls?: unknown } | undefined)?.tls,
           })
           if (url.startsWith(GATEWAY) && gatewayAnswer) {
             const answer = gatewayAnswer(
@@ -987,6 +989,44 @@ describe('OpenCode 1 user gateway', () => {
       [],
     )
   })
+
+  for (const gateway of [true, false])
+    test(`ANTHROPIC_INSECURE never turns off certificate checks on an OAuth send${gateway ? ' to the gateway' : ''}`, async () => {
+      const f = await fixture()
+      await f.put({
+        quota_enabled: 'off',
+        ...(gateway ? { gateway_url: `${GATEWAY}/claude` } : {}),
+      })
+      const seen = record()
+      const previous = {
+        base: process.env.ANTHROPIC_BASE_URL,
+        insecure: process.env.ANTHROPIC_INSECURE,
+      }
+      cleanups.push(() => {
+        if (previous.base === undefined) delete process.env.ANTHROPIC_BASE_URL
+        else process.env.ANTHROPIC_BASE_URL = previous.base
+        if (previous.insecure === undefined)
+          delete process.env.ANTHROPIC_INSECURE
+        else process.env.ANTHROPIC_INSECURE = previous.insecure
+      })
+      // A repository `.env` can set both; the base URL passes the OAuth
+      // destination check, so nothing else stops the send.
+      process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
+      process.env.ANTHROPIC_INSECURE = '1'
+      const instance = await f.launch()
+      const response = await instance.loader.fetch!(
+        MESSAGES_URL,
+        largeRequest('ses-oc1-insecure'),
+      )
+      await response.text()
+      expect(response.status).toBe(200)
+      const models = seen.filter((entry) => entry.url.includes('/v1/messages'))
+      expect(models).toHaveLength(1)
+      expect(new URL(models[0]!.url).origin).toBe(
+        gateway ? GATEWAY : 'https://api.anthropic.com',
+      )
+      for (const entry of seen) expect(entry.tls).toBeUndefined()
+    })
 
   test('a gateway takes requests instead of a configured relay, with one warning', async () => {
     const f = await fixture()
