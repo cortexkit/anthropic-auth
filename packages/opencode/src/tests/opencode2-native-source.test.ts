@@ -703,6 +703,111 @@ describe('OC2 shared routing relay', () => {
     ])
   })
 
+  test('a 404 thread continuation reports the successful resend credential once per turn', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const quotaReadings = spyOn(native, 'quotaFromHeaders')
+    cleanups.push(() => quotaReadings.mockRestore())
+    const reports: unknown[] = []
+    bridge(
+      () => null,
+      (report) => reports.push(report),
+    )
+    const host = await retryHost(native)
+    const messages = [{ role: 'user', content: 'first' }]
+    const first = await host.send(scope, placeholderSecret('anthropic'), {
+      stream: true,
+      messages,
+    })
+    const success = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_routing_anchor","content":[{"type":"text","text":"answer"}]}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    await host.streamed(first, success)
+    native.forgetTurn?.(scope.sessionID)
+    reports.length = 0
+    const second = await host.send(scope, placeholderSecret('anthropic'), {
+      stream: true,
+      messages: [
+        ...messages,
+        { role: 'assistant', content: 'answer' },
+        { role: 'user', content: 'next' },
+      ],
+    })
+    expect(
+      ((await second.clone().json()) as { thread: { type: string } }).thread
+        .type,
+    ).toBe('continue')
+    const authorizeVault = f.runtime.authorizeVault.bind(f.runtime)
+    const authorize = spyOn(f.runtime, 'authorizeVault').mockImplementation(
+      async (...args) => ({
+        ...(await authorizeVault(...args)),
+        credentialId: 'oauth:resend',
+        accessToken: 'sk-ant-oat01-resend',
+      }),
+    )
+    cleanups.push(() => authorize.mockRestore())
+    const resent: Request[] = []
+    const fetchResend = spyOn(globalThis, 'fetch').mockImplementation(
+      Object.assign(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          resent.push(
+            input instanceof Request
+              ? new Request(input, init)
+              : new Request(input.toString(), init),
+          )
+          return new Response(success, {
+            headers: {
+              'content-type': 'text/event-stream',
+              'anthropic-ratelimit-unified-5h-utilization': '0.25',
+            },
+          })
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      ) as typeof fetch,
+    )
+    cleanups.push(() => fetchResend.mockRestore())
+    const response = await host.response(
+      second,
+      404,
+      scope,
+      undefined,
+      JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'not_found_error',
+          details: { error_code: 'thread_not_found' },
+        },
+      }),
+    )
+    expect(response.status).toBe(200)
+    expect(resent).toHaveLength(1)
+    const resend = resent[0]
+    if (!resend) throw new Error('Missing thread recovery resend')
+    expect(resend.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-resend',
+    )
+    expect(((await resend.json()) as { thread: unknown }).thread).toEqual({
+      type: 'create',
+    })
+    const reading = quotaReadings.mock.calls.at(-1)
+    if (!reading) throw new Error('Missing resend quota observation')
+    native.quotaFromHeaders?.(...reading)
+    expect(
+      reports.filter(
+        (report) => (report as { kind?: string }).kind === undefined,
+      ),
+    ).toEqual([
+      {
+        account_id: identity,
+        credential_id: 'oauth:resend',
+        outcome: 'served',
+        headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.25' },
+      },
+    ])
+  })
+
   test.each([undefined, 'Claude-Fable-Pool'])(
     'Fable 429 reports the persisted usage-poll pool %s on OpenCode 2',
     async (modelId) => {
@@ -2050,6 +2155,7 @@ async function retryHost(native: ReturnType<typeof source>) {
     async send(
       input = scope,
       credential: string | { apiKey: string } = placeholderSecret('anthropic'),
+      body: Record<string, unknown> = {},
     ) {
       const draft = {
         ...hostScope(input),
@@ -2065,6 +2171,7 @@ async function retryHost(native: ReturnType<typeof source>) {
             model: input.modelID,
             max_tokens: 128,
             messages: [{ role: 'user', content: 'retry contract' }],
+            ...body,
           }),
         }),
       }
@@ -2077,11 +2184,12 @@ async function retryHost(native: ReturnType<typeof source>) {
       status: number,
       input = scope,
       headers?: Record<string, string>,
+      body = '{}',
     ) {
       const draft = {
         ...hostScope(input),
         request,
-        response: new Response('{}', { status, headers }),
+        response: new Response(body, { status, headers }),
       }
       await run('http.response', draft)
       await draft.response.text()

@@ -39,7 +39,17 @@ export function createNativePrime(options: {
   })
   const send = async (accountId: string): Promise<PrimeSendResult> => {
     const scope = scopeFor(accountId)
-    const native = createNativeAnthropicAdapter({ source })
+    const native = createNativeAnthropicAdapter({
+      source: {
+        ...source,
+        quotaFromHeaders(headers, input) {
+          return source.quotaFromHeaders?.(headers, {
+            ...input,
+            reportRouting: false,
+          })
+        },
+      },
+    })
     const started = performance.now()
     try {
       for (let index = 0; index < 3; index++) {

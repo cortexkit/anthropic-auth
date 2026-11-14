@@ -399,7 +399,10 @@ export interface NativeAnthropicSource<Q, P> {
   /** Quota carried by the upstream response headers, read once per response. */
   readonly quotaFromHeaders?: (
     headers: Headers,
-    input: NativeAnthropicResponseContext<P>,
+    input: NativeAnthropicResponseContext<P> & {
+      /** Background cache requests harvest quota without reporting turn routing. */
+      readonly reportRouting?: boolean
+    },
   ) => Q | undefined
   /**
    * Classifies an error response before its body streams. `body()` reads a
@@ -1481,10 +1484,16 @@ export function createNativeAnthropicAdapter<Q, P>(
                     received,
                   )
               }
-              if (received.ok && fromUpstream(received.headers, data))
+              if (received.ok && fromUpstream(received.headers, data)) {
                 physicalAcceptances.set(data, {
                   at: deps.now?.() ?? Date.now(),
                 })
+                source.quotaFromHeaders?.(received.headers, {
+                  ...contextOf(attempt, data),
+                  provenance: authorized.provenance,
+                  status: received.status,
+                })
+              }
               return received
             } catch (error) {
               if (

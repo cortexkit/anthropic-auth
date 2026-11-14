@@ -43,6 +43,7 @@ import {
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
 import {
+  fromNativeQuotaMap,
   nativeQuotaCodec,
   toNativeQuotaMap,
 } from '../../../core/src/native-quota-codec'
@@ -983,6 +984,51 @@ test('a due OpenCode 2 prewarm sends once with the original account and no billi
     cache: { ttl_ms: 3_600_000, warming: { on: true } },
   })
 })
+
+test.each([200, 429])(
+  'OpenCode 2 keep-warm harvests quota without routing reports at status %i',
+  async (status) => {
+    const reports: unknown[] = []
+    runnerPolicyForReview(undefined, reports)
+    const f = await fixture()
+    await f.live()
+    await Bun.sleep(10)
+    reports.length = 0
+    f.setSend(async () =>
+      Response.json(
+        status === 200
+          ? { usage: { cache_read_input_tokens: 1 } }
+          : {
+              type: 'error',
+              error: { type: 'rate_limit_error', message: 'limited' },
+            },
+        {
+          status,
+          headers: {
+            'anthropic-ratelimit-unified-5h-utilization':
+              status === 200 ? '0.25' : '1',
+          },
+        },
+      ),
+    )
+    f.due()
+    await f.timers.fire()
+    expect(f.sent).toHaveLength(1)
+    await f.dispose()
+    expect(
+      reports.filter(
+        (value) => (value as { kind?: string }).kind === undefined,
+      ),
+    ).toEqual([])
+    const stored = await f.store.read()
+    if (stored.status !== 'ready')
+      throw new Error('Missing native account store')
+    const quota = fromNativeQuotaMap(
+      stored.rows.find((row) => row.id === 'first')?.quota,
+    )
+    expect(quota?.five_hour?.remainingPercent).toBe(status === 200 ? 75 : 0)
+  },
+)
 
 test('OpenCode 2 refuses a reserved warm before dispatch without billing it', async () => {
   const reports: unknown[] = []
