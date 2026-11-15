@@ -4,6 +4,7 @@ import {
   applySessionCacheTtl,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
+  requestShortestCacheLifetimeMs,
 } from '../session-cache-policy.ts'
 
 const key = Symbol.for('cortexkit.routing')
@@ -96,6 +97,58 @@ test('none removes both marker spellings only at protocol sites', () => {
   })
   expect(requestCacheLifetimeMs(body)).toBe(0)
 })
+
+test('mixed cache lifetimes report the shortest for billing and longest for expiry', () => {
+  const body = {
+    system: [{ cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', cache_control: { type: 'ephemeral' } }],
+      },
+    ],
+  }
+  expect(requestShortestCacheLifetimeMs(body)).toBe(300_000)
+  expect(requestCacheLifetimeMs(body)).toBe(3_600_000)
+  expect(requestShortestCacheLifetimeMs(JSON.stringify(body))).toBe(300_000)
+})
+
+test.each([
+  { body: {}, ttlMs: 0 },
+  { body: 'invalid JSON', ttlMs: 0 },
+  { body: 'null', ttlMs: 0 },
+  {
+    body: { cacheControl: { type: 'ephemeral', ttl: '1h' } },
+    ttlMs: 3_600_000,
+  },
+  {
+    body: { tools: [{ cache_control: { type: 'ephemeral', ttl: 'unknown' } }] },
+    ttlMs: 300_000,
+  },
+  {
+    body: {
+      tools: [
+        { input_schema: { cache_control: { type: 'ephemeral', ttl: '1h' } } },
+      ],
+      messages: [
+        {
+          content: [
+            {
+              type: 'tool_use',
+              input: { cacheControl: { type: 'ephemeral' } },
+            },
+          ],
+        },
+      ],
+    },
+    ttlMs: 0,
+  },
+])(
+  'shortest cache lifetime handles protocol markers only (%j)',
+  ({ body, ttlMs }) => {
+    expect(requestShortestCacheLifetimeMs(body)).toBe(ttlMs)
+  },
+)
 
 test('explicit lifetimes normalize markers and omitted lifetime preserves a mix', () => {
   const body = {

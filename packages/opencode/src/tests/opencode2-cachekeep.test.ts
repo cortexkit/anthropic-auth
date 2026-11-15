@@ -3285,6 +3285,63 @@ async function modelBilling(reports: Array<Record<string, unknown>>) {
 const warmingOf = (report: Record<string, unknown> | undefined) =>
   (report?.cache as Record<string, unknown> | undefined)?.warming
 
+test('OC2 mixed sent cache lifetimes use the shortest for billing and longest for cache_touch', async () => {
+  const reports: Array<Record<string, unknown>> = []
+  const policies = runnerPolicies(reports)
+  policies.set('ses_oc2_keep', { keep_warm: 'off' })
+  const f = await fixture()
+  const originalRewrite = wireTransform.rewriteRequestBody
+  // Inject mixed lifetimes after the host normalizes its cache markers, so the
+  // reports must describe the final sent body rather than the host's defaults.
+  const rewrite = spyOn(wireTransform, 'rewriteRequestBody').mockImplementation(
+    async (...args) => {
+      const body = JSON.parse((await originalRewrite(...args))!)
+      body.system = [
+        {
+          type: 'text',
+          text: 'Stable',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]
+      body.messages = [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'Hello',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      ]
+      return JSON.stringify(body)
+    },
+  )
+  cleanups.push(() => rewrite.mockRestore())
+  const request = await f.live()
+  const sent = JSON.parse(await request.clone().text())
+  expect(sent.system[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+  expect(sent.messages[0].content[0].cache_control).toEqual({
+    type: 'ephemeral',
+  })
+  await Bun.sleep(10)
+  expect(reports.filter((report) => report.kind === 'billing')).toEqual([
+    expect.objectContaining({
+      outcome: 'completed',
+      cache: expect.objectContaining({ ttl_ms: 300_000 }),
+    }),
+  ])
+  expect(reports.filter((report) => report.kind === 'cache_touch')).toEqual([
+    {
+      kind: 'cache_touch',
+      at: expect.any(Number),
+      ttl_ms: 3_600_000,
+      source: 'response',
+    },
+  ])
+})
+
 test('OC2 model-request billing carries the keep-warm state each step leaves', async () => {
   const reports: Array<Record<string, unknown>> = []
   const policies = runnerPolicies(reports)
