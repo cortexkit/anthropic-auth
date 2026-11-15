@@ -160,31 +160,54 @@ export function applySessionCacheTtl(
   })
 }
 
-/** The longest sent cache lifetime bounds when every cached prefix is gone. */
-export function requestCacheLifetimeMs(
+function visitRequestCacheLifetimes(
   input: Record<string, unknown> | string,
-): number {
+  visit: (ttlMs: number) => void,
+): void {
   let body: unknown = input
   if (typeof input === 'string') {
     try {
       body = JSON.parse(input)
     } catch {
-      return 0
+      return
     }
   }
-  if (!record(body)) return 0
-  let ttlMs = 0
+  if (!record(body)) return
   cacheHolders(body, (holder) => {
     for (const key of ['cache_control', 'cacheControl']) {
       const control = holder[key]
       if (!record(control) || control.type !== 'ephemeral') continue
-      ttlMs = Math.max(
-        ttlMs,
+      visit(
         control.ttl === '1h'
           ? PROMPT_CACHE_1H_TTL_MS
           : PROMPT_CACHE_DEFAULT_TTL_MS,
       )
     }
   })
+}
+
+/**
+ * Cache-touch reports and our local activity, hold and keep-warm timing use the
+ * longest sent lifetime: the cache is fully cold only after every prefix expires.
+ * Billing reports use requestShortestCacheLifetimeMs instead.
+ */
+export function requestCacheLifetimeMs(
+  input: Record<string, unknown> | string,
+): number {
+  let ttlMs = 0
+  visitRequestCacheLifetimes(input, (lifetime) => {
+    ttlMs = Math.max(ttlMs, lifetime)
+  })
   return ttlMs
+}
+
+/** Billing reports use the shortest sent lifetime among the cache breakpoints. */
+export function requestShortestCacheLifetimeMs(
+  input: Record<string, unknown> | string,
+): number {
+  let ttlMs = Infinity
+  visitRequestCacheLifetimes(input, (lifetime) => {
+    ttlMs = Math.min(ttlMs, lifetime)
+  })
+  return ttlMs === Infinity ? 0 : ttlMs
 }

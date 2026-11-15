@@ -92,6 +92,7 @@ import {
   reportRoutingResponse,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
+  requestShortestCacheLifetimeMs,
   resolveNativePoolPaths,
   routingCandidates,
   routingChoiceMatches,
@@ -467,7 +468,7 @@ const piCacheKeep = new PiCacheKeep(
         requestKind: 'keep_warm',
         chargeBasis: 'subscription_included',
         cache: {
-          ttlMs: requestCacheLifetimeMs(target.bodyText),
+          ttlMs: requestShortestCacheLifetimeMs(target.bodyText),
           warming: { on: true },
         },
       }
@@ -1012,7 +1013,7 @@ async function sendAnthropicRequest(
       ? piBillingPayer(attempt).credentialId
       : apiSubject?.credentialFingerprint
     if (!credentialId) return undefined
-    const ttlMs = requestCacheLifetimeMs(wireBodyText)
+    const ttlMs = requestShortestCacheLifetimeMs(wireBodyText)
     const sessionId = relayAffinity
     return {
       ...(attempt ? piBillingPayer(attempt) : { credentialId }),

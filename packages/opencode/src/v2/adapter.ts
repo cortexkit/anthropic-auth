@@ -49,6 +49,7 @@ import {
   remapRequestBodyModel,
   reportAnthropicBillingFailure,
   requestCacheLifetimeMs,
+  requestShortestCacheLifetimeMs,
   requestSignal,
   resolveNativePoolPaths,
   runWithRequestSignal,
@@ -1807,7 +1808,7 @@ export function createNativeAnthropicAdapter<Q, P>(
           const metadata = source.billingRequest?.(contextOf(attempt, data))
           if (metadata) {
             const payload = parseJson(bodyText)
-            const ttlMs = requestCacheLifetimeMs(bodyText)
+            const ttlMs = requestShortestCacheLifetimeMs(bodyText)
             billingSend = {
               input: {
                 ...metadata,

@@ -136,6 +136,75 @@ async function fixture(api = false, keepWarm = false) {
   return { storagePath }
 }
 
+test('Pi mixed sent cache lifetimes use the shortest for billing and longest for cache_touch', async () => {
+  await fixture()
+  const reports: Record<string, unknown>[] = []
+  globals[routingKey] = () => ({
+    cache: () => ({ keep_warm: 'off' }),
+    report: (payload: Record<string, unknown>) => reports.push(payload),
+  })
+  let sent: Record<string, any> | undefined
+  globalThis.fetch = mock(async (input: any, init?: RequestInit) => {
+    if (String(input).includes('/api/claude_cli/bootstrap'))
+      return Response.json({
+        oauth_account: { account_uuid: fixtureAccountIdentity('main') },
+      })
+    sent = JSON.parse(await new Request(input, init).text())
+    return accepted()
+  }) as unknown as typeof fetch
+  const result = await streamCortexKitAnthropic(model, context(), {
+    apiKey: 'sk-ant-oat01-main-access',
+    sessionId: 'ses_pi_reports',
+    onPayload: (payload) => {
+      const body = payload as Record<string, unknown>
+      body.system = [
+        {
+          type: 'text',
+          text: 'Stable',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ]
+      body.messages = [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'Hello',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      ]
+    },
+  }).result()
+  expect(result.errorMessage).toBeUndefined()
+  expect(result.stopReason).toBe('stop')
+  expect(sent?.system[0].cache_control).toEqual({
+    type: 'ephemeral',
+    ttl: '1h',
+  })
+  expect(sent?.messages[0].content[0].cache_control).toEqual({
+    type: 'ephemeral',
+  })
+  await stopPiCacheKeep()
+  await detached()
+  expect(reports.filter((report) => report.kind === 'billing')).toEqual([
+    expect.objectContaining({
+      outcome: 'completed',
+      cache: expect.objectContaining({ ttl_ms: 300_000 }),
+    }),
+  ])
+  expect(reports.filter((report) => report.kind === 'cache_touch')).toEqual([
+    {
+      kind: 'cache_touch',
+      at: expect.any(Number),
+      ttl_ms: 3_600_000,
+      source: 'response',
+    },
+  ])
+})
+
 test.each([
   { ttl: 'none', ttlMs: 0 },
   { ttl: 'short', ttlMs: 300_000 },

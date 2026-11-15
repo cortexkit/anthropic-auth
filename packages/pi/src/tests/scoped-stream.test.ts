@@ -3678,6 +3678,68 @@ test('Pi WebSocket relay tracks exactly once only after the real upstream 200', 
   }
 })
 
+test('Pi keep-warm billing reports the shortest lifetime in a mixed sent body', async () => {
+  const f = await fixture()
+  const billing = captureBilling()
+  let sentBody: string | undefined
+  globalThis.fetch = Object.assign(
+    async (
+      _input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      sentBody = String(init?.body)
+      return Response.json({ usage: { input_tokens: 1 } })
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const prewarm = await __prewarmPiCacheKeepForTest({
+    sessionId: 'pi-prewarm-mixed-lifetimes',
+    url: 'https://api.anthropic.com/v1/messages',
+    headers: new Headers({ 'content-type': 'application/json' }),
+    bodyText: JSON.stringify({
+      model: 'claude-fable-5-1',
+      system: [
+        {
+          type: 'text',
+          text: 'Stable',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'Hello',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      ],
+    }),
+    oauthAccountId: 'main',
+    oauthAccountIdentity: fixtureAccountIdentity('main'),
+    accountStoragePath: f.path,
+  })
+  expect(prewarm.ok).toBe(true)
+  expect(sentBody).toBeDefined()
+  const sent = JSON.parse(sentBody!)
+  expect(sent.system[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+  expect(sent.messages[0].content[0].cache_control).toEqual({
+    type: 'ephemeral',
+  })
+  await Bun.sleep(10)
+  expect(billing.sessions).toEqual(['pi-prewarm-mixed-lifetimes'])
+  expect(billing.reports).toEqual([
+    expect.objectContaining({
+      request_kind: 'keep_warm',
+      outcome: 'completed',
+      cache: { ttl_ms: 300_000, warming: { on: true } },
+    }),
+  ])
+})
+
 test('Pi model-request billing carries the keep-warm state each accepted step leaves', async () => {
   const f = await fixture()
   const runtime = await f.native.service()
