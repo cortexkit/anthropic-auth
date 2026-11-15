@@ -2,13 +2,19 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
+  __setLogTestSink,
   type CacheKeepTarget,
   CacheKeepStore as CoreStore,
+  getLogLevel,
+  type LogTestRecord,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import { CacheKeepStore } from '../v2/cachekeep-store.ts'
 import { CacheKeepStore as ReleasedStore } from './fixtures/cachekeep-store-2.5.5.ts'
 import { CacheKeepStore as Published260Store } from './fixtures/cachekeep-store-2.6.0.ts'
+import { invalidReason as published2131InvalidReason } from './fixtures/cachekeep-validator-2.13.1.ts'
 
 const roots: string[] = []
 afterEach(async () => {
@@ -40,6 +46,157 @@ const target: CacheKeepTarget = {
   lastTouchAt: now,
   lastTouchKind: 'response',
 }
+
+test('Core 2.13.1 validator accepts new saved policy snapshots on rollback', async () => {
+  const current = new CacheKeepStore({
+    storageId: 'rollback-2131',
+    root: await root(),
+  })
+  const policy = {
+    ttl: 'long',
+    keep_warm: 'hours',
+    hours: { from: '09:00', to: '18:00', tz: 'UTC' },
+  } as const
+  current.changed({
+    ...target,
+    policyState: {
+      ownerSessionId: target.id,
+      planned: true,
+      policy,
+      lastRealRequestAt: now,
+      warmsSinceLastRealRequest: 7,
+      warmCostSoFar: 123,
+      pendingWarmCost: 5,
+      hasWarmed: true,
+    },
+  })
+  await current.drain()
+  const [name] = await readdir(current.directory)
+  const entry = JSON.parse(
+    gunzipSync(await readFile(join(current.directory, name!))).toString(),
+  )
+  expect(entry.policyState.policy).toEqual(policy)
+  expect(published2131InvalidReason(entry, name!, now)).toBeUndefined()
+  expect(published2131InvalidReason({ ...entry, v: 2 }, name!, now)).toBe(
+    'format',
+  )
+})
+
+test('expired planned restart records report a contracted stop before deletion', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  const reports: unknown[] = []
+  globals[key] = () => ({ report: (payload: unknown) => reports.push(payload) })
+  try {
+    const current = new CacheKeepStore({
+      storageId: 'expired-plan',
+      root: await root(),
+    })
+    current.changed({
+      ...target,
+      policyState: {
+        ownerSessionId: target.id,
+        planned: true,
+        policy: { keep_warm: 'auto' },
+        lastRealRequestAt: now,
+        warmsSinceLastRealRequest: 0,
+        warmCostSoFar: 0,
+        hasWarmed: false,
+      },
+    })
+    await current.drain()
+    const expiredAt = target.cacheExpiresAt + 1
+    let accepted = false
+    await current.load(expiredAt, () => {
+      accepted = true
+      return true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(accepted).toBe(false)
+    expect(await readdir(current.directory)).toEqual([])
+    expect(reports).toEqual([
+      { kind: 'cache_warm_stopped', at: expiredAt, reason: 'cost-cap' },
+    ])
+  } finally {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  }
+})
+
+test.each(['account-gone', 'foreign-identity'] as const)(
+  'planned %s restore drops report only validated record owners',
+  async (reason) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const level = getLogLevel()
+    const logs: LogTestRecord[] = []
+    const reports: unknown[] = []
+    globals[key] = () => ({
+      report: (payload: unknown) => reports.push(payload),
+    })
+    setLogLevel('info')
+    __setLogTestSink((record) => logs.push(record))
+    try {
+      for (const valid of [false, true]) {
+        reports.length = 0
+        logs.length = 0
+        const current = new CacheKeepStore({
+          storageId: 'account-drop',
+          root: await root(),
+        })
+        current.changed({
+          ...target,
+          policyState: {
+            ownerSessionId: target.id,
+            planned: true,
+            policy: { keep_warm: 'auto' },
+            lastRealRequestAt: now,
+            warmsSinceLastRealRequest: 0,
+            warmCostSoFar: valid ? 0 : -1,
+            hasWarmed: false,
+          },
+        })
+        await current.drain()
+        let accepted = false
+        await current.load(now, () => {
+          accepted = true
+          return reason
+        })
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(accepted).toBe(valid)
+        expect(await readdir(current.directory)).toEqual([])
+        expect(reports).toEqual(
+          valid
+            ? [{ kind: 'cache_warm_stopped', at: now, reason: 'unsupported' }]
+            : [],
+        )
+        expect(
+          logs.filter((record) => record.message === 'stopped warming session'),
+        ).toEqual(
+          valid
+            ? [
+                expect.objectContaining({
+                  level: 'info',
+                  payload: {
+                    session: target.id,
+                    reason,
+                    stage: 'restore-account',
+                  },
+                }),
+              ]
+            : [],
+        )
+      }
+    } finally {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+      __setLogTestSink(null)
+      setLogLevel(level)
+    }
+  },
+)
 
 test('OC2 v2.5.5 reads current records and the current reader reads v2.5.5 records', async () => {
   const options = { storageId: 'same-oc2-storage', root: await root() }

@@ -38,7 +38,10 @@ beforeEach(() => {
   logs = []
   level = getLogLevel()
   setLogLevel('info')
-  __setLogTestSink((record) => logs.push(record))
+  __setLogTestSink((record) => {
+    // Timing telemetry is tested separately; these counts cover lifecycle diagnostics.
+    if (record.message !== 'prewarm timing') logs.push(record)
+  })
 })
 afterEach(() => {
   for (const manager of managers.splice(0)) manager.stop()
@@ -655,7 +658,18 @@ test('expiry pruning is not a live removal and emits no warning', () => {
   now += CACHE_KEEP_TTL_MS
   manager.dropExpiredTargets()
   expect(manager.trackedCount()).toBe(0)
-  expect(logs).toEqual([])
+  expect(logs.filter((record) => record.level === 'warn')).toEqual([])
+  expect(logs).toContainEqual(
+    expect.objectContaining({
+      level: 'info',
+      message: 'stopped warming session',
+      payload: expect.objectContaining({
+        session: 'expired',
+        reason: 'expired',
+        stage: 'prune',
+      }),
+    }),
+  )
 })
 
 test.each([

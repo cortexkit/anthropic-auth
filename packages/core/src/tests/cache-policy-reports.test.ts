@@ -203,7 +203,7 @@ test('routing-moved refuses before send and reports one WARN, lifecycle reason a
     expect(
       f.reports.filter((row) => row.kind === 'cache_warm_stopped'),
     ).toEqual([
-      { kind: 'cache_warm_stopped', at: f.now, reason: 'routing-moved' },
+      { kind: 'cache_warm_stopped', at: f.now, reason: 'unsupported' },
     ])
   } finally {
     __setLogTestSink(null)
@@ -254,7 +254,7 @@ test.each([
   'account-changed',
   'outside-hours',
 ])(
-  'warm retirement reports exact %s lifecycle reason only once',
+  'warm retirement reports the contracted %s lifecycle reason only once',
   async (reason) => {
     const f = fixture()
     await f.warm()
@@ -285,11 +285,13 @@ test.each([
       kind: 'cache_warm_stopped',
       at: f.now,
       reason:
-        reason === 'off' || reason === 'none'
+        reason === 'off' || reason === 'none' || reason === 'account-changed'
           ? 'unsupported'
           : reason === 'expired'
             ? 'cost-cap'
-            : reason,
+            : reason === 'stopped'
+              ? 'session-ended'
+              : reason,
     })
     f.manager.untrack('ses_report')
     await detached()
@@ -355,7 +357,7 @@ test('priced auto retires with cost-cap at equality', async () => {
   })
 })
 
-test('unpriced auto idle retirement is idle, not a 24-count stop', async () => {
+test('unpriced auto idle retirement reports cost-cap, not a 24-count stop', async () => {
   const f = fixture()
   f.setPolicy({ ttl: 'long', keep_warm: 'auto' })
   await f.warm()
@@ -367,11 +369,11 @@ test('unpriced auto idle retirement is idle, not a 24-count stop', async () => {
       ttl_ms: 3_600_000,
       source: 'warm',
     },
-    { kind: 'cache_warm_stopped', at: f.now, reason: 'idle' },
+    { kind: 'cache_warm_stopped', at: f.now, reason: 'cost-cap' },
   ])
 })
 
-test('target-budget retirement reports evicted after an actual warm', async () => {
+test('target-budget retirement reports unsupported after an actual warm', async () => {
   const f = fixture()
   await f.warm()
   for (let n = 0; n < 32; n++)
@@ -380,7 +382,7 @@ test('target-budget retirement reports evicted after an actual warm', async () =
   expect(f.reports.at(-1)).toEqual({
     kind: 'cache_warm_stopped',
     at: f.now,
-    reason: 'evicted',
+    reason: 'unsupported',
   })
 })
 
@@ -603,7 +605,7 @@ test.each([
     expect(f.reports.at(-1)).toEqual({
       kind: 'cache_warm_stopped',
       at: f.now,
-      reason: reason === 'account-policy' ? 'unsupported' : 'account-changed',
+      reason: 'unsupported',
     })
   },
 )

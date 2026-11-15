@@ -1627,6 +1627,70 @@ function forgetCacheKeepProcess(storageId: string) {
   ;(globalThis as any)[key]?.delete(storageId)
 }
 
+test.each([0, 3])(
+  'OpenCode 2 restart keeps %s planned records while the policy reads null',
+  async (count) => {
+    const lines = captureStartupLogs()
+    const routingKey = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[routingKey]
+    let policy: { ttl: 'long'; keep_warm: 'auto' } | null = {
+      ttl: 'long',
+      keep_warm: 'auto',
+    }
+    globals[routingKey] = () => ({ cache: () => policy })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[routingKey]
+      else globals[routingKey] = original
+    })
+    const f = await fixture(true, false, 'debug')
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const before = (globalThis as any)[key].get(f.paths.storageId)
+    for (let i = 0; i < count; i++) {
+      await f.live(undefined, { model: 'claude-opus-5-5' }, `ses_restore_${i}`)
+    }
+    expect(before.manager.trackedCount()).toBe(count)
+    await f.dispose()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      cacheKeep: { enabled: false },
+      claudeCache: { enabled: false, mode: 'hybrid' },
+    }))
+    const saved = await readdir(f.disk)
+    expect(saved).toHaveLength(count)
+    for (const name of saved) {
+      const record = JSON.parse(
+        gunzipSync(await readFile(join(f.disk, name))).toString(),
+      )
+      expect(record.policyState).toMatchObject({
+        planned: true,
+        policy: { ttl: 'long', keep_warm: 'auto' },
+        prefixTokens: 1,
+      })
+    }
+    forgetCacheKeepProcess(f.paths.storageId)
+    policy = null
+    const next = await f.start()
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    expect({
+      restored: owner.manager.trackedCount(),
+      logs: lines,
+    }).toMatchObject({ restored: count })
+    expect(
+      (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
+    ).toHaveLength(count)
+    f.advance(3_570_000)
+    await f.timers.fire()
+    expect({ sends: next.sent.length, logs: lines }).toMatchObject({
+      sends: count,
+    })
+    await owner.persistence.drain()
+    expect(
+      (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
+    ).toHaveLength(count)
+  },
+)
+
 test('OpenCode 2 restores and prewarms a live format-1 record from another plugin version', async () => {
   const lines = captureStartupLogs()
   const f = await fixture(false, false, 'debug')
@@ -1655,6 +1719,32 @@ test('OpenCode 2 restores and prewarms a live format-1 record from another plugi
   expect(warm.messages).toEqual(live.messages)
   expect(warm.system.slice(1)).toEqual(live.system.slice(1))
   expect(warm.max_tokens).toBe(0)
+})
+
+test('OpenCode 2 warm timing measures physical headers before its buffered response body', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture(false, false, 'debug')
+  await f.live()
+  f.setSend(async () => {
+    f.advance(120)
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          setTimeout(() => {
+            f.advance(80)
+            controller.enqueue(new TextEncoder().encode('{}'))
+            controller.close()
+          }, 0)
+        },
+      }),
+    )
+  })
+  f.due()
+  await f.timers.fire()
+  const timing = lines.filter((line) => line.includes('prewarm timing'))
+  expect(timing).toHaveLength(1)
+  expect(timing[0]).toContain('"headersMs":120')
+  expect(timing[0]).toContain('"totalMs":200')
 })
 
 test('OpenCode 2 restores a 2.6 record without policyState and durably caps its new count', async () => {

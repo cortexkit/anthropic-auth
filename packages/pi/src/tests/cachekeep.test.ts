@@ -499,38 +499,46 @@ test('shutdown saves an accepted body queued before a sweep releases its claim',
   )
 })
 
-test('planned child warms override local off and preserve the 24-count across Pi restart', async () => {
-  const key = Symbol.for('cortexkit.routing')
-  const globals = globalThis as Record<symbol, unknown>
-  const original = globals[key]
-  globals[key] = () => ({ cache: () => ({ ttl: 'long', keep_warm: 'always' }) })
-  cleanups.push(() => {
-    if (original === undefined) delete globals[key]
-    else globals[key] = original
-  })
-  const f = await fixture()
-  f.snapshot.policyStorage.cacheKeep = { enabled: false, subagents: false }
-  f.snapshot.policyStorage.claudeCache = { enabled: false }
-  const first = f.create()
-  await first.process.trackAccepted(
-    { ...f.input('planned-pi'), isSubagent: true },
-    f.snapshot,
-  )
-  for (let n = 0; n < 23; n++) {
+test.each([false, true])(
+  'planned child warms override local off and preserve the 24-count across Pi restart (null policy: %s)',
+  async (nullPolicy) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    let policy: { ttl: 'long'; keep_warm: 'always' } | null = {
+      ttl: 'long',
+      keep_warm: 'always',
+    }
+    globals[key] = () => ({ cache: () => policy })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    })
+    const f = await fixture()
+    f.snapshot.policyStorage.cacheKeep = { enabled: false, subagents: false }
+    f.snapshot.policyStorage.claudeCache = { enabled: false }
+    const first = f.create()
+    await first.process.trackAccepted(
+      { ...f.input('planned-pi'), isSubagent: true },
+      f.snapshot,
+    )
+    for (let n = 0; n < 23; n++) {
+      f.advance(3_570_000)
+      await first.tick()
+    }
+    expect(f.sends).toHaveLength(23)
+    await first.process.stop()
+    if (nullPolicy) policy = null
+    const resumed = f.create()
+    await resumed.process.startSession('pi-storage', 'planned-pi')
     f.advance(3_570_000)
-    await first.tick()
-  }
-  expect(f.sends).toHaveLength(23)
-  await first.process.stop()
-  const resumed = f.create()
-  await resumed.process.startSession('pi-storage', 'planned-pi')
-  f.advance(3_570_000)
-  await resumed.tick()
-  expect(f.sends).toHaveLength(24)
-  f.advance(3_570_000)
-  await resumed.tick()
-  expect(f.sends).toHaveLength(24)
-})
+    await resumed.tick()
+    expect(f.sends).toHaveLength(24)
+    f.advance(3_570_000)
+    await resumed.tick()
+    expect(f.sends).toHaveLength(24)
+  },
+)
 
 test('ttl-only policy cannot restore a Pi child after the local subagent opt-out', async () => {
   const key = Symbol.for('cortexkit.routing')

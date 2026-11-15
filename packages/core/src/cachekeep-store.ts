@@ -16,6 +16,7 @@ import {
   readWindowsOwnerOnly,
 } from './owner-only.ts'
 import { renameWithWindowsSharingRetry } from './publication-rename.ts'
+import { reportSessionCacheWarmStopped } from './session-cache-policy.ts'
 
 const compress = promisify(gzip)
 const decompress = promisify(gunzip)
@@ -109,6 +110,7 @@ function record(
       policyState: {
         ownerSessionId: target.policyState.ownerSessionId,
         planned: target.policyState.planned,
+        policy: target.policyState.policy,
         lastRealRequestAt: target.policyState.lastRealRequestAt,
         lastWarmAt: target.policyState.lastWarmAt,
         warmsSinceLastRealRequest: target.policyState.warmsSinceLastRealRequest,
@@ -166,7 +168,6 @@ function invalidReason(
     !Number.isFinite(value.nextPrewarmAt)
   )
     return 'invalid'
-  if (value.cacheExpiresAt <= now) return 'expired'
   const state = value.policyState
   if (
     state !== undefined &&
@@ -196,8 +197,43 @@ function invalidReason(
       ))
   )
     return 'invalid'
+  if (state?.policy !== undefined && !validSavedPolicy(state.policy))
+    return 'invalid'
   // Malformed bodies and credential-bearing records are not replayable.
   if (sanitizedBody(value.bodyText) !== value.bodyText) return 'invalid'
+  if (value.cacheExpiresAt <= now) return 'expired'
+}
+
+function validSavedPolicy(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const policy = value as Record<string, unknown>
+  if (
+    policy.ttl !== undefined &&
+    !['none', 'short', 'long'].includes(String(policy.ttl))
+  )
+    return false
+  if (
+    policy.keep_warm !== undefined &&
+    !['off', 'auto', 'always', 'hours'].includes(String(policy.keep_warm))
+  )
+    return false
+  if (policy.keep_warm !== 'hours') return policy.hours === undefined
+  const hours = policy.hours as Record<string, unknown> | undefined
+  if (!hours || typeof hours !== 'object' || Array.isArray(hours)) return false
+  if (
+    ![hours.from, hours.to].every(
+      (time) =>
+        typeof time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(time),
+    )
+  )
+    return false
+  if (typeof hours.tz !== 'string' || !hours.tz) return false
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: hours.tz })
+    return true
+  } catch {
+    return false
+  }
 }
 
 export interface CacheKeepStoreOptions {
@@ -393,7 +429,37 @@ export class CacheKeepStore {
           reason = 'invalid'
           const entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
           const invalid = invalidReason(entry, name, now)
+          if (invalid === 'expired' && entry.policyState?.planned) {
+            // The loader retires expired records before a manager can adopt them.
+            // common-auth's CACHE_WARM_STOP_REASONS has no deadline-missed value yet,
+            // so report cost-cap to Thalamus and log the actual local cause.
+            reportSessionCacheWarmStopped(entry.policyState.ownerSessionId, {
+              at: now,
+              reason: 'cost-cap',
+            })
+            logger.info('cachekeep', 'stopped warming session', {
+              session: entry.id,
+              reason: 'retry-window-ended',
+              stage: 'restore-prune',
+              overdueMs: now - entry.cacheExpiresAt,
+            })
+          }
           const accepted = invalid ?? accept(entry)
+          if (
+            invalid === undefined &&
+            entry.policyState?.planned &&
+            (accepted === 'account-gone' || accepted === 'foreign-identity')
+          ) {
+            reportSessionCacheWarmStopped(entry.policyState.ownerSessionId, {
+              at: now,
+              reason: 'unsupported',
+            })
+            logger.info('cachekeep', 'stopped warming session', {
+              session: entry.id,
+              reason: accepted,
+              stage: 'restore-account',
+            })
+          }
           if (accepted !== true && accepted !== undefined) {
             reason = accepted || 'invalid'
             throw new Error('Stale restart file')

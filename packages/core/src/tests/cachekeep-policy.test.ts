@@ -447,6 +447,7 @@ test.each([false, true])(
     expect(f.target.policyState).toEqual({
       ownerSessionId: f.input.sessionId,
       planned,
+      ...(planned && { policy: { ttl: 'long', keep_warm: 'always' } }),
       lastRealRequestAt: lastTouchAt,
       warmsSinceLastRealRequest: 0,
       warmCostSoFar: 0,

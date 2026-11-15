@@ -108,6 +108,7 @@ interface CacheKeepLease {
     target: CacheKeepTarget,
     warm: Request,
     deadline?: AbortSignal,
+    onResponseHeaders?: () => void,
   ) => Promise<Response>
   /** Sends this lease started; its disposal waits for them to settle. */
   readonly inflight: Set<Promise<unknown>>
@@ -333,6 +334,7 @@ function createSharedCacheKeep(
         entry.target,
         request as Request,
         entry.attempt.signal,
+        entry.attempt.onResponseHeaders,
       )
       const settled = sending.then(
         () => {},
@@ -396,6 +398,7 @@ function createSharedCacheKeep(
           if (!leases.size || manager.trackedRequest(entry.id)) return undefined
           if (
             !isCacheKeepHybridActive(snapshot.policyStorage) &&
+            !entry.policyState?.planned &&
             readSessionCachePolicy(
               entry.policyState?.ownerSessionId ?? entry.id,
               true,
@@ -414,6 +417,7 @@ function createSharedCacheKeep(
             return 'account-gone'
           if (
             entry.isSubagent &&
+            !entry.policyState?.planned &&
             readSessionCachePolicy(
               entry.policyState?.ownerSessionId ?? entry.id,
               true,
@@ -564,6 +568,7 @@ export function createNativeCacheKeep(
     target: CacheKeepTarget,
     warm: Request,
     deadline?: AbortSignal,
+    onResponseHeaders?: () => void,
   ) => {
     const signal = deadline
       ? AbortSignal.any([abort.signal, deadline])
@@ -779,6 +784,7 @@ export function createNativeCacheKeep(
       signal.throwIfAborted()
       const ownerSession = target.policyState?.ownerSessionId ?? target.id
       const explicit =
+        target.policyState?.planned === true ||
         readSessionCachePolicy(ownerSession, true)?.keep_warm !== undefined
       const parent = explicit ? undefined : options.subagent?.(ownerSession)
       if (!explicit && options.subagent && parent === undefined)
@@ -789,6 +795,9 @@ export function createNativeCacheKeep(
       signal.throwIfAborted()
       stage = 'send'
       const physical = await (options.fetch ?? fetch)(request)
+      try {
+        onResponseHeaders?.()
+      } catch {}
       stage = 'response'
       status = physical.status
       const response = await native.adapter.rewriteResponse?.({

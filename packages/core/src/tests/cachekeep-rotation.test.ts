@@ -83,13 +83,15 @@ test('CacheKeep standalone immediate responses update only their own generation'
   const first = manager.prewarmNow(target)
   await started[0]!.promise
   const second = manager.prewarmNow(target)
-  await started[1]!.promise
   try {
-    responses[1]!.resolve(Response.json({}))
-    expect(await second).toEqual({ ok: true, ttlMs: 300_000 })
+    await Promise.resolve()
+    expect(sends).toBe(1)
     responses[0]!.resolve(Response.json({}))
     expect(await first).toEqual({ ok: true, ttlMs: 300_000 })
-    expect(current).toEqual([true, false])
+    await started[1]!.promise
+    responses[1]!.resolve(Response.json({}))
+    expect(await second).toEqual({ ok: true, ttlMs: 300_000 })
+    expect(current).toEqual([false, true])
   } finally {
     responses.forEach((response) => {
       response.resolve(Response.json({}))

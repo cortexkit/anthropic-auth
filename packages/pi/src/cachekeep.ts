@@ -290,6 +290,7 @@ export class PiCacheKeep {
             return 'account-gone'
           if (
             entry.isSubagent &&
+            !entry.policyState?.planned &&
             readSessionCachePolicy(
               entry.policyState?.ownerSessionId ?? entry.id,
               true,

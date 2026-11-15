@@ -2,6 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- Keep-warm now survives server restarts under Thalamus and keeps other sessions warm when one send is slow.
+
 ## 2.13.1
 
 - Under Thalamus, billing reports now give the shortest cache lifetime in a request when its cache markers mix lifetimes.
