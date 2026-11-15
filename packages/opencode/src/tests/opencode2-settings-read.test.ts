@@ -1083,7 +1083,19 @@ for (const mode of ['local', 'claustrum'] as const) {
         ] as const) {
           settingsReaderOutputs(storage)
           const observed = await observeSettings(storage, 2)
-          expect(JSON.stringify(observed), phase).toBe(
+          // Per-warm timings are tested separately and were absent in 2.11.2;
+          // keep every older diagnostic and request byte in the release oracle.
+          const compatible = {
+            ...observed,
+            logs: observed.logs.filter(
+              (record) =>
+                !(
+                  record.channel === 'cachekeep' &&
+                  record.message === 'prewarm timing'
+                ),
+            ),
+          }
+          expect(JSON.stringify(compatible), phase).toBe(
             JSON.stringify(releaseSnapshots[`oc2-${sample}`]),
           )
           expect(observed.logs.length).toBeGreaterThan(0)
