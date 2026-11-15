@@ -1832,6 +1832,27 @@ test('three restored sends reserve distinct start slots without waiting for resp
   expect(starts[2]! - starts[1]!).toBe(3000)
 })
 
+test('OC2 deferred reservation wait returns skipped without retrying or removing its target', async () => {
+  const f = await fixture()
+  runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+  await f.live()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  const target = owner.manager.targets.get('ses_oc2_keep') as CacheKeepTarget
+  const due = target.nextPrewarmAt
+  const result = await owner.manager.prewarmNow({
+    ...target,
+    sessionId: target.id,
+    headers: new Headers(),
+  })
+  expect(result).toEqual({ ok: false, skipped: true, reason: 'wait' })
+  expect(owner.manager.trackedCount()).toBe(1)
+  expect(target.nextPrewarmAt).toBe(due)
+  expect(target.consecutiveFailures).toBe(0)
+  expect(target.policyState?.warmsSinceLastRealRequest).toBe(0)
+  expect(f.sent).toHaveLength(0)
+})
+
 test('OpenCode 2 restores and prewarms a live format-1 record from another plugin version', async () => {
   const lines = captureStartupLogs()
   const f = await fixture(false, false, 'debug')

@@ -3,10 +3,7 @@ import {
   type CacheKeepDecision,
   decideCacheKeep,
 } from '@cortexkit/common-auth/cachekeep'
-import {
-  type CacheWarmStopReason,
-  isCacheWarmStopReason,
-} from '@cortexkit/common-auth/routing-accessor'
+import type { CacheWarmStopReason } from '@cortexkit/common-auth/routing-accessor'
 import type { AccountSettingsReaderInput, AccountStorage } from './accounts.ts'
 import {
   type AnthropicBillingRequest,
@@ -42,6 +39,7 @@ import {
 } from './provider-error.ts'
 import { stripServerFallbackUsageMarkers } from './server-fallback-usage.ts'
 import {
+  isSessionCacheWarmStopReason,
   readSessionCachePolicy,
   reportSessionCacheTouch,
   reportSessionCacheWarmStopped,
@@ -518,9 +516,8 @@ function stopReason(reason: string): CacheKeepStopReason {
 
 function reportStopReason(
   reason: string,
-  planned = false,
 ): CacheWarmStopReason | 'deadline-missed' {
-  if (isCacheWarmStopReason(reason)) return reason
+  if (isSessionCacheWarmStopReason(reason)) return reason
   switch (reason) {
     case 'schedule':
     case 'schedule-period-ended':
@@ -531,9 +528,10 @@ function reportStopReason(
     case 'retry-window-ended':
     case 'retries-exhausted':
     case 'expired':
-      return planned ? 'deadline-missed' : 'cost-cap'
+      return 'deadline-missed'
     case 'idle':
     case 'source-warm-idle-cap':
+      // The idle bound for unpriced automatic warming acts as its cost limit.
       return 'cost-cap'
     default:
       return 'unsupported'
@@ -719,7 +717,28 @@ export class CacheKeepWarmRefusal extends Error {
   }
 }
 
-class CacheKeepWarmWait extends Error {}
+const CACHE_KEEP_WARM_WAIT = Symbol.for(
+  'cortexkit.anthropic-auth.cachekeep.wait',
+)
+class CacheKeepWarmWait extends Error {
+  readonly [CACHE_KEEP_WARM_WAIT] = true
+}
+
+/** Preserve nonterminal waits across independently loaded host/Core bundles. */
+export function isCacheKeepWarmWait(
+  error: unknown,
+): error is CacheKeepWarmWait {
+  try {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      Object.getOwnPropertyDescriptor(error, CACHE_KEEP_WARM_WAIT)?.value ===
+        true
+    )
+  } catch {
+    return false
+  }
+}
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
@@ -855,9 +874,6 @@ export class CacheKeepManager {
 
   stop() {
     this.immediateTargets.clear()
-    const now = this.options.now?.() ?? Date.now()
-    for (const target of this.targets.values())
-      this.reportStop(target, 'stopped', now, false, false)
     if (this.dueTimer) {
       ;(this.options.clearTimeoutImpl ?? clearTimeout)(this.dueTimer)
       this.dueTimer = null
@@ -1001,8 +1017,11 @@ export class CacheKeepManager {
       return { on: true }
     const record = this.warmingRecords.get(id)
     if (!record) return undefined
-    return isCacheWarmStopReason(record.stopReason)
-      ? { on: false, stopReason: record.stopReason }
+    return isSessionCacheWarmStopReason(record.stopReason)
+      ? ({
+          on: false,
+          stopReason: record.stopReason,
+        } as AnthropicBillingWarming)
       : { on: false }
   }
 
@@ -1354,13 +1373,12 @@ export class CacheKeepManager {
     reason: string,
     at: number,
     restored = false,
-    terminal = true,
   ) {
     const state = target.policyState
     // Source warms use a synthetic id, not the session's own.
     if (!target.sourceWarm)
       this.setWarmingRecord(target.id, {
-        stopReason: reportStopReason(reason, state?.planned),
+        stopReason: reportStopReason(reason),
       })
     // Source warms are a different model's prefix, not evidence about the
     // active session cache. The shared report has no target-attribution field.
@@ -1373,22 +1391,20 @@ export class CacheKeepManager {
     )
       return
     this.reportedStops.add(state)
-    if (terminal) state.stopReported = true
+    state.stopReported = true
     const report = () =>
       reportSessionCacheWarmStopped(state.ownerSessionId, {
         at,
-        reason: reportStopReason(reason, state.planned),
+        reason: reportStopReason(reason),
       })
-    // Save the stop marker before removal. Without receiver acknowledgements a
-    // crash may lose a report, but must not report the same saved record twice.
-    if (terminal && this.options.reserveWarm)
-      void this.options
-        .reserveWarm(target)
-        .then((saved) => {
-          if (saved) report()
-        })
-        .catch(() => {})
-    else report()
+    // Persist before unlink when possible, but a failed marker must not lose a stop.
+    try {
+      if (this.options.reserveWarm)
+        void this.options.reserveWarm(target).then(report, report)
+      else report()
+    } catch {
+      report()
+    }
   }
 
   private evictOldestTarget(now: number, reason: 'budget' | 'count') {
@@ -2173,7 +2189,7 @@ export class CacheKeepManager {
         } catch (error) {
           if (
             error instanceof CacheKeepWarmRefusal ||
-            error instanceof CacheKeepWarmWait ||
+            isCacheKeepWarmWait(error) ||
             nativeAccountRefusal(error)
           ) {
             scope.dispose()
@@ -2282,7 +2298,7 @@ export class CacheKeepManager {
         ...(usage && { usage }),
       }
     } catch (error) {
-      if (error instanceof CacheKeepWarmWait)
+      if (isCacheKeepWarmWait(error))
         return { ok: false, skipped: true, reason: 'wait' }
       if (error instanceof CacheKeepWarmRefusal)
         return { ok: false, refused: true, reason: error.reason }

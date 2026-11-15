@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   type CacheTouchInput,
   type CacheWarmStoppedInput,
+  isCacheWarmStopReason,
   reportCacheTouch,
   reportCacheWarmStopped,
   type SessionCachePolicy,
@@ -109,6 +110,17 @@ export function reportSessionCacheTouch(
 export type SessionCacheWarmStopReason =
   | CacheWarmStoppedInput['reason']
   | 'deadline-missed'
+
+/**
+ * llm-runner 0.8.56 admits deadline-missed. Remove this special case with
+ * common-auth 0.51.0. In 0.50.0 the final billing wrapper still omits that
+ * reason, but cache_warm_stopped forwards it unchanged.
+ */
+export function isSessionCacheWarmStopReason(
+  value: unknown,
+): value is SessionCacheWarmStopReason {
+  return value === 'deadline-missed' || isCacheWarmStopReason(value)
+}
 
 export function reportSessionCacheWarmStopped(
   sessionId: string,

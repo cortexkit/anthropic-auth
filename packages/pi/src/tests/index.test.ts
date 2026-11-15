@@ -28,6 +28,7 @@ import { buildAnthropicRequest } from '../convert.ts'
 import cortexKitPiAnthropicAuth from '../index'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
+import { getPiTrackedCacheKeepSessions, stopPiCacheKeep } from '../stream.ts'
 import {
   fixtureAccountIdentity,
   saveNativePiFixture,
@@ -105,6 +106,98 @@ function mockPi() {
 
   return { pi, providers, events }
 }
+
+test.each(['api-key', 'other-provider', 'no-storage'] as const)(
+  'Pi turn hook retires a restored prefix before a %s turn',
+  async (route) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const reports: { kind: string; reason?: string }[] = []
+    globals[key] = () => ({
+      cache: () => null,
+      report: (payload: (typeof reports)[number]) => reports.push(payload),
+    })
+    let manager: CacheKeepManager | undefined
+    const tracked = CacheKeepManager.prototype.trackedSessions
+    const capture = spyOn(
+      CacheKeepManager.prototype,
+      'trackedSessions',
+    ).mockImplementation(function (this: CacheKeepManager) {
+      manager = this
+      return tracked.call(this)
+    })
+    try {
+      await getPiTrackedCacheKeepSessions()
+      capture.mockRestore()
+      const { pi, events } = mockPi()
+      await cortexKitPiAnthropicAuth(pi)
+      const sessionId = `restored-${route}`
+      const now = Date.now()
+      expect(
+        manager!.track({
+          sessionId,
+          url: messagesUrl,
+          headers: new Headers(),
+          bodyText: JSON.stringify({
+            model: 'claude-opus-5-5',
+            system: [
+              {
+                type: 'text',
+                text: 'old prefix',
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+              },
+            ],
+          }),
+          storage: { version: 1, accounts: [], cacheKeep: { enabled: false } },
+          cacheMode: 'hybrid',
+          retained: {
+            cacheExpiresAt: now + 3_600_000,
+            nextPrewarmAt: now + 3_570_000,
+            ttlMs: 3_600_000,
+            lastTouchAt: now,
+            lastTouchKind: 'response',
+            policyState: {
+              ownerSessionId: sessionId,
+              planned: true,
+              policy: { ttl: 'long', keep_warm: 'always' },
+              lastRealRequestAt: now,
+              warmsSinceLastRealRequest: 0,
+              warmCostSoFar: 0,
+              hasWarmed: false,
+            },
+          },
+        }).tracked,
+      ).toBe(true)
+      await events.get('turn_start')?.(
+        { type: 'turn_start' },
+        {
+          hasUI: false,
+          model: {
+            ...fableModel,
+            provider: route === 'other-provider' ? 'openai' : 'anthropic',
+          },
+          sessionManager: {
+            getSessionId: () => sessionId,
+            getBranch: () => [],
+            getEntries: () => [],
+          },
+        },
+      )
+      expect(manager!.trackedRequest(sessionId)).toBeUndefined()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(
+        reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+      ).toEqual([expect.objectContaining({ reason: 'session-ended' })])
+    } finally {
+      capture.mockRestore()
+      await stopPiCacheKeep()
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    }
+  },
+)
 
 describe('cortexKitPiAnthropicAuth provider registration', () => {
   test('exposes Claude Sonnet 5 in the Pi Anthropic catalog', async () => {

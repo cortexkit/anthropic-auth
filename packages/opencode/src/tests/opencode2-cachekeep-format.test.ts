@@ -1,8 +1,8 @@
-import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { afterEach, expect, spyOn, test } from 'bun:test'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { gunzipSync } from 'node:zlib'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   type CacheKeepTarget,
@@ -285,6 +285,156 @@ test('persisted stop marker prevents a second report after a crash before unlink
     await restarted.load(target.cacheExpiresAt + 1, () => 'expired')
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(reports).toEqual([])
+    expect(await readdir(current.directory)).toEqual([])
+  } finally {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  }
+})
+
+test.each(['expired', 'account-gone'] as const)(
+  'a live record arriving during %s marker persistence is neither reported nor unlinked',
+  async (disposition) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const reports: unknown[] = []
+    globals[key] = () => ({
+      report: (payload: unknown) => reports.push(payload),
+    })
+    try {
+      const current = new CacheKeepStore({
+        storageId: 'load-race',
+        root: await root(),
+      })
+      const saved = {
+        ...target,
+        policyState: {
+          ownerSessionId: target.id,
+          planned: true,
+          lastRealRequestAt: now,
+          warmsSinceLastRealRequest: 0,
+          warmCostSoFar: 0,
+          hasWarmed: false,
+        },
+      }
+      await current.reserveWarm(saved)
+      const entered = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      const write = Reflect.get(current, 'writeEntry').bind(current)
+      const marker = spyOn(current as any, 'writeEntry').mockImplementation(
+        async (entry: any, directory: string) => {
+          if (entry.policyState?.stopReported) {
+            entered.resolve()
+            await release.promise
+          }
+          return write(entry, directory)
+        },
+      )
+      let live = false
+      const loading = current.load(
+        disposition === 'expired' ? target.cacheExpiresAt + 1 : now,
+        () => disposition,
+        undefined,
+        () => !live,
+      )
+      await entered.promise
+      live = true
+      let written = false
+      const bodyText =
+        '{"model":"claude-opus-4-6","system":"new accepted prefix"}'
+      const fresh = current
+        .reserveWarm({
+          ...saved,
+          bodyText,
+          cacheExpiresAt: target.cacheExpiresAt + 3_600_000,
+        })
+        .then(() => {
+          written = true
+        })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const overtookMarker = written
+      release.resolve()
+      await Promise.all([loading, fresh])
+      marker.mockRestore()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(overtookMarker).toBe(false)
+      expect(reports).toEqual([])
+      const [name] = await readdir(current.directory)
+      expect(name).toBeDefined()
+      expect(
+        JSON.parse(
+          gunzipSync(await readFile(join(current.directory, name!))).toString(),
+        ).bodyText,
+      ).toBe(bodyText)
+    } finally {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    }
+  },
+)
+
+test.each(['format', 'unreadable'] as const)(
+  'a live per-file guard protects a %s restart file',
+  async (invalid) => {
+    const current = new CacheKeepStore({
+      storageId: 'invalid-live',
+      root: await root(),
+    })
+    await current.reserveWarm(target)
+    const [name] = await readdir(current.directory)
+    const path = join(current.directory, name!)
+    await writeFile(
+      path,
+      invalid === 'format'
+        ? gzipSync(JSON.stringify({ ...target, v: 999 }))
+        : new Uint8Array([0, 1, 2]),
+    )
+    await current.load(
+      now,
+      () => undefined,
+      undefined,
+      () => false,
+    )
+    expect(await readdir(current.directory)).toEqual([name!])
+  },
+)
+
+test('a failed restore marker write still reports the terminal stop', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  const reports: unknown[] = []
+  globals[key] = () => ({ report: (payload: unknown) => reports.push(payload) })
+  try {
+    const current = new CacheKeepStore({
+      storageId: 'failed-marker',
+      root: await root(),
+    })
+    await current.reserveWarm({
+      ...target,
+      policyState: {
+        ownerSessionId: target.id,
+        planned: true,
+        lastRealRequestAt: now,
+        warmsSinceLastRealRequest: 0,
+        warmCostSoFar: 0,
+        hasWarmed: false,
+      },
+    })
+    const marker = spyOn(current as any, 'writeEntry').mockRejectedValue(
+      new Error('disk write failed'),
+    )
+    await current.load(target.cacheExpiresAt + 1, () => 'expired')
+    marker.mockRestore()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports).toEqual([
+      {
+        kind: 'cache_warm_stopped',
+        at: target.cacheExpiresAt + 1,
+        reason: 'deadline-missed',
+      },
+    ])
     expect(await readdir(current.directory)).toEqual([])
   } finally {
     if (original === undefined) delete globals[key]

@@ -501,6 +501,81 @@ test('stop reporting waits for its durable marker before reporting', async () =>
   ).toHaveLength(1)
 })
 
+test('pausing leaves the record and stop deduplication untouched for a later terminal stop', async () => {
+  const f = fixture()
+  f.track()
+  f.advance(3_570_000)
+  await f.manager.tick()
+  await detached()
+  f.reports.length = 0
+  const saved = structuredClone(f.targets.get(f.input.sessionId)!)
+  f.manager.stop()
+  await detached()
+  expect(f.reports).toEqual([])
+  expect(f.targets.get(f.input.sessionId)).toEqual(saved)
+  f.setPolicy({ keep_warm: 'off' })
+  await f.manager.tick()
+  await detached()
+  expect(f.reports).toEqual([
+    { kind: 'cache_warm_stopped', at: f.now, reason: 'unsupported' },
+  ])
+  expect(saved.policyState?.stopReported).toBeUndefined()
+  expect(f.targets.get(f.input.sessionId)?.policyState?.stopReported).toBe(true)
+})
+
+test.each(['false', 'rejected', 'thrown'] as const)(
+  'terminal stop still reports after a %s marker write',
+  async (failure) => {
+    const f = fixture(undefined, undefined, {
+      reserveWarm: () => {
+        if (failure === 'thrown') throw new Error('write failed')
+        if (failure === 'rejected')
+          return Promise.reject(new Error('write failed'))
+        return Promise.resolve(false)
+      },
+    })
+    f.track()
+    f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
+    f.manager.untrack(f.input.sessionId)
+    await detached()
+    await detached()
+    expect(f.reports).toEqual([
+      { kind: 'cache_warm_stopped', at: f.now, reason: 'session-ended' },
+    ])
+  },
+)
+
+test('unplanned deadline misses remain reportable in both lifecycle and billing state', async () => {
+  const f = fixture(null)
+  Object.assign(f.input.storage, {
+    cacheKeep: { enabled: true, always: true },
+    claudeCache: { enabled: true, mode: 'hybrid' },
+  })
+  expect(f.track({ cacheMode: 'hybrid' }).tracked).toBe(true)
+  f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
+  f.advance(3_570_001)
+  await f.manager.tick()
+  await detached()
+  expect(f.reports).toEqual([
+    { kind: 'cache_warm_stopped', at: f.now, reason: 'deadline-missed' },
+  ])
+  expect(f.manager.warming(f.input.sessionId)).toEqual({
+    on: false,
+    stopReason: 'deadline-missed',
+  })
+})
+
+test('planned deadline-missed is retained in manager billing state', () => {
+  const f = fixture()
+  f.track()
+  f.advance(3_600_001)
+  f.manager.dropExpiredTargets()
+  expect(f.manager.warming(f.input.sessionId)).toEqual({
+    on: false,
+    stopReason: 'deadline-missed',
+  })
+})
+
 test('planned deadline miss logs retry-window-ended and reports deadline-missed on the wire', async () => {
   const f = fixture(
     undefined,

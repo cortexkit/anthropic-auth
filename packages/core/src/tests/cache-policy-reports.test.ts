@@ -249,7 +249,6 @@ test.each([
   'off',
   'none',
   'session-ended',
-  'stopped',
   'expired',
   'account-changed',
   'outside-hours',
@@ -266,7 +265,6 @@ test.each([
       f.setPolicy({ ttl: 'none', keep_warm: 'off' })
       await f.manager.tick()
     } else if (reason === 'session-ended') f.manager.untrack('ses_report')
-    else if (reason === 'stopped') f.manager.stop()
     else if (reason === 'expired') {
       f.advance(3_600_000)
       await f.manager.tick()
@@ -289,9 +287,7 @@ test.each([
           ? 'unsupported'
           : reason === 'expired'
             ? 'deadline-missed'
-            : reason === 'stopped'
-              ? 'session-ended'
-              : reason,
+            : reason,
     })
     f.manager.untrack('ses_report')
     await detached()

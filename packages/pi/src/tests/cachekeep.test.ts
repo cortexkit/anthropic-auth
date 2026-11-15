@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -247,6 +247,7 @@ test('a Pi real turn on an ineligible account ends its restored planned prefix',
   await second.process.startSession('pi-storage', 'session-S')
   expect(second.process.manager.trackedCount()).toBe(1)
   f.snapshot.accounts = []
+  second.process.realTurn('session-S')
   await second.process.trackAccepted(
     f.input('session-S', 'new real prefix'),
     f.snapshot,
@@ -260,6 +261,118 @@ test('a Pi real turn on an ineligible account ends its restored planned prefix',
   f.advance(3_570_000)
   await second.tick()
   expect(f.sends).toHaveLength(0)
+})
+
+test.each(['local-turn', 'live-claim'] as const)(
+  'Pi sweep rechecks %s ownership after the expiry marker write',
+  async (owner) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const reports: { kind: string; reason?: string }[] = []
+    globals[key] = () => ({
+      cache: () => ({ ttl: 'long', keep_warm: 'always' }),
+      report: (payload: (typeof reports)[number]) => reports.push(payload),
+    })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    })
+    const f = await fixture()
+    const first = f.create()
+    await first.process.startSession('pi-storage', 'old-session')
+    await first.process.trackAccepted(f.input('old-session'), f.snapshot)
+    await first.process.stop()
+    const second = f.create()
+    await second.process.startSession('pi-storage', 'other-session')
+    const store = await Reflect.get(second.process, 'stores').get('pi-storage')
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const write = Reflect.get(store, 'writeEntry').bind(store)
+    const marker = spyOn(store, 'writeEntry').mockImplementation(
+      async (entry: any, directory: string) => {
+        if (entry.policyState?.stopReported) {
+          entered.resolve()
+          await release.promise
+        }
+        return write(entry, directory)
+      },
+    )
+    f.advance(3_600_001)
+    const sweep = second.tick()
+    await entered.promise
+    let tracking: Promise<unknown> | undefined
+    const hash = createHash('sha256').update('old-session').digest('hex')
+    if (owner === 'local-turn') {
+      tracking = second.process.trackAccepted(
+        f.input('old-session', 'new accepted prefix'),
+        f.snapshot,
+      )
+    } else {
+      const path = join(store.directory, `${hash}.claim.json`)
+      const claim = JSON.parse(await readFile(path, 'utf8'))
+      await writeFile(
+        path,
+        JSON.stringify({
+          ...claim,
+          purpose: 'session',
+          token: 'new-live-owner',
+        }),
+      )
+    }
+    release.resolve()
+    await sweep
+    await tracking
+    marker.mockRestore()
+    await store.drain()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+      [],
+    )
+    const saved = JSON.parse(
+      gunzipSync(
+        await readFile(join(store.directory, `${hash}.json.gz`)),
+      ).toString(),
+    )
+    if (owner === 'local-turn')
+      expect(saved.bodyText).toContain('new accepted prefix')
+    else expect(saved.id).toBe('old-session')
+  },
+)
+
+test('Pi shutdown is silent and a later unclaimed expired sweep reports once', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  const reports: { kind: string; reason?: string }[] = []
+  globals[key] = () => ({
+    cache: () => ({ ttl: 'long', keep_warm: 'always' }),
+    report: (payload: (typeof reports)[number]) => reports.push(payload),
+  })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  const f = await fixture()
+  const first = f.create()
+  await first.process.startSession('pi-storage', 'old-session')
+  await first.process.trackAccepted(f.input('old-session'), f.snapshot)
+  f.advance(3_570_000)
+  await first.tick()
+  await first.process.stop()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+    [],
+  )
+  const second = f.create()
+  await second.process.startSession('pi-storage', 'other-session')
+  f.advance(3_600_001)
+  await second.tick()
+  await second.tick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual([
+    expect.objectContaining({ reason: 'deadline-missed' }),
+  ])
 })
 
 test('Pi restores a 2.6 record without policyState and durably caps its new count', async () => {

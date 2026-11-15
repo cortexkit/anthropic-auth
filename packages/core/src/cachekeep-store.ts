@@ -88,6 +88,11 @@ type Acceptance =
   | 'invalid'
   | undefined
 
+export type CacheKeepStoreRelease = (() => Promise<void>) & {
+  /** Pure ownership check, repeated before reporting and unlinking. */
+  canRemove?: () => boolean | Promise<boolean>
+}
+
 function record(
   target: Readonly<CacheKeepTarget>,
   pluginVersion: string,
@@ -356,8 +361,9 @@ export class CacheKeepStore {
   // restore, for example when its session is already tracked in this process.
   async load(
     now: number,
-    accept: (entry: SavedCacheKeepTarget) => Acceptance,
-    claim?: (sessionHash: string) => Promise<(() => Promise<void>) | undefined>,
+    accept: (entry: SavedCacheKeepTarget, invalid?: DropReason) => Acceptance,
+    claim?: (sessionHash: string) => Promise<CacheKeepStoreRelease | undefined>,
+    guard?: (sessionHash: string) => boolean | Promise<boolean>,
   ) {
     await this.chain
     if (!(await this.directoryReady())) return
@@ -394,7 +400,22 @@ export class CacheKeepStore {
         if (claim && !release) continue
         const path = join(directory, name)
         let reason: DropReason = 'unreadable'
+        let entry: SavedCacheKeepTarget | undefined
+        let stop:
+          | { reason: 'deadline-missed' | 'unsupported'; stage: string }
+          | undefined
+        const permitted = async () => {
+          try {
+            return (
+              (!guard || (await guard(name.slice(0, 64)))) &&
+              (!release?.canRemove || (await release.canRemove()))
+            )
+          } catch {
+            return false
+          }
+        }
         try {
+          if (!(await permitted())) continue
           if (TEMP.test(name)) {
             reason = 'unfinished-write'
             throw new Error('Unfinished write')
@@ -431,15 +452,13 @@ export class CacheKeepStore {
             maxOutputLength: MAX_RECORD_BYTES,
           })
           reason = 'invalid'
-          const entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
+          entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
           const invalid = invalidReason(entry, name, now)
           if (invalid && invalid !== 'expired') {
             reason = invalid
             throw new Error('Invalid restart file')
           }
-          // Even expired entries must pass the host's live-target/lease guards.
-          // Undefined means another owner or a live request owns this session.
-          const acceptance = accept(entry)
+          const acceptance = accept(entry, invalid)
           if (acceptance === undefined) continue
           const accepted = invalid ?? acceptance
           if (
@@ -447,19 +466,7 @@ export class CacheKeepStore {
             entry.policyState?.planned &&
             !entry.policyState.stopReported
           ) {
-            // The loader retires expired records before a manager can adopt them.
-            entry.policyState.stopReported = true
-            await this.writeEntry(entry, directory)
-            reportSessionCacheWarmStopped(entry.policyState.ownerSessionId, {
-              at: now,
-              reason: 'deadline-missed',
-            })
-            logger.info('cachekeep', 'stopped warming session', {
-              session: entry.id,
-              reason: 'retry-window-ended',
-              stage: 'restore-prune',
-              overdueMs: now - entry.cacheExpiresAt,
-            })
+            stop = { reason: 'deadline-missed', stage: 'restore-prune' }
           }
           if (
             invalid === undefined &&
@@ -467,17 +474,7 @@ export class CacheKeepStore {
             !entry.policyState.stopReported &&
             (accepted === 'account-gone' || accepted === 'foreign-identity')
           ) {
-            entry.policyState.stopReported = true
-            await this.writeEntry(entry, directory)
-            reportSessionCacheWarmStopped(entry.policyState.ownerSessionId, {
-              at: now,
-              reason: 'unsupported',
-            })
-            logger.info('cachekeep', 'stopped warming session', {
-              session: entry.id,
-              reason: accepted,
-              stage: 'restore-account',
-            })
+            stop = { reason: 'unsupported', stage: 'restore-account' }
           }
           if (accepted !== true && accepted !== undefined) {
             reason = accepted || 'invalid'
@@ -488,23 +485,69 @@ export class CacheKeepStore {
             // in the private data store.
             if (directory !== this.directory) {
               try {
-                await this.writeEntry(entry)
+                const adopted = entry
+                const migrating = this.chain.then(() =>
+                  this.writeEntry(adopted),
+                )
+                this.chain = migrating.catch(() => this.writeFailed())
+                await migrating
               } catch {
                 this.refuse()
                 return
               }
+              if (!(await permitted())) continue
               await rm(path, { force: true })
             }
             restored++
           }
         } catch {
-          logger.debug('cachekeep', 'restart record dropped', {
-            file: name,
-            reason,
-          })
-          dropped++
+          // Serialize retirement with live writes. Acceptance adopts only once;
+          // Recheck live sessions, active plugin leases and file ownership after
+          // asynchronous work, even when the saved file cannot be decoded.
+          this.chain = this.chain
+            .then(async () => {
+              if (!(await permitted())) return
+              if (
+                stop &&
+                entry?.policyState &&
+                !entry.policyState.stopReported
+              ) {
+                const marked = {
+                  ...entry,
+                  policyState: { ...entry.policyState, stopReported: true },
+                }
+                try {
+                  await this.writeEntry(marked, directory)
+                } catch {
+                  this.writeFailed()
+                }
+                if (!(await permitted())) return
+                reportSessionCacheWarmStopped(
+                  entry.policyState.ownerSessionId,
+                  { at: now, reason: stop.reason },
+                )
+                logger.info('cachekeep', 'stopped warming session', {
+                  session: entry.id,
+                  reason:
+                    stop.reason === 'deadline-missed'
+                      ? 'retry-window-ended'
+                      : reason,
+                  stage: stop.stage,
+                  ...(stop.reason === 'deadline-missed' && {
+                    overdueMs: now - entry.cacheExpiresAt,
+                  }),
+                })
+              }
+              if (!(await permitted())) return
+              await rm(path, { force: true })
+              logger.debug('cachekeep', 'restart record dropped', {
+                file: name,
+                reason,
+              })
+              dropped++
+            })
+            .catch(() => this.writeFailed())
           await this.chain
-          await rm(path, { force: true })
         } finally {
           await release?.()
         }

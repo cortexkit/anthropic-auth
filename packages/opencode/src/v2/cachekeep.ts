@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   type AnthropicBillingWarming,
@@ -12,6 +13,7 @@ import {
   isCacheKeepActiveNow,
   isCacheKeepHybridActive,
   isCacheKeepSubagentsEnabled,
+  isCacheKeepWarmWait,
   logger,
   NativeAccountRefusal,
   type NativeAccountRefusalReason,
@@ -398,66 +400,80 @@ function createSharedCacheKeep(
         const snapshot = await lease.read()
         const now = options.now?.() ?? Date.now()
         let overdue = 0
-        await shared.persistence.load(now, (entry) => {
-          // Disposal may race startup. Leave the file for the next live lease.
-          if (!leases.size || manager.trackedRequest(entry.id)) return undefined
-          if (entry.policyState?.stopReported) return 'invalid'
-          if (entry.cacheExpiresAt <= now) return 'expired'
-          if (
-            !isCacheKeepHybridActive(snapshot.policyStorage) &&
-            !entry.policyState?.planned &&
-            readSessionCachePolicy(
-              entry.policyState?.ownerSessionId ?? entry.id,
-              true,
-            )?.keep_warm === undefined
-          )
-            return 'invalid'
-          const account = snapshot.accounts.find(
-            (row) => accountKey(row) === entry.oauthAccountIdentity,
-          )
-          if (!account)
-            return missingAccountReason(
-              entry.oauthAccountIdentity,
-              snapshot.accounts,
+        await shared.persistence.load(
+          now,
+          (entry, invalid) => {
+            // Disposal may race startup. Leave the file for the next live lease.
+            if (!leases.size || manager.trackedRequest(entry?.id))
+              return undefined
+            if (invalid && invalid !== 'expired') return 'invalid'
+            if (entry.policyState?.stopReported) return 'invalid'
+            if (entry.cacheExpiresAt <= now) return 'expired'
+            if (
+              !isCacheKeepHybridActive(snapshot.policyStorage) &&
+              !entry.policyState?.planned &&
+              readSessionCachePolicy(
+                entry.policyState?.ownerSessionId ?? entry.id,
+                true,
+              )?.keep_warm === undefined
             )
-          if (account.type !== 'oauth' || !nativeAccountCanServe(account))
-            return 'account-gone'
-          if (
-            entry.isSubagent &&
-            !entry.policyState?.planned &&
-            readSessionCachePolicy(
-              entry.policyState?.ownerSessionId ?? entry.id,
-              true,
-            )?.keep_warm === undefined &&
-            !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
-          )
-            return 'invalid'
-          const nextPrewarmAt =
-            entry.nextPrewarmAt <= now
-              ? now + overdue++ * 3000
-              : entry.nextPrewarmAt
-          const result = manager.track({
-            sessionId: entry.id,
-            url: entry.url,
-            headers: new Headers(),
-            bodyText: entry.bodyText,
-            storage: snapshot.policyStorage,
-            cacheMode: 'hybrid',
-            oauthAccountId: account.id,
-            oauthAccountIdentity: entry.oauthAccountIdentity,
-            isSubagent: entry.isSubagent,
-            retained: {
-              cacheExpiresAt: entry.cacheExpiresAt,
-              nextPrewarmAt,
-              ttlMs: entry.ttlMs,
-              lastTouchAt: entry.lastTouchAt,
-              lastTouchKind: entry.lastTouchKind,
-              policyState: entry.policyState,
-            },
-          })
-          if (result.tracked) restored.add(entry.id)
-          return result.tracked ? true : 'invalid'
-        })
+              return 'invalid'
+            const account = snapshot.accounts.find(
+              (row) => accountKey(row) === entry.oauthAccountIdentity,
+            )
+            if (!account)
+              return missingAccountReason(
+                entry.oauthAccountIdentity,
+                snapshot.accounts,
+              )
+            if (account.type !== 'oauth' || !nativeAccountCanServe(account))
+              return 'account-gone'
+            if (
+              entry.isSubagent &&
+              !entry.policyState?.planned &&
+              readSessionCachePolicy(
+                entry.policyState?.ownerSessionId ?? entry.id,
+                true,
+              )?.keep_warm === undefined &&
+              !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
+            )
+              return 'invalid'
+            const nextPrewarmAt =
+              entry.nextPrewarmAt <= now
+                ? now + overdue++ * 3000
+                : entry.nextPrewarmAt
+            const result = manager.track({
+              sessionId: entry.id,
+              url: entry.url,
+              headers: new Headers(),
+              bodyText: entry.bodyText,
+              storage: snapshot.policyStorage,
+              cacheMode: 'hybrid',
+              oauthAccountId: account.id,
+              oauthAccountIdentity: entry.oauthAccountIdentity,
+              isSubagent: entry.isSubagent,
+              retained: {
+                cacheExpiresAt: entry.cacheExpiresAt,
+                nextPrewarmAt,
+                ttlMs: entry.ttlMs,
+                lastTouchAt: entry.lastTouchAt,
+                lastTouchKind: entry.lastTouchKind,
+                policyState: entry.policyState,
+              },
+            })
+            if (result.tracked) restored.add(entry.id)
+            return result.tracked ? true : 'invalid'
+          },
+          undefined,
+          (hash) =>
+            leases.size > 0 &&
+            !manager
+              .trackedSessions()
+              .some(
+                ({ id }) =>
+                  createHash('sha256').update(id).digest('hex') === hash,
+              ),
+        )
       })().catch(() => {
         logger.warn('cachekeep', 'failed to restore tracked sessions')
       })
@@ -849,7 +865,8 @@ export function createNativeCacheKeep(
       warmResponseLifetimes.set(completed, actualWarmTtl)
       return completed
     } catch (error) {
-      if (error instanceof CacheKeepWarmRefusal) throw error
+      if (error instanceof CacheKeepWarmRefusal || isCacheKeepWarmWait(error))
+        throw error
       const refusal = nativeAccountRefusal(error)
       if (refusal) throw refusal
       // The native credentials are unavailable to the manager's error scrubber;

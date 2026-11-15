@@ -221,7 +221,12 @@ export class PiCacheKeep {
         // The manager expires local targets. Cleanup must not race its queued
         // writes; only the initial restore reads a locally claimed record.
         return restoreOwn && !this.manager.trackedRequest(id)
-          ? async () => {}
+          ? Object.assign(async () => {}, {
+              canRemove: async () =>
+                (await owned.claim.isCurrent()) &&
+                !this.stopping &&
+                !this.manager.trackedRequest(id),
+            })
           : undefined
     }
     const cleanup = new PiCacheKeepClaim(store.directory, hash, {
@@ -230,7 +235,20 @@ export class PiCacheKeep {
       sessionHash: true,
     })
     if (!(await cleanup.acquire())) return undefined
-    return () => cleanup.release()
+    const canRemove = async () =>
+      (await cleanup.isCurrent()) &&
+      !this.stopping &&
+      ![...this.claims.keys()].some(
+        (id) => createHash('sha256').update(id).digest('hex') === hash,
+      ) &&
+      ![...this.sessions.keys()].some(
+        (id) => createHash('sha256').update(id).digest('hex') === hash,
+      )
+    if (!(await canRemove())) {
+      await cleanup.release()
+      return undefined
+    }
+    return Object.assign(() => cleanup.release(), { canRemove })
   }
 
   private startCleanup() {
@@ -244,7 +262,12 @@ export class PiCacheKeep {
           const now = this.now()
           await current.load(
             now,
-            (entry) => (entry.cacheExpiresAt <= now ? 'expired' : undefined),
+            (entry, invalid) =>
+              invalid && invalid !== 'expired'
+                ? 'invalid'
+                : entry.cacheExpiresAt <= now
+                  ? 'expired'
+                  : undefined,
             (hash) => this.access(current, hash),
           )
         }
@@ -274,9 +297,10 @@ export class PiCacheKeep {
       const now = this.now()
       await store.load(
         now,
-        (entry) => {
-          if (this.stopping || this.manager.trackedRequest(entry.id))
+        (entry, invalid) => {
+          if (this.stopping || this.manager.trackedRequest(entry?.id))
             return undefined
+          if (invalid && invalid !== 'expired') return 'invalid'
           if (entry.policyState?.stopReported) return 'invalid'
           if (entry.cacheExpiresAt <= now) return 'expired'
           if (!session || entry.id !== sessionId) return undefined
@@ -320,6 +344,7 @@ export class PiCacheKeep {
         },
         (hash) => this.access(store, hash, true),
       )
+      if (!this.stopping && this.manager.trackedCount()) this.manager.start()
       this.startCleanup()
       completed = !!session
     })()
@@ -332,6 +357,16 @@ export class PiCacheKeep {
       })
     this.starts.set(sessionId, starting)
     return starting
+  }
+
+  realTurn(sessionId: string) {
+    this.restored.delete(sessionId)
+    this.manager.untrackRestored(sessionId)
+    // Startup restores are detached. A turn arriving during claim/read I/O
+    // must also invalidate the old prefix if adoption finishes afterwards.
+    void this.starts
+      .get(sessionId)
+      ?.then(() => this.manager.untrackRestored(sessionId))
   }
 
   trackAccepted(input: TrackInput, snapshot: NativeAccountSnapshot) {
@@ -353,7 +388,6 @@ export class PiCacheKeep {
         !nativeAccountCanServe(account) ||
         account.accountIdentity !== input.oauthAccountIdentity
       ) {
-        this.manager.untrackRestored(sessionId)
         return
       }
       session.identity = accountKey(account)
@@ -387,8 +421,6 @@ export class PiCacheKeep {
     await this.cleaning
     // Drain before releasing claims so a successor can never read an older body.
     for (const store of this.stores.values()) await (await store).drain()
-    for (const session of this.manager.trackedSessions())
-      this.manager.untrack(session.id)
     for (const session of this.sessions.values()) await session.claim.release()
     this.sessions.clear()
     this.claims.clear()

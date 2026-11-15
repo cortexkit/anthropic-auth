@@ -174,6 +174,7 @@ export function beginPiPrimaryTurn(
   sessionId?: string,
 ): void {
   if (!sessionId) return
+  piCacheKeep.realTurn(sessionId)
   primaryTurns.delete(sessionId)
   primaryTurns.set(sessionId, storagePath)
   while (primaryTurns.size > 128) {

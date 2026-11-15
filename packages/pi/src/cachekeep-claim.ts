@@ -133,6 +133,15 @@ export class PiCacheKeepClaim {
     )
   }
 
+  async isCurrent() {
+    if (!this.held) return false
+    try {
+      return (await this.read())?.token === this.token
+    } catch {
+      return false
+    }
+  }
+
   async release() {
     if (!this.held) return
     await withNativeLock(
