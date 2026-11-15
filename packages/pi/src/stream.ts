@@ -468,7 +468,7 @@ const piCacheKeep = new PiCacheKeep(
         requestKind: 'keep_warm',
         chargeBasis: 'subscription_included',
         cache: {
-          ttlMs: requestCacheLifetimeMs(target.bodyText),
+          ttlMs: requestShortestCacheLifetimeMs(target.bodyText),
           warming: { on: true },
         },
       }
