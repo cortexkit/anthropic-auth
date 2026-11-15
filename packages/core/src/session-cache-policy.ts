@@ -106,7 +106,7 @@ export function reportSessionCacheTouch(
   )
 }
 
-/** Stops include restored and account-dropped planned records, even before their first warm. */
+/** Only in-memory terminal removals report stops; startup drops and closed lifetimes are silent. */
 export type SessionCacheWarmStopReason =
   | CacheWarmStoppedInput['reason']
   | 'deadline-missed'

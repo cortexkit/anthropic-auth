@@ -682,12 +682,10 @@ test('auto keeps the real response pricing baseline and charges the admitted cos
 
 test('restoring an unresolved dispatch accounts for a successful warm before its coalesced flush', async () => {
   let reserved: import('../cachekeep.ts').CacheKeepTarget | undefined
-  let stopped: import('../cachekeep.ts').CacheKeepTarget | undefined
   const f = plannedFixture(
     {
       reserveWarm: async (target) => {
-        if (target.policyState?.stopReported) stopped = structuredClone(target)
-        else reserved = structuredClone(target)
+        reserved = structuredClone(target)
         return true
       },
     },
@@ -708,10 +706,6 @@ test('restoring an unresolved dispatch accounts for a successful warm before its
   expect(reserved!.policyState).toMatchObject({
     warmCostSoFar: 7_600,
     pendingWarmCost: 200,
-  })
-  expect(stopped!.policyState).toMatchObject({
-    warmCostSoFar: 7800,
-    stopReported: true,
   })
   expect(
     restored.track({ retained: { ...reserved!, nextPrewarmAt: restored.now } })

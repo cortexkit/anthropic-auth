@@ -59,6 +59,7 @@ import { createNativeCacheKeep } from '../v2/cachekeep'
 import {
   type CacheKeepStore,
   cacheKeepStoreDirectory,
+  legacyCacheKeepStoreDirectory,
 } from '../v2/cachekeep-store'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
@@ -1628,6 +1629,31 @@ function forgetCacheKeepProcess(storageId: string) {
   const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
   ;(globalThis as any)[key]?.delete(storageId)
 }
+
+test('OC2 legacy migration removes its source after adopting a target and cannot resurrect a forgotten session', async () => {
+  const f = await fixture()
+  await f.live()
+  await f.dispose()
+  const legacy = legacyCacheKeepStoreDirectory(
+    f.paths.storageId,
+    dirname(f.paths.legacyConfig),
+  )
+  await rename(f.disk, legacy)
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  expect(owner.manager.trackedCount()).toBe(1)
+  expect(await readdir(legacy)).toEqual([])
+  owner.manager.untrack('ses_oc2_keep')
+  await owner.persistence.drain()
+  await next.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  await f.start()
+  expect(
+    (globalThis as any)[key].get(f.paths.storageId).manager.trackedCount(),
+  ).toBe(0)
+})
 
 test.each([0, 2])(
   'OpenCode 2 restart keeps %s planned records while the policy reads null',

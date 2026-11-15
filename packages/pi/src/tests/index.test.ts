@@ -28,7 +28,11 @@ import { buildAnthropicRequest } from '../convert.ts'
 import cortexKitPiAnthropicAuth from '../index'
 import { closePiNativeRuntime, getPiNativeRuntime } from '../native.ts'
 import { getPiAccountStoragePath } from '../paths.ts'
-import { getPiTrackedCacheKeepSessions, stopPiCacheKeep } from '../stream.ts'
+import {
+  __sendPiAnthropicRequestForTest,
+  getPiTrackedCacheKeepSessions,
+  stopPiCacheKeep,
+} from '../stream.ts'
 import {
   fixtureAccountIdentity,
   saveNativePiFixture,
@@ -78,6 +82,7 @@ function mockPi() {
     }
   >()
   const events = new Map<string, (...args: any[]) => unknown>()
+  const handlers = new Map<string, Array<(...args: any[]) => unknown>>()
 
   const pi = {
     registerCommand: () => {},
@@ -100,15 +105,27 @@ function mockPi() {
       }
     },
     on: (name: string, handler: (...args: any[]) => unknown) => {
-      events.set(name, handler)
+      handlers.set(name, [...(handlers.get(name) ?? []), handler])
+      events.set(name, async (...args: any[]) => {
+        let result: unknown
+        for (const registered of handlers.get(name) ?? []) {
+          result = await registered(...args)
+          if (
+            name === 'input' &&
+            (result as { action?: string } | undefined)?.action === 'handled'
+          )
+            break
+        }
+        return result
+      })
     },
   } as unknown as ExtensionAPI
 
-  return { pi, providers, events }
+  return { pi, providers, events, handlers }
 }
 
-test.each(['api-key', 'other-provider', 'no-storage'] as const)(
-  'Pi turn hook retires a restored prefix before a %s turn',
+test.each(['anthropic', 'other-provider'] as const)(
+  'Pi turn start keeps the restored prefix until the %s request route is decided',
   async (route) => {
     const key = Symbol.for('cortexkit.routing')
     const globals = globalThis as Record<symbol, unknown>
@@ -130,7 +147,7 @@ test.each(['api-key', 'other-provider', 'no-storage'] as const)(
     try {
       await getPiTrackedCacheKeepSessions()
       capture.mockRestore()
-      const { pi, events } = mockPi()
+      const { pi, events, handlers } = mockPi()
       await cortexKitPiAnthropicAuth(pi)
       const sessionId = `restored-${route}`
       const now = Date.now()
@@ -184,12 +201,29 @@ test.each(['api-key', 'other-provider', 'no-storage'] as const)(
           },
         },
       )
-      expect(manager!.trackedRequest(sessionId)).toBeUndefined()
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(manager!.trackedRequest(sessionId)).toBeDefined()
       await new Promise((resolve) => setTimeout(resolve, 0))
       expect(
         reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
-      ).toEqual([expect.objectContaining({ reason: 'session-ended' })])
+      ).toEqual([])
+      if (route === 'other-provider') {
+        const inputHandlers = handlers.get('input') ?? []
+        expect(inputHandlers.length).toBeGreaterThanOrEqual(1)
+        for (const handler of inputHandlers)
+          await handler(
+            { type: 'input' },
+            {
+              hasUI: false,
+              model: { ...fableModel, provider: 'openai' },
+              sessionManager: { getSessionId: () => sessionId },
+            },
+          )
+        expect(manager!.trackedRequest(sessionId)).toBeUndefined()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(
+          reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+        ).toEqual([expect.objectContaining({ reason: 'session-ended' })])
+      }
     } finally {
       capture.mockRestore()
       await stopPiCacheKeep()
@@ -198,6 +232,134 @@ test.each(['api-key', 'other-provider', 'no-storage'] as const)(
     }
   },
 )
+
+test('the keep-warm provider observer never transforms or refuses input', async () => {
+  const { pi, handlers } = mockPi()
+  await cortexKitPiAnthropicAuth(pi)
+  const observer = handlers.get('input')!.at(-1)!
+  const input = { type: 'input', text: 'original input', source: 'interactive' }
+  expect(
+    await observer(input, {
+      model: { provider: 'openai' },
+      sessionManager: {
+        getSessionId: () => {
+          throw new Error('host unavailable')
+        },
+      },
+    }),
+  ).toEqual({ action: 'continue' })
+  expect(input.text).toBe('original input')
+})
+
+test('a Pi API-key request ends a restored target inside the request path without a turn hook', async () => {
+  const storagePath = getPiAccountStoragePath()
+  await saveNativePiFixture(
+    {
+      version: 1,
+      mainAccountId: 'api-route',
+      accounts: [
+        {
+          id: 'api-route',
+          type: 'api',
+          apiKey: 'test-api-key',
+          baseURL: 'https://provider.example/anthropic',
+          authHeader: 'x-api-key',
+        },
+      ],
+    },
+    storagePath,
+  )
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  const reports: { kind: string; reason?: string }[] = []
+  globals[key] = () => ({
+    cache: () => null,
+    report: (payload: (typeof reports)[number]) => reports.push(payload),
+  })
+  let manager: CacheKeepManager | undefined
+  const tracked = CacheKeepManager.prototype.trackedSessions
+  const capture = spyOn(
+    CacheKeepManager.prototype,
+    'trackedSessions',
+  ).mockImplementation(function (this: CacheKeepManager) {
+    manager = this
+    return tracked.call(this)
+  })
+  try {
+    await getPiTrackedCacheKeepSessions()
+    capture.mockRestore()
+    const now = Date.now()
+    const sessionId = 'restored-api-request'
+    expect(
+      manager!.track({
+        sessionId,
+        url: messagesUrl,
+        headers: new Headers(),
+        cacheMode: 'hybrid',
+        storage: { version: 1, accounts: [] },
+        bodyText: JSON.stringify({
+          model: 'claude-opus-5-5',
+          system: [
+            {
+              type: 'text',
+              text: 'old prefix',
+              cache_control: { type: 'ephemeral', ttl: '1h' },
+            },
+          ],
+        }),
+        retained: {
+          cacheExpiresAt: now + 3_600_000,
+          nextPrewarmAt: now + 3_570_000,
+          ttlMs: 3_600_000,
+          policyState: {
+            ownerSessionId: sessionId,
+            planned: true,
+            policy: { ttl: 'long', keep_warm: 'always' },
+            lastRealRequestAt: now,
+            warmsSinceLastRealRequest: 0,
+            warmCostSoFar: 0,
+            hasWarmed: false,
+          },
+        },
+      }).tracked,
+    ).toBe(true)
+    const native = getPiNativeRuntime(storagePath)
+    const snapshot = await native.view()
+    const apiAccount = snapshot.accounts.find(
+      (account) => account.id === 'api-route',
+    )
+    expect(apiAccount?.type).toBe('api')
+    const response = await __sendPiAnthropicRequestForTest(
+      {
+        model: { ...fableModel, input: ['text', 'image'] },
+        context: {
+          messages: [{ role: 'user', content: 'hello', timestamp: now }],
+        },
+        storagePath,
+        apiAccount,
+        streamOptions: { sessionId },
+      },
+      {
+        native,
+        fetch: Object.assign(async () => Response.json({}), {
+          preconnect: originalFetch.preconnect,
+        }) as typeof fetch,
+      },
+    )
+    await response.text()
+    expect(manager!.trackedRequest(sessionId)).toBeUndefined()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+      [expect.objectContaining({ reason: 'session-ended' })],
+    )
+  } finally {
+    capture.mockRestore()
+    await stopPiCacheKeep()
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  }
+})
 
 describe('cortexKitPiAnthropicAuth provider registration', () => {
   test('exposes Claude Sonnet 5 in the Pi Anthropic catalog', async () => {

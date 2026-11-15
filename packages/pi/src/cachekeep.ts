@@ -42,6 +42,8 @@ function accountKey(account: NativeAccountView) {
 
 /** One Pi process owns only the sessions its lifecycle actually opened. */
 export class PiCacheKeep {
+  // A current request outranks restart data that is still being read in the background.
+  private readonly realTurns = new Set<string>()
   readonly manager: CacheKeepManager
   private readonly stores = new Map<string, Promise<CacheKeepStore>>()
   private readonly sessions = new Map<string, Session>()
@@ -262,12 +264,7 @@ export class PiCacheKeep {
           const now = this.now()
           await current.load(
             now,
-            (entry, invalid) =>
-              invalid && invalid !== 'expired'
-                ? 'invalid'
-                : entry.cacheExpiresAt <= now
-                  ? 'expired'
-                  : undefined,
+            (entry) => (entry.cacheExpiresAt <= now ? 'expired' : undefined),
             (hash) => this.access(current, hash),
           )
         }
@@ -297,11 +294,10 @@ export class PiCacheKeep {
       const now = this.now()
       await store.load(
         now,
-        (entry, invalid) => {
+        (entry) => {
           if (this.stopping || this.manager.trackedRequest(entry?.id))
             return undefined
-          if (invalid && invalid !== 'expired') return 'invalid'
-          if (entry.policyState?.stopReported) return 'invalid'
+          if (this.realTurns.has(entry.id)) return undefined
           if (entry.cacheExpiresAt <= now) return 'expired'
           if (!session || entry.id !== sessionId) return undefined
           if (!snapshot) return 'invalid'
@@ -360,16 +356,19 @@ export class PiCacheKeep {
   }
 
   realTurn(sessionId: string) {
+    this.realTurns.add(sessionId)
+  }
+
+  untrackedTurn(sessionId: string) {
+    this.realTurn(sessionId)
     this.restored.delete(sessionId)
-    this.manager.untrackRestored(sessionId)
-    // Startup restores are detached. A turn arriving during claim/read I/O
-    // must also invalidate the old prefix if adoption finishes afterwards.
-    void this.starts
-      .get(sessionId)
-      ?.then(() => this.manager.untrackRestored(sessionId))
+    this.manager.untrack(sessionId)
   }
 
   trackAccepted(input: TrackInput, snapshot: NativeAccountSnapshot) {
+    if (input.sessionId) this.realTurn(input.sessionId)
+    if (input.sessionId && !input.accountStoragePath)
+      this.untrackedTurn(input.sessionId)
     if (this.stopping || !input.sessionId || !input.accountStoragePath)
       return Promise.resolve()
     const sessionId = input.sessionId
@@ -388,6 +387,7 @@ export class PiCacheKeep {
         !nativeAccountCanServe(account) ||
         account.accountIdentity !== input.oauthAccountIdentity
       ) {
+        this.untrackedTurn(sessionId)
         return
       }
       session.identity = accountKey(account)
@@ -422,6 +422,8 @@ export class PiCacheKeep {
     // Drain before releasing claims so a successor can never read an older body.
     for (const store of this.stores.values()) await (await store).drain()
     for (const session of this.sessions.values()) await session.claim.release()
+    this.manager.dispose()
+    this.realTurns.clear()
     this.sessions.clear()
     this.claims.clear()
     this.starts.clear()

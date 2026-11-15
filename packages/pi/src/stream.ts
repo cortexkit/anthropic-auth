@@ -192,6 +192,10 @@ export function endPiPrimaryTurn(
     primaryTurns.delete(sessionId)
 }
 
+export function untrackPiCacheKeepTurn(sessionId?: string) {
+  if (sessionId) piCacheKeep.untrackedTurn(sessionId)
+}
+
 function isPiPrimaryThreadRequest(
   storagePath: string,
   options: SimpleStreamOptions | undefined,
@@ -889,6 +893,14 @@ async function sendAnthropicRequest(
     return fetchPiStreamResponse(input, init, fetchImpl)
   }
   const keep = deps.cacheKeep ?? cacheKeepManager
+  const realSession = options.streamOptions?.sessionId
+  if (!options.prime && realSession) {
+    if (!deps.cacheKeep) piCacheKeep.realTurn(realSession)
+    if (options.apiAccount || !options.storagePath) {
+      if (deps.cacheKeep) keep.untrack(realSession)
+      else piCacheKeep.untrackedTurn(realSession)
+    }
+  }
   const native = deps.native ?? getPiNativeRuntime(options.storagePath)
   let dumpHandle: DumpHandle | null = null
   // Capture the serving service while authorization is open. Shutdown rejects

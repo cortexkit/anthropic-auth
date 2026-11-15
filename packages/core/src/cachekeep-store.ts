@@ -16,7 +16,6 @@ import {
   readWindowsOwnerOnly,
 } from './owner-only.ts'
 import { renameWithWindowsSharingRetry } from './publication-rename.ts'
-import { reportSessionCacheWarmStopped } from './session-cache-policy.ts'
 
 const compress = promisify(gzip)
 const decompress = promisify(gunzip)
@@ -89,7 +88,7 @@ type Acceptance =
   | undefined
 
 export type CacheKeepStoreRelease = (() => Promise<void>) & {
-  /** Pure ownership check, repeated before reporting and unlinking. */
+  /** Pure ownership check, repeated immediately before unlinking. */
   canRemove?: () => boolean | Promise<boolean>
 }
 
@@ -122,7 +121,6 @@ function record(
         warmsSinceLastRealRequest: target.policyState.warmsSinceLastRealRequest,
         warmCostSoFar: target.policyState.warmCostSoFar,
         pendingWarmCost: target.policyState.pendingWarmCost,
-        stopReported: target.policyState.stopReported,
         prefixTokens: target.policyState.prefixTokens,
         inputTokens: target.policyState.inputTokens,
         hasWarmed: target.policyState.hasWarmed,
@@ -185,8 +183,6 @@ function invalidReason(
       !state.ownerSessionId ||
       typeof state.planned !== 'boolean' ||
       typeof state.hasWarmed !== 'boolean' ||
-      (state.stopReported !== undefined &&
-        typeof state.stopReported !== 'boolean') ||
       (state.needsRealRequest !== undefined &&
         typeof state.needsRealRequest !== 'boolean') ||
       !Number.isFinite(state.lastRealRequestAt) ||
@@ -361,7 +357,7 @@ export class CacheKeepStore {
   // restore, for example when its session is already tracked in this process.
   async load(
     now: number,
-    accept: (entry: SavedCacheKeepTarget, invalid?: DropReason) => Acceptance,
+    accept: (entry: SavedCacheKeepTarget) => Acceptance,
     claim?: (sessionHash: string) => Promise<CacheKeepStoreRelease | undefined>,
     guard?: (sessionHash: string) => boolean | Promise<boolean>,
   ) {
@@ -401,9 +397,6 @@ export class CacheKeepStore {
         const path = join(directory, name)
         let reason: DropReason = 'unreadable'
         let entry: SavedCacheKeepTarget | undefined
-        let stop:
-          | { reason: 'deadline-missed' | 'unsupported'; stage: string }
-          | undefined
         const permitted = async () => {
           try {
             return (
@@ -458,24 +451,9 @@ export class CacheKeepStore {
             reason = invalid
             throw new Error('Invalid restart file')
           }
-          const acceptance = accept(entry, invalid)
+          const acceptance = accept(entry)
           if (acceptance === undefined) continue
           const accepted = invalid ?? acceptance
-          if (
-            invalid === 'expired' &&
-            entry.policyState?.planned &&
-            !entry.policyState.stopReported
-          ) {
-            stop = { reason: 'deadline-missed', stage: 'restore-prune' }
-          }
-          if (
-            invalid === undefined &&
-            entry.policyState?.planned &&
-            !entry.policyState.stopReported &&
-            (accepted === 'account-gone' || accepted === 'foreign-identity')
-          ) {
-            stop = { reason: 'unsupported', stage: 'restore-account' }
-          }
           if (accepted !== true && accepted !== undefined) {
             reason = accepted || 'invalid'
             throw new Error('Stale restart file')
@@ -495,49 +473,17 @@ export class CacheKeepStore {
                 this.refuse()
                 return
               }
-              if (!(await permitted())) continue
+              // The durable migrated copy is authoritative. Keeping this old
+              // source could resurrect a session after it is later forgotten.
               await rm(path, { force: true })
             }
             restored++
           }
         } catch {
-          // Serialize retirement with live writes. Acceptance adopts only once;
-          // Recheck live sessions, active plugin leases and file ownership after
-          // asynchronous work, even when the saved file cannot be decoded.
+          // Serialize deletion with live writes and recheck file ownership,
+          // even when the saved file cannot be decoded.
           this.chain = this.chain
             .then(async () => {
-              if (!(await permitted())) return
-              if (
-                stop &&
-                entry?.policyState &&
-                !entry.policyState.stopReported
-              ) {
-                const marked = {
-                  ...entry,
-                  policyState: { ...entry.policyState, stopReported: true },
-                }
-                try {
-                  await this.writeEntry(marked, directory)
-                } catch {
-                  this.writeFailed()
-                }
-                if (!(await permitted())) return
-                reportSessionCacheWarmStopped(
-                  entry.policyState.ownerSessionId,
-                  { at: now, reason: stop.reason },
-                )
-                logger.info('cachekeep', 'stopped warming session', {
-                  session: entry.id,
-                  reason:
-                    stop.reason === 'deadline-missed'
-                      ? 'retry-window-ended'
-                      : reason,
-                  stage: stop.stage,
-                  ...(stop.reason === 'deadline-missed' && {
-                    overdueMs: now - entry.cacheExpiresAt,
-                  }),
-                })
-              }
               if (!(await permitted())) return
               await rm(path, { force: true })
               logger.debug('cachekeep', 'restart record dropped', {
@@ -642,11 +588,8 @@ export class CacheKeepStore {
     return committed || this.memoryOnly
   }
 
-  private async writeEntry(
-    entry: SavedCacheKeepTarget,
-    directory = this.directory,
-  ) {
-    const path = join(directory, `${hash(entry.id)}.json.gz`)
+  private async writeEntry(entry: SavedCacheKeepTarget) {
+    const path = join(this.directory, `${hash(entry.id)}.json.gz`)
     const temp = `${path}.${randomUUID()}.tmp`
     try {
       const safe = { ...entry, bodyText: sanitizedBody(entry.bodyText) }

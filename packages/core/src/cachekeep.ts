@@ -414,8 +414,6 @@ export type CacheKeepPolicyState = {
   warmCostSoFar: number
   /** Admitted cost durably reserved for dispatches whose result is not saved yet. */
   pendingWarmCost?: number
-  /** Persisted before a stop is reported, so a crash cannot replay the report. */
-  stopReported?: boolean
   prefixTokens?: number
   inputTokens?: number
   hasWarmed: boolean
@@ -757,6 +755,7 @@ export class CacheKeepManager {
   private timer: ReturnType<typeof setInterval> | null = null
   private dueTimer: ReturnType<typeof setTimeout> | null = null
   private tickPromise: Promise<void> | null = null
+  private lifetime = 0
   private nextPrewarmAttemptId = 0
   private readonly reportedStops = new WeakSet<CacheKeepPolicyState>()
   private readonly restoredTargets = new WeakSet<object>()
@@ -884,6 +883,18 @@ export class CacheKeepManager {
       this.options.clearIntervalImpl ?? globalThis.clearInterval
     clearIntervalImpl(this.timer)
     this.timer = null
+  }
+
+  /** Release a closed host lifetime without retiring its saved restart records. */
+  dispose() {
+    this.lifetime++
+    this.stop()
+    this.targets.clear()
+    this.immediateTargets.clear()
+    this.stoppedSessions.clear()
+    this.warmingRecords.clear()
+    this.sessionWarms.clear()
+    this.tickPromise = null
   }
 
   stats(
@@ -1368,12 +1379,8 @@ export class CacheKeepManager {
     return this.untrack(sessionId)
   }
 
-  private reportStop(
-    target: CacheKeepTarget,
-    reason: string,
-    at: number,
-    restored = false,
-  ) {
+  private reportStop(target: CacheKeepTarget, reason: string, at: number) {
+    if (this.targets.get(target.id) !== target) return
     const state = target.policyState
     // Source warms use a synthetic id, not the session's own.
     if (!target.sourceWarm)
@@ -1385,26 +1392,15 @@ export class CacheKeepManager {
     if (
       target.sourceWarm ||
       !state ||
-      (!state.hasWarmed && !restored && !this.restoredTargets.has(target)) ||
-      this.reportedStops.has(state) ||
-      state.stopReported
+      (!state.hasWarmed && !this.restoredTargets.has(target)) ||
+      this.reportedStops.has(state)
     )
       return
     this.reportedStops.add(state)
-    state.stopReported = true
-    const report = () =>
-      reportSessionCacheWarmStopped(state.ownerSessionId, {
-        at,
-        reason: reportStopReason(reason),
-      })
-    // Persist before unlink when possible, but a failed marker must not lose a stop.
-    try {
-      if (this.options.reserveWarm)
-        void this.options.reserveWarm(target).then(report, report)
-      else report()
-    } catch {
-      report()
-    }
+    reportSessionCacheWarmStopped(state.ownerSessionId, {
+      at,
+      reason: reportStopReason(reason),
+    })
   }
 
   private evictOldestTarget(now: number, reason: 'budget' | 'count') {
@@ -1521,8 +1517,6 @@ export class CacheKeepManager {
       return { tracked: false as const, reason }
     }
     if (!input.sessionId) return refuse('missing session id', 'missing-session')
-    if (input.retained?.policyState?.stopReported)
-      return refuse('stop already reported', 'stop-reported')
     this.immediateTargets.delete(input.sessionId)
     let previous = this.targets.get(input.sessionId)
     if (
@@ -1550,36 +1544,9 @@ export class CacheKeepManager {
     const sessionId = input.sessionId
     const retire = (reason: string) => {
       if (previous) this.removeTarget(previous, reason, now)
-      else if (input.retained?.policyState?.planned) {
-        this.reportStop(
-          {
-            ...input.retained,
-            id: sessionId,
-            bodyText: input.bodyText,
-            url: input.url,
-            headers: {},
-            bodyBytes: Buffer.byteLength(input.bodyText),
-            consecutiveFailures: 0,
-            dayKey: '',
-            isSubagent: input.isSubagent ?? false,
-            oauthAccountIdentity: input.oauthAccountIdentity,
-            policyState: input.retained.policyState,
-            sourceWarm: input.sourceWarm,
-          },
-          reason,
-          now,
-          true,
-        )
-        logger.info('cachekeep', 'stopped warming session', {
-          session: input.sessionId,
-          reason,
-          stage: 'restore',
-        })
-      }
       return refuse(reason, reason)
     }
     if (input.retained && input.retained.cacheExpiresAt <= now) {
-      if (input.retained.policyState?.planned) retire('retry-window-ended')
       return { tracked: false, reason: 'cache expired' }
     }
     if (restoredPlan && freshPolicy && freshPolicy.keep_warm === undefined)
@@ -1824,17 +1791,19 @@ export class CacheKeepManager {
 
   tick(): Promise<void> {
     if (this.tickPromise) return this.tickPromise
+    const lifetime = this.lifetime
     let run: Promise<void>
-    run = this.runTick().finally(() => {
+    run = this.runTick(lifetime).finally(() => {
       if (this.tickPromise === run) this.tickPromise = null
-      this.scheduleDueTimer()
+      if (lifetime === this.lifetime) this.scheduleDueTimer()
     })
     this.tickPromise = run
     return run
   }
 
-  private async runTick() {
+  private async runTick(lifetime: number) {
     const loaded = await this.options.loadStorage()
+    if (lifetime !== this.lifetime) return
     const storage =
       loaded && this.options.resolveSettings
         ? this.options.resolveSettings(loaded)
@@ -1933,7 +1902,7 @@ export class CacheKeepManager {
         }
       }),
     )
-    this.publishTrackedSessions()
+    if (lifetime === this.lifetime) this.publishTrackedSessions()
   }
 
   private targetSettings(storage: AccountStorage, bodyText: string) {

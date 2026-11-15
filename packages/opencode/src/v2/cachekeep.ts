@@ -402,12 +402,10 @@ function createSharedCacheKeep(
         let overdue = 0
         await shared.persistence.load(
           now,
-          (entry, invalid) => {
+          (entry) => {
             // Disposal may race startup. Leave the file for the next live lease.
             if (!leases.size || manager.trackedRequest(entry?.id))
               return undefined
-            if (invalid && invalid !== 'expired') return 'invalid'
-            if (entry.policyState?.stopReported) return 'invalid'
             if (entry.cacheExpiresAt <= now) return 'expired'
             if (
               !isCacheKeepHybridActive(snapshot.policyStorage) &&

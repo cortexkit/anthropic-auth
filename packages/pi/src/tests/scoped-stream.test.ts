@@ -64,6 +64,7 @@ import {
   beginPiPrimaryTurn,
   endPiPrimaryTurn,
   forgetPiMessageThread,
+  getPiTrackedCacheKeepSessions,
   startPiCacheKeepSession,
   stopPiCacheKeep,
   streamCortexKitAnthropic,
@@ -3545,6 +3546,7 @@ test('Pi persists an ordinary no-policy HTTP relay target without request-id pro
   await response.text()
   // Shutdown joins detached admission and drains the real singleton's store.
   await stopPiCacheKeep()
+  expect(await getPiTrackedCacheKeepSessions()).toEqual([])
   const { storageId } = await resolveNativePoolPaths(f.path)
   const sessionHash = createHash('sha256').update(sessionId).digest('hex')
   const saved = JSON.parse(

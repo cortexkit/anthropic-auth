@@ -1,15 +1,11 @@
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import {
-  __setLogTestSink,
   type CacheKeepTarget,
   CacheKeepStore as CoreStore,
-  getLogLevel,
-  type LogTestRecord,
-  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import { CacheKeepStore } from '../v2/cachekeep-store.ts'
 import { CacheKeepStore as ReleasedStore } from './fixtures/cachekeep-store-2.5.5.ts'
@@ -67,7 +63,6 @@ test('Core 2.13.1 validator accepts new saved policy snapshots on rollback', asy
       warmsSinceLastRealRequest: 7,
       warmCostSoFar: 123,
       pendingWarmCost: 5,
-      stopReported: true,
       hasWarmed: true,
     },
   })
@@ -77,128 +72,84 @@ test('Core 2.13.1 validator accepts new saved policy snapshots on rollback', asy
     gunzipSync(await readFile(join(current.directory, name!))).toString(),
   )
   expect(entry.policyState.policy).toEqual(policy)
-  expect(entry.policyState.stopReported).toBe(true)
   expect(published2131InvalidReason(entry, name!, now)).toBeUndefined()
   expect(published2131InvalidReason({ ...entry, v: 2 }, name!, now)).toBe(
     'format',
   )
 })
 
-test('expired planned restart records report a contracted stop before deletion', async () => {
-  const key = Symbol.for('cortexkit.routing')
-  const globals = globalThis as Record<symbol, unknown>
-  const original = globals[key]
-  const reports: unknown[] = []
-  globals[key] = () => ({ report: (payload: unknown) => reports.push(payload) })
-  try {
-    const current = new CacheKeepStore({
-      storageId: 'expired-plan',
-      root: await root(),
+test.each(['expired', 'account-gone', 'foreign-identity'] as const)(
+  'disk-only %s records are removed without reporting a stop',
+  async (reason) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const reports: unknown[] = []
+    globals[key] = () => ({
+      report: (payload: unknown) => reports.push(payload),
     })
-    current.changed({
-      ...target,
-      policyState: {
+    try {
+      const store = new CacheKeepStore({
+        storageId: 'silent-disk-drop',
+        root: await root(),
+      })
+      await store.reserveWarm({
+        ...target,
+        policyState: {
+          ownerSessionId: target.id,
+          planned: true,
+          lastRealRequestAt: now,
+          warmsSinceLastRealRequest: 1,
+          warmCostSoFar: 200,
+          hasWarmed: true,
+        },
+      })
+      await store.load(
+        reason === 'expired' ? target.cacheExpiresAt + 1 : now,
+        () => reason,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(reports).toEqual([])
+      expect(await readdir(store.directory)).toEqual([])
+    } finally {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    }
+  },
+)
+
+test('restart writers omit old stop markers and readers ignore them', async () => {
+  const store = new CacheKeepStore({
+    storageId: 'ignored-old-marker',
+    root: await root(),
+  })
+  await store.reserveWarm({
+    ...target,
+    policyState: Object.assign(
+      {
         ownerSessionId: target.id,
         planned: true,
-        policy: { keep_warm: 'auto' },
         lastRealRequestAt: now,
         warmsSinceLastRealRequest: 0,
         warmCostSoFar: 0,
         hasWarmed: false,
       },
-    })
-    await current.drain()
-    const expiredAt = target.cacheExpiresAt + 1
-    let accepted = false
-    await current.load(expiredAt, () => {
-      accepted = true
-      return true
-    })
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(accepted).toBe(true)
-    expect(await readdir(current.directory)).toEqual([])
-    expect(reports).toEqual([
-      { kind: 'cache_warm_stopped', at: expiredAt, reason: 'deadline-missed' },
-    ])
-  } finally {
-    if (original === undefined) delete globals[key]
-    else globals[key] = original
-  }
+      { stopReported: true },
+    ),
+  })
+  const [name] = await readdir(store.directory)
+  const path = join(store.directory, name!)
+  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+  expect(saved.policyState.stopReported).toBeUndefined()
+  saved.policyState.stopReported = 'ignored legacy metadata'
+  await writeFile(path, gzipSync(JSON.stringify(saved)))
+  let accepted = false
+  await store.load(now, () => {
+    accepted = true
+    return true
+  })
+  expect(accepted).toBe(true)
 })
-
-test.each(['account-gone', 'foreign-identity'] as const)(
-  'planned %s restore drops report only validated record owners',
-  async (reason) => {
-    const key = Symbol.for('cortexkit.routing')
-    const globals = globalThis as Record<symbol, unknown>
-    const original = globals[key]
-    const level = getLogLevel()
-    const logs: LogTestRecord[] = []
-    const reports: unknown[] = []
-    globals[key] = () => ({
-      report: (payload: unknown) => reports.push(payload),
-    })
-    setLogLevel('info')
-    __setLogTestSink((record) => logs.push(record))
-    try {
-      for (const valid of [false, true]) {
-        reports.length = 0
-        logs.length = 0
-        const current = new CacheKeepStore({
-          storageId: 'account-drop',
-          root: await root(),
-        })
-        current.changed({
-          ...target,
-          policyState: {
-            ownerSessionId: target.id,
-            planned: true,
-            policy: { keep_warm: 'auto' },
-            lastRealRequestAt: now,
-            warmsSinceLastRealRequest: 0,
-            warmCostSoFar: valid ? 0 : -1,
-            hasWarmed: false,
-          },
-        })
-        await current.drain()
-        let accepted = false
-        await current.load(now, () => {
-          accepted = true
-          return reason
-        })
-        await new Promise((resolve) => setTimeout(resolve, 0))
-        expect(accepted).toBe(valid)
-        expect(await readdir(current.directory)).toEqual([])
-        expect(reports).toEqual(
-          valid
-            ? [{ kind: 'cache_warm_stopped', at: now, reason: 'unsupported' }]
-            : [],
-        )
-        expect(
-          logs.filter((record) => record.message === 'stopped warming session'),
-        ).toEqual(
-          valid
-            ? [
-                expect.objectContaining({
-                  level: 'info',
-                  payload: {
-                    session: target.id,
-                    reason,
-                    stage: 'restore-account',
-                  },
-                }),
-              ]
-            : [],
-        )
-      }
-    } finally {
-      if (original === undefined) delete globals[key]
-      else globals[key] = original
-      __setLogTestSink(null)
-      setLogLevel(level)
-    }
-  },
-)
 
 test.each(['live-target', 'no-lease'] as const)(
   'expired restore respects %s guard without stopping or deleting its record',
@@ -258,122 +209,6 @@ test.each(['live-target', 'no-lease'] as const)(
   },
 )
 
-test('persisted stop marker prevents a second report after a crash before unlink', async () => {
-  const key = Symbol.for('cortexkit.routing')
-  const globals = globalThis as Record<symbol, unknown>
-  const original = globals[key]
-  const reports: unknown[] = []
-  globals[key] = () => ({ report: (payload: unknown) => reports.push(payload) })
-  try {
-    const options = { storageId: 'reported-stop', root: await root() }
-    const current = new CacheKeepStore(options)
-    expect(
-      await current.reserveWarm({
-        ...target,
-        policyState: {
-          ownerSessionId: target.id,
-          planned: true,
-          lastRealRequestAt: now,
-          warmsSinceLastRealRequest: 1,
-          warmCostSoFar: 200,
-          hasWarmed: true,
-          stopReported: true,
-        },
-      }),
-    ).toBe(true)
-    const restarted = new CacheKeepStore(options)
-    await restarted.load(target.cacheExpiresAt + 1, () => 'expired')
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(reports).toEqual([])
-    expect(await readdir(current.directory)).toEqual([])
-  } finally {
-    if (original === undefined) delete globals[key]
-    else globals[key] = original
-  }
-})
-
-test.each(['expired', 'account-gone'] as const)(
-  'a live record arriving during %s marker persistence is neither reported nor unlinked',
-  async (disposition) => {
-    const key = Symbol.for('cortexkit.routing')
-    const globals = globalThis as Record<symbol, unknown>
-    const original = globals[key]
-    const reports: unknown[] = []
-    globals[key] = () => ({
-      report: (payload: unknown) => reports.push(payload),
-    })
-    try {
-      const current = new CacheKeepStore({
-        storageId: 'load-race',
-        root: await root(),
-      })
-      const saved = {
-        ...target,
-        policyState: {
-          ownerSessionId: target.id,
-          planned: true,
-          lastRealRequestAt: now,
-          warmsSinceLastRealRequest: 0,
-          warmCostSoFar: 0,
-          hasWarmed: false,
-        },
-      }
-      await current.reserveWarm(saved)
-      const entered = Promise.withResolvers<void>()
-      const release = Promise.withResolvers<void>()
-      const write = Reflect.get(current, 'writeEntry').bind(current)
-      const marker = spyOn(current as any, 'writeEntry').mockImplementation(
-        async (entry: any, directory: string) => {
-          if (entry.policyState?.stopReported) {
-            entered.resolve()
-            await release.promise
-          }
-          return write(entry, directory)
-        },
-      )
-      let live = false
-      const loading = current.load(
-        disposition === 'expired' ? target.cacheExpiresAt + 1 : now,
-        () => disposition,
-        undefined,
-        () => !live,
-      )
-      await entered.promise
-      live = true
-      let written = false
-      const bodyText =
-        '{"model":"claude-opus-4-6","system":"new accepted prefix"}'
-      const fresh = current
-        .reserveWarm({
-          ...saved,
-          bodyText,
-          cacheExpiresAt: target.cacheExpiresAt + 3_600_000,
-        })
-        .then(() => {
-          written = true
-        })
-      await new Promise((resolve) => setTimeout(resolve, 0))
-      const overtookMarker = written
-      release.resolve()
-      await Promise.all([loading, fresh])
-      marker.mockRestore()
-      await new Promise((resolve) => setTimeout(resolve, 0))
-      expect(overtookMarker).toBe(false)
-      expect(reports).toEqual([])
-      const [name] = await readdir(current.directory)
-      expect(name).toBeDefined()
-      expect(
-        JSON.parse(
-          gunzipSync(await readFile(join(current.directory, name!))).toString(),
-        ).bodyText,
-      ).toBe(bodyText)
-    } finally {
-      if (original === undefined) delete globals[key]
-      else globals[key] = original
-    }
-  },
-)
-
 test.each(['format', 'unreadable'] as const)(
   'a live per-file guard protects a %s restart file',
   async (invalid) => {
@@ -399,48 +234,6 @@ test.each(['format', 'unreadable'] as const)(
     expect(await readdir(current.directory)).toEqual([name!])
   },
 )
-
-test('a failed restore marker write still reports the terminal stop', async () => {
-  const key = Symbol.for('cortexkit.routing')
-  const globals = globalThis as Record<symbol, unknown>
-  const original = globals[key]
-  const reports: unknown[] = []
-  globals[key] = () => ({ report: (payload: unknown) => reports.push(payload) })
-  try {
-    const current = new CacheKeepStore({
-      storageId: 'failed-marker',
-      root: await root(),
-    })
-    await current.reserveWarm({
-      ...target,
-      policyState: {
-        ownerSessionId: target.id,
-        planned: true,
-        lastRealRequestAt: now,
-        warmsSinceLastRealRequest: 0,
-        warmCostSoFar: 0,
-        hasWarmed: false,
-      },
-    })
-    const marker = spyOn(current as any, 'writeEntry').mockRejectedValue(
-      new Error('disk write failed'),
-    )
-    await current.load(target.cacheExpiresAt + 1, () => 'expired')
-    marker.mockRestore()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(reports).toEqual([
-      {
-        kind: 'cache_warm_stopped',
-        at: target.cacheExpiresAt + 1,
-        reason: 'deadline-missed',
-      },
-    ])
-    expect(await readdir(current.directory)).toEqual([])
-  } finally {
-    if (original === undefined) delete globals[key]
-    else globals[key] = original
-  }
-})
 
 test('OC2 v2.5.5 reads current records and the current reader reads v2.5.5 records', async () => {
   const options = { storageId: 'same-oc2-storage', root: await root() }

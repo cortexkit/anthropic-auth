@@ -167,6 +167,30 @@ test('legacy planned restart uses bounded auto and logs its fallback once', asyn
   ).toHaveLength(1)
 })
 
+test('legacy stop markers do not block a valid restored target', async () => {
+  const before = fixture()
+  before.track()
+  const retained = structuredClone(before.targets.get(before.input.sessionId)!)
+  Object.assign(retained.policyState!, { stopReported: true })
+  const after = fixture(null)
+  expect(after.track({ retained }).tracked).toBe(true)
+  after.advance(3_570_000)
+  await after.manager.tick()
+  expect(after.sends).toBe(1)
+})
+
+test('an already expired restored record is rejected without a stop report', async () => {
+  const before = fixture()
+  before.track()
+  const retained = structuredClone(before.targets.get(before.input.sessionId)!)
+  retained.policyState!.hasWarmed = true
+  const after = fixture(null)
+  after.advance(3_600_001)
+  expect(after.track({ retained }).tracked).toBe(false)
+  await detached()
+  expect(after.reports).toEqual([])
+})
+
 test('fresh off after restart stops even a restored session that never warmed', async () => {
   const before = fixture()
   before.track()
@@ -476,31 +500,6 @@ test('timing clock failure cannot turn a successful warm into a retry', async ()
   expect(f.targets.get(f.input.sessionId)?.consecutiveFailures).toBe(0)
 })
 
-test('stop reporting waits for its durable marker before reporting', async () => {
-  const gate = Promise.withResolvers<boolean>()
-  let marked = false
-  const f = fixture(undefined, undefined, {
-    reserveWarm: async (target) => {
-      marked = target.policyState?.stopReported === true
-      return gate.promise
-    },
-  })
-  f.track()
-  f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
-  f.manager.untrack(f.input.sessionId)
-  await detached()
-  expect(marked).toBe(true)
-  expect(
-    f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
-  ).toHaveLength(0)
-  gate.resolve(true)
-  await detached()
-  await detached()
-  expect(
-    f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
-  ).toHaveLength(1)
-})
-
 test('pausing leaves the record and stop deduplication untouched for a later terminal stop', async () => {
   const f = fixture()
   f.track()
@@ -519,31 +518,80 @@ test('pausing leaves the record and stop deduplication untouched for a later ter
   expect(f.reports).toEqual([
     { kind: 'cache_warm_stopped', at: f.now, reason: 'unsupported' },
   ])
-  expect(saved.policyState?.stopReported).toBeUndefined()
-  expect(f.targets.get(f.input.sessionId)?.policyState?.stopReported).toBe(true)
 })
 
-test.each(['false', 'rejected', 'thrown'] as const)(
-  'terminal stop still reports after a %s marker write',
-  async (failure) => {
-    const f = fixture(undefined, undefined, {
-      reserveWarm: () => {
-        if (failure === 'thrown') throw new Error('write failed')
-        if (failure === 'rejected')
-          return Promise.reject(new Error('write failed'))
-        return Promise.resolve(false)
+test('disposing clears timers, status and slots without late warm reports or persistence callbacks', async () => {
+  const gate = Promise.withResolvers<void>()
+  const entered = Promise.withResolvers<void>()
+  const timers = new Set<object>()
+  const schedule = (() => {
+    const timer = { unref() {} }
+    timers.add(timer)
+    return timer
+  }) as unknown as typeof setInterval
+  const cancel = ((timer: object) => {
+    timers.delete(timer)
+  }) as unknown as typeof clearInterval
+  const callbacks = { changed: 0, removed: 0, writes: 0, published: 0 }
+  const f = fixture(
+    { ttl: 'long', keep_warm: 'always' },
+    Object.assign(
+      async () => {
+        entered.resolve()
+        await gate.promise
+        return Response.json({})
       },
-    })
-    f.track()
-    f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
-    f.manager.untrack(f.input.sessionId)
-    await detached()
-    await detached()
-    expect(f.reports).toEqual([
-      { kind: 'cache_warm_stopped', at: f.now, reason: 'session-ended' },
-    ])
-  },
-)
+      { preconnect: fetch.preconnect },
+    ),
+    {
+      setIntervalImpl: schedule,
+      clearIntervalImpl: cancel,
+      setTimeoutImpl: schedule as unknown as typeof setTimeout,
+      clearTimeoutImpl: cancel as unknown as typeof clearTimeout,
+      onTargetChanged: () => {
+        callbacks.changed++
+      },
+      onTargetRemoved: () => {
+        callbacks.removed++
+      },
+      onTrackedSessionsChanged: () => {
+        callbacks.published++
+      },
+      reserveWarm: async () => {
+        callbacks.writes++
+        return true
+      },
+    },
+  )
+  f.track()
+  f.track({ sessionId: 'stopped-status' })
+  f.manager.untrack('stopped-status')
+  f.manager.recordWarmingOff('warming-off-status')
+  f.advance(3_570_000)
+  const tick = f.manager.tick()
+  await entered.promise
+  const before = { ...callbacks }
+  try {
+    expect(Reflect.get(f.manager, 'sessionWarms').size).toBe(1)
+    f.manager.dispose()
+    expect(timers.size).toBe(0)
+    expect(f.manager.trackedCount()).toBe(0)
+    expect(f.manager.registrySessions()).toEqual([])
+    expect(f.manager.warming('warming-off-status')).toBeUndefined()
+    expect(Reflect.get(f.manager, 'sessionWarms').size).toBe(0)
+    expect(callbacks).toEqual(before)
+  } finally {
+    gate.resolve()
+    await tick
+  }
+  await detached()
+  expect(f.manager.trackedCount()).toBe(0)
+  expect(f.manager.registrySessions()).toEqual([])
+  expect(Reflect.get(f.manager, 'sessionWarms').size).toBe(0)
+  expect(timers.size).toBe(0)
+  expect(callbacks).toEqual(before)
+  expect(f.reports).toEqual([])
+})
 
 test('unplanned deadline misses remain reportable in both lifecycle and billing state', async () => {
   const f = fixture(null)
