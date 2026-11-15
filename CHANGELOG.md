@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.13.1
 
 - Under Thalamus, billing reports now give the shortest cache lifetime in a request when its cache markers mix lifetimes.
 - Updated the shared authentication library to common-auth 0.50.0.
