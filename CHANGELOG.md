@@ -5,6 +5,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Keep-warm now survives server restarts under Thalamus and keeps other sessions warm when one send is slow.
+- Restored keep-warm follows your next real turn, avoids duplicate reads, and counts uncertain sends toward its spending limit.
+- Keep-warm reports missed deadlines separately from spending limits, so a slow send is no longer reported as a cost cap.
 
 ## 2.13.1
 

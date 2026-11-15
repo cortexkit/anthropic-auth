@@ -233,6 +233,7 @@ async function fixture(
   trace?: ReturnType<typeof cacheKeepFailureTrace>,
   identity = '11111111-2222-4333-8444-555555555555',
   getSession?: () => Promise<{ parentID?: string }>,
+  cacheKeepOptions: cacheKeepFactory.NativeCacheKeepOptions = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -398,6 +399,7 @@ async function fixture(
           setTimeoutImpl: timers.setTimeout,
           clearTimeoutImpl: timers.clearTimeout,
         },
+        ...cacheKeepOptions,
       },
     })
     cleanups.push(dispose)
@@ -1627,7 +1629,7 @@ function forgetCacheKeepProcess(storageId: string) {
   ;(globalThis as any)[key]?.delete(storageId)
 }
 
-test.each([0, 3])(
+test.each([0, 2])(
   'OpenCode 2 restart keeps %s planned records while the policy reads null',
   async (count) => {
     const lines = captureStartupLogs()
@@ -1690,6 +1692,145 @@ test.each([0, 3])(
     ).toHaveLength(count)
   },
 )
+
+test.each(['hybrid-inactive', 'subagents-disabled', 'not-oauth'] as const)(
+  'a real turn skipped as %s ends the restored planned prefix',
+  async (reason) => {
+    const routingKey = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[routingKey]
+    let policy: { ttl: 'long'; keep_warm: 'always' } | null = {
+      ttl: 'long',
+      keep_warm: 'always',
+    }
+    const reports: { kind: string; reason?: string }[] = []
+    globals[routingKey] = () => ({
+      cache: () => policy,
+      report: (payload: (typeof reports)[number]) => reports.push(payload),
+    })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[routingKey]
+      else globals[routingKey] = original
+    })
+    const f = await fixture(reason === 'subagents-disabled')
+    await f.live()
+    await f.dispose()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      cacheKeep: {
+        enabled: reason !== 'hybrid-inactive',
+        always: true,
+        subagents: false,
+      },
+    }))
+    forgetCacheKeepProcess(f.paths.storageId)
+    policy = null
+    const next = await f.start()
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    expect(owner.manager.trackedCount()).toBe(1)
+    if (reason === 'not-oauth') {
+      const runtime = createNativeAccountRuntime({
+        paths: f.paths,
+        host: 'opencode',
+      })
+      const keeper = createNativeCacheKeep({
+        runtime,
+        storageId: f.paths.storageId,
+        persistence: { root: dirname(f.paths.legacyConfig) },
+        source: {} as NativeSource,
+      })
+      cleanups.push(async () => {
+        await keeper.dispose()
+        runtime.close()
+      })
+      await keeper.ready
+      await keeper.track({
+        sessionID: 'ses_oc2_keep',
+        route: 'api-key',
+        kind: 'primary',
+        agent: 'build',
+        attemptId: 999,
+      } as never)
+    } else
+      await next.live(undefined, {
+        messages: [{ role: 'user', content: 'new real turn' }],
+      })
+    expect(owner.manager.trackedCount()).toBe(0)
+    await owner.persistence.drain()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+      [expect.objectContaining({ reason: 'session-ended' })],
+    )
+    f.advance(3_570_000)
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(0)
+    expect(await readdir(f.disk)).toEqual([])
+  },
+)
+
+test('three restored sends reserve distinct start slots without waiting for responses', async () => {
+  const scheduled = Promise.withResolvers<void>()
+  const response = Promise.withResolvers<void>()
+  const delays: { ms: number; release: () => void }[] = []
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    undefined,
+    undefined,
+    {
+      delayImpl: ((ms: number) => {
+        const gate = Promise.withResolvers<void>()
+        delays.push({ ms, release: () => gate.resolve() })
+        if (delays.length === 3) scheduled.resolve()
+        return gate.promise
+      }) as cacheKeepFactory.NativeCacheKeepOptions['delayImpl'],
+    },
+  )
+  for (let i = 0; i < 3; i++) await f.live(undefined, {}, `ses_spacing_${i}`)
+  await f.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  const started = Array.from({ length: 3 }, () => Promise.withResolvers<void>())
+  const starts: number[] = []
+  next.setSend(async () => {
+    starts.push(f.now())
+    started[starts.length - 1]!.resolve()
+    await response.promise
+    return Response.json({})
+  })
+  f.due()
+  const tick = f.timers.fire()
+  const ready = await Promise.race([
+    scheduled.promise.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+  ])
+  if (!ready) {
+    for (const entry of delays) entry.release()
+    response.resolve()
+    await tick
+    expect(delays.map(({ ms }) => ms)).toEqual([0, 3000, 6000])
+    return
+  }
+  const spacing = delays.map(({ ms }) => ms)
+  delays[0]!.release()
+  await started[0]!.promise
+  f.advance(3000)
+  delays[1]!.release()
+  await started[1]!.promise
+  f.advance(3000)
+  delays[2]!.release()
+  await started[2]!.promise
+  response.resolve()
+  await tick
+  expect(spacing).toEqual([0, 3000, 6000])
+  expect(starts[1]! - starts[0]!).toBe(3000)
+  expect(starts[2]! - starts[1]!).toBe(3000)
+})
 
 test('OpenCode 2 restores and prewarms a live format-1 record from another plugin version', async () => {
   const lines = captureStartupLogs()
@@ -2205,7 +2346,7 @@ test('OpenCode 2 staggers overdue restored prewarms instead of sending a burst',
   const next = await f.start()
   const times: number[] = []
   next.setSend(async () => {
-    times.push(Date.now())
+    times.push(f.now())
     return Response.json({ usage: { cache_read_input_tokens: 1 } })
   })
   await f.timers.fire()

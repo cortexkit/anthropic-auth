@@ -241,9 +241,10 @@ export class PiCacheKeep {
       this.cleaning ??= (async () => {
         for (const store of this.stores.values()) {
           const current = await store
+          const now = this.now()
           await current.load(
-            this.now(),
-            () => undefined,
+            now,
+            (entry) => (entry.cacheExpiresAt <= now ? 'expired' : undefined),
             (hash) => this.access(current, hash),
           )
         }
@@ -274,13 +275,11 @@ export class PiCacheKeep {
       await store.load(
         now,
         (entry) => {
-          if (
-            !session ||
-            entry.id !== sessionId ||
-            this.stopping ||
-            this.manager.trackedRequest(entry.id)
-          )
+          if (this.stopping || this.manager.trackedRequest(entry.id))
             return undefined
+          if (entry.policyState?.stopReported) return 'invalid'
+          if (entry.cacheExpiresAt <= now) return 'expired'
+          if (!session || entry.id !== sessionId) return undefined
           if (!snapshot) return 'invalid'
           const account = snapshot.accounts.find(
             (row) => accountKey(row) === entry.oauthAccountIdentity,
@@ -353,8 +352,10 @@ export class PiCacheKeep {
         account?.type !== 'oauth' ||
         !nativeAccountCanServe(account) ||
         account.accountIdentity !== input.oauthAccountIdentity
-      )
+      ) {
+        this.manager.untrackRestored(sessionId)
         return
+      }
       session.identity = accountKey(account)
       // Claim I/O may finish after the response, or even during shutdown. Keep
       // that accepted body, but never grant the cache the time spent waiting.

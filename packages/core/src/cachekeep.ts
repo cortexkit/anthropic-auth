@@ -416,6 +416,8 @@ export type CacheKeepPolicyState = {
   warmCostSoFar: number
   /** Admitted cost durably reserved for dispatches whose result is not saved yet. */
   pendingWarmCost?: number
+  /** Persisted before a stop is reported, so a crash cannot replay the report. */
+  stopReported?: boolean
   prefixTokens?: number
   inputTokens?: number
   hasWarmed: boolean
@@ -514,7 +516,10 @@ function stopReason(reason: string): CacheKeepStopReason {
   }
 }
 
-function reportStopReason(reason: string): CacheWarmStopReason {
+function reportStopReason(
+  reason: string,
+  planned = false,
+): CacheWarmStopReason | 'deadline-missed' {
   if (isCacheWarmStopReason(reason)) return reason
   switch (reason) {
     case 'schedule':
@@ -526,8 +531,7 @@ function reportStopReason(reason: string): CacheWarmStopReason {
     case 'retry-window-ended':
     case 'retries-exhausted':
     case 'expired':
-      // Switch to deadline-missed once common-auth's CACHE_WARM_STOP_REASONS admits it.
-      return 'cost-cap'
+      return planned ? 'deadline-missed' : 'cost-cap'
     case 'idle':
     case 'source-warm-idle-cap':
       return 'cost-cap'
@@ -683,6 +687,8 @@ export type CacheKeepPrewarmResult =
       refusal?: NativeAccountRefusalReason
       status?: number
       transient?: true
+      /** Eligibility changed while queued; keep the target without sending. */
+      skipped?: true
       provider_error?: ProviderErrorSummary['provider_error']
       stage?: CacheKeepFailure['stage']
       class?: CacheKeepFailure['class']
@@ -708,10 +714,12 @@ const PLANNED_UNPRICED_SUBAGENT_IDLE_MS = 30 * 60_000
 const WARMING_RECORD_LIMIT = 4096
 
 export class CacheKeepWarmRefusal extends Error {
-  constructor(readonly reason: CacheWarmStopReason) {
+  constructor(readonly reason: string) {
     super('CacheKeep policy refused')
   }
 }
+
+class CacheKeepWarmWait extends Error {}
 
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
@@ -725,7 +733,7 @@ export class CacheKeepManager {
   // Latest event wins; a newly tracked target clears the record.
   private readonly warmingRecords = new Map<
     string,
-    { stopReason?: CacheWarmStopReason }
+    { stopReason?: CacheWarmStopReason | 'deadline-missed' }
   >()
   private timer: ReturnType<typeof setInterval> | null = null
   private dueTimer: ReturnType<typeof setTimeout> | null = null
@@ -849,7 +857,7 @@ export class CacheKeepManager {
     this.immediateTargets.clear()
     const now = this.options.now?.() ?? Date.now()
     for (const target of this.targets.values())
-      this.reportStop(target, 'stopped', now)
+      this.reportStop(target, 'stopped', now, false, false)
     if (this.dueTimer) {
       ;(this.options.clearTimeoutImpl ?? clearTimeout)(this.dueTimer)
       this.dueTimer = null
@@ -1009,7 +1017,7 @@ export class CacheKeepManager {
 
   private setWarmingRecord(
     id: string,
-    record: { stopReason?: CacheWarmStopReason },
+    record: { stopReason?: CacheWarmStopReason | 'deadline-missed' },
   ) {
     this.warmingRecords.delete(id)
     this.warmingRecords.set(id, record)
@@ -1036,7 +1044,7 @@ export class CacheKeepManager {
     this.scheduleDueTimer()
   }
 
-  private costs(target: CacheKeepTarget) {
+  private costs(target: CacheKeepTarget, ownReservation = false) {
     const state = target.policyState
     if (state?.prefixTokens === undefined) return undefined
     let model: string
@@ -1066,7 +1074,13 @@ export class CacheKeepManager {
     return {
       nextWarmCost: read * state.prefixTokens,
       rewriteCost: write * state.prefixTokens,
-      warmCostSoFar: state.warmCostSoFar,
+      warmCostSoFar:
+        state.warmCostSoFar +
+        Math.max(
+          0,
+          (state.pendingWarmCost ?? 0) -
+            (ownReservation ? (this.admittedWarmCosts.get(state) ?? 0) : 0),
+        ),
     }
   }
 
@@ -1074,7 +1088,10 @@ export class CacheKeepManager {
     target: CacheKeepTarget,
     now: number,
     ownReservation = false,
-  ): CacheKeepDecision | undefined {
+  ):
+    | CacheKeepDecision
+    | { action: 'stop'; reason: 'retry-window-ended' }
+    | undefined {
     const state = target.policyState
     if (!state) return undefined
     const freshPolicy = readSessionCachePolicy(state.ownerSessionId, true)
@@ -1110,7 +1127,7 @@ export class CacheKeepManager {
         ? policy.hours && { mode, hours: policy.hours }
         : { mode }
     if (!plan) return { action: 'stop', reason: 'unsupported' }
-    const costs = this.costs(target)
+    const costs = this.costs(target, ownReservation)
     if (
       mode === 'auto' &&
       !costs &&
@@ -1121,7 +1138,7 @@ export class CacheKeepManager {
             : PLANNED_UNPRICED_MAIN_IDLE_MS)
     )
       return { action: 'stop', reason: 'idle' }
-    return decideCacheKeep({
+    const decision = decideCacheKeep({
       ...plan,
       now,
       ttlMs: target.ttlMs ?? 0,
@@ -1131,6 +1148,19 @@ export class CacheKeepManager {
         state.warmsSinceLastRealRequest - Number(ownReservation),
       ...costs,
     })
+    // common-auth 0.50.0 also labels its final safety margin cost-cap. Only
+    // the actual auto spending threshold is a cost stop; a late replay is not.
+    if (
+      decision.action === 'stop' &&
+      decision.reason === 'cost-cap' &&
+      !(
+        mode === 'auto' &&
+        costs &&
+        costs.warmCostSoFar + costs.nextWarmCost >= costs.rewriteCost
+      )
+    )
+      return { action: 'stop', reason: 'retry-window-ended' }
+    return decision
   }
 
   private countDecision(
@@ -1172,7 +1202,7 @@ export class CacheKeepManager {
       (isCacheKeepAlways(storage) ? this.countDecision(current) : undefined)
     if (decision?.action === 'stop')
       throw new CacheKeepWarmRefusal(decision.reason)
-    if (decision?.action === 'wait') throw new CacheKeepWarmRefusal('stopped')
+    if (decision?.action === 'wait') throw new CacheKeepWarmWait()
     const admittedCost = this.costs(current)?.nextWarmCost ?? 0
     const pendingCost = state?.pendingWarmCost
     if (state) {
@@ -1202,7 +1232,15 @@ export class CacheKeepManager {
       true,
     )
     if (fresh?.action === 'stop') throw new CacheKeepWarmRefusal(fresh.reason)
-    if (fresh?.action === 'wait') throw new CacheKeepWarmRefusal('stopped')
+    if (fresh?.action === 'wait') {
+      if (state) {
+        state.warmsSinceLastRealRequest--
+        state.pendingWarmCost = pendingCost
+        this.admittedWarmCosts.delete(state)
+        await this.options.settleWarm?.(current)
+      }
+      throw new CacheKeepWarmWait()
+    }
   }
 
   private scheduleDueTimer() {
@@ -1305,32 +1343,52 @@ export class CacheKeepManager {
     })
   }
 
+  untrackRestored(sessionId: string) {
+    const target = this.targets.get(sessionId)
+    if (!target || !this.restoredTargets.has(target)) return false
+    return this.untrack(sessionId)
+  }
+
   private reportStop(
-    target: Pick<CacheKeepTarget, 'id' | 'policyState' | 'sourceWarm'>,
+    target: CacheKeepTarget,
     reason: string,
     at: number,
     restored = false,
+    terminal = true,
   ) {
     const state = target.policyState
     // Source warms use a synthetic id, not the session's own.
     if (!target.sourceWarm)
-      this.setWarmingRecord(target.id, { stopReason: reportStopReason(reason) })
+      this.setWarmingRecord(target.id, {
+        stopReason: reportStopReason(reason, state?.planned),
+      })
     // Source warms are a different model's prefix, not evidence about the
     // active session cache. The shared report has no target-attribution field.
     if (
       target.sourceWarm ||
       !state ||
       (!state.hasWarmed && !restored && !this.restoredTargets.has(target)) ||
-      this.reportedStops.has(state)
+      this.reportedStops.has(state) ||
+      state.stopReported
     )
       return
-    if (
+    this.reportedStops.add(state)
+    if (terminal) state.stopReported = true
+    const report = () =>
       reportSessionCacheWarmStopped(state.ownerSessionId, {
         at,
-        reason: reportStopReason(reason),
+        reason: reportStopReason(reason, state.planned),
       })
-    )
-      this.reportedStops.add(state)
+    // Save the stop marker before removal. Without receiver acknowledgements a
+    // crash may lose a report, but must not report the same saved record twice.
+    if (terminal && this.options.reserveWarm)
+      void this.options
+        .reserveWarm(target)
+        .then((saved) => {
+          if (saved) report()
+        })
+        .catch(() => {})
+    else report()
   }
 
   private evictOldestTarget(now: number, reason: 'budget' | 'count') {
@@ -1447,6 +1505,8 @@ export class CacheKeepManager {
       return { tracked: false as const, reason }
     }
     if (!input.sessionId) return refuse('missing session id', 'missing-session')
+    if (input.retained?.policyState?.stopReported)
+      return refuse('stop already reported', 'stop-reported')
     this.immediateTargets.delete(input.sessionId)
     let previous = this.targets.get(input.sessionId)
     if (
@@ -1477,7 +1537,16 @@ export class CacheKeepManager {
       else if (input.retained?.policyState?.planned) {
         this.reportStop(
           {
+            ...input.retained,
             id: sessionId,
+            bodyText: input.bodyText,
+            url: input.url,
+            headers: {},
+            bodyBytes: Buffer.byteLength(input.bodyText),
+            consecutiveFailures: 0,
+            dayKey: '',
+            isSubagent: input.isSubagent ?? false,
+            oauthAccountIdentity: input.oauthAccountIdentity,
             policyState: input.retained.policyState,
             sourceWarm: input.sourceWarm,
           },
@@ -1725,19 +1794,12 @@ export class CacheKeepManager {
     }
     if (!current) this.immediateTargets.set(target.id, target)
     try {
-      let acceptedAt: number | undefined
-      const result = await this.sendPrewarm(target, (receivedAt) => {
-        acceptedAt = receivedAt
+      return await this.sendPrewarm(target, (receivedAt, result) => {
+        if (current && this.isCurrentTarget(target)) {
+          this.acceptWarm(current, result, receivedAt)
+          this.scheduleDueTimer()
+        }
       })
-      if (result.ok && current && this.isCurrentTarget(target)) {
-        this.acceptWarm(
-          current,
-          result,
-          acceptedAt ?? this.options.now?.() ?? Date.now(),
-        )
-        this.scheduleDueTimer()
-      }
-      return result
     } finally {
       if (this.immediateTargets.get(target.id) === target)
         this.immediateTargets.delete(target.id)
@@ -1785,16 +1847,6 @@ export class CacheKeepManager {
       // this target; only the current one is decided and sent.
       if (this.targets.get(target.id) !== target) return
       const attemptAt = this.options.now?.() ?? Date.now()
-      if (
-        target.nextPrewarmAt <= attemptAt &&
-        attemptAt > this.lastPrewarmStart(target)
-      ) {
-        this.removeTarget(target, 'retry-window-ended', attemptAt, {
-          stage: 'dispatch',
-          overdueMs: attemptAt - this.lastPrewarmStart(target),
-        })
-        return
-      }
       const decision = this.policyDecision(target, attemptAt)
       if (decision?.action === 'stop') {
         this.removeTarget(target, decision.reason, attemptAt)
@@ -1834,6 +1886,13 @@ export class CacheKeepManager {
         }
       }
       if (target.nextPrewarmAt > attemptAt) return
+      if (attemptAt > this.lastPrewarmStart(target)) {
+        this.removeTarget(target, 'retry-window-ended', attemptAt, {
+          stage: 'dispatch',
+          overdueMs: attemptAt - this.lastPrewarmStart(target),
+        })
+        return
+      }
       try {
         await this.prewarm(target, attemptAt)
       } catch (error) {
@@ -1911,11 +1970,36 @@ export class CacheKeepManager {
 
   private async sendPrewarm(
     target: CacheKeepTarget,
-    onAccepted?: (receivedAt: number) => void,
+    onAccepted?: (
+      receivedAt: number,
+      result: Extract<CacheKeepPrewarmResult, { ok: true }>,
+    ) => void,
   ): Promise<CacheKeepPrewarmResult> {
     const session = target.policyState?.ownerSessionId ?? target.id
-    while (this.sessionWarms.has(session)) await this.sessionWarms.get(session)
-    const sending = this.sendPrewarmAttempt(target, onAccepted)
+    let queued = false
+    while (this.sessionWarms.has(session)) {
+      queued = true
+      await this.sessionWarms.get(session)
+    }
+    if (!this.isCurrentTarget(target))
+      return { ok: false, skipped: true, reason: 'target-replaced' }
+    const current = this.targets.get(target.id)
+    if (
+      queued &&
+      current &&
+      current.nextPrewarmAt > (this.options.now?.() ?? Date.now())
+    )
+      return { ok: false, skipped: true, reason: 'already-warmed' }
+    let acceptedAt: number | undefined
+    // Publish the renewal while still holding the session slot, before any
+    // queued attempt can recheck due-ness or reserve another paid dispatch.
+    const sending = this.sendPrewarmAttempt(target, (receivedAt) => {
+      acceptedAt = receivedAt
+    }).then((result) => {
+      if (result.ok)
+        onAccepted?.(acceptedAt ?? this.options.now?.() ?? Date.now(), result)
+      return result
+    })
     this.sessionWarms.set(session, sending)
     try {
       return await sending
@@ -2089,6 +2173,7 @@ export class CacheKeepManager {
         } catch (error) {
           if (
             error instanceof CacheKeepWarmRefusal ||
+            error instanceof CacheKeepWarmWait ||
             nativeAccountRefusal(error)
           ) {
             scope.dispose()
@@ -2197,6 +2282,8 @@ export class CacheKeepManager {
         ...(usage && { usage }),
       }
     } catch (error) {
+      if (error instanceof CacheKeepWarmWait)
+        return { ok: false, skipped: true, reason: 'wait' }
       if (error instanceof CacheKeepWarmRefusal)
         return { ok: false, refused: true, reason: error.reason }
       const failure = classifyCacheKeepFailure(error, stage, responseStatus)
@@ -2217,12 +2304,14 @@ export class CacheKeepManager {
         transient: true,
       }
     } finally {
-      logger.info('cachekeep', 'prewarm timing', {
-        session: target.id,
-        stage,
-        headersMs,
-        totalMs: (this.options.now?.() ?? Date.now()) - startedAt,
-      })
+      try {
+        logger.info('cachekeep', 'prewarm timing', {
+          session: target.id,
+          stage,
+          headersMs,
+          totalMs: (this.options.now?.() ?? Date.now()) - startedAt,
+        })
+      } catch {}
       try {
         await this.options.onComplete?.({ target, attempt })
       } catch {}
@@ -2230,11 +2319,12 @@ export class CacheKeepManager {
   }
 
   private async prewarm(target: CacheKeepTarget, now: number) {
-    let acceptedAt: number | undefined
-    const result = await this.sendPrewarm(target, (receivedAt) => {
-      acceptedAt = receivedAt
+    const result = await this.sendPrewarm(target, (receivedAt, accepted) => {
+      if (this.targets.get(target.id) === target)
+        this.acceptWarm(target, accepted, receivedAt)
     })
     if (!result.ok) {
+      if (result.refused !== true && result.skipped) return
       if (result.refused === true) {
         this.removeTarget(target, result.reason, now, {
           detail: 'prewarm refused before send',
@@ -2276,10 +2366,6 @@ export class CacheKeepManager {
       }
       return
     }
-
-    if (this.targets.get(target.id) !== target) return
-    acceptedAt ??= this.options.now?.() ?? Date.now()
-    this.acceptWarm(target, result, acceptedAt)
   }
 
   private acceptWarm(

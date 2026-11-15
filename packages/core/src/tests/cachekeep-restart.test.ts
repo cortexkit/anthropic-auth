@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { CACHE_WARM_STOP_REASONS } from '@cortexkit/common-auth/routing-accessor'
 import type { AccountStorage } from '../accounts.ts'
 import { CacheKeepManager, type CacheKeepTarget } from '../cachekeep.ts'
@@ -6,6 +6,7 @@ import {
   __setLogTestSink,
   getLogLevel,
   type LogTestRecord,
+  logger,
   setLogLevel,
 } from '../logger.ts'
 import type { SessionCachePolicy } from '../session-cache-policy.ts'
@@ -28,6 +29,7 @@ const detached = () => new Promise((resolve) => setTimeout(resolve, 0))
 function fixture(
   initial: SessionCachePolicy | null = { keep_warm: 'auto', ttl: 'long' },
   send?: typeof fetch,
+  options: Partial<ConstructorParameters<typeof CacheKeepManager>[0]> = {},
 ) {
   let now = Date.parse('2026-05-18T10:00:00Z')
   let policy = initial
@@ -64,6 +66,7 @@ function fixture(
         },
         { preconnect: fetch.preconnect },
       ),
+    ...options,
   })
   managers.push(manager)
   const bodyText = JSON.stringify({
@@ -328,7 +331,177 @@ test('warm sends for the same session stay serialized', async () => {
   expect(concurrent).toBe(1)
 })
 
-test('planned deadline miss logs retry-window-ended but uses an admitted wire reason', async () => {
+test.each([true, false])(
+  'queued tick after immediate warm is a no-op (planned=%s)',
+  async (planned) => {
+    const gate = Promise.withResolvers<void>()
+    let sends = 0
+    const f = fixture(
+      planned ? { keep_warm: 'always', ttl: 'long' } : null,
+      Object.assign(
+        async () => {
+          sends++
+          await gate.promise
+          return Response.json({})
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    )
+    if (!planned)
+      Object.assign(f.input.storage, {
+        cacheKeep: { enabled: true, always: true },
+        claudeCache: { enabled: true, mode: 'hybrid' },
+      })
+    expect(
+      f.track({ cacheMode: planned ? 'explicit' : 'hybrid' }).tracked,
+    ).toBe(true)
+    f.advance(planned ? 3_570_000 : 3_300_000)
+    const immediate = f.manager.prewarmNow(f.input)
+    await detached()
+    const tick = f.manager.tick()
+    await detached()
+    gate.resolve()
+    await Promise.all([immediate, tick])
+    await detached()
+    expect(sends).toBe(1)
+    expect(f.manager.trackedCount()).toBe(1)
+    expect(
+      f.targets.get(f.input.sessionId)?.policyState?.warmsSinceLastRealRequest,
+    ).toBe(1)
+    expect(
+      f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+    ).toHaveLength(0)
+  },
+)
+
+test('ambiguous failures stay in the auto budget across successful retries without restart', async () => {
+  let sends = 0
+  const f = fixture(
+    undefined,
+    Object.assign(
+      async () => {
+        if (++sends === 1 || sends === 3)
+          throw new Error('response lost after dispatch')
+        return Response.json({})
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  )
+  f.track()
+  f.manager.recordAcceptedUsage(f.input.sessionId, f.input.bodyText, {
+    cache_read_input_tokens: 1000,
+  })
+  const state = f.targets.get(f.input.sessionId)!.policyState!
+  // A rewrite costs 8,000 and each admitted read costs 200 micro-USD.
+  state.warmCostSoFar = 6800
+  f.advance(3_570_000)
+  await f.manager.tick()
+  f.advance(f.targets.get(f.input.sessionId)!.nextPrewarmAt - f.now)
+  await f.manager.tick()
+  f.advance(3_570_000)
+  await f.manager.tick()
+  f.advance(f.targets.get(f.input.sessionId)!.nextPrewarmAt - f.now)
+  await f.manager.tick()
+  expect(sends).toBe(4)
+  expect(state.pendingWarmCost).toBe(400)
+  expect(state.warmCostSoFar).toBe(7200)
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(sends).toBe(5)
+  expect(f.manager.trackedCount()).toBe(0)
+  await detached()
+  expect(f.reports).toContainEqual({
+    kind: 'cache_warm_stopped',
+    at: f.now,
+    reason: 'cost-cap',
+  })
+})
+
+test.each(['policy', 'count'] as const)(
+  'late dispatch decides %s before the retry deadline',
+  async (cause) => {
+    const f = fixture({ keep_warm: 'always', ttl: 'long' })
+    f.track()
+    const state = f.targets.get(f.input.sessionId)!.policyState!
+    state.hasWarmed = true
+    if (cause === 'count') state.warmsSinceLastRealRequest = 24
+    else f.setPolicy({ keep_warm: 'off' })
+    f.advance(3_596_000)
+    await f.manager.tick()
+    await detached()
+    expect(f.reports).toContainEqual({
+      kind: 'cache_warm_stopped',
+      at: f.now,
+      reason: cause === 'count' ? 'count-cap' : 'unsupported',
+    })
+    expect(f.sends).toBe(0)
+  },
+)
+
+test('timing logger failure cannot turn a successful warm into a retry', async () => {
+  const f = fixture()
+  f.track()
+  f.advance(3_570_000)
+  const info = spyOn(logger, 'info').mockImplementation(() => {
+    throw new Error('logger unavailable')
+  })
+  try {
+    await f.manager.tick()
+  } finally {
+    info.mockRestore()
+  }
+  expect(f.targets.get(f.input.sessionId)?.policyState?.hasWarmed).toBe(true)
+  expect(f.targets.get(f.input.sessionId)?.consecutiveFailures).toBe(0)
+  expect(f.sends).toBe(1)
+})
+
+test('timing clock failure cannot turn a successful warm into a retry', async () => {
+  let failClock = false
+  const f = fixture(undefined, undefined, {
+    now: () => {
+      if (failClock) {
+        failClock = false
+        throw new Error('clock unavailable')
+      }
+      return f.now
+    },
+    onResponse: () => {
+      failClock = true
+    },
+  })
+  f.track()
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(f.targets.get(f.input.sessionId)?.policyState?.hasWarmed).toBe(true)
+  expect(f.targets.get(f.input.sessionId)?.consecutiveFailures).toBe(0)
+})
+
+test('stop reporting waits for its durable marker before reporting', async () => {
+  const gate = Promise.withResolvers<boolean>()
+  let marked = false
+  const f = fixture(undefined, undefined, {
+    reserveWarm: async (target) => {
+      marked = target.policyState?.stopReported === true
+      return gate.promise
+    },
+  })
+  f.track()
+  f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
+  f.manager.untrack(f.input.sessionId)
+  await detached()
+  expect(marked).toBe(true)
+  expect(
+    f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+  ).toHaveLength(0)
+  gate.resolve(true)
+  await detached()
+  await detached()
+  expect(
+    f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+  ).toHaveLength(1)
+})
+
+test('planned deadline miss logs retry-window-ended and reports deadline-missed on the wire', async () => {
   const f = fixture(
     undefined,
     Object.assign(
@@ -347,7 +520,7 @@ test('planned deadline miss logs retry-window-ended but uses an admitted wire re
   expect(f.reports).toContainEqual({
     kind: 'cache_warm_stopped',
     at: f.now,
-    reason: 'cost-cap',
+    reason: 'deadline-missed',
   })
   expect(f.manager.trackedCount()).toBe(0)
   expect(f.logs).toContainEqual(
@@ -429,9 +602,9 @@ test.each([
   ['schedule-period-ended', 'outside-hours'],
   ['session-forgotten', 'session-ended'],
   ['stopped', 'session-ended'],
-  ['retry-window-ended', 'cost-cap'],
-  ['retries-exhausted', 'cost-cap'],
-  ['expired', 'cost-cap'],
+  ['retry-window-ended', 'deadline-missed'],
+  ['retries-exhausted', 'deadline-missed'],
+  ['expired', 'deadline-missed'],
   ['idle', 'cost-cap'],
   ['source-warm-idle-cap', 'cost-cap'],
   ...[
@@ -471,7 +644,8 @@ test.each([
     expect(stops).toHaveLength(1)
     expect(stops[0]!.reason).toBe(expected)
     expect(
-      CACHE_WARM_STOP_REASONS.some((reason) => reason === stops[0]?.reason),
+      stops[0]?.reason === 'deadline-missed' ||
+        CACHE_WARM_STOP_REASONS.some((reason) => reason === stops[0]?.reason),
     ).toBe(true)
   },
 )

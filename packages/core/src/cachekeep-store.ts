@@ -82,6 +82,7 @@ type DropReason =
 
 type Acceptance =
   | boolean
+  | 'expired'
   | 'foreign-identity'
   | 'account-gone'
   | 'invalid'
@@ -116,6 +117,7 @@ function record(
         warmsSinceLastRealRequest: target.policyState.warmsSinceLastRealRequest,
         warmCostSoFar: target.policyState.warmCostSoFar,
         pendingWarmCost: target.policyState.pendingWarmCost,
+        stopReported: target.policyState.stopReported,
         prefixTokens: target.policyState.prefixTokens,
         inputTokens: target.policyState.inputTokens,
         hasWarmed: target.policyState.hasWarmed,
@@ -178,6 +180,8 @@ function invalidReason(
       !state.ownerSessionId ||
       typeof state.planned !== 'boolean' ||
       typeof state.hasWarmed !== 'boolean' ||
+      (state.stopReported !== undefined &&
+        typeof state.stopReported !== 'boolean') ||
       (state.needsRealRequest !== undefined &&
         typeof state.needsRealRequest !== 'boolean') ||
       !Number.isFinite(state.lastRealRequestAt) ||
@@ -429,13 +433,26 @@ export class CacheKeepStore {
           reason = 'invalid'
           const entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
           const invalid = invalidReason(entry, name, now)
-          if (invalid === 'expired' && entry.policyState?.planned) {
+          if (invalid && invalid !== 'expired') {
+            reason = invalid
+            throw new Error('Invalid restart file')
+          }
+          // Even expired entries must pass the host's live-target/lease guards.
+          // Undefined means another owner or a live request owns this session.
+          const acceptance = accept(entry)
+          if (acceptance === undefined) continue
+          const accepted = invalid ?? acceptance
+          if (
+            invalid === 'expired' &&
+            entry.policyState?.planned &&
+            !entry.policyState.stopReported
+          ) {
             // The loader retires expired records before a manager can adopt them.
-            // common-auth's CACHE_WARM_STOP_REASONS has no deadline-missed value yet,
-            // so report cost-cap to Thalamus and log the actual local cause.
+            entry.policyState.stopReported = true
+            await this.writeEntry(entry, directory)
             reportSessionCacheWarmStopped(entry.policyState.ownerSessionId, {
               at: now,
-              reason: 'cost-cap',
+              reason: 'deadline-missed',
             })
             logger.info('cachekeep', 'stopped warming session', {
               session: entry.id,
@@ -444,12 +461,14 @@ export class CacheKeepStore {
               overdueMs: now - entry.cacheExpiresAt,
             })
           }
-          const accepted = invalid ?? accept(entry)
           if (
             invalid === undefined &&
             entry.policyState?.planned &&
+            !entry.policyState.stopReported &&
             (accepted === 'account-gone' || accepted === 'foreign-identity')
           ) {
+            entry.policyState.stopReported = true
+            await this.writeEntry(entry, directory)
             reportSessionCacheWarmStopped(entry.policyState.ownerSessionId, {
               at: now,
               reason: 'unsupported',
@@ -484,6 +503,7 @@ export class CacheKeepStore {
             reason,
           })
           dropped++
+          await this.chain
           await rm(path, { force: true })
         } finally {
           await release?.()
@@ -579,8 +599,11 @@ export class CacheKeepStore {
     return committed || this.memoryOnly
   }
 
-  private async writeEntry(entry: SavedCacheKeepTarget) {
-    const path = join(this.directory, `${hash(entry.id)}.json.gz`)
+  private async writeEntry(
+    entry: SavedCacheKeepTarget,
+    directory = this.directory,
+  ) {
+    const path = join(directory, `${hash(entry.id)}.json.gz`)
     const temp = `${path}.${randomUUID()}.tmp`
     try {
       const safe = { ...entry, bodyText: sanitizedBody(entry.bodyText) }

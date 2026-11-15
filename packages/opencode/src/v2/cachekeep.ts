@@ -43,6 +43,7 @@ export interface NativeCacheKeepOptions {
   readonly clearIntervalImpl?: typeof globalThis.clearInterval
   readonly setTimeoutImpl?: typeof globalThis.setTimeout
   readonly clearTimeoutImpl?: typeof globalThis.clearTimeout
+  readonly delayImpl?: typeof delay
   readonly registryDirectory?: string
   /** Filesystem seam for tests; this is not a user setting. */
   readonly persistence?: Omit<CacheKeepStoreOptions, 'storageId'>
@@ -134,6 +135,7 @@ interface SharedCacheKeep {
     | 'trackedPolicyState'
     | 'warming'
     | 'recordWarmingOff'
+    | 'untrackRestored'
   > &
     Partial<
       Pick<
@@ -147,6 +149,7 @@ interface SharedCacheKeep {
         | 'trackedPolicyState'
         | 'warming'
         | 'recordWarmingOff'
+        | 'untrackRestored'
       >
     >
   readonly registry: CacheKeepSessionRegistry
@@ -321,14 +324,16 @@ function createSharedCacheKeep(
       // Even if a busy scheduler first runs after several targets became due,
       // restored sessions must not all hit the provider together.
       if (restored.delete(entry.target.id)) {
-        await delay(
-          Math.max(0, lastRestoredSend + 3000 - Date.now()),
+        const now = options.now?.() ?? Date.now()
+        const startAt = Math.max(now, lastRestoredSend + 3000)
+        lastRestoredSend = startAt
+        await (options.delayImpl ?? delay)(
+          Math.max(0, startAt - now),
           undefined,
           {
             signal: entry.attempt.signal,
           },
         )
-        lastRestoredSend = Date.now()
       }
       const sending = entry.lease.send(
         entry.target,
@@ -396,6 +401,8 @@ function createSharedCacheKeep(
         await shared.persistence.load(now, (entry) => {
           // Disposal may race startup. Leave the file for the next live lease.
           if (!leases.size || manager.trackedRequest(entry.id)) return undefined
+          if (entry.policyState?.stopReported) return 'invalid'
+          if (entry.cacheExpiresAt <= now) return 'expired'
           if (
             !isCacheKeepHybridActive(snapshot.policyStorage) &&
             !entry.policyState?.planned &&
@@ -887,10 +894,17 @@ export function createNativeCacheKeep(
   return {
     ready,
     async track(input: NativeCacheRequestPrepared) {
-      // These skips are normal (API-key routes, prewarms, subagents, policy
-      // off) and keep any existing target, so they stay at debug and do no
-      // per-request work beyond the log call.
+      // A new real turn invalidates a restored prefix even when its route or
+      // local settings exclude it from future warming. Background work does not.
       const skipped = (reason: string) => {
+        if (
+          !lease.stopped &&
+          !input.signal?.aborted &&
+          input.kind === 'primary' &&
+          input.agent !== 'cachekeep' &&
+          input.agent !== 'prime'
+        )
+          manager.untrackRestored?.(input.sessionID)
         discardAttempt(input.attemptId)
         logger.debug('cachekeep', 'tracking skipped', {
           session: input.sessionID,

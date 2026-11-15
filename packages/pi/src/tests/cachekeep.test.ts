@@ -220,6 +220,48 @@ test('a fresh Pi process restores its idle session and warms without a request',
   expect(f.delays[0]).toBeLessThan(3000)
 })
 
+test('a Pi real turn on an ineligible account ends its restored planned prefix', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  let policy: { ttl: 'long'; keep_warm: 'always' } | null = {
+    ttl: 'long',
+    keep_warm: 'always',
+  }
+  const reports: { kind: string; reason?: string }[] = []
+  globals[key] = () => ({
+    cache: () => policy,
+    report: (payload: (typeof reports)[number]) => reports.push(payload),
+  })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  const f = await fixture()
+  const first = f.create()
+  await first.process.startSession('pi-storage', 'session-S')
+  await first.process.trackAccepted(f.input('session-S'), f.snapshot)
+  await first.process.stop()
+  policy = null
+  const second = f.create()
+  await second.process.startSession('pi-storage', 'session-S')
+  expect(second.process.manager.trackedCount()).toBe(1)
+  f.snapshot.accounts = []
+  await second.process.trackAccepted(
+    f.input('session-S', 'new real prefix'),
+    f.snapshot,
+  )
+  expect(second.process.manager.trackedCount()).toBe(0)
+  await second.process.stop()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual([
+    expect.objectContaining({ reason: 'session-ended' }),
+  ])
+  f.advance(3_570_000)
+  await second.tick()
+  expect(f.sends).toHaveLength(0)
+})
+
 test('Pi restores a 2.6 record without policyState and durably caps its new count', async () => {
   const f = await fixture()
   const first = f.create()

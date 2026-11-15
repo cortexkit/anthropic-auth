@@ -105,12 +105,22 @@ export function reportSessionCacheTouch(
   )
 }
 
-/** Stops describe actual warming, not a refusal to start warming. */
+/** Stops include restored and account-dropped planned records, even before their first warm. */
+export type SessionCacheWarmStopReason =
+  | CacheWarmStoppedInput['reason']
+  | 'deadline-missed'
+
 export function reportSessionCacheWarmStopped(
   sessionId: string,
-  input: CacheWarmStoppedInput,
+  input: Omit<CacheWarmStoppedInput, 'reason'> & {
+    reason: SessionCacheWarmStopReason
+  },
 ): boolean {
-  return detachReport(() => reportCacheWarmStopped(sessionId, input))
+  // llm-runner 0.8.56 admits deadline-missed; remove this compatibility cast
+  // when adopting common-auth 0.51.0, which includes the reason in its types.
+  return detachReport(() =>
+    reportCacheWarmStopped(sessionId, input as CacheWarmStoppedInput),
+  )
 }
 
 function record(value: unknown): value is Record<string, unknown> {

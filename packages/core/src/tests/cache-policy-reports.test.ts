@@ -288,7 +288,7 @@ test.each([
         reason === 'off' || reason === 'none' || reason === 'account-changed'
           ? 'unsupported'
           : reason === 'expired'
-            ? 'cost-cap'
+            ? 'deadline-missed'
             : reason === 'stopped'
               ? 'session-ended'
               : reason,
@@ -610,7 +610,7 @@ test.each([
   },
 )
 
-test('planned final-margin retirement reports cost-cap instead of expired', async () => {
+test('planned final-margin retirement reports deadline-missed instead of cost-cap', async () => {
   const f = fixture()
   await f.warm()
   f.advance(3_596_000)
@@ -619,7 +619,7 @@ test('planned final-margin retirement reports cost-cap instead of expired', asyn
   expect(f.reports.at(-1)).toEqual({
     kind: 'cache_warm_stopped',
     at: f.now,
-    reason: 'cost-cap',
+    reason: 'deadline-missed',
   })
 })
 

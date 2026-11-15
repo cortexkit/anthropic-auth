@@ -290,6 +290,7 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
   })
   await keep.track({ ...input, attemptId: 'vanished-plan' })
   await shared.manager.tick()
+  await shared.persistence.drain()
   await new Promise((resolve) => setTimeout(resolve, 0))
   expect(reports).toEqual([
     { kind: 'cache_warm_stopped', at: now, reason: 'session-ended' },
