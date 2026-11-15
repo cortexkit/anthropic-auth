@@ -5,6 +5,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Under Thalamus, billing reports now give the shortest cache lifetime in a request when its cache markers mix lifetimes.
+- Updated the shared authentication library to common-auth 0.50.0.
 
 ## 2.13.0
 

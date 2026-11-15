@@ -7,6 +7,7 @@ import {
   POOL_LOCK_DEFAULTS,
   type PoolCredential,
   type PoolRow,
+  readPoolSettingsAt,
 } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
@@ -126,11 +127,7 @@ import {
   resolveLocalRoutingDestination,
   stateLayoutOfPaths,
 } from './pool-paths.ts'
-import {
-  createNativePoolStore,
-  nativePoolStoreLocks,
-  readNativePoolSettingsAt,
-} from './pool-store.ts'
+import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
 import type { QuotaRequestDispatch } from './quota-manager.ts'
 import { effectiveRelayTransport, type RelayConfig } from './relay.ts'
 import {
@@ -1073,7 +1070,7 @@ function buildNativeAccountRuntime(
       // files the check matched, never the selected path text again: a folder
       // swapped for a link after the check cannot redirect these reads.
       const readSettings = files
-        ? () => readNativePoolSettingsAt(files.config, nativeQuotaCodec)
+        ? () => readPoolSettingsAt(files.config)
         : () => store.readSettings()
       const runtimeFile = files ? files.runtime : paths.runtime
       // Both files are atomically published, but a reader can cross a relay
