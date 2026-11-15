@@ -31,7 +31,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@cortexkit/common-auth": "0.49.2"
+    "@cortexkit/common-auth": "0.50.0"
   },
   "dependencies": {
     "@cortexkit/claustrum-client": "0.18.0",

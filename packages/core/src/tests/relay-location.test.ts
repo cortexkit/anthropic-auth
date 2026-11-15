@@ -107,6 +107,35 @@ test('the default store reached through a symlinked folder still counts as the d
   expect((await runtime.getRelayConfig())?.url).toBe(RELAY.url)
 })
 
+test('relay settings use the matched canonical config without opening another pool store', async () => {
+  const home = await realpath(await scratch('relay-home-'))
+  const elsewhere = await scratch('relay-selected-')
+  const { paths } = await storeWithRelay(join(home, '.config', 'opencode'))
+  const link = join(elsewhere, 'selected')
+  await symlink(join(home, '.config', 'opencode'), link)
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      join(import.meta.dir, 'relay-settings-reader-fixture.ts'),
+      home,
+      join(link, basename(paths.legacyConfig)),
+      join(link, basename(paths.legacyState)),
+    ],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ])
+  expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
+  expect(JSON.parse(stdout)).toMatchObject({
+    relay: { url: RELAY.url, token: RELAY.token },
+    settingsPaths: [await realpath(paths.config)],
+    opens: 0,
+  })
+})
+
 test('a relay in a store outside the default place is ignored, shown as off, and cannot be saved', async () => {
   const home = await scratch('relay-home-')
   const elsewhere = await scratch('relay-moved-')
