@@ -31,6 +31,7 @@ import {
   collectPiEffortHistory,
   deriveContextEntries,
 } from './effort-history.ts'
+import { piForkEffortSnapshots, piForkHeadSession } from './forks.ts'
 import {
   closePiNativeRuntime,
   getPiNativeRuntime,
@@ -188,6 +189,7 @@ export default async function cortexKitPiAnthropicAuth(
     if (sessionId) {
       clearPiStickyQuotaRetries(storagePath, sessionId)
       effortHistoryBySession.delete(sessionId)
+      piForkEffortSnapshots.forget(sessionId)
       workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)
       forgetPiMessageThread(sessionId)
@@ -346,7 +348,9 @@ export default async function cortexKitPiAnthropicAuth(
         context,
         options,
         options?.sessionId
-          ? effortHistoryBySession.get(options.sessionId)
+          ? effortHistoryBySession.get(
+              piForkHeadSession(options) ?? options.sessionId,
+            )
           : undefined,
         {
           ...quotaWait,

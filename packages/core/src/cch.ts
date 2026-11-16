@@ -114,6 +114,11 @@ export class ClaudeCodeFirstUserTextTracker {
     return this.#values.has(sessionId)
   }
 
+  /** Read a head's billing-text pin without changing its lifetime or LRU order. */
+  peek(sessionId: string) {
+    return this.#values.get(sessionId)
+  }
+
   clear() {
     this.#values.clear()
   }

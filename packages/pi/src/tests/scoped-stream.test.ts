@@ -15,6 +15,7 @@ import {
   getClaudeCodeIdentityForVerifiedAccount,
   getLogLevel,
   type LogTestRecord,
+  MessageThreadTracker,
   NativeCustodyError,
   PER_TURN_CONTROL_BETA,
   resolveNativePoolPaths,
@@ -29,6 +30,7 @@ import {
 } from '@cortexkit/claustrum-client'
 import type {
   Api,
+  AssistantMessage,
   Context,
   Credential,
   CredentialStore,
@@ -51,6 +53,8 @@ import {
   recordedTimers,
   watchableVaultClient,
 } from '../../../core/src/tests/vault-watch-fixture.ts'
+import { PiCacheKeep } from '../cachekeep.ts'
+import { piForkEffortSnapshots } from '../forks.ts'
 import cortexKitPiAnthropicAuth from '../index.ts'
 import {
   closePiNativeRuntime,
@@ -123,6 +127,1083 @@ const context: Context = {
   messages: [{ role: 'user', content: 'Hello', timestamp: 0 }],
   tools: [],
 }
+
+const forkRoutingOriginals = new WeakMap<object, unknown>()
+function forkRouting(
+  accountFor?: () => Promise<unknown>,
+  extras: (sessionId: string) => Record<string, unknown> = () => ({}),
+) {
+  const globals = globalThis as Record<symbol, unknown>
+  const key = Symbol.for('cortexkit.routing')
+  const previous = globals[key]
+  // Fixture cleanups run FIFO. Replacing a handle twice must restore the
+  // pre-test handle, not leave the first replacement in the next test.
+  const original =
+    typeof previous === 'function' && forkRoutingOriginals.has(previous)
+      ? forkRoutingOriginals.get(previous)
+      : previous
+  const reports: Array<{
+    sessionId: string
+    payload: Record<string, unknown>
+  }> = []
+  const asks: string[] = []
+  const accessor = (sessionId: string) => ({
+    accountFor: async () => {
+      asks.push(sessionId)
+      return (
+        accountFor?.() ?? {
+          account_id: fixtureAccountIdentity('main'),
+          credential_id: 'oauth:anthropic',
+        }
+      )
+    },
+    report: (payload: Record<string, unknown>) =>
+      reports.push({ sessionId, payload }),
+    ...extras(sessionId),
+  })
+  forkRoutingOriginals.set(accessor, original)
+  globals[key] = accessor
+  deferCleanup(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  return { reports, asks }
+}
+
+function forkOptions(
+  headSessionId: string,
+  sessionId = `${headSessionId}-fork`,
+) {
+  return {
+    sessionId,
+    cortexkitFork: { headSessionId },
+    reasoning: 'high' as const,
+  }
+}
+
+function forkContext(base: Context, branchLength = 0): Context {
+  const answer: AssistantMessage = {
+    role: 'assistant' as const,
+    content: [{ type: 'text' as const, text: 'Head answer' }],
+    api: 'anthropic-messages' as const,
+    provider: 'anthropic',
+    model: model.id,
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'stop' as const,
+    timestamp: 1,
+  }
+  return {
+    ...base,
+    messages: [
+      ...base.messages,
+      answer,
+      ...Array.from({ length: branchLength }, (_, i) => [
+        {
+          role: 'user' as const,
+          content: `Earlier fork question ${i}`,
+          timestamp: i + 2,
+        },
+        { ...answer, timestamp: i + 3 },
+      ]).flat(),
+      { role: 'user', content: 'Fork question', timestamp: 100 },
+    ],
+  }
+}
+
+function normalizedForkBody(text: string) {
+  return JSON.parse(
+    text.replace(/cch=[a-f0-9]+/g, 'cch=SIGNATURE'),
+    (key, value) => (key === 'cache_control' ? undefined : value),
+  )
+}
+
+function stateBytes(value: unknown) {
+  return JSON.stringify(value, (_key, item) =>
+    item instanceof Map || item instanceof Set ? [...item] : item,
+  )
+}
+
+async function flushForkReports() {
+  // Billing and cache-touch callbacks run on zero-delay timers after the reply.
+  // Queue this fence after them so a missing report cannot pass merely early.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
+for (const mode of [
+  'plain',
+  'multi-turn',
+  'newer effort',
+  'turn notes',
+  'head TTL',
+  'long branch',
+] as const) {
+  test(`Pi fork preserves the head cache prefix: ${mode}`, async () => {
+    const f = await fixture()
+    const head = `fork-prefix-${mode}-${f.path}`
+    const fork = `${head}-fork`
+    const note = { after_tool_use_id: 'tool-1', text: 'Runner base note' }
+    const notesReads: string[] = []
+    const policyReads: string[] = []
+    let headAdvanced = false
+    const routing = forkRouting(undefined, (sessionId) => ({
+      turn_notes: () => {
+        notesReads.push(sessionId)
+        return mode === 'turn notes'
+          ? [
+              {
+                ...note,
+                text:
+                  headAdvanced && sessionId === head
+                    ? 'New head note'
+                    : note.text,
+              },
+            ]
+          : []
+      },
+      cache: () => {
+        policyReads.push(sessionId)
+        return mode === 'head TTL'
+          ? {
+              ttl: headAdvanced && sessionId === head ? 'short' : 'long',
+              keep_warm: 'off',
+            }
+          : null
+      },
+    }))
+    const base: Context =
+      mode === 'multi-turn'
+        ? forkContext(context)
+        : mode === 'long branch'
+          ? {
+              ...context,
+              tools: [
+                {
+                  name: 'read',
+                  description: 'Read a file',
+                  parameters: { type: 'object', properties: {} },
+                },
+              ],
+            }
+          : mode === 'turn notes'
+            ? {
+                ...context,
+                messages: [
+                  context.messages[0]!,
+                  {
+                    ...(forkContext(context).messages[1] as AssistantMessage),
+                    content: [
+                      {
+                        type: 'toolCall',
+                        id: 'tool-1',
+                        name: 'read',
+                        arguments: {},
+                      },
+                    ],
+                  },
+                  {
+                    role: 'toolResult',
+                    toolCallId: 'tool-1',
+                    toolName: 'read',
+                    content: [{ type: 'text', text: 'File read' }],
+                    isError: false,
+                    timestamp: 2,
+                  },
+                ],
+              }
+            : context
+    const bodies: string[] = []
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        const bytes = Buffer.from(await request.arrayBuffer())
+        bodies.push(
+          request.headers.get('content-encoding') === 'gzip'
+            ? gunzipSync(bytes).toString()
+            : bytes.toString(),
+        )
+        return success()
+      },
+    })
+    deferCleanup(() => server.stop(true))
+    globalThis.fetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        if (String(input).includes('/api/oauth/usage')) return Response.json({})
+        return originalFetch(server.url, init)
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+    const history = [{ afterAssistantMessages: 0, effort: 'low' as const }]
+    expect(
+      (
+        await streamCortexKitAnthropic(
+          model,
+          base,
+          { sessionId: head, reasoning: 'high' },
+          history,
+        ).result()
+      ).stopReason,
+    ).toBe('stop')
+    headAdvanced = true
+    if (mode === 'newer effort') {
+      const next = forkContext(base)
+      next.messages[next.messages.length - 1] = {
+        role: 'user',
+        content: 'New head turn',
+        timestamp: 10,
+      }
+      expect(
+        (
+          await streamCortexKitAnthropic(
+            model,
+            next,
+            { sessionId: head, reasoning: 'high' },
+            [
+              ...history,
+              {
+                afterAssistantMessages:
+                  base.messages.filter((m) => m.role === 'assistant').length +
+                  1,
+                effort: 'high',
+              },
+            ],
+          ).result()
+        ).stopReason,
+      ).toBe('stop')
+    }
+    const before = JSON.stringify(await getPiTrackedCacheKeepSessions())
+    const result = await streamCortexKitAnthropic(
+      model,
+      forkContext(base, mode === 'long branch' ? 30 : 0),
+      forkOptions(head),
+      mode === 'plain'
+        ? history
+        : [...history, { afterAssistantMessages: 1, effort: 'high' }],
+    ).result()
+    expect(result.stopReason).toBe('stop')
+    const headBody = normalizedForkBody(bodies[0]!)
+    const forkBody = normalizedForkBody(bodies.at(-1)!)
+    expect(
+      JSON.stringify(forkBody.messages.slice(0, headBody.messages.length)),
+    ).toBe(JSON.stringify(headBody.messages))
+    expect(
+      forkBody.messages.filter(
+        (message: Record<string, unknown>) => message.output_config,
+      ),
+    ).toEqual([])
+    const rawHead = JSON.parse(bodies[0]!)
+    const rawFork = JSON.parse(bodies.at(-1)!)
+    const blocks = rawFork.messages.flatMap(
+      (message: { content: unknown[] }) => message.content,
+    ) as Record<string, unknown>[]
+    const baseBlock =
+      rawFork.messages[headBody.messages.length - 1].content.at(-1)
+    const basePosition = blocks.indexOf(baseBlock)
+    const markerPositions = blocks.flatMap((block, index) =>
+      block.cache_control ? [index] : [],
+    )
+    expect(
+      markerPositions.some(
+        (position) => position >= basePosition && position - basePosition <= 20,
+      ),
+    ).toBe(true)
+    expect(Boolean(baseBlock.cache_control)).toBe(mode === 'long branch')
+    if (mode === 'long branch')
+      expect(rawFork.messages[0].content[0].cache_control).toBeUndefined()
+    if (mode === 'turn notes') expect(bodies[0]).toContain(note.text)
+    if (mode === 'head TTL') {
+      expect(bodies[0]).toContain('"ttl":"1h"')
+      expect(bodies.at(-1)).toContain('"ttl":"1h"')
+    }
+    const countMarkers = (body: typeof rawHead) =>
+      [
+        body,
+        ...(body.system ?? []),
+        ...(body.tools ?? []),
+        ...body.messages,
+        ...body.messages.flatMap(
+          (message: { content: unknown[] }) => message.content,
+        ),
+      ].filter((holder) => holder.cache_control).length
+    expect(countMarkers(rawFork)).toBeLessThanOrEqual(4)
+    delete headBody.messages
+    delete forkBody.messages
+    expect(JSON.stringify(forkBody)).toBe(JSON.stringify(headBody))
+    expect(JSON.stringify(await getPiTrackedCacheKeepSessions())).toBe(before)
+    expect(sessionCacheActivity.ttlMs(head)).toBe(
+      mode === 'head TTL' ? 3_600_000 : 300_000,
+    )
+    expect(routing.asks.at(-1)).toBe(fork)
+    await flushForkReports()
+    expect(
+      routing.reports.some(
+        (r) => r.sessionId === head && r.payload.kind === 'billing',
+      ),
+    ).toBe(true)
+    expect(
+      routing.reports.filter(
+        (r) => r.sessionId === fork && r.payload.kind === 'billing',
+      ),
+    ).toEqual([])
+    expect(
+      routing.reports.some(
+        (r) => r.sessionId === fork && r.payload.outcome === 'served',
+      ),
+    ).toBe(true)
+    expect(
+      routing.reports.filter(
+        (r) => r.sessionId === fork && r.payload.kind === 'cache_touch',
+      ),
+    ).toEqual([])
+    expect(notesReads).toContain(fork)
+    expect(policyReads).toContain(fork)
+  })
+}
+
+for (const failure of [
+  'absent',
+  'null',
+  'timeout',
+  'error',
+  'refusal',
+  'unknown',
+  'unavailable',
+] as const) {
+  test(`Pi fork refuses ${failure} routing without a model send`, async () => {
+    const f = await fixture()
+    const head = `fork-refusal-${failure}-${f.path}`
+    const globals = globalThis as Record<symbol, unknown>
+    forkRouting()
+    let sends = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        sends++
+        return success()
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+    expect(
+      (
+        await streamCortexKitAnthropic(model, context, {
+          sessionId: head,
+        }).result()
+      ).stopReason,
+    ).toBe('stop')
+    sends = 0
+    const timedOutAnswer = lifetimes.gate()
+    forkRouting(async () => {
+      if (failure === 'null') return null
+      if (failure === 'timeout') {
+        await timedOutAnswer.wait
+        return null
+      }
+      if (failure === 'error') throw new Error('Prompt-bearing routing failure')
+      if (failure === 'refusal')
+        return { refused: { code: 'account_selection_refused' } }
+      if (failure === 'unknown')
+        return { account_id: 'unknown', credential_id: 'unknown' }
+      return {
+        account_id: fixtureAccountIdentity('main'),
+        credential_id: 'oauth:anthropic',
+      }
+    })
+    if (failure === 'absent') delete globals[Symbol.for('cortexkit.routing')]
+    if (failure === 'unavailable') {
+      f.rows[0] = { ...f.rows[0]!, state: 'needs_reauth' }
+      await (await f.native.service()).vault.refresh()
+    }
+    const result = await streamCortexKitAnthropic(
+      model,
+      forkContext(context),
+      forkOptions(head),
+    ).result()
+    timedOutAnswer.open()
+    expect(result.stopReason).toBe('error')
+    expect(isRetryableAssistantError(result)).toBe(false)
+    expect(result.errorMessage).not.toContain('Prompt-bearing')
+    expect(sends).toBe(0)
+  })
+}
+
+for (const confirmed of [true, false]) {
+  test(`Pi fork ${confirmed ? 'ends on a confirmed limit' : 'retries an unconfirmed limit twice on its admitted account'}`, async () => {
+    const f = await fixture()
+    f.client.getScoped = async ({ credentialId }) => ({
+      credentialId,
+      accountId: fixtureAccountIdentity(
+        credentialId === 'oauth:other' ? 'other' : 'main',
+      ),
+      material: credentialId,
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 600_000,
+    })
+    f.rows.push(row('oauth:other', fixtureAccountIdentity('other')))
+    await (await f.native.service()).vault.refresh()
+    const head = `fork-limit-${confirmed}-${f.path}`
+    const routing = forkRouting()
+    const sent: string[] = []
+    let limited = false
+    globalThis.fetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        if (String(input).includes('/api/oauth/usage')) return Response.json({})
+        sent.push(new Headers(init?.headers).get('authorization') ?? '')
+        return limited
+          ? Response.json(
+              { error: { type: 'rate_limit_error' } },
+              {
+                status: 429,
+                headers: confirmed
+                  ? { 'anthropic-ratelimit-unified-5h-status': 'rejected' }
+                  : {},
+              },
+            )
+          : success()
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+    expect(
+      (
+        await streamCortexKitAnthropic(model, context, {
+          sessionId: head,
+        }).result()
+      ).stopReason,
+    ).toBe('stop')
+    limited = true
+    sent.length = 0
+    const send = () =>
+      streamCortexKitAnthropic(
+        model,
+        forkContext(context),
+        forkOptions(head),
+      ).result()
+    if (!confirmed) {
+      expect(isRetryableAssistantError(await send())).toBe(true)
+      expect(isRetryableAssistantError(await send())).toBe(true)
+    }
+    const result = await send()
+    expect(result.stopReason).toBe('error')
+    expect(isRetryableAssistantError(result)).toBe(false)
+    expect(sent).toHaveLength(confirmed ? 1 : 3)
+    expect(new Set(sent).size).toBe(1)
+    expect(
+      routing.reports.filter(
+        (r) =>
+          r.sessionId === `${head}-fork` && r.payload.outcome === 'exhausted',
+      ),
+    ).toHaveLength(confirmed ? 1 : 0)
+    expect(
+      routing.reports.filter(
+        (r) => r.sessionId === `${head}-fork` && r.payload.kind === 'billing',
+      ),
+    ).toEqual([])
+  })
+}
+
+test('Pi fork reports an upstream error as a failed request, not an account refusal', async () => {
+  const f = await fixture()
+  const head = `fork-upstream-error-${f.path}`
+  forkRouting()
+  let failing = false
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).includes('/api/oauth/usage')) return Response.json({})
+      if (!failing) return success()
+      sends += 1
+      return Response.json(
+        { error: { type: 'overloaded_error' } },
+        { status: 529 },
+      )
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: head,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  failing = true
+  const result = await streamCortexKitAnthropic(
+    model,
+    forkContext(context),
+    forkOptions(head),
+  ).result()
+  expect(result.stopReason).toBe('error')
+  expect(result.errorMessage).toContain('failed before an answer arrived')
+  expect(result.errorMessage).not.toContain('cannot serve')
+  expect(sends).toBe(1)
+})
+
+test('Pi fork trusts the named account despite unknown quota and local floors', async () => {
+  const f = await fixture()
+  const head = `fork-trusted-${f.path}`
+  forkRouting()
+  const sent: string[] = []
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input).includes('/api/oauth/usage')) return Response.json({})
+      sent.push(new Headers(init?.headers).get('authorization') ?? '')
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: head,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: {
+      enabled: true,
+      failClosedOnUnknownQuota: true,
+      minimumRemaining: { five_hour: 99, seven_day: 99 },
+    },
+    killswitch: { enabled: true, main: { five_hour: 99 } },
+  }))
+  f.rows.push(row('oauth:other', fixtureAccountIdentity('other')))
+  await runtime.vault.refresh()
+  f.client.getScoped = async ({ credentialId }) => ({
+    credentialId,
+    accountId: fixtureAccountIdentity(
+      credentialId === 'oauth:other' ? 'other' : 'main',
+    ),
+    material: credentialId,
+    recordVersion: 10,
+    expiresAtMs: Date.now() + 600_000,
+  })
+  forkRouting(async () => ({
+    account_id: fixtureAccountIdentity('other'),
+    credential_id: 'oauth:other',
+  }))
+  const result = await streamCortexKitAnthropic(
+    model,
+    forkContext(context),
+    forkOptions(head),
+  ).result()
+  expect(result.stopReason).toBe('stop')
+  expect(sent.at(-1)).toBe('Bearer oauth:other')
+})
+
+test('Pi fork leaves head leases, keep-warm tracking and effort provenance untouched', async () => {
+  const f = await fixture()
+  const head = `fork-state-${f.path}`
+  forkRouting()
+  globalThis.fetch = Object.assign(async () => success(), {
+    preconnect: originalFetch.preconnect,
+  }) as typeof fetch
+  const history = [{ afterAssistantMessages: 0, effort: 'low' as const }]
+  expect(
+    (
+      await streamCortexKitAnthropic(
+        model,
+        context,
+        { sessionId: head },
+        history,
+      ).result()
+    ).stopReason,
+  ).toBe('stop')
+  const effortBefore = stateBytes(piForkEffortSnapshots)
+  const keepBefore = JSON.stringify(await getPiTrackedCacheKeepSessions())
+  const lease = spyOn(PiCacheKeep.prototype, 'requestTurn')
+  const track = spyOn(PiCacheKeep.prototype, 'trackAccepted')
+  deferCleanup(() => {
+    lease.mockRestore()
+    track.mockRestore()
+  })
+  sessionCacheActivity.forget(head)
+  expect(sessionCacheActivity.holdUntil(head, 'main')).toBeUndefined()
+  const result = await streamCortexKitAnthropic(
+    model,
+    forkContext(context),
+    forkOptions(head),
+    [...history, { afterAssistantMessages: 1, effort: 'high' }],
+  ).result()
+  expect(result.stopReason).toBe('stop')
+  expect(lease).not.toHaveBeenCalled()
+  expect(track).not.toHaveBeenCalled()
+  expect(stateBytes(piForkEffortSnapshots)).toBe(effortBefore)
+  expect(JSON.stringify(await getPiTrackedCacheKeepSessions())).toBe(keepBefore)
+  expect(sessionCacheActivity.holdUntil(head, 'main')).toBeGreaterThan(
+    Date.now(),
+  )
+  expect(sessionCacheActivity.holdUntil(`${head}-fork`, 'main')).toBeUndefined()
+})
+
+test('Pi fork never reads or replaces a head thread anchor, even with primary-turn hooks', async () => {
+  // Finish saving the head's keep-warm target before the fixture restores the
+  // registry directory, or a late save can leave a target in the next test.
+  deferCleanup(() => stopPiCacheKeep())
+  const f = await fixture()
+  const head = `fork-thread-${f.path}`
+  const fork = `${head}-fork`
+  forkRouting(undefined, () => ({
+    cache: () => ({ ttl: 'long', keep_warm: 'always' }),
+  }))
+  await startPiCacheKeepSession(f.path, head)
+  const sent: Array<Record<string, unknown>> = []
+  const response = () =>
+    new Response(
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_head","content":[]}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Head answer"}}\n\nevent: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+  globalThis.fetch = Object.assign(
+    async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      sent.push(
+        JSON.parse(
+          new Headers(init?.headers).get('content-encoding') === 'gzip'
+            ? gunzipSync(init?.body as Uint8Array).toString()
+            : String(init?.body),
+        ),
+      )
+      return response()
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  let threadTracker: MessageThreadTracker | undefined
+  let cacheKeep: PiCacheKeep | undefined
+  const prepareOriginal = MessageThreadTracker.prototype.prepare
+  const thread = spyOn(
+    MessageThreadTracker.prototype,
+    'prepare',
+  ).mockImplementation(function (this: MessageThreadTracker, input) {
+    threadTracker = this
+    return prepareOriginal.call(this, input)
+  })
+  const leaseOriginal = PiCacheKeep.prototype.requestTurn
+  const lease = spyOn(PiCacheKeep.prototype, 'requestTurn').mockImplementation(
+    function (this: PiCacheKeep, sessionId) {
+      cacheKeep = this
+      return leaseOriginal.call(this, sessionId)
+    },
+  )
+  const track = spyOn(PiCacheKeep.prototype, 'trackAccepted')
+  deferCleanup(() => {
+    thread.mockRestore()
+    lease.mockRestore()
+    track.mockRestore()
+    endPiPrimaryTurn(f.path, head)
+    endPiPrimaryTurn(f.path, fork)
+    forgetPiMessageThread(head)
+  })
+  const hooks = {
+    onPayload: (payload: unknown) => payload,
+    onResponse: () => {},
+    onProviderStreamEvent: () => {},
+  }
+  beginPiPrimaryTurn(f.path, head)
+  const answer = await streamCortexKitAnthropic(
+    model,
+    context,
+    { sessionId: head, ...hooks },
+    undefined,
+    undefined,
+    'agent-loop',
+  ).result()
+  expect(answer.stopReason).toBe('stop')
+  await Promise.all(track.mock.results.map((result) => result.value))
+  expect(sent[0]?.thread).toEqual({ type: 'create' })
+  expect(threadTracker).toBeDefined()
+  expect(cacheKeep).toBeDefined()
+  beginPiPrimaryTurn(f.path, fork)
+  const targetState = () =>
+    stateBytes(
+      Object.getOwnPropertyDescriptor(cacheKeep!.manager, 'targets')?.value,
+    )
+  const leaseState = () =>
+    stateBytes(
+      ['realTurns', 'turnStarts', 'pendingTurns'].map(
+        (key) => Object.getOwnPropertyDescriptor(cacheKeep!, key)?.value,
+      ),
+    )
+  const beforeTarget = targetState()
+  expect(JSON.parse(beforeTarget)).toHaveLength(1)
+  const beforeLease = leaseState()
+  const beforeThread = stateBytes(threadTracker)
+  thread.mockClear()
+  lease.mockClear()
+  const result = await streamCortexKitAnthropic(
+    model,
+    forkContext(context),
+    { ...forkOptions(head), ...hooks },
+    undefined,
+    undefined,
+    'agent-loop',
+  ).result()
+  expect(result.stopReason).toBe('stop')
+  expect(sent.at(-1)?.thread).toBeUndefined()
+  expect(thread).not.toHaveBeenCalled()
+  expect(lease).not.toHaveBeenCalled()
+  expect(targetState()).toBe(beforeTarget)
+  expect(leaseState()).toBe(beforeLease)
+  expect(stateBytes(threadTracker)).toBe(beforeThread)
+  const continued = {
+    ...context,
+    messages: [
+      ...context.messages,
+      answer,
+      { role: 'user' as const, content: 'Next head turn', timestamp: 2 },
+    ],
+  }
+  expect(
+    (
+      await streamCortexKitAnthropic(
+        model,
+        continued,
+        { sessionId: head, ...hooks },
+        undefined,
+        undefined,
+        'agent-loop',
+      ).result()
+    ).stopReason,
+  ).toBe('stop')
+  expect(sent.at(-1)?.thread).toEqual({
+    type: 'continue',
+    previous_message_id: 'msg_head',
+  })
+})
+
+for (const transport of ['direct', 'relay fallback'] as const) {
+  test(`Pi fork allows a vault-newer-record retry on ${transport} without changing admission`, async () => {
+    const f = await fixture('main-first', transport === 'relay fallback')
+    const head = `fork-401-${transport}-${f.path}`
+    const routing = forkRouting()
+    let version = 1
+    f.client.getScoped = async ({ credentialId }) => ({
+      credentialId,
+      accountId: fixtureAccountIdentity('main'),
+      material: `fork-v${version}`,
+      recordVersion: version,
+      expiresAtMs: Date.now() + 600_000,
+    })
+    let reject = false
+    const sent: string[] = []
+    let relayCalls = 0
+    globalThis.fetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        if (String(input).includes('relay.invalid')) {
+          relayCalls++
+          throw new Error('relay unavailable')
+        }
+        const authorization =
+          new Headers(init?.headers).get('authorization') ?? ''
+        sent.push(authorization)
+        if (reject && authorization === 'Bearer fork-v1') {
+          version = 2
+          return Response.json({}, { status: 401 })
+        }
+        return success()
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+    expect(
+      (
+        await streamCortexKitAnthropic(model, context, {
+          sessionId: head,
+        }).result()
+      ).stopReason,
+    ).toBe('stop')
+    reject = true
+    sent.length = 0
+    const result = await streamCortexKitAnthropic(
+      model,
+      forkContext(context),
+      forkOptions(head),
+    ).result()
+    expect(result.stopReason).toBe('stop')
+    expect(sent).toEqual(['Bearer fork-v1', 'Bearer fork-v2'])
+    expect(routing.asks.filter((id) => id === `${head}-fork`)).toHaveLength(1)
+    await flushForkReports()
+    expect(
+      routing.reports.filter(
+        (r) => r.sessionId === `${head}-fork` && r.payload.kind === 'billing',
+      ),
+    ).toEqual([])
+    if (transport === 'relay fallback') expect(relayCalls).toBeGreaterThan(0)
+  })
+}
+
+test('Pi fork aborts while routing is unanswered without sending or billing', async () => {
+  const f = await fixture()
+  const head = `fork-abort-${f.path}`
+  forkRouting()
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async () => {
+      sends++
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: head,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  sends = 0
+  const controller = new AbortController()
+  const routingRelease = lifetimes.gate()
+  const routing = forkRouting(async () => {
+    controller.abort()
+    await routingRelease.wait
+    return null
+  })
+  const result = await streamCortexKitAnthropic(model, forkContext(context), {
+    ...forkOptions(head),
+    signal: controller.signal,
+  }).result()
+  routingRelease.open()
+  expect(result.stopReason).toBe('aborted')
+  expect(sends).toBe(0)
+  expect(
+    routing.reports.filter((report) => report.sessionId === `${head}-fork`),
+  ).toEqual([])
+})
+
+for (const mode of ['automatic', 'mixed lifetimes'] as const) {
+  test(`Pi fork long-branch cache bridge respects ${mode}`, async () => {
+    const f = await fixture()
+    const head = `fork-bridge-${mode}-${f.path}`
+    forkRouting()
+    await (await f.native.service()).updateSettings((settings) => ({
+      ...settings,
+      claudeCache: {
+        enabled: true,
+        mode: mode === 'automatic' ? 'automatic' : 'hybrid',
+      },
+    }))
+    const bodies: Array<{
+      cache_control?: unknown
+      messages: Array<{ content: Array<Record<string, unknown>> }>
+      system: Array<Record<string, unknown>>
+    }> = []
+    globalThis.fetch = Object.assign(
+      async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+        bodies.push(
+          JSON.parse(
+            new Headers(init?.headers).get('content-encoding') === 'gzip'
+              ? gunzipSync(init?.body as Uint8Array).toString()
+              : String(init?.body),
+          ),
+        )
+        return success()
+      },
+      { preconnect: originalFetch.preconnect },
+    ) as typeof fetch
+    const onPayload = (payload: unknown) => {
+      if (mode !== 'mixed lifetimes') return
+      const body = payload as (typeof bodies)[number]
+      body.messages.at(-1)!.content.at(-1)!.cache_control = {
+        type: 'ephemeral',
+      }
+      if (body.messages.length > 10)
+        body.messages[10]!.content =
+          typeof body.messages[10]!.content === 'string'
+            ? [
+                {
+                  type: 'text',
+                  text: body.messages[10]!.content,
+                  cache_control: { type: 'ephemeral', ttl: '1h' },
+                },
+              ]
+            : body.messages[10]!.content.map((block, index, blocks) =>
+                index === blocks.length - 1
+                  ? {
+                      ...block,
+                      cache_control: { type: 'ephemeral', ttl: '1h' },
+                    }
+                  : block,
+              )
+    }
+    expect(
+      (
+        await streamCortexKitAnthropic(model, context, {
+          sessionId: head,
+          onPayload,
+        }).result()
+      ).stopReason,
+    ).toBe('stop')
+    const response = await __sendPiAnthropicRequestForTest({
+      model,
+      context: forkContext(context, 30),
+      streamOptions: { ...forkOptions(head), onPayload },
+      storagePath: f.path,
+      oauthAccountId: 'main',
+    })
+    expect(response.status).toBe(200)
+    await response.text()
+    const fork = bodies.at(-1)!
+    const baseBlock = fork.messages[0]!.content.at(-1)!
+    if (mode === 'automatic') {
+      expect(fork.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+      expect(baseBlock.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+    } else {
+      expect(baseBlock.cache_control).toBeUndefined()
+      const markers = [
+        ...fork.system,
+        ...fork.messages.flatMap((message) => message.content),
+      ].filter((block) => block.cache_control)
+      expect(markers).toHaveLength(4)
+      expect(
+        markers
+          .slice(0, -1)
+          .every(
+            (block) => (block.cache_control as { ttl?: string }).ttl === '1h',
+          ),
+      ).toBe(true)
+      expect(markers.at(-1)!.cache_control).toEqual({ type: 'ephemeral' })
+    }
+  })
+}
+
+test('Pi fork refuses an unretained base without a model send', async () => {
+  await fixture()
+  forkRouting()
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async () => {
+      sends++
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  const result = await streamCortexKitAnthropic(
+    model,
+    forkContext(context),
+    forkOptions('missing-base'),
+  ).result()
+  expect(result.stopReason).toBe('error')
+  expect(result.errorMessage).toContain('fork_base_unavailable')
+  expect(isRetryableAssistantError(result)).toBe(false)
+  expect(sends).toBe(0)
+})
+
+test('Pi fork aborts an unanswered payload hook without sending', async () => {
+  const f = await fixture()
+  const head = `fork-hook-abort-${f.path}`
+  forkRouting()
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async () => {
+      sends++
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: head,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  sends = 0
+  const controller = new AbortController()
+  const release = lifetimes.gate()
+  const finished = lifetimes.gate()
+  let hookEntered = false
+  try {
+    const result = await streamCortexKitAnthropic(model, forkContext(context), {
+      ...forkOptions(head),
+      signal: controller.signal,
+      onPayload: async () => {
+        hookEntered = true
+        controller.abort()
+        await release.wait
+        finished.open()
+      },
+    }).result()
+    expect(result.stopReason).toBe('aborted')
+    expect(sends).toBe(0)
+  } finally {
+    release.open()
+    if (hookEntered) await finished.wait
+  }
+})
+
+test('Pi fork options survive real model-runtime complete dispatch and shutdown clears the retained base', async () => {
+  const f = await fixture()
+  const head = `fork-runtime-${f.path}`
+  forkRouting()
+  const host = await ModelRuntime.create({
+    credentials: {
+      read: async () => undefined,
+      list: async () => [],
+      modify: async () => {
+        throw new Error('Unexpected local credential write')
+      },
+      delete: async () => {
+        throw new Error('Unexpected local credential delete')
+      },
+    },
+    modelsPath: null,
+    modelsStorePath: join(dirname(f.path), 'fork-model-store'),
+    refreshOnCreate: false,
+    allowModelNetwork: false,
+  })
+  const events = new Map<string, (...args: unknown[]) => unknown>()
+  const pi = {
+    registerCommand: () => {},
+    on: (name: string, handler: (...args: unknown[]) => unknown) =>
+      events.set(name, handler),
+    registerProvider: (provider: Provider) =>
+      host.registerNativeProvider(provider),
+  } as unknown as ExtensionAPI
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async () => {
+      sends++
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  await cortexKitPiAnthropicAuth(pi, { connectScoped: f.connect })
+  try {
+    const registered = host.getModel('anthropic', model.id)
+    if (!registered) throw new Error('Missing registered model')
+    expect(
+      (await host.complete(registered, context, { sessionId: head }))
+        .stopReason,
+    ).toBe('stop')
+    expect(stateBytes(piForkEffortSnapshots)).toContain(head)
+    expect(
+      (await host.complete(registered, forkContext(context), forkOptions(head)))
+        .stopReason,
+    ).toBe('stop')
+    sends = 0
+    delete (globalThis as Record<symbol, unknown>)[
+      Symbol.for('cortexkit.routing')
+    ]
+    const result = await host.complete(
+      registered,
+      forkContext(context),
+      forkOptions(head),
+    )
+    expect(result.stopReason).toBe('error')
+    expect(isRetryableAssistantError(result)).toBe(false)
+    expect(sends).toBe(0)
+  } finally {
+    await events.get('session_shutdown')?.(
+      {},
+      { sessionManager: { getSessionId: () => head } },
+    )
+  }
+  expect(stateBytes(piForkEffortSnapshots)).not.toContain(head)
+})
 
 test('Pi Prime authorizes vault custody for a stateless signed physical send', async () => {
   const f = await fixture()
