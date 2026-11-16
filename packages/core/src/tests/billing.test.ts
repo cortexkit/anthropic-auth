@@ -452,41 +452,44 @@ test('oversized non-usage stream lines cannot hide a later usage frame', async (
   })
 })
 
-test('model-request billing reads keep-warm state only once a response completes', async () => {
-  const reports = capture()
-  let reads = 0
-  const tracked: AnthropicBillingRequest = {
-    ...request,
-    cache: { ttlMs: 300_000 },
-    cacheWarming: () => {
-      reads++
-      return { on: false, stopReason: 'count-cap' }
-    },
-  }
-  await (
-    await withAnthropicBilling(tracked, async () =>
-      Response.json({ id: 'msg_done', usage: { output_tokens: 1 } }),
-    )
-  ).text()
-  await (
-    await withAnthropicBilling(tracked, async () => response([start]))
-  ).text()
-  await (
-    await withAnthropicBilling(tracked, async () =>
-      Response.json({ type: 'error' }, { status: 500 }),
-    )
-  ).text()
-  await Bun.sleep(10)
-  expect(reads).toBe(1)
-  expect(reports.map((report) => [report.outcome, report.cache])).toEqual([
-    [
-      'completed',
-      { ttl_ms: 300_000, warming: { on: false, stop_reason: 'count-cap' } },
-    ],
-    ['cut', { ttl_ms: 300_000 }],
-    ['failed', undefined],
-  ])
-})
+test.each(['count-cap', 'deadline-missed'] as const)(
+  'model-request billing reads %s keep-warm state only once a response completes',
+  async (stopReason) => {
+    const reports = capture()
+    let reads = 0
+    const tracked: AnthropicBillingRequest = {
+      ...request,
+      cache: { ttlMs: 300_000 },
+      cacheWarming: () => {
+        reads++
+        return { on: false, stopReason }
+      },
+    }
+    await (
+      await withAnthropicBilling(tracked, async () =>
+        Response.json({ id: 'msg_done', usage: { output_tokens: 1 } }),
+      )
+    ).text()
+    await (
+      await withAnthropicBilling(tracked, async () => response([start]))
+    ).text()
+    await (
+      await withAnthropicBilling(tracked, async () =>
+        Response.json({ type: 'error' }, { status: 500 }),
+      )
+    ).text()
+    await Bun.sleep(10)
+    expect(reads).toBe(1)
+    expect(reports.map((report) => [report.outcome, report.cache])).toEqual([
+      [
+        'completed',
+        { ttl_ms: 300_000, warming: { on: false, stop_reason: stopReason } },
+      ],
+      ['cut', { ttl_ms: 300_000 }],
+      ['failed', undefined],
+    ])
+  },
+)
 
 test('CacheKeep warming state follows tracked, stopped and switched-off sessions', () => {
   const policies = new Map<string, unknown>()

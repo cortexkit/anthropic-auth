@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Planned keep-warm now starts 5 minutes before the cache expires, leaving room to retry a slow send.
 - Keep-warm now survives server restarts under Thalamus. A restored session keeps warming under its saved session policy until the runner can supply it again, instead of being dropped.
 - One slow keep-warm send no longer ends warming. Due warms run up to four at a time, one per session, and restored sessions still start at least 3 seconds apart.
 - A keep-warm send that can't finish before the cache expires now reports `deadline-missed` rather than `cost-cap`, and sends whose reply was lost count toward the `auto` spending limit.

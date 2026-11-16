@@ -51,12 +51,13 @@ import { readThreeWayBoolean } from './settings-three-way.ts'
 
 export const CLAUDE_CACHE_KEEP_COMMAND_NAME = 'claude-cachekeep'
 export const CACHE_KEEP_TTL_MS = 60 * 60_000
+// A planned warm needs room for transient retries before the prefix expires.
 export const CACHE_KEEP_PREWARM_LEAD_MS = 5 * 60_000
 
 function replayPrewarmLeadMs(ttlMs: number, planned: boolean): number {
-  if (!planned && ttlMs === CACHE_KEEP_TTL_MS) return CACHE_KEEP_PREWARM_LEAD_MS
-  // Match decideCacheKeep's lead for short replays: the legacy five-minute
-  // lead would otherwise make a five-minute source due at capture.
+  if (planned) return Math.min(CACHE_KEEP_PREWARM_LEAD_MS, ttlMs / 2)
+  if (ttlMs === CACHE_KEEP_TTL_MS) return CACHE_KEEP_PREWARM_LEAD_MS
+  // Unplanned short-lived prefixes keep their existing 30-second lead.
   return Math.min(30_000, ttlMs / 2)
 }
 export const CACHE_KEEP_TICK_MS = 60_000
@@ -503,6 +504,7 @@ function stopReason(reason: string): CacheKeepStopReason {
     case 'schedule-period-ended':
       return 'schedule'
     case 'retry-window-ended':
+    case 'deadline-missed':
       return 'retries-exhausted'
     case 'cachekeep-hybrid-inactive':
       return 'disabled'
@@ -515,9 +517,7 @@ function stopReason(reason: string): CacheKeepStopReason {
   }
 }
 
-function reportStopReason(
-  reason: string,
-): CacheWarmStopReason | 'deadline-missed' {
+function reportStopReason(reason: string): CacheWarmStopReason {
   if (isSessionCacheWarmStopReason(reason)) return reason
   switch (reason) {
     case 'schedule':
@@ -1343,10 +1343,7 @@ export class CacheKeepManager {
     target: CacheKeepTarget,
     now: number,
     ownReservation = false,
-  ):
-    | CacheKeepDecision
-    | { action: 'stop'; reason: 'retry-window-ended' }
-    | undefined {
+  ): CacheKeepDecision | undefined {
     const state = target.policyState
     if (!state) return undefined
     const freshPolicy = readSessionCachePolicy(state.ownerSessionId, true)
@@ -1393,29 +1390,17 @@ export class CacheKeepManager {
             : PLANNED_UNPRICED_MAIN_IDLE_MS)
     )
       return { action: 'stop', reason: 'idle' }
-    const decision = decideCacheKeep({
+    return decideCacheKeep({
       ...plan,
       now,
       ttlMs: target.ttlMs ?? 0,
+      leadMs: CACHE_KEEP_PREWARM_LEAD_MS,
       lastRealRequestAt: state.lastRealRequestAt,
       lastWarmAt: state.lastWarmAt,
       warmsSinceLastRealRequest:
         state.warmsSinceLastRealRequest - Number(ownReservation),
       ...costs,
     })
-    // common-auth 0.50.0 also labels its final safety margin cost-cap. Only
-    // the actual auto spending threshold is a cost stop; a late replay is not.
-    if (
-      decision.action === 'stop' &&
-      decision.reason === 'cost-cap' &&
-      !(
-        mode === 'auto' &&
-        costs &&
-        costs.warmCostSoFar + costs.nextWarmCost >= costs.rewriteCost
-      )
-    )
-      return { action: 'stop', reason: 'retry-window-ended' }
-    return decision
   }
 
   private countDecision(
@@ -1428,6 +1413,7 @@ export class CacheKeepManager {
       mode: 'always',
       now: state.lastRealRequestAt,
       ttlMs: CACHE_KEEP_TTL_MS,
+      ...(state.planned && { leadMs: CACHE_KEEP_PREWARM_LEAD_MS }),
       lastRealRequestAt: state.lastRealRequestAt,
       warmsSinceLastRealRequest: state.warmsSinceLastRealRequest,
     })

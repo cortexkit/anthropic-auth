@@ -1872,7 +1872,7 @@ test.each([0, 2])(
     expect(
       (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
     ).toHaveLength(count)
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     await f.timers.fire()
     expect({ sends: next.sent.length, logs: lines }).toMatchObject({
       sends: count,
@@ -1953,7 +1953,7 @@ test.each(['hybrid-inactive', 'subagents-disabled', 'not-oauth'] as const)(
     expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
       [expect.objectContaining({ reason: 'session-ended' })],
     )
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     await f.timers.fire()
     expect(next.sent).toHaveLength(0)
     expect(await readdir(f.disk)).toEqual([])
@@ -2712,10 +2712,10 @@ test('planned short warms override local off and child opt-out while preserving 
   )
   expect(
     [...f.timers.timeouts.values()].some(
-      (timer) => timer.at === f.now() + 270_000,
+      (timer) => timer.at === f.now() + 150_000,
     ),
   ).toBe(true)
-  f.advance(270_000)
+  f.advance(150_000)
   await f.timers.fireTimeouts()
   expect(f.sent).toHaveLength(1)
   const warm = JSON.parse(await f.sent[0]!.clone().text())
@@ -3264,7 +3264,7 @@ test('OC2 priced auto charges every physical warm and stops at the equality boun
     [1, 7_600],
     [2, 7_800],
   ] as const) {
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     await f.timers.fireTimeouts()
     await owner.manager.tick()
     expect(next.sent).toHaveLength(warm)
@@ -3273,7 +3273,7 @@ test('OC2 priced auto charges every physical warm and stops at the equality boun
     expect(state!.pendingWarmCost).toBeUndefined()
     expect(state!.prefixTokens).toBe(1_000)
   }
-  f.advance(3_570_000)
+  f.advance(3_300_000)
   await f.timers.fireTimeouts()
   await f.timers.fire()
   expect(next.sent).toHaveLength(2)
@@ -3298,7 +3298,7 @@ test.each(['replaced', 'retired'] as const)(
       entered()
       return held
     })
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     const warming = f.timers.fireTimeouts()
     await enteredSend
     const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
@@ -3320,7 +3320,7 @@ test.each(['replaced', 'retired'] as const)(
       .manager.trackedRequest('ses_oc2_keep')
     if (change === 'replaced') expect(restored?.bodyText).toBe(latest)
     else expect(restored).toBeUndefined()
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     await f.timers.fireTimeouts()
     if (change === 'replaced') {
       expect(next.sent).toHaveLength(1)
@@ -3616,7 +3616,7 @@ test('explicit runner keep_warm sends before an advisory parent lookup resolves'
   runnerPolicyForReview({ ttl: 'short', keep_warm: 'always' })
   try {
     await f.live()
-    f.advance(270_000)
+    f.advance(150_000)
     await f.timers.fireTimeouts()
     expect(f.sent).toHaveLength(1)
   } finally {
@@ -3649,7 +3649,7 @@ test('OC2 priced auto settles a same-generation known failure and charges the ne
     entered()
     return held
   })
-  f.advance(3_570_000)
+  f.advance(3_300_000)
   const warming = f.timers.fireTimeouts()
   await sending
   const [name] = await readdir(f.disk)
