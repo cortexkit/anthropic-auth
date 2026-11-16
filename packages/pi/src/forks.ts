@@ -18,12 +18,14 @@ export function piForkHeadSession(
 }
 
 export class PiForkRefusal extends Error {
-  constructor(kind: 'routing' | 'account' | 'limit' | 'base') {
+  constructor(kind: 'routing' | 'account' | 'limit' | 'failed' | 'base') {
     super(
       {
         routing: 'Shared routing has no admission for this fork request.',
         account: 'The admitted account cannot serve this fork request.',
         limit: 'The admitted account declined this fork request.',
+        // Upstream errors and transport failures are not account problems.
+        failed: 'The fork request failed before an answer arrived.',
         base: 'The retained head request is unavailable for this fork (fork_base_unavailable).',
       }[kind],
     )

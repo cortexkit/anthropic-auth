@@ -2235,11 +2235,11 @@ async function executeWithFallback(options: {
         throw new PiForkRefusal('limit')
       }
       void response.body?.cancel().catch(() => {})
-      throw new PiForkRefusal('account')
+      throw new PiForkRefusal('failed')
     } catch (error) {
       signal?.throwIfAborted()
       if (error instanceof PiForkRefusal) throw error
-      throw new PiForkRefusal('account')
+      throw new PiForkRefusal('failed')
     }
   }
   if (routingSessionId && !routingState.advice) {

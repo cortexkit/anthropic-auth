@@ -606,6 +606,43 @@ for (const confirmed of [true, false]) {
   })
 }
 
+test('Pi fork reports an upstream error as a failed request, not an account refusal', async () => {
+  const f = await fixture()
+  const head = `fork-upstream-error-${f.path}`
+  forkRouting()
+  let failing = false
+  let sends = 0
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).includes('/api/oauth/usage')) return Response.json({})
+      if (!failing) return success()
+      sends += 1
+      return Response.json(
+        { error: { type: 'overloaded_error' } },
+        { status: 529 },
+      )
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  expect(
+    (
+      await streamCortexKitAnthropic(model, context, {
+        sessionId: head,
+      }).result()
+    ).stopReason,
+  ).toBe('stop')
+  failing = true
+  const result = await streamCortexKitAnthropic(
+    model,
+    forkContext(context),
+    forkOptions(head),
+  ).result()
+  expect(result.stopReason).toBe('error')
+  expect(result.errorMessage).toContain('failed before an answer arrived')
+  expect(result.errorMessage).not.toContain('cannot serve')
+  expect(sends).toBe(1)
+})
+
 test('Pi fork trusts the named account despite unknown quota and local floors', async () => {
   const f = await fixture()
   const head = `fork-trusted-${f.path}`
