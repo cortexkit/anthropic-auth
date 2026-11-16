@@ -4,14 +4,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- Keep-warm now survives server restarts under Thalamus and keeps other sessions warm when one send is slow.
-- Restored keep-warm follows your next real turn, avoids duplicate reads, and counts uncertain sends toward its spending limit.
-- Keep-warm reports missed deadlines separately from spending limits, so a slow send is no longer reported as a cost cap.
-- Pausing or closing a server no longer reports a false keep-warm stop; resumed Pi turns and restart cleanup also preserve the current session safely.
-- Closed Pi sessions no longer remain listed or resume warming in a later session; their restart records are still preserved.
-- Keep-warm no longer reports stops for restart-file cleanup, and continuing Pi turns retain their warm prefix until their route is known.
-- Keep-warm pauses during live requests, stops warming prompts that are no longer eligible, and cancels in-flight sends before shutdown.
-- Keep-warm keeps the right account after overlapping Pi turns, accepts late responses after an old cache expires, and resumes after repeated turns or API-key requests.
+- Keep-warm now survives server restarts under Thalamus. A restored session keeps warming under its saved session policy until the runner can supply it again, instead of being dropped.
+- One slow keep-warm send no longer ends warming. Due warms run up to four at a time, one per session, and restored sessions still start at least 3 seconds apart.
+- A keep-warm send that can't finish before the cache expires now reports `deadline-missed` rather than `cost-cap`, and sends whose reply was lost count toward the `auto` spending limit.
+- Every real turn now replaces or ends its session's keep-warm, including API-key turns and, on Pi, turns on other providers. No warm is sent while a turn is in flight.
+- Pi releases its keep-warm sessions when it shuts down. They resume from their restart files in the next session.
 
 ## 2.13.1
 
