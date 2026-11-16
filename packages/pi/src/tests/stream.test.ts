@@ -851,6 +851,68 @@ describe('Pi stream stop reasons', () => {
     })
   }
 
+  test('one-hour cache writes reach Pi usage and are priced at the one-hour rate', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-cache-write-1h-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    await saveNativePiFixture(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        accounts: [],
+      },
+      storagePath,
+    )
+    const events = [
+      {
+        type: 'message_start',
+        message: {
+          usage: {
+            input_tokens: 3,
+            output_tokens: 0,
+            cache_read_input_tokens: 11,
+            cache_creation_input_tokens: 1_000,
+            cache_creation: {
+              ephemeral_5m_input_tokens: 400,
+              ephemeral_1h_input_tokens: 600,
+            },
+          },
+        },
+      },
+      {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { output_tokens: 7 },
+      },
+      { type: 'message_stop' },
+    ]
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      if (input.toString().includes('/api/claude_cli/bootstrap'))
+        return new Response(
+          JSON.stringify({ oauth_account: { account_uuid: 'pi-1h-uuid' } }),
+        )
+      return new Response(
+        events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } },
+      )
+    }) as unknown as typeof fetch
+
+    const result = await streamCortexKitAnthropic(
+      anthropicModel,
+      anthropicContext,
+      { apiKey: 'sk-ant-oat-pi-1h', sessionId: 'ses_pi_cache_write_1h' },
+    ).result()
+
+    expect(result.usage).toMatchObject({
+      cacheWrite: 1_000,
+      cacheWrite1h: 600,
+    })
+    const rates = anthropicModel.cost
+    expect(result.usage.cost.cacheWrite).toBeCloseTo(
+      (400 * rates.cacheWrite + 600 * rates.input * 2) / 1_000_000,
+    )
+  })
+
   test.each(['refusal', 'new_stop_reason', 'end_turn'])(
     '%s response preserves thread anchor safety',
     async (stopReason) => {

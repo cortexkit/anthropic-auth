@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- Pi now prices one-hour prompt-cache writes at the one-hour rate. They were priced as five-minute writes.
 - Pi can answer forked questions on a head's account and prompt cache for Agent Runner.
 
 ## 2.14.1
