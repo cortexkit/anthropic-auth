@@ -705,10 +705,18 @@ type Block = (
   index?: number
 }
 
+type AnthropicStreamUsage = {
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+  cache_creation?: { ephemeral_1h_input_tokens?: number }
+}
+
 function updateUsage(
   model: Model<Api>,
   output: AssistantMessage,
-  usage?: Record<string, number>,
+  usage?: AnthropicStreamUsage,
 ) {
   if (!usage) return
   output.usage.input = usage.input_tokens ?? output.usage.input
@@ -717,6 +725,10 @@ function updateUsage(
     usage.cache_read_input_tokens ?? output.usage.cacheRead
   output.usage.cacheWrite =
     usage.cache_creation_input_tokens ?? output.usage.cacheWrite
+  // Pi prices `cacheWrite1h` (a subset of `cacheWrite`) at the one-hour rate;
+  // without it every cache write is priced as a five-minute write.
+  const longWrite = usage.cache_creation?.ephemeral_1h_input_tokens
+  if (typeof longWrite === 'number') output.usage.cacheWrite1h = longWrite
   output.usage.totalTokens =
     output.usage.input +
     output.usage.output +
