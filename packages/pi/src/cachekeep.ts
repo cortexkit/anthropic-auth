@@ -27,7 +27,6 @@ type Session = {
   storagePath: string
   claim: PiCacheKeepClaim
   store: CacheKeepStore
-  identity?: string
 }
 
 function accountKey(account: NativeAccountView) {
@@ -84,10 +83,12 @@ export class PiCacheKeep {
     this.cancel = managerOptions.clearIntervalImpl ?? clearInterval
     const persistWarm = async (target: Readonly<CacheKeepTarget>) => {
       const session = this.sessions.get(target.id)
-      if (this.stopping || !session?.identity) return false
+      const identity = target.hostMetadata?.accountIdentity
+      if (this.stopping || !session || typeof identity !== 'string')
+        return false
       return session.store.reserveWarm({
         ...target,
-        oauthAccountIdentity: session.identity,
+        oauthAccountIdentity: identity,
       })
     }
     this.manager = new CacheKeepManager({
@@ -107,10 +108,11 @@ export class PiCacheKeep {
       },
       onTargetChanged: (target) => {
         const session = this.sessions.get(target.id)
-        if (session?.identity)
+        const identity = target.hostMetadata?.accountIdentity
+        if (session && typeof identity === 'string')
           session.store.changed({
             ...target,
-            oauthAccountIdentity: session.identity,
+            oauthAccountIdentity: identity,
           })
         managerOptions.onTargetChanged?.(target)
       },
@@ -139,11 +141,12 @@ export class PiCacheKeep {
         if (this.stopping && this.manager.trackedRequest(target.id))
           return undefined
         const session = this.sessions.get(target.id)
+        const identity = target.hostMetadata?.accountIdentity
         // One-off prewarmNow probes are not restart targets and have no claim.
-        if (session?.identity) {
+        if (session && typeof identity === 'string') {
           const snapshot = await this.options.read(session.storagePath)
           const account = snapshot.accounts.find(
-            (row) => accountKey(row) === session.identity,
+            (row) => accountKey(row) === identity,
           )
           if (!account || !nativeAccountCanServe(account)) return undefined
         } else if (this.manager.trackedRequest(target.id)) return undefined
@@ -316,7 +319,6 @@ export class PiCacheKeep {
             !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
           )
             return 'invalid'
-          session.identity = accountKey(account)
           const result = this.manager.track({
             sessionId,
             url: entry.url,
@@ -326,6 +328,7 @@ export class PiCacheKeep {
             cacheMode: 'hybrid',
             oauthAccountId: account.id,
             oauthAccountIdentity: account.accountIdentity,
+            hostMetadata: { accountIdentity: accountKey(account) },
             accountStoragePath: storagePath,
             isSubagent: entry.isSubagent,
             retained: {
@@ -357,6 +360,8 @@ export class PiCacheKeep {
   realTurn(sessionId: string) {
     this.realTurns.add(sessionId)
     try {
+      const previous = this.turnStarts.get(sessionId)
+      if (previous && !previous.claimed) previous.turn.finish()
       const turn = this.manager.beginRealTurn(sessionId)
       this.turnStarts.set(sessionId, { turn, claimed: false })
       return turn
@@ -425,12 +430,12 @@ export class PiCacheKeep {
       ) {
         return
       }
-      session.identity = accountKey(account)
       // Claim I/O may finish after the response, or even during shutdown. Keep
       // that accepted body, but never grant the cache the time spent waiting.
       const result = turn?.track({
         ...input,
         acceptedAt,
+        hostMetadata: { accountIdentity: accountKey(account) },
       })
       if (result?.tracked) this.restored.delete(sessionId)
       if (this.stopping) this.manager.stop()

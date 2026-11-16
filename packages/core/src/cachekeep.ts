@@ -434,6 +434,8 @@ export type CacheKeepTarget = {
   dayKey: string
   oauthAccountId?: string
   oauthAccountIdentity?: string
+  /** Host-owned facts carried with this target, never interpreted or persisted by Core. */
+  hostMetadata?: Readonly<Record<string, unknown>>
   accountStoragePath?: string
   isSubagent: boolean
   policyState?: CacheKeepPolicyState
@@ -782,6 +784,7 @@ export class CacheKeepManager {
     string,
     {
       latest: number
+      pending: number
       leases: Set<{ id: number; expiresAt: number; expire: () => void }>
     }
   >()
@@ -933,8 +936,6 @@ export class CacheKeepManager {
       } catch {}
     }
     this.turnTimers.clear()
-    for (const turns of this.realTurns.values())
-      for (const turn of [...turns.leases]) turn.expire()
     this.realTurns.clear()
     this.targets.clear()
     this.immediateTargets.clear()
@@ -957,6 +958,7 @@ export class CacheKeepManager {
   /** A request owns its busy lease; an older completion cannot retire a newer turn. */
   beginRealTurn(sessionId: string): CacheKeepRealTurn {
     let active = true
+    let busy = true
     let tracked = false
     const lifetime = this.lifetime
     const id = ++this.nextRealTurn
@@ -974,37 +976,88 @@ export class CacheKeepManager {
       (Number.isFinite(ownerExpiry) ? ownerExpiry : now + CACHE_KEEP_TTL_MS)
     const turns = this.realTurns.get(sessionId) ?? {
       latest: id,
+      pending: 0,
       leases: new Set<{ id: number; expiresAt: number; expire: () => void }>(),
     }
     turns.latest = id
+    turns.pending++
     this.realTurns.set(sessionId, turns)
     let timer: ReturnType<typeof setTimeout> | undefined
-    const release = (expired = false) => {
-      if (!active) return
-      active = false
-      turns.leases.delete(record)
+    const currentTime = () => {
+      try {
+        return this.options.now?.() ?? Date.now()
+      } catch {
+        return Date.now()
+      }
+    }
+    const clearTimer = () => {
       if (timer) {
         this.turnTimers.delete(timer)
         try {
           ;(this.options.clearTimeoutImpl ?? clearTimeout)(timer)
         } catch {}
+        timer = undefined
       }
+    }
+    const releaseBusy = () => {
+      if (!busy) return
+      busy = false
+      turns.leases.delete(record)
+      clearTimer()
+    }
+    const release = (silent = false) => {
+      if (!active) return
+      active = false
+      releaseBusy()
+      clearTimer()
+      turns.pending--
       try {
-        if (!expired && lifetime === this.lifetime && turns.latest === id)
+        if (
+          !silent &&
+          lifetime === this.lifetime &&
+          turns.latest === id &&
+          currentTime() < expiresAt + CACHE_KEEP_TTL_MS
+        )
           this.finishSessionTargets(
             sessionId,
             tracked ? this.targets.get(sessionId) : undefined,
           )
       } catch {
       } finally {
-        if (!turns.leases.size && this.realTurns.get(sessionId) === turns)
+        if (turns.pending === 0 && this.realTurns.get(sessionId) === turns)
           this.realTurns.delete(sessionId)
         try {
           if (lifetime === this.lifetime) this.scheduleDueTimer()
         } catch {}
       }
     }
-    const record = { id, expiresAt, expire: () => release(true) }
+    // Busy ownership expires with the old cache. Response authority lasts one
+    // more cache lifetime, so a legitimate late response can still replace it.
+    const record = {
+      id,
+      expiresAt,
+      expire: () => {
+        if (!active || lifetime !== this.lifetime) {
+          release(true)
+          return
+        }
+        if (!busy) return
+        releaseBusy()
+        const remaining = expiresAt + CACHE_KEEP_TTL_MS - currentTime()
+        if (remaining <= 0) release(true)
+        else {
+          try {
+            timer = (this.options.setTimeoutImpl ?? setTimeout)(
+              () => release(true),
+              remaining,
+            )
+            timer.unref?.()
+            this.turnTimers.add(timer)
+            if (lifetime === this.lifetime) this.scheduleDueTimer()
+          } catch {}
+        }
+      },
+    }
     turns.leases.add(record)
     try {
       timer = (this.options.setTimeoutImpl ?? setTimeout)(
@@ -1023,6 +1076,7 @@ export class CacheKeepManager {
         try {
           return (
             active &&
+            busy &&
             lifetime === thisManager.lifetime &&
             (thisManager.options.now?.() ?? Date.now()) < expiresAt
           )
@@ -1031,9 +1085,17 @@ export class CacheKeepManager {
         }
       },
       track: (input) => {
-        if (!active || lifetime !== this.lifetime || turns.latest !== id) {
+        if (turns.latest !== id) {
           release()
           return { tracked: false, reason: 'superseded real turn' }
+        }
+        if (
+          !active ||
+          lifetime !== this.lifetime ||
+          currentTime() >= expiresAt + CACHE_KEEP_TTL_MS
+        ) {
+          release(true)
+          return { tracked: false, reason: 'real turn ended' }
         }
         try {
           const result = this.track({ ...input, sessionId })
@@ -1635,6 +1697,7 @@ export class CacheKeepManager {
     cacheMode: string
     oauthAccountId?: string
     oauthAccountIdentity?: string
+    hostMetadata?: Readonly<Record<string, unknown>>
     accountStoragePath?: string
     isSubagent?: boolean
     sourceWarm?: boolean
@@ -1851,6 +1914,7 @@ export class CacheKeepManager {
       dayKey: today,
       oauthAccountId: input.oauthAccountId,
       oauthAccountIdentity: input.oauthAccountIdentity,
+      hostMetadata: input.hostMetadata,
       accountStoragePath: input.accountStoragePath,
       isSubagent: input.isSubagent ?? false,
       // Every 2.7 writer saves policyState for tracked targets. Its absence means

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   type CacheKeepRealTurn,
   clampHostRetryMs,
@@ -43,12 +44,45 @@ export async function installNativeAnthropic<Q, P>(
 ): Promise<NativeAnthropicInstallation<Q, P>> {
   const native = createNativeAnthropicAdapter(deps)
   const endings = new Set<Promise<void>>()
+  const requestFinisher = new AsyncLocalStorage<{
+    finish: () => void
+    route?: string
+    attemptId?: string
+  }>()
+  const attemptFinishers = new Map<string, () => void>()
   const adapter: typeof native.adapter = {
     ...native.adapter,
+    rewriteRequest(input) {
+      const request = requestFinisher.getStore()
+      if (request) {
+        request.route = input.attempt.data?.route
+        request.attemptId = input.attempt.attemptId
+        attemptFinishers.set(input.attempt.attemptId, request.finish)
+      }
+      return native.adapter.rewriteRequest?.(input)
+    },
     onAttemptEnd(attempt, outcome) {
-      const pending = Promise.resolve(
-        native.adapter.onAttemptEnd?.(attempt, outcome),
-      )
+      const pending = (async () => {
+        try {
+          await native.adapter.onAttemptEnd?.(attempt, outcome)
+        } finally {
+          const finish = attemptFinishers.get(attempt.attemptId)
+          attemptFinishers.delete(attempt.attemptId)
+          // A body-less OAuth response can end before http.response decides
+          // whether to track its cache prefix. That hook's finally closes the
+          // real-turn lease after the tracking decision.
+          if (
+            attempt.data?.route !== 'oauth' ||
+            outcome.status === undefined ||
+            outcome.status >= 400 ||
+            outcome.error
+          ) {
+            try {
+              finish?.()
+            } catch {}
+          }
+        }
+      })()
       endings.add(pending)
       void pending.finally(() => endings.delete(pending)).catch(() => {})
       return pending
@@ -126,13 +160,21 @@ export async function installNativeAnthropic<Q, P>(
         }
         let turn: CacheKeepRealTurn | undefined
         let finalRequest: Request | undefined
+        let completion: {
+          finish: () => void
+          route?: string
+          attemptId?: string
+        }
         const finish = () => {
           try {
             turn?.finish()
           } catch {}
           signal?.removeEventListener('abort', finish)
+          if (completion?.attemptId)
+            attemptFinishers.delete(completion.attemptId)
           if (finalRequest) requestTurns.delete(finalRequest)
         }
+        completion = { finish }
         try {
           // common-auth scopes these hooks to Anthropic. Other providers never
           // reach this observer, so their turns cannot invalidate a warm target.
@@ -158,7 +200,9 @@ export async function installNativeAnthropic<Q, P>(
         let completed = false
         try {
           const result = await runWithRequestSignal(signal, () =>
-            withCacheKeepRealTurn(turn, async () => callback(draft)),
+            requestFinisher.run(completion, () =>
+              withCacheKeepRealTurn(turn, async () => callback(draft)),
+            ),
           )
           completed = true
           if (turn) {
@@ -167,7 +211,7 @@ export async function installNativeAnthropic<Q, P>(
           }
           return result
         } finally {
-          if (!completed) finish()
+          if (!completed || completion.route !== 'oauth') finish()
         }
       },
       options,

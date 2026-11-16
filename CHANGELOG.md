@@ -11,6 +11,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Closed Pi sessions no longer remain listed or resume warming in a later session; their restart records are still preserved.
 - Keep-warm no longer reports stops for restart-file cleanup, and continuing Pi turns retain their warm prefix until their route is known.
 - Keep-warm pauses during live requests, stops warming prompts that are no longer eligible, and cancels in-flight sends before shutdown.
+- Keep-warm keeps the right account after overlapping Pi turns, accepts late responses after an old cache expires, and resumes after repeated turns or API-key requests.
 
 ## 2.13.1
 

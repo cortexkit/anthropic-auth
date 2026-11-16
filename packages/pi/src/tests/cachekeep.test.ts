@@ -164,6 +164,148 @@ async function restoredPlannedFixture(adopt = true) {
   return { ...f, active, reports }
 }
 
+test('a first Pi track saves its accepted target identity on the first change', async () => {
+  const f = await fixture()
+  const active = f.create()
+  const store = await Reflect.get(active.process, 'store').call(
+    active.process,
+    'pi-storage',
+  )
+  const saving = spyOn(store, 'changed')
+  try {
+    expect(
+      (await active.process.trackAccepted(f.input('session-S'), f.snapshot))
+        ?.tracked,
+    ).toBe(true)
+    expect(saving.mock.calls).toHaveLength(1)
+    expect(saving.mock.calls[0]![0]).toEqual(
+      expect.objectContaining({
+        oauthAccountIdentity: JSON.stringify([
+          'local',
+          'account-uuid',
+          null,
+          'pool',
+          'row',
+          1,
+        ]),
+      }),
+    )
+    await store.drain()
+    const [name] = (await readdir(store.directory)).filter((file) =>
+      file.endsWith('.json.gz'),
+    )
+    expect(
+      JSON.parse(
+        gunzipSync(await readFile(join(store.directory, name!))).toString(),
+      ).oauthAccountIdentity,
+    ).toBe(JSON.stringify(['local', 'account-uuid', null, 'pool', 'row', 1]))
+  } finally {
+    saving.mockRestore()
+  }
+})
+
+test('a superseded Pi acceptance cannot relabel the newer account on disk', async () => {
+  const f = await fixture()
+  f.snapshot.accounts.push({
+    ...f.snapshot.accounts[0]!,
+    id: 'oauth-B',
+    accountIdentity: 'account-B',
+    binding: {
+      kind: 'local',
+      storageId: 'pool',
+      rowId: 'row-B',
+      credentialEpoch: 2,
+    },
+  })
+  const active = f.create()
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const claim = Reflect.get(active.process, 'claim').bind(active.process)
+  let calls = 0
+  const claiming = spyOn(
+    active.process as unknown as {
+      claim: (...args: unknown[]) => Promise<unknown>
+    },
+    'claim',
+  ).mockImplementation(async (...args) => {
+    if (++calls === 1) {
+      entered.resolve()
+      await release.promise
+    }
+    return claim(...args)
+  })
+  const older = active.process.requestTurn('session-S')
+  const tracking = active.process.trackAccepted(
+    f.input('session-S', 'older account prefix'),
+    f.snapshot,
+    older,
+  )
+  try {
+    await entered.promise
+    const newer = active.process.requestTurn('session-S')
+    await active.process.trackAccepted(
+      {
+        ...f.input('session-S', 'newer account prefix'),
+        oauthAccountId: 'oauth-B',
+        oauthAccountIdentity: 'account-B',
+      },
+      f.snapshot,
+      newer,
+    )
+    release.resolve()
+    expect((await tracking)?.tracked).toBe(false)
+    const store = await Reflect.get(active.process, 'stores').get('pi-storage')
+    // A later warm reservation must preserve B's identity, not just its first save.
+    const target = Reflect.get(active.process.manager, 'targets').get(
+      'session-S',
+    )
+    expect(
+      await Reflect.get(active.process.manager, 'options').reserveWarm(target),
+    ).toBe(true)
+    await store.drain()
+    const [name] = (await readdir(store.directory)).filter((file) =>
+      file.endsWith('.json.gz'),
+    )
+    const saved = JSON.parse(
+      gunzipSync(await readFile(join(store.directory, name!))).toString(),
+    )
+    expect(saved.oauthAccountIdentity).toBe(
+      JSON.stringify(['local', 'account-B', null, 'pool', 'row-B', 2]),
+    )
+    expect(saved.bodyText).toContain('newer account prefix')
+    await active.process.stop()
+    const reopened = f.create()
+    await reopened.process.startSession('pi-storage', 'session-S')
+    expect(
+      reopened.process.manager.trackedRequest('session-S')
+        ?.oauthAccountIdentity,
+    ).toBe('account-B')
+    expect(
+      reopened.process.manager.trackedRequest('session-S')?.bodyText,
+    ).toContain('newer account prefix')
+  } finally {
+    release.resolve()
+    await tracking
+    claiming.mockRestore()
+  }
+})
+
+test('repeated unclaimed Pi turn starts release every busy lease before a later warm', async () => {
+  const f = await fixture()
+  const active = f.create()
+  active.process.realTurn('session-S')
+  active.process.realTurn('session-S')
+  active.process.realTurn('session-S')
+  active.process.endTurn('session-S')
+  const input = f.input('session-S', 'later Anthropic prefix')
+  input.bodyText = input.bodyText.replace('"ttl":"1h"', '"ttl":"5m"')
+  await active.process.trackAccepted({ ...input, ttlMs: 300_000 }, f.snapshot)
+  f.advance(60_000)
+  await active.tick()
+  expect(f.sends).toHaveLength(1)
+  expect(JSON.stringify(f.sends[0]!.body)).toContain('later Anthropic prefix')
+})
+
 test('a continuing OAuth turn replaces a restored Pi prefix without stopping or unlinking it', async () => {
   const f = await restoredPlannedFixture()
   const store = await Reflect.get(f.active.process, 'stores').get('pi-storage')

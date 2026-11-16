@@ -186,6 +186,90 @@ test('an older real-turn abort neither clears a newer busy lease nor replaces it
   expect(f.sends).toBe(1)
 })
 
+test.each([false, true])(
+  'an expired busy lease accepts a late response only without a newer turn (newer=%s)',
+  async (newer) => {
+    const timeouts = new Map<object, { callback: () => void; at: number }>()
+    const f = fixture({ ttl: 'long', keep_warm: 'always' }, undefined, {
+      setTimeoutImpl: ((callback: () => void, ms: number) => {
+        const id = { unref() {} }
+        timeouts.set(id, { callback, at: f.now + ms })
+        return id
+      }) as unknown as typeof setTimeout,
+      clearTimeoutImpl: ((id: object) => {
+        timeouts.delete(id)
+      }) as unknown as typeof clearTimeout,
+    })
+    f.track()
+    const turn = f.manager.beginRealTurn(f.input.sessionId)
+    f.advance(3_600_001)
+    for (const [id, timeout] of [...timeouts])
+      if (timeout.at <= f.now) {
+        timeouts.delete(id)
+        timeout.callback()
+      }
+    expect(turn.active).toBe(false)
+    if (newer) {
+      const next = f.manager.beginRealTurn(f.input.sessionId)
+      expect(
+        next.track({
+          ...f.input,
+          bodyText: f.input.bodyText.replace('PRIVATE PREFIX', 'newer prefix'),
+        }).tracked,
+      ).toBe(true)
+    }
+    const result = turn.track({
+      ...f.input,
+      bodyText: f.input.bodyText.replace('PRIVATE PREFIX', 'late prefix'),
+    })
+    expect(result.tracked).toBe(!newer)
+    if (newer)
+      expect(result).toEqual({ tracked: false, reason: 'superseded real turn' })
+    expect(f.manager.trackedRequest(f.input.sessionId)?.bodyText).toContain(
+      newer ? 'newer prefix' : 'late prefix',
+    )
+    f.advance(3_570_000)
+    await f.manager.tick()
+    expect(f.sends).toBe(1)
+  },
+)
+
+test('an abandoned response authority is freed after one cache lifetime of grace', () => {
+  const timeouts = new Map<object, { callback: () => void; at: number }>()
+  const f = fixture({ ttl: 'long', keep_warm: 'always' }, undefined, {
+    setTimeoutImpl: ((callback: () => void, ms: number) => {
+      const id = { unref() {} }
+      timeouts.set(id, { callback, at: f.now + ms })
+      return id
+    }) as unknown as typeof setTimeout,
+    clearTimeoutImpl: ((id: object) => {
+      timeouts.delete(id)
+    }) as unknown as typeof clearTimeout,
+  })
+  f.track()
+  const turn = f.manager.beginRealTurn(f.input.sessionId)
+  const groups = Reflect.get(f.manager, 'realTurns') as Map<string, unknown>
+  f.advance(3_600_001)
+  for (const [id, timeout] of [...timeouts])
+    if (timeout.at <= f.now) {
+      timeouts.delete(id)
+      timeout.callback()
+    }
+  expect(turn.active).toBe(false)
+  expect(groups.size).toBe(1)
+  f.advance(3_600_000)
+  for (const [id, timeout] of [...timeouts])
+    if (timeout.at <= f.now) {
+      timeouts.delete(id)
+      timeout.callback()
+    }
+  expect(groups.size).toBe(0)
+  expect(turn.track(f.input)).toEqual({
+    tracked: false,
+    reason: 'real turn ended',
+  })
+})
+
 test('an unfinished real-turn lease expires with its cache and cannot block future warming', async () => {
   const timeouts = new Map<object, { callback: () => void; at: number }>()
   const f = fixture({ ttl: 'long', keep_warm: 'always' }, undefined, {
@@ -236,7 +320,10 @@ test('an expiring real-turn lease cannot restart a paused scheduler', async () =
       timeouts.delete(id)
       timeout.callback()
     }
-  expect(timeouts.size).toBe(0)
+  // The response-authority grace timer remains, but no warm timer is restarted.
+  expect([...timeouts.values()].map(({ at }) => at)).toEqual([
+    f.now + 3_599_999,
+  ])
   expect(f.manager.trackedCount()).toBe(1)
   await detached()
   expect(f.reports).toEqual([])

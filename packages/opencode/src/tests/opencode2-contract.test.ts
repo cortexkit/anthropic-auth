@@ -1,5 +1,9 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import {
+  CacheKeepManager,
+  type CacheKeepRealTurn,
+  createEmptyStorage,
+  currentCacheKeepRealTurn,
   custodyTombstoneOAuth,
   fetchOAuthQuotaSnapshot,
   readNativeEnrollmentMode,
@@ -121,6 +125,213 @@ function request() {
 }
 
 describe('OpenCode 2 published installation contract', () => {
+  test('an API-key transport failure cannot leave an installer busy lease behind', async () => {
+    const hooks = new Hooks()
+    let now = Date.now()
+    let sends = 0
+    let turn: CacheKeepRealTurn | undefined
+    const storage = {
+      ...createEmptyStorage(),
+      cacheKeep: { enabled: true, always: true },
+      claudeCache: { enabled: true, mode: 'hybrid' as const },
+    }
+    const input = {
+      sessionId: sessionID,
+      storage,
+      cacheMode: 'hybrid',
+      ttlMs: 3_600_000,
+      headers: new Headers(),
+      url: 'https://api.anthropic.com/v1/messages',
+      bodyText: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        system: [
+          {
+            type: 'text',
+            text: 'accepted prefix',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    }
+    const manager = new CacheKeepManager({
+      now: () => now,
+      loadStorage: async () => storage,
+      setIntervalImpl: (() => ({
+        unref() {},
+      })) as unknown as typeof setInterval,
+      clearIntervalImpl: (() => {}) as typeof clearInterval,
+      setTimeoutImpl: (() => ({ unref() {} })) as unknown as typeof setTimeout,
+      clearTimeoutImpl: (() => {}) as typeof clearTimeout,
+      fetchImpl: Object.assign(
+        async () => {
+          sends++
+          return Response.json({})
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    })
+    expect(manager.track(input).tracked).toBe(true)
+    const native = await installNativeAnthropic(
+      { session: hooks },
+      {
+        source: source({
+          beginRealTurn: () => {
+            turn = manager.beginRealTurn(sessionID)
+            return turn
+          },
+          authorizeAccount: () => ({
+            route: 'api',
+            headers: { 'x-api-key': 'synthetic-api-key' },
+            provenance: { version: 7 },
+          }),
+          onRequestPrepared: () => {
+            throw new Error(
+              'an API route must not prepare an OAuth cache target',
+            )
+          },
+        }),
+      },
+      { credential: preparedAnthropicCredential },
+    )
+    try {
+      const draft = { ...scope, request: request() }
+      await hooks.run('http.request', draft)
+      const transport = async () => {
+        throw new Error('synthetic transport failure')
+      }
+      await expect(transport()).rejects.toThrow('synthetic transport failure')
+      expect(draft.request.signal.aborted).toBe(false)
+      expect(turn?.active).toBe(false)
+      const next = manager.beginRealTurn(sessionID)
+      expect(
+        next.track({
+          ...input,
+          ttlMs: 300_000,
+          bodyText: input.bodyText.replace('"ttl":"1h"', '"ttl":"5m"'),
+        }).tracked,
+      ).toBe(true)
+      now += 60_000
+      await manager.tick()
+      expect(sends).toBe(1)
+    } finally {
+      await native.dispose()
+      await manager.dispose()
+    }
+  })
+
+  test('body-less OAuth acceptance retains handoff authority and mixed attempts leave no installer finishers', async () => {
+    const hooks = new Hooks()
+    const ended: string[] = []
+    const writes: Array<{ map: Map<unknown, unknown>; key: string }> = []
+    const set = Map.prototype.set
+    const observing = spyOn(Map.prototype, 'set').mockImplementation(function (
+      this: Map<unknown, unknown>,
+      key: unknown,
+      value: unknown,
+    ) {
+      if (typeof key === 'string' && typeof value === 'function')
+        writes.push({ map: this, key })
+      return set.call(this, key, value)
+    })
+    const storage = {
+      ...createEmptyStorage(),
+      cacheKeep: { enabled: true, always: true },
+    }
+    const manager = new CacheKeepManager({ loadStorage: async () => storage })
+    let route: 'api' | 'oauth' = 'oauth'
+    let turn: CacheKeepRealTurn | undefined
+    let prepared: Parameters<CacheKeepRealTurn['track']>[0] | undefined
+    let tracked = false
+    let endedBeforeHandoff = false
+    const native = await installNativeAnthropic(
+      { session: hooks },
+      {
+        source: source({
+          beginRealTurn: () => {
+            turn = manager.beginRealTurn(sessionID)
+            return turn
+          },
+          authorizeAccount: () =>
+            route === 'oauth'
+              ? {
+                  route,
+                  accessToken: 'sk-ant-oat01-synthetic',
+                  credentialId: 'synthetic-row',
+                  provenance: { version: 7 },
+                }
+              : {
+                  route,
+                  headers: { 'x-api-key': 'synthetic-api-key' },
+                  provenance: { version: 7 },
+                },
+          onRequestPrepared: (input) => {
+            expect(currentCacheKeepRealTurn()).toBe(turn)
+            prepared = {
+              sessionId: sessionID,
+              url: input.url,
+              bodyText: input.bodyText,
+              storage,
+              cacheMode: 'hybrid',
+              headers: new Headers(),
+            }
+          },
+          onAttemptEnd: (input) => {
+            ended.push(input.attemptId)
+          },
+          onResponseHandedToHost: () => {
+            if (route === 'oauth' && prepared) {
+              endedBeforeHandoff = ended.length > 0
+              tracked = turn?.track(prepared).tracked === true
+              prepared = undefined
+            }
+          },
+        }),
+      },
+      { credential: preparedAnthropicCredential },
+    )
+    try {
+      const oauth = { ...scope, request: request() }
+      await hooks.run('http.request', oauth)
+      await hooks.run('http.response', {
+        ...oauth,
+        response: new Response(null, { status: 200 }),
+      })
+      expect(endedBeforeHandoff).toBe(true)
+      expect(tracked).toBe(true)
+      expect(manager.trackedCount()).toBe(1)
+      for (const status of [204, 500]) {
+        route = 'api'
+        const api = { ...scope, request: request() }
+        await hooks.run('http.request', api)
+        await hooks.run('http.response', {
+          ...api,
+          response: new Response(null, { status }),
+        })
+        expect(turn?.active).toBe(false)
+      }
+      route = 'oauth'
+      const abort = new AbortController()
+      await hooks.run('http.request', {
+        ...scope,
+        request: new Request(request(), { signal: abort.signal }),
+      })
+      abort.abort()
+      expect(turn?.active).toBe(false)
+      await native.dispose()
+      const maps = new Set(
+        writes.filter(({ key }) => ended.includes(key)).map(({ map }) => map),
+      )
+      expect(ended.length).toBe(4)
+      expect(maps.size).toBe(1)
+      for (const map of maps) expect(map.size).toBe(0)
+    } finally {
+      observing.mockRestore()
+      await native.dispose()
+      await manager.dispose()
+    }
+  })
+
   test('OC2 abort ends a stalled quota preflight without sending a model request', async () => {
     const hooks = new Hooks()
     let entered!: () => void
