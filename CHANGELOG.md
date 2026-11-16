@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.14.1
 
 - On Windows, setup now uses PowerShell 7 when it is installed, and warns when the check is slow on ARM.
 - Setup checks for running hosts far fewer times, making it much faster on Windows ARM.
