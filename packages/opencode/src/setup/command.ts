@@ -180,7 +180,11 @@ export async function runSetupCommand(
   }
   const runner = options.runner ?? defaultCommandRunner
   const fence =
-    options.fence ?? createProcessFence(runner, { platform: options.platform })
+    options.fence ??
+    createProcessFence(runner, {
+      platform: options.platform,
+      onProgress: print,
+    })
   const migrateLocal = options.migrateLocal ?? migrateNativeLocalForHost
   const local = new Map<HarnessKind, NativeLocalPlan>()
   const vault = new Map<HarnessKind, NativeVaultPreflight>()
@@ -496,7 +500,11 @@ async function runRestoreLegacy(
   }
   const runner = options.runner ?? defaultCommandRunner
   const fence =
-    options.fence ?? createProcessFence(runner, { platform: options.platform })
+    options.fence ??
+    createProcessFence(runner, {
+      platform: options.platform,
+      onProgress: print,
+    })
   try {
     await assertHostsStopped(fence, env)
   } catch (error) {

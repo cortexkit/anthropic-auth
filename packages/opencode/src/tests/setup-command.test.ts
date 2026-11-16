@@ -1384,11 +1384,12 @@ function inspectSetupPublications(
   }
 }
 
-// These budgets include common-auth 0.51.0's initial command.js:154 check and
-// per-host :227/:229/:246/:250/:255 checks, plus register.js:200 and :202 for
-// each changed registration file. Enrollment also keeps enroll.js:60/:86.
-// When upgrading common-auth, adjust the totals below for changed inspection
-// counts at these runner, registration and enrollment sites.
+// These budgets include common-auth 0.52.0's command.js:161/:237/:256/:263/:270/:275
+// runner checks, register.js:207's check before each changed registration rename,
+// and enroll.js:63/:85/:106/:162's enrollment checks. Uninterrupted entry checks
+// can be reused, but callbacks, writes and waits invalidate reuse. The adapter's
+// publication fences remain asserted below; update totals for changed checks at
+// these shared-runner, registration and enrollment sites when upgrading.
 lifetimes.test('inspection budget: OpenCode 2 reuse', async () => {
   const f = await callbackFixture()
   expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(0)
@@ -1403,8 +1404,8 @@ lifetimes.test('inspection budget: OpenCode 2 reuse', async () => {
       fence: probe.fence,
     }),
   ).toBe(0)
-  expect(probe.inspections()).toBe(8)
-  expect(probe.publications).toEqual(['registration@7'])
+  expect(probe.inspections()).toBe(5)
+  expect(probe.publications).toEqual(['registration@4'])
 })
 
 lifetimes.test('inspection budget: OpenCode 1 retired migration', async () => {
@@ -1430,8 +1431,8 @@ lifetimes.test('inspection budget: OpenCode 1 retired migration', async () => {
     }),
   ).toBe(0)
   expect(migrations).toBe(1)
-  expect(probe.inspections()).toBe(8)
-  expect(probe.publications).toEqual(['registration@7'])
+  expect(probe.inspections()).toBe(5)
+  expect(probe.publications).toEqual(['registration@4'])
 })
 
 lifetimes.test(
@@ -1445,11 +1446,11 @@ lifetimes.test(
     )
     const probe = inspectSetupPublications(f)
     f.io.fence = probe.fence
-    f.state.onDiscover = () => expect(probe.inspections()).toBe(7)
+    f.state.onDiscover = () => expect(probe.inspections()).toBe(3)
     expect(await f.run()).toBe(0)
     expect(f.state.grants).toBe(0)
-    expect(probe.inspections()).toBe(11)
-    expect(probe.publications).toEqual(['registration@10'])
+    expect(probe.inspections()).toBe(5)
+    expect(probe.publications).toEqual(['registration@4'])
   },
 )
 
@@ -1479,8 +1480,8 @@ lifetimes.test('inspection budget: local --login', async () => {
     ).toBe(0)
     expect(lookups).toEqual([`Bearer ${SETUP_ACCESS}`])
   })
-  expect(probe.inspections()).toBe(9)
-  expect(probe.publications).toEqual(['state@5', 'config@6', 'runtime@6'])
+  expect(probe.inspections()).toBe(7)
+  expect(probe.publications).toEqual(['state@4', 'config@5', 'runtime@5'])
 })
 
 lifetimes.test(
@@ -1506,13 +1507,13 @@ lifetimes.test(
     )
     lifetimes.deferCleanup(() => spy.mockRestore())
     expect(await f.run()).toBe(0)
-    expect(inspections).toBe(9)
+    expect(inspections).toBe(5)
     expect(publications).toEqual([])
     await writeSetupJson(pi.hostAuthPath, {})
     inspections = 0
     expect(await f.run()).toBe(0)
-    expect(inspections).toBe(10)
-    expect(publications).toEqual([8])
+    expect(inspections).toBe(6)
+    expect(publications).toEqual([4])
   },
 )
 
@@ -4008,6 +4009,51 @@ lifetimes.test(
       expect(await readNativeEnrollmentMode(plan.host, f.env)).toBe('local')
     }
     expect(f.screen()).not.toContain(CLAUDE_POOL_LOGIN_STEP)
+  },
+)
+
+lifetimes.test(
+  'Windows ARM process warning uses the setup terminal',
+  async () => {
+    const f = await callbackFixture()
+    const { fence: _injectedFence, ...io } = f.io
+    const commands: string[] = []
+    expect(
+      await runSetupCommand(['--yes', '--opencode=1'], {
+        ...io,
+        env: {
+          ...io.env,
+          SystemRoot: 'C:\\Windows',
+          ProgramFiles: f.env.HOME,
+          PROCESSOR_ARCHITECTURE: 'ARM64',
+        },
+        platform: 'win32',
+        fs: {
+          ...io.fs!,
+          isDirectory: (path) => /[/\\]opencode$/.test(path),
+        },
+        runner: {
+          run: async (file) => {
+            commands.push(file)
+            return { exitCode: 7, stdout: '', stderr: ECHO_SK }
+          },
+        },
+      }),
+    ).toBe(1)
+    expect(commands).toEqual([
+      'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    ])
+    const warning =
+      'Checking that OpenCode and Pi are not running. Without PowerShell 7 this can take up to a minute on Windows ARM; installing PowerShell 7 makes it fast.'
+    const refusal =
+      'Process inspection failed; setup cannot prove hosts are stopped.'
+    const screen = f.screen()
+    expect(screen.split(warning).length - 1).toBe(1)
+    expect(screen.split(refusal).length - 1).toBe(1)
+    expect(screen.indexOf(refusal)).toBeGreaterThan(screen.indexOf(warning))
+    expect(screen).not.toContain(ECHO_SK)
+    await expectNoDiagnostics(f)
+    expect(await readNativeMigrationJournal(f.plan.paths)).toBeUndefined()
   },
 )
 
