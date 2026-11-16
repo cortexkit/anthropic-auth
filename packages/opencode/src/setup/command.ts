@@ -195,6 +195,7 @@ export async function runSetupCommand(
   const localOptions = (host: HarnessKind) => ({
     env,
     fence,
+    sharedRunnerCheckedEntry: true as const,
     paths: paths.get(host),
     removePiAnthropicAuth: consent.get(host) ?? false,
     reportSettings: print,

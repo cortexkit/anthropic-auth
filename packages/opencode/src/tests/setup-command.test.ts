@@ -67,7 +67,10 @@ import {
   preflightNativeVaultForHost,
 } from '../setup/native-activation.ts'
 import {
+  installAbsentNativePlaceholder,
   migrateNativeLocalForHost,
+  planNativeLocalSetup,
+  revalidateNativeLocalPlan,
   SEPARATE_HOST_LOGIN_NOTICE,
 } from '../setup/native-local.ts'
 import { resolveNativeSetupPaths } from '../setup/native-paths.ts'
@@ -1279,6 +1282,59 @@ async function writeSetupJson(path: string, value: unknown) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   await writeFile(path, JSON.stringify(value), { mode: 0o600 })
 }
+
+lifetimes.test(
+  'standalone local helpers refuse running hosts at entry',
+  async () => {
+    for (const helper of [
+      'plan',
+      'revalidate',
+      'placeholder',
+      'migrate',
+    ] as const) {
+      const f = await callbackFixture()
+      const options = {
+        env: f.env,
+        paths: f.plan,
+        fence: createTestFence(),
+        removePiAnthropicAuth: false,
+      }
+      const plan = await planNativeLocalSetup('opencode', options, false)
+      const reads = forbidSetupReads([
+        f.plan.paths.journal,
+        f.plan.hostAuthPath,
+        f.plan.legacyConfigPath,
+        f.plan.legacyStatePath,
+        f.plan.routingSourcePath,
+      ])
+      const running = {
+        ...options,
+        fence: createTestFence([{ pid: 123, command: 'opencode serve' }]),
+        login: async () => {
+          throw new Error('Sign-in must not start before the entry fence')
+        },
+      }
+      try {
+        const operation =
+          helper === 'plan'
+            ? planNativeLocalSetup('opencode', running, false)
+            : helper === 'revalidate'
+              ? revalidateNativeLocalPlan(plan, running)
+              : helper === 'placeholder'
+                ? installAbsentNativePlaceholder(plan, running)
+                : migrateNativeLocalForHost('opencode', running)
+        await expect(operation).rejects.toMatchObject({
+          name: 'ProcessFenceViolationError',
+        })
+        expect(reads.hits).toEqual([])
+      } finally {
+        reads.restore()
+      }
+      expect(await readNativeMigrationJournal(f.plan.paths)).toBeUndefined()
+      expect(existsSync(f.plan.hostAuthPath)).toBe(false)
+    }
+  },
+)
 
 function inspectSetupPublications(
   f: Awaited<ReturnType<typeof callbackFixture>>,

@@ -28,6 +28,7 @@ import {
   type HarnessKind,
   type ProcessFence,
   SetupRefusal,
+  type SharedSetupRunnerEntry,
   setupProcessInspectionMessage,
 } from './types.ts'
 
@@ -108,7 +109,7 @@ function unservedCode(
   return reach.grants === 0 ? 'no-read-grant' : 'grant-reaches-nothing'
 }
 
-export interface NativeVaultActivationOptions {
+export interface NativeVaultActivationOptions extends SharedSetupRunnerEntry {
   env: NodeJS.ProcessEnv
   runner: CommandRunner
   fence: ProcessFence
@@ -197,7 +198,9 @@ export async function preflightNativeVaultForHost(
   options: NativeVaultActivationOptions,
 ): Promise<NativeVaultPreflight> {
   const env = { ...options.env }
-  validateVaultAuthContent({ ...options, env })
+  if (options.sharedRunnerCheckedEntry)
+    validateVaultAuthContent({ ...options, env })
+  else await vaultProcessFence({ ...options, env })
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
   const separateOpenCodeLogin =
     host === 'opencode' &&
@@ -239,7 +242,9 @@ export async function completeNativeVaultActivation(
 ): Promise<'committed' | 'already-vault'> {
   const env = { ...options.env }
   const processFence = () => vaultProcessFence({ ...options, env })
-  validateVaultAuthContent({ ...options, env })
+  if (options.sharedRunnerCheckedEntry)
+    validateVaultAuthContent({ ...options, env })
+  else await processFence()
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
   if (
     (await fingerprintNativeVaultInputs(host, options)) !==
@@ -250,6 +255,7 @@ export async function completeNativeVaultActivation(
     env,
     runner: options.runner,
     processFence,
+    sharedRunnerCheckedEntry: options.sharedRunnerCheckedEntry,
     ckBinary: options.enrollment?.ckBinary,
     paths: options.enrollment?.paths,
   })

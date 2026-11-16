@@ -2,6 +2,14 @@ import { types } from 'node:util'
 
 export type HarnessKind = 'opencode' | 'pi'
 
+export interface SharedSetupRunnerEntry {
+  /**
+   * Only the setup CLI sets this: the shared runner listed processes immediately
+   * before calling the adapter. Standalone callers must keep the entry check.
+   */
+  sharedRunnerCheckedEntry?: true
+}
+
 const setupRefusals = new WeakMap<object, string>()
 
 export function setupRefusalMessage(error: unknown): string | undefined {
