@@ -407,7 +407,7 @@ test('dispose aborts and drains a due-timer warm without reporting or settling i
   f.manager.recordAcceptedUsage(f.input.sessionId, f.input.bodyText, {
     cache_read_input_tokens: 1000,
   })
-  f.advance(3_570_000)
+  f.advance(3_300_000)
   const due = [...timers.values()].find(({ at }) => at === f.now)
   expect(due).toBeDefined()
   const tick = Promise.resolve(due!.callback())
@@ -1105,6 +1105,7 @@ test('warm timing records response headers separately from response completion',
 test.each([
   ['cost-cap', 'cost-cap'],
   ['count-cap', 'count-cap'],
+  ['deadline-missed', 'deadline-missed'],
   ['outside-hours', 'outside-hours'],
   ['session-ended', 'session-ended'],
   ['unsupported', 'unsupported'],
@@ -1154,8 +1155,7 @@ test.each([
     expect(stops).toHaveLength(1)
     expect(stops[0]!.reason).toBe(expected)
     expect(
-      stops[0]?.reason === 'deadline-missed' ||
-        CACHE_WARM_STOP_REASONS.some((reason) => reason === stops[0]?.reason),
+      CACHE_WARM_STOP_REASONS.some((reason) => reason === stops[0]?.reason),
     ).toBe(true)
   },
 )

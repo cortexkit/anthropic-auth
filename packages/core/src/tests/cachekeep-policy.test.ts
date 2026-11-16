@@ -164,10 +164,10 @@ function plannedFixture(
 }
 
 test.each([
-  ['short', 270_000, 300_000],
-  ['long', 3_570_000, 3_600_000],
+  ['short', 150_000, 300_000],
+  ['long', 3_300_000, 3_600_000],
 ] as const)(
-  'planned %s uses the shared due time and preserves the applied lifetime',
+  'planned %s uses a five-minute lead capped at half its lifetime',
   async (ttl, due, lifetime) => {
     const f = plannedFixture({}, { ttl, keep_warm: 'always' })
     expect(f.track().tracked).toBe(true)
@@ -185,6 +185,42 @@ test.each([
     expect(f.target.nextPrewarmAt).toBe(f.now + due)
   },
 )
+
+test('planned warms retry after 20, 40 and 60 seconds inside their five-minute lead', async () => {
+  let attempts = 0
+  const f = plannedFixture(
+    {
+      fetchImpl: Object.assign(
+        async () => {
+          if (++attempts < 4)
+            throw new TypeError('synthetic temporary network failure')
+          return Response.json({})
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    },
+    { ttl: 'long', keep_warm: 'always' },
+  )
+  f.track()
+  const expiry = f.target.cacheExpiresAt
+  f.advance(3_300_000)
+  await f.manager.tick()
+  expect(attempts).toBe(1)
+  for (const delay of [20_000, 40_000, 60_000]) {
+    const previous = attempts
+    expect(f.target.nextPrewarmAt).toBe(f.now + delay)
+    f.advance(delay - 1)
+    await f.manager.tick()
+    expect(attempts).toBe(previous)
+    f.advance(1)
+    await f.manager.tick()
+    expect(attempts).toBe(previous + 1)
+  }
+  expect(f.now).toBe(expiry - 180_000)
+  expect(f.manager.trackedCount()).toBe(1)
+  expect(f.target.cacheExpiresAt).toBe(f.now + 3_600_000)
+  expect(f.target.nextPrewarmAt).toBe(f.now + 3_300_000)
+})
 
 test('planned dispatch is refused inside the final safety margin', async () => {
   const f = plannedFixture()
@@ -367,8 +403,8 @@ test.each([
 )
 
 test.each([
-  ['10:04', '10:10', 'UTC', true],
-  ['09:00', '10:04', 'UTC', false],
+  ['10:02', '10:10', 'UTC', true],
+  ['09:00', '10:02', 'UTC', false],
   ['23:00', '11:00', 'UTC', true],
   ['12:00', '13:00', 'Europe/Istanbul', false],
 ] as const)(
@@ -379,7 +415,7 @@ test.each([
       { ttl: 'short', keep_warm: 'hours', hours: { from, to, tz } },
     )
     expect(f.track().tracked).toBe(allowed)
-    f.advance(270_000)
+    f.advance(150_000)
     await f.manager.tick()
     expect(f.sends).toBe(Number(allowed))
   },
@@ -431,7 +467,7 @@ test.each([false, true])(
       })
     }
     const lastTouchAt = f.now - 60_000
-    const interval = planned ? 3_570_000 : 3_300_000
+    const interval = 3_300_000
     expect(
       f.track({
         cacheMode: 'hybrid',
@@ -626,8 +662,8 @@ test('explicit auto selects the planned path despite local off', async () => {
   f.manager.recordAcceptedUsage(f.input.sessionId, f.input.bodyText, {
     cache_read_input_tokens: 1_000,
   })
-  expect(f.timerMs).toBe(270_000)
-  f.advance(270_000)
+  expect(f.timerMs).toBe(150_000)
+  f.advance(150_000)
   await f.due()
   expect(f.sends).toBe(1)
   expect(f.target.policyState?.planned).toBe(true)
