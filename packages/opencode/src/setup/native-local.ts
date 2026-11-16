@@ -90,6 +90,15 @@ export function nativeLocalProcessFence(
   }
 }
 
+/** Read-only planning still refuses environment-provided host auth and vault enrollment. */
+export async function validateNativeLocalSetup(
+  host: HarnessKind,
+  options: NativeLocalSetupOptions,
+): Promise<void> {
+  requireNoSupervisedAuthContentSnapshot(options.env)
+  await requireNativeLocalEnrollment([host], options.env)
+}
+
 export async function nativeSetupFileFingerprint(
   path: string,
 ): Promise<string> {
@@ -172,7 +181,7 @@ export async function planNativeLocalSetup(
   const paths =
     options.paths ?? (await resolveNativeSetupPaths(host, options.env))
   const processFence = nativeLocalProcessFence(host, options)
-  await processFence()
+  await validateNativeLocalSetup(host, options)
   const journal = await readNativeMigrationJournal(paths.paths)
   if (journal && journal.host !== host)
     throw new NativeMigrationError('invalid-source')
@@ -246,6 +255,7 @@ export async function planNativeLocalSetup(
         ...paths,
         env: options.env,
         processFence,
+        validate: () => validateNativeLocalSetup(host, options),
         removePiAnthropicAuth: options.removePiAnthropicAuth,
       })
     }
@@ -258,7 +268,6 @@ export async function revalidateNativeLocalPlan(
   plan: NativeLocalPlan,
   options: NativeLocalSetupOptions,
 ): Promise<void> {
-  await nativeLocalProcessFence(plan.paths.host, options)()
   const current = await planNativeLocalSetup(
     plan.paths.host,
     { ...options, paths: plan.paths },
@@ -283,7 +292,7 @@ export async function installAbsentNativePlaceholder(
 ): Promise<void> {
   if (plan.paths.host !== 'opencode' || plan.slot?.kind !== 'absent') return
   const processFence = nativeLocalProcessFence('opencode', options)
-  await processFence()
+  await validateNativeLocalSetup('opencode', options)
   await mkdir(dirname(plan.paths.hostAuthPath), {
     recursive: true,
     mode: 0o700,
@@ -380,7 +389,8 @@ export async function migrateNativeLocalForHost(
 ): Promise<void> {
   const env = { ...options.env }
   const processFence = nativeLocalProcessFence(host, { ...options, env })
-  await processFence()
+  const validate = () => validateNativeLocalSetup(host, { ...options, env })
+  await validate()
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
   const login = await options.login?.(host)
   if (
@@ -390,7 +400,7 @@ export async function migrateNativeLocalForHost(
     )
   )
     throw new Error('Claude sign-in did not establish an account UUID')
-  await processFence()
+  if (login) await processFence()
   await options.beforeCommit?.()
   if (!options.skipMigration)
     await runNativeMigration({
@@ -403,6 +413,7 @@ export async function migrateNativeLocalForHost(
       routingDestinationPath: plan.routingDestinationPath,
       env,
       processFence,
+      validate,
       removePiAnthropicAuth: options.removePiAnthropicAuth,
       preflight: options.preflight,
       writeSetupSettings: (settings) =>
@@ -424,7 +435,6 @@ export async function migrateNativeLocalForHost(
       const snapshot = await runtime.read()
       if (snapshot.mode !== 'local')
         throw new SetupRefusal(localVaultRecovery(host))
-      await processFence()
       await runtime.loginOAuth({ routeId: 'main', replace: true, ...login })
     } finally {
       await runtime.close()

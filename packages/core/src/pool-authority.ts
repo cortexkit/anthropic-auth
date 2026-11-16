@@ -942,7 +942,7 @@ export async function advanceNativeCustodyActivation(
 /** Publish local authority without inventing migration inputs or creating a pool. */
 export async function beginNativeEmptyInit(
   paths: NativePoolPaths,
-  hooks: JournalHooks = {},
+  hooks: JournalHooks & { validate?: () => Promise<void> } = {},
 ): Promise<NativeEmptyInitJournal> {
   return withLock(paths.journal, journalLock(hooks), async (lock) => {
     let current: NativeMigrationJournal | undefined
@@ -967,7 +967,7 @@ export async function beginNativeEmptyInit(
       host: 'opencode',
       phase: 'committed',
     }
-    await hooks.assertOwned?.()
+    await (hooks.validate ?? hooks.assertOwned)?.()
     await writeJournal(paths, initial, () => lock.assertOwned(), hooks)
     return initial
   })

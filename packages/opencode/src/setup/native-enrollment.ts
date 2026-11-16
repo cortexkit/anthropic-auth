@@ -218,7 +218,6 @@ export async function grantNativeVaultForHost(
   >,
 ): Promise<string | undefined> {
   try {
-    await options.processFence()
     // common-auth's public status API includes the operator's approvedName;
     // the proposed default can belong to a different installation.
     const status = await readClaustrumEnrollmentStatus(
@@ -234,6 +233,7 @@ export async function grantNativeVaultForHost(
     if (status.state === 'approved' && status.requestedGrantsStatus === 'sent')
       return approvedName
     const args = nativeVaultGrantArgs(host, approvedName)
+    await options.processFence()
     const grant = await options.runner.run(options.ckBinary ?? 'ck', args, {
       env: options.env,
     })

@@ -385,7 +385,7 @@ test('empty-init enrollment fence precedes reads and repeats before rename', asy
   await expect(
     publishNativeEmptyInit({
       ...f.input,
-      processFence: async () => {
+      validate: async () => {
         throw vault
       },
     }),
@@ -396,6 +396,9 @@ test('empty-init enrollment fence precedes reads and repeats before rename', asy
     publishNativeEmptyInit(
       {
         ...f.input,
+        validate: async () => {
+          if (enrolled) throw vault
+        },
         processFence: async () => {
           if (enrolled) throw vault
         },
@@ -420,12 +423,41 @@ test('empty-init enrollment fence precedes reads and repeats before rename', asy
   await expect(
     publishNativeEmptyInit({
       ...f.input,
-      processFence: async () => {
+      validate: async () => {
         throw vault
       },
     }),
   ).rejects.toBe(vault)
   expect(await readFile(f.paths.journal, 'utf8')).toBe('{bad')
+})
+
+test('empty-init validates reads but inspects processes only at journal publication', async () => {
+  const f = await emptyFixture()
+  const events: string[] = []
+  await publishNativeEmptyInit(
+    {
+      ...f.input,
+      validate: async () => {
+        events.push('validate')
+      },
+      processFence: async () => {
+        events.push('inspect')
+      },
+    },
+    {
+      onStep: async (step) => {
+        events.push(step)
+      },
+    },
+  )
+  expect(events).toEqual([
+    'validate',
+    'validate',
+    'validate',
+    'before-write:journal:committed',
+    'inspect',
+    'after-write:journal:committed',
+  ])
 })
 
 test('empty-init refuses existing destinations including a file created before rename', async () => {

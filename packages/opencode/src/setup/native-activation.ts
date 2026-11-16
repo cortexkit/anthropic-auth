@@ -170,14 +170,18 @@ export async function fingerprintNativeVaultInputs(
   ])
 }
 
-async function vaultProcessFence(
-  options: NativeVaultActivationOptions,
-): Promise<void> {
+function validateVaultAuthContent(options: NativeVaultActivationOptions): void {
   try {
     requireNoSupervisedAuthContentSnapshot(options.env)
   } catch {
     throw new NativeVaultActivationError('auth-content-refused')
   }
+}
+
+async function vaultProcessFence(
+  options: NativeVaultActivationOptions,
+): Promise<void> {
+  validateVaultAuthContent(options)
   try {
     await assertHostsStopped(options.fence, options.env)
   } catch (error) {
@@ -193,8 +197,7 @@ export async function preflightNativeVaultForHost(
   options: NativeVaultActivationOptions,
 ): Promise<NativeVaultPreflight> {
   const env = { ...options.env }
-  const processFence = () => vaultProcessFence({ ...options, env })
-  await processFence()
+  validateVaultAuthContent({ ...options, env })
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
   const separateOpenCodeLogin =
     host === 'opencode' &&
@@ -236,7 +239,7 @@ export async function completeNativeVaultActivation(
 ): Promise<'committed' | 'already-vault'> {
   const env = { ...options.env }
   const processFence = () => vaultProcessFence({ ...options, env })
-  await processFence()
+  validateVaultAuthContent({ ...options, env })
   const plan = options.paths ?? (await resolveNativeSetupPaths(host, env))
   if (
     (await fingerprintNativeVaultInputs(host, options)) !==
@@ -291,12 +294,19 @@ export async function completeNativeVaultActivation(
         ? new NativeVaultActivationError(code)
         : new NativeVaultActivationError(code, host, approvedName)
     }
-    await processFence()
-    if (host === 'pi')
-      await openNativePiAuthSlot({
+    if (host === 'pi') {
+      const slot = openNativePiAuthSlot({
         env,
         authPath: plan.hostAuthPath,
-      }).enterVault()
+      })
+      const current = await slot.inspect()
+      // Do not call a mutator without its fence, even for an observed no-op:
+      // the auth slot could change before enterVault acquires its lock.
+      if (current.slot !== 'placeholder' || current.stash !== 'valid') {
+        await processFence()
+        await slot.enterVault()
+      }
+    }
     return preflight.priorMode === 'claustrum' ? 'already-vault' : 'committed'
   } finally {
     await runtime.close()
