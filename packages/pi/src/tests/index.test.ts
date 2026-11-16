@@ -170,7 +170,7 @@ test.each(['anthropic', 'other-provider'] as const)(
           cacheMode: 'hybrid',
           retained: {
             cacheExpiresAt: now + 3_600_000,
-            nextPrewarmAt: now + 3_570_000,
+            nextPrewarmAt: now + 3_300_000,
             ttlMs: 3_600_000,
             lastTouchAt: now,
             lastTouchKind: 'response',
@@ -310,7 +310,7 @@ test('a Pi API-key request ends a restored target inside the request path withou
         }),
         retained: {
           cacheExpiresAt: now + 3_600_000,
-          nextPrewarmAt: now + 3_570_000,
+          nextPrewarmAt: now + 3_300_000,
           ttlMs: 3_600_000,
           policyState: {
             ownerSessionId: sessionId,

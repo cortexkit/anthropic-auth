@@ -342,7 +342,7 @@ test.each([false, true])(
   'a real turn during Pi startup durably prevents adoption across the next restart (stopping=%s)',
   async (stopDuringLoad) => {
     const f = await restoredPlannedFixture(false)
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     const store = await Reflect.get(f.active.process, 'store').call(
       f.active.process,
       'pi-storage',
@@ -455,7 +455,7 @@ test.each([false, true])(
 test('Pi skips due warms during a real turn and its failed-turn finally ends the prefix', async () => {
   const f = await restoredPlannedFixture()
   f.active.process.realTurn('session-S')
-  f.advance(3_570_000)
+  f.advance(3_300_000)
   await f.active.tick()
   expect(f.sends).toHaveLength(0)
   f.active.process.endTurn('session-S')
@@ -804,7 +804,7 @@ test('a Pi real turn on an ineligible account ends its restored planned prefix',
   expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual([
     expect.objectContaining({ reason: 'session-ended' }),
   ])
-  f.advance(3_570_000)
+  f.advance(3_300_000)
   await second.tick()
   expect(f.sends).toHaveLength(0)
 })
@@ -1112,7 +1112,7 @@ test.each([false, true])(
       f.snapshot,
     )
     for (let n = 0; n < 23; n++) {
-      f.advance(3_570_000)
+      f.advance(3_300_000)
       await first.tick()
     }
     expect(f.sends).toHaveLength(23)
@@ -1120,10 +1120,10 @@ test.each([false, true])(
     if (nullPolicy) policy = null
     const resumed = f.create()
     await resumed.process.startSession('pi-storage', 'planned-pi')
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     await resumed.tick()
     expect(f.sends).toHaveLength(24)
-    f.advance(3_570_000)
+    f.advance(3_300_000)
     await resumed.tick()
     expect(f.sends).toHaveLength(24)
   },
