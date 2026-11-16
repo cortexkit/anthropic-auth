@@ -67,7 +67,10 @@ import {
   preflightNativeVaultForHost,
 } from '../setup/native-activation.ts'
 import {
+  installAbsentNativePlaceholder,
   migrateNativeLocalForHost,
+  planNativeLocalSetup,
+  revalidateNativeLocalPlan,
   SEPARATE_HOST_LOGIN_NOTICE,
 } from '../setup/native-local.ts'
 import { resolveNativeSetupPaths } from '../setup/native-paths.ts'
@@ -1279,6 +1282,293 @@ async function writeSetupJson(path: string, value: unknown) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   await writeFile(path, JSON.stringify(value), { mode: 0o600 })
 }
+
+lifetimes.test(
+  'standalone local helpers refuse running hosts at entry',
+  async () => {
+    for (const helper of [
+      'plan',
+      'revalidate',
+      'placeholder',
+      'migrate',
+    ] as const) {
+      const f = await callbackFixture()
+      const options = {
+        env: f.env,
+        paths: f.plan,
+        fence: createTestFence(),
+        removePiAnthropicAuth: false,
+      }
+      const plan = await planNativeLocalSetup('opencode', options, false)
+      const reads = forbidSetupReads([
+        f.plan.paths.journal,
+        f.plan.hostAuthPath,
+        f.plan.legacyConfigPath,
+        f.plan.legacyStatePath,
+        f.plan.routingSourcePath,
+      ])
+      const running = {
+        ...options,
+        fence: createTestFence([{ pid: 123, command: 'opencode serve' }]),
+        login: async () => {
+          throw new Error('Sign-in must not start before the entry fence')
+        },
+      }
+      try {
+        const operation =
+          helper === 'plan'
+            ? planNativeLocalSetup('opencode', running, false)
+            : helper === 'revalidate'
+              ? revalidateNativeLocalPlan(plan, running)
+              : helper === 'placeholder'
+                ? installAbsentNativePlaceholder(plan, running)
+                : migrateNativeLocalForHost('opencode', running)
+        await expect(operation).rejects.toMatchObject({
+          name: 'ProcessFenceViolationError',
+        })
+        expect(reads.hits).toEqual([])
+      } finally {
+        reads.restore()
+      }
+      expect(await readNativeMigrationJournal(f.plan.paths)).toBeUndefined()
+      expect(existsSync(f.plan.hostAuthPath)).toBe(false)
+    }
+  },
+)
+
+function inspectSetupPublications(
+  f: Awaited<ReturnType<typeof callbackFixture>>,
+) {
+  let inspections = 0
+  const publications: string[] = []
+  const paths = new Map([
+    ...Object.entries(f.plan.paths).map(
+      ([name, path]) => [path, name] as const,
+    ),
+    [f.plan.hostAuthPath, 'host-auth'],
+    [f.plan.routingDestinationPath, 'routing'],
+    [join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc'), 'registration'],
+    [join(dirname(f.plan.legacyConfigPath), 'tui.jsonc'), 'tui-registration'],
+  ])
+  const rename = fsPromises.rename
+  const unlink = fsPromises.unlink
+  const record = (path: fsSync.PathLike) => {
+    const name = paths.get(String(path))
+    if (name) publications.push(`${name}@${inspections}`)
+  }
+  const renameSpy = spyOn(fsPromises, 'rename').mockImplementation(
+    async (source, destination) => {
+      record(destination)
+      return rename(source, destination)
+    },
+  )
+  const unlinkSpy = spyOn(fsPromises, 'unlink').mockImplementation(
+    async (path) => {
+      record(path)
+      return unlink(path)
+    },
+  )
+  lifetimes.deferCleanup(() => {
+    renameSpy.mockRestore()
+    unlinkSpy.mockRestore()
+  })
+  return {
+    fence: {
+      async listRunningHosts() {
+        inspections++
+        return []
+      },
+    },
+    inspections: () => inspections,
+    publications,
+  }
+}
+
+// These budgets include common-auth 0.51.0's initial command.js:154 check and
+// per-host :227/:229/:246/:250/:255 checks, plus register.js:200 and :202 for
+// each changed registration file. Enrollment also keeps enroll.js:60/:86.
+// When upgrading common-auth, adjust the totals below for changed inspection
+// counts at these runner, registration and enrollment sites.
+lifetimes.test('inspection budget: OpenCode 2 reuse', async () => {
+  const f = await callbackFixture()
+  expect(await runSetupCommand(['--yes', '--opencode=2'], f.io)).toBe(0)
+  await writeSetupJson(
+    join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc'),
+    {},
+  )
+  const probe = inspectSetupPublications(f)
+  expect(
+    await runSetupCommand(['--yes', '--opencode=2'], {
+      ...f.io,
+      fence: probe.fence,
+    }),
+  ).toBe(0)
+  expect(probe.inspections()).toBe(8)
+  expect(probe.publications).toEqual(['registration@7'])
+})
+
+lifetimes.test('inspection budget: OpenCode 1 retired migration', async () => {
+  const f = await callbackFixture()
+  expect(await runSetupCommand(['--yes', '--opencode=1'], f.io)).toBe(0)
+  expect(await readNativeMigrationJournal(f.plan.paths)).toMatchObject({
+    phase: 'retired',
+  })
+  await writeSetupJson(
+    join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc'),
+    {},
+  )
+  const probe = inspectSetupPublications(f)
+  let migrations = 0
+  expect(
+    await runSetupCommand(['--yes', '--opencode=1'], {
+      ...f.io,
+      fence: probe.fence,
+      migrateLocal: async (host, options) => {
+        migrations++
+        await migrateNativeLocalForHost(host, options)
+      },
+    }),
+  ).toBe(0)
+  expect(migrations).toBe(1)
+  expect(probe.inspections()).toBe(8)
+  expect(probe.publications).toEqual(['registration@7'])
+})
+
+lifetimes.test(
+  'inspection budget: OpenCode vault already enrolled',
+  async () => {
+    const f = await grantSetupFixture('opencode')
+    expect(await f.run()).toBe(0)
+    await writeSetupJson(
+      join(dirname(f.plan.legacyConfigPath), 'opencode.jsonc'),
+      {},
+    )
+    const probe = inspectSetupPublications(f)
+    f.io.fence = probe.fence
+    f.state.onDiscover = () => expect(probe.inspections()).toBe(7)
+    expect(await f.run()).toBe(0)
+    expect(f.state.grants).toBe(0)
+    expect(probe.inspections()).toBe(11)
+    expect(probe.publications).toEqual(['registration@10'])
+  },
+)
+
+lifetimes.test('inspection budget: local --login', async () => {
+  const f = await callbackFixture()
+  await populateSetupPool(f)
+  await writeSetupJson(f.plan.hostAuthPath, {
+    anthropic: { type: 'api', key: 'fixture-key' },
+  })
+  expect(await runSetupCommand(['--yes', '--opencode=1'], f.io)).toBe(0)
+  const probe = inspectSetupPublications(f)
+  await withSetupBootstrap(async (lookups) => {
+    expect(
+      await runSetupCommand(['--yes', '--login', '--opencode=1'], {
+        ...f.io,
+        fence: probe.fence,
+        localLogin: async () => ({
+          accountIdentity: SETUP_UUID,
+          credential: {
+            type: 'oauth',
+            access: SETUP_ACCESS,
+            refresh: 'fixture-login-refresh',
+            expires: Date.now() + 28_800_000,
+          },
+        }),
+      }),
+    ).toBe(0)
+    expect(lookups).toEqual([`Bearer ${SETUP_ACCESS}`])
+  })
+  expect(probe.inspections()).toBe(9)
+  expect(probe.publications).toEqual(['state@5', 'config@6', 'runtime@6'])
+})
+
+lifetimes.test(
+  'Pi vault skips only an exact auth-slot no-op fence',
+  async () => {
+    const f = await grantSetupFixture('pi')
+    expect(await f.run()).toBe(0)
+    const pi = await resolveNativeSetupPaths('pi', f.env)
+    let inspections = 0
+    const publications: number[] = []
+    f.io.fence = {
+      async listRunningHosts() {
+        inspections++
+        return []
+      },
+    }
+    const rename = fsPromises.rename
+    const spy = spyOn(fsPromises, 'rename').mockImplementation(
+      async (from, to) => {
+        if (String(to) === pi.hostAuthPath) publications.push(inspections)
+        return rename(from, to)
+      },
+    )
+    lifetimes.deferCleanup(() => spy.mockRestore())
+    expect(await f.run()).toBe(0)
+    expect(inspections).toBe(9)
+    expect(publications).toEqual([])
+    await writeSetupJson(pi.hostAuthPath, {})
+    inspections = 0
+    expect(await f.run()).toBe(0)
+    expect(inspections).toBe(10)
+    expect(publications).toEqual([8])
+  },
+)
+
+lifetimes.test(
+  'a host starting during login identity lookup blocks pool publication',
+  async () => {
+    const f = await callbackFixture()
+    await populateSetupPool(f)
+    await writeSetupJson(f.plan.hostAuthPath, {
+      anthropic: { type: 'api', key: 'fixture-key' },
+    })
+    const before = await setupBytes(f.plan)
+    let running = false
+    let inspectionsAfterLookup = 0
+    await withSetupBootstrap(async () => {
+      const fetch = globalThis.fetch
+      const lookup = spyOn(globalThis, 'fetch').mockImplementation(
+        Object.assign(
+          async (...args: Parameters<typeof fetch>) => {
+            const response = await fetch(...args)
+            running = true
+            return response
+          },
+          { preconnect: fetch.preconnect },
+        ),
+      )
+      try {
+        expect(
+          await runSetupCommand(['--yes', '--login', '--opencode=1'], {
+            ...f.io,
+            fence: {
+              async listRunningHosts() {
+                if (running) inspectionsAfterLookup++
+                return running ? [{ pid: 123, command: 'opencode' }] : []
+              },
+            },
+            localLogin: async () => ({
+              accountIdentity: SETUP_UUID,
+              credential: {
+                type: 'oauth',
+                access: SETUP_ACCESS,
+                refresh: 'fixture-login-refresh',
+                expires: Date.now() + 28_800_000,
+              },
+            }),
+          }),
+        ).toBe(1)
+      } finally {
+        lookup.mockRestore()
+      }
+    })
+    expect(running).toBe(true)
+    expect(inspectionsAfterLookup).toBe(1)
+    expect(await setupBytes(f.plan)).toEqual(before)
+  },
+)
 
 lifetimes.test(
   'setup reports deferred settings refusal and the same command resumes through source retirement',
@@ -4001,6 +4291,7 @@ async function grantSetupFixture(
     grants: 0,
     screenAtGrant: '',
     inventory: verifiedSetupInventory() as NativeCustodyInventory,
+    onDiscover: () => {},
   }
   const client: GrantSetupClient = {
     close() {},
@@ -4071,6 +4362,7 @@ async function grantSetupFixture(
             {
               ...options,
               discover: async () => {
+                state.onDiscover()
                 events.push('default-account')
                 if (mode === 'dropped' || mode === 'legacy')
                   expect(state.grants).toBe(1)

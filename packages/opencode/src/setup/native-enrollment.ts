@@ -14,7 +14,11 @@ import {
   readClaustrumEnrollmentStatus,
 } from '@cortexkit/common-auth/claustrum'
 
-import type { CommandRunner, HarnessKind } from './types.ts'
+import type {
+  CommandRunner,
+  HarnessKind,
+  SharedSetupRunnerEntry,
+} from './types.ts'
 
 export const NATIVE_VAULT_HOST_NAMES = {
   opencode: CLAUSTRUM_OPENCODE_ENROLLMENT_NAME,
@@ -215,10 +219,11 @@ export async function grantNativeVaultForHost(
   options: Pick<
     NativeVaultEnrollmentOptions,
     'env' | 'runner' | 'processFence' | 'ckBinary' | 'paths'
-  >,
+  > &
+    SharedSetupRunnerEntry,
 ): Promise<string | undefined> {
   try {
-    await options.processFence()
+    if (!options.sharedRunnerCheckedEntry) await options.processFence()
     // common-auth's public status API includes the operator's approvedName;
     // the proposed default can belong to a different installation.
     const status = await readClaustrumEnrollmentStatus(
@@ -234,6 +239,7 @@ export async function grantNativeVaultForHost(
     if (status.state === 'approved' && status.requestedGrantsStatus === 'sent')
       return approvedName
     const args = nativeVaultGrantArgs(host, approvedName)
+    if (options.sharedRunnerCheckedEntry) await options.processFence()
     const grant = await options.runner.run(options.ckBinary ?? 'ck', args, {
       env: options.env,
     })

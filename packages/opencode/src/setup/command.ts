@@ -53,6 +53,7 @@ import {
   requireNativeLocalEnrollment,
   revalidateNativeLocalPlan,
   SEPARATE_HOST_LOGIN_NOTICE,
+  validateNativeLocalSetup,
 } from './native-local.ts'
 import { loginNativeOffline } from './native-login.ts'
 import {
@@ -194,6 +195,7 @@ export async function runSetupCommand(
   const localOptions = (host: HarnessKind) => ({
     env,
     fence,
+    sharedRunnerCheckedEntry: true as const,
     paths: paths.get(host),
     removePiAnthropicAuth: consent.get(host) ?? false,
     reportSettings: print,
@@ -337,7 +339,7 @@ export async function runSetupCommand(
         if (context.mode === 'local') {
           await requireNativeLocalEnrollment(context.hosts, env)
           for (const selected of context.hosts)
-            await nativeLocalProcessFence(selected, localOptions(selected))()
+            await validateNativeLocalSetup(selected, localOptions(selected))
         }
         await piConsent(context)
         for (const selected of context.hosts) {
@@ -436,6 +438,7 @@ export async function runSetupCommand(
           routingDestinationPath: plan.paths.routingDestinationPath,
           env,
           processFence: nativeLocalProcessFence(host, localOptions(host)),
+          validate: () => validateNativeLocalSetup(host, localOptions(host)),
         })
       else if (plan.action === 'skip') {
         await installAbsentNativePlaceholder(plan, localOptions(host))

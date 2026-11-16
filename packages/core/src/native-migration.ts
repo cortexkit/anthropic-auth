@@ -136,6 +136,8 @@ export interface NativeMigrationOptions {
   routingDestinationPath: string
   env: NodeJS.ProcessEnv
   processFence: () => Promise<void>
+  /** Read-only safety checks; defaults to processFence for existing callers. */
+  validate?: () => Promise<void>
   removePiAnthropicAuth: boolean
   custody?: NativeMigrationCustody
   preflight?: NativeMigrationPreflight
@@ -274,6 +276,8 @@ export interface NativeEmptyInitOptions {
   paths: NativePoolPaths
   routingDestinationPath: string
   processFence: () => Promise<void>
+  /** Read-only safety checks; defaults to processFence for existing callers. */
+  validate?: () => Promise<void>
   env: NodeJS.ProcessEnv
 }
 
@@ -291,8 +295,9 @@ export async function publishNativeEmptyInit(
   const env = { ...input.env }
   const routingDestinationPath = input.routingDestinationPath
   const processFence = input.processFence
+  const validate = input.validate ?? processFence
   // Even lock acquisition may read local files; enrollment wins before any read.
-  await processFence()
+  await validate()
   requireNoSupervisedAuthContentSnapshot(env)
   return withLock(
     paths.journal,
@@ -304,9 +309,9 @@ export async function publishNativeEmptyInit(
       renew: true,
     },
     async (lease) => {
-      await processFence()
-      const checkDestinations = async () => {
-        await processFence()
+      await validate()
+      const checkDestinations = async (publication = true) => {
+        await (publication ? processFence : validate)()
         try {
           await lease.assertOwned()
         } catch {
@@ -359,6 +364,7 @@ export async function publishNativeEmptyInit(
       return beginNativeEmptyInit(paths, {
         lockOptions: hooks.lockOptions,
         assertOwned: checkDestinations,
+        validate: () => checkDestinations(false),
         onWriteStep: async (step) =>
           hooks.onStep?.(`${step}:journal:committed`),
       })
@@ -390,7 +396,7 @@ async function capture(
   checkPool = false,
 ): Promise<Captured> {
   requireNoSupervisedAuthContentSnapshot(input.env)
-  await input.processFence()
+  await (input.validate ?? input.processFence)()
   // Re-resolve in this process's layout: paths resolved in another layout
   // differ in at least one key and are refused below.
   const resolved = await resolveNativePoolPaths(
@@ -1098,13 +1104,17 @@ export async function runNativeMigration(
         if (journal.phase === 'building') {
           const projection = captured.projection
           if (!projection) refuse()
-          const beforeMutator = async () => {
+          // Operation-entry validation keeps source and lease checks; only the
+          // store/runtime publication callbacks need a fresh process listing.
+          const beforeMutator = async (publication = true) => {
             await checkPaths(operation, captured)
             await checkLegacy(captured)
-            await operation.processFence()
+            await (publication
+              ? operation.processFence
+              : (operation.validate ?? operation.processFence))()
             await assertMigration()
           }
-          await beforeMutator()
+          await beforeMutator(false)
           await store.initialize()
           // Disabled aliases go first and are disabled immediately, so a later
           // enabled alias does not inherit a transient duplicate-identity refusal.
@@ -1130,7 +1140,7 @@ export async function runNativeMigration(
                 false,
               )
             else {
-              await beforeMutator()
+              await beforeMutator(false)
               if (!account.credential) refuse()
               const result = await store.add({
                 id: account.id,
@@ -1145,7 +1155,7 @@ export async function runNativeMigration(
               if (result.id !== account.id) refuse()
               await step(`after:add:${account.id}`)
             }
-            await beforeMutator()
+            await beforeMutator(false)
             if (!account.enabled)
               await store.disable(account.id, 'user-disabled')
             else await store.enable(account.id)
@@ -1154,7 +1164,7 @@ export async function runNativeMigration(
                 (row) => row.id === account.id,
               )
               if (!row?.credentialEpoch) refuse()
-              await beforeMutator()
+              await beforeMutator(false)
               await store.recordQuota(
                 account.id,
                 {
@@ -1167,18 +1177,18 @@ export async function runNativeMigration(
               )
             }
           }
-          await beforeMutator()
+          await beforeMutator(false)
           await store.reorder(
             projection.accounts
               .filter((account) => account.credential)
               .map((account) => account.id),
           )
           if (journal.kind !== 'legacy-import') {
-            await beforeMutator()
+            await beforeMutator(false)
             await store.updateSettings(() => projection.settings)
           }
           if (captured.seedInput) {
-            await beforeMutator()
+            await beforeMutator(false)
             await step('before:roster')
             if (!operation.custody) refuse()
             seed = await operation.custody.publishSeed(
@@ -1201,7 +1211,7 @@ export async function runNativeMigration(
             rows,
             seed,
           )
-          await beforeMutator()
+          await beforeMutator(false)
           await step('before:runtime')
           if (captured.seedInput) {
             if (!operation.custody) refuse()
@@ -1348,7 +1358,7 @@ export async function runNativeMigration(
               runtime,
             )
             const authoritative = journal
-            const recheck = async () => {
+            const recheck = async (publication = true) => {
               await checkPaths(operation, captured)
               await checkLegacy(captured)
               rows = await publicRows(store)
@@ -1358,7 +1368,9 @@ export async function runNativeMigration(
                 rows,
                 runtime,
               )
-              await operation.processFence()
+              await (publication
+                ? operation.processFence
+                : (operation.validate ?? operation.processFence))()
               await assertOwned()
             }
             await withLock(
@@ -1425,7 +1437,7 @@ export async function runNativeMigration(
                 )
                   refuse()
                 await step('before:host')
-                await recheck()
+                await recheck(false)
                 await mkdir(dirname(operation.hostAuthPath), {
                   recursive: true,
                   mode: 0o700,
@@ -1447,7 +1459,7 @@ export async function runNativeMigration(
                     hooks.hostWrite,
                   )
                 await step('after:host')
-                await recheck()
+                await recheck(false)
                 const effect = await readNativeMigrationSource(
                   'hostAuth',
                   operation.hostAuthPath,
