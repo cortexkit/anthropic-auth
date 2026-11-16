@@ -530,8 +530,11 @@ test('CacheKeep warming state follows tracked, stopped and switched-off sessions
     expect(track('warm').tracked).toBe(true)
     expect(manager.warming('warm')).toEqual({ on: true })
     manager.untrack('warm', 'routing-moved')
-    // Billing reports accept only some stop reasons; other stops carry none.
-    expect(manager.warming('warm')).toEqual({ on: false })
+    // Local routing stops map to a reason the shared billing contract accepts.
+    expect(manager.warming('warm')).toEqual({
+      on: false,
+      stopReason: 'unsupported',
+    })
 
     policies.set('capped', { keep_warm: 'always' })
     expect(

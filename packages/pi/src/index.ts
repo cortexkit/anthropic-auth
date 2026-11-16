@@ -51,6 +51,7 @@ import {
   startPiCacheKeepSession,
   stopPiCacheKeep,
   streamCortexKitAnthropic,
+  untrackPiCacheKeepTurn,
 } from './stream.ts'
 
 function textImageInput(): Array<'text' | 'image'> {
@@ -93,6 +94,16 @@ function refuseHostedPiLoginPrompts(pi: ExtensionAPI) {
       else process.stderr.write(`${message}\n`)
       return { action: 'handled' }
     }
+  })
+}
+
+function trackPiCacheKeepRoute(pi: ExtensionAPI) {
+  pi.on('input', async (_event, ctx) => {
+    try {
+      if (ctx.model?.provider && ctx.model.provider !== 'anthropic')
+        untrackPiCacheKeepTurn(ctx.sessionManager?.getSessionId())
+    } catch {}
+    return { action: 'continue' }
   })
 }
 
@@ -427,4 +438,5 @@ export default async function cortexKitPiAnthropicAuth(
   }
   await configureProvider()
   if (isVaultHosted()) refuseHostedPiLoginPrompts(pi)
+  trackPiCacheKeepRoute(pi)
 }

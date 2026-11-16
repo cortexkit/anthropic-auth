@@ -535,7 +535,11 @@ export async function setupAnthropicAuth(
       }
     },
     onAttemptEnd: (input, outcome) => {
-      if (outcome.status === undefined)
+      if (
+        outcome.status === undefined ||
+        outcome.status >= 400 ||
+        outcome.error
+      )
         cacheKeep?.discardAttempt(input.attemptId)
     },
     onCacheUsage: (sessionID, bodyText, usage) =>
@@ -551,6 +555,7 @@ export async function setupAnthropicAuth(
         fetch: options.fetch,
       })
     },
+    beginRealTurn: (input) => cacheKeep?.beginRealTurn(input),
   })
   cacheKeep = createNativeCacheKeep({
     ...options.cacheKeep,

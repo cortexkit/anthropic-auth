@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import {
   type CacheKeepTarget,
   CacheKeepStore as CoreStore,
@@ -9,6 +10,7 @@ import {
 import { CacheKeepStore } from '../v2/cachekeep-store.ts'
 import { CacheKeepStore as ReleasedStore } from './fixtures/cachekeep-store-2.5.5.ts'
 import { CacheKeepStore as Published260Store } from './fixtures/cachekeep-store-2.6.0.ts'
+import { invalidReason as published2131InvalidReason } from './fixtures/cachekeep-validator-2.13.1.ts'
 
 const roots: string[] = []
 afterEach(async () => {
@@ -40,6 +42,198 @@ const target: CacheKeepTarget = {
   lastTouchAt: now,
   lastTouchKind: 'response',
 }
+
+test('Core 2.13.1 validator accepts new saved policy snapshots on rollback', async () => {
+  const current = new CacheKeepStore({
+    storageId: 'rollback-2131',
+    root: await root(),
+  })
+  const policy = {
+    ttl: 'long',
+    keep_warm: 'hours',
+    hours: { from: '09:00', to: '18:00', tz: 'UTC' },
+  } as const
+  current.changed({
+    ...target,
+    policyState: {
+      ownerSessionId: target.id,
+      planned: true,
+      policy,
+      lastRealRequestAt: now,
+      warmsSinceLastRealRequest: 7,
+      warmCostSoFar: 123,
+      pendingWarmCost: 5,
+      hasWarmed: true,
+    },
+  })
+  await current.drain()
+  const [name] = await readdir(current.directory)
+  const entry = JSON.parse(
+    gunzipSync(await readFile(join(current.directory, name!))).toString(),
+  )
+  expect(entry.policyState.policy).toEqual(policy)
+  expect(published2131InvalidReason(entry, name!, now)).toBeUndefined()
+  expect(published2131InvalidReason({ ...entry, v: 2 }, name!, now)).toBe(
+    'format',
+  )
+})
+
+test.each(['expired', 'account-gone', 'foreign-identity'] as const)(
+  'disk-only %s records are removed without reporting a stop',
+  async (reason) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const reports: unknown[] = []
+    globals[key] = () => ({
+      report: (payload: unknown) => reports.push(payload),
+    })
+    try {
+      const store = new CacheKeepStore({
+        storageId: 'silent-disk-drop',
+        root: await root(),
+      })
+      await store.reserveWarm({
+        ...target,
+        policyState: {
+          ownerSessionId: target.id,
+          planned: true,
+          lastRealRequestAt: now,
+          warmsSinceLastRealRequest: 1,
+          warmCostSoFar: 200,
+          hasWarmed: true,
+        },
+      })
+      await store.load(
+        reason === 'expired' ? target.cacheExpiresAt + 1 : now,
+        () => reason,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(reports).toEqual([])
+      expect(await readdir(store.directory)).toEqual([])
+    } finally {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    }
+  },
+)
+
+test('restart writers omit old stop markers and readers ignore them', async () => {
+  const store = new CacheKeepStore({
+    storageId: 'ignored-old-marker',
+    root: await root(),
+  })
+  await store.reserveWarm({
+    ...target,
+    policyState: Object.assign(
+      {
+        ownerSessionId: target.id,
+        planned: true,
+        lastRealRequestAt: now,
+        warmsSinceLastRealRequest: 0,
+        warmCostSoFar: 0,
+        hasWarmed: false,
+      },
+      { stopReported: true },
+    ),
+  })
+  const [name] = await readdir(store.directory)
+  const path = join(store.directory, name!)
+  const saved = JSON.parse(gunzipSync(await readFile(path)).toString())
+  expect(saved.policyState.stopReported).toBeUndefined()
+  saved.policyState.stopReported = 'ignored legacy metadata'
+  await writeFile(path, gzipSync(JSON.stringify(saved)))
+  let accepted = false
+  await store.load(now, () => {
+    accepted = true
+    return true
+  })
+  expect(accepted).toBe(true)
+})
+
+test.each(['live-target', 'no-lease'] as const)(
+  'expired restore respects %s guard without stopping or deleting its record',
+  async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const reports: unknown[] = []
+    globals[key] = () => ({
+      report: (payload: unknown) => reports.push(payload),
+    })
+    try {
+      const current = new CacheKeepStore({
+        storageId: 'guarded-expired',
+        root: await root(),
+      })
+      const expired = {
+        ...target,
+        policyState: {
+          ownerSessionId: target.id,
+          planned: true,
+          lastRealRequestAt: now,
+          warmsSinceLastRealRequest: 0,
+          warmCostSoFar: 0,
+          hasWarmed: false,
+        },
+      }
+      current.changed(expired)
+      await current.drain()
+      let guarded = false
+      const liveBody =
+        '{"model":"claude-opus-4-6","messages":[{"role":"user","content":"new real turn"}]}'
+      await current.load(target.cacheExpiresAt + 1, () => {
+        guarded = true
+        current.changed({
+          ...expired,
+          bodyText: liveBody,
+          cacheExpiresAt: target.cacheExpiresAt + 3_600_000,
+        })
+        return undefined
+      })
+      await current.drain()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(guarded).toBe(true)
+      const [name] = await readdir(current.directory)
+      expect(name).toBeDefined()
+      expect(
+        JSON.parse(
+          gunzipSync(await readFile(join(current.directory, name!))).toString(),
+        ).bodyText,
+      ).toBe(liveBody)
+      expect(reports).toEqual([])
+    } finally {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    }
+  },
+)
+
+test.each(['format', 'unreadable'] as const)(
+  'a live per-file guard protects a %s restart file',
+  async (invalid) => {
+    const current = new CacheKeepStore({
+      storageId: 'invalid-live',
+      root: await root(),
+    })
+    await current.reserveWarm(target)
+    const [name] = await readdir(current.directory)
+    const path = join(current.directory, name!)
+    await writeFile(
+      path,
+      invalid === 'format'
+        ? gzipSync(JSON.stringify({ ...target, v: 999 }))
+        : new Uint8Array([0, 1, 2]),
+    )
+    await current.load(
+      now,
+      () => undefined,
+      undefined,
+      () => false,
+    )
+    expect(await readdir(current.directory)).toEqual([name!])
+  },
+)
 
 test('OC2 v2.5.5 reads current records and the current reader reads v2.5.5 records', async () => {
   const options = { storageId: 'same-oc2-storage', root: await root() }

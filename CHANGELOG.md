@@ -2,6 +2,14 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- Keep-warm now survives server restarts under Thalamus. A restored session keeps warming under its saved session policy until the runner can supply it again, instead of being dropped.
+- One slow keep-warm send no longer ends warming. Due warms run up to four at a time, one per session, and restored sessions still start at least 3 seconds apart.
+- A keep-warm send that can't finish before the cache expires now reports `deadline-missed` rather than `cost-cap`, and sends whose reply was lost count toward the `auto` spending limit.
+- Every real turn now replaces or ends its session's keep-warm, including API-key turns and, on Pi, turns on other providers. No warm is sent while a turn is in flight.
+- Pi releases its keep-warm sessions when it shuts down. They resume from their restart files in the next session.
+
 ## 2.13.1
 
 - Under Thalamus, billing reports now give the shortest cache lifetime in a request when its cache markers mix lifetimes.

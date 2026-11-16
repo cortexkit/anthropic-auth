@@ -1,7 +1,10 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
+  type CacheKeepRealTurn,
   clampHostRetryMs,
   hostRetryResponse,
   runWithRequestSignal,
+  withCacheKeepRealTurn,
   withSessionCacheReportHandoff,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -9,6 +12,7 @@ import {
   installOpenCode2Auth,
   type OpenCode2AuthInstallation,
   type OpenCode2HookContext,
+  placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
@@ -40,12 +44,45 @@ export async function installNativeAnthropic<Q, P>(
 ): Promise<NativeAnthropicInstallation<Q, P>> {
   const native = createNativeAnthropicAdapter(deps)
   const endings = new Set<Promise<void>>()
+  const requestFinisher = new AsyncLocalStorage<{
+    finish: () => void
+    route?: string
+    attemptId?: string
+  }>()
+  const attemptFinishers = new Map<string, () => void>()
   const adapter: typeof native.adapter = {
     ...native.adapter,
+    rewriteRequest(input) {
+      const request = requestFinisher.getStore()
+      if (request) {
+        request.route = input.attempt.data?.route
+        request.attemptId = input.attempt.attemptId
+        attemptFinishers.set(input.attempt.attemptId, request.finish)
+      }
+      return native.adapter.rewriteRequest?.(input)
+    },
     onAttemptEnd(attempt, outcome) {
-      const pending = Promise.resolve(
-        native.adapter.onAttemptEnd?.(attempt, outcome),
-      )
+      const pending = (async () => {
+        try {
+          await native.adapter.onAttemptEnd?.(attempt, outcome)
+        } finally {
+          const finish = attemptFinishers.get(attempt.attemptId)
+          attemptFinishers.delete(attempt.attemptId)
+          // A body-less OAuth response can end before http.response decides
+          // whether to track its cache prefix. That hook's finally closes the
+          // real-turn lease after the tracking decision.
+          if (
+            attempt.data?.route !== 'oauth' ||
+            outcome.status === undefined ||
+            outcome.status >= 400 ||
+            outcome.error
+          ) {
+            try {
+              finish?.()
+            } catch {}
+          }
+        }
+      })()
       endings.add(pending)
       void pending.finally(() => endings.delete(pending)).catch(() => {})
       return pending
@@ -58,6 +95,7 @@ export async function installNativeAnthropic<Q, P>(
     await Promise.allSettled([...endings])
   }
   const registrations: Registration[] = []
+  const requestTurns = new WeakMap<Request, () => void>()
   const hook: Plugin.Context['session']['hook'] = async (
     name,
     callback,
@@ -92,6 +130,11 @@ export async function installNativeAnthropic<Q, P>(
               }
               if ('response' in draft && draft.response instanceof Response)
                 draft.response = hostRetryResponse(draft.response)
+              if ('request' in draft && draft.request instanceof Request) {
+                try {
+                  requestTurns.get(draft.request)?.()
+                } catch {}
+              }
             }
           })()
         }
@@ -108,7 +151,68 @@ export async function installNativeAnthropic<Q, P>(
           'request' in draft && draft.request instanceof Request
             ? draft.request.signal
             : undefined
-        return runWithRequestSignal(signal, async () => callback(draft))
+        const input = draft as {
+          sessionID: string
+          agent: string
+          kind: 'primary'
+          model: { providerID: string; id: string }
+          request: Request
+        }
+        let turn: CacheKeepRealTurn | undefined
+        let finalRequest: Request | undefined
+        let completion: {
+          finish: () => void
+          route?: string
+          attemptId?: string
+        }
+        const finish = () => {
+          try {
+            turn?.finish()
+          } catch {}
+          signal?.removeEventListener('abort', finish)
+          if (completion?.attemptId)
+            attemptFinishers.delete(completion.attemptId)
+          if (finalRequest) requestTurns.delete(finalRequest)
+        }
+        completion = { finish }
+        try {
+          // common-auth scopes these hooks to Anthropic. Other providers never
+          // reach this observer, so their turns cannot invalidate a warm target.
+          if (input.model.providerID === 'anthropic') {
+            turn = deps.source.beginRealTurn?.({
+              sessionID: input.sessionID,
+              providerID: input.model.providerID,
+              modelID: input.model.id,
+              agent: input.agent,
+              kind: input.kind,
+            })
+            if (
+              ownership.credential(input.request.headers) !==
+              placeholderSecret('anthropic')
+            )
+              finish()
+          }
+        } catch {
+          finish()
+        }
+        signal?.addEventListener('abort', finish, { once: true })
+        if (signal?.aborted) finish()
+        let completed = false
+        try {
+          const result = await runWithRequestSignal(signal, () =>
+            requestFinisher.run(completion, () =>
+              withCacheKeepRealTurn(turn, async () => callback(draft)),
+            ),
+          )
+          completed = true
+          if (turn) {
+            finalRequest = input.request
+            requestTurns.set(finalRequest, finish)
+          }
+          return result
+        } finally {
+          if (!completed || completion.route !== 'oauth') finish()
+        }
       },
       options,
     )

@@ -2,9 +2,11 @@ import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   CacheKeepManager,
+  type CacheKeepRealTurn,
   CacheKeepStore,
   type CacheKeepStoreOptions,
   type CacheKeepTarget,
+  currentCacheKeepRealTurn,
   type HolderLiveness,
   isCacheKeepSubagentsEnabled,
   logger,
@@ -25,7 +27,6 @@ type Session = {
   storagePath: string
   claim: PiCacheKeepClaim
   store: CacheKeepStore
-  identity?: string
 }
 
 function accountKey(account: NativeAccountView) {
@@ -42,6 +43,13 @@ function accountKey(account: NativeAccountView) {
 
 /** One Pi process owns only the sessions its lifecycle actually opened. */
 export class PiCacheKeep {
+  // A current request outranks restart data that is still being read in the background.
+  private readonly realTurns = new Set<string>()
+  private readonly turnStarts = new Map<
+    string,
+    { turn: CacheKeepRealTurn; claimed: boolean }
+  >()
+  private readonly pendingTurns = new Set<CacheKeepRealTurn>()
   readonly manager: CacheKeepManager
   private readonly stores = new Map<string, Promise<CacheKeepStore>>()
   private readonly sessions = new Map<string, Session>()
@@ -50,7 +58,6 @@ export class PiCacheKeep {
   private readonly restored = new Map<string, number>()
   private readonly tracking = new Set<Promise<unknown>>()
   private stopping = false
-  private ticking?: Promise<void>
   private cleaning?: Promise<void>
   private cleanupTimer?: ReturnType<typeof setInterval>
   private readonly schedule: typeof setInterval
@@ -76,10 +83,12 @@ export class PiCacheKeep {
     this.cancel = managerOptions.clearIntervalImpl ?? clearInterval
     const persistWarm = async (target: Readonly<CacheKeepTarget>) => {
       const session = this.sessions.get(target.id)
-      if (this.stopping || !session?.identity) return false
+      const identity = target.hostMetadata?.accountIdentity
+      if (this.stopping || !session || typeof identity !== 'string')
+        return false
       return session.store.reserveWarm({
         ...target,
-        oauthAccountIdentity: session.identity,
+        oauthAccountIdentity: identity,
       })
     }
     this.manager = new CacheKeepManager({
@@ -97,19 +106,13 @@ export class PiCacheKeep {
             })
           : managerOptions.peekRoutingAccount?.(target, route)
       },
-      setIntervalImpl: ((_callback: unknown, ms?: number) =>
-        schedule(() => {
-          this.ticking = this.manager
-            .tick()
-            .catch(() => logger.warn('cachekeep', 'tick failed'))
-          return this.ticking
-        }, ms)) as typeof setInterval,
       onTargetChanged: (target) => {
         const session = this.sessions.get(target.id)
-        if (session?.identity)
+        const identity = target.hostMetadata?.accountIdentity
+        if (session && typeof identity === 'string')
           session.store.changed({
             ...target,
-            oauthAccountIdentity: session.identity,
+            oauthAccountIdentity: identity,
           })
         managerOptions.onTargetChanged?.(target)
       },
@@ -120,7 +123,7 @@ export class PiCacheKeep {
           : Promise.resolve(false),
       onTargetRemoved: (id) => {
         this.restored.delete(id)
-        if (!this.stopping) this.sessions.get(id)?.store.removed(id)
+        this.sessions.get(id)?.store.removed(id)
         managerOptions.onTargetRemoved?.(id)
       },
       prepareHeaders: async (headers, target, attempt) => {
@@ -134,14 +137,16 @@ export class PiCacheKeep {
           else await delay(stagger, undefined, { signal: attempt.signal })
           if (target.cacheExpiresAt <= this.now()) return undefined
         }
+        attempt.signal?.throwIfAborted()
         if (this.stopping && this.manager.trackedRequest(target.id))
           return undefined
         const session = this.sessions.get(target.id)
+        const identity = target.hostMetadata?.accountIdentity
         // One-off prewarmNow probes are not restart targets and have no claim.
-        if (session?.identity) {
+        if (session && typeof identity === 'string') {
           const snapshot = await this.options.read(session.storagePath)
           const account = snapshot.accounts.find(
-            (row) => accountKey(row) === session.identity,
+            (row) => accountKey(row) === identity,
           )
           if (!account || !nativeAccountCanServe(account)) return undefined
         } else if (this.manager.trackedRequest(target.id)) return undefined
@@ -221,7 +226,11 @@ export class PiCacheKeep {
         // The manager expires local targets. Cleanup must not race its queued
         // writes; only the initial restore reads a locally claimed record.
         return restoreOwn && !this.manager.trackedRequest(id)
-          ? async () => {}
+          ? Object.assign(async () => {}, {
+              canRemove: async () =>
+                (await owned.claim.isCurrent()) &&
+                !this.manager.trackedRequest(id),
+            })
           : undefined
     }
     const cleanup = new PiCacheKeepClaim(store.directory, hash, {
@@ -230,7 +239,20 @@ export class PiCacheKeep {
       sessionHash: true,
     })
     if (!(await cleanup.acquire())) return undefined
-    return () => cleanup.release()
+    const canRemove = async () =>
+      (await cleanup.isCurrent()) &&
+      !this.stopping &&
+      ![...this.claims.keys()].some(
+        (id) => createHash('sha256').update(id).digest('hex') === hash,
+      ) &&
+      ![...this.sessions.keys()].some(
+        (id) => createHash('sha256').update(id).digest('hex') === hash,
+      )
+    if (!(await canRemove())) {
+      await cleanup.release()
+      return undefined
+    }
+    return Object.assign(() => cleanup.release(), { canRemove })
   }
 
   private startCleanup() {
@@ -241,9 +263,10 @@ export class PiCacheKeep {
       this.cleaning ??= (async () => {
         for (const store of this.stores.values()) {
           const current = await store
+          const now = this.now()
           await current.load(
-            this.now(),
-            () => undefined,
+            now,
+            (entry) => (entry.cacheExpiresAt <= now ? 'expired' : undefined),
             (hash) => this.access(current, hash),
           )
         }
@@ -274,13 +297,11 @@ export class PiCacheKeep {
       await store.load(
         now,
         (entry) => {
-          if (
-            !session ||
-            entry.id !== sessionId ||
-            this.stopping ||
-            this.manager.trackedRequest(entry.id)
-          )
-            return undefined
+          if (this.manager.trackedRequest(entry?.id)) return undefined
+          if (this.realTurns.has(entry.id)) return 'invalid'
+          if (this.stopping) return undefined
+          if (entry.cacheExpiresAt <= now) return 'expired'
+          if (!session || entry.id !== sessionId) return undefined
           if (!snapshot) return 'invalid'
           const account = snapshot.accounts.find(
             (row) => accountKey(row) === entry.oauthAccountIdentity,
@@ -290,6 +311,7 @@ export class PiCacheKeep {
             return 'account-gone'
           if (
             entry.isSubagent &&
+            !entry.policyState?.planned &&
             readSessionCachePolicy(
               entry.policyState?.ownerSessionId ?? entry.id,
               true,
@@ -297,7 +319,6 @@ export class PiCacheKeep {
             !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
           )
             return 'invalid'
-          session.identity = accountKey(account)
           const result = this.manager.track({
             sessionId,
             url: entry.url,
@@ -307,6 +328,7 @@ export class PiCacheKeep {
             cacheMode: 'hybrid',
             oauthAccountId: account.id,
             oauthAccountIdentity: account.accountIdentity,
+            hostMetadata: { accountIdentity: accountKey(account) },
             accountStoragePath: storagePath,
             isSubagent: entry.isSubagent,
             retained: {
@@ -320,6 +342,7 @@ export class PiCacheKeep {
         },
         (hash) => this.access(store, hash, true),
       )
+      if (!this.stopping && this.manager.trackedCount()) this.manager.start()
       this.startCleanup()
       completed = !!session
     })()
@@ -334,12 +357,64 @@ export class PiCacheKeep {
     return starting
   }
 
-  trackAccepted(input: TrackInput, snapshot: NativeAccountSnapshot) {
-    if (this.stopping || !input.sessionId || !input.accountStoragePath)
+  realTurn(sessionId: string) {
+    this.realTurns.add(sessionId)
+    try {
+      const previous = this.turnStarts.get(sessionId)
+      if (previous && !previous.claimed) previous.turn.finish()
+      const turn = this.manager.beginRealTurn(sessionId)
+      this.turnStarts.set(sessionId, { turn, claimed: false })
+      return turn
+    } catch {
+      return undefined
+    }
+  }
+
+  requestTurn(sessionId: string) {
+    const pending = this.turnStarts.get(sessionId)
+    if (pending && !pending.claimed && pending.turn.active) {
+      pending.claimed = true
+      return pending.turn
+    }
+    const turn = this.realTurn(sessionId)
+    const entry = this.turnStarts.get(sessionId)
+    if (entry) entry.claimed = true
+    return turn
+  }
+
+  endTurn(sessionId: string) {
+    const pending = this.turnStarts.get(sessionId)
+    this.turnStarts.delete(sessionId)
+    try {
+      if (pending && !pending.claimed) pending.turn.finish()
+    } catch {}
+  }
+
+  finishTurn(turn: CacheKeepRealTurn | undefined) {
+    try {
+      if (turn && !this.pendingTurns.has(turn)) turn.finish()
+    } catch {}
+  }
+
+  trackAccepted(
+    input: TrackInput,
+    snapshot: NativeAccountSnapshot,
+    requestTurn?: CacheKeepRealTurn,
+  ) {
+    let turn = requestTurn ?? currentCacheKeepRealTurn()
+    try {
+      turn ??= input.sessionId ? this.requestTurn(input.sessionId) : undefined
+    } catch {}
+    if (this.stopping || !input.sessionId || !input.accountStoragePath) {
+      try {
+        turn?.finish()
+      } catch {}
       return Promise.resolve()
+    }
     const sessionId = input.sessionId
     const storagePath = input.accountStoragePath
     const acceptedAt = this.now()
+    if (turn) this.pendingTurns.add(turn)
     const tracking = (async () => {
       const session = await this.claim(storagePath, sessionId)
       if (!session) return
@@ -352,21 +427,29 @@ export class PiCacheKeep {
         account?.type !== 'oauth' ||
         !nativeAccountCanServe(account) ||
         account.accountIdentity !== input.oauthAccountIdentity
-      )
+      ) {
         return
-      session.identity = accountKey(account)
+      }
       // Claim I/O may finish after the response, or even during shutdown. Keep
       // that accepted body, but never grant the cache the time spent waiting.
-      const result = this.manager.track({
+      const result = turn?.track({
         ...input,
         acceptedAt,
+        hostMetadata: { accountIdentity: accountKey(account) },
       })
-      if (result.tracked) this.restored.delete(sessionId)
+      if (result?.tracked) this.restored.delete(sessionId)
       if (this.stopping) this.manager.stop()
       return result
-    })().catch(() =>
-      logger.warn('cachekeep', 'accepted response tracking failed'),
-    )
+    })()
+      .finally(() => {
+        if (turn) this.pendingTurns.delete(turn)
+        try {
+          turn?.finish()
+        } catch {}
+      })
+      .catch(() =>
+        logger.warn('cachekeep', 'accepted response tracking failed'),
+      )
     this.tracking.add(tracking)
     void tracking.then(() => this.tracking.delete(tracking))
     return tracking
@@ -377,17 +460,20 @@ export class PiCacheKeep {
     if (this.cleanupTimer) this.cancel(this.cleanupTimer)
     this.cleanupTimer = undefined
     this.manager.stop()
+    this.manager.abortWarms()
     await Promise.all(this.starts.values())
     await Promise.all(this.claims.values())
     await Promise.all(this.tracking)
     this.manager.stop()
-    await this.ticking
+    await this.manager.drain()
     await this.cleaning
     // Drain before releasing claims so a successor can never read an older body.
     for (const store of this.stores.values()) await (await store).drain()
-    for (const session of this.manager.trackedSessions())
-      this.manager.untrack(session.id)
     for (const session of this.sessions.values()) await session.claim.release()
+    await this.manager.dispose()
+    this.realTurns.clear()
+    this.turnStarts.clear()
+    this.pendingTurns.clear()
     this.sessions.clear()
     this.claims.clear()
     this.starts.clear()

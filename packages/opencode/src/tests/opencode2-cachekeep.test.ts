@@ -59,6 +59,7 @@ import { createNativeCacheKeep } from '../v2/cachekeep'
 import {
   type CacheKeepStore,
   cacheKeepStoreDirectory,
+  legacyCacheKeepStoreDirectory,
 } from '../v2/cachekeep-store'
 import { createNativeMenuCapabilities } from '../v2/menu'
 import { setupAnthropicAuth } from '../v2/setup'
@@ -233,6 +234,7 @@ async function fixture(
   trace?: ReturnType<typeof cacheKeepFailureTrace>,
   identity = '11111111-2222-4333-8444-555555555555',
   getSession?: () => Promise<{ parentID?: string }>,
+  cacheKeepOptions: cacheKeepFactory.NativeCacheKeepOptions = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -398,6 +400,7 @@ async function fixture(
           setTimeoutImpl: timers.setTimeout,
           clearTimeoutImpl: timers.clearTimeout,
         },
+        ...cacheKeepOptions,
       },
     })
     cleanups.push(dispose)
@@ -407,6 +410,7 @@ async function fixture(
       sessionID = 'ses_oc2_keep',
       signal?: AbortSignal,
       agent = 'build',
+      credential = placeholderSecret('anthropic'),
     ) => {
       const draft = {
         sessionID: sessionID as SessionHooks['http.request']['sessionID'],
@@ -418,7 +422,7 @@ async function fixture(
           signal,
           headers: {
             'content-type': 'application/json',
-            authorization: `Bearer ${placeholderSecret('anthropic')}`,
+            authorization: `Bearer ${credential}`,
           },
           body: JSON.stringify({
             model: 'claude-sonnet-4-6',
@@ -802,7 +806,7 @@ for (const status of [200, 400]) {
   })
 }
 
-test('OpenCode 2 rejected oversized request keeps the old target without evicting warm sessions', async () => {
+test('OpenCode 2 rejected oversized request ends its old target without evicting other warm sessions', async () => {
   const lines = captureStartupLogs()
   const f = await fixture()
   await f.live(undefined, { system: 'a'.repeat(1024 * 1024) })
@@ -829,11 +833,19 @@ test('OpenCode 2 rejected oversized request keeps the old target without evictin
       { status: 400 },
     ),
   )
-  expect(manager.trackedRequest('ses_oc2_keep')?.bodyText.length).toBe(
-    before.bodyText.length,
+  expect(before).toBeDefined()
+  expect(manager.trackedRequest('ses_oc2_keep')).toBeUndefined()
+  expect(
+    manager
+      .trackedSessions()
+      .map(({ id }: { id: string }) => id)
+      .sort(),
+  ).toEqual(
+    sessions
+      .filter(({ id }) => id !== 'ses_oc2_keep')
+      .map(({ id }) => id)
+      .sort(),
   )
-  expect(manager.trackedRequest('ses_oc2_keep')).toEqual(before)
-  expect(await f.registry.list()).toEqual(sessions)
   expect(
     lines.filter((line) => line.includes('stopped warming session')),
   ).toEqual([])
@@ -865,7 +877,7 @@ test('OpenCode 2 accepts the oversized body at 2xx headers before streaming star
   await response.body?.cancel()
 })
 
-test('OpenCode 2 aborted attempt leaves its old target even if late 2xx headers arrive', async () => {
+test('OpenCode 2 aborted attempt ends its old target even if late 2xx headers arrive', async () => {
   const f = await fixture()
   await f.live()
   const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
@@ -880,7 +892,104 @@ test('OpenCode 2 aborted attempt leaves its old target even if late 2xx headers 
   )
   abort.abort()
   await f.respond(draft)
-  expect(manager.trackedRequest('ses_oc2_keep')).toEqual(before)
+  expect(before).toBeDefined()
+  expect(manager.trackedRequest('ses_oc2_keep')).toBeUndefined()
+})
+
+test('an OC2 API-key real turn ends a live warmed prefix through the request boundary', async () => {
+  const f = await fixture()
+  await f.live()
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(1)
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  await f.live(undefined, {}, undefined, undefined, 'build', 'real-api-key')
+  expect(owner.manager.trackedCount()).toBe(0)
+  await owner.persistence.drain()
+  expect(await readdir(f.disk)).toEqual([])
+  expect(owner.manager.warming('ses_oc2_keep')).toEqual({
+    on: false,
+    stopReason: 'session-ended',
+  })
+})
+
+test('OC2 skips a due warm while the real request is still choosing its account', async () => {
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  let blocked = false
+  const create = sourceFactory.createNativeAnthropicSource
+  const creating = spyOn(
+    sourceFactory,
+    'createNativeAnthropicSource',
+  ).mockImplementation((options) => {
+    const source = create(options)
+    const choose = source.chooseAccount.bind(source)
+    return {
+      ...source,
+      chooseAccount: async (input) => {
+        if (blocked && input.agent !== 'cachekeep' && input.agent !== 'prime') {
+          entered.resolve()
+          await release.promise
+        }
+        return choose(input)
+      },
+    }
+  })
+  cleanups.push(() => creating.mockRestore())
+  const f = await fixture()
+  await f.live()
+  f.due()
+  blocked = true
+  const abort = new AbortController()
+  const preparing = f
+    .prepare(
+      undefined,
+      { system: 'new in-flight turn' },
+      undefined,
+      abort.signal,
+    )
+    .catch((error) => error)
+  await entered.promise
+  try {
+    await f.timers.fire()
+    expect(f.sent).toHaveLength(0)
+  } finally {
+    abort.abort()
+    release.resolve()
+    await preparing
+  }
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  expect(
+    (globalThis as any)[key].get(f.paths.storageId).manager.trackedCount(),
+  ).toBe(0)
+})
+
+test('an older OC2 abort cannot unblock or replace a newer in-flight real turn', async () => {
+  const f = await fixture()
+  await f.live()
+  const abort = new AbortController()
+  const older = await f.prepare(
+    undefined,
+    { system: 'older turn' },
+    undefined,
+    abort.signal,
+  )
+  const newer = await f.prepare(undefined, { system: 'newer accepted turn' })
+  abort.abort()
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(0)
+  await f.respond(newer)
+  await f.respond(older)
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const manager = (globalThis as any)[key].get(f.paths.storageId).manager
+  expect(manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+    'newer accepted turn',
+  )
+  f.due()
+  await f.timers.fire()
+  expect(f.sent).toHaveLength(1)
 })
 
 test('OpenCode 2 records its use of the pool at setup and serves a request as before', async () => {
@@ -1409,6 +1518,65 @@ test('OpenCode 2 dispose aborts and joins an in-flight prewarm', async () => {
   expect(f.timers.callbacks.size).toBe(0)
 })
 
+test('OC2 last-lease disposal aborts and joins a due-timer restored delay before closing its runtime', async () => {
+  const entered = Promise.withResolvers<void>()
+  let signal: AbortSignal | undefined
+  let release: (() => void) | undefined
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    undefined,
+    undefined,
+    {
+      delayImpl: ((_ms, _value, options) =>
+        new Promise<void>((resolve, reject) => {
+          signal = options?.signal
+          release = resolve
+          signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('aborted', 'AbortError')),
+            { once: true },
+          )
+          entered.resolve()
+        })) as cacheKeepFactory.NativeCacheKeepOptions['delayImpl'],
+    },
+  )
+  await f.live()
+  await f.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  f.due()
+  const active = await f.start()
+  f.advance(1)
+  const [id, due] = [...f.timers.timeouts].find(
+    ([, timer]) => timer.at === f.now(),
+  )!
+  expect(due).toBeDefined()
+  f.timers.timeouts.delete(id)
+  const tick = Promise.resolve(due.callback())
+  await entered.promise
+  const stopping = active.dispose()
+  try {
+    await stopping
+    expect(signal?.aborted).toBe(true)
+    await tick
+    expect(active.sent).toHaveLength(0)
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    expect(owner.manager.trackedCount()).toBe(1)
+    expect(
+      (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
+    ).toHaveLength(1)
+  } finally {
+    release?.()
+    await stopping
+    await tick
+  }
+})
+
 test('a later OpenCode 2 instance for the same storage keeps warming a session the disposed one tracked', async () => {
   const f = await fixture()
   await f.live()
@@ -1627,6 +1795,255 @@ function forgetCacheKeepProcess(storageId: string) {
   ;(globalThis as any)[key]?.delete(storageId)
 }
 
+test('OC2 legacy migration removes its source after adopting a target and cannot resurrect a forgotten session', async () => {
+  const f = await fixture()
+  await f.live()
+  await f.dispose()
+  const legacy = legacyCacheKeepStoreDirectory(
+    f.paths.storageId,
+    dirname(f.paths.legacyConfig),
+  )
+  await rename(f.disk, legacy)
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  expect(owner.manager.trackedCount()).toBe(1)
+  expect(await readdir(legacy)).toEqual([])
+  owner.manager.untrack('ses_oc2_keep')
+  await owner.persistence.drain()
+  await next.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  await f.start()
+  expect(
+    (globalThis as any)[key].get(f.paths.storageId).manager.trackedCount(),
+  ).toBe(0)
+})
+
+test.each([0, 2])(
+  'OpenCode 2 restart keeps %s planned records while the policy reads null',
+  async (count) => {
+    const lines = captureStartupLogs()
+    const routingKey = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[routingKey]
+    let policy: { ttl: 'long'; keep_warm: 'auto' } | null = {
+      ttl: 'long',
+      keep_warm: 'auto',
+    }
+    globals[routingKey] = () => ({ cache: () => policy })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[routingKey]
+      else globals[routingKey] = original
+    })
+    const f = await fixture(true, false, 'debug')
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const before = (globalThis as any)[key].get(f.paths.storageId)
+    for (let i = 0; i < count; i++) {
+      await f.live(undefined, { model: 'claude-opus-5-5' }, `ses_restore_${i}`)
+    }
+    expect(before.manager.trackedCount()).toBe(count)
+    await f.dispose()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      cacheKeep: { enabled: false },
+      claudeCache: { enabled: false, mode: 'hybrid' },
+    }))
+    const saved = await readdir(f.disk)
+    expect(saved).toHaveLength(count)
+    for (const name of saved) {
+      const record = JSON.parse(
+        gunzipSync(await readFile(join(f.disk, name))).toString(),
+      )
+      expect(record.policyState).toMatchObject({
+        planned: true,
+        policy: { ttl: 'long', keep_warm: 'auto' },
+        prefixTokens: 1,
+      })
+    }
+    forgetCacheKeepProcess(f.paths.storageId)
+    policy = null
+    const next = await f.start()
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    expect({
+      restored: owner.manager.trackedCount(),
+      logs: lines,
+    }).toMatchObject({ restored: count })
+    expect(
+      (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
+    ).toHaveLength(count)
+    f.advance(3_570_000)
+    await f.timers.fire()
+    expect({ sends: next.sent.length, logs: lines }).toMatchObject({
+      sends: count,
+    })
+    await owner.persistence.drain()
+    expect(
+      (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
+    ).toHaveLength(count)
+  },
+)
+
+test.each(['hybrid-inactive', 'subagents-disabled', 'not-oauth'] as const)(
+  'a real turn skipped as %s ends the restored planned prefix',
+  async (reason) => {
+    const routingKey = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[routingKey]
+    let policy: { ttl: 'long'; keep_warm: 'always' } | null = {
+      ttl: 'long',
+      keep_warm: 'always',
+    }
+    const reports: { kind: string; reason?: string }[] = []
+    globals[routingKey] = () => ({
+      cache: () => policy,
+      report: (payload: (typeof reports)[number]) => reports.push(payload),
+    })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[routingKey]
+      else globals[routingKey] = original
+    })
+    const f = await fixture(reason === 'subagents-disabled')
+    await f.live()
+    await f.dispose()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      cacheKeep: {
+        enabled: reason !== 'hybrid-inactive',
+        always: true,
+        subagents: false,
+      },
+    }))
+    forgetCacheKeepProcess(f.paths.storageId)
+    policy = null
+    const next = await f.start()
+    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+    const owner = (globalThis as any)[key].get(f.paths.storageId)
+    expect(owner.manager.trackedCount()).toBe(1)
+    if (reason === 'not-oauth') {
+      const runtime = createNativeAccountRuntime({
+        paths: f.paths,
+        host: 'opencode',
+      })
+      const keeper = createNativeCacheKeep({
+        runtime,
+        storageId: f.paths.storageId,
+        persistence: { root: dirname(f.paths.legacyConfig) },
+        source: {} as NativeSource,
+      })
+      cleanups.push(async () => {
+        await keeper.dispose()
+        runtime.close()
+      })
+      await keeper.ready
+      await keeper.track({
+        sessionID: 'ses_oc2_keep',
+        route: 'api-key',
+        kind: 'primary',
+        agent: 'build',
+        attemptId: 999,
+      } as never)
+    } else
+      await next.live(undefined, {
+        messages: [{ role: 'user', content: 'new real turn' }],
+      })
+    expect(owner.manager.trackedCount()).toBe(0)
+    await owner.persistence.drain()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+      [expect.objectContaining({ reason: 'session-ended' })],
+    )
+    f.advance(3_570_000)
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(0)
+    expect(await readdir(f.disk)).toEqual([])
+  },
+)
+
+test('three restored sends reserve distinct start slots without waiting for responses', async () => {
+  const scheduled = Promise.withResolvers<void>()
+  const response = Promise.withResolvers<void>()
+  const delays: { ms: number; release: () => void }[] = []
+  const f = await fixture(
+    false,
+    false,
+    undefined,
+    false,
+    false,
+    undefined,
+    undefined,
+    undefined,
+    {
+      delayImpl: ((ms: number) => {
+        const gate = Promise.withResolvers<void>()
+        delays.push({ ms, release: () => gate.resolve() })
+        if (delays.length === 3) scheduled.resolve()
+        return gate.promise
+      }) as cacheKeepFactory.NativeCacheKeepOptions['delayImpl'],
+    },
+  )
+  for (let i = 0; i < 3; i++) await f.live(undefined, {}, `ses_spacing_${i}`)
+  await f.dispose()
+  forgetCacheKeepProcess(f.paths.storageId)
+  const next = await f.start()
+  const started = Array.from({ length: 3 }, () => Promise.withResolvers<void>())
+  const starts: number[] = []
+  next.setSend(async () => {
+    starts.push(f.now())
+    started[starts.length - 1]!.resolve()
+    await response.promise
+    return Response.json({})
+  })
+  f.due()
+  const tick = f.timers.fire()
+  const ready = await Promise.race([
+    scheduled.promise.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+  ])
+  if (!ready) {
+    for (const entry of delays) entry.release()
+    response.resolve()
+    await tick
+    expect(delays.map(({ ms }) => ms)).toEqual([0, 3000, 6000])
+    return
+  }
+  const spacing = delays.map(({ ms }) => ms)
+  delays[0]!.release()
+  await started[0]!.promise
+  f.advance(3000)
+  delays[1]!.release()
+  await started[1]!.promise
+  f.advance(3000)
+  delays[2]!.release()
+  await started[2]!.promise
+  response.resolve()
+  await tick
+  expect(spacing).toEqual([0, 3000, 6000])
+  expect(starts[1]! - starts[0]!).toBe(3000)
+  expect(starts[2]! - starts[1]!).toBe(3000)
+})
+
+test('OC2 deferred reservation wait returns skipped without retrying or removing its target', async () => {
+  const f = await fixture()
+  runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
+  await f.live()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  const target = owner.manager.targets.get('ses_oc2_keep') as CacheKeepTarget
+  const due = target.nextPrewarmAt
+  const result = await owner.manager.prewarmNow({
+    ...target,
+    sessionId: target.id,
+    headers: new Headers(),
+  })
+  expect(result).toEqual({ ok: false, skipped: true, reason: 'wait' })
+  expect(owner.manager.trackedCount()).toBe(1)
+  expect(target.nextPrewarmAt).toBe(due)
+  expect(target.consecutiveFailures).toBe(0)
+  expect(target.policyState?.warmsSinceLastRealRequest).toBe(0)
+  expect(f.sent).toHaveLength(0)
+})
+
 test('OpenCode 2 restores and prewarms a live format-1 record from another plugin version', async () => {
   const lines = captureStartupLogs()
   const f = await fixture(false, false, 'debug')
@@ -1655,6 +2072,32 @@ test('OpenCode 2 restores and prewarms a live format-1 record from another plugi
   expect(warm.messages).toEqual(live.messages)
   expect(warm.system.slice(1)).toEqual(live.system.slice(1))
   expect(warm.max_tokens).toBe(0)
+})
+
+test('OpenCode 2 warm timing measures physical headers before its buffered response body', async () => {
+  const lines = captureStartupLogs()
+  const f = await fixture(false, false, 'debug')
+  await f.live()
+  f.setSend(async () => {
+    f.advance(120)
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          setTimeout(() => {
+            f.advance(80)
+            controller.enqueue(new TextEncoder().encode('{}'))
+            controller.close()
+          }, 0)
+        },
+      }),
+    )
+  })
+  f.due()
+  await f.timers.fire()
+  const timing = lines.filter((line) => line.includes('prewarm timing'))
+  expect(timing).toHaveLength(1)
+  expect(timing[0]).toContain('"headersMs":120')
+  expect(timing[0]).toContain('"totalMs":200')
 })
 
 test('OpenCode 2 restores a 2.6 record without policyState and durably caps its new count', async () => {
@@ -2115,7 +2558,7 @@ test('OpenCode 2 staggers overdue restored prewarms instead of sending a burst',
   const next = await f.start()
   const times: number[] = []
   next.setSend(async () => {
-    times.push(Date.now())
+    times.push(f.now())
     return Response.json({ usage: { cache_read_input_tokens: 1 } })
   })
   await f.timers.fire()

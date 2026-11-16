@@ -81,10 +81,16 @@ type DropReason =
 
 type Acceptance =
   | boolean
+  | 'expired'
   | 'foreign-identity'
   | 'account-gone'
   | 'invalid'
   | undefined
+
+export type CacheKeepStoreRelease = (() => Promise<void>) & {
+  /** Pure ownership check, repeated immediately before unlinking. */
+  canRemove?: () => boolean | Promise<boolean>
+}
 
 function record(
   target: Readonly<CacheKeepTarget>,
@@ -109,6 +115,7 @@ function record(
       policyState: {
         ownerSessionId: target.policyState.ownerSessionId,
         planned: target.policyState.planned,
+        policy: target.policyState.policy,
         lastRealRequestAt: target.policyState.lastRealRequestAt,
         lastWarmAt: target.policyState.lastWarmAt,
         warmsSinceLastRealRequest: target.policyState.warmsSinceLastRealRequest,
@@ -166,7 +173,6 @@ function invalidReason(
     !Number.isFinite(value.nextPrewarmAt)
   )
     return 'invalid'
-  if (value.cacheExpiresAt <= now) return 'expired'
   const state = value.policyState
   if (
     state !== undefined &&
@@ -196,8 +202,43 @@ function invalidReason(
       ))
   )
     return 'invalid'
+  if (state?.policy !== undefined && !validSavedPolicy(state.policy))
+    return 'invalid'
   // Malformed bodies and credential-bearing records are not replayable.
   if (sanitizedBody(value.bodyText) !== value.bodyText) return 'invalid'
+  if (value.cacheExpiresAt <= now) return 'expired'
+}
+
+function validSavedPolicy(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const policy = value as Record<string, unknown>
+  if (
+    policy.ttl !== undefined &&
+    !['none', 'short', 'long'].includes(String(policy.ttl))
+  )
+    return false
+  if (
+    policy.keep_warm !== undefined &&
+    !['off', 'auto', 'always', 'hours'].includes(String(policy.keep_warm))
+  )
+    return false
+  if (policy.keep_warm !== 'hours') return policy.hours === undefined
+  const hours = policy.hours as Record<string, unknown> | undefined
+  if (!hours || typeof hours !== 'object' || Array.isArray(hours)) return false
+  if (
+    ![hours.from, hours.to].every(
+      (time) =>
+        typeof time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(time),
+    )
+  )
+    return false
+  if (typeof hours.tz !== 'string' || !hours.tz) return false
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: hours.tz })
+    return true
+  } catch {
+    return false
+  }
 }
 
 export interface CacheKeepStoreOptions {
@@ -317,7 +358,8 @@ export class CacheKeepStore {
   async load(
     now: number,
     accept: (entry: SavedCacheKeepTarget) => Acceptance,
-    claim?: (sessionHash: string) => Promise<(() => Promise<void>) | undefined>,
+    claim?: (sessionHash: string) => Promise<CacheKeepStoreRelease | undefined>,
+    guard?: (sessionHash: string) => boolean | Promise<boolean>,
   ) {
     await this.chain
     if (!(await this.directoryReady())) return
@@ -354,7 +396,19 @@ export class CacheKeepStore {
         if (claim && !release) continue
         const path = join(directory, name)
         let reason: DropReason = 'unreadable'
+        let entry: SavedCacheKeepTarget | undefined
+        const permitted = async () => {
+          try {
+            return (
+              (!guard || (await guard(name.slice(0, 64)))) &&
+              (!release?.canRemove || (await release.canRemove()))
+            )
+          } catch {
+            return false
+          }
+        }
         try {
+          if (!(await permitted())) continue
           if (TEMP.test(name)) {
             reason = 'unfinished-write'
             throw new Error('Unfinished write')
@@ -391,9 +445,15 @@ export class CacheKeepStore {
             maxOutputLength: MAX_RECORD_BYTES,
           })
           reason = 'invalid'
-          const entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
+          entry = JSON.parse(raw.toString('utf8')) as SavedCacheKeepTarget
           const invalid = invalidReason(entry, name, now)
-          const accepted = invalid ?? accept(entry)
+          if (invalid && invalid !== 'expired') {
+            reason = invalid
+            throw new Error('Invalid restart file')
+          }
+          const acceptance = accept(entry)
+          if (acceptance === undefined) continue
+          const accepted = invalid ?? acceptance
           if (accepted !== true && accepted !== undefined) {
             reason = accepted || 'invalid'
             throw new Error('Stale restart file')
@@ -403,22 +463,37 @@ export class CacheKeepStore {
             // in the private data store.
             if (directory !== this.directory) {
               try {
-                await this.writeEntry(entry)
+                const adopted = entry
+                const migrating = this.chain.then(() =>
+                  this.writeEntry(adopted),
+                )
+                this.chain = migrating.catch(() => this.writeFailed())
+                await migrating
               } catch {
                 this.refuse()
                 return
               }
+              // The durable migrated copy is authoritative. Keeping this old
+              // source could resurrect a session after it is later forgotten.
               await rm(path, { force: true })
             }
             restored++
           }
         } catch {
-          logger.debug('cachekeep', 'restart record dropped', {
-            file: name,
-            reason,
-          })
-          dropped++
-          await rm(path, { force: true })
+          // Serialize deletion with live writes and recheck file ownership,
+          // even when the saved file cannot be decoded.
+          this.chain = this.chain
+            .then(async () => {
+              if (!(await permitted())) return
+              await rm(path, { force: true })
+              logger.debug('cachekeep', 'restart record dropped', {
+                file: name,
+                reason,
+              })
+              dropped++
+            })
+            .catch(() => this.writeFailed())
+          await this.chain
         } finally {
           await release?.()
         }

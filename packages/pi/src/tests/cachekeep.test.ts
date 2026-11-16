@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -51,7 +51,10 @@ async function fixture() {
   const delays: number[] = []
   const create = (
     liveness?: HolderLiveness,
-    send?: () => Promise<Response>,
+    send?: (init?: RequestInit) => Promise<Response>,
+    managerOptions: Partial<
+      ConstructorParameters<typeof CacheKeepManager>[0]
+    > = {},
   ) => {
     const timers = new Map<object, () => unknown>()
     const process = new PiCacheKeep(
@@ -76,11 +79,12 @@ async function fixture() {
             session: new Headers(init?.headers).get('x-session')!,
             body: JSON.parse(String(init?.body)),
           })
-          if (send) return send()
+          if (send) return send(init)
           return new Response('{"usage":{"cache_read_input_tokens":100}}', {
             status: 200,
           })
         }) as typeof fetch,
+        ...managerOptions,
       },
       {
         read: async () => snapshot,
@@ -136,6 +140,488 @@ async function fixture() {
     },
   }
 }
+
+async function restoredPlannedFixture(adopt = true) {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  const reports: { kind: string; reason?: string }[] = []
+  globals[key] = () => ({
+    cache: () => ({ ttl: 'long', keep_warm: 'always' }),
+    report: (payload: (typeof reports)[number]) => reports.push(payload),
+  })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  const f = await fixture()
+  const first = f.create()
+  await first.process.startSession('pi-storage', 'session-S')
+  await first.process.trackAccepted(f.input('session-S'), f.snapshot)
+  await first.process.stop()
+  const active = f.create()
+  if (adopt) await active.process.startSession('pi-storage', 'session-S')
+  return { ...f, active, reports }
+}
+
+test('a first Pi track saves its accepted target identity on the first change', async () => {
+  const f = await fixture()
+  const active = f.create()
+  const store = await Reflect.get(active.process, 'store').call(
+    active.process,
+    'pi-storage',
+  )
+  const saving = spyOn(store, 'changed')
+  try {
+    expect(
+      (await active.process.trackAccepted(f.input('session-S'), f.snapshot))
+        ?.tracked,
+    ).toBe(true)
+    expect(saving.mock.calls).toHaveLength(1)
+    expect(saving.mock.calls[0]![0]).toEqual(
+      expect.objectContaining({
+        oauthAccountIdentity: JSON.stringify([
+          'local',
+          'account-uuid',
+          null,
+          'pool',
+          'row',
+          1,
+        ]),
+      }),
+    )
+    await store.drain()
+    const [name] = (await readdir(store.directory)).filter((file) =>
+      file.endsWith('.json.gz'),
+    )
+    expect(
+      JSON.parse(
+        gunzipSync(await readFile(join(store.directory, name!))).toString(),
+      ).oauthAccountIdentity,
+    ).toBe(JSON.stringify(['local', 'account-uuid', null, 'pool', 'row', 1]))
+  } finally {
+    saving.mockRestore()
+  }
+})
+
+test('a superseded Pi acceptance cannot relabel the newer account on disk', async () => {
+  const f = await fixture()
+  f.snapshot.accounts.push({
+    ...f.snapshot.accounts[0]!,
+    id: 'oauth-B',
+    accountIdentity: 'account-B',
+    binding: {
+      kind: 'local',
+      storageId: 'pool',
+      rowId: 'row-B',
+      credentialEpoch: 2,
+    },
+  })
+  const active = f.create()
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const claim = Reflect.get(active.process, 'claim').bind(active.process)
+  let calls = 0
+  const claiming = spyOn(
+    active.process as unknown as {
+      claim: (...args: unknown[]) => Promise<unknown>
+    },
+    'claim',
+  ).mockImplementation(async (...args) => {
+    if (++calls === 1) {
+      entered.resolve()
+      await release.promise
+    }
+    return claim(...args)
+  })
+  const older = active.process.requestTurn('session-S')
+  const tracking = active.process.trackAccepted(
+    f.input('session-S', 'older account prefix'),
+    f.snapshot,
+    older,
+  )
+  try {
+    await entered.promise
+    const newer = active.process.requestTurn('session-S')
+    await active.process.trackAccepted(
+      {
+        ...f.input('session-S', 'newer account prefix'),
+        oauthAccountId: 'oauth-B',
+        oauthAccountIdentity: 'account-B',
+      },
+      f.snapshot,
+      newer,
+    )
+    release.resolve()
+    expect((await tracking)?.tracked).toBe(false)
+    const store = await Reflect.get(active.process, 'stores').get('pi-storage')
+    // A later warm reservation must preserve B's identity, not just its first save.
+    const target = Reflect.get(active.process.manager, 'targets').get(
+      'session-S',
+    )
+    expect(
+      await Reflect.get(active.process.manager, 'options').reserveWarm(target),
+    ).toBe(true)
+    await store.drain()
+    const [name] = (await readdir(store.directory)).filter((file) =>
+      file.endsWith('.json.gz'),
+    )
+    const saved = JSON.parse(
+      gunzipSync(await readFile(join(store.directory, name!))).toString(),
+    )
+    expect(saved.oauthAccountIdentity).toBe(
+      JSON.stringify(['local', 'account-B', null, 'pool', 'row-B', 2]),
+    )
+    expect(saved.bodyText).toContain('newer account prefix')
+    await active.process.stop()
+    const reopened = f.create()
+    await reopened.process.startSession('pi-storage', 'session-S')
+    expect(
+      reopened.process.manager.trackedRequest('session-S')
+        ?.oauthAccountIdentity,
+    ).toBe('account-B')
+    expect(
+      reopened.process.manager.trackedRequest('session-S')?.bodyText,
+    ).toContain('newer account prefix')
+  } finally {
+    release.resolve()
+    await tracking
+    claiming.mockRestore()
+  }
+})
+
+test('repeated unclaimed Pi turn starts release every busy lease before a later warm', async () => {
+  const f = await fixture()
+  const active = f.create()
+  active.process.realTurn('session-S')
+  active.process.realTurn('session-S')
+  active.process.realTurn('session-S')
+  active.process.endTurn('session-S')
+  const input = f.input('session-S', 'later Anthropic prefix')
+  input.bodyText = input.bodyText.replace('"ttl":"1h"', '"ttl":"5m"')
+  await active.process.trackAccepted({ ...input, ttlMs: 300_000 }, f.snapshot)
+  f.advance(60_000)
+  await active.tick()
+  expect(f.sends).toHaveLength(1)
+  expect(JSON.stringify(f.sends[0]!.body)).toContain('later Anthropic prefix')
+})
+
+test('a continuing OAuth turn replaces a restored Pi prefix without stopping or unlinking it', async () => {
+  const f = await restoredPlannedFixture()
+  const store = await Reflect.get(f.active.process, 'stores').get('pi-storage')
+  f.active.process.realTurn('session-S')
+  await store.drain()
+  expect(f.active.process.manager.trackedCount()).toBe(1)
+  expect(f.active.process.manager.warming('session-S')).toEqual({ on: true })
+  expect(
+    (await readdir(store.directory)).filter((name) =>
+      name.endsWith('.json.gz'),
+    ),
+  ).toHaveLength(1)
+  await f.active.process.trackAccepted(
+    f.input('session-S', 'continuing accepted prefix'),
+    f.snapshot,
+  )
+  await store.drain()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(f.reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+    [],
+  )
+  expect(
+    f.active.process.manager.trackedRequest('session-S')?.bodyText,
+  ).toContain('continuing accepted prefix')
+  const [name] = (await readdir(store.directory)).filter((file) =>
+    file.endsWith('.json.gz'),
+  )
+  expect(
+    gunzipSync(await readFile(join(store.directory, name!))).toString(),
+  ).toContain('continuing accepted prefix')
+})
+
+test.each([false, true])(
+  'a real turn during Pi startup durably prevents adoption across the next restart (stopping=%s)',
+  async (stopDuringLoad) => {
+    const f = await restoredPlannedFixture(false)
+    f.advance(3_570_000)
+    const store = await Reflect.get(f.active.process, 'store').call(
+      f.active.process,
+      'pi-storage',
+    )
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const load = store.load.bind(store)
+    const loading = spyOn(store, 'load').mockImplementation(
+      async (...args: unknown[]) => {
+        entered.resolve()
+        await release.promise
+        return load(...args)
+      },
+    )
+    const adoption = spyOn(f.active.process.manager, 'track')
+    const starting = f.active.process.startSession('pi-storage', 'session-S')
+    await entered.promise
+    f.active.process.realTurn('session-S')
+    const stopping = stopDuringLoad ? f.active.process.stop() : undefined
+    release.resolve()
+    await starting
+    await stopping
+    await f.active.tick()
+    loading.mockRestore()
+    const adopted = adoption.mock.calls.length
+    adoption.mockRestore()
+    expect(adopted).toBe(0)
+    expect(f.active.process.manager.trackedCount()).toBe(0)
+    expect(f.sends).toHaveLength(0)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(
+      f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+    ).toEqual([])
+    await store.drain()
+    expect(
+      (await readdir(store.directory)).filter((name) =>
+        name.endsWith('.json.gz'),
+      ),
+    ).toEqual([])
+    await f.active.process.stop()
+    const reopened = f.create()
+    await reopened.process.startSession('pi-storage', 'session-S')
+    await reopened.tick()
+    expect(reopened.process.manager.trackedCount()).toBe(0)
+    expect(f.sends).toHaveLength(0)
+  },
+)
+
+test.each([false, true])(
+  'a refused model-specific Pi replacement retires the old prefix and its file (restored=%s)',
+  async (restored) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    const reports: { kind: string; reason?: string }[] = []
+    globals[key] = () => ({
+      cache: () => null,
+      report: (payload: (typeof reports)[number]) => reports.push(payload),
+    })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    })
+    const f = await fixture()
+    const managerOptions = {
+      resolveSettings: (
+        storage: Parameters<
+          NonNullable<
+            ConstructorParameters<typeof CacheKeepManager>[0]['resolveSettings']
+          >
+        >[0],
+        modelId?: string,
+      ) =>
+        modelId === 'claude-haiku-4-5'
+          ? { ...storage, cacheKeep: { enabled: false } }
+          : storage,
+    }
+    const first = f.create(undefined, undefined, managerOptions)
+    await first.process.startSession('pi-storage', 'session-S')
+    await first.process.trackAccepted(f.input('session-S'), f.snapshot)
+    f.advance(55 * 60_000)
+    await first.tick()
+    expect(f.sends).toHaveLength(1)
+    if (restored) await first.process.stop()
+    const active = restored
+      ? f.create(undefined, undefined, managerOptions)
+      : first
+    if (restored) await active.process.startSession('pi-storage', 'session-S')
+    const next = f.input('session-S', 'accepted new model')
+    next.bodyText = next.bodyText.replace(
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5',
+    )
+    await active.process.trackAccepted(next, f.snapshot)
+    const store = await Reflect.get(active.process, 'stores').get('pi-storage')
+    await store.drain()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(active.process.manager.trackedCount()).toBe(0)
+    expect(
+      (await readdir(store.directory)).filter((name) =>
+        name.endsWith('.json.gz'),
+      ),
+    ).toEqual([])
+    expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+      [expect.objectContaining({ reason: 'session-ended' })],
+    )
+  },
+)
+
+test('Pi skips due warms during a real turn and its failed-turn finally ends the prefix', async () => {
+  const f = await restoredPlannedFixture()
+  f.active.process.realTurn('session-S')
+  f.advance(3_570_000)
+  await f.active.tick()
+  expect(f.sends).toHaveLength(0)
+  f.active.process.endTurn('session-S')
+  expect(f.active.process.manager.trackedCount()).toBe(0)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(f.reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+    [expect.objectContaining({ reason: 'session-ended' })],
+  )
+})
+
+test('terminal retirement during Pi shutdown drains the obsolete restart file', async () => {
+  const f = await restoredPlannedFixture()
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  globals[key] = () => ({
+    cache: () => null,
+    report: (payload: (typeof f.reports)[number]) => f.reports.push(payload),
+  })
+  const store = await Reflect.get(f.active.process, 'stores').get('pi-storage')
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const claim = Reflect.get(f.active.process, 'claim').bind(f.active.process)
+  const claiming = spyOn(
+    f.active.process as unknown as {
+      claim: (...args: unknown[]) => Promise<unknown>
+    },
+    'claim',
+  ).mockImplementation(async (...args) => {
+    entered.resolve()
+    await release.promise
+    return claim(...args)
+  })
+  const tracking = f.active.process.trackAccepted(
+    f.input('session-S', 'accepted during shutdown'),
+    f.snapshot,
+  )
+  await entered.promise
+  const stopping = f.active.process.stop()
+  release.resolve()
+  try {
+    await Promise.all([tracking, stopping])
+    await store.drain()
+    expect(
+      (await readdir(store.directory)).filter((name) =>
+        name.endsWith('.json.gz'),
+      ),
+    ).toEqual([])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(
+      f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+    ).toEqual([expect.objectContaining({ reason: 'session-ended' })])
+  } finally {
+    release.resolve()
+    claiming.mockRestore()
+  }
+})
+
+test('Pi shutdown aborts and joins Core due-timer warms before releasing their claim', async () => {
+  const f = await fixture()
+  const timers = new Map<object, { callback: () => unknown; at: number }>()
+  const sent = Promise.withResolvers<void>()
+  const complete = Promise.withResolvers<void>()
+  let signal: AbortSignal | undefined
+  let releaseFetch: (() => void) | undefined
+  const active = f.create(
+    undefined,
+    (init) =>
+      new Promise<Response>((resolve, reject) => {
+        signal = init?.signal ?? undefined
+        releaseFetch = () => resolve(Response.json({}))
+        signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('aborted', 'AbortError')),
+          { once: true },
+        )
+        sent.resolve()
+      }),
+    {
+      setTimeoutImpl: ((callback: () => unknown, ms: number) => {
+        const id = { unref() {} }
+        timers.set(id, { callback, at: f.now() + ms })
+        return id
+      }) as unknown as typeof setTimeout,
+      clearTimeoutImpl: ((id: object) => {
+        timers.delete(id)
+      }) as unknown as typeof clearTimeout,
+      onComplete: async () => {
+        await complete.promise
+      },
+    },
+  )
+  await active.process.startSession('pi-storage', 'session-S')
+  const pricedInput = f.input('session-S')
+  pricedInput.bodyText = pricedInput.bodyText.replace(
+    'claude-sonnet-4-6',
+    'claude-opus-5-5',
+  )
+  await active.process.trackAccepted(pricedInput, f.snapshot)
+  active.process.manager.recordAcceptedUsage(
+    'session-S',
+    active.process.manager.trackedRequest('session-S')!.bodyText,
+    { cache_read_input_tokens: 1000 },
+  )
+  const savedStore = await Reflect.get(active.process, 'stores').get(
+    'pi-storage',
+  )
+  f.advance(55 * 60_000)
+  const due = [...timers.values()].find(({ at }) => at === f.now())
+  expect(due).toBeDefined()
+  const tick = Promise.resolve(due!.callback())
+  await sent.promise
+  const pendingCost =
+    active.process.manager.trackedPolicyState('session-S')?.pendingWarmCost
+  let stopped = false
+  const stopping = active.process.stop().then(() => {
+    stopped = true
+  })
+  try {
+    expect(pendingCost).toBeGreaterThan(0)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(signal?.aborted).toBe(true)
+    expect(stopped).toBe(false)
+    const claim = [
+      ...(
+        Reflect.get(active.process, 'sessions') as Map<
+          string,
+          { claim: PiCacheKeepClaim }
+        >
+      ).values(),
+    ][0]!.claim
+    expect(await claim.isCurrent()).toBe(true)
+    complete.resolve()
+    await stopping
+    await tick
+    expect(active.process.manager.trackedCount()).toBe(0)
+    const store = await Reflect.get(active.process, 'stores').get('pi-storage')
+    // Completed shutdown clears the store registry, not the durable prefix.
+    expect(store).toBeUndefined()
+    const [name] = (await readdir(savedStore.directory)).filter((name) =>
+      name.endsWith('.json.gz'),
+    )
+    const saved = JSON.parse(
+      gunzipSync(await readFile(join(savedStore.directory, name!))).toString(),
+    )
+    expect(saved.policyState.pendingWarmCost).toBeGreaterThan(0)
+    expect(f.sends).toHaveLength(1)
+  } finally {
+    complete.resolve()
+    releaseFetch?.()
+    await stopping
+    await tick
+  }
+})
+
+test('a storage-less accepted Pi turn ends the restored target at its route decision', async () => {
+  const f = await restoredPlannedFixture()
+  await f.active.process.trackAccepted(
+    { ...f.input('session-S'), accountStoragePath: undefined },
+    f.snapshot,
+  )
+  expect(f.active.process.manager.trackedCount()).toBe(0)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(f.reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+    [expect.objectContaining({ reason: 'session-ended' })],
+  )
+})
 
 test.each([false, true])(
   'Pi routing-moved stops an old-account warm (restored=%s)',
@@ -218,6 +704,109 @@ test('a fresh Pi process restores its idle session and warms without a request',
   expect(f.delays).toHaveLength(1)
   expect(f.delays[0]).toBeGreaterThanOrEqual(1000)
   expect(f.delays[0]).toBeLessThan(3000)
+})
+
+test('Pi stop releases its tracked lifetime without deleting restart files', async () => {
+  const f = await fixture()
+  const active = f.create()
+  await active.process.startSession('pi-storage', 'closed-session')
+  await active.process.trackAccepted(f.input('closed-session'), f.snapshot)
+  expect(active.process.manager.trackedCount()).toBe(1)
+  await active.process.stop()
+  expect(active.process.manager.trackedCount()).toBe(0)
+  expect(active.process.manager.registrySessions()).toEqual([])
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const files = (await readdir(directory)).filter((name) =>
+    name.endsWith('.json.gz'),
+  )
+  expect(files).toHaveLength(1)
+  const record = JSON.parse(
+    gunzipSync(await readFile(join(directory, files[0]!))).toString(),
+  )
+  expect(record.id).toBe('closed-session')
+  expect(record.policyState.stopReported).toBeUndefined()
+})
+
+test('a later Pi lifetime re-adopts the saved restart record after disposal', async () => {
+  const f = await fixture()
+  const active = f.create()
+  await active.process.startSession('pi-storage', 'reopened-session')
+  await active.process.trackAccepted(f.input('reopened-session'), f.snapshot)
+  const previousState =
+    active.process.manager.trackedPolicyState('reopened-session')
+  await active.process.stop()
+  const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
+  const [name] = (await readdir(directory)).filter((name) =>
+    name.endsWith('.json.gz'),
+  )
+  const path = join(directory, name!)
+  const record = JSON.parse(gunzipSync(await readFile(path)).toString())
+  // Another lifetime may update the saved prefix after the old claim is released.
+  record.bodyText = record.bodyText.replace(
+    'original prefix',
+    'prefix from the next owner',
+  )
+  await writeFile(path, gzipSync(JSON.stringify(record)))
+  f.advance(1000)
+  await active.process.startSession('pi-storage', 'reopened-session')
+  expect(
+    active.process.manager.trackedRequest('reopened-session')?.bodyText,
+  ).toContain('prefix from the next owner')
+  expect(
+    active.process.manager.trackedPolicyState('reopened-session'),
+  ).not.toBe(previousState)
+  expect(
+    active.process.manager.trackedRequest('reopened-session')?.cacheExpiresAt,
+  ).toBe(record.cacheExpiresAt)
+  f.advance(55 * 60_000 - 1000)
+  await active.tick()
+  expect(f.sends).toHaveLength(1)
+  expect(JSON.stringify(f.sends[0]?.body)).toContain(
+    'prefix from the next owner',
+  )
+})
+
+test('a Pi real turn on an ineligible account ends its restored planned prefix', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const globals = globalThis as Record<symbol, unknown>
+  const original = globals[key]
+  let policy: { ttl: 'long'; keep_warm: 'always' } | null = {
+    ttl: 'long',
+    keep_warm: 'always',
+  }
+  const reports: { kind: string; reason?: string }[] = []
+  globals[key] = () => ({
+    cache: () => policy,
+    report: (payload: (typeof reports)[number]) => reports.push(payload),
+  })
+  cleanups.push(() => {
+    if (original === undefined) delete globals[key]
+    else globals[key] = original
+  })
+  const f = await fixture()
+  const first = f.create()
+  await first.process.startSession('pi-storage', 'session-S')
+  await first.process.trackAccepted(f.input('session-S'), f.snapshot)
+  await first.process.stop()
+  policy = null
+  const second = f.create()
+  await second.process.startSession('pi-storage', 'session-S')
+  expect(second.process.manager.trackedCount()).toBe(1)
+  f.snapshot.accounts = []
+  second.process.realTurn('session-S')
+  await second.process.trackAccepted(
+    f.input('session-S', 'new real prefix'),
+    f.snapshot,
+  )
+  expect(second.process.manager.trackedCount()).toBe(0)
+  await second.process.stop()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual([
+    expect.objectContaining({ reason: 'session-ended' }),
+  ])
+  f.advance(3_570_000)
+  await second.tick()
+  expect(f.sends).toHaveLength(0)
 })
 
 test('Pi restores a 2.6 record without policyState and durably caps its new count', async () => {
@@ -499,38 +1088,46 @@ test('shutdown saves an accepted body queued before a sweep releases its claim',
   )
 })
 
-test('planned child warms override local off and preserve the 24-count across Pi restart', async () => {
-  const key = Symbol.for('cortexkit.routing')
-  const globals = globalThis as Record<symbol, unknown>
-  const original = globals[key]
-  globals[key] = () => ({ cache: () => ({ ttl: 'long', keep_warm: 'always' }) })
-  cleanups.push(() => {
-    if (original === undefined) delete globals[key]
-    else globals[key] = original
-  })
-  const f = await fixture()
-  f.snapshot.policyStorage.cacheKeep = { enabled: false, subagents: false }
-  f.snapshot.policyStorage.claudeCache = { enabled: false }
-  const first = f.create()
-  await first.process.trackAccepted(
-    { ...f.input('planned-pi'), isSubagent: true },
-    f.snapshot,
-  )
-  for (let n = 0; n < 23; n++) {
+test.each([false, true])(
+  'planned child warms override local off and preserve the 24-count across Pi restart (null policy: %s)',
+  async (nullPolicy) => {
+    const key = Symbol.for('cortexkit.routing')
+    const globals = globalThis as Record<symbol, unknown>
+    const original = globals[key]
+    let policy: { ttl: 'long'; keep_warm: 'always' } | null = {
+      ttl: 'long',
+      keep_warm: 'always',
+    }
+    globals[key] = () => ({ cache: () => policy })
+    cleanups.push(() => {
+      if (original === undefined) delete globals[key]
+      else globals[key] = original
+    })
+    const f = await fixture()
+    f.snapshot.policyStorage.cacheKeep = { enabled: false, subagents: false }
+    f.snapshot.policyStorage.claudeCache = { enabled: false }
+    const first = f.create()
+    await first.process.trackAccepted(
+      { ...f.input('planned-pi'), isSubagent: true },
+      f.snapshot,
+    )
+    for (let n = 0; n < 23; n++) {
+      f.advance(3_570_000)
+      await first.tick()
+    }
+    expect(f.sends).toHaveLength(23)
+    await first.process.stop()
+    if (nullPolicy) policy = null
+    const resumed = f.create()
+    await resumed.process.startSession('pi-storage', 'planned-pi')
     f.advance(3_570_000)
-    await first.tick()
-  }
-  expect(f.sends).toHaveLength(23)
-  await first.process.stop()
-  const resumed = f.create()
-  await resumed.process.startSession('pi-storage', 'planned-pi')
-  f.advance(3_570_000)
-  await resumed.tick()
-  expect(f.sends).toHaveLength(24)
-  f.advance(3_570_000)
-  await resumed.tick()
-  expect(f.sends).toHaveLength(24)
-})
+    await resumed.tick()
+    expect(f.sends).toHaveLength(24)
+    f.advance(3_570_000)
+    await resumed.tick()
+    expect(f.sends).toHaveLength(24)
+  },
+)
 
 test('ttl-only policy cannot restore a Pi child after the local subagent opt-out', async () => {
   const key = Symbol.for('cortexkit.routing')

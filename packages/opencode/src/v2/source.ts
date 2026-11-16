@@ -253,6 +253,7 @@ export interface NativeSourceOptions {
   ) => void
   readonly onForgetSession?: (sessionID: string) => void
   readonly onOwnedRequest?: () => void
+  readonly beginRealTurn?: NativeSource['beginRealTurn']
   readonly onRequestPrepared?: (
     input: NativeCacheRequestPrepared,
   ) => Promise<void> | void
@@ -728,6 +729,7 @@ export function createNativeAnthropicSource(
           }),
       }
     },
+    beginRealTurn: options.beginRealTurn,
     async chooseAccount(
       input: ChooseAccountInput,
     ): Promise<ChooseAccountResult> {

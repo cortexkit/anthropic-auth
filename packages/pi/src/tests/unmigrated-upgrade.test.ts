@@ -304,7 +304,7 @@ test.each(scenarios)(
     const before = await captureTree(fixture)
 
     const { session, extension, routes, available } = await startPi(fixture)
-    expect(extension.handlers.get('input')?.length).toBe(1)
+    expect(extension.handlers.get('input')?.length).toBe(2)
     // A stored Pi login hides the Anthropic provider from Pi's availability
     // list; without one, the provider stays listed. Either way the session
     // model was chosen explicitly, so prompts on it reach the extension's
@@ -389,11 +389,11 @@ test(
     lifetime.deferCleanup(() => refusalProbe.mockRestore())
 
     const { session, extension, routes, available } = await startPi(fixture)
-    // A healthy startup never asks whether migration is missing and adds no
-    // input handler.
+    // A healthy startup adds only the nonblocking keep-warm route observer,
+    // never a migration-refusal handler.
     expect(refusalProbe).toHaveBeenCalledTimes(0)
-    expect(extension.handlers.has('input')).toBe(false)
-    expect(session.extensionRunner.hasHandlers('input')).toBe(false)
+    expect(extension.handlers.get('input')).toHaveLength(1)
+    expect(session.extensionRunner.hasHandlers('input')).toBe(true)
     expect(available.some((model) => model.provider === 'anthropic')).toBe(true)
 
     await session.prompt('hello')
@@ -427,6 +427,7 @@ test(
     const slotRead = spyOn(paths, 'requirePiNativeHostAuth')
     lifetime.deferCleanup(() => slotRead.mockRestore())
     const { session, extension, routes } = await startPi(fixture)
+    expect(extension.handlers.get('input')).toHaveLength(2)
     expect(extension.commands.has('claude')).toBe(true)
     expect(slotRead).toHaveBeenCalledTimes(0)
     const notices: string[] = []
@@ -467,16 +468,18 @@ test(
     if (!model) throw new Error('Fixture OpenAI provider unavailable')
     await session.setModel(model)
     const inputs = extension.handlers.get('input')
-    expect(inputs).toHaveLength(1)
+    expect(inputs).toHaveLength(2)
     // Background vault and CacheKeep restoration also inspect the slot.
     // Isolate the input handler's synchronous provider gate before awaiting.
     slotRead.mockClear()
-    const input = inputs![0]!(
-      { type: 'input', text: 'another provider', source: 'interactive' },
-      { model } as ExtensionContext,
-    )
-    expect(slotRead).toHaveBeenCalledTimes(0)
-    expect(await input).toEqual({ action: 'continue' })
+    for (const handler of inputs!) {
+      const input = handler(
+        { type: 'input', text: 'another provider', source: 'interactive' },
+        { model } as ExtensionContext,
+      )
+      expect(slotRead).toHaveBeenCalledTimes(0)
+      expect(await input).toEqual({ action: 'continue' })
+    }
     routes.runtimeStream.mockImplementation((selected) => {
       expect(selected.provider).toBe('openai')
       const stream = createAssistantMessageEventStream()

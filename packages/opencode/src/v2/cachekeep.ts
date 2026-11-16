@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   type AnthropicBillingWarming,
@@ -5,13 +6,16 @@ import {
   CacheKeepManager,
   type CacheKeepPrewarmAttempt,
   CacheKeepPrewarmError,
+  type CacheKeepRealTurn,
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
   CacheKeepWarmRefusal,
+  currentCacheKeepRealTurn,
   getCacheKeepRegistryDirectories,
   isCacheKeepActiveNow,
   isCacheKeepHybridActive,
   isCacheKeepSubagentsEnabled,
+  isCacheKeepWarmWait,
   logger,
   NativeAccountRefusal,
   type NativeAccountRefusalReason,
@@ -43,6 +47,7 @@ export interface NativeCacheKeepOptions {
   readonly clearIntervalImpl?: typeof globalThis.clearInterval
   readonly setTimeoutImpl?: typeof globalThis.setTimeout
   readonly clearTimeoutImpl?: typeof globalThis.clearTimeout
+  readonly delayImpl?: typeof delay
   readonly registryDirectory?: string
   /** Filesystem seam for tests; this is not a user setting. */
   readonly persistence?: Omit<CacheKeepStoreOptions, 'storageId'>
@@ -108,6 +113,7 @@ interface CacheKeepLease {
     target: CacheKeepTarget,
     warm: Request,
     deadline?: AbortSignal,
+    onResponseHeaders?: () => void,
   ) => Promise<Response>
   /** Sends this lease started; its disposal waits for them to settle. */
   readonly inflight: Set<Promise<unknown>>
@@ -133,6 +139,7 @@ interface SharedCacheKeep {
     | 'trackedPolicyState'
     | 'warming'
     | 'recordWarmingOff'
+    | 'beginRealTurn'
   > &
     Partial<
       Pick<
@@ -146,6 +153,7 @@ interface SharedCacheKeep {
         | 'trackedPolicyState'
         | 'warming'
         | 'recordWarmingOff'
+        | 'beginRealTurn'
       >
     >
   readonly registry: CacheKeepSessionRegistry
@@ -167,7 +175,7 @@ interface SharedCacheKeep {
   /** The scheduler pass in progress, so the last release can wait for it. */
   ticking?: Promise<void>
   /** Called after the last lease is released. */
-  readonly retain: () => void
+  readonly retain: () => void | Promise<void>
   /** Called when a lease is taken; resumes warming any retained sessions. */
   readonly adopt: () => Promise<void>
   hybridDisabled?: boolean
@@ -231,6 +239,9 @@ function discardLocalTargets(
 // tracked. The version suffix keeps a future, differently shaped entry apart.
 const SHARED_CACHE_KEEPS = Symbol.for(
   'cortexkit.anthropic-auth.opencode2.cachekeep.v2',
+)
+const LEGACY_REAL_TURN_RULES = Symbol.for(
+  'cortexkit.anthropic-auth.opencode2.legacy-turn-rules',
 )
 
 function sharedCacheKeeps(): Map<string, SharedCacheKeep> {
@@ -320,19 +331,22 @@ function createSharedCacheKeep(
       // Even if a busy scheduler first runs after several targets became due,
       // restored sessions must not all hit the provider together.
       if (restored.delete(entry.target.id)) {
-        await delay(
-          Math.max(0, lastRestoredSend + 3000 - Date.now()),
+        const now = options.now?.() ?? Date.now()
+        const startAt = Math.max(now, lastRestoredSend + 3000)
+        lastRestoredSend = startAt
+        await (options.delayImpl ?? delay)(
+          Math.max(0, startAt - now),
           undefined,
           {
             signal: entry.attempt.signal,
           },
         )
-        lastRestoredSend = Date.now()
       }
       const sending = entry.lease.send(
         entry.target,
         request as Request,
         entry.attempt.signal,
+        entry.attempt.onResponseHeaders,
       )
       const settled = sending.then(
         () => {},
@@ -378,9 +392,11 @@ function createSharedCacheKeep(
     prepared,
     leases,
     nextGeneration: 0,
-    retain() {
+    async retain() {
       manager.stop()
+      manager.abortWarms()
       prepared.clear()
+      await manager.drain()
       dropExpired()
     },
     async adopt() {
@@ -391,62 +407,78 @@ function createSharedCacheKeep(
         const snapshot = await lease.read()
         const now = options.now?.() ?? Date.now()
         let overdue = 0
-        await shared.persistence.load(now, (entry) => {
-          // Disposal may race startup. Leave the file for the next live lease.
-          if (!leases.size || manager.trackedRequest(entry.id)) return undefined
-          if (
-            !isCacheKeepHybridActive(snapshot.policyStorage) &&
-            readSessionCachePolicy(
-              entry.policyState?.ownerSessionId ?? entry.id,
-              true,
-            )?.keep_warm === undefined
-          )
-            return 'invalid'
-          const account = snapshot.accounts.find(
-            (row) => accountKey(row) === entry.oauthAccountIdentity,
-          )
-          if (!account)
-            return missingAccountReason(
-              entry.oauthAccountIdentity,
-              snapshot.accounts,
+        await shared.persistence.load(
+          now,
+          (entry) => {
+            // Disposal may race startup. Leave the file for the next live lease.
+            if (!leases.size || manager.trackedRequest(entry?.id))
+              return undefined
+            if (entry.cacheExpiresAt <= now) return 'expired'
+            if (
+              !isCacheKeepHybridActive(snapshot.policyStorage) &&
+              !entry.policyState?.planned &&
+              readSessionCachePolicy(
+                entry.policyState?.ownerSessionId ?? entry.id,
+                true,
+              )?.keep_warm === undefined
             )
-          if (account.type !== 'oauth' || !nativeAccountCanServe(account))
-            return 'account-gone'
-          if (
-            entry.isSubagent &&
-            readSessionCachePolicy(
-              entry.policyState?.ownerSessionId ?? entry.id,
-              true,
-            )?.keep_warm === undefined &&
-            !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
-          )
-            return 'invalid'
-          const nextPrewarmAt =
-            entry.nextPrewarmAt <= now
-              ? now + overdue++ * 3000
-              : entry.nextPrewarmAt
-          const result = manager.track({
-            sessionId: entry.id,
-            url: entry.url,
-            headers: new Headers(),
-            bodyText: entry.bodyText,
-            storage: snapshot.policyStorage,
-            cacheMode: 'hybrid',
-            oauthAccountId: account.id,
-            oauthAccountIdentity: entry.oauthAccountIdentity,
-            isSubagent: entry.isSubagent,
-            retained: {
-              cacheExpiresAt: entry.cacheExpiresAt,
-              nextPrewarmAt,
-              ttlMs: entry.ttlMs,
-              lastTouchAt: entry.lastTouchAt,
-              lastTouchKind: entry.lastTouchKind,
-              policyState: entry.policyState,
-            },
-          })
-          if (result.tracked) restored.add(entry.id)
-          return result.tracked ? true : 'invalid'
-        })
+              return 'invalid'
+            const account = snapshot.accounts.find(
+              (row) => accountKey(row) === entry.oauthAccountIdentity,
+            )
+            if (!account)
+              return missingAccountReason(
+                entry.oauthAccountIdentity,
+                snapshot.accounts,
+              )
+            if (account.type !== 'oauth' || !nativeAccountCanServe(account))
+              return 'account-gone'
+            if (
+              entry.isSubagent &&
+              !entry.policyState?.planned &&
+              readSessionCachePolicy(
+                entry.policyState?.ownerSessionId ?? entry.id,
+                true,
+              )?.keep_warm === undefined &&
+              !isCacheKeepSubagentsEnabled(snapshot.policyStorage)
+            )
+              return 'invalid'
+            const nextPrewarmAt =
+              entry.nextPrewarmAt <= now
+                ? now + overdue++ * 3000
+                : entry.nextPrewarmAt
+            const result = manager.track({
+              sessionId: entry.id,
+              url: entry.url,
+              headers: new Headers(),
+              bodyText: entry.bodyText,
+              storage: snapshot.policyStorage,
+              cacheMode: 'hybrid',
+              oauthAccountId: account.id,
+              oauthAccountIdentity: entry.oauthAccountIdentity,
+              isSubagent: entry.isSubagent,
+              retained: {
+                cacheExpiresAt: entry.cacheExpiresAt,
+                nextPrewarmAt,
+                ttlMs: entry.ttlMs,
+                lastTouchAt: entry.lastTouchAt,
+                lastTouchKind: entry.lastTouchKind,
+                policyState: entry.policyState,
+              },
+            })
+            if (result.tracked) restored.add(entry.id)
+            return result.tracked ? true : 'invalid'
+          },
+          undefined,
+          (hash) =>
+            leases.size > 0 &&
+            !manager
+              .trackedSessions()
+              .some(
+                ({ id }) =>
+                  createHash('sha256').update(id).digest('hex') === hash,
+              ),
+        )
       })().catch(() => {
         logger.warn('cachekeep', 'failed to restore tracked sessions')
       })
@@ -512,6 +544,32 @@ export function createNativeCacheKeep(
   owner.persistence = persistence
   shareds.set(options.storageId, owner)
   const { manager, registry } = owner
+  const realTurns = new Set<CacheKeepRealTurn>()
+  const beginRealTurn = (input: RequestScope) => {
+    if (
+      input.kind !== 'primary' ||
+      input.agent === 'cachekeep' ||
+      input.agent === 'prime'
+    )
+      return undefined
+    try {
+      if (manager.beginRealTurn) {
+        for (const turn of realTurns) if (!turn.active) realTurns.delete(turn)
+        const turn = manager.beginRealTurn(input.sessionID)
+        realTurns.add(turn)
+        return turn
+      }
+      const globals = globalThis as Record<symbol, unknown>
+      if (!globals[LEGACY_REAL_TURN_RULES]) {
+        globals[LEGACY_REAL_TURN_RULES] = true
+        logger.info(
+          'cachekeep',
+          'new real-turn warming rules apply after a server restart',
+        )
+      }
+    } catch {}
+    return undefined
+  }
   const acceptedStates = new Map<
     string,
     NonNullable<CacheKeepTarget['policyState']>
@@ -551,19 +609,28 @@ export function createNativeCacheKeep(
       sessionID: string
       signal?: AbortSignal
       onAbort: () => void
+      turn?: CacheKeepRealTurn
       target?: Parameters<CacheKeepManager['track']>[0]
     }
   >()
-  const discardAttempt = (attemptId: string) => {
+  const takeAttempt = (attemptId: string) => {
     const entry = pending.get(attemptId)
     pending.delete(attemptId)
     entry?.signal?.removeEventListener('abort', entry.onAbort)
+    return entry
+  }
+  const discardAttempt = (attemptId: string) => {
+    const entry = takeAttempt(attemptId)
+    try {
+      entry?.turn?.finish()
+    } catch {}
     return entry?.target
   }
   const send = async (
     target: CacheKeepTarget,
     warm: Request,
     deadline?: AbortSignal,
+    onResponseHeaders?: () => void,
   ) => {
     const signal = deadline
       ? AbortSignal.any([abort.signal, deadline])
@@ -779,6 +846,7 @@ export function createNativeCacheKeep(
       signal.throwIfAborted()
       const ownerSession = target.policyState?.ownerSessionId ?? target.id
       const explicit =
+        target.policyState?.planned === true ||
         readSessionCachePolicy(ownerSession, true)?.keep_warm !== undefined
       const parent = explicit ? undefined : options.subagent?.(ownerSession)
       if (!explicit && options.subagent && parent === undefined)
@@ -789,6 +857,9 @@ export function createNativeCacheKeep(
       signal.throwIfAborted()
       stage = 'send'
       const physical = await (options.fetch ?? fetch)(request)
+      try {
+        onResponseHeaders?.()
+      } catch {}
       stage = 'response'
       status = physical.status
       const response = await native.adapter.rewriteResponse?.({
@@ -833,7 +904,8 @@ export function createNativeCacheKeep(
       warmResponseLifetimes.set(completed, actualWarmTtl)
       return completed
     } catch (error) {
-      if (error instanceof CacheKeepWarmRefusal) throw error
+      if (error instanceof CacheKeepWarmRefusal || isCacheKeepWarmWait(error))
+        throw error
       const refusal = nativeAccountRefusal(error)
       if (refusal) throw refusal
       // The native credentials are unavailable to the manager's error scrubber;
@@ -877,11 +949,35 @@ export function createNativeCacheKeep(
   let cleanup: Promise<void> | undefined
   return {
     ready,
+    beginRealTurn,
     async track(input: NativeCacheRequestPrepared) {
-      // These skips are normal (API-key routes, prewarms, subagents, policy
-      // off) and keep any existing target, so they stay at debug and do no
-      // per-request work beyond the log call.
+      let turn =
+        input.kind === 'primary' &&
+        input.agent !== 'cachekeep' &&
+        input.agent !== 'prime'
+          ? currentCacheKeepRealTurn()
+          : undefined
+      try {
+        turn ??= !lease.stopped ? beginRealTurn(input) : undefined
+      } catch {}
+      // An accepted real request replaces the session's replay target; other
+      // endings retire it. Background work never owns a real request's lease.
       const skipped = (reason: string) => {
+        try {
+          turn?.finish()
+          if (
+            !manager.beginRealTurn &&
+            !lease.stopped &&
+            !input.signal?.aborted &&
+            input.kind === 'primary' &&
+            input.agent !== 'prime' &&
+            input.agent !== 'cachekeep'
+          ) {
+            const legacy = Reflect.get(manager, 'untrackRestored')
+            if (typeof legacy === 'function')
+              legacy.call(manager, input.sessionID)
+          }
+        } catch {}
         discardAttempt(input.attemptId)
         logger.debug('cachekeep', 'tracking skipped', {
           session: input.sessionID,
@@ -894,11 +990,15 @@ export function createNativeCacheKeep(
         return skipped('background-agent')
       if (input.kind !== 'primary') return skipped('not-primary')
       if (input.signal?.aborted) return skipped('attempt-ended')
-      discardAttempt(input.attemptId)
+      const previous = takeAttempt(input.attemptId)
+      try {
+        if (previous?.turn !== turn) previous?.turn?.finish()
+      } catch {}
       const entry: NonNullable<ReturnType<typeof pending.get>> = {
         sessionID: input.sessionID,
         signal: input.signal,
         onAbort: () => discardAttempt(input.attemptId),
+        turn,
       }
       pending.set(input.attemptId, entry)
       input.signal?.addEventListener('abort', entry.onAbort, { once: true })
@@ -986,54 +1086,68 @@ export function createNativeCacheKeep(
       ttlMs?: number
       acceptedUsage?: Parameters<CacheKeepManager['recordAcceptedUsage']>[2]
     }) {
-      const target = discardAttempt(input.attemptId)
-      if (
-        !lease.stopped &&
-        input.status >= 200 &&
-        input.status < 300 &&
-        target
-      ) {
-        const sessionID = target.sessionId
-        if (!sessionID) return
-        const parent = options.subagent?.(sessionID)
-        if (parent !== undefined) target.isSubagent = parent
+      const entry = takeAttempt(input.attemptId)
+      const target = entry?.target
+      try {
         if (
-          target.isSubagent &&
-          readSessionCachePolicy(sessionID, true)?.keep_warm === undefined &&
-          !isCacheKeepSubagentsEnabled(target.storage)
+          !lease.stopped &&
+          input.status >= 200 &&
+          input.status < 300 &&
+          target
         ) {
-          if (!manager.untrack(sessionID, 'policy-refused'))
-            manager.recordWarmingOff?.(sessionID)
-          return
-        }
-        const result = manager.track({
-          ...target,
-          acceptedUsage: input.acceptedUsage,
-          ...(input.acceptedAt !== undefined && {
-            acceptedAt: input.acceptedAt,
-          }),
-          ...(input.ttlMs !== undefined && { ttlMs: input.ttlMs }),
-        })
-        if (result.tracked) {
-          // A predecessor may become the sender after this lease is disposed.
-          // Prime every live lease's parent facts without waiting for lookup.
-          for (const current of owner.leases.values())
-            current.subagent?.(sessionID)
-          acceptedStates.delete(sessionID)
-          const state = manager.trackedPolicyState?.(sessionID)
-          if (state) acceptedStates.set(sessionID, state)
-          if (acceptedStates.size > 4096) {
-            const oldest = acceptedStates.keys().next().value
-            if (oldest !== undefined) acceptedStates.delete(oldest)
+          const sessionID = target.sessionId
+          if (!sessionID) return
+          const parent = options.subagent?.(sessionID)
+          if (parent !== undefined) target.isSubagent = parent
+          if (
+            target.isSubagent &&
+            readSessionCachePolicy(sessionID, true)?.keep_warm === undefined &&
+            !isCacheKeepSubagentsEnabled(target.storage)
+          ) {
+            if (entry?.turn) entry.turn.finish()
+            else if (!manager.untrack(sessionID, 'policy-refused'))
+              manager.recordWarmingOff?.(sessionID)
+            return
           }
+          const result = (
+            entry?.turn
+              ? entry.turn.track.bind(entry.turn)
+              : manager.track.bind(manager)
+          )({
+            ...target,
+            acceptedUsage: input.acceptedUsage,
+            ...(input.acceptedAt !== undefined && {
+              acceptedAt: input.acceptedAt,
+            }),
+            ...(input.ttlMs !== undefined && { ttlMs: input.ttlMs }),
+          })
+          if (result.tracked) {
+            // A predecessor may become the sender after this lease is disposed.
+            // Update every live lease's subagent information without waiting for lookup.
+            for (const current of owner.leases.values())
+              current.subagent?.(sessionID)
+            acceptedStates.delete(sessionID)
+            const state = manager.trackedPolicyState?.(sessionID)
+            if (state) acceptedStates.set(sessionID, state)
+            if (acceptedStates.size > 4096) {
+              const oldest = acceptedStates.keys().next().value
+              if (oldest !== undefined) acceptedStates.delete(oldest)
+            }
+          }
+          if (result.tracked)
+            registry
+              .publish(
+                manager.registrySessions?.() ?? manager.trackedSessions(),
+              )
+              .catch(() => {
+                logger.warn('cachekeep', 'failed to publish tracked sessions')
+              })
+          return result
         }
-        if (result.tracked)
-          registry
-            .publish(manager.registrySessions?.() ?? manager.trackedSessions())
-            .catch(() => {
-              logger.warn('cachekeep', 'failed to publish tracked sessions')
-            })
-        return result
+      } finally {
+        try {
+          entry?.turn?.finish()
+        } catch {}
       }
     },
     discardAttempt(attemptId: string) {
@@ -1069,7 +1183,13 @@ export function createNativeCacheKeep(
     dispose() {
       if (cleanup) return cleanup
       lease.stopped = true
-      for (const attemptId of pending.keys()) discardAttempt(attemptId)
+      for (const turn of realTurns) {
+        try {
+          turn.pause()
+        } catch {}
+      }
+      realTurns.clear()
+      for (const attemptId of pending.keys()) takeAttempt(attemptId)
       abort.abort()
       for (const [id, entry] of owner.prepared)
         if (entry.lease === lease) owner.prepared.delete(id)
@@ -1078,12 +1198,16 @@ export function createNativeCacheKeep(
       // alone; the timer stops only when no instance holds a lease.
       const last =
         owner.leases.delete(lease.generation) && owner.leases.size === 0
-      if (last) owner.retain()
+      const ticking = last ? owner.ticking : undefined
+      const retaining = last ? owner.retain() : undefined
       cleanup = (async () => {
         try {
           // Join a scheduler pass already in progress. With no lease left it
           // cannot authorize or send anything more.
-          if (last) await owner.ticking
+          if (last) {
+            await retaining
+            await ticking
+          }
           await ready
           // Sends this instance started use its runtime, which the caller
           // closes after disposal; wait for them to observe the abort.
