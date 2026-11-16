@@ -1077,8 +1077,9 @@ async function sendAnthropicRequestAttempt(
     attempt?: PiNativeAttempt,
     apiSubject?: NativeApiSubject,
   ): AnthropicBillingRequest | undefined => {
-    // Prime has no session transcript. The runner bills a fork's answer usage
-    // itself, so neither request may emit a session billing report here.
+    // Prime (the five-hour window starter) has no session transcript, and
+    // Agent Runner bills a fork's answer itself from the answer's usage, so
+    // neither request may emit a session billing report here.
     if (
       options.prime ||
       forkHead ||
@@ -2147,8 +2148,10 @@ async function executeWithFallback(options: {
   const routingSessionId = options.streamOptions?.sessionId
   if (piForkHeadSession(options.streamOptions) && routingSessionId) {
     const signal = options.streamOptions?.signal
-    // Only the runner may choose the account whose cache the fork reads. Bypass
-    // local session-account assignments so neither the head nor the fork moves.
+    // The account comes only from the shared routing answer for the fork's
+    // session, which names the head's account (whose cache the fork reads).
+    // Bypass local session-account assignments so neither the head nor the
+    // fork moves.
     const advice = await raceWithSignal(
       signal,
       () =>
