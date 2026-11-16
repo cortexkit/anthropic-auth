@@ -90,6 +90,7 @@ import {
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
   type RoutingChoice,
+  raceWithSignal,
   readSessionCachePolicy,
   reportRoutingResponse,
   reportSessionCacheTouch,
@@ -140,6 +141,11 @@ import {
   fromClaudeCodeToolName,
   piThreadCacheSlot,
 } from './convert.ts'
+import {
+  PiForkRefusal,
+  piForkEffortSnapshots,
+  piForkHeadSession,
+} from './forks.ts'
 import {
   getPiNativeRuntime,
   type PiNativeAttempt,
@@ -863,10 +869,16 @@ async function sendAnthropicRequest(
   ...args: Parameters<typeof sendAnthropicRequestAttempt>
 ): Promise<Response> {
   const [options, deps = {}] = args
-  const inherited = currentCacheKeepRealTurn()
+  const forkHead = piForkHeadSession(options.streamOptions)
+  const inherited = forkHead ? undefined : currentCacheKeepRealTurn()
   let turn = inherited
   try {
-    if (!turn && !options.prime && options.streamOptions?.sessionId)
+    if (
+      !turn &&
+      !forkHead &&
+      !options.prime &&
+      options.streamOptions?.sessionId
+    )
       turn = deps.cacheKeep
         ? deps.cacheKeep.beginRealTurn(options.streamOptions.sessionId)
         : piCacheKeep.requestTurn(options.streamOptions.sessionId)
@@ -924,7 +936,8 @@ async function sendAnthropicRequestAttempt(
   }
   const keep = deps.cacheKeep ?? cacheKeepManager
   const realSession = options.streamOptions?.sessionId
-  if (!options.prime && realSession) {
+  const forkHead = piForkHeadSession(options.streamOptions)
+  if (!options.prime && !forkHead && realSession) {
     if (options.apiAccount || !options.storagePath) {
       try {
         realTurn?.finish()
@@ -981,6 +994,9 @@ async function sendAnthropicRequestAttempt(
   const oneHourCache =
     isCache1hPersistentlyEnabled(storage) ||
     options.streamOptions?.cacheRetention === 'long'
+  const forkBase = forkHead
+    ? piForkEffortSnapshots.match(forkHead, options.context)
+    : undefined
   const { body, bodyText, toolNames, cacheTtlMs } = options.prime
     ? buildPiPrimeBody(identity)
     : await buildAnthropicRequest(
@@ -995,19 +1011,32 @@ async function sendAnthropicRequestAttempt(
         identity,
         {
           deferSigning: true,
+          forkBaseMessageCount: forkBase?.messageCount,
           effortTransitions: options.apiAccount
             ? []
-            : options.effortTransitions,
+            : forkBase
+              ? forkBase.transitions
+              : options.effortTransitions,
           turnEndNote: storage.turnEndNote,
           thinkingPrefixMismatchBehavior: options.apiAccount
             ? 'account-default'
             : getThinkingPrefixMismatchBehavior(storage),
           ...(options.streamOptions?.onPayload && {
             onPayload: (payload: unknown) =>
-              options.streamOptions?.onPayload?.(payload, options.model),
+              forkHead
+                ? raceWithSignal(options.streamOptions?.signal, async () =>
+                    options.streamOptions?.onPayload?.(payload, options.model),
+                  )
+                : options.streamOptions?.onPayload?.(payload, options.model),
           }),
         },
       )
+  if (!options.prime && !forkHead && realSession && !options.apiAccount)
+    piForkEffortSnapshots.record(
+      realSession,
+      options.context,
+      options.effortTransitions,
+    )
   let wireBodyText = bodyText
   options.onResolvedToolNames?.(toolNames)
   const fastMode = body.speed === 'fast'
@@ -1048,9 +1077,14 @@ async function sendAnthropicRequestAttempt(
     attempt?: PiNativeAttempt,
     apiSubject?: NativeApiSubject,
   ): AnthropicBillingRequest | undefined => {
-    // The session runner matches billing reports to session transcripts, and
-    // Prime is account-wide with no session, so it sends no billing report.
-    if (options.prime || !relayAffinity || (!attempt && !apiSubject))
+    // Prime has no session transcript. The runner bills a fork's answer usage
+    // itself, so neither request may emit a session billing report here.
+    if (
+      options.prime ||
+      forkHead ||
+      !relayAffinity ||
+      (!attempt && !apiSubject)
+    )
       return undefined
     const credentialId = attempt
       ? piBillingPayer(attempt).credentialId
@@ -1108,6 +1142,10 @@ async function sendAnthropicRequestAttempt(
     cacheAccepted.add(attempt)
     const at = Date.now()
     const appliedTtl = requestCacheLifetimeMs(sentBody)
+    if (forkHead) {
+      sessionCacheActivity.record(forkHead, routeId, appliedTtl)
+      return
+    }
     const localTtl =
       readSessionCachePolicy(relayAffinity, true)?.ttl !== undefined
         ? appliedTtl
@@ -1153,6 +1191,7 @@ async function sendAnthropicRequestAttempt(
 
   const reported = new Set<PiNativeAttempt>()
   let retried401 = false
+  let forkCredential: string | undefined
   let lastTransport: 'direct' | 'relay' | undefined
   const used = new Set<PiNativeAttempt>()
   const report = async (
@@ -1187,6 +1226,25 @@ async function sendAnthropicRequestAttempt(
     nextAttempt = undefined
     if (attempt.accountIdentity !== verifiedUuid)
       throw new Error('Pi native OAuth route identity changed')
+    if (
+      forkHead &&
+      options.routingChoice &&
+      !routingChoiceMatches(options.routingChoice, {
+        accountIdentity: attempt.accountIdentity,
+        credentialId:
+          attempt.source === 'vault' ? attempt.receipt.credentialId : 'local',
+      })
+    )
+      throw new PiForkRefusal('account')
+    if (forkHead) {
+      const credential =
+        attempt.source === 'vault'
+          ? attempt.receipt.credentialId
+          : localMessageThreadCredential(attempt.admission.binding)
+      if (forkCredential && forkCredential !== credential)
+        throw new PiForkRefusal('account')
+      forkCredential = credential
+    }
     return attempt
   }
   let relayConfig = options.apiAccount
@@ -1202,6 +1260,7 @@ async function sendAnthropicRequestAttempt(
   if (
     !options.apiAccount &&
     !options.prime &&
+    !forkHead &&
     // Gateways may refuse the thread route: send full requests.
     !gateway &&
     isPiPrimaryThreadRequest(
@@ -1335,7 +1394,9 @@ async function sendAnthropicRequestAttempt(
         // Report the rejected credential version before retrying, even if its replacement later succeeds.
         await report(attempt, response.status, 'direct')
         const rotated =
-          !retried401 && !init.signal?.aborted
+          !retried401 &&
+          !init.signal?.aborted &&
+          (!forkHead || attempt.source === 'vault')
             ? await native
                 .retry(
                   routeId,
@@ -1347,6 +1408,18 @@ async function sendAnthropicRequestAttempt(
                 .catch(() => undefined)
             : undefined
         if (rotated) {
+          if (
+            forkHead &&
+            options.routingChoice &&
+            !routingChoiceMatches(options.routingChoice, {
+              accountIdentity: rotated.accountIdentity,
+              credentialId:
+                rotated.source === 'vault'
+                  ? rotated.receipt.credentialId
+                  : 'local',
+            })
+          )
+            throw new PiForkRefusal('account')
           retried401 = true
           await dumpDirectRequest({
             affinity: relayAffinity,
@@ -1501,6 +1574,7 @@ async function sendAnthropicRequestAttempt(
     relay401Attempt &&
     response.status === 401 &&
     !retried401 &&
+    (!forkHead || relay401Attempt.source === 'vault') &&
     !init.signal?.aborted
   ) {
     const rotated = await native
@@ -2071,6 +2145,103 @@ async function executeWithFallback(options: {
   const routingMode = getRoutingMode(storage)
   const routingRelay = routingState.relay
   const routingSessionId = options.streamOptions?.sessionId
+  if (piForkHeadSession(options.streamOptions) && routingSessionId) {
+    const signal = options.streamOptions?.signal
+    // Only the runner may choose the account whose cache the fork reads. Bypass
+    // local session-account assignments so neither the head nor the fork moves.
+    const advice = await raceWithSignal(
+      signal,
+      () =>
+        (routingState.advice ??= routingRelay.accountFor(
+          routingSessionId,
+          options.model.id,
+          routingCandidates(snapshot.accounts),
+        )),
+    )
+    signal?.throwIfAborted()
+    if (!advice) throw new PiForkRefusal('routing')
+    const account = snapshot.accounts.find((candidate) =>
+      routingChoiceMatches(advice, candidate),
+    )
+    if (!account || !nativeReady(account.id) || advice.hold)
+      throw new PiForkRefusal('account')
+    try {
+      const inspected = await raceWithSignal(signal, async () =>
+        firstStreamingError(
+          await sendAnthropicRequest({
+            ...options,
+            oauthAccountId: account.id,
+            expectedAccountIdentity: account.accountIdentity,
+            routingChoice: advice,
+          }),
+        ),
+      )
+      signal?.throwIfAborted()
+      const response =
+        inspected.preflight instanceof Response
+          ? inspected.preflight
+          : inspected.response
+      if (inspected.preflight instanceof Response && response.ok)
+        return response
+      if (response.status === 429) {
+        let quota: OAuthQuotaSnapshot | undefined = quotaExhaustionFromHeaders(
+          response.headers,
+          options.model.id,
+        )
+        if (Object.keys(quota).length === 0) {
+          try {
+            quota = await raceWithSignal(signal, () =>
+              account.id === STICKY_ROUTING_MAIN_ACCOUNT_ID
+                ? quotaManager.refreshMain(mainAccountId, '')
+                : quotaManager.refreshFallback(
+                    account.id,
+                    '',
+                    storage.accounts.find(
+                      (candidate) =>
+                        candidate.id === account.id &&
+                        isOAuthAccount(candidate),
+                    ) as OAuthAccount | undefined,
+                  ),
+            )
+          } catch {
+            quota = undefined
+          }
+        }
+        signal?.throwIfAborted()
+        const decision = decideStickyQuotaFailure({
+          quota,
+          modelId: options.model.id,
+          responseHeaders: response.headers,
+          unconfirmedRetry: {
+            counter: stickyQuotaRetries,
+            sessionId: JSON.stringify([options.storagePath, routingSessionId]),
+            turnId: String(
+              options.context.messages.findLast(
+                (message) => message.role === 'user',
+              )?.timestamp ?? routingSessionId,
+            ),
+            accountId: account.id,
+          },
+        })
+        if (decision.action === 'retain') {
+          return hostRetryResponse(
+            new Response(response.body, {
+              status: 429,
+              headers: stickyRetainRetryHeaders(response.headers),
+            }),
+          )
+        }
+        void response.body?.cancel().catch(() => {})
+        throw new PiForkRefusal('limit')
+      }
+      void response.body?.cancel().catch(() => {})
+      throw new PiForkRefusal('account')
+    } catch (error) {
+      signal?.throwIfAborted()
+      if (error instanceof PiForkRefusal) throw error
+      throw new PiForkRefusal('account')
+    }
+  }
   if (routingSessionId && !routingState.advice) {
     routingState.advice = (async () => {
       const router = await getPiStickyRouter(options.storagePath)
@@ -2582,7 +2753,8 @@ export function streamCortexKitAnthropic(
   const stream = createAssistantMessageEventStream()
   let turn: CacheKeepRealTurn | undefined
   try {
-    if (options?.sessionId) turn = piCacheKeep.requestTurn(options.sessionId)
+    if (options?.sessionId && !piForkHeadSession(options))
+      turn = piCacheKeep.requestTurn(options.sessionId)
   } catch {}
 
   void withCacheKeepRealTurn(turn, async () => {

@@ -44,6 +44,7 @@ import type {
   Tool,
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
+import { PiForkRefusal, piForkHeadSession } from './forks.ts'
 import {
   collapseSystemMessages,
   getCurrentSystemPrompt,
@@ -588,6 +589,63 @@ function walkCacheControlHolders(
   }
 }
 
+function applyForkCacheBridge(
+  body: AnthropicRequestBody,
+  baseIndex: number,
+): void {
+  if (baseIndex < 0) return
+  const base = body.messages[baseIndex]
+  const blocks = body.messages.flatMap((message) =>
+    Array.isArray(message.content)
+      ? message.content
+      : typeof message.content === 'string'
+        ? [message]
+        : [],
+  ) as Record<string, unknown>[]
+  const baseBlock = Array.isArray(base?.content)
+    ? (base.content.at(-1) as Record<string, unknown> | undefined)
+    : undefined
+  if (!baseBlock || baseBlock.cache_control) return
+  const newest: Record<string, unknown> | undefined = body.cache_control
+    ? (body as unknown as Record<string, unknown>)
+    : blocks.findLast((block) => block.cache_control)
+  const newestPosition =
+    newest === body ? blocks.length - 1 : blocks.indexOf(newest ?? {})
+  if (!newest || newestPosition - blocks.indexOf(baseBlock) <= 20) return
+  const control = newest.cache_control as Record<string, unknown>
+  const holders: Record<string, unknown>[] = []
+  walkCacheControlHolders(body, (holder) => holders.push(holder))
+  const ttl = (holder: Record<string, unknown>) =>
+    (holder.cache_control as Record<string, unknown>)?.ttl === '1h'
+      ? 3_600_000
+      : 300_000
+  const basePosition = blocks.indexOf(baseBlock)
+  // Tools and system precede messages on the wire. Never insert a long-lived
+  // marker after a short-lived one, including markers a payload hook supplied.
+  if (
+    holders.some((holder) => {
+      if (holder === body) return false
+      const index = blocks.indexOf(holder)
+      return index < 0 || index < basePosition
+        ? ttl(holder) < ttl(newest)
+        : ttl(holder) > ttl(newest)
+    })
+  )
+    return
+  const systemAnchor = body.system?.findLast((block) => block.cache_control)
+  const removable =
+    holders.find(
+      (holder) =>
+        holder !== systemAnchor && holder !== newest && blocks.includes(holder),
+    ) ?? holders.find((holder) => body.tools?.includes(holder))
+  if (holders.length >= 4 && !removable) return
+  // Drop the oldest ordinary message marker (normally the prompt paragraph),
+  // or the tool marker if none exists. The protected system anchor still covers
+  // the fixed prefix; preserving the frozen base outranks those extra anchors.
+  if (holders.length >= 4 && removable) delete removable.cache_control
+  baseBlock.cache_control = { ...control }
+}
+
 /**
  * Anthropic accepts at most four cache breakpoints per request. This provider
  * composes its own body and has already placed exactly four
@@ -645,6 +703,7 @@ export async function buildAnthropicRequest(
   identity?: ClaudeCodeIdentity,
   controls: {
     effortTransitions?: readonly MidConversationEffortTransition[]
+    forkBaseMessageCount?: number
     /** Leave the billing signature placeholder for the transport to finalize. */
     deferSigning?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
@@ -663,6 +722,16 @@ export async function buildAnthropicRequest(
   toolNames: ReadonlyMap<string, string>
   cacheTtlMs: number
 }> {
+  const forkBase =
+    controls.forkBaseMessageCount === undefined
+      ? undefined
+      : collapseSystemMessages(
+          normalizeContext({
+            ...context,
+            systemPrompt: systemPromptText(context.systemPrompt),
+            messages: context.messages.slice(0, controls.forkBaseMessageCount),
+          }),
+        )
   // Pi 0.86 passes a normalized transcript to providers, and later system
   // messages can change the prompt, its named sections and the tool set. Resolve
   // them through the local replay port; raw host prompts (including ordered OMP
@@ -685,6 +754,21 @@ export async function buildAnthropicRequest(
   const visibleReplies = new WeakMap<object, string>()
   const messages = convertMessages(context.messages, modelId, visibleReplies)
   stripEmptyTrailingAssistantMessages(messages)
+  const baseLastMessage = forkBase
+    ? messages[
+        convertMessages(forkBase.messages, modelId, new WeakMap()).length - 1
+      ]
+    : undefined
+  // The head's final user block was an array so it could carry its cache
+  // marker. Keep that block shape when it is no longer the fork's newest user.
+  if (baseLastMessage && typeof baseLastMessage.content === 'string')
+    baseLastMessage.content = [{ type: 'text', text: baseLastMessage.content }]
+  const forkHead = piForkHeadSession(options)
+  const forkFirstUserText = forkHead
+    ? firstUserTextTracker.peek(forkHead)
+    : undefined
+  if (forkHead && forkFirstUserText === undefined)
+    throw new PiForkRefusal('base')
   const system = [
     {
       type: 'text',
@@ -693,7 +777,9 @@ export async function buildAnthropicRequest(
         undefined,
         CLAUDE_CODE_ENTRYPOINT,
         options?.sessionId
-          ? firstUserTextTracker.resolve(options.sessionId, messages)
+          ? forkHead
+            ? forkFirstUserText
+            : firstUserTextTracker.resolve(options.sessionId, messages)
           : undefined,
       ),
     },
@@ -837,12 +923,16 @@ export async function buildAnthropicRequest(
     applyClaudeCodeMetadata(body, identity)
   }
 
+  const baseBoundary = baseLastMessage
+    ? body.messages.indexOf(baseLastMessage)
+    : -1
   const replaced = controls.onPayload
     ? await controls.onPayload(body)
     : undefined
   if (replaced !== undefined)
     body = { ...(replaced as AnthropicRequestBody), stream: true }
   applySessionCacheTtl(body, cachePolicy?.ttl)
+  if (baseBoundary >= 0) applyForkCacheBridge(body, baseBoundary)
   // As in Pi's native adapter, replacements must still request SSE. Hooks own
   // the validity of their other edits and must not add a fifth cache breakpoint:
   // the provider's existing layout may already use Anthropic's four slots.
