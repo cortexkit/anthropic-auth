@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash } from 'node:crypto'
 import {
   type CacheKeepDecision,
@@ -738,6 +739,25 @@ export function isCacheKeepWarmWait(
   }
 }
 
+export interface CacheKeepRealTurn {
+  readonly active: boolean
+  track(
+    input: Parameters<CacheKeepManager['track']>[0],
+  ): ReturnType<CacheKeepManager['track']>
+  finish(): void
+  /** Release a host being paused without terminally ending its retained target. */
+  pause(): void
+}
+
+const realTurnContext = new AsyncLocalStorage<CacheKeepRealTurn | undefined>()
+export const currentCacheKeepRealTurn = () => realTurnContext.getStore()
+export function withCacheKeepRealTurn<T>(
+  turn: CacheKeepRealTurn | undefined,
+  run: () => T,
+): T {
+  return realTurnContext.run(turn, run)
+}
+
 export class CacheKeepManager {
   private readonly targets = new Map<string, CacheKeepTarget>()
   // Standalone warms are not retained targets. Their object identity fences
@@ -756,6 +776,19 @@ export class CacheKeepManager {
   private dueTimer: ReturnType<typeof setTimeout> | null = null
   private tickPromise: Promise<void> | null = null
   private lifetime = 0
+  private schedulerGeneration = 0
+  private nextRealTurn = 0
+  private readonly realTurns = new Map<
+    string,
+    {
+      latest: number
+      leases: Set<{ id: number; expiresAt: number; expire: () => void }>
+    }
+  >()
+  private readonly turnTimers = new Set<ReturnType<typeof setTimeout>>()
+  private readonly ticks = new Set<Promise<void>>()
+  private readonly warmRuns = new Set<Promise<CacheKeepPrewarmResult>>()
+  private readonly warmControllers = new Map<AbortController, string>()
   private nextPrewarmAttemptId = 0
   private readonly reportedStops = new WeakSet<CacheKeepPolicyState>()
   private readonly restoredTargets = new WeakSet<object>()
@@ -861,7 +894,7 @@ export class CacheKeepManager {
       () => {
         // The caught value can carry provider or peer text, so only the fixed
         // stage name is logged.
-        void this.tick().catch(() => {
+        return this.tick().catch(() => {
           logger.warn('cachekeep', 'tick failed')
         })
       },
@@ -872,6 +905,10 @@ export class CacheKeepManager {
   }
 
   stop() {
+    // Keep the targets, but cancel work waiting to authorize, dispatch or retry
+    // before a later host resumes this scheduler.
+    this.schedulerGeneration++
+    this.tickPromise = null
     this.immediateTargets.clear()
     if (this.dueTimer) {
       ;(this.options.clearTimeoutImpl ?? clearTimeout)(this.dueTimer)
@@ -889,12 +926,138 @@ export class CacheKeepManager {
   dispose() {
     this.lifetime++
     this.stop()
+    this.abortWarms()
+    for (const timer of this.turnTimers) {
+      try {
+        ;(this.options.clearTimeoutImpl ?? clearTimeout)(timer)
+      } catch {}
+    }
+    this.turnTimers.clear()
+    for (const turns of this.realTurns.values())
+      for (const turn of [...turns.leases]) turn.expire()
+    this.realTurns.clear()
     this.targets.clear()
     this.immediateTargets.clear()
     this.stoppedSessions.clear()
     this.warmingRecords.clear()
     this.sessionWarms.clear()
     this.tickPromise = null
+    return this.drain()
+  }
+
+  abortWarms() {
+    for (const controller of this.warmControllers.keys()) controller.abort()
+  }
+
+  /** Join current work without waiting for a successor host's later sends. */
+  async drain() {
+    await Promise.allSettled([...this.ticks, ...this.warmRuns])
+  }
+
+  /** A request owns its busy lease; an older completion cannot retire a newer turn. */
+  beginRealTurn(sessionId: string): CacheKeepRealTurn {
+    let active = true
+    let tracked = false
+    const lifetime = this.lifetime
+    const id = ++this.nextRealTurn
+    let now = Date.now()
+    try {
+      now = this.options.now?.() ?? now
+    } catch {}
+    const ownerExpiry = Math.min(
+      ...[...this.targets.values()]
+        .filter((target) => target.policyState?.ownerSessionId === sessionId)
+        .map((target) => target.cacheExpiresAt),
+    )
+    const expiresAt =
+      this.targets.get(sessionId)?.cacheExpiresAt ??
+      (Number.isFinite(ownerExpiry) ? ownerExpiry : now + CACHE_KEEP_TTL_MS)
+    const turns = this.realTurns.get(sessionId) ?? {
+      latest: id,
+      leases: new Set<{ id: number; expiresAt: number; expire: () => void }>(),
+    }
+    turns.latest = id
+    this.realTurns.set(sessionId, turns)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const release = (expired = false) => {
+      if (!active) return
+      active = false
+      turns.leases.delete(record)
+      if (timer) {
+        this.turnTimers.delete(timer)
+        try {
+          ;(this.options.clearTimeoutImpl ?? clearTimeout)(timer)
+        } catch {}
+      }
+      try {
+        if (!expired && lifetime === this.lifetime && turns.latest === id)
+          this.finishSessionTargets(
+            sessionId,
+            tracked ? this.targets.get(sessionId) : undefined,
+          )
+      } catch {
+      } finally {
+        if (!turns.leases.size && this.realTurns.get(sessionId) === turns)
+          this.realTurns.delete(sessionId)
+        try {
+          if (lifetime === this.lifetime) this.scheduleDueTimer()
+        } catch {}
+      }
+    }
+    const record = { id, expiresAt, expire: () => release(true) }
+    turns.leases.add(record)
+    try {
+      timer = (this.options.setTimeoutImpl ?? setTimeout)(
+        record.expire,
+        Math.max(0, expiresAt - now),
+      )
+      timer.unref?.()
+      this.turnTimers.add(timer)
+      for (const [controller, session] of this.warmControllers)
+        if (session === sessionId) controller.abort()
+      this.scheduleDueTimer()
+    } catch {}
+    const thisManager = this
+    return {
+      get active() {
+        try {
+          return (
+            active &&
+            lifetime === thisManager.lifetime &&
+            (thisManager.options.now?.() ?? Date.now()) < expiresAt
+          )
+        } catch {
+          return false
+        }
+      },
+      track: (input) => {
+        if (!active || lifetime !== this.lifetime || turns.latest !== id) {
+          release()
+          return { tracked: false, reason: 'superseded real turn' }
+        }
+        try {
+          const result = this.track({ ...input, sessionId })
+          tracked = result.tracked
+          return result
+        } catch {
+          return { tracked: false, reason: 'real turn tracking failed' }
+        } finally {
+          release()
+        }
+      },
+      finish: () => release(),
+      pause: () => release(true),
+    }
+  }
+
+  private realTurnBusy(sessionId: string) {
+    const turns = this.realTurns.get(sessionId)
+    if (!turns) return false
+    let now = Date.now()
+    try {
+      now = this.options.now?.() ?? now
+    } catch {}
+    return [...turns.leases].some((turn) => turn.expiresAt > now)
   }
 
   stats(
@@ -1213,11 +1376,15 @@ export class CacheKeepManager {
 
   /** Called at the physical boundary, after authorization and before fetch. */
   async reserveWarmDispatch(target: Readonly<CacheKeepTarget>): Promise<void> {
+    const generation = this.schedulerGeneration
     const current = this.targets.get(target.id)
     if (!current || !this.isCurrentTarget(target))
       throw new CacheKeepWarmRefusal('stopped')
     const state = current.policyState
+    if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
+      throw new CacheKeepWarmWait()
     const loaded = await this.options.loadStorage()
+    if (generation !== this.schedulerGeneration) throw new CacheKeepWarmWait()
     const storage =
       loaded && this.options.resolveSettings
         ? this.targetSettings(
@@ -1226,6 +1393,8 @@ export class CacheKeepManager {
           )
         : loaded
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
+    if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
+      throw new CacheKeepWarmWait()
     const now = this.options.now?.() ?? Date.now()
     const decision =
       this.policyDecision(current, now) ??
@@ -1246,6 +1415,7 @@ export class CacheKeepManager {
       try {
         committed = await this.options.reserveWarm(current)
       } catch {}
+      if (generation !== this.schedulerGeneration) throw new CacheKeepWarmWait()
       if (!committed && (state?.planned || isCacheKeepAlways(storage))) {
         if (state) {
           state.warmsSinceLastRealRequest--
@@ -1256,11 +1426,9 @@ export class CacheKeepManager {
     }
     if (state) this.admittedWarmCosts.set(state, admittedCost)
     if (!this.isCurrentTarget(target)) throw new CacheKeepWarmRefusal('stopped')
-    const fresh = this.policyDecision(
-      current,
-      this.options.now?.() ?? Date.now(),
-      true,
-    )
+    const fresh = this.realTurnBusy(state?.ownerSessionId ?? target.id)
+      ? { action: 'wait' as const, until: 0 }
+      : this.policyDecision(current, this.options.now?.() ?? Date.now(), true)
     if (fresh?.action === 'stop') throw new CacheKeepWarmRefusal(fresh.reason)
     if (fresh?.action === 'wait') {
       if (state) {
@@ -1277,10 +1445,12 @@ export class CacheKeepManager {
     if (this.dueTimer)
       (this.options.clearTimeoutImpl ?? clearTimeout)(this.dueTimer)
     this.dueTimer = null
+    if (!this.timer) return
     let due = Infinity
     // Restored or near-expiry caches may not survive the next interval tick.
     for (const target of this.targets.values())
-      due = Math.min(due, target.nextPrewarmAt)
+      if (!this.realTurnBusy(target.policyState?.ownerSessionId ?? target.id))
+        due = Math.min(due, target.nextPrewarmAt)
     if (!Number.isFinite(due)) return
     this.dueTimer = (this.options.setTimeoutImpl ?? setTimeout)(
       () => {
@@ -1373,10 +1543,16 @@ export class CacheKeepManager {
     })
   }
 
-  untrackRestored(sessionId: string) {
-    const target = this.targets.get(sessionId)
-    if (!target || !this.restoredTargets.has(target)) return false
-    return this.untrack(sessionId)
+  private finishSessionTargets(sessionId: string, keep?: CacheKeepTarget) {
+    for (const target of [...this.targets.values()])
+      if (
+        target !== keep &&
+        (target.id === sessionId ||
+          target.policyState?.ownerSessionId === sessionId)
+      )
+        try {
+          this.untrack(target.id)
+        } catch {}
   }
 
   private reportStop(target: CacheKeepTarget, reason: string, at: number) {
@@ -1493,8 +1669,10 @@ export class CacheKeepManager {
     // request, and most requests are excluded before the body matters.
     let bodyBytes: number | undefined
     const refuse = (reason: string, reasonCode: string) => {
-      // Policy exclusions leave any existing target intact. Only a body that
-      // cannot fit in the budget warrants a warning rather than debug detail.
+      if (input.sessionId && !input.retained && !input.sourceWarm)
+        this.finishSessionTargets(input.sessionId)
+      // Only a body that cannot fit in the budget warrants a warning;
+      // normal eligibility exclusions remain short debug diagnostics.
       if (reasonCode === 'body-budget')
         logger.warn('cachekeep', 'tracking skipped', {
           session: input.sessionId ?? null,
@@ -1625,6 +1803,7 @@ export class CacheKeepManager {
 
     const today = cacheKeepPeriodKey(input.storage, window, new Date(now))
     this.pruneTargets(now, today)
+    previous = this.targets.get(input.sessionId)
     if (this.targets.has(input.sessionId)) this.targets.delete(input.sessionId)
     this.stoppedSessions.delete(input.sessionId)
     this.warmingRecords.delete(input.sessionId)
@@ -1792,18 +1971,24 @@ export class CacheKeepManager {
   tick(): Promise<void> {
     if (this.tickPromise) return this.tickPromise
     const lifetime = this.lifetime
+    const generation = this.schedulerGeneration
     let run: Promise<void>
     run = this.runTick(lifetime).finally(() => {
+      this.ticks.delete(run)
       if (this.tickPromise === run) this.tickPromise = null
-      if (lifetime === this.lifetime) this.scheduleDueTimer()
+      if (lifetime === this.lifetime && generation === this.schedulerGeneration)
+        this.scheduleDueTimer()
     })
     this.tickPromise = run
+    this.ticks.add(run)
     return run
   }
 
   private async runTick(lifetime: number) {
+    const generation = this.schedulerGeneration
     const loaded = await this.options.loadStorage()
-    if (lifetime !== this.lifetime) return
+    if (lifetime !== this.lifetime || generation !== this.schedulerGeneration)
+      return
     const storage =
       loaded && this.options.resolveSettings
         ? this.options.resolveSettings(loaded)
@@ -1828,9 +2013,12 @@ export class CacheKeepManager {
       (a, b) => this.lastPrewarmStart(a) - this.lastPrewarmStart(b),
     )
     const warm = async (target: CacheKeepTarget) => {
+      if (generation !== this.schedulerGeneration) return
       // An earlier prewarm's await can let a real request replace or retire
       // this target; only the current one is decided and sent.
       if (this.targets.get(target.id) !== target) return
+      if (this.realTurnBusy(target.policyState?.ownerSessionId ?? target.id))
+        return
       const attemptAt = this.options.now?.() ?? Date.now()
       const decision = this.policyDecision(target, attemptAt)
       if (decision?.action === 'stop') {
@@ -1881,6 +2069,7 @@ export class CacheKeepManager {
       try {
         await this.prewarm(target, attemptAt)
       } catch (error) {
+        if (generation !== this.schedulerGeneration) return
         logger.warn('cachekeep', 'prewarm failed', {
           session: target.id,
           ...classifyCacheKeepFailure(error, 'send'),
@@ -1889,7 +2078,10 @@ export class CacheKeepManager {
         })
         this.scheduleRetry(target, true)
       } finally {
-        if (this.targets.get(target.id) === target)
+        if (
+          generation === this.schedulerGeneration &&
+          this.targets.get(target.id) === target
+        )
           this.options.onTargetChanged?.(target)
       }
     }
@@ -1902,7 +2094,8 @@ export class CacheKeepManager {
         }
       }),
     )
-    if (lifetime === this.lifetime) this.publishTrackedSessions()
+    if (lifetime === this.lifetime && generation === this.schedulerGeneration)
+      this.publishTrackedSessions()
   }
 
   private targetSettings(storage: AccountStorage, bodyText: string) {
@@ -1960,14 +2153,21 @@ export class CacheKeepManager {
       result: Extract<CacheKeepPrewarmResult, { ok: true }>,
     ) => void,
   ): Promise<CacheKeepPrewarmResult> {
+    const generation = this.schedulerGeneration
     const session = target.policyState?.ownerSessionId ?? target.id
+    if (this.realTurnBusy(session))
+      return { ok: false, skipped: true, reason: 'real-turn-in-flight' }
     let queued = false
     while (this.sessionWarms.has(session)) {
       queued = true
       await this.sessionWarms.get(session)
+      if (generation !== this.schedulerGeneration)
+        return { ok: false, skipped: true, reason: 'scheduler-paused' }
     }
     if (!this.isCurrentTarget(target))
       return { ok: false, skipped: true, reason: 'target-replaced' }
+    if (this.realTurnBusy(session))
+      return { ok: false, skipped: true, reason: 'real-turn-in-flight' }
     const current = this.targets.get(target.id)
     if (
       queued &&
@@ -1981,14 +2181,28 @@ export class CacheKeepManager {
     const sending = this.sendPrewarmAttempt(target, (receivedAt) => {
       acceptedAt = receivedAt
     }).then((result) => {
+      if (generation !== this.schedulerGeneration)
+        return {
+          ok: false as const,
+          skipped: true as const,
+          reason: 'scheduler-paused',
+        }
+      if (result.ok && this.realTurnBusy(session))
+        return {
+          ok: false as const,
+          skipped: true as const,
+          reason: 'real-turn-in-flight',
+        }
       if (result.ok)
         onAccepted?.(acceptedAt ?? this.options.now?.() ?? Date.now(), result)
       return result
     })
     this.sessionWarms.set(session, sending)
+    this.warmRuns.add(sending)
     try {
       return await sending
     } finally {
+      this.warmRuns.delete(sending)
       if (this.sessionWarms.get(session) === sending)
         this.sessionWarms.delete(session)
     }
@@ -1998,6 +2212,7 @@ export class CacheKeepManager {
     target: CacheKeepTarget,
     onAccepted?: (receivedAt: number) => void,
   ): Promise<CacheKeepPrewarmResult> {
+    const generation = this.schedulerGeneration
     const remaining =
       target.cacheExpiresAt -
       (this.options.now?.() ?? Date.now()) -
@@ -2009,13 +2224,26 @@ export class CacheKeepManager {
     if (timeout <= 0)
       return { ok: false, refused: true, reason: 'retry-window-ended' }
     const startedAt = this.options.now?.() ?? Date.now()
+    const controller = new AbortController()
+    this.warmControllers.set(
+      controller,
+      target.policyState?.ownerSessionId ?? target.id,
+    )
     let headersMs: number | null = null
     const attempt = {
       id: ++this.nextPrewarmAttemptId,
-      signal: AbortSignal.timeout(timeout),
+      signal: AbortSignal.any([
+        AbortSignal.timeout(timeout),
+        controller.signal,
+      ]),
       onResponseHeaders: () => {
         headersMs ??= (this.options.now?.() ?? Date.now()) - startedAt
       },
+    }
+    const ensureActive = () => {
+      if (generation !== this.schedulerGeneration || controller.signal.aborted)
+        throw new CacheKeepWarmWait()
+      attempt.signal.throwIfAborted()
     }
     let stage: CacheKeepFailureStage = 'authorization'
     let responseStatus: number | undefined
@@ -2043,21 +2271,25 @@ export class CacheKeepManager {
         throw new CacheKeepWarmRefusal('routing-moved')
     }
     try {
+      ensureActive()
       checkRouting()
       let bodyText = target.bodyText
       if (this.options.prepareBody) {
         try {
           bodyText = await this.options.prepareBody(bodyText, target)
         } catch {
+          ensureActive()
           logger.warn('cachekeep', 'prepare body failed', {
             session: target.id,
           })
         }
+        ensureActive()
       }
       const preparedTarget = { ...target, bodyText }
       const prewarm = await buildCacheKeepPrewarmBody(bodyText, {
         stripServerFallback: target.sourceWarm === true,
       })
+      ensureActive()
       if (!prewarm.ok) return prewarm
 
       if (this.options.validatePrewarm) {
@@ -2070,6 +2302,7 @@ export class CacheKeepManager {
         } catch {
           verdict = undefined
         }
+        ensureActive()
         if (!verdict?.ok) {
           // Refused before any send: never dispatch a warm the keeper no
           // longer trusts. The failure branch below removes the target and
@@ -2088,6 +2321,7 @@ export class CacheKeepManager {
       const fetchImpl =
         this.options.fetchForTarget?.(target) ?? this.options.fetchImpl ?? fetch
       const prewarmTarget = { ...preparedTarget, bodyText: prewarm.bodyText }
+      ensureActive()
       let headers = this.options.prepareHeaders
         ? await this.options.prepareHeaders(
             new Headers(target.headers),
@@ -2095,6 +2329,7 @@ export class CacheKeepManager {
             attempt,
           )
         : new Headers(target.headers)
+      ensureActive()
       if (!headers) {
         const summary = summarizePrewarmProviderError({
           failure: 'credential_unavailable',
@@ -2117,6 +2352,7 @@ export class CacheKeepManager {
       // diagnostics. The scope retires when the error body is read or cancelled;
       // a successful body is passed through untouched.
       const send = async (attemptHeaders: Headers): Promise<Response> => {
+        ensureActive()
         if (!this.isCurrentTarget(target))
           throw new CacheKeepWarmRefusal('stopped')
         checkRouting()
@@ -2124,19 +2360,21 @@ export class CacheKeepManager {
           if (!this.options.deferWarmReservation)
             await this.reserveWarmDispatch(target)
         }
-        attempt.signal.throwIfAborted()
+        ensureActive()
         const scope = createProviderErrorResponseScope(
           cacheKeepSentCredentials(attemptHeaders),
           'http',
         )
         try {
-          const dispatch = () =>
-            fetchImpl(target.url, {
+          const dispatch = () => {
+            ensureActive()
+            return fetchImpl(target.url, {
               method: 'POST',
               headers: attemptHeaders,
               body: prewarm.bodyText,
               signal: attempt.signal,
             })
+          }
           let billing: AnthropicBillingRequest | undefined
           try {
             billing = this.options.billingRequest?.(prewarmTarget, attempt)
@@ -2144,6 +2382,12 @@ export class CacheKeepManager {
           const sent = await (billing
             ? withAnthropicBilling(billing, dispatch)
             : dispatch())
+          try {
+            ensureActive()
+          } catch (error) {
+            await sent.body?.cancel().catch(() => {})
+            throw error
+          }
           headersMs ??= (this.options.now?.() ?? Date.now()) - startedAt
           if (!sent.ok && this.isCurrentTarget(target) && target.policyState) {
             const state = target.policyState
@@ -2153,6 +2397,7 @@ export class CacheKeepManager {
               undefined
             this.admittedWarmCosts.delete(state)
             await this.options.settleWarm?.(target)
+            ensureActive()
           }
           return scope.redactResponse(sent)
         } catch (error) {
@@ -2169,6 +2414,7 @@ export class CacheKeepManager {
         }
       }
       response = await send(headers)
+      ensureActive()
       if (
         response.status === 401 &&
         !attempt.signal?.aborted &&
@@ -2183,30 +2429,36 @@ export class CacheKeepManager {
             attempt,
           })
         } catch (error) {
+          ensureActive()
           if (error instanceof NativeAccountRefusal) {
             await response.body?.cancel().catch(() => {})
+            ensureActive()
             throw error
           }
           // A failed credential lookup cannot justify replay. Observe and
           // report the original 401 against its actual send-time receipt.
         }
+        ensureActive()
         if (rotatedHeaders && !attempt.signal?.aborted) {
           rotatedHeaders.delete('content-length')
           rotatedHeaders.delete('transfer-encoding')
           await response.body?.cancel().catch(() => {})
+          ensureActive()
           headers = rotatedHeaders
           response = await send(headers)
+          ensureActive()
         }
       }
       stage = 'response'
       responseStatus = response.status
       const receivedAt = this.options.now?.() ?? Date.now()
       const raw = await response.text()
-      attempt.signal.throwIfAborted()
+      ensureActive()
       let data: unknown = null
       try {
         data = raw ? JSON.parse(raw) : null
       } catch {}
+      ensureActive()
       const summary = response.ok
         ? undefined
         : summarizePrewarmProviderError({ status: response.status, body: raw })
@@ -2220,6 +2472,7 @@ export class CacheKeepManager {
           attempt,
         })
       } catch {}
+      ensureActive()
       try {
         const dumpHandle = await dumpDirectRequest({
           affinity: target.id,
@@ -2231,14 +2484,17 @@ export class CacheKeepManager {
           headers,
           tag: 'cachekeep',
         })
+        ensureActive()
         await dumpResponseArtifact(dumpHandle, {
           status: response.status,
           message: data,
           ...(summary && { provider_error: summary.provider_error }),
         })
       } catch {
+        ensureActive()
         logger.debug('cachekeep', 'dump failed', { session: target.id })
       }
+      ensureActive()
       if (summary) {
         return {
           ok: false,
@@ -2267,6 +2523,8 @@ export class CacheKeepManager {
         ...(usage && { usage }),
       }
     } catch (error) {
+      if (controller.signal.aborted || generation !== this.schedulerGeneration)
+        return { ok: false, skipped: true, reason: 'warm-cancelled' }
       if (isCacheKeepWarmWait(error))
         return { ok: false, skipped: true, reason: 'wait' }
       if (error instanceof CacheKeepWarmRefusal)
@@ -2289,6 +2547,7 @@ export class CacheKeepManager {
         transient: true,
       }
     } finally {
+      this.warmControllers.delete(controller)
       try {
         logger.info('cachekeep', 'prewarm timing', {
           session: target.id,
@@ -2304,10 +2563,12 @@ export class CacheKeepManager {
   }
 
   private async prewarm(target: CacheKeepTarget, now: number) {
+    const generation = this.schedulerGeneration
     const result = await this.sendPrewarm(target, (receivedAt, accepted) => {
       if (this.targets.get(target.id) === target)
         this.acceptWarm(target, accepted, receivedAt)
     })
+    if (generation !== this.schedulerGeneration) return
     if (!result.ok) {
       if (result.refused !== true && result.skipped) return
       if (result.refused === true) {

@@ -1,7 +1,11 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
 import { CACHE_WARM_STOP_REASONS } from '@cortexkit/common-auth/routing-accessor'
 import type { AccountStorage } from '../accounts.ts'
-import { CacheKeepManager, type CacheKeepTarget } from '../cachekeep.ts'
+import {
+  CACHE_KEEP_MAX_BODY_BYTES,
+  CacheKeepManager,
+  type CacheKeepTarget,
+} from '../cachekeep.ts'
 import {
   __setLogTestSink,
   getLogLevel,
@@ -110,6 +114,302 @@ function fixture(
     },
   }
 }
+
+test.each(['disabled', 'thread', 'body-budget'] as const)(
+  'a refused real-turn %s replacement ends every session-owned target',
+  async (reason) => {
+    const f = fixture(null)
+    Object.assign(f.input.storage, {
+      cacheKeep: { enabled: true, always: true },
+      claudeCache: { enabled: true, mode: 'hybrid' },
+    })
+    expect(f.track({ cacheMode: 'hybrid' }).tracked).toBe(true)
+    expect(
+      f.track({
+        sessionId: 'source-prefix',
+        ownerSessionId: f.input.sessionId,
+        sourceWarm: true,
+        cacheMode: 'hybrid',
+      }).tracked,
+    ).toBe(true)
+    f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
+    const bodyText =
+      reason === 'body-budget'
+        ? 'x'.repeat(CACHE_KEEP_MAX_BODY_BYTES + 1)
+        : reason === 'thread'
+          ? JSON.stringify({
+              ...JSON.parse(f.input.bodyText),
+              thread: { id: 'server-thread' },
+            })
+          : f.input.bodyText
+    const result = f.track({
+      cacheMode: 'hybrid',
+      bodyText,
+      ...(reason === 'disabled' && {
+        storage: { ...f.input.storage, cacheKeep: { enabled: false } },
+      }),
+    })
+    expect(result.tracked).toBe(false)
+    expect(f.manager.trackedCount()).toBe(0)
+    await detached()
+    expect(
+      f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+    ).toEqual([
+      { kind: 'cache_warm_stopped', at: f.now, reason: 'session-ended' },
+    ])
+    await f.manager.tick()
+    expect(f.sends).toBe(0)
+  },
+)
+
+test('an older real-turn abort neither clears a newer busy lease nor replaces its accepted prefix', async () => {
+  const f = fixture({ ttl: 'long', keep_warm: 'always' })
+  f.track()
+  const older = f.manager.beginRealTurn(f.input.sessionId)
+  const newer = f.manager.beginRealTurn(f.input.sessionId)
+  older.finish()
+  expect(newer.active).toBe(true)
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(0)
+  const bodyText = f.input.bodyText.replace(
+    'PRIVATE PREFIX',
+    'new accepted prefix',
+  )
+  expect(newer.track({ ...f.input, bodyText }).tracked).toBe(true)
+  expect(older.track(f.input).tracked).toBe(false)
+  older.finish()
+  expect(f.manager.trackedRequest(f.input.sessionId)?.bodyText).toBe(bodyText)
+  expect(newer.active).toBe(false)
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(1)
+})
+
+test('an unfinished real-turn lease expires with its cache and cannot block future warming', async () => {
+  const timeouts = new Map<object, { callback: () => void; at: number }>()
+  const f = fixture({ ttl: 'long', keep_warm: 'always' }, undefined, {
+    setTimeoutImpl: ((callback: () => void, ms: number) => {
+      const id = { unref() {} }
+      timeouts.set(id, { callback, at: f.now + ms })
+      return id
+    }) as unknown as typeof setTimeout,
+    clearTimeoutImpl: ((id: object) => {
+      timeouts.delete(id)
+    }) as unknown as typeof clearTimeout,
+  })
+  f.track()
+  const abandoned = f.manager.beginRealTurn(f.input.sessionId)
+  f.advance(3_600_001)
+  for (const [id, timeout] of [...timeouts])
+    if (timeout.at <= f.now) {
+      timeouts.delete(id)
+      timeout.callback()
+    }
+  expect(abandoned.active).toBe(false)
+  await f.manager.tick()
+  const next = f.manager.beginRealTurn(f.input.sessionId)
+  expect(next.track(f.input).tracked).toBe(true)
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(1)
+})
+
+test('an expiring real-turn lease cannot restart a paused scheduler', async () => {
+  const timeouts = new Map<object, { callback: () => void; at: number }>()
+  const f = fixture({ ttl: 'long', keep_warm: 'always' }, undefined, {
+    setTimeoutImpl: ((callback: () => void, ms: number) => {
+      const id = { unref() {} }
+      timeouts.set(id, { callback, at: f.now + ms })
+      return id
+    }) as unknown as typeof setTimeout,
+    clearTimeoutImpl: ((id: object) => {
+      timeouts.delete(id)
+    }) as unknown as typeof clearTimeout,
+  })
+  f.track()
+  f.manager.beginRealTurn(f.input.sessionId)
+  f.manager.stop()
+  f.advance(3_600_001)
+  for (const [id, timeout] of [...timeouts])
+    if (timeout.at <= f.now) {
+      timeouts.delete(id)
+      timeout.callback()
+    }
+  expect(timeouts.size).toBe(0)
+  expect(f.manager.trackedCount()).toBe(1)
+  await detached()
+  expect(f.reports).toEqual([])
+})
+
+test('pausing a real-turn lease is silent and a later finish cannot retire the retained target', async () => {
+  const f = fixture({ ttl: 'long', keep_warm: 'always' })
+  f.track()
+  f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
+  const turn = f.manager.beginRealTurn(f.input.sessionId)
+  turn.pause()
+  turn.pause()
+  turn.finish()
+  expect(turn.active).toBe(false)
+  expect(f.manager.trackedCount()).toBe(1)
+  f.advance(3_570_000)
+  await f.manager.tick()
+  expect(f.sends).toBe(1)
+  await detached()
+  expect(f.reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+    [],
+  )
+})
+
+test('a pruned warmed target does not lend its warm history to an unwarmed replacement', async () => {
+  const f = fixture({ ttl: 'long', keep_warm: 'always' })
+  f.track()
+  f.targets.get(f.input.sessionId)!.policyState!.hasWarmed = true
+  f.advance(3_600_001)
+  expect(
+    f.track({
+      bodyText: f.input.bodyText.replace('PRIVATE PREFIX', 'new turn'),
+    }).tracked,
+  ).toBe(true)
+  expect(f.targets.get(f.input.sessionId)?.policyState?.hasWarmed).toBe(false)
+  f.manager.untrack(f.input.sessionId)
+  await detached()
+  expect(f.reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+    [{ kind: 'cache_warm_stopped', at: f.now, reason: 'deadline-missed' }],
+  )
+})
+
+test('dispose aborts and drains a due-timer warm without reporting or settling its ambiguous reservation', async () => {
+  const timers = new Map<object, { callback: () => unknown; at: number }>()
+  let sent!: () => void
+  const sending = new Promise<void>((resolve) => {
+    sent = resolve
+  })
+  let releaseFetch: (() => void) | undefined
+  let releaseComplete!: () => void
+  const completing = new Promise<void>((resolve) => {
+    releaseComplete = resolve
+  })
+  let signal: AbortSignal | undefined
+  const f = fixture({ ttl: 'long', keep_warm: 'always' }, undefined, {
+    setTimeoutImpl: ((callback: () => unknown, ms: number) => {
+      const id = { unref() {} }
+      timers.set(id, { callback, at: f.now + ms })
+      return id
+    }) as unknown as typeof setTimeout,
+    clearTimeoutImpl: ((id: object) => {
+      timers.delete(id)
+    }) as unknown as typeof clearTimeout,
+    fetchImpl: ((_url, init) =>
+      new Promise<Response>((resolve, reject) => {
+        signal = init?.signal ?? undefined
+        releaseFetch = () =>
+          resolve(Response.json({ usage: { input_tokens: 0 } }))
+        signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('aborted', 'AbortError')),
+          { once: true },
+        )
+        sent()
+      })) as typeof fetch,
+    onComplete: async () => {
+      await completing
+    },
+  })
+  f.track()
+  f.manager.recordAcceptedUsage(f.input.sessionId, f.input.bodyText, {
+    cache_read_input_tokens: 1000,
+  })
+  f.advance(3_570_000)
+  const due = [...timers.values()].find(({ at }) => at === f.now)
+  expect(due).toBeDefined()
+  const tick = Promise.resolve(due!.callback())
+  await sending
+  const state = f.manager.trackedPolicyState(f.input.sessionId)!
+  expect(state.pendingWarmCost).toBeGreaterThan(0)
+  let disposed = false
+  const disposal = Promise.resolve(f.manager.dispose()).then(() => {
+    disposed = true
+  })
+  try {
+    await detached()
+    expect(signal?.aborted).toBe(true)
+    expect(disposed).toBe(false)
+    releaseComplete()
+    await disposal
+    await tick
+    expect(state.pendingWarmCost).toBeGreaterThan(0)
+    expect(f.manager.trackedCount()).toBe(0)
+    expect(
+      f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+    ).toEqual([])
+  } finally {
+    releaseComplete()
+    releaseFetch?.()
+    await disposal
+    await tick
+  }
+})
+
+test.each(['loadStorage', 'prepareHeaders', 'reserveWarm'] as const)(
+  'a tick paused while awaiting %s sends nothing, retries nothing and arms nothing',
+  async (stage) => {
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const timers = new Map<object, () => unknown>()
+    const wait = async () => {
+      entered.resolve()
+      await release.promise
+    }
+    const f = fixture({ ttl: 'long', keep_warm: 'always' }, undefined, {
+      loadStorage: async () => {
+        if (stage === 'loadStorage') await wait()
+        return f.input.storage
+      },
+      prepareHeaders: async (headers) => {
+        if (stage === 'prepareHeaders') await wait()
+        return headers
+      },
+      reserveWarm: async () => {
+        if (stage === 'reserveWarm') await wait()
+        return true
+      },
+      setTimeoutImpl: ((callback: () => unknown) => {
+        const id = { unref() {} }
+        timers.set(id, callback)
+        return id
+      }) as unknown as typeof setTimeout,
+      clearTimeoutImpl: ((id: object) => {
+        timers.delete(id)
+      }) as unknown as typeof clearTimeout,
+    })
+    f.track()
+    f.manager.recordAcceptedUsage(f.input.sessionId, f.input.bodyText, {
+      cache_read_input_tokens: 1000,
+    })
+    f.advance(3_570_000)
+    const tick = f.manager.tick()
+    await entered.promise
+    try {
+      f.manager.stop()
+      release.resolve()
+      await tick
+      expect(f.sends).toBe(0)
+      expect(timers.size).toBe(0)
+      expect(f.manager.trackedCount()).toBe(1)
+      expect(
+        f.manager.trackedPolicyState(f.input.sessionId)
+          ?.warmsSinceLastRealRequest,
+      ).toBe(stage === 'reserveWarm' ? 1 : 0)
+      expect(
+        f.reports.filter(({ kind }) => kind === 'cache_warm_stopped'),
+      ).toEqual([])
+    } finally {
+      release.resolve()
+      await tick
+    }
+  },
+)
 
 test.each(['auto', 'hours', 'always'] as const)(
   'restart warms with saved %s policy while fresh policy is null',

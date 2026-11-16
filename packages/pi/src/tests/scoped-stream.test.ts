@@ -2094,7 +2094,7 @@ test('Pi bills a model response and its keep-warm under the owning real session'
 })
 
 for (const cacheKeepEnabled of [true, false]) {
-  test(`Pi records only accepted cache activity with CacheKeep ${cacheKeepEnabled ? 'on' : 'off'}`, async () => {
+  test(`Pi keeps accepted cache activity but ends untracked real turns with CacheKeep ${cacheKeepEnabled ? 'on' : 'off'}`, async () => {
     const f = await fixture()
     const runtime = await f.native.service()
     await runtime.updateSettings((settings) => ({
@@ -2159,8 +2159,8 @@ for (const cacheKeepEnabled of [true, false]) {
     expect(cacheExpiry).toBeGreaterThan(Date.now() + 55 * 60_000)
     for (status of [400, 413, 429, 500]) {
       await (await send('rejected')).text()
-      expect(keep.trackedRequest(sessionId)).toEqual(before)
-      expect(keep.registrySessions()).toEqual(facts)
+      expect(keep.trackedRequest(sessionId)).toBeUndefined()
+      expect(keep.trackedCount()).toBe(0)
       expect(
         sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
       ).toBe(cacheExpiry)
@@ -2169,7 +2169,7 @@ for (const cacheKeepEnabled of [true, false]) {
     await expect(send('transport error')).rejects.toThrow(
       'synthetic transport failure',
     )
-    expect(keep.trackedRequest(sessionId)).toEqual(before)
+    expect(keep.trackedRequest(sessionId)).toBeUndefined()
     failure = undefined
     status = 201
     await (await send('accepted next step')).text()
@@ -2177,7 +2177,6 @@ for (const cacheKeepEnabled of [true, false]) {
       expect(keep.trackedRequest(sessionId)?.bodyText).toContain(
         'accepted next step',
       )
-    const next = keep.trackedRequest(sessionId)
     const nextExpiry = sessionCacheActivity.holdUntil(
       sessionId,
       'main',
@@ -2186,12 +2185,88 @@ for (const cacheKeepEnabled of [true, false]) {
     )
     failure = 'abort'
     await expect(send('aborted')).rejects.toThrow()
-    expect(keep.trackedRequest(sessionId)).toEqual(next)
+    expect(keep.trackedRequest(sessionId)).toBeUndefined()
     expect(
       sessionCacheActivity.holdUntil(sessionId, 'main', Date.now(), 'max'),
     ).toBe(nextExpiry)
   })
 }
+
+test('a Pi request lease skips a due warm and its aborted request finally retires the old target', async () => {
+  const f = await fixture()
+  const runtime = await f.native.service()
+  await runtime.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: false },
+    claudeCache: { enabled: true, mode: 'hybrid' },
+    cacheKeep: { enabled: true, always: true },
+  }))
+  let now = Date.now()
+  let warms = 0
+  const keep = new CacheKeepManager({
+    now: () => now,
+    loadStorage: async () => (await runtime.read()).policyStorage,
+    fetchImpl: (async () => {
+      warms++
+      return Response.json({ usage: { cache_read_input_tokens: 100 } })
+    }) as unknown as typeof fetch,
+    setIntervalImpl: (() => ({ unref() {} })) as unknown as typeof setInterval,
+    clearIntervalImpl: (() => {}) as typeof clearInterval,
+  })
+  deferCleanup(() => keep.dispose())
+  const sessionId = 'pi-real-turn-busy-abort'
+  deferCleanup(() => sessionCacheActivity.forget(sessionId))
+  await (
+    await __sendPiAnthropicRequestForTest(
+      { model, context, storagePath: f.path, streamOptions: { sessionId } },
+      {
+        native: f.native,
+        cacheKeep: keep,
+        fetch: (async () => Response.json({})) as unknown as typeof fetch,
+      },
+    )
+  ).text()
+  now = keep.trackedSessions()[0]!.nextPrewarmAt
+  await keep.tick()
+  expect(warms).toBe(1)
+  const entered = lifetimes.gate()
+  const release = lifetimes.gate()
+  const abort = new AbortController()
+  const sending = __sendPiAnthropicRequestForTest(
+    {
+      model,
+      context,
+      storagePath: f.path,
+      streamOptions: { sessionId, signal: abort.signal },
+    },
+    {
+      native: f.native,
+      cacheKeep: keep,
+      fetch: (async () => {
+        entered.open()
+        await release.wait
+        abort.signal.throwIfAborted()
+        return Response.json({})
+      }) as unknown as typeof fetch,
+    },
+  ).catch((error) => error)
+  await entered.wait
+  try {
+    now = keep.trackedSessions()[0]!.nextPrewarmAt
+    await keep.tick()
+    expect(warms).toBe(1)
+    abort.abort()
+    release.open()
+    expect(await sending).toBeInstanceOf(Error)
+    expect(keep.trackedCount()).toBe(0)
+    await keep.tick()
+    expect(warms).toBe(1)
+  } finally {
+    abort.abort()
+    release.open()
+    await sending
+  }
+})
 
 // Sends one model request through Pi's real stream path, then replays its
 // captured URL, headers and body through Pi's CacheKeep prewarm, recording

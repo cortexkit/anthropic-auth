@@ -14,6 +14,7 @@ import {
   applyRunnerTurnNotes,
   assertHostAuthorityStable,
   assertNotCustodyTombstone,
+  type CacheKeepRealTurn,
   type ClaudeCodeIdentity,
   type ClaudeGateway,
   classifyGzipRejection,
@@ -342,6 +343,9 @@ export interface NativeAnthropicAttemptOutcome extends AttemptOutcome {
  * the adapter passes it is rejected at compile time.
  */
 export interface NativeAnthropicSource<Q, P> {
+  readonly beginRealTurn?: (
+    scope: RequestScope,
+  ) => CacheKeepRealTurn | undefined
   readonly billingRequest?: (
     input: NativeAnthropicAttemptContext<P>,
   ) => AnthropicBillingRequest | undefined

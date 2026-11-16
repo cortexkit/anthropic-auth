@@ -125,8 +125,17 @@ test.each(['request', 'untrack', 'stop'] as const)(
       else if (change === 'untrack') manager.untrack(target.sessionId)
       else manager.stop()
       response.resolve(Response.json({}))
-      expect(await warm).toEqual({ ok: true, ttlMs: 300_000 })
-      expect(current).toEqual([false])
+      if (change === 'stop') {
+        expect(await warm).toEqual({
+          ok: false,
+          skipped: true,
+          reason: 'scheduler-paused',
+        })
+        expect(current).toEqual([])
+      } else {
+        expect(await warm).toEqual({ ok: true, ttlMs: 300_000 })
+        expect(current).toEqual([false])
+      }
     } finally {
       response.resolve(Response.json({}))
       await warm

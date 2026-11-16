@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  logger,
   type NativeAccountRuntime,
 } from '@cortexkit/anthropic-auth-core'
 import { createNativeCacheKeep } from '../v2/cachekeep'
@@ -20,10 +21,22 @@ afterEach(async () => {
 test.each([false, true])(
   'OpenCode 2 reload tracks a response through a 2.5.3 shared owner (retained: %s)',
   async (retained) => {
+    const globals = globalThis as Record<symbol, unknown>
+    const diagnostic = Symbol.for(
+      'cortexkit.anthropic-auth.opencode2.legacy-turn-rules',
+    )
+    const previous = globals[diagnostic]
+    delete globals[diagnostic]
+    const logging = spyOn(logger, 'info').mockImplementation(() => {})
+    cleanups.push(() => {
+      logging.mockRestore()
+      if (previous === undefined) delete globals[diagnostic]
+      else globals[diagnostic] = previous
+    })
     const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-reload-'))
     cleanups.push(() => rm(directory, { recursive: true, force: true }))
     const storageId = randomUUID()
-    const now = Date.now()
+    let now = Date.now()
     const policy: Awaited<
       ReturnType<NativeAccountRuntime['read']>
     >['policyStorage'] = {
@@ -64,9 +77,14 @@ test.each([false, true])(
     }
     const persistence = new CacheKeepStore({ storageId, root: directory })
     const timers = new Set<object>()
+    let sends = 0
     const manager = new CacheKeepManager({
       now: () => now,
       loadStorage: async () => policy,
+      fetchImpl: (async () => {
+        sends++
+        return Response.json({})
+      }) as unknown as typeof fetch,
       setIntervalImpl: (() => {
         const timer = { unref() {} }
         timers.add(timer)
@@ -83,7 +101,8 @@ test.each([false, true])(
       sessionId: 'ses_before_reload',
       url: 'https://api.anthropic.com/v1/messages',
       headers: new Headers(),
-      bodyText: '{"system":"Keep this prefix"}',
+      bodyText:
+        '{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"Keep this prefix","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":"Hello"}]}',
       storage: policy,
       cacheMode: 'hybrid' as const,
       oauthAccountId: 'first',
@@ -157,6 +176,10 @@ test.each([false, true])(
     expect(manager.trackedSessions().map(({ id }) => id)).toEqual([
       'ses_after_reload',
     ])
+    now += 3_300_000
+    await manager.tick()
+    expect(sends).toBe(1)
+    expect(manager.trackedCount()).toBe(1)
     policy.cacheKeep = { enabled: false }
     await keep.track({
       sessionID: 'ses_disabled',
@@ -169,6 +192,14 @@ test.each([false, true])(
     await Reflect.get(owner, 'localCleanup')
     await owner.persistence.drain()
     expect(await readdir(owner.persistence.directory)).toEqual([])
+    expect(
+      logging.mock.calls.filter(
+        ([channel, message]) =>
+          channel === 'cachekeep' &&
+          message ===
+            'new real-turn warming rules apply after a server restart',
+      ),
+    ).toHaveLength(1)
   },
 )
 

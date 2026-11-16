@@ -11,6 +11,7 @@ import {
   buildPrimeRequestBody,
   CACHE_KEEP_EXTENDED_TTL_BETA,
   type CacheKeepManager,
+  type CacheKeepRealTurn,
   CacheKeepSessionRegistry,
   CLAUDE_CODE_ACCEPT_ENCODING,
   CLAUDE_CODE_ENTRYPOINT,
@@ -27,6 +28,7 @@ import {
   createRoutingRelay,
   createSseFramer,
   createStickyNoRouteResponse,
+  currentCacheKeepRealTurn,
   type DumpHandle,
   decideStickyQuotaFailure,
   decodeSseFrame,
@@ -116,6 +118,7 @@ import {
   stickyRouteFamilyForModel,
   warnClaudeGatewayRelayIgnored,
   withAnthropicBilling,
+  withCacheKeepRealTurn,
 } from '@cortexkit/anthropic-auth-core'
 import {
   type Api,
@@ -190,10 +193,13 @@ export function endPiPrimaryTurn(
 ): void {
   if (sessionId && primaryTurns.get(sessionId) === storagePath)
     primaryTurns.delete(sessionId)
+  if (sessionId) piCacheKeep.endTurn(sessionId)
 }
 
 export function untrackPiCacheKeepTurn(sessionId?: string) {
-  if (sessionId) piCacheKeep.untrackedTurn(sessionId)
+  try {
+    if (sessionId) piCacheKeep.requestTurn(sessionId)?.finish()
+  } catch {}
 }
 
 function isPiPrimaryThreadRequest(
@@ -854,6 +860,27 @@ export function sendPiPrimeRequest(options: PiPrimeSendOptions) {
 registerPiPrimeSender(sendPiPrimeRequest)
 
 async function sendAnthropicRequest(
+  ...args: Parameters<typeof sendAnthropicRequestAttempt>
+): Promise<Response> {
+  const [options, deps = {}] = args
+  const inherited = currentCacheKeepRealTurn()
+  let turn = inherited
+  try {
+    if (!turn && !options.prime && options.streamOptions?.sessionId)
+      turn = deps.cacheKeep
+        ? deps.cacheKeep.beginRealTurn(options.streamOptions.sessionId)
+        : piCacheKeep.requestTurn(options.streamOptions.sessionId)
+  } catch {}
+  try {
+    return await withCacheKeepRealTurn(turn, () =>
+      sendAnthropicRequestAttempt(...args),
+    )
+  } finally {
+    if (!inherited) piCacheKeep.finishTurn(turn)
+  }
+}
+
+async function sendAnthropicRequestAttempt(
   options: {
     model: Model<Api>
     context: Context
@@ -883,6 +910,9 @@ async function sendAnthropicRequest(
     native?: PiNativeRuntime
   } = {},
 ): Promise<Response> {
+  // Relay callbacks may run outside the request's async context. Keep the
+  // request-owned lease with the callback rather than looking it up later.
+  const realTurn = currentCacheKeepRealTurn()
   options.onCacheUsageRecorder?.(() => {})
   assertHostAuthorityStable()
   const fetchImpl = deps.fetch ?? globalThis.fetch
@@ -895,10 +925,10 @@ async function sendAnthropicRequest(
   const keep = deps.cacheKeep ?? cacheKeepManager
   const realSession = options.streamOptions?.sessionId
   if (!options.prime && realSession) {
-    if (!deps.cacheKeep) piCacheKeep.realTurn(realSession)
     if (options.apiAccount || !options.storagePath) {
-      if (deps.cacheKeep) keep.untrack(realSession)
-      else piCacheKeep.untrackedTurn(realSession)
+      try {
+        realTurn?.finish()
+      } catch {}
     }
   }
   const native = deps.native ?? getPiNativeRuntime(options.storagePath)
@@ -1103,8 +1133,8 @@ async function sendAnthropicRequest(
       accountStoragePath: options.storagePath,
     }
     const tracked = deps.cacheKeep
-      ? Promise.resolve(keep.track(target))
-      : piCacheKeep.trackAccepted(target, snapshot)
+      ? Promise.resolve(realTurn?.track(target) ?? keep.track(target))
+      : piCacheKeep.trackAccepted(target, snapshot, realTurn)
     cacheTracking.set(attempt, 'pending')
     void tracked.then(
       () => cacheTracking.set(attempt, 'settled'),
@@ -2550,8 +2580,12 @@ export function streamCortexKitAnthropic(
   requestOrigin: 'agent-loop' | 'direct' = 'direct',
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream()
+  let turn: CacheKeepRealTurn | undefined
+  try {
+    if (options?.sessionId) turn = piCacheKeep.requestTurn(options.sessionId)
+  } catch {}
 
-  void (async () => {
+  void withCacheKeepRealTurn(turn, async () => {
     const output = createOutput(model)
     let failThread: (() => void) | undefined
     stream.push({ type: 'start', partial: output })
@@ -2872,8 +2906,10 @@ export function streamCortexKitAnthropic(
         error instanceof Error ? error.message : String(error)
       stream.push({ type: 'error', reason: output.stopReason, error: output })
       stream.end()
+    } finally {
+      piCacheKeep.finishTurn(turn)
     }
-  })()
+  })
 
   return stream
 }

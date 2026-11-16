@@ -1,7 +1,9 @@
 import {
+  type CacheKeepRealTurn,
   clampHostRetryMs,
   hostRetryResponse,
   runWithRequestSignal,
+  withCacheKeepRealTurn,
   withSessionCacheReportHandoff,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -9,6 +11,7 @@ import {
   installOpenCode2Auth,
   type OpenCode2AuthInstallation,
   type OpenCode2HookContext,
+  placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
@@ -58,6 +61,7 @@ export async function installNativeAnthropic<Q, P>(
     await Promise.allSettled([...endings])
   }
   const registrations: Registration[] = []
+  const requestTurns = new WeakMap<Request, () => void>()
   const hook: Plugin.Context['session']['hook'] = async (
     name,
     callback,
@@ -92,6 +96,11 @@ export async function installNativeAnthropic<Q, P>(
               }
               if ('response' in draft && draft.response instanceof Response)
                 draft.response = hostRetryResponse(draft.response)
+              if ('request' in draft && draft.request instanceof Request) {
+                try {
+                  requestTurns.get(draft.request)?.()
+                } catch {}
+              }
             }
           })()
         }
@@ -108,7 +117,58 @@ export async function installNativeAnthropic<Q, P>(
           'request' in draft && draft.request instanceof Request
             ? draft.request.signal
             : undefined
-        return runWithRequestSignal(signal, async () => callback(draft))
+        const input = draft as {
+          sessionID: string
+          agent: string
+          kind: 'primary'
+          model: { providerID: string; id: string }
+          request: Request
+        }
+        let turn: CacheKeepRealTurn | undefined
+        let finalRequest: Request | undefined
+        const finish = () => {
+          try {
+            turn?.finish()
+          } catch {}
+          signal?.removeEventListener('abort', finish)
+          if (finalRequest) requestTurns.delete(finalRequest)
+        }
+        try {
+          // common-auth scopes these hooks to Anthropic. Other providers never
+          // reach this observer, so their turns cannot invalidate a warm target.
+          if (input.model.providerID === 'anthropic') {
+            turn = deps.source.beginRealTurn?.({
+              sessionID: input.sessionID,
+              providerID: input.model.providerID,
+              modelID: input.model.id,
+              agent: input.agent,
+              kind: input.kind,
+            })
+            if (
+              ownership.credential(input.request.headers) !==
+              placeholderSecret('anthropic')
+            )
+              finish()
+          }
+        } catch {
+          finish()
+        }
+        signal?.addEventListener('abort', finish, { once: true })
+        if (signal?.aborted) finish()
+        let completed = false
+        try {
+          const result = await runWithRequestSignal(signal, () =>
+            withCacheKeepRealTurn(turn, async () => callback(draft)),
+          )
+          completed = true
+          if (turn) {
+            finalRequest = input.request
+            requestTurns.set(finalRequest, finish)
+          }
+          return result
+        } finally {
+          if (!completed) finish()
+        }
       },
       options,
     )

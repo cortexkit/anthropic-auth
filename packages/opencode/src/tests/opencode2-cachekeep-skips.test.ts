@@ -153,7 +153,7 @@ test.each([
   'stopped-during-read',
   'stopped-during-lookup',
 ])(
-  'OpenCode 2 tracking skip stays quiet and retains the existing target: %s',
+  'OpenCode 2 tracking skip stays quiet and ends only real untracked turns: %s',
   async (path) => {
     const f = await fixture()
     await f.keep.track(f.input)
@@ -218,7 +218,21 @@ test.each([
       },
     })
     expect(f.logs.filter((record) => record.level === 'warn')).toEqual([])
-    expect(await f.keep.registry.list()).toEqual(tracked)
+    if (
+      [
+        'lease-stopped',
+        'cachekeep-agent',
+        'prime-agent',
+        'not-primary',
+        'stopped-during-read',
+        'stopped-during-lookup',
+      ].includes(path)
+    )
+      expect(await f.keep.registry.list()).toEqual(tracked)
+    else {
+      expect(f.manager.trackedCount()).toBe(0)
+      expect(f.manager.trackedRequest(f.input.sessionID)).toBeUndefined()
+    }
     expect(JSON.stringify(f.logs)).not.toContain('PRIVATE')
   },
 )
@@ -242,10 +256,11 @@ test('OpenCode 2 manager refusal reports its returned reason once, not just debu
       detail: 'body exceeds cachekeep memory budget',
       bodyBytes: 67_108_866,
       budgetBytes: 67_108_864,
-      targets: 1,
+      targets: 0,
     },
   })
-  expect(await f.keep.registry.list()).toEqual(tracked)
+  expect(tracked).toHaveLength(1)
+  expect(f.manager.trackedCount()).toBe(0)
 })
 
 test.each([400, 413, 429, 500, 503])(
@@ -277,7 +292,7 @@ test.each([400, 413, 429, 500, 503])(
   },
 )
 
-test('OpenCode 2 thrown transport error ends the held attempt without replacing its target', async () => {
+test('OpenCode 2 thrown transport error ends the held attempt and its old target', async () => {
   const f = await fixture()
   await f.keep.track(f.input)
   await f.accept()
@@ -323,7 +338,8 @@ test('OpenCode 2 thrown transport error ends the held attempt without replacing 
     )
   }
   source.quotaFromHeaders?.(new Headers(), { ...failed, status: 200 })
-  expect(f.manager.trackedRequest(f.input.sessionID)).toEqual(before)
+  expect(before).toBeDefined()
+  expect(f.manager.trackedRequest(f.input.sessionID)).toBeUndefined()
 })
 
 test('OpenCode 2 disposal releases held bodies and their abort listeners', async () => {

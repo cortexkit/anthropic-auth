@@ -953,7 +953,7 @@ test('an aborted accepted stream cannot publish an anchor', async () => {
   expect(tracker.prepare(advance(request)).decision.type).toBe('create')
 })
 
-test('prewarm strips create threads, refuses deltas and never replaces its full target with wire bodies', async () => {
+test('prewarm strips create threads, refuses deltas and ends a target refused for thread-wire tracking', async () => {
   const body = {
     model: 'claude-sonnet-5',
     messages: [
@@ -995,17 +995,19 @@ test('prewarm strips create threads, refuses deltas and never replaces its full 
     storage,
     cacheMode: 'hybrid',
   }
-  expect(keep.track(request).tracked).toBe(true)
   for (const thread of [
     { type: 'create' },
     { type: 'continue', previous_message_id: 'msg_previous' },
   ]) {
+    expect(keep.track(request).tracked).toBe(true)
+    expect(keep.trackedRequest('cache-thread')?.bodyText).toBe(request.bodyText)
     expect(
       keep.track({ ...request, bodyText: JSON.stringify({ ...body, thread }) })
         .tracked,
     ).toBe(false)
-    expect(keep.trackedRequest('cache-thread')?.bodyText).toBe(request.bodyText)
+    expect(keep.trackedRequest('cache-thread')).toBeUndefined()
   }
+  keep.stop()
 })
 
 test('uncorrelated main requests create without sharing an anchor', async () => {
