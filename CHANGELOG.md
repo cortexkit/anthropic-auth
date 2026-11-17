@@ -2,7 +2,7 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
-## Unreleased
+## 2.15.0
 
 - `/claude` Status and the log now say why the one-time settings move is waiting.
 - The one-time settings move is no longer held up forever by unreadable files an earlier plugin version left behind.
