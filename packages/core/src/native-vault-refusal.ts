@@ -21,6 +21,7 @@ export function createNativeVaultNoRouteResponse(input: {
   policies?: ReadonlyMap<string, NativeAccountPolicy>
   sticky?: boolean
   sessionId?: string | null
+  waitForReset?: boolean
 }): Response {
   const { snapshot, modelId } = input
   const accounts = snapshot.accounts.filter(
@@ -71,6 +72,8 @@ export function createNativeVaultNoRouteResponse(input: {
     storage: snapshot.policyStorage,
     sessionId: input.sessionId,
     vaultPolicyLimits: [...limits],
+    waitForReset:
+      input.waitForReset && active.every((account) => account.quota),
   })
 }
 

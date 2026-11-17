@@ -1,5 +1,21 @@
-/** Hosts recheck availability periodically instead of sleeping until a distant quota reset. */
+/** Ordinary host retries recheck availability periodically. */
 export const MAX_HOST_RETRY_MS = 15 * 60_000
+
+// Only locally constructed, fully evidenced pool refusals may bypass the cap.
+// An upstream Retry-After or a routing hold cannot opt itself into a long wait.
+const resetWaits = new WeakMap<Response, number>()
+
+export function markResetWaitResponse(
+  response: Response,
+  delayMs: number,
+): Response {
+  resetWaits.set(response, delayMs)
+  return response
+}
+
+export function resetWaitDelayMs(response: Response): number | undefined {
+  return resetWaits.get(response)
+}
 
 export function clampHostRetryMs(delayMs: number): number {
   return Math.max(
@@ -39,6 +55,7 @@ export function hostRetryResponse(
   response: Response,
   now = Date.now(),
 ): Response {
+  if (resetWaits.has(response)) return response
   const headers = hostRetryHeaders(response.headers, now)
   if (
     ['retry-after', 'retry-after-ms'].every(

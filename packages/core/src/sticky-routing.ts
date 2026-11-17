@@ -158,6 +158,7 @@ export function createStickyNoRouteResponse(input: {
   storage?: AccountStorage | null
   sessionId?: string | null
   vaultPolicyLimits?: readonly NativeQuotaPolicyLimit[]
+  waitForReset?: boolean
   modelId?: string
   now?: number
 }): Response {
@@ -211,6 +212,8 @@ export function createStickyNoRouteResponse(input: {
     modelId,
     now,
     sessionTtlMs: sessionCacheActivity.ttlMs(input.sessionId),
+    waitForReset: input.waitForReset,
+    sessionId: input.sessionId,
   })
   const limitNames = input.vaultPolicyLimits?.map((limit) =>
     limit === 'model-scoped'

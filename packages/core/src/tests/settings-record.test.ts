@@ -9,6 +9,7 @@ import {
   getKillswitchThresholdsForAccount,
 } from '../accounts.ts'
 import { CLAUDE_MODEL_CAPABILITIES } from '../model-capabilities.ts'
+import { getWaitForReset } from '../routing.ts'
 import {
   SETTINGS_INFER_MEMBERS,
   SETTINGS_INFERRED_FIELDS,
@@ -55,8 +56,58 @@ async function fixture(
   return { file, service, reads: () => reads }
 }
 
+test('wait_for_reset is off by default and reads user-only host overrides, never model overrides', async () => {
+  const empty = await fixture()
+  expect(
+    getWaitForReset(
+      resolveSettingsRecord(
+        createEmptyStorage(),
+        empty.service.snapshot(),
+        'opencode',
+      ),
+    ),
+  ).toBe(false)
+  const enabled = await fixture(
+    JSON.stringify({
+      schema_version: 1,
+      wait_for_reset: { default: false, pi: true, 'claude-opus-5-5': true },
+    }),
+  )
+  const generation = enabled.service.snapshot()
+  expect(
+    getWaitForReset(
+      resolveSettingsRecord(createEmptyStorage(), generation, 'pi'),
+    ),
+  ).toBe(true)
+  expect(
+    getWaitForReset(
+      resolveSettingsRecord(
+        createEmptyStorage(),
+        generation,
+        'opencode',
+        'claude-opus-5-5',
+      ),
+    ),
+  ).toBe(false)
+  const invalid = await fixture('{"schema_version":1,"wait_for_reset":"yes"}')
+  expect(
+    getWaitForReset(
+      resolveSettingsRecord(
+        createEmptyStorage(),
+        invalid.service.snapshot(),
+        'pi',
+      ),
+    ),
+  ).toBe(false)
+  expect(invalid.service.status().invalidKeys).toContain('wait_for_reset')
+})
+
 const defaults = {
-  routing: { mode: 'main-first', maxSameAccountWait: '15' },
+  routing: {
+    mode: 'main-first',
+    maxSameAccountWait: '15',
+    waitForReset: false,
+  },
   fallbackOn: [401, 403, 429],
   refresh: {
     enabled: true,
@@ -90,7 +141,11 @@ const defaults = {
 
 // Independent expected records pin the public shape rather than round-tripping a converter.
 const explicit = {
-  routing: { mode: 'fallback-first', maxSameAccountWait: 'max' },
+  routing: {
+    mode: 'fallback-first',
+    maxSameAccountWait: 'max',
+    waitForReset: true,
+  },
   fallbackOn: [502],
   refresh: {
     enabled: false,
@@ -131,6 +186,7 @@ const explicit = {
 const fileValues = {
   routing_mode: 'fallback-first',
   max_same_account_wait: 'cache',
+  wait_for_reset: true,
   fallback_on: [502],
   refresh_enabled: false,
   refresh_interval_minutes: 12,

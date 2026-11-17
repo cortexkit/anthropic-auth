@@ -85,6 +85,28 @@
         }
       ]
     },
+    "wait_for_reset": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "opencode": {
+              "type": "boolean"
+            },
+            "pi": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "fallback_on": {
       "anyOf": [
         {

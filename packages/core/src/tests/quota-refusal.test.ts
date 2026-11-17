@@ -4,6 +4,7 @@ import {
   type OAuthQuotaSnapshot,
   quotaRefusalTiming,
 } from '../accounts.ts'
+import { hostRetryResponse } from '../host-retry.ts'
 import { createQuotaRefusalResponse } from '../quota-refusal.ts'
 import {
   createStickyNoRouteResponse,
@@ -35,6 +36,97 @@ const storage = (maxSameAccountWait: '0' | '15' | 'max'): AccountStorage => ({
   version: 1,
   accounts: [],
   routing: { maxSameAccountWait },
+})
+
+test('wait_for_reset preserves the real pool reset through host response headers', () => {
+  const timing = quotaRefusalTiming({
+    readings: [{ quota: quota(), accountIdentity: 'current' }],
+    storage: { ...storage('15'), routing: { waitForReset: true } },
+    waitForReset: true,
+    now,
+  })
+  const response = hostRetryResponse(
+    createQuotaRefusalResponse('No route.', timing, now),
+    now,
+  )
+  const delay = Number(response.headers.get('retry-after')) * 1000
+  expect(delay).toBeGreaterThanOrEqual(2 * 3_600_000)
+  expect(delay).toBeLessThanOrEqual(2 * 3_600_000 + 20_000)
+})
+
+test('wait_for_reset requires every eligible account to be blocked with a known reset', () => {
+  const healthy = quota()
+  healthy.five_hour!.remainingPercent = 50
+  healthy.seven_day!.remainingPercent = 50
+  const unknown = quota()
+  unknown.seven_day!.resetsAt = undefined
+  for (const other of [
+    healthy,
+    unknown,
+    quota(now - 3_600_000),
+    { ...quota(), accountIdentity: 'previous' },
+  ]) {
+    const timing = quotaRefusalTiming({
+      readings: [
+        { quota: quota(), accountIdentity: 'current' },
+        { quota: other, accountIdentity: 'current' },
+      ],
+      storage: { ...storage('15'), routing: { waitForReset: true } },
+      waitForReset: true,
+      now,
+    })
+    expect(
+      Number(
+        hostRetryResponse(
+          createQuotaRefusalResponse('No route.', timing, now),
+          now,
+        ).headers.get('retry-after'),
+      ),
+    ).toBeLessThanOrEqual(900)
+  }
+})
+
+test('wait_for_reset uses the earliest fully unblocked account, including quota floors', () => {
+  const later = quota()
+  later.seven_day!.resetsAt = new Date(resetAt + 86_400_000).toISOString()
+  const floorBlocked = quota()
+  floorBlocked.five_hour!.remainingPercent = 10
+  floorBlocked.seven_day!.remainingPercent = 50
+  const timing = quotaRefusalTiming({
+    readings: [
+      { quota: later, accountIdentity: 'current' },
+      { quota: floorBlocked, accountIdentity: 'current' },
+    ],
+    storage: {
+      ...storage('15'),
+      routing: { waitForReset: true },
+      quota: { enabled: true, minimumRemaining: { five_hour: 20 } },
+    },
+    waitForReset: true,
+    now,
+  })
+  expect(timing.resetAt).toBe(resetAt)
+  expect(timing.resetWaitMs).toBeGreaterThanOrEqual(resetAt - now)
+})
+
+test('unsupported hosts and setting off keep capped pool headers', () => {
+  for (const [enabled, supported] of [
+    [false, true],
+    [true, false],
+  ]) {
+    const timing = quotaRefusalTiming({
+      readings: [{ quota: quota(), accountIdentity: 'current' }],
+      storage: { ...storage('15'), routing: { waitForReset: enabled } },
+      waitForReset: supported,
+      now,
+    })
+    expect(
+      hostRetryResponse(
+        createQuotaRefusalResponse('No route.', timing, now),
+        now,
+      ).headers.get('retry-after'),
+    ).toBe('900')
+  }
 })
 
 test('unknown exhausted blockers prevent a hold without changing the known-reset scan', () => {

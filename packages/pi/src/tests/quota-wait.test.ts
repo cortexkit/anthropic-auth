@@ -203,6 +203,66 @@ test('Pi waits inside the stream and resumes the same account after showing and 
   expect(clock.messages.at(-1)).toBeUndefined()
 })
 
+test.each(['resume', 'abort'] as const)(
+  'wait_for_reset owns one three-hour pool wait: %s',
+  async (outcome) => {
+    const clock = new Clock()
+    const abort = new AbortController()
+    const resetAt = clock.now + 3 * 3_600_000
+    const timing = quotaRefusalTiming({
+      now: clock.now,
+      storage: { version: 1, accounts: [], routing: { waitForReset: true } },
+      waitForReset: true,
+      readings: [
+        {
+          accountIdentity: 'current',
+          quota: {
+            accountIdentity: 'current',
+            five_hour: {
+              checkedAt: clock.now,
+              remainingPercent: 0,
+              usedPercent: 100,
+              resetsAt: new Date(resetAt).toISOString(),
+            },
+            seven_day: {
+              checkedAt: clock.now,
+              remainingPercent: 50,
+              usedPercent: 50,
+            },
+          },
+        },
+      ],
+    })
+    let sends = 0
+    const pending = withPiQuotaWait({
+      run: async () =>
+        createQuotaRefusalResponse('No account can serve.', timing, clock.now),
+      resume: async (hold) => {
+        expect(hold).toBeUndefined()
+        sends++
+        return new Response('served')
+      },
+      wait: clock.options,
+      signal: abort.signal,
+    })
+    await clock.scheduled.promise
+    expect(clock.delay).toBeGreaterThanOrEqual(3 * 3_600_000)
+    expect(clock.delay).toBeLessThanOrEqual(3 * 3_600_000 + 20_000)
+    expect(sends).toBe(0)
+    if (outcome === 'abort') {
+      abort.abort()
+      await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+      expect(clock.cleared).toBe(true)
+      expect(sends).toBe(0)
+    } else {
+      clock.callback?.()
+      expect(await (await pending).text()).toBe('served')
+      expect(sends).toBe(1)
+    }
+    expect(clock.messages.at(-1)).toBeUndefined()
+  },
+)
+
 test('Escape aborts the wait immediately with no resumed send and clears the working message', async () => {
   const clock = new Clock()
   const abort = new AbortController()

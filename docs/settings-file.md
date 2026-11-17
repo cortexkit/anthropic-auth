@@ -127,6 +127,32 @@ complete `{account, host, five_hour, seven_day, scoped}` entries. `host` is
 or account identity. Entries may not overlap for the same account and host.
 The legacy aliases `5h` and `1w` are not valid keys here.
 
+## Wait for a quota reset
+
+`wait_for_reset` is a boolean, **false by default**. Set it to `true` in the
+user settings file to keep a turn waiting when no Claude account can serve it
+and every eligible account has a known, future quota reset. It also covers
+accounts blocked by your quota floors. The wait ends at the earliest reset
+that makes an account usable, plus the usual per-session jitter; an account
+blocked by several windows must wait for the last of those windows to reset.
+
+```jsonc
+{ "schema_version": 1, "wait_for_reset": { "default": false, "pi": true } }
+```
+
+OpenCode 1 receives the real wait in `Retry-After`. Pi waits once inside the
+plugin, refreshes quota and rechecks accounts before resending once; Escape
+cancels throughout the wait. **OpenCode 2 support follows in a later release**;
+its existing 15-minute holds and retry budget are unchanged for now.
+
+When any account can still serve, routing and `max_same_account_wait` work as
+before. Unknown resets, sign-in or credential-store refusals, disabled
+accounts, Thalamus routing holds and API-key routes do not gain long waits.
+This is a pool-exhaustion option, not a per-model setting or a change to the
+same-account migration budget. It accepts `default`, `opencode` and `pi`
+host overrides, but no model overrides. `/claude` Settings Status lists its
+current value on every host. There is no menu toggle; edit the file to opt in.
+
 ## Custom gateway
 
 Claude sign-in (OAuth) model requests normally go only to

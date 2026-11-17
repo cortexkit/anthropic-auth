@@ -36,7 +36,11 @@ import {
   isCacheKeepAlways,
   isCacheKeepPersistentlyEnabled,
 } from '../cachekeep.ts'
-import { getMaxSameAccountWait, getRoutingMode } from '../routing.ts'
+import {
+  getMaxSameAccountWait,
+  getRoutingMode,
+  getWaitForReset,
+} from '../routing.ts'
 import {
   malformedSettingsText,
   refusedSettingsRecreationText,
@@ -73,6 +77,7 @@ test('all shared settings are flat, user-only and have exactly the allowed overr
     [
       'routing_mode',
       'max_same_account_wait',
+      'wait_for_reset',
       'fallback_on',
       'refresh_enabled',
       'refresh_interval_minutes',
@@ -315,6 +320,7 @@ function readTurnEndTools(storage: AccountStorage) {
 
 const defaultReaders = {
   routing_mode: getRoutingMode,
+  wait_for_reset: getWaitForReset,
   max_same_account_wait: (s: AccountStorage) =>
     ({ '0': 'off', '15': '15m', max: 'cache' })[getMaxSameAccountWait(s)],
   fallback_on: (s: AccountStorage) =>

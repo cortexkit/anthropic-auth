@@ -1,5 +1,5 @@
 import type { quotaRefusalTiming } from './accounts.ts'
-import { clampHostRetryMs } from './host-retry.ts'
+import { clampHostRetryMs, markResetWaitResponse } from './host-retry.ts'
 
 const details = new WeakMap<
   Response,
@@ -20,12 +20,16 @@ export function createQuotaRefusalResponse(
   now = Date.now(),
   options: { retry?: 'automatic' | 'manual' } = {},
 ): Response {
+  const resetWaitMs =
+    options.retry !== 'manual' ? timing.resetWaitMs : undefined
   timing = {
     ...timing,
     retryAfterSeconds:
-      timing.retryAfterSeconds === undefined
-        ? undefined
-        : clampHostRetryMs(timing.retryAfterSeconds * 1000) / 1000,
+      resetWaitMs !== undefined
+        ? resetWaitMs / 1000
+        : timing.retryAfterSeconds === undefined
+          ? undefined
+          : clampHostRetryMs(timing.retryAfterSeconds * 1000) / 1000,
   }
   const reset =
     timing.resetAt === undefined
@@ -67,9 +71,11 @@ export function createQuotaRefusalResponse(
   const message =
     options.retry === 'manual' || seconds === undefined
       ? `${room}This turn has stopped. ${manualAction} ${reason}`
-      : timing.limitName && resetTime
-        ? `${room}The earliest reset is ${resetTime} UTC (in ${duration}). Retrying every ${retryMinutes(seconds)}. ${reason}`
-        : `${reason}${retry} ${reset}`
+      : resetWaitMs !== undefined && resetTime
+        ? `${room}The earliest reset is ${resetTime} UTC (in ${duration}). Waiting until the reset before retrying. ${reason}`
+        : timing.limitName && resetTime
+          ? `${room}The earliest reset is ${resetTime} UTC (in ${duration}). Retrying every ${retryMinutes(seconds)}. ${reason}`
+          : `${reason}${retry} ${reset}`
   const response = new Response(
     JSON.stringify({
       type: 'error',
@@ -92,5 +98,7 @@ export function createQuotaRefusalResponse(
     },
   )
   details.set(response, { reason, timing })
-  return response
+  return resetWaitMs === undefined
+    ? response
+    : markResetWaitResponse(response, resetWaitMs)
 }

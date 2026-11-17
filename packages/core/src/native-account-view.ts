@@ -785,6 +785,12 @@ export function projectNativeAccountViews(input: {
     ...settings,
     accounts: fallbacks,
   }
+  // This user-file-only preference belongs in request policy, not in the
+  // legacy settings whitelist used by account-store writes and migration.
+  if (
+    (input.settings.routing as AccountStorage['routing'])?.waitForReset === true
+  )
+    policyStorage.routing = { ...policyStorage.routing, waitForReset: true }
   // The relay token is private credential state and never enters this
   // projection. Record only whether one is stored, so a status display can
   // tell a relay that requests use from one they skip for lack of a token.

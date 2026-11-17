@@ -463,6 +463,7 @@ test('OC2 status uses every no-model value and lists model row values and file d
     source: `{
     // user diagnostics
     "schema_version": 1,
+    "wait_for_reset": true,
     "claude_cache_enabled": { "default": "off", "claude-opus-5-5": "on", "not-a-row": "on" },
     "claude_cache_mode": { "default": "explicit", "claude-opus-5-5": "hybrid" },
     "claude_fast_enabled": { "default": false, "claude-opus-5-5": true },
@@ -476,6 +477,7 @@ test('OC2 status uses every no-model value and lists model row values and file d
   const status = await f.menu.readStatus('cache')
   expect(status).toContain(`Settings file: ${f.file}`)
   expect(status).toContain('Settings (no model):')
+  expect(status).toContain('wait_for_reset: true')
   expect(status).toContain('claude_cache_enabled: "off"')
   expect(status).toContain('claude_cache_enabled [claude-opus-5-5]: "on"')
   expect(status).toContain('claude_cache_mode [claude-opus-5-5]: "hybrid"')

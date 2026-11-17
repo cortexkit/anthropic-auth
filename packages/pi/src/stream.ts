@@ -47,6 +47,7 @@ import {
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
+  getWaitForReset,
   hostRetryHeaders,
   hostRetryResponse,
   isCache1hPersistentlyEnabled,
@@ -2363,6 +2364,7 @@ async function executeWithFallback(options: {
           modelId: options.model.id,
           sticky: true,
           sessionId,
+          waitForReset: getWaitForReset(storage) && !advice,
         })
       return createStickyNoRouteResponse({
         mainRefreshError: storage?.refresh?.mainLastRefreshError,
@@ -2379,6 +2381,7 @@ async function executeWithFallback(options: {
         storage,
         sessionId,
         modelId: options.model.id,
+        waitForReset: getWaitForReset(storage) && !advice,
       })
     }
     if (!resolution) return noRouteResponse()
@@ -2667,6 +2670,7 @@ async function executeWithFallback(options: {
         ),
         modelId: options.model.id,
         sessionId: options.streamOptions?.sessionId,
+        waitForReset: getWaitForReset(storage) && !advice,
       })
     return createStickyNoRouteResponse({
       routeQuotas: (storage?.accounts ?? [])
@@ -2683,6 +2687,7 @@ async function executeWithFallback(options: {
       storage,
       sessionId: options.streamOptions?.sessionId,
       modelId: options.model.id,
+      waitForReset: getWaitForReset(storage) && !advice,
     })
   }
 
@@ -2724,6 +2729,8 @@ async function executeWithFallback(options: {
             })),
           storage: current.policyStorage,
           modelId: options.model.id,
+          sessionId: options.streamOptions?.sessionId,
+          waitForReset: getWaitForReset(current.policyStorage) && !advice,
           sessionTtlMs: sessionCacheActivity.ttlMs(
             options.streamOptions?.sessionId,
           ),

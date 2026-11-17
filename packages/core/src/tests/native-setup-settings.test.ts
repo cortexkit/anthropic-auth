@@ -19,6 +19,7 @@ import {
 import {
   malformedSettingsText,
   refusedSettingsRecreationText,
+  SETTINGS_FILE_ONLY_KEYS,
   settingsDefinition,
 } from '../settings-definition.ts'
 import { readPeerLegacySettingsProtection } from '../settings-move-sources.ts'
@@ -26,10 +27,7 @@ import { resolveSettingsPaths, type SettingsHost } from '../settings-paths.ts'
 import { writeSettingsProtectionCopy } from '../settings-protection-copy.ts'
 import { legacySettingsProtection } from '../settings-protection-legacy.ts'
 import { resolveSettingsRecord } from '../settings-record.ts'
-import {
-  openSettingsService,
-  SETTINGS_GATEWAY_KEYS,
-} from '../settings-service.ts'
+import { openSettingsService } from '../settings-service.ts'
 
 const folders: string[] = []
 afterEach(async () => {
@@ -349,9 +347,9 @@ test('setup writes every explicitly held moved field in schema form without stor
   await writeFile(f.paths.target, '// keep\n{ "unknown": "keep" }')
   expect((await f.write()).outcome).toBe('saved')
   const file = await contents(f.paths.target)
-  // The gateway settings live only in the settings file: no legacy store has
-  // them, so setup must never write them. Every other setting is written.
-  const fileOnly: readonly string[] = SETTINGS_GATEWAY_KEYS
+  // File-only settings have no legacy source, so setup must never write
+  // them. Every moved setting supplied by the legacy store is written.
+  const fileOnly: readonly string[] = SETTINGS_FILE_ONLY_KEYS
   expect(
     Object.keys(file)
       .filter((key) => key !== 'unknown')
