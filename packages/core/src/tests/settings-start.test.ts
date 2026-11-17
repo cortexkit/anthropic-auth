@@ -167,6 +167,7 @@ for (const host of ['opencode', 'pi'] as const) {
         // (requests are refused by credential checks meanwhile) under the
         // file's real path, never an empty one.
         expect(started).toMatchObject({ mode: 'legacy', file: f.target })
+        expect(started.diagnostic).toEqual({ outcome: 'authority-refused' })
         expect(started.service).toBeUndefined()
         expect(started.fallback).toBeUndefined()
         expect(started.reopen?.retryDelaysMs?.[0]).toBeLessThan(10_000)
@@ -322,6 +323,9 @@ test('a failed start with no file and no marker stays in legacy mode with a way 
                 mode: 'legacy',
                 mayOpenService: true,
                 outcome: 'fence-closed',
+                blockers: [
+                  { kind: 'artifact-scan', path: '/old/rpc/port-123.json' },
+                ],
               }),
         open: async () => {
           throw new Error('synthetic open failure')
@@ -329,6 +333,16 @@ test('a failed start with no file and no marker stays in legacy mode with a way 
       },
     })
     expect(started).toMatchObject({ mode: 'legacy', file: f.target })
+    expect(started.diagnostic).toMatchObject(
+      failure === 'move'
+        ? { outcome: 'startup-failed' }
+        : {
+            outcome: 'fence-closed',
+            blockers: [
+              { kind: 'artifact-scan', path: '/old/rpc/port-123.json' },
+            ],
+          },
+    )
     expect(started.service).toBeUndefined()
     expect(started.fallback).toBeUndefined()
     expect(started.reopen).toBeDefined()

@@ -139,6 +139,7 @@ import {
   type RelocationGuard,
 } from './relocation-guard.ts'
 import { SETTINGS_WRITE_FAILURES } from './settings-definition.ts'
+import type { SettingsMoveDiagnostic } from './settings-mode-status.ts'
 import { getSettingsFilePath } from './settings-paths.ts'
 import {
   SettingsAdoptionRefusal,
@@ -244,6 +245,9 @@ export interface NativeAccountRuntime {
   resolveSettings?(stored: AccountStorage, model?: string): AccountStorage
   /** No-model settings and every explicit model override, for /claude status. */
   getSettingsStatus?(): NativeRuntimeSettingsStatus | undefined
+  getSettingsModeStatus?(): string
+  /** Update the memory-only startup diagnostic when another host instance joins. */
+  setSettingsDiagnostic?(diagnostic: SettingsMoveDiagnostic): void
   /**
    * The user's gateway for Claude OAuth model requests, from memory. Hosts
    * use it only for model requests, never for sign-in, refresh or usage.
@@ -392,6 +396,8 @@ export function acquireNativeAccountRuntime(
   )
   const vault = leaseNativeVaultRuntime(() => use().vault, close)
   const quotaObservations = use().quotaObservations
+  if (options.settingsDiagnostic)
+    use().setSettingsDiagnostic?.(options.settingsDiagnostic)
   const onLockEvent = use().onLockEvent
   const relocationGuard = use().relocationGuard
   const drainRoutingPublications = use().drainRoutingPublications
@@ -412,6 +418,7 @@ export function acquireNativeAccountRuntime(
     resolveSettings: (stored, model) =>
       use().resolveSettings?.(stored, model) ?? stored,
     getSettingsStatus: () => use().getSettingsStatus?.(),
+    getSettingsModeStatus: () => use().getSettingsModeStatus?.() ?? '',
     getClaudeGateway: () => use().getClaudeGateway?.(),
     applySettingsEffects: () => use().applySettingsEffects?.(),
     prepareSettingsAction: () =>
@@ -1231,6 +1238,11 @@ function buildNativeAccountRuntime(
       return runtimeSettings.file() ?? (await selectedStorage()).paths.config
     },
     getSettingsStatus: runtimeSettings.status,
+    getSettingsModeStatus: () =>
+      runtimeSettings.modeStatus(
+        options.settingsFile ?? getSettingsFilePath({ env }),
+      ),
+    setSettingsDiagnostic: runtimeSettings.setDiagnostic,
     getClaudeGateway: runtimeSettings.gateway,
     resolveSettings: runtimeSettings.resolve,
     applySettingsEffects: runtimeSettings.applyEffects,

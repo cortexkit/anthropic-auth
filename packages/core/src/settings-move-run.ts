@@ -28,6 +28,11 @@ import {
   writeSettingsMoveMarker,
 } from './settings-mode.ts'
 import {
+  type SettingsMoveBlockerIdentity,
+  type SettingsMoveDiagnostic,
+  settingsMoveBlockerIdentity,
+} from './settings-mode-status.ts'
+import {
   checkSettingsMoveFence,
   type SettingsMoveFenceOptions,
   settingsMoveHolderFiles,
@@ -47,7 +52,10 @@ import {
   type SettingsService,
 } from './settings-service.ts'
 
+let loggedClosedFence = false
+
 export interface SettingsMoveStartupOptions extends SettingsMoveSourcesOptions {
+  log?: SettingsMoveSourcesOptions['log'] & { info?: (message: string) => void }
   fence: Pick<
     SettingsMoveFenceOptions,
     'registration' | 'floor' | 'self' | 'liveness' | 'artifacts' | 'readHolders'
@@ -83,6 +91,8 @@ export interface SettingsMoveStartupResult {
      */
     | 'import-pending'
   move?: MoveResult
+  blockers?: SettingsMoveBlockerIdentity[]
+  sourceReason?: SettingsMoveDiagnostic['sourceReason']
   /**
    * In user-file mode: the file is missing and this host's legacy store was
    * never imported. The host uses the file (its protection comes from this
@@ -244,6 +254,14 @@ export async function runSettingsMoveAtStartup(
   const paths =
     options.paths ?? (await resolveSettingsPaths(options.host, options))
   const authority = { ...options, ...options.authority }
+  let blockers: SettingsMoveBlockerIdentity[] = []
+  const noteClosedFence = () => {
+    if (loggedClosedFence) return
+    loggedClosedFence = true
+    const message = `Settings move waits for a closed fence; keeping legacy settings. Blockers: ${JSON.stringify(blockers)}`
+    if (options.log?.info) options.log.info(message)
+    else logger.info('settings', message)
+  }
   const logged = new Set<string>()
   const warn = (message: string) => {
     const key = `${paths.target}\0${message}`
@@ -264,6 +282,7 @@ export async function runSettingsMoveAtStartup(
     // import check before adopting the file, and retry it.
     mayOpenService: mode !== 'separate' && outcome !== 'import-refused',
     outcome,
+    ...(blockers.length ? { blockers } : {}),
     ...(move ? { move } : {}),
   })
 
@@ -368,9 +387,16 @@ export async function runSettingsMoveAtStartup(
   const stores = [paths.own.account]
   if (paths.sourceRule === 'default')
     stores.push(paths.defaults.opencode.account, paths.defaults.pi.account)
-  const fence = async () =>
-    (await checkSettingsMoveFence({ ...options, ...options.fence, stores }))
-      .open
+  const fence = async () => {
+    const checked = await checkSettingsMoveFence({
+      ...options,
+      ...options.fence,
+      stores,
+    })
+    blockers = checked.blockers.map(settingsMoveBlockerIdentity)
+    if (!checked.open) noteClosedFence()
+    return checked.open
+  }
   if (!(await fence())) return result('legacy', 'fence-closed')
 
   const prepared = await (
@@ -381,7 +407,12 @@ export async function runSettingsMoveAtStartup(
       warn(
         `Settings move unavailable for ${prepared.host}: ${prepared.reason}; keeping legacy settings until the next start.`,
       )
-    return result('legacy', 'source-unavailable')
+    return {
+      ...result('legacy', 'source-unavailable'),
+      ...(prepared.status === 'unavailable'
+        ? { sourceReason: prepared.reason }
+        : {}),
+    }
   }
   // Hold every holder file's `holders` lock, in sorted path order, ahead of
   // the source locks and through publication, so no process can register
@@ -391,6 +422,7 @@ export async function runSettingsMoveAtStartup(
   // the state-layout mover takes `holders` locks in the same sorted order
   // before any data lock, as this move does.
   let holderFiles: string[]
+  let holderFile: string | undefined
   try {
     holderFiles = await settingsMoveHolderFiles({
       ...options,
@@ -403,6 +435,7 @@ export async function runSettingsMoveAtStartup(
     // registrant would), so every `holders` lock is really taken.
     const context = resolvePathOptions(options)
     for (const file of holderFiles) {
+      holderFile = file
       const folder = context.paths.dirname(file)
       if (options.authority?.fs?.mkdir) await options.authority.fs.mkdir(folder)
       else
@@ -412,6 +445,10 @@ export async function runSettingsMoveAtStartup(
         })
     }
   } catch {
+    blockers = [
+      { kind: 'holder-file', ...(holderFile ? { path: holderFile } : {}) },
+    ]
+    noteClosedFence()
     return result('legacy', 'fence-closed')
   }
   const [first, ...rest] = prepared.sources

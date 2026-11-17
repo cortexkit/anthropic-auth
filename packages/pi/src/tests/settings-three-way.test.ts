@@ -186,7 +186,7 @@ test('claude_cache_enabled: createPiNativeCommands status cache preserves legacy
   for (const { value, cache } of cases) {
     setField('claudeCache', value)
     expect(await backend.readStatus('cache', {}), String(value)).toBe(
-      `1-hour cache: ${cache ? 'enabled' : 'disabled'}; mode: explicit\n- Persisted: ${settingsPath}`,
+      `1-hour cache: ${cache ? 'enabled' : 'disabled'}; mode: explicit\n- Persisted: ${settingsPath}\nSettings: using the old settings; this separate install keeps its own settings and does not move them to the shared file`,
     )
   }
 })

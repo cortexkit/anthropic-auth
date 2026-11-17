@@ -29,6 +29,7 @@ async function fixture(
     source?: string | null
     failWrite?: boolean
     unavailableProtection?: boolean
+    diagnostic?: core.SettingsMoveDiagnostic
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'oc2-settings-menu-'))
@@ -98,6 +99,7 @@ async function fixture(
     host: 'opencode',
     settingsService: service,
     settingsMode: () => mode,
+    settingsDiagnostic: options.diagnostic,
     vault: {
       env: {
         ...env,
@@ -428,6 +430,32 @@ test('OC2 a failed file write displays its fixed failure and leaves bytes unchan
     text: `Could not write settings to "${f.file}": the settings file is unavailable. Check its folder and permissions before trying again.`,
   })
   expect(await f.text()).toBe(commented)
+})
+
+test('OC2 status shows shared-file mode after a move', async () => {
+  const f = await fixture({ diagnostic: { outcome: 'moved' } })
+  expect(await f.menu.readStatus('routing')).toContain(
+    `Settings: shared file \`${f.file}\``,
+  )
+})
+
+test('OC2 status explains a waiting move and switches to the shared file after adoption', async () => {
+  const f = await fixture({
+    mode: 'legacy',
+    source: null,
+    diagnostic: {
+      outcome: 'fence-closed',
+      blockers: [{ kind: 'artifact-scan', path: '/old/rpc/port-123.json' }],
+    },
+  })
+  expect(await f.menu.readStatus('routing')).toContain(
+    `Settings: using the old settings; the move to \`${f.file}\` waits for: an old plugin file that could not be read (the log names it)`,
+  )
+  await writeFile(f.file, commented)
+  expect(await f.menu.readStatus('routing')).toContain(
+    `Settings: shared file \`${f.file}\``,
+  )
+  expect(await f.menu.readStatus('routing')).not.toContain('waits for:')
 })
 
 test('OC2 status uses every no-model value and lists model row values and file diagnostics', async () => {

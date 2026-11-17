@@ -316,6 +316,50 @@ test('an invalid protection field moves its restrictive replacement and other va
   ).toHaveLength(1)
 })
 
+test('a closed settings fence logs blocker identities once per process without file contents', async () => {
+  const f = await fixture()
+  const secret = 'private-token-from-artifact'
+  const dir = join(f.root, 'rpc')
+  await put(join(dir, 'port-200.json'), { pid: 200, secret })
+  await fs.writeFile(join(dir, 'port-200.json'), `{${secret}`)
+  f.options.fence.artifacts = {
+    rpcRoots: [],
+    rpcDirs: [dir],
+    cacheKeepDirs: [],
+  }
+  f.options.fence.readHolders = async () => ({
+    version: 1,
+    entries: [holder('2.11.2')],
+  })
+  const info: string[] = []
+  f.options.log = {
+    warn: (message) => f.messages.push(message),
+    info: (message) => info.push(message),
+  }
+  const first = await f.start()
+  const second = await f.start()
+  expect(first.mode).toBe('legacy')
+  expect(second.mode).toBe('legacy')
+  expect(info).toHaveLength(1)
+  expect(info[0]).toContain('settings-holder')
+  expect(info[0]).toContain('artifact-scan')
+  expect(info[0]).toContain(join(dir, 'port-200.json'))
+  expect(info[0]).toContain('200')
+  expect(info[0]).toContain('2.11.2')
+  expect(info[0]).not.toContain(secret)
+  expect(f.messages).toEqual([])
+  expect(first.blockers).toEqual(second.blockers)
+  expect(JSON.stringify(first.blockers)).not.toContain(secret)
+  f.options.paths = {
+    ...f.paths,
+    target: join(f.root, 'another-settings.jsonc'),
+  }
+  f.options.fence.registration = undefined
+  const third = await f.start()
+  expect(third.blockers).toEqual([{ kind: 'registration' }])
+  expect(info).toHaveLength(1)
+})
+
 for (const release of [
   '2.11.2',
   '2.12.0-beta.1',

@@ -30,6 +30,10 @@ import {
   type SettingsMode,
   type SettingsModeOptions,
 } from './settings-mode.ts'
+import {
+  formatSettingsModeStatus,
+  type SettingsMoveDiagnostic,
+} from './settings-mode-status.ts'
 import { readSettingsMoveSource } from './settings-move-source.ts'
 import type { SettingsHost } from './settings-paths.ts'
 import {
@@ -53,6 +57,7 @@ export interface NativeRuntimeSettingsOptions {
   settingsService?: SettingsService
   /** Return the cached settings mode; this callback must not read the filesystem. */
   settingsMode?: () => SettingsMode
+  settingsDiagnostic?: SettingsMoveDiagnostic
   settingsAuthority?: {
     options?: SettingsModeOptions
     /** Schedule a background authority check and return its cancellation function. */
@@ -99,6 +104,7 @@ export function createNativeRuntimeSettings(
   },
 ) {
   const env = options.env ?? process.env
+  let diagnostic = options.settingsDiagnostic
   // Read before retaining: the check is attached to the handle startSettings returned.
   let adoption = getSettingsAdoptionCheck(options.settingsService)
   const startedPending = isSettingsImportPending(options.settingsService)
@@ -365,6 +371,21 @@ export function createNativeRuntimeSettings(
   return {
     resolve,
     status,
+    modeStatus(file: string) {
+      return formatSettingsModeStatus({
+        mode:
+          mode() === 'separate'
+            ? 'separate'
+            : userAuthority || mode() === 'user-file'
+              ? 'user-file'
+              : 'legacy',
+        file: service?.file ?? fallback?.file ?? file,
+        diagnostic,
+      })
+    },
+    setDiagnostic(next: SettingsMoveDiagnostic) {
+      diagnostic = next
+    },
     gateway,
     applyEffects,
     file: () => generation()?.file,

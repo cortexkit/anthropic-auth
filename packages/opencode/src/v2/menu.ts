@@ -125,15 +125,18 @@ export function createNativeMenuCapabilities(options: {
       : done()
   const settingsStatus = async (summary: string) => {
     const status = runtime.getSettingsStatus?.()
+    const modeStatus = runtime.getSettingsModeStatus?.()
     if (!status)
       return [
         summary,
+        ...(modeStatus ? [modeStatus] : []),
         `Settings file: ${await runtime.getSettingsPath()}`,
         ...(runtime.getRelayStatusNotes?.() ?? []),
       ].join('\n')
     const { file } = status
     return [
       summary,
+      ...(modeStatus ? [modeStatus] : []),
       `Settings file: ${file.file}`,
       ...(file.missing
         ? [

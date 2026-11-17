@@ -1,7 +1,7 @@
 import { expect } from 'bun:test'
-import { mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { HOLDER_FILE_NAME, type HolderLiveness } from '../holder-registry.ts'
 import {
@@ -9,6 +9,7 @@ import {
   type PreNArtifactLocations,
   preNArtifactBlockers,
 } from '../layout-fence.ts'
+import { checkSettingsMoveFence } from '../settings-move-fence.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 
 const { test, deferCleanup } = createTestLifetimeSuite()
@@ -56,6 +57,55 @@ async function artifact(
 }
 
 for (const kind of ['CacheKeep record', 'RPC port file'] as const) {
+  test(`a dead older writer's valid ${kind} clears, but malformed bytes keep the settings fence closed even after reboot`, async () => {
+    const { path, locations } = await artifact(kind, {}, NOW)
+    const check = () =>
+      checkSettingsMoveFence({
+        home: dirname(path),
+        env: {},
+        stores: [],
+        registration: { status: 'registered' },
+        readHolders: async () => undefined,
+        artifacts: locations,
+        liveness: { ...liveness, pidAlive: () => false },
+      })
+    expect(await check()).toEqual({ open: true, blockers: [] })
+    await writeFile(path, '{invalid-old-record')
+    await utimes(path, new Date(BOOT - 600_000), new Date(BOOT - 600_000))
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(await check()).toEqual({
+        open: false,
+        blockers: [{ kind: 'artifact-scan', path, reason: 'invalid' }],
+      })
+    }
+    await rm(path)
+    expect(await check()).toEqual({ open: true, blockers: [] })
+  })
+
+  test(`a live older writer's ${kind} blocks until a proven reboot or exit`, async () => {
+    const { path, locations } = await artifact(
+      kind,
+      { startedAt: NOW, writer: { protocol: 1, release: '2.11.2' } },
+      NOW,
+    )
+    const scan = (alive: boolean) =>
+      preNArtifactBlockers(
+        locations,
+        () => alive,
+        clock,
+        (release) => release === '2.12.0',
+      )
+    expect(await scan(true)).toEqual([
+      { kind: 'pre-n-artifact', artifact: path, pid: process.pid },
+    ])
+    expect(await scan(false)).toEqual([])
+    await writeFile(
+      path,
+      JSON.stringify({ pid: process.pid, startedAt: BOOT - 600_000 }),
+    )
+    expect(await scan(true)).toEqual([])
+  })
+
   test(`a ${kind} predating boot does not block when its pid has been reused`, async () => {
     const { locations } = await artifact(kind)
     // The test process is alive, but it did not write the pre-boot record.
@@ -94,6 +144,67 @@ for (const kind of ['CacheKeep record', 'RPC port file'] as const) {
     }
   })
 }
+
+test('an invalid RPC pid and a non-directory RPC root keep blocking without any live pid', async () => {
+  const { path, locations } = await artifact('RPC port file', {}, NOW)
+  await writeFile(path, '{}')
+  expect(await preNArtifactBlockers(locations, () => false, clock)).toEqual([
+    { kind: 'artifact-scan', path, reason: 'invalid' },
+  ])
+  const blockers = await preNArtifactBlockers(
+    { rpcRoots: [path], rpcDirs: [], cacheKeepDirs: [] },
+    () => false,
+    clock,
+  )
+  expect(blockers).toHaveLength(1)
+  expect(blockers[0]).toMatchObject({ kind: 'artifact-scan', path })
+})
+
+test('malformed holder entries and registries keep the settings fence closed without any live pid', async () => {
+  const home = await folder()
+  const file = join(home, '.config', 'opencode', HOLDER_FILE_NAME)
+  await mkdir(dirname(file), { recursive: true })
+  const check = () =>
+    checkSettingsMoveFence({
+      home,
+      env: {},
+      stores: [],
+      registration: { status: 'registered' },
+      artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
+      liveness: { ...liveness, pidAlive: () => false },
+    })
+  await writeFile(
+    file,
+    JSON.stringify({
+      version: 1,
+      entries: [
+        {
+          pid: process.pid,
+          incarnation: null,
+          release: '2.11.2',
+          registeredAt: NOW,
+        },
+      ],
+    }),
+  )
+  expect(await check()).toEqual({ open: true, blockers: [] })
+  await writeFile(file, JSON.stringify({ version: 1, entries: [{}] }))
+  expect((await check()).blockers).toEqual([
+    {
+      kind: 'settings-holder',
+      holderFile: file,
+      pid: null,
+      release: null,
+      reason: 'unreadable',
+    },
+  ])
+  await writeFile(file, '{broken')
+  expect((await check()).blockers).toMatchObject([
+    { kind: 'holder-file', holderFile: file },
+  ])
+  await rm(file)
+  expect(await check()).toEqual({ open: true, blockers: [] })
+})
 
 test('a holder with no incarnation predating boot does not block', async () => {
   const dir = await folder()

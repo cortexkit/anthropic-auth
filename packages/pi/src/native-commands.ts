@@ -391,11 +391,18 @@ export function createPiNativeCommands(
       const storage = snapshot.policyStorage
       const settingsStatus = (summary: string) => {
         const status = runtime.getSettingsStatus?.()
+        const modeStatus = runtime.getSettingsModeStatus?.()
         const relayNotes = runtime.getRelayStatusNotes?.() ?? []
-        if (!status) return [summary, ...relayNotes].join('\n')
+        if (!status)
+          return [
+            summary,
+            ...(modeStatus ? [modeStatus] : []),
+            ...relayNotes,
+          ].join('\n')
         const { file } = status
         return [
           summary,
+          ...(modeStatus ? [modeStatus] : []),
           `Settings file: ${file.file}`,
           ...(file.missing
             ? ['Settings file is missing; a menu write will recreate it.']

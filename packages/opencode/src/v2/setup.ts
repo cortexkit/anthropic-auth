@@ -439,6 +439,7 @@ export async function setupAnthropicAuth(
     settingsService,
     settingsFile: settingsStartup.file,
     settingsMode: () => settingsStartup.mode,
+    settingsDiagnostic: settingsStartup.diagnostic,
     settingsFallback: settingsStartup.fallback,
     settingsReopen: settingsStartup.reopen,
     settingsAuthority: { options: { env: settingsEnv } },

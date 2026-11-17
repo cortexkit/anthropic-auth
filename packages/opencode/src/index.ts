@@ -1440,6 +1440,7 @@ const anthropicAuthPlugin = async (
     settingsService: settingsStartup.service,
     settingsFile: settingsStartup.file,
     settingsMode: () => settingsStartup.mode,
+    settingsDiagnostic: settingsStartup.diagnostic,
     settingsFallback: settingsStartup.fallback,
     settingsReopen: settingsStartup.reopen,
     settingsAuthority: {
@@ -6450,15 +6451,18 @@ const anthropicAuthPlugin = async (
       .filter((line) => !line.includes('/claude-'))
       .join('\n')
     const status = nativeAccounts.getSettingsStatus?.()
+    const modeStatus = nativeAccounts.getSettingsModeStatus?.()
     if (!status)
       return [
         summary,
+        ...(modeStatus ? [modeStatus] : []),
         `Settings file: ${await nativeAccounts.getSettingsPath()}`,
         ...(nativeAccounts.getRelayStatusNotes?.() ?? []),
       ].join('\n')
     const { file } = status
     return [
       summary,
+      ...(modeStatus ? [modeStatus] : []),
       `Settings file: ${file.file}`,
       ...(file.missing
         ? ['Settings file is missing; a menu write will recreate it.']

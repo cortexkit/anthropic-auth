@@ -9,6 +9,7 @@ import {
   type SettingsMode,
   setSettingsAdoptionCheck,
 } from './settings-mode.ts'
+import type { SettingsMoveDiagnostic } from './settings-mode-status.ts'
 import {
   importSettingsHostStore,
   runSettingsMoveAtStartup,
@@ -79,6 +80,7 @@ export interface SettingsProtectionFallback {
 
 export interface StartedSettings {
   mode: SettingsMode
+  diagnostic?: SettingsMoveDiagnostic
   /**
    * The settings file; empty only when no path could be resolved, which the
    * shared-runtime key treats as "no settings file".
@@ -171,6 +173,9 @@ export async function startSettings(
   }
   const move = options.start?.move ?? runSettingsMoveAtStartup
   const open = options.start?.open ?? openSettingsService
+  const diagnostic: SettingsMoveDiagnostic = {
+    outcome: refused ? 'authority-refused' : 'startup-failed',
+  }
 
   // Applied copies and last-good sets wait until this host uses the file:
   // the service's lease checks this flag before saving either, whatever copy
@@ -206,6 +211,15 @@ export async function startSettings(
       warnOnce,
       'at its next settings check',
     )
+    if (outcome !== 'adopt' && outcome !== 'pending') {
+      diagnostic.outcome =
+        outcome === 'refused'
+          ? 'import-refused'
+          : outcome === 'unknown'
+            ? 'import-unknown'
+            : 'import-pending'
+      delete diagnostic.blockers
+    }
     // A missing file is used without an import: no applied copy comes from
     // it, and the check runs again once a file appears.
     if (outcome === 'pending') return 'pending'
@@ -232,15 +246,19 @@ export async function startSettings(
       const started = await move(options)
       file = started.paths.target
       paths = started.paths
+      diagnostic.outcome = started.outcome
+      diagnostic.blockers = started.blockers
+      diagnostic.sourceReason = started.sourceReason
       moved = started.mode === 'user-file'
       // The startup move already ran the import check before choosing the
       // file, unless the file is missing and this host's import is pending.
       adopted = moved && !started.importPending
-      if (!started.mayOpenService) return { mode: started.mode, file }
+      if (!started.mayOpenService)
+        return { mode: started.mode, file, diagnostic }
       const service = track(await open(serviceOptions(file)))
-      if (!service) return { mode: started.mode, file }
+      if (!service) return { mode: started.mode, file, diagnostic }
       if (started.importPending) markSettingsImportPending(service)
-      return { mode: started.mode, file, service }
+      return { mode: started.mode, file, service, diagnostic }
     } catch {
       if (!warned) {
         warned = true
@@ -303,7 +321,7 @@ export async function startSettings(
     // Injected paths say without any I/O that this is a separate install,
     // which never uses the shared settings file.
     if (options.paths?.separate)
-      return { mode: 'separate', file: options.paths.target }
+      return { mode: 'separate', file: options.paths.target, diagnostic }
     // Requests are refused by the host's credential checks while the
     // preflight refuses, so plain legacy mode with no settings I/O is enough.
     // Once it passes, requests must be served at once: legacy values apply
@@ -335,7 +353,7 @@ export async function startSettings(
       },
       { retryDelaysMs: PREFLIGHT_RETRY_DELAYS_MS, separate: () => separate },
     )
-    return { mode: 'legacy', file, reopen: reopenAfterPreflight }
+    return { mode: 'legacy', file, reopen: reopenAfterPreflight, diagnostic }
   }
   let mode: SettingsMode = 'user-file'
   let unknown = false
@@ -356,8 +374,8 @@ export async function startSettings(
       }
     }
   }
-  if (mode === 'legacy') return { mode, file, reopen: reopenLegacy }
-  if (mode !== 'user-file') return { mode, file }
+  if (mode === 'legacy') return { mode, file, reopen: reopenLegacy, diagnostic }
+  if (mode !== 'user-file') return { mode, file, diagnostic }
   const recovered = await recoverSettingsProtection(
     file,
     options.host,
@@ -368,6 +386,7 @@ export async function startSettings(
   return {
     mode,
     file,
+    diagnostic,
     fallback: {
       get file() {
         return file

@@ -38,6 +38,7 @@ async function fixture(
     source?: string | null
     failWrite?: boolean
     unavailableProtection?: boolean
+    diagnostic?: core.SettingsMoveDiagnostic
   } = {},
 ) {
   await useTempAccountFile(ctx, { version: 1, accounts: [] })
@@ -123,6 +124,7 @@ async function fixture(
       mode,
       file,
       service,
+      diagnostic: options.diagnostic,
     })
     cleanups.push(() => startup.mockRestore())
   }
@@ -539,6 +541,28 @@ test('OC1 cache, dump and fast latches change only after the settings write comm
       write.mockRestore()
     }
   }
+})
+
+test('OC1 status shows shared-file mode after a move', async () => {
+  const f = await fixture({ diagnostic: { outcome: 'moved' } })
+  expect(await f.status()).toContain(`Settings: shared file \`${f.file}\``)
+})
+
+test('OC1 status explains a waiting move and switches to the shared file after adoption', async () => {
+  const f = await fixture({
+    mode: 'legacy',
+    source: null,
+    diagnostic: {
+      outcome: 'fence-closed',
+      blockers: [{ kind: 'artifact-scan', path: '/old/rpc/port-123.json' }],
+    },
+  })
+  expect(await f.status()).toContain(
+    `Settings: using the old settings; the move to \`${f.file}\` waits for: an old plugin file that could not be read (the log names it)`,
+  )
+  await writeFile(f.file, commented)
+  expect(await f.status()).toContain(`Settings: shared file \`${f.file}\``)
+  expect(await f.status()).not.toContain('waits for:')
 })
 
 test('OC1 status lists every no-model value, model row override and file diagnostic', async () => {
