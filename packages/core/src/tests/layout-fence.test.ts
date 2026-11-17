@@ -15,7 +15,11 @@ import { createTestLifetimeSuite } from './test-lifetime.ts'
 const { test, deferCleanup } = createTestLifetimeSuite()
 const NOW = Date.UTC(2026, 0, 2, 12)
 const BOOT = Date.UTC(2026, 0, 2, 11)
-const clock = { now: () => NOW, uptime: () => 3_600 }
+const clock = {
+  now: () => NOW,
+  uptime: () => 3_600,
+  processStartedAtMs: async () => null,
+}
 const liveness: HolderLiveness = {
   ...clock,
   pidAlive: (pid) => {

@@ -13,12 +13,16 @@ export function getRpcDir(projectDirectory: string): string {
     .update(projectDirectory)
     .digest('hex')
     .slice(0, 16)
+  return join(getRpcRoot(), hash)
+}
+
+export function getRpcRoot(): string {
   const root = anthropicAuthStateRoot({
     xdgStateHome: process.env.XDG_STATE_HOME,
     home: homedir(),
     acceptRelative: true,
   })
-  return join(root, 'rpc', hash)
+  return join(root, 'rpc')
 }
 
 export { tmpdir }

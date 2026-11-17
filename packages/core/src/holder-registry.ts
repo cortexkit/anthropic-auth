@@ -263,6 +263,8 @@ export interface HolderLiveness {
   pidAlive(pid: number): boolean
   /** Undefined or null when it can't be read. */
   incarnation(pid: number): Promise<string | null>
+  /** Wall-clock process start, when the OS can report it. */
+  processStartedAtMs?(pid: number): Promise<number | null>
   /** Wall clock and OS uptime; tests replace both. */
   now?(): number
   uptime?(): number
@@ -319,6 +321,77 @@ export function processIncarnation(pid: number): Promise<string | null> {
   if (process.platform === 'linux') return linuxIncarnation(pid)
   if (process.platform === 'darwin') return macosIncarnation(pid)
   return Promise.resolve(null)
+}
+
+/** OS reads used to obtain a wall-clock process start; tests supply fixtures. */
+export interface ProcessStartReads {
+  platform: NodeJS.Platform
+  readFile(path: string): Promise<string>
+  exec(file: string, args: string[]): Promise<string>
+}
+
+const processStartReads: ProcessStartReads = {
+  platform: process.platform,
+  readFile: (path) => readFile(path, 'utf8'),
+  exec: (file, args) =>
+    new Promise((resolve, reject) => {
+      execFile(
+        file,
+        args,
+        { env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C' }, timeout: 5_000 },
+        (error, stdout) => (error ? reject(error) : resolve(String(stdout))),
+      )
+    }),
+}
+
+let clockTicks: Promise<number> | undefined
+
+/** Wall-clock process start, or null if the OS cannot safely report it. */
+export async function processStartedAtMs(
+  pid: number,
+  reads: ProcessStartReads = processStartReads,
+): Promise<number | null> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null
+  try {
+    if (reads.platform === 'darwin') {
+      const text = (
+        await reads.exec('ps', ['-o', 'lstart=', '-p', String(pid)])
+      ).trim()
+      if (!/^\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.test(text))
+        return null
+      const start = Date.parse(`${text} GMT`)
+      return Number.isFinite(start) && start >= 0 ? start : null
+    }
+    if (reads.platform !== 'linux') return null
+    const getTicks = async () => {
+      try {
+        const ticks = Number((await reads.exec('getconf', ['CLK_TCK'])).trim())
+        if (Number.isFinite(ticks) && ticks > 0) return ticks
+      } catch {}
+      return 100
+    }
+    // Only cache real OS reads; independent fixture readers must not share state.
+    let ticks: number
+    if (reads === processStartReads) {
+      clockTicks ??= getTicks()
+      ticks = await clockTicks
+    } else ticks = await getTicks()
+    const stat = await reads.readFile(`/proc/${pid}/stat`)
+    const end = stat.lastIndexOf(')')
+    if (end < 0) return null
+    const startTicks = stat
+      .slice(end + 1)
+      .trim()
+      .split(/\s+/)[19]
+    const boot = /^btime\s+(\d+)\s*$/m.exec(
+      await reads.readFile('/proc/stat'),
+    )?.[1]
+    if (!startTicks || !/^\d+$/.test(startTicks) || !boot) return null
+    const start = Number(boot) * 1000 + (Number(startTicks) / ticks) * 1000
+    return Number.isFinite(start) && start >= 0 ? start : null
+  } catch {
+    return null
+  }
 }
 
 const defaultLiveness: HolderLiveness = {

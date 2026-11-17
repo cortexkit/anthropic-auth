@@ -15,6 +15,7 @@ import {
 import type { drainNotifications } from './notifications'
 import { writePortFile } from './port-file'
 import type { ApplyRequest, ApplyResult } from './protocol'
+import { type RpcSweepOptions, sweepRpcState } from './sweep'
 
 export interface RpcServerHandle {
   port: number
@@ -29,6 +30,7 @@ export interface RpcServerOptions {
   apply?: (request: ApplyRequest) => Promise<ApplyResult>
   /** Run menu actions through the host's credential service, not legacy account-file writes. */
   applyMenu?: (request: CommandApplyRequest) => Promise<CommandApplyResult>
+  sweep?: RpcSweepOptions
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -163,6 +165,7 @@ export async function startRpcServer(
     await closeServer()
     throw error
   }
+  void sweepRpcState(options.dir, options.sweep)
 
   return {
     port,
