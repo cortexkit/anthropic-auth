@@ -1,6 +1,12 @@
 import { expect, test } from 'bun:test'
+import { applyMidConversationOutputConfig } from '@cortexkit/anthropic-auth-core'
 import type { Context, SimpleStreamOptions } from '@earendil-works/pi-ai'
-import { PiForkEffortSnapshots, piForkHeadSession } from '../forks.ts'
+import {
+  applyPiForkEffort,
+  PiForkEffortSnapshots,
+  piForkEffortHint,
+  piForkHeadSession,
+} from '../forks.ts'
 
 const context: Context = {
   messages: [{ role: 'user', content: 'Base question', timestamp: 1 }],
@@ -85,4 +91,69 @@ test('fork effort provenance uses the longest prefix and retains only eight base
   })
   expect(longest.messageCount).toBe(9)
   expect(longest.transitions[0]?.effort).toBe('high')
+})
+
+test('the fork effort hint is read only from a valid fork', () => {
+  const fork = (cortexkitFork: unknown, sessionId = 'fork') =>
+    piForkEffortHint({ sessionId, cortexkitFork } as SimpleStreamOptions)
+  for (const effort of ['low', 'medium', 'high'] as const)
+    expect(fork({ headSessionId: 'head', effort })).toBe(effort)
+  for (const effort of [undefined, 'xhigh', 'max', 'minimal', 'LOW', 1, null])
+    expect(fork({ headSessionId: 'head', effort })).toBeUndefined()
+  expect(fork({ effort: 'low' })).toBeUndefined()
+  expect(fork({ headSessionId: 'fork', effort: 'low' })).toBeUndefined()
+  expect(
+    piForkEffortHint({ effort: 'low' } as unknown as SimpleStreamOptions),
+  ).toBeUndefined()
+})
+
+function forkBody(model: string, thinking: Record<string, unknown>) {
+  return {
+    model,
+    thinking,
+    output_config: { effort: 'high' },
+    messages: [
+      { role: 'user', content: 'Base question' },
+      { role: 'assistant', content: 'Head answer' },
+      { role: 'user', content: 'Fork question' },
+    ],
+  } as Record<string, unknown>
+}
+
+test('the fork effort hint becomes one effort change at the question', () => {
+  const body = forkBody('claude-sonnet-5-5', { type: 'adaptive' })
+  const history = [{ afterAssistantMessages: 0, effort: 'high' as const }]
+  expect(applyPiForkEffort(body, history, 'low')).toBe('low')
+  expect(body.output_config).toEqual({ effort: 'high' })
+  expect(body.messages).toEqual([
+    { role: 'user', content: 'Base question' },
+    { role: 'assistant', content: 'Head answer' },
+    { role: 'system', content: [], output_config: { effort: 'low' } },
+    { role: 'user', content: 'Fork question' },
+  ])
+})
+
+test('the fork effort hint leaves Sonnet 5.5 between_tools requests as the base history built them', () => {
+  // Anthropic rejects a differing per-message effort on between_tools.
+  const history = [
+    { afterAssistantMessages: 0, effort: 'high' as const },
+    { afterAssistantMessages: 1, effort: 'medium' as const },
+  ]
+  const expected = forkBody('claude-sonnet-5-5', { type: 'between_tools' })
+  applyMidConversationOutputConfig(expected, history)
+  const body = forkBody('claude-sonnet-5-5', { type: 'between_tools' })
+  expect(applyPiForkEffort(body, history, 'low')).toBeUndefined()
+  expect(JSON.stringify(body)).toBe(JSON.stringify(expected))
+})
+
+test('the fork effort hint is dropped when the question does not follow a reply', () => {
+  // The marker would land before the earlier user message, inside the
+  // head's cached prefix.
+  const body = forkBody('claude-fable-5-1', { type: 'adaptive' })
+  ;(body.messages as unknown[]).push({ role: 'user', content: 'Follow-up' })
+  const expected = structuredClone(body)
+  const history = [{ afterAssistantMessages: 0, effort: 'high' as const }]
+  applyMidConversationOutputConfig(expected, history)
+  expect(applyPiForkEffort(body, history, 'low')).toBeUndefined()
+  expect(JSON.stringify(body)).toBe(JSON.stringify(expected))
 })
