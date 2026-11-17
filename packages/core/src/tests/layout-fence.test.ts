@@ -57,7 +57,11 @@ async function artifact(
 }
 
 for (const kind of ['CacheKeep record', 'RPC port file'] as const) {
-  test(`a dead older writer's valid ${kind} clears, but malformed bytes keep the settings fence closed even after reboot`, async () => {
+  // The CacheKeep record here is named `<pid>-old.json`, not the production
+  // `<pid>-<uuid>.json`, so its filename does not prove its writer and its
+  // malformed bytes keep blocking. A production-named RPC port file whose
+  // filename pid is dead clears even when malformed.
+  test(`a dead older writer's valid ${kind} clears; malformed bytes clear only under a production filename`, async () => {
     const { path, locations } = await artifact(kind, {}, NOW)
     const check = () =>
       checkSettingsMoveFence({
@@ -73,10 +77,14 @@ for (const kind of ['CacheKeep record', 'RPC port file'] as const) {
     await writeFile(path, '{invalid-old-record')
     await utimes(path, new Date(BOOT - 600_000), new Date(BOOT - 600_000))
     for (let attempt = 0; attempt < 2; attempt++) {
-      expect(await check()).toEqual({
-        open: false,
-        blockers: [{ kind: 'artifact-scan', path, reason: 'invalid' }],
-      })
+      expect(await check()).toEqual(
+        kind === 'RPC port file'
+          ? { open: true, blockers: [] }
+          : {
+              open: false,
+              blockers: [{ kind: 'artifact-scan', path, reason: 'invalid' }],
+            },
+      )
     }
     await rm(path)
     expect(await check()).toEqual({ open: true, blockers: [] })
@@ -145,10 +153,10 @@ for (const kind of ['CacheKeep record', 'RPC port file'] as const) {
   })
 }
 
-test('an invalid RPC pid and a non-directory RPC root keep blocking without any live pid', async () => {
+test('an invalid RPC record from a live filename pid and a non-directory RPC root keep blocking', async () => {
   const { path, locations } = await artifact('RPC port file', {}, NOW)
   await writeFile(path, '{}')
-  expect(await preNArtifactBlockers(locations, () => false, clock)).toEqual([
+  expect(await preNArtifactBlockers(locations, () => true, clock)).toEqual([
     { kind: 'artifact-scan', path, reason: 'invalid' },
   ])
   const blockers = await preNArtifactBlockers(

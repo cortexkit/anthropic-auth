@@ -210,25 +210,47 @@ function stamped(value: unknown): boolean {
   )
 }
 
+/** Only these production names identify a file's writer independently of its bytes. */
+function publisherPid(
+  kind: 'rpc' | 'cachekeep',
+  name: string,
+): number | undefined {
+  const match =
+    kind === 'rpc'
+      ? /^port-(\d+)\.json$/.exec(name)
+      : /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/.exec(
+          name,
+        )
+  const pid = Number(match?.[1])
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
+}
+
 async function readArtifact(
   path: string,
   blockers: FenceBlocker[],
-): Promise<{ value: unknown; startedAt: unknown } | undefined> {
+  malformedIsStale: (startedAt?: unknown) => boolean,
+): Promise<
+  { value: unknown; startedAt: unknown; regular: boolean } | undefined
+> {
   let text: string
   let mtimeMs: number
+  let regular: boolean
   try {
     // Keep the bytes and mtime from the same file if its writer replaces the path.
     const file = await open(path, 'r')
     try {
       text = await file.readFile('utf8')
-      mtimeMs = (await file.stat()).mtimeMs
+      const stat = await file.stat()
+      mtimeMs = stat.mtimeMs
+      regular = stat.isFile()
     } finally {
       await file.close()
     }
   } catch (error) {
     // Removed between the listing and the read: its writer released it.
     if (errorCode(error) === 'ENOENT') return undefined
-    blockers.push({ kind: 'artifact-scan', path, reason: reasonOf(error) })
+    if (!malformedIsStale())
+      blockers.push({ kind: 'artifact-scan', path, reason: reasonOf(error) })
     return undefined
   }
   try {
@@ -242,9 +264,10 @@ async function readArtifact(
             ? value.registeredAt
             : mtimeMs
         : mtimeMs
-    return { value, startedAt }
+    return { value, startedAt, regular }
   } catch {
-    blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
+    if (!malformedIsStale(regular ? mtimeMs : undefined))
+      blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
     return undefined
   }
 }
@@ -252,8 +275,9 @@ async function readArtifact(
 /**
  * The fence's check for older versions: an RPC port file or CacheKeep record without the
  * `writer` stamp, whose pid is alive, belongs to a version that registers
- * nothing and blocks. Every entry is read; a folder or file that can't be
- * read or parsed blocks too. A record from before this boot is stale even
+ * nothing and blocks. Unreadable or malformed publisher-owned files need a
+ * proven dead filename pid, or a readable regular file's pre-boot mtime.
+ * Other scan failures block. A record from before this boot is stale even
  * if its pid has been reused; missing or untrustworthy times keep blocking.
  */
 export async function preNArtifactBlockers(
@@ -273,6 +297,17 @@ export async function preNArtifactBlockers(
       acceptsRelease(
         (value as { writer: { release?: unknown } }).writer.release,
       ))
+  const malformedIsStale = (pid: number | undefined, startedAt?: unknown) => {
+    if (pid === undefined) return false
+    if (recordPredatesBoot(startedAt, clock)) return true
+    // Match the holder registry's pid probe; no incarnation can be trusted
+    // from malformed bytes, so a reused live pid must still block.
+    try {
+      return !pidAlive(pid)
+    } catch {
+      return false
+    }
+  }
   const blockers: FenceBlocker[] = []
   const portDirs = [...locations.rpcDirs]
   for (const root of locations.rpcRoots)
@@ -282,12 +317,16 @@ export async function preNArtifactBlockers(
     for (const name of await listDir(dir, blockers)) {
       if (!/^port-\d+\.json$/.test(name)) continue
       const path = join(dir, name)
-      const record = await readArtifact(path, blockers)
+      const filenamePid = publisherPid('rpc', name)
+      const isStale = (startedAt?: unknown) =>
+        malformedIsStale(filenamePid, startedAt)
+      const record = await readArtifact(path, blockers, isStale)
       if (record === undefined || exempt(record.value)) continue
       const { value, startedAt } = record
-      const pid = (value as { pid?: unknown }).pid
+      const pid = (value as { pid?: unknown } | null)?.pid
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
-        blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
+        if (!isStale(record.regular ? startedAt : undefined))
+          blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
         continue
       }
       if (!recordPredatesBoot(startedAt, clock) && pidAlive(pid))
@@ -299,7 +338,10 @@ export async function preNArtifactBlockers(
       const match = /^(\d+)-.+\.json$/.exec(name)
       if (!match) continue
       const path = join(dir, name)
-      const record = await readArtifact(path, blockers)
+      const filenamePid = publisherPid('cachekeep', name)
+      const record = await readArtifact(path, blockers, (startedAt) =>
+        malformedIsStale(filenamePid, startedAt),
+      )
       if (record === undefined || exempt(record.value)) continue
       const pid = Number(match[1])
       if (!recordPredatesBoot(record.startedAt, clock) && pidAlive(pid))
