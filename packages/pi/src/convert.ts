@@ -1,6 +1,5 @@
 import {
   applyClaudeCodeMetadata,
-  applyMidConversationOutputConfig,
   applyRunnerTurnNotes,
   applySessionCacheTtl,
   applyThinkingBindingControls,
@@ -44,7 +43,12 @@ import type {
   Tool,
   ToolResultMessage,
 } from '@earendil-works/pi-ai'
-import { PiForkRefusal, piForkHeadSession } from './forks.ts'
+import {
+  applyPiForkEffort,
+  type PiForkEffortHint,
+  PiForkRefusal,
+  piForkHeadSession,
+} from './forks.ts'
 import {
   collapseSystemMessages,
   getCurrentSystemPrompt,
@@ -704,6 +708,8 @@ export async function buildAnthropicRequest(
   controls: {
     effortTransitions?: readonly MidConversationEffortTransition[]
     forkBaseMessageCount?: number
+    /** A fork's lower answer effort, applied to its question turn only. */
+    forkEffort?: PiForkEffortHint
     /** Leave the billing signature placeholder for the transport to finalize. */
     deferSigning?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
@@ -721,6 +727,8 @@ export async function buildAnthropicRequest(
   bodyText: string
   toolNames: ReadonlyMap<string, string>
   cacheTtlMs: number
+  /** Set only when `controls.forkEffort` changed the request. */
+  forkEffortApplied?: PiForkEffortHint
 }> {
   const forkBase =
     controls.forkBaseMessageCount === undefined
@@ -895,7 +903,11 @@ export async function buildAnthropicRequest(
     }
   }
 
-  applyMidConversationOutputConfig(body, controls.effortTransitions ?? [])
+  const forkEffortApplied = applyPiForkEffort(
+    body,
+    controls.effortTransitions ?? [],
+    controls.forkEffort,
+  )
   if (identity) {
     applyTurnEndNotes(body, {
       tools: controls.turnEndNote?.tools,
@@ -962,5 +974,11 @@ export async function buildAnthropicRequest(
   // session waits on its account. Include hook edits, not the account setting;
   // a cache_control key inside tool data is not a cache breakpoint.
   const cacheTtlMs = requestCacheLifetimeMs(sentBody)
-  return { body, bodyText, toolNames, cacheTtlMs }
+  return {
+    body,
+    bodyText,
+    toolNames,
+    cacheTtlMs,
+    ...(forkEffortApplied && { forkEffortApplied }),
+  }
 }

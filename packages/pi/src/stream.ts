@@ -142,7 +142,10 @@ import {
   piThreadCacheSlot,
 } from './convert.ts'
 import {
+  type PiForkEffortHint,
   PiForkRefusal,
+  type PiForkReplyReport,
+  piForkEffortHint,
   piForkEffortSnapshots,
   piForkHeadSession,
 } from './forks.ts'
@@ -919,6 +922,7 @@ async function sendAnthropicRequestAttempt(
     route?: string
     effortTransitions?: readonly MidConversationEffortTransition[]
     onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
+    onForkEffortApplied?: (effort: PiForkEffortHint | undefined) => void
     onThreadPrepared?: (fail: () => void) => void
     onCacheUsageRecorder?: (
       record: (usage?: Record<string, number>) => void,
@@ -1009,7 +1013,7 @@ async function sendAnthropicRequestAttempt(
   const forkBase = forkHead
     ? piForkEffortSnapshots.match(forkHead, options.context)
     : undefined
-  const { body, bodyText, toolNames, cacheTtlMs } = options.prime
+  const { body, bodyText, toolNames, cacheTtlMs, ...built } = options.prime
     ? buildPiPrimeBody(identity)
     : await buildAnthropicRequest(
         options.model.id,
@@ -1024,6 +1028,10 @@ async function sendAnthropicRequestAttempt(
         {
           deferSigning: true,
           forkBaseMessageCount: forkBase?.messageCount,
+          // API-key routes send no effort history, so no fork hint either.
+          forkEffort: options.apiAccount
+            ? undefined
+            : piForkEffortHint(options.streamOptions),
           effortTransitions: options.apiAccount
             ? []
             : forkBase
@@ -1051,6 +1059,9 @@ async function sendAnthropicRequestAttempt(
     )
   let wireBodyText = bodyText
   options.onResolvedToolNames?.(toolNames)
+  options.onForkEffortApplied?.(
+    'forkEffortApplied' in built ? built.forkEffortApplied : undefined,
+  )
   const fastMode = body.speed === 'fast'
   const headers = options.apiAccount
     ? new Headers()
@@ -1804,6 +1815,7 @@ async function executeWithFallback(options: {
   storagePath: string
   effortTransitions?: readonly MidConversationEffortTransition[]
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
+  onForkEffortApplied?: (effort: PiForkEffortHint | undefined) => void
   onThreadPrepared?: (fail: () => void) => void
   routingRelay?: ReturnType<typeof createRoutingRelay>
   routingState?: {
@@ -2801,6 +2813,12 @@ export function streamCortexKitAnthropic(
         effortTransitions,
         onResolvedToolNames: (names: ReadonlyMap<string, string>) => {
           toolNames = names
+        },
+        // The last request built is the one sent; report only what it carried.
+        onForkEffortApplied: (effort: PiForkEffortHint | undefined) => {
+          const reply = output as typeof output & PiForkReplyReport
+          if (effort) reply.cortexkitFork = { effortApplied: effort }
+          else delete reply.cortexkitFork
         },
       }
       const routingState: {

@@ -467,6 +467,253 @@ for (const mode of [
   })
 }
 
+type ForkEffortLevel = 'low' | 'medium' | 'high'
+
+/** Run one head turn, then the same fork once per hint (undefined: no hint). */
+async function runForkEffortHints(options: {
+  modelId: string
+  reasoning?: ForkEffortLevel
+  base?: Context
+  history: Array<{ afterAssistantMessages: number; effort: ForkEffortLevel }>
+  hints: unknown[]
+}) {
+  const f = await fixture()
+  const head = `fork-effort-${options.modelId}-${f.path}`
+  forkRouting()
+  const bodies: string[] = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(request) {
+      const bytes = Buffer.from(await request.arrayBuffer())
+      bodies.push(
+        request.headers.get('content-encoding') === 'gzip'
+          ? gunzipSync(bytes).toString()
+          : bytes.toString(),
+      )
+      return success()
+    },
+  })
+  deferCleanup(() => server.stop(true))
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input).includes('/api/oauth/usage')) return Response.json({})
+      return originalFetch(server.url, init)
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  const forkModel = { ...model, id: options.modelId }
+  const base = options.base ?? context
+  const reasoning = options.reasoning ?? 'high'
+  expect(
+    (
+      await streamCortexKitAnthropic(
+        forkModel,
+        base,
+        { sessionId: head, reasoning },
+        options.history,
+      ).result()
+    ).stopReason,
+  ).toBe('stop')
+  const runs: Array<{
+    body: string
+    reply: AssistantMessage & { cortexkitFork?: unknown }
+  }> = []
+  for (const effort of options.hints) {
+    const forkStreamOptions = {
+      sessionId: `${head}-fork`,
+      reasoning,
+      cortexkitFork: {
+        headSessionId: head,
+        ...(effort !== undefined && { effort }),
+      },
+    }
+    const reply = await streamCortexKitAnthropic(
+      forkModel,
+      forkContext(base),
+      forkStreamOptions,
+      options.history,
+    ).result()
+    expect(reply.stopReason).toBe('stop')
+    runs.push({ body: bodies.at(-1)!, reply })
+  }
+  return runs
+}
+
+const withoutSignature = (text: string) =>
+  text.replace(/cch=[a-f0-9]+/g, 'cch=SIGNATURE')
+
+function expectQuestionEffort(
+  hinted: string,
+  unhinted: string,
+  effort: ForkEffortLevel,
+  topLevel: ForkEffortLevel,
+) {
+  const plain = normalizedForkBody(unhinted)
+  const lowered = normalizedForkBody(hinted)
+  expect(lowered.messages).toHaveLength(plain.messages.length + 1)
+  // Every message before the question is what the head cached.
+  expect(JSON.stringify(lowered.messages.slice(0, -2))).toBe(
+    JSON.stringify(plain.messages.slice(0, -1)),
+  )
+  expect(lowered.messages.at(-2)).toEqual({
+    role: 'system',
+    content: [],
+    output_config: { effort },
+  })
+  expect(JSON.stringify(lowered.messages.at(-1))).toBe(
+    JSON.stringify(plain.messages.at(-1)),
+  )
+  expect(lowered.output_config).toEqual({ effort: topLevel })
+  delete plain.messages
+  delete lowered.messages
+  expect(JSON.stringify(lowered)).toBe(JSON.stringify(plain))
+}
+
+for (const modelId of [
+  'claude-fable-5-1',
+  'claude-fable-5-2',
+  'claude-opus-5-5',
+  'claude-sonnet-5-5',
+]) {
+  test(`Pi fork answers its question at a lower effort hint: ${modelId}`, async () => {
+    const [plain, lowered] = await runForkEffortHints({
+      modelId,
+      history: [{ afterAssistantMessages: 0, effort: 'high' }],
+      hints: [undefined, 'low'],
+    })
+    expectQuestionEffort(lowered!.body, plain!.body, 'low', 'high')
+    expect(lowered!.reply.cortexkitFork).toEqual({ effortApplied: 'low' })
+    expect(plain!.reply).not.toHaveProperty('cortexkitFork')
+  })
+}
+
+for (const modelId of ['claude-fable-5-1', 'claude-opus-5-5']) {
+  test(`Pi fork ignores an equal, higher or invalid effort hint: ${modelId}`, async () => {
+    const [plain, ...ignored] = await runForkEffortHints({
+      modelId,
+      reasoning: 'medium',
+      history: [{ afterAssistantMessages: 0, effort: 'medium' }],
+      hints: [undefined, 'medium', 'high', 'xhigh', 'minimal', 'LOW', 1, null],
+    })
+    for (const run of ignored) {
+      expect(withoutSignature(run.body)).toBe(withoutSignature(plain!.body))
+      expect(run.reply).not.toHaveProperty('cortexkitFork')
+    }
+  })
+}
+
+for (const modelId of ['claude-opus-5', 'claude-haiku-5-5']) {
+  test(`Pi fork ignores the effort hint on a model without per-message effort: ${modelId}`, async () => {
+    const [plain, hinted] = await runForkEffortHints({
+      modelId,
+      history: [{ afterAssistantMessages: 0, effort: 'high' }],
+      hints: [undefined, 'low'],
+    })
+    expect(withoutSignature(hinted!.body)).toBe(withoutSignature(plain!.body))
+    expect(hinted!.reply).not.toHaveProperty('cortexkitFork')
+  })
+}
+
+test('Pi fork compares its effort hint with the effort in force at the question', async () => {
+  // The head lowered effort to medium on its second turn, so medium is not a
+  // change for the fork's question even though the top-level effort is high.
+  const base: Context = {
+    ...context,
+    messages: [
+      ...forkContext(context).messages.slice(0, 2),
+      { role: 'user', content: 'Second head turn', timestamp: 2 },
+    ],
+  }
+  const [plain, medium, low] = await runForkEffortHints({
+    modelId: 'claude-fable-5-1',
+    base,
+    history: [
+      { afterAssistantMessages: 0, effort: 'high' },
+      { afterAssistantMessages: 1, effort: 'medium' },
+    ],
+    hints: [undefined, 'medium', 'low'],
+  })
+  const plainBody = normalizedForkBody(plain!.body)
+  expect(plainBody.output_config).toEqual({ effort: 'high' })
+  expect(
+    plainBody.messages.filter(
+      (message: Record<string, unknown>) => message.output_config,
+    ),
+  ).toEqual([
+    { role: 'system', content: [], output_config: { effort: 'medium' } },
+  ])
+  expect(withoutSignature(medium!.body)).toBe(withoutSignature(plain!.body))
+  expect(medium!.reply).not.toHaveProperty('cortexkitFork')
+  expectQuestionEffort(low!.body, plain!.body, 'low', 'high')
+  expect(low!.reply.cortexkitFork).toEqual({ effortApplied: 'low' })
+})
+
+test('Pi ignores an effort hint on a request that is not a valid fork', async () => {
+  const f = await fixture()
+  const session = `not-a-fork-${f.path}`
+  forkRouting()
+  const bodies: string[] = []
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(request) {
+      const bytes = Buffer.from(await request.arrayBuffer())
+      bodies.push(
+        request.headers.get('content-encoding') === 'gzip'
+          ? gunzipSync(bytes).toString()
+          : bytes.toString(),
+      )
+      return success()
+    },
+  })
+  deferCleanup(() => server.stop(true))
+  globalThis.fetch = Object.assign(
+    async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input).includes('/api/oauth/usage')) return Response.json({})
+      return originalFetch(server.url, init)
+    },
+    { preconnect: originalFetch.preconnect },
+  ) as typeof fetch
+  const history = [{ afterAssistantMessages: 0, effort: 'high' as const }]
+  const conversation = forkContext(context)
+  const replies: Array<AssistantMessage & { cortexkitFork?: unknown }> = []
+  for (const index of [0, 1, 2]) {
+    const sessionId = `${session}-${index}`
+    // No fork, a fork object without a head, and a fork naming itself as head.
+    const cortexkitFork = [
+      undefined,
+      { effort: 'low' },
+      { headSessionId: sessionId, effort: 'low' },
+    ][index]
+    const streamOptions = {
+      sessionId,
+      reasoning: 'high' as const,
+      ...(cortexkitFork && { cortexkitFork }),
+    }
+    const reply = await streamCortexKitAnthropic(
+      model,
+      conversation,
+      streamOptions,
+      history,
+    ).result()
+    expect(reply.stopReason).toBe('stop')
+    replies.push(reply)
+  }
+  expect(bodies).toHaveLength(3)
+  const [plain, ...stray] = bodies.map((body) => normalizedForkBody(body))
+  for (const [index, body] of stray.entries()) {
+    expect(JSON.stringify(body.messages)).toBe(JSON.stringify(plain.messages))
+    expect(body.output_config).toEqual(plain.output_config)
+    expect(replies[index + 1]).not.toHaveProperty('cortexkitFork')
+  }
+  expect(
+    plain.messages.filter(
+      (message: Record<string, unknown>) => message.output_config,
+    ),
+  ).toEqual([])
+})
+
 for (const failure of [
   'absent',
   'null',
