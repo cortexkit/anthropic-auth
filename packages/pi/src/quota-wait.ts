@@ -65,7 +65,11 @@ async function waitForReset(
   }
 }
 
-/** Own one wait inside a Pi stream, rather than asking Pi's text-based retry loop. */
+/**
+ * Own one wait inside a Pi stream. Pi's own retry loop decides from an
+ * error's message text, with its own short delays, so it can't wait for a
+ * quota reset; this waits here, then resends once.
+ */
 export async function withPiQuotaWait(input: {
   run: () => Promise<Response>
   resume: (hold: PiAccountHold | undefined) => Promise<Response>
