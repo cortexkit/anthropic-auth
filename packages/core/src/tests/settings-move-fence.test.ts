@@ -1,11 +1,13 @@
-import { expect } from 'bun:test'
+import { expect, spyOn } from 'bun:test'
 import { createHash } from 'node:crypto'
+import * as fs from 'node:fs/promises'
 import {
   copyFile,
   mkdir,
   mkdtemp,
   realpath,
   rm,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -29,6 +31,8 @@ import { createTestLifetimeSuite } from './test-lifetime.ts'
 const { test, deferCleanup } = createTestLifetimeSuite()
 const FLOOR = '2.12.0'
 const NOW = Date.UTC(2026, 0, 2, 12)
+const BOOT = NOW - 3_600_000
+const UUID = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 const self = { pid: 100, incarnation: 'self-start' }
 const liveness: HolderLiveness = {
   pidAlive: (pid) => pid !== 999,
@@ -67,6 +71,271 @@ async function fixture(): Promise<SettingsMoveFenceOptions & { home: string }> {
     artifacts: { rpcRoots: [], rpcDirs: [], cacheKeepDirs: [] },
   }
 }
+
+async function malformedArtifact(
+  kind: 'RPC' | 'CacheKeep',
+  pid: string,
+  mtime = NOW,
+  suffix = UUID,
+) {
+  const options = await fixture()
+  const dir = join(options.home, 'artifacts')
+  await mkdir(dir)
+  const file = join(
+    dir,
+    kind === 'RPC' ? `port-${pid}.json` : `${pid}-${suffix}.json`,
+  )
+  await writeFile(file, '{broken json')
+  await utimes(file, new Date(mtime), new Date(mtime))
+  options.artifacts = {
+    rpcRoots: [],
+    rpcDirs: kind === 'RPC' ? [dir] : [],
+    cacheKeepDirs: kind === 'CacheKeep' ? [dir] : [],
+  }
+  return { options, file, dir }
+}
+
+for (const kind of ['RPC', 'CacheKeep'] as const) {
+  test(`a malformed ${kind} file with a dead filename pid opens the settings fence`, async () => {
+    const { options, file } = await malformedArtifact(kind, '999')
+    expect(await checkSettingsMoveFence(options)).toEqual({
+      open: true,
+      blockers: [],
+    })
+    expect(await fs.readFile(file, 'utf8')).toBe('{broken json')
+  })
+
+  test(`a malformed pre-boot ${kind} file opens the settings fence even with a reused live pid`, async () => {
+    const { options, file } = await malformedArtifact(
+      kind,
+      '200',
+      BOOT - 5 * 60_000 - 1,
+    )
+    expect(await checkSettingsMoveFence(options)).toEqual({
+      open: true,
+      blockers: [],
+    })
+    expect(await fs.readFile(file, 'utf8')).toBe('{broken json')
+  })
+
+  test(`a malformed ${kind} file with a live pid stays closed at the boot margin and later`, async () => {
+    for (const mtime of [
+      BOOT - 5 * 60_000,
+      BOOT - 5 * 60_000 + 1,
+      BOOT + 1,
+      NOW + 1,
+    ]) {
+      const { options, file } = await malformedArtifact(kind, '200', mtime)
+      expect(await checkSettingsMoveFence(options)).toEqual({
+        open: false,
+        blockers: [{ kind: 'artifact-scan', path: file, reason: 'invalid' }],
+      })
+    }
+  })
+
+  test(`an unreadable ${kind} file needs a provably dead filename pid`, async () => {
+    const { options, file } = await malformedArtifact(
+      kind,
+      '999',
+      BOOT - 5 * 60_000 - 1,
+    )
+    const originalOpen = fs.open
+    const open = spyOn(fs, 'open').mockImplementation((path, ...args) => {
+      if (path === file)
+        return Promise.reject(
+          Object.assign(new Error('denied'), { code: 'EACCES' }),
+        )
+      return originalOpen(path, ...args)
+    })
+    try {
+      expect((await checkSettingsMoveFence(options)).open).toBe(true)
+      for (const pidAlive of [
+        () => true,
+        () => {
+          throw new Error('uncheckable')
+        },
+      ]) {
+        expect(
+          await checkSettingsMoveFence({
+            ...options,
+            liveness: { ...liveness, pidAlive },
+          }),
+        ).toEqual({
+          open: false,
+          blockers: [{ kind: 'artifact-scan', path: file, reason: 'EACCES' }],
+        })
+      }
+    } finally {
+      open.mockRestore()
+    }
+  })
+
+  test(`a malformed ${kind} file cannot use an invalid filename pid as stale proof`, async () => {
+    for (const pid of ['0', '9007199254740992']) {
+      const { options, file } = await malformedArtifact(
+        kind,
+        pid,
+        BOOT - 5 * 60_000 - 1,
+      )
+      expect(
+        await checkSettingsMoveFence({
+          ...options,
+          liveness: { ...liveness, pidAlive: () => false },
+        }),
+      ).toEqual({
+        open: false,
+        blockers: [{ kind: 'artifact-scan', path: file, reason: 'invalid' }],
+      })
+    }
+  })
+
+  test(`valid ${kind} records never replace explicit invalid or future start times with an old mtime`, async () => {
+    const { options, file } = await malformedArtifact(
+      kind,
+      '200',
+      BOOT - 5 * 60_000 - 1,
+    )
+    for (const startedAt of [null, 'invalid', NOW + 1]) {
+      await writeFile(file, JSON.stringify({ pid: 200, startedAt }))
+      await utimes(file, new Date(BOOT - 600_000), new Date(BOOT - 600_000))
+      expect(await checkSettingsMoveFence(options)).toEqual({
+        open: false,
+        blockers: [{ kind: 'pre-n-artifact', artifact: file, pid: 200 }],
+      })
+    }
+  })
+}
+
+test('an unknown CacheKeep filename cannot use either stale proof', async () => {
+  const { options, file } = await malformedArtifact(
+    'CacheKeep',
+    '999',
+    BOOT - 5 * 60_000 - 1,
+    'custom',
+  )
+  expect(await checkSettingsMoveFence(options)).toEqual({
+    open: false,
+    blockers: [{ kind: 'artifact-scan', path: file, reason: 'invalid' }],
+  })
+})
+
+test('malformed files need readable regular metadata for the pre-boot proof', async () => {
+  const { options, file } = await malformedArtifact(
+    'RPC',
+    '200',
+    BOOT - 5 * 60_000 - 1,
+  )
+  const originalOpen = fs.open
+  for (const metadata of ['unreadable', 'nonregular'] as const) {
+    const open = spyOn(fs, 'open').mockImplementation(async (path, ...args) => {
+      const handle = await originalOpen(path, ...args)
+      if (path === file) {
+        const originalStat = handle.stat.bind(handle)
+        spyOn(handle, 'stat').mockImplementation((async () => {
+          if (metadata === 'unreadable')
+            throw Object.assign(new Error('denied'), { code: 'EACCES' })
+          const stat = await originalStat()
+          stat.isFile = () => false
+          return stat
+        }) as typeof handle.stat)
+      }
+      return handle
+    })
+    try {
+      expect(await checkSettingsMoveFence(options)).toEqual({
+        open: false,
+        blockers: [
+          {
+            kind: 'artifact-scan',
+            path: file,
+            reason: metadata === 'unreadable' ? 'EACCES' : 'invalid',
+          },
+        ],
+      })
+    } finally {
+      open.mockRestore()
+    }
+  }
+})
+
+test('RPC records with unusable body pids need the same stale-writer proofs', async () => {
+  for (const [pid, mtime, open] of [
+    ['999', NOW, true],
+    ['200', BOOT - 5 * 60_000 - 1, true],
+    ['200', NOW, false],
+  ] as const) {
+    for (const value of [null, { pid: 'invalid' }, { pid: 0 }]) {
+      const { options, file } = await malformedArtifact('RPC', pid)
+      await writeFile(file, JSON.stringify(value))
+      await utimes(file, new Date(mtime), new Date(mtime))
+      expect(await checkSettingsMoveFence(options)).toEqual({
+        open,
+        blockers: open
+          ? []
+          : [{ kind: 'artifact-scan', path: file, reason: 'invalid' }],
+      })
+    }
+  }
+})
+
+test('an unreadable artifact directory and a bad RPC child stay closed', async () => {
+  const { options, dir } = await malformedArtifact('RPC', '999')
+  const originalReaddir = fs.readdir
+  const readdir = spyOn(fs, 'readdir').mockImplementation(((
+    ...args: Parameters<typeof fs.readdir>
+  ) => {
+    if (args[0] === dir)
+      return Promise.reject(
+        Object.assign(new Error('denied'), { code: 'EACCES' }),
+      )
+    return originalReaddir(...args)
+  }) as typeof fs.readdir)
+  try {
+    expect(await checkSettingsMoveFence(options)).toEqual({
+      open: false,
+      blockers: [{ kind: 'artifact-scan', path: dir, reason: 'EACCES' }],
+    })
+  } finally {
+    readdir.mockRestore()
+  }
+  const child = join(options.home, 'port-999.json')
+  await writeFile(child, '')
+  options.artifacts = {
+    rpcRoots: [options.home],
+    rpcDirs: [],
+    cacheKeepDirs: [],
+  }
+  expect((await checkSettingsMoveFence(options)).blockers).toContainEqual({
+    kind: 'artifact-scan',
+    path: child,
+    reason: 'ENOTDIR',
+  })
+})
+
+test('stale malformed artifacts do not excuse malformed registries or live 2.11.x holders', async () => {
+  const { options } = await malformedArtifact('RPC', '999')
+  const holderFile = (await settingsMoveHolderFiles(options))[0]!
+  await mkdir(dirname(holderFile), { recursive: true })
+  await writeFile(holderFile, '{broken registry')
+  const malformed = await checkSettingsMoveFence(options)
+  expect(malformed.open).toBe(false)
+  expect(malformed.blockers).toContainEqual(
+    expect.objectContaining({ kind: 'holder-file', holderFile }),
+  )
+  await writeFile(
+    holderFile,
+    JSON.stringify({ version: 1, entries: [holder({ release: '2.11.4' })] }),
+  )
+  const older = await checkSettingsMoveFence(options)
+  expect(older.open).toBe(false)
+  expect(older.blockers).toContainEqual({
+    kind: 'settings-holder',
+    holderFile,
+    pid: 200,
+    release: '2.11.4',
+    reason: 'release',
+  })
+})
 
 test('the settings move first ships in 2.12.0', () => {
   expect(SETTINGS_MOVE_FIRST_RELEASE).toBe('2.12.0')

@@ -203,6 +203,48 @@ test('startup publishes before the first resolve, preserves every source, and no
   expect(f.reads).toEqual([])
 })
 
+test('startup moves settings and writes the marker despite many malformed old port files from dead writers', async () => {
+  const f = await fixture()
+  await put(f.stores.opencode.config, { dump: { enabled: true } })
+  const rpcRoot = join(f.root, 'rpc')
+  const leftovers: { file: string; bytes: string; mtimeMs: number }[] = []
+  for (let project = 0; project < 4; project++) {
+    const dir = join(rpcRoot, `old-project-${project}`)
+    await fs.mkdir(dir, { recursive: true })
+    for (let writer = 0; writer < 6; writer++) {
+      const pid = 1_000 + project * 6 + writer
+      const file = join(dir, `port-${pid}.json`)
+      const bytes = `{"pid":${pid},"writer":{"protocol":1,"release":"2.11.4"},`
+      await fs.writeFile(file, bytes)
+      const old = new Date('2025-01-01T00:00:00Z')
+      await fs.utimes(file, old, old)
+      leftovers.push({ file, bytes, mtimeMs: (await fs.stat(file)).mtimeMs })
+    }
+  }
+  f.options.fence = {
+    ...f.options.fence,
+    liveness: {
+      ...f.options.fence?.liveness,
+      pidAlive: (pid) => pid === 100,
+      incarnation: async () => null,
+    },
+    artifacts: { rpcRoots: [rpcRoot], rpcDirs: [], cacheKeepDirs: [] },
+  }
+  const started = await f.start()
+  expect(started.outcome).toBe('moved')
+  expect(started.mode).toBe('user-file')
+  expect(parse(await fs.readFile(f.paths.target, 'utf8')).dump_enabled).toBe(
+    true,
+  )
+  expect(JSON.parse(await fs.readFile(f.paths.marker, 'utf8')).target).toBe(
+    await fs.realpath(f.paths.target),
+  )
+  for (const { file, bytes, mtimeMs } of leftovers) {
+    expect(await fs.readFile(file, 'utf8')).toBe(bytes)
+    expect((await fs.stat(file)).mtimeMs).toBe(mtimeMs)
+  }
+})
+
 for (const host of ['opencode', 'pi'] as const) {
   test(`${host} no-source start publishes schema only; restart and first menu write never import legacy data`, async () => {
     const f = await fixture(host)
@@ -457,6 +499,46 @@ test('an older holder registering while the move waits for its holder locks keep
   expect(await absent(f.paths.target)).toBe(true)
   expect(await absent(f.paths.marker)).toBe(true)
 })
+
+for (const proof of ['dead writer', 'pre-boot mtime'] as const) {
+  test(`the ${proof} proof is rechecked under the mover locks`, async () => {
+    const f = await fixture()
+    const rpcDir = join(f.root, 'rpc')
+    await fs.mkdir(rpcDir)
+    const file = join(rpcDir, 'port-999.json')
+    const bytes = '{broken old port record'
+    await fs.writeFile(file, bytes)
+    const now = Date.UTC(2026, 0, 2, 12)
+    const mtime = new Date(proof === 'pre-boot mtime' ? now - 7_200_000 : now)
+    await fs.utimes(file, mtime, mtime)
+    let alive = proof === 'pre-boot mtime'
+    f.options.fence.liveness = {
+      pidAlive: () => alive,
+      incarnation: async () => null,
+      now: () => now,
+      uptime: () => 3_600,
+    }
+    f.options.fence.artifacts = {
+      rpcRoots: [],
+      rpcDirs: [rpcDir],
+      cacheKeepDirs: [],
+    }
+    const [first, second] = twoHolderFiles(f)
+    let started: ReturnType<typeof f.start> | undefined
+    await heldHolderLock(first, () =>
+      heldHolderLock(second, async () => {
+        started = f.start()
+        await waitForPath(`${f.paths.target}.settings-move.lock`)
+        alive = true
+        await fs.utimes(file, new Date(now), new Date(now))
+      }),
+    )
+    expect((await started)?.outcome).toBe('fence-closed')
+    expect(await absent(f.paths.target)).toBe(true)
+    expect(await absent(f.paths.marker)).toBe(true)
+    expect(await fs.readFile(file, 'utf8')).toBe(bytes)
+  })
+}
 
 test("an older holder can't register in either holder file between the move's last fence check and publication", async () => {
   const f = await fixture()

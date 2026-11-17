@@ -5,6 +5,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - `/claude` Status and the log now say why the one-time settings move is waiting.
+- The one-time settings move is no longer held up forever by unreadable files an earlier plugin version left behind.
 - Pi now prices one-hour prompt-cache writes at the one-hour rate. They were priced as five-minute writes.
 - Pi can answer forked questions on a head's account and prompt cache for Agent Runner.
 - Pi forks can answer at a lower effort on the question alone, keeping the head's prompt cache.
