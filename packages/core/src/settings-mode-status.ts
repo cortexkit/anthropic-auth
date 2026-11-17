@@ -52,9 +52,9 @@ const blockerWords: Record<SettingsMoveBlockerIdentity['kind'], string> = {
   floor: 'a valid minimum plugin release',
   'holder-file': 'a settings holder registry that could not be read',
   'settings-holder': 'an older or unrecognized settings holder',
-  'pre-n-artifact':
-    'an older plugin process recorded in an RPC or CacheKeep file',
-  'artifact-scan': 'an artifact scan that could not be completed',
+  'pre-n-artifact': 'an older plugin process that may still be running',
+  'artifact-scan':
+    'an old plugin file that could not be read (the log names it)',
 }
 
 const outcomeWords: Record<SettingsMoveDiagnostic['outcome'], string> = {

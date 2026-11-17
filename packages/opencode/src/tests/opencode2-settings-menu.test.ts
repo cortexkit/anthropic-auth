@@ -449,7 +449,7 @@ test('OC2 status explains a waiting move and switches to the shared file after a
     },
   })
   expect(await f.menu.readStatus('routing')).toContain(
-    `Settings: using the old settings; the move to \`${f.file}\` waits for: an artifact scan that could not be completed`,
+    `Settings: using the old settings; the move to \`${f.file}\` waits for: an old plugin file that could not be read (the log names it)`,
   )
   await writeFile(f.file, commented)
   expect(await f.menu.readStatus('routing')).toContain(

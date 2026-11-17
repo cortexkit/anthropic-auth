@@ -24,7 +24,7 @@ test('a newer startup diagnostic replaces the cached reason without settings I/O
       blockers: [{ kind: 'artifact-scan', path: '/rpc' }],
     })
     expect(runtime.modeStatus(file)).toContain(
-      'an artifact scan that could not be completed',
+      'an old plugin file that could not be read (the log names it)',
     )
     expect(runtime.modeStatus(file)).not.toContain('this process to register')
   } finally {
@@ -83,7 +83,7 @@ test('settings mode status names every fence kind in plain words, without identi
       },
     }),
   ).toBe(
-    `Settings: using the old settings; the move to \`${file}\` waits for: this process to register as a settings holder; a valid minimum plugin release; a settings holder registry that could not be read; an older or unrecognized settings holder; an older plugin process recorded in an RPC or CacheKeep file; an artifact scan that could not be completed`,
+    `Settings: using the old settings; the move to \`${file}\` waits for: this process to register as a settings holder; a valid minimum plugin release; a settings holder registry that could not be read; an older or unrecognized settings holder; an older plugin process that may still be running; an old plugin file that could not be read (the log names it)`,
   )
 })
 
