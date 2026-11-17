@@ -247,8 +247,17 @@ function convertMessages(
   messages: Message[],
   targetModelId: string,
   visibleReplies: WeakMap<object, string>,
+  droppedAssistants: WeakSet<object>,
 ): AnthropicRequestBody['messages'] {
   const result: AnthropicRequestBody['messages'] = []
+  // Effort history counts source assistant turns, including ones with nothing
+  // safe to replay. Keep their boundaries until effort markers are placed;
+  // buildAnthropicRequest removes these placeholders before any wire output.
+  const appendDroppedAssistant = () => {
+    const placeholder = { role: 'assistant', content: [] }
+    droppedAssistants.add(placeholder)
+    result.push(placeholder)
+  }
 
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]
@@ -287,6 +296,7 @@ function convertMessages(
         // a matching tool_result message. Interrupted Pi runs can leave an
         // aborted assistant message with a partial toolCall and no result; drop
         // that incomplete assistant turn from the replayed history.
+        appendDroppedAssistant()
         continue
       }
 
@@ -308,19 +318,9 @@ function convertMessages(
             message.model === targetModelId &&
             !isOpenAIReasoningSignature(signature)
 
-          // Match Pi's built-in origin check: only replay signatures from the
-          // same Anthropic API/model. Preserve visible foreign reasoning as
-          // ordinary text, but drop opaque redacted/OpenAI encrypted state.
-          if (hasSignature && !signatureBelongsToTarget) {
-            if (
-              !thinking.redacted &&
-              !isOpenAIReasoningSignature(signature) &&
-              thinking.thinking.trim()
-            ) {
-              blocks.push({ type: 'text', text: sanitize(thinking.thinking) })
-            }
-            continue
-          }
+          // Replay reasoning only with a signature from the same Anthropic
+          // API/model. Anthropic refuses reasoning replayed as ordinary text.
+          if (hasSignature && !signatureBelongsToTarget) continue
 
           if (thinking.redacted) {
             if (hasSignature) {
@@ -332,35 +332,16 @@ function convertMessages(
             continue
           }
 
-          if (!hasSignature) {
-            // Anthropic rejects unsigned thinking blocks. Preserve readable
-            // output from interrupted streams as ordinary assistant text.
-            if (thinking.thinking.trim()) {
-              blocks.push({
-                type: 'text',
-                text: sanitize(thinking.thinking),
-              })
-            }
-            continue
-          }
+          if (!hasSignature) continue
 
-          if (hasLoneSurrogate(thinking.thinking)) {
-            // Signature authenticates the thinking bytes exactly. Sanitizing the
-            // text would invalidate it, so downgrade malformed signed thinking
-            // to plain text and omit the signature instead.
-            if (thinking.thinking.trim()) {
-              blocks.push({
-                type: 'text',
-                text: sanitize(thinking.thinking),
-              })
-            }
-          } else {
-            blocks.push({
-              type: 'thinking',
-              thinking: thinking.thinking,
-              signature,
-            })
-          }
+          // A signature authenticates the exact bytes. Sanitizing malformed
+          // thinking would invalidate it, and sending lone surrogates is invalid.
+          if (hasLoneSurrogate(thinking.thinking)) continue
+          blocks.push({
+            type: 'thinking',
+            thinking: thinking.thinking,
+            signature,
+          })
         } else if (block.type === 'toolCall') {
           blocks.push({
             type: 'tool_use',
@@ -373,11 +354,11 @@ function convertMessages(
       if (blocks.length) {
         const converted = { role: 'assistant', content: blocks }
         result.push(converted)
-        // Converted thinking can become text for replay, but it was never a
-        // visible reply. Count only actual text blocks, using the exact outgoing
-        // strings collected above, so the note decision for this message stays
-        // the same on every later request.
+        // Only actual text is a visible reply. Use the exact outgoing strings so
+        // later requests make the same decision about adding a turn-end note.
         visibleReplies.set(converted, visibleText)
+      } else {
+        appendDroppedAssistant()
       }
       continue
     }
@@ -760,12 +741,26 @@ export async function buildAnthropicRequest(
   // the Anthropic messages again after conversion removes empty user messages.
   assertNoMeaningfulTrailingAssistant(context.messages)
   const visibleReplies = new WeakMap<object, string>()
-  const messages = convertMessages(context.messages, modelId, visibleReplies)
+  const droppedAssistants = new WeakSet<object>()
+  const messages = convertMessages(
+    context.messages,
+    modelId,
+    visibleReplies,
+    droppedAssistants,
+  )
   stripEmptyTrailingAssistantMessages(messages)
   const baseLastMessage = forkBase
-    ? messages[
-        convertMessages(forkBase.messages, modelId, new WeakMap()).length - 1
-      ]
+    ? messages
+        .slice(
+          0,
+          convertMessages(
+            forkBase.messages,
+            modelId,
+            new WeakMap(),
+            new WeakSet(),
+          ).length,
+        )
+        .findLast((message) => !droppedAssistants.has(message))
     : undefined
   // The head's final user block was an array so it could carry its cache
   // marker. Keep that block shape when it is no longer the fork's newest user.
@@ -907,6 +902,9 @@ export async function buildAnthropicRequest(
     body,
     controls.effortTransitions ?? [],
     controls.forkEffort,
+  )
+  body.messages = body.messages.filter(
+    (message) => !droppedAssistants.has(message),
   )
   if (identity) {
     applyTurnEndNotes(body, {
