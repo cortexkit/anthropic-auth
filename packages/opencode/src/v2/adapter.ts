@@ -80,6 +80,7 @@ import type {
   SameAccountRetryResult,
   Transport,
 } from '@cortexkit/common-auth/opencode2'
+import { findNodeAtLocation, type ParseError, parseTree } from 'jsonc-parser'
 import { BILLING_LINEAGE_REQUEST_HEADER } from '../billing-lineage'
 import {
   EFFORT_PLAN_REQUEST_HEADER,
@@ -414,6 +415,10 @@ export interface NativeAnthropicSource<Q, P> {
   readonly responseOptions?: (
     input: NativeAnthropicResponseContext<P>,
   ) => NativeAnthropicResponseOptions | undefined
+  /** Manual quota refusal only when the exhausted pool cannot hold another retry. */
+  readonly quotaStopMessage?: (
+    input: NativeAnthropicResponseContext<P> & { readonly hostAttempt: number },
+  ) => Promise<string | undefined> | string | undefined
   /** Quota carried by the upstream response headers, read once per response. */
   readonly quotaFromHeaders?: (
     headers: Headers,
@@ -498,6 +503,13 @@ export interface NativeAnthropicAdapterDeps<Q, P> {
 }
 
 export interface NativeAnthropicAdapter<Q, P> {
+  /** Bind the installer's host retry count to this physical send, never its session. */
+  bindHostAttempt(
+    attempt: Attempt<NativeAnthropicAttemptData<P>>,
+    hostAttempt: number,
+  ): void
+  /** Drop the pending quota-stop message if the send ends before its response body is rewritten. */
+  discardQuotaStopMessage(data: NativeAnthropicAttemptData<P>): void
   /** Background drivers can refuse a rewritten request before their final dispatch. */
   discardUnsentBilling(data: NativeAnthropicAttemptData<P>): void
   /** Receipt time of this adapter's final verified upstream OAuth 2xx response. */
@@ -830,6 +842,8 @@ export function createNativeAnthropicAdapter<Q, P>(
   // Only host-owned sends belong here. Recovery fetches own their billing
   // state so ending the original host attempt cannot retire an in-flight resend.
   const billingSends = new WeakMap<Data, BillingSend>()
+  const hostAttempts = new Map<Data, { sessionID: string; attempt: number }>()
+  let quotaStopMessages = new WeakMap<Data, string>()
   let requestGzipLatch = deps.requestGzipLatch
   const gzipLatch = async () => {
     if (requestGzipLatch) return requestGzipLatch
@@ -1884,6 +1898,8 @@ export function createNativeAnthropicAdapter<Q, P>(
     },
     async rewriteResponse({ response, attempt }) {
       const data = attempt.data
+      const quotaStopMessage = data ? quotaStopMessages.get(data) : undefined
+      if (data) quotaStopMessages.delete(data)
       const billingSend = data ? billingSends.get(data) : undefined
       if (billingSend) {
         billingSend.received = true
@@ -2006,6 +2022,36 @@ export function createNativeAnthropicAdapter<Q, P>(
             } catch {}
             dumpWrites.set(data, Promise.resolve())
           }
+        }
+      }
+      if (
+        data?.route === 'oauth' &&
+        response.status === 429 &&
+        quotaStopMessage !== undefined
+      ) {
+        const text = await response.clone().text()
+        const errors: ParseError[] = []
+        const tree = parseTree(text, errors, {
+          disallowComments: true,
+          allowTrailingComma: false,
+        })
+        const node =
+          tree && errors.length === 0
+            ? findNodeAtLocation(tree, ['error', 'message'])
+            : undefined
+        if (node?.type === 'string') {
+          // Splice just the message token, preserving every other body byte
+          // and the original quota headers the installer has harvested.
+          response = new Response(
+            text.slice(0, node.offset) +
+              JSON.stringify(quotaStopMessage) +
+              text.slice(node.offset + node.length),
+            {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            },
+          )
         }
       }
       // Remove this send's secrets from provider errors before any other
@@ -2196,20 +2242,39 @@ export function createNativeAnthropicAdapter<Q, P>(
           status,
         })
       safeSummaries.set(data, `provider responded with HTTP ${status}`)
-      if (!source.limitFromResponse) return undefined
       // A failed response this adapter rewrote is read through its own
       // response scope, which scrubbed it while the credentials were live.
       // Once that read reaches the end the credentials are gone, so its text
       // is passed on as it is. Anything else is scrubbed here.
       const rewritten = rewrittenFailures.get(headers) === data
       const scrubber = scrubberFor(data)
-      const limit = await source.limitFromResponse({
+      const limit = await source.limitFromResponse?.({
         ...contextOf(attempt, data),
         status,
         headers,
         body: async () =>
           rewritten ? await body() : scrubber.redactText(await body()),
       })
+      const hostAttempt = hostAttempts.get(data)?.attempt
+      if (
+        status === 429 &&
+        data.route === 'oauth' &&
+        hostAttempt !== undefined
+      ) {
+        // common-auth ends HTTP errors before rewriteResponse. Decide while
+        // provenance is live; retain only the final text for that body's rewrite.
+        const message = await Promise.resolve()
+          .then(() =>
+            source.quotaStopMessage?.({
+              ...contextOf(attempt, data),
+              status,
+              hostAttempt,
+            }),
+          )
+          .catch(() => undefined)
+        if (message !== undefined && hostAttempts.has(data))
+          quotaStopMessages.set(data, message)
+      }
       if (limit) classifiedForRetry.add(data)
       return limit
     },
@@ -2290,6 +2355,9 @@ export function createNativeAnthropicAdapter<Q, P>(
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
       if (!data) return
+      hostAttempts.delete(data)
+      if (outcome.error || outcome.status !== 429)
+        quotaStopMessages.delete(data)
       const billingSend = billingSends.get(data)
       billingSends.delete(data)
       if (
@@ -2383,6 +2451,26 @@ export function createNativeAnthropicAdapter<Q, P>(
 
   return {
     adapter,
+    discardQuotaStopMessage(data) {
+      quotaStopMessages.delete(data)
+    },
+    bindHostAttempt(attempt, hostAttempt) {
+      if (
+        !attempt.data ||
+        disposed ||
+        !Number.isInteger(hostAttempt) ||
+        hostAttempt < 1
+      )
+        return
+      hostAttempts.set(attempt.data, {
+        sessionID: attempt.sessionID,
+        attempt: hostAttempt,
+      })
+      while (hostAttempts.size > maxPending) {
+        const first = hostAttempts.keys().next().value
+        if (first) hostAttempts.delete(first)
+      }
+    },
     discardUnsentBilling: (data) => {
       billingSends.delete(data)
     },
@@ -2395,11 +2483,18 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       inProgress.clear()
       pending.clear()
+      hostAttempts.clear()
+      quotaStopMessages = new WeakMap()
       retryAttempts.clear()
       dumpContexts.clear()
       for (const data of [...owned.keys()]) release(data)
     },
     forgetSession(sessionID) {
+      for (const [data, send] of hostAttempts)
+        if (send.sessionID === sessionID) {
+          hostAttempts.delete(data)
+          quotaStopMessages.delete(data)
+        }
       messageThreads.forget(sessionID)
       for (const operation of inProgress.get(sessionID) ?? []) {
         operation.revoked = true
@@ -2412,7 +2507,10 @@ export function createNativeAnthropicAdapter<Q, P>(
         if (send.sessionID === sessionID) pending.delete(data)
       }
       for (const [data, entry] of [...owned]) {
-        if (entry.sessionID === sessionID) release(data)
+        if (entry.sessionID === sessionID) {
+          quotaStopMessages.delete(data)
+          release(data)
+        }
       }
       for (const [data, dump] of [...dumpContexts]) {
         if (dump.affinity === sessionID) dumpContexts.delete(data)
