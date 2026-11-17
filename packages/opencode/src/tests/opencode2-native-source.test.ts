@@ -31,6 +31,7 @@ import {
   type NativeAccountRuntime,
   type NativeCustodyClient,
   type NativePoolPaths,
+  NativeVaultQuotaPolicyError,
   nativeAccountPolicy,
   type ProviderAccountUuid,
   quotaSnapshotPassesPolicy,
@@ -5323,5 +5324,167 @@ describe('OC2 relay from a store outside its default place', () => {
     await expect(dispatch()).rejects.toThrow(RELAY_PROXY_REFUSAL)
     process.env.NO_PROXY = '127.0.0.1'
     expect(await dispatch()).toMatchObject({ kind: 'http-relay' })
+  })
+})
+
+describe('OC2 confirmed exhaustion is never sent again', () => {
+  const localBearer = 'Bearer sk-ant-oat01-native-only'
+  // A refused request's raw headers confirming the weekly window, which resets at `resetAt`.
+  const weeklyRejected = (resetAt: number) => ({
+    'anthropic-ratelimit-unified-7d-status': 'rejected',
+    'anthropic-ratelimit-unified-7d-reset': String(resetAt / 1000),
+  })
+  // Whole seconds, so header resets round-trip exactly.
+  const wholeSecond = () => Math.ceil(Date.now() / 1000) * 1000
+
+  async function localSticky() {
+    const fixture = await local()
+    await fixture.runtime.updateSettings((settings) => {
+      settings.routing = { mode: 'sticky-balanced' }
+    })
+    const native = source(fixture.runtime, fixture.paths)
+    const choose = spyOn(native, 'chooseAccount')
+    const host = await retryHost(native)
+    return { fixture, native, choose, host }
+  }
+
+  test('local: a sticky account with a distant reset and no other account stops with a quota refusal', async () => {
+    const { host, choose } = await localSticky()
+    const now = wholeSecond()
+    await atTime(now, async () => {
+      const first = await host.send()
+      expect(first.headers.get('authorization')).toBe(localBearer)
+      await host.response(
+        first,
+        429,
+        scope,
+        weeklyRejected(now + 72 * 3_600_000),
+      )
+      // The retry probe finds no other account; the host keeps its own retry.
+      expect(await host.retry()).toEqual({ retry: true, delay: 1234 })
+      const refusal = await host.send().then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      expect(refusal).toBeInstanceOf(NativeVaultQuotaPolicyError)
+      const error = refusal as NativeVaultQuotaPolicyError
+      expect(error.message).toStartWith(
+        'No Claude account has room for this request (weekly limit or your quota floor). The earliest reset is ',
+      )
+      expect(error.message).toContain('UTC (in 72 h).')
+      // The default longest same-account wait caps the advertised retry.
+      expect(error.status).toBe(429)
+      expect(error.retryAfter).toBe(900)
+    })
+    expect(
+      choose.mock.calls.map(([input]) =>
+        'phase' in input ? input.phase : undefined,
+      ),
+    ).toEqual(['request', 'retry', 'request'])
+  })
+
+  test('local: a reset that fits the hold still holds and serves the same account', async () => {
+    const { host } = await localSticky()
+    const now = wholeSecond()
+    await atTime(now, async () => {
+      const first = await host.send()
+      const account = host.installation.installation.accountFor(
+        scope.sessionID,
+        scope.kind,
+      )
+      if (!account) throw new Error('Missing served account')
+      sessionCacheActivity.record(scope.sessionID, account, 3_600_000, now)
+      cleanups.push(() => sessionCacheActivity.forget(scope.sessionID))
+      await host.response(first, 429, scope, {
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+        'anthropic-ratelimit-unified-5h-reset': String((now + 120_000) / 1000),
+      })
+      expect(await host.retry(false)).toEqual({
+        retry: true,
+        delay: stickyRetryAfterWithJitter(scope.sessionID, 120) * 1000,
+      })
+      const held = await host.send()
+      expect(held.headers.get('authorization')).toBe(localBearer)
+      // A new request during the granted hold still goes to the held account.
+      const again = await host.send()
+      expect(again.headers.get('authorization')).toBe(localBearer)
+    })
+  })
+
+  test('local: an unconfirmed 429 keeps its two same-account retries, then the host decides', async () => {
+    const { host } = await localSticky()
+    const held = { retry: true, delay: 60_000 }
+    let request = await host.send()
+    for (const expected of [held, held, { retry: true, delay: 1234 }]) {
+      await host.response(request, 429, scope, { 'retry-after': '432000' })
+      expect(await host.retry()).toEqual(expected)
+      request = await host.send()
+      expect(request.headers.get('authorization')).toBe(localBearer)
+    }
+  })
+
+  test('vault: a session pinned to a freshly exhausted account moves to the other account', async () => {
+    const fixture = await vaultWithFallback()
+    const native = source(fixture.runtime, fixture.paths)
+    const host = await retryHost(native)
+    const now = Date.now()
+    const first = await host.send()
+    expect(first.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-oauth:anthropic',
+    )
+    await host.response(first, 200)
+    await exhaustDefault(fixture, now + 3 * 3_600_000, now)
+    const fallback = (await fixture.runtime.read()).accounts.find(
+      (account) => account.id !== 'main',
+    )
+    if (!fallback) throw new Error('Missing fallback account')
+    await fixture.runtime.vault.publish(
+      await fixture.runtime.authorizeVault(fallback.id),
+      {
+        quota: {
+          accountIdentity: fallbackIdentity,
+          checkedAt: now,
+          five_hour: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+          seven_day: { usedPercent: 0, remainingPercent: 100, checkedAt: now },
+        },
+      },
+    )
+    const next = await host.send()
+    expect(next.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-oauth:anthropic:work',
+    )
+    expect(
+      host.installation.installation.accountFor(scope.sessionID, scope.kind),
+    ).toBe(fallback.id)
+  })
+
+  test('vault: the only account confirmed exhausted refuses with the quota-policy error', async () => {
+    const fixture = await vault([7, 8, 9])
+    const native = source(fixture.runtime, fixture.paths)
+    const host = await retryHost(native)
+    const now = wholeSecond()
+    await atTime(now, async () => {
+      const first = await host.send()
+      expect(first.headers.get('authorization')).toBe(
+        'Bearer sk-ant-oat01-vault-7',
+      )
+      await host.response(
+        first,
+        429,
+        scope,
+        weeklyRejected(now + 72 * 3_600_000),
+      )
+      expect(await host.retry()).toEqual({ retry: true, delay: 1234 })
+      const refusal = await host.send().then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      expect(refusal).toBeInstanceOf(NativeVaultQuotaPolicyError)
+      expect((refusal as Error).message).toStartWith(
+        'No Claude account has room for this request (weekly limit or your quota floor).',
+      )
+    })
+    // No credential was fetched for another send.
+    expect(fixture.gets).toHaveLength(1)
   })
 })

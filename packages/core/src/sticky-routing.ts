@@ -14,6 +14,7 @@ import {
   isPermanentRefreshError,
   type OAuthQuotaSnapshot,
   quotaFieldSource,
+  quotaRefusalRetryAfterSeconds,
   quotaRefusalTiming,
   quotaSnapshotOmitsFiveHour,
   quotaSnapshotPassesModelScope,
@@ -573,23 +574,13 @@ export function decideStickyQuotaFailure(input: {
       ? { action: 'migrate', reason: 'unconfirmed-retry-limit' }
       : { action: 'retain', reason }
   }
-  let reading = knownQuota(input.quota)
-  // The refused request can confirm exhaustion even when a quota probe fails
-  // or serves an older cached reading. Never use rounded header percentages here.
-  const confirmed = input.responseHeaders
-    ? quotaExhaustionFromHeaders(input.responseHeaders, input.modelId, now)
-    : undefined
-  if (reading && input.responseHeaders) {
-    reading = { ...reading }
-    for (const key of ['five_hour', 'seven_day', 'scoped'] as const) {
-      // Stored header readings contain display-rounded percentages, not raw evidence.
-      if (quotaFieldSource(reading, key) === 'headers') delete reading[key]
-    }
-  }
-  const quota =
-    reading || (confirmed && Object.keys(confirmed).length)
-      ? { ...reading, ...confirmed }
-      : undefined
+  const quota = stickyQuotaEvidence({
+    quota: input.quota,
+    responseHeaders: input.responseHeaders,
+    modelId: input.modelId,
+    now,
+    storedHeaderReadings: true,
+  })
   if (!quota) return retain('unknown')
   let blocking:
     | { resetAt: number; reason: 'five-hour' | 'seven-day' | 'model-scoped' }
@@ -629,6 +620,122 @@ export function decideStickyQuotaFailure(input: {
     }
   }
   return { action: 'migrate', reason: blocking.reason }
+}
+
+/**
+ * Combine a stored quota reading with the exhaustion a refused request's raw
+ * headers confirm. The refused request can confirm exhaustion even when a quota
+ * probe fails or serves an older cached reading. Stored header readings hold
+ * display-rounded percentages, not raw evidence, so they are dropped whenever
+ * raw headers are given, and also when `storedHeaderReadings` is false.
+ */
+function stickyQuotaEvidence(input: {
+  quota: OAuthQuotaSnapshot | QuotaState | undefined
+  responseHeaders?: Headers
+  modelId?: string
+  now: number
+  storedHeaderReadings: boolean
+}): OAuthQuotaSnapshot | undefined {
+  let reading = knownQuota(input.quota)
+  const confirmed = input.responseHeaders
+    ? quotaExhaustionFromHeaders(
+        input.responseHeaders,
+        input.modelId,
+        input.now,
+      )
+    : undefined
+  if (reading && (input.responseHeaders || !input.storedHeaderReadings)) {
+    reading = { ...reading }
+    for (const key of ['five_hour', 'seven_day', 'scoped'] as const) {
+      if (quotaFieldSource(reading, key) === 'headers') delete reading[key]
+    }
+  }
+  return reading || (confirmed && Object.keys(confirmed).length)
+    ? { ...reading, ...confirmed }
+    : undefined
+}
+
+export type StickyQuotaExhaustion = {
+  /** When the last exhausted window blocking the request resets. */
+  readonly resetAt: number
+  readonly reason: 'five-hour' | 'seven-day' | 'model-scoped'
+  /** The window's name as quota refusals show it, such as "weekly". */
+  readonly limitName: string
+}
+
+/**
+ * Confirmed exhaustion that still blocks a request for `modelId`: an exhausted
+ * 5-hour, weekly or model-scoped window whose reset is known and still ahead.
+ * It reads the same evidence as `decideStickyQuotaFailure`, except that stored
+ * header readings never count, because their percentages are display-rounded:
+ * only raw refused-request headers or a polled reading confirm exhaustion.
+ * Returns the latest such reset, since the account can serve the request again
+ * only after every one of those windows resets. Windows whose reset is unknown
+ * or already past are not counted.
+ */
+export function stickyQuotaExhaustionInForce(input: {
+  quota: OAuthQuotaSnapshot | QuotaState | undefined
+  responseHeaders?: Headers
+  modelId?: string
+  now?: number
+}): StickyQuotaExhaustion | undefined {
+  const now = input.now ?? Date.now()
+  const quota = stickyQuotaEvidence({
+    quota: input.quota,
+    responseHeaders: input.responseHeaders,
+    modelId: input.modelId,
+    now,
+    storedHeaderReadings: false,
+  })
+  if (!quota) return undefined
+  const scoped = getScopedQuotaWindowForModel(quota, input.modelId)
+  let blocking: StickyQuotaExhaustion | undefined
+  for (const [reason, limitName, window] of [
+    ['model-scoped', `${scoped?.modelName ?? 'Model'} weekly`, scoped],
+    ['seven-day', 'weekly', quota.seven_day],
+    ['five-hour', '5-hour', quota.five_hour],
+  ] as const) {
+    if (
+      !window ||
+      !Number.isFinite(window.remainingPercent) ||
+      window.remainingPercent > 0
+    )
+      continue
+    const resetAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN
+    if (!Number.isFinite(resetAt) || resetAt <= now) continue
+    if (!blocking || resetAt > blocking.resetAt)
+      blocking = { resetAt, reason, limitName }
+  }
+  return blocking
+}
+
+/**
+ * The quota refusal for a request that no account can take because every
+ * account that could is confirmed exhausted (see `stickyQuotaExhaustionInForce`).
+ * It names the window that resets first across those accounts.
+ */
+export function createExhaustedNoRouteResponse(input: {
+  exhausted: readonly StickyQuotaExhaustion[]
+  storage?: AccountStorage | null
+  sessionId?: string | null
+  now?: number
+}): Response {
+  const now = input.now ?? Date.now()
+  const earliest = [...input.exhausted].sort((a, b) => a.resetAt - b.resetAt)[0]
+  return createQuotaRefusalResponse(
+    'Claude reports every account that could take this request as out of quota.',
+    {
+      resetAt: earliest?.resetAt,
+      ...(earliest ? { limitName: earliest.limitName } : {}),
+      retryAfterSeconds: quotaRefusalRetryAfterSeconds({
+        resetAt: earliest?.resetAt,
+        storage: input.storage,
+        sessionTtlMs: sessionCacheActivity.ttlMs(input.sessionId),
+        now,
+      }),
+    },
+    now,
+  )
 }
 
 /** Bound an unconfirmed 429's host retry while preserving any shorter upstream wait. */
