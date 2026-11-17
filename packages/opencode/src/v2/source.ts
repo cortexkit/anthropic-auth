@@ -4,13 +4,13 @@ import {
   createExhaustedNoRouteResponse,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
+  createQuotaRefusalResponse,
   decideStickyQuotaFailure,
   effectiveRelayTransport,
   getClaudeCodeIdentityForVerifiedAccount,
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRoutingMode,
-  hostRetryHeaders,
   isDumpPersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   localMessageThreadCredential,
@@ -37,6 +37,7 @@ import {
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
   peekRoutingAccount,
+  quotaRefusalDetails,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   RELAY_PROXY_REFUSAL,
@@ -48,14 +49,14 @@ import {
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
   requestSignal,
-  type StickyQuotaExhaustion,
+  type StickyQuotaBlocker,
   StickyQuotaRetryCounter,
   StickySessionRouter,
   sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
   startRoutingWait,
-  stickyQuotaExhaustionInForce,
+  stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
@@ -133,6 +134,16 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
   (['five_hour', 'seven_day'] as const).some(
     (window) => (quota?.[window]?.remainingPercent ?? 1) <= 0,
   )
+
+// Match common-auth's installer bound; OpenCode 2 supplies its attempt label.
+const HOST_RETRY_LIMIT = 10
+
+function resetFitsRetryBudget(input: ChooseAccountInput, delayMs: number) {
+  return (
+    Math.ceil(delayMs / MAX_HOST_RETRY_MS) <=
+    HOST_RETRY_LIMIT - (input.hostAttempt ?? 1)
+  )
+}
 
 /**
  * An unconfirmed 429 gets at most two short same-account retries per turn.
@@ -219,6 +230,7 @@ function stickyHold(
   const resetWithJitterMs =
     stickyRetryAfterWithJitter(input.sessionID, decision.retryAfterSeconds) *
     1000
+  if (!resetFitsRetryBudget(input, resetWithJitterMs)) return undefined
   grant(account.id, Date.now() + resetWithJitterMs)
   const result = {
     hold: {
@@ -499,7 +511,7 @@ export function createNativeAnthropicSource(
     const responseHeaders = refusalHeaders.get(
       key({ ...scope, modelID }, account.id),
     )?.headers
-    return stickyQuotaExhaustionInForce({
+    return stickyQuotaBlockerInForce({
       quota:
         responseHeaders ||
         stickyQuotaSnapshotIsFresh(
@@ -984,7 +996,7 @@ export function createNativeAnthropicSource(
       // it again to an account that cannot serve it until its reset. A hold
       // this session was granted for that account still runs to its end.
       // A retry probe already leaves out the account that refused it.
-      const exhausted: StickyQuotaExhaustion[] = []
+      const exhausted: StickyQuotaBlocker[] = []
       const withoutRejected = oauth.filter((account) => {
         if (account.id === input.rerouteFrom?.accountId) return false
         if (input.phase === 'retry') return true
@@ -1008,15 +1020,54 @@ export function createNativeAnthropicSource(
           sessionId: input.sessionID,
         })
       const refusal = async (response: Response) => {
-        const delayMs =
-          Number(hostRetryHeaders(response.headers).get('retry-after')) * 1000
+        const details = quotaRefusalDetails(response)
+        if (details)
+          response = createQuotaRefusalResponse(
+            details.reason,
+            details.timing,
+            Date.now(),
+            { retry: 'manual' },
+          )
+        return await NativeVaultQuotaPolicyError.fromResponse(response)
+      }
+      // The sticky deadline decides when to move, not when to stop a turn
+      // whose entire eligible pool is exhausted. With no alternate route,
+      // let the host recheck the refused account in bounded gaps.
+      const poolHold = (): RetryHold | undefined => {
+        if (
+          advice ||
+          input.phase !== 'retry' ||
+          input.rerouteFrom?.limit.status !== 429 ||
+          getMaxSameAccountWait(snapshot.policyStorage) === '0' ||
+          snapshot.accounts.some(
+            (row) => row.enabled && row.state === 'needs_reauth',
+          ) ||
+          !oauth.every((row) =>
+            exhaustionInForce(input, row, snapshot, modelID),
+          )
+        )
+          return undefined
+        const account = oauth.find(
+          (row) => row.id === input.rerouteFrom?.accountId,
+        )
+        const blocked =
+          account && exhaustionInForce(input, account, snapshot, modelID)
+        if (blocked?.resetAt === undefined) return undefined
+        const delayToReset =
+          stickyRetryAfterWithJitter(
+            input.sessionID,
+            Math.max(1, Math.ceil((blocked.resetAt - Date.now()) / 1000)),
+          ) * 1000
+        // Reserve enough installer-supported slots to reach the reset.
+        if (!resetFitsRetryBudget(input, delayToReset)) return undefined
+        const delayMs = Math.min(MAX_HOST_RETRY_MS, delayToReset)
         startRoutingWait({
           sessionId: input.sessionID,
           reason: 'account_free',
           delayMs,
           nextMs: Date.now() + delayMs,
         })
-        return await NativeVaultQuotaPolicyError.fromResponse(response)
+        return { hold: { delayMs } }
       }
       if (getRoutingMode(snapshot.policyStorage) === 'sticky-balanced') {
         const candidates = withoutRejected.map((account, order) => ({
@@ -1080,6 +1131,8 @@ export function createNativeAnthropicSource(
         if (ordered[0]) return ordered[0].id
       }
       if (snapshot.mode === 'claustrum') {
+        const holdForPool = poolHold()
+        if (holdForPool) return holdForPool
         let response: Response
         try {
           response = createNativeVaultNoRouteResponse({
@@ -1135,6 +1188,8 @@ export function createNativeAnthropicSource(
         )?.id
       })()
       if (api) return api
+      const holdForPool = poolHold()
+      if (holdForPool) return holdForPool
       // Local mode explains a pool that is out of quota as the vault does.
       if (quotaExplainsRefusal) throw await refusal(exhaustedRefusal())
       return undefined

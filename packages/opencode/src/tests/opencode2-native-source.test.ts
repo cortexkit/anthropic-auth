@@ -2262,10 +2262,11 @@ async function retryHost(native: ReturnType<typeof source>) {
         message: 'provider refused the attempt',
       },
       delay = 1234,
+      attempt = 1,
     ) {
       const draft: SessionHooks['retry'] = {
         ...hostScope(input),
-        attempt: 1,
+        attempt,
         error,
         decision: retry ? { retry: true, delay } : { retry: false },
       }
@@ -2872,7 +2873,7 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     ).toBe(selected)
   })
 
-  test('installed undefined retry preserves the pin and next attempt chooses once without rerouteFrom', async () => {
+  test('installed undefined retry preserves the pin and next attempt rechecks once without rerouteFrom', async () => {
     const fixture = await local()
     await fixture.runtime.updateSettings((settings) => {
       settings.routing = { mode: 'sticky-balanced' }
@@ -2893,10 +2894,9 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     await expect(choose.mock.results[1]?.value).resolves.toBeUndefined()
     await native.drainRoutingPublications()
     expect(await readFile(routingPath, 'utf8')).toBe(pin)
-    const next = await host.send()
-    expect(next.headers.get('authorization')).toBe(
-      'Bearer sk-ant-oat01-native-only',
-    )
+    const stopped = await host.send().catch((error: unknown) => error)
+    expect(stopped).toBeInstanceOf(NativeVaultQuotaPolicyError)
+    expect((stopped as Error).message).toContain('Reset time is unknown.')
     expect(choose).toHaveBeenCalledTimes(3)
     expect(choose.mock.calls[2]?.[0]).not.toHaveProperty('rerouteFrom')
     expect(drop).toHaveBeenCalledTimes(0)
@@ -3204,7 +3204,7 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
     })
   })
 
-  test('OC2 reports an exhausted pool as a bounded host-owned account-free wait', async () => {
+  test('OC2 terminal exhausted-pool selection does not report a wait the host will not make', async () => {
     const f = await vaultWithFallback()
     const native = source(f.runtime, f.paths)
     const reports = waitRecorder()
@@ -3240,16 +3240,7 @@ describe('OC2 installed sticky quota hold (requires common-auth 0.27.0)', () => 
       atTime(now, async () => native.chooseAccount(scope)),
     ).rejects.toThrow()
     await new Promise<void>((resolve) => setImmediate(resolve))
-    expect(reports).toEqual([
-      {
-        kind: 'wait',
-        phase: 'start',
-        wait_id: expect.any(String),
-        reason: 'account_free',
-        next_ms: now + 900_000,
-        message: 'Waiting for an account to become available.',
-      },
-    ])
+    expect(reports).toEqual([])
   })
 
   test('a 429 with a short reset holds the session on its account for the jittered reset, keeping its pin', async () => {
@@ -5348,6 +5339,135 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
     return { fixture, native, choose, host }
   }
 
+  for (const custody of ['local', 'vault'] as const) {
+    test(`${custody}: OC2 quota holds bridge the reporter's 38-minute reset through the installed adapter`, async () => {
+      const fixture = custody === 'local' ? await local() : await vault()
+      await fixture.runtime.updateSettings((settings) => {
+        settings.routing = { mode: 'sticky-balanced' }
+      })
+      const native = source(fixture.runtime, fixture.paths)
+      const host = await retryHost(native)
+      let now = Date.parse('2026-11-17T14:52:00Z')
+      const resetAt = now + 38 * 60_000
+      let request = await atTime(now, () => host.send())
+      const delays: number[] = []
+      for (const attempt of [2, 3, 4]) {
+        await atTime(now, () =>
+          host.response(request, 429, scope, {
+            'anthropic-ratelimit-unified-5h-status': 'rejected',
+            'anthropic-ratelimit-unified-5h-reset': String(resetAt / 1000),
+          }),
+        )
+        const decision = await atTime(now, () =>
+          host.retry(false, scope, undefined, 1234, attempt),
+        )
+        expect(decision.retry).toBe(true)
+        if (!decision.retry) throw new Error('Quota hold was not scheduled')
+        delays.push(decision.delay)
+        now += decision.delay
+        request = await atTime(now, () => host.send())
+      }
+      expect(delays).toEqual([
+        900_000,
+        900_000,
+        stickyRetryAfterWithJitter(scope.sessionID, 8 * 60) * 1000,
+      ])
+      expect(now).toBeGreaterThanOrEqual(resetAt)
+      expect(now).toBeLessThanOrEqual(resetAt + 21_000)
+      expect(
+        (await atTime(now, () => host.response(request, 200))).status,
+      ).toBe(200)
+    })
+
+    test(`${custody}: a new exhausted request stops truthfully without a model send`, async () => {
+      const fixture = custody === 'local' ? await local() : await vault()
+      await fixture.runtime.updateSettings((settings) => {
+        settings.routing = { mode: 'sticky-balanced' }
+      })
+      const native = source(fixture.runtime, fixture.paths)
+      const host = await retryHost(native)
+      const now = wholeSecond()
+      await atTime(now, async () => {
+        const first = await host.send()
+        await host.response(
+          first,
+          429,
+          scope,
+          weeklyRejected(now + 38 * 60_000),
+        )
+        // No retry hook has reserved a choice for this new request.
+        const stopped = await host.send().catch((error: unknown) => error)
+        expect(stopped).toBeInstanceOf(NativeVaultQuotaPolicyError)
+        expect((stopped as Error).message).toContain('This turn has stopped.')
+        expect((stopped as Error).message).toMatch(
+          /Send the message again after \d\d:\d\d UTC\./,
+        )
+        expect((stopped as Error).message).not.toMatch(/Retrying|Retry in /)
+      })
+    })
+  }
+
+  test('OC2 stops truthfully on an exhausted window with an unknown reset', async () => {
+    const { host } = await localSticky()
+    const first = await host.send()
+    await host.response(first, 429, scope, {
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+    })
+    expect(await host.retry()).toEqual({ retry: true, delay: 1234 })
+    const stopped = await host.send().catch((error: unknown) => error)
+    expect(stopped).toBeInstanceOf(NativeVaultQuotaPolicyError)
+    expect((stopped as Error).message).toContain('Reset time is unknown.')
+    expect((stopped as Error).message).toContain('This turn has stopped.')
+    expect((stopped as Error).message).not.toMatch(/Retrying|Retry in /)
+  })
+
+  test.each([9, 10])(
+    'OC2 refuses another quota hold when attempt %s cannot reach the reset',
+    async (attempt) => {
+      const { host } = await localSticky()
+      const now = wholeSecond()
+      await atTime(now, async () => {
+        const first = await host.send()
+        await host.response(
+          first,
+          429,
+          scope,
+          weeklyRejected(now + 38 * 60_000),
+        )
+        const error = {
+          type: 'unknown' as const,
+          message: 'provider refused the attempt',
+        }
+        expect(await host.retry(true, scope, error, 1234, attempt)).toEqual({
+          retry: true,
+          delay: 1234,
+        })
+        const stopped = await host.send().catch((error: unknown) => error)
+        expect(stopped).toBeInstanceOf(NativeVaultQuotaPolicyError)
+        expect((stopped as Error).message).toContain('This turn has stopped.')
+        expect((stopped as Error).message).not.toContain('Retrying')
+        expect(error.message).toBe('provider refused the attempt')
+      })
+    },
+  )
+
+  test('OC2 leaves the host error unchanged when the host stops on its last retry hook', async () => {
+    const { host } = await localSticky()
+    const now = wholeSecond()
+    await atTime(now, async () => {
+      const first = await host.send()
+      await host.response(first, 429, scope, weeklyRejected(now + 38 * 60_000))
+      const error = {
+        type: 'unknown' as const,
+        message: 'provider refused the attempt',
+      }
+      expect(await host.retry(false, scope, error, 1234, 10)).toEqual({
+        retry: false,
+      })
+      expect(error.message).toBe('provider refused the attempt')
+    })
+  })
+
   test('local: a sticky account with a distant reset and no other account stops with a quota refusal', async () => {
     const { host, choose } = await localSticky()
     const now = wholeSecond()
@@ -5369,7 +5489,7 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
       expect(refusal).toBeInstanceOf(NativeVaultQuotaPolicyError)
       const error = refusal as NativeVaultQuotaPolicyError
       expect(error.message).toStartWith(
-        'No Claude account has room for this request (weekly limit or your quota floor). The earliest reset is ',
+        'No Claude account has room for this request (weekly limit or your quota floor). This turn has stopped. The earliest reset is ',
       )
       expect(error.message).toContain('UTC (in 72 h).')
       // The default longest same-account wait caps the advertised retry.

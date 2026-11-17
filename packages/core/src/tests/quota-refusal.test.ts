@@ -5,7 +5,11 @@ import {
   quotaRefusalTiming,
 } from '../accounts.ts'
 import { createQuotaRefusalResponse } from '../quota-refusal.ts'
-import { createStickyNoRouteResponse } from '../sticky-routing.ts'
+import {
+  createStickyNoRouteResponse,
+  stickyQuotaBlockerInForce,
+  stickyQuotaExhaustionInForce,
+} from '../sticky-routing.ts'
 
 const now = Date.parse('2026-11-02T10:00:00Z')
 const resetAt = now + 2 * 3_600_000
@@ -31,6 +35,24 @@ const storage = (maxSameAccountWait: '0' | '15' | 'max'): AccountStorage => ({
   version: 1,
   accounts: [],
   routing: { maxSameAccountWait },
+})
+
+test('unknown exhausted blockers prevent a hold without changing the known-reset scan', () => {
+  const reading = quota()
+  reading.seven_day!.resetsAt = undefined
+  expect(stickyQuotaBlockerInForce({ quota: reading, now })).toEqual({
+    reason: 'seven-day',
+    limitName: 'weekly',
+  })
+  expect(stickyQuotaExhaustionInForce({ quota: reading, now })).toMatchObject({
+    resetAt,
+    reason: 'five-hour',
+  })
+  reading.seven_day!.resetsAt = new Date(resetAt + 3_600_000).toISOString()
+  expect(stickyQuotaBlockerInForce({ quota: reading, now })).toMatchObject({
+    resetAt: resetAt + 3_600_000,
+    reason: 'seven-day',
+  })
 })
 
 test('only fresh current-identity scope-covered resets feed the terminal scan', () => {
@@ -127,6 +149,38 @@ test('capped retry text agrees with the header while retaining the actual later 
       timeZoneName: 'short',
     }).format(actualReset),
   )
+})
+
+test('manual quota messages name the stopped turn and resend time without changing response policy', async () => {
+  for (const limitName of [undefined, '5-hour']) {
+    for (const retryAfterSeconds of [undefined, 900]) {
+      const response = createQuotaRefusalResponse(
+        'No account can serve this request.',
+        { resetAt, limitName, retryAfterSeconds },
+        now,
+        { retry: 'manual' },
+      )
+      expect(response.status).toBe(retryAfterSeconds === undefined ? 412 : 429)
+      expect(response.headers.get('retry-after')).toBe(
+        retryAfterSeconds === undefined ? null : '900',
+      )
+      const body = (await response.json()) as { error: { message: string } }
+      expect(body.error.message).toContain('This turn has stopped.')
+      expect(body.error.message).toContain(
+        'Send the message again after 12:00 UTC.',
+      )
+      expect(body.error.message).not.toMatch(/Retrying|Retry in /)
+    }
+  }
+  const unknown = createQuotaRefusalResponse(
+    'No account can serve this request.',
+    { resetAt: undefined, retryAfterSeconds: undefined },
+    now,
+    { retry: 'manual' },
+  )
+  expect(
+    ((await unknown.json()) as { error: { message: string } }).error.message,
+  ).toContain('This turn has stopped. Reset time is unknown.')
 })
 
 test('scoped refusal includes the matching scope and standard blockers', () => {
