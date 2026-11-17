@@ -508,7 +508,7 @@ export interface NativeAnthropicAdapter<Q, P> {
     attempt: Attempt<NativeAnthropicAttemptData<P>>,
     hostAttempt: number,
   ): void
-  /** Drop terminal text if the host response hook ends before rewriting its body. */
+  /** Drop the pending quota-stop message if the send ends before its response body is rewritten. */
   discardQuotaStopMessage(data: NativeAnthropicAttemptData<P>): void
   /** Background drivers can refuse a rewritten request before their final dispatch. */
   discardUnsentBilling(data: NativeAnthropicAttemptData<P>): void

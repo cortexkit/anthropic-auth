@@ -554,7 +554,9 @@ export function createNativeAnthropicSource(
       return undefined
     const exhausted: StickyQuotaBlocker[] = []
     for (const row of oauth) {
-      // A new refusal ends the refused account's previously granted hold.
+      // While a hold we granted is running, exhaustionInForce treats the held
+      // account as usable so the session stays on it. This account has just
+      // been refused again, so that hold is over: judge it by its quota.
       const blocked = exhaustionInForce(
         input,
         row,
