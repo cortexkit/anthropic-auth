@@ -30,11 +30,30 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/** Filesystem operations and retry delay; tests supply controlled races. */
+export interface PortFileWriterIo {
+  mkdir(dir: string): Promise<void>
+  write(path: string, text: string): Promise<void>
+  rename(from: string, to: string): Promise<void>
+  sleep(ms: number): Promise<void>
+}
+
+const writerIo: PortFileWriterIo = {
+  mkdir: async (dir) => {
+    await mkdir(dir, { recursive: true })
+  },
+  write: (path, text) =>
+    writeFile(path, text, { encoding: 'utf8', mode: 0o600 }),
+  rename,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}
+
 export async function writePortFile(
   dir: string,
   entry: { port: number; token: string; pid: number },
+  overrides: Partial<PortFileWriterIo> = {},
 ): Promise<string> {
-  await mkdir(dir, { recursive: true })
+  const io = { ...writerIo, ...overrides }
   const full: PortFileEntry = {
     ...entry,
     startedAt: Date.now(),
@@ -42,9 +61,19 @@ export async function writePortFile(
   }
   const target = join(dir, `port-${entry.pid}.json`)
   const tmp = `${target}.${process.pid}.tmp`
-  await writeFile(tmp, JSON.stringify(full), { encoding: 'utf8', mode: 0o600 })
-  await rename(tmp, target)
-  return target
+  for (let attempt = 1; ; attempt++) {
+    await io.mkdir(dir)
+    try {
+      await io.write(tmp, JSON.stringify(full))
+      await io.rename(tmp, target)
+      return target
+    } catch (error) {
+      // A concurrent sweep or older process may remove an empty project folder.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || attempt >= 5)
+        throw error
+      await io.sleep(25)
+    }
+  }
 }
 
 export async function discoverPortFile(

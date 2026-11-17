@@ -70,6 +70,25 @@ async function eventuallyAbsent(path: string) {
   expect(await exists(path)).toBe(false)
 }
 
+test('full sweep keeps fresh empty folders and removes only folders older than sixty seconds', async () => {
+  const { root, active, options } = await fixture()
+  const fresh = join(root, hash(1))
+  const boundary = join(root, hash(2))
+  const old = join(root, hash(3))
+  for (const [dir, age] of [
+    [fresh, 0],
+    [boundary, 60_000],
+    [old, 60_001],
+  ] as const) {
+    await mkdir(dir)
+    await utimes(dir, new Date(NOW - age), new Date(NOW - age))
+  }
+  await sweepRpcState(active, options)
+  expect(await exists(fresh)).toBe(true)
+  expect(await exists(boundary)).toBe(true)
+  expect(await exists(old)).toBe(false)
+})
+
 test('sweep removes dead pid files across many sibling folders and removes only empty managed folders', async () => {
   const { root, active, options } = await fixture()
   const dirs = Array.from({ length: 80 }, (_, i) => join(root, hash(i + 1)))

@@ -152,7 +152,10 @@ export async function sweepRpcState(
           }
         }
         try {
-          await rmdir(dir)
+          // A writer can be between mkdir and its first temporary-file write.
+          const current = await lstat(dir)
+          if (current.isDirectory() && current.mtimeMs < now - INTERVAL_MS)
+            await rmdir(dir)
         } catch (error) {
           if (code(error) !== 'ENOTEMPTY' && code(error) !== 'EEXIST')
             failed(dirName, error)
