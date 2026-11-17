@@ -205,14 +205,19 @@ describe('Pi turn-end notes', () => {
     }
   })
 
-  test('thinking downgraded to text is not a visible reply', async () => {
+  test('dropped thinking is not a visible reply or replayed text', async () => {
     const history = [user('Question'), ...pair('a')]
     const assistant = history[1] as Extract<Message, { role: 'assistant' }>
     assistant.content[0] = {
       type: 'thinking',
       thinking: 'Private reasoning'.repeat(50),
     }
-    expect((await build(history)).wire.messages).not.toContainEqual(note)
+    const result = await build(history)
+    expect(result.wire.messages).not.toContainEqual(note)
+    expect(result.bodyText).not.toContain('Private reasoning')
+    expect(result.wire.messages[1].content).toEqual([
+      { type: 'tool_use', id: 'a', name: 'board', input: {} },
+    ])
   })
 
   test.each(['', ' \n\t'])(

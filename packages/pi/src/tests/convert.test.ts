@@ -11,6 +11,8 @@ import {
 } from '@cortexkit/anthropic-auth-core'
 import type { Context, Message } from '@earendil-works/pi-ai'
 import { buildAnthropicRequest, piThreadCacheSlot } from '../convert'
+import { collectPiEffortHistory } from '../effort-history.ts'
+import { PiForkEffortSnapshots } from '../forks.ts'
 import { normalizeContext } from '../transcript.ts'
 
 function userMsg(text: string): Message {
@@ -1268,7 +1270,7 @@ describe('convertMessages — signed thinking blocks', () => {
     expect(JSON.stringify(messages)).not.toContain('gpt reasoning summary')
   })
 
-  test('drops another provider signature but preserves its visible reasoning as text', async () => {
+  test('drops another provider thinking without replaying it as text', async () => {
     const messages = await buildMessages([
       userMsg('q1'),
       thinkingToolMsg('deepseek reasoning', 'reasoning_content', 'tool_1', {
@@ -1280,7 +1282,6 @@ describe('convertMessages — signed thinking blocks', () => {
 
     const block = messages[1]?.content as Array<Record<string, unknown>>
     expect(block).toEqual([
-      { type: 'text', text: 'deepseek reasoning' },
       {
         type: 'tool_use',
         id: 'tool_1',
@@ -1290,7 +1291,7 @@ describe('convertMessages — signed thinking blocks', () => {
     ])
   })
 
-  test('drops a different Anthropic model signature but preserves visible reasoning', async () => {
+  test('drops a different Anthropic model thinking without replaying it as text', async () => {
     const messages = await buildMessages([
       userMsg('q1'),
       thinkingToolMsg('old model reasoning', 'sig-old', 'tool_1', {
@@ -1301,7 +1302,6 @@ describe('convertMessages — signed thinking blocks', () => {
 
     const block = messages[1]?.content as Array<Record<string, unknown>>
     expect(block).toEqual([
-      { type: 'text', text: 'old model reasoning' },
       {
         type: 'tool_use',
         id: 'tool_1',
@@ -1321,8 +1321,9 @@ describe('convertMessages — signed thinking blocks', () => {
     ])
 
     const block = messages[1]?.content as Array<Record<string, unknown>>
-    expect(block[0]).toEqual({ type: 'text', text: 'Bedrock reasoning' })
-    expect(block[1]?.type).toBe('tool_use')
+    expect(block).toEqual([
+      { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+    ])
   })
 
   test('accepts same-model signatures from Pi native Anthropic history', async () => {
@@ -1399,7 +1400,7 @@ describe('convertMessages — signed thinking blocks', () => {
     })
   })
 
-  test('downgrades a signed thinking block with a lone surrogate to sanitized text', async () => {
+  test('drops signed thinking with a lone surrogate without replaying it as text', async () => {
     const messages = await buildMessages([
       userMsg('q1'),
       thinkingToolMsg('bad\uD800text', 'sig-A', 'tool_1'),
@@ -1408,14 +1409,13 @@ describe('convertMessages — signed thinking blocks', () => {
       toolResultMsg('tool_2', 'out2'),
     ])
 
-    // A signed block with a lone surrogate can't keep its signature: sanitizing
-    // would break it and sending the raw surrogate is an invalid-UTF8 400. Drop
-    // the signature and downgrade to sanitized text during conversion.
     const block = messages[1]?.content as Array<Record<string, unknown>>
-    expect(block[0]).toEqual({ type: 'text', text: 'bad\uFFFDtext' })
+    expect(block).toEqual([
+      { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+    ])
   })
 
-  test('downgrades signed last-turn thinking to sanitized text if it has a lone surrogate', async () => {
+  test('drops signed last-turn thinking if it has a lone surrogate', async () => {
     const messages = await buildMessages([
       userMsg('q1'),
       thinkingToolMsg('safe reason', 'sig-A', 'tool_1'),
@@ -1424,11 +1424,197 @@ describe('convertMessages — signed thinking blocks', () => {
       toolResultMsg('tool_2', 'out2'),
     ])
 
-    // Last assistant turn, but signed thinking contains a lone surrogate: the
-    // signature cannot survive sanitization, so drop it and emit text.
     const current = messages[3]?.content as Array<Record<string, unknown>>
-    expect(current[0]).toEqual({ type: 'text', text: 'bad\uFFFDreason' })
-    expect(current[1]?.type).toBe('tool_use')
+    expect(current).toEqual([
+      { type: 'tool_use', id: 'tool_2', name: 'Bash', input: {} },
+    ])
+  })
+
+  test('drops unsigned thinking without replaying interrupted reasoning as text', async () => {
+    const messages = await buildMessages([
+      userMsg('q1'),
+      thinkingToolMsg('interrupted private reasoning', '', 'tool_1'),
+      toolResultMsg('tool_1', 'out1'),
+    ])
+    expect(messages[1]?.content).toEqual([
+      { type: 'tool_use', id: 'tool_1', name: 'Bash', input: {} },
+    ])
+  })
+
+  test.each([
+    {
+      thinking: 'foreign private reasoning',
+      signature: 'sig-old',
+      model: 'old-model',
+    },
+    {
+      thinking: 'interrupted private reasoning',
+      signature: '',
+      model: TEST_MODEL_ID,
+    },
+    {
+      thinking: 'malformed\uD800private reasoning',
+      signature: 'sig-bad',
+      model: TEST_MODEL_ID,
+    },
+  ])(
+    'omits a thinking-only assistant turn: $thinking',
+    async ({ thinking, signature, model }) => {
+      const assistant = thinkingToolMsg(thinking, signature, 'unused', {
+        model,
+      })
+      if (assistant.role === 'assistant') assistant.content.pop()
+      expect(
+        await buildMessages([userMsg('first'), assistant, userMsg('next')]),
+      ).toEqual([
+        { role: 'user', content: 'first' },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'next',
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        },
+      ])
+    },
+  )
+
+  test('dropped thinking keeps source effort boundaries and stable final wire bytes', async () => {
+    const dropped = thinkingToolMsg(
+      'old private reasoning',
+      'sig-old',
+      'unused',
+      { model: 'old-model' },
+    )
+    if (dropped.role === 'assistant') dropped.content.pop()
+    const history = [userMsg('first'), dropped, userMsg('next')]
+    const entries = [
+      { id: '0', type: 'thinking_level_change', thinkingLevel: 'high' },
+      { id: '1', type: 'message', message: history[0] },
+      { id: '2', type: 'message', message: history[1] },
+      { id: '3', type: 'thinking_level_change', thinkingLevel: 'low' },
+      { id: '4', type: 'message', message: history[2] },
+    ]
+    const effortTransitions = collectPiEffortHistory(entries, entries)
+    expect(effortTransitions).toEqual([
+      { afterAssistantMessages: 0, effort: 'high' },
+      { afterAssistantMessages: 1, effort: 'low' },
+    ])
+    const build = () =>
+      buildAnthropicRequest(
+        'claude-opus-5-5',
+        { messages: history, tools: [] },
+        { reasoning: 'low' },
+        { enabled: true, mode: 'explicit' },
+        false,
+        undefined,
+        {
+          effortTransitions,
+          onPayload: (body) => {
+            expect(
+              body.messages.some((message) => message.role === 'assistant'),
+            ).toBe(false)
+          },
+        },
+      )
+    const first = await build()
+    const second = await build()
+    expect(first.bodyText).toBe(second.bodyText)
+    const wire = JSON.parse(first.bodyText)
+    expect(wire.output_config).toEqual({ effort: 'high' })
+    expect(wire.messages).toEqual([
+      { role: 'user', content: 'first' },
+      { role: 'system', content: [], output_config: { effort: 'low' } },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'next',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+      },
+    ])
+    expect(first.bodyText).not.toContain('old private reasoning')
+  })
+
+  test('dropped thinking preserves thread continuation and fork base cache placement', async () => {
+    const dropped = thinkingToolMsg(
+      'old private reasoning',
+      'sig-old',
+      'unused',
+      { model: 'old-model' },
+    )
+    if (dropped.role === 'assistant') dropped.content.pop()
+    const history = [userMsg('first'), dropped, userMsg('base tail')]
+    const context = { messages: history, tools: [] }
+    const transitions = [
+      { afterAssistantMessages: 0, effort: 'high' as const },
+      { afterAssistantMessages: 1, effort: 'low' as const },
+    ]
+    const snapshots = new PiForkEffortSnapshots()
+    snapshots.record('head', context, transitions)
+    const build = (messages: Message[], forkBaseMessageCount?: number) =>
+      buildAnthropicRequest(
+        'claude-opus-5-5',
+        { messages, tools: [] },
+        { reasoning: 'low' },
+        { enabled: true, mode: 'explicit' },
+        false,
+        undefined,
+        { effortTransitions: transitions, forkBaseMessageCount },
+      )
+    const first = await build(history)
+    expect(snapshots.match('head', context).messageCount).toBe(3)
+    const tracker = new MessageThreadTracker(10, () => 0)
+    const input = {
+      body: first.body,
+      betas: [],
+      account: 'pi-account',
+      credential: 'pi-row',
+      session: 'dropped-thinking-thread',
+    }
+    tracker.prepare(input).complete({
+      messageId: 'msg_before_followup',
+      stopped: true,
+      stopReason: 'end_turn',
+      reply: { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
+    })
+    const laterHistory = [
+      ...history,
+      assistantMsg('answer'),
+      userMsg('followup'),
+    ]
+    const later = await build(laterHistory)
+    const continuation = tracker.prepare({ ...input, body: later.body })
+    expect(continuation.decision.type).toBe('continue')
+    expect(continuation.body.messages).toEqual([later.body.messages.at(-1)])
+
+    const forkHistory = [
+      ...history,
+      assistantMsg('answer'),
+      {
+        role: 'user' as const,
+        content: Array.from({ length: 22 }, (_, index) => ({
+          type: 'text' as const,
+          text: `fork block ${index}`,
+        })),
+        timestamp: 0,
+      },
+    ]
+    const base = snapshots.match('head', { ...context, messages: forkHistory })
+    const fork = await build(forkHistory, base.messageCount)
+    expect(fork.body.messages.slice(0, first.body.messages.length)).toEqual(
+      first.body.messages,
+    )
+    expect(
+      fork.body.messages.filter((message) => message.role === 'assistant'),
+    ).toHaveLength(1)
+    expect(fork.bodyText).not.toContain('old private reasoning')
   })
 
   test('preserves clean signed last-turn thinking verbatim (no surrogate)', async () => {

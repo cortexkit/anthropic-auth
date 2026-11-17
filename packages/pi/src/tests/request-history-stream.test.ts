@@ -153,6 +153,90 @@ for (const apiKey of ['sk-ant-oat-fixture-history', 'fixture-api-key']) {
   )
 }
 
+test('Pi model-switch stream omits old thinking and keeps the effort change between users', async () => {
+  directory = await mkdtemp(join(tmpdir(), 'pi-model-switch-history-'))
+  const storagePath = join(directory, 'anthropic-auth.json')
+  currentStoragePath = storagePath
+  process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+  await saveNativePiFixture(
+    {
+      version: 1,
+      main: { type: 'opencode', provider: 'anthropic' },
+      accounts: [],
+      quota: { enabled: false },
+    },
+    storagePath,
+  )
+  const sent: Array<Record<string, any>> = []
+  globalThis.fetch = mock(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url.includes('/api/claude_cli/bootstrap'))
+        return Response.json({
+          oauth_account: { account_uuid: 'pi-model-switch-account' },
+        })
+      if (url.includes('/v1/messages')) {
+        sent.push(JSON.parse(String(init?.body)))
+        return new Response(
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_switch","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":0}}}\n\n' +
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n' +
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      }
+      throw new Error(`Unexpected fixture network dispatch: ${url}`)
+    },
+  ) as unknown as typeof fetch
+  const stream = streamCortexKitAnthropic(
+    model,
+    {
+      messages: [
+        { role: 'user', content: 'Original question', timestamp: 0 },
+        {
+          ...assistant,
+          model: 'claude-sonnet-4-20250514',
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'Private old-model reasoning never to replay',
+              thinkingSignature: 'old-signature',
+            },
+          ],
+        },
+        { role: 'user', content: 'Continue at low effort', timestamp: 2 },
+      ],
+      tools: [],
+    },
+    { apiKey: 'sk-ant-oat-fixture-switch', reasoning: 'low' },
+    [
+      { afterAssistantMessages: 0, effort: 'high' },
+      { afterAssistantMessages: 1, effort: 'low' },
+    ],
+  )
+  for await (const _event of stream) {
+    /* Drain the model-switch stream. */
+  }
+  expect((await stream.result()).stopReason).toBe('stop')
+  expect(sent).toHaveLength(1)
+  expect(JSON.stringify(sent)).not.toContain('Private old-model reasoning')
+  expect(JSON.stringify(sent)).not.toContain('old-signature')
+  expect(sent[0]?.output_config).toEqual({ effort: 'high' })
+  expect(sent[0]?.messages).toEqual([
+    { role: 'user', content: 'Original question' },
+    { role: 'system', content: [], output_config: { effort: 'low' } },
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: 'Continue at low effort',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    },
+  ])
+})
+
 test('Pi API-key requests never use message threads', async () => {
   directory = await mkdtemp(join(tmpdir(), 'pi-api-thread-exclusion-'))
   const storagePath = join(directory, 'accounts.json')
