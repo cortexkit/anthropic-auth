@@ -1,6 +1,7 @@
 import {
   type AnthropicBillingWarming,
   type ClaudeGateway,
+  createExhaustedNoRouteResponse,
   createNativeUsagePublisher,
   createNativeVaultNoRouteResponse,
   decideStickyQuotaFailure,
@@ -26,6 +27,7 @@ import {
   type NativeLocalCredentialValidation as NativeKnownCredentialSubject,
   type NativePoolPaths,
   type NativeQuotaObservation,
+  NativeVaultNoAccountError,
   NativeVaultQuotaPolicyError,
   nativeAccountCanServe,
   nativeLocalAccountRefusal,
@@ -46,12 +48,14 @@ import {
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
   requestSignal,
+  type StickyQuotaExhaustion,
   StickyQuotaRetryCounter,
   StickySessionRouter,
   sessionCacheActivity,
   setDumpEnabled,
   shouldFallbackStatus,
   startRoutingWait,
+  stickyQuotaExhaustionInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRetainRetryHeaders,
   stickyRetryAfterWithJitter,
@@ -140,6 +144,10 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
  * refused account outside it would be refused again by `authorizeAccount`
  * when the held retry runs, so it moves instead of waiting. That covers a
  * model-scoped window at zero and a configured quota floor or killswitch.
+ *
+ * `grant` learns of each hold for confirmed exhaustion: the account and when its
+ * blocking reset, including jitter, ends. Request-phase selection keeps serving
+ * that account until then instead of excluding it as exhausted.
  */
 function stickyHold(
   input: ChooseAccountInput,
@@ -148,6 +156,7 @@ function stickyHold(
   modelID: string,
   counter: StickyQuotaRetryCounter,
   turnId: string,
+  grant: (accountId: string, untilMs: number) => void,
   responseHeaders?: Headers,
 ): RetryHold | undefined {
   const refused = input.rerouteFrom
@@ -207,16 +216,14 @@ function stickyHold(
     return result
   }
   if (decision.action !== 'hold') return undefined
+  const resetWithJitterMs =
+    stickyRetryAfterWithJitter(input.sessionID, decision.retryAfterSeconds) *
+    1000
+  grant(account.id, Date.now() + resetWithJitterMs)
   const result = {
     hold: {
       // OpenCode 2 caps each wait; under "max", retries recheck the original cache expiry.
-      delayMs: Math.min(
-        MAX_HOST_RETRY_MS,
-        stickyRetryAfterWithJitter(
-          input.sessionID,
-          decision.retryAfterSeconds,
-        ) * 1000,
-      ),
+      delayMs: Math.min(MAX_HOST_RETRY_MS, resetWithJitterMs),
     },
   }
   startRoutingWait({
@@ -337,6 +344,10 @@ export function createNativeAnthropicSource(
   })
   const servedTurns = new Set<string>()
   const stickyQuotaRetries = new StickyQuotaRetryCounter()
+  // The latest same-account hold granted for confirmed exhaustion, by session:
+  // the held account and when its reset, with jitter, ends. Entries leave with
+  // forgetSession, which also bounds the map.
+  const grantedHolds = new Map<string, { accountId: string; untilMs: number }>()
   const turnIds = new Map<string, string>()
   // Vault mode keeps session affinity in its own file, named by the snapshot,
   // so vault sessions never read or write the local account's routing state.
@@ -469,6 +480,41 @@ export function createNativeAnthropicSource(
     (account.type === 'api' ||
       routingRelay.policy(sessionID, account, snapshot, remapModelId(modelID))
         .status === 'allowed')
+  /**
+   * Confirmed exhaustion that keeps `account` from serving this request until
+   * a reset, read from the same evidence a sticky hold decision uses: the raw
+   * headers of this scope's latest 429 from the account, and its stored
+   * reading when those headers exist or the reading is fresh. Undefined while
+   * a hold this session was granted for the account has not yet ended.
+   */
+  const exhaustionInForce = (
+    scope: RequestScope,
+    account: NativeAccountView,
+    snapshot: NativeAccountSnapshot,
+    modelID: string,
+  ) => {
+    const now = Date.now()
+    const held = grantedHolds.get(scope.sessionID)
+    if (held?.accountId === account.id && now < held.untilMs) return undefined
+    const responseHeaders = refusalHeaders.get(
+      key({ ...scope, modelID }, account.id),
+    )?.headers
+    return stickyQuotaExhaustionInForce({
+      quota:
+        responseHeaders ||
+        stickyQuotaSnapshotIsFresh(
+          account.quota,
+          snapshot.policyStorage,
+          now,
+          modelID,
+        )
+          ? account.quota
+          : undefined,
+      responseHeaders,
+      modelId: modelID,
+      now,
+    })
+  }
   const sameAccount = (
     account: NativeAccountView,
     expected: NativeAccountView,
@@ -909,6 +955,14 @@ export function createNativeAnthropicSource(
           ),
         )
       }
+      // A refusal from a held account ends its hold unless this probe grants
+      // another one.
+      if (
+        input.rerouteFrom &&
+        grantedHolds.get(input.sessionID)?.accountId ===
+          input.rerouteFrom.accountId
+      )
+        grantedHolds.delete(input.sessionID)
       const hold = stickyHold(
         input,
         snapshot,
@@ -916,6 +970,8 @@ export function createNativeAnthropicSource(
         modelID,
         stickyQuotaRetries,
         turnIds.get(input.sessionID) ?? input.kind,
+        (accountId, untilMs) =>
+          grantedHolds.set(input.sessionID, { accountId, untilMs }),
         input.rerouteFrom
           ? refusalHeaders.get(
               key({ ...input, modelID }, input.rerouteFrom.accountId),
@@ -923,9 +979,45 @@ export function createNativeAnthropicSource(
           : undefined,
       )
       if (hold) return hold
-      const withoutRejected = oauth.filter(
-        (account) => account.id !== input.rerouteFrom?.accountId,
-      )
+      // A new request never goes to an account whose exhaustion is confirmed
+      // and still in force, whatever the quota floor: the host would only send
+      // it again to an account that cannot serve it until its reset. A hold
+      // this session was granted for that account still runs to its end.
+      // A retry probe already leaves out the account that refused it.
+      const exhausted: StickyQuotaExhaustion[] = []
+      const withoutRejected = oauth.filter((account) => {
+        if (account.id === input.rerouteFrom?.accountId) return false
+        if (input.phase === 'retry') return true
+        const blocked = exhaustionInForce(input, account, snapshot, modelID)
+        if (blocked) exhausted.push(blocked)
+        return !blocked
+      })
+      // As in the vault refusal, a sign-in failure takes precedence over quota.
+      const quotaExplainsRefusal =
+        exhausted.length > 0 &&
+        !snapshot.accounts.some(
+          (account) =>
+            account.type === 'oauth' &&
+            account.enabled &&
+            account.state === 'needs_reauth',
+        )
+      const exhaustedRefusal = () =>
+        createExhaustedNoRouteResponse({
+          exhausted,
+          storage: snapshot.policyStorage,
+          sessionId: input.sessionID,
+        })
+      const refusal = async (response: Response) => {
+        const delayMs =
+          Number(hostRetryHeaders(response.headers).get('retry-after')) * 1000
+        startRoutingWait({
+          sessionId: input.sessionID,
+          reason: 'account_free',
+          delayMs,
+          nextMs: Date.now() + delayMs,
+        })
+        return await NativeVaultQuotaPolicyError.fromResponse(response)
+      }
       if (getRoutingMode(snapshot.policyStorage) === 'sticky-balanced') {
         const candidates = withoutRejected.map((account, order) => ({
           accountId: account.id,
@@ -988,52 +1080,64 @@ export function createNativeAnthropicSource(
         if (ordered[0]) return ordered[0].id
       }
       if (snapshot.mode === 'claustrum') {
-        const response = createNativeVaultNoRouteResponse({
-          snapshot,
-          sessionId: input.sessionID,
-          modelId: modelID,
-          policies,
-          sticky: getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
-        })
-        const delayMs =
-          Number(hostRetryHeaders(response.headers).get('retry-after')) * 1000
-        startRoutingWait({
-          sessionId: input.sessionID,
-          reason: 'account_free',
-          delayMs,
-          nextMs: Date.now() + delayMs,
-        })
-        throw await NativeVaultQuotaPolicyError.fromResponse(response)
+        let response: Response
+        try {
+          response = createNativeVaultNoRouteResponse({
+            snapshot,
+            sessionId: input.sessionID,
+            modelId: modelID,
+            policies,
+            sticky:
+              getRoutingMode(snapshot.policyStorage) === 'sticky-balanced',
+          })
+        } catch (error) {
+          // The vault refusal finds no quota policy at work when the accounts
+          // left out are confirmed exhausted yet not below a quota floor.
+          if (!(error instanceof NativeVaultNoAccountError)) throw error
+          if (!quotaExplainsRefusal) throw error
+          response = exhaustedRefusal()
+        }
+        throw await refusal(response)
       }
       if (advice) return undefined
-      // Fall back to a pay-per-token API key account only when the primary
-      // Claude subscription account ('main') has run out: a recent usage
-      // reading for main's current account and credential version must show
-      // its five-hour or seven-day subscription limit at zero. A limit on one
-      // model only, or a 401, never moves a request onto paid API billing.
-      const main = snapshot.accounts.find(
-        (account) => account.id === 'main' && account.type === 'oauth',
-      )
-      if (!main) return undefined
-      let quota = main.quota
-      if (
-        input.rerouteFrom?.limit.status === 429 ||
-        !stickyQuotaSnapshotIsFresh(quota, snapshot.policyStorage)
-      ) {
-        try {
-          quota = await runtime.fetchQuota('main', options.fetch, active.signal)
-        } catch {
-          return undefined
+      const api = await (async () => {
+        // Fall back to a pay-per-token API key account only when the primary
+        // Claude subscription account ('main') has run out: a recent usage
+        // reading for main's current account and credential version must show
+        // its five-hour or seven-day subscription limit at zero. A limit on one
+        // model only, or a 401, never moves a request onto paid API billing.
+        const main = snapshot.accounts.find(
+          (account) => account.id === 'main' && account.type === 'oauth',
+        )
+        if (!main) return undefined
+        let quota = main.quota
+        if (
+          input.rerouteFrom?.limit.status === 429 ||
+          !stickyQuotaSnapshotIsFresh(quota, snapshot.policyStorage)
+        ) {
+          try {
+            quota = await runtime.fetchQuota(
+              'main',
+              options.fetch,
+              active.signal,
+            )
+          } catch {
+            return undefined
+          }
         }
-      }
-      active.signal.throwIfAborted()
-      if (!quotaSnapshotIsExhausted(quota)) return undefined
-      return snapshot.accounts.find(
-        (account) =>
-          account.type === 'api' &&
-          nativeAccountCanServe(account) &&
-          account.id !== input.rerouteFrom?.accountId,
-      )?.id
+        active.signal.throwIfAborted()
+        if (!quotaSnapshotIsExhausted(quota)) return undefined
+        return snapshot.accounts.find(
+          (account) =>
+            account.type === 'api' &&
+            nativeAccountCanServe(account) &&
+            account.id !== input.rerouteFrom?.accountId,
+        )?.id
+      })()
+      if (api) return api
+      // Local mode explains a pool that is out of quota as the vault does.
+      if (quotaExplainsRefusal) throw await refusal(exhaustedRefusal())
+      return undefined
     },
     dropChoice() {
       // Account choices retain no authorization. Session routing pins outlive
@@ -1793,6 +1897,7 @@ export function createNativeAnthropicSource(
       for (const [key, value] of refusalHeaders)
         if (value.sessionID === sessionID) refusalHeaders.delete(key)
       servedTurns.delete(sessionID)
+      grantedHolds.delete(sessionID)
       sessions.get(sessionID)?.abort()
       sessions.delete(sessionID)
       servedBy.delete(sessionID)

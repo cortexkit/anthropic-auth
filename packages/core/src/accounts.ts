@@ -1632,7 +1632,32 @@ export function quotaRefusalTiming(input: {
   }
   const earliest = resetTimes.sort((a, b) => a.resetAt - b.resetAt)[0]
   const resetAt = earliest?.resetAt
+  return {
+    resetAt,
+    ...(earliest ? { limitName: earliest.limitName } : {}),
+    retryAfterSeconds: quotaRefusalRetryAfterSeconds({
+      resetAt,
+      storage: input.storage,
+      sessionTtlMs: input.sessionTtlMs,
+      now,
+    }),
+  }
+}
+
+/**
+ * The retry delay a quota refusal advertises: the time until `resetAt` (five
+ * minutes when it is unknown), capped by the longest same-account wait and the
+ * host's retry cap. The "0" wait setting advertises no retry at all.
+ */
+export function quotaRefusalRetryAfterSeconds(input: {
+  resetAt: number | undefined
+  storage?: AccountSettingsReaderInput | null
+  sessionTtlMs?: number
+  now?: number
+}): number | undefined {
+  const now = input.now ?? Date.now()
   const wait = getMaxSameAccountWait(input.storage ?? null)
+  if (wait === '0') return undefined
   const ttlMs =
     input.sessionTtlMs &&
     input.sessionTtlMs > 0 &&
@@ -1640,20 +1665,15 @@ export function quotaRefusalTiming(input: {
       ? input.sessionTtlMs
       : 300_000
   const capMs = clampHostRetryMs(wait === 'max' ? ttlMs : Number(wait) * 60_000)
-  return {
-    resetAt,
-    ...(earliest ? { limitName: earliest.limitName } : {}),
-    retryAfterSeconds:
-      wait === '0'
-        ? undefined
-        : Math.max(
-            1,
-            Math.ceil(
-              Math.min(resetAt === undefined ? 300_000 : resetAt - now, capMs) /
-                1000,
-            ),
-          ),
-  }
+  return Math.max(
+    1,
+    Math.ceil(
+      Math.min(
+        input.resetAt === undefined ? 300_000 : input.resetAt - now,
+        capMs,
+      ) / 1000,
+    ),
+  )
 }
 
 /** Compatibility accessor for callers that need only the capped retry delay. */
