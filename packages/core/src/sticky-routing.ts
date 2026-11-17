@@ -689,7 +689,11 @@ export type StickyQuotaBlocker = Omit<StickyQuotaExhaustion, 'resetAt'> & {
   readonly resetAt?: number
 }
 
-/** Include confirmed exhaustion with an unknown reset, which cannot justify a host hold. */
+/**
+ * Like stickyQuotaExhaustionInForce, but also report confirmed exhaustion whose
+ * reset time is unknown. Callers use it to stop a turn: without a known reset
+ * there is nothing to wait for, so the host is not asked to retry later.
+ */
 export function stickyQuotaBlockerInForce(input: {
   quota: OAuthQuotaSnapshot | QuotaState | undefined
   responseHeaders?: Headers

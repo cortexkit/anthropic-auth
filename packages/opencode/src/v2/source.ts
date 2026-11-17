@@ -135,7 +135,9 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
     (window) => (quota?.[window]?.remainingPercent ?? 1) <= 0,
   )
 
-// Match common-auth's installer bound; OpenCode 2 supplies its attempt label.
+// common-auth's installer accepts a hold only while this many host retries
+// remain after the current attempt; OpenCode 2 passes that attempt number as
+// `hostAttempt`.
 const HOST_RETRY_LIMIT = 10
 
 function resetFitsRetryBudget(input: ChooseAccountInput, delayMs: number) {
@@ -1058,7 +1060,8 @@ export function createNativeAnthropicSource(
             input.sessionID,
             Math.max(1, Math.ceil((blocked.resetAt - Date.now()) / 1000)),
           ) * 1000
-        // Reserve enough installer-supported slots to reach the reset.
+        // Hold only when the host retries still left can cover the whole wait to the
+// reset; otherwise stop now with the send-again message.
         if (!resetFitsRetryBudget(input, delayToReset)) return undefined
         const delayMs = Math.min(MAX_HOST_RETRY_MS, delayToReset)
         startRoutingWait({
