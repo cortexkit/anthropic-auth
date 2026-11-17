@@ -2,6 +2,11 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- OpenCode now removes leftover sidebar connection files from processes that have exited.
+- The one-time settings move is no longer held up by a leftover file whose process number now belongs to an unrelated program.
+
 ## 2.15.1
 
 - Pi no longer sends earlier reasoning back to Claude as plain text (after a model switch or an interrupted reply); Anthropic refuses that. Existing sessions rewrite the prompt cache once from the first affected reply.

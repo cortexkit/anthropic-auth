@@ -12,6 +12,7 @@ import {
   holderEntryIsLive,
   holderEntryLiveness,
   processIncarnation,
+  processStartedAtMs,
   readHolderFile,
   recordPredatesBoot,
 } from './holder-registry.ts'
@@ -228,7 +229,7 @@ function publisherPid(
 async function readArtifact(
   path: string,
   blockers: FenceBlocker[],
-  malformedIsStale: (startedAt?: unknown) => boolean,
+  malformedIsStale: (startedAt?: unknown) => Promise<boolean>,
 ): Promise<
   { value: unknown; startedAt: unknown; regular: boolean } | undefined
 > {
@@ -249,7 +250,7 @@ async function readArtifact(
   } catch (error) {
     // Removed between the listing and the read: its writer released it.
     if (errorCode(error) === 'ENOENT') return undefined
-    if (!malformedIsStale())
+    if (!(await malformedIsStale()))
       blockers.push({ kind: 'artifact-scan', path, reason: reasonOf(error) })
     return undefined
   }
@@ -266,7 +267,7 @@ async function readArtifact(
         : mtimeMs
     return { value, startedAt, regular }
   } catch {
-    if (!malformedIsStale(regular ? mtimeMs : undefined))
+    if (!(await malformedIsStale(regular ? mtimeMs : undefined)))
       blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
     return undefined
   }
@@ -276,14 +277,14 @@ async function readArtifact(
  * The fence's check for older versions: an RPC port file or CacheKeep record without the
  * `writer` stamp, whose pid is alive, belongs to a version that registers
  * nothing and blocks. Unreadable or malformed publisher-owned files need a
- * proven dead filename pid, or a readable regular file's pre-boot mtime.
+ * proven dead or reused filename pid, or a readable regular file's pre-boot mtime.
  * Other scan failures block. A record from before this boot is stale even
  * if its pid has been reused; missing or untrustworthy times keep blocking.
  */
 export async function preNArtifactBlockers(
   locations: PreNArtifactLocations,
   pidAlive: (pid: number) => boolean = defaultLiveness.pidAlive,
-  clock: Pick<HolderLiveness, 'now' | 'uptime'> = {},
+  clock: Pick<HolderLiveness, 'now' | 'uptime' | 'processStartedAtMs'> = {},
   /**
    * When set, a stamped artifact counts as older too unless this accepts its
    * `writer.release`: its writer may be a release below a later fence's
@@ -297,13 +298,26 @@ export async function preNArtifactBlockers(
       acceptsRelease(
         (value as { writer: { release?: unknown } }).writer.release,
       ))
-  const malformedIsStale = (pid: number | undefined, startedAt?: unknown) => {
+  const malformedIsStale = async (
+    pid: number | undefined,
+    startedAt?: unknown,
+  ) => {
     if (pid === undefined) return false
     if (recordPredatesBoot(startedAt, clock)) return true
-    // Match the holder registry's pid probe; no incarnation can be trusted
-    // from malformed bytes, so a reused live pid must still block.
     try {
-      return !pidAlive(pid)
+      if (!pidAlive(pid)) return true
+      if (
+        typeof startedAt !== 'number' ||
+        !Number.isFinite(startedAt) ||
+        startedAt < 0 ||
+        startedAt > (clock.now ?? Date.now)()
+      )
+        return false
+      const start = await (clock.processStartedAtMs ?? processStartedAtMs)(pid)
+      // ps reports whole seconds; tolerate clock and timestamp rounding.
+      return (
+        start !== null && Number.isFinite(start) && start > startedAt + 2_000
+      )
     } catch {
       return false
     }
@@ -325,11 +339,13 @@ export async function preNArtifactBlockers(
       const { value, startedAt } = record
       const pid = (value as { pid?: unknown } | null)?.pid
       if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) {
-        if (!isStale(record.regular ? startedAt : undefined))
+        if (!(await isStale(record.regular ? startedAt : undefined)))
           blockers.push({ kind: 'artifact-scan', path, reason: 'invalid' })
         continue
       }
-      if (!recordPredatesBoot(startedAt, clock) && pidAlive(pid))
+      if (
+        !(await malformedIsStale(pid, record.regular ? startedAt : undefined))
+      )
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })
     }
   }
@@ -344,7 +360,12 @@ export async function preNArtifactBlockers(
       )
       if (record === undefined || exempt(record.value)) continue
       const pid = Number(match[1])
-      if (!recordPredatesBoot(record.startedAt, clock) && pidAlive(pid))
+      if (
+        !(await malformedIsStale(
+          pid,
+          record.regular ? record.startedAt : undefined,
+        ))
+      )
         blockers.push({ kind: 'pre-n-artifact', artifact: path, pid })
     }
   }

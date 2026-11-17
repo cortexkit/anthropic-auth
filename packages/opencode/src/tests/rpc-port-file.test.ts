@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { discoverPortFile, writePortFile } from '../rpc/port-file'
@@ -11,6 +18,116 @@ beforeEach(async () => {
 afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
+
+for (const phase of ['write', 'rename'] as const) {
+  test(`writer recreates a folder removed once before the temp ${phase}`, async () => {
+    let attempts = 0
+    let removed = false
+    const delays: number[] = []
+    const path = await writePortFile(
+      dir,
+      { port: 5123, token: 'test-only', pid: 123 },
+      {
+        mkdir: async (path) => {
+          attempts++
+          await mkdir(path, { recursive: true })
+        },
+        write: async (path, text) => {
+          if (phase === 'write' && !removed) {
+            removed = true
+            await rm(dir, { recursive: true })
+          }
+          await writeFile(path, text, { encoding: 'utf8', mode: 0o600 })
+        },
+        rename: async (from, to) => {
+          if (phase === 'rename' && !removed) {
+            removed = true
+            await rm(dir, { recursive: true })
+          }
+          await rename(from, to)
+        },
+        sleep: async (ms) => {
+          delays.push(ms)
+        },
+      },
+    )
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({
+      pid: 123,
+      port: 5123,
+      token: 'test-only',
+    })
+    expect(attempts).toBe(2)
+    expect(delays).toEqual([25])
+  })
+
+  test(`writer gives up after five persistent temp ${phase} ENOENT failures`, async () => {
+    const error = Object.assign(new Error('missing directory'), {
+      code: 'ENOENT',
+    })
+    let attempts = 0
+    let failures = 0
+    const delays: number[] = []
+    await expect(
+      writePortFile(
+        dir,
+        { port: 5123, token: 'test-only', pid: 123 },
+        {
+          mkdir: async (path) => {
+            attempts++
+            await mkdir(path, { recursive: true })
+          },
+          write: async (path, text) => {
+            if (phase === 'write') {
+              failures++
+              throw error
+            }
+            await writeFile(path, text, { encoding: 'utf8', mode: 0o600 })
+          },
+          rename: async () => {
+            failures++
+            throw error
+          },
+          sleep: async (ms) => {
+            delays.push(ms)
+          },
+        },
+      ),
+    ).rejects.toBe(error)
+    expect(attempts).toBe(5)
+    expect(failures).toBe(5)
+    expect(delays).toEqual([25, 25, 25, 25])
+  })
+
+  test(`writer throws a non-ENOENT temp ${phase} error immediately`, async () => {
+    const error = Object.assign(new Error('denied'), { code: 'EACCES' })
+    let attempts = 0
+    const delays: number[] = []
+    await expect(
+      writePortFile(
+        dir,
+        { port: 5123, token: 'test-only', pid: 123 },
+        {
+          mkdir: async (path) => {
+            attempts++
+            await mkdir(path, { recursive: true })
+          },
+          write: async (path, text) => {
+            if (phase === 'write') throw error
+            await writeFile(path, text, { encoding: 'utf8', mode: 0o600 })
+          },
+          rename: async () => {
+            throw error
+          },
+          sleep: async (ms) => {
+            delays.push(ms)
+          },
+        },
+      ),
+    ).rejects.toBe(error)
+    expect(attempts).toBe(1)
+    expect(delays).toEqual([])
+  })
+}
 
 describe('port-file', () => {
   test('writePortFile then discover returns the entry for a live pid', async () => {
