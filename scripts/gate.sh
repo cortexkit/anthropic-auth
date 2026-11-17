@@ -150,7 +150,15 @@ case $mode in
     step oc1-config-fixture npm ci --prefix packages/e2e-tests/fixtures/opencode1-config-deps --ignore-scripts --no-audit --no-fund
     step build bun run build
     case $name in e2e | unit-opencode-*) prepare_hosts ;; esac
-    if lane_command "$name" >"$logs/$name.log" 2>&1; then
+    # Run the lane in a copy, as `all` does. A remote job seals the tracked
+    # checkout read-only, and some tests open tracked files for writing even
+    # when they only read them (Bun's snapshot files, `bun pm` on a
+    # package.json), so they fail in place. The copy under the log folder is
+    # writable.
+    dir="$logs/lanes/$name"
+    mkdir -p "$logs/lanes"
+    cp -a "$root/." "$dir"
+    if (cd "$dir" && lane_command "$name") >"$logs/$name.log" 2>&1; then
       echo "GATE_OK $commit lane $name"
       exit 0
     fi
