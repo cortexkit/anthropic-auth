@@ -1588,12 +1588,7 @@ function disconnectHarness(
 test('vault disconnect runs only the disconnect capability, only under claustrum custody', async () => {
   const vault = { ...full, custodyMode: 'claustrum' } as const
   for (const host of ['opencode', 'pi'] as const) {
-    for (const result of [
-      'disconnected',
-      'idle',
-      'busy',
-      'conflict',
-    ] as const) {
+    for (const result of ['disconnected', 'idle', 'busy'] as const) {
       const { executor, dispatched, disconnects } = disconnectHarness(
         host,
         async () => result,
@@ -1678,6 +1673,7 @@ test('vault disconnect is unsupported without a capability and reports capabilit
       'execution-failed',
     ],
     [async () => 'removed', 'invalid-outcome'],
+    [async () => 'conflict', 'invalid-outcome'],
     [async () => ({ result: 'disconnected' }), 'invalid-outcome'],
     [async () => undefined, 'invalid-outcome'],
   ] as const) {

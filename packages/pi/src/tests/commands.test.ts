@@ -767,18 +767,17 @@ describe('vault disconnect through the Pi /claude menu', () => {
     [
       'disconnected',
       1,
-      'Disconnected from the vault. This host uses local accounts again.',
+      'Pi is disconnected from the vault. Its previous saved Claude sign-in is not restored. Sign in again in Pi to use local authentication.',
     ],
-    ['idle', 1, 'This host has no active vault enrollment.'],
+    [
+      'idle',
+      1,
+      'Pi is disconnected from the vault. Its previous saved Claude sign-in is not restored. Sign in again in Pi to use local authentication.',
+    ],
     [
       'busy',
       0,
       "Vault disconnect could not finish because another process is changing this host's enrollment. Try again.",
-    ],
-    [
-      'conflict',
-      0,
-      'Disconnect stopped: this host already has a different stored sign-in, so it and the sign-in saved when the host joined the vault were both kept, and the vault connection remains. Resolve the two sign-ins with offline setup.',
     ],
   ] as const) {
     test(`a confirmed '${result}' disconnect ${refreshes ? 'reloads' : 'does not reload'} Pi's model registry`, async () => {
@@ -811,7 +810,7 @@ describe('vault disconnect through the Pi /claude menu', () => {
     test(
       reloadFails
         ? 'Pi reports reload failure without undoing a completed vault disconnect or exposing the exception'
-        : 'the default disconnect restores the stored Pi sign-in, selects local custody and leaves local account files byte-identical',
+        : 'the default disconnect clears Pi authentication without restoration, selects local custody and leaves local account files byte-identical',
       async () => {
         const enrollment = await enrollPi()
         try {
@@ -820,13 +819,11 @@ describe('vault disconnect through the Pi /claude menu', () => {
           const authPath = join(directory, 'auth.json')
           const original = `{\n  "other": {"type":"api_key","key":"synthetic-unrelated"},\n  "anthropic": {"type":"oauth","access":"sk-ant-oat01-synthetic-host","refresh":"synthetic-refresh","expires":1}\n}\n`
           await writeFile(authPath, original, { mode: 0o600 })
-          // Joining the vault set the sign-in aside through Core's shared slot
-          // writer, leaving an inert placeholder in Pi's auth file.
+          // Joining the vault discards the sign-in and leaves an inert placeholder.
           const slot = openNativePiAuthSlot({ env: process.env, authPath })
           await slot.enterVault()
           expect(await slot.inspect()).toEqual({
             slot: 'placeholder',
-            stash: 'valid',
           })
           expect(await readNativeEnrollmentMode('pi', process.env)).toBe(
             'claustrum',
@@ -860,19 +857,20 @@ describe('vault disconnect through the Pi /claude menu', () => {
           expect(notified).toEqual([
             ...(reloadFails
               ? [
-                  'Vault enrollment is inactive, but Pi could not reload its saved sign-in. Restart Pi before sending another request.',
+                  'Vault enrollment is inactive, but Pi could not reload its authentication. Restart Pi and sign in again before sending another request.',
                 ]
               : []),
-            'Disconnected from the vault. This host uses local accounts again.',
+            'Pi is disconnected from the vault. Its previous saved Claude sign-in is not restored. Sign in again in Pi to use local authentication.',
           ])
           if (reloadFails) expect(noticeLevels[0]).toBe('error')
           expect(notified.join('\n')).not.toContain(
             'synthetic-private-reload-exception',
           )
-          expect(await readFile(authPath, 'utf8')).toBe(original)
+          expect(JSON.parse(await readFile(authPath, 'utf8'))).toEqual({
+            other: { type: 'api_key', key: 'synthetic-unrelated' },
+          })
           expect(await slot.inspect()).toEqual({
-            slot: 'original',
-            stash: 'missing',
+            slot: 'empty',
           })
           expect(await readNativeEnrollmentMode('pi', process.env)).toBe(
             'local',

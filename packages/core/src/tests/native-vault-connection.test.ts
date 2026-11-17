@@ -1,5 +1,12 @@
 import { expect } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { getHostClaustrumEnrollmentPaths } from '../claustrum-enrollment.ts'
@@ -74,31 +81,36 @@ for (const entry of [
   '{"type":"oauth", "access":"synthetic-access", "refresh":"synthetic-refresh", "expires":1}',
   '{ "type" : "api_key", "key" : "synthetic-key" }',
 ]) {
-  test(`Pi disconnect restores exact stored ${entry.includes('oauth') ? 'OAuth' : 'API-key'} bytes before returning to local authority`, async () => {
+  test(`Pi disconnect clears the placeholder without restoring the discarded ${entry.includes('oauth') ? 'OAuth' : 'API-key'} sign-in`, async () => {
     const f = await fixture('pi')
     const original = `{\n  "other":{"type":"api_key","key":"synthetic-unrelated"},\n  "anthropic" : ${entry}\n}\n`
     await writeFile(f.authPath, original, { mode: 0o600 })
     await f.slot.enterVault()
     expect(await f.slot.inspect()).toEqual({
       slot: 'placeholder',
-      stash: 'valid',
+    })
+    await expect(readFile(f.stashPath)).rejects.toMatchObject({
+      code: 'ENOENT',
     })
     expect(await readNativeEnrollmentMode('pi', f.env)).toBe('claustrum')
-    const modesAtRestore: string[] = []
+    const modesAtClear: string[] = []
     expect(
       await disconnectNativeVaultForHost({
         host: 'pi',
         env: f.env,
         slot: {
           exitVault: async () => {
-            modesAtRestore.push(await readNativeEnrollmentMode('pi', f.env))
+            modesAtClear.push(await readNativeEnrollmentMode('pi', f.env))
             return f.slot.exitVault()
           },
         },
       }),
     ).toBe('disconnected')
-    expect(modesAtRestore).toEqual(['claustrum'])
-    expect(await readFile(f.authPath, 'utf8')).toBe(original)
+    expect(modesAtClear).toEqual(['claustrum'])
+    expect(JSON.parse(await readFile(f.authPath, 'utf8'))).toEqual({
+      other: { type: 'api_key', key: 'synthetic-unrelated' },
+    })
+    expect(await f.slot.inspect()).toEqual({ slot: 'empty' })
     expect(await readNativeEnrollmentMode('pi', f.env)).toBe('local')
     for (const path of [
       f.stashPath,
@@ -110,7 +122,7 @@ for (const entry of [
   })
 }
 
-test('a Pi slot conflict preserves foreign authentication, private recovery stash and both enrollment files', async () => {
+test('a new Pi sign-in survives disconnect while legacy stash and enrollment are removed', async () => {
   const f = await fixture('pi')
   await writeFile(
     f.authPath,
@@ -123,63 +135,10 @@ test('a Pi slot conflict preserves foreign authentication, private recovery stas
     '{"anthropic":{"type":"api_key","key":"synthetic-foreign"}}',
     { mode: 0o600 },
   )
-  const files = [
-    f.authPath,
-    f.stashPath,
-    f.enrollment.tokenPath,
-    f.enrollment.statePath,
-  ]
-  const before = await Promise.all(files.map((path) => readFile(path)))
-  expect(
-    await disconnectNativeVaultForHost({
-      host: 'pi',
-      env: f.env,
-      slot: f.slot,
-    }),
-  ).toBe('conflict')
-  expect(await Promise.all(files.map((path) => readFile(path)))).toEqual(before)
-  expect(await readNativeEnrollmentMode('pi', f.env)).toBe('claustrum')
-  expect(await f.localBytes()).toEqual(f.beforeLocal)
-})
-
-test('a Pi recovery-stash refusal cannot delete enrollment or expose parser input', async () => {
-  const f = await fixture('pi')
-  await writeFile(
-    f.authPath,
-    '{"anthropic":{"type":"api_key","key":"synthetic-original"}}',
-    { mode: 0o600 },
-  )
-  await f.slot.enterVault()
-  await writeFile(f.stashPath, 'synthetic-secret-invalid-json', { mode: 0o600 })
-  const files = [
-    f.authPath,
-    f.stashPath,
-    f.enrollment.tokenPath,
-    f.enrollment.statePath,
-  ]
-  const before = await Promise.all(files.map((path) => readFile(path)))
-  const result = await disconnectNativeVaultForHost({
-    host: 'pi',
-    env: f.env,
-    slot: f.slot,
-  }).then(
-    (value) => ({ value }),
-    (error: unknown) => ({ error }),
-  )
-  if (!('error' in result)) throw new Error('Malformed stash was accepted')
-  expect(result.error).toBeInstanceOf(NativePiAuthSlotError)
-  expect(result.error).toHaveProperty('message', 'Pi slot: invalid-stash')
-  expect(await Promise.all(files.map((path) => readFile(path)))).toEqual(before)
-  expect(await f.localBytes()).toEqual(f.beforeLocal)
-})
-
-test('a Pi disconnect retry after exact authentication restoration still removes enrollment', async () => {
-  const f = await fixture('pi')
-  const original =
-    '{"anthropic":{"type":"oauth","access":"synthetic-access","refresh":"synthetic-refresh","expires":1}}'
-  await writeFile(f.authPath, original, { mode: 0o600 })
-  await f.slot.enterVault()
-  await writeFile(f.authPath, original, { mode: 0o600 })
+  await mkdir(dirname(f.stashPath), { recursive: true, mode: 0o700 })
+  await writeFile(f.stashPath, 'synthetic-unread-legacy-login', { mode: 0o600 })
+  const before = await readFile(f.authPath)
+  expect(await f.slot.inspect()).toEqual({ slot: 'original' })
   expect(
     await disconnectNativeVaultForHost({
       host: 'pi',
@@ -187,9 +146,85 @@ test('a Pi disconnect retry after exact authentication restoration still removes
       slot: f.slot,
     }),
   ).toBe('disconnected')
-  expect(await readFile(f.authPath, 'utf8')).toBe(original)
+  expect(await readFile(f.authPath)).toEqual(before)
+  for (const path of [
+    f.stashPath,
+    f.enrollment.tokenPath,
+    f.enrollment.statePath,
+  ])
+    await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' })
   expect(await readNativeEnrollmentMode('pi', f.env)).toBe('local')
   expect(await f.localBytes()).toEqual(f.beforeLocal)
+})
+
+test('a malformed legacy Pi stash is deleted unread on disconnect', async () => {
+  const f = await fixture('pi')
+  await writeFile(
+    f.authPath,
+    '{"anthropic":{"type":"api_key","key":"synthetic-original"}}',
+    { mode: 0o600 },
+  )
+  await f.slot.enterVault()
+  await mkdir(dirname(f.stashPath), { recursive: true, mode: 0o700 })
+  await writeFile(f.stashPath, 'synthetic-secret-invalid-json', { mode: 0o600 })
+  expect(
+    await disconnectNativeVaultForHost({
+      host: 'pi',
+      env: f.env,
+      slot: f.slot,
+    }),
+  ).toBe('disconnected')
+  expect(JSON.parse(await readFile(f.authPath, 'utf8'))).toEqual({})
+  await expect(readFile(f.stashPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  expect(await f.localBytes()).toEqual(f.beforeLocal)
+})
+
+test('a Pi disconnect retry after clearing authentication still removes enrollment', async () => {
+  const f = await fixture('pi')
+  const original =
+    '{"anthropic":{"type":"oauth","access":"synthetic-access","refresh":"synthetic-refresh","expires":1}}'
+  await writeFile(f.authPath, original, { mode: 0o600 })
+  await f.slot.enterVault()
+  expect(await f.slot.exitVault()).toBe('cleared')
+  expect(await f.slot.exitVault()).toBe('nothing-to-do')
+  expect(
+    await disconnectNativeVaultForHost({
+      host: 'pi',
+      env: f.env,
+      slot: f.slot,
+    }),
+  ).toBe('disconnected')
+  expect(JSON.parse(await readFile(f.authPath, 'utf8'))).toEqual({})
+  expect(await readNativeEnrollmentMode('pi', f.env)).toBe('local')
+  expect(await f.localBytes()).toEqual(f.beforeLocal)
+})
+
+test('Pi entry removes malformed legacy credentials even with an existing placeholder', async () => {
+  const f = await fixture('pi')
+  await f.slot.enterVault()
+  const before = await readFile(f.authPath)
+  await mkdir(dirname(f.stashPath), { recursive: true, mode: 0o700 })
+  await writeFile(f.stashPath, 'synthetic-invalid-legacy-json', { mode: 0o600 })
+  await f.slot.enterVault()
+  expect(await readFile(f.authPath)).toEqual(before)
+  await expect(readFile(f.stashPath)).rejects.toMatchObject({ code: 'ENOENT' })
+})
+
+test('Pi legacy stash symlink refusal retains enrollment after the placeholder was cleared', async () => {
+  const f = await fixture('pi')
+  await f.slot.enterVault()
+  await mkdir(dirname(f.stashPath), { recursive: true, mode: 0o700 })
+  const target = join(f.root, 'legacy-target')
+  await writeFile(target, 'synthetic-untouched-legacy-secret', { mode: 0o600 })
+  await symlink(target, f.stashPath)
+  await expect(
+    disconnectNativeVaultForHost({ host: 'pi', env: f.env, slot: f.slot }),
+  ).rejects.toBeInstanceOf(NativePiAuthSlotError)
+  expect(await readFile(target, 'utf8')).toBe(
+    'synthetic-untouched-legacy-secret',
+  )
+  expect(JSON.parse(await readFile(f.authPath, 'utf8'))).toEqual({})
+  expect(await readNativeEnrollmentMode('pi', f.env)).toBe('claustrum')
 })
 
 test('OpenCode disconnect never opens or changes host authentication or local recovery files', async () => {
@@ -230,7 +265,9 @@ for (const host of ['opencode', 'pi'] as const) {
         ? await disconnectNativeVaultForHost({ host, env: f.env, slot: f.slot })
         : await disconnectNativeVaultForHost({ host, env: f.env })
     expect(result).toBe('disconnected')
-    expect(await readFile(f.authPath, 'utf8')).toBe(original)
+    if (host === 'pi')
+      expect(JSON.parse(await readFile(f.authPath, 'utf8'))).toEqual({})
+    else expect(await readFile(f.authPath, 'utf8')).toBe(original)
     expect(await readNativeEnrollmentMode(host, f.env)).toBe('local')
     expect(await f.localBytes()).toEqual(f.beforeLocal)
   })

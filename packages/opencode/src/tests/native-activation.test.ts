@@ -1,10 +1,12 @@
-import { expect } from 'bun:test'
+import { expect, spyOn } from 'bun:test'
+import * as fsPromises from 'node:fs/promises'
 import {
   mkdir,
   mkdtemp,
   readdir,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -486,10 +488,9 @@ for (const anthropic of [
   },
   { type: 'api_key', key: 'synthetic-host-key' },
 ]) {
-  test(`Pi vault setup preserves a consented stored ${anthropic.type} login privately and disconnect restores its exact bytes`, async () => {
+  test(`Pi vault setup deletes a consented stored ${anthropic.type} login and disconnect restores nothing`, async () => {
     const f = await fixture('pi')
     await writeHostAuth(f.paths.hostAuthPath, anthropic)
-    const hostBytes = await readFile(f.paths.hostAuthPath)
     const files = [
       ...new Set([
         f.paths.legacyConfigPath,
@@ -532,15 +533,18 @@ for (const anthropic of [
     })
     expect(await slot.inspect()).toEqual({
       slot: 'placeholder',
-      stash: 'valid',
     })
     const activeHost = await readFile(paths.authPath)
-    const activeStash = await readFile(paths.stashPath)
+    await expect(readFile(paths.stashPath)).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
     expect(await activateNativeVaultForHost('pi', f.options)).toBe(
       'already-vault',
     )
     expect(await readFile(paths.authPath)).toEqual(activeHost)
-    expect(await readFile(paths.stashPath)).toEqual(activeStash)
+    await expect(readFile(paths.stashPath)).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
     expect(await bytes()).toEqual(before)
     expect(await readNativeEnrollmentMode('pi', f.options.env)).toBe(
       'claustrum',
@@ -552,8 +556,64 @@ for (const anthropic of [
         slot,
       }),
     ).toBe('disconnected')
-    expect(await readFile(f.paths.hostAuthPath)).toEqual(hostBytes)
+    expect(JSON.parse(await readFile(f.paths.hostAuthPath, 'utf8'))).toEqual({
+      other: OTHER_PROVIDER,
+    })
     expect(await bytes()).toEqual(before)
     expect(await readNativeEnrollmentMode('pi', f.options.env)).toBe('local')
   })
 }
+
+test('Pi vault setup never opens a symlinked legacy stash', async () => {
+  const f = await fixture('pi')
+  await writeHostAuth(f.paths.hostAuthPath, {
+    type: 'api_key',
+    key: 'synthetic-original-login',
+  })
+  const { stashPath, placeholderKey } = nativePiAuthSlotPaths({
+    env: f.options.env,
+    authPath: f.paths.hostAuthPath,
+  })
+  await mkdir(dirname(stashPath), { recursive: true, mode: 0o700 })
+  const target = join(f.root, 'legacy-secret')
+  await writeFile(target, 'synthetic-unread-legacy-login', { mode: 0o600 })
+  await symlink(target, stashPath)
+  const opened: string[] = []
+  const read = fsPromises.readFile
+  const open = fsPromises.open
+  const readSpy = spyOn(fsPromises, 'readFile').mockImplementation(((
+    ...args: Parameters<typeof read>
+  ) => {
+    if (String(args[0]) === stashPath) {
+      opened.push('readFile')
+      throw new Error('Legacy stash must not be opened')
+    }
+    return read(...args)
+  }) as typeof read)
+  const openSpy = spyOn(fsPromises, 'open').mockImplementation((...args) => {
+    if (String(args[0]) === stashPath) {
+      opened.push('open')
+      throw new Error('Legacy stash must not be opened')
+    }
+    return open(...args)
+  })
+  try {
+    await expect(
+      activateNativeVaultForHost('pi', {
+        ...f.options,
+        removePiAnthropicAuth: true,
+      }),
+    ).rejects.toMatchObject({ name: 'PiSlotError', code: 'unsafe-path' })
+    expect(opened).toEqual([])
+  } finally {
+    readSpy.mockRestore()
+    openSpy.mockRestore()
+  }
+  expect(await readFile(target, 'utf8')).toBe('synthetic-unread-legacy-login')
+  expect(
+    JSON.parse(await readFile(f.paths.hostAuthPath, 'utf8')).anthropic,
+  ).toEqual({
+    type: 'api_key',
+    key: placeholderKey,
+  })
+})

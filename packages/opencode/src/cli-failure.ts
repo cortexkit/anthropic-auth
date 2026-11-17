@@ -125,10 +125,7 @@ const MIGRATION_CODES = everyCode<NativeMigrationError['code']>()([
 const PI_SLOT_CODES = everyCode<NativePiAuthSlotError['code']>()([
   'invalid-options',
   'invalid-auth',
-  'invalid-stash',
   'unsafe-path',
-  'missing-stash',
-  'conflict',
   'lock-timeout',
   'lock-compromised',
   'io',

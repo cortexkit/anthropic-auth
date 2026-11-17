@@ -50,7 +50,7 @@ Vault setup leaves local pool files, journals, runtime metadata and session pins
 
 - OpenCode 1: choose **Claude via credential vault**. An occupied separate Anthropic login is refused; remove it with OpenCode's own tools before choosing the vault option, or disconnect instead. The plugin writes only an inert placeholder into an empty slot.
 - OpenCode 2: choose **Claude vault accounts**. It returns the plugin's non-secret marker through the host API; setup does not create a connection.
-- Pi: a stored OAuth or API-key login would take precedence. With consent, setup moves that slot into a private stash and installs an inert marker. The original login is preserved for disconnect.
+- Pi: a stored OAuth or API-key login would take precedence. With consent, setup deletes that login and installs an inert marker. No hidden copy is kept and disconnect does not restore it; sign in again after disconnecting. If the vault needs this login, import it **before connecting** with `ck auth import --source pi`. Any legacy stash is deleted unread at the same path used by older versions.
 
 No placeholder can authorize a request. Each native model send, quota/profile query and cache or Prime request obtains scoped vault authorization. A revoked, unavailable or unreadable enrollment never falls back to local accounts. Ordinary host API-key routes that the plugin does not own keep stock host behavior.
 
@@ -66,6 +66,6 @@ Run `/claude` → **Accounts** → **Disconnect from the vault** and confirm. Th
 
 Disconnect can clear malformed enrollment data. It refuses unsafe storage or a record for another host or plugin. Check the named host's enrollment path, file ownership and private permissions. Use safe storage. Do not delete enrollment files by hand or change ownership to bypass a refusal. Stop other setup or disconnect attempts before retrying a busy action.
 
-OpenCode's stored sign-ins are not read or changed by disconnect. Pi first restores its stashed slot byte-for-byte, then ends enrollment. If a different Pi login occupies the slot, disconnect refuses and preserves the stash, current login and enrollment instead of overwriting either login.
+OpenCode's stored sign-ins are not read or changed by disconnect. Pi first removes its vault placeholder and deletes any legacy stash, then ends enrollment. Nothing is restored: sign in again after disconnecting to use Pi's own authentication. A new Pi sign-in made while connected is left untouched and does not block disconnect. Legacy stash cleanup refuses symlinks or other unsafe paths, possibly after the auth change committed; correct the unsafe storage and retry without deleting enrollment by hand.
 
 A successful disconnect returns to local custody but does not migrate or initialize a pool. If no local authority exists, stop the hosts and run local setup. For OpenCode 2, follow [empty initialization](opencode-2.md#empty-initialization). **Reset host enrollment**, available only in local custody, clears eligible denied/blocked ceremony state; it neither enrolls nor disconnects an approved host. Only setup proposes and polls enrollment.

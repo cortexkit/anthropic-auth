@@ -20,7 +20,7 @@ The setup CLI delegates host detection, OpenCode generation selection and packag
 | `--no-claustrum` | Run local setup. This does not disconnect enrolled hosts. |
 | `--claustrum` | Explicitly enroll selected hosts in the vault |
 | `--login` | Explicit local OpenCode 1/Pi sign-in; cannot be combined with `--claustrum` or generation 2 alone |
-| `--remove-pi-auth` | Explicit consent for setup to remove/move aside Pi's stored Anthropic login |
+| `--remove-pi-auth` | Explicit consent to move Pi's stored Anthropic login into the local pool, or delete it for vault use without restoration; sign in again after disconnecting |
 | `--help`, `-h` | List every option setup accepts, then exit without checking or changing anything |
 
 The two argument-level refusals (`--login --claustrum` and `--login --opencode=2`) also apply to dry runs. Callback checks for journal/destination conflicts, Pi consent and verified vault inventory do not run in a dry run, so a successful preview is not proof that the real run will proceed.

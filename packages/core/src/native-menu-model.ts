@@ -370,7 +370,7 @@ const actions: readonly NativeMenuAction[] = Object.freeze(
         label: 'Disconnect from the vault',
         destructive: true,
         confirm:
-          "Disconnect this host from the vault and return to local accounts? The vault keeps this host's enrollment approved until an operator revokes it there.",
+          "Disconnect this host from the vault and return to local accounts? Pi's previous saved Claude sign-in is not restored; sign in again after disconnecting. The vault keeps this host's enrollment approved until an operator revokes it there.",
         interactive: true,
         headlessRefusal: 'interactive-required',
         parameters: [],

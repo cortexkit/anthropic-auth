@@ -84,7 +84,7 @@ All local sign-in paths refuse while the host is enrolled in the vault (`Disconn
 
 Vault setup writes only the selected host's enrollment files and, for Pi with consent, Pi's auth file (below). It does not read, import, change or delete the local pool, the migration journal, local runtime metadata or routing assignments. It never imports local OAuth into the vault, and never writes OpenCode's auth file.
 
-For Pi, a stored Anthropic login (OAuth or API key) would take precedence over the vault. With consent, setup moves it into a private stash under the enrollment directory (`pi-auth-slot/anthropic.json`) and leaves an inert placeholder API key in Pi's auth file. The shared Pi slot helper performs both steps under a lock. Without consent, setup stops.
+For Pi, a stored Anthropic login (OAuth or API key) would take precedence over the vault. With consent, setup deletes it and leaves an inert placeholder API key in Pi's auth file. No hidden copy is kept and nothing is restored on disconnect; sign in again after disconnecting. If the vault needs this login, import it **before connecting** with `ck auth import --source pi`. The shared Pi slot helper writes under a lock and deletes any legacy stash at the unchanged enrollment path (`pi-auth-slot/anthropic.json`) without reading it. Without consent, setup stops.
 
 If the vault reports that an earlier enrollment request was replaced by a newer one, already used, or no longer exists, setup clears that request and stops; run setup again to propose a new one. Denied and other refused requests stay blocked until **Reset host enrollment** clears them.
 
@@ -148,12 +148,12 @@ Pi's built-in Anthropic provider implementation is replaced, keeping the `anthro
 **Disconnect from the vault** is offered while a host is enrolled, and when its enrollment record cannot be read. It requires confirmation:
 
 ```text
-Disconnect this host from the vault and return to local accounts? The vault keeps this host's enrollment approved until an operator revokes it there.
+Disconnect this host from the vault and return to local accounts? Pi's previous saved Claude sign-in is not restored; sign in again after disconnecting. The vault keeps this host's enrollment approved until an operator revokes it there.
 ```
 
 The action can clear malformed data, but it refuses unsafe storage and records for another host or plugin. Check the host's enrollment path, ownership and private permissions before retrying. Do not delete enrollment files by hand. See [disconnect recovery](vault.md#disconnect-and-recovery).
 
-OpenCode's stored sign-ins are never read or changed. For Pi, disconnect first restores the stashed login byte-for-byte in place of the placeholder, then ends the enrollment. If Pi's auth file already holds a different login, disconnect stops, keeps both logins and the enrollment, and reports the conflict for resolution with setup. After a successful disconnect the host is in local custody, and a previously migrated local pool can serve again. If the pool has never been migrated, stop the hosts and run `setup --no-claustrum`; disconnect never performs migration.
+OpenCode's stored sign-ins are never read or changed. For Pi, disconnect first removes the vault placeholder and deletes any legacy stash, then ends enrollment. It never restores a login. A new sign-in made through Pi while connected is left untouched and does not prevent disconnect. Sign in again after disconnecting to use Pi's own authentication. A legacy stash cleanup refusal can occur after the auth change committed; enrollment remains until cleanup succeeds. After a successful disconnect the host is in local custody, and a previously migrated local pool can serve again. If the pool has never been migrated, stop the hosts and run `setup --no-claustrum`; disconnect never performs migration.
 
 ## Enrollment lifecycle
 
