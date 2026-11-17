@@ -349,7 +349,7 @@ for (const host of ['opencode', 'pi'] as const) {
     const config =
       '{"enabled":false,"main":{"five_hour":5,"seven_day":10,"scoped":0},"accounts":{}}'
     expect(status.split('\nSettings file:')[0]).toBe(
-      host === 'opencode' ? config : `Killswitch: disabled\n${config}`,
+      `${host === 'opencode' ? config : `Killswitch: disabled\n${config}`}\nSettings: shared file \`${f.paths.target}\``,
     )
     expect(status).toContain(`Settings file: ${f.paths.target}`)
     const snapshot = await runtime.read()

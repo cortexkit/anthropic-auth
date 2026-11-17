@@ -295,6 +295,7 @@ export class PiNativeRuntime {
         settingsFallback: settings.fallback,
         settingsReopen: settings.reopen,
         settingsMode: () => settings.mode,
+        settingsDiagnostic: settings.diagnostic,
         settingsAuthority: options.settings?.authority,
       })
       try {

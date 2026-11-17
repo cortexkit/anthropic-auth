@@ -474,6 +474,25 @@ for (const floor of [3, 8])
     ).toEqual({ default: 4, pi: 0 })
   })
 
+test('Pi status shows shared-file mode after a move', async () => {
+  const f = await controller()
+  expect(await f.backend.readStatus('routing', {})).toContain(
+    `Settings: shared file \`${file}\``,
+  )
+})
+
+test('Pi status explains a waiting move and switches to the shared file after adoption', async () => {
+  const f = await controller(undefined, true)
+  expect(await f.backend.readStatus('routing', {})).toContain(
+    `Settings: using the old settings; the move to \`${file}\` waits for: this process to register as a settings holder`,
+  )
+  await writeFile()
+  expect(await f.backend.readStatus('routing', {})).toContain(
+    `Settings: shared file \`${file}\``,
+  )
+  expect(await f.backend.readStatus('routing', {})).not.toContain('waits for:')
+})
+
 test('settings status shows no-model values, row-id overrides and all diagnostics', async () => {
   await writeFile({
     claude_cache_enabled: {
