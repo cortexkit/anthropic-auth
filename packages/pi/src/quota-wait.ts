@@ -3,6 +3,7 @@ import {
   createQuotaRefusalResponse,
   hostRetryResponse,
   quotaRefusalDetails,
+  resetWaitDelayMs,
   startRoutingWait,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -64,7 +65,11 @@ async function waitForReset(
   }
 }
 
-/** Own one bounded wait inside a Pi stream, rather than asking Pi's text-based retry loop. */
+/**
+ * Own one wait inside a Pi stream. Pi's own retry loop decides from an
+ * error's message text, with its own short delays, so it can't wait for a
+ * quota reset; this waits here, then resends once.
+ */
 export async function withPiQuotaWait(input: {
   run: () => Promise<Response>
   resume: (hold: PiAccountHold | undefined) => Promise<Response>
@@ -88,6 +93,7 @@ export async function withPiQuotaWait(input: {
   )
     return response
   const options = input.wait ?? {}
+  const waitMs = resetWaitDelayMs(original) ?? clampHostRetryMs(delay)
   void response.body?.cancel().catch(() => {})
   input.signal?.throwIfAborted()
   // An unknown reset's retry hint is not evidence that waiting can help this request.
@@ -99,13 +105,13 @@ export async function withPiQuotaWait(input: {
   const endWait = startRoutingWait({
     sessionId: input.sessionId,
     reason: hold?.reason ?? (hold ? 'account_limit' : 'account_free'),
-    delayMs: clampHostRetryMs(delay),
-    nextMs: (options.now?.() ?? Date.now()) + clampHostRetryMs(delay),
+    delayMs: waitMs,
+    nextMs: (options.now?.() ?? Date.now()) + waitMs,
   })
   let outcome: 'resumed' | 'cancelled' | 'abandoned' = 'abandoned'
   try {
     await waitForReset(
-      clampHostRetryMs(delay),
+      waitMs,
       hold?.resetAt ?? refusal?.timing.resetAt,
       input.signal,
       options,

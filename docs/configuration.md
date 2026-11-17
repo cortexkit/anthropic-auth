@@ -11,6 +11,7 @@ The flat keys below describe user choices, not a complete default configuration.
 | Setting keys | Purpose |
 | --- | --- |
 | `routing_mode`, `max_same_account_wait` | Routing order (`main-first`, `fallback-first`, `sticky-balanced`) and longest same-account wait (`off`, `15m`, `cache`) |
+| `wait_for_reset` | Opt-in wait until an exhausted pool's earliest usable reset on OpenCode 1 and Pi; false by default. OpenCode 2 support follows in a later release |
 | `fallback_on` | Retryable OAuth fallback statuses; default `[401, 403, 429]` |
 | `refresh_enabled`, `refresh_interval_minutes`, `refresh_refresh_before_expiry_minutes` | Token refresh policy |
 | `quota_enabled`, `quota_check_interval_minutes`, `quota_refresh_every_n_requests`, `quota_minimum_remaining_five_hour`, `quota_minimum_remaining_seven_day`, `quota_minimum_remaining_scoped`, `quota_fail_closed_on_unknown_quota`, `quota_show_toasts` | Quota policy, floors and notifications |
@@ -42,6 +43,26 @@ Fallbacks are separate OAuth accounts or Anthropic-compatible API-key routes in 
 The balanced allocator normalizes headroom by time until reset and accounts for the initial prompt before the next quota refresh. It persists the assignment by hashed session ID across processes and restarts. **Reset routing session** clears only the current session. A user-selected model change discards its old assignment; transparent safety recovery retains the account. Existing hybrid CacheKeep sessions can seed their warm route instead of changing accounts unnecessarily.
 
 Affinity survives network/relay failures, 5xx responses, unconfirmed 429s, quota-probe failures and relative weight changes. Sticky-balanced holds the session on its account only when every exhausted window blocking the requested model has a known future reset and the latest reset plus deterministic per-session jitter fits before the session's same-account prompt cache expires. Cache lifetime comes from 1-hour caching in any mode (one hour when enabled, otherwise five minutes; unknown TTL uses five minutes), measured from the last accepted OAuth response or successful ordinary keep-warm prewarm. Keep-warm requests for the original model during a temporary safety fallback protect a different model's cache and do not extend the active session cache lifetime. Missing or different-account activity means no hold. `/claude` → **Routing** → **Longest wait on the same account** writes `max_same_account_wait`: **Don't wait** (`"off"`), **15 minutes** (`"15m"`, default), or **Until the cache expires** (`"cache"`). The selected wait budget also bounds eligibility. Five-hour, seven-day and the requested model's scoped limits are treated alike; another model's scoped limit does not count. Unknown, invalid or past blocking resets, or a reset beyond either bound, allow migration. OpenCode 1 returns `Retry-After`; Pi waits inside the plugin only for a known, fresh reset, with the local reset time in its working message, and Escape cancels immediately. Unknown or stale reset evidence causes an immediate non-retryable refusal, not a blind wait on the fallback retry hint. After the bounded wait it refreshes quota and rechecks admission and identity before a same-account resend, or rechecks all accounts after a pool refusal. If still blocked, it ends with a non-retryable error instead of asking Pi to retry. OpenCode 2 caps each hold at 15 minutes; with `max_same_account_wait: "cache"`, later retries can hold again against the original expiry, each consuming one of the host's ten retries. OpenCode 2 holds the same way after a 429: OpenCode waits that long, then retries on the same account, which keeps its pin. It does not hold after output has started, in a session that has used both the plugin's connection and another Anthropic credential, or when the account cannot serve the model during the wait (a model-scoped limit at zero, a configured minimum remaining quota (quota floor) or a killswitch block); those move. Disabled/removed accounts, permanent re-login failures and killswitch blocks can also cause reselection. Direct Opus sessions prefer usable accounts whose Fable quota is exhausted, preserving Fable-capable quota.
+
+### Waiting for an exhausted pool
+
+Set [`wait_for_reset: true`](settings-file.md#wait-for-a-quota-reset) in the
+shared user settings file to wait until a Claude account can serve again,
+rather than rechecking every 15 minutes. This applies on **OpenCode 1 and Pi**
+only when every eligible account is confirmed out of quota or blocked by
+your quota floors, all blocking reset times are known and in the future, and
+no other route can serve the request. The earliest account's full blocking
+reset plus per-session jitter determines the wait. OpenCode 1 hands that wait
+to the host in `Retry-After`; Pi owns one cancellable wait, then refreshes
+quota and rechecks once before resending. If still blocked, Pi stops.
+
+The default is `false`, which keeps today's behavior. When an account can
+still serve, `max_same_account_wait` still controls staying versus moving.
+Unknown resets, sign-in, disabled accounts, unavailable credentials or vault access,
+Thalamus routing holds and API-key routes are unchanged. The setting accepts
+host overrides, not model overrides. **OpenCode 2 support follows in a later
+release**; its current capped holds and terminal new-message refusals remain
+unchanged even when the setting is on.
 
 ### API-key fallback
 

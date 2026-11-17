@@ -495,6 +495,7 @@ test('Pi status explains a waiting move and switches to the shared file after ad
 
 test('settings status shows no-model values, row-id overrides and all diagnostics', async () => {
   await writeFile({
+    wait_for_reset: true,
     claude_cache_enabled: {
       default: 'off',
       'claude-opus-5-5': 'on',
@@ -529,6 +530,7 @@ test('settings status shows no-model values, row-id overrides and all diagnostic
     const status = await f.backend.readStatus(command, {})
     expect(status).toContain(`Settings file: ${file}`)
     expect(status).toContain('Settings (no model):')
+    expect(status).toContain('wait_for_reset: true')
     expect(status).toContain('claude_cache_enabled: "off"')
     expect(status).toContain('claude_cache_enabled [claude-opus-5-5]: "on"')
     expect(status).toContain('claude_fast_enabled [claude-haiku-5-5]: true')

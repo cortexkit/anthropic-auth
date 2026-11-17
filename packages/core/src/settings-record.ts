@@ -150,6 +150,7 @@ export function resolveSettingsRecord(
       ...section(stored, 'routing'),
       mode: values.routing_mode,
       maxSameAccountWait: legacyWait(values.max_same_account_wait),
+      waitForReset: values.wait_for_reset,
     },
     fallbackOn: values.fallback_on,
     refresh: {

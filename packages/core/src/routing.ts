@@ -15,6 +15,12 @@ export const MAX_SAME_ACCOUNT_WAITS = ['0', '15', 'max'] as const
 export type MaxSameAccountWait = (typeof MAX_SAME_ACCOUNT_WAITS)[number]
 export const DEFAULT_MAX_SAME_ACCOUNT_WAIT: MaxSameAccountWait = '15'
 
+export function getWaitForReset(
+  storage: AccountSettingsReaderInput | null,
+): boolean {
+  return storage?.routing?.waitForReset === true
+}
+
 export function getMaxSameAccountWait(
   storage: AccountSettingsReaderInput | null,
 ): MaxSameAccountWait {

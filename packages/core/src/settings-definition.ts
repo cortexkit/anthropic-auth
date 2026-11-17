@@ -33,6 +33,7 @@ export const settingsDefinition = defineSettings({
       value: oneOf(['off', '15m', 'cache']),
       default: '15m',
     },
+    wait_for_reset: { ...host, value: boolean(), default: false },
     fallback_on: { ...host, value: list(integer()), default: [401, 403, 429] },
     refresh_enabled: { ...host, value: boolean(), default: true },
     refresh_interval_minutes: { ...host, value: nonnegative, default: 10 },
@@ -130,6 +131,7 @@ export type SettingsKey = keyof typeof settingsDefinition.settings
  * menu never writes them.
  */
 export const SETTINGS_FILE_ONLY_KEYS = [
+  'wait_for_reset',
   'gateway_url',
   'gateway_headers',
 ] as const satisfies readonly SettingsKey[]
@@ -142,6 +144,7 @@ export const SETTINGS_PI_DIFFERING_FIELDS =
 export const SETTINGS_DEFAULT_READERS = {
   routing_mode: 'packages/core/src/routing.ts:getRoutingMode',
   max_same_account_wait: 'packages/core/src/routing.ts:getMaxSameAccountWait',
+  wait_for_reset: 'packages/core/src/routing.ts:getWaitForReset',
   fallback_on: 'packages/core/src/accounts.ts:shouldFallbackStatus',
   refresh_enabled: 'packages/opencode/src/index.ts:mainRefreshEnabled',
   refresh_interval_minutes:

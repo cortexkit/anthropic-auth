@@ -20,7 +20,7 @@ import {
   resolvePathOptions,
 } from './path-options.ts'
 import { auxiliaryRequestSignal, raceWithSignal } from './request-abort.ts'
-import { getMaxSameAccountWait } from './routing.ts'
+import { getMaxSameAccountWait, getWaitForReset } from './routing.ts'
 import {
   readThreeWayBoolean,
   type ThreeWayBoolean,
@@ -282,6 +282,7 @@ export type AccountStorage = {
   routing?: {
     mode?: RoutingMode
     maxSameAccountWait?: import('./routing.ts').MaxSameAccountWait
+    waitForReset?: boolean
   }
   fallbackOn?: number[]
   refresh?: {
@@ -1549,11 +1550,15 @@ export function quotaRefusalTiming(input: {
   scopedModelId?: string
   modelId?: string
   sessionTtlMs?: number
+  /** The caller found no other route and this host supports reset-sized waits. */
+  waitForReset?: boolean
+  sessionId?: string | null
   now?: number
 }): {
   resetAt: number | undefined
   retryAfterSeconds: number | undefined
   limitName?: string
+  resetWaitMs?: number
 } {
   const now = input.now ?? Date.now()
   const maxAge = getQuotaCheckIntervalMs(input.storage ?? null)
@@ -1632,8 +1637,25 @@ export function quotaRefusalTiming(input: {
   }
   const earliest = resetTimes.sort((a, b) => a.resetAt - b.resetAt)[0]
   const resetAt = earliest?.resetAt
+  // Each account must have current evidence for every blocker; an earlier
+  // known reset from only part of the pool cannot justify a reset-sized wait.
+  const resetWaitMs =
+    input.waitForReset &&
+    getWaitForReset(storage) &&
+    resetAt !== undefined &&
+    input.readings.length > 0 &&
+    resetTimes.length === input.readings.length
+      ? (Math.ceil((resetAt - now) / 1000) +
+          (createHash('sha256')
+            .update(input.sessionId ?? '')
+            .digest()
+            .readUInt32BE(0) %
+            21)) *
+        1000
+      : undefined
   return {
     resetAt,
+    ...(resetWaitMs === undefined ? {} : { resetWaitMs }),
     ...(earliest ? { limitName: earliest.limitName } : {}),
     retryAfterSeconds: quotaRefusalRetryAfterSeconds({
       resetAt,

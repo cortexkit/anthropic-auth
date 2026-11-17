@@ -81,6 +81,7 @@ type PluginFetch = (
 ) => Promise<Response>
 
 const envKeys = [
+  'ANTHROPIC_AUTH_SETTINGS_FILE',
   'OPENCODE_ANTHROPIC_AUTH_FILE',
   'OPENCODE_ANTHROPIC_AUTH_STATE_FILE',
   'OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE',
@@ -3761,6 +3762,7 @@ async function stickyVaultRejectedFirstSend(
   afterSend?: (response: Response) => void,
   options: {
     firstRefusal?: (headers: Record<string, string>) => Response
+    waitForReset?: boolean
     fallback?: boolean
     acceptFirst?: boolean
     repeatRefusal?: boolean
@@ -3878,6 +3880,20 @@ async function stickyVaultRejectedFirstSend(
     }
     return fixture.fetchProvider(input, init)
   })
+  if (options.waitForReset) {
+    const file = join(directory, 'settings.jsonc')
+    process.env.ANTHROPIC_AUTH_SETTINGS_FILE = file
+    await writeFile(
+      file,
+      JSON.stringify({
+        schema_version: 1,
+        wait_for_reset: true,
+        routing_mode: 'sticky-balanced',
+        quota_enabled: 'off',
+        refresh_enabled: false,
+      }),
+    )
+  }
   const plugin = await createPlugin({
     claustrumScopedConnect: async () => fixture.scopedClient,
   })
@@ -3891,6 +3907,7 @@ async function weeklyStickyRefusal(
     fallback?: boolean
     acceptFirst?: boolean
     repeatRefusal?: boolean
+    waitForReset?: boolean
   } = {},
 ) {
   const resetSeconds = options.resetSeconds ?? 5 * 24 * 60 * 60
@@ -3906,6 +3923,7 @@ async function weeklyStickyRefusal(
       fallback: options.fallback,
       acceptFirst: options.acceptFirst,
       repeatRefusal: options.repeatRefusal,
+      waitForReset: options.waitForReset,
       firstRefusal: (headers) =>
         Response.json(
           {
@@ -4094,6 +4112,40 @@ test('vault sticky weekly 429 holds main for a ten minute reset', async () => {
   expect(served).toEqual(['oauth:anthropic', 'oauth:anthropic'])
   await plugin.dispose?.()
   expect((await stickyPin(routingPath, sessionId))?.accountId).toBe('main')
+})
+
+test('wait_for_reset gives OpenCode 1 the real three-hour pool reset header', async () => {
+  const { plugin, served, sessionId } = await weeklyStickyRefusal({
+    fallback: false,
+    resetSeconds: 3 * 3600,
+    waitForReset: true,
+  })
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+    expect(response.status).toBe(429)
+    expect(Number(response.headers.get('retry-after'))).toBeGreaterThanOrEqual(
+      3 * 3600 - 2,
+    )
+    expect(Number(response.headers.get('retry-after'))).toBeLessThanOrEqual(
+      3 * 3600 + 20,
+    )
+    expect(await response.text()).toContain(
+      'Waiting until the reset before retrying.',
+    )
+    expect(served).toEqual(['oauth:anthropic'])
+  }
+})
+
+test('wait_for_reset still migrates on OpenCode 1 when another account can serve', async () => {
+  const { plugin, served, sessionId } = await weeklyStickyRefusal({
+    waitForReset: true,
+    resetSeconds: 3 * 3600,
+  })
+  const response = await sendNative(plugin, 'claude-opus-5-5', sessionId)
+  expect(response.status).toBe(200)
+  expect(response.headers.has('retry-after')).toBe(false)
+  expect(served).toEqual(['oauth:anthropic', 'oauth:secondary'])
+  await response.text()
 })
 
 test('vault sticky weekly 429 on the last eligible account still returns a quota refusal', async () => {

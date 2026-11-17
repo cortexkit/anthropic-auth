@@ -108,6 +108,7 @@ import {
   getRoutingMode,
   getScopedQuotaWindowForModel,
   getThinkingPrefixMismatchBehavior,
+  getWaitForReset,
   hostRetryResponse,
   type IdentityState,
   inspectNativeHostAuthEntry,
@@ -142,6 +143,7 @@ import {
   logger,
   type MessageThreadRequest,
   MessageThreadTracker,
+  markResetWaitResponse,
   mergeAnthropicBetas,
   mergeHeaderQuotaForPersistence,
   NativeAccountRefusal,
@@ -220,6 +222,7 @@ import {
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
   resetClaustrumEnrollmentState,
+  resetWaitDelayMs,
   resolveClaudeModelCapabilities,
   resolveNativePoolPaths,
   STICKY_ROUTING_MAIN_ACCOUNT_ID,
@@ -9988,6 +9991,9 @@ const anthropicAuthPlugin = async (
                     : {}),
                 })
                 deliverCacheReports(trace)
+                const resetWaitMs = resetWaitDelayMs(response)
+                if (resetWaitMs !== undefined)
+                  markResetWaitResponse(wrapped, resetWaitMs)
                 return hostRetryResponse(wrapped)
               }
               const authStart = nowMs()
@@ -10189,6 +10195,7 @@ const anthropicAuthPlugin = async (
                   },
                 )
               }
+              let sharedRoutingDecision = false
               async function quotaRefusal(
                 reason: string,
                 scopedModelId?: string,
@@ -10211,6 +10218,10 @@ const anthropicAuthPlugin = async (
                     storage: current.policyStorage,
                     modelId: scopedModelId ?? credentialModelId,
                     sessionTtlMs: sessionCacheActivity.ttlMs(sessionId),
+                    sessionId,
+                    waitForReset:
+                      getWaitForReset(current.policyStorage) &&
+                      !sharedRoutingDecision,
                   }),
                 )
               }
@@ -10221,6 +10232,8 @@ const anthropicAuthPlugin = async (
                     modelId: credentialModelId,
                     sticky: getRoutingMode(storage) === 'sticky-balanced',
                     sessionId,
+                    waitForReset:
+                      getWaitForReset(storage) && !sharedRoutingDecision,
                   })
                 return quotaRefusal(
                   'No enabled OAuth route can serve the requested model under current quota policy.',
@@ -10315,6 +10328,7 @@ const anthropicAuthPlugin = async (
                     routingCandidates(snapshot.accounts),
                     routingWarmCredential(snapshot.accounts, assignment),
                   )
+                  sharedRoutingDecision = Boolean(advice)
                   let advisedAccountId: string | undefined
                   if (advice) {
                     const snapshot = await nativeAccounts.read()
@@ -10454,6 +10468,7 @@ const anthropicAuthPlugin = async (
                         modelId: routingModelId,
                         sticky: true,
                         sessionId,
+                        waitForReset: getWaitForReset(storage) && !advice,
                       })
                     }
                     const response = createStickyNoRouteResponse({
@@ -10478,6 +10493,7 @@ const anthropicAuthPlugin = async (
                       storage: stickyRoutes.storage,
                       sessionId,
                       modelId: routingModelId,
+                      waitForReset: getWaitForReset(storage) && !advice,
                     })
                     trace.done('return_sticky_no_route', {
                       status: response.status,

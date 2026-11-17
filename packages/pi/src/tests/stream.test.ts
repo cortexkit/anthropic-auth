@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
@@ -2777,6 +2777,112 @@ describe('Pi API fallback routing helpers', () => {
       'Bearer sk-ant-oat01-abundant-access',
       'Bearer sk-ant-oat01-abundant-access',
     ])
+  })
+
+  test('wait_for_reset resumes Pi once after a three-hour pool reset with no intermediate sends', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'pi-reset-wait-'))
+    const storagePath = join(tempDir, 'anthropic-auth.json')
+    process.env.PI_ANTHROPIC_AUTH_FILE = storagePath
+    const checkedAt = Date.now()
+    const resetAt = checkedAt + 3 * 3_600_000
+    await saveNativePiFixture(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'anthropic' },
+        routing: { mode: 'sticky-balanced' },
+        quota: {
+          enabled: true,
+          mainQuota: {
+            checkedAt,
+            five_hour: { checkedAt, usedPercent: 0, remainingPercent: 100 },
+            seven_day: {
+              checkedAt,
+              usedPercent: 100,
+              remainingPercent: 0,
+              resetsAt: new Date(resetAt).toISOString(),
+            },
+          },
+        },
+        accounts: [],
+      },
+      storagePath,
+    )
+    const saved = process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+    const file = join(tempDir, 'settings.jsonc')
+    process.env.ANTHROPIC_AUTH_SETTINGS_FILE = file
+    await writeFile(
+      file,
+      JSON.stringify({
+        schema_version: 1,
+        wait_for_reset: true,
+        routing_mode: 'sticky-balanced',
+        quota_enabled: 'on',
+        refresh_enabled: false,
+      }),
+    )
+    let afterReset = false
+    let messages = 0
+    let rechecks = 0
+    globalThis.fetch = mock((input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url.includes('/v1/messages')) {
+        expect(afterReset).toBe(true)
+        messages++
+        return Promise.resolve(
+          new Response(
+            'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+            { headers: { 'content-type': 'text/event-stream' } },
+          ),
+        )
+      }
+      if (afterReset) rechecks++
+      return Promise.resolve(
+        Response.json({
+          five_hour: { utilization: 0 },
+          seven_day: {
+            utilization: afterReset ? 0 : 1,
+            resets_at: new Date(resetAt).toISOString(),
+          },
+        }),
+      )
+    }) as unknown as typeof fetch
+    const delays: number[] = []
+    const status: (string | undefined)[] = []
+    try {
+      const stream = streamCortexKitAnthropic(
+        anthropicModel,
+        anthropicContext,
+        { apiKey: 'sk-ant-oat01-main-access', sessionId: 'pi-reset-wait' },
+        undefined,
+        {
+          now: () => (afterReset ? resetAt + 20_000 : checkedAt),
+          setWorkingMessage: (message) => status.push(message),
+          setTimeout: ((callback: () => void, delay: number) => {
+            delays.push(delay)
+            expect(messages).toBe(0)
+            afterReset = true
+            queueMicrotask(callback)
+            return 1
+          }) as unknown as typeof setTimeout,
+          clearTimeout: (() => {}) as unknown as typeof clearTimeout,
+        },
+      )
+      for await (const _event of stream) {
+        /* Drain the resumed response. */
+      }
+      expect((await stream.result()).errorMessage).toBeUndefined()
+      expect(delays).toHaveLength(1)
+      expect(delays[0]).toBeGreaterThanOrEqual(3 * 3_600_000 - 2_000)
+      expect(delays[0]).toBeLessThanOrEqual(3 * 3_600_000 + 20_000)
+      expect(messages).toBe(1)
+      expect(rechecks).toBe(1)
+      expect(status[0]).toContain('Esc to cancel')
+      expect(status.at(-1)).toBeUndefined()
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_AUTH_SETTINGS_FILE
+      else process.env.ANTHROPIC_AUTH_SETTINGS_FILE = saved
+      sessionCacheActivity.forget('pi-reset-wait')
+    }
   })
 
   for (const knownBeforeSend of [true, false]) {

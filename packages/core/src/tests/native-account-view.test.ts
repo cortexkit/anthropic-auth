@@ -6,12 +6,14 @@ import {
   formatNativeAccountState,
   nativeAccountCanServe,
   nativeAccountReadError,
+  nativeAccountSettings,
   nativeQuotaFailure,
   projectNativeAccountViews,
 } from '../native-account-view.ts'
 import { toNativeQuotaMap } from '../native-quota-codec.ts'
 import type { NativeRuntimeState } from '../native-runtime.ts'
 import type { NativePoolPaths } from '../pool-paths.ts'
+import { getWaitForReset } from '../routing.ts'
 
 const paths: NativePoolPaths = {
   storageId: 'a'.repeat(64),
@@ -58,6 +60,14 @@ const runtime: NativeRuntimeState = {
     },
   },
 }
+
+test('wait_for_reset reaches request policy without entering the legacy account settings', () => {
+  const settings = { mainAccountId: row.id, routing: { waitForReset: true } }
+  const snapshot = projectNativeAccountViews({ paths, rows: [row], settings })
+  expect(getWaitForReset(snapshot.policyStorage)).toBe(true)
+  expect(nativeAccountSettings(settings).routing).toEqual({})
+  expect(snapshot.settings.routing).toEqual({})
+})
 
 test('secret-free native policy projection preserves primary and fallback order without inheriting stale metadata', () => {
   const snapshot = projectNativeAccountViews({
