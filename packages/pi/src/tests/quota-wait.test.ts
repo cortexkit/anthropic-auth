@@ -257,7 +257,8 @@ test('a capped pool refusal rechecks once and its final error does not match the
       errorMessage: message,
     } as AssistantMessage),
   ).toBe(false)
-  expect(message).toContain('Reset at ')
+  expect(message).toContain('This turn has stopped.')
+  expect(message).toContain('Send the message again after 11:00 UTC.')
 })
 
 test('zero wait never schedules a timer or rechecks', async () => {
@@ -398,7 +399,8 @@ test('host retry cap keeps Pi to one bounded wait and one recheck for a 26-hour 
   const message = await final.text()
   expect(message).toContain('weekly limit')
   expect(message).toContain('12:00 UTC (in 26 h)')
-  expect(message).toContain('Send the message again after that.')
+  expect(message).toContain('This turn has stopped.')
+  expect(message).toContain('Send the message again after 12:00 UTC.')
   expect(message).not.toContain('Retrying')
   expect(
     isRetryableAssistantError({

@@ -679,6 +679,39 @@ export function stickyQuotaExhaustionInForce(input: {
   modelId?: string
   now?: number
 }): StickyQuotaExhaustion | undefined {
+  const blocker = quotaBlockerInForce(input, false)
+  return blocker?.resetAt === undefined
+    ? undefined
+    : { ...blocker, resetAt: blocker.resetAt }
+}
+
+export type StickyQuotaBlocker = Omit<StickyQuotaExhaustion, 'resetAt'> & {
+  readonly resetAt?: number
+}
+
+/**
+ * Like stickyQuotaExhaustionInForce, but also report confirmed exhaustion whose
+ * reset time is unknown. Callers use it to stop a turn: without a known reset
+ * there is nothing to wait for, so the host is not asked to retry later.
+ */
+export function stickyQuotaBlockerInForce(input: {
+  quota: OAuthQuotaSnapshot | QuotaState | undefined
+  responseHeaders?: Headers
+  modelId?: string
+  now?: number
+}): StickyQuotaBlocker | undefined {
+  return quotaBlockerInForce(input, true)
+}
+
+function quotaBlockerInForce(
+  input: {
+    quota: OAuthQuotaSnapshot | QuotaState | undefined
+    responseHeaders?: Headers
+    modelId?: string
+    now?: number
+  },
+  includeUnknown: boolean,
+): StickyQuotaBlocker | undefined {
   const now = input.now ?? Date.now()
   const quota = stickyQuotaEvidence({
     quota: input.quota,
@@ -690,6 +723,7 @@ export function stickyQuotaExhaustionInForce(input: {
   if (!quota) return undefined
   const scoped = getScopedQuotaWindowForModel(quota, input.modelId)
   let blocking: StickyQuotaExhaustion | undefined
+  let unknown: StickyQuotaBlocker | undefined
   for (const [reason, limitName, window] of [
     ['model-scoped', `${scoped?.modelName ?? 'Model'} weekly`, scoped],
     ['seven-day', 'weekly', quota.seven_day],
@@ -702,11 +736,15 @@ export function stickyQuotaExhaustionInForce(input: {
     )
       continue
     const resetAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN
-    if (!Number.isFinite(resetAt) || resetAt <= now) continue
+    if (!Number.isFinite(resetAt)) {
+      if (includeUnknown) unknown = { reason, limitName }
+      continue
+    }
+    if (resetAt <= now) continue
     if (!blocking || resetAt > blocking.resetAt)
       blocking = { resetAt, reason, limitName }
   }
-  return blocking
+  return unknown ?? blocking
 }
 
 /**
@@ -715,18 +753,20 @@ export function stickyQuotaExhaustionInForce(input: {
  * It names the window that resets first across those accounts.
  */
 export function createExhaustedNoRouteResponse(input: {
-  exhausted: readonly StickyQuotaExhaustion[]
+  exhausted: readonly StickyQuotaBlocker[]
   storage?: AccountStorage | null
   sessionId?: string | null
   now?: number
 }): Response {
   const now = input.now ?? Date.now()
-  const earliest = [...input.exhausted].sort((a, b) => a.resetAt - b.resetAt)[0]
+  const earliest = input.exhausted
+    .filter((row): row is StickyQuotaExhaustion => row.resetAt !== undefined)
+    .sort((a, b) => a.resetAt - b.resetAt)[0]
   return createQuotaRefusalResponse(
     'Claude reports every account that could take this request as out of quota.',
     {
       resetAt: earliest?.resetAt,
-      ...(earliest ? { limitName: earliest.limitName } : {}),
+      limitName: earliest?.limitName ?? input.exhausted[0]?.limitName,
       retryAfterSeconds: quotaRefusalRetryAfterSeconds({
         resetAt: earliest?.resetAt,
         storage: input.storage,

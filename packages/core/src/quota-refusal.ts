@@ -58,10 +58,18 @@ export function createQuotaRefusalResponse(
     remaining >= 3_600_000
       ? `${Math.ceil(remaining / 3_600_000)} h`
       : `${Math.ceil(remaining / 60_000)} min`
+  const room = timing.limitName
+    ? `No Claude account has room for this request (${timing.limitName} limit or your quota floor). `
+    : ''
+  const manualAction = resetTime
+    ? `The earliest reset is ${resetTime} UTC (in ${duration}). Send the message again after ${resetTime} UTC.`
+    : 'Reset time is unknown. Check account availability before sending the message again.'
   const message =
-    timing.limitName && resetTime
-      ? `No Claude account has room for this request (${timing.limitName} limit or your quota floor). The earliest reset is ${resetTime} UTC (in ${duration}). ${seconds === undefined || options.retry === 'manual' ? 'Send the message again after that.' : `Retrying every ${retryMinutes(seconds)}.`} ${reason}`
-      : `${reason}${retry} ${reset}`
+    options.retry === 'manual' || seconds === undefined
+      ? `${room}This turn has stopped. ${manualAction} ${reason}`
+      : timing.limitName && resetTime
+        ? `${room}The earliest reset is ${resetTime} UTC (in ${duration}). Retrying every ${retryMinutes(seconds)}. ${reason}`
+        : `${reason}${retry} ${reset}`
   const response = new Response(
     JSON.stringify({
       type: 'error',

@@ -185,7 +185,8 @@ test('vault quota floors refuse new OpenCode 2 sessions without asking for sign-
     type: 'error',
     error: { type: 'rate_limit_error', message: policyError.message },
   })
-  expect(policyError.message).toContain('Retry in ')
+  expect(policyError.message).toContain('This turn has stopped.')
+  expect(policyError.message).not.toContain('Retry in ')
   expect(policyError.message).not.toContain('signing in')
   expect(policyError.message).not.toContain('SYNTHETIC')
   await quota(19)
@@ -251,7 +252,11 @@ test('host retry cap gives OpenCode 2 a named 26-hour pool reset without dispatc
     expect(refusal.headers.get('retry-after')).toBe('900')
     expect(refusal.message).toContain('weekly limit')
     expect(refusal.message).toContain('UTC (in 26 h)')
-    expect(refusal.message).toContain('Retrying every 15 minutes.')
+    expect(refusal.message).toContain('This turn has stopped.')
+    expect(refusal.message).toMatch(
+      /Send the message again after \d\d:\d\d UTC\./,
+    )
+    expect(refusal.message).not.toContain('Retrying')
     expect(networkCalls()).toBe(0)
   }
 })

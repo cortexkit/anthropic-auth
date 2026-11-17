@@ -2876,9 +2876,7 @@ describe('Pi API fallback routing helpers', () => {
           const result = await stream.result()
           expect(result.errorMessage).toContain('weekly limit')
           expect(result.errorMessage).toContain('UTC (in 26 h)')
-          expect(result.errorMessage).toContain(
-            'Send the message again after that.',
-          )
+          expect(result.errorMessage).toContain('Send the message again after ')
           expect(isRetryableAssistantError(result)).toBe(false)
           expect(messageRequests).toBe(knownBeforeSend ? 0 : 1)
           expect(result.errorMessage).not.toContain('Synthetic upstream text')
