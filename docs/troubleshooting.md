@@ -29,7 +29,7 @@ Local setup names hosts that are still connected to the vault. In each named hos
 
 If OpenCode holds a separate Anthropic login while enrolled, remove that login using OpenCode's tools and choose the vault method, or disconnect. If vault setup reports no verified default Claude account, sign in through the vault and rerun setup; a local token cannot satisfy that check.
 
-Pi setup requires explicit stored-login consent. A missing stash or conflicting current Pi slot is a preservation refusal, not an invitation to delete either login. Keep the stash, slot and enrollment intact and resolve the conflict before retrying. [Vault disconnect](vault.md#disconnect-and-recovery) describes the restore order.
+Pi setup requires explicit consent to delete its saved Claude sign-in for vault use. No hidden copy is kept and disconnect restores nothing; sign in again after disconnecting. Legacy stashes are deleted unread, but unsafe paths (including symlinks) refuse cleanup and can leave enrollment active after the auth change committed. Correct the unsafe storage and retry. [Vault disconnect](vault.md#disconnect-and-recovery) describes the cleanup order.
 
 ## Requests and diagnostics
 

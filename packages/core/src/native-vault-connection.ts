@@ -22,7 +22,7 @@ export interface NativePiAuthSlotOptions {
   env?: NodeJS.ProcessEnv
 }
 
-/** Setup and disconnect must use the same host auth file, private stash and inert API-key marker. */
+/** Keep the legacy stash path stable so setup and disconnect remove old saved credentials. */
 export function nativePiAuthSlotPaths(options: NativePiAuthSlotOptions) {
   return {
     authPath: resolve(options.authPath),
@@ -36,7 +36,7 @@ export function nativePiAuthSlotPaths(options: NativePiAuthSlotOptions) {
   }
 }
 
-/** Delegate private Pi-auth preservation to the shared locked writer; never create a second host-slot writer. */
+/** Delegate Pi-auth replacement and legacy cleanup to the shared locked writer. */
 export function openNativePiAuthSlot(options: NativePiAuthSlotOptions): PiSlot {
   return openPiSlot(nativePiAuthSlotPaths(options))
 }
@@ -45,24 +45,18 @@ export type NativeVaultDisconnectOptions =
   | { host: 'opencode'; env?: NodeJS.ProcessEnv }
   | { host: 'pi'; env?: NodeJS.ProcessEnv; slot: Pick<PiSlot, 'exitVault'> }
 
-export type NativeVaultDisconnectResult =
-  | 'disconnected'
-  | 'idle'
-  | 'busy'
-  | 'conflict'
+export type NativeVaultDisconnectResult = 'disconnected' | 'idle' | 'busy'
 
 /**
- * Restore Pi's stored authentication before removing this host's enrollment.
- * A conflicting replacement belongs to the user: leave both it and enrollment
- * intact rather than selecting local custody with unresolved recovery data.
+ * Clear Pi's vault placeholder before removing this host's enrollment.
+ * No saved sign-in is restored; a new sign-in made through Pi is left alone.
  * OpenCode authentication is never changed by this operation.
  */
 export async function disconnectNativeVaultForHost(
   options: NativeVaultDisconnectOptions,
 ): Promise<NativeVaultDisconnectResult> {
   if (isVaultHosted()) throw new Error(VAULT_HOST_CONNECT_REFUSAL)
-  if (options.host === 'pi' && (await options.slot.exitVault()) === 'conflict')
-    return 'conflict'
+  if (options.host === 'pi') await options.slot.exitVault()
   const paths = getHostClaustrumEnrollmentPaths(options.host, options.env)
   const result = await disconnectClaustrumEnrollment(
     paths,

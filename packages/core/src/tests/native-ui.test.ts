@@ -1121,11 +1121,11 @@ describe('vault custody', () => {
         'reset-backoff',
         'vault-disconnect',
       ])
-      // Disconnect is confirmed, but marked reversible: connecting again
-      // through offline setup undoes it.
+      // Enrollment can be established again through offline setup. This does
+      // not recover the Pi sign-in discarded when connecting to the vault.
       expect(accounts?.actions.at(-1)?.confirm).toEqual({
         message:
-          "Disconnect this host from the vault and return to local accounts? The vault keeps this host's enrollment approved until an operator revokes it there.",
+          "Disconnect this host from the vault and return to local accounts? Pi's previous saved Claude sign-in is not restored; sign in again after disconnecting. The vault keeps this host's enrollment approved until an operator revokes it there.",
         irreversible: false,
       })
       expect(
@@ -1354,11 +1354,6 @@ describe('vault custody', () => {
       code: 'busy',
       text: "Vault disconnect could not finish because another process is changing this host's enrollment. Try again.",
     },
-    conflict: {
-      ok: false,
-      code: 'conflict',
-      text: 'Disconnect stopped: this host already has a different stored sign-in, so it and the sign-in saved when the host joined the vault were both kept, and the vault connection remains. Resolve the two sign-ins with offline setup.',
-    },
   }
 
   for (const host of ['opencode', 'pi'] as const) {
@@ -1393,7 +1388,14 @@ describe('vault custody', () => {
           ok: applied.ok,
           text: applied.text,
           ...(applied.code !== undefined ? { code: applied.code } : {}),
-        }).toEqual(expected)
+        }).toEqual(
+          host === 'pi' && (result === 'disconnected' || result === 'idle')
+            ? {
+                ok: true,
+                text: 'Pi is disconnected from the vault. Its previous saved Claude sign-in is not restored. Sign in again in Pi to use local authentication.',
+              }
+            : expected,
+        )
         expect(disconnects).toBe(1)
         expect(calls).toEqual([])
         // The menu returned with the result reads the custody mode again
@@ -1527,26 +1529,7 @@ describe('vault custody', () => {
   test('Pi disconnect maps closed slot refusals without reading raw text or accessors', async () => {
     const cases = [
       ['unsafe-path', 'disconnect-unsafe-file', 'Check file ownership'],
-      [
-        'invalid-auth',
-        'disconnect-pi-recovery',
-        'Repair the Pi sign-in and its private recovery copy',
-      ],
-      [
-        'invalid-stash',
-        'disconnect-pi-recovery',
-        'Repair the Pi sign-in and its private recovery copy',
-      ],
-      [
-        'missing-stash',
-        'disconnect-pi-recovery',
-        'Repair the Pi sign-in and its private recovery copy',
-      ],
-      [
-        'conflict',
-        'disconnect-conflict',
-        'Resolve the stored Pi sign-in and its private recovery copy',
-      ],
+      ['invalid-auth', 'disconnect-pi-recovery', 'Repair Pi’s auth file'],
       [
         'lock-timeout',
         'disconnect-busy',

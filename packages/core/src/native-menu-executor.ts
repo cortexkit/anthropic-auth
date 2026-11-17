@@ -186,17 +186,11 @@ export type NativeMenuExecutorOptions = {
 
 /**
  * What a host's vault disconnect reports. `disconnected`: the host is back in
- * local custody. `idle`: no active enrollment remains; Pi's saved sign-in may
- * still have been restored. `busy`: another process holds the enrollment lock
- * and disconnect could not finish. `conflict`:
- * the host's stored sign-in could not be restored without overwriting one it
- * already has, so both were kept and the enrollment remains.
+ * local custody. `idle`: no active enrollment remains. Pi's vault placeholder
+ * is cleared in either case, but no discarded sign-in is restored.
+ * `busy`: another process holds the enrollment lock and disconnect could not finish.
  */
-export type NativeVaultDisconnectResult =
-  | 'disconnected'
-  | 'idle'
-  | 'busy'
-  | 'conflict'
+export type NativeVaultDisconnectResult = 'disconnected' | 'idle' | 'busy'
 
 /** The host capability that disconnects this host from the vault. */
 export type NativeVaultDisconnect = (
@@ -259,7 +253,6 @@ export type NativeMenuExecutionResult =
         | 'disconnect-unsafe-file'
         | 'disconnect-wrong-consumer'
         | 'disconnect-pi-recovery'
-        | 'disconnect-conflict'
         | 'disconnect-busy'
         | 'disconnect-io'
     }
@@ -696,12 +689,7 @@ function plan(
 }
 
 const DISCONNECT_RESULTS: ReadonlySet<unknown> =
-  new Set<NativeVaultDisconnectResult>([
-    'disconnected',
-    'idle',
-    'busy',
-    'conflict',
-  ])
+  new Set<NativeVaultDisconnectResult>(['disconnected', 'idle', 'busy'])
 
 function readOutcome(
   action: NativeMenuDispatchActionId,
@@ -740,11 +728,7 @@ function disconnectFailureCode(
       case 'unsafe-path':
         return 'disconnect-unsafe-file'
       case 'invalid-auth':
-      case 'invalid-stash':
-      case 'missing-stash':
         return 'disconnect-pi-recovery'
-      case 'conflict':
-        return 'disconnect-conflict'
       case 'lock-timeout':
       case 'lock-compromised':
         return 'disconnect-busy'

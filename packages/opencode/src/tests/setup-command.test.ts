@@ -1485,11 +1485,19 @@ lifetimes.test('inspection budget: local --login', async () => {
 })
 
 lifetimes.test(
-  'Pi vault skips only an exact auth-slot no-op fence',
+  'Pi vault fences legacy stash cleanup even when the auth slot is already a placeholder',
   async () => {
     const f = await grantSetupFixture('pi')
     expect(await f.run()).toBe(0)
     const pi = await resolveNativeSetupPaths('pi', f.env)
+    const { stashPath } = nativePiAuthSlotPaths({
+      env: f.env,
+      authPath: pi.hostAuthPath,
+    })
+    await mkdir(dirname(stashPath), { recursive: true, mode: 0o700 })
+    await writeFile(stashPath, 'synthetic-malformed-legacy-login', {
+      mode: 0o600,
+    })
     let inspections = 0
     const publications: number[] = []
     f.io.fence = {
@@ -1507,8 +1515,9 @@ lifetimes.test(
     )
     lifetimes.deferCleanup(() => spy.mockRestore())
     expect(await f.run()).toBe(0)
-    expect(inspections).toBe(5)
+    expect(inspections).toBe(6)
     expect(publications).toEqual([])
+    await expect(readFile(stashPath)).rejects.toMatchObject({ code: 'ENOENT' })
     await writeSetupJson(pi.hostAuthPath, {})
     inspections = 0
     expect(await f.run()).toBe(0)
@@ -3532,7 +3541,7 @@ lifetimes.test(
 )
 
 lifetimes.test(
-  'Pi-only vault setup uses the Pi connection override and preserves consented stored auth',
+  'Pi-only vault setup uses the Pi connection override and deletes consented stored auth without a stash',
   async () => {
     const f = await callbackFixture({
       opencode: false,
@@ -3615,9 +3624,7 @@ lifetimes.test(
     expect(writes.hits).toEqual([])
     expect(activated).toBeDefined()
     expect(await setupBytes(pi)).toEqual(activated!)
-    expect(await readFile(stashPath, 'utf8')).toContain(
-      SETUP_HOST_LOGIN.refresh,
-    )
+    await expect(readFile(stashPath)).rejects.toMatchObject({ code: 'ENOENT' })
     expect(await readNativeEnrollmentMode('pi', f.env)).toBe('claustrum')
     expect(await readNativeMigrationJournal(pi.paths)).toBeUndefined()
     expect(
@@ -4707,11 +4714,7 @@ for (const scenario of [
   )
 }
 
-for (const failure of [
-  'missing-stash',
-  'consent-required',
-  'connection-file',
-] as const) {
+for (const failure of ['consent-required', 'connection-file'] as const) {
   lifetimes.test(
     `first vault preflight refuses Pi ${failure} before enrollment or OpenCode effects`,
     async () => {
@@ -4721,15 +4724,7 @@ for (const failure of [
         claustrum: true,
       })
       const pi = await resolveNativeSetupPaths('pi', f.env)
-      if (failure === 'missing-stash') {
-        const slot = nativePiAuthSlotPaths({
-          env: f.env,
-          authPath: pi.hostAuthPath,
-        })
-        await writeSetupJson(pi.hostAuthPath, {
-          anthropic: { type: 'api_key', key: slot.placeholderKey },
-        })
-      } else if (failure === 'consent-required') {
+      if (failure === 'consent-required') {
         await writeSetupJson(pi.hostAuthPath, { anthropic: SETUP_HOST_LOGIN })
       } else {
         f.env.PI_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE = join(
@@ -4773,7 +4768,6 @@ for (const failure of [
       expect(effects).toEqual([])
       expect(f.screen()).toContain(
         {
-          'missing-stash': 'missing-stash',
           'consent-required':
             'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth',
           'connection-file':
@@ -4795,7 +4789,7 @@ for (const failure of [
   )
 }
 
-for (const change of ['slot', 'stash', 'enrollment'] as const) {
+for (const change of ['slot', 'enrollment'] as const) {
   lifetimes.test(
     `vault migrate refuses an external Pi ${change} change after beforeRegister without further provider writes`,
     async () => {
@@ -4811,7 +4805,6 @@ for (const change of ['slot', 'stash', 'enrollment'] as const) {
         authPath: getPiAuthPath(f.env),
       })
       let changed: Awaited<ReturnType<typeof setupBytes>>[] | undefined
-      let stashBytes: string | undefined
       expect(
         await runSetupCommand(
           ['--yes', '--claustrum', '--remove-pi-auth', '--opencode=both'],
@@ -4841,11 +4834,6 @@ for (const change of ['slot', 'stash', 'enrollment'] as const) {
                         key: 'external-replacement',
                       },
                     })
-                  else if (change === 'stash')
-                    await writeFile(
-                      slot.stashPath,
-                      `${await readFile(slot.stashPath, 'utf8')}\n`,
-                    )
                   else {
                     const enrollment = getHostClaustrumEnrollmentPaths(
                       'pi',
@@ -4858,7 +4846,6 @@ for (const change of ['slot', 'stash', 'enrollment'] as const) {
                     setupBytes(f.plan),
                     setupBytes(pi),
                   ])
-                  stashBytes = await readFile(slot.stashPath, 'utf8')
                 }
                 return { exitCode: 0, stdout: '1.0.0', stderr: '' }
               },
@@ -4873,7 +4860,9 @@ for (const change of ['slot', 'stash', 'enrollment'] as const) {
       expect(
         await settleSetupSiblings([setupBytes(f.plan), setupBytes(pi)]),
       ).toEqual(changed!)
-      expect(await readFile(slot.stashPath, 'utf8')).toBe(stashBytes!)
+      await expect(readFile(slot.stashPath)).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
     },
   )
 }
@@ -5361,7 +5350,7 @@ for (const mode of ['local', 'claustrum'] as const) {
         const message =
           mode === 'local'
             ? 'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to move it into the native account pool.'
-            : 'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth to preserve it privately during vault use and restore it on disconnect.'
+            : 'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth to delete it for vault use. It is not restored; sign in again after disconnecting.'
         expect(
           await runSetupCommand(
             [

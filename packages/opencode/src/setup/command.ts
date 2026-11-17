@@ -6,7 +6,6 @@ import {
   decidePiStateLayout,
   isVaultHosted,
   type NativeHolderRegistration,
-  NativePiAuthSlotError,
   NativeSetupSettingsWriteError,
   openNativePiAuthSlot,
   publishNativeEmptyInit,
@@ -102,7 +101,7 @@ const COMMAND_FLAGS: ReadonlyArray<{ label: string; description: string }> = [
   {
     label: REMOVE_PI_AUTH,
     description:
-      'Agree in advance to move a stored Pi Anthropic login out of the way: into the local account pool, or aside privately for vault use (restored on disconnect).',
+      'Agree in advance to move a stored Pi Anthropic login into the local account pool, or delete it for vault use (not restored; sign in again after disconnecting).',
   },
   {
     label: RESTORE_LEGACY,
@@ -219,8 +218,6 @@ export async function runSetupCommand(
         env,
         authPath: plan.hostAuthPath,
       }).inspect()
-      if (slot.slot === 'placeholder' && slot.stash === 'missing')
-        throw new NativePiAuthSlotError('missing-stash')
       if (context.mode === 'claustrum') {
         if (slot.slot === 'placeholder') return
       }
@@ -231,14 +228,14 @@ export async function runSetupCommand(
     }
     const message =
       context.mode === 'claustrum'
-        ? 'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth to preserve it privately during vault use and restore it on disconnect.'
+        ? 'Pi has stored Anthropic authentication. Rerun with --remove-pi-auth to delete it for vault use. It is not restored; sign in again after disconnecting.'
         : 'Pi has a stored Anthropic login. Rerun with --remove-pi-auth to move it into the native account pool.'
     if (args.includes('--yes') || !terminal.input.isTTY)
       throw new SetupRefusal(message)
     const answer = await confirm(
       terminal,
       context.mode === 'claustrum'
-        ? 'Move Pi authentication aside privately for vault use, then restore it on disconnect?'
+        ? 'Delete Pi’s saved Anthropic sign-in for vault use? It is not restored; sign in again after disconnecting.'
         : 'Move the Pi Anthropic OAuth login into the native account pool and remove its stored copy?',
     )
     if (!answer)

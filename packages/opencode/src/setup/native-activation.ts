@@ -6,8 +6,6 @@ import {
   inspectNativeHostAuthEntry,
   type NativeCustodyActivationHooks,
   type NativeCustodyInventory,
-  NativePiAuthSlotError,
-  nativePiAuthSlotPaths,
   openNativePiAuthSlot,
   readNativeEnrollmentMode,
   requireNoSupervisedAuthContentSnapshot,
@@ -18,7 +16,6 @@ import {
   type NativeVaultEnrollmentOptions,
   nativeVaultGrantArgs,
 } from './native-enrollment.ts'
-import { nativeSetupFileFingerprint } from './native-local.ts'
 import {
   type NativeSetupPaths,
   resolveNativeSetupPaths,
@@ -57,7 +54,7 @@ function activationMessage(
     case 'primary-conflict':
       return 'Pi has a stored Anthropic API key, which would take precedence over the vault account. Remove it in Pi, then rerun setup.'
     case 'consent-required':
-      return 'Pi has stored Anthropic authentication. Explicit consent is required to move it aside for vault use.'
+      return 'Pi has stored Anthropic authentication. Explicit consent is required to delete it for vault use. It is not restored; sign in again after disconnecting.'
     case 'primary-unverified':
       return 'The vault has no verified default Claude account. Sign in through the vault and rerun setup.'
     case 'no-read-grant':
@@ -113,7 +110,7 @@ export interface NativeVaultActivationOptions extends SharedSetupRunnerEntry {
   env: NodeJS.ProcessEnv
   runner: CommandRunner
   fence: ProcessFence
-  /** Consent to move Pi's stored authentication aside; never consent to delete it. */
+  /** Consent to delete Pi's saved authentication for vault use, without restoration. */
   removePiAnthropicAuth: boolean
   /**
    * Tests override the host paths, enrollment client and vault listing;
@@ -160,15 +157,9 @@ export async function fingerprintNativeVaultInputs(
     env: options.env,
     authPath: plan.hostAuthPath,
   })
-  const { stashPath } = nativePiAuthSlotPaths({
-    env: options.env,
-    authPath: plan.hostAuthPath,
-  })
-  return JSON.stringify([
-    entry.digest,
-    await slot.inspect(),
-    await nativeSetupFileFingerprint(stashPath),
-  ])
+  // Older versions saved Pi's login in a stash file. Only the slot helper
+  // removes that file; preflight must not open it or follow a stash symlink.
+  return JSON.stringify([entry.digest, await slot.inspect()])
 }
 
 function validateVaultAuthContent(options: NativeVaultActivationOptions): void {
@@ -218,8 +209,6 @@ export async function preflightNativeVaultForHost(
       env,
       authPath: plan.hostAuthPath,
     }).inspect()
-    if (slot.slot === 'placeholder' && slot.stash === 'missing')
-      throw new NativePiAuthSlotError('missing-stash')
     if (
       entry.kind !== 'absent' &&
       slot.slot !== 'placeholder' &&
@@ -234,7 +223,7 @@ export async function preflightNativeVaultForHost(
   }
 }
 
-/** Grant native-account read access and require a vault-backed default Claude account with an account identity before moving Pi's login aside. */
+/** Verify the vault's default Claude account before deleting Pi's saved login. */
 export async function completeNativeVaultActivation(
   host: HarnessKind,
   options: NativeVaultActivationOptions,
@@ -305,13 +294,9 @@ export async function completeNativeVaultActivation(
         env,
         authPath: plan.hostAuthPath,
       })
-      const current = await slot.inspect()
-      // Do not call a mutator without its fence, even for an observed no-op:
-      // the auth slot could change before enterVault acquires its lock.
-      if (current.slot !== 'placeholder' || current.stash !== 'valid') {
-        await processFence()
-        await slot.enterVault()
-      }
+      // Enter even for an existing placeholder to remove legacy saved credentials.
+      await processFence()
+      await slot.enterVault()
     }
     return preflight.priorMode === 'claustrum' ? 'already-vault' : 'committed'
   } finally {

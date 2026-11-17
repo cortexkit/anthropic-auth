@@ -26,9 +26,8 @@ export interface PiNativeCommands {
   readMode?: NativeUiOptions['readMode']
   readAccounts?: NativeUiOptions['readAccounts']
   /**
-   * Disconnects Pi from the vault. When left out, Core first restores the
-   * Anthropic sign-in that enrollment set aside in Pi's own auth file, then
-   * ends Pi's enrollment.
+   * Disconnects Pi from the vault. When left out, Core clears the vault
+   * placeholder, restores no sign-in, then ends Pi's enrollment.
    */
   disconnectVault?: NativeUiOptions['disconnectVault']
 }
@@ -36,7 +35,7 @@ export interface PiNativeCommands {
 /**
  * Pi's default disconnect. The auth file is the one Pi's SDK uses
  * (getAgentDir() honours PI_CODING_AGENT_DIR); Core chooses the private
- * stash and placeholder, so setup and disconnect always agree on them.
+ * legacy stash path and placeholder, so setup and disconnect agree on cleanup.
  */
 const disconnectPi: NativeUiOptions['disconnectVault'] = () =>
   disconnectNativeVaultForHost({
@@ -72,14 +71,14 @@ export function registerCommands(pi: ExtensionAPI, backend: PiNativeCommands) {
         disconnectVault: async (options) => {
           const result = await disconnect(options)
           // Reload after successful or already-inactive enrollment so Pi sees
-          // any restored sign-in. Reload failure cannot undo the completed
+          // the cleared vault placeholder. Reload failure cannot undo the completed
           // disconnect, so report it separately without exposing the exception.
           if (result === 'disconnected' || result === 'idle') {
             try {
               await ctx.modelRegistry.refresh()
             } catch {
               ctx.ui.notify(
-                'Vault enrollment is inactive, but Pi could not reload its saved sign-in. Restart Pi before sending another request.',
+                'Vault enrollment is inactive, but Pi could not reload its authentication. Restart Pi and sign in again before sending another request.',
                 'error',
               )
             }

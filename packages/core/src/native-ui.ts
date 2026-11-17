@@ -92,9 +92,7 @@ export interface NativeUiOptions {
   /**
    * Disconnects this host from the vault; while enrolled, this is the host's
    * only enrollment action. Before ending the enrollment, the callback
-   * restores any host sign-in set aside when the host joined the vault. If
-   * that restore would overwrite a sign-in the host already has, the callback
-   * reports `conflict` and leaves the enrollment in place. Every host must
+   * clears Pi's vault placeholder without restoring any sign-in. Every host must
    * supply it: a host enrolled in the vault, or with an unreadable
    * enrollment, always needs a way back to local accounts.
    */
@@ -318,11 +316,6 @@ const DISCONNECT_OUTCOMES: Readonly<
     code: 'busy',
     text: "Vault disconnect could not finish because another process is changing this host's enrollment. Try again.",
   },
-  conflict: {
-    ok: false,
-    code: 'conflict',
-    text: 'Disconnect stopped: this host already has a different stored sign-in, so it and the sign-in saved when the host joined the vault were both kept, and the vault connection remains. Resolve the two sign-ins with offline setup.',
-  },
 }
 
 const DISCONNECT_FAILURES = {
@@ -331,9 +324,7 @@ const DISCONNECT_FAILURES = {
   'disconnect-wrong-consumer':
     'The enrollment belongs to another host or plugin. Check this host’s enrollment path. Then try Disconnect again. Do not delete another host’s enrollment.',
   'disconnect-pi-recovery':
-    'Repair the Pi sign-in and its private recovery copy with offline setup. Keep both files. Then try Disconnect again.',
-  'disconnect-conflict':
-    'Resolve the stored Pi sign-in and its private recovery copy with offline setup. Keep both sign-ins. Then try Disconnect again.',
+    'Repair Pi’s auth file with offline setup. Then try Disconnect again. No saved sign-in will be restored.',
   'disconnect-busy':
     'Stop other setup or disconnect attempts. Then try Disconnect again.',
   'disconnect-io':
@@ -369,6 +360,14 @@ function outcome(
         text: `Offline ${result.mode} setup guidance (nothing changed):\n${result.instructions.join('\n')}`,
       }
     case 'disconnect':
+      if (
+        host === 'pi' &&
+        (result.result === 'disconnected' || result.result === 'idle')
+      )
+        return {
+          ok: true,
+          text: 'Pi is disconnected from the vault. Its previous saved Claude sign-in is not restored. Sign in again in Pi to use local authentication.',
+        }
       return DISCONNECT_OUTCOMES[result.result]
     case 'failed':
       if (result.action === 'vault-disconnect')
@@ -690,9 +689,8 @@ export function createNativeUi(options: NativeUiOptions): CommandMenu {
       // action. The host's disconnect callback does the safety checks: it
       // deletes only this host's enrollment token and ceremony record, and
       // refuses if either file has the wrong owner or is readable by others.
-      // For Pi it first restores the Anthropic sign-in that enrollment moved
-      // out of Pi's auth file, and stops without disconnecting if that would
-      // overwrite a sign-in Pi already has.
+      // For Pi it first clears the vault placeholder and removes legacy stashes;
+      // it never restores credentials or overwrites a new Pi sign-in on exit.
       if (custody === undefined && isNativeMenuLocalCustodyAction(action.id))
         return finish({
           ok: false,

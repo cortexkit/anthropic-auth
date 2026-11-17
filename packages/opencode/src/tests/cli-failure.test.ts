@@ -201,7 +201,7 @@ test('fixed remedies and validated closed codes are admitted word for word', () 
     new NativeVaultEnrollmentError('approval-refused'),
     new NativeMigrationError('primary-unverified'),
     new NativeMigrationError('migration-busy'),
-    new NativePiAuthSlotError('missing-stash'),
+    new NativePiAuthSlotError('invalid-auth'),
     new NativeCustodyError('invalid-token'),
     new NativeCustodyError('not-enrolled'),
     new NativeCustodyError('placeholder-refresh'),
