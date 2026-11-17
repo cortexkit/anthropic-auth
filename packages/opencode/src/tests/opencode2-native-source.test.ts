@@ -2072,6 +2072,7 @@ function rawPin(text: string, sessionID: string) {
 /** Drives installNativeAnthropic's hooks with the real adapter and account runtime. */
 async function retryHost(native: ReturnType<typeof source>) {
   const callbacks = new Map<string, (input: unknown) => unknown>()
+  const responseBodies = new WeakMap<Response, string>()
   type HostEvent =
     ReturnType<
       NonNullable<OpenCode2HookContext['event']>['subscribe']
@@ -2196,8 +2197,13 @@ async function retryHost(native: ReturnType<typeof source>) {
         response: new Response(body, { status, headers }),
       }
       await run('http.response', draft)
-      await draft.response.text()
+      responseBodies.set(draft.response, await draft.response.text())
       return draft.response
+    },
+    body(response: Response) {
+      const body = responseBodies.get(response)
+      if (body === undefined) throw new Error('Host has not read this response')
+      return body
     },
     /** Answers with a 200 event stream whose events the host reads to the end. */
     async streamed(request: Request, events: string, input = scope) {
@@ -5419,6 +5425,176 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
     expect((stopped as Error).message).toContain('Reset time is unknown.')
     expect((stopped as Error).message).toContain('This turn has stopped.')
     expect((stopped as Error).message).not.toMatch(/Retrying|Retry in /)
+  })
+
+  test.each([
+    ['remaining retries cannot reach the reset', 9, 38 * 60_000, true],
+    ['the host retry schedule is exhausted', 11, 60_000, true],
+    ['the reset is unknown', 1, undefined, true],
+    ['one hold remains at the budget boundary', 8, 10 * 60_000, false],
+    ['no hold remains at the budget boundary', 9, 10 * 60_000, true],
+    ['a quota hold can still reach the reset', 1, 38 * 60_000, false],
+    ['the 429 is unconfirmed', 10, undefined, false],
+  ] as const)(
+    'OC2 response stop text when %s',
+    async (scenario, attempt, resetDelay, stopped) => {
+      const { host, native } = await localSticky()
+      const stopMessage = spyOn(native, 'quotaStopMessage')
+      const now = Date.parse('2026-11-17T14:52:00Z')
+      await atTime(now, async () => {
+        let request = await host.send()
+        if (attempt > 1) {
+          await host.response(request, 200)
+          // Transport retries also consume the host's schedule, even when no
+          // quota classifier or retry-phase account chooser was involved.
+          await host.retry(true, scope, undefined, 1234, attempt)
+          request = await host.send()
+        }
+        const headers = {
+          'content-type': 'application/json',
+          'retry-after': '60',
+          'retry-after-ms': '60000',
+          'request-id': 'quota-refusal',
+          ...(scenario === 'the 429 is unconfirmed'
+            ? {}
+            : { 'anthropic-ratelimit-unified-5h-status': 'rejected' }),
+          ...(resetDelay === undefined
+            ? {}
+            : {
+                'anthropic-ratelimit-unified-5h-reset': String(
+                  (now + resetDelay) / 1000,
+                ),
+              }),
+        }
+        const before =
+          '{ "type": "error", "error": { "type": "rate_limit_error", "message": "Provider quota exceeded", "detail": [1, 2] }, "request_id": "quota-refusal" }\n'
+        const response = await host.response(
+          request,
+          429,
+          scope,
+          headers,
+          before,
+        )
+        expect(response.status).toBe(429)
+        expect([...response.headers]).toEqual([...new Headers(headers)])
+        const after = host.body(response)
+        expect(stopMessage.mock.calls[0]?.[0].hostAttempt).toBe(attempt)
+        if (stopped) {
+          expect(await stopMessage.mock.results[0]?.value).toBeString()
+          // OpenCode v2.3.0's providerErrorMessage reads error.message first;
+          // to-session-error carries that message into the visible rate-limit error.
+          // https://github.com/anomalyco/opencode/blob/v2.3.0/packages/ai/src/provider-error.ts#L177-L194
+          const message = JSON.parse(after).error.message as string
+          expect(message).toContain('This turn has stopped.')
+          expect(message).not.toMatch(/Retrying|Retry in /)
+          if (resetDelay === undefined)
+            expect(message).toContain('Reset time is unknown.')
+          else
+            expect(message).toContain(
+              `Send the message again after ${new Date(now + resetDelay).toISOString().slice(11, 16)} UTC.`,
+            )
+          expect(after).toBe(
+            before.replace(
+              '"Provider quota exceeded"',
+              JSON.stringify(message),
+            ),
+          )
+          // A depleted host schedule does not call the retry hook at all.
+          // The body already handed to the host must carry the stopped text.
+          if (attempt === 9)
+            expect(
+              await host.retry(
+                false,
+                scope,
+                { type: 'unknown', message },
+                1234,
+                10,
+              ),
+            ).toEqual({ retry: false })
+        } else {
+          expect(after).toBe(before)
+          if (attempt === 8) {
+            expect(await host.retry(false, scope, undefined, 1234, 9)).toEqual({
+              retry: true,
+              delay: stickyRetryAfterWithJitter(scope.sessionID, 600) * 1000,
+            })
+          }
+        }
+      })
+    },
+  )
+
+  test.each(['alternate account', 'waiting off', 'non-JSON body'] as const)(
+    'OC2 leaves a terminal 429 unchanged with %s',
+    async (condition) => {
+      const fixture =
+        condition === 'alternate account'
+          ? await vaultWithFallback()
+          : await local()
+      if (condition === 'waiting off')
+        await fixture.runtime.updateSettings((settings) => {
+          settings.routing = {
+            mode: 'sticky-balanced',
+            maxSameAccountWait: '0',
+          }
+        })
+      const host = await retryHost(source(fixture.runtime, fixture.paths))
+      const now = Date.parse('2026-11-17T14:52:00Z')
+      await atTime(now, async () => {
+        const request = await host.send()
+        const headers = {
+          ...weeklyRejected(now + 72 * 3_600_000),
+          'retry-after': '60',
+        }
+        const before =
+          condition === 'non-JSON body'
+            ? 'rate limited: not JSON\n'
+            : '{ "error": { "type": "rate_limit_error", "message": "limited" } }\n'
+        const response = await host.response(
+          request,
+          429,
+          scope,
+          headers,
+          before,
+        )
+        expect(host.body(response)).toBe(before)
+        expect([...response.headers]).toEqual([...new Headers(headers)])
+      })
+    },
+  )
+
+  test('OC2 host retry snapshots are consumed by only the matching next send', async () => {
+    const { host } = await localSticky()
+    const now = Date.parse('2026-11-17T14:52:00Z')
+    await atTime(now, async () => {
+      const first = await host.send()
+      await host.response(first, 200)
+      await host.retry(true, scope, undefined, 1234, 11)
+      const other = { ...scope, sessionID: 'independent-quota-turn' }
+      const parallel = await host.send(other)
+      const last = await host.send()
+      // The following request has no queued host retry and starts at attempt 1.
+      const fresh = await host.send()
+      const headers = weeklyRejected(now + 38 * 60_000)
+      const before = '{"error":{"type":"rate_limit_error","message":"limited"}}'
+      for (const [request, input, stopped] of [
+        [parallel, other, false],
+        [last, scope, true],
+        [fresh, scope, false],
+      ] as const) {
+        const response = await host.response(
+          request,
+          429,
+          input,
+          headers,
+          before,
+        )
+        expect(host.body(response).includes('This turn has stopped.')).toBe(
+          stopped,
+        )
+        expect([...response.headers]).toEqual([...new Headers(headers)])
+      }
+    })
   })
 
   test.each([9, 10])(

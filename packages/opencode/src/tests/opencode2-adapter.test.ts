@@ -323,6 +323,83 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true)
 }
 
+test('quota response rewriting requires a live per-send host retry snapshot', async () => {
+  const calls: number[] = []
+  const { source } = makeSource({
+    quotaStopMessage(input) {
+      calls.push(input.hostAttempt)
+      return 'This turn has stopped.'
+    },
+  })
+  const native = createNativeAnthropicAdapter({ source })
+  const host = new Host(native.adapter)
+  const scope = scopeOf()
+  const before =
+    '{ "error": { "type": "rate_limit_error", "message": "limited" } }'
+  const headers = { 'retry-after': '30', 'content-type': 'application/json' }
+  const classify = (sent: Awaited<ReturnType<Host['run']>>) =>
+    native.adapter.limitFromResponse?.({
+      status: 429,
+      headers: new Headers(headers),
+      body: async () => before,
+      attempt: sent.attempt,
+    })
+  const respond = async (sent: Awaited<ReturnType<Host['run']>>) => {
+    const response = await native.adapter.rewriteResponse?.({
+      ...sent.attempt,
+      attempt: sent.attempt,
+      request: sent.final,
+      response: new Response(before, { status: 429, headers }),
+    })
+    if (!response) throw new Error('Missing rewritten response')
+    expect(response.status).toBe(429)
+    expect([...response.headers]).toEqual([...new Headers(headers)])
+    return await response.text()
+  }
+  try {
+    const missing = await host.run(scope, hostRequest(sonnetPayload()))
+    await classify(missing)
+    expect(await respond(missing)).toBe(before)
+    expect(calls).toEqual([])
+    const live = await host.run(scope, hostRequest(sonnetPayload()))
+    native.bindHostAttempt(live.attempt, 9)
+    await classify(live)
+    expect(await respond(live)).toBe(
+      before.replace('"limited"', '"This turn has stopped."'),
+    )
+    expect(calls).toEqual([9])
+    expect(await respond(live)).not.toContain('This turn has stopped.')
+    const cancelled = await host.run(scope, hostRequest(sonnetPayload()))
+    native.bindHostAttempt(cancelled.attempt, 10)
+    await classify(cancelled)
+    await native.adapter.onAttemptEnd?.(cancelled.attempt, {
+      outputStarted: false,
+      error: { reason: 'cancelled' },
+    })
+    expect(await respond(cancelled)).not.toContain('This turn has stopped.')
+    const ended = await host.run(scope, hostRequest(sonnetPayload()))
+    native.bindHostAttempt(ended.attempt, 11)
+    await classify(ended)
+    await native.adapter.onAttemptEnd?.(ended.attempt, {
+      status: 429,
+      outputStarted: false,
+    })
+    if (!ended.attempt.data) throw new Error('Missing attempt data')
+    native.discardQuotaStopMessage(ended.attempt.data)
+    expect(await respond(ended)).not.toContain('This turn has stopped.')
+    const later = await host.run(scope, hostRequest(sonnetPayload()))
+    expect(await respond(later)).toBe(before)
+    const forgotten = await host.run(scope, hostRequest(sonnetPayload()))
+    native.bindHostAttempt(forgotten.attempt, 11)
+    await classify(forgotten)
+    native.forgetSession(scope.sessionID)
+    expect(await respond(forgotten)).not.toContain('This turn has stopped.')
+    expect(calls).toEqual([9, 10, 11, 11])
+  } finally {
+    native.dispose()
+  }
+})
+
 const sonnetPayload = () => ({
   model: 'claude-sonnet-5',
   max_tokens: 32000,

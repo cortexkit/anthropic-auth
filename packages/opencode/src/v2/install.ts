@@ -46,15 +46,41 @@ export async function installNativeAnthropic<Q, P>(
   const endings = new Set<Promise<void>>()
   const requestFinisher = new AsyncLocalStorage<{
     finish: () => void
+    hostAttempt: number
+    discardQuotaStop?: () => void
     route?: string
     attemptId?: string
   }>()
+  const retryScopeKey = (input: {
+    sessionID: string
+    agent: string
+    model: { providerID: string; id: string }
+  }) =>
+    JSON.stringify([
+      input.sessionID,
+      input.agent,
+      input.model.providerID,
+      input.model.id,
+    ])
+  const nextHostAttempts = new Map<
+    string,
+    { sessionID: string; attempt: number }
+  >()
+  const forgetHostAttempts = (sessionID: string) => {
+    for (const [key, next] of nextHostAttempts)
+      if (next.sessionID === sessionID) nextHostAttempts.delete(key)
+  }
   const attemptFinishers = new Map<string, () => void>()
+  const responseCleanups = new WeakMap<Request, () => void>()
   const adapter: typeof native.adapter = {
     ...native.adapter,
     rewriteRequest(input) {
       const request = requestFinisher.getStore()
       if (request) {
+        native.bindHostAttempt(input.attempt, request.hostAttempt)
+        const data = input.attempt.data
+        if (data)
+          request.discardQuotaStop = () => native.discardQuotaStopMessage(data)
         request.route = input.attempt.data?.route
         request.attemptId = input.attempt.attemptId
         attemptFinishers.set(input.attempt.attemptId, request.finish)
@@ -113,6 +139,8 @@ export async function installNativeAnthropic<Q, P>(
               return result
             } finally {
               if ('request' in draft && draft.request instanceof Request) {
+                responseCleanups.get(draft.request)?.()
+                responseCleanups.delete(draft.request)
                 try {
                   const response =
                     'response' in draft && draft.response instanceof Response
@@ -140,8 +168,21 @@ export async function installNativeAnthropic<Q, P>(
         }
         if (name === 'retry') {
           const result = await callback(draft)
-          if ('decision' in draft && draft.decision.retry)
-            draft.decision.delay = clampHostRetryMs(draft.decision.delay)
+          if ('decision' in draft) {
+            const key = retryScopeKey(draft)
+            nextHostAttempts.delete(key)
+            if (draft.decision.retry) {
+              draft.decision.delay = clampHostRetryMs(draft.decision.delay)
+              nextHostAttempts.set(key, {
+                sessionID: draft.sessionID,
+                attempt: draft.attempt,
+              })
+              while (nextHostAttempts.size > 512) {
+                const first = nextHostAttempts.keys().next().value
+                if (first !== undefined) nextHostAttempts.delete(first)
+              }
+            }
+          }
           return result
         }
         if (name !== 'http.request') return callback(draft)
@@ -162,6 +203,8 @@ export async function installNativeAnthropic<Q, P>(
         let finalRequest: Request | undefined
         let completion: {
           finish: () => void
+          hostAttempt: number
+          discardQuotaStop?: () => void
           route?: string
           attemptId?: string
         }
@@ -174,7 +217,12 @@ export async function installNativeAnthropic<Q, P>(
             attemptFinishers.delete(completion.attemptId)
           if (finalRequest) requestTurns.delete(finalRequest)
         }
-        completion = { finish }
+        // Retry hooks expose the host count; response hooks do not. Consume
+        // it once for the next send, including retries unrelated to quota.
+        const key = retryScopeKey(input)
+        const hostAttempt = nextHostAttempts.get(key)?.attempt ?? 1
+        nextHostAttempts.delete(key)
+        completion = { finish, hostAttempt }
         try {
           // common-auth scopes these hooks to Anthropic. Other providers never
           // reach this observer, so their turns cannot invalidate a warm target.
@@ -205,6 +253,8 @@ export async function installNativeAnthropic<Q, P>(
             ),
           )
           completed = true
+          if (completion.discardQuotaStop)
+            responseCleanups.set(input.request, completion.discardQuotaStop)
           if (turn) {
             finalRequest = input.request
             requestTurns.set(finalRequest, finish)
@@ -239,6 +289,7 @@ export async function installNativeAnthropic<Q, P>(
   }
 
   const forgetSession = (sessionID: string) => {
+    forgetHostAttempts(sessionID)
     native.forgetSession(sessionID)
     installation.forgetSession(sessionID)
   }
@@ -257,8 +308,10 @@ export async function installNativeAnthropic<Q, P>(
               event.type === 'session.idle' ||
               (event.type === 'session.status' &&
                 event.data.status.type === 'idle')
-            )
+            ) {
+              forgetHostAttempts(event.data.sessionID)
               deps.source.forgetTurn?.(event.data.sessionID)
+            }
           }
         } catch (error) {
           if (!abort.signal.aborted)
@@ -279,6 +332,7 @@ export async function installNativeAnthropic<Q, P>(
       // Cancel credential callbacks before awaiting hook removal, so a
       // callback that finishes during cleanup cannot return a usable token.
       native.dispose()
+      nextHostAttempts.clear()
       abort.abort()
       cleanup = (async () => {
         await installation.dispose()

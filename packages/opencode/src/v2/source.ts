@@ -136,8 +136,8 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
   )
 
 // common-auth's installer accepts a hold only while this many host retries
-// remain after the current attempt; OpenCode 2 passes that attempt number as
-// `hostAttempt`.
+// remain when selecting the prospective retry; OpenCode 2 passes that retry's
+// number as `hostAttempt` (the first retry hook receives 2).
 const HOST_RETRY_LIMIT = 10
 
 function resetFitsRetryBudget(input: ChooseAccountInput, delayMs: number) {
@@ -506,10 +506,16 @@ export function createNativeAnthropicSource(
     account: NativeAccountView,
     snapshot: NativeAccountSnapshot,
     modelID: string,
+    ignoreGrantedHold = false,
   ) => {
     const now = Date.now()
     const held = grantedHolds.get(scope.sessionID)
-    if (held?.accountId === account.id && now < held.untilMs) return undefined
+    if (
+      !ignoreGrantedHold &&
+      held?.accountId === account.id &&
+      now < held.untilMs
+    )
+      return undefined
     const responseHeaders = refusalHeaders.get(
       key({ ...scope, modelID }, account.id),
     )?.headers
@@ -528,6 +534,117 @@ export function createNativeAnthropicSource(
       modelId: modelID,
       now,
     })
+  }
+  const poolDecision = (
+    input: ChooseAccountInput,
+    snapshot: NativeAccountSnapshot,
+    oauth: readonly NativeAccountView[],
+    modelID: string,
+    advice: unknown,
+  ) => {
+    if (
+      advice ||
+      input.phase !== 'retry' ||
+      input.rerouteFrom?.limit.status !== 429 ||
+      getMaxSameAccountWait(snapshot.policyStorage) === '0' ||
+      snapshot.accounts.some(
+        (row) => row.enabled && row.state === 'needs_reauth',
+      )
+    )
+      return undefined
+    const exhausted: StickyQuotaBlocker[] = []
+    for (const row of oauth) {
+      // A new refusal ends the refused account's previously granted hold.
+      const blocked = exhaustionInForce(
+        input,
+        row,
+        snapshot,
+        modelID,
+        row.id === input.rerouteFrom.accountId,
+      )
+      if (!blocked) return undefined
+      exhausted.push(blocked)
+    }
+    const index = oauth.findIndex(
+      (row) => row.id === input.rerouteFrom?.accountId,
+    )
+    if (index < 0) return undefined
+    const blocked = exhausted[index]
+    if (!blocked) return undefined
+    if (blocked.resetAt === undefined) return { exhausted }
+    const delayToReset =
+      stickyRetryAfterWithJitter(
+        input.sessionID,
+        Math.max(1, Math.ceil((blocked.resetAt - Date.now()) / 1000)),
+      ) * 1000
+    return {
+      exhausted,
+      delayMs: resetFitsRetryBudget(input, delayToReset)
+        ? Math.min(MAX_HOST_RETRY_MS, delayToReset)
+        : undefined,
+    }
+  }
+  const oauthPool = async (
+    input: RequestScope,
+    snapshot: NativeAccountSnapshot,
+    modelID: string,
+    active: { signal: AbortSignal },
+  ) => {
+    const oauth: NativeAccountView[] = []
+    const policies = new Map<string, NativeAccountPolicy>()
+    for (const account of snapshot.accounts) {
+      if (account.type !== 'oauth') continue
+      const policy = routingRelay.policy(
+        input.sessionID,
+        account,
+        snapshot,
+        modelID,
+      )
+      policies.set(account.id, policy)
+      if (policy.status !== 'allowed') continue
+      if (account.source === 'local') {
+        // Do not count a local credential whose refresh cannot serve a request.
+        const admission = await runtime.authorizeLocal(account.id, {
+          signal: active.signal,
+          policy: (row, view) =>
+            routingRelay.policy(input.sessionID, row, view, modelID),
+        })
+        active.signal.throwIfAborted()
+        if (admission.status !== 'usable') continue
+      }
+      oauth.push(account)
+    }
+    return { oauth, policies }
+  }
+  const paidFallback = async (
+    input: ChooseAccountInput,
+    snapshot: NativeAccountSnapshot,
+    active: { signal: AbortSignal },
+  ) => {
+    // Only general subscription exhaustion opens the pay-per-token route.
+    const main = snapshot.accounts.find(
+      (account) => account.id === 'main' && account.type === 'oauth',
+    )
+    if (!main) return undefined
+    let quota = main.quota
+    if (
+      input.rerouteFrom?.limit.status === 429 ||
+      !stickyQuotaSnapshotIsFresh(quota, snapshot.policyStorage)
+    ) {
+      try {
+        quota = await runtime.fetchQuota('main', options.fetch, active.signal)
+      } catch {
+        return undefined
+      }
+    }
+    active.signal.throwIfAborted()
+    if (!quotaSnapshotIsExhausted(quota)) return undefined
+    return snapshot.accounts.find(
+      (account) =>
+        account.type === 'api' &&
+        nativeAccountCanServe(account) &&
+        account.id !== input.rerouteFrom?.accountId,
+    )?.id
   }
   const sameAccount = (
     account: NativeAccountView,
@@ -875,32 +992,12 @@ export function createNativeAnthropicSource(
         active.signal.throwIfAborted()
         assertTransport(snapshot, gateway())
       }
-      const oauth: NativeAccountView[] = []
-      const policies = new Map<string, NativeAccountPolicy>()
-      for (const account of snapshot.accounts) {
-        if (account.type !== 'oauth') continue
-        const policy = routingRelay.policy(
-          input.sessionID,
-          account,
-          snapshot,
-          modelID,
-        )
-        policies.set(account.id, policy)
-        if (policy.status !== 'allowed') continue
-        if (account.source === 'local') {
-          // Skip a local account whose token refresh failed, so it is not
-          // selected. Check usability without keeping its token; the send
-          // obtains a fresh credential itself.
-          const admission = await runtime.authorizeLocal(account.id, {
-            signal: active.signal,
-            policy: (row, view) =>
-              routingRelay.policy(input.sessionID, row, view, modelID),
-          })
-          active.signal.throwIfAborted()
-          if (admission.status !== 'usable') continue
-        }
-        oauth.push(account)
-      }
+      const { oauth, policies } = await oauthPool(
+        input,
+        snapshot,
+        modelID,
+        active,
+      )
       if (advice) {
         const account = oauth.find((row) => routingChoiceMatches(advice, row))
         const candidates = oauth.map((row, order) => ({
@@ -1036,34 +1133,14 @@ export function createNativeAnthropicSource(
       // whose entire eligible pool is exhausted. With no alternate route,
       // let the host recheck the refused account in bounded gaps.
       const poolHold = (): RetryHold | undefined => {
-        if (
-          advice ||
-          input.phase !== 'retry' ||
-          input.rerouteFrom?.limit.status !== 429 ||
-          getMaxSameAccountWait(snapshot.policyStorage) === '0' ||
-          snapshot.accounts.some(
-            (row) => row.enabled && row.state === 'needs_reauth',
-          ) ||
-          !oauth.every((row) =>
-            exhaustionInForce(input, row, snapshot, modelID),
-          )
-        )
-          return undefined
-        const account = oauth.find(
-          (row) => row.id === input.rerouteFrom?.accountId,
-        )
-        const blocked =
-          account && exhaustionInForce(input, account, snapshot, modelID)
-        if (blocked?.resetAt === undefined) return undefined
-        const delayToReset =
-          stickyRetryAfterWithJitter(
-            input.sessionID,
-            Math.max(1, Math.ceil((blocked.resetAt - Date.now()) / 1000)),
-          ) * 1000
-        // Hold only when the host retries still left can cover the whole wait to the
-        // reset; otherwise stop now with the send-again message.
-        if (!resetFitsRetryBudget(input, delayToReset)) return undefined
-        const delayMs = Math.min(MAX_HOST_RETRY_MS, delayToReset)
+        const delayMs = poolDecision(
+          input,
+          snapshot,
+          oauth,
+          modelID,
+          advice,
+        )?.delayMs
+        if (delayMs === undefined) return undefined
         startRoutingWait({
           sessionId: input.sessionID,
           reason: 'account_free',
@@ -1156,40 +1233,7 @@ export function createNativeAnthropicSource(
         throw await refusal(response)
       }
       if (advice) return undefined
-      const api = await (async () => {
-        // Fall back to a pay-per-token API key account only when the primary
-        // Claude subscription account ('main') has run out: a recent usage
-        // reading for main's current account and credential version must show
-        // its five-hour or seven-day subscription limit at zero. A limit on one
-        // model only, or a 401, never moves a request onto paid API billing.
-        const main = snapshot.accounts.find(
-          (account) => account.id === 'main' && account.type === 'oauth',
-        )
-        if (!main) return undefined
-        let quota = main.quota
-        if (
-          input.rerouteFrom?.limit.status === 429 ||
-          !stickyQuotaSnapshotIsFresh(quota, snapshot.policyStorage)
-        ) {
-          try {
-            quota = await runtime.fetchQuota(
-              'main',
-              options.fetch,
-              active.signal,
-            )
-          } catch {
-            return undefined
-          }
-        }
-        active.signal.throwIfAborted()
-        if (!quotaSnapshotIsExhausted(quota)) return undefined
-        return snapshot.accounts.find(
-          (account) =>
-            account.type === 'api' &&
-            nativeAccountCanServe(account) &&
-            account.id !== input.rerouteFrom?.accountId,
-        )?.id
-      })()
+      const api = await paidFallback(input, snapshot, active)
       if (api) return api
       const holdForPool = poolHold()
       if (holdForPool) return holdForPool
@@ -1611,6 +1655,58 @@ export function createNativeAnthropicSource(
         })
       }
       if (cached.ended) cacheAttempts.delete(attemptId)
+    },
+    async quotaStopMessage(input) {
+      const state = states.get(input.provenance)
+      if (!state || state.active.signal.aborted || input.route !== 'oauth')
+        return undefined
+      const modelID = state.scope.modelID
+      const snapshot = await runtime.read(modelID)
+      const assignment = await routerFor(snapshot).readAssignment(
+        input.sessionID,
+      )
+      const advice = await routingRelay.accountFor(
+        input.sessionID,
+        modelID,
+        routingCandidates(snapshot.accounts),
+        routingWarmCredential(snapshot.accounts, assignment),
+      )
+      const { oauth } = await oauthPool(input, snapshot, modelID, state.active)
+      const retry: ChooseAccountInput = {
+        ...input,
+        modelID,
+        phase: 'retry',
+        hostAttempt: input.hostAttempt + 1,
+        rerouteFrom: {
+          accountId: input.accountId,
+          limit: { status: 429, reason: 'provider-429' },
+        },
+      }
+      const decision = poolDecision(retry, snapshot, oauth, modelID, advice)
+      if (!decision || decision.delayMs !== undefined) return undefined
+      if (
+        snapshot.mode !== 'claustrum' &&
+        snapshot.accounts.some(
+          (row) => row.type === 'api' && nativeAccountCanServe(row),
+        ) &&
+        (await paidFallback(retry, snapshot, state.active))
+      )
+        return undefined
+      const refusal = createExhaustedNoRouteResponse({
+        exhausted: decision.exhausted,
+        storage: snapshot.policyStorage,
+        sessionId: input.sessionID,
+      })
+      const details = quotaRefusalDetails(refusal)
+      if (!details) return undefined
+      const manual = createQuotaRefusalResponse(
+        details.reason,
+        details.timing,
+        Date.now(),
+        { retry: 'manual' },
+      )
+      const body = (await manual.json()) as { error: { message: string } }
+      return body.error.message
     },
     responseOptions(input) {
       const cached = cacheAttempts.get(input.attemptId)
