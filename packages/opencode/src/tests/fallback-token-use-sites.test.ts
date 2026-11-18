@@ -1867,6 +1867,7 @@ describe('vault fallback eligibility', () => {
       expect(sent.map((record) => record.authorization)).toEqual([
         `Bearer ${vaultToken('request')}-next`,
       ])
+      await getPluginTestHandles(fixture.plugin).drainSidebarRouteWrites()
       await drainSidebarWrites()
       expect(
         fixture.credentialGets.some(
@@ -1896,6 +1897,7 @@ describe('vault fallback eligibility', () => {
         mainState: 'needs_reauth',
       })
       await serveOrdered(fixture)
+      await getPluginTestHandles(fixture.plugin).drainSidebarRouteWrites()
       await drainSidebarWrites()
       const state = await getSidebarState()
       expect(state.main.stateLine).toBe('needs sign-in in the vault')
@@ -1919,6 +1921,7 @@ describe('vault fallback eligibility', () => {
       expect(sent.map((record) => record.authorization)).toEqual([
         `Bearer ${vaultToken('request')}-next`,
       ])
+      await getPluginTestHandles(fixture.plugin).drainSidebarRouteWrites()
       await drainSidebarWrites()
       expect(
         (await getSidebarState()).fallbacks.find(

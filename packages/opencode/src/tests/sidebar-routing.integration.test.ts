@@ -878,11 +878,12 @@ describe('auth.loader', () => {
       { models: {} },
     )
     // Establish the plugin's actual route before testing a quota-only write.
+    await getPluginTestHandles(plugin).fallbackRefreshReady
+    await seedSidebarRouting('main', 'main', Date.now())
     const response = await loaded.fetch(MESSAGES_URL, EMPTY_POST)
     expect(response.status).toBe(200)
-    await getPluginTestHandles(plugin).fallbackRefreshReady
-    await drainSidebarWrites()
-    expect((await getSidebarState()).activeId).toBe('fallback-1')
+    const routed = await waitForSidebarState((s) => s.activeId === 'fallback-1')
+    expect(routed.activeId).toBe('fallback-1')
     if (clearExistingRouting) {
       const current = await getSidebarState()
       await setSidebarState({
@@ -1133,9 +1134,8 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
-    await drainSidebarWrites()
 
-    const state = await getSidebarState()
+    const state = await waitForSidebarState((s) => s.activeId === 'main')
     expect(state.activeId).toBe('main')
     expect(state.route).toBe('main')
   })
@@ -1257,7 +1257,9 @@ describe('auth.loader', () => {
       }),
     })
 
-    const state = await getSidebarState()
+    const state = await waitForSidebarState(
+      (s) => s.main.quota?.seven_day?.usedPercent === 2,
+    )
     expect(state.main.quota?.seven_day?.usedPercent).toBe(2)
     expect(quotaApiCalls).toBe(0)
   })
@@ -1326,8 +1328,6 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
-    await drainSidebarWrites()
-
     const state = await waitForSidebarState(
       (candidate) =>
         candidate.activeId === 'fallback-1' &&

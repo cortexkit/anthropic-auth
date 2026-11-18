@@ -29,6 +29,7 @@ export type PluginRuntimeOverrides = Partial<{
   claustrumScopedConnect: () => Promise<NativeCustodyClient>
   cacheKeepAggregateRefreshIntervalMs: number
   tuiPickupTimeoutMs: number
+  beforeSidebarAccountReload: () => void | Promise<void>
 }>
 
 // Sidebar write hooks are installed per state file and replace each other.

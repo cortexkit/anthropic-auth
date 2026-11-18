@@ -29,7 +29,9 @@ import {
   createOpencode1Test,
   createOpencode1TestContext,
   EMPTY_POST,
+  getBodyLifetime,
   installOpencode1TestHooks,
+  withDeadlockGuard,
 } from './support/opencode1-test-context.ts'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
@@ -1079,8 +1081,6 @@ describe('auth.loader', () => {
         messages: [{ role: 'user', content: 'hello' }],
       }),
     })
-    await drainSidebarWrites()
-
     // Fallback served → active id should be the fallback.
     const state = await waitForSidebarState(
       (candidate) =>
@@ -1089,6 +1089,7 @@ describe('auth.loader', () => {
     expect(state.route).toBe('fallback')
 
     // The callback must preserve the active fallback instead of selecting main.
+    await drainSidebarWrites()
     const after = await getSidebarState()
     expect(after.activeId).toBe('fallback-1')
   })
@@ -1501,7 +1502,7 @@ describe('auth.loader', () => {
     ])
   })
 
-  test('sticky-balanced reselects after the user changes the session model', async () => {
+  test('sticky-balanced reselects after a model change without waiting for the sidebar or publishing stale routing', async () => {
     const checkedAt = Date.now()
     const quota = (fableRemaining: number) => ({
       checkedAt,
@@ -1584,7 +1585,11 @@ describe('auth.loader', () => {
       }),
     ) as unknown as typeof fetch
 
-    const plugin = await getPlugin(createMockClient())
+    const lifetime = getBodyLifetime(testContext)
+    let onSidebarReload: (() => Promise<void>) | undefined
+    const plugin = await getPlugin(createMockClient(), undefined, {
+      beforeSidebarAccountReload: () => onSidebarReload?.(),
+    })
     const result = await plugin.auth.loader(
       () =>
         Promise.resolve({
@@ -1606,10 +1611,66 @@ describe('auth.loader', () => {
       }),
     })
 
-    await (await result.fetch(MESSAGES_URL, request('claude-fable-5-1'))).text()
-    await (await result.fetch(MESSAGES_URL, request('claude-opus-5'))).text()
+    const holdNextSidebarReload = () => {
+      const entered = lifetime.gate()
+      const release = lifetime.gate()
+      onSidebarReload = () => {
+        onSidebarReload = undefined
+        entered.open()
+        return release.wait
+      }
+      return { entered: entered.wait, release: release.open }
+    }
+    const fetchFableWithSidebarHeld = async (
+      gate: ReturnType<typeof holdNextSidebarReload>,
+    ) => {
+      const pending: Promise<Response> = result.fetch(
+        MESSAGES_URL,
+        request('claude-fable-5-1'),
+      )
+      lifetime.trackDetached(pending)
+      const [, response] = await withDeadlockGuard(
+        Promise.all([gate.entered, pending]),
+        2_000,
+        'Sticky response waited for the sidebar account reload',
+      )
+      expect(response.status).toBe(200)
+      await response.text()
+    }
+
+    const first = holdNextSidebarReload()
+    try {
+      await fetchFableWithSidebarHeld(first)
+      expect((await getSidebarState()).activeId).not.toBe('fable-rich')
+      const published = waitForSidebarState(
+        (state) =>
+          state.activeId === 'fable-rich' && state.route === 'sticky-balanced',
+      )
+      first.release()
+      await published
+    } finally {
+      first.release()
+    }
+
+    const older = holdNextSidebarReload()
+    try {
+      await fetchFableWithSidebarHeld(older)
+      await (await result.fetch(MESSAGES_URL, request('claude-opus-5'))).text()
+      await waitForSidebarState(
+        (state) =>
+          state.activeId === 'main' && state.route === 'sticky-balanced',
+      )
+    } finally {
+      older.release()
+    }
+    await plugin.dispose()
+    expect(await getSidebarState()).toMatchObject({
+      activeId: 'main',
+      route: 'sticky-balanced',
+    })
 
     expect(authorizations).toEqual([
+      'Bearer sk-ant-oat01-fable-rich-access',
       'Bearer sk-ant-oat01-fable-rich-access',
       'Bearer sk-ant-oat01-main-access',
     ])

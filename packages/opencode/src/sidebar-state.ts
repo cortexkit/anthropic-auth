@@ -690,6 +690,7 @@ export async function getSidebarState(
 
 export interface SidebarStateWriteOptions {
   routingAuthoritative?: boolean
+  onError?: () => void
   resolvePreservedRouting?: (current: SidebarState) =>
     | (Pick<SidebarState, 'activeId' | 'route'> & {
         state?: SidebarState
@@ -809,7 +810,7 @@ export async function setSidebarState(
       }
     })
     .catch(() => {
-      // Best-effort — sidebar is non-critical
+      options.onError?.()
     })
 
   return writeChain
