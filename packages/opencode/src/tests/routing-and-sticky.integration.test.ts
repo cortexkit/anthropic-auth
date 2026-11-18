@@ -99,7 +99,7 @@ function expectUnknownQuotaAdmissionBlocked(storage: AccountStorage) {
 describe('auth.loader', () => {
   installLoaderSetup(testContext)
 
-  test('sticky-balanced OpenCode 1 retries unconfirmed 429s twice per turn and account', async () => {
+  async function setupUnconfirmed429s() {
     const checkedAt = Date.now()
     let now = checkedAt
     Date.now = mock(() => now)
@@ -211,6 +211,34 @@ describe('auth.loader', () => {
       await response.text()
       return { accounts: sent.slice(start), response }
     }
+    return { plugin, send }
+  }
+
+  test('sticky-balanced OpenCode 1 retries unconfirmed 429s twice per turn and account', async () => {
+    const { send } = await setupUnconfirmed429s()
+    const initial = (await send('budget-session', 'turn-one')).accounts[0]
+    if (!initial) throw new Error('Initial request did not reach an account')
+    expect((await send('budget-session', 'turn-one')).accounts).toEqual([
+      initial,
+    ])
+    const moved = (await send('budget-session', 'turn-one')).accounts
+    expect(moved).toHaveLength(2)
+    expect(moved[0]).toBe(initial)
+    expect(moved[1]).not.toBe(initial)
+    const replacement = moved[1]
+    if (!replacement)
+      throw new Error('Third refusal did not move to an account')
+    for (let i = 0; i < 2; i++) {
+      expect((await send('budget-session', 'turn-one')).accounts).toEqual([
+        replacement,
+      ])
+    }
+    const movedAgain = (await send('budget-session', 'turn-one')).accounts
+    expect(movedAgain).toEqual([replacement, initial])
+  })
+
+  test('sticky-balanced OpenCode 1 keeps unconfirmed 429 retry budgets separate per session', async () => {
+    const { send } = await setupUnconfirmed429s()
     const initial = (await send('budget-session', 'turn-one')).accounts[0]
     if (!initial) throw new Error('Initial request did not reach an account')
     expect((await send('budget-session', 'turn-one')).accounts).toEqual([
@@ -218,6 +246,22 @@ describe('auth.loader', () => {
     ])
     const other = (await send('other-budget-session', 'other-turn')).accounts[0]
     if (!other) throw new Error('Independent session did not reach an account')
+    expect((await send('budget-session', 'turn-one')).accounts).toHaveLength(2)
+    expect((await send('other-budget-session', 'other-turn')).accounts).toEqual(
+      [other],
+    )
+    expect(
+      (await send('other-budget-session', 'other-turn')).accounts,
+    ).toHaveLength(2)
+  })
+
+  test('sticky-balanced OpenCode 1 resets the unconfirmed 429 budget on a new turn or idle', async () => {
+    const { plugin, send } = await setupUnconfirmed429s()
+    const initial = (await send('budget-session', 'turn-one')).accounts[0]
+    if (!initial) throw new Error('Initial request did not reach an account')
+    expect((await send('budget-session', 'turn-one')).accounts).toEqual([
+      initial,
+    ])
     // A new user message resets a spent two-retry budget without an idle event.
     for (let i = 0; i < 2; i++) {
       const retained = await send('budget-session', 'turn-two')
@@ -226,27 +270,6 @@ describe('auth.loader', () => {
         Number(retained.response.headers.get('retry-after')),
       ).toBeLessThanOrEqual(60)
     }
-    const moved = (await send('budget-session', 'turn-two')).accounts
-    expect(moved).toHaveLength(2)
-    expect(moved[0]).toBe(initial)
-    expect(moved[1]).not.toBe(initial)
-    const replacement = moved[1]
-    if (!replacement)
-      throw new Error('Third refusal did not move to an account')
-    expect((await send('budget-session', 'turn-two')).accounts).toEqual([
-      replacement,
-    ])
-    expect((await send('budget-session', 'turn-two')).accounts).toEqual([
-      replacement,
-    ])
-    const movedAgain = (await send('budget-session', 'turn-two')).accounts
-    expect(movedAgain).toEqual([replacement, initial])
-    expect((await send('other-budget-session', 'other-turn')).accounts).toEqual(
-      [other],
-    )
-    expect(
-      (await send('other-budget-session', 'other-turn')).accounts,
-    ).toHaveLength(2)
     await plugin.event({
       event: {
         type: 'session.idle',
