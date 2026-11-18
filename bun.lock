@@ -27,7 +27,7 @@
       "name": "@cortexkit/anthropic-auth-core",
       "version": "2.16.1",
       "dependencies": {
-        "@cortexkit/claustrum-client": "0.18.0",
+        "@cortexkit/claustrum-client": "0.20.0",
         "@cortexkit/private-files": "0.2.2",
         "@cortexkit/subc-client": "^0.24",
         "jsonc-parser": "^3.3.1",
@@ -53,7 +53,7 @@
       "dependencies": {
         "@clack/prompts": "^1.9.0",
         "@cortexkit/anthropic-auth-core": "2.16.1",
-        "@cortexkit/claustrum-client": "0.18.0",
+        "@cortexkit/claustrum-client": "0.20.0",
         "@cortexkit/private-files": "0.2.2",
         "@cortexkit/subc-client": "^0.24",
         "@opentui/core": "0.8.4",
@@ -251,7 +251,7 @@
 
     "@cortexkit/anthropic-auth-e2e": ["@cortexkit/anthropic-auth-e2e@workspace:packages/e2e-tests"],
 
-    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.18.0", "", { "dependencies": { "@cortexkit/store": "^0.2.3", "@cortexkit/subc-client": "^0.24.0" } }, "sha512-tdRTrtnmOk3En1ZT1T+J+8NDwZl5FNxtN4w4Im2KV12QypPwyMi1ZBUXS2X4ZyDn4vPbHiOK8gjP+hQMsZ/V9g=="],
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.20.0", "", { "dependencies": { "@cortexkit/store": "^0.2.3", "@cortexkit/subc-client": "^0.24.0" } }, "sha512-RzW6jYFHYDBK9ZkESuq39g+sEAy8ielSm6AO5Uh6CWG0aWD296N9eX7ZmltjhV5sO5JiEG9J8BueEl1ss1X23A=="],
 
     "@cortexkit/common-auth": ["@cortexkit/common-auth@0.55.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/opencode-sidebar": ">=0.1.0 <0.4.0", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0 || ^0.24.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/opencode-sidebar", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-EScwmEDdxSdW/z+6n1v630bsTdAUSQYBuG4l16yziRqptG4MhjCAoH6aNelSy/I3hIJ2j6bV3IcqteoGWBLpSg=="],
 
