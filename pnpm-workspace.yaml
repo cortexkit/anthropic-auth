@@ -1,7 +1,0 @@
-allowBuilds:
-  '@google/genai': set this to true or false
-  lefthook: set this to true or false
-  msgpackr-extract: set this to true or false
-  opencode-ai: set this to true or false
-  protobufjs: set this to true or false
-  workerd: set this to true or false
