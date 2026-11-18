@@ -9,12 +9,12 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import type { ClaustrumClient } from '@cortexkit/claustrum-client'
 import {
   ClaustrumConsumerError,
   type ClaustrumConsumerFailureKind,
   ClaustrumCredentialError,
   type ClaustrumScopedAttempt,
+  type ClaustrumScopedClient,
   ClaustrumScopedCustody,
   type VaultInventory,
 } from '@cortexkit/common-auth/claustrum'
@@ -36,14 +36,14 @@ import {
 } from '../native-custody.ts'
 
 type Assert<T extends true> = T
-type PublishedClient = Pick<
-  ClaustrumClient,
+type CommonAuthClient = Pick<
+  ClaustrumScopedClient,
   'listScoped' | 'getScoped' | 'reportAuthFailureScoped' | 'close'
 >
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
-// Compare Core's structural types with common-auth and the published client.
+// Compare Core's structural types with common-auth.
 // Keep these dependencies in tests, outside Core's public type declarations.
-export type ClientParity = Assert<Same<NativeCustodyClient, PublishedClient>>
+export type ClientParity = Assert<Same<NativeCustodyClient, CommonAuthClient>>
 export type ErrorParity = Assert<
   Same<NativeCustodyErrorCode, ClaustrumConsumerFailureKind>
 >

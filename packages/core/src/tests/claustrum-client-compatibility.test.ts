@@ -20,6 +20,11 @@ type ClaustrumScopedClient = Pick<
   ClaustrumClient,
   'listScoped' | 'getScoped' | 'reportAuthFailureScoped' | 'close'
 >
+type CommonAuthInventory = Omit<ScopedInventory, 'rows'> & {
+  readonly rows: readonly (Omit<ScopedInventoryRow, 'authMethod'> & {
+    readonly authMethod?: string
+  })[]
+}
 
 type Assert<T extends true> = T
 type Equal<Actual, Expected> = [Actual] extends [Expected]
@@ -79,7 +84,7 @@ const producerContract: [
   Assert<
     Equal<
       ScopedInventoryRow['authMethod'],
-      'apikey' | 'chatgpt' | 'antigravity' | 'oauth' | undefined
+      'apikey' | 'chatgpt' | 'antigravity' | 'oauth' | 'gateway' | undefined
     >
   >,
   Assert<
@@ -145,7 +150,14 @@ const producerContract: [
       { credentialId?: string; recordVersion?: number }
     >
   >,
-  Assert<Equal<ClaustrumScopedClient, CommonAuthScopedClient>>,
+  Assert<
+    Equal<
+      Omit<ClaustrumScopedClient, 'listScoped'> & {
+        listScoped(enrollmentToken?: string): Promise<CommonAuthInventory>
+      },
+      CommonAuthScopedClient
+    >
+  >,
   Assert<
     Equal<
       Pick<ClaustrumClient, 'enrollPropose' | 'enrollPoll'>,

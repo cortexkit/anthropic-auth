@@ -38,7 +38,7 @@ export interface NativeCustodyClient {
       readonly credentialType: string
       readonly serves: readonly string[]
       readonly providerIds: readonly string[]
-      readonly authMethod?: 'apikey' | 'chatgpt' | 'antigravity' | 'oauth'
+      readonly authMethod?: string
       readonly refreshAdapter?: string
       readonly state: string
       readonly recordVersion: number
