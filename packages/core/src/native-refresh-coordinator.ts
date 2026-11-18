@@ -41,6 +41,7 @@ import {
   isNativeTransientAccountError,
   joinNativePoolWrite,
   NativeTransientAccountError,
+  readNativePool,
 } from './native-transient-account.ts'
 import {
   assertHostAuthorityStable,
@@ -593,7 +594,7 @@ export function createNativeRefreshCoordinator(
   const onLockEvent = nativeLockObserver(options.onLockEvent)
 
   async function rowFor(binding: NativeLocalPoolBinding) {
-    const read = await store.read()
+    const read = await readNativePool(store.read())
     return read.status === 'ready'
       ? read.rows.find((row) => row.id === binding.rowId)
       : undefined

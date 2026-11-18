@@ -23,8 +23,11 @@ import {
   isDumpPersistentlyEnabled,
   isFastModePersistentlyEnabled,
   isKillswitchEnabled,
+  isNativeTransientAccountError,
   isPrimePersistentlyEnabled,
   isVaultHosted,
+  logger,
+  type NativeAccountSnapshot,
   type NativeMenuDispatch,
   type NativeMenuKillswitchEntry,
   type NativeSettingsWriteResult,
@@ -47,6 +50,8 @@ export function createPiNativeCommands(
   storagePath = getPiAccountStoragePath(),
 ): PiNativeCommands {
   const native = getPiNativeRuntime(storagePath)
+  let lastStatusSnapshot: NativeAccountSnapshot | undefined
+  let statusReadContended = false
   const custody = createPiCustodyCommands()
   const pending = new Map<
     string,
@@ -381,7 +386,25 @@ export function createPiNativeCommands(
     async readStatus(command) {
       const runtime = await native.service()
       await runtime.prepareSettingsAction?.()
-      const snapshot = await runtime.read()
+      let snapshot: NativeAccountSnapshot
+      try {
+        snapshot = await runtime.read()
+        lastStatusSnapshot = snapshot
+        statusReadContended = false
+      } catch (error) {
+        if (!isNativeTransientAccountError(error) || !error.poolRead)
+          throw error
+        if (!statusReadContended) {
+          statusReadContended = true
+          logger.warn(
+            'native-auth',
+            'Account update in progress; keeping status display',
+          )
+        }
+        if (!lastStatusSnapshot)
+          return 'Anthropic account update in progress; try status again shortly.'
+        snapshot = lastStatusSnapshot
+      }
       if (
         (command === 'account' || command === 'quota') &&
         snapshot.mode === 'claustrum' &&

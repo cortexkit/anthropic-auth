@@ -10,6 +10,7 @@ import {
   getLogLevel,
   type LogTestRecord,
   type NativeAccountRuntime,
+  NativeTransientAccountError,
   type ProviderAccountUuid,
   resolveNativePoolPaths,
   runNativeMigration,
@@ -751,6 +752,81 @@ async function modelSender(
     },
   }
 }
+
+test('OC2 retry selection leaves the host retry in charge when the account read is busy', async () => {
+  const provider = startProvider(suite, (token, index) =>
+    index === 0
+      ? new Response(echoError('overloaded_error', token), { status: 503 })
+      : usageReply('req_account_read_retry'),
+  )
+  const fixture = await primeFixture(provider, false)
+  await fixture.runtime.updateSettings((settings) => ({
+    ...settings,
+    fallbackOn: [503],
+  }))
+  const choose = fixture.source.chooseAccount.bind(fixture.source)
+  let contended = 0
+  const choosing = spyOn(fixture.source, 'chooseAccount').mockImplementation(
+    async (input) => {
+      if (input.phase !== 'retry') return choose(input)
+      const read = spyOn(fixture.runtime, 'read').mockImplementationOnce(
+        async () => {
+          contended++
+          throw new NativeTransientAccountError('pool-read')
+        },
+      )
+      try {
+        return await choose(input)
+      } finally {
+        read.mockRestore()
+      }
+    },
+  )
+  deferCleanup(() => {
+    choosing.mockRestore()
+  })
+  const model = await modelSender(fixture, provider)
+  expect(await model.send()).toMatchObject({ status: 200 })
+  expect(contended).toBe(1)
+  expect(provider.sent).toEqual([FIRST, FIRST])
+  expect(model.warnings).toContainEqual(
+    expect.stringContaining('the host decides the retry'),
+  )
+})
+
+test('OC2 passes a retryable provider response to the host when classifying the account is busy', async () => {
+  const provider = startProvider(suite, (token, index) =>
+    index === 0
+      ? new Response(echoError('overloaded_error', token), { status: 503 })
+      : usageReply('req_busy_response_retry'),
+  )
+  const fixture = await primeFixture(provider, false)
+  const classify = fixture.source.limitFromResponse!
+  let contended = 0
+  const classifying = spyOn(
+    fixture.source,
+    'limitFromResponse',
+  ).mockImplementation(async (input) => {
+    const read = spyOn(fixture.runtime, 'read').mockImplementationOnce(
+      async () => {
+        contended++
+        throw new NativeTransientAccountError('pool-read')
+      },
+    )
+    try {
+      return await classify(input)
+    } finally {
+      read.mockRestore()
+    }
+  })
+  deferCleanup(() => {
+    classifying.mockRestore()
+  })
+  const model = await modelSender(fixture, provider)
+  expect(await model.send()).toMatchObject({ status: 200 })
+  expect(contended).toBe(1)
+  expect(provider.sent).toEqual([FIRST, FIRST])
+})
 
 for (const [code, level] of [
   ['publication-refused', 'error'],

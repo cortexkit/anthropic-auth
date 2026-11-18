@@ -3115,7 +3115,13 @@ export function streamCortexKitAnthropic(
       for (const block of output.content as Block[]) delete block.index
       output.stopReason = options?.signal?.aborted ? 'aborted' : 'error'
       output.errorMessage =
-        error instanceof Error ? error.message : String(error)
+        output.stopReason === 'error' &&
+        isNativeTransientAccountError(error) &&
+        error.poolRead
+          ? 'Anthropic account service unavailable while an update is in progress; retry the request'
+          : error instanceof Error
+            ? error.message
+            : String(error)
       stream.push({ type: 'error', reason: output.stopReason, error: output })
       stream.end()
     } finally {

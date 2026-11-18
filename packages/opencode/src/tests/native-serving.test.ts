@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
+import { createAnthropic } from '@ai-sdk/anthropic'
 import {
   __setLogTestSink,
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
@@ -30,6 +31,7 @@ import {
   type NativeCustodyClient,
   NativeCustodyError,
   type NativeLockEvent,
+  NativeTransientAccountError,
   PrimeManager,
   type ProviderAccountUuid,
   publishNativeEmptyInit,
@@ -72,6 +74,7 @@ import { MockRelayServer } from '../../../e2e-tests/src/mock-relay.ts'
 import { AnthropicAuthPlugin } from '../index.ts'
 import { drainNotifications } from '../rpc/notifications.ts'
 import { COMMAND_MODAL_NAMES } from '../rpc/protocol.ts'
+import { drainSidebarWrites, getSidebarState } from '../sidebar-state.ts'
 import { getPluginTestHandles } from './plugin-test-handles'
 
 type PluginHooks = Awaited<ReturnType<typeof AnthropicAuthPlugin>>
@@ -947,6 +950,57 @@ async function sendNative(
     }),
   })
 }
+
+test('OC1 classifies an exhausted account read as retryable and preserves the sidebar file', async () => {
+  const fixture = await migrateServingFixture('local')
+  const plugin = await createPlugin()
+  const options = await load(plugin, async () =>
+    custodyTombstoneOAuth('anthropic'),
+  )
+  const handles = getPluginTestHandles(plugin)
+  await handles.fallbackRefreshReady
+  await handles.refreshSidebarQuota()
+  await drainSidebarWrites()
+  const before = await getSidebarState()
+  expect(before.lastUpdated).toBeGreaterThan(0)
+  const contention = spyOn(handles.nativeAccounts, 'read').mockRejectedValue(
+    new NativeTransientAccountError('pool-read'),
+  )
+  lifetimes.deferCleanup(() => {
+    contention.mockRestore()
+  })
+  const records: LogTestRecord[] = []
+  __setLogTestSink((record) => records.push(record))
+  lifetimes.deferCleanup(() => __setLogTestSink(null))
+
+  await handles.refreshSidebarQuota()
+  await handles.refreshSidebarQuota()
+  await drainSidebarWrites()
+  expect(await getSidebarState()).toEqual(before)
+  expect(
+    records.filter(
+      (entry) =>
+        entry.channel === 'sidebar' &&
+        entry.message.includes('keeping sidebar state'),
+    ),
+  ).toHaveLength(1)
+
+  const model = createAnthropic({
+    apiKey: '',
+    fetch: Object.assign(requestFetch(options), {
+      preconnect: globalThis.fetch.preconnect,
+    }),
+  })('claude-sonnet-4-6')
+  await expect(
+    model.doStream({
+      prompt: [{ role: 'user', content: [{ type: 'text', text: 'say ok' }] }],
+    }),
+  ).rejects.toMatchObject({ isRetryable: true })
+  expect(contention).toHaveBeenCalled()
+  expect(
+    fixture.records.filter((record) => record.url.includes('/v1/messages')),
+  ).toEqual([])
+})
 
 test('OC1 abort ends a stalled quota preflight without sending a model request', async () => {
   const fixture = await migrateServingFixture('claustrum')

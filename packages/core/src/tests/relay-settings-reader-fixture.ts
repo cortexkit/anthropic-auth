@@ -1,19 +1,40 @@
 import { mock } from 'bun:test'
 import { join } from 'node:path'
+import { PrivateFileError } from '@cortexkit/common-auth/fs'
 import * as storeModule from '@cortexkit/common-auth/store'
 
 const real = { ...storeModule }
 const settingsPaths: string[] = []
 let opens = 0
+let contended = false
+let busy: PrivateFileError | undefined
 
 mock.module('@cortexkit/common-auth/store', () => ({
   ...real,
   openPoolStore: (options: storeModule.OpenPoolStoreOptions) => {
     opens++
-    return real.openPoolStore(options)
+    const store = real.openPoolStore(options)
+    return {
+      ...store,
+      read: async () =>
+        contended
+          ? {
+              status: 'error',
+              file: 'config',
+              kind: 'snapshot-contended',
+              reason: 'The account pool changed while it was being read',
+              retryable: true,
+            }
+          : store.read(),
+      readSettings: async () => {
+        if (busy) throw busy
+        return store.readSettings()
+      },
+    } satisfies storeModule.PoolStore
   },
-  readPoolSettingsAt: (configPath: string) => {
+  readPoolSettingsAt: async (configPath: string) => {
     settingsPaths.push(configPath)
+    if (busy) throw busy
     return real.readPoolSettingsAt(configPath)
   },
 }))
@@ -24,7 +45,13 @@ const { createNativeAccountRuntime } = await import(
 )
 const { resolveNativePoolPaths } = await import('../pool-paths.ts')
 const { TEST_RELAY_ACCOUNT_HOME_KEY } = await import('../relay-location.ts')
-const [home, config, state] = process.argv.slice(2)
+const { isNativeTransientAccountError } = await import(
+  '../native-transient-account.ts'
+)
+const { readNativeAccountsForRequest } = await import(
+  '../native-vault-admission.ts'
+)
+const [home, config, state, mode] = process.argv.slice(2)
 if (!home || !config || !state)
   throw new Error('expected home, config and state')
 const paths = await resolveNativePoolPaths(config, state)
@@ -43,11 +70,45 @@ const runtime = createNativeAccountRuntime({
   },
 })
 try {
-  await runtime.read()
-  settingsPaths.length = 0
-  const before = opens
-  const relay = await runtime.getRelayConfig()
-  console.log(JSON.stringify({ relay, settingsPaths, opens: opens - before }))
+  const initial = await runtime.read()
+  if (mode === 'contention') {
+    const failure = async (read: () => Promise<unknown>) => {
+      try {
+        await read()
+        return 'unexpected-success'
+      } catch (error) {
+        if (isNativeTransientAccountError(error)) return error.code
+        if (error === busy) return 'original-private-file-error'
+        return String(error)
+      }
+    }
+    contended = true
+    const pool = await failure(() => readNativeAccountsForRequest(runtime))
+    contended = false
+    const settings = []
+    const relay = []
+    for (const win32Code of [32, 303, 5]) {
+      busy = new PrivateFileError(paths.config, 'read', {
+        reason: 'io-error',
+        win32Code,
+      })
+      settings.push(await failure(() => runtime.read()))
+      relay.push(await failure(() => runtime.getRelayConfig()))
+    }
+    console.log(
+      JSON.stringify({
+        pool,
+        settings,
+        relay,
+        kept: runtime.peek?.() === initial,
+      }),
+    )
+  } else {
+    settingsPaths.length = 0
+    const before = opens
+    const relay = await runtime.getRelayConfig()
+    console.log(JSON.stringify({ relay, settingsPaths, opens: opens - before }))
+  }
 } finally {
   await runtime.close()
 }

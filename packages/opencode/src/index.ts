@@ -549,6 +549,7 @@ async function resolveFreshSidebarRouting(
   try {
     freshStorage = await loadFreshStorage()
   } catch (error) {
+    if (isNativeTransientAccountError(error)) throw error
     logger.warn('sidebar', 'account storage reload failed; routing preserved', {
       message: error instanceof Error ? error.message : String(error),
     })
@@ -4919,6 +4920,30 @@ const anthropicAuthPlugin = async (
     }
   }
 
+  let sidebarReadContended = false
+  function noteSidebarReadContention(error: unknown) {
+    if (!isNativeTransientAccountError(error)) return false
+    if (!sidebarReadContended) {
+      sidebarReadContended = true
+      logger.warn(
+        'sidebar',
+        'Account update in progress; keeping sidebar state',
+      )
+    }
+    return true
+  }
+
+  async function readSidebarAccounts() {
+    try {
+      const storage = await loadAccounts(accountStoragePath)
+      sidebarReadContended = false
+      return storage
+    } catch (error) {
+      noteSidebarReadContention(error)
+      throw error
+    }
+  }
+
   function writeSidebarState(
     storage: Awaited<ReturnType<typeof loadAccounts>>,
     options: SidebarStateInput,
@@ -4937,13 +4962,16 @@ const anthropicAuthPlugin = async (
           : async (current) => {
               const preservedRouting = await resolveFreshSidebarRouting(
                 current,
-                () => loadAccounts(accountStoragePath),
+                readSidebarAccounts,
                 { activeId: state.activeId, route: state.route },
               )
               const displayStorage = await overlayFailedHydratedProfiles(
                 preservedRouting.freshStorage,
                 currentSnapshot,
-              )
+              ).catch((error) => {
+                noteSidebarReadContention(error)
+                throw error
+              })
               return {
                 activeId: preservedRouting.activeId,
                 route: preservedRouting.route,
@@ -4977,7 +5005,8 @@ const anthropicAuthPlugin = async (
           .then((displayStorage) =>
             write(buildSidebarState(displayStorage, options)),
           )
-          .catch(() => {
+          .catch((error) => {
+            if (noteSidebarReadContention(error)) return
             logger.debug(
               'quota',
               'failed to recheck account profile for sidebar',
@@ -4992,7 +5021,7 @@ const anthropicAuthPlugin = async (
   async function resolveSidebarQuotaAccess() {
     // Read saved account quota and profile data without requesting an OAuth
     // token. Acquiring credentials can refresh main merely to redraw the sidebar.
-    const storage = await loadAccounts(accountStoragePath)
+    const storage = await readSidebarAccounts()
     return { storage, access: undefined }
   }
 
@@ -5003,7 +5032,12 @@ const anthropicAuthPlugin = async (
     // instances (other project directories) may track sessions this instance
     // never sees, and their writes must not be clobbered with a stale zero.
     await getAllTrackedCacheKeepSessions().catch(() => {})
-    const { storage, access } = await resolveSidebarQuotaAccess()
+    const accounts = await resolveSidebarQuotaAccess().catch((error) => {
+      if (!isNativeTransientAccountError(error)) throw error
+      return undefined
+    })
+    if (!accounts) return
+    const { storage, access } = accounts
     writeSidebarState(storage, {
       activeId: lastSidebarRouting.activeId,
       route: lastSidebarRouting.route,
@@ -10268,11 +10302,11 @@ const anthropicAuthPlugin = async (
                   )
                 ) {
                   try {
-                    const currentStorage =
-                      await loadAccounts(accountStoragePath)
+                    const currentStorage = await readSidebarAccounts()
                     if (currentStorage) sidebarStorage = currentStorage
                     else skipFallbackQuotaSeed = true
-                  } catch {
+                  } catch (error) {
+                    if (isNativeTransientAccountError(error)) return
                     // An unverifiable snapshot must not seed spend-affecting state.
                     skipFallbackQuotaSeed = true
                   }
@@ -11694,6 +11728,7 @@ const anthropicAuthPlugin = async (
     primeManager,
     quotaManager,
     cacheKeepManager,
+    nativeAccounts,
     fableFallbackManager,
     resolveMainQuotaIdentity: resolveMainQuotaAccountIdentity,
     resolveSidebarQuotaAccess,

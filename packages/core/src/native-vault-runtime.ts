@@ -86,6 +86,7 @@ import {
   nativeRuntimeOptionIdentity,
   nativeRuntimeStorageKey,
 } from './native-runtime-registry.ts'
+import { readNativePoolSettings } from './native-transient-account.ts'
 import { waitForNativeUsageDrain } from './native-usage-publication.ts'
 import {
   assertHostAuthorityStable,
@@ -953,7 +954,7 @@ export function createNativeVaultRuntime(
     roster: NativeVaultRosterDocument | undefined,
     routeId: string,
   ) {
-    const settings = await store.readSettings()
+    const settings = await readNativePoolSettings(store.readSettings())
     if (settings.status !== 'ready')
       throw new NativeCustodyError('invalid-state')
     const pin = nativeVaultPrimaryPin(settings.settings)

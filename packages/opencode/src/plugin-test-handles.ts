@@ -34,6 +34,7 @@ export interface PluginTestHandles {
   }>
   refreshSidebarQuota: () => Promise<void>
   fallbackRefreshReady: Promise<void>
+  readonly nativeAccounts: ReturnType<typeof acquireNativeAccountRuntime>
   readonly scopedRuntime: ReturnType<
     typeof acquireNativeAccountRuntime
   >['vault']

@@ -97,6 +97,8 @@ import {
 import {
   joinNativePoolWrite,
   NativeTransientAccountError,
+  readNativePool,
+  readNativePoolSettings,
 } from './native-transient-account.ts'
 import {
   createNativeUsagePublisher,
@@ -633,14 +635,14 @@ function buildNativeAccountRuntime(
     }
   }
   async function poolRow(id: string) {
-    const read = await store.read()
+    const read = await readNativePool(store.read())
     if (read.status !== 'ready')
       throw new NativeRuntimeError('publication-refused')
     return read.rows.find((row) => row.id === id)
   }
   async function physicalId(id: string): Promise<string> {
     if (id !== 'main') return id
-    const settings = await store.readSettings()
+    const settings = await readNativePoolSettings(store.readSettings())
     if (
       settings.status !== 'ready' ||
       typeof settings.settings.mainAccountId !== 'string'
@@ -920,8 +922,8 @@ function buildNativeAccountRuntime(
     const selectedPaths = mode === 'claustrum' ? vaultPaths : paths
     const selectedStore = mode === 'claustrum' ? vaultStore : store
     const [read, settings, metadata] = await Promise.all([
-      selectedStore.read(),
-      selectedStore.readSettings(),
+      readNativePool(selectedStore.read()),
+      readNativePoolSettings(selectedStore.readSettings()),
       readNativeRuntime(selectedPaths.runtime, selectedPaths.storageId),
     ])
     if (read.status !== 'ready' || settings.status !== 'ready')
@@ -1087,7 +1089,7 @@ function buildNativeAccountRuntime(
       // legacy data; a mixed stamped/unstamped pair must also wait for agreement.
       for (let attempt = 0; attempt < 4; attempt++) {
         if (attempt) await new Promise((resolve) => setTimeout(resolve, 10))
-        const settings = await readSettings()
+        const settings = await readNativePoolSettings(readSettings())
         if (settings.status !== 'ready')
           throw new NativeRuntimeError('publication-refused')
         if (location !== 'default') {

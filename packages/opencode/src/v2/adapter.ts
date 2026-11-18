@@ -35,6 +35,7 @@ import {
   guardAnthropicStreamResponse,
   type IncompleteStreamDiagnostics,
   isDumpEnabled as isDumpEnabledCore,
+  isNativeTransientAccountError,
   type MessageThreadRequest,
   MessageThreadTracker,
   mergeAnthropicBetas,
@@ -2248,13 +2249,22 @@ export function createNativeAnthropicAdapter<Q, P>(
       // is passed on as it is. Anything else is scrubbed here.
       const rewritten = rewrittenFailures.get(headers) === data
       const scrubber = scrubberFor(data)
-      const limit = await source.limitFromResponse?.({
-        ...contextOf(attempt, data),
-        status,
-        headers,
-        body: async () =>
-          rewritten ? await body() : scrubber.redactText(await body()),
-      })
+      let limit: LimitSignal | undefined
+      try {
+        limit = await source.limitFromResponse?.({
+          ...contextOf(attempt, data),
+          status,
+          headers,
+          body: async () =>
+            rewritten ? await body() : scrubber.redactText(await body()),
+        })
+      } catch (error) {
+        if (!isNativeTransientAccountError(error) || !error.poolRead)
+          throw error
+        // A busy account file prevents rerouting, not delivery of the provider's
+        // response. Let the host classify and retry that response normally.
+        return undefined
+      }
       const hostAttempt = hostAttempts.get(data)?.attempt
       if (
         status === 429 &&

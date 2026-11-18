@@ -136,6 +136,34 @@ test('relay settings use the matched canonical config without opening another po
   })
 })
 
+test('exhausted pool and config reads refuse retryably without replacing the last good snapshot', async () => {
+  const home = await realpath(await scratch('relay-contention-home-'))
+  const { paths } = await storeWithRelay(join(home, '.config', 'opencode'))
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      join(import.meta.dir, 'relay-settings-reader-fixture.ts'),
+      home,
+      paths.legacyConfig,
+      paths.legacyState,
+      'contention',
+    ],
+    { stdout: 'pipe', stderr: 'pipe' },
+  )
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ])
+  expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
+  expect(JSON.parse(stdout)).toEqual({
+    pool: 'ECONNRESET',
+    settings: ['ECONNRESET', 'ECONNRESET', 'original-private-file-error'],
+    relay: ['ECONNRESET', 'ECONNRESET', 'original-private-file-error'],
+    kept: true,
+  })
+})
+
 test('a relay in a store outside the default place is ignored, shown as off, and cannot be saved', async () => {
   const home = await scratch('relay-home-')
   const elsewhere = await scratch('relay-moved-')
