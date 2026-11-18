@@ -27,12 +27,14 @@ import {
   getLogLevel,
   getMaxSameAccountWait,
   getStickyRoutingStatePath,
+  getWaitForReset,
   type LogTestRecord,
   type NativeAccountRuntime,
   type NativeCustodyClient,
   type NativePoolPaths,
   NativeVaultQuotaPolicyError,
   nativeAccountPolicy,
+  openSettingsService,
   type ProviderAccountUuid,
   quotaSnapshotPassesPolicy,
   RELAY_PROXY_REFUSAL,
@@ -1680,7 +1682,7 @@ for (const configured of [false, true]) {
   )
 }
 
-async function storage(owned = cleanups) {
+async function storage(owned = cleanups, waitForReset = false) {
   const parent = resolve(
     import.meta.dir,
     '../../../../node_modules/.cache/opencode2-native-source',
@@ -1717,19 +1719,41 @@ async function storage(owned = cleanups) {
   // enrollment file exists, regardless of account settings. Give each fixture
   // its own enrollment file path inside its directory, so the tests never read
   // an enrollment file on the machine running them.
+  const settingsFile = join(directory, 'settings.jsonc')
+  let settingsService: Awaited<ReturnType<typeof openSettingsService>>
+  if (waitForReset) {
+    await writeFile(
+      settingsFile,
+      JSON.stringify({
+        schema_version: 1,
+        wait_for_reset: true,
+        quota_enabled: 'off',
+        refresh_enabled: false,
+        routing_mode: 'sticky-balanced',
+      }),
+    )
+    const service = await openSettingsService({ file: settingsFile })
+    if (!service) throw new Error('Could not open reset-wait settings')
+    owned.push(() => service.dispose())
+    settingsService = service
+  }
   const env = {
     OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE: join(
       directory,
       'opencode-enrollment.json',
     ),
   }
-  return { paths, store, env }
+  return { paths, store, env, settingsService }
 }
 async function local(
   localOptions?: Parameters<typeof createNativeAccountRuntime>[0]['local'],
   owned = cleanups,
+  waitForReset = false,
 ) {
-  const { paths, store, env } = await storage(owned)
+  const { paths, store, env, settingsService } = await storage(
+    owned,
+    waitForReset,
+  )
   await store.add({
     id: 'primary-row',
     identity,
@@ -1786,6 +1810,7 @@ async function local(
     paths,
     host: 'opencode',
     local: localOptions,
+    settingsService,
     vault: { env },
   })
   owned.push(() => runtime.close())
@@ -1963,8 +1988,8 @@ async function vault(
  * makes the vault report a different account UUID for the default credential,
  * as when its Claude account is replaced.
  */
-async function vaultWithFallback() {
-  const { paths, env } = await storage()
+async function vaultWithFallback(waitForReset = false) {
+  const { paths, env, settingsService } = await storage(cleanups, waitForReset)
   await writeFile(
     env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
     JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
@@ -2023,6 +2048,7 @@ async function vaultWithFallback() {
   const runtime = createNativeAccountRuntime({
     paths,
     host: 'opencode',
+    settingsService,
     vault: {
       env,
       connect: async () => client,
@@ -5334,11 +5360,14 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
   // Whole seconds, so header resets round-trip exactly.
   const wholeSecond = () => Math.ceil(Date.now() / 1000) * 1000
 
-  async function localSticky() {
-    const fixture = await local()
+  async function localSticky(waitForReset = false) {
+    const fixture = await local(undefined, cleanups, waitForReset)
     await fixture.runtime.updateSettings((settings) => {
       settings.routing = { mode: 'sticky-balanced' }
     })
+    expect(getWaitForReset((await fixture.runtime.read()).policyStorage)).toBe(
+      waitForReset,
+    )
     const native = source(fixture.runtime, fixture.paths)
     const choose = spyOn(native, 'chooseAccount')
     const host = await retryHost(native)
@@ -5386,7 +5415,10 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
     })
 
     test(`${custody}: a new exhausted request stops truthfully without a model send`, async () => {
-      const fixture = custody === 'local' ? await local() : await vault()
+      const fixture =
+        custody === 'local'
+          ? await local(undefined, cleanups, true)
+          : await vault()
       await fixture.runtime.updateSettings((settings) => {
         settings.routing = { mode: 'sticky-balanced' }
       })
@@ -5431,8 +5463,8 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
     ['remaining retries cannot reach the reset', 9, 38 * 60_000, true],
     ['the host retry schedule is exhausted', 11, 60_000, true],
     ['the reset is unknown', 1, undefined, true],
-    ['one hold remains at the budget boundary', 8, 10 * 60_000, false],
-    ['no hold remains at the budget boundary', 9, 10 * 60_000, true],
+    ['one hold remains at the budget boundary', 10, 10 * 60_000, false],
+    ['no hold remains at the budget boundary', 11, 10 * 60_000, true],
     ['a quota hold can still reach the reset', 1, 38 * 60_000, false],
     ['the 429 is unconfirmed', 10, undefined, false],
   ] as const)(
@@ -5501,25 +5533,182 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
           )
           // A depleted host schedule does not call the retry hook at all.
           // The body already handed to the host must carry the stopped text.
-          if (attempt === 9)
+          if (attempt === 11)
             expect(
               await host.retry(
                 false,
                 scope,
                 { type: 'unknown', message },
                 1234,
-                10,
+                12,
               ),
             ).toEqual({ retry: false })
         } else {
           expect(after).toBe(before)
-          if (attempt === 8) {
-            expect(await host.retry(false, scope, undefined, 1234, 9)).toEqual({
-              retry: true,
-              delay: stickyRetryAfterWithJitter(scope.sessionID, 600) * 1000,
-            })
+          if (scenario === 'one hold remains at the budget boundary') {
+            expect(await host.retry(false, scope, undefined, 1234, 11)).toEqual(
+              {
+                retry: true,
+                delay: stickyRetryAfterWithJitter(scope.sessionID, 600) * 1000,
+              },
+            )
           }
         }
+      })
+    },
+  )
+
+  test.each([9, 10])(
+    'OC2 reaches a reset needing %s host holds',
+    async (holds) => {
+      const { host } = await localSticky()
+      let now = wholeSecond() - 3 * 3_600_000
+      const resetAt = now + holds * 900_000 - 30_000
+      let request = await atTime(now, () => host.send())
+      for (let attempt = 2; attempt <= holds + 1; attempt++) {
+        await atTime(now, () =>
+          host.response(request, 429, scope, weeklyRejected(resetAt)),
+        )
+        const decision = await atTime(now, () =>
+          host.retry(false, scope, undefined, 1234, attempt),
+        )
+        expect(decision).toEqual({
+          retry: true,
+          delay:
+            attempt <= holds
+              ? 900_000
+              : stickyRetryAfterWithJitter(scope.sessionID, 870) * 1000,
+        })
+        if (!decision.retry) throw new Error('Quota hold was not scheduled')
+        now += decision.delay
+        request = await atTime(now, () => host.send())
+      }
+      expect(now).toBeGreaterThanOrEqual(resetAt)
+      expect(
+        (await atTime(now, () => host.response(request, 200))).status,
+      ).toBe(200)
+    },
+  )
+
+  const hour = 3_600_000
+  const day = 24 * hour
+  const limitBody = '{"error":{"type":"rate_limit_error","message":"limited"}}'
+  const poolHeaders = (resetAt: number | undefined) => ({
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-7d-utilization': '1',
+    'anthropic-ratelimit-unified-7d-status': 'rejected',
+    ...(resetAt === undefined ? {} : weeklyRejected(resetAt)),
+  })
+
+  test.each([3 * hour, 7 * day])(
+    'OC2 wait_for_reset schedules one terminal hold of %s ms',
+    async (wait) => {
+      const { host, choose } = await localSticky(true)
+      // Keep the seeded credential valid after jumping the provider clock.
+      const now = wholeSecond() - 8 * day
+      const resetAt = now + wait
+      const delay =
+        stickyRetryAfterWithJitter(scope.sessionID, wait / 1000) * 1000
+      await atTime(now, async () => {
+        const request = await host.send()
+        const response = await host.response(
+          request,
+          429,
+          scope,
+          poolHeaders(resetAt),
+          limitBody,
+        )
+        const decision = await host.retry(false, scope, undefined, 1234, 2)
+        expect(decision).toEqual({ retry: true, delay })
+        expect(delay).toBeLessThan(8 * day)
+        expect(await choose.mock.results.at(-1)?.value).toMatchObject({
+          hold: { kind: 'terminal', delayMs: delay, target: now + delay },
+        })
+        expect(host.body(response)).toContain(
+          'Waiting until the reset before retrying.',
+        )
+        expect(host.body(response)).not.toContain('This turn has stopped.')
+        expect(choose.mock.calls.map(([input]) => input.phase)).toEqual([
+          'request',
+          'retry',
+        ])
+      })
+      if (wait === 3 * hour) {
+        await atTime(now + delay, async () => {
+          const resumed = await host.send()
+          expect(resumed.headers.get('authorization')).toBe(localBearer)
+          expect((await host.response(resumed, 200)).status).toBe(200)
+        })
+        expect(choose.mock.calls.map(([input]) => input.phase)).toEqual([
+          'request',
+          'retry',
+          'request',
+        ])
+        expect(choose.mock.calls.at(-1)?.[0].wake).toMatchObject({
+          kind: 'terminal',
+          target: now + delay,
+        })
+      }
+    },
+  )
+
+  test.each([
+    ['off', false, 3 * hour],
+    ['past the eight-day cap', true, 8 * day + 60_000],
+    ['unknown', true, undefined],
+  ] as const)(
+    'OC2 does not grant a long wait with wait_for_reset %s',
+    async (_, enabled, wait) => {
+      const { host } = await localSticky(enabled)
+      const now = wholeSecond()
+      await atTime(now, async () => {
+        const request = await host.send()
+        const response = await host.response(
+          request,
+          429,
+          scope,
+          poolHeaders(wait === undefined ? undefined : now + wait),
+          limitBody,
+        )
+        expect(await host.retry(false, scope, undefined, 1234, 2)).toEqual({
+          retry: false,
+        })
+        expect(host.body(response)).toContain('This turn has stopped.')
+        expect(host.body(response)).not.toContain('Waiting until the reset')
+      })
+    },
+  )
+
+  test.each([false, true])(
+    'OC2 wait_for_reset keeps other routes (Thalamus hold: %s)',
+    async (routingHold) => {
+      const fixture = await vaultWithFallback(true)
+      expect(
+        getWaitForReset((await fixture.runtime.read()).policyStorage),
+      ).toBe(true)
+      const native = source(fixture.runtime, fixture.paths)
+      const host = await retryHost(native)
+      const now = wholeSecond()
+      await atTime(now, async () => {
+        const request = await host.send()
+        if (routingHold)
+          waitRecorder(() => ({
+            account_id: identity,
+            credential_id: 'oauth:anthropic',
+            hold: { retry_after_ms: 3 * hour },
+          }))
+        const response = await host.response(
+          request,
+          429,
+          scope,
+          poolHeaders(now + 3 * hour),
+          limitBody,
+        )
+        expect(await host.retry(false, scope, undefined, 1234, 2)).toEqual({
+          retry: true,
+          delay: routingHold ? 900_000 : 0,
+        })
+        expect(host.body(response)).toBe(limitBody)
       })
     },
   )
@@ -5597,7 +5786,7 @@ describe('OC2 confirmed exhaustion is never sent again', () => {
     })
   })
 
-  test.each([9, 10])(
+  test.each([10, 11])(
     'OC2 refuses another quota hold when attempt %s cannot reach the reset',
     async (attempt) => {
       const { host } = await localSticky()

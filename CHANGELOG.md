@@ -5,8 +5,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - Pi: connecting to the vault now deletes Pi's own saved Claude sign-in; disconnecting no longer restores it. Sign in again after disconnecting.
-- Updates common-auth to 0.53.0.
-- Add opt-in `wait_for_reset` (off by default) so OpenCode 1 and Pi can wait until an exhausted Claude pool resets and continue the turn; OpenCode 2 support follows in a later release.
+- Updates common-auth to 0.54.0.
+- OpenCode 2 can now use all ten of its retries for quota waits.
+- The opt-in `wait_for_reset` setting now works on OpenCode 2 as well as OpenCode 1 and Pi. OpenCode 2 can wait for a reset after a quota refusal; new messages on an already exhausted pool still stop immediately.
 
 ## 2.15.2
 

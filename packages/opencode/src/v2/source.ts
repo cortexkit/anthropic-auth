@@ -11,6 +11,7 @@ import {
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRoutingMode,
+  getWaitForReset,
   isDumpPersistentlyEnabled,
   isQuotaBearingHeaderFrame,
   localMessageThreadCredential,
@@ -38,6 +39,7 @@ import {
   type ProviderAccountUuid,
   peekRoutingAccount,
   quotaRefusalDetails,
+  quotaRefusalTiming,
   quotaSnapshotCheckedAt,
   quotaSnapshotHasStandardWindows,
   RELAY_PROXY_REFUSAL,
@@ -64,12 +66,13 @@ import {
   warnClaudeGatewayRelayIgnored,
   warnRelayProxyRefused,
 } from '@cortexkit/anthropic-auth-core'
-import type {
-  ChooseAccountInput,
-  ChooseAccountResult,
-  HeaderEdits,
-  RequestScope,
-  RetryHold,
+import {
+  type ChooseAccountInput,
+  type ChooseAccountResult,
+  type HeaderEdits,
+  MAX_TERMINAL_HOLD_MS,
+  type RequestScope,
+  type RetryHold,
 } from '@cortexkit/common-auth/opencode2'
 import { extractAnthropicRequestId } from '../billing-lineage'
 import {
@@ -135,15 +138,26 @@ const quotaSnapshotIsExhausted = (quota: OAuthQuotaSnapshot | undefined) =>
     (window) => (quota?.[window]?.remainingPercent ?? 1) <= 0,
   )
 
-// common-auth's installer accepts a hold only while this many host retries
-// remain when selecting the prospective retry; OpenCode 2 passes that retry's
-// number as `hostAttempt` (the first retry hook receives 2).
+// Match common-auth: the ten retry labels are 2 through 11, inclusive.
 const HOST_RETRY_LIMIT = 10
 
+const remainingHostRetries = (input: ChooseAccountInput) =>
+  HOST_RETRY_LIMIT + 2 - (input.hostAttempt ?? 2)
+
 function resetFitsRetryBudget(input: ChooseAccountInput, delayMs: number) {
+  return Math.ceil(delayMs / MAX_HOST_RETRY_MS) <= remainingHostRetries(input)
+}
+
+// Only this source may authorize the installer to bypass the ordinary cap.
+const terminalPoolHolds = new WeakSet<RetryHold>()
+
+export function isTerminalPoolHold(
+  choice: ChooseAccountResult,
+): choice is RetryHold {
   return (
-    Math.ceil(delayMs / MAX_HOST_RETRY_MS) <=
-    HOST_RETRY_LIMIT - (input.hostAttempt ?? 1)
+    typeof choice === 'object' &&
+    'hold' in choice &&
+    terminalPoolHolds.has(choice)
   )
 }
 
@@ -648,6 +662,61 @@ export function createNativeAnthropicSource(
         account.id !== input.rerouteFrom?.accountId,
     )?.id
   }
+  const terminalPoolDecision = async (
+    input: ChooseAccountInput,
+    snapshot: NativeAccountSnapshot,
+    modelID: string,
+    advice: unknown,
+    active: { signal: AbortSignal },
+  ) => {
+    if (
+      advice ||
+      input.phase !== 'retry' ||
+      input.rerouteFrom?.limit.status !== 429 ||
+      !(remainingHostRetries(input) >= 1) ||
+      !getWaitForReset(snapshot.policyStorage) ||
+      snapshot.accounts.some(
+        (row) => row.enabled && row.state === 'needs_reauth',
+      )
+    )
+      return undefined
+    // Include accounts blocked by a quota floor: they can be the first to
+    // recover, but an unknown or stale blocker cannot justify a long wait.
+    const eligible = snapshot.accounts.filter(
+      (row) => row.type === 'oauth' && nativeAccountCanServe(row),
+    )
+    if (!eligible.some((row) => row.id === input.rerouteFrom?.accountId))
+      return undefined
+    const now = Date.now()
+    const timing = quotaRefusalTiming({
+      readings: eligible.map(({ quota, accountIdentity, id }) => ({
+        quota,
+        accountIdentity,
+        accountId: id,
+      })),
+      storage: snapshot.policyStorage,
+      modelId: modelID,
+      sessionId: input.sessionID,
+      waitForReset: true,
+      now,
+    })
+    if (
+      timing.resetWaitMs === undefined ||
+      timing.resetAt === undefined ||
+      timing.resetAt - now > MAX_TERMINAL_HOLD_MS ||
+      (snapshot.mode !== 'claustrum' &&
+        snapshot.accounts.some(
+          (row) => row.type === 'api' && nativeAccountCanServe(row),
+        ) &&
+        (await paidFallback(input, snapshot, active)))
+    )
+      return undefined
+    const delayMs = Math.min(timing.resetWaitMs, MAX_TERMINAL_HOLD_MS)
+    return {
+      timing: { ...timing, resetWaitMs: delayMs },
+      target: now + delayMs,
+    }
+  }
   const sameAccount = (
     account: NativeAccountView,
     expected: NativeAccountView,
@@ -1076,6 +1145,30 @@ export function createNativeAnthropicSource(
           input.rerouteFrom.accountId
       )
         grantedHolds.delete(input.sessionID)
+      const terminal = await terminalPoolDecision(
+        input,
+        snapshot,
+        modelID,
+        advice,
+        active,
+      )
+      if (terminal) {
+        const hold: RetryHold = {
+          hold: {
+            kind: 'terminal',
+            delayMs: terminal.timing.resetWaitMs,
+            target: terminal.target,
+          },
+        }
+        terminalPoolHolds.add(hold)
+        startRoutingWait({
+          sessionId: input.sessionID,
+          reason: 'account_free',
+          delayMs: hold.hold.delayMs,
+          nextMs: terminal.target,
+        })
+        return hold
+      }
       const hold = stickyHold(
         input,
         snapshot,
@@ -1673,7 +1766,6 @@ export function createNativeAnthropicSource(
         routingCandidates(snapshot.accounts),
         routingWarmCredential(snapshot.accounts, assignment),
       )
-      const { oauth } = await oauthPool(input, snapshot, modelID, state.active)
       const retry: ChooseAccountInput = {
         ...input,
         modelID,
@@ -1684,6 +1776,22 @@ export function createNativeAnthropicSource(
           limit: { status: 429, reason: 'provider-429' },
         },
       }
+      const terminal = await terminalPoolDecision(
+        retry,
+        snapshot,
+        modelID,
+        advice,
+        state.active,
+      )
+      if (terminal) {
+        const waiting = createQuotaRefusalResponse(
+          'No Claude account can take this request until a quota window resets.',
+          terminal.timing,
+        )
+        const body = (await waiting.json()) as { error: { message: string } }
+        return body.error.message
+      }
+      const { oauth } = await oauthPool(input, snapshot, modelID, state.active)
       const decision = poolDecision(retry, snapshot, oauth, modelID, advice)
       if (!decision || decision.delayMs !== undefined) return undefined
       if (

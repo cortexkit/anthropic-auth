@@ -21,6 +21,7 @@ import {
   type NativeAnthropicAdapterDeps,
   type NativeAnthropicAttemptData,
 } from './adapter'
+import { isTerminalPoolHold } from './source'
 
 export interface NativeAnthropicInstallation<Q, P> {
   readonly installation: OpenCode2AuthInstallation<
@@ -51,6 +52,7 @@ export async function installNativeAnthropic<Q, P>(
     route?: string
     attemptId?: string
   }>()
+  const retryWait = new AsyncLocalStorage<{ terminalDelay?: number }>()
   const retryScopeKey = (input: {
     sessionID: string
     agent: string
@@ -74,6 +76,13 @@ export async function installNativeAnthropic<Q, P>(
   const responseCleanups = new WeakMap<Request, () => void>()
   const adapter: typeof native.adapter = {
     ...native.adapter,
+    async chooseAccount(input) {
+      const choice = await native.adapter.chooseAccount(input)
+      const retry = retryWait.getStore()
+      if (retry && isTerminalPoolHold(choice))
+        retry.terminalDelay = choice.hold.delayMs
+      return choice
+    },
     rewriteRequest(input) {
       const request = requestFinisher.getStore()
       if (request) {
@@ -167,12 +176,19 @@ export async function installNativeAnthropic<Q, P>(
           })()
         }
         if (name === 'retry') {
-          const result = await callback(draft)
+          const previous = 'decision' in draft ? draft.decision : undefined
+          const wait: { terminalDelay?: number } = {}
+          const result = await retryWait.run(wait, () => callback(draft))
           if ('decision' in draft) {
             const key = retryScopeKey(draft)
             nextHostAttempts.delete(key)
             if (draft.decision.retry) {
-              draft.decision.delay = clampHostRetryMs(draft.decision.delay)
+              // The installer must have accepted the locally marked pool hold.
+              if (
+                draft.decision === previous ||
+                draft.decision.delay !== wait.terminalDelay
+              )
+                draft.decision.delay = clampHostRetryMs(draft.decision.delay)
               nextHostAttempts.set(key, {
                 sessionID: draft.sessionID,
                 attempt: draft.attempt,
