@@ -2620,7 +2620,9 @@ describe('OpenCode 2 native Anthropic adapter: OAuth destination', () => {
     const started = await host.begin(scopeOf())
     try {
       const final = await host.send(started, request)
-      await (await fetch(final)).text()
+      // A short-lived loopback fixture can reuse an earlier server's port
+      // before Bun drops its closed connection from the pool.
+      await (await fetch(final, { keepalive: false })).text()
       return { started, failure: undefined }
     } catch (failure) {
       return { started, failure }
