@@ -49,3 +49,8 @@ verification-inputs/
 *.flow
 *.flow.log
 captures/*.txt
+
+# lefthook's installed hook falls back to `pnpm lefthook` when lefthook is not on PATH,
+# and pnpm then writes these files. This repository uses Bun only.
+pnpm-lock.yaml
+pnpm-workspace.yaml
