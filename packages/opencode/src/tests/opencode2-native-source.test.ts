@@ -462,6 +462,28 @@ describe('OC2 shared routing relay', () => {
     })
   }
 
+  function expectedVaultRoutingAsk(includePrimary: boolean) {
+    const primary = {
+      account_id: identity,
+      credential_id: 'oauth:anthropic',
+    }
+    const work = {
+      account_id: fallbackIdentity,
+      credential_id: 'oauth:anthropic:work',
+    }
+    return {
+      provider: 'anthropic',
+      modelId: scope.modelID,
+      refusals: true,
+      candidates: {
+        view_digest: includePrimary
+          ? 'f9931dedab031ea19b2b7e3106ec12e9deba6d08fe580529fb8a9f14ba976283'
+          : '33172ad31466d23e69ef8604f19fd6fb594385b1dcd5111a7543833554b3601d',
+        accounts: includePrimary ? [primary, work] : [work],
+      },
+    }
+  }
+
   test('OC2 sends a warm vault credential on each pinned ask, including after source restart', async () => {
     const f = await vaultWithFallback()
     const native = source(f.runtime, f.paths)
@@ -475,11 +497,7 @@ describe('OC2 shared routing relay', () => {
     expect(await native.chooseAccount(scope)).toBe('main')
     const restarted = source(f.runtime, f.paths)
     expect(await restarted.chooseAccount(scope)).toBe('main')
-    const plain = {
-      provider: 'anthropic',
-      modelId: scope.modelID,
-      refusals: true,
-    }
+    const plain = expectedVaultRoutingAsk(true)
     expect(requests).toEqual([
       plain,
       { ...plain, warm_credential: 'oauth:anthropic' },
@@ -518,8 +536,10 @@ describe('OC2 shared routing relay', () => {
       })
       cleanups.push(() => read.mockRestore())
       expect(await native.chooseAccount(scope)).not.toBe('main')
-      expect(requests).toHaveLength(2)
-      expect(requests[1]).toBe(requests[0])
+      expect(requests).toEqual([
+        JSON.stringify(expectedVaultRoutingAsk(true)),
+        JSON.stringify(expectedVaultRoutingAsk(false)),
+      ])
     },
   )
 
