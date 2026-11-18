@@ -32,6 +32,7 @@ import type { PluginRuntimeOverrides } from './support/opencode1-test-context.ts
 import {
   createOpencode1Test,
   createOpencode1TestContext,
+  getBodyLifetime,
   installOpencode1TestHooks,
 } from './support/opencode1-test-context.ts'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
@@ -1215,149 +1216,163 @@ describe('auth.loader', () => {
 
 describe('message threads wire', () => {
   const originalFetch = globalThis.fetch
-  const restores: Array<() => void> = []
-  afterEach(() => {
-    globalThis.fetch = originalFetch
-    for (const restore of restores.splice(0)) restore()
-  })
-  test.each(['direct', 'http'] as const)(
-    'create then continue survives local refresh and sends only new messages over %s',
-    async (transport) => {
-      await useTempAccountFile(
-        createFallbackStorage({
-          accounts: [],
-          claudeCache: { enabled: true, mode: 'hybrid' },
-          quota: {
-            enabled: false,
-            checkIntervalMinutes: 5,
-            minimumRemaining: {},
-            failClosedOnUnknownQuota: false,
-          },
-          relay: {
-            enabled: transport === 'http',
-            url: 'https://relay.example.test',
-            token: 'relay-token',
-            transport: 'http',
-            fallbackToDirect: false,
-          },
-        }),
-      )
-      const tracked = spyOn(Core.CacheKeepManager.prototype, 'track')
-      restores.push(() => tracked.mockRestore())
-      const sent: Array<{ body: any; text: string; headers: Headers }> = []
-      let rejection: string | undefined
-      let relayBody = ''
-      const applyPatch = new Function(
-        Core.WORKER_SCRIPT.replace(
-          /export default[\s\S]*$/,
-          'return applyPatchSet',
-        ),
-      )() as (base: string, patch: unknown) => string
-      globalThis.fetch = mock(
-        withNativeAdmission((_input: unknown, init?: RequestInit) => {
-          const url = extractUrl(_input as string | URL | Request)
-          if (
-            (!url.includes('/v1/messages') &&
-              !url.startsWith('https://relay.example.test')) ||
-            !init?.body
-          )
-            return Promise.resolve(
-              Response.json({
-                five_hour: { utilization: 0 },
-                seven_day: { utilization: 0 },
-              }),
-            )
-          const wireText =
-            init.body instanceof Uint8Array
-              ? gunzipSync(init.body).toString().trim()
-              : String(init.body)
-          const envelope = JSON.parse(wireText)
-          const text =
-            envelope.mode === 'patch'
-              ? applyPatch(relayBody, envelope.patch)
-              : typeof envelope.body === 'string'
-                ? envelope.body
-                : wireText
-          if (envelope.mode) relayBody = text
+  const transports = ['direct', 'http'] as const
+  const first = {
+    role: 'user',
+    content: 'Original question for suffix pinning.',
+  }
+  const answer = { role: 'assistant', content: 'Answer' }
 
-          sent.push({
-            body: JSON.parse(text),
-            text,
-            headers: new Headers(envelope.upstream?.headers ?? init?.headers),
-          })
-          if (rejection) {
-            const code = rejection
-            rejection = undefined
-            return Promise.resolve(
-              Response.json(
-                {
-                  type: 'error',
-                  error: {
-                    type:
-                      code === 'thread_not_found'
-                        ? 'not_found_error'
-                        : 'invalid_request_error',
-                    details: { error_code: code },
-                  },
-                },
-                {
-                  status: code === 'thread_not_found' ? 404 : 400,
-                  headers: { 'request-id': 'req_thread_error' },
-                },
-              ),
-            )
-          }
+  async function setup(transport: (typeof transports)[number]) {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claudeCache: { enabled: true, mode: 'hybrid' },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+        relay: {
+          enabled: transport === 'http',
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          transport: 'http',
+          fallbackToDirect: false,
+        },
+      }),
+    )
+    const tracked = spyOn(Core.CacheKeepManager.prototype, 'track')
+    getBodyLifetime(testContext).deferCleanup(() => {
+      globalThis.fetch = originalFetch
+      tracked.mockRestore()
+    })
+    const sent: Array<{ body: any; text: string; headers: Headers }> = []
+    let rejection: string | undefined
+    let relayBody = ''
+    const applyPatch = new Function(
+      Core.WORKER_SCRIPT.replace(
+        /export default[\s\S]*$/,
+        'return applyPatchSet',
+      ),
+    )() as (base: string, patch: unknown) => string
+    globalThis.fetch = mock(
+      withNativeAdmission((_input: unknown, init?: RequestInit) => {
+        const url = extractUrl(_input as string | URL | Request)
+        if (
+          (!url.includes('/v1/messages') &&
+            !url.startsWith('https://relay.example.test')) ||
+          !init?.body
+        )
           return Promise.resolve(
-            new Response(
-              [
-                `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_thread_${sent.length}","content":[{"type":"text","text":"Answer"}]}}\n\n`,
-                'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
-                'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-              ].join(''),
+            Response.json({
+              five_hour: { utilization: 0 },
+              seven_day: { utilization: 0 },
+            }),
+          )
+        const wireText =
+          init.body instanceof Uint8Array
+            ? gunzipSync(init.body).toString().trim()
+            : String(init.body)
+        const envelope = JSON.parse(wireText)
+        const text =
+          envelope.mode === 'patch'
+            ? applyPatch(relayBody, envelope.patch)
+            : typeof envelope.body === 'string'
+              ? envelope.body
+              : wireText
+        if (envelope.mode) relayBody = text
+
+        sent.push({
+          body: JSON.parse(text),
+          text,
+          headers: new Headers(envelope.upstream?.headers ?? init?.headers),
+        })
+        if (rejection) {
+          const code = rejection
+          rejection = undefined
+          return Promise.resolve(
+            Response.json(
               {
-                headers: {
-                  'content-type': 'text/event-stream',
-                  'request-id': `req_thread_${sent.length}`,
+                type: 'error',
+                error: {
+                  type:
+                    code === 'thread_not_found'
+                      ? 'not_found_error'
+                      : 'invalid_request_error',
+                  details: { error_code: code },
                 },
+              },
+              {
+                status: code === 'thread_not_found' ? 404 : 400,
+                headers: { 'request-id': 'req_thread_error' },
               },
             ),
           )
+        }
+        return Promise.resolve(
+          new Response(
+            [
+              `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_thread_${sent.length}","content":[{"type":"text","text":"Answer"}]}}\n\n`,
+              'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+              'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            ].join(''),
+            {
+              headers: {
+                'content-type': 'text/event-stream',
+                'request-id': `req_thread_${sent.length}`,
+              },
+            },
+          ),
+        )
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const auth = await plugin.auth.loader(
+      () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
+      { models: {} },
+    )
+    const send = async (
+      messages: unknown[],
+      session = 'ses_message_thread',
+      auxiliary = false,
+      subagent = false,
+    ) => {
+      const response = await auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: {
+          'x-session-affinity': session,
+          'x-cortexkit-request-class': auxiliary ? 'auxiliary' : 'main',
+          'x-client-request-id': 'thread-client',
+          ...(subagent ? { 'x-parent-session-id': 'parent-session' } : {}),
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-5',
+          max_tokens: 32,
+          stream: true,
+          system: 'Stable instructions',
+          tools: [{ name: 'read', input_schema: { type: 'object' } }],
+          messages,
         }),
-      ) as unknown as typeof fetch
-      const plugin = await getPlugin()
-      const auth = await plugin.auth.loader(
-        () => Promise.resolve({ type: 'oauth', ...syntheticMainHostAuth() }),
-        { models: {} },
-      )
-      const send = async (
-        messages: unknown[],
-        session = 'ses_message_thread',
-        auxiliary = false,
-        subagent = false,
-      ) => {
-        const response = await auth.fetch(MESSAGES_URL, {
-          method: 'POST',
-          headers: {
-            'x-session-affinity': session,
-            'x-cortexkit-request-class': auxiliary ? 'auxiliary' : 'main',
-            'x-client-request-id': 'thread-client',
-            ...(subagent ? { 'x-parent-session-id': 'parent-session' } : {}),
-          },
-          body: JSON.stringify({
-            model: 'claude-sonnet-5',
-            max_tokens: 32,
-            stream: true,
-            system: 'Stable instructions',
-            tools: [{ name: 'read', input_schema: { type: 'object' } }],
-            messages,
-          }),
-        })
-        await response.text()
-      }
-      const first = {
-        role: 'user',
-        content: 'Original question for suffix pinning.',
-      }
+      })
+      await response.text()
+    }
+    return {
+      plugin,
+      send,
+      sent,
+      tracked,
+      rejectNext(code: string) {
+        rejection = code
+      },
+    }
+  }
+
+  test.each(transports)(
+    'create then continue survives local refresh and sends only new messages over %s',
+    async (transport) => {
+      const { plugin, send, sent, tracked } = await setup(transport)
       await send([first])
       await refreshPoolMainElsewhere(testContext, {
         access: 'sk-ant-oat01-refreshed-thread-access',
@@ -1421,8 +1436,14 @@ describe('message threads wire', () => {
       const warm = await Core.buildCacheKeepPrewarmBody(retained ?? '{}')
       expect(warm.ok).toBe(true)
       if (warm.ok) expect(JSON.parse(warm.bodyText).thread).toBeUndefined()
+    },
+  )
+
+  test.each(transports)(
+    'a full tail replay retains the cache anchor for the next continue over %s',
+    async (transport) => {
+      const { send, sent } = await setup(transport)
       const tailSession = `full-tail-${transport}`
-      const answer = { role: 'assistant', content: 'Answer' }
       const tailHistory = [
         {
           role: 'user',
@@ -1474,14 +1495,21 @@ describe('message threads wire', () => {
         JSON.stringify(fullTail.body.tools),
       )
       expect(afterTail.text).toBe(await Core.signRequestBody(afterTail.text))
-      for (const code of [
-        'thread_not_found',
-        'thread_fingerprint_mismatch',
-        'thread_already_continued',
-        'thread_continue_in_flight',
-        'thread_unsupported_request',
-        'unrelated',
-      ]) {
+    },
+  )
+
+  for (const code of [
+    'thread_not_found',
+    'thread_fingerprint_mismatch',
+    'thread_already_continued',
+    'thread_continue_in_flight',
+    'thread_unsupported_request',
+    'unrelated',
+  ]) {
+    test.each(transports)(
+      `${code} invalidates the thread over %s`,
+      async (transport) => {
+        const { send, sent, rejectNext } = await setup(transport)
         const session = `thread-error-${code}`
         await send([first], session)
         const history = [
@@ -1490,7 +1518,7 @@ describe('message threads wire', () => {
           { role: 'user', content: `Following ${code}` },
         ]
         const before = sent.length
-        rejection = code
+        rejectNext(code)
         await send(history, session)
         expect(sent[before]?.body.thread.type, code).toBe('continue')
         expect(sent.length - before).toBe(code === 'unrelated' ? 1 : 2)
@@ -1503,7 +1531,14 @@ describe('message threads wire', () => {
         }
         await send(history, session)
         expect(sent.at(-1)?.body.thread).toEqual({ type: 'create' })
-      }
+      },
+    )
+  }
+
+  test.each(transports)(
+    'auxiliary and subagent requests stay stateless without clearing the parent thread over %s',
+    async (transport) => {
+      const { send, sent } = await setup(transport)
       await send([first], 'auxiliary-thread-exclusion', true)
       expect(sent.at(-1)?.body.thread).toBeUndefined()
       const sharedSession = 'subagent-shared-affinity'
@@ -1526,7 +1561,14 @@ describe('message threads wire', () => {
         type: 'continue',
         previous_message_id: parentMessageId,
       })
-      for (const change of ['replacement', 'account'] as const) {
+    },
+  )
+
+  for (const change of ['replacement', 'account'] as const) {
+    test.each(transports)(
+      `changing the login ${change === 'replacement' ? 'on the same account' : 'to a different account'} starts a new thread over %s`,
+      async (transport) => {
+        const { send, sent } = await setup(transport)
         const session = `thread-${change}`
         await send([first], session)
         const credential = {
@@ -1553,9 +1595,9 @@ describe('message threads wire', () => {
           session,
         )
         expect(sent.at(-1)?.body.thread).toEqual({ type: 'create' })
-      }
-    },
-  )
+      },
+    )
+  }
 })
 
 test('stateless OpenCode 1 HTTP relay handles an effort edit before a fixed-position billing cch', async () => {
