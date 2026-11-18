@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,18 +9,21 @@ import {
   getLogLevel,
   getStickyRoutingStatePath,
   type LogTestRecord,
+  NativeTransientAccountError,
   resolveLocalRoutingDestination,
   resolveNativePoolPaths,
   runNativeMigration,
   setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import type { Api, Context, Model } from '@earendil-works/pi-ai'
+import { isRetryableAssistantError } from '@earendil-works/pi-ai/compat'
 import { TestLifetime } from '../../../core/src/tests/test-lifetime.ts'
 import {
   closePiNativeRuntime,
   getPiNativeRuntime,
   PiNativeRuntime,
 } from '../native.ts'
+import { createPiNativeCommands } from '../native-commands.ts'
 import { streamCortexKitAnthropic } from '../stream.ts'
 import {
   fixtureAccountIdentity,
@@ -78,6 +81,50 @@ afterEach(async () => {
   delete process.env.PI_CODING_AGENT_DIR
   delete process.env.PI_ANTHROPIC_AUTH_FILE
   await rm(directory, { recursive: true, force: true })
+})
+
+test('Pi classifies an exhausted account read as retryable and keeps the last snapshot', async () => {
+  const native = getPiNativeRuntime(storagePath)
+  const runtime = await native.service()
+  const commands = createPiNativeCommands(storagePath)
+  const status = await commands.readStatus('account', {})
+  expect(status).toContain('main:')
+  const before = runtime.peek?.()
+  expect(before).toBeDefined()
+  const failure = spyOn(runtime, 'read').mockRejectedValue(
+    new NativeTransientAccountError('pool-read'),
+  )
+  let sends = 0
+  const records: LogTestRecord[] = []
+  const level = getLogLevel()
+  setLogLevel('warn')
+  __setLogTestSink((record) => records.push(record))
+  globalThis.fetch = Object.assign(
+    async () => {
+      sends++
+      return success()
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  try {
+    expect(await commands.readStatus('account', {})).toBe(status)
+    expect(await commands.readStatus('account', {})).toBe(status)
+    expect(
+      records.filter((record) =>
+        record.message.includes('keeping status display'),
+      ),
+    ).toHaveLength(1)
+    const result = await streamCortexKitAnthropic(model, context).result()
+    expect(result.stopReason).toBe('error')
+    expect(isRetryableAssistantError(result)).toBe(true)
+    expect(failure).toHaveBeenCalled()
+    expect(runtime.peek?.()).toBe(before)
+    expect(sends).toBe(0)
+  } finally {
+    __setLogTestSink(null)
+    setLogLevel(level)
+    failure.mockRestore()
+  }
 })
 
 test('Pi abort ends a stalled quota preflight without sending a model request', async () => {

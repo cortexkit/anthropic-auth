@@ -17,7 +17,9 @@ import {
   isCacheKeepAlways,
   isCacheKeepHybridActive,
   isCacheKeepPersistentlyEnabled,
+  isNativeTransientAccountError,
   isVaultHosted,
+  logger,
   type NativeAccountRuntime,
   type NativeAccountSnapshot,
   type NativeMenuDispatch,
@@ -30,7 +32,7 @@ import {
   VAULT_HOST_CONNECT_REFUSAL,
 } from '@cortexkit/anthropic-auth-core'
 import { LANE_START_TEXT } from '../lane-start'
-import { normalizeSidebarState } from '../sidebar-state'
+import { normalizeSidebarState, type SidebarState } from '../sidebar-state'
 import {
   CLAUDE_POOL_LOGIN_METHOD_ID,
   CLAUDE_POOL_LOGIN_METHOD_LABEL,
@@ -107,6 +109,8 @@ export function createNativeMenuCapabilities(options: {
   readonly start: (sessionID: string, text: string) => Promise<void>
 }): NativeMenuCapabilities {
   const { runtime, source } = options
+  let lastSidebar: SidebarState | undefined
+  let sidebarReadContended = false
   const pending = new Map<
     string,
     { auth?: AuthorizationResult; readonly active: AbortController }
@@ -522,17 +526,33 @@ export function createNativeMenuCapabilities(options: {
       )
     },
     async readSidebar(sessionID) {
-      const [snapshot, sessions] = await Promise.all([
-        runtime.read(),
-        options.cacheKeepRegistry?.list() ?? [],
-      ])
-      return normalizeSidebarState(
-        buildNativeSidebarState(snapshot, {
-          activeId: source.servedAccount(sessionID),
+      try {
+        const [snapshot, sessions] = await Promise.all([
+          runtime.read(),
+          options.cacheKeepRegistry?.list() ?? [],
+        ])
+        lastSidebar = buildNativeSidebarState(snapshot, {
+          activeId: undefined,
           trackedSessions: sessions.length,
           now: Date.now(),
-        }),
-      )
+        })
+        sidebarReadContended = false
+      } catch (error) {
+        if (!isNativeTransientAccountError(error) || !error.poolRead)
+          throw error
+        if (!sidebarReadContended) {
+          sidebarReadContended = true
+          logger.warn(
+            'sidebar',
+            'Account update in progress; keeping sidebar state',
+          )
+        }
+      }
+      // The cached display is shared, but the served account belongs to this session.
+      return normalizeSidebarState({
+        ...lastSidebar,
+        activeId: source.servedAccount(sessionID),
+      })
     },
     forgetSession(sessionID) {
       pending.get(sessionID)?.active.abort()

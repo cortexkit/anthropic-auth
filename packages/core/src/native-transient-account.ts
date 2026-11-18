@@ -1,8 +1,9 @@
 import {
   acquireRefreshFileLock,
+  PrivateFileError,
   type RefreshFileLock,
 } from '@cortexkit/common-auth/fs'
-import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
+import { POOL_LOCK_DEFAULTS, type PoolLoad } from '@cortexkit/common-auth/store'
 import {
   type NativeLockEvent,
   nativeLockObserver,
@@ -23,9 +24,8 @@ const TRANSIENT_ACCOUNT_MESSAGE =
 const transientAccountErrors = new WeakSet<object>()
 
 /**
- * A local account could not be authorized because the caller's short wait for
- * an account write or a refresh replacing a provider-rejected token expired.
- * The shared write or refresh may still finish after the caller stops waiting.
+ * An account update prevented a request from reading or authorizing the account
+ * within its short wait budget. The shared write or refresh may still finish.
  *
  * The request should be retried. `code: 'ECONNRESET'` is how this package
  * marks an error retryable for its hosts. A host must surface it rather than
@@ -35,14 +35,16 @@ const transientAccountErrors = new WeakSet<object>()
 export class NativeTransientAccountError extends Error {
   declare readonly code: 'ECONNRESET'
   declare readonly syscall: 'native-account-update'
+  declare readonly poolRead?: true
 
-  constructor() {
+  constructor(operation?: 'pool-read') {
     super(TRANSIENT_ACCOUNT_MESSAGE)
     const fixed = {
       name: 'NativeTransientAccountError',
       message: TRANSIENT_ACCOUNT_MESSAGE,
       code: 'ECONNRESET',
       syscall: 'native-account-update',
+      ...(operation === 'pool-read' && { poolRead: true }),
     }
     for (const [key, value] of Object.entries(fixed))
       Object.defineProperty(this, key, {
@@ -64,6 +66,36 @@ export function isNativeTransientAccountError(
     value !== null &&
     transientAccountErrors.has(value)
   )
+}
+
+export async function readNativePool(
+  read: Promise<PoolLoad>,
+): Promise<PoolLoad> {
+  const result = await readNativePoolSettings(read)
+  if (
+    result.status === 'error' &&
+    result.kind === 'snapshot-contended' &&
+    result.retryable
+  )
+    throw new NativeTransientAccountError('pool-read')
+  return result
+}
+
+export async function readNativePoolSettings<T>(read: Promise<T>): Promise<T> {
+  try {
+    return await read
+  } catch (error) {
+    // Only the Windows read errors associated with an atomic replace qualify.
+    // Access denied and other policy or I/O failures must still surface intact.
+    if (
+      error instanceof PrivateFileError &&
+      error.stage === 'read' &&
+      error.reason === 'io-error' &&
+      (error.win32Code === 32 || error.win32Code === 303)
+    )
+      throw new NativeTransientAccountError('pool-read')
+    throw error
+  }
 }
 
 /**

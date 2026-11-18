@@ -1,14 +1,22 @@
 import { describe, expect, test } from 'bun:test'
-import type {
-  NativeAccountSnapshot,
-  NativeAccountView,
+import {
+  __setLogTestSink,
+  getLogLevel,
+  type LogTestRecord,
+  type NativeAccountRuntime,
+  type NativeAccountSnapshot,
+  type NativeAccountView,
+  NativeTransientAccountError,
+  setLogLevel,
 } from '@cortexkit/anthropic-auth-core'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import { Schema } from 'effect'
 import { normalizeSidebarState } from '../sidebar-state'
+import { createNativeMenuCapabilities } from '../v2/menu'
 import type { NativeMenuCapabilities } from '../v2/menu-contract'
 import { NATIVE_MENU_RPC, registerNativeMenu } from '../v2/rpc'
 import { buildNativeSidebarState } from '../v2/sidebar'
+import type { NativeSource } from '../v2/source'
 
 const now = Date.UTC(2026, 9, 18, 12)
 const checkedAt = now - 60_000
@@ -446,5 +454,61 @@ describe('OpenCode 2 sidebar RPC', () => {
     expect(asked).toEqual(['ses_a'])
     expect(answer.activeId).toBe('main')
     await registration.dispose()
+  })
+
+  test('serves the last account state and logs once when the sidebar account read is busy', async () => {
+    let handlers: Record<string, (input: { sessionId: string }) => unknown> = {}
+    const ctx = {
+      rpc: {
+        register: async (_definition: unknown, value: typeof handlers) => {
+          handlers = value
+          return { dispose: async () => {}, events: { emit: async () => {} } }
+        },
+      },
+      command: { transform: async () => ({ dispose: async () => {} }) },
+      event: { subscribe: async function* () {} },
+    }
+    let failure: Error | undefined
+    const capabilities = createNativeMenuCapabilities({
+      runtime: {
+        read: async () => {
+          if (failure) throw failure
+          return snapshot([account({ quota: quota(30, 60) })])
+        },
+      } as NativeAccountRuntime,
+      source: {
+        servedAccount: (session: string) =>
+          session === 'ses_a' ? 'main' : undefined,
+      } as NativeSource,
+      start: async () => {},
+    })
+    const registration = await registerNativeMenu(
+      ctx as never,
+      {} as never,
+      capabilities,
+    )
+    const poll = async (sessionId: string) =>
+      encodeSidebar(await handlers.sidebar?.({ sessionId }))
+    const records: LogTestRecord[] = []
+    const level = getLogLevel()
+    setLogLevel('warn')
+    __setLogTestSink((record) => records.push(record))
+    try {
+      const before = await poll('ses_a')
+      expect(before).toHaveProperty('activeId', 'main')
+      failure = new NativeTransientAccountError('pool-read')
+      expect(await poll('ses_a')).toEqual(before)
+      expect(await poll('ses_a')).toEqual(before)
+      expect(await poll('ses_b')).not.toHaveProperty('activeId')
+      expect(
+        records.filter((record) => record.channel === 'sidebar'),
+      ).toHaveLength(1)
+      failure = new Error('not a sharing violation')
+      await expect(poll('ses_a')).rejects.toBe(failure)
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(level)
+      await registration.dispose()
+    }
   })
 })
