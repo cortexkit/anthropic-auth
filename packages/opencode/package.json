@@ -76,7 +76,7 @@
     }
   },
   "dependencies": {
-    "@clack/prompts": "^1.6.0",
+    "@clack/prompts": "^1.9.0",
     "@cortexkit/anthropic-auth-core": "2.16.1",
     "@cortexkit/claustrum-client": "0.18.0",
     "@cortexkit/private-files": "0.2.2",
