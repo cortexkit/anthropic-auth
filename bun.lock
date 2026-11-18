@@ -265,7 +265,7 @@
 
     "@cortexkit/store": ["@cortexkit/store@0.2.3", "", { "dependencies": { "@cortexkit/private-files": "^0.2.0" } }, "sha512-cOCjAhb2rJp9u71xHXTlb2tS67237hHVN5DCB+aVh9S/FSu1UjOj8j/LjTSnVAZYXrNuWWb8eoQghiEcDtNT8g=="],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.24.1", "", {}, "sha512-wdi0m2xWl0tIVK74xSyyjzHF4kJGxaiZzoy+JDma2v0HkaaVxiAcbOvQJkklhsqWNeAvS/ZvtIXITTM9IwYmnw=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.24.5", "", {}, "sha512-quPMUUXjj6RG8Ns3EJcNV7rbFyCLP5MVoaOSSBAwD6deY8Rxg77Y/4GA5bKdr5WAO/JTQT9aLz53fTvuzNF9Sg=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 
