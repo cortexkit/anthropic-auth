@@ -37,6 +37,7 @@ import {
 import { resolveNativePoolPaths } from '../pool-paths.ts'
 import { createNativePoolStore } from '../pool-store.ts'
 import { QuotaManager } from '../quota-manager.ts'
+import { routingCandidates, routingWarmCredential } from '../routing-relay.ts'
 import { initializeNativeTestAuthority } from './native-authority-fixture.ts'
 import { createTestLifetimeSuite } from './test-lifetime.ts'
 import { vaultOutageClock } from './vault-outage-clock.ts'
@@ -2446,3 +2447,50 @@ test('the last host to stop watching the roster closes the vault watch', async (
   expect(f.counts.lists).toBe(1)
   expect(f.counts.closes).toBe(0)
 })
+
+for (const [authMethod, servable] of [
+  ['gateway', false],
+  ['future-method', false],
+  [undefined, true],
+  ['oauth', true],
+] as const) {
+  test(`Claude custody category: ${authMethod ?? 'missing auth method'}`, async () => {
+    const f = await fixture()
+    f.rows([authMethod === undefined ? listed : { ...listed, authMethod }])
+    const inventory = await discoverNativeVaultInventory(f.options)
+    const facade = accountRuntime(f)
+    await facade.vault.refresh()
+    const { mode, accounts } = await facade.read()
+    const authorization = await facade.authorizeVault('main').then(
+      ({ accessToken }) => ({ accessToken }),
+      (error: unknown) => {
+        if (!(error instanceof NativeCustodyError)) throw error
+        return { code: error.code }
+      },
+    )
+
+    const expectedIds = servable ? [id] : []
+    expect({
+      mode,
+      inventory: inventory.credentials.map((row) => row.credentialId),
+      displayed: accounts.map((row) => row.credentialId),
+      candidates: routingCandidates(accounts).map((row) => row.credentialId),
+      warmHint: routingWarmCredential(accounts, {
+        accountId: 'main',
+        accountIdentity: uuid,
+      }),
+      authorization,
+      scopedGets: f.counts.gets,
+    }).toEqual({
+      mode: 'claustrum',
+      inventory: expectedIds,
+      displayed: expectedIds,
+      candidates: expectedIds,
+      warmHint: servable ? id : undefined,
+      authorization: servable
+        ? { accessToken: 'synthetic-bearer-7' }
+        : { code: 'route-unavailable' },
+      scopedGets: servable ? 1 : 0,
+    })
+  })
+}
