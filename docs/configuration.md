@@ -11,7 +11,7 @@ The flat keys below describe user choices, not a complete default configuration.
 | Setting keys | Purpose |
 | --- | --- |
 | `routing_mode`, `max_same_account_wait` | Routing order (`main-first`, `fallback-first`, `sticky-balanced`) and longest same-account wait (`off`, `15m`, `cache`) |
-| `wait_for_reset` | Opt-in wait until an exhausted pool's earliest usable reset on OpenCode 1 and Pi; false by default. OpenCode 2 support follows in a later release |
+| `wait_for_reset` | Opt-in wait until an exhausted pool's earliest usable reset on OpenCode and Pi; false by default |
 | `fallback_on` | Retryable OAuth fallback statuses; default `[401, 403, 429]` |
 | `refresh_enabled`, `refresh_interval_minutes`, `refresh_refresh_before_expiry_minutes` | Token refresh policy |
 | `quota_enabled`, `quota_check_interval_minutes`, `quota_refresh_every_n_requests`, `quota_minimum_remaining_five_hour`, `quota_minimum_remaining_seven_day`, `quota_minimum_remaining_scoped`, `quota_fail_closed_on_unknown_quota`, `quota_show_toasts` | Quota policy, floors and notifications |
@@ -48,21 +48,22 @@ Affinity survives network/relay failures, 5xx responses, unconfirmed 429s, quota
 
 Set [`wait_for_reset: true`](settings-file.md#wait-for-a-quota-reset) in the
 shared user settings file to wait until a Claude account can serve again,
-rather than rechecking every 15 minutes. This applies on **OpenCode 1 and Pi**
+rather than rechecking every 15 minutes. This applies on **OpenCode 1, OpenCode 2 and Pi**
 only when every eligible account is confirmed out of quota or blocked by
 your quota floors, all blocking reset times are known and in the future, and
 no other route can serve the request. The earliest account's full blocking
 reset plus per-session jitter determines the wait. OpenCode 1 hands that wait
 to the host in `Retry-After`; Pi owns one cancellable wait, then refreshes
-quota and rechecks once before resending. If still blocked, Pi stops.
+quota and rechecks once before resending. If still blocked, Pi stops. OpenCode 2
+uses one host retry to wait up to eight days after a quota refusal, then rechecks
+the pool before sending. New messages on an already exhausted pool still stop at
+once. A reset more than eight days away does not get a long wait on OpenCode 2.
 
 The default is `false`, which keeps today's behavior. When an account can
 still serve, `max_same_account_wait` still controls staying versus moving.
 Unknown resets, sign-in, disabled accounts, unavailable credentials or vault access,
 Thalamus routing holds and API-key routes are unchanged. The setting accepts
-host overrides, not model overrides. **OpenCode 2 support follows in a later
-release**; its current capped holds and terminal new-message refusals remain
-unchanged even when the setting is on.
+host overrides, not model overrides.
 
 ### API-key fallback
 

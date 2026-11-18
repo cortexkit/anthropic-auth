@@ -142,8 +142,10 @@ blocked by several windows must wait for the last of those windows to reset.
 
 OpenCode 1 receives the real wait in `Retry-After`. Pi waits once inside the
 plugin, refreshes quota and rechecks accounts before resending once; Escape
-cancels throughout the wait. **OpenCode 2 support follows in a later release**;
-its existing 15-minute holds and retry budget are unchanged for now.
+cancels throughout the wait. After a quota-limited reply, OpenCode 2 uses
+one host retry to wait for the reset, up to eight days, then rechecks before
+sending. New messages on an already exhausted pool still stop immediately.
+Unknown resets or resets more than eight days away keep the ordinary behavior.
 
 When any account can still serve, routing and `max_same_account_wait` work as
 before. Unknown resets, sign-in or credential-store refusals, disabled
