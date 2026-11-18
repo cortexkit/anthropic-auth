@@ -54,3 +54,6 @@ captures/*.txt
 # and pnpm then writes these files. This repository uses Bun only.
 pnpm-lock.yaml
 pnpm-workspace.yaml
+
+# Scratch output from remote jobs and worker checks (unpacked packages, logs).
+target/
