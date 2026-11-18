@@ -20,6 +20,11 @@ describe('shared routing relay', () => {
           provider: 'anthropic',
           modelId: 'model',
           refusals: true,
+          candidates: {
+            view_digest:
+              'c7eaf74ae1601bfb35b7b99d470a66b6f28037161cf31d53da2cab10aabeb9aa',
+            accounts: [{ account_id: 'account', credential_id: 'credential' }],
+          },
         })
         expect(options).toEqual({ deadlineMs: 2000 })
         return { account_id: 'account', credential_id: 'credential' }

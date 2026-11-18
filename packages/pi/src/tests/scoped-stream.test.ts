@@ -4241,13 +4241,36 @@ async function vaultWarmHintFixture() {
   }
 }
 
+function expectedVaultRoutingAsk(includePrimary: boolean) {
+  const primary = {
+    account_id: fixtureAccountIdentity('main'),
+    credential_id: 'oauth:anthropic',
+  }
+  const work = {
+    account_id: fixtureAccountIdentity('work'),
+    credential_id: 'oauth:anthropic:work',
+  }
+  return {
+    provider: 'anthropic',
+    modelId: model.id,
+    refusals: true,
+    candidates: {
+      // Only the digest sorts the pairs; the wire array stays in fixture order.
+      view_digest: includePrimary
+        ? 'a16c4e0158d4c41bc1287f115ff4bef300c8aafe39a84b9cfb429df2633a756c'
+        : 'bc478767e59d442751d6d01662ef933c889a861191cb31d2f8facfb5e89f45e4',
+      accounts: includePrimary ? [primary, work] : [work],
+    },
+  }
+}
+
 test('Pi sends its pinned vault warm credential on every model request without changing request bytes', async () => {
   const f = await vaultWarmHintFixture()
   expect((await f.send()).stopReason).toBe('stop')
   f.noAdvice()
   expect((await f.send()).stopReason).toBe('stop')
   expect((await f.send()).stopReason).toBe('stop')
-  const plain = { provider: 'anthropic', modelId: model.id, refusals: true }
+  const plain = expectedVaultRoutingAsk(true)
   expect(f.requests).toEqual([
     plain,
     { ...plain, warm_credential: 'oauth:anthropic' },
@@ -4275,8 +4298,10 @@ for (const condition of ['disabled', 'signed out', 'unservable']) {
       await f.runtime.vault.refresh()
     }
     expect((await f.send()).stopReason).toBe('stop')
-    expect(f.requests).toHaveLength(2)
-    expect(JSON.stringify(f.requests[1])).toBe(JSON.stringify(f.requests[0]))
+    expect(f.requests.map((request) => JSON.stringify(request))).toEqual([
+      JSON.stringify(expectedVaultRoutingAsk(true)),
+      JSON.stringify(expectedVaultRoutingAsk(false)),
+    ])
   })
 }
 

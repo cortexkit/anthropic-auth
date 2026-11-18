@@ -2422,16 +2422,34 @@ async function vaultWarmHintFixture() {
   }
 }
 
+function expectedVaultRoutingAsk(includePrimary: boolean) {
+  const primary = {
+    account_id: mainIdentity,
+    credential_id: 'oauth:anthropic',
+  }
+  const secondary = {
+    account_id: fallbackIdentity,
+    credential_id: 'oauth:secondary',
+  }
+  return {
+    provider: 'anthropic',
+    modelId: 'claude-sonnet-4-6',
+    refusals: true,
+    candidates: {
+      view_digest: includePrimary
+        ? 'f4028c74216e6e34a57580234815738d687a464335ec616965dc401213f0efdf'
+        : '4b6e662013d68bd3d671298d6c09a2602a6967a456a70afbd425b4e8f8b83cbc',
+      accounts: includePrimary ? [primary, secondary] : [secondary],
+    },
+  }
+}
+
 test('OC1 sends its pinned vault warm credential without changing model request bytes', async () => {
   const f = await vaultWarmHintFixture()
   expect((await sendNative(f.plugin)).status).toBe(200)
   f.noAdvice()
   expect((await sendNative(f.plugin)).status).toBe(200)
-  const plain = {
-    provider: 'anthropic',
-    modelId: 'claude-sonnet-4-6',
-    refusals: true,
-  }
+  const plain = expectedVaultRoutingAsk(true)
   expect(f.requests).toEqual([
     plain,
     { ...plain, warm_credential: 'oauth:anthropic' },
@@ -2468,8 +2486,10 @@ for (const condition of ['disabled', 'signed out', 'unservable']) {
       await f.runtime.vault.refresh()
     }
     expect((await sendNative(f.plugin)).status).toBe(200)
-    expect(f.requests).toHaveLength(2)
-    expect(JSON.stringify(f.requests[1])).toBe(JSON.stringify(f.requests[0]))
+    expect(f.requests.map((request) => JSON.stringify(request))).toEqual([
+      JSON.stringify(expectedVaultRoutingAsk(true)),
+      JSON.stringify(expectedVaultRoutingAsk(false)),
+    ])
   })
 }
 

@@ -74,10 +74,16 @@ test('warm hints add only the matching candidate credential to the routing reque
   await relay.accountFor('session', 'model', accounts)
   await relay.accountFor('session', 'model', accounts, 'credential')
   await relay.accountFor('session', 'model', accounts, 'not-a-candidate')
+  const plain = { provider: 'anthropic', modelId: 'model', refusals: true }
+  const candidates = {
+    view_digest:
+      'c7eaf74ae1601bfb35b7b99d470a66b6f28037161cf31d53da2cab10aabeb9aa',
+    accounts: [{ account_id: 'account', credential_id: 'credential' }],
+  }
   expect(requests).toEqual([
-    '{"provider":"anthropic","modelId":"model","refusals":true}',
-    '{"provider":"anthropic","modelId":"model","refusals":true,"warm_credential":"credential"}',
-    '{"provider":"anthropic","modelId":"model","refusals":true}',
+    JSON.stringify({ ...plain, candidates }),
+    JSON.stringify({ ...plain, warm_credential: 'credential', candidates }),
+    JSON.stringify({ ...plain, candidates }),
   ])
 })
 
