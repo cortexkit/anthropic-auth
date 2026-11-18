@@ -248,6 +248,7 @@ import {
   tokenFingerprint,
   VAULT_HOST_CONNECT_REFUSAL,
   VAULT_HOST_STATUS,
+  waitForNativeUsageDrain,
   warnClaudeGatewayRelayIgnored,
   withAbortableFetch,
   withSessionCacheReportHandoff,
@@ -1282,6 +1283,7 @@ type PluginRuntimeOverrides = Partial<{
   quotaCallPause: QuotaManagerOptions['pauseBetweenQuotaCalls']
   /** How long /claude waits for a TUI to take its menu; see CLAUDE_MENU_TUI_PICKUP_MS. */
   tuiPickupTimeoutMs: number
+  beforeSidebarAccountReload: () => void | Promise<void>
 }>
 
 function getConfiguredClaustrumConnectionFile(): string | undefined {
@@ -1801,6 +1803,7 @@ const anthropicAuthPlugin = async (
     await Promise.all([
       usagePublications.close(),
       nativeAccounts.drainQuotaPublications(),
+      closeSidebarRouteWrites(),
     ])
     await Promise.all(
       [...stickySessionRouters.values()].map((router) => router.drain()),
@@ -4777,6 +4780,42 @@ const anthropicAuthPlugin = async (
     route: 'main',
   }
   const sidebarStateFile = getSidebarStateFile()
+  const sidebarRouteWrites = new Set<Promise<void>>()
+  let sidebarRequestSequence = 0
+  let latestSidebarRequest = 0
+  let latestSidebarWrite = 0
+  let sidebarRouteWritesClosed = false
+
+  function warnSidebarWriteFailure() {
+    logger.warn('sidebar', 'state write failed')
+  }
+
+  function queueSidebarRouteWrite(
+    requestSequence: number,
+    write: (isCurrent: () => boolean) => Promise<void>,
+  ) {
+    if (sidebarRouteWritesClosed || requestSequence < latestSidebarRequest)
+      return
+    latestSidebarRequest = requestSequence
+    const sequence = ++latestSidebarWrite
+    // The file writer serializes enqueued frames, but an older account reload
+    // can finish after a newer frame has already been enqueued.
+    const isCurrent = () =>
+      !sidebarRouteWritesClosed && sequence === latestSidebarWrite
+    const pending = write(isCurrent).catch(warnSidebarWriteFailure)
+    sidebarRouteWrites.add(pending)
+    void pending.then(() => sidebarRouteWrites.delete(pending))
+  }
+
+  async function drainSidebarRouteWrites() {
+    while (sidebarRouteWrites.size) await Promise.all([...sidebarRouteWrites])
+  }
+
+  async function closeSidebarRouteWrites() {
+    await waitForNativeUsageDrain(drainSidebarRouteWrites())
+    sidebarRouteWritesClosed = true
+  }
+
   const fableRecoveryNotices = new Map<
     string,
     NonNullable<SidebarState['fableRecoveries']>[number]
@@ -4789,6 +4828,7 @@ const anthropicAuthPlugin = async (
     mainRefreshToken?: string
     routingAuthoritative?: boolean
     skipFallbackQuotaSeed?: boolean
+    isCurrent?: () => boolean
   }
 
   function buildSidebarState(
@@ -4950,13 +4990,19 @@ const anthropicAuthPlugin = async (
     currentSnapshot?: Awaited<ReturnType<typeof nativeAccounts.read>>,
   ) {
     const routingAuthoritative = options.routingAuthoritative !== false
-    if (routingAuthoritative) {
-      lastSidebarRouting = { activeId: options.activeId, route: options.route }
-    }
 
-    function write(state: SidebarState) {
+    function write(displayStorage: typeof storage) {
+      if (options.isCurrent && !options.isCurrent()) return Promise.resolve()
+      const state = buildSidebarState(displayStorage, options)
+      if (routingAuthoritative) {
+        lastSidebarRouting = {
+          activeId: options.activeId,
+          route: options.route,
+        }
+      }
       return setSidebarState(state, sidebarStateFile, {
         routingAuthoritative,
+        onError: routingAuthoritative ? warnSidebarWriteFailure : undefined,
         resolvePreservedRouting: routingAuthoritative
           ? undefined
           : async (current) => {
@@ -4987,11 +5033,7 @@ const anthropicAuthPlugin = async (
           : (routing) => {
               lastSidebarRouting = routing
             },
-      }).catch((error) =>
-        logger.warn('sidebar', 'state write failed', {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      )
+      })
     }
 
     if (routingAuthoritative) {
@@ -5001,21 +5043,14 @@ const anthropicAuthPlugin = async (
           storage,
           currentSnapshot,
           candidates,
-        )
-          .then((displayStorage) =>
-            write(buildSidebarState(displayStorage, options)),
-          )
-          .catch((error) => {
-            if (noteSidebarReadContention(error)) return
-            logger.debug(
-              'quota',
-              'failed to recheck account profile for sidebar',
-            )
-            return write(buildSidebarState(storage, options))
-          })
+        ).then(write, (error) => {
+          if (noteSidebarReadContention(error)) return
+          logger.debug('quota', 'failed to recheck account profile for sidebar')
+          return write(storage)
+        })
       }
     }
-    return write(buildSidebarState(storage, options))
+    return write(storage)
   }
 
   async function resolveSidebarQuotaAccess() {
@@ -9417,10 +9452,7 @@ const anthropicAuthPlugin = async (
               returnLastOnExhausted?: boolean
               mainAccessToken?: string
               mainQuotaIdentity?: MainQuotaIdentityBinding
-              onSuccess?: (account: {
-                id: string
-                access?: string
-              }) => void | Promise<void>
+              onSuccess?: (account: { id: string; access?: string }) => void
               fableRequest?: FableRequestContext
               laneStartRequest?: boolean
             },
@@ -9522,7 +9554,7 @@ const anthropicAuthPlugin = async (
                   isApiKeyAccount(account) ? 'api' : 'oauth',
                 )
 
-                await options?.onSuccess?.(account)
+                options?.onSuccess?.(account)
                 // Active-route every-N refresh: this fallback just served the
                 // request, so keep its quota fresh on the same cadence as main.
                 // Non-blocking; only the served account, never idle fallbacks.
@@ -9540,7 +9572,7 @@ const anthropicAuthPlugin = async (
                           : (account.access ?? ''),
                         account,
                       )
-                      .then(() => options?.onSuccess?.(account))
+                      .then(() => refreshSidebarQuota())
                       .catch(() => {})
                   }
                 }
@@ -9565,7 +9597,7 @@ const anthropicAuthPlugin = async (
             onFallbackSuccess?: (account: {
               id: string
               access?: string
-            }) => void | Promise<void>,
+            }) => void,
             modelId?: string,
             fableRequest?: FableRequestContext,
             laneStartRequest = false,
@@ -9679,6 +9711,7 @@ const anthropicAuthPlugin = async (
           const authTransport = withAbortableFetch({
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
+              const requestSequence = ++sidebarRequestSequence
               if (input instanceof Request && init?.signal === undefined)
                 init = { ...init, signal: input.signal }
               const incomingHeaders = mergeHeaders(input, init)
@@ -10290,34 +10323,45 @@ const anthropicAuthPlugin = async (
                   requestMainQuotaIdentity,
                 )
               }
-              async function writeCurrentSidebarState(
+              function writeCurrentSidebarState(
                 activeId: string | undefined,
                 route: string,
+                revalidateQuota = true,
               ) {
-                let sidebarStorage = storage
-                let skipFallbackQuotaSeed = false
-                if (
-                  (storage?.accounts ?? []).some(
-                    (account) => isOAuthAccount(account) && account.quota,
-                  )
-                ) {
-                  try {
-                    const currentStorage = await readSidebarAccounts()
-                    if (currentStorage) sidebarStorage = currentStorage
-                    else skipFallbackQuotaSeed = true
-                  } catch (error) {
-                    if (isNativeTransientAccountError(error)) return
-                    // An unverifiable snapshot must not seed spend-affecting state.
-                    skipFallbackQuotaSeed = true
+                queueSidebarRouteWrite(requestSequence, async (isCurrent) => {
+                  let sidebarStorage = storage
+                  let skipFallbackQuotaSeed = false
+                  if (
+                    revalidateQuota &&
+                    (storage?.accounts ?? []).some(
+                      (account) => isOAuthAccount(account) && account.quota,
+                    )
+                  ) {
+                    try {
+                      if (runtimeOverrides.beforeSidebarAccountReload)
+                        await runtimeOverrides.beforeSidebarAccountReload()
+                      if (!isCurrent()) return
+                      const currentStorage = await readSidebarAccounts()
+                      if (currentStorage) sidebarStorage = currentStorage
+                      else skipFallbackQuotaSeed = true
+                    } catch (error) {
+                      if (isNativeTransientAccountError(error)) return
+                      logger.warn(
+                        'sidebar',
+                        'account reload failed; keeping unverified quota out of sidebar state',
+                      )
+                      // An unverifiable snapshot must not seed spend-affecting state.
+                      skipFallbackQuotaSeed = true
+                    }
                   }
-                }
-                // State construction reconciles quota caches synchronously; only
-                // the display-only file write is detached from the response path.
-                void writeSidebarState(sidebarStorage, {
-                  activeId,
-                  route,
-                  mainAccessToken: auth.access,
-                  skipFallbackQuotaSeed,
+                  if (!isCurrent()) return
+                  await writeSidebarState(sidebarStorage, {
+                    activeId,
+                    route,
+                    mainAccessToken: auth.access,
+                    skipFallbackQuotaSeed,
+                    isCurrent,
+                  })
                 })
               }
               let preselectedFallbackAccounts:
@@ -10612,15 +10656,12 @@ const anthropicAuthPlugin = async (
                           : undefined,
                       )
                     }
-                    const completeRoute = async (
+                    const completeRoute = (
                       selected: StickyOAuthRoute,
                       response: Response,
                       _markUsed = true,
                     ) => {
-                      await writeCurrentSidebarState(
-                        selected.id,
-                        'sticky-balanced',
-                      )
+                      writeCurrentSidebarState(selected.id, 'sticky-balanced')
                       trace.done('return_sticky_balanced', {
                         status: response.status,
                         accountId: selected.id,
@@ -11268,11 +11309,7 @@ const anthropicAuthPlugin = async (
                   }
                   // Update the sidebar every replayable request so fallback
                   // quota refreshed by the background timer is reflected too.
-                  writeSidebarState(storage, {
-                    activeId: 'main',
-                    route: 'main',
-                    mainAccessToken: auth.access,
-                  })
+                  writeCurrentSidebarState('main', 'main', false)
                   const routingQuotaPasses =
                     quotaSnapshotPassesPolicy(routingQuota, storage) &&
                     quotaSnapshotPassesModelScope(routingQuota, requestModelId)
@@ -11593,15 +11630,14 @@ const anthropicAuthPlugin = async (
                 auth.access,
                 (account) => {
                   fallbackServed = true
-                  return writeCurrentSidebarState(account.id, 'fallback')
+                  writeCurrentSidebarState(account.id, 'fallback')
                 },
                 requestModelId,
                 fableRequest,
                 laneStartRequest,
                 requestMainQuotaIdentity,
               )
-              if (!fallbackServed)
-                await writeCurrentSidebarState('main', 'main')
+              if (!fallbackServed) writeCurrentSidebarState('main', 'main')
 
               trace.done('return_response', { status: response.status })
               return wrapResponse(response)
@@ -11725,6 +11761,7 @@ const anthropicAuthPlugin = async (
   } as any
   pluginTestHandles?.set(plugin, {
     drainDispatchWork,
+    drainSidebarRouteWrites,
     primeManager,
     quotaManager,
     cacheKeepManager,

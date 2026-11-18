@@ -1348,6 +1348,7 @@ describe('quota header feed integration', () => {
       expect(response.status).toBe(200)
       await response.text()
 
+      await getPluginTestHandles(plugin).drainSidebarRouteWrites()
       expect(
         quotaManager.getAllFallbacks().get('fallback-1')?.quota.five_hour
           ?.usedPercent,

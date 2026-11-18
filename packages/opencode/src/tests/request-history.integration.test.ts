@@ -30,6 +30,7 @@ import {
 import {
   readAccountStorage as readAccountStorageWithCtx,
   restoreProcessTestFiles,
+  waitForSidebarState,
 } from './support/opencode1-state-observers.ts'
 import type { PluginRuntimeOverrides } from './support/opencode1-test-context.ts'
 import {
@@ -811,8 +812,11 @@ describe('meaningful trailing assistant history', () => {
       'Bearer sk-ant-oat01-main-access',
       'Bearer sk-ant-oat01-fallback-access',
     ])
-    await drainSidebarWrites()
-    expect((await getSidebarState()).activeId).toBe('fallback-1')
+    const sidebar = await waitForSidebarState(
+      testContext,
+      (state) => state.activeId === 'fallback-1',
+    )
+    expect(sidebar.activeId).toBe('fallback-1')
     await plugin.dispose?.()
     expect(
       (await readAccountStorage())?.accounts.find(
@@ -920,8 +924,11 @@ describe('meaningful trailing assistant history', () => {
     // The API-key route must return its local 400, not throw. A throw would
     // make routing try main and set sidebar activeId to 'main' instead of the
     // API-key account id asserted below.
-    await drainSidebarWrites()
-    expect(await getSidebarState()).toMatchObject({
+    const sidebar = await waitForSidebarState(
+      testContext,
+      (state) => state.activeId === 'api-trailing',
+    )
+    expect(sidebar).toMatchObject({
       activeId: 'api-trailing',
       route: 'fallback-first',
     })
