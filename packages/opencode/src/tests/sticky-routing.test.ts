@@ -6,7 +6,9 @@ import {
   createStickyNoRouteResponse,
   decideStickyQuotaFailure,
   getStickyRoutingStatePath,
+  killswitchPassesPolicy,
   type OAuthQuotaSnapshot,
+  quotaSnapshotPassesPolicy,
   type StickyRouteCandidate,
   StickySessionRouter,
   stickyQuotaSnapshotIsFresh,
@@ -640,34 +642,102 @@ describe('sticky-balanced session routing', () => {
     expect(result?.accountId).toBe('healthy')
   })
 
-  test('uses known Fable-depleted accounts first for direct Opus sessions', async () => {
-    const path = await statePath()
-    const router = ownRouter({ path, now: () => NOW })
-    const depleted = candidate({
-      accountId: 'main',
-      order: 0,
-      fiveHour: 100,
-      sevenDay: 40,
-      fable: 0,
-    })
-    const fableRich = candidate({
-      accountId: 'ufuk2',
-      order: 1,
-      fiveHour: 100,
-      sevenDay: 99,
-      fable: 98,
-    })
+  test('routes a new Opus session when Fable-exhausted accounts are at the quota floor', async () => {
+    const router = ownRouter({ path: await statePath(), now: () => NOW })
+    const readings = [
+      ['A', 100, 100],
+      ['B', 100, 100],
+      ['C', 30, 36],
+      ['D', 40, 5],
+      ['E', 60, 20],
+      ['F', 4, 0],
+      ['G', 4, 0],
+      ['H', 5, 0],
+      ['I', 5, 0],
+    ] as const
+    const pool = readings.map(([accountId, sevenDay, fable], order) =>
+      candidate({ accountId, order, fiveHour: 100, sevenDay, fable }),
+    )
+    const floorStorage = {
+      ...storage,
+      quota: {
+        ...storage.quota,
+        minimumRemaining: { five_hour: 5, seven_day: 5 },
+      },
+      killswitch: { enabled: true, main: { five_hour: 0, seven_day: 0 } },
+    }
+    const modelId = 'claude-opus-4-8'
+    const candidates = pool.filter(
+      ({ accountId, quota }) =>
+        quotaSnapshotPassesPolicy(quota, floorStorage) &&
+        killswitchPassesPolicy(quota, floorStorage, accountId, modelId),
+    )
+    expect(candidates.map(({ accountId }) => accountId)).toEqual([
+      'A',
+      'B',
+      'C',
+      'D',
+      'E',
+      'H',
+      'I',
+    ])
+
     const result = await router.resolve({
-      sessionId: 'opus-session',
+      sessionId: 'opus-at-floor',
       family: 'opus',
-      modelId: 'claude-opus-4-8',
-      candidates: [depleted, fableRich],
-      retainAccountIds: new Set(['main', 'ufuk2']),
-      storage,
+      modelId,
+      candidates,
+      retainAccountIds: new Set(pool.map(({ accountId }) => accountId)),
+      storage: floorStorage,
       inputBytes: 10_000,
     })
-    expect(result?.accountId).toBe('main')
+    expect(result?.accountId).toBe('A')
   })
+
+  test.each([
+    [
+      'uses known Fable-depleted accounts first for direct Opus sessions',
+      'opus',
+      'claude-opus-4-8',
+      'fable-depleted',
+    ],
+    [
+      'uses the spendable Fable quota for new Fable sessions',
+      'fable',
+      'claude-fable-5',
+      'fable-rich',
+    ],
+    [
+      'uses the spendable general quota for new general sessions',
+      'general',
+      'claude-sonnet-5',
+      'weekly-rich',
+    ],
+  ] as const)(
+    '%s',
+    async (_description, family, modelId, expectedAccountId) => {
+      const router = ownRouter({ path: await statePath(), now: () => NOW })
+      const readings = [
+        ['weekly-rich', 100, 20],
+        ['fable-rich', 60, 100],
+        ['fable-depleted', 40, 0],
+      ] as const
+      const candidates = readings.map(([accountId, sevenDay, fable], order) =>
+        candidate({ accountId, order, fiveHour: 100, sevenDay, fable }),
+      )
+
+      const result = await router.resolve({
+        sessionId: `new-${family}-session`,
+        family,
+        modelId,
+        candidates,
+        retainAccountIds: new Set(candidates.map(({ accountId }) => accountId)),
+        storage,
+        inputBytes: 10_000,
+      })
+      expect(result?.accountId).toBe(expectedAccountId)
+    },
+  )
 
   test('expires an inactive assignment even while the router process stays alive', async () => {
     const path = await statePath()

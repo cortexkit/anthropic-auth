@@ -1256,23 +1256,26 @@ export class StickySessionRouter {
     storage: AccountStorage | null
     inputBytes: number
   }) {
-    let candidates = [...input.candidates]
-    if (input.family === 'opus') {
-      const depleted = candidates.filter((candidate) =>
-        stickyRouteKnownFableExhausted(candidate, input.storage, this.now()),
-      )
-      if (depleted.length > 0) candidates = depleted
-    }
-    const weighted = candidates.flatMap((candidate) => {
+    const { candidates } = input
+    const now = this.now()
+    let weighted = candidates.flatMap((candidate) => {
       const weight = stickyRouteCandidateWeight({
         candidate,
         family: input.family,
         modelId: input.modelId,
         storage: input.storage,
-        now: this.now(),
+        now,
       })
       return weight > 0 ? [{ candidate, weight }] : []
     })
+    if (input.family === 'opus') {
+      // Save Fable quota for Fable sessions, but only if an exhausted account
+      // still has quota for a new Opus session.
+      const depleted = weighted.filter(({ candidate }) =>
+        stickyRouteKnownFableExhausted(candidate, input.storage, now),
+      )
+      if (depleted.length > 0) weighted = depleted
+    }
     if (
       weighted.length === 0 &&
       candidates.every((candidate) => !knownQuota(candidate.quota))

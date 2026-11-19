@@ -2,6 +2,10 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+- Sticky-balanced routing: a new Opus session no longer gets a quota-floor refusal while other accounts still have usable quota.
+
 ## 2.16.2
 
 - Updates common-auth to 0.55.1 and claustrum-client to 0.20.0.
