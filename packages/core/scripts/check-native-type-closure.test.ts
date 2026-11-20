@@ -166,7 +166,7 @@ test.each([
     )
 
     await expect(closeNativeTypeDeclarations(dist, producer)).rejects.toThrow(
-      `Expected published common-auth 0.56.0, got ${version}`,
+      `Expected published common-auth 0.56.1, got ${version}`,
     )
     expect(await readdir(dist)).not.toContain('internal-types')
   },
@@ -180,7 +180,7 @@ test('copies the complete published relative declaration graph including cycles 
     producer,
     'package.json',
     JSON.stringify({
-      version: '0.56.0',
+      version: '0.56.1',
       exports: { './store': { types: './dist/store/index.d.ts' } },
     }),
   )
@@ -316,7 +316,7 @@ test('packed Core types and Node runtime work in a fresh consumer without common
   const manifest = JSON.parse(
     await readFile(join(core, 'package.json'), 'utf8'),
   )
-  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.56.0')
+  expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('0.56.1')
   expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe('0.21.0')
   expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.24')
   expect(manifest.dependencies['jsonc-parser']).toBe('^3.3.1')
