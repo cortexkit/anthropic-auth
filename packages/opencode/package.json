@@ -78,7 +78,7 @@
   "dependencies": {
     "@clack/prompts": "^1.9.0",
     "@cortexkit/anthropic-auth-core": "2.16.3",
-    "@cortexkit/claustrum-client": "0.20.0",
+    "@cortexkit/claustrum-client": "0.21.0",
     "@cortexkit/private-files": "0.2.2",
     "@cortexkit/subc-client": "^0.24",
     "@opentui/core": "0.8.4",
