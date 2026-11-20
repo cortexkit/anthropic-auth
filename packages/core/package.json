@@ -31,10 +31,10 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@cortexkit/common-auth": "0.55.1"
+    "@cortexkit/common-auth": "0.56.0"
   },
   "dependencies": {
-    "@cortexkit/claustrum-client": "0.20.0",
+    "@cortexkit/claustrum-client": "0.21.0",
     "@cortexkit/private-files": "0.2.2",
     "@cortexkit/subc-client": "^0.24",
     "jsonc-parser": "^3.3.1",
