@@ -4,7 +4,8 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- Updates common-auth to 0.56.1 and claustrum-client to 0.21.0.
+- Updates common-auth to 0.56.3 and claustrum-client to 0.21.0.
+- OpenCode 2: once a reply has shown output, a later retry of that request stays on the same account or stops, instead of replaying on another account; a refused title or compaction request no longer decides the retry of the main request.
 
 ## 2.16.3
 
