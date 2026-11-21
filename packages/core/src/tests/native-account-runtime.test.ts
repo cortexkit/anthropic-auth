@@ -47,8 +47,10 @@ import { createTestLifetimeSuite } from './test-lifetime.ts'
 const { test, deferCleanup, gate, trackDetached } = createTestLifetimeSuite()
 const uuid = '11111111-2222-4333-8444-555555555555' as ProviderAccountUuid
 const now = 1_000_000
-const observeBookkeeping = () =>
-  new Promise((resolve) => setTimeout(resolve, 200))
+// A bookkeeping write that ignores a held pool lock finishes well inside this
+// bound; one that waits on the lock would block for the lock's whole acquire
+// timeout, so it misses the bound and the test fails.
+const BOOKKEEPING_BOUND_MS = 3_000
 async function localSubject(f: Awaited<ReturnType<typeof fixture>>) {
   const admission = await f.runtime.authorizeLocal('main')
   if (admission.status !== 'usable')
@@ -353,7 +355,14 @@ for (const lockIndex of [0, 1]) {
       })
     trackDetached(write)
     try {
-      await observeBookkeeping()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([
+        write,
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, BOOKKEEPING_BOUND_MS)
+        }),
+      ])
+      clearTimeout(timer)
       expect(finished).toBe(true)
       await lease.assertOwned()
     } finally {
