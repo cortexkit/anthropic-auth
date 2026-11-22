@@ -174,7 +174,7 @@ import {
   requirePiOAuthOrigin,
 } from './transport.ts'
 
-const messageThreads = new MessageThreadTracker()
+const messageThreads = MessageThreadTracker.withTailPersistence('pi')
 const dumpResponseObservers = new WeakMap<
   Response,
   ReturnType<typeof createDumpResponseObserver>
@@ -233,8 +233,11 @@ function isPiPrimaryThreadRequest(
   )
 }
 
-export function forgetPiMessageThread(sessionId: string): void {
-  messageThreads.forget(sessionId)
+export function forgetPiMessageThread(
+  sessionId: string,
+  disposition: 'session_closed' | 'session_deleted' = 'session_deleted',
+): void {
+  messageThreads.forget(sessionId, disposition)
 }
 
 /** Dump label for a physical send that failed before any response arrived. */

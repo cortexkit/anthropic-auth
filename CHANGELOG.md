@@ -5,6 +5,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 ## Unreleased
 
 - OpenCode 2: the serving account's model-scoped weekly windows and credits now refresh from Insula (vault) or the regular poll (local) while response headers keep arriving, so the sidebar no longer shows a growing 'checked … ago' for it.
+- OpenCode 2 and Pi: after a host restart, the first full request of a threaded session reuses the previous full request's cache boundary, instead of rewriting the conversation.
 - OpenCode 2: retries after a rate limit try other available accounts before cycling back to one that already refused the request. Accounts with confirmed exhaustion are skipped.
 - OpenCode 1 and 2: every step served by Anthropic's safety fallback now writes one log line with per-attempt token counts; OpenCode 2 previously logged nothing. The safety-fallback notice no longer says follow-up requests stay on the fallback model.
 

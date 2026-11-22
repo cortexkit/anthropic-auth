@@ -1,9 +1,22 @@
 import { describe, expect, spyOn, test } from 'bun:test'
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { logger } from '../logger.ts'
+import { MessageThreadTailStore } from '../message-thread-tail-store.ts'
 import {
   type MessageThreadInput,
   MessageThreadTracker,
   messageThreadBetas,
+  messageThreadCachePrefix,
   prepareMessageThreadRequest,
 } from '../message-threads.ts'
 
@@ -109,6 +122,169 @@ function expectSkip(
     log.mockRestore()
   }
 }
+
+async function restartFixture(acceptContinuation = true) {
+  const root = await mkdtemp(join(tmpdir(), 'thread-tail-restart-'))
+  let now = 1_000
+  const clock = () => now
+  const first = initial()
+  first.betas = messageThreadBetas(new Headers({ 'anthropic-beta': 'base' }))
+  const continued = next(first)
+  const originalStore = new MessageThreadTailStore('opencode2', root, clock)
+  const original = new MessageThreadTracker(20, clock, undefined, originalStore)
+  const create = original.prepare(first)
+  expect(create.decision.type).toBe('create')
+  complete(create)
+  const prepared = original.prepare(continued)
+  expect(prepared.decision.type).toBe('continue')
+  now += 100
+  if (acceptContinuation) complete(prepared)
+  original.forget(first.session, 'session_closed')
+  await originalStore.drain()
+  const store = new MessageThreadTailStore('opencode2', root, clock)
+  const tracker = new MessageThreadTracker(20, clock, undefined, store)
+  return {
+    close: () => rm(root, { recursive: true, force: true }),
+    expire: () => {
+      now = 3_601_000
+    },
+    path: async () =>
+      join(store.directory, (await readdir(store.directory))[0]!),
+    store,
+    first,
+    request: next(continued),
+    render: (request: MessageThreadInput) =>
+      prepareMessageThreadRequest(tracker, {
+        ...request,
+        headers: new Headers({ 'anthropic-beta': 'base' }),
+        bodyText: JSON.stringify(request.body),
+      }),
+  }
+}
+
+describe('full tails across a host restart', () => {
+  test('the first create reuses the accepted full prefix without storing message text', async () => {
+    const f = await restartFixture()
+    try {
+      const outgoing = JSON.parse((await f.render(f.request)).bodyText)
+      expect(outgoing.thread).toEqual({ type: 'create' })
+      expect(outgoing.messages[2].content[0].cache_control).toEqual(long)
+      expect(outgoing.system[0].cache_control).toBeUndefined()
+      const prefix = messageThreadCachePrefix(
+        f.first.body,
+        2,
+        [0],
+        f.first.betas,
+      )
+      expect(messageThreadCachePrefix(outgoing, 2, [0], f.first.betas)).toBe(
+        prefix,
+      )
+      const path = await f.path()
+      expect(await readdir(f.store.directory)).toHaveLength(1)
+      const raw = await readFile(path, 'utf8')
+      expect(JSON.parse(raw)).toMatchObject({
+        continued: true,
+        tail: { prefix, messageIndex: 2, blockPath: [0], acceptedAt: 1_000 },
+      })
+      for (const secret of [
+        'old full tail',
+        'audit-tail',
+        'account',
+        'credential',
+      ])
+        expect(raw).not.toContain(secret)
+      if (process.platform !== 'win32') {
+        expect((await stat(path)).mode & 0o777).toBe(0o600)
+        expect((await stat(f.store.directory)).mode & 0o777).toBe(0o700)
+      }
+    } finally {
+      await f.close()
+    }
+  })
+
+  test('an accepted create alone does not make a stored tail reusable', async () => {
+    const f = await restartFixture(false)
+    try {
+      const raw = JSON.parse(await readFile(await f.path(), 'utf8'))
+      expect(raw.continued).toBe(false)
+      const prepared = await f.render(f.request)
+      expect(prepared.bodyText).toBe(JSON.stringify(fullBody(f.request)))
+    } finally {
+      await f.close()
+    }
+  })
+
+  test('the restart directory retains only the newest 1,024 sessions', async () => {
+    const f = await restartFixture()
+    try {
+      const path = await f.path()
+      const raw = await readFile(path, 'utf8')
+      for (let i = 0; i < 1024; i += 32) {
+        await Promise.all(
+          Array.from({ length: 32 }, async (_, offset) => {
+            const n = i + offset
+            const copy = join(
+              f.store.directory,
+              `${n.toString(16).padStart(64, '0')}.json`,
+            )
+            await writeFile(copy, raw, { mode: 0o600 })
+            await utimes(copy, n + 1, n + 1)
+          }),
+        )
+      }
+      f.store.changed(f.first.session, JSON.parse(raw).tail, true)
+      await f.store.drain()
+      const remaining = await readdir(f.store.directory)
+      expect(remaining).toHaveLength(1024)
+      expect(remaining).not.toContain(`${'0'.repeat(64)}.json`)
+      expect(await readFile(path, 'utf8')).toBe(raw)
+    } finally {
+      await f.close()
+    }
+  })
+
+  test.each([
+    ['prefix', 'prefix_changed'],
+    ['account', 'account_changed'],
+    ['credential', 'account_changed'],
+    ['lifetime', 'expired'],
+    ['corrupt', 'no_anchor'],
+    ['missing', 'no_anchor'],
+  ] as const)(
+    'ignores a persisted tail on %s failure',
+    async (variant, reason) => {
+      const f = await restartFixture()
+      const log = spyOn(logger, 'debug')
+      try {
+        const { request } = f
+        if (variant === 'prefix')
+          (request.body.messages as Message[])[0]!.content[0]!.text = 'changed'
+        if (variant === 'account' || variant === 'credential')
+          request[variant] = 'changed'
+        if (variant === 'lifetime') f.expire()
+        if (variant === 'corrupt')
+          await writeFile(await f.path(), 'invalid json')
+        if (variant === 'missing') await rm(await f.path())
+        const prepared = await f.render(request)
+        expect(prepared.bodyText).toBe(JSON.stringify(fullBody(request)))
+        const event =
+          reason === 'no_anchor'
+            ? 'message_thread_create'
+            : 'message_thread_tail_marker'
+        expect(
+          log.mock.calls.find((call) => call[1] === event)?.[2],
+        ).toMatchObject({ reason })
+        if (variant === 'lifetime') {
+          await f.store.drain()
+          expect(await readdir(f.store.directory)).toEqual([])
+        }
+      } finally {
+        log.mockRestore()
+        await f.close()
+      }
+    },
+  )
+})
 
 describe('full-tail state and wire invariants', () => {
   test.each(['same lifetime', 'different lifetime'] as const)(
