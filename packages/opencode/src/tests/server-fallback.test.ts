@@ -23,6 +23,10 @@ const iterations = [
     cache_read_input_tokens: 400_000,
     cache_creation_input_tokens: 500,
     output_tokens: 0,
+    cache_creation: {
+      ephemeral_5m_input_tokens: 0,
+      ephemeral_1h_input_tokens: 500,
+    },
   },
   {
     type: 'fallback_message',
@@ -402,8 +406,10 @@ describe('createServerSideFallbackStreamRewriter', () => {
   test('exposes terminal fallback iterations in a separate complete hidden marker without changing billed usage', async () => {
     for (const handoff of [true, false]) {
       const { beforeTerminal, terminal } = usageStream(terminalUsage, handoff)
+      const outcomes: ServerSideFallbackOutcome[] = []
       const rewriter = createServerSideFallbackStreamRewriter({
         requestedModel: 'claude-opus-5-5',
+        onOutcome: (outcome) => outcomes.push(outcome),
       })
       const early = rewriter.push(beforeTerminal)
       expect(early).toContain('fallback answer')
@@ -439,6 +445,11 @@ describe('createServerSideFallbackStreamRewriter', () => {
           ),
         ),
       ).toEqual({ iterations })
+      expect(outcomes).toEqual([
+        expect.objectContaining({
+          iterations: iterations.map(({ type: _type, ...counts }) => counts),
+        }),
+      ])
       expect(frames[3].usage).toEqual(terminalUsage)
       const wrapped = createStrippedStream(
         new Response(beforeTerminal + terminal),
@@ -451,10 +462,12 @@ describe('createServerSideFallbackStreamRewriter', () => {
   })
 
   test('bounds fallback usage metadata and ignores unknown fields', () => {
+    const outcomes: ServerSideFallbackOutcome[] = []
     const rewrite = (usage: unknown) => {
       const { beforeTerminal, terminal } = usageStream(usage)
       const rewriter = createServerSideFallbackStreamRewriter({
         requestedModel: 'claude-opus-5-5',
+        onOutcome: (outcome) => outcomes.push(outcome),
       })
       return rewriter.push(beforeTerminal + terminal) + rewriter.flush()
     }
@@ -495,6 +508,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
       expect(rewrite({ ...terminalUsage, iterations: invalid })).not.toContain(
         SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
       )
+      expect(outcomes.at(-1)?.iterations).toEqual([])
     }
   })
 
@@ -569,6 +583,7 @@ describe('createServerSideFallbackStreamRewriter', () => {
         fallback: true,
         handoff: true,
         stopReason: 'end_turn',
+        iterations: [],
       },
     ])
   })

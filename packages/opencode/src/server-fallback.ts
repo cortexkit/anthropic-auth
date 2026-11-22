@@ -1,4 +1,6 @@
 import {
+  logger,
+  normalizeAnthropicModelId,
   resolveClaudeModelCapabilities,
   SERVER_FALLBACK_USAGE_MARKER_TEXT,
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
@@ -14,37 +16,62 @@ export {
   SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX,
 }
 
-function usageMarkerSignature(usage: Record<string, unknown> | undefined) {
+type ServerSideFallbackIteration = {
+  model: string
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number
+    ephemeral_1h_input_tokens?: number
+  }
+}
+
+function tokenCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function validateFallbackUsage(usage: Record<string, unknown> | undefined) {
   const raw = usage?.iterations
   if (!Array.isArray(raw) || raw.length === 0 || raw.length > 8) return
-  const iterations: Record<string, unknown>[] = []
+  const iterations: Array<
+    ServerSideFallbackIteration & { type: 'message' | 'fallback_message' }
+  > = []
   for (const value of raw) {
     const iteration = asRecord(value)
     if (
       !iteration ||
       (iteration.type !== 'message' && iteration.type !== 'fallback_message') ||
-      !safeModelId(iteration.model)
+      !safeModelId(iteration.model) ||
+      !tokenCount(iteration.input_tokens) ||
+      !tokenCount(iteration.output_tokens)
     )
       return
-    const clean: Record<string, unknown> = {
+    const clean: (typeof iterations)[number] = {
       type: iteration.type,
       model: iteration.model,
+      input_tokens: iteration.input_tokens,
+      output_tokens: iteration.output_tokens,
     }
     for (const field of [
-      'input_tokens',
-      'output_tokens',
       'cache_read_input_tokens',
       'cache_creation_input_tokens',
-    ]) {
+    ] as const) {
       const count = iteration[field]
-      if (count === undefined && field.startsWith('cache_')) continue
-      if (
-        typeof count !== 'number' ||
-        !Number.isSafeInteger(count) ||
-        count < 0
-      )
-        return
+      if (count === undefined) continue
+      if (!tokenCount(count)) return
       clean[field] = count
+    }
+    const cacheCreation = asRecord(iteration.cache_creation)
+    for (const field of [
+      'ephemeral_5m_input_tokens',
+      'ephemeral_1h_input_tokens',
+    ] as const) {
+      const count = cacheCreation?.[field]
+      if (!tokenCount(count)) continue
+      clean.cache_creation ??= {}
+      clean.cache_creation[field] = count
     }
     iterations.push(clean)
   }
@@ -52,7 +79,10 @@ function usageMarkerSignature(usage: Record<string, unknown> | undefined) {
     return
   const payload = JSON.stringify({ iterations })
   if (payload.length > 4096) return
-  return SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX + payload
+  return {
+    iterations,
+    signature: SERVER_FALLBACK_USAGE_SIGNATURE_PREFIX + payload,
+  }
 }
 
 export type ContentFilterFallbackMode = 'server' | 'legacy'
@@ -64,6 +94,42 @@ export type ServerSideFallbackOutcome = {
   fallback: boolean
   handoff: boolean
   stopReason: string
+  iterations: ServerSideFallbackIteration[]
+}
+
+const LOGGABLE_STOP_REASONS = new Set([
+  'end_turn',
+  'max_tokens',
+  'stop_sequence',
+  'tool_use',
+  'pause_turn',
+  'refusal',
+  'model_context_window_exceeded',
+])
+
+export function logServedServerFallback(
+  session: string | null,
+  outcome: ServerSideFallbackOutcome,
+) {
+  if (!outcome.fallback || !outcome.targetModel) return
+  logger.info(
+    'server-fallback',
+    'Anthropic server-side safety fallback served step',
+    {
+      session,
+      requestedModel: safeModelId(
+        normalizeAnthropicModelId(outcome.requestedModel),
+      )
+        ? outcome.requestedModel
+        : 'unknown',
+      servedModel: outcome.targetModel,
+      handoff: outcome.handoff,
+      stopReason: LOGGABLE_STOP_REASONS.has(outcome.stopReason)
+        ? outcome.stopReason
+        : 'unknown',
+      iterations: outcome.iterations,
+    },
+  )
 }
 
 type ServerSideFallbackMarker = {
@@ -291,7 +357,10 @@ export function createServerSideFallbackStreamRewriter(options: {
     }
   }
 
-  const complete = (stopReason: string) => {
+  const complete = (
+    stopReason: string,
+    usage: ReturnType<typeof validateFallbackUsage>,
+  ) => {
     if (completed) return
     completed = true
     const targetModel =
@@ -307,6 +376,8 @@ export function createServerSideFallbackStreamRewriter(options: {
       fallback: Boolean(targetModel),
       handoff: Boolean(handoff),
       stopReason,
+      iterations:
+        usage?.iterations.map(({ type: _type, ...counts }) => counts) ?? [],
     })
   }
 
@@ -357,31 +428,29 @@ export function createServerSideFallbackStreamRewriter(options: {
         hasCompletedToolUse = true
       }
     } else if (type === 'message_delta') {
-      observeIterations(asRecord(data?.usage))
+      const usage = asRecord(data?.usage)
+      observeIterations(usage)
       const delta = asRecord(data?.delta)
       const stopReason = stringField(delta, 'stop_reason')
-      if (stopReason) complete(stopReason)
+      const fallbackUsage =
+        stopReason && !usageMarkerEmitted
+          ? validateFallbackUsage(usage)
+          : undefined
+      if (stopReason) complete(stopReason, fallbackUsage)
       let usageMarker = ''
-      if (
-        stopReason &&
-        !usageMarkerEmitted &&
-        maxBlockIndex < Number.MAX_SAFE_INTEGER
-      ) {
-        const signature = usageMarkerSignature(asRecord(data?.usage))
-        if (signature) {
-          usageMarkerEmitted = true
-          const index = ++maxBlockIndex
-          usageMarker =
-            hiddenThinkingFrames(
-              index,
-              SERVER_FALLBACK_USAGE_MARKER_TEXT,
-              signature,
-            ) +
-            sseFrame('content_block_stop', {
-              type: 'content_block_stop',
-              index,
-            })
-        }
+      if (fallbackUsage && maxBlockIndex < Number.MAX_SAFE_INTEGER) {
+        usageMarkerEmitted = true
+        const index = ++maxBlockIndex
+        usageMarker =
+          hiddenThinkingFrames(
+            index,
+            SERVER_FALLBACK_USAGE_MARKER_TEXT,
+            fallbackUsage.signature,
+          ) +
+          sseFrame('content_block_stop', {
+            type: 'content_block_stop',
+            index,
+          })
       }
       if (
         stopReason === 'refusal' &&

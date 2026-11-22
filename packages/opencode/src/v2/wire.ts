@@ -2,6 +2,7 @@ import {
   type NativeAccountSnapshot,
   readThreeWayBoolean,
   remapModelId,
+  resolveClaudeModelCapabilities,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode/plugin'
 import type { Registration } from '@opencode/plugin/promise/registration'
@@ -11,12 +12,24 @@ import {
   BillingLineageTracker,
 } from '../billing-lineage'
 import { LANE_START_REQUEST_HEADER, LANE_START_TEXT } from '../lane-start'
-import { resolveContentFilterFallbackMode } from '../server-fallback'
+import {
+  logServedServerFallback,
+  resolveContentFilterFallbackMode,
+  type ServerSideFallbackOutcome,
+} from '../server-fallback'
 import type {
   NativeAnthropicRequestContext,
   NativeAnthropicResponseContext,
 } from './adapter'
 import type { NativeSourceProvenance } from './source'
+
+function serverSideFallbackEnabled() {
+  return (
+    resolveContentFilterFallbackMode(
+      process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK,
+    ) === 'server'
+  )
+}
 
 /**
  * Claude Code's billing header names the user prompt a request belongs to and
@@ -152,10 +165,7 @@ export function createNativeWirePolicy() {
         midConversationEffortEnabled: false,
         turnEndNoteEnabled: true,
         turnEndNote: snapshot.policyStorage.turnEndNote,
-        serverSideFallbackEnabled:
-          resolveContentFilterFallbackMode(
-            process.env.OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK,
-          ) === 'server',
+        serverSideFallbackEnabled: serverSideFallbackEnabled(),
         laneStart,
         billingLineage: lineage
           ? {
@@ -167,10 +177,21 @@ export function createNativeWirePolicy() {
       }
     },
     responseOptions(
-      input: NativeAnthropicResponseContext<NativeSourceProvenance>,
+      input: Pick<
+        NativeAnthropicResponseContext<NativeSourceProvenance>,
+        'attemptId' | 'modelID' | 'sessionID' | 'kind'
+      >,
     ) {
+      const model = remapModelId(input.modelID)
+      // A dated model alias can differ from the requested ID without a fallback.
+      const canFallback =
+        serverSideFallbackEnabled() &&
+        resolveClaudeModelCapabilities(model)?.serverSideFallback === true
       return {
-        serverSideFallbackModel: remapModelId(input.modelID),
+        serverSideFallbackModel: model,
+        onServerSideFallbackOutcome(outcome: ServerSideFallbackOutcome) {
+          if (canFallback) logServedServerFallback(input.sessionID, outcome)
+        },
         laneStart: laneAttempts.has(input.attemptId),
         onMessageStart(message: Record<string, unknown>) {
           if (input.kind === 'primary' && typeof message.id === 'string') {

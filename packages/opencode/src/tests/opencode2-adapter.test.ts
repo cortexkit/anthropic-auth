@@ -98,6 +98,7 @@ const ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'OPENCODE_ANTHROPIC_AUTH_CONTENT_FILTER_FALLBACK',
 ]
 const savedEnv = new Map<string, string | undefined>()
 const routingKey = Symbol.for('cortexkit.routing')
@@ -936,6 +937,134 @@ describe('OpenCode 2 native Anthropic adapter: request shape', () => {
     expect(
       outputs[2].messages.filter((message: any) => message.clear_at),
     ).toHaveLength(3)
+  })
+
+  test('logs one INFO record with only validated metadata for each server fallback step', async () => {
+    const wire = createNativeWirePolicy()
+    const { source } = makeSource({
+      options: { serverSideFallbackEnabled: true },
+      responseOptions: wire.responseOptions,
+    })
+    const native = createNativeAnthropicAdapter({ source })
+    const host = new Host(native.adapter)
+    const info = spyOn(core.logger, 'info').mockImplementation(() => {})
+    const requestedModel = 'claude-opus-5-5'
+    const servedModel = 'claude-opus-4-8'
+    const responseText = 'Distinctive fallback response text, not log data'
+    const stopReasonText = 'Unrecognized stop reason, not log data'
+    const iterations = [
+      {
+        model: requestedModel,
+        input_tokens: 100,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 390,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 90,
+          ephemeral_1h_input_tokens: 300,
+        },
+      },
+      {
+        model: servedModel,
+        input_tokens: 120,
+        output_tokens: 80,
+        cache_read_input_tokens: 380,
+        cache_creation_input_tokens: 10,
+      },
+    ]
+    const scope = scopeOf({ modelID: `${requestedModel}[1m]` })
+    try {
+      for (const step of ['handoff', 'sticky', 'primary', 'dated-alias']) {
+        const modelID =
+          step === 'dated-alias' ? 'claude-haiku-4-5' : scope.modelID
+        const { attempt, final } = await host.run(
+          { ...scope, modelID },
+          hostRequest({ ...sonnetPayload(), model: modelID, stream: true }),
+        )
+        const frames = [
+          sse('message_start', {
+            type: 'message_start',
+            message: {
+              model:
+                step === 'sticky'
+                  ? servedModel
+                  : step === 'dated-alias'
+                    ? 'claude-haiku-4-5-20251001'
+                    : requestedModel,
+            },
+          }),
+          ...(step === 'handoff'
+            ? [
+                sse('content_block_start', {
+                  type: 'content_block_start',
+                  index: 0,
+                  content_block: {
+                    type: 'fallback',
+                    from: { model: requestedModel },
+                    to: { model: servedModel },
+                  },
+                }),
+                sse('content_block_stop', {
+                  type: 'content_block_stop',
+                  index: 0,
+                }),
+              ]
+            : []),
+          sse('content_block_start', {
+            type: 'content_block_start',
+            index: 1,
+            content_block: { type: 'text', text: '' },
+          }),
+          sse('content_block_delta', {
+            type: 'content_block_delta',
+            index: 1,
+            delta: { type: 'text_delta', text: responseText },
+          }),
+          sse('content_block_stop', { type: 'content_block_stop', index: 1 }),
+          sse('message_delta', {
+            type: 'message_delta',
+            delta: {
+              stop_reason: step === 'sticky' ? stopReasonText : 'end_turn',
+            },
+            usage: {
+              iterations:
+                step === 'handoff' || step === 'sticky'
+                  ? [
+                      { ...iterations[0], type: 'message', text: responseText },
+                      { ...iterations[1], type: 'fallback_message' },
+                    ]
+                  : [],
+            },
+          }),
+          sse('message_stop', { type: 'message_stop' }),
+        ]
+        const response = await native.adapter.rewriteResponse?.({
+          ...attempt,
+          attempt,
+          request: final,
+          response: sseResponse(frames.join('')),
+        })
+        expect(await response?.text()).toContain(responseText)
+      }
+      const records = info.mock.calls.filter(
+        ([channel]) => channel === 'server-fallback',
+      )
+      expect(records.map(([, , payload]) => payload)).toEqual(
+        [true, false].map((handoff) => ({
+          session: scope.sessionID,
+          requestedModel: scope.modelID,
+          servedModel,
+          handoff,
+          stopReason: handoff ? 'end_turn' : 'unknown',
+          iterations,
+        })),
+      )
+      expect(JSON.stringify(records)).not.toContain(responseText)
+      expect(JSON.stringify(records)).not.toContain(stopReasonText)
+    } finally {
+      info.mockRestore()
+      native.dispose()
+    }
   })
 
   test('OAuth send carries the Claude Code wire shape, signed body and betas', async () => {
