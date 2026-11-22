@@ -192,7 +192,7 @@ export default async function cortexKitPiAnthropicAuth(
       piForkEffortSnapshots.forget(sessionId)
       workingMessageBySession.delete(sessionId)
       sessionCacheActivity.forget(sessionId)
-      forgetPiMessageThread(sessionId)
+      forgetPiMessageThread(sessionId, 'session_closed')
     }
     await stopPiCacheKeep()
     await closePiNativeRuntime(storagePath)

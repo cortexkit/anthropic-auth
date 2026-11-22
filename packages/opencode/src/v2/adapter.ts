@@ -1255,7 +1255,7 @@ export function createNativeAnthropicAdapter<Q, P>(
     return { headers: relayHeaders ?? headers, attempt: data }
   }
 
-  const messageThreads = new MessageThreadTracker()
+  const messageThreads = MessageThreadTracker.withTailPersistence('opencode2')
   const threadRequests = new WeakMap<
     Data,
     {

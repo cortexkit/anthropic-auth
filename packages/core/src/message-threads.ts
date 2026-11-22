@@ -1,6 +1,12 @@
 import { createHash, type Hash, randomUUID } from 'node:crypto'
 import { signRequestBody } from './cch.ts'
 import { logger } from './logger.ts'
+import {
+  type FullCacheTail,
+  fullCacheTailExpired,
+  type MessageThreadTailHost,
+  MessageThreadTailStore,
+} from './message-thread-tail-store.ts'
 import type { NativeLocalPoolBinding } from './pool-binding.ts'
 import { isServerFallbackUsageMarker } from './server-fallback-usage.ts'
 import { createSseFramer, decodeSseFrame, parseSseFrame } from './sse.ts'
@@ -74,6 +80,7 @@ export type MessageThreadDisposition =
   | 'thread_rejected'
   | 'account_disabled'
   | 'evicted'
+  | 'session_closed'
   | 'session_deleted'
 
 /** Refresh preserves the local epoch; replacing a login advances it even when the row id is reused. */
@@ -686,15 +693,6 @@ export interface MessageThreadCompletion {
   reply?: unknown
 }
 
-interface FullCacheTail {
-  identity: string
-  messageIndex: number
-  blockPath: number[]
-  prefix: string
-  control: { type: 'ephemeral'; ttl?: '1h' | '5m' }
-  acceptedAt: number
-}
-
 interface FullTailHistory {
   hadThread: boolean
   continued: boolean
@@ -869,11 +867,7 @@ function restoreFullCacheTail(
   if (!tail) return { reason: 'no_full_tail' }
   if (tail.identity !== hash([input.account, input.credential]))
     return { reason: 'account_changed' }
-  if (
-    now < tail.acceptedAt ||
-    now >= tail.acceptedAt + (tail.control.ttl === '1h' ? 3_600_000 : 300_000)
-  )
-    return { reason: 'expired' }
+  if (fullCacheTailExpired(tail, now)) return { reason: 'expired' }
   if (input.body.cache_control) return { reason: 'slot_taken' }
   const slot = input.cacheSlot?.(input.body)
   if (!slot) return { reason: 'slot_taken' }
@@ -930,6 +924,7 @@ export class MessageThreadTracker {
   private messageHashes = 0
   private readonly dispositions = new Map<string, MessageThreadDisposition>()
   private readonly instance = randomUUID()
+  readonly #tailStore?: MessageThreadTailStore
   // One hash-only full-render boundary per session, independent of continue age.
   private readonly fullTails = new Map<string, FullTailHistory>()
 
@@ -937,7 +932,52 @@ export class MessageThreadTracker {
     private readonly capacity = MAX_SESSIONS,
     private readonly now = Date.now,
     private readonly hashBudget = MAX_MESSAGE_HASHES,
-  ) {}
+    tailStore?: MessageThreadTailStore,
+  ) {
+    this.#tailStore = tailStore
+  }
+
+  static withTailPersistence(host: MessageThreadTailHost) {
+    return new MessageThreadTracker(
+      MAX_SESSIONS,
+      Date.now,
+      MAX_MESSAGE_HASHES,
+      new MessageThreadTailStore(host),
+    )
+  }
+
+  private canLoadFullTail(session: string): boolean {
+    const disposition = this.dispositions.get(session)
+    return (
+      !this.fullTails.has(session) &&
+      !this.sessions.has(session) &&
+      disposition !== 'session_deleted' &&
+      disposition !== 'evicted'
+    )
+  }
+
+  loadFullTail(session: string): Promise<void> | undefined {
+    if (!this.#tailStore || !this.canLoadFullTail(session)) return
+    const disposition = this.dispositions.get(session)
+    return this.#tailStore.load(session).then((entry) => {
+      if (
+        entry &&
+        this.dispositions.get(session) === disposition &&
+        this.canLoadFullTail(session)
+      )
+        this.rememberFullTail(session, { hadThread: true, ...entry })
+    })
+  }
+
+  private rememberFullTail(session: string, history: FullTailHistory): void {
+    this.fullTails.delete(session)
+    this.fullTails.set(session, history)
+    while (this.fullTails.size > this.capacity) {
+      const oldest = this.fullTails.keys().next().value
+      if (oldest === undefined) break
+      this.fullTails.delete(oldest)
+    }
+  }
 
   forget(
     session: string,
@@ -945,6 +985,8 @@ export class MessageThreadTracker {
   ): void {
     if (disposition === 'session_deleted' || disposition === 'evicted')
       this.fullTails.delete(session)
+    if (disposition === 'session_deleted')
+      this.#tailStore?.changed(session, undefined, false)
     this.messageHashes -=
       this.sessions.get(session)?.anchor?.messages.length ?? 0
     this.sessions.delete(session)
@@ -1164,24 +1206,28 @@ export class MessageThreadTracker {
         const completedAt = this.now()
         accepted = true
         const sentInput = { ...input, body: tailResult?.body ?? input.body }
-        this.fullTails.delete(input.session)
-        if (decision.type === 'create') {
-          if (!input.stateless || oldTail?.hadThread)
-            this.fullTails.set(input.session, {
-              hadThread: true,
-              continued: false,
-              tail: fullCacheTail(sentInput, completedAt),
-            })
-        } else
-          this.fullTails.set(input.session, {
+        if (
+          decision.type === 'continue' ||
+          !input.stateless ||
+          oldTail?.hadThread
+        ) {
+          const continued = decision.type === 'continue'
+          const tail = continued
+            ? oldTail?.tail
+            : fullCacheTail(sentInput, completedAt)
+          this.rememberFullTail(input.session, {
             hadThread: true,
-            continued: true,
-            tail: oldTail?.tail,
+            continued,
+            tail,
           })
-        while (this.fullTails.size > this.capacity) {
-          const oldest = this.fullTails.keys().next().value
-          if (oldest === undefined) break
-          this.fullTails.delete(oldest)
+        }
+        if (this.#tailStore) {
+          const history = this.fullTails.get(input.session)
+          this.#tailStore.changed(
+            input.session,
+            history?.tail,
+            history?.continued ?? false,
+          )
         }
         if (input.stateless) return
         // Compute a create request's history fingerprint after response completion.
@@ -1511,6 +1557,10 @@ export async function prepareMessageThreadRequest(
   const fullText = input.bodyText
   let full: Body | undefined
   const fullBody = () => (full ??= JSON.parse(fullText) as Body)
+  if (input.session) {
+    const loading = tracker.loadFullTail(input.session)
+    if (loading) await loading
+  }
   const accountKey = input.account
   let threading = !disabledThreadAccounts.has(accountKey)
   if (threading) messageThreadBetas(input.headers)
