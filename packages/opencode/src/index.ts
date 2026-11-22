@@ -359,6 +359,7 @@ import {
   type RpcServerAdoption,
 } from './rpc/server-registry.ts'
 import {
+  logServedServerFallback,
   resolveContentFilterFallbackMode,
   type ServerSideFallbackOutcome,
 } from './server-fallback.ts'
@@ -968,7 +969,7 @@ function buildServerFallbackNotice(
   requestedModelId: string,
   targetModelId: string,
 ): string {
-  return `Anthropic safety fallback active: ${fallbackModelLabel(requestedModelId)} → ${fallbackModelLabel(targetModelId)}. Follow-up requests may remain on the fallback model for about one hour.`
+  return `Anthropic's safety fallback served this step on ${fallbackModelLabel(targetModelId)}; the next step tries ${fallbackModelLabel(requestedModelId)} again.`
 }
 
 function buildServerRestoredNotice(requestedModelId: string): string {
@@ -5414,6 +5415,7 @@ const anthropicAuthPlugin = async (
     storage: AccountStorage | null,
     auth: { access?: string; refresh?: string },
   ) {
+    logServedServerFallback(plan.sessionId, outcome)
     if (outcome.fallback && outcome.targetModel) {
       const previousTarget = serverFallbackTargets.get(plan.recoveryKey)
       serverFallbackTargets.delete(plan.recoveryKey)
@@ -5433,16 +5435,6 @@ const anthropicAuthPlugin = async (
       ) {
         return
       }
-      logger.info(
-        'fable-fallback',
-        'Anthropic server-side safety fallback active',
-        {
-          session: plan.sessionId,
-          requestedModel: plan.requestedModel,
-          targetModel: outcome.targetModel,
-          handoff: outcome.handoff,
-        },
-      )
       publishFableRecoveryNotice(
         {
           sessionId: plan.sessionId,
@@ -10038,22 +10030,20 @@ const anthropicAuthPlugin = async (
                   ...(serverFallbackModel
                     ? {
                         serverSideFallbackModel: serverFallbackModel,
-                        ...(fablePlan
-                          ? {
-                              onServerSideFallbackOutcome: (
-                                outcome: ServerSideFallbackOutcome,
-                              ) => {
-                                if (fableRequest)
-                                  fableRequest.serverFallback = outcome.fallback
-                                observeServerFallbackOutcome(
-                                  fablePlan,
-                                  outcome,
-                                  storage,
-                                  auth,
-                                )
-                              },
-                            }
-                          : {}),
+                        onServerSideFallbackOutcome: (
+                          outcome: ServerSideFallbackOutcome,
+                        ) => {
+                          if (fableRequest)
+                            fableRequest.serverFallback = outcome.fallback
+                          if (fablePlan)
+                            observeServerFallbackOutcome(
+                              fablePlan,
+                              outcome,
+                              storage,
+                              auth,
+                            )
+                          else logServedServerFallback(sessionId, outcome)
+                        },
                       }
                     : {}),
                 })

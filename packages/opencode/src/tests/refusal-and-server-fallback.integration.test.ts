@@ -1,6 +1,7 @@
-import { describe, expect, mock } from 'bun:test'
+import { describe, expect, mock, spyOn } from 'bun:test'
 import {
   type AccountStorage,
+  logger,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 import {
@@ -141,19 +142,33 @@ describe('auth.loader', () => {
         }),
       { models: {} },
     )
-    const response = await result.fetch(MESSAGES_URL, {
-      method: 'POST',
-      body: JSON.stringify({
-        model: 'claude-fable-5',
-        stream: true,
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
-    })
-    const responseText = await response.text()
+    const info = spyOn(logger, 'info').mockImplementation(() => {})
+    try {
+      const response = await result.fetch(MESSAGES_URL, {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'claude-fable-5',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+      const responseText = await response.text()
 
-    expect(sentBody?.fallbacks).toBe('default')
-    expect(responseText).not.toContain('"type":"fallback","from"')
-    expect(responseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+      expect(sentBody?.fallbacks).toBe('default')
+      expect(responseText).not.toContain('"type":"fallback","from"')
+      expect(responseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+      const records = info.mock.calls.filter(
+        ([channel]) => channel === 'server-fallback',
+      )
+      expect(records.map(([, , payload]) => payload)).toEqual([
+        expect.objectContaining({
+          session: null,
+          servedModel: 'claude-opus-5',
+        }),
+      ])
+    } finally {
+      info.mockRestore()
+    }
   })
 
   const assertServerFallbackTransitions = async (modelId: string) => {
@@ -320,14 +335,31 @@ describe('auth.loader', () => {
       }),
     }
 
-    const fallbackResponse = await result.fetch(MESSAGES_URL, request)
-    const fallbackResponseText = await fallbackResponse.text()
-    expect(fallbackResponseText).toContain('fallback answer')
-    expect(fallbackResponseText).not.toContain('"type":"fallback","from"')
-    expect(fallbackResponseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
-    expect(requestBodies).toHaveLength(1)
-    expect(requestBodies[0]?.fallbacks).toBe('default')
-    expect(requestBetas[0]?.split(',')).toContain(SERVER_SIDE_FALLBACK_BETA)
+    const info = spyOn(logger, 'info').mockImplementation(() => {})
+    try {
+      const fallbackResponse = await result.fetch(MESSAGES_URL, request)
+      const fallbackResponseText = await fallbackResponse.text()
+      expect(fallbackResponseText).toContain('fallback answer')
+      expect(fallbackResponseText).not.toContain('"type":"fallback","from"')
+      expect(fallbackResponseText).toContain(SERVER_FALLBACK_SIGNATURE_PREFIX)
+      expect(requestBodies).toHaveLength(1)
+      expect(requestBodies[0]?.fallbacks).toBe('default')
+      expect(requestBetas[0]?.split(',')).toContain(SERVER_SIDE_FALLBACK_BETA)
+
+      modelRequest = 0
+      const nextResponse = await result.fetch(MESSAGES_URL, request)
+      await expect(nextResponse.text()).resolves.toContain('fallback answer')
+      expect(requestBodies[1]?.fallbacks).toBe('default')
+      expect(
+        info.mock.calls.filter(
+          ([channel, message]) =>
+            channel === 'server-fallback' ||
+            message === 'Anthropic server-side safety fallback active',
+        ),
+      ).toHaveLength(2)
+    } finally {
+      info.mockRestore()
+    }
     const switched = await waitForSidebarState((state) =>
       Boolean(
         state.fableRecoveries?.some(
@@ -399,9 +431,7 @@ describe('auth.loader', () => {
           noReply: true,
           parts: [
             expect.objectContaining({
-              text: expect.stringContaining(
-                `Anthropic safety fallback active: ${label} → Opus 5`,
-              ),
+              text: `Anthropic's safety fallback served this step on Opus 5; the next step tries ${label} again.`,
             }),
           ],
         }),
