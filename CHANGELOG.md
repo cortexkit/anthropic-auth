@@ -4,7 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
-- OpenCode 2: retries after a rate limit try other available accounts before cycling back to one that already refused the request. Accounts with confirmed exhaustion are skipped. Addresses #862.
+- OpenCode 2: retries after a rate limit try other available accounts before cycling back to one that already refused the request. Accounts with confirmed exhaustion are skipped.
 
 ## 2.16.4
 
