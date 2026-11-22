@@ -4,6 +4,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+- OpenCode 2: retries after a rate limit try other available accounts before cycling back to one that already refused the request. Accounts with confirmed exhaustion are skipped.
 - OpenCode 1 and 2: every step served by Anthropic's safety fallback now writes one log line with per-attempt token counts; OpenCode 2 previously logged nothing. The safety-fallback notice no longer says follow-up requests stay on the fallback model.
 
 ## 2.16.4
