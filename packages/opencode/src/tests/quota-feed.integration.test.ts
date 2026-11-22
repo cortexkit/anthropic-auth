@@ -809,12 +809,27 @@ describe('quota header feed integration', () => {
         const firstResponse = await firstRequest
         expect(firstResponse.status).toBe(200)
         await firstResponse.text()
-        await waitForNativePoolQuota(
+        const persisted = await waitForNativePoolQuota(
           'main',
-          (quota) => quota?.checkedAt === clock,
+          (quota) =>
+            quota?.five_hour?.checkedAt === clock &&
+            quota.seven_day?.checkedAt === clock,
         )
+        expect(persisted?.checkedAt).toBe(pollCheckedAt)
         expect((await readAccountStorage())?.quota?.mainQuota?.scoped).toEqual(
           scoped,
+        )
+        // Storage acceptance does not wait for the detached feed write.
+        await waitForFeedEntries(
+          (entries) =>
+            entries.some(
+              (entry) =>
+                entry !== null &&
+                typeof entry === 'object' &&
+                'observed_at_ms' in entry &&
+                entry.observed_at_ms === clock,
+            ),
+          'first header observation',
         )
         clock += 1_000
         const secondResponse = await result.fetch(MESSAGES_URL, EMPTY_POST)
@@ -963,8 +978,11 @@ describe('quota header feed integration', () => {
       await response.text()
 
       const persisted = await waitForAccountStorage(
-        (candidate) => candidate?.quota?.mainQuota?.checkedAt === clock,
+        (candidate) =>
+          candidate?.quota?.mainQuota?.five_hour?.checkedAt === clock &&
+          candidate.quota.mainQuota.seven_day?.checkedAt === clock,
       )
+      expect(persisted?.quota?.mainQuota?.checkedAt).toBe(pollCheckedAt)
       expect(persisted?.quota?.mainQuota?.five_hour?.usedPercent).toBe(11)
       expect(persisted?.quota?.mainQuota?.seven_day?.usedPercent).toBe(22)
       expect(persisted?.quota?.mainQuota?.scoped).toEqual(scoped)

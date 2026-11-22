@@ -145,6 +145,8 @@ export interface NativeVaultRuntimeOptions {
  *   minute per daemon and enrollment), look the route's account up in it,
  *   and skip the usage GET for a current reading, a cold cache or an upstream
  *   failure. Skipped misses leave the account due for the next sweep.
+ * - 'background-cache': apply a current reading from the already-warmed
+ *   cache even if recent headers mean a provider poll is not due.
  * - 'admission': a request needs a reading. Look the served credential's
  *   account up in insula's cache only, never refreshing it, then poll on a
  *   miss except an upstream failure, which uses a dated reading if attached
@@ -152,7 +154,7 @@ export interface NativeVaultRuntimeOptions {
  * Omitted: poll Anthropic directly (explicit user refreshes and other
  *   callers that must see the provider's own reading).
  */
-export type NativeVaultQuotaPurpose = QuotaReadingPurpose
+export type NativeVaultQuotaPurpose = QuotaReadingPurpose | 'background-cache'
 
 export interface NativeVaultWatchOptions {
   intervalMs: number
@@ -1249,11 +1251,14 @@ export function createNativeVaultRuntime(
     },
     async fetchQuota(routeId, fetchImpl = fetch, signal, dispatch, purpose) {
       const row = await rowFor(await runtime.read(), routeId)
+      const cacheOnly = purpose === 'background-cache'
       // A background sweep asks insula about the roster row's account (its
       // list_scoped account_id) before any credential is fetched.
       let swept: InsulaQuotaResult<InsulaClaudeQuota> | undefined
-      if (purpose === 'background' && row) {
-        await refreshInsula()
+      if ((purpose === 'background' || cacheOnly) && row) {
+        // The background sweep already warmed the cache. Leave provider polling
+        // to the due-gated background path when there is no current reading.
+        if (!cacheOnly) await refreshInsula()
         check(signal)
         swept = insulaLookup(row.accountIdentity)
         if (swept.miss === 'cold' || swept.miss === 'upstream-failed') {
@@ -1261,6 +1266,8 @@ export function createNativeVaultRuntime(
           throw new QuotaRefreshDeferred()
         }
       }
+      if (cacheOnly && (swept?.miss || !swept?.reading))
+        throw new QuotaRefreshDeferred()
       const state = await readNativeRuntime(paths.runtime, paths.storageId)
       const before =
         state.status === 'ready'
@@ -1291,7 +1298,7 @@ export function createNativeVaultRuntime(
             miss: 'unreachable',
           }
           let accountChanged = false
-          if (purpose === 'background') {
+          if (purpose === 'background' || cacheOnly) {
             // The sweep joined the roster row's account; publish it only for
             // a credential served for that same account.
             if (
@@ -1331,7 +1338,10 @@ export function createNativeVaultRuntime(
               stored ? fromNativeQuotaMap(stored) : undefined,
             )
           }
-          if (purpose === 'admission' && lookup.miss === 'upstream-failed')
+          if (
+            cacheOnly ||
+            (purpose === 'admission' && lookup.miss === 'upstream-failed')
+          )
             return undefined
           return fetchOAuthQuotaSnapshot({
             accessToken: receipt.accessToken,

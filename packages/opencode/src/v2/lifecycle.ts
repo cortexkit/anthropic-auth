@@ -5,6 +5,7 @@ import {
   type NativeAccountRuntime,
   nativeAccountCanServe,
   oauthProfileIsFresh,
+  quotaPollCheckedAt,
   quotaSnapshotCheckedAt,
   readThreeWayBoolean,
 } from '@cortexkit/anthropic-auth-core'
@@ -36,24 +37,37 @@ export function startNativeAnthropicLifecycle(
     for (const account of current.accounts) {
       if (abort.signal.aborted) return
       if (!nativeAccountCanServe(account) || account.type !== 'oauth') continue
-      if (
-        readThreeWayBoolean(current.policyStorage.quota?.enabled, true) &&
-        Date.now() - quotaSnapshotCheckedAt(account.quota) >= interval
-      ) {
+      if (readThreeWayBoolean(current.policyStorage.quota?.enabled, true)) {
+        const vault = current.mode === 'claustrum'
+        const quota = account.quota
+        const pollCheckedAt = quotaPollCheckedAt(quota)
+        // Legacy readings without provenance or poll-only fields have no
+        // separate poll clock. Their window times still date the reading.
+        const legacyStandardOnly =
+          quota?.source === undefined &&
+          quota?.scoped === undefined &&
+          quota?.extraUsage === undefined &&
+          pollCheckedAt === 0
+        const checkedAt =
+          vault || legacyStandardOnly
+            ? quotaSnapshotCheckedAt(quota)
+            : Math.min(
+                pollCheckedAt,
+                ...(quota?.scoped ?? []).map((window) => window.checkedAt),
+              )
+        const due = Date.now() - checkedAt >= interval
         // Each quota reading or failure is bound to the credential version
         // used for its request, so a late result cannot affect a newer login.
-        // This is the background tick: for a vault account the runtime uses
-        // a current reading from insula (the vault daemon's quota monitor)
-        // instead of a usage GET when one exists; see NativeVaultQuotaPurpose.
-        await runtime
-          .fetchQuota(
-            account.id,
-            fetchImpl,
-            abort.signal,
-            undefined,
-            'background',
-          )
-          .catch(() => {})
+        if (due || vault)
+          await runtime
+            .fetchQuota(
+              account.id,
+              fetchImpl,
+              abort.signal,
+              undefined,
+              due ? 'background' : 'background-cache',
+            )
+            .catch(() => {})
       }
       if (!oauthProfileIsFresh(account.profile) && !abort.signal.aborted)
         await runtime

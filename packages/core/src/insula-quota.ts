@@ -9,8 +9,9 @@ import {
   type OAuthExtraUsageSnapshot,
   type OAuthQuotaSnapshot,
   type QuotaFieldSources,
+  quotaFieldSource,
+  quotaPollCheckedAt,
   quotaSnapshotCheckedAt,
-  quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
 
 /** An insula reading in the shape our usage poll produces, before the account identity is attached. */
@@ -224,41 +225,31 @@ function newer<T extends { checkedAt: number }>(
  * a window read after insula's fetch (a response header, or our own poll).
  * Stored quota is replaced as one snapshot, newest wins, so publishing the
  * older insula reading as is would be refused and lose its other windows.
- * Keep the newer reading of each window instead.
+ * Keep newer standard windows, but take scoped limits and credits together
+ * from the newest poll, including fields it no longer reports.
  */
 export function mergeInsulaQuota(
   reading: InsulaClaudeQuota,
   stored: OAuthQuotaSnapshot | undefined,
 ): OAuthQuotaSnapshot {
-  if (!stored || quotaSnapshotCheckedAt(stored) <= reading.checkedAt)
-    return reading
-  const five_hour = quotaSnapshotOmitsFiveHour(stored)
-    ? undefined
-    : !reading.five_hour &&
-        (stored.five_hour?.checkedAt ?? 0) <= reading.checkedAt
+  if (!stored) return reading
+  if (quotaPollCheckedAt(stored) > reading.checkedAt) return stored
+  if (quotaSnapshotCheckedAt(stored) <= reading.checkedAt) return reading
+  const five_hour =
+    !reading.five_hour &&
+    (stored.five_hour?.checkedAt ?? 0) <= reading.checkedAt
       ? undefined
       : newer(reading.five_hour, stored.five_hour)
   const seven_day = newer(reading.seven_day, stored.seven_day)
-  const scoped = new Map(reading.scoped.map((window) => [window.id, window]))
-  for (const window of stored.scoped ?? []) {
-    const merged = newer(scoped.get(window.id), window)
-    if (merged) scoped.set(window.id, merged)
-  }
   const fieldSources: QuotaFieldSources = { ...reading.fieldSources }
-  if (five_hour !== reading.five_hour && stored.fieldSources?.five_hour)
-    fieldSources.five_hour = stored.fieldSources.five_hour
-  if (seven_day !== reading.seven_day && stored.fieldSources?.seven_day)
-    fieldSources.seven_day = stored.fieldSources.seven_day
+  if (five_hour && five_hour !== reading.five_hour)
+    fieldSources.five_hour = quotaFieldSource(stored, 'five_hour')
+  if (seven_day !== reading.seven_day)
+    fieldSources.seven_day = quotaFieldSource(stored, 'seven_day')
   return {
     ...reading,
     five_hour,
     ...(seven_day && { seven_day }),
-    scoped: [...scoped.values()],
-    checkedAt: quotaSnapshotOmitsFiveHour(stored)
-      ? stored.checkedAt
-      : quotaSnapshotOmitsFiveHour(reading)
-        ? reading.checkedAt
-        : Math.max(reading.checkedAt, quotaSnapshotCheckedAt(stored)),
     fieldSources,
   }
 }

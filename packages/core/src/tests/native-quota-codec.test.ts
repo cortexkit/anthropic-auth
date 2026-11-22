@@ -6,6 +6,7 @@ import {
   getScopedQuotaWindowForModel,
   mergeHeaderQuotaForPersistence,
   type OAuthQuotaSnapshot,
+  quotaPollCheckedAt,
   quotaSnapshotCheckedAt,
 } from '../accounts.ts'
 import {
@@ -536,7 +537,7 @@ test('captured Team poll and response headers survive the production provider pa
   expect(fromNativeQuotaMap(toNativeQuotaMap(headers))).toEqual(headers)
 })
 
-test('the older-poll gap cannot be closed without a storage-format change because legacy data loses the poll clock', () => {
+test('new native header merges retain the poll clock even though legacy data could lose it', () => {
   const emptyPoll = (checkedAt: number) =>
     toNativeQuotaMap({
       accountIdentity: 'synthetic-account-A',
@@ -563,11 +564,17 @@ test('the older-poll gap cannot be closed without a storage-format change becaus
   const latePollAt = 1200
   const first = history(earlierPollAt)
   const second = history(laterPollAt)
-  // Headers replace the snapshot and shared-window clocks. An empty poll has
-  // no scoped-window clock, and fieldSources stores labels rather than times.
-  expect(first).toEqual(second)
   expect(first.anthropic.source).toBe('headers')
-  expect(first.anthropic.checkedAt).toBe(2000)
+  expect(first.anthropic.checkedAt).toBe(earlierPollAt)
+  expect(second.anthropic.checkedAt).toBe(laterPollAt)
+  // Before the poll clock was retained, both histories produced the same map.
+  // Neither the two header windows nor the empty scoped list can recover it.
+  const legacy = (map: NativeQuotaMap): NativeQuotaMap => ({
+    ...map,
+    anthropic: { ...map.anthropic, checkedAt: 2000 },
+  })
+  expect(legacy(first)).toEqual(legacy(second))
+  expect(quotaPollCheckedAt(fromNativeQuotaMap(legacy(first)))).toBe(0)
   const latePoll = toNativeQuotaMap({
     accountIdentity: 'synthetic-account-A',
     source: 'poll',
@@ -590,13 +597,14 @@ test('the older-poll gap cannot be closed without a storage-format change becaus
   const afterSecond = fromNativeQuotaMap(
     nativeQuotaCodec.merge(second, latePoll),
   )
-  // The newest-poll rule would accept the late poll only after the earlier
-  // history, but identical legacy inputs cannot distinguish those outcomes.
-  expect(latePollAt > earlierPollAt).toBe(true)
-  expect(latePollAt > laterPollAt).toBe(false)
-  expect(afterFirst).toEqual(afterSecond)
-  expect(afterFirst.scoped).toEqual([])
-  expect(afterFirst.extraUsage).toBeUndefined()
+  expect(afterFirst.checkedAt).toBe(latePollAt)
+  expect(afterFirst.scoped?.[0]?.id).toBe('fable')
+  expect(afterFirst.extraUsage).toEqual(full.extraUsage)
+  expect(afterFirst.five_hour?.checkedAt).toBe(2000)
+  expect(afterSecond.checkedAt).toBe(laterPollAt)
+  expect(afterSecond.scoped).toEqual([])
+  expect(afterSecond.extraUsage).toBeUndefined()
+  expect(nativeQuotaCodec.merge(legacy(first), latePoll)).toEqual(legacy(first))
 })
 
 test('a newer complete poll replaces the whole snapshot and clears older scoped limits and extra usage', () => {
@@ -616,4 +624,30 @@ test('a newer complete poll replaces the whole snapshot and clears older scoped 
     expect(merged.scoped ?? []).toEqual([])
     expect(merged.extraUsage).toBeUndefined()
   }
+})
+
+test('a late header carrying a prior poll cannot restore removed credits or scoped limits', () => {
+  const old: OAuthQuotaSnapshot = { ...full, source: 'poll' }
+  const latest: OAuthQuotaSnapshot = {
+    accountIdentity: full.accountIdentity,
+    checkedAt: 2000,
+    source: 'poll',
+    scoped: [{ ...full.scoped![1]!, checkedAt: 2000 }],
+  }
+  const lateHeaders = mergeHeaderQuotaForPersistence(old, {
+    accountIdentity: full.accountIdentity,
+    source: 'headers',
+    checkedAt: 3000,
+    seven_day: { usedPercent: 30, remainingPercent: 70, checkedAt: 3000 },
+  })
+  const merged = fromNativeQuotaMap(
+    nativeQuotaCodec.merge(
+      toNativeQuotaMap(latest),
+      toNativeQuotaMap(lateHeaders),
+    ),
+  )
+  expect(merged.seven_day).toEqual(lateHeaders.seven_day)
+  expect(merged.scoped).toEqual(latest.scoped)
+  expect(merged.extraUsage).toBeUndefined()
+  expect(merged.checkedAt).toBe(2000)
 })

@@ -900,10 +900,10 @@ test('admission reads only the insula cache: never refreshes it, polls on a miss
   )
   expect(f.counts.insula).toBe(1)
   expect(f.counts.usage).toEqual([bearer(workRow.id), bearer(mainRow.id)])
-  // The cold poll above is newer than insula's fetch, so its standard windows
-  // stay; the Fable window only insula reported is added.
+  // The cold poll above is newer than Insula's fetch. Its empty scoped list
+  // is authoritative, so an older cached poll cannot restore the Fable limit.
   expect(quota.five_hour).toMatchObject({ usedPercent: 10, checkedAt: now })
-  expect(quota.scoped?.map((window) => window.checkedAt)).toEqual([fetchedAt])
+  expect(quota.scoped).toEqual([])
 })
 
 test('runtimes on one connection file and token path share one insula source until all release it', async () => {
@@ -1223,5 +1223,33 @@ test('a newer stored window survives an older insula reading', () => {
     checkedAt: fetchedAt,
   })
   expect(merged.scoped?.[0]?.checkedAt).toBe(fetchedAt)
-  expect(merged.checkedAt).toBe(now)
+  expect(merged.checkedAt).toBe(fetchedAt)
+})
+
+test('an Insula poll removes unreported scoped limits and credits without reviving them from an older poll', () => {
+  const earlier = normalizeInsulaClaudeQuota(
+    entry(uuid, {
+      pools: [
+        { title: 'Extra usage', total: { minor: 100 }, used: { minor: 40 } },
+      ],
+    }),
+    { fetchedAt },
+  )
+  const latest = normalizeInsulaClaudeQuota(
+    entry(uuid, { usage: { secondary: { usedPercent: 15 } } }),
+    { fetchedAt: fetchedAt + 1000 },
+  )
+  if (!earlier || !latest) throw new Error('expected readings')
+  const stored = mergeInsulaQuota(earlier, {
+    source: 'headers',
+    checkedAt: now,
+    seven_day: { checkedAt: now, usedPercent: 22, remainingPercent: 78 },
+  })
+  expect(stored.scoped).toHaveLength(1)
+  expect(stored.extraUsage?.used.amountMinor).toBe(40)
+  const merged = mergeInsulaQuota(latest, stored)
+  expect(merged.seven_day).toEqual(stored.seven_day)
+  expect(merged.scoped).toEqual([])
+  expect(merged.extraUsage).toBeUndefined()
+  expect(mergeInsulaQuota(earlier, merged)).toEqual(merged)
 })

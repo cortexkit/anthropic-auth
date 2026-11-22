@@ -5,6 +5,11 @@ import { pathToFileURL } from 'node:url'
 import type { QuotaCodec } from '@cortexkit/common-auth/quota'
 import type { OAuthQuotaSnapshot } from '../src/accounts.ts'
 import {
+  mergeInsulaQuota,
+  normalizeInsulaClaudeQuota,
+} from '../src/insula-quota.ts'
+import {
+  fromNativeQuotaMap,
   type NativeQuotaMap,
   nativeQuotaCodec,
   toNativeQuotaMap,
@@ -24,11 +29,10 @@ async function run(command: string[], cwd: string) {
   return stdout
 }
 
-/** Network integration guard against making a shared pool unreadable after rollback. */
-test('quota maps written by the shared store remain accepted by the published Core 2.2.7 codec', async () => {
+async function checkPublishedQuotaCodec(version: string) {
   const scratch = new URL('../../../target/scratch/', import.meta.url).pathname
   await mkdir(scratch, { recursive: true })
-  const root = await mkdtemp(join(scratch, 'quota-format-227-'))
+  const root = await mkdtemp(join(scratch, `quota-format-${version}-`))
   try {
     // npm 11 prints an array of records, npm 12 an object keyed by package name.
     const packed: unknown = JSON.parse(
@@ -36,7 +40,7 @@ test('quota maps written by the shared store remain accepted by the published Co
         [
           'npm',
           'pack',
-          '@cortexkit/anthropic-auth-core@2.2.7',
+          `@cortexkit/anthropic-auth-core@${version}`,
           '--json',
           '--pack-destination',
           root,
@@ -47,7 +51,7 @@ test('quota maps written by the shared store remain accepted by the published Co
     const [pack] = (
       Array.isArray(packed) ? packed : Object.values(packed as object)
     ) as Array<{ filename: string; version: string; shasum: string }>
-    if (pack?.version !== '2.2.7')
+    if (pack?.version !== version)
       throw new Error('Wrong compatibility release')
     console.log(
       'QUOTA_COMPATIBILITY_PACK',
@@ -110,10 +114,47 @@ test('quota maps written by the shared store remain accepted by the published Co
       five_hour: { usedPercent: 12, remainingPercent: 88, checkedAt: 2000 },
       seven_day: { usedPercent: 21, remainingPercent: 79, checkedAt: 2000 },
     }
+    const weeklyOnly = { ...poll, five_hour: undefined }
+    const weeklyHeaders = { ...headers, five_hour: undefined }
+    const insula = normalizeInsulaClaudeQuota(
+      {
+        provider: 'claude',
+        account: identity,
+        fetchedAt: new Date(1500).toISOString(),
+        source: 'vault',
+        usage: { secondary: { usedPercent: 15 } },
+      },
+      { fetchedAt: 1500 },
+    )
+    if (!insula) throw new Error('Expected a cached quota reading')
+    const afterHeaders = fromNativeQuotaMap(
+      nativeQuotaCodec.merge(
+        toNativeQuotaMap(weeklyOnly),
+        toNativeQuotaMap(weeklyHeaders),
+      ),
+    )
     const cases: Array<{ name: string; readings: OAuthQuotaSnapshot[] }> = [
       { name: 'full poll', readings: [poll] },
       { name: 'poll followed by headers', readings: [poll, headers] },
-      { name: 'headers followed by an older poll', readings: [headers, poll] },
+      {
+        name: 'local poll clock survives newer headers on both standard windows',
+        readings: [{ ...poll, scoped: [] }, headers],
+      },
+      {
+        name: 'vault Insula reading brings the poll clock forward independently of headers',
+        readings: [
+          weeklyOnly,
+          weeklyHeaders,
+          {
+            ...mergeInsulaQuota(insula, afterHeaders),
+            accountIdentity: identity,
+          },
+        ],
+      },
+      {
+        name: 'headers followed by an older poll',
+        readings: [headers, poll],
+      },
       {
         name: 'newer complete poll clears optional fields',
         readings: [poll, { ...headers, source: 'poll', scoped: [] }],
@@ -207,4 +248,11 @@ test('quota maps written by the shared store remain accepted by the published Co
   } finally {
     await rm(root, { recursive: true, force: true })
   }
-}, 60_000)
+}
+
+/** Network integration guard against making a shared pool unreadable after rollback. */
+test.each(['2.2.7', '2.16.4'])(
+  'quota maps written by the shared store remain accepted by the published Core %s codec',
+  checkPublishedQuotaCodec,
+  60_000,
+)

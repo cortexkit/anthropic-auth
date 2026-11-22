@@ -21,7 +21,11 @@ import {
 } from '../native-quota-codec.ts'
 import { mergeHeaderQuotaSnapshot } from '../quota-headers.ts'
 import { QuotaManager } from '../quota-manager.ts'
-import { buildClaudeQuotaSummary } from '../quotas.ts'
+import {
+  buildClaudeQuotaSummary,
+  formatQuota,
+  quotaDisplayProjection,
+} from '../quotas.ts'
 import {
   decideStickyQuotaFailure,
   stickyQuotaSnapshotIsFresh,
@@ -427,4 +431,39 @@ test('insula merge preserves a poll-removed session limit across independently n
   const merged = mergeInsulaQuota(old, quota)
   expect(merged.five_hour).toBeUndefined()
   expect(merged.checkedAt).toBe(quota.checkedAt)
+})
+
+test('a fresh Insula poll clears the sidebar age for a weekly-only account with credits', async () => {
+  const now = Date.now()
+  const old = now - 60 * 60_000
+  const extraUsage = {
+    used: { amountMinor: 10, currency: 'USD', exponent: 2 },
+    limit: { amountMinor: 100, currency: 'USD', exponent: 2 },
+    exhausted: false,
+  }
+  const headers: OAuthQuotaSnapshot = {
+    source: 'headers',
+    checkedAt: now,
+    seven_day: window(now, 80),
+  }
+  const stored = mergeHeaderQuotaForPersistence(
+    { ...(await poll(0, old)), extraUsage },
+    headers,
+  )
+  const at = now - 1000
+  const current = await poll(0, at)
+  const reading: InsulaClaudeQuota = {
+    ...current,
+    checkedAt: at,
+    seven_day: window(at),
+    scoped: current.scoped!,
+    extraUsage,
+  }
+  const sidebar = (quota: OAuthQuotaSnapshot) =>
+    formatQuota(quotaDisplayProjection(quota, now), { form: 'compact', now })
+  expect(sidebar(stored)).toContain('checked 1h ago')
+  const merged = mergeInsulaQuota(reading, stored)
+  expect(merged.checkedAt).toBe(at)
+  expect(merged.seven_day).toEqual(headers.seven_day)
+  expect(sidebar(merged)).not.toContain('checked')
 })

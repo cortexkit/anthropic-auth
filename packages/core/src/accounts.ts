@@ -663,6 +663,35 @@ export function quotaFieldSource(
   )
 }
 
+/** The poll's clock, independent of newer standard windows read from headers. */
+export function quotaPollCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
+  if (!quota) return 0
+  const standard = ['five_hour', 'seven_day'] as const
+  const hasPoll =
+    quota.source === 'poll' ||
+    quotaSnapshotOmitsFiveHour(quota) ||
+    quota.scoped !== undefined ||
+    quota.extraUsage !== undefined ||
+    standard.some((key) => quotaFieldSource(quota, key) === 'poll')
+  if (!hasPoll) return 0
+  // Older mixed snapshots could put a header's clock here. Use only the
+  // surviving poll windows in that case; if none survived, the poll is due.
+  const topLevelIsHeader = standard.some(
+    (key) =>
+      quotaFieldSource(quota, key) === 'headers' &&
+      quota[key]?.checkedAt === quota.checkedAt,
+  )
+  return Math.max(
+    !topLevelIsHeader ? (quota.checkedAt ?? 0) : 0,
+    ...(quota.scoped ?? []).map((window) => window.checkedAt),
+    ...standard.map((key) =>
+      quotaFieldSource(quota, key) === 'poll'
+        ? (quota[key]?.checkedAt ?? 0)
+        : 0,
+    ),
+  )
+}
+
 function fieldSourcesForMergedQuota(
   existing: OAuthQuotaSnapshot,
   incoming: OAuthQuotaSnapshot,
@@ -712,13 +741,24 @@ export function mergeHeaderQuotaForPersistence(
 ) {
   if (!existing || incoming.source !== 'headers') return incoming
   const preservePollBinding = existing.bindingWindowSource === 'poll'
+  const pollCheckedAt = quotaPollCheckedAt(existing)
+  const preservePollFields =
+    pollCheckedAt > 0 && quotaPollCheckedAt(incoming) <= pollCheckedAt
   const merged = {
     ...existing,
     ...incoming,
     five_hour: mergeHeaderOwnedWindow(existing, incoming, 'five_hour'),
     seven_day: mergeHeaderOwnedWindow(existing, incoming, 'seven_day'),
-    scoped: mergeHeaderScopedQuota(existing, incoming),
-    extraUsage: existing.extraUsage ?? incoming.extraUsage,
+    // A response may carry the poll fields seen at dispatch. Do not let it
+    // restore fields that a newer stored poll removed. Independently timed
+    // scoped observations still merge by window.
+    scoped:
+      preservePollFields && quotaFieldSource(incoming, 'scoped') !== 'headers'
+        ? existing.scoped
+        : mergeHeaderScopedQuota(existing, incoming),
+    extraUsage: preservePollFields
+      ? existing.extraUsage
+      : (existing.extraUsage ?? incoming.extraUsage),
     fallbackAdvised:
       incoming.fieldSources?.fallbackAdvised !== undefined
         ? incoming.fallbackAdvised
@@ -729,10 +769,10 @@ export function mergeHeaderQuotaForPersistence(
     bindingWindowSource: preservePollBinding
       ? 'poll'
       : (incoming.bindingWindowSource ?? existing.bindingWindowSource),
-    // Keep the successful poll's absence evidence and original clock so later
-    // merges can distinguish older polls from newer observations.
-    ...(quotaSnapshotOmitsFiveHour(existing) && {
-      checkedAt: existing.checkedAt,
+    // Headers advance their own windows, not the age of the scoped limits or
+    // credits. The poll clock also dates evidence that the 5h limit is absent.
+    ...(pollCheckedAt > 0 && {
+      checkedAt: pollCheckedAt,
     }),
   } satisfies OAuthQuotaSnapshot
   const fieldSources = fieldSourcesForMergedQuota(existing, incoming, merged)

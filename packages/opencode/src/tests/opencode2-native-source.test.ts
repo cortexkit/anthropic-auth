@@ -138,6 +138,71 @@ const exists = (path: string) =>
   )
 const cleanups: Array<() => Promise<void> | void> = []
 
+test('OpenCode 2 admission does not poll a header-fed account with an old poll clock', async () => {
+  const { paths, runtime, store } = await local()
+  await store.updateSettings((settings) => ({
+    ...settings,
+    quota: { enabled: true, checkIntervalMinutes: 5 },
+  }))
+  const credential = await runtime.authorizeLocal('main')
+  if (credential.status !== 'usable')
+    throw new Error('Missing local credential')
+  const now = Date.now()
+  const old = now - 60 * 60_000
+  const window = (checkedAt: number, usedPercent: number) => ({
+    checkedAt,
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+  })
+  await runtime.publishLocal(credential.subject, {
+    quota: {
+      accountIdentity: identity,
+      source: 'poll',
+      checkedAt: old,
+      five_hour: window(old, 10),
+      seven_day: window(old, 20),
+      scoped: [
+        {
+          ...window(old, 100),
+          id: 'fable',
+          modelName: 'Fable',
+          title: 'Fable only',
+        },
+      ],
+    },
+  })
+  await runtime.publishLocal(credential.subject, {
+    quota: {
+      accountIdentity: identity,
+      source: 'headers',
+      checkedAt: now,
+      five_hour: window(now, 12),
+      seven_day: window(now, 22),
+    },
+  })
+  expect((await runtime.read()).accounts[0]?.quota).toMatchObject({
+    checkedAt: old,
+    five_hour: window(now, 12),
+    seven_day: window(now, 22),
+  })
+  const requests: string[] = []
+  const native = createNativeAnthropicSource({
+    runtime,
+    paths,
+    requestOptions: () => ({}),
+    fetch: Object.assign(
+      async (input: Parameters<typeof fetch>[0]) => {
+        requests.push(String(input))
+        return Response.json({})
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  cleanups.push(() => native.close())
+  expect(await native.chooseAccount(scope)).toBe('main')
+  expect(requests).toEqual([])
+})
+
 test('Ultra fresh weekly-only poll passes policy and selects the local OpenCode 2 account', async () => {
   const fixture = await local()
   const credential = await fixture.runtime.authorizeLocal('main')

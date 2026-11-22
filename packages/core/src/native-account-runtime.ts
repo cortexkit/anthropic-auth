@@ -130,7 +130,10 @@ import {
   stateLayoutOfPaths,
 } from './pool-paths.ts'
 import { createNativePoolStore, nativePoolStoreLocks } from './pool-store.ts'
-import type { QuotaRequestDispatch } from './quota-manager.ts'
+import {
+  QuotaRefreshDeferred,
+  type QuotaRequestDispatch,
+} from './quota-manager.ts'
 import { effectiveRelayTransport, type RelayConfig } from './relay.ts'
 import {
   createRelayLocationCheck,
@@ -2050,6 +2053,7 @@ function buildNativeAccountRuntime(
       const snapshot = await runtime.read()
       if (snapshot.mode === 'claustrum')
         return vault.fetchQuota(routeId, fetchImpl, signal, dispatch, purpose)
+      if (purpose === 'background-cache') throw new QuotaRefreshDeferred()
       const before = snapshot.accounts.find((row) => row.id === routeId)
       const result = await fetchReading(
         routeId,

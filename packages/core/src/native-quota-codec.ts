@@ -12,8 +12,8 @@ import {
   QUOTA_FIELD_NAMES,
   type QuotaFieldSources,
   type QuotaMoney,
+  quotaPollCheckedAt,
   quotaSnapshotCheckedAt,
-  quotaSnapshotOmitsFiveHour,
 } from './accounts.ts'
 
 type ScopedMetadata = {
@@ -441,13 +441,12 @@ export const nativeQuotaCodec: QuotaCodec = {
       )
     const previousTime = quotaSnapshotCheckedAt(previous)
     const incomingTime = quotaSnapshotCheckedAt(incoming)
+    const previousPollAt = quotaPollCheckedAt(previous)
     // Poll order is the read's own clock, not a retained scoped/header clock.
     if (
       incoming.source === 'poll' &&
       incoming.checkedAt !== undefined &&
-      previous.checkedAt !== undefined &&
-      (previous.source === 'poll' || quotaSnapshotOmitsFiveHour(previous)) &&
-      incoming.checkedAt < previous.checkedAt
+      incoming.checkedAt < previousPollAt
     )
       return toNativeQuotaMap(previous)
     // A newer complete poll owns the absence of a session limit even if a
@@ -466,8 +465,26 @@ export const nativeQuotaCodec: QuotaCodec = {
           ? mergeHeaderQuotaForPersistence(incoming, {
               ...previous,
               five_hour: undefined,
+              scoped: undefined,
+              extraUsage: undefined,
             })
           : incoming,
+      )
+    if (
+      incoming.source === 'poll' &&
+      incoming.checkedAt !== undefined &&
+      previous.source === 'headers' &&
+      previousPollAt > 0 &&
+      previousTime > incomingTime
+    )
+      // A header can arrive after the poll completed but before it was stored.
+      // Preserve the newer standard readings without copying old poll fields.
+      return toNativeQuotaMap(
+        mergeHeaderQuotaForPersistence(incoming, {
+          ...previous,
+          scoped: undefined,
+          extraUsage: undefined,
+        }),
       )
     return toNativeQuotaMap(
       previousTime > incomingTime ||
