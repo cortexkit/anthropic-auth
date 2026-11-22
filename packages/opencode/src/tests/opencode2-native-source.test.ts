@@ -2681,8 +2681,7 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     expect(moved.account).not.toBe(first.account)
     expect(moved.decision).toEqual(held)
     expect(await fail()).toEqual({ account: moved.account, decision: held })
-    // Both accounts have refused this request, so the host's stop stands.
-    expect((await fail()).decision).toEqual({ retry: false })
+    expect((await fail()).decision).toEqual({ retry: true, delay: 0 })
     // The other session still has its own original two-retry allowance.
     turnId = '11111111-2222-4333-8444-555555555555'
     expect(await fail(otherScope)).toEqual({
@@ -3071,7 +3070,9 @@ describe('OC2 installed quota reroutes', () => {
     ),
   })
 
-  async function vaultRetryPool(mode: 'fallback-first' | 'main-first') {
+  async function vaultRetryPool(
+    mode: 'fallback-first' | 'main-first' | 'sticky-balanced',
+  ) {
     const fixture = await vaultWithFallback(false, { mode, spare: true })
     const now = Date.now()
     const snapshot = await fixture.runtime.read()
@@ -3175,7 +3176,7 @@ describe('OC2 installed quota reroutes', () => {
     await host.response(third, 200)
   })
 
-  test('vault: a retry ignores shared routing advice to use an excluded account', async () => {
+  test('vault: a retry uses excluded shared routing advice only after trying the other routes', async () => {
     const fixture = await vaultRetryPool('main-first')
     const host = await retryHost(source(fixture.runtime, fixture.paths))
     const first = await host.send()
@@ -3185,11 +3186,18 @@ describe('OC2 installed quota reroutes', () => {
     const second = await host.send()
     expect(second.headers.get('authorization')).toBe(vaultBearer(work))
     await host.response(second, 429)
-    waitRecorder(() => ({ account_id: identity, credential_id: main }))
+    let advice = { account_id: identity, credential_id: main }
+    waitRecorder(() => advice)
     expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
     const third = await host.send()
     expect(third.headers.get('authorization')).toBe(vaultBearer(spare))
-    await host.response(third, 200)
+    await host.response(third, 429)
+    // With no untried account left, accept the advice rather than use main-first order.
+    advice = { account_id: fallbackIdentity, credential_id: work }
+    expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+    const fourth = await host.send()
+    expect(fourth.headers.get('authorization')).toBe(vaultBearer(work))
+    await host.response(fourth, 200)
   })
 
   test.each([false, true])(
@@ -3237,6 +3245,35 @@ describe('OC2 installed quota reroutes', () => {
       NativeVaultQuotaPolicyError,
     )
     expect(authorize).toHaveBeenCalledTimes(3)
+  })
+
+  test('vault: unconfirmed retries try all three accounts before cycling', async () => {
+    const fixture = await vaultRetryPool('sticky-balanced')
+    const host = await retryHost(source(fixture.runtime, fixture.paths))
+    const refused: string[] = []
+    const headers = { 'retry-after': '432000' }
+    let attempt = 0
+    const retry = () => host.retry(false, scope, undefined, 1234, ++attempt)
+    for (let route = 0; route < 3; route++) {
+      let request = await host.send()
+      const bearer = request.headers.get('authorization')
+      if (!bearer) throw new Error('Missing vault authorization')
+      expect(refused).not.toContain(bearer)
+      for (let hold = 0; hold < 2; hold++) {
+        await host.response(request, 429, scope, headers)
+        expect(await retry()).toEqual({ retry: true, delay: 60_000 })
+        request = await host.send()
+        expect(request.headers.get('authorization')).toBe(bearer)
+      }
+      refused.push(bearer)
+      await host.response(request, 429, scope, headers)
+      expect(await retry()).toEqual({ retry: true, delay: 0 })
+    }
+    const cycled = await host.send()
+    expect(refused.slice(0, 2)).toContain(
+      cycled.headers.get('authorization') ?? '',
+    )
+    await host.response(cycled, 200)
   })
 })
 

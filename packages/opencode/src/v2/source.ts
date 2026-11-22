@@ -1069,9 +1069,18 @@ export function createNativeAnthropicSource(
         modelID,
         active,
       )
-      const rejected = (account: NativeAccountView) =>
-        account.id === input.rerouteFrom?.accountId ||
-        (input.phase === 'retry' && input.excluded?.includes(account.id))
+      const lastRefuser = input.rerouteFrom?.accountId
+      const excluded = input.phase === 'retry' ? input.excluded : undefined
+      const previouslyRefused = (account: NativeAccountView) =>
+        excluded?.includes(account.id)
+      const blockerFor = (account: NativeAccountView) =>
+        exhaustionInForce(
+          input,
+          account,
+          snapshot,
+          modelID,
+          input.phase === 'retry',
+        )
       if (advice) {
         const account = oauth.find((row) => routingChoiceMatches(advice, row))
         const candidates = oauth.map((row, order) => ({
@@ -1081,15 +1090,25 @@ export function createNativeAnthropicSource(
         }))
         const supportedHold =
           !advice.hold ||
-          (input.phase === 'retry' &&
-            input.rerouteFrom?.accountId === account?.id)
+          (input.phase === 'retry' && lastRefuser === account?.id)
+        const acceptsRoutingPick = (pick: NativeAccountView) => {
+          if (pick.id === lastRefuser) return false
+          if (input.phase !== 'retry') return true
+          if (blockerFor(pick)) return false
+          return (
+            !previouslyRefused(pick) ||
+            !oauth.some(
+              (row) =>
+                row.id !== lastRefuser &&
+                !previouslyRefused(row) &&
+                !blockerFor(row),
+            )
+          )
+        }
         if (
           account &&
           supportedHold &&
-          (advice.hold ||
-            (!rejected(account) &&
-              (input.phase !== 'retry' ||
-                !exhaustionInForce(input, account, snapshot, modelID))))
+          (advice.hold || acceptsRoutingPick(account))
         ) {
           const selected = await routerFor(snapshot).resolve({
             sessionId: input.sessionID,
@@ -1191,16 +1210,20 @@ export function createNativeAnthropicSource(
           : undefined,
       )
       if (hold) return hold
-      // Once same-account holds have been considered, pick a route that can
-      // serve. A retry skips every account that has already refused this request.
-      // Confirmed exhaustion blocks a route even without a minimum quota setting.
+      // After considering holds, leave out the last refuser and any account
+      // with confirmed exhaustion. Retry on an untried account first; only
+      // revisit an earlier refuser if no untried account can serve.
       const exhausted: StickyQuotaBlocker[] = []
-      const withoutRejected = oauth.filter((account) => {
-        if (rejected(account)) return false
-        const blocked = exhaustionInForce(input, account, snapshot, modelID)
+      const usable = oauth.filter((account) => {
+        if (account.id === lastRefuser) return false
+        const blocked = blockerFor(account)
         if (blocked) exhausted.push(blocked)
         return !blocked
       })
+      const untried = excluded
+        ? usable.filter((row) => !previouslyRefused(row))
+        : usable
+      const routes = untried.length ? untried : usable
       // As in the vault refusal, a sign-in failure takes precedence over quota.
       const quotaExplainsRefusal =
         exhausted.length > 0 &&
@@ -1248,7 +1271,7 @@ export function createNativeAnthropicSource(
         return { hold: { delayMs } }
       }
       if (getRoutingMode(snapshot.policyStorage) === 'sticky-balanced') {
-        const candidates = withoutRejected.map((account, order) => ({
+        const candidates = routes.map((account, order) => ({
           accountId: account.id,
           order,
           quota: account.quota ?? { kind: 'unknown' as const },
@@ -1259,9 +1282,7 @@ export function createNativeAnthropicSource(
           modelId: modelID,
           affinityModelId: input.modelID,
           candidates,
-          retainAccountIds: new Set(
-            withoutRejected.map((account) => account.id),
-          ),
+          retainAccountIds: new Set(routes.map((account) => account.id)),
           // Vault routes are bound to the verified account UUID they served,
           // so a route whose UUID changed (a replaced vault default) is
           // re-placed instead of keeping another account's session pin. List
@@ -1299,12 +1320,12 @@ export function createNativeAnthropicSource(
         const ordered =
           mode === 'fallback-first'
             ? [
-                ...withoutRejected.filter((account) => account.id !== 'main'),
-                ...withoutRejected.filter((account) => account.id === 'main'),
+                ...routes.filter((account) => account.id !== 'main'),
+                ...routes.filter((account) => account.id === 'main'),
               ]
             : [
-                ...withoutRejected.filter((account) => account.id === 'main'),
-                ...withoutRejected.filter((account) => account.id !== 'main'),
+                ...routes.filter((account) => account.id === 'main'),
+                ...routes.filter((account) => account.id !== 'main'),
               ]
         if (ordered[0]) return ordered[0].id
       }
