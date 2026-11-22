@@ -431,7 +431,7 @@ describe('auth.loader', () => {
           noReply: true,
           parts: [
             expect.objectContaining({
-              text: `Anthropic's safety fallback served this step on Opus 5; the next step tries ${label} again.`,
+              text: `Anthropic safety fallback served this step on Opus 5; the next step tries ${label} again.`,
             }),
           ],
         }),

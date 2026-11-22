@@ -969,7 +969,7 @@ function buildServerFallbackNotice(
   requestedModelId: string,
   targetModelId: string,
 ): string {
-  return `Anthropic's safety fallback served this step on ${fallbackModelLabel(targetModelId)}; the next step tries ${fallbackModelLabel(requestedModelId)} again.`
+  return `Anthropic safety fallback served this step on ${fallbackModelLabel(targetModelId)}; the next step tries ${fallbackModelLabel(requestedModelId)} again.`
 }
 
 function buildServerRestoredNotice(requestedModelId: string): string {
