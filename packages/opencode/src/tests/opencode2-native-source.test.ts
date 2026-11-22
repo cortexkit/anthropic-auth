@@ -2008,7 +2008,16 @@ async function vault(
  * makes the vault report a different account UUID for the default credential,
  * as when its Claude account is replaced.
  */
-async function vaultWithFallback(waitForReset = false) {
+async function vaultWithFallback(
+  waitForReset = false,
+  {
+    mode = 'sticky-balanced',
+    spare = false,
+  }: {
+    mode?: 'sticky-balanced' | 'fallback-first' | 'main-first'
+    spare?: boolean
+  } = {},
+) {
   const { paths, env, settingsService } = await storage(cleanups, waitForReset)
   await writeFile(
     env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_ENROLLMENT_FILE,
@@ -2022,12 +2031,13 @@ async function vaultWithFallback(waitForReset = false) {
   await store.initialize()
   await store.updateSettings(() => ({
     quota: { enabled: false },
-    routing: { mode: 'sticky-balanced' },
+    routing: { mode },
   }))
   const identities = new Map([
     ['oauth:anthropic', identity],
     ['oauth:anthropic:work', fallbackIdentity],
   ])
+  if (spare) identities.set('oauth:anthropic:spare', changedIdentity)
   const states = new Map<string, string>()
   let discoveries = 0
   const row = (credentialId: string) => ({
@@ -2671,7 +2681,8 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
     expect(moved.account).not.toBe(first.account)
     expect(moved.decision).toEqual(held)
     expect(await fail()).toEqual({ account: moved.account, decision: held })
-    expect((await fail()).decision).toEqual({ retry: true, delay: 0 })
+    // Both accounts have refused this request, so the host's stop stands.
+    expect((await fail()).decision).toEqual({ retry: false })
     // The other session still has its own original two-retry allowance.
     turnId = '11111111-2222-4333-8444-555555555555'
     expect(await fail(otherScope)).toEqual({
@@ -3045,6 +3056,188 @@ describe('OC2 installed retry contract (requires common-auth 0.30.0)', () => {
       expect(drop).toHaveBeenCalledTimes(1)
     })
   }
+})
+
+describe('OC2 installed quota reroutes', () => {
+  const main = 'oauth:anthropic'
+  const work = 'oauth:anthropic:work'
+  const spare = 'oauth:anthropic:spare'
+  const vaultBearer = (credential: string) =>
+    `Bearer sk-ant-oat01-${credential}`
+  const rejectWindow = (window: '7d' | '5h', hours: number) => ({
+    [`anthropic-ratelimit-unified-${window}-status`]: 'rejected',
+    [`anthropic-ratelimit-unified-${window}-reset`]: String(
+      Math.floor(Date.now() / 1000) + hours * 3600,
+    ),
+  })
+
+  async function vaultRetryPool(mode: 'fallback-first' | 'main-first') {
+    const fixture = await vaultWithFallback(false, { mode, spare: true })
+    const now = Date.now()
+    const snapshot = await fixture.runtime.read()
+    const order: string[] = []
+    for (const credential of [main, work, spare]) {
+      const account = snapshot.accounts.find(
+        (row) => row.credentialId === credential,
+      )
+      if (!account?.accountIdentity)
+        throw new Error(`Missing vault account ${credential}`)
+      order.push(account.id)
+      await fixture.runtime.vault.publish(
+        await fixture.runtime.authorizeVault(account.id),
+        {
+          quota: {
+            accountIdentity: account.accountIdentity,
+            checkedAt: now,
+            five_hour: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: now,
+            },
+            seven_day: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: now,
+            },
+          },
+        },
+      )
+    }
+    await fixture.runtime.updateSettings((settings) => {
+      settings.nativeAccountOrder = order
+    })
+    return fixture
+  }
+
+  for (const [mode, order, description] of [
+    [
+      'fallback-first',
+      [work, spare, main],
+      'refused fallbacks in one turn do not starve main',
+    ],
+    [
+      'main-first',
+      [main, work, spare],
+      'refused accounts in one turn do not starve the last fallback',
+    ],
+  ] as const) {
+    test(`vault ${mode}: ${description}`, async () => {
+      const fixture = await vaultRetryPool(mode)
+      const host = await retryHost(source(fixture.runtime, fixture.paths))
+      const first = await host.send()
+      expect(first.headers.get('authorization')).toBe(vaultBearer(order[0]))
+      await host.response(first, 429, scope, rejectWindow('7d', 3))
+      expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+
+      const second = await host.send()
+      expect(second.headers.get('authorization')).toBe(vaultBearer(order[1]))
+      await host.response(second, 429, scope, rejectWindow('5h', 2))
+      expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+
+      const third = await host.send()
+      expect(third.headers.get('authorization')).toBe(vaultBearer(order[2]))
+      await host.response(third, 200)
+    })
+  }
+
+  test('local: a retry skips an excluded account even without confirmed exhaustion', async () => {
+    const workAccess = 'sk-ant-oat01-local-work'
+    const spareAccess = 'sk-ant-oat01-local-spare'
+    const fixture = await local({
+      resolveIdentity: async (access) =>
+        ({
+          accountUuid:
+            access === workAccess ? fallbackIdentity : changedIdentity,
+        }) as never,
+    })
+    for (const [routeId, access] of [
+      ['work', workAccess],
+      ['spare', spareAccess],
+    ] as const) {
+      await fixture.runtime.loginOAuth({
+        routeId,
+        credential: {
+          access,
+          refresh: `${routeId}-refresh`,
+          expires: Date.now() + 3600_000,
+        },
+      })
+    }
+    const host = await retryHost(source(fixture.runtime, fixture.paths))
+    for (const access of ['sk-ant-oat01-native-only', workAccess]) {
+      const request = await host.send()
+      expect(request.headers.get('authorization')).toBe(`Bearer ${access}`)
+      await host.response(request, 429)
+      expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+    }
+    const third = await host.send()
+    expect(third.headers.get('authorization')).toBe(`Bearer ${spareAccess}`)
+    await host.response(third, 200)
+  })
+
+  test('vault: a retry ignores shared routing advice to use an excluded account', async () => {
+    const fixture = await vaultRetryPool('main-first')
+    const host = await retryHost(source(fixture.runtime, fixture.paths))
+    const first = await host.send()
+    expect(first.headers.get('authorization')).toBe(vaultBearer(main))
+    await host.response(first, 429)
+    expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+    const second = await host.send()
+    expect(second.headers.get('authorization')).toBe(vaultBearer(work))
+    await host.response(second, 429)
+    waitRecorder(() => ({ account_id: identity, credential_id: main }))
+    expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+    const third = await host.send()
+    expect(third.headers.get('authorization')).toBe(vaultBearer(spare))
+    await host.response(third, 200)
+  })
+
+  test.each([false, true])(
+    'vault: a retry skips another account with confirmed exhaustion (shared advice: %s)',
+    async (sharedAdvice) => {
+      const fixture = await vaultRetryPool('fallback-first')
+      const host = await retryHost(source(fixture.runtime, fixture.paths))
+      const first = await host.send()
+      expect(first.headers.get('authorization')).toBe(vaultBearer(work))
+      await host.response(first, 429, scope, rejectWindow('7d', 3))
+      await exhaustDefault(fixture, Date.now() + 3 * 3_600_000)
+      if (sharedAdvice) {
+        waitRecorder(() => ({ account_id: identity, credential_id: main }))
+      } else {
+        // Put the exhausted account first in the ordinary retry order.
+        await fixture.runtime.updateSettings((settings) => {
+          settings.routing = { mode: 'main-first' }
+        })
+      }
+      expect(await host.retry(false)).toEqual({ retry: true, delay: 0 })
+      const second = await host.send()
+      expect(second.headers.get('authorization')).toBe(vaultBearer(spare))
+      await host.response(second, 200)
+    },
+  )
+
+  test('vault: when all three accounts refuse, quota stops the next send', async () => {
+    const fixture = await vaultRetryPool('main-first')
+    const native = source(fixture.runtime, fixture.paths)
+    const authorize = spyOn(native, 'authorizeAccount')
+    const host = await retryHost(native)
+    for (const [attempt, credential] of [main, work, spare].entries()) {
+      const request = await host.send()
+      expect(request.headers.get('authorization')).toBe(vaultBearer(credential))
+      await host.response(request, 429, scope, rejectWindow('7d', 72))
+      // When no quota hold or alternate route is available, the host keeps its own delay.
+      expect(
+        await host.retry(true, scope, undefined, 1234, attempt + 1),
+      ).toEqual({
+        retry: true,
+        delay: attempt < 2 ? 0 : 1234,
+      })
+    }
+    await expect(host.send()).rejects.toBeInstanceOf(
+      NativeVaultQuotaPolicyError,
+    )
+    expect(authorize).toHaveBeenCalledTimes(3)
+  })
 })
 
 /**

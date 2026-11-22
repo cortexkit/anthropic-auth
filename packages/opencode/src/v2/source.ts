@@ -1069,6 +1069,9 @@ export function createNativeAnthropicSource(
         modelID,
         active,
       )
+      const rejected = (account: NativeAccountView) =>
+        account.id === input.rerouteFrom?.accountId ||
+        (input.phase === 'retry' && input.excluded?.includes(account.id))
       if (advice) {
         const account = oauth.find((row) => routingChoiceMatches(advice, row))
         const candidates = oauth.map((row, order) => ({
@@ -1083,7 +1086,10 @@ export function createNativeAnthropicSource(
         if (
           account &&
           supportedHold &&
-          (advice.hold || account.id !== input.rerouteFrom?.accountId)
+          (advice.hold ||
+            (!rejected(account) &&
+              (input.phase !== 'retry' ||
+                !exhaustionInForce(input, account, snapshot, modelID))))
         ) {
           const selected = await routerFor(snapshot).resolve({
             sessionId: input.sessionID,
@@ -1185,15 +1191,12 @@ export function createNativeAnthropicSource(
           : undefined,
       )
       if (hold) return hold
-      // A new request never goes to an account whose exhaustion is confirmed
-      // and still in force, whatever the quota floor: the host would only send
-      // it again to an account that cannot serve it until its reset. A hold
-      // this session was granted for that account still runs to its end.
-      // A retry probe already leaves out the account that refused it.
+      // Once same-account holds have been considered, pick a route that can
+      // serve. A retry skips every account that has already refused this request.
+      // Confirmed exhaustion blocks a route even without a minimum quota setting.
       const exhausted: StickyQuotaBlocker[] = []
       const withoutRejected = oauth.filter((account) => {
-        if (account.id === input.rerouteFrom?.accountId) return false
-        if (input.phase === 'retry') return true
+        if (rejected(account)) return false
         const blocked = exhaustionInForce(input, account, snapshot, modelID)
         if (blocked) exhausted.push(blocked)
         return !blocked
