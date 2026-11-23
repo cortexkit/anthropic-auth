@@ -243,6 +243,7 @@ import {
   startRoutingWait,
   startSettings,
   stateRefusalPublicMessage,
+  stickyQuotaBlockerInForce,
   stickyQuotaSnapshotIsFresh,
   stickyRouteCandidateWeight,
   stickyRouteFamilyForModel,
@@ -9334,6 +9335,28 @@ const anthropicAuthPlugin = async (
           }
 
           const responseRouteKinds = new WeakMap<Response, 'oauth' | 'api'>()
+          function cancelAbandonedResponse(response?: Response) {
+            void response?.body?.cancel().catch(() => {})
+          }
+
+          function scheduleServedFallbackQuotaRefresh(
+            account: OAuthAccount,
+            storage: Awaited<ReturnType<typeof loadAccounts>>,
+          ) {
+            // Keep the serving fallback's quota fresh on the same cadence as
+            // main, without delaying the response or polling idle fallbacks.
+            if (
+              !mainQuotaRoutingEnabled(storage) ||
+              !quotaManager.shouldRefreshOnRequestCount(sessionRequestCount)
+            )
+              return
+            // The native runtime obtains the credential for the quota poll.
+            void quotaManager
+              .refreshFallback(account.id, '', account)
+              .then(() => refreshSidebarQuota())
+              .catch(() => {})
+          }
+
           const orderedRouting = new WeakMap<
             PerfTrace,
             {
@@ -9367,17 +9390,17 @@ const anthropicAuthPlugin = async (
             let lastResponse: Response | null = currentResponse ?? null
             const shared = trace && orderedRouting.get(trace)
             let canceledCurrentResponse = false
-            const cancelCurrentResponse = async () => {
+            const cancelCurrentResponse = () => {
               if (canceledCurrentResponse) return
               canceledCurrentResponse = true
-              await currentResponse?.body?.cancel().catch(() => {})
+              cancelAbandonedResponse(currentResponse)
             }
 
             for (const [index, account] of accounts.entries()) {
               if (shared?.skipLocal(account.id)) continue
               let response: Response
               if (isApiKeyAccount(account)) {
-                await cancelCurrentResponse()
+                cancelCurrentResponse()
                 response = await sendWithApiAccount(
                   input,
                   init,
@@ -9409,7 +9432,7 @@ const anthropicAuthPlugin = async (
                   throw new Error(
                     'Native vault fallback credential is unavailable',
                   )
-                await cancelCurrentResponse()
+                cancelCurrentResponse()
                 response = await sendWithAccessToken(
                   input,
                   init,
@@ -9428,7 +9451,7 @@ const anthropicAuthPlugin = async (
                 getClaustrumMode(storage) === 'local' &&
                 account.access
               ) {
-                await cancelCurrentResponse()
+                cancelCurrentResponse()
                 response = await sendWithAccessToken(
                   input,
                   init,
@@ -9460,27 +9483,8 @@ const anthropicAuthPlugin = async (
                 )
 
                 options?.onSuccess?.(account)
-                // Active-route every-N refresh: this fallback just served the
-                // request, so keep its quota fresh on the same cadence as main.
-                // Non-blocking; only the served account, never idle fallbacks.
-                if (
-                  isOAuthAccount(account) &&
-                  mainQuotaRoutingEnabled(storage) &&
-                  quotaManager.shouldRefreshOnRequestCount(sessionRequestCount)
-                ) {
-                  if (isScopedCustodyActive(storage) || account.access) {
-                    void quotaManager
-                      .refreshFallback(
-                        account.id,
-                        isScopedCustodyActive(storage)
-                          ? ''
-                          : (account.access ?? ''),
-                        account,
-                      )
-                      .then(() => refreshSidebarQuota())
-                      .catch(() => {})
-                  }
-                }
+                if (isOAuthAccount(account))
+                  scheduleServedFallbackQuotaRefresh(account, storage)
                 return response
               }
               if (shared && isOAuthAccount(account)) {
@@ -9491,7 +9495,7 @@ const anthropicAuthPlugin = async (
                 if (replacement) return replacement
               }
               if (index < accounts.length - 1 || !returnLastOnExhausted) {
-                await response.body?.cancel().catch(() => {})
+                cancelAbandonedResponse(response)
               }
             }
 
@@ -10242,19 +10246,101 @@ const anthropicAuthPlugin = async (
               }
 
               let mainSharedRefusal: Response | undefined
+              let mainSharedCredentialError:
+                | NativeCredentialUnavailableError
+                | NativeModelPolicyError
+                | NativeUnsupportedCredentialError
+                | undefined
               if (
                 sessionId &&
-                replayableRequest &&
                 getRoutingMode(storage) !== 'sticky-balanced' &&
                 hasSharedRouting()
               ) {
                 const routingSessionId = sessionId
-                const refused = new Set<string>()
+                const refused = new Map<string, Headers>()
+                const revisited = new Set<string>()
+                const unavailable = new Set<string>()
                 let triedSharedAccount = false
                 const judged = new WeakSet<Response>()
+                function blockedOnRetry(
+                  account: NativeAccountView,
+                  snapshot: NativeAccountSnapshot,
+                ) {
+                  if (
+                    unavailable.has(account.id) ||
+                    (account.id === 'main' && providerRestriction)
+                  )
+                    return true
+                  const responseHeaders = refused.get(account.id)
+                  const quota = routingAccountQuota(
+                    account,
+                    snapshot.policyStorage,
+                  )
+                  const now = runtimeNow()
+                  return Boolean(
+                    stickyQuotaBlockerInForce({
+                      quota:
+                        responseHeaders ||
+                        stickyQuotaSnapshotIsFresh(
+                          quota,
+                          snapshot.policyStorage,
+                          now,
+                          routingModelId,
+                        )
+                          ? quota
+                          : undefined,
+                      responseHeaders,
+                      modelId: routingModelId,
+                      now,
+                    }),
+                  )
+                }
+                async function hasUntriedAlternative(
+                  snapshot: NativeAccountSnapshot,
+                  lastRefuser: string,
+                ) {
+                  for (const row of routingCandidates(snapshot.accounts)) {
+                    if (
+                      row.id === lastRefuser ||
+                      refused.has(row.id) ||
+                      blockedOnRetry(row, snapshot) ||
+                      routingRelay.policy(
+                        routingSessionId,
+                        row,
+                        snapshot,
+                        routingModelId,
+                      ).status !== 'allowed'
+                    )
+                      continue
+                    if (row.source === 'vault') return true
+                    const admission = await nativeAccounts.authorizeLocal(
+                      row.id,
+                      {
+                        signal: init?.signal ?? undefined,
+                        policy: (account, view) =>
+                          routingRelay.policy(
+                            routingSessionId,
+                            account,
+                            view,
+                            routingModelId,
+                          ),
+                      },
+                    )
+                    init?.signal?.throwIfAborted()
+                    if (admission.status === 'usable') return true
+                    unavailable.add(row.id)
+                  }
+                  return false
+                }
                 async function consult(
                   lastRefuser?: string,
+                  localRefusal?: Response,
                 ): Promise<Response | undefined> {
+                  let lastSharedRefusal: Response | undefined
+                  const abandonLastFallback = () => {
+                    if (lastSharedRefusal !== mainSharedRefusal)
+                      cancelAbandonedResponse(lastSharedRefusal)
+                  }
                   for (;;) {
                     let pick: Awaited<ReturnType<typeof askSharedRouting>>
                     try {
@@ -10263,25 +10349,55 @@ const anthropicAuthPlugin = async (
                         lastRefuser === undefined ? undefined : 0,
                       )
                     } catch (error) {
+                      abandonLastFallback()
                       if (error instanceof RoutingRefusalError)
                         return error.response()
                       throw error
                     }
                     const { advice, account, snapshot, routing } = pick
-                    if (!advice) return
+                    if (!advice) {
+                      abandonLastFallback()
+                      return
+                    }
+                    if (account?.id === 'main' && providerRestriction) {
+                      abandonLastFallback()
+                      routingRelay.override(
+                        routingSessionId,
+                        'provider wait on main account',
+                      )
+                      return
+                    }
                     if (
                       !account ||
+                      unavailable.has(account.id) ||
                       (advice.hold
                         ? account.id !== lastRefuser
-                        : refused.has(account.id) ||
-                          (lastRefuser && retryQuotaBlocked(account, snapshot)))
+                        : lastRefuser !== undefined &&
+                          (account.id === lastRefuser ||
+                            blockedOnRetry(account, snapshot) ||
+                            (refused.has(account.id) &&
+                              (await hasUntriedAlternative(
+                                snapshot,
+                                lastRefuser,
+                              )))))
                     ) {
+                      abandonLastFallback()
                       routingRelay.override(
                         routingSessionId,
                         'unknown account, credential or retry policy',
                       )
                       return
                     }
+                    // This fetch loop sends retries without a host retry limit.
+                    // Allow one revisit per account so alternating advice ends.
+                    if (!advice.hold && revisited.has(account.id)) {
+                      routingRelay.override(
+                        routingSessionId,
+                        'account retry budget spent',
+                      )
+                      return lastSharedRefusal ?? localRefusal
+                    }
+                    abandonLastFallback()
                     const selected = await routing.router.resolve({
                       sessionId: routingSessionId,
                       family: stickyRouteFamilyForModel(routingModelId),
@@ -10312,23 +10428,45 @@ const anthropicAuthPlugin = async (
                       return routingHoldResponse(advice.hold.retry_after_ms)
                     countSessionRequest()
                     triedSharedAccount = true
-                    let response = await sendWithAccessToken(
-                      input,
-                      init,
-                      '',
-                      trace,
-                      `routing:${account.id}`,
-                      storage,
-                      account.id,
-                      undefined,
-                      fableRequest,
-                      laneStartRequest,
-                      account.id === 'main'
-                        ? requestMainQuotaIdentity
-                        : undefined,
-                    )
-                    let retry = shouldFallbackResponse(response, storage)
-                    if (!retry) {
+                    if (refused.has(account.id)) revisited.add(account.id)
+                    let response: Response
+                    try {
+                      response = await sendWithAccessToken(
+                        input,
+                        init,
+                        '',
+                        trace,
+                        `routing:${account.id}`,
+                        storage,
+                        account.id,
+                        undefined,
+                        fableRequest,
+                        laneStartRequest,
+                        account.id === 'main'
+                          ? requestMainQuotaIdentity
+                          : undefined,
+                      )
+                    } catch (error) {
+                      init?.signal?.throwIfAborted()
+                      if (
+                        !(error instanceof NativeCredentialUnavailableError) &&
+                        !(error instanceof NativeModelPolicyError) &&
+                        !(error instanceof NativeUnsupportedCredentialError)
+                      )
+                        throw error
+                      unavailable.add(account.id)
+                      if (account.id === 'main')
+                        mainSharedCredentialError = error
+                      routingRelay.override(
+                        routingSessionId,
+                        'advised credential could not serve',
+                      )
+                      return
+                    }
+                    let retry =
+                      replayableRequest &&
+                      shouldFallbackResponse(response, storage)
+                    if (replayableRequest && !retry) {
                       const inspected = await inspectStreamingRateLimit(
                         response,
                         trace,
@@ -10341,27 +10479,46 @@ const anthropicAuthPlugin = async (
                         account.id,
                         account.id === 'main' ? 'main' : 'fallback',
                       )
+                      const fallback = snapshot.policyStorage.accounts.find(
+                        (row) => row.id === account.id,
+                      )
+                      if (
+                        replayableRequest &&
+                        fallback &&
+                        isOAuthAccount(fallback)
+                      )
+                        scheduleServedFallbackQuotaRefresh(
+                          fallback,
+                          snapshot.policyStorage,
+                        )
                       return response
                     }
                     judged.add(response)
-                    refused.add(account.id)
+                    refused.set(account.id, response.headers)
                     lastRefuser = account.id
-                    if (account.id === 'main') mainSharedRefusal = response
-                    else await response.body?.cancel().catch(() => {})
+                    lastSharedRefusal = response
+                    if (account.id === 'main') {
+                      cancelAbandonedResponse(mainSharedRefusal)
+                      mainSharedRefusal = response
+                    }
                   }
                 }
                 orderedRouting.set(trace, {
                   // Once shared routing sent on an account, the local loop
                   // should try routes that have not refused this request yet.
-                  skipLocal: (id) => triedSharedAccount && refused.has(id),
+                  skipLocal: (id) =>
+                    unavailable.has(id) ||
+                    (triedSharedAccount && refused.has(id)),
                   async afterRefusal(id, response) {
-                    if (judged.has(response)) return
+                    if (!replayableRequest || judged.has(response)) return
                     judged.add(response)
-                    refused.add(id)
-                    const replacement = await consult(id)
+                    refused.set(id, response.headers)
+                    const replacement = await consult(id, response)
                     if (replacement) {
-                      await response.body?.cancel().catch(() => {})
-                      await mainSharedRefusal?.body?.cancel().catch(() => {})
+                      if (response !== replacement)
+                        cancelAbandonedResponse(response)
+                      if (mainSharedRefusal !== replacement)
+                        cancelAbandonedResponse(mainSharedRefusal)
                       mainSharedRefusal = undefined
                     }
                     return replacement
@@ -10369,7 +10526,8 @@ const anthropicAuthPlugin = async (
                 })
                 const selected = await consult()
                 if (selected) {
-                  await mainSharedRefusal?.body?.cancel().catch(() => {})
+                  if (mainSharedRefusal !== selected)
+                    cancelAbandonedResponse(mainSharedRefusal)
                   return wrapResponse(selected)
                 }
                 if (mainSharedRefusal)
@@ -11031,6 +11189,7 @@ const anthropicAuthPlugin = async (
                         mainQuotaIdentity: requestMainQuotaIdentity,
                       })
                       const rejectedInitialAdvice = advice && !advisedAccountId
+                      let retryAdviceGiven = false
                       advisedAccountId = undefined
                       if (hasSharedRouting()) {
                         let pick: Awaited<ReturnType<typeof askSharedRouting>>
@@ -11038,13 +11197,12 @@ const anthropicAuthPlugin = async (
                           pick = await askSharedRouting(sessionId, 0)
                         } catch (error) {
                           if (error instanceof RoutingRefusalError)
-                            await inspected.response.body
-                              ?.cancel()
-                              .catch(() => {})
+                            cancelAbandonedResponse(inspected.response)
                           throw error
                         }
                         const { advice: retryAdvice, account, snapshot } = pick
                         if (retryAdvice) {
+                          retryAdviceGiven = true
                           const eligible =
                             account &&
                             stickyRoutes.allRoutes.some(
@@ -11055,9 +11213,7 @@ const anthropicAuthPlugin = async (
                               retryAdvice.hold &&
                               account.id === failedRouteId
                             ) {
-                              await inspected.response.body
-                                ?.cancel()
-                                .catch(() => {})
+                              cancelAbandonedResponse(inspected.response)
                               return routingHoldResponse(
                                 retryAdvice.hold.retry_after_ms,
                               )
@@ -11120,6 +11276,7 @@ const anthropicAuthPlugin = async (
                         }
                       } else if (
                         !rejectedInitialAdvice &&
+                        !retryAdviceGiven &&
                         (inspected.response.status === 429 ||
                           inspected.streamingRateLimit) &&
                         mainQuotaEntryIsFreshExhausted(
@@ -11189,7 +11346,7 @@ const anthropicAuthPlugin = async (
                           ),
                       )
                     ) {
-                      await inspected.response.body?.cancel().catch(() => {})
+                      cancelAbandonedResponse(inspected.response)
                       return completeRoute(route, await noRouteResponse())
                     }
                     return completeRoute(route, inspected.response)
@@ -11272,6 +11429,40 @@ const anthropicAuthPlugin = async (
 
               if (mainSharedRefusal)
                 return continueAfterSharedMainRefusal(mainSharedRefusal)
+
+              if (mainSharedCredentialError) {
+                const fallbackAccounts =
+                  replayableRequest &&
+                  getRoutingMode(storage) !== 'fallback-first'
+                    ? await getRoutableFallbackAccounts(storage, {
+                        modelId: requestModelId,
+                      })
+                    : []
+                const response = await tryUsableFallbackAccounts(
+                  input,
+                  init,
+                  fallbackAccounts,
+                  storage,
+                  undefined,
+                  trace,
+                  {
+                    onSuccess: (account) =>
+                      writeCurrentSidebarState(account.id, 'fallback'),
+                    fableRequest,
+                    laneStartRequest,
+                  },
+                )
+                if (response) return wrapResponse(response)
+                if (mainSharedCredentialError instanceof NativeModelPolicyError)
+                  return modelDeniedResponse()
+                if (
+                  isScopedCustodyActive(storage) &&
+                  mainSharedCredentialError instanceof
+                    NativeCredentialUnavailableError
+                )
+                  throw new NativeVaultNoAccountError()
+                throw mainSharedCredentialError
+              }
 
               // Fallback-first reached main only after its fallback attempts.
               // Resolve current access now; absence from the earlier metadata

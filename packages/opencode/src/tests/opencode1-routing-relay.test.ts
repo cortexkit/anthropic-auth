@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, mock } from 'bun:test'
+import { afterEach, describe, expect, mock, spyOn } from 'bun:test'
 import { gunzipSync } from 'node:zlib'
 import { tokenFingerprint } from '@cortexkit/anthropic-auth-core'
 import { ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
+import { getPluginTestHandles } from './plugin-test-handles'
 import { installLoaderSetup } from './support/opencode1-loader-setup'
 import {
   bindPoolAccounts,
@@ -89,32 +90,66 @@ describe('OC1 shared routing relay', () => {
             ),
             mainQuotaCheckedAt: now,
             mainQuotaToken: tokenFingerprint('sk-ant-oat01-main-access'),
+            ...(mode === 'provider wait' && {
+              mainLastQuotaApiError: {
+                message: 'usage wait',
+                checkedAt: now,
+                nextRetryAt: now + 60_000,
+                accountIdentity: syntheticMainAccountUuid,
+              },
+            }),
+            ...(mode === 'refresh cadence' && { refreshEveryNRequests: 1 }),
           },
           ...(mode === 'floor' || mode === 'blocked'
             ? { killswitch: { enabled: true, main: { five_hour: 20 } } }
             : {}),
-          accounts: [
-            {
-              id: 'fallback-1',
-              type: 'oauth',
-              access: 'sk-ant-oat01-fallback-access',
-              refresh: 'fallback-refresh',
-              expires: now + 3600_000,
-              quota:
-                mode === 'unknown quota'
-                  ? undefined
-                  : quota(mode === 'floor' || mode === 'blocked' ? 10 : 80),
-              ...(mode === 'signed out'
-                ? {
-                    lastRefreshError: {
-                      message: 'sign in required',
-                      checkedAt: now,
-                      permanent: true,
-                    },
-                  }
-                : {}),
-            },
-          ],
+          accounts:
+            mode === 'paid backup'
+              ? [
+                  {
+                    id: 'paid',
+                    type: 'api',
+                    apiKey: 'paid-key',
+                    baseURL: 'https://paid.example.test',
+                    authHeader: 'authorization-bearer',
+                  },
+                ]
+              : [
+                  {
+                    id: 'fallback-1',
+                    type: 'oauth',
+                    access: 'sk-ant-oat01-fallback-access',
+                    refresh: 'fallback-refresh',
+                    expires: now + 3600_000,
+                    quota:
+                      mode === 'unknown quota'
+                        ? undefined
+                        : quota(
+                            mode === 'floor' || mode === 'blocked' ? 10 : 80,
+                          ),
+                    ...(mode === 'signed out'
+                      ? {
+                          lastRefreshError: {
+                            message: 'sign in required',
+                            checkedAt: now,
+                            permanent: true,
+                          },
+                        }
+                      : {}),
+                  },
+                  ...(mode === 'three accounts'
+                    ? [
+                        {
+                          id: 'fallback-2',
+                          type: 'oauth' as const,
+                          access: 'sk-ant-oat01-third-access',
+                          refresh: 'third-refresh',
+                          expires: now + 3600_000,
+                          quota: quota(80),
+                        },
+                      ]
+                    : []),
+                ],
         }),
       ),
     )
@@ -140,7 +175,9 @@ describe('OC1 shared routing relay', () => {
                     ?.includes('fallback')
                   ? {}
                   : {
-                      five_hour: { utilization: 0 },
+                      five_hour: {
+                        utilization: mode === 'paid backup' ? 100 : 0,
+                      },
                       seven_day: { utilization: 0 },
                     },
               ),
@@ -175,23 +212,33 @@ describe('OC1 shared routing relay', () => {
       }),
       { models: {} } as any,
     )) as any
-    const send = (payload?: Record<string, unknown>) =>
+    const send = (
+      payload?: Record<string, unknown> | ReadableStream<Uint8Array>,
+    ) =>
       loader.fetch(MESSAGES_URL, {
         method: 'POST',
         headers: { 'x-session-affinity': 'ses_relay_oc1' },
-        body: JSON.stringify(
-          payload ?? {
-            model: mode.startsWith('fable')
-              ? 'claude-fable-5'
-              : mode === 'reserve'
-                ? 'claude-opus-4-8'
-                : 'claude-sonnet-5',
-            messages: [{ role: 'user', content: 'hello' }],
-            max_tokens: 10,
-          },
-        ),
+        body:
+          payload instanceof ReadableStream
+            ? payload
+            : JSON.stringify(
+                payload ?? {
+                  model: mode.startsWith('fable')
+                    ? 'claude-fable-5'
+                    : mode === 'reserve'
+                      ? 'claude-opus-4-8'
+                      : 'claude-sonnet-5',
+                  messages: [{ role: 'user', content: 'hello' }],
+                  max_tokens: 10,
+                },
+              ),
       }) as Promise<Response>
-    return { sends, send, bodies }
+    return {
+      sends,
+      send,
+      bodies,
+      ...getPluginTestHandles(plugin),
+    }
   }
 
   test('OC1 OAuth sends runner notes from its session handle in the final signed body', async () => {
@@ -266,39 +313,36 @@ describe('OC1 shared routing relay', () => {
     // Establish a different sticky assignment before the runner asks to move it.
     await (await f.send()).text()
     expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-main-access')
-    const reports: unknown[] = []
+    const reports: Record<string, unknown>[] = []
     let answer: unknown = {
       account_id: syntheticFallbackAccountUuid(0),
       credential_id: 'local',
     }
     globals[key] = () => ({
       accountFor: async () => answer,
-      report: (value: unknown) => {
+      report: (value: Record<string, unknown>) => {
         reports.push(value)
         throw new Error('report failure cannot fail the request')
       },
     })
     await (await f.send()).text()
     expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-fallback-access')
-    const routingReports = (): unknown[] =>
-      reports.filter(
-        (report) =>
-          typeof report === 'object' &&
-          report !== null &&
-          'outcome' in report &&
-          report.outcome === 'served',
-      )
-    expect(routingReports()).toEqual([
-      {
-        account_id: syntheticFallbackAccountUuid(0),
-        outcome: 'served',
-        headers: { 'anthropic-ratelimit-future': 'all' },
-      },
-    ])
+    const routingReports = () =>
+      reports.filter((report) => report.kind !== 'billing')
+    const touch = expect.objectContaining({
+      kind: 'cache_touch',
+      source: 'response',
+    })
+    const served = {
+      account_id: syntheticFallbackAccountUuid(0),
+      outcome: 'served',
+      headers: { 'anthropic-ratelimit-future': 'all' },
+    }
+    expect(routingReports()).toEqual([touch, served])
     answer = null
     await (await f.send()).text()
     expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-fallback-access')
-    expect(routingReports()).toHaveLength(2)
+    expect(routingReports()).toEqual([touch, served, touch, served])
   })
 
   for (const [mode, accountId, token] of [
@@ -317,6 +361,235 @@ describe('OC1 shared routing relay', () => {
       expect(f.sends).toEqual([`Bearer sk-ant-oat01-${token}-access`])
     })
   }
+
+  test('ordered routing overrides main advice before acquiring its bearer during a provider wait', async () => {
+    const f = await fixture(
+      'provider wait',
+      undefined,
+      undefined,
+      'fallback-first',
+    )
+    const authorizeLocal = spyOn(f.nativeAccounts, 'authorizeLocal')
+    globals[key] = () => ({
+      accountFor: async () => ({
+        account_id: syntheticMainAccountUuid,
+        credential_id: 'local',
+      }),
+    })
+    try {
+      expect(await (await f.send()).text()).toBe('ok')
+      expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+      expect(authorizeLocal.mock.calls.map(([id]) => id)).not.toContain('main')
+    } finally {
+      authorizeLocal.mockRestore()
+    }
+  })
+
+  test('ordered routing tries a healthy login when the advised credential cannot refresh', async () => {
+    const f = await fixture('normal', undefined, undefined, 'main-first')
+    const authorize = f.nativeAccounts.authorizeLocal.bind(f.nativeAccounts)
+    const authorizeLocal = spyOn(
+      f.nativeAccounts,
+      'authorizeLocal',
+    ).mockImplementation(async (id, options) =>
+      id === 'fallback-1'
+        ? {
+            status: 'failed',
+            failure: {
+              kind: 'provider',
+              classification: 'invalid-grant',
+              status: 400,
+            },
+            persisted: true,
+            reconciliationFailed: false,
+          }
+        : authorize(id, options),
+    )
+    globals[key] = () => ({
+      accountFor: async () => ({
+        account_id: syntheticFallbackAccountUuid(0),
+        credential_id: 'local',
+      }),
+    })
+    try {
+      expect(await (await f.send()).text()).toBe('ok')
+      expect(authorizeLocal).toHaveBeenCalledWith(
+        'fallback-1',
+        expect.objectContaining({ intent: 'serve' }),
+      )
+      expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+    } finally {
+      authorizeLocal.mockRestore()
+    }
+  })
+
+  test.each(['recovered', 'exhausted', 'alternative'])(
+    'ordered routing revisits an earlier refuser only when appropriate (%s)',
+    async (scenario) => {
+      let sends = 0
+      const f = await fixture(
+        scenario === 'alternative' ? 'three accounts' : 'normal',
+        () => {
+          sends++
+          return scenario !== 'exhausted' && sends === 3
+            ? new Response('recovered')
+            : new Response(`refusal ${sends}`, { status: 403 })
+        },
+        undefined,
+        'main-first',
+      )
+      let asks = 0
+      globals[key] = () => ({
+        accountFor: async () => ({
+          account_id:
+            asks++ % 2 === 0
+              ? syntheticMainAccountUuid
+              : syntheticFallbackAccountUuid(0),
+          credential_id: 'local',
+        }),
+      })
+      const response = await f.send()
+      const main = 'Bearer sk-ant-oat01-main-access'
+      const fallback = 'Bearer sk-ant-oat01-fallback-access'
+      if (scenario === 'exhausted') {
+        expect(response.status).toBe(403)
+        expect(await response.text()).toBe('refusal 4')
+        expect(f.sends).toEqual([main, fallback, main, fallback])
+        expect(asks).toBe(5)
+      } else {
+        expect(response.status).toBe(200)
+        expect(await response.text()).toBe('recovered')
+        expect(f.sends).toEqual([
+          main,
+          fallback,
+          scenario === 'alternative'
+            ? 'Bearer sk-ant-oat01-third-access'
+            : main,
+        ])
+      }
+    },
+  )
+
+  test('ordered routing schedules the serving fallback quota refresh without waiting', async () => {
+    const f = await fixture(
+      'refresh cadence',
+      undefined,
+      undefined,
+      'main-first',
+    )
+    const pending =
+      Promise.withResolvers<
+        Awaited<ReturnType<typeof f.quotaManager.refreshFallback>>
+      >()
+    const refreshFallback = spyOn(
+      f.quotaManager,
+      'refreshFallback',
+    ).mockReturnValue(pending.promise)
+    globals[key] = () => ({
+      accountFor: async () => ({
+        account_id: syntheticFallbackAccountUuid(0),
+        credential_id: 'local',
+      }),
+    })
+    try {
+      expect(await (await f.send()).text()).toBe('ok')
+      expect(f.sends).toEqual(['Bearer sk-ant-oat01-fallback-access'])
+      expect(
+        refreshFallback.mock.calls.map(([id, access]) => [id, access]),
+      ).toEqual([['fallback-1', '']])
+    } finally {
+      pending.reject(new Error('fixture quota poll ended'))
+      await pending.promise.catch(() => {})
+      refreshFallback.mockRestore()
+    }
+  })
+
+  for (const mode of ['sticky-balanced', 'main-first'] as const) {
+    test(`${mode} returns routing refusal while abandoned body cancellation is pending`, async () => {
+      const upstream = new Response('upstream refusal', { status: 403 })
+      const cancel = Promise.withResolvers<void>()
+      const cancelBody = spyOn(upstream.body!, 'cancel').mockReturnValue(
+        cancel.promise,
+      )
+      const f = await fixture('normal', () => upstream, undefined, mode)
+      let asks = 0
+      globals[key] = () => ({
+        accountFor: async () =>
+          ++asks === 1
+            ? {
+                account_id:
+                  mode === 'sticky-balanced'
+                    ? syntheticMainAccountUuid
+                    : syntheticFallbackAccountUuid(0),
+                credential_id: 'local',
+              }
+            : { refused: { code: 'account_selection_final' } },
+      })
+      const request = f.send()
+      try {
+        const response = await Promise.race([
+          request,
+          Bun.sleep(1_000).then(() => null),
+        ])
+        expect(response).not.toBeNull()
+        expect(response?.status).toBe(403)
+        expect(await response?.json()).toMatchObject({
+          error: { code: 'account_selection_final' },
+        })
+        expect(cancelBody).toHaveBeenCalledTimes(1)
+        expect(asks).toBe(2)
+      } finally {
+        cancel.resolve()
+        await Promise.allSettled([request])
+        cancelBody.mockRestore()
+      }
+    })
+  }
+
+  test('ordered routing asks before sending a non-replayable request', async () => {
+    const f = await fixture('normal', undefined, undefined, 'main-first')
+    const accountFor = mock(async () => ({
+      refused: { code: 'account_selection_final' },
+    }))
+    globals[key] = () => ({ accountFor })
+    const response = await f.send(
+      new ReadableStream({ start: (controller) => controller.close() }),
+    )
+    expect(response.status).toBe(403)
+    expect(await response.json()).toMatchObject({
+      error: { code: 'account_selection_final' },
+    })
+    expect(accountFor).toHaveBeenCalledTimes(1)
+    expect(f.sends).toEqual([])
+  })
+
+  test.each([true, false])(
+    'sticky retry advice blocks paid fallback only when given (%s)',
+    async (advised) => {
+      let sends = 0
+      const f = await fixture('paid backup', () =>
+        ++sends === 1
+          ? new Response('usage limit reached', { status: 429 })
+          : new Response('paid'),
+      )
+      let asks = 0
+      globals[key] = () => ({
+        accountFor: async () =>
+          ++asks === 2 && advised
+            ? { account_id: syntheticMainAccountUuid, credential_id: 'local' }
+            : null,
+      })
+      const response = await f.send()
+      expect(asks).toBe(2)
+      expect(response.status).toBe(advised ? 429 : 200)
+      await response.text()
+      expect(f.sends).toEqual(
+        advised
+          ? ['Bearer sk-ant-oat01-main-access']
+          : ['Bearer sk-ant-oat01-main-access', 'Bearer paid-key'],
+      )
+    },
+  )
 
   test('sticky reroute asks shared routing again and honors a final refusal', async () => {
     const f = await fixture('normal', () => new Response(null, { status: 403 }))
@@ -678,8 +951,8 @@ describe('OC1 shared routing relay', () => {
     const reports: unknown[] = []
     globals[key] = () => ({
       accountFor: async () => null,
-      report: (report: { outcome?: string }) => {
-        if (report.outcome === 'served') reports.push(report)
+      report: (report: { kind?: string }) => {
+        if (report.kind !== 'billing') reports.push(report)
       },
     })
     await (await f.send()).text()
