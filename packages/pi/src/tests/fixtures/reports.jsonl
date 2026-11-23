@@ -1,0 +1,3 @@
+{"kind":"plan_notes_supported","model":"claude-opus-5-5","supported":true}
+{"kind":"plan_notes_supported","model":"claude-haiku-4-5","supported":false}
+{"kind":"plan_note_unanchored","after_user_timestamp":1795474012345}

@@ -1,6 +1,7 @@
 import {
   applyCacheDiagnosticsOptIn,
   applyClaudeCodeMetadata,
+  applyRunnerPlanNotes,
   applyRunnerTurnNotes,
   applySessionCacheTtl,
   applyThinkingBindingControls,
@@ -257,6 +258,7 @@ function convertMessages(
   visibleReplies: WeakMap<object, string>,
   droppedAssistants: WeakSet<object>,
   mapToolName = toClaudeCodeToolName,
+  userTimestamps?: WeakMap<object, number>,
 ): AnthropicRequestBody['messages'] {
   const result: AnthropicRequestBody['messages'] = []
   // Effort history counts source assistant turns, including ones with nothing
@@ -272,10 +274,10 @@ function convertMessages(
     const message = messages[index]
     if (!message) continue
     if (message.role === 'user') {
+      let content: AnthropicRequestBody['messages'][number]['content']
       if (typeof message.content === 'string') {
-        if (message.content.trim()) {
-          result.push({ role: 'user', content: sanitize(message.content) })
-        }
+        if (!message.content.trim()) continue
+        content = sanitize(message.content)
       } else {
         const parts = message.content as Array<TextContent | ImageContent>
         // A text-only user message with several parts keeps them as separate
@@ -287,11 +289,11 @@ function convertMessages(
               .filter((item): item is TextContent => item.type === 'text')
               .map((item) => ({ type: 'text', text: sanitize(item.text) }))
               .filter((block) => block.text.trim())
-        result.push({
-          role: 'user',
-          content: blocks.length > 1 ? blocks : convertTextAndImages(parts),
-        })
+        content = blocks.length > 1 ? blocks : convertTextAndImages(parts)
       }
+      const converted = { role: 'user', content }
+      result.push(converted)
+      userTimestamps?.set(converted, message.timestamp)
       continue
     }
 
@@ -869,12 +871,16 @@ export async function buildAnthropicRequest(
   assertNoMeaningfulTrailingAssistant(context.messages)
   const visibleReplies = new WeakMap<object, string>()
   const droppedAssistants = new WeakSet<object>()
+  // Keep timestamps off the wire. Message identity survives dropped empty
+  // users, prepended documentation and inserted effort or turn-note messages.
+  const userTimestamps = new WeakMap<object, number>()
   const messages = convertMessages(
     context.messages,
     modelId,
     visibleReplies,
     droppedAssistants,
     mapToolName,
+    userTimestamps,
   )
   stripEmptyTrailingAssistantMessages(messages)
   const baseLastMessage = forkBase
@@ -1063,6 +1069,13 @@ export async function buildAnthropicRequest(
     sessionId: options?.sessionId,
     modelId,
     isOAuth: !!identity,
+  })
+  applyRunnerPlanNotes(body, {
+    // A fork's own handle returns the notes from its retained base request.
+    sessionId: options?.sessionId,
+    modelId,
+    isOAuth: !!identity && !apiKey,
+    userTimestamps,
   })
   const cachePolicy = apiKey
     ? undefined

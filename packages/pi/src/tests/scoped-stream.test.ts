@@ -74,6 +74,7 @@ import {
   stopPiCacheKeep,
   streamCortexKitAnthropic,
 } from '../stream.ts'
+import planNotes from './fixtures/plan-notes.json'
 import {
   fixtureAccountIdentity,
   readNativePiFixture,
@@ -1043,18 +1044,49 @@ test('Pi fork leaves head leases, keep-warm tracking and effort provenance untou
   expect(sessionCacheActivity.holdUntil(`${head}-fork`, 'main')).toBeUndefined()
 })
 
-test('Pi fork never reads or replaces a head thread anchor, even with primary-turn hooks', async () => {
+test('Pi fork never reads or replaces a head thread anchor, even with primary-turn hooks', () =>
+  expectForkThreadAnchor())
+test('Pi plan notes from the fork handle replay the base request bytes', () =>
+  expectForkThreadAnchor('fork'))
+test('Pi plan notes remain fixed history through thread continuation', () =>
+  expectForkThreadAnchor('thread'))
+
+async function expectForkThreadAnchor(checkPlanNotes?: 'fork' | 'thread') {
   // Finish saving the head's keep-warm target before the fixture restores the
   // registry directory, or a late save can leave a target in the next test.
   deferCleanup(() => stopPiCacheKeep())
   const f = await fixture()
   const head = `fork-thread-${f.path}`
   const fork = `${head}-fork`
-  forkRouting(undefined, () => ({
+  const plan = planNotes[0]!
+  const base: Context = checkPlanNotes
+    ? {
+        ...context,
+        messages: [
+          {
+            role: 'user',
+            content: 'Hello',
+            timestamp: plan.after_user_timestamp,
+          },
+        ],
+      }
+    : context
+  const expected = plan.texts.map((content) => ({ role: 'system', content }))
+  let changeHeadNotes = false
+  const planReads: string[] = []
+  forkRouting(undefined, (sessionId) => ({
     cache: () => ({ ttl: 'long', keep_warm: 'always' }),
+    ...(checkPlanNotes && {
+      plan_notes: () => {
+        planReads.push(sessionId)
+        return changeHeadNotes && sessionId === head
+          ? [{ ...plan, texts: ['Edited head instructions'] }]
+          : structuredClone(planNotes)
+      },
+    }),
   }))
   await startPiCacheKeepSession(f.path, head)
-  const sent: Array<Record<string, unknown>> = []
+  const sent: Array<{ thread?: unknown; messages?: unknown[] }> = []
   const response = () =>
     new Response(
       'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_head","content":[]}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Head answer"}}\n\nevent: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
@@ -1117,7 +1149,7 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
   beginPiPrimaryTurn(f.path, head)
   const answer = await streamCortexKitAnthropic(
     model,
-    context,
+    base,
     { sessionId: head, ...hooks },
     undefined,
     undefined,
@@ -1145,9 +1177,10 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
   const beforeThread = stateBytes(threadTracker)
   thread.mockClear()
   lease.mockClear()
+  changeHeadNotes = true
   const result = await streamCortexKitAnthropic(
     model,
-    forkContext(context),
+    forkContext(base),
     { ...forkOptions(head), ...hooks },
     undefined,
     undefined,
@@ -1155,36 +1188,77 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
   ).result()
   expect(result.stopReason).toBe('stop')
   expect(sent.at(-1)?.thread).toBeUndefined()
+  if (checkPlanNotes === 'fork') {
+    const actual = sent.at(-1)?.messages?.slice(1, 3)
+    expect(actual).toEqual(expected)
+    expect(planReads).toEqual([head, fork])
+    expect(JSON.stringify(actual)).toBe(
+      JSON.stringify(sent[0]?.messages?.slice(1)),
+    )
+  }
   expect(thread).not.toHaveBeenCalled()
   expect(lease).not.toHaveBeenCalled()
   expect(targetState()).toBe(beforeTarget)
   expect(leaseState()).toBe(beforeLease)
   expect(stateBytes(threadTracker)).toBe(beforeThread)
   const continued = {
-    ...context,
+    ...base,
     messages: [
-      ...context.messages,
+      ...base.messages,
       answer,
       { role: 'user' as const, content: 'Next head turn', timestamp: 2 },
     ],
   }
-  expect(
-    (
-      await streamCortexKitAnthropic(
-        model,
-        continued,
-        { sessionId: head, ...hooks },
-        undefined,
-        undefined,
-        'agent-loop',
-      ).result()
-    ).stopReason,
-  ).toBe('stop')
+  changeHeadNotes = false
+  const next = await streamCortexKitAnthropic(
+    model,
+    continued,
+    { sessionId: head, ...hooks },
+    undefined,
+    undefined,
+    'agent-loop',
+  ).result()
+  expect(next.stopReason).toBe('stop')
   expect(sent.at(-1)?.thread).toEqual({
     type: 'continue',
     previous_message_id: 'msg_head',
   })
-})
+  if (checkPlanNotes === 'thread') {
+    expect(sent[0]?.messages).toEqual([
+      expect.objectContaining({ role: 'user' }),
+      ...expected,
+    ])
+    expect(sent.at(-1)?.messages).toEqual([
+      expect.objectContaining({ role: 'user' }),
+    ])
+    // Editing an earlier note is a history change, not a continuation delta.
+    changeHeadNotes = true
+    expect(
+      (
+        await streamCortexKitAnthropic(
+          model,
+          {
+            ...continued,
+            messages: [
+              ...continued.messages,
+              next,
+              { role: 'user', content: 'Third head turn', timestamp: 3 },
+            ],
+          },
+          { sessionId: head, ...hooks },
+          undefined,
+          undefined,
+          'agent-loop',
+        ).result()
+      ).stopReason,
+    ).toBe('stop')
+    expect(sent.at(-1)?.thread).toEqual({ type: 'create' })
+    expect(sent.at(-1)?.messages?.[1]).toEqual({
+      role: 'system',
+      content: 'Edited head instructions',
+    })
+  }
+}
 
 for (const transport of ['direct', 'relay fallback'] as const) {
   test(`Pi fork allows a vault-newer-record retry on ${transport} without changing admission`, async () => {

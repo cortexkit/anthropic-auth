@@ -330,6 +330,7 @@ export {
 } from './owner-only.ts'
 export * from './path-options.ts'
 export * from './pkce.ts'
+export { applyRunnerPlanNotes } from './plan-notes.ts'
 export type {
   NativeEmptyInitJournal,
   NativeLegacyMigrationJournal,
