@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import {
+  CacheKeepClaim,
   type CacheKeepManager,
   cacheKeepStoreDirectory,
   createEmptyStorage,
@@ -12,7 +13,6 @@ import {
   type NativeAccountSnapshot,
 } from '@cortexkit/anthropic-auth-core'
 import { PiCacheKeep } from '../cachekeep.ts'
-import { PiCacheKeepClaim } from '../cachekeep-claim.ts'
 
 const cleanups: Array<() => unknown | Promise<unknown>> = []
 afterEach(async () => {
@@ -582,7 +582,7 @@ test('Pi shutdown aborts and joins Core due-timer warms before releasing their c
       ...(
         Reflect.get(active.process, 'sessions') as Map<
           string,
-          { claim: PiCacheKeepClaim }
+          { claim: CacheKeepClaim }
         >
       ).values(),
     ][0]!.claim
@@ -975,16 +975,16 @@ test('Pi drains the latest accepted body on shutdown and removes stopped targets
 test('a reused pid cannot hold a Pi session and an old release cannot remove its successor claim', async () => {
   const f = await fixture()
   const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
-  const old = new PiCacheKeepClaim(directory, 'S', {
+  const old = new CacheKeepClaim(directory, 'S', {
     liveness: { pidAlive: () => true, incarnation: async () => 'old-start' },
   })
-  const next = new PiCacheKeepClaim(directory, 'S', {
+  const next = new CacheKeepClaim(directory, 'S', {
     liveness: { pidAlive: () => true, incarnation: async () => 'new-start' },
   })
   expect(await old.acquire()).toBe(true)
   expect(await next.acquire()).toBe(true)
   await old.release()
-  const contender = new PiCacheKeepClaim(directory, 'S', {
+  const contender = new CacheKeepClaim(directory, 'S', {
     liveness: { pidAlive: () => true, incarnation: async () => 'new-start' },
   })
   expect(await contender.acquire()).toBe(false)
@@ -1001,7 +1001,7 @@ test('a Pi owner waits out a sweep and restores without another turn or request'
   f.advance(55 * 60_000)
   const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
   const hash = createHash('sha256').update('session-S').digest('hex')
-  const sweep = new PiCacheKeepClaim(directory, hash, {
+  const sweep = new CacheKeepClaim(directory, hash, {
     sessionHash: true,
     liveness: { pidAlive: () => true, incarnation: async () => 'same-start' },
   })
@@ -1049,7 +1049,7 @@ test('shutdown saves an accepted body queued before a sweep releases its claim',
   const f = await fixture()
   const directory = cacheKeepStoreDirectory('shared-storage', f.root, 'pi')
   const hash = createHash('sha256').update('session-S').digest('hex')
-  const sweep = new PiCacheKeepClaim(directory, hash, {
+  const sweep = new CacheKeepClaim(directory, hash, {
     sessionHash: true,
     liveness: { pidAlive: () => true, incarnation: async () => 'same-start' },
   })

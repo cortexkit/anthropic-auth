@@ -77,7 +77,7 @@ docs/           public user and contributor documentation
 - `convert.ts` and `transcript.ts`: build the Anthropic body from Pi's context.
 - `stream.ts` and `transport.ts`: send, relay, threads, billing lineage, quota-header observation, cache diagnostics and stream mapping.
 - `native.ts` and `native-commands.ts`: the account runtime and menu.
-- `cachekeep.ts` and `cachekeep-claim.ts`: keep-warm, with the restart store and the per-session claim.
+- `cachekeep.ts`: keep-warm, with the restart store and Core's per-session claim (`CacheKeepClaim`, shared with OpenCode 1 and 2).
 - `prime.ts`: the Prime scheduler, which sends through `stream.ts`'s registered Prime sender.
 - Other files: `effort-history.ts`, `quota-wait.ts`, `custody.ts` and `paths.ts`.
 

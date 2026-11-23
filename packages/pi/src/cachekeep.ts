@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
+  CacheKeepClaim,
   CacheKeepManager,
   type CacheKeepRealTurn,
   CacheKeepStore,
@@ -19,13 +20,12 @@ import {
   type StickySessionRouter,
 } from '@cortexkit/anthropic-auth-core'
 import { version as pluginVersion } from '../package.json'
-import { PiCacheKeepClaim } from './cachekeep-claim.ts'
 
 type TrackInput = Parameters<CacheKeepManager['track']>[0]
 type ManagerOptions = ConstructorParameters<typeof CacheKeepManager>[0]
 type Session = {
   storagePath: string
-  claim: PiCacheKeepClaim
+  claim: CacheKeepClaim
   store: CacheKeepStore
 }
 
@@ -191,7 +191,7 @@ export class PiCacheKeep {
     let claiming: Promise<Session | undefined>
     claiming = (async () => {
       const store = await this.store(storagePath)
-      const claim = new PiCacheKeepClaim(store.directory, sessionId, {
+      const claim = new CacheKeepClaim(store.directory, sessionId, {
         ownerOnly: this.options.persistence?.ownerOnly,
         liveness: this.options.liveness,
       })
@@ -238,7 +238,7 @@ export class PiCacheKeep {
             })
           : undefined
     }
-    const cleanup = new PiCacheKeepClaim(store.directory, hash, {
+    const cleanup = new CacheKeepClaim(store.directory, hash, {
       ...this.options.persistence,
       liveness: this.options.liveness,
       sessionHash: true,
