@@ -1201,6 +1201,38 @@ describe('OC1 shared routing relay', () => {
     ])
   })
 
+  for (const mode of ['main-first', 'fallback-first'] as const) {
+    test(`${mode} keeps the subscription refusal when the routing hook disappears`, async () => {
+      const f = await fixture(
+        'paid backup',
+        () => {
+          delete globals[key]
+          return f.sends.length === 1
+            ? new Response('usage limit reached', { status: 429 })
+            : new Response('paid')
+        },
+        undefined,
+        mode,
+      )
+      const accountFor = mock(async () => ({
+        account_id: syntheticMainAccountUuid,
+        credential_id: 'local',
+      }))
+      globals[key] = () => ({ accountFor })
+      const quotaPoll = spyOn(f.quotaManager, 'refreshMain')
+      try {
+        const response = await f.send()
+        expect(response.status).toBe(429)
+        expect(await response.text()).toBe('usage limit reached')
+        expect(accountFor).toHaveBeenCalledTimes(1)
+        expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+        expect(quotaPoll).not.toHaveBeenCalled()
+      } finally {
+        quotaPoll.mockRestore()
+      }
+    })
+  }
+
   test.each([true, false])(
     'sticky paid fallback needs an actual null retry after initial advice was overridden (%s)',
     async (retryProbeRuns) => {

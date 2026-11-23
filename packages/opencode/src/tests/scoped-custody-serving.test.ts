@@ -1343,6 +1343,11 @@ for (const { outcome, finalStatus } of [
     let version = 1
     const reports: number[] = []
     const wireTokens: string[] = []
+    const rejected = new Response('old token rejected', { status: 401 })
+    const pendingCancel = lifetimes.gate()
+    const cancelBody = spyOn(rejected.body!, 'cancel').mockReturnValue(
+      pendingCancel.wait,
+    )
     const scopedClient: NativeCustodyClient = {
       listScoped: async () => ({
         view: 'main-only',
@@ -1369,7 +1374,7 @@ for (const { outcome, finalStatus } of [
       wireTokens.push(token)
       if (token === 'Bearer scoped-version-1') {
         version = 2 // The vault rotates after getScoped, before Anthropic responds.
-        return new Response('old token rejected', { status: 401 })
+        return rejected
       }
       if (finalStatus === 'network-error')
         throw new Error('new record transport failed')
@@ -1383,14 +1388,21 @@ for (const { outcome, finalStatus } of [
       migratedActivation(fixture),
       { models: {} },
     )
-    if (finalStatus === 'network-error') {
-      await expect(loader.fetch(MESSAGES_URL, EMPTY_POST)).rejects.toThrow(
-        'new record transport failed',
-      )
-    } else {
-      const response = await loader.fetch(MESSAGES_URL, EMPTY_POST)
-      expect(response.status).toBe(finalStatus)
-      expect(await response.text()).toBe('rotated token response')
+    const request: Promise<Response> = loader.fetch(MESSAGES_URL, EMPTY_POST)
+    try {
+      const replay = Promise.race([request, Bun.sleep(1_000).then(() => null)])
+      if (finalStatus === 'network-error') {
+        await expect(replay).rejects.toThrow('new record transport failed')
+      } else {
+        const response = await replay
+        expect(response?.status).toBe(finalStatus)
+        expect(await response?.text()).toBe('rotated token response')
+      }
+      expect(cancelBody).toHaveBeenCalledTimes(1)
+    } finally {
+      pendingCancel.open()
+      await Promise.allSettled([request])
+      cancelBody.mockRestore()
     }
     expect(wireTokens).toEqual([
       'Bearer scoped-version-1',
@@ -1516,6 +1528,14 @@ for (const finalStatus of [200, 401]) {
     let version = 1
     const reports: number[] = [],
       relayTokens: string[] = []
+    const rejected = new Response('old relay token rejected', {
+      status: 401,
+      headers: { 'request-id': 'req_upstream_rotated' },
+    })
+    const pendingCancel = lifetimes.gate()
+    const cancelBody = spyOn(rejected.body!, 'cancel').mockReturnValue(
+      pendingCancel.wait,
+    )
     const scopedClient: NativeCustodyClient = {
       listScoped: async () => ({
         view: 'main-only',
@@ -1546,10 +1566,7 @@ for (const finalStatus of [200, 401]) {
       relayTokens.push(token)
       if (token === 'Bearer scoped-version-1') {
         version = 2
-        return new Response('old relay token rejected', {
-          status: 401,
-          headers: { 'request-id': 'req_upstream_rotated' },
-        })
+        return rejected
       }
       return new Response('new relay token response', {
         status: finalStatus,
@@ -1564,12 +1581,23 @@ for (const finalStatus of [200, 401]) {
       migratedActivation(fixture),
       { models: {} },
     )
-    const response = await loader.fetch(MESSAGES_URL, {
+    const request: Promise<Response> = loader.fetch(MESSAGES_URL, {
       ...EMPTY_POST,
       headers: { 'x-session-affinity': 'relay-rotation' },
     })
-    expect(response.status).toBe(finalStatus)
-    expect(await response.text()).toBe('new relay token response')
+    try {
+      const response = await Promise.race([
+        request,
+        Bun.sleep(1_000).then(() => null),
+      ])
+      expect(response?.status).toBe(finalStatus)
+      expect(await response?.text()).toBe('new relay token response')
+      expect(cancelBody).toHaveBeenCalledTimes(1)
+    } finally {
+      pendingCancel.open()
+      await Promise.allSettled([request])
+      cancelBody.mockRestore()
+    }
     expect(relayTokens).toEqual([
       'Bearer scoped-version-1',
       'Bearer scoped-version-2',

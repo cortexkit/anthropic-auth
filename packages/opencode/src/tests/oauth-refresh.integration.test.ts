@@ -1750,6 +1750,11 @@ describe('auth.loader', () => {
     )
     let tokenRefreshCount = 0
     const messageAuthorizations: string[] = []
+    const rejected = new Response('unauthorized', { status: 401 })
+    const pendingCancel = bodyLifetime().gate()
+    const cancelBody = spyOn(rejected.body!, 'cancel').mockReturnValue(
+      pendingCancel.wait,
+    )
     globalThis.fetch = mock(
       withNativeBootstrap(async (input: any, init?: RequestInit) => {
         const url = extractUrl(input)
@@ -1771,7 +1776,7 @@ describe('auth.loader', () => {
               refresh: 'new-refresh',
               expires: checkedAt + 8 * 60 * 60_000,
             })
-            return new Response('unauthorized', { status: 401 })
+            return rejected
           }
           return new Response('{}', { status: 200 })
         }
@@ -1786,7 +1791,7 @@ describe('auth.loader', () => {
         models: {},
       },
     )
-    const response = await result.fetch(MESSAGES_URL, {
+    const request: Promise<Response> = result.fetch(MESSAGES_URL, {
       method: 'POST',
       headers: { 'x-session-affinity': 'ses-refresh-race' },
       body: JSON.stringify({
@@ -1796,7 +1801,18 @@ describe('auth.loader', () => {
       }),
     })
 
-    expect(response.status).toBe(200)
+    try {
+      const response = await Promise.race([
+        request,
+        Bun.sleep(1_000).then(() => null),
+      ])
+      expect(response?.status).toBe(200)
+      expect(cancelBody).toHaveBeenCalledTimes(1)
+    } finally {
+      pendingCancel.open()
+      await Promise.allSettled([request])
+      cancelBody.mockRestore()
+    }
     expect(messageAuthorizations).toEqual([
       'Bearer sk-ant-oat01-old-access',
       'Bearer sk-ant-oat01-new-access',

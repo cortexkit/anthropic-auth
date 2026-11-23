@@ -8675,7 +8675,7 @@ const anthropicAuthPlugin = async (
                   // Keep the 401 and report the exact relay-served record below.
                 }
                 if (rotated) {
-                  await response.body?.cancel().catch(() => {})
+                  cancelAbandonedResponse(response)
                   logger.info(
                     'claustrum',
                     'retrying after scoped credential rotation',
@@ -8711,7 +8711,7 @@ const anthropicAuthPlugin = async (
                   // Preserve the genuine 401 if no replacement can be verified.
                 }
                 if (rotated) {
-                  await response.body?.cancel().catch(() => {})
+                  cancelAbandonedResponse(response)
                   logger.info(
                     'claustrum',
                     'retrying after scoped credential rotation',
@@ -8744,7 +8744,7 @@ const anthropicAuthPlugin = async (
                   nativeLocalRefreshFailures.set(response, error)
                 }
                 if (replacement && replacement.accessToken !== rejectedAccess) {
-                  await response.body?.cancel().catch(() => {})
+                  cancelAbandonedResponse(response)
                   response = usedDirectFetch
                     ? await directFetch()
                     : await sendOnce()
@@ -10384,6 +10384,7 @@ const anthropicAuthPlugin = async (
                 const revisited = new Set<string>()
                 const unavailable = new Set<string>()
                 let triedSharedAccount = false
+                let allowPaidFallback = false
                 const judged = new WeakSet<Response>()
                 function blockedOnRetry(
                   account: NativeAccountView,
@@ -10470,7 +10471,9 @@ const anthropicAuthPlugin = async (
                         return error.response()
                       throw error
                     }
-                    const { advice, account, snapshot, routing } = pick
+                    const { advice, account, snapshot, routing, probed } = pick
+                    // A missing hook is not a probe that returned no advice.
+                    allowPaidFallback = probed && !advice
                     if (!advice) return
                     if (account?.id === 'main' && providerRestriction) {
                       routingRelay.override(
@@ -10611,7 +10614,7 @@ const anthropicAuthPlugin = async (
                   }
                 }
                 requestRouting.shared = {
-                  allowPaidFallback: () => !sharedRoutingDecision,
+                  allowPaidFallback: () => allowPaidFallback,
                   // Once shared routing sent on an account, the local loop
                   // should try routes that have not refused this request yet.
                   skipLocal: (id) =>
