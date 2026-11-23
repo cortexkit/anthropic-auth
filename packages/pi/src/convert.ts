@@ -465,18 +465,24 @@ function addEphemeralCacheControl(body: AnthropicRequestBody): void {
   }
 }
 
-/** Keep Pi's native system, tool and conversation markers without the OAuth lookback bridge. */
+/**
+ * Paid API-key requests get the cache markers Pi's own Anthropic provider would
+ * place (system, last tool, last message), and none of the plugin's own
+ * subscription layout such as the bridge to an earlier cache boundary.
+ */
 function applyPiApiKeyCache(
   body: AnthropicRequestBody,
   options: SimpleStreamOptions | undefined,
   compat: Model<'anthropic-messages'>['compat'],
 ): void {
-  const envRetention =
-    options?.env?.PI_CACHE_RETENTION || process.env.PI_CACHE_RETENTION
+  // Same resolution as Pi's own provider (resolveCacheRetention): the
+  // environment can only ask for long retention, and no caching needs the
+  // explicit cacheRetention option. Paid requests stay as Pi would send them.
   const retention =
     options?.cacheRetention ??
-    (envRetention === 'long' || envRetention === 'none'
-      ? envRetention
+    ((options?.env?.PI_CACHE_RETENTION || process.env.PI_CACHE_RETENTION) ===
+    'long'
+      ? 'long'
       : 'short')
   if (retention === 'none') return
   const control = {

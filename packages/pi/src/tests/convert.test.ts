@@ -199,11 +199,9 @@ test.each([
     const { body: native } = await captureNativeAnthropicCacheRequest(
       model,
       context,
-      // Pi's resolveCacheRetention only reads "long" from the environment.
-      // Compare our environment opt-out to Pi's explicit no-cache request.
-      retention === 'env none'
-        ? { ...options, cacheRetention: 'none' }
-        : options,
+      // Pi's resolveCacheRetention reads only "long" from the environment,
+      // so an environment "none" gets Pi's short markers on both sides.
+      options,
     )
     const { body, bodyText, cacheTtlMs } = await buildAnthropicRequest(
       model.id,
