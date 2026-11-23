@@ -5513,6 +5513,50 @@ async function sendPrimary(
   await response.text()
 }
 
+test('Pi gzips eligible prewarms and rescues them with the same signed body', async () => {
+  const f = await fixture()
+  const sent: Array<{ encoding: string | null; body: string }> = []
+  globalThis.fetch = Object.assign(
+    async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const encoding = new Headers(init?.headers).get('content-encoding')
+      const body =
+        encoding === 'gzip'
+          ? gunzipSync(init?.body as Uint8Array).toString()
+          : String(init?.body)
+      sent.push({ encoding, body })
+      if (encoding === 'gzip')
+        return new Response('Unsupported content-encoding: gzip', {
+          status: 415,
+        })
+      return Response.json({ usage: { cache_read_input_tokens: 1 } })
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+  const result = await __prewarmPiCacheKeepForTest({
+    sessionId: 'pi-gzip-warm',
+    url: 'https://api.anthropic.com/v1/messages?beta=true',
+    headers: new Headers(),
+    bodyText: JSON.stringify({
+      model: model.id,
+      max_tokens: 128,
+      system: [
+        {
+          type: 'text',
+          text: 'stable prefix '.repeat(500),
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [{ role: 'user', content: 'warm' }],
+    }),
+    oauthAccountId: 'main',
+    oauthAccountIdentity: fixtureAccountIdentity('main'),
+    accountStoragePath: f.path,
+  })
+  expect(result.ok).toBe(true)
+  expect(sent.map(({ encoding }) => encoding)).toEqual(['gzip', null])
+  expect(sent[0]?.body.trimEnd()).toBe(sent[1]?.body)
+})
+
 test('Pi sends model and keep-warm requests to the gateway as full uncompressed requests', async () => {
   const f = await fixture()
   const sent = recordSends()

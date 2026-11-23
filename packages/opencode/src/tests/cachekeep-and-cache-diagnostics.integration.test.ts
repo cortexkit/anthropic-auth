@@ -1,21 +1,29 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   __setLogTestSink,
   type AccountStorage,
   CacheKeepManager,
   type CommandApplyRequest,
   type CommandApplyResult,
+  cacheKeepStoreDirectory,
   getDumpDirectory,
   isDumpEnabled,
   type LogTestRecord,
+  type MessageThreadTracker,
+  messageThreadBetas,
+  prepareMessageThreadRequest,
+  resetBillingHeaderCCH,
   resetCache1hState,
   resetDumpState,
   setLogLevel,
+  signRequestBody,
   tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
+import { MessageThreadTailStore } from '../../../core/src/message-thread-tail-store.ts'
 import { drainSidebarWrites } from '../sidebar-state'
 import { getPluginTestHandles } from './plugin-test-handles'
 import {
@@ -85,6 +93,273 @@ function applyMenuAction(
 
 describe('auth.loader', () => {
   installLoaderSetup(testContext)
+
+  async function warmFixture() {
+    await useTempAccountFile(
+      bindPoolAccounts(
+        createFallbackStorage({
+          routing: { mode: 'fallback-first' },
+          refresh: { enabled: false },
+          quota: { enabled: false },
+          claudeCache: { enabled: true, mode: 'hybrid' },
+          cacheKeep: { enabled: true, always: true },
+        }),
+      ),
+    )
+  }
+
+  async function acceptRequest(
+    plugin: any,
+    sessionId: string,
+    text: string,
+    model = 'claude-opus-4-8',
+  ) {
+    const result = await plugin.auth.loader(
+      () => Promise.resolve({ ...syntheticMainHostAuth(), type: 'oauth' }),
+      { models: {} },
+    )
+    const response = await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'x-session-affinity': sessionId },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: text }],
+      }),
+    })
+    expect(response.status).toBe(200)
+    await response.text()
+  }
+
+  test('OC1 records prefix usage for auto keep-warm pricing without a restart', async () => {
+    await warmFixture()
+    globalThis.fetch = mock(
+      withNativeAdmission(() =>
+        Response.json({
+          usage: { cache_read_input_tokens: 1500, input_tokens: 12 },
+        }),
+      ),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    const sessionId = 'oc1-warm-prefix-usage'
+    await acceptRequest(plugin, sessionId, 'a priced prefix')
+    const handles = getPluginTestHandles(plugin)
+    await handles.drainDispatchWork()
+    expect(
+      handles.cacheKeepManager.trackedPolicyState(sessionId),
+    ).toMatchObject({
+      prefixTokens: 1500,
+      inputTokens: 1512,
+    })
+  })
+
+  test('OC1 restores an idle warm once per server and keeps its durable budget', async () => {
+    let now = Date.now()
+    Date.now = mock(() => now)
+    await warmFixture()
+    const warmBodies: string[] = []
+    const directory = cacheKeepStoreDirectory(
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE!,
+      undefined,
+      'opencode1',
+    )
+    const readRecord = async () => {
+      const files = (await readdir(directory)).filter((name) =>
+        name.endsWith('.json.gz'),
+      )
+      expect(files).toHaveLength(1)
+      const path = join(directory, files[0]!)
+      if (process.platform !== 'win32')
+        expect((await stat(path)).mode & 0o777).toBe(0o600)
+      return JSON.parse(gunzipSync(await readFile(path)).toString())
+    }
+    const reservations: unknown[] = []
+    globalThis.fetch = mock(
+      withNativeAdmission(async (_input: unknown, init: RequestInit) => {
+        const body = String(init.body)
+        if (JSON.parse(body).max_tokens === 0) {
+          warmBodies.push(body)
+          reservations.push((await readRecord()).policyState)
+        }
+        return Response.json({ usage: { cache_read_input_tokens: 1500 } })
+      }),
+    ) as unknown as typeof fetch
+
+    const original = await getPlugin(undefined, '/original-project')
+    const sessionId = 'oc1-restart-warm'
+    await acceptRequest(
+      original,
+      sessionId,
+      'a restartable prefix',
+      'claude-opus-5-5',
+    )
+    await getPluginTestHandles(original).drainDispatchWork()
+    await original.dispose()
+    testContext.livePlugins.delete(original)
+    const saved = await readRecord()
+    expect(saved).toMatchObject({ v: 1, id: sessionId })
+    expect(saved.bodyText).toContain('a restartable prefix')
+    expect(saved.headers).toBeUndefined()
+    expect(saved.policyState.prefixTokens).toBe(1500)
+
+    const plugins = await Promise.all([
+      getPlugin(undefined, '/first-project'),
+      getPlugin(undefined, '/second-project'),
+    ])
+    const managers = plugins.map(
+      (plugin) => getPluginTestHandles(plugin).cacheKeepManager,
+    )
+    expect(
+      managers
+        .flatMap((manager) => manager.trackedSessions())
+        .map(({ id }) => id),
+    ).toEqual([sessionId])
+    now = saved.nextPrewarmAt + 1
+    await Promise.all(managers.map((manager) => manager.tick()))
+    expect(warmBodies).toHaveLength(1)
+    expect(warmBodies[0]).toContain('a restartable prefix')
+    expect(reservations).toEqual([
+      expect.objectContaining({
+        warmsSinceLastRealRequest: 1,
+        pendingWarmCost: expect.any(Number),
+      }),
+    ])
+    const owner = managers.findIndex((manager) =>
+      manager.trackedRequest(sessionId),
+    )
+    const close = async (plugin: any) => {
+      await plugin.dispose()
+      testContext.livePlugins.delete(plugin)
+    }
+    await close(plugins[owner])
+    expect(managers[1 - owner]?.trackedRequest(sessionId)).toBeDefined()
+    await close(plugins[1 - owner])
+    const updated = await readRecord()
+    expect(updated.policyState).toMatchObject({ warmsSinceLastRealRequest: 1 })
+    expect(updated.policyState.warmCostSoFar).toBeGreaterThan(0)
+    expect(updated.cacheExpiresAt).toBeGreaterThan(saved.cacheExpiresAt)
+    const restarted = await getPlugin(undefined, '/third-project')
+    const restored =
+      getPluginTestHandles(restarted).cacheKeepManager.trackedPolicyState(
+        sessionId,
+      )
+    expect(restored).toMatchObject({
+      warmsSinceLastRealRequest: 1,
+      warmCostSoFar: updated.policyState.warmCostSoFar,
+    })
+  })
+
+  test('OC1 reuses the previous full cache boundary after a thread restart', async () => {
+    await warmFixture()
+    const original = await getPlugin(undefined, '/original-thread-project')
+    const tracker = getPluginTestHandles(original).messageThreads
+    const session = `oc1-thread-${crypto.randomUUID()}`
+    const mark = { type: 'ephemeral', ttl: '1h' }
+    const text = (text: string, cache = false) => ({
+      type: 'text',
+      text,
+      ...(cache && { cache_control: mark }),
+    })
+    const body = {
+      model: 'claude-opus-4-8',
+      system: [text('system', true)],
+      messages: [{ role: 'user', content: [text('cached first turn', true)] }],
+    }
+    const input = {
+      session,
+      account: 'account',
+      credential: 'credential',
+      betas: messageThreadBetas(new Headers()),
+    }
+    const reply = { role: 'assistant', content: [text('answer')] }
+    const complete = (prepared: ReturnType<MessageThreadTracker['prepare']>) =>
+      prepared.complete({
+        messageId: 'msg_accepted',
+        reply,
+        stopped: true,
+        stopReason: 'end_turn',
+      })
+    complete(tracker.prepare({ ...input, body }))
+    const second = { role: 'user', content: [text('next turn', true)] }
+    const continued = tracker.prepare({
+      ...input,
+      body: { ...body, messages: [...body.messages, reply, second] },
+    })
+    expect(continued.decision.type).toBe('continue')
+    complete(continued)
+
+    const store = new MessageThreadTailStore('opencode1')
+    try {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        if ((await store.load(session))?.continued) break
+        await Bun.sleep(10)
+      }
+      expect(await store.load(session)).toMatchObject({ continued: true })
+      expect(
+        await new MessageThreadTailStore('opencode2').load(session),
+      ).toBeUndefined()
+      await original.dispose()
+      testContext.livePlugins.delete(original)
+      const restarted = await getPlugin(undefined, '/restarted-thread-project')
+      const prepared = await prepareMessageThreadRequest(
+        getPluginTestHandles(restarted).messageThreads,
+        {
+          ...input,
+          headers: new Headers(),
+          bodyText: JSON.stringify({
+            ...body,
+            messages: [
+              { role: 'user', content: [text('cached first turn')] },
+              reply,
+              { role: 'user', content: [text('next turn')] },
+              reply,
+              { role: 'user', content: [text('new turn', true)] },
+            ],
+          }),
+          cacheSlot: (outgoing) =>
+            (outgoing.system as Record<string, unknown>[])[0],
+        },
+      )
+      const outgoing = JSON.parse(prepared.bodyText)
+      expect(outgoing.thread).toEqual({ type: 'create' })
+      expect(outgoing.messages[0].content[0].cache_control).toEqual(mark)
+      expect(outgoing.system[0].cache_control).toBeUndefined()
+    } finally {
+      store.changed(session, undefined, false)
+      await store.drain()
+    }
+  })
+
+  test('OC1 gzips eligible prewarms and rescues them with the same signed body', async () => {
+    let now = Date.now()
+    Date.now = mock(() => now)
+    await warmFixture()
+    const sends: Array<{ body: string; encoding: string | null }> = []
+    globalThis.fetch = mock(
+      withNativeAdmission((_input: unknown, init: RequestInit) => {
+        const encoding = new Headers(init.headers).get('content-encoding')
+        const body =
+          encoding === 'gzip'
+            ? gunzipSync(init.body as Uint8Array).toString()
+            : String(init.body)
+        if (JSON.parse(body).max_tokens === 0) {
+          sends.push({ body, encoding })
+          if (encoding === 'gzip')
+            return new Response('Unsupported content-encoding: gzip', {
+              status: 415,
+            })
+        }
+        return Response.json({ usage: { cache_read_input_tokens: 1 } })
+      }),
+    ) as unknown as typeof fetch
+    const plugin = await getPlugin()
+    await acceptRequest(plugin, 'oc1-gzip-warm', 'large prefix '.repeat(500))
+    now += 55 * 60_000
+    await getPluginTestHandles(plugin).cacheKeepManager.tick()
+    expect(sends.map(({ encoding }) => encoding)).toEqual(['gzip', null])
+    const identityBody = sends[1]!.body
+    expect(await signRequestBody(identityBody)).toBe(identityBody)
+    expect(sends[0]?.body.trimEnd()).toBe(resetBillingHeaderCCH(identityBody))
+  })
 
   test('OC1 routing-moved stops an old-account warm before the next real turn', async () => {
     let now = Date.now()
@@ -1076,27 +1351,11 @@ describe('cache diagnostics', () => {
     )
   })
 
-  test('cache diagnostics records cachekeep prewarms and carries their provider id forward', async () => {
+  test('OC1 CacheKeep prewarms stay out of the cache diagnostics chain', async () => {
     let now = 1_000
-    const intervals: Array<{ callback: () => unknown; ms: number }> = []
-    const sentBodies: Record<string, unknown>[] = []
+    const sent: Array<{ body: Record<string, unknown>; betas: string[] }> = []
     const records: LogTestRecord[] = []
-    let prewarmStartedFlag = false
-    let resolvePrewarmStarted: (() => void) | undefined
-    const prewarmStarted = new Promise<void>((resolve) => {
-      resolvePrewarmStarted = () => {
-        prewarmStartedFlag = true
-        resolve()
-      }
-    })
     Date.now = mock(() => now) as unknown as typeof Date.now
-    testContext.pluginRuntimeOverrides = {
-      setInterval: mock((callback: () => unknown, ms: number) => {
-        intervals.push({ callback, ms })
-        return { unref() {} } as unknown as ReturnType<typeof setInterval>
-      }) as unknown as typeof setInterval,
-      clearInterval: mock(() => {}) as unknown as typeof clearInterval,
-    }
     await useTempAccountFile(
       createFallbackStorage({
         accounts: [],
@@ -1109,9 +1368,11 @@ describe('cache diagnostics', () => {
     globalThis.fetch = mock(
       withNativeAdmission((_input: any, init: RequestInit) => {
         const body = JSON.parse(String(init.body)) as Record<string, unknown>
-        sentBodies.push(body)
+        const betas = (new Headers(init.headers).get('anthropic-beta') ?? '')
+          .split(',')
+          .map((beta) => beta.trim())
+        sent.push({ body, betas })
         if (body.max_tokens === 0) {
-          resolvePrewarmStarted?.()
           return Promise.resolve(
             new Response(JSON.stringify(message('provider-warm-B')), {
               status: 200,
@@ -1144,49 +1405,33 @@ describe('cache diagnostics', () => {
     }
     await (await result.fetch(MESSAGES_URL, request)).text()
     now += 55 * 60_000
-    const cacheKeepTick = intervals.at(-1)
-    if (!cacheKeepTick) throw new Error('missing cachekeep interval')
-    cacheKeepTick.callback()
-    await Bun.sleep(20)
-    await prewarmStarted
-    expect(prewarmStartedFlag).toBe(true)
-    for (
-      let attempt = 0;
-      attempt < 50 &&
-      !records.some(
-        (record) =>
-          record.channel === 'cache-diagnostics' &&
-          record.message.includes('provider-warm-B'),
-      );
-      attempt++
-    ) {
-      await Bun.sleep(10)
-    }
+    await getPluginTestHandles(plugin).cacheKeepManager.tick()
     await (await result.fetch(MESSAGES_URL, request)).text()
 
-    const prewarmBody = sentBodies.find((body) => body.max_tokens === 0)
-    expect(prewarmBody?.diagnostics).toEqual({
-      previous_message_id: 'provider-real-A',
-    })
-    expect(sentBodies.at(-1)?.diagnostics).toEqual({
-      previous_message_id: 'provider-warm-B',
-    })
-    const prewarmRecord = records.find(
-      (record) =>
-        record.channel === 'cache-diagnostics' &&
-        record.message.includes('provider-warm-B'),
+    const warms = sent.filter(({ body }) => body.max_tokens === 0)
+    expect(warms).toHaveLength(1)
+    const diagnosticBeta = 'cache-diagnosis-2026-04-07'
+    expect(sent[0]?.betas).toContain(diagnosticBeta)
+    expect(sent[0]?.body.diagnostics).toEqual({ previous_message_id: null })
+    expect(sent.at(-1)?.betas).toContain(diagnosticBeta)
+    const logged = records
+      .filter((record) => record.message.startsWith('MC-CACHE-DIAG '))
+      .map((record) => record.message)
+    expect(logged.some((record) => record.includes('provider-real-A'))).toBe(
+      true,
     )
-    expect(prewarmRecord).toBeDefined()
-    expect(
-      JSON.parse(prewarmRecord!.message.replace('MC-CACHE-DIAG ', '')),
-    ).toMatchObject({
-      is_subagent: false,
-      ttl_sent: '1h',
-      previous_message_id: 'provider-real-A',
-      source: 'prewarm_cachekeep',
-      synthetic: true,
-      account_id: 'main',
-      betas_hash: expect.stringMatching(/^[0-9a-f]{16}$/),
+    expect({
+      warmDiagnostics: warms[0]?.body.diagnostics,
+      warmOptIn: warms[0]?.betas.includes(diagnosticBeta),
+      nextDiagnostics: sent.at(-1)?.body.diagnostics,
+      warmRecords: logged.filter((record) =>
+        record.includes('prewarm_cachekeep'),
+      ),
+    }).toEqual({
+      warmDiagnostics: undefined,
+      warmOptIn: false,
+      nextDiagnostics: { previous_message_id: 'provider-real-A' },
+      warmRecords: [],
     })
     setLogLevel('info')
   })

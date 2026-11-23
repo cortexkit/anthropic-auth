@@ -28,10 +28,12 @@ const MAX_RECORD_BYTES = 2 * CACHE_KEEP_MAX_BODY_BYTES + 64 * 1024
 // previous format so updates do not discard still-live caches.
 const RECORD_FORMAT_VERSION = 1
 
+type CacheKeepStoreHost = 'opencode1' | 'pi'
+
 export function cacheKeepStoreDirectory(
   storageId: string,
   root = getHostDataHome(),
-  host?: 'pi',
+  host?: CacheKeepStoreHost,
 ) {
   return join(
     root,
@@ -244,8 +246,8 @@ function validSavedPolicy(value: unknown): boolean {
 export interface CacheKeepStoreOptions {
   storageId: string
   pluginVersion: string
-  /** OpenCode retains its original namespace; Pi never reads its records. */
-  host?: 'pi'
+  /** OpenCode 2 retains its original namespace; other hosts do not read it. */
+  host?: CacheKeepStoreHost
   /** Test seam for the data home; never the host's config. */
   root?: string
   /** Test seam for the pre-2.5.4 temp-root migration. */
@@ -364,8 +366,8 @@ export class CacheKeepStore {
     await this.chain
     if (!(await this.directoryReady())) return
     let directory = this.directory
-    // Only an empty OpenCode store may recover pre-2.5.4 temp files, once per
-    // writer. Pi has never used the legacy OpenCode location.
+    // Only an empty OpenCode 2 store may recover the old temp files, once per
+    // writer. The other hosts have never used this location.
     const firstLoad = !this.legacyLoadAttempted
     this.legacyLoadAttempted = true
     if (

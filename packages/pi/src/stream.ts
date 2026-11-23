@@ -528,12 +528,13 @@ const piCacheKeep = new PiCacheKeep(
     fetchImpl: fetchPiOAuth,
     // A keep-warm is a model request, so it follows the current gateway of
     // the target's own runtime.
-    fetchForTarget: (target) =>
-      createPiOAuthModelFetch(() =>
-        piClaudeGatewayFromMemory(
-          target.accountStoragePath ?? getPiAccountStoragePath(),
-        ),
-      ),
+    fetchForTarget: (target) => {
+      const storagePath = target.accountStoragePath ?? getPiAccountStoragePath()
+      return createPiOAuthModelFetch(
+        () => piClaudeGatewayFromMemory(storagePath),
+        getRequestGzipLatch(getRequestGzipLatchPath(storagePath)),
+      )
+    },
     loadStorage: async () => (await getPiNativeRuntime().view()).policyStorage,
     resolveSettings: resolvePiSettingsFromMemory,
     onTrackedSessionsChanged: (sessions) =>

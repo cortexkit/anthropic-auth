@@ -23,6 +23,7 @@ import {
   CACHE_KEEP_EXTENDED_TTL_BETA,
   CacheKeepManager,
   CacheKeepSessionRegistry,
+  CacheKeepWarmRefusal,
   CLAUDE_FABLE_MYTHOS_5_MODEL_SPECS,
   CLAUDE_HAIKU_4_5_MODEL_ID,
   CLAUDE_HAIKU_5_5_CONTEXT_WINDOW,
@@ -265,7 +266,6 @@ import {
   extractAnthropicRequestId,
 } from './billing-lineage.ts'
 import {
-  applyCacheDiagnosticsOptIn,
   buildCacheDiagnosticsRecord,
   CACHE_DIAGNOSTICS_BETA,
   CacheDiagnosticsBetaTracker,
@@ -277,6 +277,10 @@ import {
   summarizeCacheTtl,
   withStickyRetryAfter,
 } from './cache-diagnostics.ts'
+import {
+  adoptCacheKeepRestart,
+  cacheKeepRestartCredential,
+} from './cachekeep-restart.ts'
 import {
   custodyStateFor,
   fallbackCustodyDimensions,
@@ -1319,7 +1323,7 @@ const anthropicAuthPlugin = async (
   const { client } = ctx
   const profileFetch = globalThis.fetch
   const accountStoragePath = getAccountStoragePath()
-  const messageThreads = new MessageThreadTracker()
+  const messageThreads = MessageThreadTracker.withTailPersistence('opencode1')
 
   // -- OAuth add-flow pending state (Add account modal) --------------------
   interface OAuthPendingEntry {
@@ -1873,6 +1877,12 @@ const anthropicAuthPlugin = async (
       ...(ttlMs > 0 && { cache: { ttlMs } }),
     }
   }
+  const cacheKeepCredential = (authorization: NativeOAuthAuthorization) =>
+    cacheKeepRestartCredential(
+      authorization.scopedAttempt ? 'vault' : 'local',
+      authorization.accountIdentity,
+      authorization.credentialId,
+    )
   function nativeWireIdentity(accountIdentity: string | undefined) {
     const accountUuid = asProviderAccountUuid(accountIdentity)
     if (!accountUuid)
@@ -3597,6 +3607,7 @@ const anthropicAuthPlugin = async (
     toolNameMap?: ToolNameMap
     failThread?: () => void
     cacheKeepBodyText?: string
+    acceptedCacheKeepBodyText?: () => string | undefined
     cacheKeepSignal?: AbortSignal | null
     fableRequest?: FableRequestContext
     sourceCandidate?: FableSourceWarmInit
@@ -3632,16 +3643,6 @@ const anthropicAuthPlugin = async (
       if (!signal?.aborted)
         reportSessionCacheTouch(sessionId, { ...touch, source: 'response' })
   }
-  const cacheKeepDiagnosticsRequests = new Map<
-    string,
-    CacheDiagnosticsRequestContext & {
-      accountId: string
-      synthetic: boolean
-      betasHash?: string
-      betas?: string[]
-      requestedModel?: string
-    }
-  >()
 
   function observeCacheDiagnosticsMessage(input: {
     source: CacheDiagnosticsSource
@@ -3813,10 +3814,13 @@ const anthropicAuthPlugin = async (
       // delta. Warming signs the template again before sending it.
       context.fableRequest.sourceCacheUsed = context.sourceCandidate
     }
-    if (usage)
+    // The wire body can be a thread delta or have a different signature. Price
+    // the full logical body only if this response actually replaced the target.
+    const acceptedBody = context.acceptedCacheKeepBodyText?.()
+    if (usage && acceptedBody !== undefined)
       cacheKeepManager.recordAcceptedUsage(
         context.trackSessionId,
-        context.cacheKeepBodyText,
+        acceptedBody,
         usage,
       )
   }
@@ -3951,7 +3955,7 @@ const anthropicAuthPlugin = async (
   > = []
   const cacheKeepScopedAttempts = new Map<number, NativeOAuthAuthorization>()
   const cacheKeepSourceCopies = new Map<string, FableSourceWarmKeep>()
-  const cacheKeepManager = new CacheKeepManager({
+  const cacheKeepManager: CacheKeepManager = new CacheKeepManager({
     loadStorage: () => loadAccounts(accountStoragePath),
     resolveSettings: (storage, model) =>
       nativeAccounts.resolveSettings?.(storage, model) ?? storage,
@@ -3969,7 +3973,10 @@ const anthropicAuthPlugin = async (
     },
     // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
     // A keep-warm is a model request, so it follows the current gateway.
-    fetchImpl: fetchOAuthModel(() => nativeAccounts.getClaudeGateway?.()),
+    fetchImpl: fetchOAuthModel(
+      () => nativeAccounts.getClaudeGateway?.(),
+      requestGzipLatch,
+    ),
     billingRequest: (target, attempt) => {
       const payer = cacheKeepScopedAttempts.get(attempt.id)
       if (!payer) return
@@ -3988,8 +3995,13 @@ const anthropicAuthPlugin = async (
     },
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
+    reserveWarm: (target) => cacheKeepRestart.reserve(target),
+    settleWarm: (target) => cacheKeepRestart.settle(target),
     onTargetChanged: (target) => {
-      if (!target.sourceWarm) return
+      if (!target.sourceWarm) {
+        cacheKeepRestart.changed(target)
+        return
+      }
       const kept = fableFallbackManager.sourceWarmForTarget(target.id)
       if (
         kept &&
@@ -3999,6 +4011,7 @@ const anthropicAuthPlugin = async (
         cacheKeepSourceCopies.set(target.id, kept)
     },
     onTargetRemoved: (id) => {
+      cacheKeepRestart.removed(id)
       const kept = cacheKeepSourceCopies.get(id)
       cacheKeepSourceCopies.delete(id)
       // A terminal stop must retire both copies. Do not let an old target's
@@ -4010,47 +4023,15 @@ const anthropicAuthPlugin = async (
       await cacheKeepRegistry.publish(sessions)
       aggregateCacheKeepSessions = await cacheKeepRegistry.list(sessions)
     },
-    prepareBody: (bodyText, target) => {
-      if (
-        !new Headers(target.headers)
-          .get('anthropic-beta')
-          ?.split(',')
-          .map((beta) => beta.trim())
-          .includes(CACHE_DIAGNOSTICS_BETA)
-      ) {
-        return bodyText
-      }
-      try {
-        const body = JSON.parse(bodyText) as Record<string, unknown>
-        const previous = cacheDiagnosticsTracker.previousFor(target.id)
-        const previousMessageId = previous?.messageId ?? null
-        applyCacheDiagnosticsOptIn(body, previousMessageId)
-        cacheKeepDiagnosticsRequests.set(target.id, {
-          sessionId: target.id,
-          previousMessageId,
-          ...(previous
-            ? { previousMessageReceivedAt: previous.receivedAt }
-            : {}),
-          isSubagent: target.isSubagent,
-          ttlSent: summarizeCacheTtl(body),
-          accountId: target.oauthAccountId ?? 'main',
-          synthetic: true,
-          requestedModel:
-            typeof body.model === 'string' ? body.model : undefined,
-        })
-        return JSON.stringify(body)
-      } catch {
-        return bodyText
-      }
+    prepareBody: (bodyText) => {
+      // Strip the real turn's diagnostic predecessor before signing. A warm
+      // refreshes the prefix but does not join the turn's diagnostics chain.
+      const body = JSON.parse(bodyText) as Record<string, unknown>
+      if (!Object.hasOwn(body, 'diagnostics')) return bodyText
+      delete body.diagnostics
+      return JSON.stringify(body)
     },
-    onResponse: async ({
-      target,
-      bodyText,
-      status,
-      data,
-      receivedAt,
-      attempt,
-    }) => {
+    onResponse: async ({ target, bodyText, status, receivedAt, attempt }) => {
       const authorization = cacheKeepScopedAttempts.get(attempt.id)
       // A recovery source warm protects another model, not the active fallback's cache.
       if (
@@ -4078,47 +4059,6 @@ const anthropicAuthPlugin = async (
         cacheKeepManager.isCurrentTarget(target)
       ) {
         fableFallbackManager.noteSourceWarmSentForTarget(target.id)
-      }
-      const prepared = cacheKeepDiagnosticsRequests.get(target.id)
-      if (!prepared?.betasHash || !prepared.betas) {
-        cacheKeepDiagnosticsRequests.delete(target.id)
-        return
-      }
-      try {
-        const sentBody = JSON.parse(bodyText)
-        const diagnostics =
-          sentBody && typeof sentBody === 'object' && !Array.isArray(sentBody)
-            ? (sentBody as { diagnostics?: unknown }).diagnostics
-            : undefined
-        const previousMessageId =
-          diagnostics &&
-          typeof diagnostics === 'object' &&
-          !Array.isArray(diagnostics) &&
-          (diagnostics as { previous_message_id?: unknown })
-            .previous_message_id === prepared.previousMessageId
-            ? prepared.previousMessageId
-            : undefined
-        if (previousMessageId === undefined) return
-        observeCacheDiagnosticsMessage({
-          source: 'prewarm_cachekeep',
-          accountId: prepared.accountId,
-          synthetic: prepared.synthetic,
-          betasHash: prepared.betasHash,
-          betas: prepared.betas,
-          requestedModel: prepared.requestedModel,
-          request: {
-            ...prepared,
-            previousMessageId,
-            ttlSent: summarizeCacheTtl(sentBody),
-          },
-          trackSessionId: target.id,
-          status,
-          message: data,
-          receivedAt,
-        })
-      } catch {
-      } finally {
-        cacheKeepDiagnosticsRequests.delete(target.id)
       }
     },
     onComplete: ({ attempt }) => {
@@ -4150,6 +4090,9 @@ const anthropicAuthPlugin = async (
       )
       if (
         current.accountIdentity !== served.accountIdentity ||
+        (target.hostMetadata?.restartCredential !== undefined &&
+          cacheKeepCredential(current) !==
+            target.hostMetadata.restartCredential) ||
         Boolean(current.scopedAttempt) !== Boolean(served.scopedAttempt)
       )
         return undefined
@@ -4170,6 +4113,12 @@ const anthropicAuthPlugin = async (
       return rotatedHeaders
     },
     prepareHeaders: async (headers, target, attempt) => {
+      await cacheKeepRestart.stagger(target, attempt.signal)
+      if (
+        !cacheKeepRestart.active() ||
+        !cacheKeepManager.isCurrentTarget(target)
+      )
+        throw new CacheKeepWarmRefusal('stopped')
       // A remembered URL gets the same destination rule as a live request;
       // refuse it before any credential is authorized for the prewarm.
       if (!isAllowedOAuthDestination(target.url, modelGateway(target.url)))
@@ -4188,8 +4137,11 @@ const anthropicAuthPlugin = async (
         'cachekeep',
       )
       if (
-        target.oauthAccountIdentity &&
-        credential.accountIdentity !== target.oauthAccountIdentity
+        (target.oauthAccountIdentity &&
+          credential.accountIdentity !== target.oauthAccountIdentity) ||
+        (target.hostMetadata?.restartCredential !== undefined &&
+          cacheKeepCredential(credential) !==
+            target.hostMetadata.restartCredential)
       )
         throw new NativeAccountRefusal('credential-changed')
       const accessToken = credential.accessToken
@@ -4212,15 +4164,16 @@ const anthropicAuthPlugin = async (
           ]),
         )
         if (parsedBody.speed === 'fast') addFastModeBetaHeader(headers)
-        const prepared = cacheKeepDiagnosticsRequests.get(target.id)
-        if (prepared) {
-          const { betas, betasHash } = await getCacheDiagnosticsBetas(headers)
-          prepared.betas = betas
-          prepared.betasHash = betasHash
-        }
       } catch {
         setOAuthHeaders(headers, accessToken)
       }
+      const betas = headers.get('anthropic-beta')?.split(',') ?? []
+      headers.set(
+        'anthropic-beta',
+        betas
+          .filter((beta) => beta.trim() !== CACHE_DIAGNOSTICS_BETA)
+          .join(','),
+      )
 
       const finalCredential = await authorizeOAuth(
         accountId,
@@ -4231,6 +4184,9 @@ const anthropicAuthPlugin = async (
       )
       if (
         finalCredential.accountIdentity !== credential.accountIdentity ||
+        (target.hostMetadata?.restartCredential !== undefined &&
+          cacheKeepCredential(finalCredential) !==
+            target.hostMetadata.restartCredential) ||
         Boolean(finalCredential.scopedAttempt) !==
           Boolean(credential.scopedAttempt)
       )
@@ -4295,6 +4251,12 @@ const anthropicAuthPlugin = async (
       }
       return { ok: true as const }
     },
+  })
+  const cacheKeepRestart = adoptCacheKeepRestart(accountStoragePath, {
+    manager: cacheKeepManager,
+    read: () => nativeAccounts.read(),
+    allowUrl: (url) => isAllowedOAuthDestination(url, modelGateway(url)),
+    now: runtimeNow,
   })
 
   // Track one recovery round's kept source prefix as a second CacheKeep
@@ -4747,6 +4709,12 @@ const anthropicAuthPlugin = async (
   const dispose: NonNullable<Hooks['dispose']> = async () => {
     holderRegistration?.close()
     profileHydrationShutdown.abort()
+    try {
+      await cacheKeepRestart.dispose()
+      await cacheKeepRegistry.dispose()
+    } catch {
+      logger.warn('cachekeep', 'failed to stop')
+    }
     while (profilePublications.size) await Promise.all([...profilePublications])
     try {
       await closeOpenCodeScopedRuntime(accountStoragePath)
@@ -4794,13 +4762,6 @@ const anthropicAuthPlugin = async (
       }
     } catch (error) {
       logger.warn('cachekeep', 'failed to stop aggregate refresh', {
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
-    try {
-      cacheKeepManager.stop()
-    } catch (error) {
-      logger.warn('cachekeep', 'failed to stop', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -6909,6 +6870,7 @@ const anthropicAuthPlugin = async (
         stickyQuotaRetries.clear(sessionId)
         sessionCacheActivity.forget(sessionId)
         messageThreads.forget(sessionId)
+        cacheKeepRestart.forget(sessionId)
         fableFallbackManager.clearSession(sessionId)
         recoveryThinking.forgetSession(sessionId)
         dropSessionSourceWarms(sessionId)
@@ -8272,6 +8234,7 @@ const anthropicAuthPlugin = async (
             if (fableRequest) fableRequest.oauthAccountId = oauthAccountId
             if (fableRequest) fableRequest.subagent = subagentRequest
             let trackCacheKeepRequest: (() => void) | undefined
+            let acceptedCacheKeepBodyText: string | undefined
             const acceptedCacheAttempts = new WeakSet<object>()
             const trackAcceptedRequest = (attempt: object, sentBody = body) => {
               if (init?.signal?.aborted) return
@@ -8320,6 +8283,7 @@ const anthropicAuthPlugin = async (
               ) {
                 const bodyText = body
                 trackCacheKeepRequest = () => {
+                  if (!cacheKeepRestart.active()) return
                   const cacheKeepStart = nowMs()
                   const tracked = cacheKeepManager.track({
                     sessionId: relayAffinity,
@@ -8332,8 +8296,17 @@ const anthropicAuthPlugin = async (
                     ttlMs: acceptedCacheTtlMs,
                     oauthAccountId,
                     oauthAccountIdentity: nativeAuthorization?.accountIdentity,
+                    hostMetadata: {
+                      restartCredential:
+                        cacheKeepCredential(nativeAuthorization),
+                    },
                     isSubagent: subagentRequest,
                   })
+                  acceptedCacheKeepBodyText = tracked.tracked
+                    ? bodyText
+                    : undefined
+                  if (!tracked.tracked && relayAffinity)
+                    cacheKeepRestart.forget(relayAffinity)
                   trace?.mark('cachekeep_track', {
                     session: relayAffinity,
                     ms: roundMs(nowMs() - cacheKeepStart),
@@ -8960,6 +8933,7 @@ const anthropicAuthPlugin = async (
                 accountId: oauthAccountId,
                 synthetic: laneStartRequest,
                 cacheKeepBodyText: typeof body === 'string' ? body : undefined,
+                acceptedCacheKeepBodyText: () => acceptedCacheKeepBodyText,
                 cacheKeepSignal: init?.signal,
                 fableRequest,
                 sourceCandidate: fableRequest?.sourceCandidate,
@@ -12155,12 +12129,14 @@ const anthropicAuthPlugin = async (
     dispose,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
+  await cacheKeepRestart.restore()
   pluginTestHandles?.set(plugin, {
     drainDispatchWork,
     drainSidebarRouteWrites,
     primeManager,
     quotaManager,
     cacheKeepManager,
+    messageThreads,
     nativeAccounts,
     fableFallbackManager,
     resolveMainQuotaIdentity: resolveMainQuotaAccountIdentity,

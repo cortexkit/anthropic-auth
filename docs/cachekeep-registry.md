@@ -50,12 +50,13 @@ The first release shipping this data-folder interface is the transition
 release; the following release removes the compatibility paths. Version 2.5.3
 predates the data-folder interface.
 
-OpenCode 2 and Pi share a **private restart store** implementation, which does
+OpenCode 1, OpenCode 2 and Pi share a **private restart store** implementation, which does
 contain compressed replay bodies and is not this public interface. OpenCode 2
 keeps its existing location,
-`<data>/cortexkit/anthropic-auth/cachekeep-restore/<storage-id-hash>/`; Pi uses
+`<data>/cortexkit/anthropic-auth/cachekeep-restore/<storage-id-hash>/`; OpenCode 1 uses
+`<data>/cortexkit/anthropic-auth/cachekeep-restore/opencode1/<storage-id-hash>/`; Pi uses
 `<data>/cortexkit/anthropic-auth/cachekeep-restore/pi/<storage-id-hash>/`.
-Both use the same owner-only protections, including Windows ACLs, and the same
+All use the same owner-only protections, including Windows ACLs, and the same
 versioned gzip format. Records whitelist replay fields, never transport headers
 or credentials. Only an accepted response updates the saved body; writes keep
 the latest body, at most once per five seconds per session, and drain on clean
@@ -76,7 +77,9 @@ it neither writes nor restores there; memory-only warming still enforces all
 bounds. A transient reservation failure in an enabled store instead skips that
 warm rather than risking an older on-disk count. See [cache policy](cache.md#per-session-runner-policy).
 
-OpenCode 2 restores all eligible sessions in its storage. Pi restores only the
+OpenCode 1 and 2 restore all eligible sessions in their respective stores. On
+OpenCode 1 only one project instance in the server warms each restored session.
+Pi restores only the
 session named by `session_start` (or the first `turn_start` on a host that
 delivers it first), without waiting for another request. A per-session claim
 is acquired in the background: startup, turns and accepted responses never
@@ -84,7 +87,7 @@ wait for restart-store I/O. An early accepted body is saved after its claim
 arrives, including during a clean shutdown. The claim
 records the process id and OS start identity, so only one live Pi process warms
 that session; shutdown drains writes and releases the claim. Other sessions'
-records remain untouched until expiry cleanup. Both hosts reject expired,
+records remain untouched until expiry cleanup. All hosts reject expired,
 foreign-account, changed-login and disabled-account records, and reauthorize
 and re-sign prewarms through their normal send path. Overdue restored warms are
 staggered rather than sent in a restart burst.

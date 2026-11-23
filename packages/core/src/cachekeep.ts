@@ -1217,6 +1217,16 @@ export class CacheKeepManager {
     return true
   }
 
+  /** Hand a target to another live host instance without reporting a stop. */
+  releaseTarget(id: string) {
+    this.immediateTargets.delete(id)
+    if (!this.targets.delete(id)) return
+    for (const [controller, sessionId] of this.warmControllers)
+      if (sessionId === id) controller.abort()
+    this.publishTrackedSessions()
+    this.scheduleDueTimer()
+  }
+
   trackedCount(): number {
     return this.targets.size
   }

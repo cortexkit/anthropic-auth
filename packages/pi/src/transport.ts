@@ -10,6 +10,7 @@ import {
   createAnthropicOAuthFetch,
   createClaudeModelFetch,
   type IncompleteStreamDiagnostics,
+  type RequestGzipLatch,
   requireAnthropicOAuthOrigin,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -155,6 +156,11 @@ export async function fetchPiStreamResponse(
  */
 export function createPiOAuthModelFetch(
   gateway: () => ClaudeGateway | undefined,
+  requestGzipLatch?: RequestGzipLatch,
 ): typeof fetch {
-  return createClaudeModelFetch({ origin: PI_OAUTH_ORIGIN, gateway })
+  return createClaudeModelFetch({
+    origin: PI_OAUTH_ORIGIN,
+    gateway,
+    requestGzipLatch,
+  })
 }

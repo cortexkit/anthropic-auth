@@ -4,6 +4,8 @@
 
 The Anthropic API opt-in `cache-diagnosis-2026-04-07` (sent in the `anthropic-beta` header) asks for cache diagnostics; it does not change cache controls or routing. OpenCode 1 and 2 capture the response's opaque top-level message ID and send it as `diagnostics.previous_message_id` on the next eligible request in that session. The first eligible request sends `null`.
 
+Keep-warm requests on OpenCode do not opt in to cache diagnostics or change the previous-message ID. In older OpenCode 1 logs, `prewarm_cachekeep` identifies a keep-warm response.
+
 `MC-CACHE-DIAG ` records and the beta-list side channel are emitted only at debug level. Choose **Logging level** → `debug` in `/claude` → **Diagnostics**. An empty stream can mean no activity or a lower log level: compare it with an independent activity witness such as usage rows, billing or dumps before drawing conclusions.
 
 ## Version 2 record
