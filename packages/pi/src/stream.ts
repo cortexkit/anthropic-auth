@@ -1821,10 +1821,11 @@ async function executeWithFallback(options: {
   onResolvedToolNames?: (toolNames: ReadonlyMap<string, string>) => void
   onForkEffortApplied?: (effort: PiForkEffortHint | undefined) => void
   onThreadPrepared?: (fail: () => void) => void
+  onCapacityWait?: () => () => void
   routingRelay?: ReturnType<typeof createRoutingRelay>
   routingState?: {
     relay: ReturnType<typeof createRoutingRelay>
-    advice?: Promise<RoutingChoice | null>
+    advice?: Promise<RoutingChoice | undefined>
   }
 }): Promise<Response> {
   const routingState = options.routingState ?? {
@@ -2187,6 +2188,11 @@ async function executeWithFallback(options: {
           routingSessionId,
           options.model.id,
           routingCandidates(snapshot.accounts),
+          {
+            capacityWait: 'wait',
+            signal,
+            onCapacityWait: options.onCapacityWait,
+          },
         )),
     )
     signal?.throwIfAborted()
@@ -2281,7 +2287,15 @@ async function executeWithFallback(options: {
         routingSessionId,
         options.model.id,
         routingCandidates(snapshot.accounts),
-        routingWarmCredential(snapshot.accounts, assignment),
+        {
+          capacityWait: 'wait',
+          signal: options.streamOptions?.signal,
+          onCapacityWait: options.onCapacityWait,
+          warmCredentialId: routingWarmCredential(
+            snapshot.accounts,
+            assignment,
+          ),
+        },
       )
     })()
   }
@@ -2806,12 +2820,21 @@ export function streamCortexKitAnthropic(
       let recordCacheUsage:
         | ((usage?: Record<string, number>) => void)
         | undefined
+      const setWorkingMessage = wait?.setWorkingMessage
       const request = {
         model,
         context,
         streamOptions: options,
         requestOrigin,
         storagePath,
+        onCapacityWait: setWorkingMessage
+          ? () => {
+              setWorkingMessage(
+                'Waiting for a free account slot (Esc to cancel)',
+              )
+              return () => setWorkingMessage()
+            }
+          : undefined,
         onThreadPrepared: (fail: () => void) => {
           failThread = fail
         },
@@ -2833,7 +2856,7 @@ export function streamCortexKitAnthropic(
       }
       const routingState: {
         relay: ReturnType<typeof createRoutingRelay>
-        advice?: Promise<RoutingChoice | null>
+        advice?: Promise<RoutingChoice | undefined>
       } = { relay: createRoutingRelay() }
       Object.assign(request, { routingState })
       const response = await runWithRequestSignal(options?.signal, () =>

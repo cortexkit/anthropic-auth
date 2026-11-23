@@ -5,6 +5,7 @@ import { createRoutingRelay, ROUTING_HOLD_LIMIT_MS } from '../routing-relay'
 const key = Symbol.for('cortexkit.routing')
 const globals = globalThis as Record<symbol, unknown>
 const candidates = [{ accountIdentity: 'account', credentialId: 'credential' }]
+const wait = { capacityWait: 'wait' } as const
 afterEach(() => {
   delete globals[key]
 })
@@ -12,14 +13,18 @@ afterEach(() => {
 describe('shared routing relay', () => {
   test('discovers a bridge installed after module and client load', async () => {
     const relay = createRoutingRelay()
-    expect(await relay.accountFor('session', 'model', candidates)).toBeNull()
+    expect(
+      await relay.accountFor('session', 'model', candidates, wait),
+    ).toBeUndefined()
     globals[key] = (session: string) => ({
       accountFor: async (input: unknown, options: unknown) => {
         expect(session).toBe('session')
         expect(input).toEqual({
           provider: 'anthropic',
           modelId: 'model',
+          request_id: expect.any(String),
           refusals: true,
+          waits_for_capacity: true,
           candidates: {
             view_digest:
               'c7eaf74ae1601bfb35b7b99d470a66b6f28037161cf31d53da2cab10aabeb9aa',
@@ -30,7 +35,9 @@ describe('shared routing relay', () => {
         return { account_id: 'account', credential_id: 'credential' }
       },
     })
-    expect(await relay.accountFor('session', 'model', candidates)).toEqual({
+    expect(
+      await relay.accountFor('session', 'model', candidates, wait),
+    ).toEqual({
       account_id: 'account',
       credential_id: 'credential',
     })
@@ -48,8 +55,13 @@ describe('shared routing relay', () => {
         },
       })
       expect(
-        await createRoutingRelay().accountFor('session', 'model', candidates),
-      ).toBeNull()
+        await createRoutingRelay().accountFor(
+          'session',
+          'model',
+          candidates,
+          wait,
+        ),
+      ).toBeUndefined()
     },
   )
 
@@ -66,8 +78,9 @@ describe('shared routing relay', () => {
       'session',
       'model',
       candidates,
+      wait,
     )
-    expect(result).toBeNull()
+    expect(result).toBeUndefined()
     expect(performance.now() - start).toBeGreaterThanOrEqual(1900)
     resolve({ account_id: 'late', credential_id: 'late' })
   })
@@ -81,8 +94,14 @@ describe('shared routing relay', () => {
       }),
     })
     expect(
-      (await createRoutingRelay().accountFor('session', 'model', candidates))
-        ?.hold?.retry_after_ms,
+      (
+        await createRoutingRelay().accountFor(
+          'session',
+          'model',
+          candidates,
+          wait,
+        )
+      )?.hold?.retry_after_ms,
     ).toBe(ROUTING_HOLD_LIMIT_MS)
   })
 

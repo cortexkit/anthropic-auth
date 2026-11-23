@@ -10394,7 +10394,14 @@ const anthropicAuthPlugin = async (
                     sessionId,
                     routingModelId ?? '',
                     routingCandidates(snapshot.accounts),
-                    routingWarmCredential(snapshot.accounts, assignment),
+                    {
+                      capacityWait: { maxInRequestMs: 240_000 },
+                      signal: init?.signal ?? undefined,
+                      warmCredentialId: routingWarmCredential(
+                        snapshot.accounts,
+                        assignment,
+                      ),
+                    },
                   )
                   sharedRoutingDecision = Boolean(advice)
                   let advisedAccountId: string | undefined
@@ -10975,6 +10982,7 @@ const anthropicAuthPlugin = async (
                   })
                   if (error instanceof RoutingRefusalError)
                     return error.response()
+                  init?.signal?.throwIfAborted()
                   if (
                     stickyRouteSelected ||
                     isNativeTransientAccountError(error)

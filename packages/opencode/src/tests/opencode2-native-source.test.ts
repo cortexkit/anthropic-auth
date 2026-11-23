@@ -404,6 +404,77 @@ test.each([1_999, 2_000])(
 )
 
 describe('OC2 shared routing relay', () => {
+  test('OC2 waits for capacity before serving on the selected vault account', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const host = await retryHost(native)
+    const requests: Record<string, unknown>[] = []
+    bridge((request) => {
+      requests.push(request)
+      if (!request.waits_for_capacity)
+        return { refused: { code: 'account_selection_final' } }
+      if (requests.length === 1)
+        return {
+          refused: {
+            code: 'concurrency_full',
+            resets_at_ms: Date.now() + 5,
+          },
+        }
+      return {
+        account_id: fallbackIdentity,
+        credential_id: 'oauth:anthropic:work',
+      }
+    })
+
+    const request = await host.send()
+    expect(request.headers.get('authorization')).toBe(
+      'Bearer sk-ant-oat01-oauth:anthropic:work',
+    )
+    expect(requests).toHaveLength(2)
+    expect(requests[1]).toEqual(requests[0])
+    expect((await host.response(request, 200)).ok).toBe(true)
+  })
+
+  test('OC2 capacity refusal does not wait or rewrite the provider 429 stop text', async () => {
+    const f = await vaultWithFallback()
+    const native = source(f.runtime, f.paths)
+    const stopMessage = spyOn(native, 'quotaStopMessage')
+    const host = await retryHost(native)
+    const requests: Record<string, unknown>[] = []
+    bridge((request) => {
+      requests.push(request)
+      if (requests.length === 1) return null
+      return request.waits_for_capacity
+        ? {
+            refused: {
+              code: 'concurrency_full',
+              resets_at_ms: Date.now() + 60_000,
+            },
+          }
+        : { refused: { code: 'account_selection_final' } }
+    })
+    const request = await host.send()
+    const before = JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: 'Provider quota exceeded' },
+    })
+    const response = await host.response(
+      request,
+      429,
+      scope,
+      {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+      },
+      before,
+    )
+    expect(stopMessage).toHaveBeenCalledTimes(1)
+    expect(response.status).toBe(429)
+    expect(host.body(response)).toBe(before)
+    expect(requests).toHaveLength(2)
+    expect(requests[1]?.waits_for_capacity).toBe(true)
+  })
+
   test.each(['different account', 'different credential', 'unsupported hold'])(
     'routing quota exemption never leaks to %s',
     async (mode) => {
@@ -539,7 +610,9 @@ describe('OC2 shared routing relay', () => {
     return {
       provider: 'anthropic',
       modelId: scope.modelID,
+      request_id: expect.any(String),
       refusals: true,
+      waits_for_capacity: true,
       candidates: {
         view_digest: includePrimary
           ? 'f9931dedab031ea19b2b7e3106ec12e9deba6d08fe580529fb8a9f14ba976283'
@@ -568,7 +641,6 @@ describe('OC2 shared routing relay', () => {
       { ...plain, warm_credential: 'oauth:anthropic' },
       { ...plain, warm_credential: 'oauth:anthropic' },
     ])
-    expect(JSON.stringify(requests[0])).toBe(JSON.stringify(plain))
   })
 
   test.each(['disabled', 'signed out', 'unservable'])(
@@ -576,9 +648,9 @@ describe('OC2 shared routing relay', () => {
     async (condition) => {
       const f = await vaultWithFallback()
       const native = source(f.runtime, f.paths)
-      const requests: string[] = []
+      const requests: Record<string, unknown>[] = []
       bridge((request) => {
-        requests.push(JSON.stringify(request))
+        requests.push(request)
         return null
       })
       expect(await native.chooseAccount(scope)).toBe('main')
@@ -602,8 +674,8 @@ describe('OC2 shared routing relay', () => {
       cleanups.push(() => read.mockRestore())
       expect(await native.chooseAccount(scope)).not.toBe('main')
       expect(requests).toEqual([
-        JSON.stringify(expectedVaultRoutingAsk(true)),
-        JSON.stringify(expectedVaultRoutingAsk(false)),
+        expectedVaultRoutingAsk(true),
+        expectedVaultRoutingAsk(false),
       ])
     },
   )
