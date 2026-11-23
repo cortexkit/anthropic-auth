@@ -448,7 +448,8 @@ describe('setting-change INFO logs', () => {
     expect(rec).toBeDefined()
     expect(rec!.payload?.thresholds).toEqual({ five_hour: 3, seven_day: 8 })
     const raw = await claude.settings()
-    expect(raw.killswitch?.enabled).toBe(true)
+    // Editing thresholds leaves the on/off switch alone, as on OpenCode 2 and Pi.
+    expect(raw.killswitch?.enabled).not.toBe(true)
     expect(raw.killswitch?.main?.five_hour).toBe(3)
     expect(raw.killswitch?.main?.seven_day).toBe(8)
   })
