@@ -255,15 +255,21 @@ test('Pi Prime enabled with a due account fires once through the signed model tr
   expect([...timeouts.values()].map((timer) => timer.ms)).toEqual([90_000])
 })
 
-test.each(['single', 'multipart'])(
+test.each(['string', 'single-block'] as const)(
   'Pi /claude queues lane start as a visible turn that warms the session cache (%s)',
   (shape) => runLaneStart(shape),
 )
 
-test('Pi lane stays out of the thread and predecessor when a human prompt arrives during routing', () =>
-  runLaneStart('single', true))
+test('Pi answers a lane delivery with other content as a normal turn', () =>
+  runLaneStart('mixed'))
 
-async function runLaneStart(shape: string, interleaveHumanPrompt = false) {
+test('Pi lane stays out of the thread and predecessor when a human prompt arrives during routing', () =>
+  runLaneStart('single-block', true))
+
+async function runLaneStart(
+  shape: 'string' | 'single-block' | 'mixed',
+  interleaveHumanPrompt = false,
+) {
   const native = await fixture(false, {
     routing: { mode: 'sticky-balanced' },
     accounts: [
@@ -380,12 +386,11 @@ async function runLaneStart(shape: string, interleaveHumanPrompt = false) {
     timestamp: now,
   } as const
   const extra =
-    shape === 'multipart'
-      ? [{ type: 'text' as const, text: 'Other content' }]
-      : []
+    shape === 'mixed' ? [{ type: 'text' as const, text: 'Other content' }] : []
+  const raw = queued[0]![0] as string
   const lane = {
     role: 'user',
-    content: [...extra, { type: 'text', text: queued[0]![0] as string }],
+    content: shape === 'string' ? raw : [...extra, { type: 'text', text: raw }],
     timestamp: now + 2,
   } satisfies Parameters<typeof streamCortexKitAnthropic>[1]['messages'][number]
   const typed = { role: 'user', content: marker, timestamp: now + 1 } as const
@@ -466,8 +471,7 @@ async function runLaneStart(shape: string, interleaveHumanPrompt = false) {
       'Bearer sk-ant-oat01-fallback-access',
     )
     const body = JSON.parse(sent.text)
-    expect(body).toMatchObject({ model: modelId, max_tokens: 1 })
-    expect(body.thread).toBeUndefined()
+    expect(body.model).toBe(modelId)
     expect(body.messages).toHaveLength(3)
     expect(body.messages[0]).toMatchObject({
       role: 'user',
@@ -489,14 +493,28 @@ async function runLaneStart(shape: string, interleaveHumanPrompt = false) {
     expect(persisted).not.toContain('cortexkit lane start:')
     expect(
       JSON.parse(persisted.trimEnd().split('\n').at(-1)!).message.content,
-    ).toEqual([...extra, { type: 'text', text: marker }])
+    ).toEqual(
+      shape === 'string' ? marker : [...extra, { type: 'text', text: marker }],
+    )
     expect(sent.text).not.toContain('cortexkit lane start:')
-    expect(body.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
-    expect(body.thinking).toBeUndefined()
+    // A lane start whose message carries other content is answered as a normal turn.
+    if (shape === 'mixed') {
+      expect(body.max_tokens).toBe(123)
+      expect(body.thinking).toEqual(human.thinking)
+      expect(body.system[0].text).toMatch(/cc_prompt_id=[\da-f-]{36};/)
+      expect(body.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
+      expect(body.system[0].text).toContain('cc_prompt_index=3;')
+    } else {
+      expect(body.max_tokens).toBe(1)
+      expect(body.thread).toBeUndefined()
+      expect(body.system[0].text).not.toMatch(/cc_(?:prompt_id|prev_req)=/)
+      expect(body.thinking).toBeUndefined()
+    }
     expect(await signRequestBody(sent.text)).toBe(sent.text)
     expect(sessionCacheActivity.ttlMs(sessionId)).toBe(
       PROMPT_CACHE_DEFAULT_TTL_MS,
     )
+    if (shape === 'mixed') return
 
     if (interleaveHumanPrompt) {
       // The routing callback already delivered this prompt's message_start.
@@ -542,9 +560,7 @@ async function runLaneStart(shape: string, interleaveHumanPrompt = false) {
     expect(following.messages[0]).toEqual(body.messages[0])
     expect(following.messages[2]).toMatchObject({
       role: 'user',
-      content: extra.length
-        ? [...extra, { type: 'text', text: marker }]
-        : marker,
+      content: marker,
     })
     expect(following.system[0].text).toContain('cc_prev_req=req_lane_test_1;')
     expect(following.system[0].text).toContain('cc_prompt_index=3;')

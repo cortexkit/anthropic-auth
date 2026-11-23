@@ -21,8 +21,10 @@ import { collectPiEffortHistory } from '../effort-history.ts'
 import { PiForkEffortSnapshots } from '../forks.ts'
 import {
   forgetPiLaneStarts,
+  isPiLaneStartMessage,
   queuePiLaneStart,
   stripPiLaneStartNonce,
+  takePiLaneStart,
 } from '../lane-start.ts'
 import { normalizeContext } from '../transcript.ts'
 import { captureNativeAnthropicCacheRequest } from './native-anthropic-cache.ts'
@@ -122,21 +124,28 @@ test('lane nonce stripping preserves pasted markers not pending in this session'
 
 test('conversion strips an issued delivery nonce from a later text block', async () => {
   const sessionId = 'lane-converter-multipart'
-  const raw = queuePiLaneStart(sessionId)
-  const content = [
-    { type: 'text', text: 'Other content' },
-    { type: 'text', text: raw },
-  ] as const
+  const user: Message = {
+    role: 'user',
+    timestamp: 0,
+    content: [
+      { type: 'text', text: 'Other content' },
+      { type: 'text', text: queuePiLaneStart(sessionId) },
+    ],
+  }
   try {
     const { bodyText } = await buildAnthropicRequest(
       TEST_MODEL_ID,
-      { messages: [{ role: 'user', timestamp: 0, content: [...content] }] },
+      { messages: [user] },
       { sessionId },
       defaultCache,
     )
     expect(bodyText).not.toContain('cortexkit lane start:')
     expect(bodyText).toContain('Other content')
     expect(bodyText).toContain(LANE_START_TEXT)
+    expect({
+      marked: isPiLaneStartMessage(user),
+      ready: takePiLaneStart([user], sessionId),
+    }).toEqual({ marked: false, ready: false })
   } finally {
     forgetPiLaneStarts(sessionId)
   }
@@ -171,6 +180,55 @@ test('a lane delivery survives queuing more than 128 sessions', async () => {
     for (const id of [sessionId, ...others]) forgetPiLaneStarts(id)
   }
 })
+
+test('a ready lane delivery survives queuing another session before dispatch', () => {
+  const sessionId = 'lane-ready-under-pressure'
+  const other = 'lane-queue-before-dispatch'
+  const others = Array.from(
+    { length: 128 },
+    (_, i) => `lane-ready-pending-${i}`,
+  )
+  try {
+    for (const id of others) queuePiLaneStart(id)
+    const user: Message = {
+      role: 'user',
+      timestamp: 0,
+      content: [{ type: 'text', text: queuePiLaneStart(sessionId) }],
+    }
+    stripPiLaneStartNonce(user, sessionId)
+    expect(user.content).toEqual([{ type: 'text', text: LANE_START_TEXT }])
+    expect(isPiLaneStartMessage(user)).toBe(true)
+
+    queuePiLaneStart(other)
+    expect(takePiLaneStart([user], sessionId)).toBe(true)
+    expect(takePiLaneStart([user], sessionId)).toBe(false)
+  } finally {
+    for (const id of [sessionId, other, ...others]) forgetPiLaneStarts(id)
+  }
+})
+
+test.each([false, true])(
+  'a ready lane delivery expires after one day (another queue: %s)',
+  (queueAnother) => {
+    const sessionId = 'lane-expiring-ready'
+    const other = 'lane-queue-after-ready-expiry'
+    const day = 24 * 60 * 60 * 1000
+    const clock = spyOn(Date, 'now').mockReturnValue(day)
+    try {
+      const user = userMsg(queuePiLaneStart(sessionId))
+      stripPiLaneStartNonce(user, sessionId)
+      expect(isPiLaneStartMessage(user)).toBe(true)
+
+      clock.mockReturnValue(2 * day)
+      if (queueAnother) queuePiLaneStart(other)
+      expect(takePiLaneStart([user], sessionId)).toBe(false)
+    } finally {
+      clock.mockRestore()
+      forgetPiLaneStarts(sessionId)
+      forgetPiLaneStarts(other)
+    }
+  },
+)
 
 test('queuing a lane start expires old nonces without dropping newer ones in the same session', () => {
   const sessionId = 'lane-expiring-nonces'
@@ -217,6 +275,10 @@ test('a lane delivery scrubs embedded envelopes without changing surrounding tex
         ],
       },
     ])
+    expect({
+      marked: isPiLaneStartMessage(user),
+      ready: takePiLaneStart([user], sessionId),
+    }).toEqual({ marked: false, ready: false })
   } finally {
     forgetPiLaneStarts(sessionId)
   }

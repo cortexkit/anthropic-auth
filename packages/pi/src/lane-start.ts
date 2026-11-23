@@ -8,10 +8,13 @@ type LaneUserMessage = Extract<Message, { role: 'user' }> & {
 
 const marker = `${LANE_START_TEXT}\n[cortexkit lane start: `
 const uuidLength = 36
-const pendingMaxAgeMs = 24 * 60 * 60 * 1000
+const laneStartMaxAgeMs = 24 * 60 * 60 * 1000
 const sessions = new Map<
   string,
-  { pending: Map<string, number>; ready?: number }
+  {
+    pending: Map<string, number>
+    ready?: { timestamp: number; deliveredAt: number }
+  }
 >()
 
 export function queuePiLaneStart(sessionId: string): string {
@@ -21,18 +24,15 @@ export function queuePiLaneStart(sessionId: string): string {
   const nonce = randomUUID()
   const now = Date.now()
   state.pending.set(nonce, now)
-  sessions.delete(sessionId)
   sessions.set(sessionId, state)
-  // The host may still deliver a queued nonce; only age out abandoned ones.
+  // A host can still deliver a queued nonce or dispatch a delivered lane start.
   for (const [id, entry] of sessions) {
     for (const [pending, issuedAt] of entry.pending) {
-      if (now - issuedAt >= pendingMaxAgeMs) entry.pending.delete(pending)
+      if (now - issuedAt >= laneStartMaxAgeMs) entry.pending.delete(pending)
     }
-    if (
-      !entry.pending.size &&
-      (entry.ready === undefined || sessions.size > 128)
-    )
-      sessions.delete(id)
+    if (entry.ready && now - entry.ready.deliveredAt >= laneStartMaxAgeMs)
+      delete entry.ready
+    if (!entry.pending.size && !entry.ready) sessions.delete(id)
   }
   return `${marker}${nonce}]`
 }
@@ -46,8 +46,8 @@ export function stripPiLaneStartNonce(
   message: Message,
   sessionId?: string,
 ): void {
-  if (message.role !== 'user') return
-  const state = sessionId ? sessions.get(sessionId) : undefined
+  if (message.role !== 'user' || !sessionId) return
+  const state = sessions.get(sessionId)
   if (!state?.pending.size) return
   const pending = state.pending
   const delivered = new Set<string>()
@@ -79,8 +79,20 @@ export function stripPiLaneStartNonce(
   if (!delivered.size) return
   // Consume after scanning so a repeated block in this delivery is also clean.
   for (const nonce of delivered) pending.delete(nonce)
-  ;(message as LaneUserMessage).cortexkitLaneStart = true
-  state.ready = message.timestamp
+  const { content } = message
+  const text =
+    typeof content === 'string'
+      ? content
+      : content.length === 1 && content[0]?.type === 'text'
+        ? content[0].text
+        : undefined
+  // A message carrying anything besides the lane text is a normal user turn.
+  if (text === LANE_START_TEXT) {
+    ;(message as LaneUserMessage).cortexkitLaneStart = true
+    state.ready = { timestamp: message.timestamp, deliveredAt: Date.now() }
+  } else if (!pending.size && !state.ready) {
+    sessions.delete(sessionId)
+  }
 }
 
 export function isPiLaneStartMessage(message: Message): boolean {
@@ -94,12 +106,15 @@ export function takePiLaneStart(
   messages: Message[],
   sessionId?: string,
 ): boolean {
+  if (!sessionId) return false
   // Dispatch also sees the raw marker on hosts that did not deliver message_start.
   for (const message of messages) stripPiLaneStartNonce(message, sessionId)
-  const state = sessionId ? sessions.get(sessionId) : undefined
-  if (!state || state.ready === undefined) return false
-  const tail = messages.findLast((message) => message.role !== 'system')
-  const ready = state.ready
+  const state = sessions.get(sessionId)
+  if (!state?.ready) return false
+  const { timestamp, deliveredAt } = state.ready
   delete state.ready
-  return !!tail && tail.timestamp === ready && isPiLaneStartMessage(tail)
+  if (!state.pending.size) sessions.delete(sessionId)
+  if (Date.now() - deliveredAt >= laneStartMaxAgeMs) return false
+  const tail = messages.findLast((message) => message.role !== 'system')
+  return !!tail && tail.timestamp === timestamp && isPiLaneStartMessage(tail)
 }
