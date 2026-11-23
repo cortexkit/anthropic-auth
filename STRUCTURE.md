@@ -34,13 +34,15 @@ docs/           public user and contributor documentation
 - **Menus:** `native-menu-model.ts`, `native-menu-executor.ts` and `native-ui.ts`. `commands/account.ts` holds the account command execution.
 - **Request:**
   - Claude Code shape: `claude-code.ts`, `cch.ts` (billing header and body signature), `constants.ts` (the emulated Claude Code version and betas).
+  - Paid API-key routes: `api-key-request.ts` (history checks, internal-marker cleanup and model aliases without OAuth shaping) and `api-route-url.ts` (saved URL and environment precedence).
+  - Cache diagnostics: `cache-diagnostics.ts` (previous-message tracking, record validation and debug formatting shared by all hosts).
   - Per-model handling: `model-capabilities.ts` (one row per model) and `models.ts` (catalogue and pricing).
   - Mid-conversation controls: `thinking-binding.ts`, `mid-conversation-output-config.ts` (effort markers) and `turn-end-note.ts`.
   - History and transport: `request-history.ts` (structural checks), `message-threads.ts`, `request-gzip.ts`, `relay.ts`, `oauth-origin.ts` and `request-abort.ts`.
 - **Routing and quota:**
   - Routing: `routing.ts` and `sticky-routing.ts`.
   - Quota policy: `killswitch.ts`, `quota-refusal.ts` and `session-cache-activity.ts`.
-  - Quota readings: `quota-manager.ts`, `quota-headers.ts`, `quota-header-feed.ts`, `insula-quota.ts` and `quotas.ts`.
+  - Quota readings: `quota-manager.ts`, `quota-headers.ts`, `insula-quota.ts` and `quotas.ts`.
 - **Cache:** `cache1h.ts`, `session-cache-policy.ts` (per-session policy from Thalamus), `cachekeep.ts`, `cachekeep-store.ts` (restart store), `cachekeep-registry.ts` (session list) and `prime.ts`.
 - **State layout:** `state-layout-*.ts`, `holder-registry.ts`, `layout-fence.ts`, `relocation-guard.ts` and `state-home-serving-guard.ts`.
 - **Shared plumbing:** `logger.ts`, `logging.ts`, `dump.ts`, `json.ts` (redacting JSON parse), `sse.ts`, `owner-only.ts`, `publication-rename.ts`, `network-errors.ts` and `provider-error.ts`.
@@ -51,6 +53,7 @@ docs/           public user and contributor documentation
 
 - `index.ts`: the OpenCode 1 plugin factory. It must export only `AnthropicAuthPlugin`, because OpenCode's file loader calls every exported function.
 - `transform.ts`: OpenCode 1 request and stream rewriting.
+- `cachekeep-restart.ts`: OpenCode 1 restart ownership, persistence and staggered restore.
 - **Shared by OpenCode 1 and 2:**
   - Server fallback and OpenCode 1 recovery rounds: `server-fallback.ts`, `fable-fallback.ts`.
   - Request plumbing: `effort-history.ts` (the effort plan), `billing-lineage.ts`, `lane-start.ts`, `routing-relay.ts` (shared routing), `prompt-context.ts`.
@@ -72,7 +75,7 @@ docs/           public user and contributor documentation
 
 - `index.ts`: extension entry; registers the provider, commands and session hooks.
 - `convert.ts` and `transcript.ts`: build the Anthropic body from Pi's context.
-- `stream.ts` and `transport.ts`: send, relay, threads and stream mapping.
+- `stream.ts` and `transport.ts`: send, relay, threads, billing lineage, quota-header observation, cache diagnostics and stream mapping.
 - `native.ts` and `native-commands.ts`: the account runtime and menu.
 - `cachekeep.ts` and `cachekeep-claim.ts`: keep-warm, with the restart store and the per-session claim.
 - `prime.ts`: the Prime scheduler, which sends through `stream.ts`'s registered Prime sender.
