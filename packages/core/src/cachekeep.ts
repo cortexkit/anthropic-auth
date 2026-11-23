@@ -729,7 +729,7 @@ export type CacheKeepWarmReservation =
 const CACHE_KEEP_WARM_WAIT = Symbol.for(
   'cortexkit.anthropic-auth.cachekeep.wait',
 )
-class CacheKeepWarmWait extends Error {
+export class CacheKeepWarmWait extends Error {
   readonly [CACHE_KEEP_WARM_WAIT] = true
 }
 

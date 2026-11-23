@@ -4150,6 +4150,109 @@ test('OpenCode 2 sends no warm in an active local window without the session cla
   expect(await peer.peer.reserveWarm(peer.tracked)).toBe(true)
 })
 
+test.each(['newer', 'older'] as const)(
+  'OpenCode 2 reload prevents a boolean-protocol manager from warming without verified ownership on the %s lease',
+  async (lease) => {
+    const f = await fixture()
+    const startHour = new Date(f.now()).getHours()
+    await f.store.updateSettings((settings) => ({
+      ...settings,
+      cacheKeep: { enabled: true, startHour, endHour: (startHour + 3) % 24 },
+    }))
+    await f.live()
+    const owner = sharedKeeper(f)
+    const manager = owner.manager
+    const oldWriter = owner.persistence
+    const reservations: unknown[] = []
+    // The retained scheduler treats any truthy store result as a committed count.
+    Reflect.get(manager, 'options').reserveWarm = async (
+      target: Readonly<CacheKeepTarget>,
+    ) => {
+      const result = await owner.persistence.reserveWarm(target)
+      reservations.push(result)
+      return Boolean(result)
+    }
+    const next = await f.start()
+    expect(sharedKeeper(f).manager).toBe(manager)
+    expect(owner.persistence).not.toBe(oldWriter)
+    const currentWriter = owner.persistence
+    await (lease === 'older' ? next : f).dispose()
+    const active = lease === 'older' ? f : next
+    expect(owner.persistence).toBe(currentWriter)
+    await owner.persistence.drain()
+    expect(owner.persistence.isCommitted('ses_oc2_keep')).toBe(true)
+
+    const check = spyOn(
+      CacheKeepClaim.prototype,
+      'withCurrent',
+    ).mockRejectedValue(new Error('Could not verify the claim'))
+    try {
+      f.due()
+      await f.timers.fire()
+      expect(reservations).toEqual(['ownership-unverified'])
+      expect(active.sent).toHaveLength(0)
+      expect(manager.trackedRequest('ses_oc2_keep')).toBeDefined()
+    } finally {
+      check.mockRestore()
+    }
+
+    f.advance(20_000)
+    await f.timers.fire()
+    expect(reservations).toEqual(['ownership-unverified', true])
+    expect(active.sent).toHaveLength(1)
+  },
+)
+
+test('OpenCode 2 reload cancels a warm already authorizing on the older lease', async () => {
+  const create = sourceFactory.createNativeAnthropicSource
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  let paused = false
+  const source = spyOn(
+    sourceFactory,
+    'createNativeAnthropicSource',
+  ).mockImplementation((options) => {
+    const native = create(options)
+    return {
+      ...native,
+      async authorizeAccount(input, ...args) {
+        if (!paused && input.sessionID === 'oc2-cachekeep:ses_oc2_keep') {
+          paused = true
+          entered.resolve()
+          await resume.promise
+        }
+        return native.authorizeAccount(input, ...args)
+      },
+    }
+  })
+  cleanups.push(() => source.mockRestore())
+  const f = await fixture()
+  await f.live()
+  const { manager } = sharedKeeper(f)
+  f.due()
+  const warming = f.timers.fire()
+  try {
+    await Promise.race([entered.promise, warming])
+    expect(paused).toBe(true)
+    const next = await f.start()
+    resume.resolve()
+    await warming
+    expect(f.sent).toHaveLength(0)
+    expect(next.sent).toHaveLength(0)
+    expect(Reflect.get(manager, 'targets').get('ses_oc2_keep')).toMatchObject({
+      consecutiveFailures: 0,
+      policyState: { warmsSinceLastRealRequest: 0 },
+    })
+
+    f.advance(20_000)
+    await f.timers.fire()
+    expect(next.sent).toHaveLength(1)
+  } finally {
+    resume.resolve()
+    await warming
+  }
+})
+
 test('OpenCode 2 persists a successor acceptance during release of an earlier claim', async () => {
   const f = await fixture()
   const owner = sharedKeeper(f)

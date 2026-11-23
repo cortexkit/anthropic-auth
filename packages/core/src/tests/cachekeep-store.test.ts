@@ -4,10 +4,12 @@ import {
   mkdir,
   mkdtemp,
   readdir,
+  readFile,
   rename,
   rm,
   stat,
   utimes,
+  writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -24,13 +26,14 @@ const key = createHash('sha256').update(session).digest('hex')
 
 async function storeFixture() {
   const root = await mkdtemp(join(tmpdir(), 'cachekeep-claim-'))
-  const makeStore = (onClaimLost?: (id: string) => void) =>
+  const makeStore = (onClaimLost?: (id: string) => void, now?: () => number) =>
     new CacheKeepStore({
       root,
       storageId: 'test',
       pluginVersion: 'test',
       sessionClaims: true,
       onClaimLost,
+      now,
     })
   const store = makeStore()
   const now = Date.now()
@@ -103,6 +106,31 @@ test('a warm reservation reopens a claim after the initial lock times out', asyn
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('a second claim lock timeout keeps the real turn available for the next reservation', async () => {
+  const { root, makeStore, target, claims } = await storeFixture()
+  const lost: string[] = []
+  const store = makeStore((id) => lost.push(id))
+  const setup = new CacheKeepClaim(claims, session)
+  expect(await setup.acquire()).toBe(true)
+  await setup.release()
+  const unlock = await holdClaimLock(claims)
+  try {
+    store.changed(target)
+    await store.drain()
+    expect(await readdir(store.directory)).toEqual([])
+    expect(await store.reserveWarm(target)).toBe('ownership-unverified')
+    expect(lost).toEqual([])
+    expect(await readdir(store.directory)).toEqual([])
+    await unlock()
+    expect(await store.reserveWarm(target)).toBe(true)
+    expect(store.isCommitted(session)).toBe(true)
+  } finally {
+    await unlock()
+    await store.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+}, 8000)
 
 test('a failed release can be retried while the original claimant is alive', async () => {
   const { root, store, target, claims } = await storeFixture()
@@ -325,15 +353,81 @@ test('a deletion delayed by the claim lock is retried', async () => {
   }
 }, 8000)
 
+test('an unsafe deletion tombstone skips restore without erasing the record', async () => {
+  const { root, store, makeStore, target } = await storeFixture()
+  const restoring = makeStore()
+  const path = join(store.directory, `${key}.json.gz`)
+  const tombstone = join(store.directory, `${key}.deleted`)
+  const restored: string[] = []
+  const load = () =>
+    restoring.load(Date.now(), (entry) => {
+      restored.push(entry.id)
+      return true
+    })
+  try {
+    store.changed(target)
+    await store.drain()
+    await store.releaseClaims(() => true)
+    const bytes = await readFile(path)
+    await mkdir(tombstone, { mode: 0o700 })
+
+    await load()
+    expect(restored).toEqual([])
+    expect(await readdir(store.directory)).toContain(`${key}.json.gz`)
+    expect(await readFile(path)).toEqual(bytes)
+
+    await rm(tombstone, { recursive: true })
+    await load()
+    expect(restored).toEqual([session])
+  } finally {
+    await restoring.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a deletion still blocks an older accepted record when its file mtime is wrong', async () => {
+  const { root, store, makeStore, target, claims } = await storeFixture()
+  const restoring = makeStore()
+  const restored: string[] = []
+  try {
+    const acceptedAt = Date.now() - 1000
+    store.changed({ ...target, lastTouchAt: acceptedAt })
+    await store.drain()
+    await store.releaseClaims(() => true)
+    const path = join(store.directory, `${key}.json.gz`)
+    const saved = await readFile(path)
+    store.removed(session, 'deleted')
+    await store.drain()
+    const tombstone = join(store.directory, `${key}.deleted`)
+    const beforeAcceptance = new Date(acceptedAt - 1000)
+    await utimes(tombstone, beforeAcceptance, beforeAcceptance)
+    await writeFile(path, saved, { mode: 0o600 })
+
+    await restoring.load(Date.now(), (entry) => {
+      restored.push(entry.id)
+      return true
+    })
+    expect(restored).toEqual([])
+    expect(await readdir(store.directory)).toEqual([`${key}.deleted`])
+    expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
+  } finally {
+    await restoring.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('restart cleanup sweeps deletion tombstones only after 24 hours', async () => {
-  const { root, store, makeStore } = await storeFixture()
+  const { root, makeStore } = await storeFixture()
+  const deletedAt = Date.now()
+  let now = deletedAt
+  const store = makeStore(undefined, () => now)
   try {
     store.removed(session, 'deleted')
     await store.drain()
-    const sweeper = makeStore()
+    const sweeper = makeStore(undefined, () => now)
     const sweep = () =>
       sweeper.load(
-        Date.now(),
+        now,
         () => {
           throw new Error('Tombstones are not restart records')
         },
@@ -342,10 +436,22 @@ test('restart cleanup sweeps deletion tombstones only after 24 hours', async () 
         'sweep',
       )
     const tombstone = `${key}.deleted`
-    const at = new Date(Date.now() - 25 * 60 * 60 * 1000)
     await sweep()
     expect(await readdir(store.directory)).toEqual([tombstone])
-    await utimes(join(store.directory, tombstone), at, at)
+    expect(
+      JSON.parse(await readFile(join(store.directory, tombstone), 'utf8')),
+    ).toEqual({ deletedAt })
+    now += 25 * 60 * 60 * 1000
+    await sweep()
+    expect(await readdir(store.directory)).toEqual([])
+
+    // Older writers left the deletion time in the filesystem metadata only.
+    const legacy = join(store.directory, tombstone)
+    await writeFile(legacy, '{}', { mode: 0o600 })
+    await utimes(legacy, new Date(now), new Date(now))
+    await sweep()
+    expect(await readdir(store.directory)).toEqual([tombstone])
+    await utimes(legacy, new Date(deletedAt), new Date(deletedAt))
     await sweep()
     expect(await readdir(store.directory)).toEqual([])
   } finally {

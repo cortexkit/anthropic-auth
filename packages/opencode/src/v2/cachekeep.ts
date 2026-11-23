@@ -10,6 +10,7 @@ import {
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
   CacheKeepWarmRefusal,
+  CacheKeepWarmWait,
   currentCacheKeepRealTurn,
   getCacheKeepRegistryDirectories,
   isCacheKeepActiveNow,
@@ -161,6 +162,7 @@ interface SharedCacheKeep {
   persistence: CacheKeepStore
   readonly persistenceFollowsOwner?: true
   legacyPersistence?: CacheKeepStore
+  warmDispatchChecksOwnership?: true
   loading?: Promise<void>
   restoreSkips?: Set<string>
   readonly prepared: Map<
@@ -585,6 +587,22 @@ export function createNativeCacheKeep(
     legacy.removed = (id) => persistence.removed(id)
     legacy.clear = () => persistence.clear()
     legacy.load = (now, accept) => persistence.load(now, accept)
+  }
+  if (previous) {
+    // Cancel attempts that can still be inside the old dispatch method before
+    // the store changes underneath them. The scheduler retries cancelled warms.
+    owner.manager.abortWarms?.()
+    const reserve = owner.manager.reserveWarmDispatch
+    if (reserve && !owner.warmDispatchChecksOwnership) {
+      // A retained scheduler can read a truthy ownership veto as a saved count.
+      // Check the same reservation for every lease, without a second disk read.
+      owner.manager.reserveWarmDispatch = async (target) => {
+        await reserve.call(owner.manager, target)
+        if (owner.persistence.warmOwnershipVetoed(target))
+          throw new CacheKeepWarmWait()
+      }
+      owner.warmDispatchChecksOwnership = true
+    }
   }
   owner.persistence = persistence
   shareds.set(options.storageId, owner)

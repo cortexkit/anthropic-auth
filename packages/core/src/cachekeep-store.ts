@@ -139,6 +139,7 @@ export class CacheKeepClaim {
       sessionHash?: boolean
       purpose?: 'session' | 'sweep'
       recordDirectory?: string
+      now?: () => number
     } = {},
   ) {
     const key = options.sessionHash ? sessionId : hash(sessionId)
@@ -255,6 +256,7 @@ export class CacheKeepClaim {
     if (!stat) return
     if (
       !stat.isFile() ||
+      stat.size > 4096 ||
       !(await isOwnerOnly(
         this.tombstonePath,
         () => stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o600,
@@ -262,21 +264,47 @@ export class CacheKeepClaim {
       ))
     )
       throw new Error('Unsafe CacheKeep deletion tombstone')
-    return stat.mtimeMs
+    let bytes = await readWindowsOwnerOnly(
+      this.tombstonePath,
+      this.options.ownerOnly,
+    )
+    if (!bytes) {
+      const file = await open(
+        this.tombstonePath,
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      )
+      try {
+        bytes = await file.readFile()
+      } finally {
+        await file.close()
+      }
+    }
+    const value: unknown = JSON.parse(bytes.toString())
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      throw new Error('Invalid CacheKeep deletion tombstone')
+    // Older writers recorded the deletion only in the file metadata.
+    if (!('deletedAt' in value)) return stat.mtimeMs
+    if (
+      typeof value.deletedAt !== 'number' ||
+      !Number.isFinite(value.deletedAt)
+    )
+      throw new Error('Invalid CacheKeep deletion time')
+    return value.deletedAt
   }
 
   async deletedAfter(acceptedAt: number) {
     const deletedAt = await this.tombstoneTime()
     return (
       deletedAt !== undefined &&
-      deletedAt > Date.now() - TOMBSTONE_MS &&
+      deletedAt > (this.options.now?.() ?? Date.now()) - TOMBSTONE_MS &&
       deletedAt >= acceptedAt
     )
   }
 
   async sweepTombstone() {
     const expired = async () =>
-      ((await this.tombstoneTime()) ?? Infinity) <= Date.now() - TOMBSTONE_MS
+      ((await this.tombstoneTime()) ?? Infinity) <=
+      (this.options.now?.() ?? Date.now()) - TOMBSTONE_MS
     if (!(await expired())) return
     await ensureHolderDirectory(this.directory, this.options.ownerOnly)
     await withNativeLock(this.path, CLAIM_LOCK, async (lease) => {
@@ -394,9 +422,14 @@ export class CacheKeepClaim {
     await withNativeLock(this.path, CLAIM_LOCK, async (lease) => {
       const current = await this.read()
       const assertOwned = () => lease.assertOwned()
-      // Releasing a marked claim removes the marker with it. Keep a separate
-      // deletion file so bodies accepted before its modification time stay out.
-      if (markLive) await this.publish({}, assertOwned, this.tombstonePath)
+      // The claim can disappear on release, and the filesystem clock can differ
+      // from the clock that timestamps accepted bodies.
+      if (markLive)
+        await this.publish(
+          { deletedAt: this.options.now?.() ?? Date.now() },
+          assertOwned,
+          this.tombstonePath,
+        )
       if (
         current &&
         current.token !== this.token &&
@@ -613,9 +646,11 @@ export interface CacheKeepStoreOptions {
   onClaimLost?: (id: string) => void
 }
 
+type UnverifiedClaim = 'ownership-unverified'
+
 type StoreClaim = {
   claim: CacheKeepClaim
-  acquired: Promise<boolean>
+  acquired: Promise<boolean | UnverifiedClaim>
   retained: boolean
   restoreOnly: boolean
   closing?: Promise<void>
@@ -638,6 +673,7 @@ export class CacheKeepStore {
   private readonly latest: Map<string, SavedCacheKeepTarget>
   private readonly committed: Map<string, SavedCacheKeepTarget>
   private readonly pendingRealClaims: Map<string, object>
+  private readonly warmOwnershipVetoes: WeakSet<object>
   private switchingWriter: boolean
 
   constructor(
@@ -653,6 +689,7 @@ export class CacheKeepStore {
     this.latest = previous?.latest ?? new Map()
     this.committed = previous?.committed ?? new Map()
     this.pendingRealClaims = previous?.pendingRealClaims ?? new Map()
+    this.warmOwnershipVetoes = previous?.warmOwnershipVetoes ?? new WeakSet()
     // Capture pending writes before the shared entry switches writers. New
     // writes and loads wait for them, so an old write cannot land last.
     this.switchingWriter = !!previous
@@ -675,6 +712,7 @@ export class CacheKeepStore {
       purpose,
       ownerOnly: this.options.ownerOnly,
       recordDirectory: this.directory,
+      now: this.options.now,
     })
   }
 
@@ -692,7 +730,7 @@ export class CacheKeepStore {
       restoreOnly,
       acquired: claim.acquire(restoreOnly, acceptedAt).catch(() => {
         this.writeFailed()
-        return false
+        return 'ownership-unverified' as const
       }),
     }
     if (purpose === 'session') this.claims.set(key, item)
@@ -704,7 +742,7 @@ export class CacheKeepStore {
     item.releaseRetry = undefined
     item.retained = false
     item.closing ??= (async () => {
-      if (await item.acquired) await item.claim.release()
+      if ((await item.acquired) === true) await item.claim.release()
       if (this.claims?.get(key) === item) this.claims.delete(key)
     })().catch((error) => {
       item.closing = undefined
@@ -723,7 +761,7 @@ export class CacheKeepStore {
   private async scanClaim(key: string, purpose: 'session' | 'sweep') {
     const item = this.openClaim(key, purpose, purpose === 'session')
     if (!item) return undefined
-    if (!(await item.acquired)) {
+    if ((await item.acquired) !== true) {
       await this.closeClaim(key, item)
       return undefined
     }
@@ -766,7 +804,7 @@ export class CacheKeepStore {
       item = undefined
     }
     if (item) {
-      if (await item.acquired) {
+      if ((await item.acquired) === true) {
         if (await item.claim.promote(when)) {
           item.retained = true
           item.restoreOnly = false
@@ -783,14 +821,16 @@ export class CacheKeepStore {
     }
     // The restore claim may have yielded to a peer that has since released it.
     item = this.openClaim(key, 'session', false, when)
-    if (!item) return
-    if (await item.acquired) {
+    if (!item) return 'ownership-unverified' as const
+    const result = await item.acquired
+    if (result === true) {
       item.retained = true
       acquired()
       return item
     }
     if (item.claim.wasDeleted) dropDeleted()
     await this.closeClaim(key, item)
+    if (result === 'ownership-unverified') return result
   }
 
   realTurn(id: string, acquire = true) {
@@ -1015,10 +1055,18 @@ export class CacheKeepStore {
             throw new Error('Invalid restart file')
           }
           if (!(await permitted())) continue
-          if (
-            this.claims &&
-            (await this.newClaim(key, 'sweep').deletedAfter(acceptedAt(entry)))
-          ) {
+          let deleted = false
+          try {
+            if (this.claims)
+              deleted = await this.newClaim(key, 'sweep').deletedAfter(
+                acceptedAt(entry),
+              )
+          } catch {
+            // An unreadable deletion marker is not proof the record is stale.
+            this.writeFailed()
+            continue
+          }
+          if (deleted) {
             reason = 'deleted'
             throw new Error('Deleted restart record')
           }
@@ -1165,6 +1213,8 @@ export class CacheKeepStore {
   async reserveWarm(
     target: Readonly<CacheKeepTarget>,
   ): Promise<CacheKeepWarmReservation> {
+    const key = target.policyState ?? target
+    this.warmOwnershipVetoes.delete(key)
     if (this.disabled) return this.memoryOnly
     const entry = record(target, this.options.pluginVersion)
     const timer = this.timers.get(entry.id)
@@ -1182,7 +1232,14 @@ export class CacheKeepStore {
       })
       .catch(() => this.writeFailed())
     await this.chain
+    if (!this.memoryOnly && typeof result === 'string')
+      this.warmOwnershipVetoes.add(key)
     return this.memoryOnly || result
+  }
+
+  warmOwnershipVetoed(target: Readonly<CacheKeepTarget>) {
+    // The scheduler passes a rewritten copy to the host, sharing its policy state.
+    return this.warmOwnershipVetoes.has(target.policyState ?? target)
   }
 
   private async persist(
@@ -1196,8 +1253,11 @@ export class CacheKeepStore {
     if (
       this.pendingRealClaims.has(id) &&
       (item?.restoreOnly || (reopen && !item?.retained))
-    )
-      item = await this.takeRealClaim(id)
+    ) {
+      const reopened = await this.takeRealClaim(id)
+      if (reopened === 'ownership-unverified') return reopened
+      item = reopened
+    }
     const claim = item?.retained ? item.claim : this.options.externalClaim?.(id)
     if ((this.claims || this.options.externalClaim) && !claim) {
       if (reopen && this.latest.get(id) === entry) this.loseClaim(id)
@@ -1324,7 +1384,7 @@ export class CacheKeepStore {
         const key = name.slice(0, 64)
         const own = this.claims?.get(key)
         if (own) {
-          if (await own.acquired)
+          if ((await own.acquired) === true)
             await own.claim.withCurrent(async (assertOwned) => {
               if (temp && !(await this.staleTemp(path))) return
               await assertOwned()
