@@ -449,7 +449,8 @@ async function startBody(options: BodyOptions) {
   stopPlugin = stop
   lifetimes.trackDetached(stopping.wait.then(stop))
   const plugin = await creation
-  // Construction registers the jittered fallback sweep first, then Prime.
+  // Construction registers the jittered fallback sweep first, then the Prime
+  // timer (the opt-in five-hour window starter).
   // Prime has an interval even when disabled and can share the sweep's delay.
   expect(intervals).toHaveLength(2)
   const [sweep, prime] = intervals

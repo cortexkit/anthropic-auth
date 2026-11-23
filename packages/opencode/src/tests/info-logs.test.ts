@@ -278,7 +278,8 @@ async function migratedClaude() {
 
 test('does not retain a background interval unless the helper opts in', async () => {
   const claude = await migratedClaude()
-  // Construction schedules fallback refresh and Prime, whose tick checks
+  // Construction schedules fallback refresh and the Prime timer (the opt-in
+  // five-hour window starter), whose tick checks
   // whether it is enabled. The helper's mock starts neither timer.
   expect(timerTracking.disabledIntervalCalls).toBe(2)
   expect(activeIntervals.size).toBe(0)

@@ -1347,7 +1347,8 @@ describe('account command INFO logs (via plugin)', () => {
   test('does not retain a background interval unless the helper opts in', async () => {
     const fixture = await migrate(baseStorage())
     await fixture.getPlugin()
-    // Prime registers at startup alongside fallback refresh, even when off.
+    // The Prime timer (the opt-in five-hour window starter) registers at
+    // startup alongside fallback refresh, even when Prime is off.
     expect(timerTracking.disabledIntervalCalls).toBe(2)
     expect(activeIntervals.size).toBe(0)
 

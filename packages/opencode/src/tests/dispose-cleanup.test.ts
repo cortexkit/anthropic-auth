@@ -248,7 +248,8 @@ describe('dispose stops per-instance background services', () => {
       const pool = await migratedPool({})
 
       // The fixture disables CacheKeep's aggregate refresh. Construction
-      // schedules fallback refresh and Prime, even while Prime is off.
+      // schedules fallback refresh and the Prime timer (the opt-in five-hour
+      // window starter), even while Prime is off.
       const counted = await pool.getPlugin()
       expect(timerTracking.disabledIntervalCalls).toBe(2)
       await pool.dispose(counted)
