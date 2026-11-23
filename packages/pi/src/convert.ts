@@ -32,6 +32,7 @@ import {
   isOpenAIReasoningSignature,
   orderClaudeCodeBody,
   prepareApiKeyRequestBody,
+  readRunOutputCap,
   readSessionCachePolicy,
   requestCacheLifetimeMs,
   selectClaudeCodeBetas,
@@ -1132,6 +1133,22 @@ export async function buildAnthropicRequest(
     throw new Error(
       `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
     )
+  // Apply the cap after the payload hook and lane-start override so neither can
+  // bypass it. Use the request's own session, not the head that supplied fork history.
+  const cap = readRunOutputCap(options?.sessionId)
+  if (cap !== null && cap < body.max_tokens) {
+    body.max_tokens = cap
+    if (body.thinking?.type === 'enabled') {
+      // As in Pi's Anthropic provider, reserve 1,024 tokens for the reply.
+      // Omit manual thinking if its remaining budget is below Anthropic's minimum.
+      const budget = Math.min(
+        body.thinking.budget_tokens,
+        Math.max(0, cap - 1024),
+      )
+      if (budget < 1024) delete body.thinking
+      else body.thinking = { ...body.thinking, budget_tokens: budget }
+    }
+  }
   if (
     controls.cacheDiagnosticsPreviousMessageId !== undefined &&
     selectClaudeCodeBetas(body).split(',').includes(CACHE_DIAGNOSTICS_BETA)
