@@ -34,6 +34,11 @@ describe('OC1 shared routing relay', () => {
     mode = 'normal',
     responseFor?: () => Response,
     modelId?: string,
+    routingMode:
+      | 'sticky-balanced'
+      | 'main-first'
+      | 'fallback-first' = 'sticky-balanced',
+    relay = false,
   ) {
     const now = Date.now()
     const quota = (remaining: number, fable = 100) => ({
@@ -63,7 +68,16 @@ describe('OC1 shared routing relay', () => {
       ctx,
       bindPoolAccounts(
         createFallbackStorage({
-          routing: { mode: 'sticky-balanced' },
+          routing: { mode: routingMode },
+          ...(relay && {
+            relay: {
+              enabled: true,
+              url: 'https://relay.example.test',
+              token: 'relay-token',
+              fallbackToDirect: false,
+              transport: 'http',
+            },
+          }),
           quota: {
             enabled: true,
             checkIntervalMinutes: 5,
@@ -108,6 +122,14 @@ describe('OC1 shared routing relay', () => {
     const bodies: string[] = []
     globalThis.fetch = mock(
       withNativeAdmission(ctx, (input: any, init: any) => {
+        if (extractUrl(input).startsWith('https://relay.example.test')) {
+          const envelope = JSON.parse(String(init.body))
+          bodies.push(envelope.body)
+          sends.push(
+            new Headers(envelope.upstream.headers).get('authorization') ?? '',
+          )
+          if (responseFor) return Promise.resolve(responseFor())
+        }
         if (extractUrl(input).includes('/api/oauth/usage'))
           return Promise.resolve(
             new Response(
@@ -261,7 +283,10 @@ describe('OC1 shared routing relay', () => {
     const routingReports = (): unknown[] =>
       reports.filter(
         (report) =>
-          typeof report === 'object' && report !== null && 'outcome' in report,
+          typeof report === 'object' &&
+          report !== null &&
+          'outcome' in report &&
+          report.outcome === 'served',
       )
     expect(routingReports()).toEqual([
       {
@@ -274,6 +299,148 @@ describe('OC1 shared routing relay', () => {
     await (await f.send()).text()
     expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-fallback-access')
     expect(routingReports()).toHaveLength(2)
+  })
+
+  for (const [mode, accountId, token] of [
+    ['main-first', syntheticFallbackAccountUuid(0), 'fallback'],
+    ['fallback-first', syntheticMainAccountUuid, 'main'],
+  ] as const) {
+    test(`${mode} honors the shared login choice ahead of local order`, async () => {
+      const f = await fixture('normal', undefined, undefined, mode)
+      const accountFor = mock(async () => ({
+        account_id: accountId,
+        credential_id: 'local',
+      }))
+      globals[key] = () => ({ accountFor })
+      await (await f.send()).text()
+      expect(accountFor).toHaveBeenCalledTimes(1)
+      expect(f.sends).toEqual([`Bearer sk-ant-oat01-${token}-access`])
+    })
+  }
+
+  test('sticky reroute asks shared routing again and honors a final refusal', async () => {
+    const f = await fixture('normal', () => new Response(null, { status: 403 }))
+    let choices = 0
+    globals[key] = () => ({
+      accountFor: async () =>
+        ++choices === 1
+          ? { account_id: syntheticMainAccountUuid, credential_id: 'local' }
+          : { refused: { code: 'account_selection_final' } },
+    })
+    const response = await f.send()
+    expect(choices).toBe(2)
+    expect(response.status).toBe(403)
+    expect(await response.json()).toMatchObject({
+      error: { code: 'account_selection_final' },
+    })
+    expect(f.sends).toEqual(['Bearer sk-ant-oat01-main-access'])
+  })
+
+  for (const [mode, token] of [
+    ['main-first', 'main'],
+    ['fallback-first', 'fallback'],
+  ] as const) {
+    test(`${mode} asks again before changing an account and honors a final refusal`, async () => {
+      const f = await fixture(
+        'normal',
+        () => new Response(null, { status: 403 }),
+        undefined,
+        mode,
+      )
+      let choices = 0
+      globals[key] = () => ({
+        accountFor: async () =>
+          ++choices === 1
+            ? null
+            : { refused: { code: 'account_selection_final' } },
+      })
+      const response = await f.send()
+      expect(choices).toBe(2)
+      expect(await response.json()).toMatchObject({
+        error: { code: 'account_selection_final' },
+      })
+      expect(f.sends).toEqual([`Bearer sk-ant-oat01-${token}-access`])
+    })
+  }
+
+  test('bills each physical OpenCode 1 send with its own payer and usage', async () => {
+    let sends = 0
+    const f = await fixture('normal', () =>
+      ++sends === 1
+        ? new Response(null, { status: 403 })
+        : Response.json({
+            id: 'msg_oc1',
+            type: 'message',
+            usage: { input_tokens: 120, output_tokens: 18 },
+          }),
+    )
+    const reports: Record<string, unknown>[] = []
+    globals[key] = () => ({
+      report: (report: Record<string, unknown>) => {
+        if (report.kind === 'billing') reports.push(report)
+        return new Promise(() => {})
+      },
+    })
+    const response = await f.send()
+    expect(response.status).toBe(200)
+    await response.text()
+    await Bun.sleep(10)
+    expect(reports).toHaveLength(2)
+    expect(reports).toContainEqual(
+      expect.objectContaining({
+        account_id: syntheticMainAccountUuid,
+        outcome: 'failed',
+        status: 403,
+      }),
+    )
+    expect(reports).toContainEqual(
+      expect.objectContaining({
+        account_id: syntheticFallbackAccountUuid(0),
+        outcome: 'completed',
+        provider_response_id: 'msg_oc1',
+        usage: { input: 120, output: 18 },
+      }),
+    )
+    expect(reports[0]?.attempt_id).toEqual(expect.any(String))
+    expect(reports[1]?.attempt_id).toEqual(expect.any(String))
+    expect(reports[0]?.attempt_id).not.toBe(reports[1]?.attempt_id)
+  })
+
+  test('bills the upstream response from an OpenCode 1 HTTP relay', async () => {
+    const f = await fixture(
+      'normal',
+      () =>
+        Response.json(
+          {
+            id: 'msg_relay',
+            type: 'message',
+            usage: { input_tokens: 80, output_tokens: 9 },
+          },
+          { headers: { 'request-id': 'req_relay' } },
+        ),
+      undefined,
+      'sticky-balanced',
+      true,
+    )
+    const reports: Record<string, unknown>[] = []
+    globals[key] = () => ({
+      report: (report: Record<string, unknown>) => {
+        if (report.kind === 'billing') reports.push(report)
+      },
+    })
+    await (await f.send()).text()
+    await Bun.sleep(10)
+    expect(f.sends).toHaveLength(1)
+    expect(reports).toEqual([
+      expect.objectContaining({
+        account_id: syntheticMainAccountUuid,
+        request_kind: 'primary',
+        provider_request_id: 'req_relay',
+        provider_response_id: 'msg_relay',
+        outcome: 'completed',
+        usage: { input: 80, output: 9 },
+      }),
+    ])
   })
 
   for (const mode of ['null', 'unknown']) {
@@ -414,12 +581,14 @@ describe('OC1 shared routing relay', () => {
 
   test('an eligible hold returns 429 and capped Retry-After without sending', async () => {
     const f = await fixture()
+    const reports: Record<string, unknown>[] = []
     globals[key] = () => ({
       accountFor: async () => ({
         account_id: syntheticFallbackAccountUuid(0),
         credential_id: 'local',
         hold: { retry_after_ms: 9_000_000 },
       }),
+      report: (report: Record<string, unknown>) => reports.push(report),
     })
     const response = await f.send()
     expect(response.status).toBe(429)
@@ -427,6 +596,16 @@ describe('OC1 shared routing relay', () => {
       String(ROUTING_HOLD_LIMIT_MS / 1000),
     )
     expect(f.sends).toEqual([])
+    expect(reports.filter((report) => report.kind === 'wait')).toEqual([
+      {
+        kind: 'wait',
+        phase: 'start',
+        wait_id: expect.any(String),
+        reason: 'routing_hold',
+        next_ms: expect.any(Number),
+        message: 'Waiting for shared routing to release the request.',
+      },
+    ])
     delete globals[key]
     await (await f.send()).text()
     expect(f.sends.at(-1)).toBe('Bearer sk-ant-oat01-fallback-access')
@@ -465,7 +644,9 @@ describe('OC1 shared routing relay', () => {
     const reports: unknown[] = []
     globals[key] = () => ({
       accountFor: async () => null,
-      report: (report: unknown) => reports.push(report),
+      report: (report: { outcome?: string }) => {
+        if (report.outcome === 'served') reports.push(report)
+      },
     })
     await (await f.send()).text()
     expect(reports).toEqual([
@@ -512,6 +693,14 @@ describe('OC1 shared routing relay', () => {
         140,
       )
       expect(f.sends).toHaveLength(1)
+      expect(reports).toContainEqual(
+        expect.objectContaining({
+          kind: 'wait',
+          phase: 'start',
+          reason: 'account_limit',
+          next_ms: expect.any(Number),
+        }),
+      )
       expect(
         reports.filter((report) => report.outcome === 'exhausted'),
       ).toEqual([

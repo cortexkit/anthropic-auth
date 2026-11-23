@@ -10,6 +10,7 @@ import {
   type AccountCommandStatusProjection,
   type AccountStorage,
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
+  type AnthropicBillingRequest,
   type ApiKeyAccount,
   acquireNativeAccountRuntime,
   applyCustomHeaders,
@@ -221,6 +222,7 @@ import {
   remapRequestBodyModel,
   reportSessionCacheTouch,
   requestCacheLifetimeMs,
+  requestShortestCacheLifetimeMs,
   resetClaustrumEnrollmentState,
   resetWaitDelayMs,
   resolveClaudeModelCapabilities,
@@ -239,6 +241,7 @@ import {
   shouldFallbackStatus,
   signRequestBody,
   snapshotHasServableLocalOAuth,
+  startRoutingWait,
   startSettings,
   stateRefusalPublicMessage,
   stickyQuotaSnapshotIsFresh,
@@ -251,6 +254,7 @@ import {
   waitForNativeUsageDrain,
   warnClaudeGatewayRelayIgnored,
   withAbortableFetch,
+  withAnthropicBilling,
   withSessionCacheReportHandoff,
 } from '@cortexkit/anthropic-auth-core'
 import type { Hooks, Plugin } from '@opencode-ai/plugin'
@@ -322,8 +326,10 @@ import {
   RecoveryThinkingStore,
 } from './recovery-thinking.ts'
 import {
+  BILLING_REQUEST_KIND_HEADER,
   isAuxiliaryAgent,
   REQUEST_CLASS_REQUEST_HEADER,
+  takeBillingRequestKind,
   takeRequestClassHeader,
 } from './request-class.ts'
 import {
@@ -1828,6 +1834,45 @@ const anthropicAuthPlugin = async (
     localSource?: 'current' | 'validated' | 'rotated' | 'adopted'
     scopedAttempt?: NativeCustodyReceipt
   }
+  function hasSharedRouting() {
+    try {
+      return (
+        typeof Reflect.get(globalThis, Symbol.for('cortexkit.routing')) ===
+        'function'
+      )
+    } catch {
+      return false
+    }
+  }
+  function parseRequestModel(body: RequestInit['body'] | null | undefined) {
+    if (typeof body !== 'string') return undefined
+    try {
+      const parsed = JSON.parse(body) as { model?: unknown }
+      return typeof parsed.model === 'string' ? parsed.model : undefined
+    } catch {
+      return undefined
+    }
+  }
+  function modelBillingRequest(
+    sessionId: string | null | undefined,
+    body: RequestInit['body'],
+    payer: Pick<AnthropicBillingRequest, 'accountId' | 'credentialId'>,
+    requestKind: AnthropicBillingRequest['requestKind'],
+    chargeBasis: AnthropicBillingRequest['chargeBasis'],
+  ): AnthropicBillingRequest | undefined {
+    if (!sessionId || typeof body !== 'string' || !hasSharedRouting()) return
+    const model = parseRequestModel(body)
+    if (!model) return
+    const ttlMs = requestShortestCacheLifetimeMs(body)
+    return {
+      sessionId,
+      ...payer,
+      model,
+      requestKind,
+      chargeBasis,
+      ...(ttlMs > 0 && { cache: { ttlMs } }),
+    }
+  }
   function nativeWireIdentity(accountIdentity: string | undefined) {
     const accountUuid = asProviderAccountUuid(accountIdentity)
     if (!accountUuid)
@@ -1902,7 +1947,11 @@ const anthropicAuthPlugin = async (
       storage: AccountStorage,
       receipt?: NativeCustodyReceipt,
     ) => {
-      if (routingSessionId && routingRelay.admitted(routingSessionId, view))
+      if (
+        routingSessionId &&
+        hasSharedRouting() &&
+        routingRelay.admitted(routingSessionId, view)
+      )
         return
       const quota = routingAccountQuota(view, storage, receipt)
       // Ordered routing can try main after eligible fallbacks are exhausted.
@@ -3921,6 +3970,22 @@ const anthropicAuthPlugin = async (
     // Prewarms carry an OAuth bearer: recheck the destination, no redirects.
     // A keep-warm is a model request, so it follows the current gateway.
     fetchImpl: fetchOAuthModel(() => nativeAccounts.getClaudeGateway?.()),
+    billingRequest: (target, attempt) => {
+      const payer = cacheKeepScopedAttempts.get(attempt.id)
+      if (!payer) return
+      const billing = modelBillingRequest(
+        target.policyState?.ownerSessionId ?? target.id,
+        target.bodyText,
+        { accountId: payer.accountIdentity, credentialId: payer.credentialId },
+        'keep_warm',
+        'subscription_included',
+      )
+      if (billing)
+        return {
+          ...billing,
+          cache: { ...billing.cache, warming: { on: true } },
+        }
+    },
     setIntervalImpl: runtimeTimers.setInterval,
     clearIntervalImpl: runtimeTimers.clearInterval,
     onTargetChanged: (target) => {
@@ -6743,6 +6808,9 @@ const anthropicAuthPlugin = async (
     ) => {
       if (isAuxiliaryAgent(agent))
         output.headers[REQUEST_CLASS_REQUEST_HEADER] = 'auxiliary'
+      if (agent === 'title' || agent === 'compaction' || agent === 'summary')
+        output.headers[BILLING_REQUEST_KIND_HEADER] =
+          agent === 'title' ? 'title' : 'compaction'
       laneStartTracker.markHeaders({
         sessionId: sessionID,
         messageId: message.id,
@@ -7385,18 +7453,6 @@ const anthropicAuthPlugin = async (
             return body == null || typeof body === 'string'
           }
 
-          function parseRequestModel(
-            body: RequestInit['body'] | null | undefined,
-          ) {
-            if (typeof body !== 'string') return undefined
-            try {
-              const parsed = JSON.parse(body) as { model?: unknown }
-              return typeof parsed.model === 'string' ? parsed.model : undefined
-            } catch {
-              return undefined
-            }
-          }
-
           function isSubagentRequest(headers: Headers) {
             return headers.has('x-parent-session-id')
           }
@@ -7677,6 +7733,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
             // The API-key route sends no Claude Code headers; drop the marker.
             requestHeaders.delete(REQUEST_CLASS_REQUEST_HEADER)
+            const billingRequestKind = takeBillingRequestKind(requestHeaders)
             let body = await fetchBody(input, init)
             const wireSettings = requestWireSettings(
               currentStorage,
@@ -7773,14 +7830,26 @@ const anthropicAuthPlugin = async (
             )
             let response: Response
             try {
-              // Redact the sent API key before response dumps, diagnostics or routing.
-              response = scope.redactResponse(
-                await fetch(rewritten.input, {
+              const billing = modelBillingRequest(
+                directAffinity,
+                body,
+                {
+                  accountId: apiCredential.subject.binding.identity,
+                  credentialId: apiCredential.subject.credentialFingerprint,
+                },
+                billingRequestKind,
+                'metered_api',
+              )
+              const send = () =>
+                fetch(rewritten.input, {
                   ...init,
                   body,
                   headers: requestHeaders,
                   ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-                }),
+                })
+              // Redact the sent API key before response dumps, diagnostics or routing.
+              response = scope.redactResponse(
+                await (billing ? withAnthropicBilling(billing, send) : send()),
               )
             } catch (caught) {
               const error = scope.redactError(caught)
@@ -7937,6 +8006,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
             const requestClass = takeRequestClassHeader(requestHeaders)
+            const billingRequestKind = takeBillingRequestKind(requestHeaders)
             let body = await fetchBody(input, init)
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
@@ -8442,6 +8512,25 @@ const anthropicAuthPlugin = async (
             let usedDirectFetch = false
             let directAttempt = scopedAttempt
 
+            const billingFor = (payer: NativeOAuthAuthorization) => {
+              const billing = modelBillingRequest(
+                relayAffinity,
+                body,
+                {
+                  accountId: payer.accountIdentity,
+                  credentialId: payer.credentialId,
+                },
+                billingRequestKind,
+                'subscription_included',
+              )
+              if (billing)
+                return {
+                  ...billing,
+                  cacheWarming: () =>
+                    cacheKeepManager.warming(billing.sessionId),
+                }
+            }
+
             const directFetch = async () => {
               usedDirectFetch = true
               // Validate current local credentials or obtain new vault
@@ -8477,16 +8566,20 @@ const anthropicAuthPlugin = async (
                 const physicalSend = (
                   wireBody: RequestInit['body'],
                   wireHeaders: Headers,
-                ) =>
+                ) => {
                   // fetchOAuthModel rechecks the destination, refuses
                   // redirects and, with a gateway, sends there instead. The
                   // ANTHROPIC_INSECURE opt-out applies to API-key routes only:
                   // an OAuth send always checks certificates.
-                  fetchOAuthModel(gateway)(rewritten.input, {
-                    ...init,
-                    body: wireBody,
-                    headers: wireHeaders,
-                  })
+                  const send = () =>
+                    fetchOAuthModel(gateway)(rewritten.input, {
+                      ...init,
+                      body: wireBody,
+                      headers: wireHeaders,
+                    })
+                  const billing = billingFor(nativeAuthorization)
+                  return billing ? withAnthropicBilling(billing, send) : send()
+                }
                 // Claude Code gzips large bodies on the wire. `body` stays the
                 // signed uncompressed wire text for dumps and relay fallback.
                 // CacheKeep retains the separate full stateless template.
@@ -8670,6 +8763,7 @@ const anthropicAuthPlugin = async (
                   const acceptedBody = body
                   return {
                     headers: relayHeaders,
+                    billing: billingFor(nextAuthorization),
                     errorSecrets: [nextAuthorization.accessToken],
                     onUpstreamStatus: (status: number) => {
                       if (
@@ -9413,6 +9507,16 @@ const anthropicAuthPlugin = async (
           }
 
           const responseRouteKinds = new WeakMap<Response, 'oauth' | 'api'>()
+          const orderedRouting = new WeakMap<
+            PerfTrace,
+            {
+              afterRefusal: (
+                id: string,
+                response: Response,
+              ) => Promise<Response | undefined>
+              skipLocal: (id: string) => boolean
+            }
+          >()
 
           async function tryUsableFallbackAccounts(
             input: string | URL | Request,
@@ -9434,6 +9538,7 @@ const anthropicAuthPlugin = async (
 
             const returnLastOnExhausted = options?.returnLastOnExhausted ?? true
             let lastResponse: Response | null = currentResponse ?? null
+            const shared = trace && orderedRouting.get(trace)
             let canceledCurrentResponse = false
             const cancelCurrentResponse = async () => {
               if (canceledCurrentResponse) return
@@ -9442,6 +9547,7 @@ const anthropicAuthPlugin = async (
             }
 
             for (const [index, account] of accounts.entries()) {
+              if (shared?.skipLocal(account.id)) continue
               let response: Response
               if (isApiKeyAccount(account)) {
                 await cancelCurrentResponse()
@@ -9551,6 +9657,13 @@ const anthropicAuthPlugin = async (
                 }
                 return response
               }
+              if (shared && isOAuthAccount(account)) {
+                const replacement = await shared.afterRefusal(
+                  account.id,
+                  response,
+                )
+                if (replacement) return replacement
+              }
               if (index < accounts.length - 1 || !returnLastOnExhausted) {
                 await response.body?.cancel().catch(() => {})
               }
@@ -9592,7 +9705,8 @@ const anthropicAuthPlugin = async (
                   (isApiKeyAccount(account) &&
                     isValidApiBaseURL(account.baseURL))),
             )
-            if (!hasPotentialFallbackRoute) return mainResponse
+            const shared = trace && orderedRouting.get(trace)
+            if (!hasPotentialFallbackRoute && !shared) return mainResponse
 
             let currentResponse = mainResponse
             let shouldFallback = shouldFallbackResponse(
@@ -9618,6 +9732,14 @@ const anthropicAuthPlugin = async (
             if (!shouldFallback) {
               return currentResponse
             }
+            if (shared) {
+              const replacement = await shared.afterRefusal(
+                'main',
+                currentResponse,
+              )
+              if (replacement) return replacement
+            }
+            if (!hasPotentialFallbackRoute) return currentResponse
             let includeApiRoutes = false
             if (preselectedAccounts) {
               includeApiRoutes = preselectedAccounts.some(isApiKeyAccount)
@@ -10051,6 +10173,7 @@ const anthropicAuthPlugin = async (
               if (auth.type !== 'oauth') {
                 const rewritten = rewriteUrl(input)
                 const passthroughHeaders = mergeHeaders(input, init)
+                passthroughHeaders.delete(BILLING_REQUEST_KIND_HEADER)
                 applyCustomHeaders(passthroughHeaders)
                 let passthroughBody = await fetchBody(input, init)
                 if (typeof passthroughBody === 'string') {
@@ -10179,6 +10302,273 @@ const anthropicAuthPlugin = async (
                       currentMainObservation?.generalExhausted === true,
                   )
                 : undefined
+              function reportHostWait(
+                response: Response,
+                reason: Parameters<typeof startRoutingWait>[0]['reason'],
+              ) {
+                if (hasSharedRouting() && response.status === 429) {
+                  const delayMs =
+                    resetWaitDelayMs(response) ??
+                    Number(response.headers.get('retry-after')) * 1000
+                  startRoutingWait({
+                    sessionId: sessionId ?? undefined,
+                    reason,
+                    delayMs,
+                    nextMs: Date.now() + delayMs,
+                  })
+                }
+                return response
+              }
+              function routingHoldResponse(delayMs: number) {
+                return reportHostWait(
+                  new Response(
+                    JSON.stringify({
+                      type: 'error',
+                      error: {
+                        type: 'rate_limit_error',
+                        message:
+                          'Shared routing requested a wait; retaining session affinity.',
+                      },
+                    }),
+                    {
+                      status: 429,
+                      headers: {
+                        'content-type': 'application/json',
+                        'retry-after': String(Math.ceil(delayMs / 1000)),
+                      },
+                    },
+                  ),
+                  'routing_hold',
+                )
+              }
+              const routingModelId = fablePlan?.effectiveModel ?? requestModelId
+              let countedRequest = false
+              function countSessionRequest() {
+                if (!replayableRequest || countedRequest) return
+                countedRequest = true
+                sessionRequestCount++
+                if (auth.access && (!auth.expires || auth.expires > Date.now()))
+                  scheduleSidebarMainQuotaRefresh(
+                    storage,
+                    auth.access,
+                    requestMainQuotaIdentity,
+                  )
+              }
+              let sharedRoutingDecision = false
+              // OpenCode 1 ends a request that has no response after 5 minutes.
+              // The first ask may wait up to 4 minutes for a free account slot.
+              // An ask after a failed attempt has already spent part of that
+              // budget, so it doesn't wait in the request: a full pool becomes
+              // a host retry instead.
+              async function askSharedRouting(
+                routingSessionId: string,
+                maxInRequestMs = 240_000,
+              ) {
+                const snapshot = await nativeAccounts.read(routingModelId)
+                const routing = await currentStickyRouting()
+                const assignment =
+                  await routing.router.readAssignment(routingSessionId)
+                init?.signal?.throwIfAborted()
+                const advice = await routingRelay.accountFor(
+                  routingSessionId,
+                  routingModelId ?? '',
+                  routingCandidates(snapshot.accounts),
+                  {
+                    capacityWait: { maxInRequestMs },
+                    signal: init?.signal ?? undefined,
+                    warmCredentialId: routingWarmCredential(
+                      snapshot.accounts,
+                      assignment,
+                    ),
+                  },
+                )
+                init?.signal?.throwIfAborted()
+                sharedRoutingDecision = Boolean(advice)
+                const current = advice
+                  ? await nativeAccounts.read(routingModelId)
+                  : snapshot
+                const account =
+                  advice &&
+                  routingCandidates(current.accounts).find((row) =>
+                    routingChoiceMatches(advice, row),
+                  )
+                return { advice, account, snapshot: current, routing }
+              }
+              function retryQuotaBlocked(
+                account: NativeAccountView,
+                snapshot: NativeAccountSnapshot,
+              ) {
+                const quota = routingAccountQuota(
+                  account,
+                  snapshot.policyStorage,
+                )
+                return (
+                  stickyQuotaSnapshotIsFresh(
+                    quota,
+                    snapshot.policyStorage,
+                    runtimeNow(),
+                    routingModelId,
+                  ) &&
+                  (quotaSnapshotIsExhausted(quota) ||
+                    quotaSnapshotModelScopeIsExhausted(quota, routingModelId))
+                )
+              }
+
+              let mainSharedRefusal: Response | undefined
+              if (
+                sessionId &&
+                replayableRequest &&
+                getRoutingMode(storage) !== 'sticky-balanced' &&
+                hasSharedRouting()
+              ) {
+                const routingSessionId = sessionId
+                const refused = new Set<string>()
+                let triedSharedAccount = false
+                const judged = new WeakSet<Response>()
+                async function consult(
+                  lastRefuser?: string,
+                ): Promise<Response | undefined> {
+                  for (;;) {
+                    let pick: Awaited<ReturnType<typeof askSharedRouting>>
+                    try {
+                      pick = await askSharedRouting(
+                        routingSessionId,
+                        lastRefuser === undefined ? undefined : 0,
+                      )
+                    } catch (error) {
+                      if (error instanceof RoutingRefusalError)
+                        return error.response()
+                      throw error
+                    }
+                    const { advice, account, snapshot, routing } = pick
+                    if (!advice) return
+                    if (
+                      !account ||
+                      (advice.hold
+                        ? account.id !== lastRefuser
+                        : refused.has(account.id) ||
+                          (lastRefuser && retryQuotaBlocked(account, snapshot)))
+                    ) {
+                      routingRelay.override(
+                        routingSessionId,
+                        'unknown account, credential or retry policy',
+                      )
+                      return
+                    }
+                    const selected = await routing.router.resolve({
+                      sessionId: routingSessionId,
+                      family: stickyRouteFamilyForModel(routingModelId),
+                      modelId: routingModelId,
+                      affinityModelId: requestModel,
+                      candidates: [
+                        {
+                          accountId: account.id,
+                          order: 0,
+                          quota: account.quota ?? { kind: 'unknown' },
+                        },
+                      ],
+                      retainAccountIds: new Set([account.id]),
+                      storage: snapshot.policyStorage,
+                      inputBytes: 1,
+                      preserveOnNoCandidate: true,
+                      routingAccountId: account.id,
+                      accountIdentities: routing.accountIdentities,
+                    })
+                    if (!selected) {
+                      routingRelay.override(
+                        routingSessionId,
+                        'advised account is not selectable',
+                      )
+                      return
+                    }
+                    if (advice.hold)
+                      return routingHoldResponse(advice.hold.retry_after_ms)
+                    countSessionRequest()
+                    triedSharedAccount = true
+                    let response = await sendWithAccessToken(
+                      input,
+                      init,
+                      '',
+                      trace,
+                      `routing:${account.id}`,
+                      storage,
+                      account.id,
+                      undefined,
+                      fableRequest,
+                      laneStartRequest,
+                      account.id === 'main'
+                        ? requestMainQuotaIdentity
+                        : undefined,
+                    )
+                    let retry = shouldFallbackResponse(response, storage)
+                    if (!retry) {
+                      const inspected = await inspectStreamingRateLimit(
+                        response,
+                        trace,
+                      )
+                      response = inspected.response
+                      retry = inspected.rateLimited
+                    }
+                    if (!retry) {
+                      writeCurrentSidebarState(
+                        account.id,
+                        account.id === 'main' ? 'main' : 'fallback',
+                      )
+                      return response
+                    }
+                    judged.add(response)
+                    refused.add(account.id)
+                    lastRefuser = account.id
+                    if (account.id === 'main') mainSharedRefusal = response
+                    else await response.body?.cancel().catch(() => {})
+                  }
+                }
+                orderedRouting.set(trace, {
+                  // Once shared routing sent on an account, the local loop
+                  // should try routes that have not refused this request yet.
+                  skipLocal: (id) => triedSharedAccount && refused.has(id),
+                  async afterRefusal(id, response) {
+                    if (judged.has(response)) return
+                    judged.add(response)
+                    refused.add(id)
+                    const replacement = await consult(id)
+                    if (replacement) {
+                      await response.body?.cancel().catch(() => {})
+                      await mainSharedRefusal?.body?.cancel().catch(() => {})
+                      mainSharedRefusal = undefined
+                    }
+                    return replacement
+                  },
+                })
+                const selected = await consult()
+                if (selected) {
+                  await mainSharedRefusal?.body?.cancel().catch(() => {})
+                  return wrapResponse(selected)
+                }
+                if (mainSharedRefusal)
+                  return continueAfterSharedMainRefusal(mainSharedRefusal)
+              }
+              async function continueAfterSharedMainRefusal(
+                response: Response,
+              ) {
+                return wrapResponse(
+                  await tryFallbackAccounts(
+                    input,
+                    init,
+                    response,
+                    undefined,
+                    trace,
+                    storage,
+                    auth.access,
+                    (account) =>
+                      writeCurrentSidebarState(account.id, 'fallback'),
+                    requestModelId,
+                    fableRequest,
+                    laneStartRequest,
+                    requestMainQuotaIdentity,
+                  ),
+                )
+              }
               if (providerRestriction) {
                 // A provider-issued wait applies before primary token acquisition.
                 // Available fallbacks may serve; a blocked primary must not refresh
@@ -10212,88 +10602,83 @@ const anthropicAuthPlugin = async (
                   return quotaRefusal(
                     'No OAuth account currently satisfies quota policy.',
                   )
-                return new Response(
-                  JSON.stringify({
-                    type: 'error',
-                    error: {
-                      type: 'rate_limit_error',
-                      message: providerRestriction.message,
+                return reportHostWait(
+                  new Response(
+                    JSON.stringify({
+                      type: 'error',
+                      error: {
+                        type: 'rate_limit_error',
+                        message: providerRestriction.message,
+                      },
+                    }),
+                    {
+                      status: 429,
+                      headers: {
+                        'content-type': 'application/json',
+                        'retry-after': String(
+                          clampHostRetryMs(
+                            providerRestriction.retryAfter * 1000,
+                          ) / 1000,
+                        ),
+                      },
                     },
-                  }),
-                  {
-                    status: 429,
-                    headers: {
-                      'content-type': 'application/json',
-                      'retry-after': String(
-                        clampHostRetryMs(
-                          providerRestriction.retryAfter * 1000,
-                        ) / 1000,
-                      ),
-                    },
-                  },
+                  ),
+                  'account_limit',
                 )
               }
-              let sharedRoutingDecision = false
               async function quotaRefusal(
                 reason: string,
                 scopedModelId?: string,
               ) {
                 const current = await nativeAccounts.read()
-                return createQuotaRefusalResponse(
-                  reason,
-                  quotaRefusalTiming({
-                    readings: current.accounts
-                      .filter(
-                        (account) =>
-                          account.type === 'oauth' &&
-                          nativeAccountCanServe(account),
-                      )
-                      .map((account) => ({
-                        quota: account.quota,
-                        accountIdentity: account.accountIdentity,
-                        accountId: account.id,
-                      })),
-                    storage: current.policyStorage,
-                    modelId: scopedModelId ?? credentialModelId,
-                    sessionTtlMs: sessionCacheActivity.ttlMs(sessionId),
-                    sessionId,
-                    waitForReset:
-                      getWaitForReset(current.policyStorage) &&
-                      !sharedRoutingDecision,
-                  }),
+                return reportHostWait(
+                  createQuotaRefusalResponse(
+                    reason,
+                    quotaRefusalTiming({
+                      readings: current.accounts
+                        .filter(
+                          (account) =>
+                            account.type === 'oauth' &&
+                            nativeAccountCanServe(account),
+                        )
+                        .map((account) => ({
+                          quota: account.quota,
+                          accountIdentity: account.accountIdentity,
+                          accountId: account.id,
+                        })),
+                      storage: current.policyStorage,
+                      modelId: scopedModelId ?? credentialModelId,
+                      sessionTtlMs: sessionCacheActivity.ttlMs(sessionId),
+                      sessionId,
+                      waitForReset:
+                        getWaitForReset(current.policyStorage) &&
+                        !sharedRoutingDecision,
+                    }),
+                  ),
+                  'account_free',
                 )
               }
               const modelDeniedResponse = async () => {
                 if (isScopedCustodyActive(storage))
-                  return createNativeVaultNoRouteResponse({
-                    snapshot: await nativeAccounts.read(),
-                    modelId: credentialModelId,
-                    sticky: getRoutingMode(storage) === 'sticky-balanced',
-                    sessionId,
-                    waitForReset:
-                      getWaitForReset(storage) && !sharedRoutingDecision,
-                  })
+                  return reportHostWait(
+                    createNativeVaultNoRouteResponse({
+                      snapshot: await nativeAccounts.read(),
+                      modelId: credentialModelId,
+                      sticky: getRoutingMode(storage) === 'sticky-balanced',
+                      sessionId,
+                      waitForReset:
+                        getWaitForReset(storage) && !sharedRoutingDecision,
+                    }),
+                    'account_free',
+                  )
                 return quotaRefusal(
                   'No enabled OAuth route can serve the requested model under current quota policy.',
                   credentialModelId,
                 )
               }
-              // Count every replayable request up front — before the
-              // fallback-first early return — so the every-N refresh cadence
-              // (quota.refreshEveryNRequests) advances for main and the active
-              // fallback route on all paths, including successful fallback-first.
-              if (replayableRequest) sessionRequestCount++
-              if (
-                replayableRequest &&
-                auth.access &&
-                (!auth.expires || auth.expires > Date.now())
-              ) {
-                scheduleSidebarMainQuotaRefresh(
-                  storage,
-                  auth.access,
-                  requestMainQuotaIdentity,
-                )
-              }
+              // Count requests before a fallback can return so the every-N
+              // quota refresh cadence uses the account that serves them.
+              countSessionRequest()
               function writeCurrentSidebarState(
                 activeId: string | undefined,
                 route: string,
@@ -10344,8 +10729,6 @@ const anthropicAuthPlugin = async (
                 sessionId &&
                 getRoutingMode(storage) === 'sticky-balanced'
               ) {
-                const routingModelId =
-                  fablePlan?.effectiveModel ?? requestModelId
                 const family = stickyRouteFamilyForModel(routingModelId)
                 const trackedRoute =
                   cacheKeepManager.trackedOAuthRoute(sessionId)
@@ -10367,30 +10750,10 @@ const anthropicAuthPlugin = async (
                     requestedModelId: routingModelId,
                     mainQuotaIdentity: requestMainQuotaIdentity,
                   })
-                  const snapshot = await nativeAccounts.read()
-                  const routing = await currentStickyRouting()
-                  const assignment =
-                    await routing.router.readAssignment(sessionId)
-                  const advice = await routingRelay.accountFor(
-                    sessionId,
-                    routingModelId ?? '',
-                    routingCandidates(snapshot.accounts),
-                    {
-                      capacityWait: { maxInRequestMs: 240_000 },
-                      signal: init?.signal ?? undefined,
-                      warmCredentialId: routingWarmCredential(
-                        snapshot.accounts,
-                        assignment,
-                      ),
-                    },
-                  )
-                  sharedRoutingDecision = Boolean(advice)
+                  const { snapshot, advice, account } =
+                    await askSharedRouting(sessionId)
                   let advisedAccountId: string | undefined
                   if (advice) {
-                    const snapshot = await nativeAccounts.read()
-                    const account = snapshot.accounts.find((row) =>
-                      routingChoiceMatches(advice, row),
-                    )
                     if (
                       account &&
                       nativeAccountCanServe(account) &&
@@ -10410,9 +10773,7 @@ const anthropicAuthPlugin = async (
                     excludeAccountIds?: Set<string>,
                   ) => {
                     const routing = await currentStickyRouting()
-                    // Use shared routing advice only for the first choice;
-                    // retries after quota exhaustion make their own account choice.
-                    const advised = !excludeAccountIds && advisedAccountId
+                    const advised = advisedAccountId
                     return routing.router.resolve({
                       sessionId,
                       family,
@@ -10477,25 +10838,7 @@ const anthropicAuthPlugin = async (
                     resolution?.accountId === advisedAccountId &&
                     advice?.hold
                   ) {
-                    return new Response(
-                      JSON.stringify({
-                        type: 'error',
-                        error: {
-                          type: 'rate_limit_error',
-                          message:
-                            'Shared routing requested a wait; retaining session affinity.',
-                        },
-                      }),
-                      {
-                        status: 429,
-                        headers: {
-                          'content-type': 'application/json',
-                          'retry-after': String(
-                            Math.ceil(advice.hold.retry_after_ms / 1000),
-                          ),
-                        },
-                      },
-                    )
+                    return routingHoldResponse(advice.hold.retry_after_ms)
                   }
                   if (!resolution && incompleteQuotaPool) {
                     if (auth.modelDenied) return modelDeniedResponse()
@@ -10507,25 +10850,28 @@ const anthropicAuthPlugin = async (
                     if (auth.modelDenied) return modelDeniedResponse()
                     if (isScopedCustodyActive(storage)) {
                       const current = await nativeAccounts.read()
-                      return createNativeVaultNoRouteResponse({
-                        snapshot: {
-                          ...current,
-                          // Use the refusal's quota before its background write reaches account storage.
-                          accounts: current.accounts.map((account) => {
-                            const quota = stickyRoutes.allRoutes.find(
-                              (route) => route.id === account.id,
-                            )?.quota
-                            return quota?.accountIdentity ===
-                              account.accountIdentity
-                              ? { ...account, quota }
-                              : account
-                          }),
-                        },
-                        modelId: routingModelId,
-                        sticky: true,
-                        sessionId,
-                        waitForReset: getWaitForReset(storage) && !advice,
-                      })
+                      return reportHostWait(
+                        createNativeVaultNoRouteResponse({
+                          snapshot: {
+                            ...current,
+                            // Use the refusal's quota before its background write reaches account storage.
+                            accounts: current.accounts.map((account) => {
+                              const quota = stickyRoutes.allRoutes.find(
+                                (route) => route.id === account.id,
+                              )?.quota
+                              return quota?.accountIdentity ===
+                                account.accountIdentity
+                                ? { ...account, quota }
+                                : account
+                            }),
+                          },
+                          modelId: routingModelId,
+                          sticky: true,
+                          sessionId,
+                          waitForReset: getWaitForReset(storage) && !advice,
+                        }),
+                        'account_free',
+                      )
                     }
                     const response = createStickyNoRouteResponse({
                       mainRefreshError:
@@ -10554,7 +10900,7 @@ const anthropicAuthPlugin = async (
                     trace.done('return_sticky_no_route', {
                       status: response.status,
                     })
-                    return response
+                    return reportHostWait(response, 'account_free')
                   }
                   if (!resolution) return noRouteResponse()
                   let route = stickyRoutes.allRoutes.find(
@@ -10694,25 +11040,28 @@ const anthropicAuthPlugin = async (
                     if (proactiveQuotaDecision?.action === 'hold') {
                       return completeRoute(
                         route,
-                        await withStickyRetryAfter(
-                          new Response(
-                            JSON.stringify({
-                              type: 'error',
-                              error: {
-                                type: 'rate_limit_error',
-                                message:
-                                  'Sticky OAuth account quota resets shortly; retaining session affinity.',
+                        reportHostWait(
+                          await withStickyRetryAfter(
+                            new Response(
+                              JSON.stringify({
+                                type: 'error',
+                                error: {
+                                  type: 'rate_limit_error',
+                                  message:
+                                    'Sticky OAuth account quota resets shortly; retaining session affinity.',
+                                },
+                              }),
+                              {
+                                status: 429,
+                                headers: { 'content-type': 'application/json' },
                               },
-                            }),
-                            {
-                              status: 429,
-                              headers: { 'content-type': 'application/json' },
-                            },
+                            ),
+                            sessionId,
+                            proactiveQuotaDecision.retryAfterSeconds,
+                            false,
+                            cacheDiagnosticsResponses,
                           ),
-                          sessionId,
-                          proactiveQuotaDecision.retryAfterSeconds,
-                          false,
-                          cacheDiagnosticsResponses,
+                          'account_limit',
                         ),
                         false,
                       )
@@ -10809,25 +11158,31 @@ const anthropicAuthPlugin = async (
                       if (decision.action === 'hold') {
                         return completeRoute(
                           route,
-                          await withStickyRetryAfter(
-                            inspected.response,
-                            sessionId,
-                            decision.retryAfterSeconds,
-                            inspected.streamingRateLimit,
-                            cacheDiagnosticsResponses,
+                          reportHostWait(
+                            await withStickyRetryAfter(
+                              inspected.response,
+                              sessionId,
+                              decision.retryAfterSeconds,
+                              inspected.streamingRateLimit,
+                              cacheDiagnosticsResponses,
+                            ),
+                            'account_limit',
                           ),
                         )
                       }
                       if (decision.action === 'retain') {
                         return completeRoute(
                           route,
-                          await withStickyRetryAfter(
-                            inspected.response,
-                            sessionId,
-                            60,
-                            inspected.streamingRateLimit,
-                            cacheDiagnosticsResponses,
-                            true,
+                          reportHostWait(
+                            await withStickyRetryAfter(
+                              inspected.response,
+                              sessionId,
+                              60,
+                              inspected.streamingRateLimit,
+                              cacheDiagnosticsResponses,
+                              true,
+                            ),
+                            'rate_limited',
                           ),
                         )
                       }
@@ -10848,14 +11203,70 @@ const anthropicAuthPlugin = async (
                         requestedModelId: routingModelId,
                         mainQuotaIdentity: requestMainQuotaIdentity,
                       })
+                      const rejectedInitialAdvice = advice && !advisedAccountId
+                      advisedAccountId = undefined
+                      if (hasSharedRouting()) {
+                        let pick: Awaited<ReturnType<typeof askSharedRouting>>
+                        try {
+                          pick = await askSharedRouting(sessionId, 0)
+                        } catch (error) {
+                          if (error instanceof RoutingRefusalError)
+                            await inspected.response.body
+                              ?.cancel()
+                              .catch(() => {})
+                          throw error
+                        }
+                        const { advice: retryAdvice, account, snapshot } = pick
+                        if (retryAdvice) {
+                          const eligible =
+                            account &&
+                            stickyRoutes.allRoutes.some(
+                              (row) => row.id === account.id,
+                            )
+                          if (eligible && account) {
+                            if (
+                              retryAdvice.hold &&
+                              account.id === failedRouteId
+                            ) {
+                              await inspected.response.body
+                                ?.cancel()
+                                .catch(() => {})
+                              return routingHoldResponse(
+                                retryAdvice.hold.retry_after_ms,
+                              )
+                            }
+                            if (
+                              !retryAdvice.hold &&
+                              account.id !== failedRouteId &&
+                              !retryQuotaBlocked(account, snapshot)
+                            )
+                              advisedAccountId = account.id
+                          }
+                          if (!advisedAccountId)
+                            routingRelay.override(
+                              sessionId,
+                              'unknown account, credential or retry policy',
+                            )
+                        }
+                      }
                       const alternatives = stickyRoutes.candidates.filter(
                         (candidate) => candidate.accountId !== failedRouteId,
                       )
-                      if (alternatives.length > 0) {
+                      if (advisedAccountId || alternatives.length > 0) {
                         await inspected.response.body?.cancel().catch(() => {})
                         resolution = await resolveRoute(
                           new Set([failedRouteId]),
                         )
+                        if (advisedAccountId && !resolution) {
+                          routingRelay.override(
+                            sessionId,
+                            'advised account is not selectable',
+                          )
+                          advisedAccountId = undefined
+                          resolution = await resolveRoute(
+                            new Set([failedRouteId]),
+                          )
+                        }
                         const migratedRoute = stickyRoutes.allRoutes.find(
                           (candidate) => candidate.id === resolution?.accountId,
                         )
@@ -10881,7 +11292,7 @@ const anthropicAuthPlugin = async (
                           return completeRoute(route, await sendRoute(route))
                         }
                       } else if (
-                        !(advice && !advisedAccountId) &&
+                        !rejectedInitialAdvice &&
                         (inspected.response.status === 429 ||
                           inspected.streamingRateLimit) &&
                         mainQuotaEntryIsFreshExhausted(
@@ -11031,6 +11442,9 @@ const anthropicAuthPlugin = async (
                   if (isNativeTransientAccountError(error)) throw error
                 }
               }
+
+              if (mainSharedRefusal)
+                return continueAfterSharedMainRefusal(mainSharedRefusal)
 
               // Fallback-first reached main only after its fallback attempts.
               // Resolve current access now; absence from the earlier metadata
@@ -11374,29 +11788,32 @@ const anthropicAuthPlugin = async (
                   nextRetryAt: lastError?.nextRetryAt,
                   retryCount: lastError?.retryCount,
                 })
-                return new Response(
-                  JSON.stringify({
-                    type: 'error',
-                    error: { type: 'rate_limit_error', message: msg },
-                  }),
-                  {
-                    status: 429,
-                    headers: {
-                      'content-type': 'application/json',
-                      'retry-after': String(
-                        clampHostRetryMs(
-                          (lastError?.nextRetryAt
-                            ? Math.max(
-                                1,
-                                Math.ceil(
-                                  (lastError.nextRetryAt - Date.now()) / 1000,
-                                ),
-                              )
-                            : 60) * 1000,
-                        ) / 1000,
-                      ),
+                return reportHostWait(
+                  new Response(
+                    JSON.stringify({
+                      type: 'error',
+                      error: { type: 'rate_limit_error', message: msg },
+                    }),
+                    {
+                      status: 429,
+                      headers: {
+                        'content-type': 'application/json',
+                        'retry-after': String(
+                          clampHostRetryMs(
+                            (lastError?.nextRetryAt
+                              ? Math.max(
+                                  1,
+                                  Math.ceil(
+                                    (lastError.nextRetryAt - Date.now()) / 1000,
+                                  ),
+                                )
+                              : 60) * 1000,
+                          ) / 1000,
+                        ),
+                      },
                     },
-                  },
+                  ),
+                  'account_free',
                 )
               }
               // Killswitch — eagerly refresh quota so it can evaluate

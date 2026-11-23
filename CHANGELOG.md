@@ -21,6 +21,9 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - OpenCode 1 and 2: opt-in Prime can start a quota window without a first chat request, and enabling Prime in the settings file takes effect without restarting OpenCode.
 - Pi now links Claude subscription requests to the same user turn across tool calls and retries, matching OpenCode 1 and 2.
 - Pi's hybrid prompt cache now reuses an earlier conversation boundary after long replies or tool exchanges, matching OpenCode 1 and 2.
+- OpenCode 1 on Thalamus now asks for the shared login choice in every routing mode and when switching logins on a retry, like OpenCode 2.
+- OpenCode 1 on Thalamus now reports when a request starts waiting for routing or quota, like OpenCode 2; OpenCode still handles the wait.
+- OpenCode 1 on Thalamus now reports which login paid for each Claude send and how many tokens it used, including relayed sends and keep-warm requests, like OpenCode 2.
 
 ## 2.16.5
 

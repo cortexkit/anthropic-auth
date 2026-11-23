@@ -28,6 +28,7 @@ import {
   bindPoolAccounts,
   createFallbackStorage,
   getPlugin as getPluginWithCtx,
+  syntheticMainAccountUuid,
   syntheticMainHostAuth,
   updatePoolSettings,
   useTempAccountFile as useTempAccountFileWithCtx,
@@ -620,6 +621,8 @@ describe('auth.loader', () => {
 describe('cache diagnostics', () => {
   const originalFetch = globalThis.fetch
   const originalDateNow = Date.now
+  const globals = globalThis as Record<symbol, unknown>
+  const routingKey = Symbol.for('cortexkit.routing')
 
   const message = (
     id: string,
@@ -673,6 +676,7 @@ describe('cache diagnostics', () => {
   })
 
   afterEach(async () => {
+    delete globals[routingKey]
     __setLogTestSink(null)
     globalThis.fetch = originalFetch
     Date.now = originalDateNow
@@ -973,6 +977,12 @@ describe('cache diagnostics', () => {
   })
 
   test('an OpenCode 1 prewarm preserves thinking block binding and carries its beta', async () => {
+    const reports: Record<string, unknown>[] = []
+    globals[routingKey] = () => ({
+      report: (report: Record<string, unknown>) => {
+        if (report.kind === 'billing') reports.push(report)
+      },
+    })
     let now = 1_000
     Date.now = mock(() => now) as unknown as typeof Date.now
     await useTempAccountFile(
@@ -992,7 +1002,12 @@ describe('cache diagnostics', () => {
         return Promise.resolve(
           body.max_tokens === 0
             ? Response.json(message('provider-thinking-warm'))
-            : sseResponse(message('provider-thinking-live')),
+            : new Response(
+                `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: message('provider-thinking-live') })}\n\n` +
+                  'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":2}}\n\n' +
+                  'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+                { headers: { 'content-type': 'text/event-stream' } },
+              ),
         )
       }),
     ) as unknown as typeof fetch
@@ -1038,6 +1053,26 @@ describe('cache diagnostics', () => {
     expect(warm.body.messages).toEqual(live.body.messages)
     expect(warm.headers.get('anthropic-beta')?.split(',')).toContain(
       'thinking-binding-controls-2026-08-01',
+    )
+    await Bun.sleep(10)
+    expect(reports).toHaveLength(2)
+    expect(reports).toContainEqual(
+      expect.objectContaining({
+        account_id: syntheticMainAccountUuid,
+        request_kind: 'keep_warm',
+        provider_response_id: 'provider-thinking-warm',
+        outcome: 'completed',
+        usage: expect.objectContaining({ input: 101, cache_read: 75 }),
+        cache: expect.objectContaining({ warming: { on: true } }),
+      }),
+    )
+    expect(reports).toContainEqual(
+      expect.objectContaining({
+        account_id: syntheticMainAccountUuid,
+        request_kind: 'primary',
+        provider_response_id: 'provider-thinking-live',
+        cache: expect.objectContaining({ warming: { on: true } }),
+      }),
     )
   })
 
