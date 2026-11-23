@@ -156,7 +156,10 @@ export async function openKeeper(
       return keeper.onResponseHeaders({ attemptId, status: 200 })
     },
     dispose: keeper.dispose,
-    forget: () => keeper.forgetSession(SESSION),
+    forget: () => {
+      keeper.forgetSession(SESSION)
+      keeper.sessionDeleted(SESSION)
+    },
   }
 }
 
@@ -180,5 +183,6 @@ if (import.meta.main) {
   process.send?.({ tracked, sent: keeper.sent() })
   const finish = await Bun.stdin.text()
   if (finish === 'delete') keeper.forget()
+  if (finish === 'untrack') keeper.manager.untrack(SESSION)
   await keeper.dispose()
 }

@@ -1224,9 +1224,13 @@ export function createNativeCacheKeep(
       acceptedStates.delete(sessionID)
       owner.restoreSkips?.add(sessionHash(sessionID))
       manager.untrack(sessionID)
-      owner.persistence.removed(sessionID, 'deleted')
       for (const [attemptId, entry] of pending)
         if (entry.sessionID === sessionID) discardAttempt(attemptId)
+    },
+    sessionDeleted(sessionID: string) {
+      // Local routing cleanup also runs on eviction and shutdown. Only the host
+      // deletion event can invalidate a record belonging to another server.
+      owner.persistence.removed(sessionID, 'deleted')
     },
     registry,
     dispose() {

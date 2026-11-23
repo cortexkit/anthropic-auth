@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   chmod,
   mkdir,
@@ -18,6 +19,7 @@ import {
   ANTHROPIC_OAUTH_ORIGIN_REFUSAL,
   CACHE_KEEP_PREWARM_LEAD_MS,
   CACHE_KEEP_TTL_MS,
+  CacheKeepClaim,
   CacheKeepManager,
   CacheKeepSessionRegistry,
   type CacheKeepTarget,
@@ -330,6 +332,7 @@ async function fixture(
   const start = async (
     enrollmentFile = 'enrollment.json',
     waitForRestore = true,
+    deletedSession?: string,
   ) => {
     const hooks = new Map<string, Array<(draft: any) => unknown>>()
     const registration = { dispose: async () => {} }
@@ -358,7 +361,15 @@ async function fixture(
         }),
       },
       command: { transform: async () => registration },
-      event: { subscribe: async function* () {} },
+      event: {
+        subscribe: async function* () {
+          if (deletedSession)
+            yield {
+              type: 'session.deleted',
+              data: { sessionID: deletedSession },
+            }
+        },
+      },
     } as unknown as Plugin.Context
     const sent: Request[] = []
     let send: (request: Request) => Promise<Response> = async () =>
@@ -1690,8 +1701,10 @@ test.each(['delete', 'turn'])(
       await entered.promise
       await f.start('enrollment.json', false)
       expect(next).toBeDefined()
-      if (action === 'delete') next!.forgetSession('ses_oc2_keep')
-      else
+      if (action === 'delete') {
+        next!.forgetSession('ses_oc2_keep')
+        next!.sessionDeleted('ses_oc2_keep')
+      } else
         next!.beginRealTurn({
           sessionID: 'ses_oc2_keep',
           kind: 'primary',
@@ -4003,4 +4016,185 @@ test('OC2 model-request billing reports keep-warm off when a plan or setting nev
   expect(warmingOf(localOff)).toEqual({
     on: false,
   })
+})
+
+function sharedKeeper(f: Awaited<ReturnType<typeof fixture>>) {
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  return (globalThis as any)[key].get(f.paths.storageId) as {
+    manager: CacheKeepManager
+    persistence: CacheKeepStore
+  }
+}
+
+async function seedPeer(f: Awaited<ReturnType<typeof fixture>>) {
+  const id = 'ses_oc2_keep'
+  const key = createHash('sha256').update(id).digest('hex')
+  const peer = new CacheKeepStore({
+    storageId: f.paths.storageId,
+    root: f.root,
+    sessionClaims: true,
+  })
+  const record = join(f.disk, `${key}.json.gz`)
+  const claim = join(`${f.disk}.claims`, `${key}.claim.json`)
+  await f.live()
+  const tracked = Reflect.get(sharedKeeper(f).manager, 'targets').get(
+    id,
+  ) as CacheKeepTarget
+  await f.dispose()
+  peer.changed(tracked)
+  await peer.drain()
+  cleanups.push(() => peer.releaseClaims(() => true))
+  expect(peer.isCommitted(id)).toBe(true)
+  return { id, peer, record, claim, tracked }
+}
+
+test.each(['eviction', 'disposal'] as const)(
+  'OpenCode 2 %s does not delete a peer-owned warm record',
+  async (action) => {
+    const create = sourceFactory.createNativeAnthropicSource
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    let source!: NativeSource
+    const f = await fixture()
+    const peer = await seedPeer(f)
+    const record = await readFile(peer.record)
+    const claim = await readFile(peer.claim, 'utf8')
+    const capture = spyOn(
+      sourceFactory,
+      'createNativeAnthropicSource',
+    ).mockImplementation((options) => {
+      const native = create(options)
+      source =
+        action === 'disposal'
+          ? {
+              ...native,
+              async chooseAccount(input) {
+                entered.resolve()
+                await resume.promise
+                return native.chooseAccount(input)
+              },
+            }
+          : native
+      return source
+    })
+    cleanups.push(() => capture.mockRestore())
+    const next = await f.start()
+    const { persistence } = sharedKeeper(f)
+    const forget = spyOn(source, 'forgetSession')
+    cleanups.push(() => forget.mockRestore())
+    if (action === 'eviction') {
+      for (const sessionID of [
+        peer.id,
+        ...Array.from({ length: 512 }, (_, i) => `ses_fill_${i}`),
+      ])
+        await source.authorizeAccount(
+          {
+            sessionID,
+            kind: 'primary',
+            agent: 'build',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet-4-6',
+          },
+          'missing-account',
+        )
+    } else {
+      const preparing = next.prepare().catch(() => undefined)
+      try {
+        await entered.promise
+        await next.dispose()
+      } finally {
+        resume.resolve()
+        await preparing
+      }
+    }
+    expect(forget).toHaveBeenCalledWith(peer.id)
+    await persistence.drain()
+    expect(await readFile(peer.record)).toEqual(record)
+    expect(await readFile(peer.claim, 'utf8')).toBe(claim)
+  },
+)
+
+test('the OpenCode 2 host deletion event invalidates a peer-owned warm record', async () => {
+  const f = await fixture()
+  const peer = await seedPeer(f)
+  await f.start('enrollment.json', true, peer.id)
+  await sharedKeeper(f).persistence.drain()
+  expect(JSON.parse(await readFile(peer.claim, 'utf8')).deleted).toBe(true)
+  expect(await peer.peer.reserveWarm(peer.tracked)).toBe('not-owner')
+  expect(await readdir(f.disk)).toEqual([
+    `${createHash('sha256').update(peer.id).digest('hex')}.deleted`,
+  ])
+})
+
+test('OpenCode 2 sends no warm in an active local window without the session claim', async () => {
+  const f = await fixture()
+  const peer = await seedPeer(f)
+  const startHour = new Date(f.now()).getHours()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, startHour, endHour: (startHour + 3) % 24 },
+  }))
+  const next = await f.start()
+  await next.live(undefined, {
+    messages: [{ role: 'user', content: 'Local accepted turn' }],
+  })
+  const owner = sharedKeeper(f)
+  await owner.persistence.drain()
+  expect(owner.manager.trackedRequest(peer.id)).toBeDefined()
+  expect(owner.persistence.isCommitted(peer.id)).toBe(false)
+
+  f.due()
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(0)
+  expect(owner.manager.trackedRequest(peer.id)).toBeUndefined()
+  expect(await peer.peer.reserveWarm(peer.tracked)).toBe(true)
+})
+
+test('OpenCode 2 persists a successor acceptance during release of an earlier claim', async () => {
+  const f = await fixture()
+  const owner = sharedKeeper(f)
+  await f.live(undefined, {}, 'ses_release_first')
+  await f.live()
+  await owner.persistence.drain()
+  expect(owner.persistence.isCommitted('ses_release_first')).toBe(true)
+  expect(owner.persistence.isCommitted('ses_oc2_keep')).toBe(true)
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const release = CacheKeepClaim.prototype.release
+  let first = true
+  const releasing = spyOn(
+    CacheKeepClaim.prototype,
+    'release',
+  ).mockImplementation(async function (this: CacheKeepClaim) {
+    if (first) {
+      first = false
+      entered.resolve()
+      await resume.promise
+    }
+    await release.call(this)
+  })
+  const stopping = f.dispose()
+  try {
+    await entered.promise
+    const next = await f.start('enrollment.json', false)
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'Accepted during hand-over' }],
+    })
+    expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+      'Accepted during hand-over',
+    )
+    resume.resolve()
+    await stopping
+    await owner.persistence.drain()
+    expect(owner.persistence.isCommitted('ses_oc2_keep')).toBe(true)
+    const key = createHash('sha256').update('ses_oc2_keep').digest('hex')
+    expect(
+      gunzipSync(await readFile(join(f.disk, `${key}.json.gz`))).toString(),
+    ).toContain('Accepted during hand-over')
+    expect(await readdir(`${f.disk}.claims`)).toContain(`${key}.claim.json`)
+  } finally {
+    resume.resolve()
+    await stopping
+    releasing.mockRestore()
+  }
 })

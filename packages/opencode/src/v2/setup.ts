@@ -588,6 +588,7 @@ export async function setupAnthropicAuth(
     ctx,
     {
       source,
+      onSessionDeleted: (sessionID) => cacheKeep?.sessionDeleted(sessionID),
       now: options.cacheKeep?.now,
       log: { warn: (message, data) => logger.warn('opencode2', message, data) },
     },

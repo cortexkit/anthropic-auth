@@ -85,7 +85,7 @@ export class PiCacheKeep {
       const session = this.sessions.get(target.id)
       const identity = target.hostMetadata?.accountIdentity
       if (this.stopping || !session || typeof identity !== 'string')
-        return false
+        return 'not-owner' as const
       return session.store.reserveWarm({
         ...target,
         oauthAccountIdentity: identity,
@@ -212,9 +212,19 @@ export class PiCacheKeep {
         .then(async (session) => {
           if (!session) return this.claim(storagePath, sessionId, true)
           if (await session.claim.promote()) return session
-          if (this.sessions.get(sessionId) === session)
+          if (this.claims.get(sessionId) !== existing)
+            return this.claim(storagePath, sessionId, true)
+          if (session.claim.wasDeleted) {
             this.dropClaimTarget(sessionId)
-          return undefined
+            return undefined
+          }
+          // A peer may already have released the claim it took from this restore.
+          this.sessions.delete(sessionId)
+          this.claims.delete(sessionId)
+          const acquired = await this.claim(storagePath, sessionId, true)
+          if (!acquired && !this.claims.has(sessionId))
+            this.dropClaimTarget(sessionId)
+          return acquired
         })
         .catch(() => {
           logger.warn(
@@ -271,6 +281,12 @@ export class PiCacheKeep {
               canRemove: async () =>
                 (await owned.claim.isCurrent()) &&
                 !this.manager.trackedRequest(id),
+              withCurrent: (action: () => Promise<void>) =>
+                owned.claim.withCurrent(async (assertOwned) => {
+                  if (this.manager.trackedRequest(id)) return
+                  await assertOwned()
+                  await action()
+                }),
             })
           : undefined
     }
@@ -401,7 +417,13 @@ export class PiCacheKeep {
   realTurn(sessionId: string) {
     this.realTurns.add(sessionId)
     const session = this.sessions.get(sessionId)
-    if (session) void this.claim(session.storagePath, sessionId, true)
+    if (session && !this.stopping) {
+      // Shutdown must join a detached promotion before releasing its token;
+      // otherwise the promotion could reopen a claim for a stopped keeper.
+      const promoting = this.claim(session.storagePath, sessionId, true)
+      this.tracking.add(promoting)
+      void promoting.then(() => this.tracking.delete(promoting))
+    }
     try {
       const previous = this.turnStarts.get(sessionId)
       if (previous && !previous.claimed) previous.turn.finish()

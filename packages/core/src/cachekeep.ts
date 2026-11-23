@@ -720,6 +720,12 @@ export class CacheKeepWarmRefusal extends Error {
   }
 }
 
+/** False means the warm count could not be stored, not that a peer owns it. */
+export type CacheKeepWarmReservation =
+  | boolean
+  | 'not-owner'
+  | 'ownership-unverified'
+
 const CACHE_KEEP_WARM_WAIT = Symbol.for(
   'cortexkit.anthropic-auth.cachekeep.wait',
 )
@@ -859,9 +865,13 @@ export class CacheKeepManager {
       onTargetChanged?: (target: Readonly<CacheKeepTarget>) => void
       onTargetRemoved?: (id: string) => void
       /** Persistent hosts must commit the reservation before any physical send. */
-      reserveWarm?: (target: Readonly<CacheKeepTarget>) => Promise<boolean>
+      reserveWarm?: (
+        target: Readonly<CacheKeepTarget>,
+      ) => Promise<CacheKeepWarmReservation>
       /** Persist a known failed dispatch so restore need not charge its cost. */
-      settleWarm?: (target: Readonly<CacheKeepTarget>) => Promise<boolean>
+      settleWarm?: (
+        target: Readonly<CacheKeepTarget>,
+      ) => Promise<CacheKeepWarmReservation>
       /** Native hosts authorize asynchronously inside fetchImpl and reserve there. */
       deferWarmReservation?: boolean
       /** A native host may rewrite the final physical warm after fetchImpl starts. */
@@ -1477,16 +1487,26 @@ export class CacheKeepManager {
     // Process-only keepers have no restart replay. Persistent hosts must prove
     // the new count is stored before sending; a failed attempt keeps its slot.
     if (this.options.reserveWarm) {
-      let committed = false
+      let reservation: CacheKeepWarmReservation = false
       try {
-        committed = await this.options.reserveWarm(current)
+        reservation = await this.options.reserveWarm(current)
       } catch {}
       if (generation !== this.schedulerGeneration) throw new CacheKeepWarmWait()
-      if (!committed && (state?.planned || isCacheKeepAlways(storage))) {
+      if (
+        reservation === 'not-owner' ||
+        reservation === 'ownership-unverified' ||
+        (!reservation && (state?.planned || isCacheKeepAlways(storage)))
+      ) {
         if (state) {
           state.warmsSinceLastRealRequest--
           state.pendingWarmCost = pendingCost
         }
+        if (reservation === 'not-owner') {
+          if (this.isCurrentTarget(target)) this.releaseTarget(target.id)
+          throw new CacheKeepWarmRefusal('stopped')
+        }
+        if (reservation === 'ownership-unverified')
+          throw new CacheKeepWarmWait()
         throw new CacheKeepPrewarmError('authorization', undefined)
       }
     }

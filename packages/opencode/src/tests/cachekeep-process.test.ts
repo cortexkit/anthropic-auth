@@ -276,6 +276,20 @@ test.each(['opencode1', 'opencode2'] as const)(
 )
 
 test.each(['opencode1', 'opencode2'] as const)(
+  '%s removes its own saved record on bare manager untrack',
+  (host) =>
+    withRestoredOwner(host, async ({ owner, child, start, saved }) => {
+      await owner.dispose()
+      const successor = child()
+      expect(await successor.online).toEqual({ tracked: 1, sent: 0 })
+      expect(await saved()).toHaveLength(1)
+      await successor.close('untrack')
+      expect(await saved()).toEqual([])
+      expect((await start()).manager.trackedCount()).toBe(0)
+    }),
+)
+
+test.each(['opencode1', 'opencode2'] as const)(
   '%s honors deletion from another process before warming',
   (host) =>
     withRestoredOwner(host, async ({ owner, child, due, saved }) => {

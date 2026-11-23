@@ -1090,7 +1090,17 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
       return leaseOriginal.call(this, sessionId)
     },
   )
-  const track = spyOn(PiCacheKeep.prototype, 'trackAccepted')
+  const tracked =
+    Promise.withResolvers<Awaited<ReturnType<PiCacheKeep['trackAccepted']>>>()
+  const trackOriginal = PiCacheKeep.prototype.trackAccepted
+  const track = spyOn(
+    PiCacheKeep.prototype,
+    'trackAccepted',
+  ).mockImplementation(function (this: PiCacheKeep, ...args) {
+    const tracking = trackOriginal.apply(this, args)
+    if (args[0].sessionId === head) tracked.resolve(tracking)
+    return tracking
+  })
   deferCleanup(() => {
     thread.mockRestore()
     lease.mockRestore()
@@ -1114,7 +1124,7 @@ test('Pi fork never reads or replaces a head thread anchor, even with primary-tu
     'agent-loop',
   ).result()
   expect(answer.stopReason).toBe('stop')
-  await Promise.all(track.mock.results.map((result) => result.value))
+  await tracked.promise
   expect(sent[0]?.thread).toEqual({ type: 'create' })
   expect(threadTracker).toBeDefined()
   expect(cacheKeep).toBeDefined()

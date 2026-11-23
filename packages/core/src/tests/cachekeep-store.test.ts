@@ -1,10 +1,22 @@
 import { expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  rename,
+  rm,
+  stat,
+  utimes,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { CacheKeepClaim, CacheKeepStore } from '../cachekeep-store.ts'
+import {
+  CacheKeepClaim,
+  CacheKeepStore,
+  legacyCacheKeepStoreDirectory,
+} from '../cachekeep-store.ts'
 import { withNativeLock } from '../native-lock-observer.ts'
 
 const session = 'session'
@@ -12,12 +24,15 @@ const key = createHash('sha256').update(session).digest('hex')
 
 async function storeFixture() {
   const root = await mkdtemp(join(tmpdir(), 'cachekeep-claim-'))
-  const store = new CacheKeepStore({
-    root,
-    storageId: 'test',
-    pluginVersion: 'test',
-    sessionClaims: true,
-  })
+  const makeStore = (onClaimLost?: (id: string) => void) =>
+    new CacheKeepStore({
+      root,
+      storageId: 'test',
+      pluginVersion: 'test',
+      sessionClaims: true,
+      onClaimLost,
+    })
+  const store = makeStore()
   const now = Date.now()
   const target = {
     id: session,
@@ -33,7 +48,7 @@ async function storeFixture() {
     dayKey: 'test',
   }
   const claims = `${store.directory}.claims`
-  return { root, store, target, claims }
+  return { root, store, makeStore, target, claims }
 }
 
 async function holdClaimLock(directory: string) {
@@ -187,5 +202,183 @@ test('a forward wall-clock step cannot displace a live claim without an incarnat
     } finally {
       await rm(root, { recursive: true, force: true })
     }
+  }
+})
+
+test('a real turn claims again after a peer took over and released a restore-only claim', async () => {
+  const { root, store: seed, makeStore, target, claims } = await storeFixture()
+  const lost: string[] = []
+  const restoring = makeStore((id) => lost.push(id))
+  const peer = new CacheKeepClaim(claims, session)
+  try {
+    seed.changed(target)
+    await seed.drain()
+    await seed.releaseClaims(() => true)
+    const restored: string[] = []
+    await restoring.load(Date.now(), (entry) => {
+      restored.push(entry.id)
+      return true
+    })
+    expect(restored).toEqual([session])
+    expect(await peer.acquire()).toBe(true)
+    await peer.release()
+
+    restoring.changed({ ...target, bodyText: '{"model":"next"}' })
+    await restoring.drain()
+    expect(lost).toEqual([])
+    expect(restoring.isCommitted(session)).toBe(true)
+    expect(await peer.acquire()).toBe(false)
+  } finally {
+    await peer.release()
+    await restoring.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+for (const deletion of ['owner', 'non-owner'] as const) {
+  test(`a pending real turn cannot resurrect a record deleted by the ${deletion}`, async () => {
+    const {
+      root,
+      store: owner,
+      makeStore,
+      target,
+      claims,
+    } = await storeFixture()
+    const lost: string[] = []
+    const contender = makeStore((id) => lost.push(id))
+    try {
+      const lastRealRequestAt = Date.now() - 1000
+      const beforeDeletion = {
+        ...target,
+        lastTouchAt: lastRealRequestAt,
+        policyState: {
+          ownerSessionId: session,
+          planned: false,
+          lastRealRequestAt,
+          warmsSinceLastRealRequest: 0,
+          warmCostSoFar: 0,
+          hasWarmed: false,
+        },
+      }
+      owner.changed(beforeDeletion)
+      await owner.drain()
+      contender.changed(beforeDeletion)
+      await contender.drain()
+      expect(owner.isCommitted(session)).toBe(true)
+      expect(contender.isCommitted(session)).toBe(false)
+      const deleting = deletion === 'owner' ? owner : makeStore()
+      deleting.removed(session, 'deleted')
+      await deleting.drain()
+      if (deleting !== owner) await owner.reserveWarm(beforeDeletion)
+      expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
+      expect(await readdir(owner.directory)).not.toContain(`${key}.json.gz`)
+
+      // A later cache touch must not make the older accepted body new again.
+      expect(
+        await contender.reserveWarm({
+          ...beforeDeletion,
+          lastTouchAt: Date.now() + 1000,
+          lastTouchKind: 'warm',
+        }),
+      ).toBe('not-owner')
+      expect(lost).toEqual([session])
+      expect(await readdir(claims)).not.toContain(`${key}.claim.json`)
+      const tombstone = `${key}.deleted`
+      expect(await readdir(owner.directory)).toEqual([tombstone])
+      expect((await stat(join(owner.directory, tombstone))).mode & 0o777).toBe(
+        0o600,
+      )
+
+      contender.changed({ ...target, lastTouchAt: Date.now() + 1000 })
+      await contender.drain()
+      expect(contender.isCommitted(session)).toBe(true)
+    } finally {
+      await contender.releaseClaims(() => true)
+      await owner.releaseClaims(() => true)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+}
+
+test('a deletion delayed by the claim lock is retried', async () => {
+  const { root, store, target, claims } = await storeFixture()
+  store.changed(target)
+  await store.drain()
+  const unlock = await holdClaimLock(claims)
+  try {
+    store.removed(session, 'deleted')
+    // Hold until the first attempt times out, then allow the retry to commit.
+    await store.drain()
+    expect(await readdir(store.directory)).toContain(`${key}.json.gz`)
+    await unlock()
+    for (
+      let remaining = 20;
+      remaining && (await readdir(store.directory)).includes(`${key}.json.gz`);
+      remaining--
+    )
+      await delay(100)
+    expect(await readdir(store.directory)).toEqual([`${key}.deleted`])
+  } finally {
+    await unlock()
+    await store.releaseClaims(() => true)
+    await rm(root, { recursive: true, force: true })
+  }
+}, 8000)
+
+test('restart cleanup sweeps deletion tombstones only after 24 hours', async () => {
+  const { root, store, makeStore } = await storeFixture()
+  try {
+    store.removed(session, 'deleted')
+    await store.drain()
+    const sweeper = makeStore()
+    const sweep = () =>
+      sweeper.load(
+        Date.now(),
+        () => {
+          throw new Error('Tombstones are not restart records')
+        },
+        undefined,
+        undefined,
+        'sweep',
+      )
+    const tombstone = `${key}.deleted`
+    const at = new Date(Date.now() - 25 * 60 * 60 * 1000)
+    await sweep()
+    expect(await readdir(store.directory)).toEqual([tombstone])
+    await utimes(join(store.directory, tombstone), at, at)
+    await sweep()
+    expect(await readdir(store.directory)).toEqual([])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a deletion tombstone does not block unrelated OpenCode 2 legacy migration', async () => {
+  const { root, store, makeStore, target } = await storeFixture()
+  const other = 'other-session'
+  try {
+    store.changed(target)
+    store.changed({ ...target, id: other })
+    await store.drain()
+    await store.releaseClaims(() => true)
+    const legacy = legacyCacheKeepStoreDirectory('test', root)
+    await mkdir(legacy, { mode: 0o700 })
+    for (const name of await readdir(store.directory))
+      await rename(join(store.directory, name), join(legacy, name))
+    store.removed(session, 'deleted')
+    await store.drain()
+
+    const restored: string[] = []
+    const loading = makeStore()
+    await loading.load(Date.now(), (entry) => {
+      restored.push(entry.id)
+      return true
+    })
+    await loading.releaseClaims(() => true)
+    expect(restored).toEqual([other])
+    expect(await readdir(legacy)).toEqual([])
+    expect(await readdir(store.directory)).toHaveLength(2)
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
 })

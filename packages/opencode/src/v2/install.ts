@@ -40,7 +40,9 @@ export interface NativeAnthropicInstallation<Q, P> {
  */
 export async function installNativeAnthropic<Q, P>(
   ctx: OpenCode2HookContext,
-  deps: NativeAnthropicAdapterDeps<Q, P>,
+  deps: NativeAnthropicAdapterDeps<Q, P> & {
+    onSessionDeleted?: (sessionID: string) => void
+  },
   ownership: NonNullable<InstallOpenCode2AuthOptions['gateOnPlaceholder']>,
 ): Promise<NativeAnthropicInstallation<Q, P>> {
   const native = createNativeAnthropicAdapter(deps)
@@ -318,8 +320,10 @@ export async function installNativeAnthropic<Q, P>(
           for await (const event of events.subscribe({
             signal: abort.signal,
           })) {
-            if (event.type === 'session.deleted')
+            if (event.type === 'session.deleted') {
               forgetSession(event.data.sessionID)
+              deps.onSessionDeleted?.(event.data.sessionID)
+            }
             if (
               event.type === 'session.idle' ||
               (event.type === 'session.status' &&
