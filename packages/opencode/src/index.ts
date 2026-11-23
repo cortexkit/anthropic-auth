@@ -9350,7 +9350,8 @@ const anthropicAuthPlugin = async (
               !quotaManager.shouldRefreshOnRequestCount(sessionRequestCount)
             )
               return
-            // The native runtime obtains the credential for the quota poll.
+            // The empty token is deliberate: the shared account runtime
+            // (nativeAccounts) fetches the account's credential for the poll.
             void quotaManager
               .refreshFallback(account.id, '', account)
               .then(() => refreshSidebarQuota())
