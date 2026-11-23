@@ -44,6 +44,13 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Pi: `/claude` quota refresh continues when one account fails, and editing killswitch thresholds no longer turns the killswitch on.
 - OpenCode 2 and Pi no longer wait for optional cache diagnostics before delivering replies, and keep diagnostics linked to the latest reply when detailed cache usage is missing.
 - OpenCode 2 keeps subscription prices at zero when a credential lookup fails temporarily.
+- OpenCode 1 never takes a paid API key on a routing check where shared routing gave advice, as on OpenCode 2. A later check with no advice can still use an eligible paid backup after confirmed subscription exhaustion.
+- OpenCode 1 switches to another subscription when a routed login becomes unavailable mid-request, and keeps Anthropic's original refusal if none takes over.
+- OpenCode 1 no longer waits for abandoned responses to cancel or for cache diagnostics before sending, and editing killswitch thresholds no longer turns the killswitch on.
+- Keep-warm follows the process where you actually work: a session restored by another OpenCode or Pi process at startup is handed over on your next turn, and a session deleted in one process no longer comes back from another's saved state.
+- Keep-warm recovers from temporary lock contention when claiming or releasing a session, and OpenCode 2 keeps the newest cache body in memory if its final save fails.
+- Pi: a pasted lane-start marker is left intact, the marker never reaches Anthropic or the session file, a lane start no longer joins the conversation's request chain, and a lane start that would go to a paid API key is skipped with a short message.
+- Pi: when the session's cache is off, earlier messages are no longer reshaped for a cache marker.
 
 ## 2.16.6
 
