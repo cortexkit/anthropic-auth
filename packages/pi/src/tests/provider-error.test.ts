@@ -177,6 +177,9 @@ async function ownDirectory(prefix: string) {
   const directory = await mkdtemp(join(tmpdir(), prefix))
   const storagePath = join(directory, 'accounts.json')
   const envKeys = [
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_MODEL',
     'PI_CODING_AGENT_DIR',
     'PI_AGENT_DIR',
     'PI_ANTHROPIC_AUTH_FILE',
@@ -491,7 +494,10 @@ function expectQuotaPollGaps(requested: readonly number[]) {
 }
 
 /** Create a local OAuth account with a paid API fallback for general quota exhaustion. */
-async function paidFixture(apiKey = PAID_KEY) {
+async function paidFixture(
+  apiKey = PAID_KEY,
+  baseURL = 'https://paid.invalid',
+) {
   const quotaPauses = recordQuotaPauses()
   const { directory, storagePath } = await ownDirectory(
     'pi-provider-error-paid-',
@@ -504,7 +510,7 @@ async function paidFixture(apiKey = PAID_KEY) {
           type: 'api',
           id: 'paid',
           apiKey,
-          baseURL: 'https://paid.invalid',
+          baseURL,
         },
       ],
     },
@@ -512,6 +518,53 @@ async function paidFixture(apiKey = PAID_KEY) {
     { mainAccess: MAIN_ACCESS },
   )
   return { directory, quotaPauses }
+}
+
+for (const customEndpoint of [false, true]) {
+  test(`Pi paid route keeps its ${customEndpoint ? 'custom URL and uses the family alias' : 'stored default URL and uses the default alias'}`, async () => {
+    await paidFixture(
+      PAID_KEY,
+      customEndpoint
+        ? 'https://paid.invalid/anthropic/v2'
+        : 'https://api.anthropic.com',
+    )
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.invalid'
+    process.env.ANTHROPIC_MODEL = 'default-proxy-alias'
+    if (customEndpoint)
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'sonnet-proxy-alias'
+    else delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
+
+    const requests: Array<{ url: string; model: string }> = []
+    useFetch(async (url, init) => {
+      if (url.includes('/api/oauth/usage'))
+        return Response.json({
+          five_hour: { utilization: 100 },
+          seven_day: { utilization: 100 },
+        })
+      if (!url.includes('/messages')) return new Response('{}', { status: 503 })
+      const body = JSON.parse(String(init?.body)) as { model: string }
+      requests.push({ url, model: body.model })
+      return authorizationOf(init) === `Bearer ${PAID_KEY}`
+        ? eventStream(healthy('paid reply'))
+        : jsonError(429, 'rate_limit_error', MAIN_ACCESS)
+    })
+
+    expect(
+      (await streamCortexKitAnthropic(model, context).result()).stopReason,
+    ).toBe('stop')
+    expect(requests).toEqual([
+      {
+        url: 'https://api.anthropic.com/v1/messages?beta=true',
+        model: model.id,
+      },
+      {
+        url: customEndpoint
+          ? 'https://paid.invalid/anthropic/v2/messages?beta=true'
+          : 'https://api.anthropic.com/v1/messages?beta=true',
+        model: customEndpoint ? 'sonnet-proxy-alias' : 'default-proxy-alias',
+      },
+    ])
+  })
 }
 
 test('Pi usage-limit echo still reaches the paid route, whose error omits the paid key', async () => {
@@ -560,6 +613,40 @@ test('Pi usage-limit echo without exhaustion keeps the primary 429 and scrubs it
   )
   expect(modelRequests).toEqual([`Bearer ${MAIN_ACCESS}`])
   expectQuotaPollGaps(quotaPauses)
+})
+
+test('Pi never opens the paid route from rounded header quota while polling is backed off', async () => {
+  const { directory } = await paidFixture()
+  const modelRequests: string[] = []
+  let polls = 0
+  useFetch(async (url, init) => {
+    if (url.includes('/api/oauth/usage')) {
+      polls++
+      return new Response(null, { status: 429 })
+    }
+    if (!url.includes('/v1/messages'))
+      return new Response('{}', { status: 503 })
+    const authorization = authorizationOf(init)
+    modelRequests.push(authorization)
+    if (authorization === `Bearer ${PAID_KEY}`)
+      return eventStream(healthy('paid reply'))
+    const response = jsonError(429, 'rate_limit_error', MAIN_ACCESS)
+    response.headers.set('anthropic-ratelimit-unified-5h-utilization', '.999')
+    return response
+  })
+  await expectError('pi-first-poll-429', [MAIN_ACCESS], ['HTTP 429'])
+  const native = getPiNativeRuntime(join(directory, 'accounts.json'))
+  await native.usagePublications.drain()
+  const snapshot = await native.view()
+  const main = snapshot.accounts.find((account) => account.id === 'main')
+  expect(main?.quota?.five_hour?.remainingPercent).toBe(0)
+
+  await expectError('pi-poll-backed-off', [MAIN_ACCESS], ['HTTP 429'])
+  expect(polls).toBe(1)
+  expect(modelRequests).toEqual([
+    `Bearer ${MAIN_ACCESS}`,
+    `Bearer ${MAIN_ACCESS}`,
+  ])
 })
 
 // A streamed rate limit arrives as an `error` event whose `error.type` is

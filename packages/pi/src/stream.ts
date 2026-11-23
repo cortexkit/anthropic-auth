@@ -3,6 +3,7 @@ import {
   type AccountStorage,
   type AnthropicBillingRequest,
   type ApiKeyAccount,
+  applyAnthropicApiBaseUrl,
   applyClaudeCodeHeaders,
   applyClaudeCodeMetadata,
   applyClaudeGatewayHeaders,
@@ -86,6 +87,7 @@ import {
   type QuotaState,
   quotaBackoffActive,
   quotaExhaustionFromHeaders,
+  quotaFieldSource,
   quotaRefusalTiming,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotModelScopeIsExhausted,
@@ -776,13 +778,11 @@ function updateUsage(
 export function buildExplicitBaseMessagesUrl(baseURL: string) {
   const url = new URL(baseURL)
   const basePath = url.pathname.replace(/\/$/, '')
-  if (/\/v\d[^/]*\/messages$/.test(basePath)) {
-    url.pathname = basePath
-  } else if (/\/v\d[^/]*$/.test(basePath)) {
-    url.pathname = `${basePath}/messages`
-  } else {
-    url.pathname = `${basePath}/v1/messages`
-  }
+  // A route can already name the messages resource rather than a base path.
+  url.pathname = /\/v\d[^/]*\/messages$/.test(basePath)
+    ? basePath
+    : '/v1/messages'
+  applyAnthropicApiBaseUrl(url, baseURL)
   url.searchParams.set('beta', 'true')
   return url
 }
@@ -1096,6 +1096,7 @@ async function sendAnthropicRequestAttempt(
         {
           deferSigning: true,
           billingLineage: lineage,
+          modelRemapEnabled: options.apiAccount !== undefined,
           forkBaseMessageCount: forkBase?.messageCount,
           // API-key routes send no effort history, so no fork hint either.
           forkEffort: options.apiAccount
@@ -1140,11 +1141,12 @@ async function sendAnthropicRequestAttempt(
         ...(options.prime && { requestClass: 'auxiliary' }),
       })
   const relayAffinity = options.streamOptions?.sessionId ?? null
-  const reportRoutingHeaders = (
+  const observeResponseHeaders = (
     attempt: PiNativeAttempt,
     responseHeaders: Headers,
     status: number,
   ) => {
+    native.observeQuotaHeaders(attempt, responseHeaders, servingRuntime)
     if (options.prime || !relayAffinity) return
     if (
       options.routingRelay &&
@@ -1479,7 +1481,7 @@ async function sendAnthropicRequestAttempt(
         ? withAnthropicBilling(billing, send)
         : send())
       if (attempt)
-        reportRoutingHeaders(attempt, response.headers, response.status)
+        observeResponseHeaders(attempt, response.headers, response.status)
       return response
     }
     let response: Response
@@ -1626,7 +1628,7 @@ async function sendAnthropicRequestAttempt(
       onResponseHeaders: (responseHeaders) => {
         observeRequestId(responseHeaders)
         if (upstream)
-          reportRoutingHeaders(
+          observeResponseHeaders(
             upstream.attempt,
             responseHeaders,
             upstream.status,
@@ -1756,8 +1758,12 @@ async function endIfCancelled(
 function quotaSnapshotIsExhausted(
   quota: Awaited<ReturnType<QuotaManager['refreshMain']>> | undefined,
 ) {
+  // A deferred poll can return the cached quota. A header percentage rounded
+  // to 100% is display evidence, not permission to switch to a paid route.
   return (['five_hour', 'seven_day'] as const).some(
-    (key) => (quota?.[key]?.remainingPercent ?? 1) <= 0,
+    (key) =>
+      quotaFieldSource(quota, key) !== 'headers' &&
+      (quota?.[key]?.remainingPercent ?? 1) <= 0,
   )
 }
 

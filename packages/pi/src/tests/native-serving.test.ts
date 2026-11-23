@@ -202,6 +202,92 @@ test('Pi abort ends a stalled quota preflight without sending a model request', 
   expect(sends).toBe(0)
 })
 
+test('Pi ready replies do not wait for header quota to merge with the last poll', async () => {
+  const checkedAt = Date.now() - 60_000
+  const resetAt = Math.floor(Date.now() / 1_000) + 3_600
+  const weekly = { usedPercent: 22, remainingPercent: 78, checkedAt }
+  const scoped = [{ ...weekly, id: 'opus', title: 'Opus', modelName: 'Opus' }]
+  const extraUsage = {
+    used: { amountMinor: 100, currency: 'USD', exponent: 2 },
+    limit: { amountMinor: 500, currency: 'USD', exponent: 2 },
+    utilizationPercent: 20,
+    exhausted: false,
+  }
+  await saveNativePiFixture(
+    {
+      version: 1,
+      accounts: [],
+      quota: {
+        enabled: false,
+        mainQuota: {
+          source: 'poll',
+          checkedAt,
+          five_hour: { usedPercent: 5, remainingPercent: 95, checkedAt },
+          seven_day: weekly,
+          scoped,
+          extraUsage,
+        },
+      },
+    },
+    storagePath,
+  )
+  const native = getPiNativeRuntime(storagePath)
+  const runtime = await native.service()
+  const publishLocal = runtime.publishLocal.bind(runtime)
+  const started = Promise.withResolvers<void>()
+  const unblock = Promise.withResolvers<void>()
+  const publication = spyOn(runtime, 'publishLocal').mockImplementation(
+    async (subject, patch, signal) => {
+      if (patch.quota?.source === 'headers') {
+        started.resolve()
+        await unblock.promise
+      }
+      return publishLocal(subject, patch, signal)
+    },
+  )
+  globalThis.fetch = Object.assign(
+    async () => {
+      const response = success()
+      response.headers.set('anthropic-ratelimit-unified-5h-utilization', '.39')
+      response.headers.set(
+        'anthropic-ratelimit-unified-5h-reset',
+        String(resetAt),
+      )
+      return response
+    },
+    { preconnect: originalFetch.preconnect },
+  )
+
+  const pending = streamCortexKitAnthropic(model, context).result()
+  try {
+    const result = await Promise.race([
+      pending,
+      started.promise.then(() => Bun.sleep(1_000)).then(() => undefined),
+    ])
+    expect(result?.stopReason).toBe('stop')
+  } finally {
+    unblock.resolve()
+    await pending
+    await native.usagePublications.drain()
+    publication.mockRestore()
+  }
+  const snapshot = await runtime.read()
+  expect(
+    snapshot.accounts.find((account) => account.id === 'main')?.quota,
+  ).toMatchObject({
+    source: 'headers',
+    checkedAt,
+    five_hour: {
+      usedPercent: 39,
+      remainingPercent: 61,
+      resetsAt: new Date(resetAt * 1_000).toISOString(),
+    },
+    seven_day: weekly,
+    scoped,
+    extraUsage,
+  })
+})
+
 test('Pi empty-init routing uses the construction-time override or native derived path; missing authority refuses', () =>
   trackPiTestBody(
     (async () => {

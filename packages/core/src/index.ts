@@ -35,6 +35,7 @@ export {
   setupUsage,
 } from '@cortexkit/common-auth/setup'
 export * from './accounts.ts'
+export { applyAnthropicApiBaseUrl } from './api-route-url.ts'
 export * from './auth.ts'
 export * from './billing.ts'
 export * from './cache-diagnostics.ts'

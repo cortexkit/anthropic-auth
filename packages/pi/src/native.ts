@@ -11,6 +11,7 @@ import {
   getPersistedLogLevel,
   getSettingsFilePath,
   isKillswitchEnabled,
+  isQuotaBearingHeaderFrame,
   isVaultHosted,
   killswitchPassesPolicy,
   LEGACY_STATE_LAYOUT,
@@ -32,6 +33,7 @@ import {
   nativeLocalAccountRefusal,
   nativeMigrationAuthorityPhase,
   nativeRuntimeOptionIdentity,
+  normalizeQuotaHeaders,
   quotaSnapshotHasStandardWindows,
   quotaSnapshotPassesModelScope,
   quotaSnapshotPassesPolicy,
@@ -623,6 +625,32 @@ export class PiNativeRuntime {
         patch,
         this.usagePublications.signal,
       )
+  }
+
+  observeQuotaHeaders(
+    served: PiNativeAttempt,
+    headers: Headers,
+    runtime: NativeAccountRuntime,
+  ): void {
+    if (!isQuotaBearingHeaderFrame(headers)) return
+    const quota = {
+      ...normalizeQuotaHeaders(headers),
+      accountIdentity: served.accountIdentity,
+    }
+    // The store accepts updates only for the account that served the request.
+    // It merges against the latest quota so poll-owned windows and credits stay.
+    this.usagePublications.publish(async (signal) => {
+      const kept =
+        served.source === 'vault'
+          ? await runtime.vault.publish(served.receipt, { quota }, signal)
+          : await runtime.publishLocal(
+              served.admission.subject,
+              { quota },
+              signal,
+            )
+      if (!kept)
+        logger.debug('quota', 'Native header quota publication refused')
+    })
   }
 
   close(): Promise<void> {

@@ -30,6 +30,7 @@ import {
   LANE_START_TEXT,
   orderClaudeCodeBody,
   readSessionCachePolicy,
+  remapRequestBodyModel,
   requestCacheLifetimeMs,
   signRequestBody,
   stripEmptyTrailingAssistantMessages,
@@ -760,6 +761,7 @@ export async function buildAnthropicRequest(
     forkEffort?: PiForkEffortHint
     /** Leave the billing signature placeholder for the transport to finalize. */
     deferSigning?: boolean
+    modelRemapEnabled?: boolean
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     turnEndNote?: { tools: string[] }
     /**
@@ -1043,6 +1045,7 @@ export async function buildAnthropicRequest(
     throw new Error(
       `Anthropic accepts at most 4 cache breakpoints; the onPayload hook left ${breakpoints}`,
     )
+  if (controls.modelRemapEnabled) remapRequestBodyModel(body)
   const unsigned = JSON.stringify(
     orderClaudeCodeBody(body, { isOAuth: !!identity }),
   )
