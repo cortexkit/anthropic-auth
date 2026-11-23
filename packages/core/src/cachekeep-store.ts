@@ -1219,8 +1219,9 @@ export class CacheKeepStore {
           committed = true
         } catch (error) {
           if (!reopen) throw error
-          // Local hours mode can warm without a durable count, but not without
-          // ownership. Check that the write failed without losing the lock.
+          // In the local "hours" keep-warm schedule (no runner policy) a warm may
+          // go out without its count saved to disk, but never without owning the
+          // session. Check that the write failed without losing the lock.
           await assertOwned()
           this.writeFailed()
         }

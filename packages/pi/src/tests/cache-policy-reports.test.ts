@@ -366,8 +366,9 @@ test('Pi unmarked no-policy response retains its legacy hold and keeper lifetime
   ) as unknown as typeof fetch
   const originalTrack = CacheKeepManager.prototype.track
   let kept: ReturnType<CacheKeepManager['trackedRequest']>
-  // Tracking runs detached after the reply, once the session's keep-warm claim
-  // is confirmed for this real turn (claim file I/O), so wait for the call.
+  // Tracking runs detached after the reply, once this process has confirmed it
+  // owns the session's saved keep-warm record (its claim file), so wait for
+  // the call itself.
   let markTracked!: () => void
   const tracked = new Promise<void>((resolve) => {
     markTracked = resolve
