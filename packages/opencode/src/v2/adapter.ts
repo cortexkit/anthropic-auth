@@ -14,6 +14,8 @@ import {
   applyRunnerTurnNotes,
   assertHostAuthorityStable,
   assertNotCustodyTombstone,
+  CACHE_DIAGNOSTICS_BETA,
+  type CacheDiagnosticsRequestContext,
   type CacheKeepRealTurn,
   type ClaudeCodeIdentity,
   type ClaudeGateway,
@@ -30,6 +32,7 @@ import {
   dumpRelayRequest,
   dumpResponseArtifact,
   encodeGzipRequestBody,
+  getCacheDiagnosticsBetas,
   getRequestGzipLatch,
   getRequestGzipLatchPath,
   guardAnthropicStreamResponse,
@@ -62,6 +65,7 @@ import {
   stateRefusalCause,
   stateRefusalPublicMessage,
   stripEmptyTrailingAssistantMessages,
+  summarizeCacheTtl,
   TrailingAssistantHistoryError,
 } from '@cortexkit/anthropic-auth-core'
 import type {
@@ -276,7 +280,9 @@ export type NativeAnthropicBodyOptions = Omit<
   | 'isOAuth'
   | 'onToolNameMap'
   | 'deferSigning'
->
+> & {
+  readonly cacheDiagnosticsPreviousMessageReceivedAt?: number
+}
 
 type StrippedStreamOptions = NonNullable<
   Parameters<typeof createStrippedStream>[1]
@@ -320,7 +326,16 @@ export interface NativeAnthropicRequestContext<P>
 export interface NativeAnthropicResponseContext<P>
   extends NativeAnthropicAttemptContext<P> {
   readonly status: number
+  readonly cacheDiagnostics?: CacheDiagnosticsSend
 }
+
+type CacheDiagnosticsSend = Omit<
+  CacheDiagnosticsRequestContext,
+  'sessionId' | 'isSubagent'
+> &
+  Awaited<ReturnType<typeof getCacheDiagnosticsBetas>> & {
+    requestedModel?: string
+  }
 
 /** An `error` event inside a streamed response. */
 export interface NativeAnthropicStreamErrorContext<P>
@@ -892,6 +907,10 @@ export function createNativeAnthropicAdapter<Q, P>(
     Data,
     NonNullable<StrippedStreamOptions['toolNameMap']>
   >()
+  const cacheDiagnosticsSends = new WeakMap<
+    Data,
+    Promise<CacheDiagnosticsSend | undefined>
+  >()
   // Each sent request privately holds its own credentials, so errors about
   // it can be scrubbed after rewriteSend has dropped the pending credential:
   // a response scope for the one response the request gets, and a redactor
@@ -1299,12 +1318,18 @@ export function createNativeAnthropicAdapter<Q, P>(
     }
 
     const headers = new Headers(request.headers)
-    applyCustomHeaders(headers)
+    if (data.route === 'api') applyCustomHeaders(headers)
     const correlation = takeInternalHeaders(headers)
     let body = request.body === null ? undefined : await request.text()
     let threadCacheSlot: Parameters<
       typeof prepareMessageThreadRequest
     >[1]['cacheSlot']
+    let diagnosticsOptIn:
+      | Pick<
+          CacheDiagnosticsRequestContext,
+          'previousMessageId' | 'previousMessageReceivedAt'
+        >
+      | undefined
     // A session forgotten while the body was read never reaches the source's
     // options or the body rewrite.
     ensureLive()
@@ -1370,7 +1395,8 @@ export function createNativeAnthropicAdapter<Q, P>(
             route: 'oauth',
             correlation,
           }
-          const options = (await source.requestOptions?.(context)) ?? {}
+          const { cacheDiagnosticsPreviousMessageReceivedAt, ...options } =
+            (await source.requestOptions?.(context)) ?? {}
           // Recheck session revocation after awaiting policy options. A
           // cleared session must not enter body rewriting or signing.
           ensureLive()
@@ -1378,7 +1404,14 @@ export function createNativeAnthropicAdapter<Q, P>(
           // re-signed for the prewarm. Rewriting it again would prefix the
           // tool names twice and add the system blocks again, so the prewarm
           // would miss the session's cache instead of reading it.
-          if (attempt.agent !== 'cachekeep')
+          if (attempt.agent !== 'cachekeep') {
+            if (options.cacheDiagnosticsPreviousMessageId !== undefined) {
+              diagnosticsOptIn = {
+                previousMessageId: options.cacheDiagnosticsPreviousMessageId,
+                previousMessageReceivedAt:
+                  cacheDiagnosticsPreviousMessageReceivedAt,
+              }
+            }
             body = await rewriteRequestBody(body, {
               ...options,
               deferSigning: true,
@@ -1391,6 +1424,7 @@ export function createNativeAnthropicAdapter<Q, P>(
               isOAuth: true,
               onToolNameMap: (map) => responseToolNameMaps.set(data, map),
             })
+          }
           const parsed = parseJson(body)
           finalBody = isRecord(parsed) ? parsed : null
         }
@@ -1848,6 +1882,35 @@ export function createNativeAnthropicAdapter<Q, P>(
       }
       if (data?.route !== 'oauth' || !messages || bodyText === undefined)
         return billingSend
+      if (diagnosticsOptIn) {
+        cacheDiagnosticsSends.delete(data)
+        const payload = parseJson(bodyText)
+        if (
+          isRecord(payload) &&
+          isRecord(payload.diagnostics) &&
+          payload.diagnostics.previous_message_id ===
+            diagnosticsOptIn.previousMessageId
+        ) {
+          const sent = {
+            ...diagnosticsOptIn,
+            requestedModel:
+              typeof payload.model === 'string' ? payload.model : undefined,
+            ttlSent: summarizeCacheTtl(payload),
+          }
+          // For a relay, these are the upstream headers inside the envelope,
+          // not the headers on the outer Request to the relay itself.
+          cacheDiagnosticsSends.set(
+            data,
+            getCacheDiagnosticsBetas(headers)
+              .then((betas) =>
+                betas.betas.includes(CACHE_DIAGNOSTICS_BETA)
+                  ? { ...sent, ...betas }
+                  : undefined,
+              )
+              .catch(() => undefined),
+          )
+        }
+      }
       try {
         source.onFinalRequestPrepared?.({
           attemptId: attempt.attemptId,
@@ -2087,7 +2150,13 @@ export function createNativeAnthropicAdapter<Q, P>(
             : safe,
         )
       }
-      const context = { ...contextOf(attempt, data), status: response.status }
+      const diagnostics = cacheDiagnosticsSends.get(data)
+      cacheDiagnosticsSends.delete(data)
+      const context = {
+        ...contextOf(attempt, data),
+        status: response.status,
+        ...(diagnostics ? { cacheDiagnostics: await diagnostics } : {}),
+      }
       const options = source.responseOptions?.(context) ?? {}
       const json = data
         ? modes.get(data) === 'http'

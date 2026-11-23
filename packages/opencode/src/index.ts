@@ -49,7 +49,6 @@ import {
   claudeGatewayHeaderValues,
   claudeGatewayModelUrl,
   claudeGatewayStatusNotes,
-  computeXxhash64Hex,
   configuredAnthropicOAuthAccountCount,
   createDumpResponseObserver,
   createEmptyStorage,
@@ -91,6 +90,7 @@ import {
   getAccountStoragePath,
   getCache1hMode,
   getCache1hPersistentMode,
+  getCacheDiagnosticsBetas,
   getCacheKeepRegistryDirectories,
   getCacheKeepWindow,
   getClaudeCodeIdentityForVerifiedAccount,
@@ -3593,18 +3593,6 @@ const anthropicAuthPlugin = async (
       requestedModel?: string
     }
   >()
-
-  async function getCacheDiagnosticsBetas(headers: Headers) {
-    const betas = (headers.get('anthropic-beta') ?? '')
-      .split(',')
-      .map((beta) => beta.trim())
-      .filter(Boolean)
-      .sort()
-    return {
-      betas,
-      betasHash: await computeXxhash64Hex(betas.join(',')),
-    }
-  }
 
   function observeCacheDiagnosticsMessage(input: {
     source: CacheDiagnosticsSource

@@ -467,12 +467,14 @@ export async function setupAnthropicAuth(
     setDumpEnabled(isDumpPersistentlyEnabled(initial.policyStorage))
   } catch {}
   let active = true
-  const wire = createNativeWirePolicy()
   const models = createNativeClaudeModelRules()
   let lifecycle: ReturnType<typeof startNativeAnthropicLifecycle> | undefined
   let prime: ReturnType<typeof createNativePrime> | undefined
   let cacheKeep: ReturnType<typeof createNativeCacheKeep> | undefined
   const parents = new Map<string, { value?: boolean }>()
+  const wire = createNativeWirePolicy({
+    isSubagent: (sessionID) => parents.get(sessionID)?.value,
+  })
   const subagent = (sessionID: string): boolean | undefined => {
     const cached = parents.get(sessionID)
     if (cached) return cached.value
