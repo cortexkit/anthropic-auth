@@ -9,11 +9,12 @@ import { nativeQuotaCodec } from '../../../core/src/native-quota-codec'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths'
 import { settingsReaderOutputs } from './opencode2-settings-readers'
 import { getPluginTestHandles } from './plugin-test-handles'
-import {
-  expectedReleaseSnapshot,
-  snapshotSettings,
-} from './settings-snapshot-fixture'
+import { snapshotSettings } from './settings-snapshot-fixture'
 import { observeSettings } from './settings-snapshot-observe'
+import {
+  cacheKeepWarmSnapshot,
+  expectedReleaseSnapshot,
+} from './settings-snapshot-parity'
 import {
   applyMenuAction,
   createMockClient,
@@ -785,6 +786,9 @@ describe('OpenCode 1 settings service reads', () => {
             // keep every older diagnostic and request byte in the release oracle.
             const compatible = {
               ...observed,
+              warms: observed.warms.map((warm) =>
+                cacheKeepWarmSnapshot(warm, 'current'),
+              ),
               logs: observed.logs.filter(
                 (record) =>
                   !(

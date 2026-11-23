@@ -19,11 +19,12 @@ import * as reloadFactory from '../v2/reload'
 import { setupAnthropicAuth } from '../v2/setup'
 import * as sourceFactory from '../v2/source'
 import { settingsReaderOutputs } from './opencode2-settings-readers'
-import {
-  expectedReleaseSnapshot,
-  snapshotSettings,
-} from './settings-snapshot-fixture'
+import { snapshotSettings } from './settings-snapshot-fixture'
 import { observeSettings } from './settings-snapshot-observe'
+import {
+  cacheKeepWarmSnapshot,
+  expectedReleaseSnapshot,
+} from './settings-snapshot-parity'
 
 const cleanups: (() => unknown | Promise<unknown>)[] = []
 afterEach(async () => {
@@ -1247,6 +1248,9 @@ for (const mode of ['local', 'claustrum'] as const) {
           // keep every older diagnostic and request byte in the release oracle.
           const compatible = {
             ...observed,
+            warms: observed.warms.map((warm) =>
+              cacheKeepWarmSnapshot(warm, 'current'),
+            ),
             logs: observed.logs.filter(
               (record) =>
                 !(

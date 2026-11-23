@@ -21,6 +21,7 @@ import { parse } from 'jsonc-parser'
 import { nativeAccountSettings } from '../../../core/src/native-account-view.ts'
 import { nativeQuotaCodec } from '../../../core/src/native-quota-codec.ts'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import { promptCacheSnapshot } from '../../../core/src/tests/prompt-cache-snapshot.ts'
 import { buildAnthropicRequest } from '../convert.ts'
 import {
   closePiNativeRuntime,
@@ -1132,10 +1133,18 @@ for (const mode of ['local', 'claustrum'] as const)
         expect(await (await native.service()).getSettingsPath()).toBe(file)
         expect(await fs.exists(`${file}.moved`)).toBe(true)
         expect(await fs.readFile(selected.config, 'utf8')).toBe(sourceBytes)
-        const released = releaseSnapshots[fixture]
+        const release = releaseSnapshots[fixture]
         const { quota_header_feed_enabled: _removed, ...readers } =
-          released.readers
-        const expected = JSON.stringify({ ...released, readers })
+          release.readers
+        const conversationBytes = (send: (typeof release.sends)[number]) => ({
+          ...send,
+          body: promptCacheSnapshot(JSON.parse(send.body)),
+        })
+        const expected = JSON.stringify({
+          ...release,
+          readers,
+          sends: release.sends.map(conversationBytes),
+        })
         for (const [phase, storage] of [
           ['before', before],
           ['after', after],
@@ -1148,6 +1157,9 @@ for (const mode of ['local', 'claustrum'] as const)
           // keep every older diagnostic and request byte in the release oracle.
           const compatible = {
             ...observed,
+            // The conversation gained a diagnostics predecessor, which also
+            // changes the body signature. Warm bodies still compare byte for byte.
+            sends: observed.sends.map(conversationBytes),
             logs: observed.logs.filter(
               (record) =>
                 !(
@@ -1158,6 +1170,9 @@ for (const mode of ['local', 'claustrum'] as const)
           }
           expect(JSON.stringify(compatible), phase).toBe(expected)
           expect(observed.sends).toHaveLength(1)
+          expect(JSON.parse(observed.sends[0]!.body).diagnostics).toEqual({
+            previous_message_id: null,
+          })
           expect(observed.logs.length).toBeGreaterThan(0)
           expect(observed.tracks).toHaveLength(1)
         }
@@ -1398,6 +1413,7 @@ test('the stream applies model settings and mirrors dump_enabled from every snap
           baseURL: 'https://api.anthropic.com',
         },
       ],
+      quota: { enabled: false },
       prime: { enabled: false },
     },
     storagePath,
@@ -1412,11 +1428,11 @@ test('the stream applies model settings and mirrors dump_enabled from every snap
     (account) => account.type === 'api',
   )
   const bodies: Record<string, unknown>[] = []
-  const send = () =>
+  const send = (account?: typeof apiAccount) =>
     __sendPiAnthropicRequestForTest(
       {
         storagePath,
-        apiAccount,
+        apiAccount: account,
         model: {
           id: 'claude-opus-5-5',
           name: 'Opus',
@@ -1451,6 +1467,10 @@ test('the stream applies model settings and mirrors dump_enabled from every snap
   await send()
   expect(core.isDumpEnabled()).toBe(true)
   expect(bodies[0]?.speed).toBe('fast')
+  if (!apiAccount) throw new Error('Missing paid fixture account')
+  // API-key requests are not shaped with the subscription fast-mode setting.
+  await send(apiAccount)
+  expect(bodies[1]).not.toHaveProperty('speed')
   await write({ dump_enabled: false, claude_fast_enabled: false })
   await changed(
     native,
@@ -1459,7 +1479,7 @@ test('the stream applies model settings and mirrors dump_enabled from every snap
   core.setDumpEnabled(true)
   await send()
   expect(core.isDumpEnabled()).toBe(false)
-  expect(bodies[1]?.speed).toBeUndefined()
+  expect(bodies[2]).not.toHaveProperty('speed')
 })
 
 for (const peer of ['never ran', 'stricter'] as const) {

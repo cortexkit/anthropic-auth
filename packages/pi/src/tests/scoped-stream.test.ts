@@ -49,6 +49,7 @@ import {
   type ProviderConfig,
 } from '@earendil-works/pi-coding-agent'
 import { nativeVaultPaths } from '../../../core/src/native-vault-paths.ts'
+import { promptCacheSnapshot } from '../../../core/src/tests/prompt-cache-snapshot.ts'
 import { createTestLifetimeSuite } from '../../../core/src/tests/test-lifetime.ts'
 import {
   recordedTimers,
@@ -401,6 +402,11 @@ for (const mode of [
     ).toEqual([])
     const rawHead = JSON.parse(bodies[0]!)
     const rawFork = JSON.parse(bodies.at(-1)!)
+    expect(rawHead.diagnostics).toEqual({ previous_message_id: null })
+    expect(rawFork).not.toHaveProperty('diagnostics')
+    expect(rawFork.system[0].text).not.toMatch(
+      /cc_(?:prompt_id|prev_req|prompt_index|turn_index|turn_origin)=/,
+    )
     const blocks = rawFork.messages.flatMap(
       (message: { content: unknown[] }) => message.content,
     ) as Record<string, unknown>[]
@@ -436,7 +442,7 @@ for (const mode of [
     expect(countMarkers(rawFork)).toBeLessThanOrEqual(4)
     delete headBody.messages
     delete forkBody.messages
-    expect(JSON.stringify(forkBody)).toBe(JSON.stringify(headBody))
+    expect(promptCacheSnapshot(forkBody)).toBe(promptCacheSnapshot(headBody))
     expect(JSON.stringify(await getPiTrackedCacheKeepSessions())).toBe(before)
     expect(sessionCacheActivity.ttlMs(head)).toBe(
       mode === 'head TTL' ? 3_600_000 : 300_000,

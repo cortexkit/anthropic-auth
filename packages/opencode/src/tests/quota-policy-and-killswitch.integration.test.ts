@@ -2590,9 +2590,8 @@ describe('auth.loader', () => {
       authorization: 'Bearer kie-key',
     })
     expect(requests[1]?.body).not.toHaveProperty('fallbacks')
-    expect(requests[1]?.beta?.split(',')).not.toContain(
-      SERVER_SIDE_FALLBACK_BETA,
-    )
+    // An API-key request has no injected Claude Code betas.
+    expect(requests[1]?.beta).toBeNull()
   })
 
   test('does not route to API-key fallback after main 429 when quota does not confirm exhaustion', async () => {

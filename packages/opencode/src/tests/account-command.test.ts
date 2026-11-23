@@ -1347,7 +1347,8 @@ describe('account command INFO logs (via plugin)', () => {
   test('does not retain a background interval unless the helper opts in', async () => {
     const fixture = await migrate(baseStorage())
     await fixture.getPlugin()
-    expect(timerTracking.disabledIntervalCalls).toBe(1)
+    // Prime registers at startup alongside fallback refresh, even when off.
+    expect(timerTracking.disabledIntervalCalls).toBe(2)
     expect(activeIntervals.size).toBe(0)
 
     await timerTracking.withTrackedInterval(async () => {
@@ -1355,6 +1356,7 @@ describe('account command INFO logs (via plugin)', () => {
         setInterval: trackedSetInterval,
         clearInterval: trackedClearInterval,
       })
+      // The second instance shares the Prime timer; only its fallback refresh is new.
       expect(activeIntervals.size).toBe(1)
     })
     expect(activeIntervals.size).toBe(0)

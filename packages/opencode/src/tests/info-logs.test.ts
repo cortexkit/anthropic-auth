@@ -278,10 +278,9 @@ async function migratedClaude() {
 
 test('does not retain a background interval unless the helper opts in', async () => {
   const claude = await migratedClaude()
-  // The helper supplies an interval mock that starts no timer. Construction
-  // schedules only the fallback-account refresh, so the mock is called once
-  // while the tracked set of active intervals remains empty.
-  expect(timerTracking.disabledIntervalCalls).toBe(1)
+  // Construction schedules fallback refresh and Prime, whose tick checks
+  // whether it is enabled. The helper's mock starts neither timer.
+  expect(timerTracking.disabledIntervalCalls).toBe(2)
   expect(activeIntervals.size).toBe(0)
 
   await timerTracking.withTrackedInterval(async () => {
@@ -289,6 +288,7 @@ test('does not retain a background interval unless the helper opts in', async ()
       setInterval: trackedSetInterval,
       clearInterval: trackedClearInterval,
     })
+    // The second instance shares the Prime timer; only its fallback refresh is new.
     expect(activeIntervals.size).toBe(1)
   })
   expect(activeIntervals.size).toBe(0)
