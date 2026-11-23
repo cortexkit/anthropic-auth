@@ -51,6 +51,10 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Keep-warm recovers from temporary lock contention when claiming or releasing a session, and OpenCode 2 keeps the newest cache body in memory if its final save fails.
 - Pi: `/claude` lane start (a one-token turn that warms the session's cache) tags its queued message with a one-time marker. A user who pastes that marker keeps their text, the marker never reaches Anthropic or the session file, a lane start no longer joins the conversation's request chain, and a lane start that would go to a paid API key is skipped with a short message.
 - Pi: when the session's cache is off, earlier messages are no longer reshaped for a cache marker.
+- OpenCode 1 returns Anthropic's original refusal when no other route can serve and never returns a closed response. It tries every eligible Claude subscription before a paid API key, tries each paid key at most once per request, and checks quota before a paid fallback only when a paid key can actually serve.
+- OpenCode 2 no longer clears another server's keep-warm state when it drops old sessions from memory or shuts down, and a deleted session can't be brought back by a request that was still in flight.
+- Keep-warm requests are sent only by the process that owns the session, and a real turn can resume keep-warm after another process took over a restored session and then let it go.
+- Pi: a queued lane start keeps its marker hidden even with many sessions open or text after it, stays out of the conversation's request chain if you type while it routes, and can still use a subscription listed after a paid key.
 
 ## 2.16.6
 
