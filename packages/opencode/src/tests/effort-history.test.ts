@@ -805,7 +805,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(tracker.resolveHeader(secondHeader)?.messageId).toBe('msg_current_b')
   })
 
-  test('defaults absent variants to high and does not mark non-Fable requests', () => {
+  test('defaults Fable 5.1 to high and leaves unsupported models unmarked', () => {
     const defaulted = [user('msg_default', 'ses_default', 'claude-fable-5-1')]
     const defaultPlan = markOpenCodeEffortTransitions(defaulted)
     expect(defaultPlan).toMatchObject({ baseline: 'high', markerCount: 0 })
@@ -828,7 +828,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(body.output_config).toEqual({ effort: 'high' })
 
     const otherModel = [
-      user('msg_other', 'ses_other', 'claude-mythos-5-1', 'max'),
+      user('msg_other', 'ses_other', 'claude-mythos-5', 'max'),
     ]
     expect(markOpenCodeEffortTransitions(otherModel)).toBeNull()
     expect(markerTexts(otherModel)).toEqual([])
@@ -1258,6 +1258,10 @@ describe('OpenCode per-message effort beyond Fable 5.1', () => {
     'claude-opus-5-5',
     'claude-opus-5-5[1m]',
     'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+    'claude-mythos-5-2',
+    'claude-opus-5',
+    'claude-mythos-5-1',
   ]) {
     test(`${model} keeps the earliest top-level effort and inserts a system marker`, () => {
       const session = `ses_${model}`
@@ -1299,6 +1303,7 @@ describe('OpenCode per-message effort beyond Fable 5.1', () => {
       ['claude-opus-5-5', 'high'],
       ['claude-opus-5-5', undefined],
       ['claude-sonnet-5-5', 'max'],
+      ['claude-haiku-5-5', 'high'],
     ] as const) {
       const messages: HostMessage[] = [
         user('msg_first', 'ses_steady', model, variant),
@@ -1327,12 +1332,8 @@ describe('OpenCode per-message effort beyond Fable 5.1', () => {
     }
   })
 
-  test('adds no markers or effort messages for Opus 5, Haiku 5.5 and Mythos 5.1', () => {
-    for (const model of [
-      'claude-opus-5',
-      'claude-haiku-5-5',
-      'claude-mythos-5-1',
-    ]) {
+  test('adds no markers or effort messages for Fable 5 and Mythos 5', () => {
+    for (const model of ['claude-fable-5', 'claude-mythos-5']) {
       const messages: HostMessage[] = [
         user('msg_low', `ses_${model}`, model, 'low'),
         assistant('msg_step', `ses_${model}`),

@@ -112,11 +112,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Group a model id into the per-message-effort family whose user turns share
- * one effort timeline. Every model that takes effort markers (Fable 5.1/5.2,
- * Opus 5.5 and Sonnet 5.5) is its own family, and turns sent to a different
- * family in the same session are left out: an Opus 5.5 timeline never counts
- * Sonnet 5.5 or Fable 5.1/5.2 turns, and the reverse.
+ * Group variants of each model that takes effort markers into one timeline.
+ * User turns sent to other models in the same session don't count toward it.
  */
 function perMessageEffortFamily(model: unknown): string | undefined {
   // Models whose capability row allows effort markers; the family is the
@@ -1097,9 +1094,7 @@ export function applyOpenCodeEffortMarkers(
     rewritten.push(message.value)
   }
   body.messages = rewritten
-  // Models with `effortMarkers: "always"` (Fable 5.1/5.2) always pin the earliest
-  // effort. The other models change top-level effort only when a marker
-  // carries the later effort.
+  // Only `always` rows pin the earliest effort even without a marker.
   if (applyConfig && (inserted > 0 || pinsEffortOnEveryRequest(body.model))) {
     const outputConfig = isRecord(body.output_config)
       ? { ...body.output_config }

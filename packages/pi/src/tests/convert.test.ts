@@ -821,7 +821,14 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     })
   })
 
-  for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5']) {
+  for (const model of [
+    'claude-opus-5-5',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+    'claude-mythos-5-2',
+    'claude-opus-5',
+    'claude-mythos-5-1',
+  ]) {
     test(`injects Pi effort changes before their user turns for ${model}`, async () => {
       const context = {
         messages: [
@@ -859,8 +866,8 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
         output_config: { effort: 'high' },
       })
 
-      // A steady effort, and the empty history an API-key route passes,
-      // both leave the request exactly as Pi built it.
+      // The requested effort is already the baseline, so a steady effort
+      // leaves the request byte-identical to a request with no history.
       const untouched = (await build([])).bodyText
       expect(
         (await build([{ afterAssistantMessages: 0, effort: 'high' }])).bodyText,
@@ -869,12 +876,8 @@ describe('buildAnthropicRequest — Fable/Mythos thinking', () => {
     })
   }
 
-  test('leaves Opus 5, Haiku 5.5 and Mythos 5.1 requests unchanged by effort history', async () => {
-    for (const model of [
-      'claude-opus-5',
-      'claude-haiku-5-5',
-      'claude-mythos-5-1',
-    ]) {
+  test('leaves Fable 5 and Mythos 5 requests unchanged by effort history', async () => {
+    for (const model of ['claude-fable-5', 'claude-mythos-5']) {
       const build = (
         effortTransitions: {
           afterAssistantMessages: number

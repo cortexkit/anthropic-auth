@@ -1056,8 +1056,8 @@ describe('setOAuthHeaders', () => {
 
     for (const model of [
       'claude-fable-5',
-      'claude-mythos-5-1',
-      'claude-opus-5',
+      'claude-mythos-5',
+      'claude-opus-4-8',
     ]) {
       const headers = new Headers()
       setOAuthHeaders(headers, 'token', { body: { model, messages: [] } })
@@ -1212,12 +1212,8 @@ describe('setOAuthHeaders', () => {
     expect(JSON.stringify(apiBody)).not.toContain('cortexkit-internal-effort')
   })
 
-  test('leaves Opus 5, Haiku 5.5 and Mythos 5.1 OAuth requests unchanged after an effort change', async () => {
-    for (const model of [
-      'claude-opus-5',
-      'claude-haiku-5-5',
-      'claude-mythos-5-1',
-    ]) {
+  test('leaves Fable 5 and Mythos 5 OAuth requests unchanged after an effort change', async () => {
+    for (const model of ['claude-fable-5', 'claude-mythos-5']) {
       const sourceMessages = ['low', 'high'].flatMap((variant, index) => [
         ...(index > 0
           ? [
@@ -1265,23 +1261,8 @@ describe('setOAuthHeaders', () => {
       ])
       const headers = new Headers()
       setOAuthHeaders(headers, 'token', { body })
-      // Claude Code 2.1.302 sends the per-turn-control beta (per-message
-      // effort) on Haiku 5.5 too, after
-      // claude-code-20250219, which it moves behind the prompt-caching scope
-      // beta. No effort marker or other beta changes.
-      const scope = CLAUDE_CODE_FULL_AGENT_BETAS.indexOf(
-        'prompt-caching-scope-2026-01-05',
-      )
       expect(headers.get('anthropic-beta')).toBe(
-        (model === 'claude-haiku-5-5'
-          ? [
-              ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(1, scope + 1),
-              'claude-code-20250219',
-              'per-turn-control-2026-07-01',
-              ...CLAUDE_CODE_FULL_AGENT_BETAS.slice(scope + 1),
-            ]
-          : CLAUDE_CODE_FULL_AGENT_BETAS
-        ).join(','),
+        CLAUDE_CODE_FULL_AGENT_BETAS.join(','),
       )
     }
   })

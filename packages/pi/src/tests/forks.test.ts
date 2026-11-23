@@ -120,18 +120,43 @@ function forkBody(model: string, thinking: Record<string, unknown>) {
   } as Record<string, unknown>
 }
 
-test('the fork effort hint becomes one effort change at the question', () => {
-  const body = forkBody('claude-sonnet-5-5', { type: 'adaptive' })
-  const history = [{ afterAssistantMessages: 0, effort: 'high' as const }]
-  expect(applyPiForkEffort(body, history, 'low')).toBe('low')
-  expect(body.output_config).toEqual({ effort: 'high' })
-  expect(body.messages).toEqual([
-    { role: 'user', content: 'Base question' },
-    { role: 'assistant', content: 'Head answer' },
-    { role: 'system', content: [], output_config: { effort: 'low' } },
-    { role: 'user', content: 'Fork question' },
-  ])
-})
+test.each([
+  'claude-sonnet-5-5',
+  'claude-haiku-5-5',
+  'claude-mythos-5-2',
+  'claude-opus-5',
+  'claude-mythos-5-1',
+])(
+  'the %s fork effort hint becomes one effort change at the question',
+  (model) => {
+    const body = forkBody(model, { type: 'adaptive' })
+    const history = [{ afterAssistantMessages: 0, effort: 'high' as const }]
+    expect(applyPiForkEffort(body, history, 'low')).toBe('low')
+    expect(body.output_config).toEqual({ effort: 'high' })
+    expect(body.messages).toEqual([
+      { role: 'user', content: 'Base question' },
+      { role: 'assistant', content: 'Head answer' },
+      { role: 'system', content: [], output_config: { effort: 'low' } },
+      { role: 'user', content: 'Fork question' },
+    ])
+  },
+)
+
+test.each(['claude-haiku-5-5', 'claude-opus-5'])(
+  'the fork effort hint leaves disabled %s requests byte-identical',
+  (model) => {
+    const body = forkBody(model, { type: 'disabled' })
+    const before = JSON.stringify(body)
+    expect(
+      applyPiForkEffort(
+        body,
+        [{ afterAssistantMessages: 0, effort: 'high' }],
+        'low',
+      ),
+    ).toBeUndefined()
+    expect(JSON.stringify(body)).toBe(before)
+  },
+)
 
 test('an unaligned effort marker stays on the head user message in the fork', () => {
   const body = forkBody('claude-sonnet-5-5', { type: 'adaptive' })
