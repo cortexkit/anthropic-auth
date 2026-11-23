@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,7 +7,6 @@ import { gunzipSync } from 'node:zlib'
 import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
-  logger,
   type NativeAccountRuntime,
 } from '@cortexkit/anthropic-auth-core'
 import { createNativeCacheKeep } from '../v2/cachekeep'
@@ -20,24 +19,12 @@ afterEach(async () => {
 })
 
 test.each([false, true])(
-  'OpenCode 2 reload tracks a response through a 2.5.3 shared owner (retained: %s)',
+  'OpenCode 2 reload restores and tracks after closing a 2.5.3 shared owner (retained: %s)',
   async (retained) => {
-    const globals = globalThis as Record<symbol, unknown>
-    const diagnostic = Symbol.for(
-      'cortexkit.anthropic-auth.opencode2.legacy-turn-rules',
-    )
-    const previous = globals[diagnostic]
-    delete globals[diagnostic]
-    const logging = spyOn(logger, 'info').mockImplementation(() => {})
-    cleanups.push(() => {
-      logging.mockRestore()
-      if (previous === undefined) delete globals[diagnostic]
-      else globals[diagnostic] = previous
-    })
     const directory = await mkdtemp(join(tmpdir(), 'oc2-cachekeep-reload-'))
     cleanups.push(() => rm(directory, { recursive: true, force: true }))
     const storageId = randomUUID()
-    let now = Date.now()
+    const now = Date.now()
     const policy: Awaited<
       ReturnType<NativeAccountRuntime['read']>
     >['policyStorage'] = {
@@ -51,7 +38,15 @@ test.each([false, true])(
     const runtime = {
       read: async () => ({
         policyStorage: policy,
-        accounts: [{ id: 'first', accountIdentity, binding }],
+        accounts: [
+          {
+            id: 'first',
+            type: 'oauth',
+            source: 'local',
+            accountIdentity,
+            binding,
+          },
+        ],
       }),
     } as unknown as NativeAccountRuntime
     const disk = new CacheKeepSessionRegistry({
@@ -78,14 +73,9 @@ test.each([false, true])(
     }
     const persistence = new CacheKeepStore({ storageId, root: directory })
     const timers = new Set<object>()
-    let sends = 0
     const manager = new CacheKeepManager({
       now: () => now,
       loadStorage: async () => policy,
-      fetchImpl: (async () => {
-        sends++
-        return Response.json({})
-      }) as unknown as typeof fetch,
       setIntervalImpl: (() => {
         const timer = { unref() {} }
         timers.add(timer)
@@ -107,7 +97,14 @@ test.each([false, true])(
       storage: policy,
       cacheMode: 'hybrid' as const,
       oauthAccountId: 'first',
-      oauthAccountIdentity: accountIdentity,
+      oauthAccountIdentity: JSON.stringify([
+        'local',
+        accountIdentity,
+        null,
+        storageId,
+        'first',
+        0,
+      ]),
     }
     // Expose the old manager surface, not its new registrySessions method or
     // reason-aware untrack signature, even though the backing scheduler is current.
@@ -120,7 +117,6 @@ test.each([false, true])(
       manager: legacyManager,
       registry,
       persistence,
-      persistenceFollowsOwner: true,
       prepared: new Map(),
       leases: new Map(retained ? [] : [[0, { stopped: false }]]),
       nextGeneration: 1,
@@ -143,13 +139,17 @@ test.each([false, true])(
       runtime,
       source: {} as NativeSource,
       persistence: { root: directory },
+      registryDirectory: join(directory, 'registry'),
       now: () => now,
     })
     cleanups.push(() => keep.dispose())
     await keep.ready
-    expect(shared.get(storageId)).toBe(owner)
-    expect(keep.registry === (registry as unknown)).toBe(true)
-    expect(timers.size).toBe(1)
+    const current = shared.get(storageId)
+    expect(current).not.toBe(owner)
+    expect(keep.registry).not.toBe(
+      registry as unknown as CacheKeepSessionRegistry,
+    )
+    expect(timers.size).toBe(0)
     await keep.track({
       sessionID: 'ses_after_reload',
       attemptId: 'after-reload',
@@ -165,22 +165,26 @@ test.each([false, true])(
       keep.onResponseHeaders({ attemptId: 'after-reload', status: 200 })
         ?.tracked,
     ).toBe(true)
-    expect(await registry.list()).toEqual(
+    expect(
+      (await keep.registry.list()).map(
+        ({ id, cacheExpiresAt, nextPrewarmAt }) => ({
+          id,
+          cacheExpiresAt,
+          nextPrewarmAt,
+        }),
+      ),
+    ).toEqual(
       ['ses_after_reload', 'ses_before_reload'].map((id) => ({
         id,
         cacheExpiresAt: now + 3_600_000,
         nextPrewarmAt: now + 3_300_000,
       })),
     )
-    expect(timers.size).toBe(1)
+    expect(timers.size).toBe(0)
     keep.forgetSession('ses_before_reload')
-    expect(manager.trackedSessions().map(({ id }) => id)).toEqual([
-      'ses_after_reload',
-    ])
-    now += 3_300_000
-    await manager.tick()
-    expect(sends).toBe(1)
-    expect(manager.trackedCount()).toBe(1)
+    expect(
+      current.manager.trackedSessions().map(({ id }: LegacySession) => id),
+    ).toEqual(['ses_after_reload'])
     policy.cacheKeep = { enabled: false }
     await keep.track({
       sessionID: 'ses_disabled',
@@ -189,18 +193,10 @@ test.each([false, true])(
       agent: 'build',
       kind: 'primary',
     } as Parameters<typeof keep.track>[0])
-    expect(manager.trackedSessions()).toEqual([])
-    await Reflect.get(owner, 'localCleanup')
-    await owner.persistence.drain()
-    expect(await readdir(owner.persistence.directory)).toEqual([])
-    expect(
-      logging.mock.calls.filter(
-        ([channel, message]) =>
-          channel === 'cachekeep' &&
-          message ===
-            'new real-turn warming rules apply after a server restart',
-      ),
-    ).toHaveLength(1)
+    expect(current.manager.trackedSessions()).toEqual([])
+    await current.localCleanup
+    await current.persistence.drain()
+    expect(await readdir(current.persistence.directory)).toEqual([])
   },
 )
 

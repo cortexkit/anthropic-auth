@@ -644,6 +644,8 @@ export interface CacheKeepStoreOptions {
   /** Pi claims only sessions opened by its host, in its existing directory. */
   externalClaim?: (id: string) => CacheKeepClaim | undefined
   onClaimLost?: (id: string) => void
+  /** Wait for the previous scheduler to flush and release its claims. */
+  waitForWriter?: Promise<void>
 }
 
 type UnverifiedClaim = 'ownership-unverified'
@@ -673,8 +675,8 @@ export class CacheKeepStore {
   private readonly latest: Map<string, SavedCacheKeepTarget>
   private readonly committed: Map<string, SavedCacheKeepTarget>
   private readonly pendingRealClaims: Map<string, object>
-  private readonly warmOwnershipVetoes: WeakSet<object>
   private switchingWriter: boolean
+  private claimReleases = 0
 
   constructor(
     private readonly options: CacheKeepStoreOptions,
@@ -689,12 +691,12 @@ export class CacheKeepStore {
     this.latest = previous?.latest ?? new Map()
     this.committed = previous?.committed ?? new Map()
     this.pendingRealClaims = previous?.pendingRealClaims ?? new Map()
-    this.warmOwnershipVetoes = previous?.warmOwnershipVetoes ?? new WeakSet()
     // Capture pending writes before the shared entry switches writers. New
     // writes and loads wait for them, so an old write cannot land last.
-    this.switchingWriter = !!previous
-    this.chain = previous
-      ? previous.drain().finally(() => {
+    const handover = options.waitForWriter ?? previous?.drain()
+    this.switchingWriter = !!handover
+    this.chain = handover
+      ? handover.finally(() => {
           this.switchingWriter = false
         })
       : Promise.resolve()
@@ -837,9 +839,11 @@ export class CacheKeepStore {
     if (!this.claims || this.disabled) return
     const item = this.claims.get(hash(id))
     if (!item?.retained && !acquire) return
-    // The old writer can still release this token while its drain is pending.
+    // The old writer or an overlapping last-lease release can still drop this
+    // token. Queue a fresh acquisition behind that release before persisting.
     if (
       !this.switchingWriter &&
+      this.claimReleases === 0 &&
       item?.retained &&
       !item.restoreOnly &&
       this.latest.has(id)
@@ -859,12 +863,17 @@ export class CacheKeepStore {
   }
 
   async releaseClaims(shouldRelease: (hash: string) => boolean) {
-    this.chain = this.chain.then(async () => {
-      for (const [key, item] of this.claims ?? []) {
-        if (!shouldRelease(key)) continue
-        await this.closeClaim(key, item).catch(() => this.writeFailed())
-      }
-    })
+    this.claimReleases++
+    this.chain = this.chain
+      .then(async () => {
+        for (const [key, item] of this.claims ?? []) {
+          if (!shouldRelease(key)) continue
+          await this.closeClaim(key, item).catch(() => this.writeFailed())
+        }
+      })
+      .finally(() => {
+        this.claimReleases--
+      })
     await this.chain
   }
 
@@ -1213,8 +1222,6 @@ export class CacheKeepStore {
   async reserveWarm(
     target: Readonly<CacheKeepTarget>,
   ): Promise<CacheKeepWarmReservation> {
-    const key = target.policyState ?? target
-    this.warmOwnershipVetoes.delete(key)
     if (this.disabled) return this.memoryOnly
     const entry = record(target, this.options.pluginVersion)
     const timer = this.timers.get(entry.id)
@@ -1232,14 +1239,7 @@ export class CacheKeepStore {
       })
       .catch(() => this.writeFailed())
     await this.chain
-    if (!this.memoryOnly && typeof result === 'string')
-      this.warmOwnershipVetoes.add(key)
     return this.memoryOnly || result
-  }
-
-  warmOwnershipVetoed(target: Readonly<CacheKeepTarget>) {
-    // The scheduler passes a rewritten copy to the host, sharing its policy state.
-    return this.warmOwnershipVetoes.has(target.policyState ?? target)
   }
 
   private async persist(

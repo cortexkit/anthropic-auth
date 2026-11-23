@@ -1451,7 +1451,17 @@ export class CacheKeepManager {
   }
 
   /** Called at the physical boundary, after authorization and before fetch. */
-  async reserveWarmDispatch(target: Readonly<CacheKeepTarget>): Promise<void> {
+  async reserveWarmDispatch(target: Readonly<CacheKeepTarget>): Promise<void>
+  async reserveWarmDispatch<T>(
+    target: Readonly<CacheKeepTarget>,
+    dispatch: () => Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T>
+  async reserveWarmDispatch<T>(
+    target: Readonly<CacheKeepTarget>,
+    dispatch?: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T | undefined> {
     const generation = this.schedulerGeneration
     const current = this.targets.get(target.id)
     if (!current || !this.isCurrentTarget(target))
@@ -1460,7 +1470,9 @@ export class CacheKeepManager {
     if (this.realTurnBusy(state?.ownerSessionId ?? target.id))
       throw new CacheKeepWarmWait()
     const loaded = await this.options.loadStorage()
-    if (generation !== this.schedulerGeneration) throw new CacheKeepWarmWait()
+    const cancelled = () =>
+      generation !== this.schedulerGeneration || signal?.aborted
+    if (cancelled()) throw new CacheKeepWarmWait()
     const storage =
       loaded && this.options.resolveSettings
         ? this.targetSettings(
@@ -1484,23 +1496,38 @@ export class CacheKeepManager {
       state.warmsSinceLastRealRequest++
       state.pendingWarmCost = (pendingCost ?? 0) + admittedCost
     }
+    const refund = () => {
+      if (!state) return
+      state.warmsSinceLastRealRequest--
+      state.pendingWarmCost = pendingCost
+    }
     // Process-only keepers have no restart replay. Persistent hosts must prove
     // the new count is stored before sending; a failed attempt keeps its slot.
     if (this.options.reserveWarm) {
       let reservation: CacheKeepWarmReservation = false
       try {
         reservation = await this.options.reserveWarm(current)
-      } catch {}
-      if (generation !== this.schedulerGeneration) throw new CacheKeepWarmWait()
+      } catch {
+        // A memory-only store returns success without I/O. An exception from
+        // the reservation cannot establish ownership of a persisted session.
+        reservation = 'ownership-unverified'
+      }
+      if (cancelled()) {
+        // Only the caller that hands us dispatch can tie the reservation to
+        // the send. Keep the conservative charge for a standalone reservation.
+        if (dispatch) {
+          refund()
+          if (state && reservation === true && this.isCurrentTarget(target))
+            await this.options.settleWarm?.(current)
+        }
+        throw new CacheKeepWarmWait()
+      }
       if (
         reservation === 'not-owner' ||
         reservation === 'ownership-unverified' ||
         (!reservation && (state?.planned || isCacheKeepAlways(storage)))
       ) {
-        if (state) {
-          state.warmsSinceLastRealRequest--
-          state.pendingWarmCost = pendingCost
-        }
+        refund()
         if (reservation === 'not-owner') {
           if (this.isCurrentTarget(target)) this.releaseTarget(target.id)
           throw new CacheKeepWarmRefusal('stopped')
@@ -1518,13 +1545,15 @@ export class CacheKeepManager {
     if (fresh?.action === 'stop') throw new CacheKeepWarmRefusal(fresh.reason)
     if (fresh?.action === 'wait') {
       if (state) {
-        state.warmsSinceLastRealRequest--
-        state.pendingWarmCost = pendingCost
+        refund()
         this.admittedWarmCosts.delete(state)
         await this.options.settleWarm?.(current)
       }
       throw new CacheKeepWarmWait()
     }
+    // Once admitted, dispatch without yielding: a hand-over must either
+    // refund a cancelled reservation or leave the charge for a real send.
+    return dispatch?.()
   }
 
   private scheduleDueTimer() {

@@ -503,6 +503,20 @@ async function fixture(
       },
     }
   }
+  const reload = async (waitForRestore = true) => {
+    // Another directory uses the same module. A reload evaluates a fresh copy.
+    const path = '../v2/cachekeep.ts?reload'
+    const fresh: typeof cacheKeepFactory = await import(path)
+    const creating = spyOn(
+      cacheKeepFactory,
+      'createNativeCacheKeep',
+    ).mockImplementation(fresh.createNativeCacheKeep)
+    try {
+      return await start(undefined, waitForRestore)
+    } finally {
+      creating.mockRestore()
+    }
+  }
   return {
     ...(await start()),
     setQuota: (id: string, remainingPercent = 80) => {
@@ -528,6 +542,7 @@ async function fixture(
     },
     /** Another plugin instance for the same account storage and clock. */
     start,
+    reload,
     paths,
     store,
     routingPath: join(directory, 'routing.json'),
@@ -2346,66 +2361,53 @@ test('OpenCode 2 still drops a restart record requiring a real request', async (
   expect(next.sent).toEqual([])
 })
 
-test.each([false, true])(
-  'an OpenCode 2 adopted entry writes through the newer store (legacy callbacks: %s)',
-  async (legacy) => {
-    const f = await fixture()
-    const first = (await (await f.live()).json()) as Record<string, any>
-    const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
-    const owner = (globalThis as any)[key].get(f.paths.storageId)
-    const oldStore: CacheKeepStore = owner.persistence
-    if (legacy) delete owner.persistenceFollowsOwner
-    const next = await f.start()
-    const newStore: CacheKeepStore = owner.persistence
-    expect(newStore).not.toBe(oldStore)
-    await newStore.drain()
-    const [name] = await readdir(f.disk)
-    const saved = () =>
-      readFile(join(f.disk, name!)).then((bytes) =>
-        JSON.parse(gunzipSync(bytes).toString()),
-      )
-    expect(JSON.parse((await saved()).bodyText).messages).toEqual(
-      first.messages,
+test('an OpenCode 2 adopted entry writes through the newer store', async () => {
+  const f = await fixture()
+  const first = (await (await f.live()).json()) as Record<string, any>
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  const oldStore: CacheKeepStore = owner.persistence
+  const next = await f.reload()
+  const newStore = sharedKeeper(f).persistence
+  expect(newStore).not.toBe(oldStore)
+  await newStore.drain()
+  const [name] = await readdir(f.disk)
+  const saved = () =>
+    readFile(join(f.disk, name!)).then((bytes) =>
+      JSON.parse(gunzipSync(bytes).toString()),
     )
-    const notifications: Array<Readonly<CacheKeepTarget>> = []
-    const persist = newStore.changed.bind(newStore)
-    const changed = spyOn(newStore, 'changed').mockImplementation((target) => {
-      notifications.push({
-        ...target,
-        policyState: target.policyState && { ...target.policyState },
-      })
-      persist(target)
+  expect(JSON.parse((await saved()).bodyText).messages).toEqual(first.messages)
+  const notifications: Array<Readonly<CacheKeepTarget>> = []
+  const persist = newStore.changed.bind(newStore)
+  const changed = spyOn(newStore, 'changed').mockImplementation((target) => {
+    notifications.push({
+      ...target,
+      policyState: target.policyState && { ...target.policyState },
     })
-    cleanups.push(() => changed.mockRestore())
-    const latest = (await (
-      await next.live(undefined, {
-        messages: [{ role: 'user', content: 'A request after plugin reload' }],
-      })
-    ).json()) as Record<string, any>
-    // The first target notification carries no token counts; after the response
-    // drains, one later notification adds them.
-    expect(changed).toHaveBeenCalledTimes(2)
-    expect(notifications[0]!.policyState?.prefixTokens).toBeUndefined()
-    expect(notifications[0]!.policyState?.inputTokens).toBeUndefined()
-    expect(notifications[1]).toEqual({
-      ...notifications[0]!,
-      policyState: {
-        ...notifications[0]!.policyState!,
-        prefixTokens: 1,
-        inputTokens: 1,
-      },
+    persist(target)
+  })
+  cleanups.push(() => changed.mockRestore())
+  const latest = (await (
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'A request after plugin reload' }],
     })
-    if (legacy) {
-      // Emulate an older manager's callback, which captured the first store.
-      oldStore.changed(changed.mock.calls[0]![0])
-      expect(changed).toHaveBeenCalledTimes(3)
-    }
-    await newStore.drain()
-    expect(JSON.parse((await saved()).bodyText).messages).toEqual(
-      latest.messages,
-    )
-  },
-)
+  ).json()) as Record<string, any>
+  // The first target notification carries no token counts; after the response
+  // drains, one later notification adds them.
+  expect(changed).toHaveBeenCalledTimes(2)
+  expect(notifications[0]!.policyState?.prefixTokens).toBeUndefined()
+  expect(notifications[0]!.policyState?.inputTokens).toBeUndefined()
+  expect(notifications[1]).toEqual({
+    ...notifications[0]!,
+    policyState: {
+      ...notifications[0]!.policyState!,
+      prefixTokens: 1,
+      inputTokens: 1,
+    },
+  })
+  await newStore.drain()
+  expect(JSON.parse((await saved()).bodyText).messages).toEqual(latest.messages)
+})
 
 test('OpenCode 2 startup reports restored and dropped counts, but not an empty store', async () => {
   const lines = captureStartupLogs()
@@ -2753,11 +2755,10 @@ test('a policy-refused OpenCode 2 target is also removed from restart storage', 
   )
   const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
   const owner = (globalThis as any)[key].get(f.paths.storageId)
-  trace.observeStore(owner.persistence, 'original')
+  trace.observeStore(owner.persistence, 'shared')
   await trace.wait('accepted live response', () => f.live())
   await trace.wait('original dispose', () => f.dispose())
   const next = await trace.wait('successor startup', () => f.start())
-  trace.observeStore(owner.persistence, 'successor')
   await trace.wait('policy settings update', () =>
     f.store.updateSettings((settings) => ({
       ...settings,
@@ -3194,7 +3195,7 @@ test('hybrid-disabled request dispatch never waits on a held restart write', asy
   }
 })
 
-test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted usage safe', async () => {
+test('reload from a 2.6.0-shaped owner supports accepted usage and planned warming', async () => {
   const f = await fixture()
   const reports: unknown[] = []
   runnerPolicyForReview(null, reports)
@@ -3221,7 +3222,7 @@ test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted u
       return typeof value === 'function' ? value.bind(target) : value
     },
   })
-  const next = await f.start()
+  const next = await f.reload()
   await next.live()
   await new Promise((resolve) => setTimeout(resolve, 0))
   expect(
@@ -3230,18 +3231,12 @@ test('reload onto a 2.6.0-shaped owner keeps legacy warm dispatch and accepted u
   f.due()
   await f.timers.fire()
   expect(next.sent).toHaveLength(1)
-  const debug = spyOn(logger, 'debug')
-  cleanups.push(() => debug.mockRestore())
   runnerPolicyForReview({ ttl: 'long', keep_warm: 'always' })
   await next.live()
   f.due()
   await f.timers.fire()
-  expect(next.sent).toHaveLength(1)
-  expect(
-    debug.mock.calls.filter((call) =>
-      String(call[1]).includes('planned warming requires a server restart'),
-    ),
-  ).toHaveLength(1)
+  expect(next.sent).toHaveLength(2)
+  expect(f.sent).toHaveLength(0)
   owner.manager = original
 })
 
@@ -4026,6 +4021,140 @@ function sharedKeeper(f: Awaited<ReturnType<typeof fixture>>) {
   }
 }
 
+test('OC2 reload refunds a persisted reservation that never dispatches', async () => {
+  const reports: Array<Record<string, unknown>> = []
+  runnerPolicies(reports)
+  const f = await fixture()
+  await f.live(undefined, { model: 'claude-opus-5-5' })
+  const old = sharedKeeper(f)
+  const id = 'ses_oc2_keep'
+  const target = (
+    Reflect.get(old.manager, 'targets') as Map<string, CacheKeepTarget>
+  ).get(id)!
+  Object.assign(target.policyState!, {
+    warmsSinceLastRealRequest: 23,
+    warmCostSoFar: 2,
+    prefixTokens: 1000,
+    inputTokens: 1000,
+    hasWarmed: true,
+  })
+  expect(await old.persistence.reserveWarm(target)).toBe(true)
+  const [name] = await readdir(f.disk)
+  const saved = async () =>
+    JSON.parse(gunzipSync(await readFile(join(f.disk, name!))).toString())
+  expect((await saved()).policyState.warmsSinceLastRealRequest).toBe(23)
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const reserve = old.persistence.reserveWarm.bind(old.persistence)
+  const reserving = spyOn(old.persistence, 'reserveWarm').mockImplementation(
+    async (entry) => {
+      const result = await reserve(entry)
+      entered.resolve()
+      await resume.promise
+      return result
+    },
+  )
+  f.due()
+  const warming = f.timers.fire()
+  try {
+    await Promise.race([entered.promise, warming])
+    expect(reserving).toHaveBeenCalledTimes(1)
+    expect((await saved()).policyState.warmsSinceLastRealRequest).toBe(24)
+    expect((await saved()).policyState.pendingWarmCost).toBeGreaterThan(0)
+    const next = await f.reload(false)
+    const current = sharedKeeper(f)
+    resume.resolve()
+    await warming
+    await Reflect.get(current, 'loading')
+    expect(f.sent).toHaveLength(0)
+    expect(next.sent).toHaveLength(0)
+    expect((await saved()).policyState).toMatchObject({
+      warmsSinceLastRealRequest: 23,
+      warmCostSoFar: 2,
+    })
+    expect((await saved()).policyState.pendingWarmCost).toBeUndefined()
+    expect(target.consecutiveFailures).toBe(0)
+    expect(reports.filter(({ kind }) => kind === 'cache_warm_stopped')).toEqual(
+      [],
+    )
+    expect(current.manager.trackedRequest(id)).toBeDefined()
+    expect(old.manager.trackedCount()).toBe(0)
+    f.advance(20_000)
+    await f.timers.fire()
+    expect(f.sent).toHaveLength(0)
+    expect(next.sent).toHaveLength(1)
+  } finally {
+    resume.resolve()
+    await warming
+    reserving.mockRestore()
+  }
+})
+
+test('OC2 reload saves the last accepted body and does not delay a new turn on the old writer', async () => {
+  const f = await fixture()
+  await f.live(
+    undefined,
+    { messages: [{ role: 'user', content: 'Superseded by the new turn' }] },
+    'ses_during_reload',
+  )
+  await f.live(undefined, {
+    messages: [{ role: 'user', content: 'Earlier body' }],
+  })
+  const accepted = await f.prepare(undefined, {
+    messages: [{ role: 'user', content: 'Accepted before reload' }],
+  })
+  await f.respond(accepted, undefined, false)
+  const old = sharedKeeper(f)
+  const entered = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const drain = old.persistence.drain.bind(old.persistence)
+  const draining = spyOn(old.persistence, 'drain').mockImplementation(
+    async () => {
+      entered.resolve()
+      await resume.promise
+      await drain()
+    },
+  )
+  try {
+    const next = await f.reload(false)
+    await entered.promise
+    const current = sharedKeeper(f)
+    await next.live(
+      undefined,
+      { messages: [{ role: 'user', content: 'Accepted during reload' }] },
+      'ses_during_reload',
+    )
+    resume.resolve()
+    await Reflect.get(current, 'loading')
+    await current.persistence.drain()
+    const bodies = new Map<string, string>()
+    for (const name of (await readdir(f.disk)).filter((file) =>
+      file.endsWith('.json.gz'),
+    )) {
+      const entry = JSON.parse(
+        gunzipSync(await readFile(join(f.disk, name))).toString(),
+      )
+      bodies.set(entry.id, entry.bodyText)
+    }
+    expect(bodies.get('ses_oc2_keep')).toContain('Accepted before reload')
+    expect(bodies.get('ses_during_reload')).toContain('Accepted during reload')
+    expect(current.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+      'Accepted before reload',
+    )
+    expect(
+      current.manager.trackedRequest('ses_during_reload')?.bodyText,
+    ).toContain('Accepted during reload')
+    expect(current.persistence.isCommitted('ses_during_reload')).toBe(true)
+    expect(await readdir(`${f.disk}.claims`)).toContain(
+      `${createHash('sha256').update('ses_during_reload').digest('hex')}.claim.json`,
+    )
+    expect(current.manager).not.toBe(old.manager)
+  } finally {
+    resume.resolve()
+    draining.mockRestore()
+  }
+})
+
 async function seedPeer(f: Awaited<ReturnType<typeof fixture>>) {
   const id = 'ses_oc2_keep'
   const key = createHash('sha256').update(id).digest('hex')
@@ -4150,58 +4279,52 @@ test('OpenCode 2 sends no warm in an active local window without the session cla
   expect(await peer.peer.reserveWarm(peer.tracked)).toBe(true)
 })
 
-test.each(['newer', 'older'] as const)(
-  'OpenCode 2 reload prevents a boolean-protocol manager from warming without verified ownership on the %s lease',
-  async (lease) => {
-    const f = await fixture()
-    const startHour = new Date(f.now()).getHours()
-    await f.store.updateSettings((settings) => ({
-      ...settings,
-      cacheKeep: { enabled: true, startHour, endHour: (startHour + 3) % 24 },
-    }))
-    await f.live()
-    const owner = sharedKeeper(f)
-    const manager = owner.manager
-    const oldWriter = owner.persistence
-    const reservations: unknown[] = []
-    // The retained scheduler treats any truthy store result as a committed count.
-    Reflect.get(manager, 'options').reserveWarm = async (
-      target: Readonly<CacheKeepTarget>,
-    ) => {
-      const result = await owner.persistence.reserveWarm(target)
-      reservations.push(result)
-      return Boolean(result)
-    }
-    const next = await f.start()
-    expect(sharedKeeper(f).manager).toBe(manager)
-    expect(owner.persistence).not.toBe(oldWriter)
-    const currentWriter = owner.persistence
-    await (lease === 'older' ? next : f).dispose()
-    const active = lease === 'older' ? f : next
-    expect(owner.persistence).toBe(currentWriter)
-    await owner.persistence.drain()
-    expect(owner.persistence.isCommitted('ses_oc2_keep')).toBe(true)
+test('OpenCode 2 reload replaces a boolean-protocol scheduler before retrying ownership', async () => {
+  const f = await fixture()
+  const startHour = new Date(f.now()).getHours()
+  await f.store.updateSettings((settings) => ({
+    ...settings,
+    cacheKeep: { enabled: true, startHour, endHour: (startHour + 3) % 24 },
+  }))
+  await f.live()
+  const owner = sharedKeeper(f)
+  const manager = owner.manager
+  const oldWriter = owner.persistence
+  // An older scheduler treats any truthy store result as a committed count.
+  const legacyReserve = spyOn(
+    Reflect.get(manager, 'options'),
+    'reserveWarm',
+  ).mockImplementation(async (target: Readonly<CacheKeepTarget>) =>
+    Boolean(await oldWriter.reserveWarm(target)),
+  )
+  const next = await f.reload()
+  const current = sharedKeeper(f)
+  expect(current.manager).not.toBe(manager)
+  expect(current.persistence).not.toBe(oldWriter)
+  await current.persistence.drain()
+  expect(current.persistence.isCommitted('ses_oc2_keep')).toBe(true)
 
-    const check = spyOn(
-      CacheKeepClaim.prototype,
-      'withCurrent',
-    ).mockRejectedValue(new Error('Could not verify the claim'))
-    try {
-      f.due()
-      await f.timers.fire()
-      expect(reservations).toEqual(['ownership-unverified'])
-      expect(active.sent).toHaveLength(0)
-      expect(manager.trackedRequest('ses_oc2_keep')).toBeDefined()
-    } finally {
-      check.mockRestore()
-    }
-
-    f.advance(20_000)
+  const check = spyOn(
+    CacheKeepClaim.prototype,
+    'withCurrent',
+  ).mockRejectedValue(new Error('Could not verify the claim'))
+  try {
+    f.due()
     await f.timers.fire()
-    expect(reservations).toEqual(['ownership-unverified', true])
-    expect(active.sent).toHaveLength(1)
-  },
-)
+    expect(check).toHaveBeenCalled()
+    expect(next.sent).toHaveLength(0)
+    expect(current.manager.trackedRequest('ses_oc2_keep')).toBeDefined()
+  } finally {
+    check.mockRestore()
+  }
+
+  f.advance(20_000)
+  await f.timers.fire()
+  expect(next.sent).toHaveLength(1)
+  expect(f.sent).toHaveLength(0)
+  expect(legacyReserve).not.toHaveBeenCalled()
+  legacyReserve.mockRestore()
+})
 
 test('OpenCode 2 reload cancels a warm already authorizing on the older lease', async () => {
   const create = sourceFactory.createNativeAnthropicSource
@@ -4234,12 +4357,17 @@ test('OpenCode 2 reload cancels a warm already authorizing on the older lease', 
   try {
     await Promise.race([entered.promise, warming])
     expect(paused).toBe(true)
-    const next = await f.start()
+    const next = await f.reload(false)
+    const current = sharedKeeper(f)
     resume.resolve()
     await warming
+    await Reflect.get(current, 'loading')
     expect(f.sent).toHaveLength(0)
     expect(next.sent).toHaveLength(0)
-    expect(Reflect.get(manager, 'targets').get('ses_oc2_keep')).toMatchObject({
+    expect(manager.trackedCount()).toBe(0)
+    expect(
+      Reflect.get(current.manager, 'targets').get('ses_oc2_keep'),
+    ).toMatchObject({
       consecutiveFailures: 0,
       policyState: { warmsSinceLastRealRequest: 0 },
     })
