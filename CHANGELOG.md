@@ -10,19 +10,14 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - An invalid sticky-routing state file is now set aside as a private backup and replaced, with one warning, instead of failing and logging on every routing write (#876).
 - After a revoked vault enrollment is replaced at the same path, the plugin uses the new enrollment without a restart (#877).
 - OpenCode 2: after a rate limit with no reset time, a newer quota check showing room again lets the session send again, instead of refusing until the session is forgotten (#878).
-
-## 2.16.6
-
 - OpenCode 1 CacheKeep can run a one-off prewarm again without dropping its normal account and destination checks.
 - Pi keep-warms no longer send the conversation's previous message ID to Claude.
-- Changing effort mid-conversation now preserves the prompt cache in OpenCode v1, OpenCode v2, and Pi for Claude Mythos 5.1 and 5.2, and for Claude Opus 5 and Haiku 5.5 when adaptive thinking is on.
 - OpenCode 1: idle sessions can keep warming a still-live Claude prompt cache after a server restart without resetting their budgets; `auto` keep-warm now uses the accepted prefix's token counts to price warms, even without a restart.
 - OpenCode 1: after a server restart, a threaded session's first full request can reuse the previous full request's cache boundary, as on OpenCode 2 and Pi.
 - OpenCode 1 and Pi: eligible direct CacheKeep requests now use gzip, like OpenCode 2, and resend uncompressed if gzip is rejected.
 - OpenCode 1: keep-warm requests no longer appear in cache diagnostics or replace the previous real response, as on OpenCode 2.
 - OpenCode 1 and Pi now send paid API-key requests like OpenCode 2, without adding a Claude Code prompt or billing signature or renaming tools. Claude subscription requests are unchanged.
 - OpenCode 1, OpenCode 2 and Pi always verify TLS for API-key requests to custom HTTPS addresses. The `ANTHROPIC_INSECURE` environment variable is gone.
-- Pi: changing thinking effort during a conversation now preserves the prompt cache on models that support per-message effort, including in conversations shortened by Magic Context.
 - OpenCode 2 now keeps custom proxy headers off Claude sign-in requests, like OpenCode 1 and Pi, while still sending them on API-key routes.
 - For conversation requests, OpenCode 2 now matches OpenCode 1: the first eligible request sends a null previous message ID, and cache results and beta lists appear in debug logs.
 - OpenCode 2: Claude subscription models now show zero token prices by default, like OpenCode 1. You can opt out to display catalogue prices; API-key prices are unchanged.
@@ -39,6 +34,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 - Pi now links cache diagnostics across conversation replies like OpenCode 1 and 2, with cache results and beta lists in the debug log.
 - OpenCode 2 now uses the five-minute Claude prompt cache by default, like OpenCode 1 and Pi. An explicit cache setting or Agent Runner session policy still takes precedence.
 - OpenCode 1 no longer publishes the optional quota header feed; quota readings still reach the vault. The `quota_header_feed_enabled` setting is gone and can be deleted from your settings file.
+
+## 2.16.6
+
+- Changing effort mid-conversation now preserves the prompt cache in OpenCode v1, OpenCode v2, and Pi for Claude Mythos 5.1 and 5.2, and for Claude Opus 5 and Haiku 5.5 when adaptive thinking is on.
+- Pi: changing thinking effort during a conversation now preserves the prompt cache on models that support per-message effort, including in conversations shortened by Magic Context.
 
 ## 2.16.5
 
