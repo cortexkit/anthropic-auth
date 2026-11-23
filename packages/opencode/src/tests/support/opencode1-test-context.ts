@@ -21,6 +21,7 @@ export type PoolLogin = { access: string; refresh: string; identity: string }
 
 export type PluginRuntimeOverrides = Partial<{
   authorize: typeof import('@cortexkit/anthropic-auth-core').authorize
+  now: () => number
   setTimeout: typeof globalThis.setTimeout
   clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval

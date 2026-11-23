@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { gunzip, gzip } from 'node:zlib'
+import { LockOwnershipError } from '@cortexkit/common-auth/fs'
 import { CACHE_KEEP_MAX_BODY_BYTES, type CacheKeepTarget } from './cachekeep.ts'
 import {
   ensureHolderDirectory,
@@ -175,9 +176,19 @@ export class CacheKeepClaim {
   async acquire() {
     if (this.held) return true
     await ensureHolderDirectory(this.directory, this.options.ownerOnly)
+    let retriedOwnershipLoss = false
     for (;;) {
-      const result = await this.tryAcquire()
-      if (result !== 'sweep') return result
+      try {
+        const result = await this.tryAcquire()
+        if (result !== 'sweep') return result
+      } catch (error) {
+        if (retriedOwnershipLoss || !(error instanceof LockOwnershipError))
+          throw error
+        // A wall-clock step or a suspend can expire the publication lock.
+        // Reacquire once and recheck whether another process claimed the session.
+        retriedOwnershipLoss = true
+        continue
+      }
       // A sweep only borrows ownership to inspect one record. A resuming
       // session waits in the background rather than abandoning its claim.
       await delay(25)
@@ -188,7 +199,15 @@ export class CacheKeepClaim {
     return withNativeLock(this.path, CLAIM_LOCK, async (lease) => {
       const existing = await this.read()
       const life = holderEntryLiveness(existing)
-      if (life && (await holderEntryIsLive(life, this.options.liveness)))
+      // Without an incarnation, a live PID still blocks takeover. A wall-clock
+      // correction is not evidence that its registration predates this boot.
+      if (
+        life &&
+        (await holderEntryIsLive(
+          { pid: life.pid, incarnation: life.incarnation },
+          this.options.liveness,
+        ))
+      )
         return this.purpose === 'session' && existing?.purpose === 'sweep'
           ? ('sweep' as const)
           : false

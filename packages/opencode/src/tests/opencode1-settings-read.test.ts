@@ -39,6 +39,7 @@ import {
   createOpencode1Test,
   createOpencode1TestContext,
   installOpencode1TestHooks,
+  type PluginRuntimeOverrides,
 } from './support/opencode1-test-context'
 import { MESSAGES_URL } from './test-fetch'
 
@@ -204,8 +205,16 @@ async function fixture(
       },
     ),
   ) as unknown as typeof fetch
-  const launch = async (directory?: string) => {
-    const plugin = await getPlugin(ctx, createMockClient(), directory)
+  const launch = async (
+    directory?: string,
+    runtimeOverrides?: PluginRuntimeOverrides,
+  ) => {
+    const plugin = await getPlugin(
+      ctx,
+      createMockClient(),
+      directory,
+      runtimeOverrides,
+    )
     const runtime = runtimes.at(-1)!
     const loader = await plugin.auth!.loader!(
       async () => ({
@@ -890,12 +899,7 @@ describe('OpenCode 1 user gateway', () => {
   }
 
   test('model and keep-warm requests go to the gateway as full uncompressed requests; nothing else does', async () => {
-    let now = 1_000
-    const realNow = Date.now
-    Date.now = mock(() => now) as unknown as typeof Date.now
-    cleanups.push(() => {
-      Date.now = realNow
-    })
+    let now = Date.now()
     const f = await fixture()
     await f.put({
       quota_enabled: 'off',
@@ -908,7 +912,7 @@ describe('OpenCode 1 user gateway', () => {
     })
     const seen = record()
     const records = logs()
-    const instance = await f.launch()
+    const instance = await f.launch(undefined, { now: () => now })
     const response = await instance.loader.fetch!(
       MESSAGES_URL,
       largeRequest('ses-oc1-gateway'),
@@ -1048,12 +1052,7 @@ describe('OpenCode 1 user gateway', () => {
     )
 
   test('gateway errors echoing a gateway header value are redacted for model and keep-warm sends, logs and dumps', async () => {
-    let now = 1_000
-    const realNow = Date.now
-    Date.now = mock(() => now) as unknown as typeof Date.now
-    cleanups.push(() => {
-      Date.now = realNow
-    })
+    let now = Date.now()
     const dumps = await fs.mkdtemp(join(ctx.migratedPool!.root, 'dumps-'))
     const previousDir = process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR
     process.env.OPENCODE_ANTHROPIC_AUTH_DUMP_DIR = dumps
@@ -1079,7 +1078,8 @@ describe('OpenCode 1 user gateway', () => {
       body.max_tokens === 0 ? echo(401) : undefined,
     )
     const records = logs()
-    const instance = await f.launch()
+    // Advance the scheduler without stepping the wall clock under the claim lock.
+    const instance = await f.launch(undefined, { now: () => now })
     const live = await instance.loader.fetch!(
       MESSAGES_URL,
       largeRequest('ses-oc1-gateway-redact'),
