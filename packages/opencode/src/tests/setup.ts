@@ -114,7 +114,12 @@ export function createGuardedFetch(
           request,
           // Bun's connection-pool opt-out is a fetch option, not a Request
           // property. Preserve it when rebuilding requests, including redirects.
-          { keepalive: init?.keepalive },
+          // Tests default to no pooling: every test starts its own loopback
+          // servers, and when the OS gives a new server a port an earlier,
+          // stopped server used, Bun reuses the stale pooled socket and the
+          // request fails with ECONNRESET. A test that needs pooling passes
+          // keepalive: true.
+          { keepalive: init?.keepalive ?? false },
         ])
         if (!REDIRECT_STATUSES.has(response.status)) return response
         const location = response.headers.get('location')
