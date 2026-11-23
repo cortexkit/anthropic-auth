@@ -318,6 +318,7 @@ export type NativeCustodyRetry =
 export interface NativeCustody {
   /** Authority lifetime only; replacing a relay does not retire issued tokens. */
   readonly generation?: number
+  readonly closed?: boolean
   discover: (signal?: AbortSignal) => Promise<NativeCustodyInventory>
   authorize: (
     identity: NativeCustodyIdentity,
@@ -716,6 +717,9 @@ export function createNativeCustody(
   const custody: NativeCustody = {
     get generation() {
       return generation
+    },
+    get closed() {
+      return closed
     },
     discover: (signal) =>
       run(async () => {

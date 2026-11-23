@@ -11,6 +11,7 @@ import {
   getMaxSameAccountWait,
   getQuotaCheckIntervalMs,
   getRoutingMode,
+  getScopedQuotaWindowForModel,
   getWaitForReset,
   isDumpPersistentlyEnabled,
   isQuotaBearingHeaderFrame,
@@ -38,6 +39,7 @@ import {
   type OAuthQuotaSnapshot,
   type ProviderAccountUuid,
   peekRoutingAccount,
+  quotaExhaustionFromHeaders,
   quotaRefusalDetails,
   quotaRefusalTiming,
   quotaSnapshotCheckedAt,
@@ -184,7 +186,7 @@ function stickyHold(
   counter: StickyQuotaRetryCounter,
   turnId: string,
   grant: (accountId: string, untilMs: number) => void,
-  responseHeaders?: Headers,
+  refusalFor: (account: NativeAccountView) => Headers | undefined,
 ): RetryHold | undefined {
   const refused = input.rerouteFrom
   if (
@@ -196,6 +198,7 @@ function stickyHold(
   const account = servable.find((row) => row.id === refused.accountId)
   // Only a current reading can show when the blocking windows reset.
   if (!account) return undefined
+  const responseHeaders = refusalFor(account)
   const decision = decideStickyQuotaFailure({
     quota:
       responseHeaders ||
@@ -424,7 +427,7 @@ export function createNativeAnthropicSource(
   const retries = new Map<string, Retry>()
   const refusalHeaders = new Map<
     string,
-    { sessionID: string; headers: Headers }
+    { sessionID: string; headers: Headers; receivedAt: number }
   >()
   const recoveries = new Map<string, Retry[]>()
   const sessions = new Map<string, AbortController>()
@@ -508,6 +511,64 @@ export function createNativeAnthropicSource(
     (account.type === 'api' ||
       routingRelay.policy(sessionID, account, snapshot, remapModelId(modelID))
         .status === 'allowed')
+
+  const refusalInForce = (
+    scope: RequestScope,
+    account: NativeAccountView,
+    modelID: string,
+    now: number,
+  ) => {
+    const refusalKey = key({ ...scope, modelID }, account.id)
+    const refusal = refusalHeaders.get(refusalKey)
+    if (!refusal || !account.quota) return refusal?.headers
+    const rejected = quotaExhaustionFromHeaders(
+      refusal.headers,
+      modelID,
+      refusal.receivedAt,
+    )
+    const scoped = rejected.scoped?.[0]
+    let headers: Headers | undefined
+    // A refusal without a reset can outlive the turn that saw it. Only a later
+    // reading of the same window can show that the refusal no longer applies.
+    for (const [suffix, refused, current] of [
+      ['5h', rejected.five_hour, account.quota.five_hour],
+      ['7d', rejected.seven_day, account.quota.seven_day],
+      [
+        scoped?.id,
+        scoped,
+        getScopedQuotaWindowForModel(account.quota, modelID),
+      ],
+    ] as const) {
+      if (
+        !suffix ||
+        !refused ||
+        refused.resetsAt ||
+        !current ||
+        !(current.checkedAt > refusal.receivedAt) ||
+        !Number.isFinite(current.remainingPercent) ||
+        current.remainingPercent <= 0
+      )
+        continue
+      headers ??= new Headers(refusal.headers)
+      headers.delete(`anthropic-ratelimit-unified-${suffix}-status`)
+      headers.delete(`anthropic-ratelimit-unified-${suffix}-utilization`)
+    }
+    if (!headers) return refusal.headers
+    if (
+      stickyQuotaBlockerInForce({
+        quota: undefined,
+        responseHeaders: headers,
+        modelId: modelID,
+        now,
+      })
+    ) {
+      refusal.headers = headers
+      return headers
+    }
+    refusalHeaders.delete(refusalKey)
+    return undefined
+  }
+
   /**
    * Confirmed exhaustion that keeps `account` from serving this request until
    * a reset, read from the same evidence a sticky hold decision uses: the raw
@@ -530,9 +591,7 @@ export function createNativeAnthropicSource(
       now < held.untilMs
     )
       return undefined
-    const responseHeaders = refusalHeaders.get(
-      key({ ...scope, modelID }, account.id),
-    )?.headers
+    const responseHeaders = refusalInForce(scope, account, modelID, now)
     return stickyQuotaBlockerInForce({
       quota:
         responseHeaders ||
@@ -1210,11 +1269,7 @@ export function createNativeAnthropicSource(
         turnIds.get(input.sessionID) ?? input.kind,
         (accountId, untilMs) =>
           grantedHolds.set(input.sessionID, { accountId, untilMs }),
-        input.rerouteFrom
-          ? refusalHeaders.get(
-              key({ ...input, modelID }, input.rerouteFrom.accountId),
-            )?.headers
-          : undefined,
+        (account) => refusalInForce(input, account, modelID, Date.now()),
       )
       if (hold) return hold
       // After considering holds, leave out the last refuser and any account
@@ -1901,6 +1956,7 @@ export function createNativeAnthropicSource(
       }
     },
     quotaFromHeaders(headers, input) {
+      const receivedAt = Date.now()
       options.onResponseHeaders?.(input)
       const state = states.get(input.provenance)
       const cacheAttempt = cacheAttempts.get(input.attemptId)
@@ -1934,6 +1990,7 @@ export function createNativeAnthropicSource(
           refusalHeaders.set(refusalKey, {
             sessionID: input.sessionID,
             headers,
+            receivedAt,
           })
           if (refusalHeaders.size > 512) {
             const oldest = refusalHeaders.keys().next().value
@@ -1975,7 +2032,7 @@ export function createNativeAnthropicSource(
           ? input.provenance.subject.binding.identity
           : state.receipt?.assertedAccountIdentity
       const incoming = {
-        ...normalizeQuotaHeaders(headers),
+        ...normalizeQuotaHeaders(headers, receivedAt),
         ...(identity ? { accountIdentity: identity } : {}),
       }
       const quota = mergeHeaderQuotaForPersistence(state.quota, incoming)

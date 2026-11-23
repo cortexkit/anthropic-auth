@@ -1,6 +1,14 @@
 import { expect } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
@@ -56,6 +64,20 @@ async function fixture() {
     return lease
   }
   return { directory, path, router, hold }
+}
+
+function stickyWarnings() {
+  const records: LogTestRecord[] = []
+  const previous = getLogLevel()
+  setLogLevel('warn')
+  __setLogTestSink((record) => {
+    if (record.channel === 'sticky-routing') records.push(record)
+  })
+  lifetimes.deferCleanup(() => {
+    __setLogTestSink(null)
+    setLogLevel(previous)
+  })
+  return records
 }
 
 lifetimes.test(
@@ -217,6 +239,135 @@ for (const operation of ['assign', 'clear', 'seed'] as const) {
     },
   )
 }
+
+lifetimes.test(
+  'sticky routing preserves invalid state once and persists new assignments',
+  async () => {
+    const f = await fixture()
+    const invalid = '{"version":2,"assignments":{}}\n'
+    await writeFile(f.path, invalid, { mode: 0o644 })
+    const records = stickyWarnings()
+
+    const router = f.router()
+    expect((await router.resolve(input('first')))?.accountId).toBe('main')
+    await router.drain()
+    const another = f.router()
+    expect((await another.resolve(input('second', 'other')))?.accountId).toBe(
+      'other',
+    )
+    await another.drain()
+
+    const state = JSON.parse(await readFile(f.path, 'utf8'))
+    expect(state.version).toBe(1)
+    expect(state.assignments[key('first')].accountId).toBe('main')
+    expect(state.assignments[key('second')].accountId).toBe('other')
+    const backups = (await readdir(f.directory)).filter((name) =>
+      name.startsWith('routing.json.invalid-'),
+    )
+    expect(backups).toHaveLength(1)
+    const [backupName] = backups
+    if (!backupName) throw new Error('Invalid state backup missing')
+    const backup = join(f.directory, backupName)
+    expect(await readFile(backup, 'utf8')).toBe(invalid)
+    expect((await stat(backup)).mode & 0o777).toBe(0o600)
+    expect(records.map((record) => record.message)).toEqual([
+      'invalid state set aside',
+    ])
+  },
+)
+
+lifetimes.test(
+  'sticky routing serves requests without waiting and rechecks invalid state after contention',
+  async () => {
+    const f = await fixture()
+    const records = stickyWarnings()
+    const contended = lifetimes.gate()
+    const router = f.router((event) => {
+      if (event.detached && event.type === 'contended') contended.open()
+    })
+    await router.resolve(input('existing'))
+    await router.drain()
+    const valid = await readFile(f.path, 'utf8')
+    const invalid = '{'
+    const held = await f.hold()
+    try {
+      await writeFile(f.path, invalid)
+      expect(await router.readAssignment('existing')).toBeUndefined()
+      expect(
+        await router.resolve({ ...input('existing'), candidates: [] }),
+      ).toBeNull()
+      expect(records).toEqual([])
+      expect((await router.resolve(input('new', 'other')))?.accountId).toBe(
+        'other',
+      )
+      await contended.wait
+      expect(await readFile(f.path, 'utf8')).toBe(invalid)
+      await held.assertOwned()
+      await writeFile(f.path, valid)
+    } finally {
+      await held.release()
+    }
+    await router.drain()
+    const state = JSON.parse(await readFile(f.path, 'utf8'))
+    expect(state.assignments[key('existing')].accountId).toBe('main')
+    expect(state.assignments[key('new')].accountId).toBe('other')
+    expect(await readdir(f.directory)).toEqual(['routing.json'])
+    expect(records).toEqual([])
+  },
+)
+
+lifetimes.test(
+  'sticky routing still reports an unreadable state without setting it aside',
+  async () => {
+    const f = await fixture()
+    await mkdir(f.path)
+    const records = stickyWarnings()
+    const router = f.router()
+    expect((await router.resolve(input('unreadable')))?.accountId).toBe('main')
+    await router.drain()
+    expect((await stat(f.path)).isDirectory()).toBe(true)
+    expect(await readdir(f.directory)).toEqual(['routing.json'])
+    expect(records).toMatchObject([
+      {
+        message: 'assignment write refused',
+        payload: { operation: 'assign', reason: 'storage-unavailable' },
+      },
+    ])
+  },
+)
+
+lifetimes.test(
+  'sticky routing warns once for invalid bytes when repair keeps failing',
+  async () => {
+    const f = await fixture()
+    const invalid = '{"version":2}'
+    await writeFile(f.path, invalid)
+    const records = stickyWarnings()
+    let attempts = 0
+    for (const sessionId of ['one', 'two']) {
+      const router = new StickySessionRouter({
+        path: f.path,
+        relocationGuard: {
+          assertNotRelocated: async () => {
+            attempts++
+            throw new Error('routing state relocated')
+          },
+        },
+      })
+      try {
+        expect((await router.resolve(input(sessionId)))?.accountId).toBe('main')
+      } finally {
+        await router.drain()
+      }
+    }
+    expect(attempts).toBe(2)
+    expect(await readFile(f.path, 'utf8')).toBe(invalid)
+    expect(await readdir(f.directory)).toEqual(['routing.json'])
+    expect(records.map((record) => record.message)).toEqual([
+      'invalid state could not be set aside',
+    ])
+  },
+)
 
 lifetimes.test(
   'failed sticky publication logs once, preserves its choice, and retries on the next resolve',

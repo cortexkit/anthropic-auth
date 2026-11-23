@@ -1,5 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { readVaultRoster } from '@cortexkit/common-auth/claustrum'
 import {
@@ -835,6 +844,9 @@ export function stickyRetryAfterWithJitter(
 
 // Share recovery attempts across router instances, including concurrent plugin loads.
 const localRecoveries = new Map<string, Promise<void>>()
+const warnedInvalidStates = new Set<string>()
+
+class InvalidStateRepairError extends Error {}
 
 export class StickySessionRouter {
   private loaded = false
@@ -875,24 +887,60 @@ export class StickySessionRouter {
     return this.options.now?.() ?? Date.now()
   }
 
-  private async readState() {
-    try {
-      const raw = await readFile(this.options.path, 'utf8')
-      const normalized = normalizeState(JSON.parse(raw))
-      if (!normalized) {
-        throw new Error(`Invalid sticky routing state at ${this.options.path}`)
-      }
-      return normalized
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return {
-          ...emptyState(this.now()),
-          ...(this.options.vaultSeed
-            ? { vaultLegacySeed: 'pending' as const }
-            : {}),
-        }
-      }
+  private async readState(lock?: { assertOwned(): Promise<void> }) {
+    const raw = await readFile(this.options.path).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
       throw error
+    })
+    if (raw !== undefined) {
+      let normalized: StickyRouteState | undefined
+      try {
+        normalized = normalizeState(JSON.parse(raw.toString('utf8')))
+      } catch {
+        // Malformed bytes are invalid state, unlike a failed disk read.
+      }
+      if (normalized) return normalized
+      // Request reads never take the routing lock. Only a publisher holding
+      // it can move the invalid file it just read under that lock.
+      if (lock) await this.setAsideInvalidState(raw, lock)
+    }
+    return {
+      ...emptyState(this.now()),
+      ...(this.options.vaultSeed
+        ? { vaultLegacySeed: 'pending' as const }
+        : {}),
+    }
+  }
+
+  private async setAsideInvalidState(
+    raw: Buffer,
+    lock: { assertOwned(): Promise<void> },
+  ) {
+    const { path, relocationGuard } = this.options
+    let moved = false
+    try {
+      await relocationGuard?.assertNotRelocated()
+      const file = await lstat(path)
+      // Do not chmod a symlink target or keep a symlink as a private backup.
+      if (!file.isFile()) throw new Error('Routing state is not a regular file')
+      await lock.assertOwned()
+      await chmod(path, 0o600)
+      await lock.assertOwned()
+      await rename(path, `${path}.invalid-${this.now()}-${randomUUID()}`)
+      moved = true
+    } catch (cause) {
+      throw new InvalidStateRepairError(undefined, { cause })
+    } finally {
+      const key = `${path}\0${createHash('sha256').update(raw).digest('hex')}`
+      if (!warnedInvalidStates.has(key)) {
+        warnedInvalidStates.add(key)
+        logger.warn(
+          'sticky-routing',
+          moved
+            ? 'invalid state set aside'
+            : 'invalid state could not be set aside',
+        )
+      }
     }
   }
 
@@ -987,7 +1035,7 @@ export class StickySessionRouter {
         throw error
       }
       if (!legacy) return
-      const state = await this.readState()
+      const state = await this.readState(lock)
       let changed = false
       for (const [key, assignment] of Object.entries(legacy.assignments)) {
         if (
@@ -1095,7 +1143,7 @@ export class StickySessionRouter {
       if (!roster?.complete) return
       const lock = await this.acquireLock(true, true)
       try {
-        const state = await this.readState()
+        const state = await this.readState(lock)
         if (state.vaultLegacySeed !== 'pending') {
           this.seedFinalized = true
           return
@@ -1163,7 +1211,8 @@ export class StickySessionRouter {
   }
 
   private enqueuePublication(operation: string, work: () => Promise<void>) {
-    const pending = this.publicationChain.then(work).catch(() => {
+    const pending = this.publicationChain.then(work).catch((error) => {
+      if (error instanceof InvalidStateRepairError) return
       if (operation === 'recovery') {
         logger.warn('sticky-routing', 'local pin recovery unavailable', {
           reason: 'recovery-failed',
@@ -1202,7 +1251,7 @@ export class StickySessionRouter {
       if (this.changes.get(key) !== change) return
       const lock = await this.acquireLock(true, true)
       try {
-        const state = await this.readState()
+        const state = await this.readState(lock)
         // A reset or reassignment may supersede a change while publication waits.
         if (this.changes.get(key) !== change) return
         // Re-read under the publication lease and merge only this session, so
