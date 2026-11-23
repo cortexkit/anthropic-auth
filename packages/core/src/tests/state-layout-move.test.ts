@@ -18,7 +18,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { withLock } from '@cortexkit/common-auth/fs'
 import type { OAuthQuotaSnapshot } from '../accounts.ts'
 import type { ProviderAccountUuid } from '../claude-code.ts'
@@ -27,6 +27,7 @@ import {
   type HolderLiveness,
   HolderRegistrationError,
   resetNativeHolderRegistryForTests,
+  stateRefusalPublicMessage,
 } from '../holder-registry.ts'
 import type { PreNArtifactLocations } from '../layout-fence.ts'
 import { __setLogTestSink, type LogTestRecord } from '../logger.ts'
@@ -54,7 +55,10 @@ import {
   type StateLayoutDecision,
   unmovedRegistrationPolicy,
 } from '../state-layout-decision.ts'
-import { StateLayoutRefusalError } from '../state-layout-errors.ts'
+import {
+  StateLayoutRefusalError,
+  stateLayoutRefusalPublicMessage,
+} from '../state-layout-errors.ts'
 import {
   defaultStateLayoutFs,
   type StateLayoutFs,
@@ -1773,6 +1777,74 @@ test('a start under another XDG_STATE_HOME that waited for the old holder lock w
   expect(JSON.parse(holders).entries).not.toContainEqual(
     expect.objectContaining({ kind: 'legacy' }),
   )
+})
+
+test('a start under another XDG_STATE_HOME refuses while a move to the usual state folder stopped after setting the journal aside', async () => {
+  const m = await machine()
+  const otherRoot = join(m.root, 'other-state')
+  const otherSub = join(otherRoot, 'cortexkit', 'anthropic-auth', 'opencode')
+  // The first mover stops after setting the journal aside, before either
+  // runtime tombstone: only its own state folder records the move.
+  await expect(
+    decide(m, { onStep: crashAt('journal-set-aside') }),
+  ).rejects.toBeInstanceOf(StateLayoutCrash)
+  const record = await readStateLayoutRecord(m.sub)
+  expect(record?.phase).toBe('preparing')
+  const moving = `${m.oldPaths.journal}.moving-${record?.attempt}`
+  expect(await exists(moving)).toBe(true)
+  expect(await exists(m.oldPaths.journal)).toBe(false)
+  const before = await oldTree(m)
+
+  // A second start with another state folder must not move the dataset
+  // without its journal, or adopt or remove the other attempt's files.
+  const second = decide(m, { env: { XDG_STATE_HOME: otherRoot } })
+  await expect(second).rejects.toMatchObject({
+    code: 'move-unfinished-elsewhere',
+  })
+  await expect(second).rejects.toThrow(moving)
+  const refusal = await second.catch((error: unknown) => error)
+  expect(refusal).toBeInstanceOf(StateLayoutRefusalError)
+  const shown = stateRefusalPublicMessage(refusal)
+  expect(shown).toBe(
+    stateLayoutRefusalPublicMessage('move-unfinished-elsewhere'),
+  )
+  expect(shown).not.toContain(record?.attempt as string)
+  expect(await oldTree(m)).toEqual(before)
+  expect(await readFile(moving, 'utf8')).toBe(m.original.journal as string)
+  expect(await readRelocationPointer(m.oldPaths.runtime)).toBeUndefined()
+  expect(await exists(join(otherSub, 'layout.json'))).toBe(false)
+  expect(processStateLayout(m.oldPaths.legacyConfig)).toBe(LEGACY_STATE_LAYOUT)
+
+  // The original setting rolls the first move back and then finishes a move.
+  expect((await decide(m)).kind).toBe('state-home')
+  expect(await exists(moving)).toBe(false)
+  expect(await readFile(m.newPaths.journal, 'utf8')).toBe(
+    m.original.journal as string,
+  )
+  expect(await usableCopies(m)).toEqual(['state-home'])
+})
+
+test('under another XDG_STATE_HOME, a start recovers its own move that stopped after setting the journal aside', async () => {
+  const m = await machine()
+  const otherRoot = join(m.root, 'other-state')
+  const otherSub = join(otherRoot, 'cortexkit', 'anthropic-auth', 'opencode')
+  const env = { XDG_STATE_HOME: otherRoot }
+  await expect(
+    decide(m, { env, onStep: crashAt('journal-set-aside') }),
+  ).rejects.toBeInstanceOf(StateLayoutCrash)
+  const record = await readStateLayoutRecord(otherSub)
+  expect(record?.phase).toBe('preparing')
+  const moving = `${m.oldPaths.journal}.moving-${record?.attempt}`
+  expect(await exists(moving)).toBe(true)
+
+  // Its own preparing record rolls the journal back before the check runs.
+  const decision = await decide(m, { env })
+  expect(decision.kind).toBe('state-home')
+  expect(decision.layout).toEqual({ kind: 'state-home', dir: otherSub })
+  expect(await exists(moving)).toBe(false)
+  expect(
+    await readFile(join(otherSub, basename(m.oldPaths.journal)), 'utf8'),
+  ).toBe(m.original.journal as string)
 })
 
 test('a state-home process whose registration fails refuses and never falls back to legacy', async () => {

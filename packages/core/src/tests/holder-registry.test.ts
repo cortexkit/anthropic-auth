@@ -295,6 +295,71 @@ test('an unreadable incarnation counts as alive and a matching one is never clea
   ).toBe(false)
 })
 
+test('a matching incarnation keeps a holder live after the wall clock is corrected forward', async () => {
+  // The process registered one minute after boot while the wall clock was an
+  // hour slow. Two hours later the clock has been corrected, so the recorded
+  // time now looks older than this boot.
+  const boot = Date.UTC(2026, 0, 2, 11)
+  const registeredAt = boot + 60_000 - 3_600_000
+  const now = boot + 2 * 3_600_000
+  const clock = { now: () => now, uptime: () => 2 * 3_600 }
+  const pid = 910020
+  const at = (incarnation: string | null): HolderLiveness => ({
+    ...liveness({ incarnations: { [pid]: incarnation } }),
+    ...clock,
+  })
+  const entry = { pid, incarnation: 'started-once', registeredAt }
+
+  expect(await holderEntryIsLive(entry, at('started-once'))).toBe(true)
+  // A known different incarnation is a reused pid.
+  expect(await holderEntryIsLive(entry, at('another'))).toBe(false)
+  // Without a provable incarnation the before-this-boot rule decides.
+  expect(await holderEntryIsLive(entry, at(null))).toBe(false)
+  expect(
+    await holderEntryIsLive(
+      { ...entry, incarnation: null },
+      at('started-once'),
+    ),
+  ).toBe(false)
+  // A dead pid is stale whatever its incarnation.
+  expect(
+    await holderEntryIsLive(entry, {
+      ...at('started-once'),
+      pidAlive: () => false,
+    }),
+  ).toBe(false)
+  // Missing or unusable times keep the entry when nothing else proves it gone.
+  for (const time of [undefined, 'soon', -1, now + 60_000])
+    expect(
+      await holderEntryIsLive(
+        { pid, incarnation: null, registeredAt: time },
+        at(null),
+      ),
+    ).toBe(true)
+
+  // The next locked write keeps the live entry instead of pruning it.
+  const dir = await folder('opencode')
+  const paths = await dataset(dir)
+  const holder = {
+    ...entry,
+    instance: 'registered-before-the-clock-step',
+    role: 'opencode2',
+    release: '2.16.5',
+    kind: 'legacy',
+    identity: dir,
+    files: nativeHolderDatasetFiles(paths),
+  }
+  await writeFile(
+    join(dir, HOLDER_FILE_NAME),
+    JSON.stringify({ version: 1, entries: [holder] }),
+  )
+  await register(paths, { liveness: at('started-once'), now: () => now })
+  expect((await holders(dir)).entries.map((value) => value.pid)).toEqual([
+    pid,
+    process.pid,
+  ])
+})
+
 test('a malformed holder file is never overwritten; an ordinary process keeps serving, logs once and retries', async () => {
   const dir = await folder('opencode')
   const paths = await dataset(dir)
