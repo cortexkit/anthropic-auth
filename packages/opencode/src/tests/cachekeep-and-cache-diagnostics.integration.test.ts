@@ -7,6 +7,7 @@ import {
   __setLogTestSink,
   type AccountStorage,
   CacheKeepManager,
+  CacheKeepStore,
   type CommandApplyRequest,
   type CommandApplyResult,
   cacheKeepStoreDirectory,
@@ -208,6 +209,9 @@ describe('auth.loader', () => {
     const managers = plugins.map(
       (plugin) => getPluginTestHandles(plugin).cacheKeepManager,
     )
+    await Promise.all(
+      plugins.map((p) => getPluginTestHandles(p).drainDispatchWork()),
+    )
     expect(
       managers
         .flatMap((manager) => manager.trackedSessions())
@@ -238,6 +242,7 @@ describe('auth.loader', () => {
     expect(updated.policyState.warmCostSoFar).toBeGreaterThan(0)
     expect(updated.cacheExpiresAt).toBeGreaterThan(saved.cacheExpiresAt)
     const restarted = await getPlugin(undefined, '/third-project')
+    await getPluginTestHandles(restarted).drainDispatchWork()
     const restored =
       getPluginTestHandles(restarted).cacheKeepManager.trackedPolicyState(
         sessionId,
@@ -246,6 +251,57 @@ describe('auth.loader', () => {
       warmsSinceLastRealRequest: 1,
       warmCostSoFar: updated.policyState.warmCostSoFar,
     })
+  })
+
+  test('OC1 dispatches the first request without waiting for restart restoration', async () => {
+    await warmFixture()
+    globalThis.fetch = mock(
+      withNativeAdmission(() =>
+        Response.json({ usage: { cache_read_input_tokens: 1500 } }),
+      ),
+    ) as unknown as typeof fetch
+    const sessionId = 'oc1-late-restore'
+    const original = await getPlugin()
+    await acceptRequest(original, sessionId, 'saved prefix')
+    await original.dispose()
+    testContext.livePlugins.delete(original)
+
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const load = CacheKeepStore.prototype.load
+    const scan = spyOn(CacheKeepStore.prototype, 'load').mockImplementation(
+      async function (this: CacheKeepStore, ...args) {
+        entered.resolve()
+        await release.promise
+        return load.apply(this, args)
+      },
+    )
+    const firstRequest = (async () => {
+      const plugin = await getPlugin(undefined, '/late-restore')
+      await acceptRequest(plugin, sessionId, 'first live prefix')
+      return getPluginTestHandles(plugin)
+    })()
+    let cancelDeadline = () => {}
+    let finished: Awaited<typeof firstRequest> | undefined
+    try {
+      await entered.promise
+      finished = await Promise.race([
+        firstRequest,
+        new Promise<undefined>((resolve) => {
+          const deadline = setTimeout(resolve, 1500)
+          cancelDeadline = () => clearTimeout(deadline)
+        }),
+      ])
+    } finally {
+      cancelDeadline()
+      release.resolve()
+      scan.mockRestore()
+      await (await firstRequest).drainDispatchWork()
+    }
+    expect(finished).toBeDefined()
+    expect(
+      finished?.cacheKeepManager.trackedRequest(sessionId)?.bodyText,
+    ).toContain('first live prefix')
   })
 
   test('OC1 reuses the previous full cache boundary after a thread restart', async () => {

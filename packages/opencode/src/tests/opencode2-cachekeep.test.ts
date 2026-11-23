@@ -7,6 +7,7 @@ import {
   readFile,
   rename,
   rm,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -57,7 +58,7 @@ import {
 import * as cacheKeepFactory from '../v2/cachekeep'
 import { createNativeCacheKeep } from '../v2/cachekeep'
 import {
-  type CacheKeepStore,
+  CacheKeepStore,
   cacheKeepStoreDirectory,
   legacyCacheKeepStoreDirectory,
 } from '../v2/cachekeep-store'
@@ -326,7 +327,10 @@ async function fixture(
       recursive: true,
       mode: 0o755,
     })
-  const start = async (enrollmentFile = 'enrollment.json') => {
+  const start = async (
+    enrollmentFile = 'enrollment.json',
+    waitForRestore = true,
+  ) => {
     const hooks = new Map<string, Array<(draft: any) => unknown>>()
     const registration = { dispose: async () => {} }
     const ctx = {
@@ -404,6 +408,10 @@ async function fixture(
       },
     })
     cleanups.push(dispose)
+    if (waitForRestore) {
+      const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+      await (globalThis as any)[key]?.get(paths.storageId)?.loading
+    }
     const prepare = async (
       url = 'https://api.anthropic.com/v1/messages',
       extra: Record<string, unknown> = {},
@@ -1566,10 +1574,12 @@ test('OC2 last-lease disposal aborts and joins a due-timer restored delay before
     expect(active.sent).toHaveLength(0)
     const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
     const owner = (globalThis as any)[key].get(f.paths.storageId)
-    expect(owner.manager.trackedCount()).toBe(1)
+    expect(owner.manager.trackedCount()).toBe(0)
     expect(
       (await readdir(f.disk)).filter((name) => name.endsWith('.json.gz')),
     ).toHaveLength(1)
+    await f.start()
+    expect(owner.manager.trackedCount()).toBe(1)
   } finally {
     release?.()
     await stopping
@@ -1748,6 +1758,55 @@ test('an OpenCode 2 instance that boots after the last one was disposed keeps wa
   expect(next.sent).toHaveLength(1)
   expect(next.sent[0]!.headers.get('authorization')).toBe(
     'Bearer sk-ant-oat01-first',
+  )
+})
+
+test('OC2 dispatches the first request without waiting for restart restoration', async () => {
+  const f = await fixture()
+  await f.live(undefined, {
+    messages: [{ role: 'user', content: 'saved prefix' }],
+  })
+  await f.dispose()
+
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const load = CacheKeepStore.prototype.load
+  const scan = spyOn(CacheKeepStore.prototype, 'load').mockImplementation(
+    async function (this: CacheKeepStore, ...args) {
+      entered.resolve()
+      await release.promise
+      return load.apply(this, args)
+    },
+  )
+  const firstRequest = (async () => {
+    const next = await f.start(undefined, false)
+    await next.live(undefined, {
+      messages: [{ role: 'user', content: 'first live prefix' }],
+    })
+    return true
+  })()
+  const key = Symbol.for('cortexkit.anthropic-auth.opencode2.cachekeep.v2')
+  const owner = (globalThis as any)[key].get(f.paths.storageId)
+  let deadline: ReturnType<typeof setTimeout> | undefined
+  let finished = false
+  try {
+    await entered.promise
+    finished = await Promise.race([
+      firstRequest,
+      new Promise<boolean>((resolve) => {
+        deadline = setTimeout(() => resolve(false), 1500)
+      }),
+    ])
+  } finally {
+    clearTimeout(deadline)
+    release.resolve()
+    scan.mockRestore()
+    await firstRequest
+    await owner.loading
+  }
+  expect(finished).toBe(true)
+  expect(owner.manager.trackedRequest('ses_oc2_keep')?.bodyText).toContain(
+    'first live prefix',
   )
 })
 
@@ -2367,8 +2426,10 @@ test.each([
     )
     const droppedName =
       change === 'unfinished-write' ? `${name!}.1234.tmp` : name!
-    if (change === 'unfinished-write')
+    if (change === 'unfinished-write') {
       await rename(path, join(f.disk, droppedName))
+      await utimes(join(f.disk, droppedName), 0, 0)
+    }
     if (change === 'unsafe-file') await chmod(path, 0o644)
     forgetCacheKeepProcess(f.paths.storageId)
     lines.length = 0
@@ -3001,11 +3062,16 @@ test('hybrid-disabled request dispatch never waits on a held restart write', asy
     await owner.localCleanup
     drain.mockRestore()
     await owner.persistence.drain()
-    const retained: string[] = []
-    await owner.persistence.load(f.now(), (entry: { id: string }) => {
-      retained.push(entry.id)
-      return undefined
-    })
+    const files = (await readdir(f.disk)).filter((name) =>
+      name.endsWith('.json.gz'),
+    )
+    const retained = await Promise.all(
+      files.map(
+        async (file) =>
+          JSON.parse(gunzipSync(await readFile(join(f.disk, file))).toString())
+            .id,
+      ),
+    )
     expect(retained).toEqual(['ses_oc2_keep'])
   } finally {
     clearTimeout(timeout)

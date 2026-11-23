@@ -7,6 +7,7 @@ import {
   rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -71,6 +72,33 @@ test('restart storage defaults to a hashed private data folder, never the config
   expect(basename(path)).toMatch(/^[a-f0-9]{16}$/)
   expect(path).not.toContain('my-account')
   expect(cacheKeepStoreDirectory('another-account')).not.toBe(path)
+})
+
+test('a restart scan preserves a writer’s new temporary file but removes old leftovers', async () => {
+  const f = await fixture()
+  f.store.changed(f.target)
+  await f.store.drain()
+  const [name] = await readdir(f.store.directory)
+  const published = join(f.store.directory, name!)
+  const writing = `${published}.1234.tmp`
+  const abandoned = `${published}.5678.tmp`
+  await rename(published, writing)
+  await writeFile(abandoned, 'abandoned', { mode: 0o600 })
+  await utimes(abandoned, 0, 0)
+
+  const scanning = new CacheKeepStore({ storageId: 'store', root: f.root })
+  const restored: string[] = []
+  const scan = () =>
+    scanning.load(Date.now(), (entry) => {
+      restored.push(entry.id)
+      return true
+    })
+  await scan()
+  expect(await readdir(f.store.directory)).toEqual([basename(writing)])
+  expect(restored).toEqual([])
+  await rename(writing, published)
+  await scan()
+  expect(restored).toEqual([f.target.id])
 })
 
 test('restart files exclude headers and credential fields, use gzip and owner-only modes', async () => {

@@ -3,11 +3,20 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { gunzip, gzip } from 'node:zlib'
 import { CACHE_KEEP_MAX_BODY_BYTES, type CacheKeepTarget } from './cachekeep.ts'
+import {
+  ensureHolderDirectory,
+  type HolderLiveness,
+  holderEntryIsLive,
+  holderEntryLiveness,
+  processIncarnation,
+} from './holder-registry.ts'
 import { getHostDataHome } from './host-paths.ts'
 import { logger } from './logger.ts'
+import { withNativeLock } from './native-lock-observer.ts'
 import {
   createWindowsOwnerOnly,
   ensureWindowsOwnerOnlyDirectory,
@@ -22,6 +31,7 @@ const decompress = promisify(gunzip)
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const FILE = /^[a-f0-9]{64}\.json\.gz$/
 const TEMP = /^[a-f0-9]{64}\.json\.gz\.[a-f0-9-]+\.tmp$/
+const TEMP_STALE_MS = 60 * 60 * 1000
 const MAX_RECORD_BYTES = 2 * CACHE_KEEP_MAX_BODY_BYTES + 64 * 1024
 // Replay compatibility depends only on the record format, not the plugin
 // version. Bump this for format changes; the loader must accept or migrate the
@@ -92,6 +102,142 @@ type Acceptance =
 export type CacheKeepStoreRelease = (() => Promise<void>) & {
   /** Pure ownership check, repeated immediately before unlinking. */
   canRemove?: () => boolean | Promise<boolean>
+}
+
+const CLAIM_LOCK = {
+  name: 'cachekeep-session',
+  ttlMs: 10_000,
+  timeoutMs: 2000,
+  renew: true,
+}
+
+/** A process-lifetime claim, not a timer lease that can expire during a pause. */
+export class CacheKeepClaim {
+  private readonly token = randomUUID()
+  private readonly path: string
+  private readonly purpose: 'session' | 'sweep'
+  private held = false
+
+  constructor(
+    private readonly directory: string,
+    sessionId: string,
+    private readonly options: {
+      ownerOnly?: OwnerOnlyOptions
+      liveness?: HolderLiveness
+      sessionHash?: boolean
+      purpose?: 'session' | 'sweep'
+    } = {},
+  ) {
+    const key = options.sessionHash ? sessionId : hash(sessionId)
+    if (!/^[a-f0-9]{64}$/.test(key)) throw new Error('Invalid session hash')
+    this.path = join(directory, `${key}.claim.json`)
+    this.purpose =
+      options.purpose ?? (options.sessionHash ? 'sweep' : 'session')
+  }
+
+  private async read(): Promise<Record<string, unknown> | undefined> {
+    try {
+      const stat = await lstat(this.path)
+      if (
+        !stat.isFile() ||
+        stat.isSymbolicLink() ||
+        stat.size > 4096 ||
+        !(await isOwnerOnly(
+          this.path,
+          () =>
+            stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o600,
+          this.options.ownerOnly,
+        ))
+      )
+        throw new Error('Unsafe CacheKeep claim')
+      let bytes = await readWindowsOwnerOnly(this.path, this.options.ownerOnly)
+      if (!bytes) {
+        const file = await open(
+          this.path,
+          constants.O_RDONLY | constants.O_NOFOLLOW,
+        )
+        try {
+          bytes = await file.readFile()
+        } finally {
+          await file.close()
+        }
+      }
+      const value = JSON.parse(bytes.toString())
+      if (!holderEntryLiveness(value) || typeof value.token !== 'string')
+        throw new Error('Invalid CacheKeep claim')
+      return value
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+  }
+
+  async acquire() {
+    if (this.held) return true
+    await ensureHolderDirectory(this.directory, this.options.ownerOnly)
+    for (;;) {
+      const result = await this.tryAcquire()
+      if (result !== 'sweep') return result
+      // A sweep only borrows ownership to inspect one record. A resuming
+      // session waits in the background rather than abandoning its claim.
+      await delay(25)
+    }
+  }
+
+  private tryAcquire() {
+    return withNativeLock(this.path, CLAIM_LOCK, async (lease) => {
+      const existing = await this.read()
+      const life = holderEntryLiveness(existing)
+      if (life && (await holderEntryIsLive(life, this.options.liveness)))
+        return this.purpose === 'session' && existing?.purpose === 'sweep'
+          ? ('sweep' as const)
+          : false
+      const bytes = JSON.stringify({
+        pid: process.pid,
+        incarnation: await (
+          this.options.liveness?.incarnation ?? processIncarnation
+        )(process.pid),
+        registeredAt: Date.now(),
+        token: this.token,
+        purpose: this.purpose,
+      })
+      const temp = `${this.path}.${this.token}.tmp`
+      try {
+        if (
+          !(await createWindowsOwnerOnly(temp, bytes, this.options.ownerOnly))
+        )
+          await writeFile(temp, bytes, { flag: 'wx', mode: 0o600 })
+        await lease.assertOwned()
+        await renameWithWindowsSharingRetry(temp, this.path, {
+          platform: this.options.ownerOnly?.platform,
+        })
+        this.held = true
+        return true
+      } finally {
+        await rm(temp, { force: true })
+      }
+    })
+  }
+
+  async isCurrent() {
+    if (!this.held) return false
+    try {
+      return (await this.read())?.token === this.token
+    } catch {
+      return false
+    }
+  }
+
+  async release() {
+    if (!this.held) return
+    await withNativeLock(this.path, CLAIM_LOCK, async (lease) => {
+      if ((await this.read())?.token === this.token) {
+        await lease.assertOwned()
+        await rm(this.path, { force: true })
+      }
+      this.held = false
+    })
+  }
 }
 
 function record(
@@ -256,11 +402,21 @@ export interface CacheKeepStoreOptions {
   now?: () => number
   setTimeoutImpl?: typeof globalThis.setTimeout
   clearTimeoutImpl?: typeof globalThis.clearTimeout
+  /** Hold a process claim from adoption or a live write through the last warm. */
+  sessionClaims?: boolean
+}
+
+type StoreClaim = {
+  claim: CacheKeepClaim
+  acquired: Promise<boolean>
+  retained: boolean
+  closing?: Promise<void>
 }
 
 /** Best-effort restart storage. No caller of changed() waits for disk or zlib. */
 export class CacheKeepStore {
   readonly directory: string
+  private readonly claims?: Map<string, StoreClaim>
   private disabled = false
   private memoryOnly = false
   private persistenceEnabled = false
@@ -281,9 +437,69 @@ export class CacheKeepStore {
       options.root,
       options.host,
     )
+    if (options.sessionClaims) this.claims = previous?.claims ?? new Map()
     // Capture pending writes before the shared entry switches writers. New
     // writes and loads wait for them, so an old write cannot land last.
     this.chain = previous?.drain() ?? Promise.resolve()
+  }
+
+  get isMemoryOnly() {
+    return this.memoryOnly
+  }
+
+  private openClaim(key: string, purpose: 'session' | 'sweep') {
+    if (!this.claims || this.claims.has(key)) return
+    // Keep claims outside the record directory, including during migration
+    // from the legacy temp directory. Old readers still see the same files.
+    const claim = new CacheKeepClaim(`${this.directory}.claims`, key, {
+      sessionHash: true,
+      purpose,
+      ownerOnly: this.options.ownerOnly,
+    })
+    const item: StoreClaim = {
+      claim,
+      retained: false,
+      acquired: claim.acquire().catch(() => {
+        this.writeFailed()
+        return false
+      }),
+    }
+    if (purpose === 'session') this.claims.set(key, item)
+    return item
+  }
+
+  private closeClaim(key: string, item: StoreClaim) {
+    item.closing ??= (async () => {
+      if (await item.acquired) await item.claim.release()
+    })().finally(() => {
+      if (this.claims?.get(key) === item) this.claims.delete(key)
+    })
+    return item.closing
+  }
+
+  private async scanClaim(key: string, purpose: 'session' | 'sweep') {
+    const item = this.openClaim(key, purpose)
+    if (!item) return undefined
+    if (!(await item.acquired)) {
+      await this.closeClaim(key, item)
+      return undefined
+    }
+    return Object.assign(
+      () => (item.retained ? Promise.resolve() : this.closeClaim(key, item)),
+      {
+        canRemove: async () => (await item.claim.isCurrent()) && !item.retained,
+      },
+    )
+  }
+
+  async releaseClaims(shouldRelease: (hash: string) => boolean) {
+    this.chain = this.chain.then(async () => {
+      for (const [key, item] of this.claims ?? []) {
+        if (!shouldRelease(key)) continue
+        await this.closeClaim(key, item).catch(() => this.writeFailed())
+      }
+    })
+    await this.chain
   }
 
   private refuse(memoryOnly = false) {
@@ -362,6 +578,7 @@ export class CacheKeepStore {
     accept: (entry: SavedCacheKeepTarget) => Acceptance,
     claim?: (sessionHash: string) => Promise<CacheKeepStoreRelease | undefined>,
     guard?: (sessionHash: string) => boolean | Promise<boolean>,
+    mode: 'restore' | 'sweep' = 'restore',
   ) {
     await this.chain
     if (!(await this.directoryReady())) return
@@ -391,19 +608,28 @@ export class CacheKeepStore {
     let dropped = 0
     try {
       for (const name of (await readdir(directory)).sort()) {
-        if (!FILE.test(name) && !TEMP.test(name)) continue
+        const temp = TEMP.test(name)
+        if (!FILE.test(name) && !temp) continue
+        const key = name.slice(0, 64)
+        const path = join(directory, name)
+        if (temp && !(await this.staleTemp(path))) continue
+        if (guard && !(await guard(key))) continue
         // Multi-process hosts must hold the session claim while reading or
         // deleting, including expiry cleanup and abandoned temporary writes.
-        const release = claim ? await claim(name.slice(0, 64)) : undefined
-        if (claim && !release) continue
-        const path = join(directory, name)
+        const release = claim
+          ? await claim(key)
+          : await this.scanClaim(
+              key,
+              temp || mode === 'sweep' ? 'sweep' : 'session',
+            )
+        if ((claim || this.claims) && !release) continue
         let reason: DropReason = 'unreadable'
         let entry: SavedCacheKeepTarget | undefined
         const permitted = async () => {
           try {
             return (
-              (!guard || (await guard(name.slice(0, 64)))) &&
-              (!release?.canRemove || (await release.canRemove()))
+              (!release?.canRemove || (await release.canRemove())) &&
+              (!guard || (await guard(key)))
             )
           } catch {
             return false
@@ -411,7 +637,7 @@ export class CacheKeepStore {
         }
         try {
           if (!(await permitted())) continue
-          if (TEMP.test(name)) {
+          if (temp) {
             reason = 'unfinished-write'
             throw new Error('Unfinished write')
           }
@@ -461,6 +687,8 @@ export class CacheKeepStore {
             throw new Error('Stale restart file')
           }
           if (accepted === true) {
+            const owned = this.claims?.get(key)
+            if (owned && !claim && mode === 'restore') owned.retained = true
             // Retire pre-2.5.4 files only after the accepted record is durable
             // in the private data store.
             if (directory !== this.directory) {
@@ -482,20 +710,24 @@ export class CacheKeepStore {
             restored++
           }
         } catch {
-          // Serialize deletion with live writes and recheck file ownership,
-          // even when the saved file cannot be decoded.
-          this.chain = this.chain
-            .then(async () => {
-              if (!(await permitted())) return
-              await rm(path, { force: true })
-              logger.debug('cachekeep', 'restart record dropped', {
-                file: name,
-                reason,
-              })
-              dropped++
+          const drop = async () => {
+            if (temp && !(await this.staleTemp(path))) return
+            if (!(await permitted())) return
+            await rm(path, { force: true })
+            logger.debug('cachekeep', 'restart record dropped', {
+              file: name,
+              reason,
             })
-            .catch(() => this.writeFailed())
-          await this.chain
+            dropped++
+          }
+          // A live writer may already be queued behind the sweep's claim.
+          // Delete under that claim rather than waiting for the writer.
+          if (this.claims && !claim)
+            await drop().catch(() => this.writeFailed())
+          else {
+            this.chain = this.chain.then(drop).catch(() => this.writeFailed())
+            await this.chain
+          }
         } finally {
           await release?.()
         }
@@ -509,6 +741,13 @@ export class CacheKeepStore {
           dropped,
         })
     }
+  }
+
+  private async staleTemp(path: string) {
+    // Older writers used anonymous temporary names. Allow a full long-cache
+    // lifetime for publication before treating any of these files as abandoned.
+    const stat = await lstat(path).catch(() => undefined)
+    return !!stat && stat.mtimeMs <= Date.now() - TEMP_STALE_MS
   }
 
   changed(target: Readonly<CacheKeepTarget>) {
@@ -532,6 +771,16 @@ export class CacheKeepStore {
       return
     this.latest.set(entry.id, entry)
     this.pending.set(entry.id, entry)
+    if (this.claims) {
+      const key = hash(entry.id)
+      this.enqueue(async () => {
+        await this.claims?.get(key)?.closing
+        const item = this.claims?.get(key) ?? this.openClaim(key, 'session')
+        if (!item) return
+        item.retained = true
+        if (!(await item.acquired)) await this.closeClaim(key, item)
+      })
+    }
     if (this.timers.has(entry.id)) return
     // Coalesce nearby preparations into the latest body, including tool steps
     // in a long user turn. Each session is capped at one write per five seconds;
@@ -558,7 +807,9 @@ export class CacheKeepStore {
     this.pending.delete(id)
     if (!entry) return this.chain
     this.lastWrite.set(id, this.options.now?.() ?? Date.now())
-    this.enqueue(() => this.writeEntry(entry))
+    this.enqueue(async () => {
+      if (await this.canWrite(id)) await this.writeEntry(entry)
+    })
     return this.chain
   }
 
@@ -582,12 +833,19 @@ export class CacheKeepStore {
     this.chain = this.chain
       .then(async () => {
         if (!(await this.directoryReady())) return
+        if (!(await this.canWrite(entry.id))) return
         await this.writeEntry(entry)
         committed = true
       })
       .catch(() => this.writeFailed())
     await this.chain
     return committed || this.memoryOnly
+  }
+
+  private async canWrite(id: string) {
+    if (!this.claims) return true
+    const item = this.claims.get(hash(id))
+    return !!item?.retained && (await item.claim.isCurrent())
   }
 
   private async writeEntry(entry: SavedCacheKeepTarget) {
@@ -606,16 +864,28 @@ export class CacheKeepStore {
     }
   }
 
-  removed(id: string) {
+  removed(id: string, removeUnowned = false) {
     const timer = this.timers.get(id)
     if (timer) (this.options.clearTimeoutImpl ?? clearTimeout)(timer)
     this.timers.delete(id)
     this.pending.delete(id)
     this.latest.delete(id)
     this.lastWrite.delete(id)
-    this.enqueue(() =>
-      rm(join(this.directory, `${hash(id)}.json.gz`), { force: true }),
-    )
+    this.enqueue(async () => {
+      const key = hash(id)
+      const item =
+        this.claims?.get(key) ??
+        (removeUnowned ? this.openClaim(key, 'sweep') : undefined)
+      try {
+        if (
+          !this.claims ||
+          (item && (await item.acquired) && (await item.claim.isCurrent()))
+        )
+          await rm(join(this.directory, `${key}.json.gz`), { force: true })
+      } finally {
+        if (item) await this.closeClaim(key, item)
+      }
+    })
   }
 
   clear() {
@@ -626,9 +896,21 @@ export class CacheKeepStore {
     this.latest.clear()
     this.lastWrite.clear()
     this.enqueue(async () => {
-      for (const name of await readdir(this.directory))
-        if (FILE.test(name) || TEMP.test(name))
-          await rm(join(this.directory, name), { force: true })
+      for (const name of await readdir(this.directory)) {
+        const path = join(this.directory, name)
+        const temp = TEMP.test(name)
+        if (!FILE.test(name) && !temp) continue
+        if (temp && !(await this.staleTemp(path))) continue
+        const release = await this.scanClaim(name.slice(0, 64), 'sweep')
+        if (this.claims && !release) continue
+        try {
+          if (release?.canRemove && !(await release.canRemove())) continue
+          if (temp && !(await this.staleTemp(path))) continue
+          await rm(path, { force: true })
+        } finally {
+          await release?.()
+        }
+      }
     })
   }
 

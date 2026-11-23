@@ -567,14 +567,8 @@ export async function setupAnthropicAuth(
     fetch: options.fetch,
     subagent,
   })
-  await cacheKeep.ready.catch(async (error: unknown) => {
-    requests.retire()
-    holderRegistration?.close()
-    await cacheKeep?.dispose()
-    await source.close()
-    await runtime.close()
-    await settingsService?.dispose()
-    throw error
+  void cacheKeep.ready.catch(() => {
+    logger.warn('cachekeep', 'failed to start keep-warm restoration')
   })
   const capabilities = createNativeMenuCapabilities({
     runtime,

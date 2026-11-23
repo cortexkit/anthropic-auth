@@ -163,6 +163,7 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       pluginVersion,
       host: 'opencode1',
       now: lease.now,
+      sessionClaims: true,
     }),
     leases: new Set<Lease>(),
     owners: new Map(),
@@ -219,7 +220,7 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       if (owner || shared.loading) {
         shared.owners.delete(hash)
         shared.restored.delete(hash)
-        shared.store.removed(id)
+        shared.store.removed(id, true)
       }
     },
     reserve,
@@ -242,7 +243,8 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
       shared.closing++
       try {
         await lease.manager.dispose()
-        await shared.loading
+        const loading = shared.loading
+        await loading
         let released = false
         for (const [hash, owner] of shared.owners) {
           if (owner !== lease) continue
@@ -251,7 +253,9 @@ export function adoptCacheKeepRestart(storageId: string, lease: Lease) {
           released = true
         }
         await shared.store.drain()
-        if (released && shared.leases.size > 0) await restore(shared)
+        await shared.store.releaseClaims((hash) => !shared.owners.has(hash))
+        if ((released || loading) && shared.leases.size > 0)
+          await restore(shared)
       } finally {
         shared.closing--
         if (shared.leases.size === 0 && shared.closing === 0)

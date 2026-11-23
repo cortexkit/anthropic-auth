@@ -12173,9 +12173,12 @@ const anthropicAuthPlugin = async (
     dispose,
     // biome-ignore lint/suspicious/noExplicitAny: Plugin type doesn't include undocumented auth/hooks
   } as any
-  await cacheKeepRestart.restore()
+  const restoredCacheKeep = cacheKeepRestart.restore()
   pluginTestHandles?.set(plugin, {
-    drainDispatchWork,
+    async drainDispatchWork() {
+      await restoredCacheKeep
+      await drainDispatchWork()
+    },
     drainSidebarRouteWrites,
     primeManager,
     quotaManager,

@@ -1,8 +1,9 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import {
   CacheKeepManager,
   CacheKeepSessionRegistry,
@@ -287,19 +288,16 @@ test('OpenCode 2 hybrid disable removes local records but preserves a mixed stor
   expect(
     shared.manager.trackedSessions().map(({ id }: { id: string }) => id),
   ).toEqual(['ses_runner'])
-  const retained: string[] = []
-  let saved: any
-  await shared.persistence.load(now, (entry: { id: string }) => {
-    retained.push(entry.id)
-    saved = entry
-    return undefined
-  })
-  expect(retained).toEqual(['ses_runner'])
-  expect(
-    (await readdir(shared.persistence.directory)).filter((name) =>
-      name.endsWith('.json.gz'),
-    ),
-  ).toHaveLength(1)
+  const files = (await readdir(shared.persistence.directory)).filter((name) =>
+    name.endsWith('.json.gz'),
+  )
+  expect(files).toHaveLength(1)
+  const saved = JSON.parse(
+    gunzipSync(
+      await readFile(join(shared.persistence.directory, files[0]!)),
+    ).toString(),
+  )
+  expect(saved.id).toBe('ses_runner')
   const reports: unknown[] = []
   shared.manager.track({
     sessionId: 'ses_runner',
